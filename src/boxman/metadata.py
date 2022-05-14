@@ -1,0 +1,11 @@
+package = 'boxman'
+project = 'boxman'
+project_no_spaces = project.replace(' ', '')
+version = '0.0.0.dev0'
+description = 'placeholder description for this project'
+authors = ['John Smith']
+authors_string = ', '.join(authors)
+emails = ['john@example.com']
+license = 'GPL v3'
+copyright = '20XX ' + authors_string
+url = 'https://boxman.example.com'
