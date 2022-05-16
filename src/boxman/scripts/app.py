@@ -9,6 +9,7 @@ from datetime import datetime
 
 from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.virtualbox.utils import Command
+from boxman.abstract.hosts_specs import HostsSpecs
 
 now = datetime.utcnow()
 snap_name = now.strftime('%Y-%m-%dT%H:%M:%S')
@@ -172,11 +173,14 @@ def provision(session, args):
 
     # .. todo:: prefix the vm name (not the hostname) with the cluster group name
     # .. todo:: place each vm in a virtualbox group (like in the ui)
-    for vm_name, vm_info in cluster['vms'].items():
+    vms = cluster['vms']
+    for vm_name, vm_info in vms.items():
         # set the path of the disk for every disk that is defined
         for disk_info in vm_info['disks']:
-            disk_info['disk_path'] = os.path.join(workdir,
-                                                  f'{cluster_name}_{vm_name}_{disk_info["name"]}.vdi')
+            disk_info['disk_path'] = os.path.join(
+                workdir,
+                f'{cluster_name}_{vm_name}_{disk_info["name"]}.vdi'
+            )
 
     ###############################################################################
     ###############################################################################
