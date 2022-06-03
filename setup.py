@@ -18,7 +18,9 @@ setup(
         'boxman',
         'boxman.loggers',
         'boxman.scripts',
-        'boxman.virtualbox'
+        'boxman.virtualbox',
+        'boxman.abstract',
+        'boxman.utils'
     ],
     package_dir={
         'boxman': os.path.join('src', 'boxman')
