@@ -4,7 +4,7 @@ project: test_cluster
 clusters:
   cluster_1:
     workdir: ~/tmp/sandbox/test_cluster
-    base_image: centos-7
+    base_image: centos-7-boxman-testcluster-template
     proxy_host: localhost
     admin_user: admin
     admin_pass: testcluster
