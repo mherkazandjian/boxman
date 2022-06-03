@@ -1,0 +1,74 @@
+---
+project: test_cluster
+
+clusters:
+  cluster_1:
+    workdir: ~/tmp/sandbox/test_cluster
+    base_image: centos-7-boxman-dev-testcluster-template
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: testcluster
+    admin_key_name: id_ed25519_boxman
+    ssh_config: ssh_config
+    ansible_inventory: inventory/01-hosts.yml
+
+    networks:
+      test_cluster_mgmt:
+        network: 1.2.3.0/24
+        enable: True
+
+    ansible_inventory_yaml: |
+      ---
+      all:
+        hosts:
+          mgmt01:
+          node01:
+          node02:
+      ...
+
+    vms:
+      management_01:
+        hostname: mgmt01
+        access_port: 15522
+        disks:
+          - name: disk01
+            medium_type: disk
+            format: VDI
+            size: 2048
+            attach_to:
+              controller:
+                storagectl: SATA
+                port: 1
+                medium_type: hdd
+        network_adapters:
+          - name: adapter_1
+            cableconnected: 'on'
+            attached_to:
+              nat: ''
+          - name: adapter_2
+            cableconnected: 'on'
+            attached_to:
+              natnetwork: test_cluster_mgmt
+      node_01:
+        hostname: node01
+        access_port: 15524
+        disks:
+          - name: disk01
+            medium_type: disk
+            format: VDI
+            size: 2048
+            attach_to:
+              controller:
+                storagectl: SATA
+                port: 1
+                medium_type: hdd
+        network_adapters:
+          - name: adapter_1
+            cableconnected: 'on'
+            attached_to:
+              nat: ''
+          - name: adapter_2
+            cableconnected: 'on'
+            attached_to:
+              natnetwork: test_cluster_mgmt
+...
