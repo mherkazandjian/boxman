@@ -9,6 +9,7 @@ from datetime import datetime
 
 from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.virtualbox.utils import Command
+from boxman.utils.io import write_files
 from boxman.abstract.hosts_specs import HostsSpecs
 
 now = datetime.utcnow()
@@ -137,7 +138,6 @@ def restore(session, args):
     for vm in vms:
         session.snapshot.restore(vm, snap_name=args.snapshot_name)
 
-
 def provision(session, args):
     conf = session.conf
     project = conf['project']
@@ -152,24 +152,22 @@ def provision(session, args):
     admin_pass = cluster['admin_pass']
     admin_key_name = cluster['admin_key_name']
     ssh_config = cluster['ssh_config']
-    ansible_inventory = cluster['ansible_inventory']
     workdir = cluster['workdir']
     # -------------------- end global config -----------------------
 
     admin_priv_key = os.path.expanduser(os.path.join(workdir, admin_key_name))
     admin_public_key = os.path.expanduser(os.path.join(workdir, admin_key_name + '.pub'))
     ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
-    ansible_inventory = os.path.expanduser(os.path.join(workdir, ansible_inventory))
     workdir = os.path.abspath(os.path.expanduser(workdir))
     if not os.path.isdir(workdir):
         os.makedirs(workdir)
 
+    # write the files specified in the configuration
+    if files := cluster.get('files'):
+        write_files(files, rootdir=cluster['workdir'])
+
     # create the guest only NAT networks
     nat_networks = cluster['networks']
-
-    # define the ansible inventory file. This is written to:
-    #       workdir/ansible_inventory
-    ansible_inventory_yaml = cluster['ansible_inventory_yaml']
 
     # .. todo:: prefix the vm name (not the hostname) with the cluster group name
     # .. todo:: place each vm in a virtualbox group (like in the ui)
@@ -268,14 +266,6 @@ def provision(session, args):
             fobj.write(f'    IdentityFile {admin_priv_key}\n')
             fobj.write('\n\n')
 
-    # write the ansible inventory file to the workdir
-    print('write the ansible inventory file')
-    ansible_inventory_dirpath = os.path.dirname(ansible_inventory)
-    if not os.path.isdir(ansible_inventory_dirpath):
-        os.makedirs(ansible_inventory_dirpath)
-    with open(ansible_inventory, 'w') as fobj:
-        fobj.write(ansible_inventory_yaml)
-
     # generate the ssh priv/pub key pair if it does not exist
     if not os.path.exists(admin_priv_key):
         cmd = f'ssh-keygen -t ed25519 -a 100 -f {admin_priv_key} -q -N ""'
@@ -345,10 +335,7 @@ def provision(session, args):
 
     print('to run ansible:')
     print(
-        f'>>> ansible --ssh-common-args="-F {ssh_config}" -i {ansible_inventory_dirpath} all -m ping')
-
-    print('set env vars for the setup:')
-    print(f'>>> source /path/to/bashrc-that-defined-ssh-config and inventory and gateway host')
+        f'>>> ansible --ssh-common-args="-F {ssh_config}" -i /path/to/inventory all -m ping')
 
 
 def main():
@@ -356,8 +343,7 @@ def main():
     arg_parser = parse_args()
     args = arg_parser.parse_args()
 
-    config = 'conf.yml'
-    with open(config) as fobj:
+    with open(args.conf) as fobj:
         conf = yaml.safe_load(fobj.read())
 
     session = Virtualbox(conf)
