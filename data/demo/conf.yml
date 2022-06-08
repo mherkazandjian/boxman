@@ -10,21 +10,11 @@ clusters:
     admin_pass: testcluster
     admin_key_name: id_ed25519_boxman
     ssh_config: ssh_config
-    ansible_inventory: inventory/01-hosts.yml
 
     networks:
       test_cluster_mgmt:
         network: 1.2.3.0/24
         enable: True
-
-    ansible_inventory_yaml: |
-      ---
-      all:
-        hosts:
-          mgmt01:
-          node01:
-          node02:
-      ...
 
     vms:
       management_01:

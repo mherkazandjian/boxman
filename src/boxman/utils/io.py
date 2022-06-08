@@ -14,6 +14,8 @@ def write_files(files, rootdir=None):
             fpath = _fpath
 
         fpath = os.path.expanduser(fpath)
+        print(f'provision file {fpath}')
+
         dirpath = os.path.dirname(fpath)
         if not os.path.exists(dirpath):
             os.makedirs(dirpath, exist_ok=True)
