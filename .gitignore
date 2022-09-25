@@ -121,6 +121,9 @@ dmypy.json
 CMakeLists.txt
 cmake-build-debug
 
+# vscode
+.vscode
+
 # make
 common_options.mk
 
