@@ -11,3 +11,7 @@ build:
 
 install:
 	@python setup.py install
+
+
+devshell:
+	@cd data/dev && PYTHONPATH=../../src:$P{PYTHONPATH} ipython
