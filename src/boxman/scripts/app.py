@@ -216,7 +216,7 @@ def provision(session, cli_args):
 
         # clone the vm
         session.removevm(vm_name)
-        session.clonevm(vmname=base_image, name=vm_name)
+        session.clonevm(vmname=base_image, name=vm_name, basefolder=workdir)
         session.group_vm(vmname=vm_name, groups=os.path.join(f'/{project}', cluster_group))
 
         # create the meedium and attach the disks
