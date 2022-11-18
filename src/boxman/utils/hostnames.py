@@ -3,9 +3,13 @@ import re
 
 def expand_name_range(name_range: str):
     """
+    Expand a name range into a list of strings.
 
-    :param name_range:
-    :return:
+    For example:
+       node0[1:3] -> node01, node02, node03
+
+    :param name_range: the name range to be exanded
+    :return: a tuple of strings
     """
     host_range_only = re.search(r'\[(.*?)\]', name_range).group(1)
     name_from, name_to = host_range_only.split(':')
