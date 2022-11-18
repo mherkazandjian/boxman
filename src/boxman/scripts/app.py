@@ -11,6 +11,9 @@ from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.virtualbox.utils import Command
 from boxman.utils.io import write_files
 from boxman.abstract.hosts_specs import HostsSpecs
+from boxman.abstract.providers import Providers
+from boxman.abstract.providers import Session
+
 
 now = datetime.utcnow()
 snap_name = now.strftime('%Y-%m-%dT%H:%M:%S')
@@ -116,29 +119,38 @@ def parse_args():
     return parser
 
 
-def parse_vms_list(session, args):
+def parse_vms_list(session: Session, cli_args):
+    """
+    Parse the list of vms, either "all" vms or a comma-separated list
+
+    When 'all' is specified, all the vms from the session configurations
+    are used.
+
+    :param session: The instance of a session
+    """
     vms = []
-    if args.vms == 'all':
+    if cli_args.vms == 'all':
         for cluster in session.conf['clusters']:
             for vm in session.conf['clusters'][cluster]['vms']:
                 vms.append(vm)
     else:
-        vms.extend(args.vms.split(','))
+        vms.extend(cli_args.vms.split(','))
+
     return vms
 
 
-def snapshot(session, args):
-    vms = parse_vms_list(session, args)
+def snapshot(session, cli_args):
+    vms = parse_vms_list(session, cli_args)
     for vm in vms:
-        session.snapshot.take(vm, snap_name=args.snapshot_name)
+        session.snapshot.take(vm, snap_name=cli_args.snapshot_name)
 
 
-def restore(session, args):
-    vms = parse_vms_list(session, args)
+def restore(session, cli_args):
+    vms = parse_vms_list(session, cli_args)
     for vm in vms:
-        session.snapshot.restore(vm, snap_name=args.snapshot_name)
+        session.snapshot.restore(vm, snap_name=cli_args.snapshot_name)
 
-def provision(session, args):
+def provision(session, cli_args):
     conf = session.conf
     project = conf['project']
     cluster_group = list(conf['clusters'].keys())[0]  # one cluster supported for now
@@ -346,6 +358,10 @@ def main():
     with open(args.conf) as fobj:
         conf = yaml.safe_load(fobj.read())
 
+    # .. todo:: implement guessing the provider from the config file
+    # .. todo:: is it worth to think/design for multiple providers
+    # .         in the same config?
+    # session = Session(my_provider)
     session = Virtualbox(conf)
 
     args.func(session, args)
