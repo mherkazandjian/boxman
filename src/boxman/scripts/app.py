@@ -42,7 +42,6 @@ def parse_args():
             "       # snapshot and set a name for the snapshot (all vms get the same snapshot name)\n"
             "       $ boxman snapshot --name=mystate1\n"
             "\n"
-            "\n"
             "   restore\n"
             "       # restore all vms in the default config file\n"
             "       $ boxman restore --name=mystate1\n"
@@ -65,11 +64,15 @@ def parse_args():
 
     subparsers = parser.add_subparsers(help='')
 
+    #
     # sub parser for provisioning a configuration
+    #
     parser_prov = subparsers.add_parser('provision', help='provision a configuration')
     parser_prov.set_defaults(func=provision)
 
+    #
     # sub parser for the 'snapshot' subcommand
+    #
     parser_snap = subparsers.add_parser('snapshot', help='snapshot the state of the vms')
     parser_snap.add_argument(
         '--vms',
@@ -94,9 +97,24 @@ def parse_args():
         dest='snapshot_descr',
         default=''
     )
+
+    parser_snap.add_argument(
+        '--live',
+        action='store_true',
+        help='take a snapshot with stopping the vm',
+    )
+    parser_snap.add_argument(
+        '--no-live',
+        action='store_false',
+        help='take a snapshot without stopping the vm',
+        dest='live',
+    )
+
     parser_snap.set_defaults(func=snapshot)
 
+    #
     # sub parser for the 'restore' subcommand
+    #
     parser_restore = subparsers.add_parser('restore', help='restore the state of vms from snapshots')
     parser_restore.add_argument(
         '--vms',
@@ -142,7 +160,10 @@ def parse_vms_list(session: Session, cli_args):
 def snapshot(session, cli_args):
     vms = parse_vms_list(session, cli_args)
     for vm in vms:
-        session.snapshot.take(vm, snap_name=cli_args.snapshot_name)
+        session.snapshot.take(
+            vm,
+            snap_name=cli_args.snapshot_name,
+            live=cli_args.live)
 
 
 def restore(session, cli_args):
