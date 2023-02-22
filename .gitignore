@@ -155,3 +155,5 @@ docs/examples
 .bash_history
 .conda
 .scratch
+.current_env
+.default_env

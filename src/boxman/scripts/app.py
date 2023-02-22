@@ -32,23 +32,33 @@ def parse_args():
             "       $ boxman provision\n"
             "\n"
             "   snapshot\n"
+            "\n"
+            "     list\n"
+            "       # list snapshots\n"
+            "       $ boxman snapshot list\n"
+            "\n"
+            "     delete\n"
+            "       # delete snapshots\n"
+            "       $ boxman snapshot delete\n"
+            "\n"
+            "     take\n"
             "       # snapshot all vms in the default config file\n"
-            "       $ boxman snapshot\n"
+            "       $ boxman snapshot take\n"
             "\n"
             "       # snapshot one or more vms\n"
-            "       $ boxman snapshot --vm=myvm1\n"
-            "       $ boxman snapshot --vm=myvm1,myvm2\n"
+            "       $ boxman snapshot take --vm=myvm1\n"
+            "       $ boxman snapshot take --vm=myvm1,myvm2\n"
             "\n"
             "       # snapshot and set a name for the snapshot (all vms get the same snapshot name)\n"
-            "       $ boxman snapshot --name=mystate1\n"
+            "       $ boxman snapshot take --name=mystate1\n"
             "\n"
-            "   restore\n"
+            "     restore\n"
             "       # restore all vms in the default config file\n"
-            "       $ boxman restore --name=mystate1\n"
+            "       $ boxman snapshot restore --name=mystate1\n"
             "\n"
             "       # restore one or more vms\n"
-            "       $ boxman restore --vm=myvm1\n"
-            "       $ boxman restore  --vm=myvm1,myvm2\n"
+            "       $ boxman snapshot restore --vm=myvm1\n"
+            "       $ boxman snapshot restore  --vm=myvm1,myvm2\n"
             "\n"
         ),
         formatter_class=RawTextHelpFormatter
@@ -62,7 +72,7 @@ def parse_args():
         default='conf.yml'
     )
 
-    subparsers = parser.add_subparsers(help='')
+    subparsers = parser.add_subparsers(help=f"sub-commands for boxman")
 
     #
     # sub parser for provisioning a configuration
@@ -73,58 +83,75 @@ def parse_args():
     #
     # sub parser for the 'snapshot' subcommand
     #
-    parser_snap = subparsers.add_parser('snapshot', help='snapshot the state of the vms')
-    parser_snap.add_argument(
+    parser_snap = subparsers.add_parser('snapshot', help='manage snapshots the state of the vms')
+
+    subparsers_snap = parser_snap.add_subparsers(
+        help=f"sub-commands for boxman snapshot")
+
+    #
+    # sub parser for the 'snapshot take' subsubcommand
+    #
+    parser_snap_take = subparsers_snap.add_parser('take', help='take a snapshot')
+    parser_snap_take.set_defaults(func=snapshot_take)
+    parser_snap_take.add_argument(
         '--vms',
         type=str,
-        help='snapshot one or more vms, specify the names of the vms as a csv list',
+        help='the names of the vms as a csv list',
         dest='vms',
         default='all'
     )
-
-    parser_snap.add_argument(
+    parser_snap_take.add_argument(
         '--name',
         type=str,
         help='the name of the snapshot',
         dest='snapshot_name',
         default=now.strftime('%Y-%m-%dT%H:%M:%S')
     )
-
-    parser_snap.add_argument(
+    parser_snap_take.add_argument(
         '-m',
         type=str,
         help='the description of the snapshot',
         dest='snapshot_descr',
         default=''
     )
-
-    parser_snap.add_argument(
+    parser_snap_take.add_argument(
         '--live',
         action='store_true',
         help='take a snapshot with stopping the vm',
     )
-    parser_snap.add_argument(
+    parser_snap_take.add_argument(
         '--no-live',
         action='store_false',
         help='take a snapshot without stopping the vm',
         dest='live',
     )
 
-    parser_snap.set_defaults(func=snapshot)
-
     #
-    # sub parser for the 'restore' subcommand
+    # sub parser for the 'snapshot list' subsubcommand
     #
-    parser_restore = subparsers.add_parser('restore', help='restore the state of vms from snapshots')
-    parser_restore.add_argument(
+    parser_snap_list = subparsers_snap.add_parser('list', help='list snapshots')
+    parser_snap_list.set_defaults(func=snapshot_list)
+    parser_snap_list.add_argument(
         '--vms',
         type=str,
-        help='restore one or more vms, specify the names of the vms as a csv list',
+        help='the names of the vms as a csv list',
         dest='vms',
         default='all'
     )
 
-    parser_restore.add_argument(
+    #
+    # sub parser for the 'snapshot restore' subsubcommand
+    #
+    parser_snap_restore = subparsers_snap.add_parser('restore', help='restore the state of vms from snapshot')
+    parser_snap_restore.set_defaults(func=snapshot_restore)
+    parser_snap_restore.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all'
+    )
+    parser_snap_restore.add_argument(
         '--name',
         type=str,
         help='the name of the snapshot',
@@ -132,7 +159,25 @@ def parse_args():
         default=None
     )
 
-    parser_restore.set_defaults(func=restore)
+    #
+    # sub parser for the 'snapshot delete' subsubcommand
+    #
+    parser_snap_delete = subparsers_snap.add_parser('delete', help='delete a snapshot')
+    parser_snap_delete.set_defaults(func=snapshot_delete)
+    parser_snap_delete.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all'
+    )
+    parser_snap_delete.add_argument(
+        '--name',
+        type=str,
+        help='the name of the snapshot',
+        dest='snapshot_name',
+        default=None
+    )
 
     return parser
 
@@ -157,7 +202,7 @@ def parse_vms_list(session: Session, cli_args):
     return vms
 
 
-def snapshot(session, cli_args):
+def snapshot_take(session, cli_args):
     vms = parse_vms_list(session, cli_args)
     for vm in vms:
         session.snapshot.take(
@@ -166,7 +211,21 @@ def snapshot(session, cli_args):
             live=cli_args.live)
 
 
-def restore(session, cli_args):
+def snapshot_list(session, cli_args):
+    vms = parse_vms_list(session, cli_args)
+    for vm in vms:
+        session.snapshot.list(vm)
+
+
+def snapshot_delete(session, cli_args):
+    vms = parse_vms_list(session, cli_args)
+    for vm in vms:
+        session.snapshot.delete(
+            vm,
+            snap_name=cli_args.snapshot_name)
+
+
+def snapshot_restore(session, cli_args):
     vms = parse_vms_list(session, cli_args)
     for vm in vms:
         session.snapshot.restore(vm, snap_name=cli_args.snapshot_name)
@@ -363,8 +422,8 @@ def provision(session, cli_args):
         if ssh_success is False:
             raise ValueError('could not add ssh key')
 
-    print('to ssh to a certain host e.g mgmt_01:')
-    print(f'>>> ssh -F {ssh_config} mgmt_01')
+    print('to ssh to a certain host e.g mgmt01:')
+    print(f'>>> ssh -F {ssh_config} mgmt01')
 
     print('to run ansible:')
     print(

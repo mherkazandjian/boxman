@@ -4,7 +4,7 @@ project: test_cluster
 clusters:
   cluster_1:
     workdir: ~/tmp/sandbox/test_cluster
-    base_image: centos-7-boxman-testcluster-template
+    base_image: centos-7-boxman-dev-testcluster-template
     proxy_host: localhost
     admin_user: admin
     admin_pass: testcluster
@@ -63,8 +63,20 @@ clusters:
               natnetwork: test_cluster_mgmt
     files:
       env.sh: |
-        export INVENTORY=configs/full/inventory
-        export SSH_CONFIG=${HOME}/workspaces/full_hpccluster/ssh_config
+        export INVENTORY=inventory
+        export SSH_CONFIG=${HOME}/tmp/sandbox/test_cluster/ssh_config
         export GATEWAYHOST=mgmt01
-        export ANSIBLE_CONFIG=ansible/ansible.cfg
+        export ANSIBLE_CONFIG=${HOME}/tmp/sandbox/test_cluster/ansible.cfg
+      ansible.cfg: |
+        [defaults]
+        host_key_checking = False
+        poll_interval = 5
+        callbacks_enabled = timer
+        nocows = 1
+        timeout = 30
+
+        [ssh_connection]
+        pipelining = True
+        ssh_args = -o ControlMaster=auto -o ControlPersist=60s
+        control_path = /tmp/ansible-ssh-%%h-%%p-%%r
 ...
