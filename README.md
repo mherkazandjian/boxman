@@ -12,6 +12,11 @@ keep it simple and customizable.
  - git clone
  - python setup.py install
 
+### other pre-requisites
+
+    - sshpass
+    - ansible
+
 ## Sample configuration
 
   https://github.com/mherkazandjian/boxman/blob/main/data/conf.yml

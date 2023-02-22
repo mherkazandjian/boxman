@@ -154,4 +154,4 @@ docs/gen_modules/*
 docs/examples
 .bash_history
 .conda
-
+.scratch
