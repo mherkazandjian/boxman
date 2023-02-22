@@ -94,6 +94,13 @@ def parse_args():
     parser_snap_take = subparsers_snap.add_parser('take', help='take a snapshot')
     parser_snap_take.set_defaults(func=snapshot_take)
     parser_snap_take.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all'
+    )
+    parser_snap_take.add_argument(
         '--name',
         type=str,
         help='the name of the snapshot',
@@ -122,8 +129,15 @@ def parse_args():
     #
     # sub parser for the 'snapshot list' subsubcommand
     #
-    parser_snap_list = subparsers_snap.add_parser('list', help='list snapshot')
+    parser_snap_list = subparsers_snap.add_parser('list', help='list snapshots')
     parser_snap_list.set_defaults(func=snapshot_list)
+    parser_snap_list.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all'
+    )
 
     #
     # sub parser for the 'snapshot restore' subsubcommand
@@ -196,23 +210,19 @@ def snapshot_take(session, cli_args):
             snap_name=cli_args.snapshot_name,
             live=cli_args.live)
 
+
 def snapshot_list(session, cli_args):
-    pass
-    #vms = parse_vms_list(session, cli_args)
-    #for vm in vms:
-    #    session.snapshot.take(
-    #        vm,
-    #        snap_name=cli_args.snapshot_name,
-    #        live=cli_args.live)
+    vms = parse_vms_list(session, cli_args)
+    for vm in vms:
+        session.snapshot.list(vm)
+
 
 def snapshot_delete(session, cli_args):
-    pass
-    #vms = parse_vms_list(session, cli_args)
-    #for vm in vms:
-    #    session.snapshot.take(
-    #        vm,
-    #        snap_name=cli_args.snapshot_name,
-    #        live=cli_args.live)
+    vms = parse_vms_list(session, cli_args)
+    for vm in vms:
+        session.snapshot.delete(
+            vm,
+            snap_name=cli_args.snapshot_name)
 
 
 def snapshot_restore(session, cli_args):

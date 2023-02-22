@@ -37,6 +37,20 @@ class Snapshot:
 
         Command(cmd).run()
 
+    def list(self, vm_name: str):
+        """
+        list a snapshot
+
+        :param vm_name: The name of the vm
+        """
+        assert vm_name, 'the name of the snapshot must be provided'
+
+        # compose the command and set the arguments
+        cmd = f'vboxmanage snapshot {vm_name} list'
+
+        Command(cmd).run()
+
+
     def delete(self, vm_name: str, snap_name: str = None):
         """
         Delete a snapshot
@@ -47,7 +61,7 @@ class Snapshot:
         assert vm_name, 'the name of the snapshot must be provided'
 
         # compose the command and set the arguments
-        cmd = f'vboxmanage snapshot {vm_name} delete {snap_name} '
+        cmd = f'vboxmanage snapshot {vm_name} delete {snap_name}'
 
         Command(cmd).run()
 
