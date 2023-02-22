@@ -1,0 +1,13 @@
+---
+all:
+  hosts:
+    mgmt01:
+    node01:
+  children:
+    mgmt:
+      hosts:
+        mgmt01:
+    compute:
+      hosts:
+        node01:
+...

@@ -1,7 +1,7 @@
 # boxman
 
 Boxman (box manager) is a package that can be used to manage
-infrastructure using configuration files (yaml). It is 
+infrastructure using configuration files (yaml). It is
 inspired by ``Docker Compose`` and ``vagrant``.
 The main goal is to avoid having many dependencies and to
 keep it simple and customizable.
@@ -38,6 +38,23 @@ keep it simple and customizable.
  - test
  - submit pull request
 
+### run boxman in development mode
+
+````
+cd $PROJECT_ROOT
+PYTHONPATH=src:$PYTHONPATH python3 src/boxman/scripts/app.py <sub-command> <cmd-line-args>
+
+# or export the PYTHONPATH
+export PYTHONPATH=$PWD/src:$PYTHONPATH
+python3 src/boxman/scripts/app.py <sub-command> <cmd-line-args>
+
+# change to the development infra dir and provision the cluster
+cd data/dev/minimal_ansible
+python3 ../../../src/boxman/scripts/app.py provision
+make set-default-env env=~/tmp/sandbox/test_cluster/env.sh
+make set-current-env env=~/tmp/sandbox/test_cluster/env.sh
+make ping
+````
 ## Contributing
 
  - git clone
