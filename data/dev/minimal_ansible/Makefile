@@ -17,8 +17,8 @@ $(info |    set an environemt by pointing to a certain environment file)
 $(info )
 $(info examples:)
 $(info )
-$(info |    - make set-current-env env=~/workspaces/full_hpccluster/env.sh)
-$(info |    - make set-default-env env=~/workspaces/full_hpccluster/env.sh)
+$(info |    - make set-current-env env=~/tmp/sandbox/test_cluster/env.sh)
+$(info |    - make set-default-env env=~/tmp/sandbox/test_cluster/env.sh)
 endif
 
 ANSIBLE_FLAGS = -i ${INVENTORY} --ssh-extra-args '-F ${SSH_CONFIG}'
