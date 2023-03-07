@@ -90,6 +90,23 @@ class Virtualbox:
         """
         Command(f"vboxmanage controlvm {name} savestate").run()
 
+    def suspend(self, name: str = None):
+        """
+        Suspend the vm
+
+        :param name: the name or uuid of the vm
+        """
+        Command(f"vboxmanage controlvm {name} pause").run()
+
+    def resume(self, name: str = None):
+        """
+        Resume the vm
+
+        :param name: the name or uuid of the vm
+        """
+        Command(f"vboxmanage controlvm {name} resume").run()
+
+
     def unregistervm(self, name: str = None):
         """
         Remove/delete a virtualmachine

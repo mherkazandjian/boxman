@@ -179,6 +179,40 @@ def parse_args():
         default=None
     )
 
+    #
+    # sub parser for the 'control' subcommand
+    #
+    parser_ctrl = subparsers.add_parser('control', help='control the state of vms')
+
+    subparsers_ctrl = parser_ctrl.add_subparsers(
+        help=f"sub-commands for boxman control")
+
+    #
+    # sub parser for the 'control suspend' subsubcommand
+    #
+    parser_ctrl_suspend = subparsers_ctrl.add_parser('suspend', help='suspend vms')
+    parser_ctrl_suspend.set_defaults(func=machine_suspend)
+    parser_ctrl_suspend.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all'
+    )
+
+    #
+    # sub parser for the 'control resume' subsubcommand
+    #
+    parser_ctrl_resume = subparsers_ctrl.add_parser('resume', help='resume vms')
+    parser_ctrl_resume.set_defaults(func=machine_resume)
+    parser_ctrl_resume.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all'
+    )
+
     return parser
 
 
@@ -229,6 +263,19 @@ def snapshot_restore(session, cli_args):
     vms = parse_vms_list(session, cli_args)
     for vm in vms:
         session.snapshot.restore(vm, snap_name=cli_args.snapshot_name)
+
+
+def machine_suspend(session, cli_args):
+    vms = parse_vms_list(session, cli_args)
+    for vm in vms:
+        session.suspend(vm)
+
+
+def machine_resume(session, cli_args):
+    vms = parse_vms_list(session, cli_args)
+    for vm in vms:
+        session.resume(vm)
+
 
 def provision(session, cli_args):
     conf = session.conf
@@ -449,6 +496,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
-
