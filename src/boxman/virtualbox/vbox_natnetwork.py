@@ -29,7 +29,7 @@ class NatNetwork:
         else:
             print(f'WARN: nat network {network_name} is not defined')
 
-    def add(self, network_name, network=None, enable=False, recreate=False):
+    def add(self, network_name, network=None, enable=False, recreate=False, dhcp='on'):
         if network_name in self.list and recreate:
             self.stop(network_name)
             self.remove(network_name)
@@ -40,6 +40,7 @@ class NatNetwork:
         cmd += f'--network "{network}" '
         if enable:
             cmd += '--enable '
+        cmd += f'--dhcp {dhcp} '
         Command(cmd).run()
 
 
