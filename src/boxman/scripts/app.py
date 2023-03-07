@@ -330,7 +330,8 @@ def provision(session, cli_args):
             nat_network,
             network=info['network'],
             enable=info['enable'],
-            recreate=True
+            recreate=True,
+            dhcp=info['dhcp']
         )
 
     #

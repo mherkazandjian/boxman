@@ -15,6 +15,7 @@ clusters:
       test_cluster_mgmt:
         network: 1.2.3.0/24
         enable: True
+        dhcp: 'on'
 
     vms:
       management_01:
