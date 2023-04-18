@@ -7,6 +7,7 @@ import argparse
 from argparse import RawTextHelpFormatter
 from datetime import datetime
 import shutil
+from multiprocessing import Process, Pipe
 
 from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.virtualbox.utils import Command
@@ -252,12 +253,22 @@ def parse_vms_list(session: Session, cli_args):
 
 
 def snapshot_take(session, cli_args):
+    """
+    Take a snapshot of the vms
+
+    :param session: The instance of a session
+    :param cli_args: The parsed arguments from the cli
+    """
     vms = parse_vms_list(session, cli_args)
-    for vm in vms:
+    def _take(vm):
         session.snapshot.take(
             vm,
             snap_name=cli_args.snapshot_name,
             live=cli_args.live)
+    processes = [Process(target=_take, args=(vm,)) for vm in vms]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
+    #_ = [_take(vm) for vm in vms]
 
 
 def snapshot_list(session, cli_args):
@@ -275,21 +286,50 @@ def snapshot_delete(session, cli_args):
 
 
 def snapshot_restore(session, cli_args):
+    """
+    Restore a snapshot of the vms
+
+    :param session: The instance of a session
+    :param cli_args: The parsed arguments from the cli
+    """
     vms = parse_vms_list(session, cli_args)
-    for vm in vms:
-        session.snapshot.restore(vm, snap_name=cli_args.snapshot_name)
+    def _restore(vm):
+        session.snapshot.restore(
+            vm,
+            snap_name=cli_args.snapshot_name)
+    processes = [Process(target=_restore, args=(vm,)) for vm in vms]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
 
 
 def machine_suspend(session, cli_args):
+    """
+    Suspend the vms
+
+    :param session: The instance of a session
+    :param cli_args: The parsed arguments from the cli
+    """
     vms = parse_vms_list(session, cli_args)
-    for vm in vms:
+    def _suspend(vm):
         session.suspend(vm)
+    processes = [Process(target=_suspend, args=(vm,)) for vm in vms]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
 
 
 def machine_resume(session, cli_args):
+    """
+    Resume the vms
+
+    :param session: The instance of a session
+    :param cli_args: The parsed arguments from the cli
+    """
     vms = parse_vms_list(session, cli_args)
-    for vm in vms:
+    def _resume(vm):
         session.resume(vm)
+    processes = [Process(target=_resume, args=(vm,)) for vm in vms]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
 
 
 def provision(session, cli_args):
