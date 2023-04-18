@@ -40,7 +40,12 @@ class NatNetwork:
         cmd += f'--network "{network}" '
         if enable:
             cmd += '--enable '
+
+        if dhcp in [None, False]:
+            dhcp = 'off'
+        assert dhcp in ['on', 'off']
         cmd += f'--dhcp {dhcp} '
+
         Command(cmd).run()
 
 

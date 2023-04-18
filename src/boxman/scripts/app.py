@@ -8,7 +8,7 @@ import argparse
 from argparse import RawTextHelpFormatter
 from datetime import datetime
 import shutil
-from multiprocessing import Process, Pipe
+from multiprocess import Process
 
 import boxman
 from boxman.virtualbox.vboxmanage import Virtualbox
