@@ -573,14 +573,19 @@ def deprovision_config(session, cli_args):
 
     # delete the vms
     vms = cluster['vms']
-    for vm_name, _ in vms.items():
-        print(f'remove vm {vm_name}')
-        session.removevm(vm_name)
+    def _delete_vm(vm):
+        session.removevm(vm)
+    processes = [Process(target=_delete_vm, args=(vm,)) for vm in vms]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
 
-    ## delete the networks
+    # delete the networks
     nat_networks = cluster['networks']
-    for nat_network, _ in nat_networks.items():
+    def _delete_networks(nat_network):
         session.natnetwork.remove(nat_network)
+    processes = [Process(target=_delete_networks, args=(network,)) for network in nat_networks]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
 
     # delete the workdir
     workdir = os.path.abspath(os.path.expanduser(workdir))
