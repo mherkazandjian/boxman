@@ -329,9 +329,9 @@ def provision(session, cli_args):
         session.natnetwork.add(
             nat_network,
             network=info['network'],
-            enable=info['enable'],
+            enable=info.get('enable'),
             recreate=True,
-            dhcp=info['dhcp']
+            dhcp=info.get('dhcp')
         )
 
     #
