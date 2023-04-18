@@ -27,6 +27,7 @@ def parse_args():
 
     parser = argparse.ArgumentParser(
         description=(
+            f"Boxman version {boxman.metadata.version}\n"
             "Virtualbox vboxmanage wrapper and infrastructure as code manager\n"
             "\n"
             "usage example\n"
