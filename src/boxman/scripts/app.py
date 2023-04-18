@@ -409,17 +409,11 @@ def provision(session, cli_args):
     [p.join() for p in processes]
 
     #
-    # clone vm, forward the ssh access port to the vm and boot the vm
+    # configure the disks
     #
-    vms = cluster['vms']
-    for vm_name, vm_info in vms.items():
-        print(f'provision vm {vm_name}')
+    def _manage_disks(vm_name, vm_info):
+        print(f'manage the disks of the vm {vm_name}')
         pprint(vm_info)
-
-        # clone the vm
-        #session.removevm(vm_name)
-        #session.clonevm(vmname=base_image, name=vm_name, basefolder=workdir)
-        #session.group_vm(vmname=vm_name, groups=os.path.join(f'/{project}', cluster_group))
 
         # create the meedium and attach the disks
         # get the UUID of the disk from the name of the disk and delete it
@@ -447,6 +441,20 @@ def provision(session, cli_args):
                 port=disk_info['attach_to']['controller']['port'],
                 medium=disk_path,
                 medium_type=disk_info['attach_to']['controller']['medium_type'])
+
+    processes = [
+        Process(target=_manage_disks, args=(vm_name, vm_info))
+        for vm_name, vm_info in vms.items()]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
+
+    #
+    # clone vm, forward the ssh access port to the vm and boot the vm
+    #
+    vms = cluster['vms']
+    for vm_name, vm_info in vms.items():
+        print(f'provision vm {vm_name}')
+        pprint(vm_info)
 
         # configure the network interfaces
         for interface_no, netowrk_interface_info in enumerate(vm_info['network_adapters']):
