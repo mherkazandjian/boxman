@@ -122,7 +122,7 @@ help: env
 	@echo "     make ssh-to host=my_host"
 	@echo "   rsync"
 	@echo "     rsyncf --rsync-path='sudo rsync' -e 'ssh -F ${HOME}/workspaces/testcluster/ssh_config' /path/to/local/content testcluster01:/path/to/dst"
-	@echo "   boxman-provision"
+	@echo "   boxman-provision (change infra=local with infra=my_target_info)"
 	@echo "     make boxman-provision infra=local"
 	@echo "     make boxman-snapshot infra=local name=foo"
 	@echo "     make boxman-restore infra=local name=foo"

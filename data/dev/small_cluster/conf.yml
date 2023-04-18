@@ -1,0 +1,148 @@
+---
+project: small_cluster
+
+clusters:
+  cluster_1:
+    workdir: ~/tmp/sandbox/small_cluster
+    base_image: centos-7-boxman-dev-testcluster-template
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: testcluster
+    admin_key_name: id_ed25519_boxman
+    ssh_config: ssh_config
+
+    networks:
+      small_cluster_priv:
+        network: 1.2.3.0/24
+        enable: True
+
+    vms:
+      node01:
+        hostname: node01
+        access_port: 15522
+        disks:
+          - name: disk01
+            medium_type: disk
+            format: VDI
+            size: 2048
+            attach_to:
+              controller:
+                storagectl: SATA
+                port: 1
+                medium_type: hdd
+        network_adapters:
+          - name: adapter_1
+            cableconnected: 'on'
+            attached_to:
+              nat: ''
+          - name: adapter_2
+            cableconnected: 'on'
+            attached_to:
+              natnetwork: small_cluster_priv
+      node02:
+        hostname: node02
+        access_port: 15523
+        disks:
+          - name: disk01
+            medium_type: disk
+            format: VDI
+            size: 2048
+            attach_to:
+              controller:
+                storagectl: SATA
+                port: 1
+                medium_type: hdd
+        network_adapters:
+          - name: adapter_1
+            cableconnected: 'on'
+            attached_to:
+              nat: ''
+          - name: adapter_2
+            cableconnected: 'on'
+            attached_to:
+              natnetwork: small_cluster_priv
+      node03:
+        hostname: node03
+        access_port: 15524
+        disks:
+          - name: disk01
+            medium_type: disk
+            format: VDI
+            size: 2048
+            attach_to:
+              controller:
+                storagectl: SATA
+                port: 1
+                medium_type: hdd
+        network_adapters:
+          - name: adapter_1
+            cableconnected: 'on'
+            attached_to:
+              nat: ''
+          - name: adapter_2
+            cableconnected: 'on'
+            attached_to:
+              natnetwork: small_cluster_priv
+      node04:
+        hostname: node04
+        access_port: 15525
+        disks:
+          - name: disk01
+            medium_type: disk
+            format: VDI
+            size: 2048
+            attach_to:
+              controller:
+                storagectl: SATA
+                port: 1
+                medium_type: hdd
+        network_adapters:
+          - name: adapter_1
+            cableconnected: 'on'
+            attached_to:
+              nat: ''
+          - name: adapter_2
+            cableconnected: 'on'
+            attached_to:
+              natnetwork: small_cluster_priv
+      node05:
+        hostname: node05
+        access_port: 15526
+        disks:
+          - name: disk01
+            medium_type: disk
+            format: VDI
+            size: 2048
+            attach_to:
+              controller:
+                storagectl: SATA
+                port: 1
+                medium_type: hdd
+        network_adapters:
+          - name: adapter_1
+            cableconnected: 'on'
+            attached_to:
+              nat: ''
+          - name: adapter_2
+            cableconnected: 'on'
+            attached_to:
+              natnetwork: small_cluster_priv
+    files:
+      env.sh: |
+        export INVENTORY=inventory
+        export SSH_CONFIG=${HOME}/tmp/sandbox/small_cluster/ssh_config
+        export GATEWAYHOST=node01
+        export ANSIBLE_CONFIG=${HOME}/tmp/sandbox/small_cluster/ansible.cfg
+      ansible.cfg: |
+        [defaults]
+        host_key_checking = False
+        poll_interval = 5
+        callbacks_enabled = timer
+        nocows = 1
+        timeout = 30
+
+        [ssh_connection]
+        pipelining = True
+        ssh_args = -o ControlMaster=auto -o ControlPersist=60s
+        control_path = /tmp/ansible-ssh-%%h-%%p-%%r
+...
