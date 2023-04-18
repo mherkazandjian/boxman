@@ -19,6 +19,15 @@ devshell:
 	@cd data/dev && PYTHONPATH=${PWD}/src:${PYTHONPATH} bash
 
 help:
-	@echo export PYTHONPATH=${PWD}/src:${PYTHONPATH}
-	@echo python app.py
-	@echo python app.py --conf conf.yml
+	@echo "For development"
+	@echo "   explicit steps"
+	@echo "     $ cd <ROOTDIR>"
+	@echo "     $ export PYTHONPATH=${PWD}/src:${PYTHONPATH}"
+	@echo "     $ cd data/dev"
+	@echo "     $ cd minimal"
+	@echo "     $ python ../../../src/boxman/scripts/app.py --help"
+	@echo "     $ python ../../../src/boxman/scripts/app.py provision"
+	@echo "     $ ssh -F ~/tmp/sandbox/minimal/ssh_config boxman01"
+	@echo "   using make ( .. todo:: this does not work as expected, sinc the bash env vars are not preserved)"
+	@echo "   	$ make devshell"
+	@echo "   	$ cd minimal"
