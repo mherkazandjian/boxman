@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import os
+import sys
 import time
 import yaml
 from pprint import pprint
@@ -9,6 +10,7 @@ from datetime import datetime
 import shutil
 from multiprocessing import Process, Pipe
 
+import boxman
 from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.virtualbox.utils import Command
 from boxman.utils.io import write_files
@@ -72,6 +74,13 @@ def parse_args():
         help='the name of the configuration file',
         dest='conf',
         default='conf.yml'
+    )
+
+    parser.add_argument(
+        '--version',
+        action='count',
+        default=0,
+        help='display the version and exit'
     )
 
     subparsers = parser.add_subparsers(help=f"sub-commands for boxman")
@@ -598,6 +607,10 @@ def main():
 
     arg_parser = parse_args()
     args = arg_parser.parse_args()
+
+    if args.version:
+        print(f'v{boxman.metadata.version}')
+        sys.exit(0)
 
     with open(args.conf) as fobj:
         conf = yaml.safe_load(fobj.read())
