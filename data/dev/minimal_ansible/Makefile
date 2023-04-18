@@ -69,10 +69,10 @@ boxman-restore:
 	cd configs/${infra} && boxman snapshot restore --name ${name}
 
 ping:
-	ansible ${ANSIBLE_FLAGS}  all -o -m ping
+	ansible ${ANSIBLE_FLAGS}  all -o -m ansible.buitin.ping
 
 cmd:
-	ansible ${ANSIBLE_FLAGS} all -o -a "cat /etc/os-release"
+	ansible ${ANSIBLE_FLAGS} all -o -m ansible.builtin.shell -a "${ARGS}"
 
 playbooks-syntax:
 	ansible-playbook ${ANSIBLE_FLAGS} --become ansible/site.yml --syntax-check
