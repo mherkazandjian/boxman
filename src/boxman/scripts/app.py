@@ -449,11 +449,10 @@ def provision(session, cli_args):
     [p.join() for p in processes]
 
     #
-    # clone vm, forward the ssh access port to the vm and boot the vm
+    # configure the network interfaces
     #
-    vms = cluster['vms']
-    for vm_name, vm_info in vms.items():
-        print(f'provision vm {vm_name}')
+    def _manage_network_interfaces(vm_name, vm_info):
+        print(f'manage the network interfaces {vm_name}')
         pprint(vm_info)
 
         # configure the network interfaces
@@ -469,6 +468,12 @@ def provision(session, cli_args):
         session.forward_local_port_to_vm(
             vmname=vm_name, host_port=access_port, guest_port="22")
         session.startvm(vm_name)
+
+    processes = [
+        Process(target=_manage_network_interfaces, args=(vm_name, vm_info))
+        for vm_name, vm_info in vms.items()]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
 
     # generate the ssh configuration file for easy access without typing much
     # .. todo:: use the ssh config generator in utils.py
