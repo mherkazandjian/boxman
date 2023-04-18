@@ -6,6 +6,7 @@ from pprint import pprint
 import argparse
 from argparse import RawTextHelpFormatter
 from datetime import datetime
+import shutil
 
 from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.virtualbox.utils import Command
@@ -212,6 +213,20 @@ def parse_args():
         dest='vms',
         default='all'
     )
+
+    #
+    # sub parser for the 'deprovision' subcommand
+    #
+    parser_deprov = subparsers.add_parser('deprovision', help='deprovision components')
+
+    subparsers_deprov = parser_deprov.add_subparsers(
+        help=f"sub-commands for boxman deprovision")
+
+    #
+    # sub parser for the 'deprovision cluster' subsubcommand
+    #
+    parser_deprov_config = subparsers_deprov.add_parser('config', help='deprovision the whole cluster')
+    parser_deprov_config.set_defaults(func=deprovision_config)
 
     return parser
 
@@ -477,6 +492,30 @@ def provision(session, cli_args):
     print(
         f'>>> ansible --ssh-common-args="-F {ssh_config}" -i /path/to/inventory all -m ping')
 
+
+def deprovision_config(session, cli_args):
+    conf = session.conf
+    cluster_group = list(conf['clusters'].keys())[0]  # one cluster supported for now
+    cluster = conf['clusters'][cluster_group]
+    workdir = cluster['workdir']
+
+    # delete the vms
+    vms = cluster['vms']
+    for vm_name, _ in vms.items():
+        print(f'remove vm {vm_name}')
+        session.removevm(vm_name)
+
+    ## delete the networks
+    nat_networks = cluster['networks']
+    for nat_network, _ in nat_networks.items():
+        session.natnetwork.remove(nat_network)
+
+    # delete the workdir
+    workdir = os.path.abspath(os.path.expanduser(workdir))
+    print(f'remove workdir {workdir}...')
+    if os.path.isdir(workdir):
+        shutil.rmtree(workdir)
+    print(f'\ncompleted deprovisioning the cluster {cluster_group}')
 
 def main():
 
