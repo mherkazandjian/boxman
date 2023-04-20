@@ -652,6 +652,8 @@ def export_config(session: Session, cli_args):
 
     :param session: The instance of a session
     :param cli_args: The parsed arguments from the cli
+
+    .. todo:: add option to specify exporting a certain snapshot
     """
     vms = parse_vms_list(session, cli_args)
     assert cli_args.path
