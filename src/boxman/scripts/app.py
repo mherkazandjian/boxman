@@ -239,6 +239,45 @@ def parse_args():
     parser_deprov_config = subparsers_deprov.add_parser('config', help='deprovision the whole cluster')
     parser_deprov_config.set_defaults(func=deprovision_config)
 
+    #
+    # sub parser for the 'export' subcommand
+    #
+    parser_export = subparsers.add_parser('export', help='export the vms')
+    parser_export.set_defaults(func=export_config)
+    parser_export.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all'
+    )
+    parser_export.add_argument(
+        '--path',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='path',
+        default=None
+    )
+
+    #
+    # sub parser for the 'import' subcommand
+    #
+    parser_import = subparsers.add_parser('import', help='import the vms')
+    parser_import.set_defaults(func=import_config)
+    parser_import.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all'
+    )
+    parser_import.add_argument(
+        '--path',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='path',
+    )
+
     return parser
 
 
@@ -598,11 +637,58 @@ def deprovision_config(session, cli_args):
     [p.join() for p in processes]
 
     # delete the workdir
+    # .. todo:: delete the directory only if there are no vms left because
+    #           sometimes if a vm is locked it is not deleted.
     workdir = os.path.abspath(os.path.expanduser(workdir))
     print(f'remove workdir {workdir}...')
     if os.path.isdir(workdir):
         shutil.rmtree(workdir)
     print(f'\ncompleted deprovisioning the cluster {cluster_group}')
+
+
+def export_config(session: Session, cli_args):
+    """
+    Take the vms
+
+    :param session: The instance of a session
+    :param cli_args: The parsed arguments from the cli
+    """
+    vms = parse_vms_list(session, cli_args)
+    assert cli_args.path
+    os.makedirs(cli_args.path, exist_ok=False)
+    def _export_vm(vm, dirpath):
+        session.savestate(vm)
+        session.export_vm(
+            vm,
+            path=os.path.expanduser(os.path.join(dirpath, f'{vm}.ovf'))
+        )
+        session.startvm(vm)
+    processes = [Process(target=_export_vm, args=(vm, cli_args.path)) for vm in vms]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
+    #_ = [_export_vm(vm, cli_args.export_path) for vm in vms]
+
+
+
+def import_config(session: Session, cli_args):
+    """
+    Take a snapshot of the vms
+
+    :param session: The instance of a session
+    :param cli_args: The parsed arguments from the cli
+    # .. todo:: add option to start/resume the vms once imported
+    """
+    vms = parse_vms_list(session, cli_args)
+    def _take(vm):
+        session.snapshot.take(
+            vm,
+            snap_name=cli_args.snapshot_name,
+            live=cli_args.live)
+    processes = [Process(target=_take, args=(vm,)) for vm in vms]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
+    #_ = [_take(vm) for vm in vms]
+
 
 def main():
 

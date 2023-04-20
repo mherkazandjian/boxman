@@ -285,3 +285,14 @@ class Virtualbox:
 
         return dict(re.findall(r"(.*)\=\"?(.*)\"?", process.stdout))
 
+    def export_vm(self, vmname: str = None, path: str = None):
+        """
+        Export a vm to an ovf file
+
+        :param vmname: The name or uuid of the vm
+        :param output: The output file
+        """
+        cmd = ""
+        cmd += f'vboxmanage export {vmname} --output {path}'
+        process = Command(cmd)
+        process.run(capture=True)
