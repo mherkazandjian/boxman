@@ -680,16 +680,17 @@ def import_config(session: Session, cli_args):
     :param cli_args: The parsed arguments from the cli
     # .. todo:: add option to start/resume the vms once imported
     """
-    vms = parse_vms_list(session, cli_args)
-    def _take(vm):
-        session.snapshot.take(
-            vm,
-            snap_name=cli_args.snapshot_name,
-            live=cli_args.live)
-    processes = [Process(target=_take, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-    #_ = [_take(vm) for vm in vms]
+    raise NotImplementedError('importing is not implemented yet')
+    #vms = parse_vms_list(session, cli_args)
+    #def _take(vm):
+    #    session.snapshot.take(
+    #        vm,
+    #        snap_name=cli_args.snapshot_name,
+    #        live=cli_args.live)
+    #processes = [Process(target=_take, args=(vm,)) for vm in vms]
+    #[p.start() for p in processes]
+    #[p.join() for p in processes]
+    ##_ = [_take(vm) for vm in vms]
 
 
 def main():
