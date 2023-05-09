@@ -292,7 +292,4 @@ class Virtualbox:
         :param vmname: The name or uuid of the vm
         :param output: The output file
         """
-        cmd = ""
-        cmd += f'vboxmanage export {vmname} --output {path}'
-        process = Command(cmd)
-        process.run(capture=True)
+        process = Command(f'vboxmanage export {vmname} --output {path}').run()
