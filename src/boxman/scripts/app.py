@@ -226,6 +226,32 @@ def parse_args():
     )
 
     #
+    # sub parser for the 'control save' subsubcommand
+    #
+    parser_ctrl_save = subparsers_ctrl.add_parser('save', help='save the state of vms')
+    parser_ctrl_save.set_defaults(func=machine_save)
+    parser_ctrl_save.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all'
+    )
+
+    #
+    # sub parser for the 'control start' subsubcommand
+    #
+    parser_ctrl_start = subparsers_ctrl.add_parser('start', help='start the vms')
+    parser_ctrl_start.set_defaults(func=machine_start)
+    parser_ctrl_start.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all'
+    )
+
+    #
     # sub parser for the 'deprovision' subcommand
     #
     parser_deprov = subparsers.add_parser('deprovision', help='deprovision components')
@@ -377,6 +403,36 @@ def machine_resume(session, cli_args):
     def _resume(vm):
         session.resume(vm)
     processes = [Process(target=_resume, args=(vm,)) for vm in vms]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
+
+
+def machine_save(session, cli_args):
+    """
+    Save the vms
+
+    :param session: The instance of a session
+    :param cli_args: The parsed arguments from the cli
+    """
+    vms = parse_vms_list(session, cli_args)
+    def _save(vm):
+        session.save(vm)
+    processes = [Process(target=_save, args=(vm,)) for vm in vms]
+    [p.start() for p in processes]
+    [p.join() for p in processes]
+
+
+def machine_start(session, cli_args):
+    """
+    Start the vms
+
+    :param session: The instance of a session
+    :param cli_args: The parsed arguments from the cli
+    """
+    vms = parse_vms_list(session, cli_args)
+    def _start(vm):
+        session.startvm(vm)
+    processes = [Process(target=_start, args=(vm,)) for vm in vms]
     [p.start() for p in processes]
     [p.join() for p in processes]
 
