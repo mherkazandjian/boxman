@@ -416,7 +416,7 @@ def machine_save(session, cli_args):
     """
     vms = parse_vms_list(session, cli_args)
     def _save(vm):
-        session.save(vm)
+        session.savestate(vm)
     processes = [Process(target=_save, args=(vm,)) for vm in vms]
     [p.start() for p in processes]
     [p.join() for p in processes]
