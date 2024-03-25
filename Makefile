@@ -2,9 +2,9 @@
 nothing:
 
 clean:
-	@rm -fvr build boxman.egg-info dist
-	@find . -type d -name '__pycache__' -exec rm -fvr '{}' \;
-	@find . -type f -name '__pycache__' -exec rm -fv '{}' \;
+	@rm -fvr build boxman.egg-info dist || true
+	@find . -type d -name '__pycache__' -exec rm -fvr '{}' \; || true
+	@find . -type f -name '__pycache__' -exec rm -fv '{}' \; || true
 
 build:
 	@python setup.py build
