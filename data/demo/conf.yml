@@ -68,4 +68,5 @@ clusters:
         export SSH_CONFIG=${HOME}/workspaces/full_hpccluster/ssh_config
         export GATEWAYHOST=mgmt01
         export ANSIBLE_CONFIG=ansible/ansible.cfg
+        export INFRA=
 ...

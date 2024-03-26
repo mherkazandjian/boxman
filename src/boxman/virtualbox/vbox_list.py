@@ -63,4 +63,3 @@ class ListHdds:
                 return disk_uuid
         else:
             return None
-

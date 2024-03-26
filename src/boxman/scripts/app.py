@@ -547,6 +547,8 @@ def provision(session, cli_args):
                 medium=disk_path,
                 medium_type=disk_info['attach_to']['controller']['medium_type'])
 
+    #for vm_name, vm_info in vms.items():
+    #    _manage_disks(vm_name, vm_info)
     processes = [
         Process(target=_manage_disks, args=(vm_name, vm_info))
         for vm_name, vm_info in vms.items()]

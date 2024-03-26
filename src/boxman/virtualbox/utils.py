@@ -82,7 +82,6 @@ class Command(object):
         if asyncexec:
             stdout, stderr = None, None
         else:
-            process.wait()
             stdout, stderr = process.communicate()
 
         if stdout is not None:
@@ -136,4 +135,3 @@ class SshConfigGenerator:
 class AnsibleHelper:
     def __inif__(self):
         pass
-

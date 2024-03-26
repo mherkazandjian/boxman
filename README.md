@@ -1,6 +1,6 @@
 # boxman
 
-Boxman (box manager) is a package that can be used to manage
+Boxman (**box** **man**ager) is a package that can be used to manage
 infrastructure using configuration files (yaml). It is
 inspired by ``Docker Compose`` and ``vagrant``.
 The main goal is to avoid having many dependencies and to
