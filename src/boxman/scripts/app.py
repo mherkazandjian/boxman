@@ -12,7 +12,7 @@ from multiprocess import Process
 
 import boxman
 from boxman.manager import BoxmanManager
-#from boxman.providers.libvirt.session import LibvirtSession
+from boxman.providers.libvirt.session import LibVirtSession
 from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.virtualbox.utils import Command
 from boxman.utils.io import write_files
@@ -92,7 +92,7 @@ def parse_args():
     # sub parser for provisioning a configuration
     #
     parser_prov = subparsers.add_parser('provision', help='provision a configuration')
-    parser_prov.set_defaults(func=provision)
+    parser_prov.set_defaults(func=BoxmanManager.provision)
 
     #
     # sub parser for the 'snapshot' subcommand
@@ -440,13 +440,12 @@ def machine_start(session, cli_args):
 
 
 def provision(session, cli_args):
-    asdasdad
-    conf = session.conf
-    project = conf['project']
-    cluster_group = list(conf['clusters'].keys())[0]  # one cluster supported for now
+    config = session.config
+    project = config['project']
+    cluster_group = list(config['clusters'].keys())[0]  # one cluster supported for now
     # -------------------- global config ---------------------------
 
-    cluster = conf['clusters'][cluster_group]
+    cluster = config['clusters'][cluster_group]
     base_image = cluster['base_image']
     cluster_name = cluster_group
     proxy_host = cluster['proxy_host']
@@ -765,17 +764,19 @@ def main():
 
     manager = BoxmanManager(config=args.conf)
 
-    provider = conf.get('provider', 'virtualbox')
-    if provider == 'virtualbox':
-        session = Virtualbox(conf)
-    elif provider == 'libvirt':
-        from boxman.libvirt.libvirt import Libvirt
-        session = Libvirt(conf)
+    provider = manager.config.get('provider', {'virtualbox': {}})
+    # the provider is expected to be a dict with one key
+    provider_type = list(manager.config['provider'].keys())[0]
+
+    if provider_type == 'virtualbox':
+        session = Virtualbox(manager.config)
+    elif provider_type == 'libvirt':
+        session = LibVirtSession(manager.config)
+        manager.provider = session
     elif provider == 'docker-compose':
         raise NotImplementedError('docker-compose is not implemented yet')
         from boxman.docker_compose.docker_compose import DockerCompose
 
-    session = Virtualbox(conf)
     args.func(session, args)
 
 
