@@ -1,6 +1,6 @@
 import os
 from typing import Dict, Any, Optional
-from .netdefine import NetDefine
+from .net import Network
 
 class LibVirtSession:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -29,8 +29,59 @@ class LibVirtSession:
         workdir = self.config['clusters'][cluster_name]['workdir']
         network_name = f'{cluster_name}_{network_name}'
 
-        net_define = NetDefine(network_name, network_info)
+        network = Network(network_name, network_info)
 
-        status = net_define.define_network(
+        status = network.define_network(
             file_path=os.path.join(workdir, f'{network_name}_net_define.xml')
         )
+
+    def destroy_network(self, cluster_name: str, network_name: str) -> bool:
+        """
+        Destroy a network.
+
+        Args:
+            cluster_name: Name of the cluster
+            network_name: Name of the network
+
+        Returns:
+            True if successful, False otherwise
+        """
+        network_info = self.config['clusters'][cluster_name]['networks'][network_name]
+        full_network_name = f'{cluster_name}_{network_name}'
+
+        network = Network(full_network_name, network_info)
+        return network.destroy_network()
+
+    def undefine_network(self, cluster_name: str, network_name: str) -> bool:
+        """
+        Undefine a network.
+
+        Args:
+            cluster_name: Name of the cluster
+            network_name: Name of the network
+
+        Returns:
+            True if successful, False otherwise
+        """
+        network_info = self.config['clusters'][cluster_name]['networks'][network_name]
+        full_network_name = f'{cluster_name}_{network_name}'
+
+        network = Network(full_network_name, network_info)
+        return network.undefine_network()
+
+    def remove_network(self, cluster_name: str, network_name: str) -> bool:
+        """
+        Complete removal of a network: destroy and undefine.
+
+        Args:
+            cluster_name: Name of the cluster
+            network_name: Name of the network
+
+        Returns:
+            True if successful, False otherwise
+        """
+        network_info = self.config['clusters'][cluster_name]['networks'][network_name]
+        full_network_name = f'{cluster_name}_{network_name}'
+
+        network = Network(full_network_name, network_info)
+        return network.remove_network()

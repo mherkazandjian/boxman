@@ -86,8 +86,8 @@ class BoxmanManager:
         Destroy the networks specified in the cluster configuration.
         """
         for cluster_name, cluster in self.config['clusters'].items():
-            for network_name, network_info in cluster['networks'].items():
-                self.provider.destroy_network(cluster_name, network_name)
+            for network_name in cluster['networks'].keys():
+                self.provider.remove_network(cluster_name, network_name)
     ###
 
     def clone_vms(self) -> None:

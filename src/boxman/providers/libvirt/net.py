@@ -6,7 +6,8 @@ from typing import Optional, Dict, Any, Union
 from jinja2 import Template, Environment, FileSystemLoader
 import invoke
 
-class NetDefine:
+
+class Network:
     """
     Class to define libvirt networks by creating XML definitions and using virsh commands.
     """
@@ -20,6 +21,9 @@ class NetDefine:
             info: Dictionary containing network configuration with keys like:
                  mode, bridge, mac, ip, network, enable, etc.
         """
+        #: dict: The provider configuration
+        self.provider_config = {}
+
         #: str: Name of the network
         self.name = name
 
@@ -210,6 +214,79 @@ class NetDefine:
             return False
 
         if autostart and not self.autostart_network():
+            return False
+
+        return True
+
+    def destroy_network(self) -> bool:
+        """
+        Destroy (stop) the network.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Check if network exists first
+            result = invoke.run(f"sudo virsh net-list --all | grep -q {self.name}", hide=True, warn=True)
+            if result.return_code != 0:
+                print(f"Network {self.name} does not exist, nothing to destroy")
+                return True
+
+            # Check if network is active
+            result = invoke.run(f"sudo virsh net-list | grep -q {self.name}", hide=True, warn=True)
+            if result.return_code == 0:
+                # Network is active, stop it
+                result = invoke.run(f"sudo virsh net-destroy {self.name}", hide=True)
+                if not result.ok:
+                    print(f"Failed to destroy network {self.name}: {result.stderr}")
+                    return False
+                print(f"Network {self.name} destroyed successfully")
+
+            return True
+        except invoke.exceptions.UnexpectedExit as e:
+            print(f"Error destroying network: {e}")
+            return False
+
+    def undefine_network(self) -> bool:
+        """
+        Undefine (remove definition of) the network.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Check if network exists
+            result = invoke.run(f"sudo virsh net-list --all | grep -q {self.name}", hide=True, warn=True)
+            if result.return_code != 0:
+                print(f"Network {self.name} does not exist, nothing to undefine")
+                return True
+
+            # Disable autostart first if it's enabled
+            result = invoke.run(f"sudo virsh net-autostart {self.name} --disable", hide=True, warn=True)
+
+            # Undefine the network
+            result = invoke.run(f"sudo virsh net-undefine {self.name}", hide=True)
+            if result.ok:
+                print(f"Network {self.name} undefined successfully")
+                return True
+            else:
+                print(f"Failed to undefine network {self.name}: {result.stderr}")
+                return False
+        except invoke.exceptions.UnexpectedExit as e:
+            print(f"Error undefining network: {e}")
+            return False
+
+    def remove_network(self) -> bool:
+        """
+        Complete removal of a network: destroy and undefine.
+
+        Returns:
+            True if all operations were successful, False otherwise
+        """
+        if not self.destroy_network():
+            return False
+
+        if not self.undefine_network():
             return False
 
         return True
