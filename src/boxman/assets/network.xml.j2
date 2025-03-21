@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<network>
+  <name>{{ name }}</name>
+  <uuid>{{ uuid_val }}</uuid>
+  <forward mode='{{ forward_mode }}'/>
+  <bridge name='{{ bridge_name }}' stp='{{ bridge_stp }}' delay='{{ bridge_delay }}'/>
+  <mac address='{{ mac_address }}'/>
+  <ip address='{{ ip_address }}' netmask='{{ netmask }}'>
+    <dhcp>
+      <range start='{{ dhcp_range_start }}' end='{{ dhcp_range_end }}'/>
+    </dhcp>
+  </ip>
+</network>

@@ -63,9 +63,46 @@ class BoxmanManager:
             conf: Dict[str, Any] = yaml.safe_load(fobj.read())
         return conf
 
+    def provision_files(self) -> None:
+        """
+        Provision files specified in the cluster configuration.
+        """
+        clusters = self.config['clusters']
+        for cluster_name, cluster in clusters.items():
+            if files := cluster.get('files'):
+                write_files(files, rootdir=cluster['workdir'])
+
+    def define_networks(self) -> None:
+        """
+        Define the networks specified in the cluster configuration.
+        """
+        for cluster_name, cluster in self.config['clusters'].items():
+            for network_name, network_info in cluster['networks'].items():
+                self.provider.define_network(cluster_name, network_name)
+
+    def clone_vms(self) -> None:
+        """
+        Clone the VMs defined in the configuration.
+        """
+        def _clone(vm_name, vm_info):
+           print(f'clone the vm {vm_name}')
+           pprint(vm_info)
+
+           cls.removevm(vm_name)
+           cls.clonevm(vmname=base_image, name=vm_name, basefolder=workdir)
+           cls.group_vm(vmname=vm_name, groups=os.path.join(f'/{project}', cluster_group))
+
+        processes = [
+            Process(target=_clone, args=(vm_name, vm_info))
+            for vm_name, vm_info in vms.items()]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+        pass
+
     @staticmethod
-    def provision(session, cli_args):
-        config = session.config
+    def provision(cls, cli_args):
+        config = cls.config
         project = config['project']
         cluster_group = list(config['clusters'].keys())[0]  # one cluster supported for now
         # -------------------- global config ---------------------------
@@ -88,9 +125,9 @@ class BoxmanManager:
         if not os.path.isdir(workdir):
             os.makedirs(workdir)
 
-        # write the files specified in the configuration
-        if files := cluster.get('files'):
-            write_files(files, rootdir=cluster['workdir'])
+        cls.provision_files()
+
+        cls.define_networks()
 
         # .. todo:: prefix the vm name (not the hostname) with the cluster group name
         # .. todo:: place each vm in a virtualbox group (like in the ui)
@@ -112,7 +149,7 @@ class BoxmanManager:
         # create the guest only NAT networks
         nat_networks = cluster['networks']
         for nat_network, info in nat_networks.items():
-            session.natnetwork.add(
+            cls.natnetwork.add(
                 nat_network,
                 network=info['network'],
                 enable=info.get('enable'),
@@ -129,9 +166,9 @@ class BoxmanManager:
             print(f'clone the vm {vm_name}')
             pprint(vm_info)
 
-            session.removevm(vm_name)
-            session.clonevm(vmname=base_image, name=vm_name, basefolder=workdir)
-            session.group_vm(vmname=vm_name, groups=os.path.join(f'/{project}', cluster_group))
+            cls.removevm(vm_name)
+            cls.clonevm(vmname=base_image, name=vm_name, basefolder=workdir)
+            cls.group_vm(vmname=vm_name, groups=os.path.join(f'/{project}', cluster_group))
 
         processes = [
             Process(target=_clone, args=(vm_name, vm_info))
@@ -151,22 +188,22 @@ class BoxmanManager:
             for disk_info in vm_info['disks']:
 
                 disk_path = disk_info['disk_path']
-                disk_uuid = session.list('hdds').query_disk_by_path(disk_path)
+                disk_uuid = cls.list('hdds').query_disk_by_path(disk_path)
                 if disk_uuid:
                     print(f'disk {disk_path} already exists...close and  delete it')
                     # .. todo:: implement detaching the disk from the vm before
                     #           deleting it but if the vm to which the disk was
                     #           attached is off or deleted this is not a problem
-                    session.closemedium(
+                    cls.closemedium(
                         disk_info['medium_type'], target=disk_uuid, delete=True)
 
-                session.createmedium(
+                cls.createmedium(
                     disk_info['medium_type'],
                     filename=disk_path,
                     format=disk_info['format'],
                     size=disk_info['size'])
 
-                session.storageattach(
+                cls.storageattach(
                     vm_name,
                     storagectl=disk_info['attach_to']['controller']['storagectl'],
                     port=disk_info['attach_to']['controller']['port'],
@@ -190,7 +227,7 @@ class BoxmanManager:
 
             # configure the network interfaces
             for interface_no, netowrk_interface_info in enumerate(vm_info['network_adapters']):
-                session.modifyvm_network_settings.apply(
+                cls.modifyvm_network_settings.apply(
                     vm_name,
                     interface_no + 1,
                     netowrk_interface_info
@@ -198,9 +235,9 @@ class BoxmanManager:
 
             # create the port forwarding rule
             access_port = vm_info['access_port']
-            session.forward_local_port_to_vm(
+            cls.forward_local_port_to_vm(
                 vmname=vm_name, host_port=access_port, guest_port="22")
-            session.startvm(vm_name)
+            cls.startvm(vm_name)
 
         processes = [
             Process(target=_manage_network_interfaces, args=(vm_name, vm_info))
@@ -239,7 +276,7 @@ class BoxmanManager:
         print("wait for vms to be ssh'able")
         for vm_name, vm_info in vms.items():
             print(f'vm: {vm_name}')
-            ssh_status = session.wait_for_ssh_server_up(
+            ssh_status = cls.wait_for_ssh_server_up(
                 host='localhost',
                 port=vm_info['access_port'],
                 timeout=60,

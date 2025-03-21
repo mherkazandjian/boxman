@@ -764,8 +764,8 @@ def main():
 
     manager = BoxmanManager(config=args.conf)
 
+    # Get the provider and its type
     provider = manager.config.get('provider', {'virtualbox': {}})
-    # the provider is expected to be a dict with one key
     provider_type = list(manager.config['provider'].keys())[0]
 
     if provider_type == 'virtualbox':
@@ -777,7 +777,7 @@ def main():
         raise NotImplementedError('docker-compose is not implemented yet')
         from boxman.docker_compose.docker_compose import DockerCompose
 
-    args.func(session, args)
+    args.func(manager, args)
 
 
 if __name__ == '__main__':

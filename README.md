@@ -11,6 +11,8 @@ keep it simple and customizable.
 
  - git clone
  - python setup.py install
+ - For the libvirt provider it is necessary that the user executing boxman
+   can run sudo virhs and other libvirt commands (see blow).
 
 ### other pre-requisites
 

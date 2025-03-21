@@ -16,8 +16,22 @@ clusters:
 
     networks:
       test_cluster_mgmt:
-        network: 1.2.3.0/24
+        mode: nat
+        bridge:
+          name: virbr1
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:01'
+        ip:
+          address: '192.168.123.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.123.2'
+              end: '192.168.123.254'
+        network: '1.2.3.0/24'
         enable: True
+        autostart: True
 
     vms:
       boxman01:
