@@ -72,6 +72,7 @@ class BoxmanManager:
             if files := cluster.get('files'):
                 write_files(files, rootdir=cluster['workdir'])
 
+    ###
     def define_networks(self) -> None:
         """
         Define the networks specified in the cluster configuration.
@@ -79,6 +80,15 @@ class BoxmanManager:
         for cluster_name, cluster in self.config['clusters'].items():
             for network_name, network_info in cluster['networks'].items():
                 self.provider.define_network(cluster_name, network_name)
+
+    def destroy_networks(self) -> None:
+        """
+        Destroy the networks specified in the cluster configuration.
+        """
+        for cluster_name, cluster in self.config['clusters'].items():
+            for network_name, network_info in cluster['networks'].items():
+                self.provider.destroy_network(cluster_name, network_name)
+    ###
 
     def clone_vms(self) -> None:
         """
@@ -333,3 +343,69 @@ class BoxmanManager:
         print('to run ansible:')
         print(
             f'>>> ansible --ssh-common-args="-F {ssh_config}" -i /path/to/inventory all -m ping')
+
+
+    @staticmethod
+    def deprovision(cls, cli_args):
+
+        config = cls.config
+        project = config['project']
+        cluster_group = list(config['clusters'].keys())[0]  # one cluster supported for now
+        # -------------------- global config ---------------------------
+
+        cluster = config['clusters'][cluster_group]
+        base_image = cluster['base_image']
+        cluster_name = cluster_group
+        proxy_host = cluster['proxy_host']
+        admin_user = cluster['admin_user']
+        admin_pass = cluster['admin_pass']
+        admin_key_name = cluster['admin_key_name']
+        ssh_config = cluster['ssh_config']
+        workdir = cluster['workdir']
+        # -------------------- end global config -----------------------
+
+        admin_priv_key = os.path.expanduser(os.path.join(workdir, admin_key_name))
+        admin_public_key = os.path.expanduser(os.path.join(workdir, admin_key_name + '.pub'))
+        ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
+        workdir = os.path.abspath(os.path.expanduser(workdir))
+        if not os.path.isdir(workdir):
+            os.makedirs(workdir)
+
+        # .. todo:: implement undo'ing the provisioning of the files (not important for now)
+        #cls.provision_files()
+
+        cls.destroy_networks()
+
+        asdasdasd
+
+
+
+        conf = cls.conf
+        cluster_group = list(conf['clusters'].keys())[0]  # one cluster supported for now
+        cluster = conf['clusters'][cluster_group]
+        workdir = cluster['workdir']
+
+        # delete the vms
+        vms = cluster['vms']
+        def _delete_vm(vm):
+            cls.session.removevm(vm)
+        processes = [Process(target=_delete_vm, args=(vm,)) for vm in vms]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+        # delete the networks
+        nat_networks = cluster['networks']
+        def _delete_networks(nat_network):
+            cls.session.natnetwork.remove(nat_network)
+        processes = [Process(target=_delete_networks, args=(network,)) for network in nat_networks]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+        # delete the workdir
+        # .. todo:: delete the directory only if there are no vms left because
+        #           sometimes if a vm is locked it is not deleted.
+        workdir = os.path.abspath(os.path.expanduser(workdir))
+        print(f'remove workdir {workdir}...')
+        if os.path.isdir(workdir):
+            shutil.rmtree(workdir)
+        print(f'\ncompleted deprovisioning the cluster {cluster_group}')
