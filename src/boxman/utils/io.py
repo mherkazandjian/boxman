@@ -1,11 +1,15 @@
 import os
+from typing import Dict, Optional
 
 
-def write_files(files, rootdir=None):
+def write_files(files: Dict[str, str], rootdir: Optional[str] = None) -> None:
     """
+    Write files to the filesystem. The files are specified as a dictionary
+    where the keys are the file paths and the values are the file contents.
 
-    :param files:
-    :return:
+    :param files: Dictionary mapping file paths to their contents
+    :param rootdir: Optional root directory where files will be created
+    :return: None
     """
     for _fpath in files:
         if rootdir:
@@ -21,4 +25,3 @@ def write_files(files, rootdir=None):
             os.makedirs(dirpath, exist_ok=True)
         with open(fpath, 'w') as fobj:
             fobj.write(files[_fpath])
-

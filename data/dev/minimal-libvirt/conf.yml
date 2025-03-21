@@ -1,0 +1,45 @@
+---
+project: minimal
+provider:
+  libvirt:
+    uri: qemu:///system
+
+clusters:
+  cluster_1:
+    workdir: ~/tmp/sandbox/minimal-libvirt
+    base_image: rocky-95-base-template
+    proxy_host: localhost
+    admin_user: '<placeholder>'
+    admin_pass: '<placeholder>'
+    admin_key_name: id_ed25519_boxman    # generated automatically at provisioning time
+    ssh_config: ssh_config               # generated automatically at provisioning time
+
+    networks:
+      test_cluster_mgmt:
+        network: 1.2.3.0/24
+        enable: True
+
+    vms:
+      boxman01:
+        hostname: boxman01
+        access_port: 15522
+        disks:
+          - name: disk01
+            medium_type: disk
+            format: VDI
+            size: 2048
+            attach_to:
+              controller:
+                storagectl: SATA
+                port: 1
+                medium_type: hdd
+        network_adapters:
+          - name: adapter_1
+            cableconnected: 'on'
+            attached_to:
+              nat: ''
+          - name: adapter_2
+            cableconnected: 'on'
+            attached_to:
+              natnetwork: test_cluster_mgmt
+...

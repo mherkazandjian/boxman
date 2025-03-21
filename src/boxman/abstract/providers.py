@@ -1,6 +1,5 @@
-class Providers:
+class Provider:
     pass
 
-
-class Session:
+class ProviderSession:
     pass

@@ -11,12 +11,14 @@ import shutil
 from multiprocess import Process
 
 import boxman
+from boxman.manager import BoxmanManager
+#from boxman.providers.libvirt.session import LibvirtSession
 from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.virtualbox.utils import Command
 from boxman.utils.io import write_files
 from boxman.abstract.hosts_specs import HostsSpecs
-from boxman.abstract.providers import Providers
-from boxman.abstract.providers import Session
+#from boxman.abstract.providers import Providers
+from boxman.abstract.providers import ProviderSession as Session
 
 
 now = datetime.utcnow()
@@ -438,6 +440,7 @@ def machine_start(session, cli_args):
 
 
 def provision(session, cli_args):
+    asdasdad
     conf = session.conf
     project = conf['project']
     cluster_group = list(conf['clusters'].keys())[0]  # one cluster supported for now
@@ -760,15 +763,19 @@ def main():
         print(f'v{boxman.metadata.version}')
         sys.exit(0)
 
-    with open(args.conf) as fobj:
-        conf = yaml.safe_load(fobj.read())
+    manager = BoxmanManager(config=args.conf)
 
-    # .. todo:: implement guessing the provider from the config file
-    # .. todo:: is it worth to think/design for multiple providers
-    # .         in the same config?
-    # session = Session(my_provider)
+    provider = conf.get('provider', 'virtualbox')
+    if provider == 'virtualbox':
+        session = Virtualbox(conf)
+    elif provider == 'libvirt':
+        from boxman.libvirt.libvirt import Libvirt
+        session = Libvirt(conf)
+    elif provider == 'docker-compose':
+        raise NotImplementedError('docker-compose is not implemented yet')
+        from boxman.docker_compose.docker_compose import DockerCompose
+
     session = Virtualbox(conf)
-
     args.func(session, args)
 
 
