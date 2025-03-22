@@ -145,44 +145,6 @@ class Network(VirshCommand):
             print(f"Error defining network: {e}")
             return False
 
-    def start_network(self) -> bool:
-        """
-        Start the defined network.
-
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            result = invoke.run(f"sudo virsh net-start {self.name}", hide=True)
-            if result.ok:
-                print(f"Network {self.name} started successfully")
-                return True
-            else:
-                print(f"Failed to start network: {result.stderr}")
-                return False
-        except invoke.exceptions.UnexpectedExit as e:
-            print(f"Error starting network: {e}")
-            return False
-
-    def autostart_network(self) -> bool:
-        """
-        Set the network to autostart.
-
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            result = invoke.run(f"sudo virsh net-autostart {self.name}", hide=True)
-            if result.ok:
-                print(f"Network {self.name} set to autostart")
-                return True
-            else:
-                print(f"Failed to set network to autostart: {result.stderr}")
-                return False
-        except invoke.exceptions.UnexpectedExit as e:
-            print(f"Error setting network to autostart: {e}")
-            return False
-
     def define_and_start(self,
                         file_path: Optional[str] = None,
                         autostart: bool = True) -> bool:
@@ -255,7 +217,7 @@ class Network(VirshCommand):
             print(f"Network {self.name} undefined successfully")
             return True
         except RuntimeError as e:
-            print(f"Error undefining network: {e}")
+            print(f"Error un-defining network: {e}")
             return False
 
     def remove_network(self) -> bool:

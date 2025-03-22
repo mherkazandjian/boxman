@@ -73,13 +73,29 @@ class BoxmanManager:
                 write_files(files, rootdir=cluster['workdir'])
 
     ### networks define / remove / destroy
+    # create the NAT guest only network(s)
+    # create the guest only NAT networks
+    #nat_networks = cluster['networks']
+    #for nat_network, info in nat_networks.items():
+    #    cls.natnetwork.add(
+    #        nat_network,
+    #        network=info['network'],
+    #        enable=info.get('enable'),
+    #        recreate=True,
+    #        dhcp=info.get('dhcp')
+    #    )
     def define_networks(self) -> None:
         """
         Define the networks specified in the cluster configuration.
         """
         for cluster_name, cluster in self.config['clusters'].items():
             for network_name, network_info in cluster['networks'].items():
-                self.provider.define_network(cluster_name, network_name)
+                _network_name = f'{cluster_name}_{network_name}'
+                self.provider.define_network(
+                    name=_network_name,
+                    info=network_info,
+                    workdir=cluster['workdir']
+                )
 
     def destroy_networks(self) -> None:
         """
@@ -91,25 +107,69 @@ class BoxmanManager:
     ### end networks define / remove / destroy
 
     ### vms define / remove / destroy
+    #
+    # clone the vms
+    #
+    #def _clone(vm_name, vm_info):
+    #    print(f'clone the vm {vm_name}')
+    #    pprint(vm_info)
+
+    #    cls.removevm(vm_name)
+    #    cls.clonevm(vmname=base_image, name=vm_name, basefolder=workdir)
+    #    cls.group_vm(vmname=vm_name, groups=os.path.join(f'/{project}', cluster_group))
+
+    #processes = [
+    #    Process(target=_clone, args=(vm_name, vm_info))
+    #    for vm_name, vm_info in vms.items()]
+    #[p.start() for p in processes]
+    #[p.join() for p in processes]
+
     def clone_vms(self) -> None:
         """
         Clone the VMs defined in the configuration.
+
+        The following is done for every vm in every cluster
+
+            - remove the vm
+            - clone the vm
         """
-        def _clone(vm_name, vm_info):
-           print(f'clone the vm {vm_name}')
-           pprint(vm_info)
+        for cluster_name, cluster in self.config['clusters'].items():
+            for vm_name, vm_info in cluster['vms'].items():
+                vm_info = vm_info.copy()
+                vm_info['src_vm_name'] = cluster['base_image']
+                new_vm_name = f"{cluster_name}_{vm_name}"
+                self.provider.destroy_vm(cluster_name, vm_name)
+                self.provider.clone_vm(
+                    new_cluster_name,
+                    vm_name,
+                    vm_info)
+                asdasd
+                if success:
+                    print(f"Successfully cloned VM {vm_name}")
+                else:
+                    print(f"Failed to clone VM {vm_name}")
 
-           cls.removevm(vm_name)
-           cls.clonevm(vmname=base_image, name=vm_name, basefolder=workdir)
-           cls.group_vm(vmname=vm_name, groups=os.path.join(f'/{project}', cluster_group))
+    def destroy_vms(self) -> None:
+        """
+        Destroy the VMs specified in the cluster configuration.
+        """
+        if not self.provider:
+            print("No provider set, cannot destroy VMs")
+            return
 
-        processes = [
-            Process(target=_clone, args=(vm_name, vm_info))
-            for vm_name, vm_info in vms.items()]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        for cluster_name, cluster in self.config['clusters'].items():
+            for vm_name in cluster['vms'].keys():
+                print(f"Destroying VM {vm_name} in cluster {cluster_name}")
+                vm_name = f"{cluster_name}_{vm_name}"
+                success = self.provider.destroy_vm(
+                    name=vm_name,
+                    remove_storage=True
+                )
 
-        pass
+                if success:
+                    print(f"Successfully destroyed VM {vm_name}")
+                else:
+                    print(f"Failed to destroy VM {vm_name}")
     ### end vms define / remove / destroy
 
     @staticmethod
@@ -141,6 +201,7 @@ class BoxmanManager:
 
         cls.define_networks()
 
+        cls.destroy_vms()
         cls.clone_vms()
 
         asdasd

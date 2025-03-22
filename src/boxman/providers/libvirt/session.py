@@ -1,6 +1,8 @@
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from .net import Network
+from .clone_vm import CloneVM
+from .destroy_vm import DestroyVM
 
 class LibVirtSession:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -14,26 +16,24 @@ class LibVirtSession:
         self.config = config
 
     def define_network(self,
-                       cluster_name,
-                       network_name):
+                       name: str = None,
+                       info: Optional[Dict[str, Any]] = None,
+                       workdir: Optional[str] = None) -> bool:
         """
 
         Args:
             name: Name of the network
-            network_info: Dictionary containing network configuration
+            info: Dictionary containing network configuration
 
         Returns:
             True if successful, False otherwise
         """
-        network_info = self.config['clusters'][cluster_name]['networks'][network_name]
-        workdir = self.config['clusters'][cluster_name]['workdir']
-        network_name = f'{cluster_name}_{network_name}'
-
-        network = Network(network_name, network_info)
+        network = Network(name=name, info=info)
 
         status = network.define_network(
-            file_path=os.path.join(workdir, f'{network_name}_net_define.xml')
+            file_path=os.path.join(workdir, f'{name}_net_define.xml')
         )
+        return status
 
     def destroy_network(self, cluster_name: str, network_name: str) -> bool:
         """
@@ -91,6 +91,53 @@ class LibVirtSession:
 
         return status
 
-    def clone_vm
+    def clone_vm(self,
+                 cluster_name: str,
+                 vm_name: str,
+                 vm_info: Dict[str, Any]) -> bool:
+        """
+        Clone a VM.
 
-    def destroy_vm
+        Args:
+            cluster_name: Name of the cluster
+            vm_name: Name of the VM
+            vm_info: VM configuration information
+
+        Returns:
+            True if successful, False otherwise
+        """
+        workdir = self.config['clusters'][cluster_name]['workdir']
+        full_vm_name = f"{cluster_name}_{vm_name}"
+
+        # Prepare configuration for CloneVM
+        clone_config = vm_info.copy()
+        clone_config['xml_path'] = os.path.join(workdir, f"{full_vm_name}.xml")
+
+        # Ensure the disk path is set
+        if 'disk_path' not in clone_config:
+            clone_config['disk_path'] = os.path.join(workdir, f"{full_vm_name}.qcow2")
+
+        # Create CloneVM instance
+        cloner = CloneVM(
+            name=full_vm_name,
+            config=clone_config,
+            provider_config=self.config.get('provider', {})
+        )
+
+        # Clone VM and start it
+        return cloner.clone_and_start()
+
+    def destroy_vm(self, name: str, remove_storage: bool = True) -> bool:
+        """
+        Destroy (remove) a VM.
+
+        Args:
+            name: Name of the VM to destroy
+            remove_storage: Whether to remove associated storage
+
+        Returns:
+            True if successful, False otherwise
+        """
+        destroyer = DestroyVM(name=name, provider_config=self.config.get('provider', {}))
+        status = destroyer.remove(remove_storage=remove_storage)
+        return status
