@@ -135,14 +135,18 @@ class BoxmanManager:
         """
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
+
                 vm_info = vm_info.copy()
-                vm_info['src_vm_name'] = cluster['base_image']
                 new_vm_name = f"{cluster_name}_{vm_name}"
-                self.provider.destroy_vm(cluster_name, vm_name)
+
+                self.provider.destroy_vm(new_vm_name)
+
                 self.provider.clone_vm(
-                    new_cluster_name,
-                    vm_name,
-                    vm_info)
+                    src_vm_name=cluster['base_image'],
+                    new_vm_name=new_vm_name,
+                    info=vm_info,
+                    workdir=cluster['workdir']
+                )
                 asdasd
                 if success:
                     print(f"Successfully cloned VM {vm_name}")
@@ -201,7 +205,6 @@ class BoxmanManager:
 
         cls.define_networks()
 
-        cls.destroy_vms()
         cls.clone_vms()
 
         asdasd

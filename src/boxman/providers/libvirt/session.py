@@ -92,40 +92,31 @@ class LibVirtSession:
         return status
 
     def clone_vm(self,
-                 cluster_name: str,
-                 vm_name: str,
-                 vm_info: Dict[str, Any]) -> bool:
+                 new_vm_name: str,
+                 src_vm_name: str,
+                 info: Dict[str, Any],
+                 workdir: str,
+                 ) -> bool:
         """
         Clone a VM.
 
         Args:
-            cluster_name: Name of the cluster
-            vm_name: Name of the VM
-            vm_info: VM configuration information
+            new_vm_name: Name of the new VM
+            src_vm_name: Name of the source VM
+            info: VM configuration information
 
         Returns:
             True if successful, False otherwise
         """
-        workdir = self.config['clusters'][cluster_name]['workdir']
-        full_vm_name = f"{cluster_name}_{vm_name}"
-
-        # Prepare configuration for CloneVM
-        clone_config = vm_info.copy()
-        clone_config['xml_path'] = os.path.join(workdir, f"{full_vm_name}.xml")
-
-        # Ensure the disk path is set
-        if 'disk_path' not in clone_config:
-            clone_config['disk_path'] = os.path.join(workdir, f"{full_vm_name}.qcow2")
-
-        # Create CloneVM instance
         cloner = CloneVM(
-            name=full_vm_name,
-            config=clone_config,
-            provider_config=self.config.get('provider', {})
+            src_vm_name=src_vm_name,
+            new_vm_name=new_vm_name,
+            info=info,
+            provider_config=self.config.get('provider', {}),
+            workdir=workdir,
         )
 
-        # Clone VM and start it
-        return cloner.clone_and_start()
+        return cloner.clone()
 
     def destroy_vm(self, name: str, remove_storage: bool = True) -> bool:
         """
