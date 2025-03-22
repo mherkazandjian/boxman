@@ -3,6 +3,8 @@ project: minimal
 provider:
   libvirt:
     uri: qemu:///system
+    use_sudo: True
+  verbose: True
 
 clusters:
   cluster_1:

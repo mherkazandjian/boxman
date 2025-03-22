@@ -4,15 +4,18 @@ import pkg_resources
 from typing import Optional, Dict, Any, Union
 
 from jinja2 import Template, Environment, FileSystemLoader
-import invoke
+from .commands import VirshCommand
 
 
-class Network:
+class Network(VirshCommand):
     """
     Class to define libvirt networks by creating XML definitions and using virsh commands.
     """
 
-    def __init__(self, name: str, info: Dict[str, Any]):
+    def __init__(self,
+                name: str,
+                info: Dict[str, Any],
+                provider_config: Optional[Dict[str, Any]] = None):
         """
         Initialize the network definition with a dictionary-based configuration.
 
@@ -20,9 +23,9 @@ class Network:
             name: Name of the network
             info: Dictionary containing network configuration with keys like:
                  mode, bridge, mac, ip, network, enable, etc.
+            provider_config: Configuration for the libvirt provider
         """
-        #: dict: The provider configuration
-        self.provider_config = {}
+        super().__init__(provider_config)
 
         #: str: Name of the network
         self.name = name
@@ -132,29 +135,15 @@ class Network:
 
         self.write_xml(file_path)
 
-        # run the following commands to define and start the networks
-        cmds = [
-            f"sudo virsh net-define {file_path}",
-            f"sudo virsh net-start {self.name}",
-            f"sudo virsh net-autostart {self.name}"
-        ]
-
-        for cmd in cmds:
-            try:
-                result = invoke.run(cmd, hide=True)
-                if result.ok:
-                    print(f"Network {self.name} defined successfully")
-                else:
-                    print(f"Failed to define network: {result.stderr}")
-            except invoke.exceptions.UnexpectedExit as exc:
-                msg = (
-                    f"Error defining network: {exc}\n"
-                    f"Command: {cmd}\n"
-                    f"Exit code: {exc.result.return_code}\n"
-                    f"Stdout: {exc.result.stdout}\n"
-                    f"Stderr: {exc.result.stderr}"
-                )
-                raise RuntimeError(msg)
+        # Define the network
+        try:
+            self.execute("net-define", file_path)
+            self.execute("net-start", self.name)
+            self.execute("net-autostart", self.name)
+            return True
+        except RuntimeError as e:
+            print(f"Error defining network: {e}")
+            return False
 
     def start_network(self) -> bool:
         """
@@ -227,23 +216,20 @@ class Network:
         """
         try:
             # Check if network exists first
-            result = invoke.run(f"sudo virsh net-list --all | grep -q {self.name}", hide=True, warn=True)
+            result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
             if result.return_code != 0:
                 print(f"Network {self.name} does not exist, nothing to destroy")
                 return True
 
             # Check if network is active
-            result = invoke.run(f"sudo virsh net-list | grep -q {self.name}", hide=True, warn=True)
+            result = self.execute("net-list", "| grep -q " + self.name, warn=True)
             if result.return_code == 0:
                 # Network is active, stop it
-                result = invoke.run(f"sudo virsh net-destroy {self.name}", hide=True)
-                if not result.ok:
-                    print(f"Failed to destroy network {self.name}: {result.stderr}")
-                    return False
+                self.execute("net-destroy", self.name)
                 print(f"Network {self.name} destroyed successfully")
 
             return True
-        except invoke.exceptions.UnexpectedExit as e:
+        except RuntimeError as e:
             print(f"Error destroying network: {e}")
             return False
 
@@ -256,23 +242,19 @@ class Network:
         """
         try:
             # Check if network exists
-            result = invoke.run(f"sudo virsh net-list --all | grep -q {self.name}", hide=True, warn=True)
+            result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
             if result.return_code != 0:
                 print(f"Network {self.name} does not exist, nothing to undefine")
                 return True
 
             # Disable autostart first if it's enabled
-            result = invoke.run(f"sudo virsh net-autostart {self.name} --disable", hide=True, warn=True)
+            self.execute("net-autostart", self.name, "--disable", warn=True)
 
             # Undefine the network
-            result = invoke.run(f"sudo virsh net-undefine {self.name}", hide=True)
-            if result.ok:
-                print(f"Network {self.name} undefined successfully")
-                return True
-            else:
-                print(f"Failed to undefine network {self.name}: {result.stderr}")
-                return False
-        except invoke.exceptions.UnexpectedExit as e:
+            self.execute("net-undefine", self.name)
+            print(f"Network {self.name} undefined successfully")
+            return True
+        except RuntimeError as e:
             print(f"Error undefining network: {e}")
             return False
 

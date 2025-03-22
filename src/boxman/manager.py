@@ -376,7 +376,7 @@ class BoxmanManager:
 
         cls.destroy_networks()
 
-        asdasdasd
+        return
 
 
 

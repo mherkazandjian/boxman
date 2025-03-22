@@ -83,5 +83,10 @@ class LibVirtSession:
         network_info = self.config['clusters'][cluster_name]['networks'][network_name]
         full_network_name = f'{cluster_name}_{network_name}'
 
-        network = Network(full_network_name, network_info)
-        return network.remove_network()
+        network = Network(name=full_network_name,
+                          info=network_info,
+                          provider_config=self.config['provider'])
+
+        status = network.remove_network()
+
+        return status
