@@ -72,7 +72,7 @@ class BoxmanManager:
             if files := cluster.get('files'):
                 write_files(files, rootdir=cluster['workdir'])
 
-    ###
+    ### networks define / remove / destroy
     def define_networks(self) -> None:
         """
         Define the networks specified in the cluster configuration.
@@ -88,8 +88,9 @@ class BoxmanManager:
         for cluster_name, cluster in self.config['clusters'].items():
             for network_name in cluster['networks'].keys():
                 self.provider.remove_network(cluster_name, network_name)
-    ###
+    ### end networks define / remove / destroy
 
+    ### vms define / remove / destroy
     def clone_vms(self) -> None:
         """
         Clone the VMs defined in the configuration.
@@ -109,6 +110,7 @@ class BoxmanManager:
         [p.join() for p in processes]
 
         pass
+    ### end vms define / remove / destroy
 
     @staticmethod
     def provision(cls, cli_args):
@@ -139,17 +141,9 @@ class BoxmanManager:
 
         cls.define_networks()
 
-        # .. todo:: prefix the vm name (not the hostname) with the cluster group name
-        # .. todo:: place each vm in a virtualbox group (like in the ui)
-        vms = cluster['vms']
-        for vm_name, vm_info in vms.items():
-            # set the path of the disk for every disk that is defined
-            for disk_info in vm_info['disks']:
-                disk_info['disk_path'] = os.path.join(
-                    workdir,
-                    f'{cluster_name}_{vm_name}_{disk_info["name"]}.vdi'
-                )
+        cls.clone_vms()
 
+        asdasd
         ###############################################################################
         ###############################################################################
         ###############################################################################
@@ -157,34 +151,45 @@ class BoxmanManager:
         ###############################################################################
         # create the NAT guest only network(s)
         # create the guest only NAT networks
-        nat_networks = cluster['networks']
-        for nat_network, info in nat_networks.items():
-            cls.natnetwork.add(
-                nat_network,
-                network=info['network'],
-                enable=info.get('enable'),
-                recreate=True,
-                dhcp=info.get('dhcp')
-            )
+        #nat_networks = cluster['networks']
+        #for nat_network, info in nat_networks.items():
+        #    cls.natnetwork.add(
+        #        nat_network,
+        #        network=info['network'],
+        #        enable=info.get('enable'),
+        #        recreate=True,
+        #        dhcp=info.get('dhcp')
+        #    )
 
         vms = cluster['vms']
 
         #
         # clone the vms
         #
-        def _clone(vm_name, vm_info):
-            print(f'clone the vm {vm_name}')
-            pprint(vm_info)
+        #def _clone(vm_name, vm_info):
+        #    print(f'clone the vm {vm_name}')
+        #    pprint(vm_info)
 
-            cls.removevm(vm_name)
-            cls.clonevm(vmname=base_image, name=vm_name, basefolder=workdir)
-            cls.group_vm(vmname=vm_name, groups=os.path.join(f'/{project}', cluster_group))
+        #    cls.removevm(vm_name)
+        #    cls.clonevm(vmname=base_image, name=vm_name, basefolder=workdir)
+        #    cls.group_vm(vmname=vm_name, groups=os.path.join(f'/{project}', cluster_group))
 
-        processes = [
-            Process(target=_clone, args=(vm_name, vm_info))
-            for vm_name, vm_info in vms.items()]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        #processes = [
+        #    Process(target=_clone, args=(vm_name, vm_info))
+        #    for vm_name, vm_info in vms.items()]
+        #[p.start() for p in processes]
+        #[p.join() for p in processes]
+
+        # .. todo:: prefix the vm name (not the hostname) with the cluster group name
+        # .. todo:: place each vm in a virtualbox group (like in the ui)
+        #vms = cluster['vms']
+        #for vm_name, vm_info in vms.items():
+        #    # set the path of the disk for every disk that is defined
+        #    for disk_info in vm_info['disks']:
+        #        disk_info['disk_path'] = os.path.join(
+        #            workdir,
+        #            f'{cluster_name}_{vm_name}_{disk_info["name"]}.vdi'
+        #        )
 
         #
         # configure the disks

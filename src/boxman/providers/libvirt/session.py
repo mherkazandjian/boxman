@@ -90,3 +90,7 @@ class LibVirtSession:
         status = network.remove_network()
 
         return status
+
+    def clone_vm
+
+    def destroy_vm

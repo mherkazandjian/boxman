@@ -38,7 +38,6 @@ clusters:
     vms:
       boxman01:
         hostname: boxman01
-        access_port: 15522
         disks:
           - name: disk01
             driver:
