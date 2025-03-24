@@ -53,7 +53,6 @@ class CloneVM:
             True if successful, False otherwise
         """
         try:
-            # Step 1: Clone the VM
             cmd_args = []
             cmd_kwargs = {
                 'original': self.src_vm_name,

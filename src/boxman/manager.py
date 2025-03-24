@@ -141,17 +141,21 @@ class BoxmanManager:
 
                 self.provider.destroy_vm(new_vm_name)
 
+                self.provider.destroy_disks(
+                    cluster['workdir'],
+                    vm_name=new_vm_name,
+                    disks=vm_info['disks']
+                )
+
                 self.provider.clone_vm(
                     src_vm_name=cluster['base_image'],
                     new_vm_name=new_vm_name,
                     info=vm_info,
                     workdir=cluster['workdir']
                 )
-                asdasd
-                if success:
-                    print(f"Successfully cloned VM {vm_name}")
-                else:
-                    print(f"Failed to clone VM {vm_name}")
+
+        asdasda
+
 
     def destroy_vms(self) -> None:
         """
@@ -178,6 +182,9 @@ class BoxmanManager:
 
     @staticmethod
     def provision(cls, cli_args):
+
+        cls.deprovision(cls, cli_args)
+
         config = cls.config
         project = config['project']
         cluster_group = list(config['clusters'].keys())[0]  # one cluster supported for now
@@ -444,6 +451,20 @@ class BoxmanManager:
         #cls.provision_files()
 
         cls.destroy_networks()
+
+        for cluster_name, cluster in cls.config['clusters'].items():
+            for vm_name, vm_info in cluster['vms'].items():
+
+                vm_info = vm_info.copy()
+                new_vm_name = f"{cluster_name}_{vm_name}"
+
+                cls.provider.destroy_vm(new_vm_name)
+
+                cls.provider.destroy_disks(
+                    cluster['workdir'],
+                    vm_name=new_vm_name,
+                    disks=vm_info['disks']
+                )
 
         return
 

@@ -54,6 +54,24 @@ clusters:
             cableconnected: 'on'
             attached_to:
               natnetwork: test_cluster_mgmt
+      boxman02:
+        hostname: boxman02
+        disks:
+          - name: disk01
+            driver:
+              name: qemu
+              type: qcow2
+            target: vdb
+            size: 2048
+        network_adapters:
+          - name: adapter_1
+            cableconnected: 'on'
+            attached_to:
+              nat: ''
+          - name: adapter_2
+            cableconnected: 'on'
+            attached_to:
+              natnetwork: test_cluster_mgmt
 
     files:
       env.sh: |

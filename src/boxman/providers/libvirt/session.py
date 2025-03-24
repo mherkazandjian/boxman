@@ -116,19 +116,54 @@ class LibVirtSession:
             workdir=workdir,
         )
 
-        return cloner.clone()
+        status = cloner.clone()
+        if not status:
+            raise RuntimeError(
+                f"Failed to clone VM {src_vm_name} to {new_vm_name}"
+            )
 
-    def destroy_vm(self, name: str, remove_storage: bool = False) -> bool:
+    def destroy_disks(self,
+                      workdir : str,
+                      vm_name: str,
+                      disks: List[Dict[str, str]],
+                      ) -> bool:
+        """
+        Destroy disks associated with the VM.
+
+        Args:
+            vm_name: Name of the VM
+            vm_info: VM configuration information
+
+        Returns:
+            True if successful, False otherwise
+        """
+        boot_disk = os.path.expanduser(
+            os.path.join(workdir, f'{vm_name}.qcow2'))
+
+        if os.path.isfile(boot_disk):
+            os.remove(boot_disk)
+
+        for disk in disks:
+            disk_path = os.path.expanduser(
+                os.path.join(
+                    workdir,
+                    f'{vm_name}_{disk["name"]}.qcow2')
+                )
+            if os.path.isfile(disk_path):
+                os.remove(disk_path)
+
+        return True
+
+    def destroy_vm(self, name: str) -> bool:
         """
         Destroy (remove) a VM.
 
         Args:
             name: Name of the VM to destroy
-            remove_storage: Whether to remove associated storage
 
         Returns:
             True if successful, False otherwise
         """
         destroyer = DestroyVM(name=name, provider_config=self.config.get('provider', {}))
-        status = destroyer.remove(remove_storage=remove_storage)
+        status = destroyer.remove()
         return status

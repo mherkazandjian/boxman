@@ -153,14 +153,12 @@ class DestroyVM(VirshCommand):
         Returns:
             True if VM is stopped successfully, False otherwise
         """
-        # If force is explicitly True, skip straight to force shutdown
         if force is True:
             return self.force_shutdown_vm()
 
-        # Otherwise try graceful shutdown, with force option based on force parameter
         return self.shutdown_vm(timeout=timeout, force=force is not False)
 
-    def undefine_vm(self, remove_storage: bool = True) -> bool:
+    def undefine_vm(self) -> bool:
         """
         Undefine (remove) the VM.
 
@@ -177,10 +175,7 @@ class DestroyVM(VirshCommand):
         try:
             self.logger.info(f"Un-defining VM {self.name}")
 
-            if remove_storage:
-                self.execute("undefine", self.name, "--remove-all-storage")
-            else:
-                self.execute("undefine", self.name)
+            self.execute("undefine", self.name)
 
             # Verify VM is no longer defined
             if not self.is_vm_defined():
@@ -190,15 +185,14 @@ class DestroyVM(VirshCommand):
             self.logger.error(f"VM {self.name} is still defined after undefine")
             return False
         except RuntimeError as e:
-            self.logger.error(f"Error undefining VM {self.name}: {e}")
+            self.logger.error(f"Error un-defining VM {self.name}: {e}")
             return False
 
-    def remove(self, remove_storage: bool = True, force: Optional[bool] = None) -> bool:
+    def remove(self, force: Optional[bool] = None) -> bool:
         """
         Completely destroy the VM: shutdown, force destroy if needed, and undefine.
 
         Args:
-            remove_storage: Whether to remove associated storage
             force: Whether to force destroy the VM if it's running
 
         Returns:
@@ -209,6 +203,6 @@ class DestroyVM(VirshCommand):
                 self.logger.error(f"Failed to stop VM {self.name}, cannot proceed with undefine")
                 return False
 
-        status = self.undefine_vm(remove_storage=remove_storage)
+        status = self.undefine_vm()
 
         return status
