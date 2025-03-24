@@ -150,9 +150,13 @@ class Network(VirshCommand):
             self.execute("net-start", self.name)
             self.execute("net-autostart", self.name)
 
-            # If this is a routed network, apply the iptables rule
+            # Apply appropriate network configuration based on type
             if self.forward_mode == 'route':
                 self.apply_route_iptables_rule()
+            elif self.forward_mode == 'nat':
+                self.apply_nat_config()
+            else:
+                raise RuntimeError(f"Unsupported forward mode: {self.forward_mode}")
 
             return True
         except RuntimeError as e:
@@ -323,6 +327,79 @@ class Network(VirshCommand):
                 return False
         except Exception as e:
             self.logger.error(f"Error applying iptables rule: {e}")
+            return False
+
+    def apply_nat_config(self) -> bool:
+        """
+        Apply NAT configuration for networks with forward mode 'nat'.
+
+        This method:
+        1. Finds the outgoing interface (eth0, wlan0, etc.)
+        2. Gets the bridge name for this network
+        3. Allows forwarding between the bridge and outgoing interface
+        4. Enables IP masquerading for the network
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Step 1: Find the outgoing interface
+            cmd_executor = LibVirtCommandBase(self.provider_config)
+
+            # Get the outgoing interface using 'ip route'
+            result = cmd_executor.execute_shell("ip route get 8.8.8.8 | awk '{print $5}'", hide=True)
+            if not result.ok:
+                self.logger.error(f"Failed to find outgoing interface: {result.stderr}")
+                return False
+
+            outgoing_iface = result.stdout.strip()
+            if not outgoing_iface:
+                self.logger.error("Could not determine outgoing interface")
+                return False
+
+            self.logger.info(f"Found outgoing interface: {outgoing_iface}")
+
+            # Step 2: Bridge interface is already known (self.bridge_name)
+            self.logger.info(f"Using bridge interface: {self.bridge_name}")
+
+            # Step 3: Allow forwarding between interfaces
+            # Forward outgoing -> bridge
+            cmd = f"sudo iptables -I FORWARD -i {outgoing_iface} -o {self.bridge_name} -j ACCEPT"
+            result = cmd_executor.execute_shell(cmd)
+            if not result.ok:
+                self.logger.error(f"Failed to set up forwarding from {outgoing_iface} to {self.bridge_name}: {result.stderr}")
+                return False
+
+            # Forward bridge -> outgoing
+            cmd = f"sudo iptables -I FORWARD -i {self.bridge_name} -o {outgoing_iface} -j ACCEPT"
+            result = cmd_executor.execute_shell(cmd)
+            if not result.ok:
+                self.logger.error(f"Failed to set up forwarding from {self.bridge_name} to {outgoing_iface}: {result.stderr}")
+                return False
+
+            # Step 4: Enable NAT for the virtual network
+            # Extract network address from IP and netmask
+            import ipaddress
+            try:
+                ip_interface = ipaddress.IPv4Interface(f"{self.ip_address}/{self.netmask}")
+                network_cidr = str(ip_interface.network)
+
+                # Add masquerade rule
+                cmd = f"sudo iptables -t nat -A POSTROUTING -s {network_cidr} -j MASQUERADE"
+                result = cmd_executor.execute_shell(cmd)
+                if not result.ok:
+                    self.logger.error(f"Failed to set up masquerading for {network_cidr}: {result.stderr}")
+                    return False
+
+                self.logger.info(f"Successfully configured NAT for network {self.name} ({network_cidr})")
+                return True
+
+            except ValueError as e:
+                self.logger.error(f"Error calculating network CIDR: {e}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Error configuring NAT for network {self.name}: {e}")
             return False
 
 
