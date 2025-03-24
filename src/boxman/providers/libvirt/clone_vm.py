@@ -1,5 +1,6 @@
 import os
 import uuid
+import re
 from typing import Optional, Dict, Any, List, Union
 import logging
 
@@ -64,20 +65,9 @@ class CloneVM:
             self.logger.info(f"Cloning VM {self.src_vm_name} to {self.new_vm_name}")
             self.virt_clone.execute(*cmd_args, **cmd_kwargs)
 
-            ## Step 2: Dump the XML configuration
-            #xml_temp_path = f"/tmp/{self.new_vm_name}.xml"
-            #self.logger.info(f"Dumping XML configuration to {xml_temp_path}")
-            #self.virsh.execute("dumpxml", self.new_vm_name, ">", xml_temp_path)
-
-            ## Step 3: Move the XML to the specified location if provided
-            #if self.xml_path:
-            #    os.makedirs(os.path.dirname(self.xml_path), exist_ok=True)
-            #    os.rename(xml_temp_path, self.xml_path)
-            #    self.logger.info(f"Moved XML configuration to {self.xml_path}")
-
-            #    # Step 4: Define the VM with the XML file
-            #    self.logger.info(f"Defining VM from {self.xml_path}")
-            #    self.virsh.execute("define", "--validate", self.xml_path)
+            # After cloning, remove all inherited network interfaces
+            if not self.remove_network_interfaces():
+                self.logger.warning(f"Failed to remove network interfaces from VM {self.new_vm_name}")
 
             return True
         except RuntimeError as e:
@@ -95,3 +85,63 @@ class CloneVM:
             return False
 
         return True
+
+    def remove_network_interfaces(self) -> bool:
+        """
+        Remove all network interfaces from the cloned VM.
+
+        This ensures we start with a clean slate and can add the interfaces
+        specified in the configuration.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Use virsh domiflist to get the network interfaces
+            result = self.virsh.execute("domiflist", self.new_vm_name)
+            if not result.ok:
+                self.logger.error(f"Failed to get interface list for VM {self.new_vm_name}")
+                return False
+
+            # Parse the output to extract interface information
+            # Output format is like:
+            # Interface  Type       Source     Model       MAC
+            # -------------------------------------------------------
+            # vnet0      network    default    virtio      52:54:00:xx:xx:xx
+
+            interfaces = []
+            lines = result.stdout.strip().split('\n')
+            if len(lines) > 2:  # Skip header and separator lines
+                for line in lines[2:]:
+                    parts = line.split()
+                    if len(parts) >= 5:  # Interface Type Source Model MAC
+                        iface_type = parts[1]
+                        source = parts[2]
+                        mac = parts[4]
+                        interfaces.append((iface_type, source, mac))
+
+            self.logger.info(f"Found {len(interfaces)} network interfaces to remove from VM {self.new_vm_name}")
+
+            # Remove each interface
+            for iface_type, source, mac in interfaces:
+                self.logger.info(f"Removing interface with MAC {mac} from VM {self.new_vm_name}")
+
+                # Use the detach-interface command with the correct type and MAC
+                remove_result = self.virsh.execute(
+                    "detach-interface",
+                    self.new_vm_name,
+                    iface_type,  # Use the actual interface type from domiflist
+                    f"--mac={mac}",
+                    "--config",  # Make change persistent
+                    warn=True
+                )
+
+                if not remove_result.ok:
+                    self.logger.warning(f"Failed to remove interface with MAC {mac}: {remove_result.stderr}")
+                else:
+                    self.logger.info(f"Successfully removed interface with MAC {mac}")
+
+            return True
+        except Exception as e:
+            self.logger.error(f"Error removing network interfaces: {e}")
+            return False

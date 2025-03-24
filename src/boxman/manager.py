@@ -139,14 +139,6 @@ class BoxmanManager:
                 vm_info = vm_info.copy()
                 new_vm_name = f"{cluster_name}_{vm_name}"
 
-                self.provider.destroy_vm(new_vm_name)
-
-                self.provider.destroy_disks(
-                    cluster['workdir'],
-                    vm_name=new_vm_name,
-                    disks=vm_info['disks']
-                )
-
                 self.provider.clone_vm(
                     src_vm_name=cluster['base_image'],
                     new_vm_name=new_vm_name,
