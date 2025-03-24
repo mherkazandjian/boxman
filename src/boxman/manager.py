@@ -1,6 +1,7 @@
 import os
 import yaml
 from typing import Dict, Any, Optional, Union, TYPE_CHECKING
+import time
 
 if TYPE_CHECKING:
     from boxman.providers.libvirt.session import LibVirtSession
@@ -251,6 +252,36 @@ class BoxmanManager:
                 else:
                     print(f"Failed to start VM {vm_name}")
 
+    def get_connect_info(self) -> bool:
+        """
+        Gather connection information for all VMs in all clusters.
+
+        This method attempts to get IP addresses for all VMs and returns
+        True only if all VMs have at least one IP address.
+
+        Returns:
+            True if all VMs have at least one IP address, False otherwise
+        """
+        if not self.provider:
+            print("No provider set, cannot retrieve connection information")
+            return False
+
+        all_vms_have_ip = True
+
+        for cluster_name, cluster in self.config['clusters'].items():
+            for vm_name, vm_info in cluster['vms'].items():
+                full_vm_name = f"{cluster_name}_{vm_name}"
+
+                # Get IP addresses for this VM
+                ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
+
+                # If no IP addresses found, mark as failure
+                if not ip_addresses:
+                    all_vms_have_ip = False
+                    print(f"VM {vm_name} does not have an IP address yet")
+
+        return all_vms_have_ip
+
     def connect_info(self) -> None:
         """
         Display connection information for all VMs in all clusters.
@@ -349,12 +380,30 @@ class BoxmanManager:
 
         cls.start_vms()
 
-        # Wait a moment for IPs to be assigned
-        import time
+        # Use adaptive wait for IP address assignment
         print("Waiting for VMs to initialize and get IP addresses...")
-        time.sleep(120)
+        wait_time = 1  # Start with 1 second
+        max_wait = 600  # Maximum total wait time (10 minutes)
+        total_waited = 0
 
+        while total_waited < max_wait:
+            # Check if all VMs have IP addresses
+            if cls.get_connect_info():
+                print(f"All VMs have IP addresses (waited {total_waited}s)")
+                break
+
+            # If we get here, at least one VM doesn't have an IP yet
+            print(f"Waiting {wait_time}s for IP assignment (total waited: {total_waited}s)")
+            time.sleep(wait_time)
+            total_waited += wait_time
+            wait_time = min(wait_time * 2, 60)  # Double the wait time up to 1 minute max per iteration
+
+        if total_waited >= max_wait:
+            print("Warning: Reached maximum wait time. Some VMs may not have IP addresses.")
+
+        # Display connection information
         cls.connect_info()
+
         asdasd
         ###############################################################################
         ###############################################################################
