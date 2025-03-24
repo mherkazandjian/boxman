@@ -148,6 +148,11 @@ class Network(VirshCommand):
             self.execute("net-define", file_path)
             self.execute("net-start", self.name)
             self.execute("net-autostart", self.name)
+
+            # If this is a routed network, apply the iptables rule
+            if self.forward_mode == 'route':
+                self.apply_route_iptables_rule()
+
             return True
         except RuntimeError as e:
             print(f"Error defining network: {e}")
@@ -287,3 +292,34 @@ class Network(VirshCommand):
             self.logger.error(f"Error finding available bridge name: {e}")
             # Return a default if all else fails
             return "virbr0"
+
+    def apply_route_iptables_rule(self) -> bool:
+        """
+        Apply iptables rule to allow communication between hosts on a routed network.
+
+        This adds a rule to the FORWARD chain to allow traffic between hosts
+        on the same bridge interface.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.forward_mode != 'route':
+            return True  # Nothing to do for non-route networks
+
+        try:
+            # Build the iptables command
+            iptables_cmd = f"iptables -I FORWARD -i {self.bridge_name} -o {self.bridge_name} -j ACCEPT"
+            self.logger.info(f"Applying iptables rule for routed network: {iptables_cmd}")
+
+            # Execute the command using shell execution
+            result = self.execute_shell(iptables_cmd)
+
+            if result.ok:
+                self.logger.info(f"Applied iptables rule for routed network {self.name}")
+                return True
+            else:
+                self.logger.error(f"Failed to apply iptables rule: {result.stderr}")
+                return False
+        except Exception as e:
+            self.logger.error(f"Error applying iptables rule: {e}")
+            return False

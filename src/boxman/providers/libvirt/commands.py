@@ -121,8 +121,60 @@ class LibVirtCommandBase:
                 raise RuntimeError(error_message)
             return exc.result
 
+    def execute_shell(self, command: str, hide: bool = True, warn: bool = False) -> invoke.runners.Result:
+        """
+        Execute a raw shell command.
 
-class VirshCommand(LibVirtCommandBase):
+        This is useful for running commands that aren't directly related to the primary command tool,
+        such as iptables, sysctl, etc.
+
+        Args:
+            command: The full shell command to execute
+            hide: Whether to hide command output
+            warn: Whether to warn instead of raising exceptions
+
+        Returns:
+            Result of the command execution
+
+        Raises:
+            RuntimeError: If the command fails and warn is False
+        """
+        # Add sudo if needed
+        if self.use_sudo and not command.startswith("sudo "):
+            command = f"sudo {command}"
+
+        if self.verbose:
+            self.logger.info(f"Executing shell command: {command}")
+
+        try:
+            result = invoke.run(command, hide=hide, warn=warn)
+
+            if not result.ok and not warn:
+                error_message = (
+                    f"Shell command failed: {command}\n"
+                    f"Exit code: {result.return_code}\n"
+                    f"Stdout: {result.stdout}\n"
+                    f"Stderr: {result.stderr}"
+                )
+                self.logger.error(error_message)
+                raise RuntimeError(error_message)
+
+            return result
+        except invoke.exceptions.UnexpectedExit as exc:
+            if not warn:
+                error_message = (
+                    f"Error executing shell command: {exc}\n"
+                    f"Command: {command}\n"
+                    f"Exit code: {exc.result.return_code}\n"
+                    f"Stdout: {exc.result.stdout}\n"
+                    f"Stderr: {exc.result.stderr}"
+                )
+                self.logger.error(error_message)
+                raise RuntimeError(error_message)
+            return exc.result
+
+
+class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
     """
     Class for executing virsh commands for managing libvirt domains,
     networks, storage, etc.
