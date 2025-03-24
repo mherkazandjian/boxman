@@ -146,8 +146,33 @@ class BoxmanManager:
                     workdir=cluster['workdir']
                 )
 
-        asdasda
 
+    def configure_network_interfaces(self) -> None:
+        """
+        Configure network interfaces for all VMs based on their network_adapters configuration.
+
+        This method adds network interfaces to VMs after they have been cloned,
+        connecting them to the appropriate networks.
+        """
+        for cluster_name, cluster in self.config['clusters'].items():
+            for vm_name, vm_info in cluster['vms'].items():
+                full_vm_name = f"{cluster_name}_{vm_name}"
+
+                print(f"Configuring network interfaces for VM {vm_name} in cluster {cluster_name}")
+
+                if 'network_adapters' not in vm_info:
+                    print(f"No network adapters defined for VM {vm_name}, skipping")
+                    continue
+
+                success = self.provider.configure_vm_network_interfaces(
+                    vm_name=full_vm_name,
+                    network_adapters=vm_info['network_adapters']
+                )
+
+                if success:
+                    print(f"All network interfaces configured successfully for VM {vm_name}")
+                else:
+                    print(f"Some network interfaces could not be configured for VM {vm_name}")
 
     def destroy_vms(self) -> None:
         """
@@ -205,6 +230,9 @@ class BoxmanManager:
         cls.define_networks()
 
         cls.clone_vms()
+
+        cls.configure_network_interfaces()
+
 
         asdasd
         ###############################################################################

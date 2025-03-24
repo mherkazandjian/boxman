@@ -3,7 +3,8 @@ import uuid
 import re
 import pkg_resources
 from typing import Optional, Dict, Any, Union
-
+import logging
+import tempfile
 from jinja2 import Template, Environment, FileSystemLoader
 from .commands import VirshCommand, LibVirtCommandBase
 
@@ -323,3 +324,113 @@ class Network(VirshCommand):
         except Exception as e:
             self.logger.error(f"Error applying iptables rule: {e}")
             return False
+
+
+class NetworkInterface(VirshCommand):
+    """
+    Class to manage network interfaces for libvirt VMs.
+    """
+
+    def __init__(self,
+                 vm_name: str,
+                 provider_config: Optional[Dict[str, Any]] = None):
+        """
+        Initialize the network interface manager.
+
+        Args:
+            vm_name: Name of the VM to manage interfaces for
+            provider_config: Configuration for the libvirt provider
+        """
+        super().__init__(provider_config)
+
+        #: str: Name of the VM
+        self.vm_name = vm_name
+
+        #: logging.Logger: Logger instance
+        self.logger = logging.getLogger(__name__)
+
+    def add_interface(self,
+                      network_source: str,
+                      link_state: str = 'active',
+                      mac_address: Optional[str] = None,
+                      model: str = 'virtio') -> bool:
+        """
+        Add a network interface to the VM.
+
+        Args:
+            network_source: Name of the network to attach to
+            link_state: State of the link ('active' or 'inactive')
+            mac_address: Optional MAC address for the interface
+            model: NIC model (default: virtio)
+
+        Returns:
+            True if successful, False otherwise
+        """
+
+        try:
+            # Get the path to the assets directory
+            assets_path = pkg_resources.resource_filename('boxman', 'assets')
+
+            # Create a Jinja environment
+            env = Environment(
+                loader=FileSystemLoader(assets_path),
+                trim_blocks=True,
+                lstrip_blocks=True
+            )
+
+            # Load the template
+            template = env.get_template('network_interface.xml.j2')
+
+            # Render the template with the interface configuration
+            context = {
+                'network_source': network_source,
+                'link_state': link_state,
+                'mac_address': mac_address,
+                'model': model
+            }
+
+            xml_content = template.render(**context)
+
+            # Create a temporary file to store the XML
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as temp:
+                temp.write(xml_content)
+                temp_path = temp.name
+
+            # Use virsh to attach the interface
+            self.execute("attach-device", self.vm_name, temp_path, "--persistent")
+
+            # Remove temporary file
+            os.unlink(temp_path)
+            self.logger.info(f"Added network interface to VM {self.vm_name}: network={network_source}, model={model}")
+            return True
+        except Exception as e:
+            import traceback
+            self.logger.error(f"Error adding network interface to VM {self.vm_name}: {e}")
+            self.logger.debug(traceback.format_exc())
+
+            # Clean up temp file if it exists
+            if 'temp_path' in locals() and os.path.exists(temp_path):
+                os.unlink(temp_path)
+            return False
+
+    def configure_from_config(self, adapter_config: Dict[str, Any]) -> bool:
+        """
+        Configure a network interface from configuration.
+
+        Args:
+            adapter_config: Dictionary with network adapter configuration
+
+        Returns:
+            True if successful, False otherwise
+        """
+        network_source = adapter_config['network_source']
+        link_state = adapter_config['link_state']
+        mac_address = adapter_config.get('mac', None)
+        model = adapter_config.get('model', 'virtio')
+
+        return self.add_interface(
+            network_source=network_source,
+            link_state=link_state,
+            mac_address=mac_address,
+            model=model
+        )

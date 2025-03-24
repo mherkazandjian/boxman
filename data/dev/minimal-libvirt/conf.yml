@@ -60,13 +60,11 @@ clusters:
             size: 2048
         network_adapters:
           - name: adapter_1
-            cableconnected: 'on'
-            attached_to:
-              nat: ''
+            link_state: 'up'
+            network_source: 'cluster_1_nat'
           - name: adapter_2
-            cableconnected: 'on'
-            attached_to:
-              natnetwork: test_cluster_mgmt
+            link_state: 'up'
+            network_source: 'cluster_1_isolated1'
       boxman02:
         hostname: boxman02
         disks:
@@ -78,14 +76,11 @@ clusters:
             size: 2048
         network_adapters:
           - name: adapter_1
-            cableconnected: 'on'
-            attached_to:
-              nat: ''
+            link_state: 'up'
+            network_source: 'cluster_1_nat'
           - name: adapter_2
-            cableconnected: 'on'
-            attached_to:
-              natnetwork: test_cluster_mgmt
-
+            link_state: 'up'
+            network_source: 'cluster_1_isolated1'
     files:
       env.sh: |
         export INVENTORY=inventory

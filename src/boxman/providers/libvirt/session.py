@@ -1,6 +1,6 @@
 import os
 from typing import Dict, Any, Optional, List
-from .net import Network
+from .net import Network, NetworkInterface
 from .clone_vm import CloneVM
 from .destroy_vm import DestroyVM
 
@@ -167,3 +167,64 @@ class LibVirtSession:
         destroyer = DestroyVM(name=name, provider_config=self.config.get('provider', {}))
         status = destroyer.remove()
         return status
+
+    def add_network_interface(self,
+                              vm_name: str,
+                              network_source: str,
+                              link_state: str = 'active',
+                              mac_address: Optional[str] = None,
+                              model: str = 'virtio') -> bool:
+        """
+        Add a network interface to a VM.
+
+        Args:
+            vm_name: Name of the VM
+            network_source: Name of the network to attach to
+            link_state: State of the link ('active' or 'inactive')
+            mac_address: Optional MAC address for the interface
+            model: NIC model (default: virtio)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        network_interface = NetworkInterface(
+            vm_name=vm_name,
+            provider_config=self.config.get('provider', {})
+        )
+
+        return network_interface.add_interface(
+            network_source=network_source,
+            link_state=link_state,
+            mac_address=mac_address,
+            model=model
+        )
+
+    def configure_vm_network_interfaces(self,
+                                       vm_name: str,
+                                       network_adapters: List[Dict[str, Any]]) -> bool:
+        """
+        Configure all network interfaces for a VM.
+
+        Args:
+            vm_name: Name of the VM
+            network_adapters: List of network adapter configurations
+
+        Returns:
+            True if all adapters were configured successfully, False otherwise
+        """
+        network_interface = NetworkInterface(
+            vm_name=vm_name,
+            provider_config=self.config.get('provider', {})
+        )
+
+        success = True
+        for i, adapter_config in enumerate(network_adapters):
+            print(f"Configuring network interface {i+1} for VM {vm_name}")
+
+            if not network_interface.configure_from_config(adapter_config):
+                print(f"Failed to configure network interface {i+1} for VM {vm_name}")
+                success = False
+            else:
+                print(f"Successfully configured network interface {i+1} for VM {vm_name}")
+
+        return success

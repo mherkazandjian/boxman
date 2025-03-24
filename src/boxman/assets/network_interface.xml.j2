@@ -1,0 +1,8 @@
+<interface type='network'>
+  <source network='{{ network_source }}'/>
+  <model type='{{ model }}'/>
+  <link state='{{ link_state }}'/>
+  {% if mac_address %}
+  <mac address='{{ mac_address }}'/>
+  {% endif %}
+</interface>
