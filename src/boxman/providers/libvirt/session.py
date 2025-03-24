@@ -169,6 +169,50 @@ class LibVirtSession:
         status = destroyer.remove()
         return status
 
+    def start_vm(self, vm_name: str) -> bool:
+        """
+        Start a VM.
+
+        Args:
+            vm_name: Name of the VM to start
+
+        Returns:
+            True if successful, False otherwise
+        """
+        from .commands import VirshCommand
+
+        try:
+            virsh = VirshCommand(self.config.get('provider', {}))
+
+            # Check if VM is already running
+            result = virsh.execute("domstate", vm_name, warn=True)
+            if result.ok and "running" in result.stdout:
+                print(f"VM {vm_name} is already running")
+                return True
+
+            # Try to start the VM
+            result = virsh.execute("start", vm_name)
+
+            if not result.ok:
+                print(f"Failed to start VM {vm_name}: {result.stderr}")
+                return False
+
+            # Verify that VM is running
+            verify_result = virsh.execute("domstate", vm_name)
+
+            if "running" in verify_result.stdout:
+                print(f"VM {vm_name} started successfully")
+                return True
+            else:
+                print(f"VM {vm_name} did not start properly. Current state: {verify_result.stdout}")
+                return False
+
+        except Exception as e:
+            import traceback
+            print(f"Error starting VM {vm_name}: {e}")
+            print(traceback.format_exc())
+            return False
+
     def add_network_interface(self,
                               vm_name: str,
                               network_source: str,

@@ -229,6 +229,28 @@ class BoxmanManager:
                     print(f"Failed to destroy VM {vm_name}")
     ### end vms define / remove / destroy
 
+    def start_vms(self) -> None:
+        """
+        Start all VMs in the configuration.
+
+        This powers on all VMs after they have been configured.
+        """
+        if not self.provider:
+            print("No provider set, cannot start VMs")
+            return
+
+        for cluster_name, cluster in self.config['clusters'].items():
+            for vm_name, vm_info in cluster['vms'].items():
+                full_vm_name = f"{cluster_name}_{vm_name}"
+
+                print(f"Starting VM {vm_name}")
+                success = self.provider.start_vm(full_vm_name)
+
+                if success:
+                    print(f"Successfully started VM {vm_name}")
+                else:
+                    print(f"Failed to start VM {vm_name}")
+
     @staticmethod
     def provision(cls, cli_args):
 
@@ -266,6 +288,8 @@ class BoxmanManager:
         cls.configure_network_interfaces()
 
         cls.configure_disks()
+
+        cls.start_vms()
 
         asdasd
         ###############################################################################
