@@ -311,3 +311,58 @@ class LibVirtSession:
                 print(f"Successfully configured disk {i+1} for VM {vm_name}")
 
         return success
+
+    def get_vm_ip_addresses(self, vm_name: str) -> Dict[str, str]:
+        """
+        Get all IP addresses for a VM.
+
+        Args:
+            vm_name: Name of the VM
+
+        Returns:
+            Dictionary mapping interface names to IP addresses
+        """
+        try:
+            # Use virsh commands to get domain info
+            from .commands import VirshCommand
+            virsh = VirshCommand(self.config.get('provider', {}))
+
+            # First check if VM is running
+            result = virsh.execute("domstate", vm_name, warn=True)
+            if not result.ok or "running" not in result.stdout:
+                print(f"VM {vm_name} is not running, cannot get IP addresses")
+                return {}
+
+            # Try domifaddr to get all interfaces and their IPs
+            result = virsh.execute("domifaddr", vm_name, warn=True)
+
+            if not result.ok:
+                print(f"Failed to get interface addresses for VM {vm_name}")
+                return {}
+
+            # Parse the output to extract interface information
+            # Output format is like:
+            # Name       MAC address          Protocol     Address
+            # ---------------------------------------------------------
+            # vnet0      52:54:00:xx:xx:xx    ipv4         192.168.122.x/24
+
+            ip_addresses = {}
+            lines = result.stdout.strip().split('\n')
+
+            if len(lines) > 2:  # Skip header and separator lines
+                for line in lines[2:]:
+                    parts = line.split()
+                    if len(parts) >= 4:  # Name MAC Protocol Address
+                        iface_name = parts[0]
+                        ip_address = parts[3].split('/')[0]  # Remove CIDR notation
+
+                        if iface_name and ip_address and not ip_address.startswith('N/A'):
+                            ip_addresses[iface_name] = ip_address
+
+            return ip_addresses
+
+        except Exception as e:
+            import traceback
+            print(f"Error getting IP addresses for VM {vm_name}: {e}")
+            print(traceback.format_exc())
+            return {}

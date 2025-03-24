@@ -251,6 +251,64 @@ class BoxmanManager:
                 else:
                     print(f"Failed to start VM {vm_name}")
 
+    def connect_info(self) -> None:
+        """
+        Display connection information for all VMs in all clusters.
+
+        This method displays the VM names, hostnames, IP addresses, and
+        other connection details for all configured VMs.
+        """
+        if not self.provider:
+            print("No provider set, cannot retrieve connection information")
+            return
+
+        print("\n=== VM Connection Information ===\n")
+
+        for cluster_name, cluster in self.config['clusters'].items():
+            print(f"Cluster: {cluster_name}")
+            print("-" * 60)
+
+            for vm_name, vm_info in cluster['vms'].items():
+                full_vm_name = f"{cluster_name}_{vm_name}"
+                hostname = vm_info.get('hostname', vm_name)
+
+                print(f"VM: {vm_name} (hostname: {hostname})")
+
+                # Get IP addresses for all interfaces
+                ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
+
+                if ip_addresses:
+                    print("  IP Addresses:")
+                    for iface, ip in ip_addresses.items():
+                        print(f"    {iface}: {ip}")
+                else:
+                    print("  IP Addresses: Not available")
+
+                # Get SSH connection information
+                admin_user = cluster.get('admin_user', '<placeholder>')
+                admin_key = os.path.expanduser(os.path.join(
+                    cluster.get('workdir', '~'),
+                    cluster.get('admin_key_name', 'id_ed25519_boxman')
+                ))
+
+                print("  Connect via SSH:")
+                # Show direct connection if IP is available
+                if ip_addresses:
+                    first_ip = next(iter(ip_addresses.values()))
+                    print(f"    Direct: ssh -i {admin_key} {admin_user}@{first_ip}")
+
+                # Show connection using ssh_config if available
+                if 'ssh_config' in cluster:
+                    ssh_config = os.path.expanduser(os.path.join(
+                        cluster.get('workdir', '~'),
+                        cluster.get('ssh_config', 'ssh_config')
+                    ))
+                    print(f"    Via config: ssh -F {ssh_config} {hostname}")
+
+                print()
+
+            print()
+
     @staticmethod
     def provision(cls, cli_args):
 
@@ -291,6 +349,12 @@ class BoxmanManager:
 
         cls.start_vms()
 
+        # Wait a moment for IPs to be assigned
+        import time
+        print("Waiting for VMs to initialize and get IP addresses...")
+        time.sleep(10)
+
+        cls.connect_info()
         asdasd
         ###############################################################################
         ###############################################################################
