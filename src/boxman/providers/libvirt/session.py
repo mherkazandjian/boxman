@@ -3,6 +3,7 @@ from typing import Dict, Any, Optional, List
 from .net import Network, NetworkInterface
 from .clone_vm import CloneVM
 from .destroy_vm import DestroyVM
+from .disk import DiskManager
 
 class LibVirtSession:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -226,5 +227,43 @@ class LibVirtSession:
                 success = False
             else:
                 print(f"Successfully configured network interface {i+1} for VM {vm_name}")
+
+        return success
+
+    def configure_vm_disks(self,
+                          vm_name: str,
+                          disks: List[Dict[str, Any]],
+                          workdir: str,
+                          disk_prefix: str = "") -> bool:
+        """
+        Configure all disks for a VM.
+
+        Args:
+            vm_name: Name of the VM
+            disks: List of disk configurations
+            workdir: Working directory for disk images
+            disk_prefix: Prefix to add to disk image filenames
+
+        Returns:
+            True if all disks were configured successfully, False otherwise
+        """
+        disk_manager = DiskManager(
+            vm_name=vm_name,
+            provider_config=self.config.get('provider', {})
+        )
+
+        success = True
+        for i, disk_config in enumerate(disks):
+            print(f"Configuring disk {i+1} for VM {vm_name}")
+
+            if not disk_manager.configure_from_disk_config(
+                disk_config=disk_config,
+                workdir=workdir,
+                disk_prefix=disk_prefix
+            ):
+                print(f"Failed to configure disk {i+1} for VM {vm_name}")
+                success = False
+            else:
+                print(f"Successfully configured disk {i+1} for VM {vm_name}")
 
         return success

@@ -174,6 +174,38 @@ class BoxmanManager:
                 else:
                     print(f"Some network interfaces could not be configured for VM {vm_name}")
 
+    def configure_disks(self) -> None:
+        """
+        Configure disks for all VMs based on their disks configuration.
+
+        This method creates and attaches disks to VMs after they have been cloned.
+        """
+        for cluster_name, cluster in self.config['clusters'].items():
+            workdir = cluster.get('workdir', '.')
+
+            for vm_name, vm_info in cluster['vms'].items():
+                full_vm_name = f"{cluster_name}_{vm_name}"
+
+                print(f"Configuring disks for VM {vm_name} in cluster {cluster_name}")
+
+                # Check if there are disks defined in the VM configuration
+                if 'disks' not in vm_info or not vm_info['disks']:
+                    print(f"No disks defined for VM {vm_name}, skipping")
+                    continue
+
+                # Configure all disks for this VM
+                success = self.provider.configure_vm_disks(
+                    vm_name=full_vm_name,
+                    disks=vm_info['disks'],
+                    workdir=workdir,
+                    disk_prefix=full_vm_name
+                )
+
+                if success:
+                    print(f"All disks configured successfully for VM {vm_name}")
+                else:
+                    print(f"Some disks could not be configured for VM {vm_name}")
+
     def destroy_vms(self) -> None:
         """
         Destroy the VMs specified in the cluster configuration.
@@ -233,6 +265,7 @@ class BoxmanManager:
 
         cls.configure_network_interfaces()
 
+        cls.configure_disks()
 
         asdasd
         ###############################################################################
