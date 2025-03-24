@@ -1,10 +1,11 @@
 import os
 import uuid
+import re
 import pkg_resources
 from typing import Optional, Dict, Any, Union
 
 from jinja2 import Template, Environment, FileSystemLoader
-from .commands import VirshCommand
+from .commands import VirshCommand, LibVirtCommandBase
 
 
 class Network(VirshCommand):
@@ -38,8 +39,15 @@ class Network(VirshCommand):
 
         # Extract bridge configuration
         bridge_info = info.get('bridge', {})
+
+        # Handle the bridge name - if not specified, find the first available virbrX
+        bridge_name = bridge_info.get('name')
+        if not bridge_name:
+            bridge_name = self.find_available_bridge_name()
+
         #: str: Bridge name
-        self.bridge_name = bridge_info.get('name', f"virbr{self.name[-1] if name[-1].isdigit() else '0'}")
+        self.bridge_name = bridge_name
+
         #: str: STP on/off for the bridge
         self.bridge_stp = bridge_info.get('stp', 'on')
         #: str: Delay for STP
@@ -234,3 +242,48 @@ class Network(VirshCommand):
             return False
 
         return True
+
+    def find_available_bridge_name(self) -> str:
+        """
+        Find the first available virbrX name that is not in use.
+
+        Returns:
+            The first available virbrX name
+        """
+        # Get a list of existing bridge interfaces using brctl
+        try:
+            # Create a shell command to execute brctl
+            cmd_executor = LibVirtCommandBase()
+            result = cmd_executor.execute("brctl", "show", hide=True, warn=True)
+
+            if not result.ok:
+                self.logger.warning("Failed to run brctl show, defaulting to virbr0")
+                return "virbr0"
+
+            # Parse brctl output to find existing virbr bridges
+            existing_bridges = []
+            lines = result.stdout.splitlines()
+            if len(lines) > 1:  # Skip header line
+                for line in lines[1:]:
+                    parts = line.split()
+                    if parts and parts[0].startswith('virbr'):
+                        existing_bridges.append(parts[0])
+
+            # Find the first unused virbr index
+            used_indices = set()
+            for bridge in existing_bridges:
+                match = re.match(r'virbr(\d+)', bridge)
+                if match:
+                    used_indices.add(int(match.group(1)))
+
+            # Find the first available index
+            index = 0
+            while index in used_indices:
+                index += 1
+
+            return f"virbr{index}"
+
+        except Exception as e:
+            self.logger.error(f"Error finding available bridge name: {e}")
+            # Return a default if all else fails
+            return "virbr0"

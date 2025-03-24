@@ -22,7 +22,7 @@ class LibVirtCommandBase:
         self.provider_config = provider_config or {}
 
         #: bool: Whether to use sudo for commands
-        self.use_sudo = self.provider_config.get('use_sudo', True)
+        self.use_sudo = self.provider_config.get('use_sudo', False)
 
         #: bool: Whether to show command output
         self.verbose = self.provider_config.get('verbose', False)
