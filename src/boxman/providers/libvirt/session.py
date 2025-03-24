@@ -118,7 +118,7 @@ class LibVirtSession:
 
         return cloner.clone()
 
-    def destroy_vm(self, name: str, remove_storage: bool = True) -> bool:
+    def destroy_vm(self, name: str, remove_storage: bool = False) -> bool:
         """
         Destroy (remove) a VM.
 
