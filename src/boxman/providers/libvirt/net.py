@@ -300,10 +300,11 @@ class Network(VirshCommand):
 
     def apply_route_iptables_rule(self) -> bool:
         """
-        Apply iptables rule to allow communication between hosts on a routed network.
+        Apply iptables rules for truly isolated routed networks.
 
-        This adds a rule to the FORWARD chain to allow traffic between hosts
-        on the same bridge interface.
+        This method configures iptables to:
+        1. Allow VM-to-VM communication on the same bridge
+        2. Block ALL traffic between host and guests in both directions
 
         Returns:
             True if successful, False otherwise
@@ -312,21 +313,39 @@ class Network(VirshCommand):
             return True  # Nothing to do for non-route networks
 
         try:
-            # Build the iptables command
-            iptables_cmd = f"iptables -I FORWARD -i {self.bridge_name} -o {self.bridge_name} -j ACCEPT"
-            self.logger.info(f"Applying iptables rule for routed network: {iptables_cmd}")
+            # Get the bridge interface name
+            bridge_name = self.bridge_name
+            self.logger.info(f"Configuring complete isolation for routed network with bridge {bridge_name}")
 
-            # Execute the command using shell execution
-            result = self.execute_shell(iptables_cmd)
-
-            if result.ok:
-                self.logger.info(f"Applied iptables rule for routed network {self.name}")
-                return True
-            else:
-                self.logger.error(f"Failed to apply iptables rule: {result.stderr}")
+            # 1. Allow VM-to-VM communication on the same bridge
+            vm_to_vm_cmd = f"iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
+            self.logger.info(f"Setting up VM-to-VM communication: {vm_to_vm_cmd}")
+            result = self.execute_shell(vm_to_vm_cmd)
+            if not result.ok:
+                self.logger.error(f"Failed to allow VM-to-VM communication: {result.stderr}")
                 return False
+
+            # 2. Block ALL traffic from VMs to host
+            host_to_vm_block = f"iptables -I INPUT -i {bridge_name} -j DROP"
+            self.logger.info(f"Blocking all traffic from VMs to host: {host_to_vm_block}")
+            result = self.execute_shell(host_to_vm_block)
+            if not result.ok:
+                self.logger.error(f"Failed to block VM to host traffic: {result.stderr}")
+                return False
+
+            # 3. Block ALL traffic from host to VMs
+            vm_to_host_block = f"iptables -I OUTPUT -o {bridge_name} -j DROP"
+            self.logger.info(f"Blocking all traffic from host to VMs: {vm_to_host_block}")
+            result = self.execute_shell(vm_to_host_block)
+            if not result.ok:
+                self.logger.error(f"Failed to block host to VM traffic: {result.stderr}")
+                return False
+
+            self.logger.info(f"Successfully applied complete isolation for routed network {self.name}")
+            return True
+
         except Exception as e:
-            self.logger.error(f"Error applying iptables rule: {e}")
+            self.logger.error(f"Error applying route isolation rules: {e}")
             return False
 
     def apply_nat_config(self) -> bool:

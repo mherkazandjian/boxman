@@ -18,7 +18,7 @@ clusters:
 
     networks:
       nat:
-        mode: nat           # route, nat
+        mode: nat
         bridge:
           stp: 'on'
           delay: '0'
@@ -33,18 +33,18 @@ clusters:
         enable: True
         autostart: True
       isolated1:
-        mode: route           # route, nat
+        mode: route
         bridge:
           stp: 'on'
           delay: '0'
         mac: '52:54:00:00:00:02'
         ip:
-          address: '192.168.124.1'
+          address: '10.0.10.1'
           netmask: '255.255.255.0'
           dhcp:
             range:
-              start: '192.168.124.2'
-              end: '192.168.124.254'
+              start: '10.0.10.2'
+              end: '10.0.10.254'
         enable: True
         autostart: True
 

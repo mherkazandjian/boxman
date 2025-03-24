@@ -352,7 +352,7 @@ class BoxmanManager:
         # Wait a moment for IPs to be assigned
         import time
         print("Waiting for VMs to initialize and get IP addresses...")
-        time.sleep(10)
+        time.sleep(120)
 
         cls.connect_info()
         asdasd
