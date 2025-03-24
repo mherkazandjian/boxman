@@ -17,10 +17,10 @@ clusters:
     ssh_config: ssh_config               # generated automatically at provisioning time
 
     networks:
-      test_cluster_mgmt:
-        mode: nat
+      nat:
+        mode: nat           # route, nat
         bridge:
-          name: virbr1
+          name: virbr4      # todo:: support using the next available virbrX name automatically if this is not specified
           stp: 'on'
           delay: '0'
         mac: '52:54:00:00:00:01'
@@ -31,7 +31,22 @@ clusters:
             range:
               start: '192.168.123.2'
               end: '192.168.123.254'
-        network: '1.2.3.0/24'
+        enable: True
+        autostart: True
+      isolated1:
+        mode: route           # route, nat
+        bridge:
+          name: virbr5        # todo:: support using the next available virbrX name automatically if this is not specified
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:02'
+        ip:
+          address: '192.168.124.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.124.2'
+              end: '192.168.124.254'
         enable: True
         autostart: True
 
