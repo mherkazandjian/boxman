@@ -493,24 +493,19 @@ class LibVirtSession:
         snapshot_mgr = SnapshotManager(self.provider_config)
         return snapshot_mgr.revert_to_snapshot(full_vm_name, snapshot_name)
 
-    def delete_snapshot(self, vm_name, snapshot_name, cluster_name=None):
+    def delete_snapshot(self, vm_name, snapshot_name):
         """
         Delete a specific snapshot from a VM.
 
         Args:
             vm_name (str): Name of the VM
             snapshot_name (str): Name of the snapshot to delete
-            cluster_name (str, optional): Name of the cluster containing the VM
 
         Returns:
             bool: True if successful, False otherwise
         """
-        # Format VM name with cluster prefix if needed
-        full_vm_name = f"{cluster_name}_{vm_name}" if cluster_name else vm_name
+        self.logger.info(f"Deleting snapshot {snapshot_name} from VM {vm_name}")
 
-        self.logger.info(f"Deleting snapshot {snapshot_name} from VM {full_vm_name}")
-
-        # Initialize snapshot manager
         snapshot_mgr = SnapshotManager(self.provider_config)
-        return snapshot_mgr.delete_snapshot(full_vm_name, snapshot_name)
+        return snapshot_mgr.delete_snapshot(vm_name, snapshot_name)
     # end snapshots

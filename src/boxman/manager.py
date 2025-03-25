@@ -774,20 +774,12 @@ class BoxmanManager:
         """
         Delete a snapshot of the VMs in the cluster.
         """
-        if not hasattr(cli_args, 'vm') or not hasattr(cli_args, 'name'):
-            print("Error: VM name and snapshot name are required")
+        if not cli_args.snapshot_name:
+            print("Error: Snapshot name is required")
             return
 
-        vm_name = cli_args.vm
-        snapshot_name = cli_args.name
-        cluster_name = cli_args.cluster if hasattr(cli_args, 'cluster') else None
-
-        print(f"Deleting snapshot {snapshot_name} from VM {vm_name}")
-
-        # Delete snapshot
-        success = cls.provider.delete_snapshot(vm_name, snapshot_name, cluster_name)
-
-        if success:
-            print(f"✓ Successfully deleted snapshot {snapshot_name} from VM {vm_name}")
-        else:
-            print(f"✗ Failed to delete snapshot {snapshot_name} from VM {vm_name}")
+        # if the vm name and the cluster name is not specified process all vms
+        for cluster_name, cluster in cls.config['clusters'].items():
+            for vm_name, _ in cluster['vms'].items():
+                full_vm_name = f"{cluster_name}_{vm_name}"
+                cls.provider.delete_snapshot(full_vm_name, cli_args.snapshot_name)
