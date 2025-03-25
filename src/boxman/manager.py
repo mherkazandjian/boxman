@@ -137,19 +137,25 @@ class BoxmanManager:
             print("No provider set, cannot destroy VMs")
             return
 
-        for cluster_name, cluster in self.config['clusters'].items():
-            for vm_name in cluster['vms'].keys():
-                print(f"Destroying VM {vm_name} in cluster {cluster_name}")
-                vm_name = f"{cluster_name}_{vm_name}"
-                success = self.provider.destroy_vm(
-                    name=vm_name,
-                    remove_storage=True
-                )
+        def vm_destroy_tasks():
+            for cluster_name, cluster in self.config['clusters'].items():
+                for vm_name in cluster['vms'].keys():
+                    full_vm_name = f"{cluster_name}_{vm_name}"
+                    yield full_vm_name, cluster_name, vm_name
 
-                if success:
-                    print(f"Successfully destroyed VM {vm_name}")
-                else:
-                    print(f"Failed to destroy VM {vm_name}")
+        def _destroy(full_vm_name, cluster_name, vm_name):
+            print(f"Destroying VM {vm_name} in cluster {cluster_name}")
+            self.provider.destroy_vm(
+                name=full_vm_name,
+                remove_storage=True
+            )
+
+        processes = [
+            Process(target=_destroy, args=(full_vm_name, cluster_name, vm_name))
+            for full_vm_name, cluster_name, vm_name in vm_destroy_tasks()
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
     ### end vms define / remove / destroy
 
     def configure_network_interfaces(self) -> None:
