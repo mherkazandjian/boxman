@@ -1,11 +1,11 @@
 import os
 import yaml
-from typing import Dict, Any, Optional, Union, TYPE_CHECKING
+from typing import Dict, Any, Optional
 import time
 
-if TYPE_CHECKING:
-    from boxman.providers.libvirt.session import LibVirtSession
+from invoke import run
 
+from boxman.providers.libvirt.session import LibVirtSession
 from boxman.utils.io import write_files
 
 class BoxmanManager:
@@ -451,7 +451,7 @@ class BoxmanManager:
         all_successful = True
 
         for cluster_name, cluster in self.config['clusters'].items():
-            workdir = os.path.expanduser(cluster.get('workdir', '~'))
+            workdir = os.path.expanduser(cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
             admin_pub_key = os.path.join(workdir, f"{admin_key_name}.pub")
             admin_user = cluster.get('admin_user', 'admin')
@@ -488,9 +488,11 @@ class BoxmanManager:
                 # Try to add the key with exponential backoff
                 success = self._try_add_ssh_key(
                     ip_address=ip_address,
+                    hostname=vm_info['hostname'],
                     admin_user=admin_user,
                     admin_pass=admin_pass,
-                    pub_key_path=admin_pub_key
+                    pub_key_path=admin_pub_key,
+                    ssh_conf_path=os.path.join(workdir, cluster['ssh_config'])
                 )
 
                 if success:
@@ -501,22 +503,27 @@ class BoxmanManager:
 
         return all_successful
 
-    def _try_add_ssh_key(self, ip_address: str, admin_user: str, admin_pass: str, pub_key_path: str) -> bool:
+    def _try_add_ssh_key(self,
+                         ip_address: str,
+                         hostname: str,
+                         admin_user: str,
+                         admin_pass: str,
+                         pub_key_path: str,
+                         ssh_conf_path: str) -> bool:
         """
         Try to add an SSH key to a VM with exponential backoff.
 
         Args:
             ip_address: IP address of the VM
+            hostname: Hostname of the VM
             admin_user: Username for SSH login
             admin_pass: Password for SSH login
             pub_key_path: Path to the public key file
+            ssh_conf_path: Path to the SSH config file
 
         Returns:
             bool: True if successful, False otherwise
         """
-        from invoke import run
-        import time
-
         wait_time = 1  # Start with 1 second
         max_retries = 5
         max_wait = 60  # Maximum wait per attempt
@@ -536,7 +543,7 @@ class BoxmanManager:
 
                 if result.ok:
                     # Verify we can SSH without password
-                    ssh_success = self._verify_ssh_connection(ip_address, admin_user)
+                    ssh_success = self._verify_ssh_connection(hostname, ssh_conf_path)
 
                     if ssh_success:
                         return True
@@ -550,37 +557,29 @@ class BoxmanManager:
 
         return False
 
-    def _verify_ssh_connection(self, ip_address: str, admin_user: str) -> bool:
+    def _verify_ssh_connection(self, hostname: str, ssh_config_path: str) -> bool:
         """
-        Verify that SSH connection works using the key.
+        Verify SSH connection to a VM.
 
         Args:
-            ip_address: IP address of the VM
-            admin_user: Username for SSH login
+            hostname: Hostname of the VM
+            ssh_config_path: Path to the SSH config file
 
         Returns:
             bool: True if successful, False otherwise
         """
-        from invoke import run
 
-        try:
-            # Try a simple command like hostname
-            ssh_cmd = (
-                f'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
-                f'-o BatchMode=yes -o ConnectTimeout=5 {admin_user}@{ip_address} hostname'
-            )
+        print(f"Verifying SSH connection to: {hostname}")
+        ssh_cmd = f'ssh -F {ssh_config_path} {hostname} hostname'
+        result = run(ssh_cmd, hide=True, warn=True)
 
-            result = run(ssh_cmd, hide=True, warn=True)
-
-            # Check if we got output and successful exit code
-            if result.ok and result.stdout.strip():
-                print(f"SSH connection verified: {result.stdout.strip()}")
-                return True
-
-        except Exception as e:
-            print(f"SSH verification failed: {e}")
-
-        return False
+        if result.ok and result.stdout.strip():
+            hostname_output = result.stdout.strip()
+            print(f"SSH connection verified: {hostname_output}")
+            return True
+        else:
+            print(f"SSH connection failed for {hostname}: {result.stderr.strip()}")
+            return False
 
     def setup_ssh_access(self) -> bool:
         """
