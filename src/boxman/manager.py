@@ -1,8 +1,9 @@
 import os
-import yaml
-from typing import Dict, Any, Optional
 import time
-
+from typing import Dict, Any, Optional
+import yaml
+from multiprocessing import Pool
+from multiprocessing import Process
 from invoke import run
 
 from boxman.providers.libvirt.session import LibVirtSession
@@ -74,17 +75,6 @@ class BoxmanManager:
                 write_files(files, rootdir=cluster['workdir'])
 
     ### networks define / remove / destroy
-    # create the NAT guest only network(s)
-    # create the guest only NAT networks
-    #nat_networks = cluster['networks']
-    #for nat_network, info in nat_networks.items():
-    #    cls.natnetwork.add(
-    #        nat_network,
-    #        network=info['network'],
-    #        enable=info.get('enable'),
-    #        recreate=True,
-    #        dhcp=info.get('dhcp')
-    #    )
     def define_networks(self) -> None:
         """
         Define the networks specified in the cluster configuration.
@@ -108,23 +98,6 @@ class BoxmanManager:
     ### end networks define / remove / destroy
 
     ### vms define / remove / destroy
-    #
-    # clone the vms
-    #
-    #def _clone(vm_name, vm_info):
-    #    print(f'clone the vm {vm_name}')
-    #    pprint(vm_info)
-
-    #    cls.removevm(vm_name)
-    #    cls.clonevm(vmname=base_image, name=vm_name, basefolder=workdir)
-    #    cls.group_vm(vmname=vm_name, groups=os.path.join(f'/{project}', cluster_group))
-
-    #processes = [
-    #    Process(target=_clone, args=(vm_name, vm_info))
-    #    for vm_name, vm_info in vms.items()]
-    #[p.start() for p in processes]
-    #[p.join() for p in processes]
-
     def clone_vms(self) -> None:
         """
         Clone the VMs defined in the configuration.
@@ -134,19 +107,50 @@ class BoxmanManager:
             - remove the vm
             - clone the vm
         """
+        def vm_clone_tasks():
+            for cluster_name, cluster in self.config['clusters'].items():
+                for vm_name, vm_info in cluster['vms'].items():
+                    vm_info = vm_info.copy()
+                    new_vm_name = f"{cluster_name}_{vm_name}"
+                    yield cluster, vm_info, new_vm_name
+
+        def _clone(cluster, vm_info, new_vm_name):
+            self.provider.clone_vm(
+                src_vm_name=cluster['base_image'],
+                new_vm_name=new_vm_name,
+                info=vm_info,
+                workdir=cluster['workdir']
+            )
+
+        processes = [
+            Process(target=_clone, args=(cluster, vm_info, new_vm_name))
+            for cluster, vm_info, new_vm_name in vm_clone_tasks()
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+    def destroy_vms(self) -> None:
+        """
+        Destroy the VMs specified in the cluster configuration.
+        """
+        if not self.provider:
+            print("No provider set, cannot destroy VMs")
+            return
+
         for cluster_name, cluster in self.config['clusters'].items():
-            for vm_name, vm_info in cluster['vms'].items():
-
-                vm_info = vm_info.copy()
-                new_vm_name = f"{cluster_name}_{vm_name}"
-
-                self.provider.clone_vm(
-                    src_vm_name=cluster['base_image'],
-                    new_vm_name=new_vm_name,
-                    info=vm_info,
-                    workdir=cluster['workdir']
+            for vm_name in cluster['vms'].keys():
+                print(f"Destroying VM {vm_name} in cluster {cluster_name}")
+                vm_name = f"{cluster_name}_{vm_name}"
+                success = self.provider.destroy_vm(
+                    name=vm_name,
+                    remove_storage=True
                 )
 
+                if success:
+                    print(f"Successfully destroyed VM {vm_name}")
+                else:
+                    print(f"Failed to destroy VM {vm_name}")
+    ### end vms define / remove / destroy
 
     def configure_network_interfaces(self) -> None:
         """
@@ -199,36 +203,12 @@ class BoxmanManager:
                     vm_name=full_vm_name,
                     disks=vm_info['disks'],
                     workdir=workdir,
-                    disk_prefix=full_vm_name
-                )
+                    disk_prefix=full_vm_name)
 
                 if success:
                     print(f"All disks configured successfully for VM {vm_name}")
                 else:
                     print(f"Some disks could not be configured for VM {vm_name}")
-
-    def destroy_vms(self) -> None:
-        """
-        Destroy the VMs specified in the cluster configuration.
-        """
-        if not self.provider:
-            print("No provider set, cannot destroy VMs")
-            return
-
-        for cluster_name, cluster in self.config['clusters'].items():
-            for vm_name in cluster['vms'].keys():
-                print(f"Destroying VM {vm_name} in cluster {cluster_name}")
-                vm_name = f"{cluster_name}_{vm_name}"
-                success = self.provider.destroy_vm(
-                    name=vm_name,
-                    remove_storage=True
-                )
-
-                if success:
-                    print(f"Successfully destroyed VM {vm_name}")
-                else:
-                    print(f"Failed to destroy VM {vm_name}")
-    ### end vms define / remove / destroy
 
     def start_vms(self) -> None:
         """
@@ -236,10 +216,6 @@ class BoxmanManager:
 
         This powers on all VMs after they have been configured.
         """
-        if not self.provider:
-            print("No provider set, cannot start VMs")
-            return
-
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{cluster_name}_{vm_name}"
@@ -262,10 +238,6 @@ class BoxmanManager:
         Returns:
             True if all VMs have at least one IP address, False otherwise
         """
-        if not self.provider:
-            print("No provider set, cannot retrieve connection information")
-            return False
-
         all_vms_have_ip = True
 
         for cluster_name, cluster in self.config['clusters'].items():
@@ -289,10 +261,6 @@ class BoxmanManager:
         This method displays the VM names, hostnames, IP addresses, and
         other connection details for all configured VMs.
         """
-        if not self.provider:
-            print("No provider set, cannot retrieve connection information")
-            return
-
         print("\n=== VM Connection Information ===\n")
 
         for cluster_name, cluster in self.config['clusters'].items():
@@ -399,8 +367,6 @@ class BoxmanManager:
         Returns:
             bool: True if successful, False otherwise
         """
-        from invoke import run
-
         success = True
 
         for cluster_name, cluster in self.config['clusters'].items():
@@ -446,8 +412,6 @@ class BoxmanManager:
         Returns:
             bool: True if all VMs received the key successfully, False otherwise
         """
-        from invoke import run
-
         all_successful = True
 
         for cluster_name, cluster in self.config['clusters'].items():
@@ -568,7 +532,6 @@ class BoxmanManager:
         Returns:
             bool: True if successful, False otherwise
         """
-
         print(f"Verifying SSH connection to: {hostname}")
         ssh_cmd = f'ssh -F {ssh_config_path} {hostname} hostname'
         result = run(ssh_cmd, hide=True, warn=True)
@@ -593,19 +556,15 @@ class BoxmanManager:
         Returns:
             bool: True if all steps completed successfully, False otherwise
         """
-        # Generate SSH keys
         if not self.generate_ssh_keys():
             print("Failed to generate SSH keys")
             return False
 
-        # Write SSH config
         self.write_ssh_config()
 
-        # Add SSH keys to VMs
         if not self.add_ssh_keys_to_vms():
             print("Failed to add SSH keys to some VMs")
             return False
-
 
         print("\nSSH access setup complete")
         print("You can now connect to VMs using the SSH config file")
@@ -618,23 +577,14 @@ class BoxmanManager:
         cls.deprovision(cls, cli_args)
 
         config = cls.config
-        project = config['project']
         cluster_group = list(config['clusters'].keys())[0]  # one cluster supported for now
         # -------------------- global config ---------------------------
 
         cluster = config['clusters'][cluster_group]
-        base_image = cluster['base_image']
-        cluster_name = cluster_group
-        proxy_host = cluster['proxy_host']
-        admin_user = cluster['admin_user']
-        admin_pass = cluster['admin_pass']
-        admin_key_name = cluster['admin_key_name']
         ssh_config = cluster['ssh_config']
         workdir = cluster['workdir']
         # -------------------- end global config -----------------------
 
-        admin_priv_key = os.path.expanduser(os.path.join(workdir, admin_key_name))
-        admin_public_key = os.path.expanduser(os.path.join(workdir, admin_key_name + '.pub'))
         ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
         if not os.path.isdir(workdir):
@@ -683,30 +633,18 @@ class BoxmanManager:
     def deprovision(cls, cli_args):
 
         config = cls.config
-        project = config['project']
         cluster_group = list(config['clusters'].keys())[0]  # one cluster supported for now
         # -------------------- global config ---------------------------
 
         cluster = config['clusters'][cluster_group]
-        base_image = cluster['base_image']
         cluster_name = cluster_group
-        proxy_host = cluster['proxy_host']
-        admin_user = cluster['admin_user']
-        admin_pass = cluster['admin_pass']
-        admin_key_name = cluster['admin_key_name']
         ssh_config = cluster['ssh_config']
         workdir = cluster['workdir']
         # -------------------- end global config -----------------------
 
-        admin_priv_key = os.path.expanduser(os.path.join(workdir, admin_key_name))
-        admin_public_key = os.path.expanduser(os.path.join(workdir, admin_key_name + '.pub'))
         ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
-        if not os.path.isdir(workdir):
-            os.makedirs(workdir)
 
-        # .. todo:: implement undo'ing the provisioning of the files (not important for now)
-        #cls.provision_files()
 
         cls.destroy_networks()
 
@@ -724,36 +662,7 @@ class BoxmanManager:
                     disks=vm_info['disks']
                 )
 
+        # .. todo:: implement undo'ing the provisioning of the files (not important for now)
+        #cls.provision_files()
+
         return
-
-
-
-        conf = cls.conf
-        cluster_group = list(conf['clusters'].keys())[0]  # one cluster supported for now
-        cluster = conf['clusters'][cluster_group]
-        workdir = cluster['workdir']
-
-        # delete the vms
-        vms = cluster['vms']
-        def _delete_vm(vm):
-            cls.session.removevm(vm)
-        processes = [Process(target=_delete_vm, args=(vm,)) for vm in vms]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
-
-        # delete the networks
-        nat_networks = cluster['networks']
-        def _delete_networks(nat_network):
-            cls.session.natnetwork.remove(nat_network)
-        processes = [Process(target=_delete_networks, args=(network,)) for network in nat_networks]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
-
-        # delete the workdir
-        # .. todo:: delete the directory only if there are no vms left because
-        #           sometimes if a vm is locked it is not deleted.
-        workdir = os.path.abspath(os.path.expanduser(workdir))
-        print(f'remove workdir {workdir}...')
-        if os.path.isdir(workdir):
-            shutil.rmtree(workdir)
-        print(f'\ncompleted deprovisioning the cluster {cluster_group}')
