@@ -133,7 +133,7 @@ class SnapshotManager:
             log.error(f"Error listing snapshots for VM {vm_name}: {e}")
             return []
 
-    def revert_to_snapshot(self, vm_name: str, snapshot_name: str) -> bool:
+    def snapshot_restore(self, vm_name: str, snapshot_name: str) -> bool:
         """
         Revert a VM to a specific snapshot.
 

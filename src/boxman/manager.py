@@ -717,10 +717,6 @@ class BoxmanManager:
         """
         Take a snapshot of the VMs in the cluster.
         """
-        if not cli_args.snapshot_name:
-            print("Error: Snapshot name is required")
-            return
-
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{cluster_name}_{vm_name}"
@@ -734,23 +730,15 @@ class BoxmanManager:
         """
         Restore the state of the VMs in the cluster from a snapshot.
         """
-        if not hasattr(cli_args, 'vm') or not hasattr(cli_args, 'name'):
-            print("Error: VM name and snapshot name are required")
-            return
+        if not cli_args.snapshot_name:
+           print("Error: Snapshot name is required")
+           return
 
-        vm_name = cli_args.vm
-        snapshot_name = cli_args.name
-        cluster_name = cli_args.cluster if hasattr(cli_args, 'cluster') else None
+        for cluster_name, cluster in cls.config['clusters'].items():
+            for vm_name, _ in cluster['vms'].items():
+                full_vm_name = f"{cluster_name}_{vm_name}"
+                cls.provider.snapshot_restore(full_vm_name, cli_args.snapshot_name)
 
-        print(f"Reverting VM {vm_name} to snapshot {snapshot_name}")
-
-        # Revert to snapshot
-        success = cls.provider.snapshot_restore(vm_name, snapshot_name, cluster_name)
-
-        if success:
-            print(f"✓ Successfully reverted VM {vm_name} to snapshot {snapshot_name}")
-        else:
-            print(f"✗ Failed to revert VM {vm_name} to snapshot {snapshot_name}")
 
     @staticmethod
     def snapshot_delete(cls, cli_args):
@@ -761,7 +749,6 @@ class BoxmanManager:
             print("Error: Snapshot name is required")
             return
 
-        # if the vm name and the cluster name is not specified process all vms
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{cluster_name}_{vm_name}"
