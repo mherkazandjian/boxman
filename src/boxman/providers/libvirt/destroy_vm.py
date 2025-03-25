@@ -1,7 +1,6 @@
 import os
 import time
 from typing import Optional, Dict, Any, List, Union
-import logging
 
 from .commands import VirshCommand
 
@@ -27,9 +26,6 @@ class DestroyVM(VirshCommand):
 
         #: str: Name of the VM to destroy
         self.name = name
-
-        #: logging.Logger: Logger instance
-        self.logger = logging.getLogger(__name__)
 
         #: int: Maximum seconds to wait for VM to shutdown
         self.shutdown_timeout = 30

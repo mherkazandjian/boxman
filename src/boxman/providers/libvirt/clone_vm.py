@@ -2,7 +2,7 @@ import os
 import uuid
 import re
 from typing import Optional, Dict, Any, List, Union
-import logging
+from boxman import log
 
 from .commands import VirtCloneCommand, VirshCommand
 
@@ -44,7 +44,7 @@ class CloneVM:
         self.virsh = VirshCommand(provider_config)
 
         #: logging.Logger: Logger instance
-        self.logger = logging.getLogger(__name__)
+        self.logger = log
 
     def create_clone(self) -> bool:
         """

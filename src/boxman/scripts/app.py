@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 import os
 import sys
-import time
-import yaml
 from pprint import pprint
 import argparse
 from argparse import RawTextHelpFormatter

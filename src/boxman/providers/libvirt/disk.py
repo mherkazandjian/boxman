@@ -1,5 +1,4 @@
 import os
-import logging
 from typing import Optional, Dict, Any, List
 import tempfile
 from jinja2 import Environment, FileSystemLoader
@@ -27,9 +26,6 @@ class DiskManager(VirshCommand):
 
         #: str: Name of the VM
         self.vm_name = vm_name
-
-        #: logging.Logger: Logger instance
-        self.logger = logging.getLogger(__name__)
 
     def create_disk(self, disk_path: str, size: int, format: str = 'qcow2') -> bool:
         """

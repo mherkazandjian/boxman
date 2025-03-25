@@ -43,32 +43,31 @@ class ColoredFormatter(logging.Formatter):
 # create logger
 logger = logging.getLogger('boxman')
 logger.log_depth = 0
+logger.setLevel(logging.DEBUG)
 
-if not len(logger.handlers):
+# Only configure the logger if it doesn't have handlers already
+if not logger.handlers:
 
-    logger.setLevel(logging.DEBUG)
+    # remove all existing handlers first to ensure we don't add duplicates
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
 
     # create console handler and set level to debug
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.DEBUG)
 
     # create formatter
-    formatter = logging.Formatter(
-        ('[%(asctime)s %(funcName)s() %(filename)s'
-         ':%(lineno)s][%(levelname)-8s] %(message)s'))
-
-    # just like print()
-    # formatter = logging.Formatter('%(message)s')
-
-    # a color formatter
-    FORMAT = ("[%(asctime)s %(levelname)-18s "
-              "$BOLD%(filename)s{%(lineno)d}$RESET:%(funcName)s()] "
-              "%(message)s")
+    FORMAT = (
+        "[%(asctime)s %(levelname)-18s "
+        "$BOLD%(filename)s{%(lineno)d}$RESET:%(funcName)s()] "
+        "%(message)s"
+    )
     COLOR_FORMAT = formatter_message(FORMAT, True)
     formatter = ColoredFormatter(COLOR_FORMAT)
 
-    # add formatter to ch
+    # add formatter to the console handler and then add the console handler to the logger
     ch.setFormatter(formatter)
-
-    # add ch to logger
     logger.addHandler(ch)
+
+    # Prevent propagation to prevent duplicate logs if this is a child logger
+    logger.propagate = False

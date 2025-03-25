@@ -6,12 +6,12 @@ This module provides functionality to manage VM snapshots using command-line too
 """
 
 import os
-import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from .commands import VirshCommand
+from xml.etree import ElementTree as ET
 
-log = logging.getLogger(__name__)
+from boxman import log
 
 class SnapshotManager:
     """
@@ -33,6 +33,9 @@ class SnapshotManager:
 
         #: bool: Whether to use sudo
         self.use_sudo = provider_config.get('use_sudo', False) if provider_config else False
+
+        #: logging.Logger: Logger instance
+        self.logger = log
 
     def create_snapshot(self,
                         vm_name: str,
@@ -64,13 +67,13 @@ class SnapshotManager:
             result = self.virsh.execute("snapshot-create", vm_name, f"--xmlfile={tmp_xml_path}")
 
             if result.ok:
-                log.info(f"Snapshot '{snapshot_name}' created for VM {vm_name}")
+                self.logger.info(f"Snapshot '{snapshot_name}' created for VM {vm_name}")
                 return True
             else:
-                log.error(f"Failed to create snapshot for VM {vm_name}: {result.stderr}")
+                self.logger.error(f"Failed to create snapshot for VM {vm_name}: {result.stderr}")
                 return False
         except Exception as e:
-            log.error(f"Error creating snapshot for VM {vm_name}: {e}")
+            self.logger.error(f"Error creating snapshot for VM {vm_name}: {e}")
             return False
         finally:
             # Clean up temporary file
@@ -88,49 +91,30 @@ class SnapshotManager:
             list: List of snapshot info dictionaries
         """
         try:
-            # Use virsh snapshot-list to get all snapshots
+            # fetch the available snapshots
             result = self.virsh.execute("snapshot-list", vm_name, "--name")
-
             if not result.ok:
-                log.error(f"Failed to list snapshots for VM {vm_name}: {result.stderr}")
+                self.logger.error(f"Failed to list snapshots for VM {vm_name}: {result.stderr}")
                 return []
 
             snapshot_names = result.stdout.strip().split('\n')
-            # Filter out empty strings
             snapshot_names = [name for name in snapshot_names if name]
 
+            # get the snapshot details
             snapshots = []
-            for name in snapshot_names:
-                # Get detailed information about each snapshot
-                info_result = self.virsh.execute("snapshot-info", vm_name, name)
+            for snapshot_name in snapshot_names:
+                dumpxml_result = self.virsh.execute("snapshot-dumpxml", vm_name, snapshot_name)
+                if dumpxml_result.ok:
+                    snap_info = {'name': snapshot_name}
+                    xml_content = dumpxml_result.stdout
 
-                if info_result.ok:
-                    info_lines = info_result.stdout.strip().split('\n')
-                    snap_info = {'name': name}
-
-                    # Parse snapshot info output
-                    for line in info_lines:
-                        if ':' in line:
-                            key, value = line.split(':', 1)
-                            key = key.strip().lower().replace(' ', '_')
-                            value = value.strip()
-
-                            if key == 'description':
-                                snap_info['description'] = value
-                            elif key == 'creation_time':
-                                snap_info['creation_time'] = value
-
-                    # Set default values if not found
-                    if 'description' not in snap_info:
-                        snap_info['description'] = "No description"
-                    if 'creation_time' not in snap_info:
-                        snap_info['creation_time'] = "Unknown"
+                    root = ET.fromstring(xml_content)
+                    snap_info['description'] = root.findtext('description', default='')
 
                     snapshots.append(snap_info)
-
             return snapshots
         except Exception as e:
-            log.error(f"Error listing snapshots for VM {vm_name}: {e}")
+            self.logger.error(f"Error listing snapshots for VM {vm_name}: {e}")
             return []
 
     def snapshot_restore(self, vm_name: str, snapshot_name: str) -> bool:
@@ -149,13 +133,13 @@ class SnapshotManager:
             result = self.virsh.execute("snapshot-revert", vm_name, snapshot_name)
 
             if result.ok:
-                log.info(f"VM {vm_name} reverted to snapshot '{snapshot_name}'")
+                self.logger.info(f"VM {vm_name} reverted to snapshot '{snapshot_name}'")
                 return True
             else:
-                log.error(f"Failed to revert VM {vm_name} to snapshot '{snapshot_name}': {result.stderr}")
+                self.logger.error(f"Failed to revert VM {vm_name} to snapshot '{snapshot_name}': {result.stderr}")
                 return False
         except Exception as e:
-            log.error(f"Error reverting VM {vm_name} to snapshot '{snapshot_name}': {e}")
+            self.logger.error(f"Error reverting VM {vm_name} to snapshot '{snapshot_name}': {e}")
             return False
 
     def delete_snapshot(self, vm_name: str, snapshot_name: str) -> bool:
@@ -174,11 +158,11 @@ class SnapshotManager:
             result = self.virsh.execute("snapshot-delete", vm_name, snapshot_name)
 
             if result.ok:
-                log.info(f"Snapshot '{snapshot_name}' deleted from VM {vm_name}")
+                self.logger.info(f"Snapshot '{snapshot_name}' deleted from VM {vm_name}")
                 return True
             else:
-                log.error(f"Failed to delete snapshot '{snapshot_name}' from VM {vm_name}: {result.stderr}")
+                self.logger.error(f"Failed to delete snapshot '{snapshot_name}' from VM {vm_name}: {result.stderr}")
                 return False
         except Exception as e:
-            log.error(f"Error deleting snapshot '{snapshot_name}' from VM {vm_name}: {e}")
+            self.logger.error(f"Error deleting snapshot '{snapshot_name}' from VM {vm_name}: {e}")
             return False

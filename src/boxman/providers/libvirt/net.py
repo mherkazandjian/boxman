@@ -3,9 +3,10 @@ import uuid
 import re
 import pkg_resources
 from typing import Optional, Dict, Any, Union
-import logging
+
 import tempfile
 from jinja2 import Template, Environment, FileSystemLoader
+
 from .commands import VirshCommand, LibVirtCommandBase
 
 

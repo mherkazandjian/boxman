@@ -4,9 +4,11 @@ from .net import Network, NetworkInterface
 from .clone_vm import CloneVM
 from .destroy_vm import DestroyVM
 from .disk import DiskManager
-import logging
 from datetime import datetime
+
+from boxman import log
 from .snapshot import SnapshotManager
+
 
 class LibVirtSession:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -20,7 +22,7 @@ class LibVirtSession:
         self.config = config
 
         #: logging.Logger: Logger instance
-        self.logger = logging.getLogger(__name__)
+        self.logger = log
 
         # Get provider config
         self.provider_config = config.get('provider', {}).get('libvirt', {}) if config else {}
@@ -400,7 +402,7 @@ class LibVirtSession:
             snapshot_name=snapshot_name,
             description=description)
 
-    def snapshot_list(self, cluster_name=None, vm_name=None):
+    def snapshot_list(self, vm_name=None):
         """
         List snapshots for VMs in the specified cluster or all clusters.
 
@@ -411,37 +413,14 @@ class LibVirtSession:
         Returns:
             dict: Dictionary of snapshots per VM
         """
-        self.logger.info(f"Listing snapshots for VMs in cluster(s): {cluster_name or 'all'}")
-
-        # Initialize snapshot manager
+        self.logger.info(f"Listing snapshots for the VM: {vm_name}")
         snapshot_mgr = SnapshotManager(self.provider_config)
+        snapshots = snapshot_mgr.list_snapshots(vm_name)
+        for snapshot in snapshots:
+            self.logger.info(
+                f"  Snapshot: {snapshot['name']} - Description: {snapshot['description']}")
 
-        results = {}
-
-        if vm_name:
-            # Format VM name if cluster is specified
-            full_vm_name = f"{cluster_name}_{vm_name}" if cluster_name else vm_name
-
-            # List snapshots for a specific VM
-            results[vm_name] = snapshot_mgr.list_snapshots(full_vm_name)
-        elif cluster_name:
-            # List snapshots for all VMs in the specified cluster
-            if cluster_name in self.config.get('clusters', {}):
-                cluster_config = self.config['clusters'][cluster_name]
-                for vm, vm_config in cluster_config.get('vms', {}).items():
-                    full_vm_name = f"{cluster_name}_{vm}"
-                    results[vm] = snapshot_mgr.list_snapshots(full_vm_name)
-            else:
-                self.logger.error(f"Cluster {cluster_name} not found in configuration")
-                results["error"] = f"Cluster {cluster_name} not found"
-        else:
-            # List snapshots for all VMs in all clusters
-            for name, cluster_config in self.config.get('clusters', {}).items():
-                for vm, vm_config in cluster_config.get('vms', {}).items():
-                    full_vm_name = f"{name}_{vm}"
-                    results[full_vm_name] = snapshot_mgr.list_snapshots(full_vm_name)
-
-        return results
+        return snapshots
 
     def snapshot_restore(self, vm_name, snapshot_name):
         """

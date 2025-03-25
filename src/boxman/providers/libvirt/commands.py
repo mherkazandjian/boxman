@@ -1,6 +1,6 @@
 from typing import Dict, Any, Optional, List, Union
 import invoke
-import logging
+from boxman import log
 
 class LibVirtCommandBase:
     """
@@ -28,7 +28,7 @@ class LibVirtCommandBase:
         self.verbose = self.provider_config.get('verbose', False)
 
         #: logging.Logger: Logger instance
-        self.logger = logging.getLogger(__name__)
+        self.logger = log
 
         #: str: Command executable path
         self.command_path = None

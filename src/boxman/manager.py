@@ -673,44 +673,16 @@ class BoxmanManager:
 
         return
 
+    ### start snapshot functions ####
     @staticmethod
     def snapshot_list(cls, cli_args):
         """
         List snapshots of the VMs in the cluster.
         """
-        config = cls.config
-        cluster_name = cli_args.cluster if hasattr(cli_args, 'cluster') else None
-        vm_name = cli_args.vm if hasattr(cli_args, 'vm') else None
-
-        # Get snapshots
-        snapshots = cls.provider.list_snapshots(cluster_name, vm_name)
-
-        # Display the results
-        if not snapshots:
-            print("No snapshots found.")
-            return
-
-        if "error" in snapshots:
-            print(f"Error: {snapshots['error']}")
-            return
-
-        print("\n=== VM Snapshots ===\n")
-
-        for vm, snap_list in snapshots.items():
-            if not snap_list:
-                print(f"No snapshots for VM: {vm}")
-                continue
-
-            print(f"VM: {vm}")
-            print("-" * 40)
-
-            for i, snap in enumerate(snap_list, 1):
-                print(f"  {i}. {snap['name']}")
-                print(f"     Description: {snap['description']}")
-                print(f"     Created: {snap['creation_time']}")
-                print()
-
-            print()
+        for cluster_name, cluster in cls.config['clusters'].items():
+            for vm_name, _ in cluster['vms'].items():
+                full_vm_name = f"{cluster_name}_{vm_name}"
+                cls.provider.snapshot_list(full_vm_name)
 
     @staticmethod
     def snapshot_take(cls, cli_args):
@@ -753,3 +725,4 @@ class BoxmanManager:
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{cluster_name}_{vm_name}"
                 cls.provider.snapshot_delete(full_vm_name, cli_args.snapshot_name)
+    ### end snapshot functions ####
