@@ -340,6 +340,279 @@ class BoxmanManager:
 
             print()
 
+    def write_ssh_config(self) -> None:
+        """
+        Generate SSH configuration file for easy access to VMs.
+
+        Creates an SSH config file in the workdir of each cluster that allows
+        simplified access to VMs without typing full connection details.
+        """
+        for cluster_name, cluster in self.config['clusters'].items():
+            # Get the SSH config path
+            ssh_config = os.path.expanduser(os.path.join(
+                cluster.get('workdir', '~'),
+                cluster.get('ssh_config', 'ssh_config')
+            ))
+
+            admin_priv_key = os.path.expanduser(os.path.join(
+                cluster.get('workdir', '~'),
+                cluster.get('admin_key_name', 'id_ed25519_boxman')
+            ))
+
+            print(f"Writing SSH config to {ssh_config}")
+
+            with open(ssh_config, 'w') as fobj:
+                # Write global SSH options
+                fobj.write('Host *\n')
+                fobj.write('    StrictHostKeyChecking no\n')
+                fobj.write('    UserKnownHostsFile /dev/null\n')
+                fobj.write('\n\n')
+
+                # Write host-specific configurations
+                for vm_name, vm_info in cluster['vms'].items():
+                    full_vm_name = f"{cluster_name}_{vm_name}"
+                    hostname = vm_info.get('hostname', vm_name)
+
+                    # Get the first IP address if available
+                    ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
+
+                    if ip_addresses:
+                        first_ip = next(iter(ip_addresses.values()))
+
+                        fobj.write(f'Host {hostname}\n')
+                        fobj.write(f'    Hostname {first_ip}\n')
+                        fobj.write(f'    User {cluster.get("admin_user", "admin")}\n')
+                        fobj.write(f'    IdentityFile {admin_priv_key}\n')
+                        fobj.write('\n\n')
+                    else:
+                        print(f"Warning: No IP address available for VM {vm_name}, skipping SSH config entry")
+
+            print(f"SSH config file written to {ssh_config}")
+            print(f"To connect: ssh -F {ssh_config} <hostname>")
+
+    def generate_ssh_keys(self) -> bool:
+        """
+        Generate SSH keys for connecting to VMs.
+
+        Creates an SSH key pair in each cluster's workdir if it doesn't already exist.
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        from invoke import run
+
+        success = True
+
+        for cluster_name, cluster in self.config['clusters'].items():
+            workdir = os.path.expanduser(cluster['workdir'])
+            admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
+
+            admin_priv_key = os.path.join(workdir, admin_key_name)
+            admin_pub_key = os.path.join(workdir, f"{admin_key_name}.pub")
+
+            # Create workdir if it doesn't exist
+            if not os.path.isdir(workdir):
+                os.makedirs(workdir, exist_ok=True)
+
+            # Generate key pair if it doesn't exist
+            if not os.path.exists(admin_priv_key):
+                print(f"Generating SSH key pair in {workdir}")
+
+                try:
+                    cmd = f'ssh-keygen -t ed25519 -a 100 -f {admin_priv_key} -q -N ""'
+                    result = run(cmd, hide=True, warn=True)
+
+                    # Verify keys were created
+                    if os.path.isfile(admin_priv_key) and os.path.isfile(admin_pub_key):
+                        print(f"SSH key pair successfully generated at {admin_priv_key}")
+                    else:
+                        print(f"Failed to generate SSH key pair at {admin_priv_key}")
+                        success = False
+
+                except Exception as e:
+                    print(f"Error generating SSH key pair: {e}")
+                    success = False
+            else:
+                print(f"Using existing SSH key pair at {admin_priv_key}")
+
+        return success
+
+    def add_ssh_keys_to_vms(self) -> bool:
+        """
+        Add the generated SSH public key to all VMs to enable passwordless login.
+
+        Uses sshpass to add the public key to each VM using the admin password.
+
+        Returns:
+            bool: True if all VMs received the key successfully, False otherwise
+        """
+        from invoke import run
+
+        all_successful = True
+
+        for cluster_name, cluster in self.config['clusters'].items():
+            workdir = os.path.expanduser(cluster.get('workdir', '~'))
+            admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
+            admin_pub_key = os.path.join(workdir, f"{admin_key_name}.pub")
+            admin_user = cluster.get('admin_user', 'admin')
+            admin_pass = cluster.get('admin_pass', '')
+
+            if not admin_pass:
+                print(f"Warning: No admin password provided for cluster {cluster_name}, cannot add SSH keys")
+                all_successful = False
+                continue
+
+            if not os.path.isfile(admin_pub_key):
+                print(f"Error: SSH public key {admin_pub_key} does not exist")
+                all_successful = False
+                continue
+
+            print(f"Adding SSH public key to VMs in cluster {cluster_name}")
+
+            for vm_name, vm_info in cluster['vms'].items():
+                full_vm_name = f"{cluster_name}_{vm_name}"
+
+                # Get IP addresses for this VM
+                ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
+
+                if not ip_addresses:
+                    print(f"Warning: No IP address available for VM {vm_name}, cannot add SSH key")
+                    all_successful = False
+                    continue
+
+                # Use first available IP address
+                ip_address = next(iter(ip_addresses.values()))
+
+                print(f"Adding SSH key to VM {vm_name} ({ip_address})...")
+
+                # Try to add the key with exponential backoff
+                success = self._try_add_ssh_key(
+                    ip_address=ip_address,
+                    admin_user=admin_user,
+                    admin_pass=admin_pass,
+                    pub_key_path=admin_pub_key
+                )
+
+                if success:
+                    print(f"Successfully added SSH key to VM {vm_name}")
+                else:
+                    print(f"Failed to add SSH key to VM {vm_name}")
+                    all_successful = False
+
+        return all_successful
+
+    def _try_add_ssh_key(self, ip_address: str, admin_user: str, admin_pass: str, pub_key_path: str) -> bool:
+        """
+        Try to add an SSH key to a VM with exponential backoff.
+
+        Args:
+            ip_address: IP address of the VM
+            admin_user: Username for SSH login
+            admin_pass: Password for SSH login
+            pub_key_path: Path to the public key file
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        from invoke import run
+        import time
+
+        wait_time = 1  # Start with 1 second
+        max_retries = 5
+        max_wait = 60  # Maximum wait per attempt
+
+        for attempt in range(1, max_retries + 1):
+            print(f"Attempt {attempt}/{max_retries} to add SSH key (waiting {wait_time}s)")
+
+            try:
+                # Use sshpass to add the public key
+                cmd = (
+                    f'sshpass -p {admin_pass} ssh-copy-id -i {pub_key_path} '
+                    f'-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
+                    f'{admin_user}@{ip_address}'
+                )
+
+                result = run(cmd, hide=True, warn=True)
+
+                if result.ok:
+                    # Verify we can SSH without password
+                    ssh_success = self._verify_ssh_connection(ip_address, admin_user)
+
+                    if ssh_success:
+                        return True
+
+            except Exception as e:
+                print(f"SSH key addition failed: {e}")
+
+            # Wait before next attempt with exponential backoff
+            time.sleep(wait_time)
+            wait_time = min(wait_time * 2, max_wait)
+
+        return False
+
+    def _verify_ssh_connection(self, ip_address: str, admin_user: str) -> bool:
+        """
+        Verify that SSH connection works using the key.
+
+        Args:
+            ip_address: IP address of the VM
+            admin_user: Username for SSH login
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        from invoke import run
+
+        try:
+            # Try a simple command like hostname
+            ssh_cmd = (
+                f'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
+                f'-o BatchMode=yes -o ConnectTimeout=5 {admin_user}@{ip_address} hostname'
+            )
+
+            result = run(ssh_cmd, hide=True, warn=True)
+
+            # Check if we got output and successful exit code
+            if result.ok and result.stdout.strip():
+                print(f"SSH connection verified: {result.stdout.strip()}")
+                return True
+
+        except Exception as e:
+            print(f"SSH verification failed: {e}")
+
+        return False
+
+    def setup_ssh_access(self) -> bool:
+        """
+        Set up SSH access to all VMs.
+
+        This method:
+        1. Generates SSH keys if they don't exist
+        2. Adds the public key to all VMs
+        3. Writes an SSH config file for easy access
+
+        Returns:
+            bool: True if all steps completed successfully, False otherwise
+        """
+        # Generate SSH keys
+        if not self.generate_ssh_keys():
+            print("Failed to generate SSH keys")
+            return False
+
+        # Write SSH config
+        self.write_ssh_config()
+
+        # Add SSH keys to VMs
+        if not self.add_ssh_keys_to_vms():
+            print("Failed to add SSH keys to some VMs")
+            return False
+
+
+        print("\nSSH access setup complete")
+        print("You can now connect to VMs using the SSH config file")
+
+        return True
+
     @staticmethod
     def provision(cls, cli_args):
 
@@ -404,212 +677,8 @@ class BoxmanManager:
         # Display connection information
         cls.connect_info()
 
-        asdasd
-        ###############################################################################
-        ###############################################################################
-        ###############################################################################
-        ###############################################################################
-        ###############################################################################
-        # create the NAT guest only network(s)
-        # create the guest only NAT networks
-        #nat_networks = cluster['networks']
-        #for nat_network, info in nat_networks.items():
-        #    cls.natnetwork.add(
-        #        nat_network,
-        #        network=info['network'],
-        #        enable=info.get('enable'),
-        #        recreate=True,
-        #        dhcp=info.get('dhcp')
-        #    )
-
-        vms = cluster['vms']
-
-        #
-        # clone the vms
-        #
-        #def _clone(vm_name, vm_info):
-        #    print(f'clone the vm {vm_name}')
-        #    pprint(vm_info)
-
-        #    cls.removevm(vm_name)
-        #    cls.clonevm(vmname=base_image, name=vm_name, basefolder=workdir)
-        #    cls.group_vm(vmname=vm_name, groups=os.path.join(f'/{project}', cluster_group))
-
-        #processes = [
-        #    Process(target=_clone, args=(vm_name, vm_info))
-        #    for vm_name, vm_info in vms.items()]
-        #[p.start() for p in processes]
-        #[p.join() for p in processes]
-
-        # .. todo:: prefix the vm name (not the hostname) with the cluster group name
-        # .. todo:: place each vm in a virtualbox group (like in the ui)
-        #vms = cluster['vms']
-        #for vm_name, vm_info in vms.items():
-        #    # set the path of the disk for every disk that is defined
-        #    for disk_info in vm_info['disks']:
-        #        disk_info['disk_path'] = os.path.join(
-        #            workdir,
-        #            f'{cluster_name}_{vm_name}_{disk_info["name"]}.vdi'
-        #        )
-
-        #
-        # configure the disks
-        #
-        def _manage_disks(vm_name, vm_info):
-            print(f'manage the disks of the vm {vm_name}')
-            pprint(vm_info)
-
-            # create the meedium and attach the disks
-            # get the UUID of the disk from the name of the disk and delete it
-            for disk_info in vm_info['disks']:
-
-                disk_path = disk_info['disk_path']
-                disk_uuid = cls.list('hdds').query_disk_by_path(disk_path)
-                if disk_uuid:
-                    print(f'disk {disk_path} already exists...close and  delete it')
-                    # .. todo:: implement detaching the disk from the vm before
-                    #           deleting it but if the vm to which the disk was
-                    #           attached is off or deleted this is not a problem
-                    cls.closemedium(
-                        disk_info['medium_type'], target=disk_uuid, delete=True)
-
-                cls.createmedium(
-                    disk_info['medium_type'],
-                    filename=disk_path,
-                    format=disk_info['format'],
-                    size=disk_info['size'])
-
-                cls.storageattach(
-                    vm_name,
-                    storagectl=disk_info['attach_to']['controller']['storagectl'],
-                    port=disk_info['attach_to']['controller']['port'],
-                    medium=disk_path,
-                    medium_type=disk_info['attach_to']['controller']['medium_type'])
-
-        #for vm_name, vm_info in vms.items():
-        #    _manage_disks(vm_name, vm_info)
-        processes = [
-            Process(target=_manage_disks, args=(vm_name, vm_info))
-            for vm_name, vm_info in vms.items()]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
-
-        #
-        # configure the network interfaces
-        #
-        def _manage_network_interfaces(vm_name, vm_info):
-            print(f'manage the network interfaces {vm_name}')
-            pprint(vm_info)
-
-            # configure the network interfaces
-            for interface_no, netowrk_interface_info in enumerate(vm_info['network_adapters']):
-                cls.modifyvm_network_settings.apply(
-                    vm_name,
-                    interface_no + 1,
-                    netowrk_interface_info
-                )
-
-            # create the port forwarding rule
-            access_port = vm_info['access_port']
-            cls.forward_local_port_to_vm(
-                vmname=vm_name, host_port=access_port, guest_port="22")
-            cls.startvm(vm_name)
-
-        processes = [
-            Process(target=_manage_network_interfaces, args=(vm_name, vm_info))
-            for vm_name, vm_info in vms.items()]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
-
-        # generate the ssh configuration file for easy access without typing much
-        # .. todo:: use the ssh config generator in utils.py
-        print('write the ssh_config file')
-        with open(ssh_config, 'w') as fobj:
-
-            fobj.write('Host *\n')
-            fobj.write('    StrictHostKeyChecking no\n')
-            fobj.write('    UserKnownHostsFile /dev/null\n')
-            fobj.write('\n\n')
-
-            for vm_name, vm_info in vms.items():
-                fobj.write(f'Host {vm_info["hostname"]}\n')
-                fobj.write(f'    Hostname {proxy_host}\n')
-                fobj.write(f'    User {admin_user}\n')
-                fobj.write(f'    Port {vm_info["access_port"]}\n')
-                fobj.write(f'    IdentityFile {admin_priv_key}\n')
-                fobj.write('\n\n')
-
-        # generate the ssh priv/pub key pair if it does not exist
-        if not os.path.exists(admin_priv_key):
-            cmd = f'ssh-keygen -t ed25519 -a 100 -f {admin_priv_key} -q -N ""'
-            Command(cmd).run()
-            for fpath in [admin_priv_key, admin_public_key]:
-                _fpath = os.path.abspath(os.path.expanduser(fpath))
-                assert os.path.isfile(_fpath)
-            print('admin priv/pub key generated successfully')
-
-        # wait for all the vms to be ssh'able
-        print("wait for vms to be ssh'able")
-        for vm_name, vm_info in vms.items():
-            print(f'vm: {vm_name}')
-            ssh_status = cls.wait_for_ssh_server_up(
-                host='localhost',
-                port=vm_info['access_port'],
-                timeout=60,
-                n_try=20
-            )
-            if ssh_status is True:
-                print(f"vm {vm_name} is ssh'able")
-
-            # add the ssh-key of the admin account to enable passwordless login
-            # .. todo:: make sure that the machine is sshable by executing a ssh
-            #           command that echo's the hostname or something and repeat
-            #           until it succeeds with max n tries...etc...
-            n_try = 5
-            t_retry = 10
-            ssh_success = False
-            print(f'try to add ssh key to {vm_name}')
-            for try_no in range(n_try):
-                print(f'trial {try_no}')
-
-                process = Command(
-                    f'sshpass -p {admin_pass} ssh-copy-id -p {vm_info["access_port"]} '
-                    f'-i {admin_public_key} -o StrictHostKeyChecking=no '
-                    f'-o UserKnownHostsFile="/dev/null" {admin_user}@localhost'
-                ).run(capture=True)
-
-                print(process.stdout)
-                print(process.stderr)
-
-                if process.process.returncode == 0:
-
-                    cmd = Command(f'ssh -F {ssh_config} {vm_info["hostname"]} hostname')
-                    process = cmd.run(capture=True)
-                    print('-' * 10)
-                    print(f'stdout: {process.stdout}')
-                    print(f'stderr: {process.stderr}')
-                    print('-' * 10)
-                    # .. todo:: replace the osboxes and hostname cmd check with
-                    # something more reliable
-                    if len(process.stdout.strip()) > 0:
-                        ssh_success = True
-
-                if ssh_success:
-                    print('sucessfully sshed to vm')
-                    break
-
-                time.sleep(t_retry)
-
-            if ssh_success is False:
-                raise ValueError('could not add ssh key')
-
-        print('to ssh to a certain host e.g mgmt01:')
-        print(f'>>> ssh -F {ssh_config} mgmt01')
-
-        print('to run ansible:')
-        print(
-            f'>>> ansible --ssh-common-args="-F {ssh_config}" -i /path/to/inventory all -m ping')
-
+        # Generate SSH keys, add them to VMs, and write SSH config
+        cls.setup_ssh_access()
 
     @staticmethod
     def deprovision(cls, cli_args):
