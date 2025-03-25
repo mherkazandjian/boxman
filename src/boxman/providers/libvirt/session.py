@@ -381,55 +381,26 @@ class LibVirtSession:
             return {}
 
     ### snapshots
-    def snapshot_vms(self, cluster_name=None, snapshot_name=None, description=None):
+    def snapshot_take(self, vm_name=None, snapshot_name=None, description=None):
         """
-        Create snapshots of VMs in the specified cluster or all clusters.
+        Create a snapshot of a specific VM
 
         Args:
-            cluster_name (str, optional): Name of the cluster. If None, all clusters.
-            snapshot_name (str, optional): Name for the snapshot.
-            description (str, optional): Description for the snapshot.
+            vm_name (str, optional): Full name of the VM to snapshot
+            snapshot_name (str): Name for the snapshot
+            description (str, optional): Description for the snapshot
 
         Returns:
-            dict: Results of the snapshot operation per VM
+            bool: True if successful, False otherwise
         """
-        self.logger.info(f"Creating snapshots of VMs in cluster(s): {cluster_name or 'all'}")
-
-        if not snapshot_name:
-            snapshot_name = f"boxman_snap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-        if not description:
-            description = f"Snapshot created by Boxman on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-        # Initialize snapshot manager
         snapshot_mgr = SnapshotManager(self.provider_config)
+        self.logger.info(f"Processing vm: {vm_name}")
+        return snapshot_mgr.create_snapshot(
+            vm_name=vm_name,
+            snapshot_name=snapshot_name,
+            description=description)
 
-        results = {}
-
-        if cluster_name:
-            # Snapshot VMs in the specified cluster only
-            if cluster_name in self.config.get('clusters', {}):
-                cluster_config = self.config['clusters'][cluster_name].copy()
-                cluster_config['name'] = cluster_name
-                results[cluster_name] = snapshot_mgr.snapshot_all_vms(
-                    cluster_config, snapshot_name, description
-                )
-            else:
-                self.logger.error(f"Cluster {cluster_name} not found in configuration")
-                results["error"] = f"Cluster {cluster_name} not found"
-        else:
-            # Snapshot VMs in all clusters
-            for name, cluster_config in self.config.get('clusters', {}).items():
-                self.logger.info(f"Processing cluster: {name}")
-                cluster_config_copy = cluster_config.copy()
-                cluster_config_copy['name'] = name
-                results[name] = snapshot_mgr.snapshot_all_vms(
-                    cluster_config_copy, snapshot_name, description
-                )
-
-        return results
-
-    def list_snapshots(self, cluster_name=None, vm_name=None):
+    def snapshot_list(self, cluster_name=None, vm_name=None):
         """
         List snapshots for VMs in the specified cluster or all clusters.
 
@@ -472,9 +443,9 @@ class LibVirtSession:
 
         return results
 
-    def revert_snapshot(self, vm_name, snapshot_name, cluster_name=None):
+    def snapshot_restore(self, vm_name, snapshot_name, cluster_name=None):
         """
-        Revert a VM to a specific snapshot.
+        Restore a VM to a specific snapshot.
 
         Args:
             vm_name (str): Name of the VM to revert
@@ -493,7 +464,7 @@ class LibVirtSession:
         snapshot_mgr = SnapshotManager(self.provider_config)
         return snapshot_mgr.revert_to_snapshot(full_vm_name, snapshot_name)
 
-    def delete_snapshot(self, vm_name, snapshot_name):
+    def snapshot_delete(self, vm_name, snapshot_name):
         """
         Delete a specific snapshot from a VM.
 
@@ -505,7 +476,6 @@ class LibVirtSession:
             bool: True if successful, False otherwise
         """
         self.logger.info(f"Deleting snapshot {snapshot_name} from VM {vm_name}")
-
         snapshot_mgr = SnapshotManager(self.provider_config)
         return snapshot_mgr.delete_snapshot(vm_name, snapshot_name)
     # end snapshots

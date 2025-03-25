@@ -131,7 +131,7 @@ def parse_args():
         type=str,
         help='the name of the snapshot',
         dest='snapshot_name',
-        default=now.strftime('%Y-%m-%dT%H:%M:%S')
+        default=now.strftime('%Y-%m-%dT%H-%M-%S')
     )
     parser_snap_take.add_argument(
         '-m',

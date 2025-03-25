@@ -34,8 +34,10 @@ class SnapshotManager:
         #: bool: Whether to use sudo
         self.use_sudo = provider_config.get('use_sudo', False) if provider_config else False
 
-    def create_snapshot(self, vm_name: str, snapshot_name: Optional[str] = None,
-                       description: Optional[str] = None) -> bool:
+    def create_snapshot(self,
+                        vm_name: str,
+                        snapshot_name: str,
+                        description: str) -> bool:
         """
         Create a snapshot of a VM.
 
@@ -47,21 +49,12 @@ class SnapshotManager:
         Returns:
             bool: True if successful, False otherwise
         """
-        if not snapshot_name:
-            snapshot_name = f"snap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-        if not description:
-            description = f"Snapshot taken on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-        # Create XML for snapshot
         xml_content = f"""
         <domainsnapshot>
             <name>{snapshot_name}</name>
             <description>{description}</description>
         </domainsnapshot>
         """
-
-        # Write XML to temporary file
         tmp_xml_path = os.path.expanduser(f"/tmp/{vm_name}_snapshot_{snapshot_name}.xml")
         try:
             with open(tmp_xml_path, 'w') as f:
@@ -189,69 +182,3 @@ class SnapshotManager:
         except Exception as e:
             log.error(f"Error deleting snapshot '{snapshot_name}' from VM {vm_name}: {e}")
             return False
-
-    def snapshot_all_vms(self, cluster_config: Dict[str, Any],
-                        snapshot_name: Optional[str] = None,
-                        description: Optional[str] = None) -> Dict[str, bool]:
-        """
-        Create snapshots for all VMs in a cluster.
-
-        Args:
-            cluster_config: Cluster configuration dictionary
-            snapshot_name: Name for the snapshots
-            description: Description for the snapshots
-
-        Returns:
-            dict: Dictionary with results per VM
-        """
-        results = {}
-
-        # If no snapshot name provided, create a timestamped one
-        if not snapshot_name:
-            snapshot_name = f"boxman_snap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-        if not description:
-            description = f"Snapshot taken by Boxman on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-        for vm_name, vm_config in cluster_config.get('vms', {}).items():
-            log.info(f"Creating snapshot for VM: {vm_name}")
-
-            # For clustered VMs, the actual VM name in libvirt includes the cluster name prefix
-            cluster_name = cluster_config.get('name', '')
-            full_vm_name = f"{cluster_name}_{vm_name}" if cluster_name else vm_name
-
-            success = self.create_snapshot(full_vm_name, snapshot_name, description)
-            results[vm_name] = success
-
-        return results
-
-    def snapshot_all_clusters(self, config: Dict[str, Any],
-                             snapshot_name: Optional[str] = None,
-                             description: Optional[str] = None) -> Dict[str, Dict[str, bool]]:
-        """
-        Create snapshots for all VMs in all clusters.
-
-        Args:
-            config: Configuration dictionary
-            snapshot_name: Name for the snapshots
-            description: Description for the snapshots
-
-        Returns:
-            dict: Dictionary with results per cluster and VM
-        """
-        results = {}
-
-        # Iterate through clusters and their VMs
-        for cluster_name, cluster_config in config.get('clusters', {}).items():
-            log.info(f"Processing cluster: {cluster_name}")
-
-            # Update the cluster config with the cluster name
-            cluster_config_with_name = cluster_config.copy()
-            cluster_config_with_name['name'] = cluster_name
-
-            cluster_results = self.snapshot_all_vms(
-                cluster_config_with_name, snapshot_name, description
-            )
-            results[cluster_name] = cluster_results
-
-        return results

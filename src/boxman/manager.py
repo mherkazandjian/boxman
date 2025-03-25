@@ -717,34 +717,17 @@ class BoxmanManager:
         """
         Take a snapshot of the VMs in the cluster.
         """
-        config = cls.config
-        cluster_name = cli_args.cluster if hasattr(cli_args, 'cluster') else None
-        snapshot_name = cli_args.name if hasattr(cli_args, 'name') else None
-        description = cli_args.description if hasattr(cli_args, 'description') else None
-
-        print(f"Taking snapshot{' for cluster '+cluster_name if cluster_name else ''} with name: {snapshot_name or 'auto-generated'}")
-
-        # Create snapshots
-        results = cls.provider.snapshot_vms(cluster_name, snapshot_name, description)
-
-        if "error" in results:
-            print(f"Error: {results['error']}")
+        if not cli_args.snapshot_name:
+            print("Error: Snapshot name is required")
             return
 
-        # Count successful snapshots
-        success_count = 0
-        total_count = 0
-
-        for cluster, vm_results in results.items():
-            for vm, success in vm_results.items():
-                total_count += 1
-                if success:
-                    success_count += 1
-                    print(f"✓ Successfully created snapshot for VM {vm} in cluster {cluster}")
-                else:
-                    print(f"✗ Failed to create snapshot for VM {vm} in cluster {cluster}")
-
-        print(f"\nSnapshot operation completed: {success_count}/{total_count} successful")
+        for cluster_name, cluster in cls.config['clusters'].items():
+            for vm_name, _ in cluster['vms'].items():
+                full_vm_name = f"{cluster_name}_{vm_name}"
+                cls.provider.snapshot_take(
+                    vm_name=full_vm_name,
+                    snapshot_name=cli_args.snapshot_name,
+                    description=cli_args.snapshot_descr)
 
     @staticmethod
     def snapshot_restore(cls, cli_args):
@@ -762,7 +745,7 @@ class BoxmanManager:
         print(f"Reverting VM {vm_name} to snapshot {snapshot_name}")
 
         # Revert to snapshot
-        success = cls.provider.revert_snapshot(vm_name, snapshot_name, cluster_name)
+        success = cls.provider.snapshot_restore(vm_name, snapshot_name, cluster_name)
 
         if success:
             print(f"✓ Successfully reverted VM {vm_name} to snapshot {snapshot_name}")
@@ -782,4 +765,4 @@ class BoxmanManager:
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{cluster_name}_{vm_name}"
-                cls.provider.delete_snapshot(full_vm_name, cli_args.snapshot_name)
+                cls.provider.snapshot_delete(full_vm_name, cli_args.snapshot_name)
