@@ -672,3 +672,122 @@ class BoxmanManager:
         #cls.provision_files()
 
         return
+
+    @staticmethod
+    def snapshot_list(cls, cli_args):
+        """
+        List snapshots of the VMs in the cluster.
+        """
+        config = cls.config
+        cluster_name = cli_args.cluster if hasattr(cli_args, 'cluster') else None
+        vm_name = cli_args.vm if hasattr(cli_args, 'vm') else None
+
+        # Get snapshots
+        snapshots = cls.provider.list_snapshots(cluster_name, vm_name)
+
+        # Display the results
+        if not snapshots:
+            print("No snapshots found.")
+            return
+
+        if "error" in snapshots:
+            print(f"Error: {snapshots['error']}")
+            return
+
+        print("\n=== VM Snapshots ===\n")
+
+        for vm, snap_list in snapshots.items():
+            if not snap_list:
+                print(f"No snapshots for VM: {vm}")
+                continue
+
+            print(f"VM: {vm}")
+            print("-" * 40)
+
+            for i, snap in enumerate(snap_list, 1):
+                print(f"  {i}. {snap['name']}")
+                print(f"     Description: {snap['description']}")
+                print(f"     Created: {snap['creation_time']}")
+                print()
+
+            print()
+
+    @staticmethod
+    def snapshot_take(cls, cli_args):
+        """
+        Take a snapshot of the VMs in the cluster.
+        """
+        config = cls.config
+        cluster_name = cli_args.cluster if hasattr(cli_args, 'cluster') else None
+        snapshot_name = cli_args.name if hasattr(cli_args, 'name') else None
+        description = cli_args.description if hasattr(cli_args, 'description') else None
+
+        print(f"Taking snapshot{' for cluster '+cluster_name if cluster_name else ''} with name: {snapshot_name or 'auto-generated'}")
+
+        # Create snapshots
+        results = cls.provider.snapshot_vms(cluster_name, snapshot_name, description)
+
+        if "error" in results:
+            print(f"Error: {results['error']}")
+            return
+
+        # Count successful snapshots
+        success_count = 0
+        total_count = 0
+
+        for cluster, vm_results in results.items():
+            for vm, success in vm_results.items():
+                total_count += 1
+                if success:
+                    success_count += 1
+                    print(f"✓ Successfully created snapshot for VM {vm} in cluster {cluster}")
+                else:
+                    print(f"✗ Failed to create snapshot for VM {vm} in cluster {cluster}")
+
+        print(f"\nSnapshot operation completed: {success_count}/{total_count} successful")
+
+    @staticmethod
+    def snapshot_restore(cls, cli_args):
+        """
+        Restore the state of the VMs in the cluster from a snapshot.
+        """
+        if not hasattr(cli_args, 'vm') or not hasattr(cli_args, 'name'):
+            print("Error: VM name and snapshot name are required")
+            return
+
+        vm_name = cli_args.vm
+        snapshot_name = cli_args.name
+        cluster_name = cli_args.cluster if hasattr(cli_args, 'cluster') else None
+
+        print(f"Reverting VM {vm_name} to snapshot {snapshot_name}")
+
+        # Revert to snapshot
+        success = cls.provider.revert_snapshot(vm_name, snapshot_name, cluster_name)
+
+        if success:
+            print(f"✓ Successfully reverted VM {vm_name} to snapshot {snapshot_name}")
+        else:
+            print(f"✗ Failed to revert VM {vm_name} to snapshot {snapshot_name}")
+
+    @staticmethod
+    def snapshot_delete(cls, cli_args):
+        """
+        Delete a snapshot of the VMs in the cluster.
+        """
+        if not hasattr(cli_args, 'vm') or not hasattr(cli_args, 'name'):
+            print("Error: VM name and snapshot name are required")
+            return
+
+        vm_name = cli_args.vm
+        snapshot_name = cli_args.name
+        cluster_name = cli_args.cluster if hasattr(cli_args, 'cluster') else None
+
+        print(f"Deleting snapshot {snapshot_name} from VM {vm_name}")
+
+        # Delete snapshot
+        success = cls.provider.delete_snapshot(vm_name, snapshot_name, cluster_name)
+
+        if success:
+            print(f"✓ Successfully deleted snapshot {snapshot_name} from VM {vm_name}")
+        else:
+            print(f"✗ Failed to delete snapshot {snapshot_name} from VM {vm_name}")

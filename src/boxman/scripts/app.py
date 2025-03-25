@@ -118,7 +118,7 @@ def parse_args():
     # sub parser for the 'snapshot take' subsubcommand
     #
     parser_snap_take = subparsers_snap.add_parser('take', help='take a snapshot')
-    parser_snap_take.set_defaults(func=snapshot_take)
+    parser_snap_take.set_defaults(func=BoxmanManager.snapshot_take)
     parser_snap_take.add_argument(
         '--vms',
         type=str,
@@ -156,7 +156,7 @@ def parse_args():
     # sub parser for the 'snapshot list' subsubcommand
     #
     parser_snap_list = subparsers_snap.add_parser('list', help='list snapshots')
-    parser_snap_list.set_defaults(func=snapshot_list)
+    parser_snap_list.set_defaults(func=BoxmanManager.snapshot_list)
     parser_snap_list.add_argument(
         '--vms',
         type=str,
@@ -169,7 +169,7 @@ def parse_args():
     # sub parser for the 'snapshot restore' subsubcommand
     #
     parser_snap_restore = subparsers_snap.add_parser('restore', help='restore the state of vms from snapshot')
-    parser_snap_restore.set_defaults(func=snapshot_restore)
+    parser_snap_restore.set_defaults(func=BoxmanManager.snapshot_restore)
     parser_snap_restore.add_argument(
         '--vms',
         type=str,
@@ -189,7 +189,7 @@ def parse_args():
     # sub parser for the 'snapshot delete' subsubcommand
     #
     parser_snap_delete = subparsers_snap.add_parser('delete', help='delete a snapshot')
-    parser_snap_delete.set_defaults(func=snapshot_delete)
+    parser_snap_delete.set_defaults(func=BoxmanManager.snapshot_delete)
     parser_snap_delete.add_argument(
         '--vms',
         type=str,

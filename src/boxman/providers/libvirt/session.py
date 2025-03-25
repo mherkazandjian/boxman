@@ -4,6 +4,9 @@ from .net import Network, NetworkInterface
 from .clone_vm import CloneVM
 from .destroy_vm import DestroyVM
 from .disk import DiskManager
+import logging
+from datetime import datetime
+from .snapshot import SnapshotManager
 
 class LibVirtSession:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -15,6 +18,16 @@ class LibVirtSession:
         """
         #: Optional[Dict[str, Any]]: The configuration for this session
         self.config = config
+
+        #: logging.Logger: Logger instance
+        self.logger = logging.getLogger(__name__)
+
+        # Get provider config
+        self.provider_config = config.get('provider', {}).get('libvirt', {}) if config else {}
+
+        # Extract commonly used provider settings
+        self.uri = self.provider_config.get('uri', 'qemu:///system')
+        self.use_sudo = self.provider_config.get('use_sudo', False)
 
     def define_network(self,
                        name: str = None,
@@ -366,3 +379,138 @@ class LibVirtSession:
             print(f"Error getting IP addresses for VM {vm_name}: {e}")
             print(traceback.format_exc())
             return {}
+
+    ### snapshots
+    def snapshot_vms(self, cluster_name=None, snapshot_name=None, description=None):
+        """
+        Create snapshots of VMs in the specified cluster or all clusters.
+
+        Args:
+            cluster_name (str, optional): Name of the cluster. If None, all clusters.
+            snapshot_name (str, optional): Name for the snapshot.
+            description (str, optional): Description for the snapshot.
+
+        Returns:
+            dict: Results of the snapshot operation per VM
+        """
+        self.logger.info(f"Creating snapshots of VMs in cluster(s): {cluster_name or 'all'}")
+
+        if not snapshot_name:
+            snapshot_name = f"boxman_snap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        if not description:
+            description = f"Snapshot created by Boxman on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+        # Initialize snapshot manager
+        snapshot_mgr = SnapshotManager(self.provider_config)
+
+        results = {}
+
+        if cluster_name:
+            # Snapshot VMs in the specified cluster only
+            if cluster_name in self.config.get('clusters', {}):
+                cluster_config = self.config['clusters'][cluster_name].copy()
+                cluster_config['name'] = cluster_name
+                results[cluster_name] = snapshot_mgr.snapshot_all_vms(
+                    cluster_config, snapshot_name, description
+                )
+            else:
+                self.logger.error(f"Cluster {cluster_name} not found in configuration")
+                results["error"] = f"Cluster {cluster_name} not found"
+        else:
+            # Snapshot VMs in all clusters
+            for name, cluster_config in self.config.get('clusters', {}).items():
+                self.logger.info(f"Processing cluster: {name}")
+                cluster_config_copy = cluster_config.copy()
+                cluster_config_copy['name'] = name
+                results[name] = snapshot_mgr.snapshot_all_vms(
+                    cluster_config_copy, snapshot_name, description
+                )
+
+        return results
+
+    def list_snapshots(self, cluster_name=None, vm_name=None):
+        """
+        List snapshots for VMs in the specified cluster or all clusters.
+
+        Args:
+            cluster_name (str, optional): Name of the cluster. If None, all clusters.
+            vm_name (str, optional): Name of the VM. If None, all VMs in cluster(s).
+
+        Returns:
+            dict: Dictionary of snapshots per VM
+        """
+        self.logger.info(f"Listing snapshots for VMs in cluster(s): {cluster_name or 'all'}")
+
+        # Initialize snapshot manager
+        snapshot_mgr = SnapshotManager(self.provider_config)
+
+        results = {}
+
+        if vm_name:
+            # Format VM name if cluster is specified
+            full_vm_name = f"{cluster_name}_{vm_name}" if cluster_name else vm_name
+
+            # List snapshots for a specific VM
+            results[vm_name] = snapshot_mgr.list_snapshots(full_vm_name)
+        elif cluster_name:
+            # List snapshots for all VMs in the specified cluster
+            if cluster_name in self.config.get('clusters', {}):
+                cluster_config = self.config['clusters'][cluster_name]
+                for vm, vm_config in cluster_config.get('vms', {}).items():
+                    full_vm_name = f"{cluster_name}_{vm}"
+                    results[vm] = snapshot_mgr.list_snapshots(full_vm_name)
+            else:
+                self.logger.error(f"Cluster {cluster_name} not found in configuration")
+                results["error"] = f"Cluster {cluster_name} not found"
+        else:
+            # List snapshots for all VMs in all clusters
+            for name, cluster_config in self.config.get('clusters', {}).items():
+                for vm, vm_config in cluster_config.get('vms', {}).items():
+                    full_vm_name = f"{name}_{vm}"
+                    results[full_vm_name] = snapshot_mgr.list_snapshots(full_vm_name)
+
+        return results
+
+    def revert_snapshot(self, vm_name, snapshot_name, cluster_name=None):
+        """
+        Revert a VM to a specific snapshot.
+
+        Args:
+            vm_name (str): Name of the VM to revert
+            snapshot_name (str): Name of the snapshot to revert to
+            cluster_name (str, optional): Name of the cluster containing the VM
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        # Format VM name with cluster prefix if needed
+        full_vm_name = f"{cluster_name}_{vm_name}" if cluster_name else vm_name
+
+        self.logger.info(f"Reverting VM {full_vm_name} to snapshot {snapshot_name}")
+
+        # Initialize snapshot manager
+        snapshot_mgr = SnapshotManager(self.provider_config)
+        return snapshot_mgr.revert_to_snapshot(full_vm_name, snapshot_name)
+
+    def delete_snapshot(self, vm_name, snapshot_name, cluster_name=None):
+        """
+        Delete a specific snapshot from a VM.
+
+        Args:
+            vm_name (str): Name of the VM
+            snapshot_name (str): Name of the snapshot to delete
+            cluster_name (str, optional): Name of the cluster containing the VM
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        # Format VM name with cluster prefix if needed
+        full_vm_name = f"{cluster_name}_{vm_name}" if cluster_name else vm_name
+
+        self.logger.info(f"Deleting snapshot {snapshot_name} from VM {full_vm_name}")
+
+        # Initialize snapshot manager
+        snapshot_mgr = SnapshotManager(self.provider_config)
+        return snapshot_mgr.delete_snapshot(full_vm_name, snapshot_name)
+    # end snapshots
