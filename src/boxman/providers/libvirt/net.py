@@ -318,7 +318,7 @@ class Network(VirshCommand):
             self.logger.info(f"Configuring complete isolation for routed network with bridge {bridge_name}")
 
             # 1. Allow VM-to-VM communication on the same bridge
-            vm_to_vm_cmd = f"iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
+            vm_to_vm_cmd = f"sudo iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
             self.logger.info(f"Setting up VM-to-VM communication: {vm_to_vm_cmd}")
             result = self.execute_shell(vm_to_vm_cmd)
             if not result.ok:
@@ -326,7 +326,7 @@ class Network(VirshCommand):
                 return False
 
             # 2. Block ALL traffic from VMs to host
-            host_to_vm_block = f"iptables -I INPUT -i {bridge_name} -j DROP"
+            host_to_vm_block = f"sudo iptables -I INPUT -i {bridge_name} -j DROP"
             self.logger.info(f"Blocking all traffic from VMs to host: {host_to_vm_block}")
             result = self.execute_shell(host_to_vm_block)
             if not result.ok:
@@ -334,7 +334,7 @@ class Network(VirshCommand):
                 return False
 
             # 3. Block ALL traffic from host to VMs
-            vm_to_host_block = f"iptables -I OUTPUT -o {bridge_name} -j DROP"
+            vm_to_host_block = f"sudo iptables -I OUTPUT -o {bridge_name} -j DROP"
             self.logger.info(f"Blocking all traffic from host to VMs: {vm_to_host_block}")
             result = self.execute_shell(vm_to_host_block)
             if not result.ok:
