@@ -9,6 +9,7 @@ from jinja2 import Template, Environment, FileSystemLoader
 
 from .commands import VirshCommand, LibVirtCommandBase
 
+from boxman import log
 
 class Network(VirshCommand):
     """
@@ -444,7 +445,7 @@ class NetworkInterface(VirshCommand):
         self.vm_name = vm_name
 
         #: logging.Logger: Logger instance
-        self.logger = logging.getLogger(__name__)
+        self.logger = log
 
     def add_interface(self,
                       network_source: str,

@@ -184,6 +184,62 @@ class DestroyVM(VirshCommand):
             self.logger.error(f"Error un-defining VM {self.name}: {e}")
             return False
 
+    def delete_all_snapshots(self) -> bool:
+        """
+        Delete all snapshots for the VM.
+
+        This should be called before undefining the VM to ensure
+        all associated snapshot data is cleaned up.
+
+        Returns:
+            True if all snapshots were deleted successfully or if there are no snapshots,
+            False if there was an error deleting any snapshot
+        """
+        if not self.is_vm_defined():
+            self.logger.info(f"VM {self.name} is not defined, no snapshots to delete")
+            return True
+
+        try:
+            # List all snapshots
+            self.logger.info(f"Checking for snapshots of VM {self.name}")
+            result = self.execute("snapshot-list", self.name, "--name", warn=True)
+
+            if not result.ok:
+                self.logger.warning(f"Failed to list snapshots for VM {self.name}: {result.stderr}")
+                return False
+
+            if not result.stdout.strip():
+                self.logger.info(f"No snapshots found for VM {self.name}")
+                return True
+
+            # Process the list of snapshots
+            snapshots = [s for s in result.stdout.strip().split('\n') if s.strip()]
+
+            if not snapshots:
+                self.logger.info(f"No snapshots found for VM {self.name}")
+                return True
+
+            self.logger.info(f"Found {len(snapshots)} snapshots to delete for VM {self.name}")
+
+            # Delete each snapshot
+            success = True
+            for snapshot in snapshots:
+                try:
+                    self.logger.info(f"Deleting snapshot '{snapshot}' for VM {self.name}")
+                    delete_result = self.execute("snapshot-delete", self.name, snapshot)
+
+                    if not delete_result.ok:
+                        self.logger.error(f"Failed to delete snapshot '{snapshot}' for VM {self.name}: {delete_result.stderr}")
+                        success = False
+                except RuntimeError as e:
+                    self.logger.error(f"Error deleting snapshot '{snapshot}' for VM {self.name}: {e}")
+                    success = False
+
+            return success
+        except RuntimeError as e:
+            self.logger.error(f"Error handling snapshots for VM {self.name}: {e}")
+            return False
+
     def remove(self, force: Optional[bool] = None) -> bool:
         """
         Completely destroy the VM: shutdown, force destroy if needed, and undefine.
@@ -198,6 +254,12 @@ class DestroyVM(VirshCommand):
             if not self.destroy_vm(force=force):
                 self.logger.error(f"Failed to stop VM {self.name}, cannot proceed with undefine")
                 return False
+
+        # Delete all snapshots before undefining the VM
+        if not self.delete_all_snapshots():
+            self.logger.warning(f"Failed to delete all snapshots for VM {self.name}, continuing with undefine anyway")
+            # Continuing with undefine even if snapshot deletion failed
+            # This is a deliberate choice to ensure VM removal attempts completion
 
         status = self.undefine_vm()
 
