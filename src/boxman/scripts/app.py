@@ -215,7 +215,7 @@ def parse_args():
     # sub parser for the 'control suspend' subsubcommand
     #
     parser_ctrl_suspend = subparsers_ctrl.add_parser('suspend', help='suspend vms')
-    parser_ctrl_suspend.set_defaults(func=machine_suspend)
+    parser_ctrl_suspend.set_defaults(func=BoxmanManager.suspend_vm)
     parser_ctrl_suspend.add_argument(
         '--vms',
         type=str,
@@ -228,7 +228,7 @@ def parse_args():
     # sub parser for the 'control resume' subsubcommand
     #
     parser_ctrl_resume = subparsers_ctrl.add_parser('resume', help='resume vms')
-    parser_ctrl_resume.set_defaults(func=machine_resume)
+    parser_ctrl_resume.set_defaults(func=BoxmanManager.resume_vm)
     parser_ctrl_resume.add_argument(
         '--vms',
         type=str,
@@ -241,7 +241,7 @@ def parse_args():
     # sub parser for the 'control save' subsubcommand
     #
     parser_ctrl_save = subparsers_ctrl.add_parser('save', help='save the state of vms')
-    parser_ctrl_save.set_defaults(func=machine_save)
+    parser_ctrl_save.set_defaults(func=BoxmanManager.save_vm)
     parser_ctrl_save.add_argument(
         '--vms',
         type=str,
@@ -254,7 +254,7 @@ def parse_args():
     # sub parser for the 'control start' subsubcommand
     #
     parser_ctrl_start = subparsers_ctrl.add_parser('start', help='start the vms')
-    parser_ctrl_start.set_defaults(func=machine_start)
+    parser_ctrl_start.set_defaults(func=BoxmanManager.start_vm)
     parser_ctrl_start.add_argument(
         '--vms',
         type=str,
@@ -262,7 +262,13 @@ def parse_args():
         dest='vms',
         default='all'
     )
-
+    parser_ctrl_start.add_argument(
+        '--restore',
+        action='store_true',
+        default=False,
+        help='restore the saved state of the vm before starting',
+        dest='restore'
+    )
 
     #
     # sub parser for the 'export' subcommand

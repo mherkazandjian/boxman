@@ -162,7 +162,7 @@ class Network(VirshCommand):
 
             return True
         except RuntimeError as e:
-            print(f"Error defining network: {e}")
+            self.logger.error(f"Error defining network: {e}")
             return False
 
     def define_and_start(self,
@@ -200,7 +200,7 @@ class Network(VirshCommand):
             # Check if network exists first
             result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
             if result.return_code != 0:
-                print(f"Network {self.name} does not exist, nothing to destroy")
+                self.logger.info(f"Network {self.name} does not exist, nothing to destroy")
                 return True
 
             # Check if network is active
@@ -208,11 +208,11 @@ class Network(VirshCommand):
             if result.return_code == 0:
                 # Network is active, stop it
                 self.execute("net-destroy", self.name)
-                print(f"Network {self.name} destroyed successfully")
+                self.logger.info(f"Network {self.name} destroyed successfully")
 
             return True
         except RuntimeError as e:
-            print(f"Error destroying network: {e}")
+            self.logger.error(f"Error destroying network: {e}")
             return False
 
     def undefine_network(self) -> bool:
@@ -226,7 +226,7 @@ class Network(VirshCommand):
             # Check if network exists
             result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
             if result.return_code != 0:
-                print(f"Network {self.name} does not exist, nothing to undefine")
+                self.logger.info(f"Network {self.name} does not exist, nothing to undefine")
                 return True
 
             # Disable autostart first if it's enabled
@@ -234,10 +234,10 @@ class Network(VirshCommand):
 
             # Undefine the network
             self.execute("net-undefine", self.name)
-            print(f"Network {self.name} undefined successfully")
+            self.logger.info(f"Network {self.name} undefined successfully")
             return True
         except RuntimeError as e:
-            print(f"Error un-defining network: {e}")
+            self.logger.error(f"Error un-defining network: {e}")
             return False
 
     def remove_network(self) -> bool:

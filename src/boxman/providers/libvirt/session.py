@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Dict, Any, Optional, List
 from .net import Network, NetworkInterface
 from .clone_vm import CloneVM
@@ -8,6 +9,7 @@ from datetime import datetime
 
 from boxman import log
 from .snapshot import SnapshotManager
+from .commands import VirshCommand
 
 
 class LibVirtSession:
@@ -194,7 +196,6 @@ class LibVirtSession:
         Returns:
             True if successful, False otherwise
         """
-        from .commands import VirshCommand
 
         try:
             virsh = VirshCommand(self.config.get('provider', {}))
@@ -202,30 +203,30 @@ class LibVirtSession:
             # Check if VM is already running
             result = virsh.execute("domstate", vm_name, warn=True)
             if result.ok and "running" in result.stdout:
-                print(f"VM {vm_name} is already running")
+                self.logger.info(f"VM {vm_name} is already running")
                 return True
 
             # Try to start the VM
             result = virsh.execute("start", vm_name)
 
             if not result.ok:
-                print(f"Failed to start VM {vm_name}: {result.stderr}")
+                self.logger.error(f"Failed to start VM {vm_name}: {result.stderr}")
                 return False
 
             # Verify that VM is running
             verify_result = virsh.execute("domstate", vm_name)
 
             if "running" in verify_result.stdout:
-                print(f"VM {vm_name} started successfully")
+                self.logger.info(f"VM {vm_name} started successfully")
                 return True
             else:
-                print(f"VM {vm_name} did not start properly. Current state: {verify_result.stdout}")
+                self.logger.error(f"VM {vm_name} did not start properly. Current state: {verify_result.stdout}")
                 return False
 
         except Exception as e:
             import traceback
-            print(f"Error starting VM {vm_name}: {e}")
-            print(traceback.format_exc())
+            self.logger.error(f"Error starting VM {vm_name}: {e}")
+            self.logger.error(traceback.format_exc())
             return False
 
     def add_network_interface(self,
@@ -279,13 +280,13 @@ class LibVirtSession:
 
         success = True
         for i, adapter_config in enumerate(network_adapters):
-            print(f"Configuring network interface {i+1} for VM {vm_name}")
+            self.logger.info(f"Configuring network interface {i+1} for VM {vm_name}")
 
             if not network_interface.configure_from_config(adapter_config):
-                print(f"Failed to configure network interface {i+1} for VM {vm_name}")
+                self.logger.error(f"Failed to configure network interface {i+1} for VM {vm_name}")
                 success = False
             else:
-                print(f"Successfully configured network interface {i+1} for VM {vm_name}")
+                self.logger.info(f"Successfully configured network interface {i+1} for VM {vm_name}")
 
         return success
 
@@ -313,17 +314,17 @@ class LibVirtSession:
 
         success = True
         for i, disk_config in enumerate(disks):
-            print(f"Configuring disk {i+1} for VM {vm_name}")
+            self.logger.info(f"Configuring disk {i+1} for VM {vm_name}")
 
             if not disk_manager.configure_from_disk_config(
                 disk_config=disk_config,
                 workdir=workdir,
                 disk_prefix=disk_prefix
             ):
-                print(f"Failed to configure disk {i+1} for VM {vm_name}")
+                self.logger.error(f"Failed to configure disk {i+1} for VM {vm_name}")
                 success = False
             else:
-                print(f"Successfully configured disk {i+1} for VM {vm_name}")
+                self.logger.info(f"Successfully configured disk {i+1} for VM {vm_name}")
 
         return success
 
@@ -345,14 +346,14 @@ class LibVirtSession:
             # First check if VM is running
             result = virsh.execute("domstate", vm_name, warn=True)
             if not result.ok or "running" not in result.stdout:
-                print(f"VM {vm_name} is not running, cannot get IP addresses")
+                self.logger.warn(f"VM {vm_name} is not running, cannot get IP addresses")
                 return {}
 
             # Try domifaddr to get all interfaces and their IPs
             result = virsh.execute("domifaddr", vm_name, warn=True)
 
             if not result.ok:
-                print(f"Failed to get interface addresses for VM {vm_name}")
+                self.logger.error(f"Failed to get interface addresses for VM {vm_name}")
                 return {}
 
             # Parse the output to extract interface information
@@ -378,8 +379,8 @@ class LibVirtSession:
 
         except Exception as e:
             import traceback
-            print(f"Error getting IP addresses for VM {vm_name}: {e}")
-            print(traceback.format_exc())
+            self.logger.error(f"Error getting IP addresses for VM {vm_name}: {e}")
+            self.logger.debug(traceback.format_exc())
             return {}
 
     ### snapshots
@@ -452,3 +453,200 @@ class LibVirtSession:
         snapshot_mgr = SnapshotManager(self.provider_config)
         return snapshot_mgr.delete_snapshot(vm_name, snapshot_name)
     # end snapshots
+
+    ### control vm
+    def suspend_vm(self, vm_name: str) -> bool:
+        """
+        Suspend (pause) a VM.
+
+        Args:
+            vm_name: Name of the VM to suspend
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            virsh = VirshCommand(self.provider_config)
+
+            # Check if VM is running
+            result = virsh.execute("domstate", vm_name, warn=True)
+            if not result.ok or "running" not in result.stdout:
+                self.logger.warning(f"VM {vm_name} is not running, cannot suspend")
+                return False
+
+            # Try to suspend the VM
+            self.logger.info(f"Suspending VM {vm_name}")
+            result = virsh.execute("suspend", vm_name)
+
+            if not result.ok:
+                self.logger.error(f"Failed to suspend VM {vm_name}: {result.stderr}")
+                return False
+
+            # Verify VM is suspended
+            verify_result = virsh.execute("domstate", vm_name)
+            if "paused" in verify_result.stdout:
+                self.logger.info(f"VM {vm_name} suspended successfully")
+                return True
+            else:
+                self.logger.error(f"VM {vm_name} not suspended. Current state: {verify_result.stdout}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Error suspending VM {vm_name}: {e}")
+            return False
+
+    def resume_vm(self, vm_name: str) -> bool:
+        """
+        Resume a suspended VM.
+
+        Args:
+            vm_name: Name of the VM to resume
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            virsh = VirshCommand(self.provider_config)
+
+            # Check if VM is suspended
+            result = virsh.execute("domstate", vm_name, warn=True)
+            if not result.ok:
+                self.logger.warning(f"VM {vm_name} does not exist")
+                return False
+            if "paused" not in result.stdout:
+                self.logger.warning(f"VM {vm_name} is not suspended (current state: {result.stdout.strip()})")
+                return False
+
+            # Try to resume the VM
+            self.logger.info(f"Resuming VM {vm_name}")
+            result = virsh.execute("resume", vm_name)
+
+            if not result.ok:
+                self.logger.error(f"Failed to resume VM {vm_name}: {result.stderr}")
+                return False
+
+            # Verify VM is running
+            verify_result = virsh.execute("domstate", vm_name)
+            if "running" in verify_result.stdout:
+                self.logger.info(f"VM {vm_name} resumed successfully")
+                return True
+            else:
+                self.logger.error(f"VM {vm_name} not resumed. Current state: {verify_result.stdout}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Error resuming VM {vm_name}: {e}")
+            return False
+
+    def save_vm(self, vm_name: str, workdir: str) -> bool:
+        """
+        Save VM state to a file in the specified workdir.
+
+        Args:
+            vm_name: Name of the VM to save
+            workdir: Directory where the VM state will be saved
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            virsh = VirshCommand(self.provider_config)
+
+            # Check if VM is running
+            result = virsh.execute("domstate", vm_name, warn=True)
+            if not result.ok or "running" not in result.stdout:
+                self.logger.warning(f"VM {vm_name} is not running, cannot save state")
+                return False
+
+            # Expand the workdir path and ensure it exists
+            workdir = os.path.expanduser(workdir)
+            if not os.path.exists(workdir):
+                os.makedirs(workdir, exist_ok=True)
+
+            save_path = os.path.join(workdir, f"{vm_name}.save")
+
+            # Try to save the VM state
+            self.logger.info(f"Saving VM {vm_name} state to {save_path}")
+            result = virsh.execute("save", vm_name, save_path)
+
+            if not result.ok:
+                self.logger.error(f"Failed to save VM {vm_name} state: {result.stderr}")
+                return False
+
+            # Verify the save file exists
+            if os.path.exists(save_path):
+                self.logger.info(f"VM {vm_name} state saved successfully to {save_path}")
+                return True
+            else:
+                self.logger.error(f"Save file {save_path} not created for VM {vm_name}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Error saving VM {vm_name} state: {e}")
+            return False
+
+    def restore_vm(self, vm_name: str, workdir: str) -> bool:
+        """
+        Restore VM from a saved state file in the specified workdir.
+
+        Args:
+            vm_name: Name of the VM to restore
+            workdir: Directory where the VM state was saved
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            virsh = VirshCommand(self.provider_config)
+
+            # Expand the workdir path
+            workdir = os.path.expanduser(workdir)
+            save_path = os.path.join(workdir, f"{vm_name}.save")
+
+            # Check if save file exists
+            if not os.path.exists(save_path):
+                self.logger.error(f"Save file {save_path} does not exist")
+                return False
+
+            # Check if the VM is defined but not running
+            exists_result = virsh.execute("domstate", vm_name, warn=True)
+            if exists_result.ok and "running" in exists_result.stdout:
+                self.logger.warning(f"VM {vm_name} is already running, shutting down first")
+                shutdown_result = virsh.execute("shutdown", vm_name)
+                if not shutdown_result.ok:
+                    self.logger.error(f"Failed to shutdown VM {vm_name} before restore: {shutdown_result.stderr}")
+                    return False
+
+                # Wait for VM to shut down
+                for i in range(30):
+                    state_result = virsh.execute("domstate", vm_name, warn=True)
+                    if state_result.ok and "shut off" in state_result.stdout:
+                        break
+                    time.sleep(1)
+                else:
+                    self.logger.error(f"VM {vm_name} did not shut down within timeout")
+                    return False
+
+            # Try to restore the VM
+            self.logger.info(f"Restoring VM {vm_name} from {save_path}")
+            result = virsh.execute("restore", save_path)
+
+            if not result.ok:
+                self.logger.error(f"Failed to restore VM {vm_name}: {result.stderr}")
+                return False
+
+            # Verify VM is running
+            verify_result = virsh.execute("domstate", vm_name)
+            if "running" in verify_result.stdout:
+                self.logger.info(f"VM {vm_name} restored successfully from {save_path}")
+                # Optionally remove the save file after successful restore
+                # os.remove(save_path)
+                return True
+            else:
+                self.logger.error(f"VM {vm_name} not restored. Current state: {verify_result.stdout}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Error restoring VM {vm_name}: {e}")
+            return False
+    ### end control vm

@@ -8,6 +8,7 @@ from invoke import run
 
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.utils.io import write_files
+from boxman import log
 
 class BoxmanManager:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -25,6 +26,9 @@ class BoxmanManager:
 
         #: Private backing field for the provider property
         self._provider = None
+
+        #: set the logger
+        self.logger = log
 
         if isinstance(config, str):
             self.config_path = config
@@ -133,10 +137,6 @@ class BoxmanManager:
         """
         Destroy the VMs specified in the cluster configuration.
         """
-        if not self.provider:
-            print("No provider set, cannot destroy VMs")
-            return
-
         def vm_destroy_tasks():
             for cluster_name, cluster in self.config['clusters'].items():
                 for vm_name in cluster['vms'].keys():
@@ -144,7 +144,7 @@ class BoxmanManager:
                     yield full_vm_name, cluster_name, vm_name
 
         def _destroy(full_vm_name, cluster_name, vm_name):
-            print(f"Destroying VM {vm_name} in cluster {cluster_name}")
+            self.logger.info(f"Destroying VM {vm_name} in cluster {cluster_name}")
             self.provider.destroy_vm(
                 name=full_vm_name,
                 remove_storage=True
@@ -169,10 +169,10 @@ class BoxmanManager:
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{cluster_name}_{vm_name}"
 
-                print(f"Configuring network interfaces for VM {vm_name} in cluster {cluster_name}")
+                self.logger.info(f"Configuring network interfaces for VM {vm_name} in cluster {cluster_name}")
 
                 if 'network_adapters' not in vm_info:
-                    print(f"No network adapters defined for VM {vm_name}, skipping")
+                    self.logger.warning(f"No network adapters defined for VM {vm_name}, skipping")
                     continue
 
                 success = self.provider.configure_vm_network_interfaces(
@@ -181,9 +181,9 @@ class BoxmanManager:
                 )
 
                 if success:
-                    print(f"All network interfaces configured successfully for VM {vm_name}")
+                    self.logger.info(f"All network interfaces configured successfully for VM {vm_name}")
                 else:
-                    print(f"Some network interfaces could not be configured for VM {vm_name}")
+                    self.logger.warning(f"Some network interfaces could not be configured for VM {vm_name}")
 
     def configure_disks(self) -> None:
         """
@@ -197,11 +197,11 @@ class BoxmanManager:
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{cluster_name}_{vm_name}"
 
-                print(f"Configuring disks for VM {vm_name} in cluster {cluster_name}")
+                self.logger.info(f"Configuring disks for VM {vm_name} in cluster {cluster_name}")
 
                 # Check if there are disks defined in the VM configuration
                 if 'disks' not in vm_info or not vm_info['disks']:
-                    print(f"No disks defined for VM {vm_name}, skipping")
+                    self.logger.warning(f"No disks defined for VM {vm_name}, skipping")
                     continue
 
                 # Configure all disks for this VM
@@ -212,9 +212,9 @@ class BoxmanManager:
                     disk_prefix=full_vm_name)
 
                 if success:
-                    print(f"All disks configured successfully for VM {vm_name}")
+                    self.logger.info(f"All disks configured successfully for VM {vm_name}")
                 else:
-                    print(f"Some disks could not be configured for VM {vm_name}")
+                    self.logger.warning(f"Some disks could not be configured for VM {vm_name}")
 
     def start_vms(self) -> None:
         """
@@ -226,13 +226,13 @@ class BoxmanManager:
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{cluster_name}_{vm_name}"
 
-                print(f"Starting VM {vm_name}")
+                self.logger.info(f"Starting VM {vm_name}")
                 success = self.provider.start_vm(full_vm_name)
 
                 if success:
-                    print(f"Successfully started VM {vm_name}")
+                    self.logger.info(f"Successfully started VM {vm_name}")
                 else:
-                    print(f"Failed to start VM {vm_name}")
+                    self.logger.warning(f"Failed to start VM {vm_name}")
 
     def get_connect_info(self) -> bool:
         """
@@ -256,7 +256,7 @@ class BoxmanManager:
                 # If no IP addresses found, mark as failure
                 if not ip_addresses:
                     all_vms_have_ip = False
-                    print(f"VM {vm_name} does not have an IP address yet")
+                    self.logger.warning(f"VM {vm_name} does not have an IP address yet")
 
         return all_vms_have_ip
 
@@ -267,27 +267,27 @@ class BoxmanManager:
         This method displays the VM names, hostnames, IP addresses, and
         other connection details for all configured VMs.
         """
-        print("\n=== VM Connection Information ===\n")
+        self.logger.info("\n=== VM Connection Information ===\n")
 
         for cluster_name, cluster in self.config['clusters'].items():
-            print(f"Cluster: {cluster_name}")
-            print("-" * 60)
+            self.logger.info(f"Cluster: {cluster_name}")
+            self.logger.info("-" * 60)
 
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{cluster_name}_{vm_name}"
                 hostname = vm_info.get('hostname', vm_name)
 
-                print(f"VM: {vm_name} (hostname: {hostname})")
+                self.logger.info(f"VM: {vm_name} (hostname: {hostname})")
 
                 # Get IP addresses for all interfaces
                 ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
 
                 if ip_addresses:
-                    print("  IP Addresses:")
+                    self.logger.info("  IP Addresses:")
                     for iface, ip in ip_addresses.items():
-                        print(f"    {iface}: {ip}")
+                        self.logger.info(f"    {iface}: {ip}")
                 else:
-                    print("  IP Addresses: Not available")
+                    self.logger.info("  IP Addresses: Not available")
 
                 # Get SSH connection information
                 admin_user = cluster.get('admin_user', '<placeholder>')
@@ -296,11 +296,11 @@ class BoxmanManager:
                     cluster.get('admin_key_name', 'id_ed25519_boxman')
                 ))
 
-                print("  Connect via SSH:")
+                self.logger.info("  Connect via SSH:")
                 # Show direct connection if IP is available
                 if ip_addresses:
                     first_ip = next(iter(ip_addresses.values()))
-                    print(f"    Direct: ssh -i {admin_key} {admin_user}@{first_ip}")
+                    self.logger.info(f"    Direct: ssh -i {admin_key} {admin_user}@{first_ip}")
 
                 # Show connection using ssh_config if available
                 if 'ssh_config' in cluster:
@@ -308,11 +308,11 @@ class BoxmanManager:
                         cluster.get('workdir', '~'),
                         cluster.get('ssh_config', 'ssh_config')
                     ))
-                    print(f"    Via config: ssh -F {ssh_config} {hostname}")
+                    self.logger.info(f"    Via config: ssh -F {ssh_config} {hostname}")
 
-                print()
+                self.logger.info("")
 
-            print()
+            self.logger.info("")
 
     def write_ssh_config(self) -> None:
         """
@@ -333,7 +333,7 @@ class BoxmanManager:
                 cluster.get('admin_key_name', 'id_ed25519_boxman')
             ))
 
-            print(f"Writing SSH config to {ssh_config}")
+            self.logger.info(f"Writing SSH config to {ssh_config}")
 
             with open(ssh_config, 'w') as fobj:
                 # Write global SSH options
@@ -359,10 +359,10 @@ class BoxmanManager:
                         fobj.write(f'    IdentityFile {admin_priv_key}\n')
                         fobj.write('\n\n')
                     else:
-                        print(f"Warning: No IP address available for VM {vm_name}, skipping SSH config entry")
+                        self.logger.warning(f"No IP address available for VM {vm_name}, skipping SSH config entry")
 
-            print(f"SSH config file written to {ssh_config}")
-            print(f"To connect: ssh -F {ssh_config} <hostname>")
+            self.logger.info(f"SSH config file written to {ssh_config}")
+            self.logger.info(f"To connect: ssh -F {ssh_config} <hostname>")
 
     def generate_ssh_keys(self) -> bool:
         """
@@ -388,7 +388,7 @@ class BoxmanManager:
 
             # Generate key pair if it doesn't exist
             if not os.path.exists(admin_priv_key):
-                print(f"Generating SSH key pair in {workdir}")
+                self.logger.info(f"Generating SSH key pair in {workdir}")
 
                 try:
                     cmd = f'ssh-keygen -t ed25519 -a 100 -f {admin_priv_key} -q -N ""'
@@ -396,16 +396,16 @@ class BoxmanManager:
 
                     # Verify keys were created
                     if os.path.isfile(admin_priv_key) and os.path.isfile(admin_pub_key):
-                        print(f"SSH key pair successfully generated at {admin_priv_key}")
+                        self.logger.info(f"SSH key pair successfully generated at {admin_priv_key}")
                     else:
-                        print(f"Failed to generate SSH key pair at {admin_priv_key}")
+                        self.logger.warning(f"Failed to generate SSH key pair at {admin_priv_key}")
                         success = False
 
                 except Exception as e:
-                    print(f"Error generating SSH key pair: {e}")
+                    self.logger.error(f"Error generating SSH key pair: {e}")
                     success = False
             else:
-                print(f"Using existing SSH key pair at {admin_priv_key}")
+                self.logger.info(f"Using existing SSH key pair at {admin_priv_key}")
 
         return success
 
@@ -428,16 +428,16 @@ class BoxmanManager:
             admin_pass = cluster.get('admin_pass', '')
 
             if not admin_pass:
-                print(f"Warning: No admin password provided for cluster {cluster_name}, cannot add SSH keys")
+                self.logger.info(f"Warning: No admin password provided for cluster {cluster_name}, cannot add SSH keys")
                 all_successful = False
                 continue
 
             if not os.path.isfile(admin_pub_key):
-                print(f"Error: SSH public key {admin_pub_key} does not exist")
+                self.logger.error(f"Error: SSH public key {admin_pub_key} does not exist")
                 all_successful = False
                 continue
 
-            print(f"Adding SSH public key to VMs in cluster {cluster_name}")
+            self.logger.info(f"Adding SSH public key to VMs in cluster {cluster_name}")
 
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{cluster_name}_{vm_name}"
@@ -446,14 +446,14 @@ class BoxmanManager:
                 ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
 
                 if not ip_addresses:
-                    print(f"Warning: No IP address available for VM {vm_name}, cannot add SSH key")
+                    self.logger.warning(f"No IP address available for VM {vm_name}, cannot add SSH key")
                     all_successful = False
                     continue
 
                 # Use first available IP address
                 ip_address = next(iter(ip_addresses.values()))
 
-                print(f"Adding SSH key to VM {vm_name} ({ip_address})...")
+                self.logger.info(f"Adding SSH key to VM {vm_name} ({ip_address})...")
 
                 # Try to add the key with exponential backoff
                 success = self._try_add_ssh_key(
@@ -466,9 +466,9 @@ class BoxmanManager:
                 )
 
                 if success:
-                    print(f"Successfully added SSH key to VM {vm_name}")
+                    self.logger.info(f"Successfully added SSH key to VM {vm_name}")
                 else:
-                    print(f"Failed to add SSH key to VM {vm_name}")
+                    self.logger.error(f"Failed to add SSH key to VM {vm_name}")
                     all_successful = False
 
         return all_successful
@@ -499,7 +499,7 @@ class BoxmanManager:
         max_wait = 60  # Maximum wait per attempt
 
         for attempt in range(1, max_retries + 1):
-            print(f"Attempt {attempt}/{max_retries} to add SSH key (waiting {wait_time}s)")
+            self.logger.info(f"Attempt {attempt}/{max_retries} to add SSH key (waiting {wait_time}s)")
 
             try:
                 # Use sshpass to add the public key
@@ -519,7 +519,7 @@ class BoxmanManager:
                         return True
 
             except Exception as e:
-                print(f"SSH key addition failed: {e}")
+                self.logger.error(f"SSH key addition failed: {e}")
 
             # Wait before next attempt with exponential backoff
             time.sleep(wait_time)
@@ -538,16 +538,16 @@ class BoxmanManager:
         Returns:
             bool: True if successful, False otherwise
         """
-        print(f"Verifying SSH connection to: {hostname}")
+        self.logger.info(f"Verifying SSH connection to: {hostname}")
         ssh_cmd = f'ssh -F {ssh_config_path} {hostname} hostname'
         result = run(ssh_cmd, hide=True, warn=True)
 
         if result.ok and result.stdout.strip():
             hostname_output = result.stdout.strip()
-            print(f"SSH connection verified: {hostname_output}")
+            self.logger.info(f"SSH connection verified: {hostname_output}")
             return True
         else:
-            print(f"SSH connection failed for {hostname}: {result.stderr.strip()}")
+            self.logger.error(f"SSH connection failed for {hostname}: {result.stderr.strip()}")
             return False
 
     def setup_ssh_access(self) -> bool:
@@ -563,17 +563,17 @@ class BoxmanManager:
             bool: True if all steps completed successfully, False otherwise
         """
         if not self.generate_ssh_keys():
-            print("Failed to generate SSH keys")
+            self.logger.error("Failed to generate SSH keys")
             return False
 
         self.write_ssh_config()
 
         if not self.add_ssh_keys_to_vms():
-            print("Failed to add SSH keys to some VMs")
+            self.logger.error("Failed to add SSH keys to some VMs")
             return False
 
-        print("\nSSH access setup complete")
-        print("You can now connect to VMs using the SSH config file")
+        self.logger.info("\nSSH access setup complete")
+        self.logger.info("You can now connect to VMs using the SSH config file")
 
         return True
 
@@ -609,7 +609,7 @@ class BoxmanManager:
         cls.start_vms()
 
         # Use adaptive wait for IP address assignment
-        print("Waiting for VMs to initialize and get IP addresses...")
+        cls.logger.info("Waiting for VMs to initialize and get IP addresses...")
         wait_time = 1  # Start with 1 second
         max_wait = 600  # Maximum total wait time (10 minutes)
         total_waited = 0
@@ -617,17 +617,17 @@ class BoxmanManager:
         while total_waited < max_wait:
             # Check if all VMs have IP addresses
             if cls.get_connect_info():
-                print(f"All VMs have IP addresses (waited {total_waited}s)")
+                cls.logger.info(f"All VMs have IP addresses (waited {total_waited}s)")
                 break
 
             # If we get here, at least one VM doesn't have an IP yet
-            print(f"Waiting {wait_time}s for IP assignment (total waited: {total_waited}s)")
+            cls.logger.info(f"Waiting {wait_time}s for IP assignment (total waited: {total_waited}s)")
             time.sleep(wait_time)
             total_waited += wait_time
             wait_time = min(wait_time * 2, 60)  # Double the wait time up to 1 minute max per iteration
 
         if total_waited >= max_wait:
-            print("Warning: Reached maximum wait time. Some VMs may not have IP addresses.")
+            cls.logger.warning("Warning: Reached maximum wait time. Some VMs may not have IP addresses.")
 
         # Display connection information
         cls.connect_info()
@@ -703,7 +703,7 @@ class BoxmanManager:
         Restore the state of the VMs in the cluster from a snapshot.
         """
         if not cli_args.snapshot_name:
-           print("Error: Snapshot name is required")
+           cls.logger.error("Error: Snapshot name is required")
            return
 
         for cluster_name, cluster in cls.config['clusters'].items():
@@ -718,11 +718,73 @@ class BoxmanManager:
         Delete a snapshot of the VMs in the cluster.
         """
         if not cli_args.snapshot_name:
-            print("Error: Snapshot name is required")
+            cls.logger.error("Error: Snapshot name is required")
             return
 
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{cluster_name}_{vm_name}"
                 cls.provider.snapshot_delete(full_vm_name, cli_args.snapshot_name)
+                cls.logger.info(f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
     ### end snapshot functions ####
+
+    ### start control vm functions ####
+    def process_vm_list(self, cli_args):
+        """
+        Process the list of VMs to control.
+        """
+        retval = []
+        if hasattr(cli_args, 'vms') and cli_args.vms:
+            _vm_names = cli_args.vms.split(',')
+            for cluster_name, cluster in self.config['clusters'].items():
+               workdir = os.path.expanduser(cluster['workdir'])
+               for vm_name, _ in cluster['vms'].items():
+                   full_vm_name = f"{cluster_name}_{vm_name}"
+                   retval.append((full_vm_name, workdir))
+        else:
+            vm_names = []
+            for cluster_name, cluster in self.config['clusters'].items():
+                workdir = os.path.expanduser(cluster['workdir'])
+                for vm_name, _ in cluster['vms'].items():
+                    full_vm_name = f"{cluster_name}_{vm_name}"
+                    vm_names.append((full_vm_name, workdir))
+
+        return retval
+
+    @staticmethod
+    def suspend_vm(cls, cli_args):
+        """
+        Suspend (pause) the VMs in the cluster.
+        """
+        for vm_name, _ in cls.process_vm_list(cli_args):
+            cls.provider.suspend_vm(vm_name)
+            cls.logger.info(f"VM {vm_name} suspended")
+
+    @staticmethod
+    def resume_vm(cls, cli_args):
+        """
+        Resume previously suspended VMs in the cluster.
+        """
+        for vm_name, _ in cls.process_vm_list(cli_args):
+            cls.provider.resume_vm(vm_name)
+            cls.logger.info(f"VM {vm_name} resumed")
+
+    @staticmethod
+    def save_vm(cls, cli_args):
+        """
+        Save the state of the VMs in the cluster to a file.
+        """
+        for vm_name, workdir in cls.process_vm_list(cli_args):
+            cls.provider.save_vm(vm_name, workdir)
+
+    @staticmethod
+    def start_vm(cls, cli_args):
+        """
+        Start VMs in the cluster.
+        """
+        for vm_name, workdir in cls.process_vm_list(cli_args):
+            if cli_args.restore:
+                cls.provider.restore_vm(vm_name, workdir)
+            else:
+                cls.provider.start_vm(vm_name)
+    ### end control vm functions ####

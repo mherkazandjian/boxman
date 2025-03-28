@@ -1,6 +1,7 @@
 import os
 from typing import Dict, Optional
 
+from boxman import log
 
 def write_files(files: Dict[str, str], rootdir: Optional[str] = None) -> None:
     """
@@ -18,7 +19,7 @@ def write_files(files: Dict[str, str], rootdir: Optional[str] = None) -> None:
             fpath = _fpath
 
         fpath = os.path.expanduser(fpath)
-        print(f'provision file {fpath}')
+        log.info(f'provision file {fpath}')
 
         dirpath = os.path.dirname(fpath)
         if not os.path.exists(dirpath):
