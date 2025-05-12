@@ -368,6 +368,9 @@ class Network(VirshCommand):
             cmd_executor = LibVirtCommandBase(self.provider_config)
 
             # Get the outgoing interface using 'ip route'
+            # .. todo:: figure out how to get the default route interface in case the host
+            #           is not connected to the internet. This should work even if the host is not
+            #           connected to the internet.
             result = cmd_executor.execute_shell("ip route get 8.8.8.8 | awk '{print $5}'", hide=True)
             if not result.ok:
                 self.logger.error(f"Failed to find outgoing interface: {result.stderr}")

@@ -126,12 +126,19 @@ class BoxmanManager:
                 workdir=cluster['workdir']
             )
 
-        processes = [
-            Process(target=_clone, args=(cluster, vm_info, new_vm_name))
-            for cluster, vm_info, new_vm_name in vm_clone_tasks()
-        ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        # clone the vms one at a time
+        for cluster, vm_info, new_vm_name in vm_clone_tasks():
+            self.logger.info(f"Cloning VM {new_vm_name} from base image {cluster['base_image']}")
+            _clone(cluster, vm_info, new_vm_name)
+            time.sleep(1)  # Add a small delay to avoid overwhelming the provider
+
+        # optionally use multiprocessing to speed up the cloning process
+        #processes = [
+        #    Process(target=_clone, args=(cluster, vm_info, new_vm_name))
+        #    for cluster, vm_info, new_vm_name in vm_clone_tasks()
+        #]
+        #[p.start() for p in processes]
+        #[p.join() for p in processes]
 
     def destroy_vms(self) -> None:
         """
@@ -501,25 +508,23 @@ class BoxmanManager:
         for attempt in range(1, max_retries + 1):
             self.logger.info(f"Attempt {attempt}/{max_retries} to add SSH key (waiting {wait_time}s)")
 
-            try:
-                # Use sshpass to add the public key
-                cmd = (
-                    f'sshpass -p {admin_pass} ssh-copy-id -i {pub_key_path} '
-                    f'-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
-                    f'{admin_user}@{ip_address}'
-                )
+            # Use sshpass to add the public key
+            cmd = (
+                f'sshpass -p {admin_pass} ssh-copy-id -i {pub_key_path} '
+                f'-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
+                f'{admin_user}@{ip_address}'
+            )
 
-                result = run(cmd, hide=True, warn=True)
+            result = run(cmd, hide=False, warn=True)
 
-                if result.ok:
-                    # Verify we can SSH without password
-                    ssh_success = self._verify_ssh_connection(hostname, ssh_conf_path)
+            if result.ok:
+                # Verify we can SSH without password
+                ssh_success = self._verify_ssh_connection(hostname, ssh_conf_path)
 
-                    if ssh_success:
-                        return True
-
-            except Exception as e:
-                self.logger.error(f"SSH key addition failed: {e}")
+                if ssh_success:
+                    return True
+            else:
+                self.logger.error(f"SSH key addition failed: {result.stderr.strip()}")
 
             # Wait before next attempt with exponential backoff
             time.sleep(wait_time)
