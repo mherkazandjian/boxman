@@ -78,15 +78,75 @@ class BoxmanManager:
             if files := cluster.get('files'):
                 write_files(files, rootdir=cluster['workdir'])
 
+    @classmethod
+    def full_network_name(cls,
+                          project_config: Dict[str, Any],
+                          cluster_name: str = None,
+                          network_name: str = None) -> str:
+        """
+        Return the computed network name based on how it is resolved in the name string.
+
+        The network name is expected to have the following format:
+
+            <project_name>::<cluster_name>::<base_network_name>
+
+        The project prefix is always added to the network name.
+
+           prj_name = f'bprj__{project_config["project"]}__bprj'
+
+        The cluster name is added after the project name as such
+
+           cluster_name = f'clstr__{cluster_name}__clstr'
+
+        Finally the network name is added as such
+
+            full_network_name = f'{prj_name}__{cluster_name}__{base_network_name}'
+
+        Args:
+            project_config (Dict[str, Any]): The project configuration dictionary.
+            network_name (str): The network name string, e.g. 'base_name',
+              'cluster_name::base_name', or 'project_name::cluster_name::base_name'.
+
+        Returns:
+            str: The fully qualified network name.
+        """
+        parts = network_name.split("::")
+
+        if len(parts) == 3:           # project, cluster, base
+            _project, _cluster_name, _base_name = parts
+            retval = f'bprj__{_project}__bprj'
+            retval = retval + f'__clstr__{_cluster_name}__clstr'
+            retval = retval + f'__{_base_name}'
+            return retval
+        elif len(parts) == 2:         # cluster, base
+            _cluster_name, _base_name = parts
+            retval = f'bprj__{project_config["project"]}__bprj'
+            retval = retval + f'__clstr__{_cluster_name}__clstr'
+            retval = retval + f'__{_base_name}'
+            return retval
+        elif len(parts) == 1:         # base only
+            _base_name = parts[0]
+            retval = f'bprj__{project_config["project"]}__bprj'
+            retval = retval + f'__clstr__{cluster_name}__clstr'
+            retval = retval + f'__{_base_name}'
+            return retval
+        else:
+            raise ValueError(f"Invalid network name format: {network_name}")
+
     ### networks define / remove / destroy
     def define_networks(self) -> None:
         """
         Define the networks specified in the cluster configuration.
         """
-        prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for network_name, network_info in cluster['networks'].items():
-                _network_name = f'{prj_name}_{cluster_name}_{network_name}'
+
+                _network_name = self.full_network_name(
+                    project_config=self.config,
+                    cluster_name=cluster_name,
+                    network_name=network_name
+                )
+
                 self.provider.define_network(
                     name=_network_name,
                     info=network_info,
@@ -98,10 +158,15 @@ class BoxmanManager:
         """
         Destroy the networks specified in the cluster configuration.
         """
-        prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for network_name, network_info in cluster['networks'].items():
-                _network_name = f'{prj_name}_{cluster_name}_{network_name}'
+
+                _network_name = self.full_network_name(
+                    project_config=self.config,
+                    cluster_name=cluster_name,
+                    network_name=network_name
+                )
+
                 self.provider.remove_network(
                     name=_network_name,
                     info=network_info

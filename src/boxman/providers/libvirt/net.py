@@ -520,7 +520,8 @@ class NetworkInterface(VirshCommand):
                 os.unlink(temp_path)
             return False
 
-    def configure_from_config(self, adapter_config: Dict[str, Any]) -> bool:
+    def configure_from_config(self,
+                              adapter_config: Dict[str, Any]) -> bool:
         """
         Configure a network interface from configuration.
 

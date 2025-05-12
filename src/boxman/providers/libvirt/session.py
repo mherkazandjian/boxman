@@ -192,32 +192,33 @@ class LibVirtSession:
         try:
             virsh = VirshCommand(self.provider_config)
 
-            # check if VM is already running
+            # check if the vm is already running
             result = virsh.execute("domstate", vm_name, warn=True)
             if result.ok and "running" in result.stdout:
-                self.logger.info(f"VM {vm_name} is already running")
+                self.logger.info(f"vm {vm_name} is already running")
                 return True
 
             # try to start the VM
             result = virsh.execute("start", vm_name)
 
             if not result.ok:
-                self.logger.error(f"Failed to start VM {vm_name}: {result.stderr}")
+                self.logger.error(f"failed to start VM {vm_name}: {result.stderr}")
                 return False
 
             # verify that VM is running
             verify_result = virsh.execute("domstate", vm_name)
 
             if "running" in verify_result.stdout:
-                self.logger.info(f"VM {vm_name} started successfully")
+                self.logger.info(f"vm {vm_name} started successfully")
                 return True
             else:
-                self.logger.error(f"VM {vm_name} did not start properly. Current state: {verify_result.stdout}")
+                self.logger.error(
+                    f"vm {vm_name} did not start properly. current state: {verify_result.stdout}")
                 return False
 
         except Exception as exc:
             import traceback
-            self.logger.error(f"Error starting VM {vm_name}: {exc}")
+            self.logger.error(f"error starting vm {vm_name}: {exc}")
             self.logger.error(traceback.format_exc())
             return False
 
@@ -262,18 +263,20 @@ class LibVirtSession:
         Returns:
             True if all adapters were configured successfully, False otherwise
         """
-        network_interface = NetworkInterface(vm_name=vm_name, provider_config=self.provider_config)
+        network_interface = NetworkInterface(
+            vm_name=vm_name,
+            provider_config=self.provider_config)
 
         success = True
         for i, adapter_config in enumerate(network_adapters):
-            self.logger.info(f"configuring network interface {i+1} for VM {vm_name}")
+            self.logger.info(f"configuring network interface {i+1} for vm {vm_name}")
 
             if not network_interface.configure_from_config(adapter_config):
-                self.logger.error(f"failed to configure network interface {i+1} for VM {vm_name}")
+                self.logger.error(f"failed to configure network interface {i+1} for vm {vm_name}")
                 success = False
             else:
                 self.logger.info(
-                    f"successfully configured network interface {i+1} for VM {vm_name}")
+                    f"successfully configured network interface {i+1} for vm {vm_name}")
 
         return success
 
