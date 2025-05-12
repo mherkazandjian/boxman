@@ -1,15 +1,19 @@
 ---
+version: 1.0
 project: minimal
 provider:
   libvirt:
     uri: qemu:///system
     use_sudo: True
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/bin/virsh'
   verbose: True
 
 clusters:
   cluster_1:
-    workdir: ~/tmp/sandbox/minimal-libvirt
-    base_image: rocky-95-base-template
+    workdir: ~/workspaces/boxmandev/minimal
+    base_image: rocky-95-minimal-base-template
     proxy_host: localhost
     admin_user: '<placeholder>'
     admin_pass: '<placeholder>'
@@ -17,7 +21,7 @@ clusters:
     ssh_config: ssh_config               # generated automatically at provisioning time
 
     networks:
-      nat:
+      nat1:
         mode: nat
         bridge:
           stp: 'on'
@@ -61,10 +65,12 @@ clusters:
         network_adapters:
           - name: adapter_1
             link_state: 'up'
-            network_source: 'cluster_1_nat1'
+            network_source: 'nat1'
+            #network_source: 'cluster_1::nat1'
+            #network_source: 'myprj::cluster_1_nat1'
           - name: adapter_2
             link_state: 'up'
-            network_source: 'cluster_1_isolated1'
+            network_source: 'isolated1'
       boxman02:
         hostname: boxman02
         disks:
@@ -77,10 +83,10 @@ clusters:
         network_adapters:
           - name: adapter_1
             link_state: 'up'
-            network_source: 'cluster_1_nat1'
+            network_source: 'nat1'
           - name: adapter_2
             link_state: 'up'
-            network_source: 'cluster_1_isolated1'
+            network_source: 'isolated1'
     files:
       env.sh: |
         export INVENTORY=inventory

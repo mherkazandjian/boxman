@@ -250,14 +250,27 @@ class BoxmanManager:
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
+
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                vm_info = vm_info.copy()
 
                 self.logger.info(
                     f"configuring network interfaces for VM {vm_name} in cluster {cluster_name}")
 
                 if 'network_adapters' not in vm_info:
-                    self.logger.warning(f"no network adapters defined for VM {vm_name}, skipping")
+                    self.logger.warning(f"no network adapters defined for vm {vm_name}, skipping")
                     continue
+                else:
+                    # use the fully qualified network name to which the adapter will connect to
+                    for adapter in vm_info['network_adapters']:
+
+                        full_network_name = self.full_network_name(
+                            project_config=self.config,
+                            cluster_name=cluster_name,
+                            network_name=adapter['network_source']
+                        )
+
+                        adapter['network_source'] = full_network_name
 
                 success = self.provider.configure_vm_network_interfaces(
                     vm_name=full_vm_name,
