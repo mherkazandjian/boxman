@@ -201,13 +201,13 @@ class Network(VirshCommand):
             # check if network exists first
             result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
             if result.return_code != 0:
-                self.logger.info(f"Network {self.name} does not exist, nothing to destroy")
+                self.logger.info(f"network {self.name} does not exist, nothing to destroy")
                 return True
 
             # check if network is active
             result = self.execute("net-list", "| grep -q " + self.name, warn=True)
             if result.return_code == 0:
-                # Network is active, stop it
+                # the network is active, stop it
                 self.execute("net-destroy", self.name)
                 self.logger.info(f"network {self.name} destroyed successfully")
 

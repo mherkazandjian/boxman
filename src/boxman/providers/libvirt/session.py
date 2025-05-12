@@ -53,7 +53,9 @@ class LibVirtSession:
         )
         return status
 
-    def destroy_network(self, cluster_name: str, network_name: str) -> bool:
+    def destroy_network(self,
+                        name: str = None,
+                        info: Optional[Dict[str, Any]] = None) -> bool:
         """
         Destroy a network.
 
@@ -64,13 +66,12 @@ class LibVirtSession:
         Returns:
             True if successful, False otherwise
         """
-        network_info = self.config['clusters'][cluster_name]['networks'][network_name]
-        full_network_name = f'{cluster_name}_{network_name}'
-
-        network = Network(full_network_name, network_info)
+        network = Network(name=name, info=info)
         return network.destroy_network()
 
-    def undefine_network(self, cluster_name: str, network_name: str) -> bool:
+    def undefine_network(self,
+                         name: str = None,
+                         info: Optional[Dict[str, Any]] = None) -> bool:
         """
         Undefine a network.
 
@@ -81,32 +82,23 @@ class LibVirtSession:
         Returns:
             True if successful, False otherwise
         """
-        network_info = self.config['clusters'][cluster_name]['networks'][network_name]
-        full_network_name = f'{cluster_name}_{network_name}'
-
-        network = Network(full_network_name, network_info)
+        network = Network(name=name, info=info)
         return network.undefine_network()
 
-    def remove_network(self, cluster_name: str, network_name: str) -> bool:
+    def remove_network(self,
+                       name: str = None,
+                       info: Optional[Dict[str, Any]] = None) -> bool:
         """
         Complete removal of a network: destroy and undefine.
 
         Args:
-            cluster_name: Name of the cluster
-            network_name: Name of the network
+            name: The name of the network
 
         Returns:
             True if successful, False otherwise
         """
-        network_info = self.config['clusters'][cluster_name]['networks'][network_name]
-        full_network_name = f'{cluster_name}_{network_name}'
-
-        network = Network(name=full_network_name,
-                          info=network_info,
-                          provider_config=self.provider_config)
-
+        network = Network(name=name, info=info)
         status = network.remove_network()
-
         return status
 
     def clone_vm(self,
