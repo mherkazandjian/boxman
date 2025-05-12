@@ -24,7 +24,7 @@ class DiskManager(VirshCommand):
         """
         super().__init__(provider_config)
 
-        #: str: Name of the VM
+        #: str: the name of the VM
         self.vm_name = vm_name
 
     def create_disk(self, disk_path: str, size: int, format: str = 'qcow2') -> bool:
@@ -40,29 +40,31 @@ class DiskManager(VirshCommand):
             True if successful, False otherwise
         """
         try:
-            # Ensure the directory exists
+            # ensure the directory exists
             disk_dir = os.path.dirname(os.path.expanduser(disk_path))
             os.makedirs(disk_dir, exist_ok=True)
 
-            # Convert size to proper format (MB to bytes)
+            # convert size to proper format (MB to bytes)
             size_in_mb = size
 
-            # Build qemu-img command
+            # build qemu-img command
             cmd = f"qemu-img create -f {format} {disk_path} {size_in_mb}M"
-            self.logger.info(f"Creating disk image: {cmd}")
+            self.logger.info(f"creating disk image: {cmd}")
 
-            # Execute the command
-            cmd_executor = LibVirtCommandBase(self.provider_config)
+            # execute the command
+            cmd_executor = LibVirtCommandBase(
+                provider_config=self.provider_config,
+                override_config_use_sudo=False)
             result = cmd_executor.execute_shell(cmd)
 
             if not result.ok:
-                self.logger.error(f"Failed to create disk image: {result.stderr}")
+                self.logger.error(f"failed to create disk image: {result.stderr}")
                 return False
 
-            self.logger.info(f"Successfully created disk image at {disk_path}")
+            self.logger.info(f"successfully created disk image at {disk_path}")
             return True
-        except Exception as e:
-            self.logger.error(f"Error creating disk image: {e}")
+        except Exception as exc:
+            self.logger.error(f"error creating disk image: {exc}")
             return False
 
     def attach_disk(self,

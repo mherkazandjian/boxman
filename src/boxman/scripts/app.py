@@ -511,7 +511,7 @@ def main():
     elif provider_type == 'libvirt':
         session = LibVirtSession(manager.config)
         manager.provider = session
-    elif provider == 'docker-compose':
+    elif provider_type == 'docker-compose':
         raise NotImplementedError('docker-compose is not implemented yet')
         from boxman.docker_compose.docker_compose import DockerCompose
 

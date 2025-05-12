@@ -1,7 +1,7 @@
 import os
 import uuid
 import re
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any
 from boxman import log
 
 from .commands import VirtCloneCommand, VirshCommand
@@ -27,23 +27,22 @@ class CloneVM:
             info: Dictionary containing VM configuration
             provider_config: Configuration for the libvirt provider
         """
-        #: str: Name of the source VM
+        #: str: the name of the source vm
         self.src_vm_name = src_vm_name
 
-        #: str: Name of the new VM
+        #: str: the name of the new vm
         self.new_vm_name = new_vm_name
 
-        #: str: Path to the disk image
-        self.new_image_path = os.path.expanduser(
-            os.path.join(workdir, f'{new_vm_name}.qcow2'))
+        #: str: the path to the disk image
+        self.new_image_path = os.path.expanduser(os.path.join(workdir, f'{new_vm_name}.qcow2'))
 
-        #: VirtCloneCommand: Command executor for virt-clone
+        #: VirtCloneCommand: the command executor for virt-clone
         self.virt_clone = VirtCloneCommand(provider_config)
 
-        #: VirshCommand: Command executor for virsh
+        #: VirshCommand: the command executor for virsh
         self.virsh = VirshCommand(provider_config)
 
-        #: logging.Logger: Logger instance
+        #: logging.Logger: the logger instance
         self.logger = log
 
     def create_clone(self) -> bool:
@@ -62,21 +61,22 @@ class CloneVM:
                 'auto_clone': True
             }
 
-            self.logger.info(f"Cloning VM {self.src_vm_name} to {self.new_vm_name}")
+            self.logger.info(f"cloning the vm {self.src_vm_name} to {self.new_vm_name}")
             self.virt_clone.execute(*cmd_args, **cmd_kwargs)
 
-            # After cloning, remove all inherited network interfaces
+            # after cloning, remove all inherited network interfaces
             if not self.remove_network_interfaces():
-                self.logger.warning(f"Failed to remove network interfaces from VM {self.new_vm_name}")
+                self.logger.warning(
+                    f"failed to remove network interfaces from the vm {self.new_vm_name}")
 
             return True
-        except RuntimeError as e:
-            self.logger.error(f"Error cloning VM: {e}")
+        except RuntimeError as exc:
+            self.logger.error(f"Error cloning the vm: {exc}")
             return False
 
     def clone(self) -> bool:
         """
-        Clone the VM and start it.
+        Clone the vm and start it.
 
         Returns:
             True if all operations were successful, False otherwise
@@ -88,7 +88,7 @@ class CloneVM:
 
     def remove_network_interfaces(self) -> bool:
         """
-        Remove all network interfaces from the cloned VM.
+        Remove all network interfaces from the cloned vm.
 
         This ensures we start with a clean slate and can add the interfaces
         specified in the configuration.
@@ -97,14 +97,15 @@ class CloneVM:
             True if successful, False otherwise
         """
         try:
-            # Use virsh domiflist to get the network interfaces
-            result = self.virsh.execute("domiflist", self.new_vm_name)
+            vm_name = self.new_vm_name
+            # use virsh domiflist to get the network interfaces
+            result = self.virsh.execute("domiflist", vm_name)
             if not result.ok:
-                self.logger.error(f"Failed to get interface list for VM {self.new_vm_name}")
+                self.logger.error(f"Failed to get interface list for VM {vm_name}")
                 return False
 
-            # Parse the output to extract interface information
-            # Output format is like:
+            # parse the output to extract interface information
+            # output format is like:
             # Interface  Type       Source     Model       MAC
             # -------------------------------------------------------
             # vnet0      network    default    virtio      52:54:00:xx:xx:xx
@@ -120,11 +121,12 @@ class CloneVM:
                         mac = parts[4]
                         interfaces.append((iface_type, source, mac))
 
-            self.logger.info(f"Found {len(interfaces)} network interfaces to remove from VM {self.new_vm_name}")
+            self.logger.info(
+                f"found {len(interfaces)} network interfaces to remove from the vm {vm_name}")
 
             # Remove each interface
             for iface_type, source, mac in interfaces:
-                self.logger.info(f"Removing interface with MAC {mac} from VM {self.new_vm_name}")
+                self.logger.info(f"removing interface with MAC {mac} from the vm {vm_name}")
 
                 # Use the detach-interface command with the correct type and MAC
                 remove_result = self.virsh.execute(
@@ -137,11 +139,12 @@ class CloneVM:
                 )
 
                 if not remove_result.ok:
-                    self.logger.warning(f"Failed to remove interface with MAC {mac}: {remove_result.stderr}")
+                    self.logger.warning(
+                        f"failed to remove interface with MAC {mac}: {remove_result.stderr}")
                 else:
                     self.logger.info(f"Successfully removed interface with MAC {mac}")
 
             return True
-        except Exception as e:
-            self.logger.error(f"Error removing network interfaces: {e}")
+        except Exception as exc:
+            self.logger.error(f"Error removing network interfaces: {exc}")
             return False

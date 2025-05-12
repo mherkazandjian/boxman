@@ -18,16 +18,16 @@ class BoxmanManager:
         Args:
             config: Optional configuration dictionary or path to config file
         """
-        #: Optional[str]: Path to the configuration file if one was provided
+        #: Optional[str]: the path to the configuration file if one was provided
         self.config_path: Optional[str] = None
 
-        #: Optional[Dict[str, Any]]: The loaded configuration dictionary
+        #: Optional[Dict[str, Any]]: the loaded configuration dictionary
         self.config: Optional[Dict[str, Any]] = None
 
-        #: Private backing field for the provider property
+        #: the private backing field for the provider property
         self._provider = None
 
-        #: set the logger
+        #: the logger instance
         self.logger = log
 
         if isinstance(config, str):
@@ -112,10 +112,11 @@ class BoxmanManager:
             - clone the vm
         """
         def vm_clone_tasks():
+            prj_name = f'bprj__{self.config["project"]}__bprj'
             for cluster_name, cluster in self.config['clusters'].items():
                 for vm_name, vm_info in cluster['vms'].items():
                     vm_info = vm_info.copy()
-                    new_vm_name = f"{cluster_name}_{vm_name}"
+                    new_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                     yield cluster, vm_info, new_vm_name
 
         def _clone(cluster, vm_info, new_vm_name):
@@ -144,10 +145,11 @@ class BoxmanManager:
         """
         Destroy the VMs specified in the cluster configuration.
         """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
         def vm_destroy_tasks():
             for cluster_name, cluster in self.config['clusters'].items():
                 for vm_name in cluster['vms'].keys():
-                    full_vm_name = f"{cluster_name}_{vm_name}"
+                    full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                     yield full_vm_name, cluster_name, vm_name
 
         def _destroy(full_vm_name, cluster_name, vm_name):
@@ -172,9 +174,10 @@ class BoxmanManager:
         This method adds network interfaces to VMs after they have been cloned,
         connecting them to the appropriate networks.
         """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{cluster_name}_{vm_name}"
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
 
                 self.logger.info(f"Configuring network interfaces for VM {vm_name} in cluster {cluster_name}")
 
@@ -198,11 +201,12 @@ class BoxmanManager:
 
         This method creates and attaches disks to VMs after they have been cloned.
         """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             workdir = cluster.get('workdir', '.')
 
             for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{cluster_name}_{vm_name}"
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
 
                 self.logger.info(f"Configuring disks for VM {vm_name} in cluster {cluster_name}")
 
@@ -229,9 +233,10 @@ class BoxmanManager:
 
         This powers on all VMs after they have been configured.
         """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{cluster_name}_{vm_name}"
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
 
                 self.logger.info(f"Starting VM {vm_name}")
                 success = self.provider.start_vm(full_vm_name)
@@ -253,9 +258,10 @@ class BoxmanManager:
         """
         all_vms_have_ip = True
 
+        prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{cluster_name}_{vm_name}"
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
 
                 # Get IP addresses for this VM
                 ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
@@ -276,12 +282,13 @@ class BoxmanManager:
         """
         self.logger.info("\n=== VM Connection Information ===\n")
 
+        prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             self.logger.info(f"Cluster: {cluster_name}")
             self.logger.info("-" * 60)
 
             for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{cluster_name}_{vm_name}"
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 hostname = vm_info.get('hostname', vm_name)
 
                 self.logger.info(f"VM: {vm_name} (hostname: {hostname})")
@@ -328,6 +335,7 @@ class BoxmanManager:
         Creates an SSH config file in the workdir of each cluster that allows
         simplified access to VMs without typing full connection details.
         """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             # Get the SSH config path
             ssh_config = os.path.expanduser(os.path.join(
@@ -351,7 +359,7 @@ class BoxmanManager:
 
                 # Write host-specific configurations
                 for vm_name, vm_info in cluster['vms'].items():
-                    full_vm_name = f"{cluster_name}_{vm_name}"
+                    full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                     hostname = vm_info.get('hostname', vm_name)
 
                     # Get the first IP address if available
@@ -382,26 +390,26 @@ class BoxmanManager:
         """
         success = True
 
-        for cluster_name, cluster in self.config['clusters'].items():
+        for _, cluster in self.config['clusters'].items():
             workdir = os.path.expanduser(cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
 
             admin_priv_key = os.path.join(workdir, admin_key_name)
             admin_pub_key = os.path.join(workdir, f"{admin_key_name}.pub")
 
-            # Create workdir if it doesn't exist
+            # create workdir if it doesn't exist
             if not os.path.isdir(workdir):
                 os.makedirs(workdir, exist_ok=True)
 
-            # Generate key pair if it doesn't exist
+            # generate key pair if it doesn't exist
             if not os.path.exists(admin_priv_key):
-                self.logger.info(f"Generating SSH key pair in {workdir}")
+                self.logger.info(f"generating SSH key pair in {workdir}")
 
                 try:
                     cmd = f'ssh-keygen -t ed25519 -a 100 -f {admin_priv_key} -q -N ""'
                     result = run(cmd, hide=True, warn=True)
 
-                    # Verify keys were created
+                    # verify keys were created
                     if os.path.isfile(admin_priv_key) and os.path.isfile(admin_pub_key):
                         self.logger.info(f"SSH key pair successfully generated at {admin_priv_key}")
                     else:
@@ -427,6 +435,7 @@ class BoxmanManager:
         """
         all_successful = True
 
+        prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             workdir = os.path.expanduser(cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
@@ -447,9 +456,9 @@ class BoxmanManager:
             self.logger.info(f"Adding SSH public key to VMs in cluster {cluster_name}")
 
             for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{cluster_name}_{vm_name}"
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
 
-                # Get IP addresses for this VM
+                # get IP addresses for this VM
                 ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
 
                 if not ip_addresses:
@@ -457,12 +466,12 @@ class BoxmanManager:
                     all_successful = False
                     continue
 
-                # Use first available IP address
+                # use first available IP address
                 ip_address = next(iter(ip_addresses.values()))
 
                 self.logger.info(f"Adding SSH key to VM {vm_name} ({ip_address})...")
 
-                # Try to add the key with exponential backoff
+                # try to add the key with exponential backoff
                 success = self._try_add_ssh_key(
                     ip_address=ip_address,
                     hostname=vm_info['hostname'],
@@ -508,7 +517,7 @@ class BoxmanManager:
         for attempt in range(1, max_retries + 1):
             self.logger.info(f"Attempt {attempt}/{max_retries} to add SSH key (waiting {wait_time}s)")
 
-            # Use sshpass to add the public key
+            # use sshpass to add the public key
             cmd = (
                 f'sshpass -p {admin_pass} ssh-copy-id -i {pub_key_path} '
                 f'-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
@@ -518,7 +527,7 @@ class BoxmanManager:
             result = run(cmd, hide=False, warn=True)
 
             if result.ok:
-                # Verify we can SSH without password
+                # verify we can SSH without password
                 ssh_success = self._verify_ssh_connection(hostname, ssh_conf_path)
 
                 if ssh_success:
@@ -526,7 +535,7 @@ class BoxmanManager:
             else:
                 self.logger.error(f"SSH key addition failed: {result.stderr.strip()}")
 
-            # Wait before next attempt with exponential backoff
+            # wait before next attempt with exponential backoff
             time.sleep(wait_time)
             wait_time = min(wait_time * 2, max_wait)
 
@@ -543,7 +552,7 @@ class BoxmanManager:
         Returns:
             bool: True if successful, False otherwise
         """
-        self.logger.info(f"Verifying SSH connection to: {hostname}")
+        self.logger.info(f"verifying SSH connection to: {hostname}")
         ssh_cmd = f'ssh -F {ssh_config_path} {hostname} hostname'
         result = run(ssh_cmd, hide=True, warn=True)
 
@@ -659,11 +668,12 @@ class BoxmanManager:
 
         cls.destroy_networks()
 
+        prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
 
                 vm_info = vm_info.copy()
-                new_vm_name = f"{cluster_name}_{vm_name}"
+                new_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
 
                 cls.provider.destroy_vm(new_vm_name)
 
@@ -684,9 +694,10 @@ class BoxmanManager:
         """
         List snapshots of the VMs in the cluster.
         """
+        prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
-                full_vm_name = f"{cluster_name}_{vm_name}"
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 cls.provider.snapshot_list(full_vm_name)
 
     @staticmethod
@@ -694,9 +705,10 @@ class BoxmanManager:
         """
         Take a snapshot of the VMs in the cluster.
         """
+        prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
-                full_vm_name = f"{cluster_name}_{vm_name}"
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 cls.provider.snapshot_take(
                     vm_name=full_vm_name,
                     snapshot_name=cli_args.snapshot_name,
@@ -711,9 +723,10 @@ class BoxmanManager:
            cls.logger.error("Error: Snapshot name is required")
            return
 
+        prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
-                full_vm_name = f"{cluster_name}_{vm_name}"
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 cls.provider.snapshot_restore(full_vm_name, cli_args.snapshot_name)
 
 
@@ -726,9 +739,10 @@ class BoxmanManager:
             cls.logger.error("Error: Snapshot name is required")
             return
 
+        prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
-                full_vm_name = f"{cluster_name}_{vm_name}"
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 cls.provider.snapshot_delete(full_vm_name, cli_args.snapshot_name)
                 cls.logger.info(f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
     ### end snapshot functions ####
@@ -739,19 +753,20 @@ class BoxmanManager:
         Process the list of VMs to control.
         """
         retval = []
+        prj_name = f'bprj__{cls.config["project"]}__bprj'
         if hasattr(cli_args, 'vms') and cli_args.vms:
             _vm_names = cli_args.vms.split(',')
             for cluster_name, cluster in self.config['clusters'].items():
                workdir = os.path.expanduser(cluster['workdir'])
                for vm_name, _ in cluster['vms'].items():
-                   full_vm_name = f"{cluster_name}_{vm_name}"
+                   full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                    retval.append((full_vm_name, workdir))
         else:
             vm_names = []
             for cluster_name, cluster in self.config['clusters'].items():
                 workdir = os.path.expanduser(cluster['workdir'])
                 for vm_name, _ in cluster['vms'].items():
-                    full_vm_name = f"{cluster_name}_{vm_name}"
+                    full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                     vm_names.append((full_vm_name, workdir))
 
         return retval

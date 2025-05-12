@@ -23,13 +23,13 @@ class LibVirtSession:
         #: Optional[Dict[str, Any]]: The configuration for this session
         self.config = config
 
-        #: logging.Logger: Logger instance
+        #: logging.Logger: the logger instance
         self.logger = log
 
-        # Get provider config
-        self.provider_config = config.get('provider', {}).get('libvirt', {}) if config else {}
+        # get provider config
+        self.provider_config = config.get('provider', {}).get('libvirt', {})
 
-        # Extract commonly used provider settings
+        # extract commonly used provider settings
         self.uri = self.provider_config.get('uri', 'qemu:///system')
         self.use_sudo = self.provider_config.get('use_sudo', False)
 
@@ -103,7 +103,7 @@ class LibVirtSession:
 
         network = Network(name=full_network_name,
                           info=network_info,
-                          provider_config=self.config['provider'])
+                          provider_config=self.provider_config)
 
         status = network.remove_network()
 
@@ -130,7 +130,7 @@ class LibVirtSession:
             src_vm_name=src_vm_name,
             new_vm_name=new_vm_name,
             info=info,
-            provider_config=self.config.get('provider', {}),
+            provider_config=self.provider_config,
             workdir=workdir,
         )
 
@@ -182,7 +182,7 @@ class LibVirtSession:
         Returns:
             True if successful, False otherwise
         """
-        destroyer = DestroyVM(name=name, provider_config=self.config.get('provider', {}))
+        destroyer = DestroyVM(name=name, provider_config=self.provider_config)
         status = destroyer.remove()
         return status
 
@@ -198,22 +198,22 @@ class LibVirtSession:
         """
 
         try:
-            virsh = VirshCommand(self.config.get('provider', {}))
+            virsh = VirshCommand(self.provider_config)
 
-            # Check if VM is already running
+            # check if VM is already running
             result = virsh.execute("domstate", vm_name, warn=True)
             if result.ok and "running" in result.stdout:
                 self.logger.info(f"VM {vm_name} is already running")
                 return True
 
-            # Try to start the VM
+            # try to start the VM
             result = virsh.execute("start", vm_name)
 
             if not result.ok:
                 self.logger.error(f"Failed to start VM {vm_name}: {result.stderr}")
                 return False
 
-            # Verify that VM is running
+            # verify that VM is running
             verify_result = virsh.execute("domstate", vm_name)
 
             if "running" in verify_result.stdout:
@@ -223,9 +223,9 @@ class LibVirtSession:
                 self.logger.error(f"VM {vm_name} did not start properly. Current state: {verify_result.stdout}")
                 return False
 
-        except Exception as e:
+        except Exception as exc:
             import traceback
-            self.logger.error(f"Error starting VM {vm_name}: {e}")
+            self.logger.error(f"Error starting VM {vm_name}: {exc}")
             self.logger.error(traceback.format_exc())
             return False
 
@@ -248,10 +248,7 @@ class LibVirtSession:
         Returns:
             True if successful, False otherwise
         """
-        network_interface = NetworkInterface(
-            vm_name=vm_name,
-            provider_config=self.config.get('provider', {})
-        )
+        network_interface = NetworkInterface(vm_name=vm_name, provider_config=self.provider_config)
 
         return network_interface.add_interface(
             network_source=network_source,
@@ -273,58 +270,53 @@ class LibVirtSession:
         Returns:
             True if all adapters were configured successfully, False otherwise
         """
-        network_interface = NetworkInterface(
-            vm_name=vm_name,
-            provider_config=self.config.get('provider', {})
-        )
+        network_interface = NetworkInterface(vm_name=vm_name, provider_config=self.provider_config)
 
         success = True
         for i, adapter_config in enumerate(network_adapters):
-            self.logger.info(f"Configuring network interface {i+1} for VM {vm_name}")
+            self.logger.info(f"configuring network interface {i+1} for VM {vm_name}")
 
             if not network_interface.configure_from_config(adapter_config):
-                self.logger.error(f"Failed to configure network interface {i+1} for VM {vm_name}")
+                self.logger.error(f"failed to configure network interface {i+1} for VM {vm_name}")
                 success = False
             else:
-                self.logger.info(f"Successfully configured network interface {i+1} for VM {vm_name}")
+                self.logger.info(
+                    f"successfully configured network interface {i+1} for VM {vm_name}")
 
         return success
 
     def configure_vm_disks(self,
-                          vm_name: str,
-                          disks: List[Dict[str, Any]],
-                          workdir: str,
-                          disk_prefix: str = "") -> bool:
+                           vm_name: str,
+                           disks: List[Dict[str, Any]],
+                           workdir: str,
+                           disk_prefix: str = "") -> bool:
         """
         Configure all disks for a VM.
 
         Args:
-            vm_name: Name of the VM
-            disks: List of disk configurations
-            workdir: Working directory for disk images
-            disk_prefix: Prefix to add to disk image filenames
+            vm_name: the name of the VM
+            disks: the list of disk configurations
+            workdir: the working directory for disk images
+            disk_prefix: the prefix to add to disk image filenames
 
         Returns:
             True if all disks were configured successfully, False otherwise
         """
-        disk_manager = DiskManager(
-            vm_name=vm_name,
-            provider_config=self.config.get('provider', {})
-        )
+        disk_manager = DiskManager(vm_name=vm_name, provider_config=self.provider_config)
 
         success = True
         for i, disk_config in enumerate(disks):
-            self.logger.info(f"Configuring disk {i+1} for VM {vm_name}")
+            self.logger.info(f"configuring disk {i+1} for VM {vm_name}")
 
             if not disk_manager.configure_from_disk_config(
                 disk_config=disk_config,
                 workdir=workdir,
                 disk_prefix=disk_prefix
             ):
-                self.logger.error(f"Failed to configure disk {i+1} for VM {vm_name}")
+                self.logger.error(f"failed to configure disk {i+1} for vm {vm_name}")
                 success = False
             else:
-                self.logger.info(f"Successfully configured disk {i+1} for VM {vm_name}")
+                self.logger.info(f"successfully configured disk {i+1} for vm {vm_name}")
 
         return success
 
@@ -339,25 +331,25 @@ class LibVirtSession:
             Dictionary mapping interface names to IP addresses
         """
         try:
-            # Use virsh commands to get domain info
+            # use virsh commands to get domain info
             from .commands import VirshCommand
             virsh = VirshCommand(self.config.get('provider', {}))
 
-            # First check if VM is running
+            # first check if the vm is running
             result = virsh.execute("domstate", vm_name, warn=True)
             if not result.ok or "running" not in result.stdout:
-                self.logger.warn(f"VM {vm_name} is not running, cannot get IP addresses")
+                self.logger.warning(f"the vm {vm_name} is not running, cannot get the ip addresses")
                 return {}
 
             # Try domifaddr to get all interfaces and their IPs
             result = virsh.execute("domifaddr", vm_name, warn=True)
 
             if not result.ok:
-                self.logger.error(f"Failed to get interface addresses for VM {vm_name}")
+                self.logger.error(f"failed to get interface addresses for vm {vm_name}")
                 return {}
 
-            # Parse the output to extract interface information
-            # Output format is like:
+            # parse the output to extract interface information
+            # output format is like:
             # Name       MAC address          Protocol     Address
             # ---------------------------------------------------------
             # vnet0      52:54:00:xx:xx:xx    ipv4         192.168.122.x/24
@@ -365,10 +357,10 @@ class LibVirtSession:
             ip_addresses = {}
             lines = result.stdout.strip().split('\n')
 
-            if len(lines) > 2:  # Skip header and separator lines
+            if len(lines) > 2:  # skip header and separator lines
                 for line in lines[2:]:
                     parts = line.split()
-                    if len(parts) >= 4:  # Name MAC Protocol Address
+                    if len(parts) >= 4:  # name MAC Protocol Address
                         iface_name = parts[0]
                         ip_address = parts[3].split('/')[0]  # Remove CIDR notation
 
@@ -377,9 +369,9 @@ class LibVirtSession:
 
             return ip_addresses
 
-        except Exception as e:
+        except Exception as exc:
             import traceback
-            self.logger.error(f"Error getting IP addresses for VM {vm_name}: {e}")
+            self.logger.error(f"error getting ip addresses for vm {vm_name}: {exc}")
             self.logger.debug(traceback.format_exc())
             return {}
 
@@ -397,7 +389,8 @@ class LibVirtSession:
             bool: True if successful, False otherwise
         """
         snapshot_mgr = SnapshotManager(self.provider_config)
-        self.logger.info(f"Processing vm: {vm_name}")
+        self.logger.info(f"processing the vm: {vm_name}")
+
         return snapshot_mgr.create_snapshot(
             vm_name=vm_name,
             snapshot_name=snapshot_name,
@@ -414,7 +407,7 @@ class LibVirtSession:
         Returns:
             dict: Dictionary of snapshots per VM
         """
-        self.logger.info(f"Listing snapshots for the VM: {vm_name}")
+        self.logger.info(f"list the snapshots for the vm: {vm_name}")
         snapshot_mgr = SnapshotManager(self.provider_config)
         snapshots = snapshot_mgr.list_snapshots(vm_name)
         for snapshot in snapshots:
@@ -434,7 +427,7 @@ class LibVirtSession:
         Returns:
             bool: True if successful, False otherwise
         """
-        self.logger.info(f"Reverting VM {vm_name} to snapshot {snapshot_name}")
+        self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
         snapshot_mgr = SnapshotManager(self.provider_config)
         return snapshot_mgr.snapshot_restore(vm_name, snapshot_name)
 
@@ -449,7 +442,7 @@ class LibVirtSession:
         Returns:
             bool: True if successful, False otherwise
         """
-        self.logger.info(f"Deleting snapshot {snapshot_name} from VM {vm_name}")
+        self.logger.info(f"deleting the snapshot {snapshot_name} from vm {vm_name}")
         snapshot_mgr = SnapshotManager(self.provider_config)
         return snapshot_mgr.delete_snapshot(vm_name, snapshot_name)
     # end snapshots
@@ -471,28 +464,29 @@ class LibVirtSession:
             # Check if VM is running
             result = virsh.execute("domstate", vm_name, warn=True)
             if not result.ok or "running" not in result.stdout:
-                self.logger.warning(f"VM {vm_name} is not running, cannot suspend")
+                self.logger.warning(f"vm {vm_name} is not running, cannot suspend")
                 return False
 
             # Try to suspend the VM
-            self.logger.info(f"Suspending VM {vm_name}")
+            self.logger.info(f"suspending the vm {vm_name}")
             result = virsh.execute("suspend", vm_name)
 
             if not result.ok:
-                self.logger.error(f"Failed to suspend VM {vm_name}: {result.stderr}")
+                self.logger.error(f"failed to suspend the vm {vm_name}: {result.stderr}")
                 return False
 
             # Verify VM is suspended
             verify_result = virsh.execute("domstate", vm_name)
             if "paused" in verify_result.stdout:
-                self.logger.info(f"VM {vm_name} suspended successfully")
+                self.logger.info(f"suspended the vm {vm_name} successfully")
                 return True
             else:
-                self.logger.error(f"VM {vm_name} not suspended. Current state: {verify_result.stdout}")
+                self.logger.error(
+                    f"vm {vm_name} not suspended. Current state: {verify_result.stdout}")
                 return False
 
-        except Exception as e:
-            self.logger.error(f"Error suspending VM {vm_name}: {e}")
+        except Exception as exc:
+            self.logger.error(f"error suspending the vm {vm_name}: {exc}")
             return False
 
     def resume_vm(self, vm_name: str) -> bool:
@@ -511,31 +505,33 @@ class LibVirtSession:
             # Check if VM is suspended
             result = virsh.execute("domstate", vm_name, warn=True)
             if not result.ok:
-                self.logger.warning(f"VM {vm_name} does not exist")
+                self.logger.warning(f"vm {vm_name} does not exist")
                 return False
             if "paused" not in result.stdout:
-                self.logger.warning(f"VM {vm_name} is not suspended (current state: {result.stdout.strip()})")
+                self.logger.warning(
+                    f"vm {vm_name} is not suspended (current state: {result.stdout.strip()})")
                 return False
 
             # Try to resume the VM
-            self.logger.info(f"Resuming VM {vm_name}")
+            self.logger.info(f"resuming the vm {vm_name}")
             result = virsh.execute("resume", vm_name)
 
             if not result.ok:
-                self.logger.error(f"Failed to resume VM {vm_name}: {result.stderr}")
+                self.logger.error(f"failed to resume the vm {vm_name}: {result.stderr}")
                 return False
 
             # Verify VM is running
             verify_result = virsh.execute("domstate", vm_name)
             if "running" in verify_result.stdout:
-                self.logger.info(f"VM {vm_name} resumed successfully")
+                self.logger.info(f"the vm {vm_name} resumed successfully")
                 return True
             else:
-                self.logger.error(f"VM {vm_name} not resumed. Current state: {verify_result.stdout}")
+                self.logger.error(
+                    f"the vm {vm_name} not resumed. current state: {verify_result.stdout}")
                 return False
 
-        except Exception as e:
-            self.logger.error(f"Error resuming VM {vm_name}: {e}")
+        except Exception as exc:
+            self.logger.error(f"error resuming the vm {vm_name}: {exc}")
             return False
 
     def save_vm(self, vm_name: str, workdir: str) -> bool:
@@ -555,22 +551,22 @@ class LibVirtSession:
             # Check if VM is running
             result = virsh.execute("domstate", vm_name, warn=True)
             if not result.ok or "running" not in result.stdout:
-                self.logger.warning(f"VM {vm_name} is not running, cannot save state")
+                self.logger.warning(f"vm {vm_name} is not running, cannot save state")
                 return False
 
-            # Expand the workdir path and ensure it exists
+            # expand the workdir path and ensure it exists
             workdir = os.path.expanduser(workdir)
             if not os.path.exists(workdir):
                 os.makedirs(workdir, exist_ok=True)
 
             save_path = os.path.join(workdir, f"{vm_name}.save")
 
-            # Try to save the VM state
-            self.logger.info(f"Saving VM {vm_name} state to {save_path}")
+            # try to save the VM state
+            self.logger.info(f"saving VM {vm_name} state to {save_path}")
             result = virsh.execute("save", vm_name, save_path)
 
             if not result.ok:
-                self.logger.error(f"Failed to save VM {vm_name} state: {result.stderr}")
+                self.logger.error(f"failed to save the vm {vm_name} state: {result.stderr}")
                 return False
 
             # Verify the save file exists
@@ -581,8 +577,8 @@ class LibVirtSession:
                 self.logger.error(f"Save file {save_path} not created for VM {vm_name}")
                 return False
 
-        except Exception as e:
-            self.logger.error(f"Error saving VM {vm_name} state: {e}")
+        except Exception as exc:
+            self.logger.error(f"error saving the vm {vm_name} state: {exc}")
             return False
 
     def restore_vm(self, vm_name: str, workdir: str) -> bool:
@@ -605,13 +601,13 @@ class LibVirtSession:
 
             # Check if save file exists
             if not os.path.exists(save_path):
-                self.logger.error(f"Save file {save_path} does not exist")
+                self.logger.error(f"save file {save_path} does not exist")
                 return False
 
             # Check if the VM is defined but not running
             exists_result = virsh.execute("domstate", vm_name, warn=True)
             if exists_result.ok and "running" in exists_result.stdout:
-                self.logger.warning(f"VM {vm_name} is already running, shutting down first")
+                self.logger.warning(f"vm {vm_name} is already running, shutting down first")
                 shutdown_result = virsh.execute("shutdown", vm_name)
                 if not shutdown_result.ok:
                     self.logger.error(f"Failed to shutdown VM {vm_name} before restore: {shutdown_result.stderr}")
@@ -624,29 +620,30 @@ class LibVirtSession:
                         break
                     time.sleep(1)
                 else:
-                    self.logger.error(f"VM {vm_name} did not shut down within timeout")
+                    self.logger.error(f"vm {vm_name} did not shut down within timeout")
                     return False
 
-            # Try to restore the VM
-            self.logger.info(f"Restoring VM {vm_name} from {save_path}")
+            # try to restore the VM
+            self.logger.info(f"restoring vm {vm_name} from {save_path}")
             result = virsh.execute("restore", save_path)
 
             if not result.ok:
-                self.logger.error(f"Failed to restore VM {vm_name}: {result.stderr}")
+                self.logger.error(f"failed to restore the vm {vm_name}: {result.stderr}")
                 return False
 
             # Verify VM is running
             verify_result = virsh.execute("domstate", vm_name)
             if "running" in verify_result.stdout:
-                self.logger.info(f"VM {vm_name} restored successfully from {save_path}")
+                self.logger.info(f"restoring vm {vm_name} successfully from {save_path}")
                 # Optionally remove the save file after successful restore
                 # os.remove(save_path)
                 return True
             else:
-                self.logger.error(f"VM {vm_name} not restored. Current state: {verify_result.stdout}")
+                self.logger.error(
+                    f"vm {vm_name} not restored. Current state: {verify_result.stdout}")
                 return False
 
-        except Exception as e:
-            self.logger.error(f"Error restoring VM {vm_name}: {e}")
+        except Exception as exc:
+            self.logger.error(f"error restoring the vm {vm_name}: {exc}")
             return False
     ### end control vm
