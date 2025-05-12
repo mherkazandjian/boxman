@@ -22,12 +22,12 @@ class DestroyVM(VirshCommand):
             name: Name of the VM to destroy
             provider_config: Configuration for the libvirt provider
         """
-        super().__init__(provider_config)
+        super().__init__(provider_config=provider_config)
 
-        #: str: Name of the VM to destroy
+        #: str: the name of the VM to destroy
         self.name = name
 
-        #: int: Maximum seconds to wait for VM to shutdown
+        #: int: the maximum seconds to wait for the vms to shutdown
         self.shutdown_timeout = 30
 
     def is_vm_running(self) -> bool:
@@ -80,27 +80,31 @@ class DestroyVM(VirshCommand):
             timeout = self.shutdown_timeout
 
         try:
-            # Try graceful shutdown first
-            self.logger.info(f"Shutting down VM {self.name} gracefully")
+            # try graceful shutdown first
+            self.logger.info(f"shutting down vm {self.name} gracefully")
             self.execute("shutdown", self.name)
 
-            # Wait for VM to shut down
+            # wait for vm to shut down
             for i in range(timeout):
                 if not self.is_vm_running():
-                    self.logger.info(f"VM {self.name} shut down successfully after {i+1} seconds")
+                    self.logger.info(f"vm {self.name} shut down successfully after {i+1} seconds")
                     return True
                 time.sleep(1)
 
             if not force:
-                self.logger.warning(f"VM {self.name} did not shut down within {timeout} seconds and force is disabled")
+                self.logger.warning(
+                    f"vm {self.name} did not shut down within {timeout} "
+                    f"seconds and force is disabled")
                 return False
 
-            # Force shutdown if requested
-            self.logger.warning(f"VM {self.name} did not shut down within {timeout} seconds, forcing shutdown")
+            # force shutdown if requested
+            self.logger.warning(
+                f"the vm {self.name} did not shut down within {timeout} "
+                f"seconds, forcing shutdown")
             return self.force_shutdown_vm()
 
-        except RuntimeError as e:
-            self.logger.error(f"Error shutting down VM {self.name}: {e}")
+        except RuntimeError as exc:
+            self.logger.error(f"error shutting down the vm {self.name}: {exc}")
             return False
 
     def force_shutdown_vm(self) -> bool:
@@ -114,22 +118,22 @@ class DestroyVM(VirshCommand):
             True if VM is successfully powered off, False otherwise
         """
         if not self.is_vm_running():
-            self.logger.info(f"VM {self.name} is not running, no need to force shutdown")
+            self.logger.info(f"vm {self.name} is not running, no need to force shutdown")
             return True
 
         try:
-            self.logger.info(f"Force shutting down VM {self.name}")
+            self.logger.info(f"force shutting down the vm {self.name}")
             self.execute("destroy", self.name)
 
-            # Verify VM is no longer running
+            # verify that the vm is no longer running
             if not self.is_vm_running():
-                self.logger.info(f"VM {self.name} force shutdown successfully")
+                self.logger.info(f"vm {self.name} force shutdown successfully")
                 return True
 
-            self.logger.error(f"VM {self.name} is still running after force shutdown")
+            self.logger.error(f"vm {self.name} is still running after force shutdown")
             return False
-        except RuntimeError as e:
-            self.logger.error(f"Error force shutting down VM {self.name}: {e}")
+        except RuntimeError as exc:
+            self.logger.error(f"error force shutting down vm {self.name}: {exc}")
             return False
 
     def destroy_vm(self,
@@ -165,23 +169,23 @@ class DestroyVM(VirshCommand):
             True if undefine successful, False otherwise
         """
         if not self.is_vm_defined():
-            self.logger.info(f"VM {self.name} is not defined, nothing to undefine")
+            self.logger.info(f"vm {self.name} is not defined, nothing to undefine")
             return True
 
         try:
-            self.logger.info(f"Un-defining VM {self.name}")
+            self.logger.info(f"un-defining VM {self.name}")
 
             self.execute("undefine", self.name)
 
             # Verify VM is no longer defined
             if not self.is_vm_defined():
-                self.logger.info(f"VM {self.name} undefined successfully")
+                self.logger.info(f"vm {self.name} undefined successfully")
                 return True
 
-            self.logger.error(f"VM {self.name} is still defined after undefine")
+            self.logger.error(f"vm {self.name} is still defined after undefine")
             return False
-        except RuntimeError as e:
-            self.logger.error(f"Error un-defining VM {self.name}: {e}")
+        except RuntimeError as exc:
+            self.logger.error(f"error un-defining VM {self.name}: {exc}")
             return False
 
     def delete_all_snapshots(self) -> bool:
@@ -196,48 +200,49 @@ class DestroyVM(VirshCommand):
             False if there was an error deleting any snapshot
         """
         if not self.is_vm_defined():
-            self.logger.info(f"VM {self.name} is not defined, no snapshots to delete")
+            self.logger.info(f"vm {self.name} is not defined, no snapshots to delete")
             return True
 
         try:
             # List all snapshots
-            self.logger.info(f"Checking for snapshots of VM {self.name}")
+            self.logger.info(f"checking for snapshots of VM {self.name}")
             result = self.execute("snapshot-list", self.name, "--name", warn=True)
 
             if not result.ok:
-                self.logger.warning(f"Failed to list snapshots for VM {self.name}: {result.stderr}")
+                self.logger.warning(f"failed to list snapshots for VM {self.name}: {result.stderr}")
                 return False
 
             if not result.stdout.strip():
-                self.logger.info(f"No snapshots found for VM {self.name}")
+                self.logger.info(f"no snapshots found for VM {self.name}")
                 return True
 
             # Process the list of snapshots
             snapshots = [s for s in result.stdout.strip().split('\n') if s.strip()]
 
             if not snapshots:
-                self.logger.info(f"No snapshots found for VM {self.name}")
+                self.logger.info(f"no snapshots found for VM {self.name}")
                 return True
 
-            self.logger.info(f"Found {len(snapshots)} snapshots to delete for VM {self.name}")
+            self.logger.info(f"found {len(snapshots)} snapshots to delete for VM {self.name}")
 
             # Delete each snapshot
             success = True
             for snapshot in snapshots:
                 try:
-                    self.logger.info(f"Deleting snapshot '{snapshot}' for VM {self.name}")
+                    self.logger.info(f"deleting snapshot '{snapshot}' for VM {self.name}")
                     delete_result = self.execute("snapshot-delete", self.name, snapshot)
 
                     if not delete_result.ok:
-                        self.logger.error(f"Failed to delete snapshot '{snapshot}' for VM {self.name}: {delete_result.stderr}")
+                        self.logger.error(f"failed to delete snapshot '{snapshot}' for VM {self.name}: {delete_result.stderr}")
                         success = False
-                except RuntimeError as e:
-                    self.logger.error(f"Error deleting snapshot '{snapshot}' for VM {self.name}: {e}")
+                except RuntimeError as exc:
+                    self.logger.error(
+                        f"error deleting snapshot '{snapshot}' for VM {self.name}: {exc}")
                     success = False
 
             return success
-        except RuntimeError as e:
-            self.logger.error(f"Error handling snapshots for VM {self.name}: {e}")
+        except RuntimeError as exc:
+            self.logger.error(f"error handling snapshots for VM {self.name}: {exc}")
             return False
 
     def remove(self, force: Optional[bool] = None) -> bool:
@@ -252,12 +257,14 @@ class DestroyVM(VirshCommand):
         """
         if self.is_vm_running():
             if not self.destroy_vm(force=force):
-                self.logger.error(f"Failed to stop VM {self.name}, cannot proceed with undefine")
+                self.logger.error(f"failed to stop VM {self.name}, cannot proceed with undefine")
                 return False
 
-        # Delete all snapshots before undefining the VM
+        # delete all snapshots before un-defining the VM
         if not self.delete_all_snapshots():
-            self.logger.warning(f"Failed to delete all snapshots for VM {self.name}, continuing with undefine anyway")
+            self.logger.warning(
+                f"failed to delete all snapshots for VM {self.name}, "
+                f"continuing with undefine anyway")
             # Continuing with undefine even if snapshot deletion failed
             # This is a deliberate choice to ensure VM removal attempts completion
 

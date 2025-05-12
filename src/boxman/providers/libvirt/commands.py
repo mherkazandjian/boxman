@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional
 import invoke
 from boxman import log
 
@@ -10,11 +10,14 @@ class LibVirtCommandBase:
     virt-install, virt-clone, etc. It handles configuration, command execution,
     and error management.
     """
-    def __init__(self, provider_config: Optional[Dict[str, Any]] = None):
+    def __init__(self,
+                 override_config_use_sudo: Optional[bool] = None,
+                 provider_config: Optional[Dict[str, Any]] = None):
         """
         Initialize a Command with provider configuration.
 
         Args:
+            override_config_use_sudo: Whether to override the use_sudo setting with a custom value
             provider_config: Dictionary containing provider-specific configuration
                             such as credentials, paths, etc.
         """
@@ -32,6 +35,10 @@ class LibVirtCommandBase:
 
         #: str: Command executable path
         self.command_path = None
+
+        # override use_sudo if provided
+        if override_config_use_sudo:
+            self.use_sudo = override_config_use_sudo
 
     def build_command(self, *args, **kwargs) -> str:
         """
@@ -92,7 +99,7 @@ class LibVirtCommandBase:
         command = self.build_command(*args, **kwargs)
 
         if self.verbose:
-            self.logger.info(f"Executing: {command}")
+            self.logger.info(f"executing: {command}")
 
         try:
             result = invoke.run(command, hide=hide, warn=warn)
@@ -139,7 +146,7 @@ class LibVirtCommandBase:
         Raises:
             RuntimeError: If the command fails and warn is False
         """
-        # Add sudo if needed
+        # add sudo if needed
         if self.use_sudo and not command.startswith("sudo "):
             command = f"sudo {command}"
 
@@ -191,8 +198,8 @@ class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
         #: str: Connection URI for libvirt
         self.uri = self.provider_config.get('uri', 'qemu:///system')
 
-        #: str: Path to virsh binary
-        self.command_path = self.provider_config.get('virsh_path', 'virsh')
+        #: str: the path to the virsh binary
+        self.command_path = self.provider_config.get('virsh_cmd', 'virsh')
 
     def build_command(self, cmd: str, *args, **kwargs) -> str:
         """
@@ -206,26 +213,26 @@ class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
         Returns:
             Complete command string ready for execution
         """
-        # Start with the prefix (sudo if needed)
+        # start with the prefix (sudo if needed)
         command_parts = []
         if self.use_sudo:
             command_parts.append("sudo")
 
-        # Add the virsh command with connection URI
+        # add the virsh command with connection URI
         command_parts.append(f"{self.command_path} -c {self.uri}")
 
-        # Add the actual virsh subcommand
+        # add the actual virsh subcommand
         command_parts.append(cmd)
 
-        # Add positional arguments
+        # add positional arguments
         command_parts.extend([str(arg) for arg in args])
 
-        # Add keyword arguments as options
+        # add keyword arguments as options
         for key, value in kwargs.items():
             if value is True:
                 command_parts.append(f"--{key.replace('_', '-')}")
             elif value is False or value is None:
-                # Skip False or None values
+                # skip False or None values
                 continue
             else:
                 command_parts.append(f"--{key.replace('_', '-')}={value}")
@@ -262,10 +269,10 @@ class VirtInstallCommand(LibVirtCommandBase):
         """
         super().__init__(provider_config)
 
-        #: str: Path to virt-install binary
-        self.command_path = self.provider_config.get('virt_install_path', 'virt-install')
+        #: str: the path to virt-install binary
+        self.command_path = self.provider_config.get('virt_install_cmd', 'virt-install')
 
-        #: str: Connection URI for libvirt
+        #: str: the connection URI for libvirt
         self.uri = self.provider_config.get('uri', 'qemu:///system')
 
     def build_command(self, *args, **kwargs) -> str:
@@ -279,7 +286,7 @@ class VirtInstallCommand(LibVirtCommandBase):
         Returns:
             Complete command string ready for execution
         """
-        # Add URI option if not already in kwargs
+        # add URI option if not already in kwargs
         if 'connect' not in kwargs:
             kwargs['connect'] = self.uri
 
@@ -299,12 +306,12 @@ class VirtCloneCommand(LibVirtCommandBase):
         Args:
             provider_config: Dictionary containing provider-specific configuration
         """
-        super().__init__(provider_config)
+        super().__init__(provider_config=provider_config)
 
-        #: str: Path to virt-clone binary
-        self.command_path = self.provider_config.get('virt_clone_path', 'virt-clone')
+        #: str: the path to virt-clone binary
+        self.command_path = self.provider_config.get('virt_clone_cmd', 'virt-clone')
 
-        #: str: Connection URI for libvirt
+        #: str: the connection URI for libvirt
         self.uri = self.provider_config.get('uri', 'qemu:///system')
 
     def build_command(self, *args, **kwargs) -> str:

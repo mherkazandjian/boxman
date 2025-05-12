@@ -7,7 +7,7 @@ clusters:
     base_image: centos-7-boxman-testcluster-template
     proxy_host: localhost
     admin_user: admin
-    admin_pass: testcluster
+    admin_pass: <placeholder>
     admin_key_name: id_ed25519_boxman
     ssh_config: ssh_config
 
