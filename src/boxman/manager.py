@@ -1,5 +1,6 @@
 import os
 import time
+import re
 from typing import Dict, Any, Optional
 import yaml
 from multiprocessing import Pool
@@ -369,7 +370,7 @@ class BoxmanManager:
         This method displays the VM names, hostnames, IP addresses, and
         other connection details for all configured VMs.
         """
-        self.logger.info("\n=== vm connection information ===\n")
+        self.logger.info("=== vm connection information ===")
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
@@ -515,6 +516,41 @@ class BoxmanManager:
 
         return success
 
+    @classmethod
+    def fetch_value(cls, value) -> str:
+        """
+        Get the value referenced by *value*.
+
+        supported reference formats:
+          - Environment variable:  '${env:ENV_VAR_NAME}'
+          - File contents:         'file:///abs/or/relative/path'
+
+        for any other string the input is returned unchanged.
+
+        Raises:
+            ValueError: If the environment variable is not set.
+            FileNotFoundError: If the referenced file does not exist.
+        """
+        if isinstance(value, str):
+            # ${env:VAR}
+            env_match = re.fullmatch(r"\$\{env:(.+)\}", value)
+            if env_match:
+                var = env_match.group(1)
+                if var not in os.environ:
+                    raise ValueError(f"environment variable '{var}' is not set")
+                return os.environ[var]
+
+            # file:///path/to/file
+            if value.startswith("file://"):
+                path = os.path.expanduser(value[len("file://"):])
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(f"referenced file does not exist: {path}")
+                with open(path, "r") as fobj:
+                    return fobj.read().rstrip("\n")
+
+        # default: return as-is
+        return value
+
     def add_ssh_keys_to_vms(self) -> bool:
         """
         Add the generated SSH public key to all VMs to enable password-less login.
@@ -531,8 +567,9 @@ class BoxmanManager:
             workdir = os.path.expanduser(cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
             admin_pub_key = os.path.join(workdir, f"{admin_key_name}.pub")
+
             admin_user = cluster.get('admin_user', 'admin')
-            admin_pass = cluster.get('admin_pass', '')
+            admin_pass = self.fetch_value(cluster.get('admin_pass', None))
 
             if not admin_pass:
                 self.logger.info(

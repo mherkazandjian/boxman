@@ -15,8 +15,8 @@ clusters:
     workdir: ~/workspaces/boxmandev/minimal
     base_image: rocky-95-minimal-base-template
     proxy_host: localhost
-    admin_user: '<placeholder>'
-    admin_pass: '<placeholder>'
+    admin_user: 'root'
+    admin_pass: '${env:BOXMAN_ADMIN_PASS}'
     admin_key_name: id_ed25519_boxman    # generated automatically at provisioning time
     ssh_config: ssh_config               # generated automatically at provisioning time
 
