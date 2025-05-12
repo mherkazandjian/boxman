@@ -140,9 +140,9 @@ class CloneVM:
 
                 if not remove_result.ok:
                     self.logger.warning(
-                        f"failed to remove interface with MAC {mac}: {remove_result.stderr}")
+                        f"failed to remove interface with mac {mac}: {remove_result.stderr}")
                 else:
-                    self.logger.info(f"Successfully removed interface with MAC {mac}")
+                    self.logger.info(f"successfully removed interface with mac {mac}")
 
             return True
         except Exception as exc:

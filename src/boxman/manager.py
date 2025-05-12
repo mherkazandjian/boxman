@@ -129,7 +129,7 @@ class BoxmanManager:
 
         # clone the vms one at a time
         for cluster, vm_info, new_vm_name in vm_clone_tasks():
-            self.logger.info(f"Cloning VM {new_vm_name} from base image {cluster['base_image']}")
+            self.logger.info(f"cloning vm {new_vm_name} from base image {cluster['base_image']}")
             _clone(cluster, vm_info, new_vm_name)
             time.sleep(1)  # Add a small delay to avoid overwhelming the provider
 
@@ -242,9 +242,9 @@ class BoxmanManager:
                 success = self.provider.start_vm(full_vm_name)
 
                 if success:
-                    self.logger.info(f"Successfully started VM {vm_name}")
+                    self.logger.info(f"successfully started the vm {vm_name}")
                 else:
-                    self.logger.warning(f"Failed to start VM {vm_name}")
+                    self.logger.warning(f"failed to start the vm {vm_name}")
 
     def get_connect_info(self) -> bool:
         """
@@ -482,9 +482,9 @@ class BoxmanManager:
                 )
 
                 if success:
-                    self.logger.info(f"Successfully added SSH key to VM {vm_name}")
+                    self.logger.info(f"successfully added the ssh key to the vm {vm_name}")
                 else:
-                    self.logger.error(f"Failed to add SSH key to VM {vm_name}")
+                    self.logger.error(f"failed to add the ssh key to the vm {vm_name}")
                     all_successful = False
 
         return all_successful
@@ -622,31 +622,33 @@ class BoxmanManager:
 
         cls.start_vms()
 
-        # Use adaptive wait for IP address assignment
+        # use adaptive wait for IP address assignment
         cls.logger.info("Waiting for VMs to initialize and get IP addresses...")
         wait_time = 1  # Start with 1 second
         max_wait = 600  # Maximum total wait time (10 minutes)
         total_waited = 0
 
         while total_waited < max_wait:
-            # Check if all VMs have IP addresses
+            # check if all VMs have IP addresses
             if cls.get_connect_info():
                 cls.logger.info(f"All VMs have IP addresses (waited {total_waited}s)")
                 break
 
-            # If we get here, at least one VM doesn't have an IP yet
-            cls.logger.info(f"Waiting {wait_time}s for IP assignment (total waited: {total_waited}s)")
+            # if we get here, at least one VM doesn't have an IP yet
+            cls.logger.info(f"Wait {wait_time}s for ip assignment (total waited: {total_waited}s)")
             time.sleep(wait_time)
             total_waited += wait_time
-            wait_time = min(wait_time * 2, 60)  # Double the wait time up to 1 minute max per iteration
+            # double the wait time up to 1 minute max per iteration
+            wait_time = min(wait_time * 2, 60)
 
         if total_waited >= max_wait:
-            cls.logger.warning("Warning: Reached maximum wait time. Some VMs may not have IP addresses.")
+            cls.logger.warning(
+                "Reached maximum wait time. Some VMs may not have IP addresses.")
 
-        # Display connection information
+        # display connection information
         cls.connect_info()
 
-        # Generate SSH keys, add them to VMs, and write SSH config
+        # generate SSH keys, add them to vms, and write ssh config
         cls.setup_ssh_access()
 
     @staticmethod

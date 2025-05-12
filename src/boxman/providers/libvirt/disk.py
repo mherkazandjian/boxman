@@ -111,7 +111,7 @@ class DiskManager(VirshCommand):
                 self.logger.error(f"Failed to attach disk: {result.stderr}")
                 return False
 
-            self.logger.info(f"Successfully attached disk {disk_path} to VM {self.vm_name}")
+            self.logger.info(f"successfully attached disk {disk_path} to VM {self.vm_name}")
             return True
         except Exception as e:
             self.logger.error(f"Error attaching disk: {e}")
@@ -196,7 +196,7 @@ class DiskManager(VirshCommand):
                 self.logger.error(f"Failed to attach disk {disk_path} to VM {self.vm_name}")
                 return False
 
-            self.logger.info(f"Successfully configured disk {disk_name} for VM {self.vm_name}")
+            self.logger.info(f"successfully configured disk {disk_name} for VM {self.vm_name}")
             return True
         except Exception as e:
             self.logger.error(f"Error configuring disk from config: {e}")

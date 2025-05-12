@@ -29,54 +29,55 @@ class Network(VirshCommand):
                  mode, bridge, mac, ip, network, enable, etc.
             provider_config: Configuration for the libvirt provider
         """
-        super().__init__(provider_config)
+        super().__init__(provider_config=provider_config)
 
-        #: str: Name of the network
+        #: str: the name of the network
         self.name = name
 
-        #: str: UUID of the network, generated if not provided
+        #: str: the uuid of the network, generated if not provided
         self.uuid_val = str(uuid.uuid4())
 
-        #: str: Forward mode (nat, route, bridge, etc.)
+        #: str: the forward mode (nat, route, bridge, etc.)
         self.forward_mode = info.get('mode', 'nat')
 
-        # Extract bridge configuration
+        # extract bridge configuration
         bridge_info = info.get('bridge', {})
 
-        # Handle the bridge name - if not specified, find the first available virbrX
+        # handle the bridge name - if not specified, find the first available virbrX
         bridge_name = bridge_info.get('name')
         if not bridge_name:
             bridge_name = self.find_available_bridge_name()
 
-        #: str: Bridge name
+        #: str: the name of the bridge interface
         self.bridge_name = bridge_name
 
-        #: str: STP on/off for the bridge
+        #: str: use stp on/off for the bridge
         self.bridge_stp = bridge_info.get('stp', 'on')
-        #: str: Delay for STP
+        #: str: they delay for the stp
         self.bridge_delay = bridge_info.get('delay', '0')
 
-        #: str: MAC address for the bridge
-        self.mac_address = info.get('mac', f"52:54:00:{':'.join(['%02x' % (i + 10) for i in range(3)])}")
+        #: str: set the mac address for the bridge
+        self.mac_address = info.get(
+            'mac', f"52:54:00:{':'.join(['%02x' % (i + 10) for i in range(3)])}")
 
-        # Extract IP configuration
+        # extract the ip configuration
         ip_info = info.get('ip', {})
-        #: str: IP address for the network
+        #: str: the ip address for the network
         self.ip_address = ip_info.get('address', '192.168.122.1')
-        #: str: Netmask for the network
+        #: str: the netmask for the network
         self.netmask = ip_info.get('netmask', '255.255.255.0')
 
-        # Extract DHCP configuration
+        # extract the dhcp configuration
         dhcp_info = ip_info.get('dhcp', {}).get('range', {})
-        #: str: Start of DHCP range
+        #: str: the start of DHCP range
         self.dhcp_range_start = dhcp_info.get('start', '192.168.122.2')
-        #: str: End of DHCP range
+        #: str: the end of DHCP range
         self.dhcp_range_end = dhcp_info.get('end', '192.168.122.254')
 
-        #: bool: Whether the network should be enabled
+        #: bool: whether the network should be enabled
         self.enable = info.get('enable', True)
 
-        #: str: Network CIDR notation
+        #: str: the network cidr notation
         self.network = info.get('network', '')
 
     def generate_xml(self) -> str:
@@ -86,20 +87,20 @@ class Network(VirshCommand):
         Returns:
             XML string for the network definition
         """
-        # Get the path to the assets directory
+        # get the path to the assets directory
         assets_path = pkg_resources.resource_filename('boxman', 'assets')
 
-        # Create a Jinja environment
+        # create a jinja environment
         env = Environment(
             loader=FileSystemLoader(assets_path),
             trim_blocks=True,
             lstrip_blocks=True
         )
 
-        # Load the template
+        # load the template
         template = env.get_template('network.xml.j2')
 
-        # Render the template with the network configuration
+        # render the template with the network configuration
         context = {
             'name': self.name,
             'uuid_val': self.uuid_val,
@@ -146,13 +147,13 @@ class Network(VirshCommand):
 
         self.write_xml(file_path)
 
-        # Define the network
+        # define the network
         try:
             self.execute("net-define", file_path)
             self.execute("net-start", self.name)
             self.execute("net-autostart", self.name)
 
-            # Apply appropriate network configuration based on type
+            # apply appropriate network configuration based on type
             if self.forward_mode == 'route':
                 self.apply_route_iptables_rule()
             elif self.forward_mode == 'nat':
@@ -197,22 +198,22 @@ class Network(VirshCommand):
             True if successful, False otherwise
         """
         try:
-            # Check if network exists first
+            # check if network exists first
             result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
             if result.return_code != 0:
                 self.logger.info(f"Network {self.name} does not exist, nothing to destroy")
                 return True
 
-            # Check if network is active
+            # check if network is active
             result = self.execute("net-list", "| grep -q " + self.name, warn=True)
             if result.return_code == 0:
                 # Network is active, stop it
                 self.execute("net-destroy", self.name)
-                self.logger.info(f"Network {self.name} destroyed successfully")
+                self.logger.info(f"network {self.name} destroyed successfully")
 
             return True
-        except RuntimeError as e:
-            self.logger.error(f"Error destroying network: {e}")
+        except RuntimeError as exc:
+            self.logger.error(f"Error destroying network: {exc}")
             return False
 
     def undefine_network(self) -> bool:
@@ -223,18 +224,18 @@ class Network(VirshCommand):
             True if successful, False otherwise
         """
         try:
-            # Check if network exists
+            # check if network exists
             result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
             if result.return_code != 0:
                 self.logger.info(f"Network {self.name} does not exist, nothing to undefine")
                 return True
 
-            # Disable autostart first if it's enabled
+            # disable autostart first if it's enabled
             self.execute("net-autostart", self.name, "--disable", warn=True)
 
-            # Undefine the network
+            # undefine the network
             self.execute("net-undefine", self.name)
-            self.logger.info(f"Network {self.name} undefined successfully")
+            self.logger.info(f"network {self.name} undefined successfully")
             return True
         except RuntimeError as e:
             self.logger.error(f"Error un-defining network: {e}")
@@ -262,9 +263,9 @@ class Network(VirshCommand):
         Returns:
             The first available virbrX name
         """
-        # Get a list of existing bridge interfaces using brctl
+        # get a list of existing bridge interfaces using brctl
         try:
-            # Create a shell command to execute brctl
+            # create a shell command to execute brctl
             cmd_executor = LibVirtCommandBase()
             result = cmd_executor.execute("brctl", "show", hide=True, warn=True)
 
@@ -272,7 +273,7 @@ class Network(VirshCommand):
                 self.logger.warning("Failed to run brctl show, defaulting to virbr0")
                 return "virbr0"
 
-            # Parse brctl output to find existing virbr bridges
+            # parse brctl output to find existing virbr bridges
             existing_bridges = []
             lines = result.stdout.splitlines()
             if len(lines) > 1:  # Skip header line
@@ -281,23 +282,23 @@ class Network(VirshCommand):
                     if parts and parts[0].startswith('virbr'):
                         existing_bridges.append(parts[0])
 
-            # Find the first unused virbr index
+            # find the first unused virbr index
             used_indices = set()
             for bridge in existing_bridges:
                 match = re.match(r'virbr(\d+)', bridge)
                 if match:
                     used_indices.add(int(match.group(1)))
 
-            # Find the first available index
+            # find the first available index
             index = 0
             while index in used_indices:
                 index += 1
 
             return f"virbr{index}"
 
-        except Exception as e:
-            self.logger.error(f"Error finding available bridge name: {e}")
-            # Return a default if all else fails
+        except Exception as exc:
+            self.logger.error(f"Error finding available bridge name: {exc}")
+            # return a default if all else fails
             return "virbr0"
 
     def apply_route_iptables_rule(self) -> bool:
@@ -315,39 +316,41 @@ class Network(VirshCommand):
             return True  # Nothing to do for non-route networks
 
         try:
-            # Get the bridge interface name
+            # get the bridge interface name
             bridge_name = self.bridge_name
-            self.logger.info(f"Configuring complete isolation for routed network with bridge {bridge_name}")
+            self.logger.info(
+                f"configuring complete isolation for routed network with bridge {bridge_name}")
 
-            # 1. Allow VM-to-VM communication on the same bridge
+            # 1. allow vm-to-vm communication on the same bridge
             vm_to_vm_cmd = f"sudo iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
-            self.logger.info(f"Setting up VM-to-VM communication: {vm_to_vm_cmd}")
+            self.logger.info(f"setting up vm-to-vm communication: {vm_to_vm_cmd}")
             result = self.execute_shell(vm_to_vm_cmd)
             if not result.ok:
-                self.logger.error(f"Failed to allow VM-to-VM communication: {result.stderr}")
+                self.logger.error(f"failed to allow VM-to-VM communication: {result.stderr}")
                 return False
 
-            # 2. Block ALL traffic from VMs to host
+            # 2. block all traffic from the vms to the host
             host_to_vm_block = f"sudo iptables -I INPUT -i {bridge_name} -j DROP"
-            self.logger.info(f"Blocking all traffic from VMs to host: {host_to_vm_block}")
+            self.logger.info(f"blocking all traffic from the vms to the host: {host_to_vm_block}")
             result = self.execute_shell(host_to_vm_block)
             if not result.ok:
-                self.logger.error(f"Failed to block VM to host traffic: {result.stderr}")
+                self.logger.error(f"failed to block vm to host traffic: {result.stderr}")
                 return False
 
-            # 3. Block ALL traffic from host to VMs
+            # 3. block ALL traffic from host to the vms
             vm_to_host_block = f"sudo iptables -I OUTPUT -o {bridge_name} -j DROP"
-            self.logger.info(f"Blocking all traffic from host to VMs: {vm_to_host_block}")
+            self.logger.info(f"blocking all traffic from host to the vms: {vm_to_host_block}")
             result = self.execute_shell(vm_to_host_block)
             if not result.ok:
-                self.logger.error(f"Failed to block host to VM traffic: {result.stderr}")
+                self.logger.error(f"failed to block host to vm traffic: {result.stderr}")
                 return False
 
-            self.logger.info(f"Successfully applied complete isolation for routed network {self.name}")
+            self.logger.info(
+                f"successfully applied complete isolation for routed network {self.name}")
             return True
 
-        except Exception as e:
-            self.logger.error(f"Error applying route isolation rules: {e}")
+        except Exception as exc:
+            self.logger.error(f"error applying route isolation rules: {exc}")
             return False
 
     def apply_nat_config(self) -> bool:
@@ -364,45 +367,45 @@ class Network(VirshCommand):
             True if successful, False otherwise
         """
         try:
-            # Step 1: Find the outgoing interface
+            # step 1: find the outgoing interface
             cmd_executor = LibVirtCommandBase(self.provider_config)
 
-            # Get the outgoing interface using 'ip route'
+            # get the outgoing interface using 'ip route'
             # .. todo:: figure out how to get the default route interface in case the host
             #           is not connected to the internet. This should work even if the host is not
             #           connected to the internet.
             result = cmd_executor.execute_shell("ip route get 8.8.8.8 | awk '{print $5}'", hide=True)
             if not result.ok:
-                self.logger.error(f"Failed to find outgoing interface: {result.stderr}")
+                self.logger.error(f"failed to find outgoing interface: {result.stderr}")
                 return False
 
             outgoing_iface = result.stdout.strip()
             if not outgoing_iface:
-                self.logger.error("Could not determine outgoing interface")
+                self.logger.error("could not determine outgoing interface")
                 return False
 
-            self.logger.info(f"Found outgoing interface: {outgoing_iface}")
+            self.logger.info(f"found outgoing interface: {outgoing_iface}")
 
-            # Step 2: Bridge interface is already known (self.bridge_name)
-            self.logger.info(f"Using bridge interface: {self.bridge_name}")
+            # step 2: bridge interface is already known (self.bridge_name)
+            self.logger.info(f"using bridge interface: {self.bridge_name}")
 
-            # Step 3: Allow forwarding between interfaces
-            # Forward outgoing -> bridge
+            # step 3: allow forwarding between interfaces
+            # forward outgoing -> bridge
             cmd = f"sudo iptables -I FORWARD -i {outgoing_iface} -o {self.bridge_name} -j ACCEPT"
             result = cmd_executor.execute_shell(cmd)
             if not result.ok:
-                self.logger.error(f"Failed to set up forwarding from {outgoing_iface} to {self.bridge_name}: {result.stderr}")
+                self.logger.error(f"failed to set up forwarding from {outgoing_iface} to {self.bridge_name}: {result.stderr}")
                 return False
 
-            # Forward bridge -> outgoing
+            # forward bridge -> outgoing
             cmd = f"sudo iptables -I FORWARD -i {self.bridge_name} -o {outgoing_iface} -j ACCEPT"
             result = cmd_executor.execute_shell(cmd)
             if not result.ok:
-                self.logger.error(f"Failed to set up forwarding from {self.bridge_name} to {outgoing_iface}: {result.stderr}")
+                self.logger.error(f"failed to set up forwarding from {self.bridge_name} to {outgoing_iface}: {result.stderr}")
                 return False
 
-            # Step 4: Enable NAT for the virtual network
-            # Extract network address from IP and netmask
+            # step 4: enable NAT for the virtual network
+            # extract network address from IP and netmask
             import ipaddress
             try:
                 ip_interface = ipaddress.IPv4Interface(f"{self.ip_address}/{self.netmask}")
@@ -412,18 +415,20 @@ class Network(VirshCommand):
                 cmd = f"sudo iptables -t nat -A POSTROUTING -s {network_cidr} -j MASQUERADE"
                 result = cmd_executor.execute_shell(cmd)
                 if not result.ok:
-                    self.logger.error(f"Failed to set up masquerading for {network_cidr}: {result.stderr}")
+                    self.logger.error(
+                        f"failed to set up masquerading for {network_cidr}: {result.stderr}")
                     return False
 
-                self.logger.info(f"Successfully configured NAT for network {self.name} ({network_cidr})")
+                self.logger.info(
+                    f"successfully configured nat for network {self.name} ({network_cidr})")
                 return True
 
-            except ValueError as e:
-                self.logger.error(f"Error calculating network CIDR: {e}")
+            except ValueError as exc:
+                self.logger.error(f"error calculating network cidr: {exc}")
                 return False
 
-        except Exception as e:
-            self.logger.error(f"Error configuring NAT for network {self.name}: {e}")
+        except Exception as exc:
+            self.logger.error(f"error configuring NAT for network {self.name}: {exc}")
             return False
 
 
@@ -431,7 +436,6 @@ class NetworkInterface(VirshCommand):
     """
     Class to manage network interfaces for libvirt VMs.
     """
-
     def __init__(self,
                  vm_name: str,
                  provider_config: Optional[Dict[str, Any]] = None):
@@ -442,7 +446,7 @@ class NetworkInterface(VirshCommand):
             vm_name: Name of the VM to manage interfaces for
             provider_config: Configuration for the libvirt provider
         """
-        super().__init__(provider_config)
+        super().__init__(provider_config=provider_config)
 
         #: str: Name of the VM
         self.vm_name = vm_name
@@ -469,20 +473,20 @@ class NetworkInterface(VirshCommand):
         """
 
         try:
-            # Get the path to the assets directory
+            # get the path to the assets directory
             assets_path = pkg_resources.resource_filename('boxman', 'assets')
 
-            # Create a Jinja environment
+            # create a jinja environment
             env = Environment(
                 loader=FileSystemLoader(assets_path),
                 trim_blocks=True,
                 lstrip_blocks=True
             )
 
-            # Load the template
+            # load the template
             template = env.get_template('network_interface.xml.j2')
 
-            # Render the template with the interface configuration
+            # render the template with the interface configuration
             context = {
                 'network_source': network_source,
                 'link_state': link_state,
@@ -492,24 +496,26 @@ class NetworkInterface(VirshCommand):
 
             xml_content = template.render(**context)
 
-            # Create a temporary file to store the XML
+            # create a temporary file to store the XML
             with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as temp:
                 temp.write(xml_content)
                 temp_path = temp.name
 
-            # Use virsh to attach the interface
+            # use virsh to attach the interface
             self.execute("attach-device", self.vm_name, temp_path, "--persistent")
 
-            # Remove temporary file
+            # remove temporary file
             os.unlink(temp_path)
-            self.logger.info(f"Added network interface to VM {self.vm_name}: network={network_source}, model={model}")
+            self.logger.info(
+                f"added network interface to vm "
+                f"{self.vm_name}: network={network_source}, model={model}")
             return True
-        except Exception as e:
+        except Exception as exc:
             import traceback
-            self.logger.error(f"Error adding network interface to VM {self.vm_name}: {e}")
+            self.logger.error(f"error adding network interface to vm {self.vm_name}: {exc}")
             self.logger.debug(traceback.format_exc())
 
-            # Clean up temp file if it exists
+            # clean up temp file if it exists
             if 'temp_path' in locals() and os.path.exists(temp_path):
                 os.unlink(temp_path)
             return False
