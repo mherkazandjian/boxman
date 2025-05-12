@@ -1,25 +1,22 @@
 #!/usr/bin/env python
+
 import os
 import sys
-from pprint import pprint
 import argparse
 from argparse import RawTextHelpFormatter
-from datetime import datetime
-import shutil
+from datetime import datetime, timezone
 from multiprocess import Process
 
 import boxman
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.virtualbox.vboxmanage import Virtualbox
-from boxman.virtualbox.utils import Command
 from boxman.utils.io import write_files
-from boxman.abstract.hosts_specs import HostsSpecs
 #from boxman.abstract.providers import Providers
 from boxman.abstract.providers import ProviderSession as Session
 
 
-now = datetime.utcnow()
+now = datetime.now(timezone.utc)
 snap_name = now.strftime('%Y-%m-%dT%H:%M:%S')
 
 
