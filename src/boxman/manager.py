@@ -801,7 +801,6 @@ class BoxmanManager:
         ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
 
-
         cls.destroy_networks()
 
         prj_name = f'bprj__{cls.config["project"]}__bprj'

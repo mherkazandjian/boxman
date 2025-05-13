@@ -254,6 +254,14 @@ class Network(VirshCommand):
         if not self.undefine_network():
             return False
 
+        # remove iptables rules if any
+        if self.forward_mode == 'route':
+            self.remove_route_iptables_rule()
+        elif self.forward_mode == 'nat':
+            self.remove_nat_config()
+        else:
+            raise RuntimeError(f"Unsupported forward mode: {self.forward_mode}")
+
         return True
 
     def find_available_bridge_name(self) -> str:
@@ -304,27 +312,117 @@ class Network(VirshCommand):
             return "virbr0"
 
     @staticmethod
-    def _ensure_rule(instance, check_cmd: str, insert_cmd: str) -> bool:
+    def _ensure_rule(instance,
+                     check_cmd: str,
+                     action_cmd: str,
+                     present: bool = True) -> bool:
         """
-        Ensure an iptables rule exists, inserting it if necessary.
+        Make sure a rule is either present (present=True) or absent (present=False).
 
         Args:
-            instance: The Network (or other) object providing execute_shell & logger
-            check_cmd: Command that checks for rule existence (uses -C)
-            insert_cmd: Command that inserts the rule (uses -I or -A)
-
-        Returns:
-            True on success, False otherwise
+            instance   : object exposing execute_shell & logger
+            check_cmd  : iptables -C ... command used to probe rule existence
+            action_cmd : command that adds the rule (present) or deletes the rule (absent)
+            present    : True -> ensure rule exists, False -> ensure rule is removed
         """
-        check_res = instance.execute_shell(check_cmd, warn=True)
-        if check_res.return_code == 0:
-            instance.logger.debug(f"rule already present: {check_cmd}")
+        chk_res = instance.execute_shell(check_cmd, warn=True)
+
+        # desired state already reached
+        if (present and chk_res.return_code == 0) or (not present and chk_res.return_code != 0):
+            instance.logger.debug(f"rule already in desired state: {check_cmd}")
             return True
-        ins_res = instance.execute_shell(insert_cmd)
-        if not ins_res.ok:
-            instance.logger.error(f"failed to add iptables rule: {insert_cmd}\n{ins_res.stderr}")
+
+        # need an action to reach desired state
+        apply_res = instance.execute_shell(action_cmd, warn=True)
+        if not apply_res.ok:
+            instance.logger.error(f"failed to execute '{action_cmd}': {apply_res.stderr}")
             return False
         return True
+
+    def remove_route_iptables_rule(self) -> bool:
+        """
+        Remove the isolation rules inserted by apply_route_iptables_rule.
+        Executed during `remove_network`.  Follows the same check-then-execute
+        pattern used in apply_route_iptables_rule.
+        """
+        if self.forward_mode != 'route':
+            return True
+
+        try:
+            br_name = self.bridge_name
+            self.logger.info(f"removing route isolation rules for bridge {br_name}")
+
+            if not self._ensure_rule(
+                    self,
+                    f"sudo iptables -C FORWARD -i {br_name} -o {br_name} -j ACCEPT",
+                    f"sudo iptables -D FORWARD -i {br_name} -o {br_name} -j ACCEPT",
+                    present=False):
+                return False
+            if not self._ensure_rule(
+                    self,
+                    f"sudo iptables -C INPUT  -i {br_name} -j DROP",
+                    f"sudo iptables -D INPUT  -i {br_name} -j DROP",
+                    present=False):
+                return False
+            if not self._ensure_rule(
+                    self,
+                    f"sudo iptables -C OUTPUT -o {br_name} -j DROP",
+                    f"sudo iptables -D OUTPUT -o {br_name} -j DROP",
+                    present=False):
+                return False
+
+            self.logger.info(f"successfully removed isolation rules for routed network {self.name}")
+            return True
+        except Exception as exc:
+            self.logger.error(f"error removing route isolation rules: {exc}")
+            return False
+
+    def remove_nat_config(self) -> bool:
+        """
+        Remove the forwarding and masquerade rules inserted by apply_nat_config.
+        """
+        if self.forward_mode != 'nat':
+            return True
+
+        try:
+            # discover outgoing iface (same logic as insertion)
+            cmd_exec = LibVirtCommandBase(provider_config=self.provider_config,
+                                          override_config_use_sudo=False)
+            res = cmd_exec.execute_shell("ip route get 8.8.8.8 | awk '{print $5}'",
+                                         hide=True, warn=True)
+            out_iface = res.stdout.strip() if res.ok else ""
+            bridge_name = self.bridge_name
+
+            if out_iface:
+                self._ensure_rule(
+                    self,
+                    f"sudo iptables -C FORWARD -i {out_iface} -o {bridge_name} -j ACCEPT",
+                    f"sudo iptables -D FORWARD -i {out_iface} -o {bridge_name} -j ACCEPT",
+                    present=False)
+                self._ensure_rule(
+                    self,
+                    f"sudo iptables -C FORWARD -i {bridge_name} -o {out_iface} -j ACCEPT",
+                    f"sudo iptables -D FORWARD -i {bridge_name} -o {out_iface} -j ACCEPT",
+                    present=False)
+            else:
+                self.logger.warning("could not determine outgoing iface while cleaning nat rules")
+
+            # remove masquerade
+            import ipaddress
+            try:
+                net_cidr = str(ipaddress.IPv4Interface(f"{self.ip_address}/{self.netmask}").network)
+                self._ensure_rule(
+                    self,
+                    f"sudo iptables -t nat -C POSTROUTING -s {net_cidr} -j MASQUERADE",
+                    f"sudo iptables -t nat -D POSTROUTING -s {net_cidr} -j MASQUERADE",
+                    present=False)
+            except ValueError:
+                self.logger.warning("could not compute network cidr while cleaning masquerade rule")
+
+            return True
+        except Exception as exc:
+            self.logger.error(f"error removing NAT configuration for {self.name}: {exc}")
+            return False
 
     def apply_route_iptables_rule(self) -> bool:
         """

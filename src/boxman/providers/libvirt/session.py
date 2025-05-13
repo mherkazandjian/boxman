@@ -67,7 +67,8 @@ class LibVirtSession:
             True if successful, False otherwise
         """
         network = Network(name=name, info=info)
-        return network.destroy_network()
+        status = network.destroy_network()
+        return status
 
     def undefine_network(self,
                          name: str = None,
@@ -83,7 +84,8 @@ class LibVirtSession:
             True if successful, False otherwise
         """
         network = Network(name=name, info=info)
-        return network.undefine_network()
+        status = network.undefine_network()
+        return status
 
     def remove_network(self,
                        name: str = None,
@@ -105,8 +107,7 @@ class LibVirtSession:
                  new_vm_name: str,
                  src_vm_name: str,
                  info: Dict[str, Any],
-                 workdir: str,
-                 ) -> bool:
+                 workdir: str) -> bool:
         """
         Clone a VM.
 

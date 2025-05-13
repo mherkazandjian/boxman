@@ -160,33 +160,33 @@ class DiskManager(VirshCommand):
             True if successful, False otherwise
         """
         try:
-            # Extract configuration
+            # extract configuration
             disk_name = disk_config.get("name", "disk")
-            disk_size = disk_config.get("size", 1024)  # Default 1GB
+            disk_size = disk_config.get("size", 1024)  # default 1GB
 
-            # Get driver info
+            # get driver info
             driver = disk_config.get("driver", {})
             driver_name = driver.get("name", "qemu")
             driver_type = driver.get("type", "qcow2")
 
-            # Get target device
+            # get target device
             target_dev = disk_config.get("target", "vdb")
 
-            # Create disk path
+            # create disk path
             if disk_prefix:
                 disk_path = os.path.join(workdir, f"{disk_prefix}_{disk_name}.{driver_type}")
             else:
                 disk_path = os.path.join(workdir, f"{disk_name}.{driver_type}")
 
-            # Ensure path is expanded
+            # ensure path is expanded
             disk_path = os.path.expanduser(disk_path)
 
-            # 1. Create the disk
+            # 1. create the disk
             if not self.create_disk(disk_path, disk_size, format=driver_type):
-                self.logger.error(f"Failed to create disk {disk_path}")
+                self.logger.error(f"failed to create disk {disk_path}")
                 return False
 
-            # 2. Attach the disk to the VM
+            # 2. attach the disk to the VM
             if not self.attach_disk(
                 disk_path=disk_path,
                 target_dev=target_dev,
@@ -198,6 +198,6 @@ class DiskManager(VirshCommand):
 
             self.logger.info(f"successfully configured disk {disk_name} for VM {self.vm_name}")
             return True
-        except Exception as e:
-            self.logger.error(f"Error configuring disk from config: {e}")
+        except Exception as exc:
+            self.logger.error(f"error configuring disk from config: {exc}")
             return False
