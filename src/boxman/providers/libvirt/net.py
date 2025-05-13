@@ -399,48 +399,38 @@ class Network(VirshCommand):
                 self.logger.error(f"failed to find outgoing interface: {result.stderr}")
                 return False
 
-            outgoing_iface = result.stdout.strip()
-            if not outgoing_iface:
+            bridge = self.bridge_name
+
+            out_iface = result.stdout.strip()
+            if not out_iface:
                 self.logger.error("could not determine outgoing interface")
                 return False
 
-            self.logger.info(f"found outgoing interface: {outgoing_iface}")
+            self.logger.info(f"found outgoing interface: {out_iface}")
 
             # step 2: bridge interface is already known (self.bridge_name)
-            self.logger.info(f"using bridge interface: {self.bridge_name}")
+            self.logger.info(f"using bridge interface: {bridge}")
 
-            # step 3: allow forwarding between interfaces
-            # forward outgoing -> bridge
-            cmd = f"sudo iptables -I FORWARD -i {outgoing_iface} -o {self.bridge_name} -j ACCEPT"
-            result = cmd_executor.execute_shell(cmd)
-            if not result.ok:
-                self.logger.error(
-                    f"failed to set up forwarding from {outgoing_iface} to {self.bridge_name}: "
-                    f"{result.stderr}")
+            # 3. allow forwarding between interfaces
+            fwd1_check = f"sudo iptables -C FORWARD -i {out_iface} -o {bridge} -j ACCEPT"
+            fwd1_cmd   = f"sudo iptables -I FORWARD -i {out_iface} -o {bridge} -j ACCEPT"
+            if not self._ensure_rule(self, fwd1_check, fwd1_cmd):
                 return False
 
-            # forward bridge -> outgoing
-            cmd = f"sudo iptables -I FORWARD -i {self.bridge_name} -o {outgoing_iface} -j ACCEPT"
-            result = cmd_executor.execute_shell(cmd)
-            if not result.ok:
-                self.logger.error(
-                    f"failed to set up forwarding from {self.bridge_name} to {outgoing_iface}: "
-                    f"{result.stderr}")
+            fwd2_check = f"sudo iptables -C FORWARD -i {bridge} -o {out_iface} -j ACCEPT"
+            fwd2_cmd   = f"sudo iptables -I FORWARD -i {bridge} -o {out_iface} -j ACCEPT"
+            if not self._ensure_rule(self, fwd2_check, fwd2_cmd):
                 return False
 
-            # step 4: enable NAT for the virtual network
-            # extract network address from IP and netmask
+            # 4. enable nat for the virtual network
             import ipaddress
             try:
                 ip_interface = ipaddress.IPv4Interface(f"{self.ip_address}/{self.netmask}")
                 network_cidr = str(ip_interface.network)
 
-                # Add masquerade rule
-                cmd = f"sudo iptables -t nat -A POSTROUTING -s {network_cidr} -j MASQUERADE"
-                result = cmd_executor.execute_shell(cmd)
-                if not result.ok:
-                    self.logger.error(
-                        f"failed to set up masquerading for {network_cidr}: {result.stderr}")
+                masq_check = f"sudo iptables -t nat -C POSTROUTING -s {network_cidr} -j MASQUERADE"
+                masq_cmd   = f"sudo iptables -t nat -A POSTROUTING -s {network_cidr} -j MASQUERADE"
+                if not self._ensure_rule(self, masq_check, masq_cmd):
                     return False
 
                 self.logger.info(
