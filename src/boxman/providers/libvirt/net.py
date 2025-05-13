@@ -312,7 +312,7 @@ class Network(VirshCommand):
             return "virbr0"
 
     @staticmethod
-    def _ensure_rule(instance,
+    def _ensure_rule(cls,
                      check_cmd: str,
                      action_cmd: str,
                      present: bool = True) -> bool:
@@ -325,17 +325,17 @@ class Network(VirshCommand):
             action_cmd : command that adds the rule (present) or deletes the rule (absent)
             present    : True -> ensure rule exists, False -> ensure rule is removed
         """
-        chk_res = instance.execute_shell(check_cmd, warn=True)
+        chk_res = cls.execute_shell(check_cmd, warn=True)
 
         # desired state already reached
         if (present and chk_res.return_code == 0) or (not present and chk_res.return_code != 0):
-            instance.logger.debug(f"rule already in desired state: {check_cmd}")
+            cls.logger.debug(f"rule already in desired state: {check_cmd}")
             return True
 
         # need an action to reach desired state
-        apply_res = instance.execute_shell(action_cmd, warn=True)
+        apply_res = cls.execute_shell(action_cmd, warn=True)
         if not apply_res.ok:
-            instance.logger.error(f"failed to execute '{action_cmd}': {apply_res.stderr}")
+            cls.logger.error(f"failed to execute '{action_cmd}': {apply_res.stderr}")
             return False
         return True
 
