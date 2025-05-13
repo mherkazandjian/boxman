@@ -303,13 +303,36 @@ class Network(VirshCommand):
             # return a default if all else fails
             return "virbr0"
 
+    @staticmethod
+    def _ensure_rule(instance, check_cmd: str, insert_cmd: str) -> bool:
+        """
+        Ensure an iptables rule exists, inserting it if necessary.
+
+        Args:
+            instance: The Network (or other) object providing execute_shell & logger
+            check_cmd: Command that checks for rule existence (uses -C)
+            insert_cmd: Command that inserts the rule (uses -I or -A)
+
+        Returns:
+            True on success, False otherwise
+        """
+        check_res = instance.execute_shell(check_cmd, warn=True)
+        if check_res.return_code == 0:
+            instance.logger.debug(f"rule already present: {check_cmd}")
+            return True
+        ins_res = instance.execute_shell(insert_cmd)
+        if not ins_res.ok:
+            instance.logger.error(f"failed to add iptables rule: {insert_cmd}\n{ins_res.stderr}")
+            return False
+        return True
+
     def apply_route_iptables_rule(self) -> bool:
         """
         Apply iptables rules for truly isolated routed networks.
 
         This method configures iptables to:
-        1. Allow VM-to-VM communication on the same bridge
-        2. Block ALL traffic between host and guests in both directions
+        1. Allow vm-to-vm communication on the same bridge
+        2. Block all traffic between host and guests in both directions
 
         Returns:
             True if successful, False otherwise
@@ -318,37 +341,29 @@ class Network(VirshCommand):
             return True  # Nothing to do for non-route networks
 
         try:
-            # get the bridge interface name
             bridge_name = self.bridge_name
             self.logger.info(
                 f"configuring complete isolation for routed network with bridge {bridge_name}")
 
             # 1. allow vm-to-vm communication on the same bridge
-            vm_to_vm_cmd = f"sudo iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
-            self.logger.info(f"setting up vm-to-vm communication: {vm_to_vm_cmd}")
-            result = self.execute_shell(vm_to_vm_cmd)
-            if not result.ok:
-                self.logger.error(f"failed to allow VM-to-VM communication: {result.stderr}")
+            vm2vm_check = f"sudo iptables -C FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
+            vm2vm_cmd   = f"sudo iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
+            if not self._ensure_rule(self, vm2vm_check, vm2vm_cmd):
                 return False
 
-            # 2. block all traffic from the vms to the host
-            host_to_vm_block = f"sudo iptables -I INPUT -i {bridge_name} -j DROP"
-            self.logger.info(f"blocking all traffic from the vms to the host: {host_to_vm_block}")
-            result = self.execute_shell(host_to_vm_block)
-            if not result.ok:
-                self.logger.error(f"failed to block vm to host traffic: {result.stderr}")
+            # 2. block all traffic from the VMs to the host
+            host2vm_check = f"sudo iptables -C INPUT -i {bridge_name} -j DROP"
+            host2vm_cmd   = f"sudo iptables -I INPUT -i {bridge_name} -j DROP"
+            if not self._ensure_rule(self, host2vm_check, host2vm_cmd):
                 return False
 
-            # 3. block ALL traffic from host to the vms
-            vm_to_host_block = f"sudo iptables -I OUTPUT -o {bridge_name} -j DROP"
-            self.logger.info(f"blocking all traffic from host to the vms: {vm_to_host_block}")
-            result = self.execute_shell(vm_to_host_block)
-            if not result.ok:
-                self.logger.error(f"failed to block host to vm traffic: {result.stderr}")
+            # 3. block all traffic from host to the VMs
+            vm2host_check = f"sudo iptables -C OUTPUT -o {bridge_name} -j DROP"
+            vm2host_cmd   = f"sudo iptables -I OUTPUT -o {bridge_name} -j DROP"
+            if not self._ensure_rule(self, vm2host_check, vm2host_cmd):
                 return False
 
-            self.logger.info(
-                f"successfully applied complete isolation for routed network {self.name}")
+            self.logger.info(f"successfully applied complete isolation for routed network {self.name}")
             return True
 
         except Exception as exc:
