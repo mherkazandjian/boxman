@@ -17,6 +17,8 @@ clusters:
     proxy_host: localhost
     admin_user: 'root'
     admin_pass: '${env:BOXMAN_ADMIN_PASS}'
+    # admin_pass: 'file:///abs/or/relative/path'
+    # admin_pass: 'file://~/path/to/file'
     admin_key_name: id_ed25519_boxman    # generated automatically at provisioning time
     ssh_config: ssh_config               # generated automatically at provisioning time
 

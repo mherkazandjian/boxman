@@ -46,7 +46,7 @@ class LibVirtSession:
         Returns:
             True if successful, False otherwise
         """
-        network = Network(name=name, info=info)
+        network = Network(name=name, info=info, provider_config=self.provider_config)
 
         status = network.define_network(
             file_path=os.path.join(workdir, f'{name}_net_define.xml')
@@ -97,7 +97,7 @@ class LibVirtSession:
         Returns:
             True if successful, False otherwise
         """
-        network = Network(name=name, info=info)
+        network = Network(name=name, info=info, provider_config=self.provider_config)
         status = network.remove_network()
         return status
 

@@ -37,7 +37,7 @@ class LibVirtCommandBase:
         self.command_path = None
 
         # override use_sudo if provided
-        if override_config_use_sudo:
+        if override_config_use_sudo is not None:
             self.use_sudo = override_config_use_sudo
 
     def build_command(self, *args, **kwargs) -> str:
@@ -193,7 +193,7 @@ class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
         Args:
             provider_config: Dictionary containing provider-specific configuration
         """
-        super().__init__(provider_config)
+        super().__init__(provider_config=provider_config)
 
         #: str: Connection URI for libvirt
         self.uri = self.provider_config.get('uri', 'qemu:///system')

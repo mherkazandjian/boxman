@@ -524,6 +524,7 @@ class BoxmanManager:
         supported reference formats:
           - Environment variable:  '${env:ENV_VAR_NAME}'
           - File contents:         'file:///abs/or/relative/path'
+          -                        'file://~/path/to/file'
 
         for any other string the input is returned unchanged.
 

@@ -162,8 +162,8 @@ class Network(VirshCommand):
                 raise RuntimeError(f"Unsupported forward mode: {self.forward_mode}")
 
             return True
-        except RuntimeError as e:
-            self.logger.error(f"Error defining network: {e}")
+        except RuntimeError as exc:
+            self.logger.error(f"Error defining network: {exc}")
             return False
 
     def define_and_start(self,
@@ -266,7 +266,9 @@ class Network(VirshCommand):
         # get a list of existing bridge interfaces using brctl
         try:
             # create a shell command to execute brctl
-            cmd_executor = LibVirtCommandBase()
+            cmd_executor = LibVirtCommandBase(
+                provider_config=self.provider_config,
+                override_config_use_sudo=False)
             result = cmd_executor.execute("brctl", "show", hide=True, warn=True)
 
             if not result.ok:
@@ -368,13 +370,16 @@ class Network(VirshCommand):
         """
         try:
             # step 1: find the outgoing interface
-            cmd_executor = LibVirtCommandBase(self.provider_config)
+            cmd_executor = LibVirtCommandBase(
+                provider_config=self.provider_config,
+                override_config_use_sudo=False)
 
             # get the outgoing interface using 'ip route'
             # .. todo:: figure out how to get the default route interface in case the host
             #           is not connected to the internet. This should work even if the host is not
             #           connected to the internet.
-            result = cmd_executor.execute_shell("ip route get 8.8.8.8 | awk '{print $5}'", hide=True)
+            cmd = "ip route get 8.8.8.8 | awk '{print $5}'"
+            result = cmd_executor.execute_shell(cmd, hide=True)
             if not result.ok:
                 self.logger.error(f"failed to find outgoing interface: {result.stderr}")
                 return False
@@ -394,14 +399,18 @@ class Network(VirshCommand):
             cmd = f"sudo iptables -I FORWARD -i {outgoing_iface} -o {self.bridge_name} -j ACCEPT"
             result = cmd_executor.execute_shell(cmd)
             if not result.ok:
-                self.logger.error(f"failed to set up forwarding from {outgoing_iface} to {self.bridge_name}: {result.stderr}")
+                self.logger.error(
+                    f"failed to set up forwarding from {outgoing_iface} to {self.bridge_name}: "
+                    f"{result.stderr}")
                 return False
 
             # forward bridge -> outgoing
             cmd = f"sudo iptables -I FORWARD -i {self.bridge_name} -o {outgoing_iface} -j ACCEPT"
             result = cmd_executor.execute_shell(cmd)
             if not result.ok:
-                self.logger.error(f"failed to set up forwarding from {self.bridge_name} to {outgoing_iface}: {result.stderr}")
+                self.logger.error(
+                    f"failed to set up forwarding from {self.bridge_name} to {outgoing_iface}: "
+                    f"{result.stderr}")
                 return False
 
             # step 4: enable NAT for the virtual network
