@@ -456,13 +456,13 @@ class LibVirtSession:
         try:
             virsh = VirshCommand(self.provider_config)
 
-            # Check if VM is running
+            # check if the vm is running
             result = virsh.execute("domstate", vm_name, warn=True)
             if not result.ok or "running" not in result.stdout:
                 self.logger.warning(f"vm {vm_name} is not running, cannot suspend")
                 return False
 
-            # Try to suspend the VM
+            # try to suspend the vm
             self.logger.info(f"suspending the vm {vm_name}")
             result = virsh.execute("suspend", vm_name)
 
@@ -470,14 +470,14 @@ class LibVirtSession:
                 self.logger.error(f"failed to suspend the vm {vm_name}: {result.stderr}")
                 return False
 
-            # Verify VM is suspended
+            # verify if the vm is suspended
             verify_result = virsh.execute("domstate", vm_name)
             if "paused" in verify_result.stdout:
                 self.logger.info(f"suspended the vm {vm_name} successfully")
                 return True
             else:
                 self.logger.error(
-                    f"vm {vm_name} not suspended. Current state: {verify_result.stdout}")
+                    f"vm {vm_name} not suspended. current state: {verify_result.stdout}")
                 return False
 
         except Exception as exc:

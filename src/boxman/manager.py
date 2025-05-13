@@ -328,13 +328,13 @@ class BoxmanManager:
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
 
-                self.logger.info(f"Starting VM {vm_name}")
+                self.logger.info(f"starting vm {full_vm_name}")
                 success = self.provider.start_vm(full_vm_name)
 
                 if success:
-                    self.logger.info(f"successfully started the vm {vm_name}")
+                    self.logger.info(f"successfully started the vm {full_vm_name}")
                 else:
-                    self.logger.warning(f"failed to start the vm {vm_name}")
+                    self.logger.warning(f"failed to start the vm {full_vm_name}")
 
     def get_connect_info(self) -> bool:
         """
@@ -359,7 +359,7 @@ class BoxmanManager:
                 # if no ip addresses found, mark as failure
                 if not ip_addresses:
                     all_vms_have_ip = False
-                    self.logger.warning(f"vm {vm_name} does not have an ip address yet")
+                    self.logger.warning(f"vm {full_vm_name} does not have an ip address yet")
 
         return all_vms_have_ip
 
@@ -374,7 +374,7 @@ class BoxmanManager:
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
-            self.logger.info(f"Cluster: {cluster_name}")
+            self.logger.info(f"cluster: {cluster_name}")
             self.logger.info("-" * 60)
 
             for vm_name, vm_info in cluster['vms'].items():
@@ -404,7 +404,7 @@ class BoxmanManager:
                 # show direct connection if ip is available
                 if ip_addresses:
                     first_ip = next(iter(ip_addresses.values()))
-                    self.logger.info(f"    Direct: ssh -i {admin_key} {admin_user}@{first_ip}")
+                    self.logger.info(f"    direct: ssh -i {admin_key} {admin_user}@{first_ip}")
 
                 # show connection using ssh_config if available
                 if 'ssh_config' in cluster:
@@ -495,7 +495,7 @@ class BoxmanManager:
 
             # generate key pair if it doesn't exist
             if not os.path.exists(admin_priv_key):
-                self.logger.info(f"generating SSH key pair in {workdir}")
+                self.logger.info(f"generating ssh key pair in {workdir}")
 
                 try:
                     cmd = f'ssh-keygen -t ed25519 -a 100 -f {admin_priv_key} -q -N ""'
@@ -512,7 +512,7 @@ class BoxmanManager:
                     self.logger.error(f"error generating ssh key pair: {exc}")
                     success = False
             else:
-                self.logger.info(f"Using existing SSH key pair at {admin_priv_key}")
+                self.logger.info(f"using existing ssh key pair at {admin_priv_key}")
 
         return success
 
@@ -888,9 +888,8 @@ class BoxmanManager:
         Process the list of VMs to control.
         """
         retval = []
-        prj_name = f'bprj__{cls.config["project"]}__bprj'
+        prj_name = f'bprj__{self.config["project"]}__bprj'
         if hasattr(cli_args, 'vms') and cli_args.vms:
-            _vm_names = cli_args.vms.split(',')
             for cluster_name, cluster in self.config['clusters'].items():
                workdir = os.path.expanduser(cluster['workdir'])
                for vm_name, _ in cluster['vms'].items():
@@ -913,7 +912,7 @@ class BoxmanManager:
         """
         for vm_name, _ in cls.process_vm_list(cli_args):
             cls.provider.suspend_vm(vm_name)
-            cls.logger.info(f"VM {vm_name} suspended")
+            cls.logger.info(f"vm {vm_name} suspended")
 
     @staticmethod
     def resume_vm(cls, cli_args):

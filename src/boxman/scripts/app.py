@@ -499,7 +499,7 @@ def main():
 
     manager = BoxmanManager(config=args.conf)
 
-    # Get the provider and its type
+    # get the provider and its type
     provider = manager.config.get('provider', {'virtualbox': {}})
     provider_type = list(manager.config['provider'].keys())[0]
 
