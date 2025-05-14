@@ -99,7 +99,12 @@ class LibVirtSession:
         Returns:
             True if successful, False otherwise
         """
-        network = Network(name=name, info=info, provider_config=self.provider_config)
+        network = Network(
+            name=name,
+            info=info,
+            provider_config=self.provider_config,
+            assign_new_bridge=False
+        )
         status = network.remove_network()
         return status
 

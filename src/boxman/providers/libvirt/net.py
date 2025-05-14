@@ -20,6 +20,7 @@ class Network(VirshCommand):
     def __init__(self,
                 name: str,
                 info: Dict[str, Any],
+                assign_new_bridge: bool = True,
                 provider_config: Optional[Dict[str, Any]] = None):
         """
         Initialize the network definition with a dictionary-based configuration.
@@ -28,6 +29,7 @@ class Network(VirshCommand):
             name: Name of the network
             info: Dictionary containing network configuration with keys like:
                  mode, bridge, mac, ip, network, enable, etc.
+            assign_new_bridge: Whether to assign a bridge name automatically
             provider_config: Configuration for the libvirt provider
         """
         super().__init__(provider_config=provider_config)
@@ -44,20 +46,24 @@ class Network(VirshCommand):
         # extract bridge configuration
         bridge_info = info.get('bridge', {})
 
-        if bridge_name := self.get_bridge_from_network(name):
-            pass
-        else:
+        if assign_new_bridge:
             # handle the bridge name - if not specified, find the first available virbrX
             bridge_name = bridge_info.get('name')
             if not bridge_name:
                 bridge_name = self.find_available_bridge_name()
+        else:
+            if bridge_name := self.get_bridge_from_network(name):
+                self.logger.info(f"found existing bridge {bridge_name} for network {name}")
+            else:
+                self.logger.warning(f"no existing bridge found for network {name}, "
+                                    f"assigning new bridge name")
 
         #: str: the name of the bridge interface
         self.bridge_name = bridge_name
 
         #: str: use stp on/off for the bridge
         self.bridge_stp = bridge_info.get('stp', 'on')
-        #: str: they delay for the stp
+        #: str: the delay for the stp
         self.bridge_delay = bridge_info.get('delay', '0')
 
         #: str: set the mac address for the bridge
@@ -260,13 +266,11 @@ class Network(VirshCommand):
 
         # remove iptables rules if any
         if self.forward_mode == 'route':
-            self.remove_route_iptables_rule()
+            return self.remove_route_iptables_rule()
         elif self.forward_mode == 'nat':
-            self.remove_nat_config()
+            return self.remove_nat_config()
         else:
             raise RuntimeError(f"Unsupported forward mode: {self.forward_mode}")
-
-        return True
 
     def find_available_bridge_name(self) -> str:
         """
@@ -352,6 +356,10 @@ class Network(VirshCommand):
         if self.forward_mode != 'route':
             return True
 
+        if not self.bridge_name:
+            self.logger.warning("no bridge name found, cannot remove isolation rules")
+            return True
+
         try:
             br_name = self.bridge_name
             self.logger.info(f"removing route isolation rules for bridge {br_name}")
@@ -388,45 +396,71 @@ class Network(VirshCommand):
         if self.forward_mode != 'nat':
             return True
 
-        try:
-            # discover outgoing iface (same logic as insertion)
-            cmd_exec = LibVirtCommandBase(provider_config=self.provider_config,
-                                          override_config_use_sudo=False)
-            res = cmd_exec.execute_shell("ip route get 8.8.8.8 | awk '{print $5}'",
-                                         hide=True, warn=True)
-            out_iface = res.stdout.strip() if res.ok else ""
-            bridge_name = self.bridge_name
+        status = True
 
-            if out_iface:
-                self._ensure_rule(
-                    self,
-                    f"sudo iptables -C FORWARD -i {out_iface} -o {bridge_name} -j ACCEPT",
-                    f"sudo iptables -D FORWARD -i {out_iface} -o {bridge_name} -j ACCEPT",
-                    present=False)
-                self._ensure_rule(
-                    self,
-                    f"sudo iptables -C FORWARD -i {bridge_name} -o {out_iface} -j ACCEPT",
-                    f"sudo iptables -D FORWARD -i {bridge_name} -o {out_iface} -j ACCEPT",
-                    present=False)
-            else:
-                self.logger.warning("could not determine outgoing iface while cleaning nat rules")
+        def remove_ip_tables_rules():
 
-            # remove masquerade
-            import ipaddress
+            if not self.bridge_name:
+                self.logger.warning("no bridge name found, cannot remove isolation rules")
+                return True
+
             try:
-                net_cidr = str(ipaddress.IPv4Interface(f"{self.ip_address}/{self.netmask}").network)
-                self._ensure_rule(
-                    self,
-                    f"sudo iptables -t nat -C POSTROUTING -s {net_cidr} -j MASQUERADE",
-                    f"sudo iptables -t nat -D POSTROUTING -s {net_cidr} -j MASQUERADE",
-                    present=False)
-            except ValueError:
-                self.logger.warning("could not compute network cidr while cleaning masquerade rule")
+                # discover outgoing iface (same logic as insertion)
+                cmd_exec = LibVirtCommandBase(
+                    provider_config=self.provider_config,
+                    override_config_use_sudo=False)
 
-            return True
-        except Exception as exc:
-            self.logger.error(f"error removing NAT configuration for {self.name}: {exc}")
-            return False
+                cmd = "ip route get 8.8.8.8 | awk '{print $5}'"
+                res = cmd_exec.execute_shell(cmd, hide=True, warn=True)
+                out_iface = res.stdout.strip() if res.ok else ""
+                bridge_name = self.bridge_name
+
+                if out_iface:
+                    self._ensure_rule(
+                        self,
+                        f"sudo iptables -C FORWARD -i {out_iface} -o {bridge_name} -j ACCEPT",
+                        f"sudo iptables -D FORWARD -i {out_iface} -o {bridge_name} -j ACCEPT",
+                        present=False)
+                    self._ensure_rule(
+                        self,
+                        f"sudo iptables -C FORWARD -i {bridge_name} -o {out_iface} -j ACCEPT",
+                        f"sudo iptables -D FORWARD -i {bridge_name} -o {out_iface} -j ACCEPT",
+                        present=False)
+                else:
+                    self.logger.warning(
+                        "could not determine outgoing iface while cleaning nat rules")
+
+                return True
+            except Exception as exc:
+                self.logger.error(f"error removing NAT configuration for {self.name}: {exc}")
+                return False
+
+        status &= remove_ip_tables_rules()
+
+        def remove_iptables_nat_rules():
+            try:
+                # remove masquerade
+                import ipaddress
+                try:
+                    net_cidr = str(ipaddress.IPv4Interface(
+                        f"{self.ip_address}/{self.netmask}").network)
+                    self._ensure_rule(
+                        self,
+                        f"sudo iptables -t nat -C POSTROUTING -s {net_cidr} -j MASQUERADE",
+                        f"sudo iptables -t nat -D POSTROUTING -s {net_cidr} -j MASQUERADE",
+                        present=False)
+                except ValueError:
+                    self.logger.warning(
+                        "could not compute network cidr while cleaning masquerade rule")
+
+                return True
+            except Exception as exc:
+                self.logger.error(f"error removing NAT configuration for {self.name}: {exc}")
+                return False
+
+        status &= remove_iptables_nat_rules()
+
+        return status
 
     def apply_route_iptables_rule(self) -> bool:
         """
@@ -563,6 +597,13 @@ class Network(VirshCommand):
         Returns:
             The bridge interface name (e.g. 'virbr0') or None on failure.
         """
+
+        # check if network name exists
+        existing_networks = Network.list_networks(provider_config=provider_config)
+        if network_name not in existing_networks:
+            log.warning(f"network {network_name} does not exist")
+            return None
+
         try:
             virsh = VirshCommand(provider_config=provider_config)
 
