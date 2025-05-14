@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any, Union
 
 import tempfile
 from jinja2 import Template, Environment, FileSystemLoader
+import xml.etree.ElementTree as ET
 
 from .commands import VirshCommand, LibVirtCommandBase
 
@@ -43,10 +44,13 @@ class Network(VirshCommand):
         # extract bridge configuration
         bridge_info = info.get('bridge', {})
 
-        # handle the bridge name - if not specified, find the first available virbrX
-        bridge_name = bridge_info.get('name')
-        if not bridge_name:
-            bridge_name = self.find_available_bridge_name()
+        if bridge_name := self.get_bridge_from_network(name):
+            pass
+        else:
+            # handle the bridge name - if not specified, find the first available virbrX
+            bridge_name = bridge_info.get('name')
+            if not bridge_name:
+                bridge_name = self.find_available_bridge_name()
 
         #: str: the name of the bridge interface
         self.bridge_name = bridge_name
@@ -542,6 +546,51 @@ class Network(VirshCommand):
         except Exception as exc:
             self.logger.error(f"error configuring NAT for network {self.name}: {exc}")
             return False
+
+    @staticmethod
+    def get_bridge_from_network(network_name: str,
+                                provider_config: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """
+        Fetch the bridge name of a network
+
+        An xml dump of the network is obtained using virsh, and the bridge name
+        is extracted from the xml.
+
+        Args:
+            network_name    : the libvirt network to inspect
+            provider_config : optional provider config (sudo, uri, ...)
+
+        Returns:
+            The bridge interface name (e.g. 'virbr0') or None on failure.
+        """
+        try:
+            virsh = VirshCommand(provider_config=provider_config)
+
+            # obtain the xml definition
+            result = virsh.execute("net-dumpxml", network_name)
+            if not result.ok:
+                log.error(f"failed to dump XML for network {network_name}: {result.stderr}")
+                return None
+
+            # write to a temporary file so that we exactly follow the 'dump -> read-back' wording
+            with tempfile.NamedTemporaryFile(mode="w+", suffix=".xml", delete=False) as tmp:
+                tmp.write(result.stdout)
+                tmp_path = tmp.name
+
+            # parse the xml and extract the bridge name
+            bridge_name = None
+            try:
+                tree = ET.parse(tmp_path)
+                bridge_elem = tree.find("./bridge")
+                if bridge_elem is not None:
+                    bridge_name = bridge_elem.attrib.get("name")
+            finally:
+                os.unlink(tmp_path)  # clean up temp file
+
+            return bridge_name
+        except Exception as exc:
+            log.error(f"error getting bridge for network {network_name}: {exc}")
+            return None
 
 
 class NetworkInterface(VirshCommand):
