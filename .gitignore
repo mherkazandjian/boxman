@@ -157,4 +157,4 @@ docs/examples
 .scratch
 .current_env
 .default_env
-data/dev/minimal-libvirt
+data/dev/*
