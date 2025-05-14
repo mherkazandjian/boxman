@@ -2,7 +2,7 @@ import os
 import uuid
 import re
 import pkg_resources
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 
 import tempfile
 from jinja2 import Template, Environment, FileSystemLoader
@@ -591,6 +591,37 @@ class Network(VirshCommand):
         except Exception as exc:
             log.error(f"error getting bridge for network {network_name}: {exc}")
             return None
+
+    @staticmethod
+    def list_networks(provider_config: Optional[Dict[str, Any]] = None,
+                      active_only: bool = False) -> List[str]:
+        """
+        Return the names of libvirt networks.
+
+        Args:
+            provider_config: Optionally forward the provider configuration
+            active_only    : If True, list only active networks; otherwise '--all' is used.
+
+        Returns:
+            A list with network names. Returns an empty list on failure.
+        """
+        try:
+            virsh = VirshCommand(provider_config=provider_config)
+            cmd_parts = ["net-list"]
+            if not active_only:
+                cmd_parts.append("--all")
+            cmd_parts.append("--name")          # names only for easy parsing
+
+            result = virsh.execute(*cmd_parts, warn=True)
+            if not result.ok:
+                log.error(f"failed to list networks: {result.stderr}")
+                return []
+
+            # filter out empty lines that may appear in the output
+            return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        except Exception as exc:
+            log.error(f"error listing networks: {exc}")
+            return []
 
 
 class NetworkInterface(VirshCommand):
