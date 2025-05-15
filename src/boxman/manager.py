@@ -801,8 +801,6 @@ class BoxmanManager:
         ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
 
-        cls.destroy_networks()
-
         prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
@@ -818,6 +816,7 @@ class BoxmanManager:
                     disks=vm_info['disks']
                 )
 
+        cls.destroy_networks()
         # .. todo:: implement undo'ing the provisioning of the files (not important for now)
         #cls.provision_files()
 
