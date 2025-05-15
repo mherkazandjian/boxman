@@ -412,7 +412,7 @@ class BoxmanManager:
                         cluster.get('workdir', '~'),
                         cluster.get('ssh_config', 'ssh_config')
                     ))
-                    self.logger.info(f"    Via config: ssh -F {ssh_config} {hostname}")
+                    self.logger.info(f"    via config: ssh -F {ssh_config} {hostname}")
 
                 self.logger.info("")
 
@@ -846,6 +846,7 @@ class BoxmanManager:
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 cls.provider.snapshot_take(
                     vm_name=full_vm_name,
+                    vm_dir=os.path.expanduser(cluster['workdir']),
                     snapshot_name=cli_args.snapshot_name,
                     description=cli_args.snapshot_descr)
 

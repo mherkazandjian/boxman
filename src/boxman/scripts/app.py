@@ -129,6 +129,7 @@ def parse_args():
         default=now.strftime('%Y-%m-%dT%H-%M-%S')
     )
     parser_snap_take.add_argument(
+        "--description",
         '-m',
         type=str,
         help='the description of the snapshot',
@@ -499,7 +500,7 @@ def main():
 
     manager = BoxmanManager(config=args.conf)
 
-    # get the provider and its type
+    # Get the provider and its type
     provider = manager.config.get('provider', {'virtualbox': {}})
     provider_type = list(manager.config['provider'].keys())[0]
 

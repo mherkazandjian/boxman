@@ -377,12 +377,17 @@ class LibVirtSession:
             return {}
 
     ### snapshots
-    def snapshot_take(self, vm_name=None, snapshot_name=None, description=None):
+    def snapshot_take(self,
+                      vm_name=None,
+                      vm_dir=None,
+                      snapshot_name=None,
+                      description=None):
         """
         Create a snapshot of a specific VM
 
         Args:
             vm_name (str, optional): Full name of the VM to snapshot
+            vm_dir (str): Directory for the VM
             snapshot_name (str): Name for the snapshot
             description (str, optional): Description for the snapshot
 
@@ -394,6 +399,7 @@ class LibVirtSession:
 
         return snapshot_mgr.create_snapshot(
             vm_name=vm_name,
+            vm_dir=vm_dir,
             snapshot_name=snapshot_name,
             description=description)
 
