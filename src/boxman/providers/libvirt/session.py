@@ -634,8 +634,6 @@ class LibVirtSession:
             # try to restore the vm
             self.logger.info(f"restoring the vm {vm_name} from {save_path}")
             result = virsh.execute("restore", save_path)
-            self.logger.info(f"restoring vm {vm_name} from {save_path}")
-            result = virsh.execute("restore", save_path)
 
             if not result.ok:
                 self.logger.error(f"failed to restore the vm {vm_name}: {result.stderr}")
