@@ -509,7 +509,7 @@ class LibVirtSession:
         try:
             virsh = VirshCommand(self.provider_config)
 
-            # Check if VM is suspended
+            # check if the vm is suspended
             result = virsh.execute("domstate", vm_name, warn=True)
             if not result.ok:
                 self.logger.warning(f"vm {vm_name} does not exist")
@@ -519,7 +519,7 @@ class LibVirtSession:
                     f"vm {vm_name} is not suspended (current state: {result.stdout.strip()})")
                 return False
 
-            # Try to resume the VM
+            # try to resume the vm
             self.logger.info(f"resuming the vm {vm_name}")
             result = virsh.execute("resume", vm_name)
 
@@ -527,7 +527,7 @@ class LibVirtSession:
                 self.logger.error(f"failed to resume the vm {vm_name}: {result.stderr}")
                 return False
 
-            # Verify VM is running
+            # verify that the vm is running
             verify_result = virsh.execute("domstate", vm_name)
             if "running" in verify_result.stdout:
                 self.logger.info(f"the vm {vm_name} resumed successfully")
@@ -568,17 +568,17 @@ class LibVirtSession:
 
             save_path = os.path.join(workdir, f"{vm_name}.save")
 
-            # try to save the VM state
-            self.logger.info(f"saving VM {vm_name} state to {save_path}")
+            # try to save the vm state
+            self.logger.info(f"saving the vm {vm_name} state to {save_path}")
             result = virsh.execute("save", vm_name, save_path)
 
             if not result.ok:
                 self.logger.error(f"failed to save the vm {vm_name} state: {result.stderr}")
                 return False
 
-            # Verify the save file exists
+            # verify the save file exists
             if os.path.exists(save_path):
-                self.logger.info(f"VM {vm_name} state saved successfully to {save_path}")
+                self.logger.info(f"vm {vm_name} state saved successfully to {save_path}")
                 return True
             else:
                 self.logger.error(f"Save file {save_path} not created for VM {vm_name}")
@@ -590,7 +590,7 @@ class LibVirtSession:
 
     def restore_vm(self, vm_name: str, workdir: str) -> bool:
         """
-        Restore VM from a saved state file in the specified workdir.
+        Restore the vm from a saved state file in the specified workdir.
 
         Args:
             vm_name: Name of the VM to restore
@@ -602,16 +602,16 @@ class LibVirtSession:
         try:
             virsh = VirshCommand(self.provider_config)
 
-            # Expand the workdir path
+            # expand the workdir path
             workdir = os.path.expanduser(workdir)
             save_path = os.path.join(workdir, f"{vm_name}.save")
 
-            # Check if save file exists
+            # check if save file exists
             if not os.path.exists(save_path):
                 self.logger.error(f"save file {save_path} does not exist")
                 return False
 
-            # Check if the VM is defined but not running
+            # check if the VM is defined but not running
             exists_result = virsh.execute("domstate", vm_name, warn=True)
             if exists_result.ok and "running" in exists_result.stdout:
                 self.logger.warning(f"vm {vm_name} is already running, shutting down first")
@@ -620,7 +620,7 @@ class LibVirtSession:
                     self.logger.error(f"Failed to shutdown VM {vm_name} before restore: {shutdown_result.stderr}")
                     return False
 
-                # Wait for VM to shut down
+                # wait for the vm to shut down
                 for i in range(30):
                     state_result = virsh.execute("domstate", vm_name, warn=True)
                     if state_result.ok and "shut off" in state_result.stdout:
@@ -630,7 +630,9 @@ class LibVirtSession:
                     self.logger.error(f"vm {vm_name} did not shut down within timeout")
                     return False
 
-            # try to restore the VM
+            # try to restore the vm
+            self.logger.info(f"restoring the vm {vm_name} from {save_path}")
+            result = virsh.execute("restore", save_path)
             self.logger.info(f"restoring vm {vm_name} from {save_path}")
             result = virsh.execute("restore", save_path)
 
