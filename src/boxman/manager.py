@@ -319,7 +319,7 @@ class BoxmanManager:
 
     def configure_cpu_mem(self) -> None:
         """
-        Configure CPU and memory settings for all VMs based on their configuration.
+        Configure cpu and memory settings for all vms based on their configuration.
 
         This method modifies the CPU and memory settings of VMs after they have been cloned.
         """
@@ -329,19 +329,19 @@ class BoxmanManager:
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
 
                 self.logger.info(
-                    f"configuring CPU and memory for vm {vm_name} in cluster {cluster_name}")
+                    f"configuring cpu and memory for vm {vm_name} in cluster {cluster_name}")
 
-                # extract CPU and memory configuration
+                # extract the cpu and memory configuration
                 cpus = vm_info.get('cpus')
                 memory = vm_info.get('memory')
 
-                # skip if neither CPU nor memory is configured
+                # skip if neither cpu nor memory is configured
                 if not cpus and not memory:
                     self.logger.warning(
-                        f"no CPU or memory configuration for vm {vm_name}, skipping")
+                        f"no cpu or memory configuration for vm {vm_name}, skipping")
                     continue
 
-                # configure CPU and memory
+                # configure cpu and memory
                 success = self.provider.configure_vm_cpu_memory(
                     vm_name=full_vm_name,
                     cpus=cpus,
@@ -349,9 +349,9 @@ class BoxmanManager:
                 )
 
                 if success:
-                    self.logger.info(f"successfully configured CPU and memory for vm {vm_name}")
+                    self.logger.info(f"successfully configured cpu and memory for vm {vm_name}")
                 else:
-                    self.logger.warning(f"failed to configure CPU and memory for vm {vm_name}")
+                    self.logger.warning(f"failed to configure cpu and memory for vm {vm_name}")
 
     def start_vms(self) -> None:
         """

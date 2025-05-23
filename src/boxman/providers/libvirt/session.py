@@ -663,10 +663,10 @@ class LibVirtSession:
                                 cpus: Optional[Dict[str, int]] = None,
                                 memory_mb: Optional[int] = None) -> bool:
         """
-        Configure CPU and memory settings for a VM.
+        Configure cpu and memory settings for a vm.
 
         Args:
-            vm_name: Name of the VM
+            vm_name: Name of the vm
             cpus: Dictionary with 'sockets', 'cores', 'threads' keys
             memory_mb: Memory in MB
 
