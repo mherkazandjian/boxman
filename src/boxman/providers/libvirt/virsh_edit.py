@@ -1,4 +1,4 @@
-import xml.etree.ElementTree as ET
+from lxml import etree, html
 from typing import Dict, Any, Optional, List, Tuple
 from boxman import log
 from .commands import VirshCommand
@@ -55,15 +55,30 @@ class VirshEdit:
             Modified XML content as string
         """
         try:
-            root = ET.fromstring(xml_content)
+            # Parse XML using lxml for better XPath support
+            tree = etree.fromstring(xml_content.encode('utf-8'))
 
             for xpath, attr_or_text, new_value in modifications:
-                elements = root.findall(xpath)
+                # Use lxml XPath to find elements
+                elements = tree.xpath(xpath)
 
                 if not elements:
-                    self.logger.warning(f"No elements found for XPath: {xpath}")
-                    continue
-
+                    # Special handling for CPU topology - create if it doesn't exist
+                    if xpath == '//cpu/topology':
+                        cpu_elements = tree.xpath('//cpu')
+                        if cpu_elements:
+                            cpu_element = cpu_elements[0]
+                            # Create topology element using XPath-style approach
+                            topology_element = etree.Element('topology')
+                            cpu_element.append(topology_element)
+                            elements = [topology_element]
+                            self.logger.info(f"Created new topology element under cpu")
+                        else:
+                            self.logger.warning(f"No cpu element found to add topology to")
+                            continue
+                    else:
+                        self.logger.warning(f"No elements found for XPath: {xpath}")
+                        continue
                 for element in elements:
                     if attr_or_text == 'text':
                         element.text = new_value
@@ -72,13 +87,48 @@ class VirshEdit:
 
                 self.logger.debug(f"Modified {len(elements)} element(s) at {xpath}")
 
-            return ET.tostring(root, encoding='unicode')
+            # Return the modified XML as string
+            return etree.tostring(tree, encoding='unicode', pretty_print=True)
 
-        except ET.ParseError as exc:
+        except etree.XMLSyntaxError as exc:
             self.logger.error(f"Failed to parse XML: {exc}")
             raise
         except Exception as exc:
             self.logger.error(f"Failed to modify XML: {exc}")
+            raise
+
+    def find_xpath_values(self, xml_content: str, xpath: str) -> List[str]:
+        """
+        Find values using XPath expressions.
+
+        Args:
+            xml_content: The XML content to search
+            xpath: XPath expression to find values
+
+        Returns:
+            List of matching values
+        """
+        try:
+            tree = etree.fromstring(xml_content.encode('utf-8'))
+            matches = tree.xpath(xpath)
+
+            # Convert results to strings
+            result = []
+            for match in matches:
+                if isinstance(match, str):
+                    result.append(match)
+                elif hasattr(match, 'text') and match.text:
+                    result.append(match.text)
+                else:
+                    result.append(str(match))
+
+            return result
+
+        except etree.XMLSyntaxError as exc:
+            self.logger.error(f"Failed to parse XML: {exc}")
+            raise
+        except Exception as exc:
+            self.logger.error(f"Failed to find XPath values: {exc}")
             raise
 
     def configure_cpu_memory(self,
@@ -99,14 +149,27 @@ class VirshEdit:
         try:
             # Get current XML
             xml_content = self.get_domain_xml(domain_name)
+
+            # Debug: Log current CPU configuration
+            tree = etree.fromstring(xml_content.encode('utf-8'))
+            cpu_elements = tree.xpath('//cpu')
+            if cpu_elements:
+                self.logger.debug(f"Found CPU element: {etree.tostring(cpu_elements[0], encoding='unicode')}")
+
+            topology_elements = tree.xpath('//cpu/topology')
+            if topology_elements:
+                self.logger.debug(f"Found topology element: {etree.tostring(topology_elements[0], encoding='unicode')}")
+            else:
+                self.logger.debug("No topology element found")
+
             modifications = []
 
             # Configure memory if specified
             if memory_mb is not None:
                 memory_kb = memory_mb * 1024
                 modifications.extend([
-                    ('./memory', 'text', str(memory_kb)),
-                    ('./currentMemory', 'text', str(memory_kb))
+                    ('//memory', 'text', str(memory_kb)),
+                    ('//currentMemory', 'text', str(memory_kb))
                 ])
 
             # Configure CPU if specified
@@ -117,10 +180,10 @@ class VirshEdit:
                 total_vcpus = sockets * cores * threads
 
                 modifications.extend([
-                    ('./vcpu', 'text', str(total_vcpus)),
-                    ('./cpu/topology', 'sockets', str(sockets)),
-                    ('./cpu/topology', 'cores', str(cores)),
-                    ('./cpu/topology', 'threads', str(threads))
+                    ('//vcpu', 'text', str(total_vcpus)),
+                    ('//cpu/topology', 'sockets', str(sockets)),
+                    ('//cpu/topology', 'cores', str(cores)),
+                    ('//cpu/topology', 'threads', str(threads))
                 ])
 
             if not modifications:
