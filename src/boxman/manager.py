@@ -317,6 +317,42 @@ class BoxmanManager:
                 else:
                     self.logger.warning(f"some disks could not be configured for vm {vm_name}")
 
+    def configure_cpu_mem(self) -> None:
+        """
+        Configure CPU and memory settings for all VMs based on their configuration.
+
+        This method modifies the CPU and memory settings of VMs after they have been cloned.
+        """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        for cluster_name, cluster in self.config['clusters'].items():
+            for vm_name, vm_info in cluster['vms'].items():
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+
+                self.logger.info(
+                    f"configuring CPU and memory for vm {vm_name} in cluster {cluster_name}")
+
+                # extract CPU and memory configuration
+                cpus = vm_info.get('cpus')
+                memory = vm_info.get('memory')
+
+                # skip if neither CPU nor memory is configured
+                if not cpus and not memory:
+                    self.logger.warning(
+                        f"no CPU or memory configuration for vm {vm_name}, skipping")
+                    continue
+
+                # configure CPU and memory
+                success = self.provider.configure_vm_cpu_memory(
+                    vm_name=full_vm_name,
+                    cpus=cpus,
+                    memory_mb=memory
+                )
+
+                if success:
+                    self.logger.info(f"successfully configured CPU and memory for vm {vm_name}")
+                else:
+                    self.logger.warning(f"failed to configure CPU and memory for vm {vm_name}")
+
     def start_vms(self) -> None:
         """
         Start all VMs in the configuration.
@@ -749,6 +785,8 @@ class BoxmanManager:
         cls.define_networks()
 
         cls.clone_vms()
+
+        cls.configure_cpu_mem()
 
         cls.configure_network_interfaces()
 

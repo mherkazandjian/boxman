@@ -10,6 +10,7 @@ from datetime import datetime
 from boxman import log
 from .snapshot import SnapshotManager
 from .commands import VirshCommand
+from .virsh_edit import VirshEdit
 
 
 class LibVirtSession:
@@ -656,3 +657,21 @@ class LibVirtSession:
             self.logger.error(f"error restoring the vm {vm_name}: {exc}")
             return False
     ### end control vm
+
+    def configure_vm_cpu_memory(self,
+                                vm_name: str,
+                                cpus: Optional[Dict[str, int]] = None,
+                                memory_mb: Optional[int] = None) -> bool:
+        """
+        Configure CPU and memory settings for a VM.
+
+        Args:
+            vm_name: Name of the VM
+            cpus: Dictionary with 'sockets', 'cores', 'threads' keys
+            memory_mb: Memory in MB
+
+        Returns:
+            True if successful, False otherwise
+        """
+        editor = VirshEdit(provider_config=self.provider_config)
+        return editor.configure_cpu_memory(vm_name, cpus, memory_mb)

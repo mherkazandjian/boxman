@@ -64,6 +64,11 @@ clusters:
               type: qcow2
             target: vdb
             size: 2048
+        cpus:
+          sockets: 1
+          cores: 1
+          threads: 1
+        memory: 2048
         network_adapters:
           - name: adapter_1
             link_state: 'up'
