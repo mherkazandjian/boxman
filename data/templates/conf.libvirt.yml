@@ -94,6 +94,24 @@ clusters:
           - name: adapter_2
             link_state: 'up'
             network_source: 'isolated1'
+      {% for i in range(3, 8) %}
+      boxman{{ "%02d" % i }}:
+        hostname: boxman{{ "%02d" % i }}
+        disks:
+          - name: disk01
+            driver:
+              name: qemu
+              type: qcow2
+            target: vdb
+            size: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'isolated1'
+      {% endfor %}
     files:
       env.sh: |
         export INVENTORY=inventory

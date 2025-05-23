@@ -6,6 +6,7 @@ import yaml
 from multiprocessing import Pool
 from multiprocessing import Process
 from invoke import run
+from jinja2 import Environment, FileSystemLoader, Template
 
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.utils.io import write_files
@@ -59,15 +60,40 @@ class BoxmanManager:
         """
         Load configuration from a YAML file.
 
+        The file is first treated as a Jinja template and rendered,
+        then parsed as YAML.
+
         Args:
             config_path: Path to the configuration file
 
         Returns:
             Dict containing the configuration
         """
-        # Load the configuration file
-        with open(config_path) as fobj:
-            conf: Dict[str, Any] = yaml.safe_load(fobj.read())
+        # get the directory and filename for jinja template loading
+        config_dir = os.path.dirname(os.path.abspath(config_path))
+        config_filename = os.path.basename(config_path)
+
+        # create jinja environment with the config directory as template path
+        env = Environment(loader=FileSystemLoader(config_dir))
+
+        # load the template
+        template = env.get_template(config_filename)
+
+        # render the template (you can pass variables here if needed)
+        rendered_yaml = template.render(
+            env=os.environ,  # make environment variables available in template
+        )
+
+        # parse the rendered yaml
+        conf = yaml.safe_load(rendered_yaml)
+
+        # dump the rendered yaml file for debugging/inspection
+        rendered_filename = f"{os.path.splitext(config_filename)[0]}.rendered.yml"
+        rendered_path = os.path.join(config_dir, rendered_filename)
+        with open(rendered_path, 'w') as fobj:
+            fobj.write(rendered_yaml)
+            self.logger.info(f"rendered YAML template written to {rendered_path}")
+
         return conf
 
     def provision_files(self) -> None:
