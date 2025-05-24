@@ -1,6 +1,4 @@
 import os
-import uuid
-import re
 from typing import Optional, Dict, Any
 from boxman import log
 
@@ -36,6 +34,9 @@ class CloneVM:
         #: str: the path to the disk image
         self.new_image_path = os.path.expanduser(os.path.join(workdir, f'{new_vm_name}.qcow2'))
 
+        #: the info of the vm
+        self.info = info
+
         #: VirtCloneCommand: the command executor for virt-clone
         self.virt_clone = VirtCloneCommand(provider_config)
 
@@ -64,10 +65,12 @@ class CloneVM:
             self.logger.info(f"cloning the vm {self.src_vm_name} to {self.new_vm_name}")
             self.virt_clone.execute(*cmd_args, **cmd_kwargs)
 
-            # after cloning, remove all inherited network interfaces
-            if not self.remove_network_interfaces():
-                self.logger.warning(
-                    f"failed to remove network interfaces from the vm {self.new_vm_name}")
+            # after cloning, remove all inherited network interfaces if the machine has network
+            # interfaces defined. .. todo:: do this later on when configuring network interfaces
+            if 'network_adapters' in self.info:
+                if not self.remove_network_interfaces():
+                    self.logger.warning(
+                        f"failed to remove network interfaces from the vm {self.new_vm_name}")
 
             return True
         except RuntimeError as exc:

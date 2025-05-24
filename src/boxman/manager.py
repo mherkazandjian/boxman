@@ -166,7 +166,7 @@ class BoxmanManager:
         Define the networks specified in the cluster configuration.
         """
         for cluster_name, cluster in self.config['clusters'].items():
-            for network_name, network_info in cluster['networks'].items():
+            for network_name, network_info in cluster.get('networks', {}).items():
 
                 _network_name = self.full_network_name(
                     project_config=self.config,
@@ -186,7 +186,7 @@ class BoxmanManager:
         Destroy the networks specified in the cluster configuration.
         """
         for cluster_name, cluster in self.config['clusters'].items():
-            for network_name, network_info in cluster['networks'].items():
+            for network_name, network_info in cluster.get('networks', {}).items():
 
                 _network_name = self.full_network_name(
                     project_config=self.config,
@@ -789,8 +789,6 @@ class BoxmanManager:
 
     @staticmethod
     def provision(cls, cli_args):
-
-        cls.deprovision(cls, cli_args)
 
         config = cls.config
         cluster_group = list(config['clusters'].keys())[0]  # one cluster supported for now

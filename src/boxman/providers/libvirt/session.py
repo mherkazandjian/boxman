@@ -12,7 +12,6 @@ from .snapshot import SnapshotManager
 from .commands import VirshCommand
 from .virsh_edit import VirshEdit
 
-
 class LibVirtSession:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """
@@ -197,7 +196,7 @@ class LibVirtSession:
         """
 
         try:
-            virsh = VirshCommand(self.provider_config)
+            virsh = VirshCommand(provider_config=self.provider_config)
 
             # check if the vm is already running
             result = virsh.execute("domstate", vm_name, warn=True)
@@ -334,8 +333,7 @@ class LibVirtSession:
         """
         try:
             # use virsh commands to get domain info
-            from .commands import VirshCommand
-            virsh = VirshCommand(self.config.get('provider', {}))
+            virsh = VirshCommand(provider_config=self.provider_config)
 
             # first check if the vm is running
             result = virsh.execute("domstate", vm_name, warn=True)
@@ -467,7 +465,7 @@ class LibVirtSession:
             True if successful, False otherwise
         """
         try:
-            virsh = VirshCommand(self.provider_config)
+            virsh = VirshCommand(provider_config=self.provider_config)
 
             # check if the vm is running
             result = virsh.execute("domstate", vm_name, warn=True)
@@ -508,7 +506,7 @@ class LibVirtSession:
             True if successful, False otherwise
         """
         try:
-            virsh = VirshCommand(self.provider_config)
+            virsh = VirshCommand(provider_config=self.provider_config)
 
             # check if the vm is suspended
             result = virsh.execute("domstate", vm_name, warn=True)
@@ -554,7 +552,7 @@ class LibVirtSession:
             True if successful, False otherwise
         """
         try:
-            virsh = VirshCommand(self.provider_config)
+            virsh = VirshCommand(provider_config=self.provider_config)
 
             # Check if VM is running
             result = virsh.execute("domstate", vm_name, warn=True)
@@ -601,7 +599,7 @@ class LibVirtSession:
             True if successful, False otherwise
         """
         try:
-            virsh = VirshCommand(self.provider_config)
+            virsh = VirshCommand(provider_config=self.provider_config)
 
             # expand the workdir path
             workdir = os.path.expanduser(workdir)
