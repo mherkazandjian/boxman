@@ -291,11 +291,14 @@ class BoxmanManager:
                     # use the fully qualified network name to which the adapter will connect to
                     for adapter in vm_info['network_adapters']:
 
-                        full_network_name = self.full_network_name(
-                            project_config=self.config,
-                            cluster_name=cluster_name,
-                            network_name=adapter['network_source']
-                        )
+                        if adapter.get('is_global', False):
+                            full_network_name = adapter['network_source']
+                        else:
+                            full_network_name = self.full_network_name(
+                                project_config=self.config,
+                                cluster_name=cluster_name,
+                                network_name=adapter['network_source']
+                            )
 
                         adapter['network_source'] = full_network_name
 

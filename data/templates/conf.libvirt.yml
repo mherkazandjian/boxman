@@ -96,6 +96,10 @@ clusters:
           - name: adapter_2
             link_state: 'up'
             network_source: 'isolated1'
+          - name: adapter_3
+            link_state: 'up'
+            network_source: 'default'
+            is_global: True             # set to True to use the global network without expanding the network name to the project scope
       {% for i in range(3, 8) %}
       boxman{{ "%02d" % i }}:
         hostname: boxman{{ "%02d" % i }}
