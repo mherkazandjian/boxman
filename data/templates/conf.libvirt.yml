@@ -81,12 +81,14 @@ clusters:
       boxman02:
         hostname: boxman02
         disks:
-          - name: disk01
+          {% for suffix in 'bcde' %}        # add disks vdb, vdc, vdd, vde
+          - name: disk{{ suffix }}
             driver:
               name: qemu
               type: qcow2
-            target: vdb
+            target: vd{{ suffix }}
             size: 2048
+          {% endfor %}
         network_adapters:
           - name: adapter_1
             link_state: 'up'
