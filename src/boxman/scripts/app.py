@@ -29,7 +29,11 @@ def parse_args():
             "\n"
             "usage example\n"
             "\n"
-            "   provision"
+            "   list\n"
+            "       # list all projects that have been provisioned\n"
+            "       $ boxman list\n"
+            "\n"
+            "   provision\n"
             "       # provision the configuration in the default config file (conf.yml)\n"
             "       $ boxman provision\n"
             "\n"
@@ -82,6 +86,12 @@ def parse_args():
     )
 
     subparsers = parser.add_subparsers(help=f"sub-commands for boxman")
+
+    #
+    # sub parser for listing the registered projects
+    #
+    parser_list = subparsers.add_parser('list', help='list all registered projects')
+    parser_list.set_defaults(func=BoxmanManager.list_projects)
 
     #
     # sub parser for provisioning a configuration
@@ -440,8 +450,6 @@ def machine_start(session, cli_args):
     [p.join() for p in processes]
 
 
-
-
 def export_config(session: Session, cli_args):
     """
     Take the vms
@@ -465,7 +473,6 @@ def export_config(session: Session, cli_args):
     [p.start() for p in processes]
     [p.join() for p in processes]
     #_ = [_export_vm(vm, cli_args.export_path) for vm in vms]
-
 
 
 def import_config(session: Session, cli_args):
@@ -498,22 +505,25 @@ def main():
         print(f'v{boxman.metadata.version}')
         sys.exit(0)
 
-    manager = BoxmanManager(config=args.conf)
+    if args.func == BoxmanManager.list_projects:
+        manager = BoxmanManager(config=None)
+        args.func(manager, None)
+        sys.exit(0)
+    else:
+        manager = BoxmanManager(config=args.conf)
 
-    # get the provider and its type
-    provider = manager.config.get('provider', {'virtualbox': {}})
-    provider_type = list(manager.config['provider'].keys())[0]
+        provider_type = list(manager.config['provider'].keys())[0]
 
-    if provider_type == 'virtualbox':
-        session = Virtualbox(manager.config)
-    elif provider_type == 'libvirt':
-        session = LibVirtSession(manager.config)
-        manager.provider = session
-    elif provider_type == 'docker-compose':
-        raise NotImplementedError('docker-compose is not implemented yet')
-        from boxman.docker_compose.docker_compose import DockerCompose
+        if provider_type == 'virtualbox':
+            session = Virtualbox(manager.config)    # .. todo:: rename to VirtualBoxSession
+        elif provider_type == 'libvirt':
+            session = LibVirtSession(manager.config)
+            manager.provider = session
+        elif provider_type == 'docker-compose':
+            raise NotImplementedError('docker-compose is not implemented yet')
+            from boxman.docker_compose.docker_compose import DockerCompose
 
-    args.func(manager, args)
+        args.func(manager, args)
 
 
 if __name__ == '__main__':

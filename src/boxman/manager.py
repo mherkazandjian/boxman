@@ -9,6 +9,7 @@ from invoke import run
 from jinja2 import Environment, FileSystemLoader, Template
 
 from boxman.providers.libvirt.session import LibVirtSession
+from boxman.config_cache import BoxmanCache
 from boxman.utils.io import write_files
 from boxman import log
 
@@ -35,6 +36,8 @@ class BoxmanManager:
         if isinstance(config, str):
             self.config_path = config
             self.config = self.load_config(config)
+
+        self.cache = BoxmanCache()
 
     @property
     def provider(self) -> Optional["LibVirtSession"]:
@@ -159,6 +162,49 @@ class BoxmanManager:
             return retval
         else:
             raise ValueError(f"Invalid network name format: {network_name}")
+
+    @staticmethod
+    def list_projects(cls, _) -> None:
+        """
+        List all projects that have been provisioned
+
+        :param manager: The instance of the BoxmanManager
+        :param cli_args: The parsed arguments from the cli
+        """
+        # print table header
+        header_project = "project_name"
+        header_path = "project path"
+        padding_project = 20
+        padding_path = 50
+        print(f"{header_project:<{padding_project}} | {header_path:<{padding_path}}")
+
+        # create separator line with "+" at the intersection
+        separator_project = "-" * padding_project
+        separator_path = "-" * padding_path
+        print(f"{separator_project}-+{separator_path}")
+
+        # Print each project row
+        for project, project_conf_path in cls.cache.read_projects_cache().items():
+            print(f"{project:<{padding_project}} | {project_conf_path:<{padding_path}}")
+    ### register/un-register the project in the cache
+    def register_in_cache(self) -> None:
+        """
+        Register the project in the Boxman cache.
+
+        This method saves the project configuration to the cache for later use.
+        """
+        self.cache.register_project(
+            project_name=self.config['project'],
+            config_fpath=self.config_path)
+
+    def unregister_from_cache(self) -> None:
+        """
+        Register the project in the Boxman cache.
+
+        This method saves the project configuration to the cache for later use.
+        """
+        self.cache.unregister_project(project_name=self.config['project'])
+    ### end register the project in the cache
 
     ### networks define / remove / destroy
     def define_networks(self) -> None:
@@ -807,6 +853,8 @@ class BoxmanManager:
         if not os.path.isdir(workdir):
             os.makedirs(workdir)
 
+        cls.register_in_cache()
+
         cls.provision_files()
 
         cls.define_networks()
@@ -884,6 +932,8 @@ class BoxmanManager:
         cls.destroy_networks()
         # .. todo:: implement undo'ing the provisioning of the files (not important for now)
         #cls.provision_files()
+
+        cls.unregister_from_cache()
 
         return
 
