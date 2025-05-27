@@ -23,6 +23,9 @@ class BoxmanCache:
         #: str: the path to the cache directory where boxman stores its data
         self.cache_dir = os.path.expanduser(DEFAULT_CACHE_DIR)
 
+        #: str: the path to the projects cache file
+        self.projects_cache_file = os.path.join(self.cache_dir, 'projects.json')
+
         #: dict: contains information about projects that are managed by boxman
         self.projects = None
 
@@ -36,6 +39,19 @@ class BoxmanCache:
         if not os.path.exists(self.cache_dir):
             os.makedirs(self.cache_dir, exist_ok=True)
             log.info(f"cache directory created at: {self.cache_dir}")
+
+    def read_projects_cache(self) -> dict:
+        """
+        Read the cache and return its contents.
+        """
+        if not os.path.exists(self.projects_cache_file):
+            log.warning(f"no projects cache file found at {self.projects_cache_file}")
+            return {}
+
+        with open(self.projects_cache_file, 'r') as fobj:
+            self.projects = json.load(fobj)
+
+        return self.projects
 
     def register_project(self,
                          project_name: str,
@@ -51,14 +67,12 @@ class BoxmanCache:
         """
         # if the projects.json file does not exist, create it else load it
         # assuming that it is a valid JSON file
-        projects_file = os.path.abspath(os.path.join(self.cache_dir, 'projects.json'))
-        if not os.path.exists(projects_file):
-            with open(projects_file, 'w') as fobj:
+        if not os.path.exists(self.projects_cache_file):
+            with open(self.projects_cache_file, 'w') as fobj:
                 self.projects = {}
                 fobj.write('{}')
         else:
-            with open(projects_file, 'r') as fobj:
-                self.projects = json.load(fobj)
+            self.read_projects_cache()
 
         # if the project already exists, log an error and return
         if project_name in self.projects:
@@ -66,9 +80,13 @@ class BoxmanCache:
             log.error(msg)
             return False
 
-        self.projects[project_name] = os.path.abspath(os.path.expanduser(config_fpath))
-        with open(projects_file, 'w') as fobj:
+        self.projects[project_name] = {
+            'conf': os.path.abspath(os.path.expanduser(config_fpath))
+        }
+
+        with open(self.projects_cache_file, 'w') as fobj:
             json.dump(self.projects, fobj, indent=4)
+
         log.info(f"project '{project_name}' registered in cache with path: {config_fpath}")
 
     def unregister_project(self, project_name: str) -> bool:
@@ -82,14 +100,7 @@ class BoxmanCache:
             True if the project was unregistered, False otherwise
         """
         # load the projects file if it exists
-        projects_file = os.path.join(self.cache_dir, 'projects.json')
-        if not os.path.exists(projects_file):
-            log.warning(f"no projects cache file found at {projects_file}")
-            return False
-
-        # load the existing projects
-        with open(projects_file, 'r') as fobj:
-            self.projects = json.load(fobj)
+        self.read_projects_cache()
 
         # check if the project exists in the cache
         if project_name not in self.projects:
@@ -98,22 +109,8 @@ class BoxmanCache:
 
         # remove the project and update the file
         removed_path = self.projects.pop(project_name)
-        with open(projects_file, 'w') as fobj:
+        with open(self.projects_cache_file, 'w') as fobj:
             json.dump(self.projects, fobj, indent=4)
 
         log.info(f"project '{project_name}' unregistered from cache (was at: {removed_path})")
         return True
-
-    def read_projects_cache(self) -> dict:
-        """
-        Read the projects cache file and return its contents.
-        """
-        projects_file = os.path.join(self.cache_dir, 'projects.json')
-        if not os.path.exists(projects_file):
-            log.warning(f"no projects cache file found at {projects_file}")
-            return {}
-
-        with open(projects_file, 'r') as fobj:
-            self.projects = json.load(fobj)
-
-        return self.projects

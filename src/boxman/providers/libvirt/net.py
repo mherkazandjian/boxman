@@ -21,7 +21,8 @@ class Network(VirshCommand):
                 name: str,
                 info: Dict[str, Any],
                 assign_new_bridge: bool = True,
-                provider_config: Optional[Dict[str, Any]] = None):
+                provider_config: Optional[Dict[str, Any]] = None,
+                cache = None):
         """
         Initialize the network definition with a dictionary-based configuration.
 
@@ -31,6 +32,7 @@ class Network(VirshCommand):
                  mode, bridge, mac, ip, network, enable, etc.
             assign_new_bridge: Whether to assign a bridge name automatically
             provider_config: Configuration for the libvirt provider
+            cache: Optional cache object for storing network definitions
         """
         super().__init__(provider_config=provider_config)
 
@@ -45,6 +47,9 @@ class Network(VirshCommand):
 
         # extract bridge configuration
         bridge_info = info.get('bridge', {})
+
+        #: the cache object to be used to store network information
+        self.cache = cache
 
         if assign_new_bridge:
             # handle the bridge name - if not specified, find the first available virbrX
@@ -129,18 +134,34 @@ class Network(VirshCommand):
 
     def write_xml(self, file_path: str) -> str:
         """
-        Write the XML to a file.
+        Write the xml configuration to a file.
 
         Args:
-            file_path: Path where the XML file should be written
+            file_path: The path where the xml file should be written
 
         Returns:
             The path to the written file
         """
         xml_content = self.generate_xml()
-        with open(os.path.expanduser(file_path), 'w') as f:
-            f.write(xml_content)
+        with open(os.path.expanduser(file_path), 'w') as fobj:
+            fobj.write(xml_content)
+
         return file_path
+
+    def check_network_exists(self) -> bool:
+        """
+        Check if there are any issues or conflicts with existing networks.
+
+        Returns:
+            True if the network exists, False otherwise
+        """
+        asasd
+        try:
+            result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
+            return result.return_code == 0
+        except RuntimeError as exc:
+            self.logger.error(f"Error checking network existence: {exc}")
+            return False
 
     def define_network(self, file_path: Optional[str] = None):
         """

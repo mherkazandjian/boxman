@@ -184,10 +184,11 @@ class BoxmanManager:
         print(f"{separator_project}-+{separator_path}")
 
         # Print each project row
-        for project, project_conf_path in cls.cache.read_projects_cache().items():
-            print(f"{project:<{padding_project}} | {project_conf_path:<{padding_path}}")
+        for project, project_data in cls.cache.read_projects_cache().items():
+            print(f"{project:<{padding_project}} | {project_data['conf']:<{padding_path}}")
+
     ### register/un-register the project in the cache
-    def register_in_cache(self) -> None:
+    def register_project_in_cache(self) -> None:
         """
         Register the project in the Boxman cache.
 
@@ -853,7 +854,7 @@ class BoxmanManager:
         if not os.path.isdir(workdir):
             os.makedirs(workdir)
 
-        cls.register_in_cache()
+        cls.register_project_in_cache()
 
         cls.provision_files()
 

@@ -517,9 +517,10 @@ def main():
         if provider_type == 'virtualbox':
             session = Virtualbox(manager.config)    # .. todo:: rename to VirtualBoxSession
         elif provider_type == 'libvirt':
-            session = LibVirtSession(manager.config)
-            manager.provider = session
-        elif provider_type == 'docker-compose':
+            session = LibVirtSession(manager.config)  # .. todo:: since the manager is needed for
+            session.manager = manager                 #           the cache probably a good idea
+            manager.provider = session                #           to pass it in full instead of
+        elif provider_type == 'docker-compose':       #           passing the config as well
             raise NotImplementedError('docker-compose is not implemented yet')
             from boxman.docker_compose.docker_compose import DockerCompose
 

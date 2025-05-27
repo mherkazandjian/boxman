@@ -13,7 +13,8 @@ from .commands import VirshCommand
 from .virsh_edit import VirshEdit
 
 class LibVirtSession:
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self,
+                 config: Optional[Dict[str, Any]] = None):
         """
         Initialize the LibVirtSession.
 
@@ -33,11 +34,15 @@ class LibVirtSession:
         self.uri = self.provider_config.get('uri', 'qemu:///system')
         self.use_sudo = self.provider_config.get('use_sudo', False)
 
+        #: the boxman manager instance (mainly to get access to the cache)
+        self.manager = None
+
     def define_network(self,
                        name: str = None,
                        info: Optional[Dict[str, Any]] = None,
                        workdir: Optional[str] = None) -> bool:
         """
+        Define a network that can be used to be attached to the interfaces of vms.
 
         Args:
             name: Name of the network
@@ -46,11 +51,14 @@ class LibVirtSession:
         Returns:
             True if successful, False otherwise
         """
-        network = Network(name=name, info=info, provider_config=self.provider_config)
+        network = Network(
+            name=name,
+            info=info,
+            provider_config=self.provider_config,
+            manager=self.manager)
 
-        status = network.define_network(
-            file_path=os.path.join(workdir, f'{name}_net_define.xml')
-        )
+        status = network.define_network(file_path=os.path.join(workdir, f'{name}_net_define.xml'))
+
         return status
 
     def destroy_network(self,
