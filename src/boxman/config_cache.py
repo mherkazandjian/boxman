@@ -53,6 +53,19 @@ class BoxmanCache:
 
         return self.projects
 
+    def write_projects_cache(self) -> None:
+        """
+        Write the projects cache to the file.
+        """
+        if self.projects is None:
+            log.warning("no projects to write to cache")
+            return
+
+        with open(self.projects_cache_file, 'w') as fobj:
+            json.dump(self.projects, fobj, indent=4)
+            log.info(f"projects cache written to {self.projects_cache_file}")
+
+
     def register_project(self,
                          project_name: str,
                          config_fpath: str) -> bool:

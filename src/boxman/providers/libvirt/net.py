@@ -22,7 +22,7 @@ class Network(VirshCommand):
                 info: Dict[str, Any],
                 assign_new_bridge: bool = True,
                 provider_config: Optional[Dict[str, Any]] = None,
-                cache = None):
+                manager = None):
         """
         Initialize the network definition with a dictionary-based configuration.
 
@@ -49,7 +49,7 @@ class Network(VirshCommand):
         bridge_info = info.get('bridge', {})
 
         #: the cache object to be used to store network information
-        self.cache = cache
+        self.manager = manager
 
         if assign_new_bridge:
             # handle the bridge name - if not specified, find the first available virbrX
@@ -148,20 +148,69 @@ class Network(VirshCommand):
 
         return file_path
 
-    def check_network_exists(self) -> bool:
+    def update_network_cache(self) -> bool:
         """
-        Check if there are any issues or conflicts with existing networks.
+        Write the network information to the cache.
+        """
+        self.manager.cache.read_projects_cache()
+        projects_in_cache = self.manager.cache.projects
+        project_name = self.manager.config['project']
+        project_cache = projects_in_cache[project_name]
+
+        if 'networks' not in project_cache:
+            project_cache['networks'] = {}
+        project_cache['networks'][self.name] = {}
+        project_cache['networks'][self.name]['ip_address'] = self.ip_address
+        project_cache['networks'][self.name]['bridge_name'] = self.bridge_name
+
+        self.manager.cache.write_projects_cache()
+
+    def check_network_exists(self) -> None:
+        """
+        Check if there are any issues or conflicts with existing networks in the cache.
 
         Returns:
             True if the network exists, False otherwise
         """
-        asasd
-        try:
-            result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
-            return result.return_code == 0
-        except RuntimeError as exc:
-            self.logger.error(f"Error checking network existence: {exc}")
-            return False
+        self.manager.cache.read_projects_cache()
+        projects_in_cache = self.manager.cache.projects
+
+        conflicts = {}
+        n_conflicts = 0
+        for project_name, project_data in projects_in_cache.items():
+            conflicts[project_name] = {}
+            if 'networks' in project_data:
+                conflicts[project_name]['networks'] = {}
+                for net_name, net_info in project_data['networks'].items():
+                    conflicts[project_name]['networks'][net_name] = {}
+                    if net_name == self.name:
+                        # network already exists in the cache
+                        msg = f"network {self.name} already exists in project {project_name}"
+                        conflicts[project_name]['networks'][net_name]['name'] = msg
+                        n_conflicts += 1
+                    if net_info.get('bridge_name') == self.bridge_name:
+                        # bridge name conflict
+                        msg = f"bridge {self.bridge_name} is already used by network {net_name} in project {project_name}"
+                        conflicts[project_name]['networks'][net_name]['bridge'] = msg
+                        n_conflicts += 1
+                    if net_info.get('ip_address') == self.ip_address:
+                        # ip address conflict
+                        msg = f"ip address {self.ip_address} is already used by network {net_name} in project {project_name}"
+                        conflicts[project_name]['networks'][net_name]['ip'] = msg
+                        n_conflicts += 1
+
+        if n_conflicts > 0:
+            for project, project_conflicts in conflicts.items():
+                if 'networks' in project_conflicts:
+                    for net_name, net_conflicts in project_conflicts['networks'].items():
+                        for conflict_type, conflict_msg in net_conflicts.items():
+                            self.logger.error(f"{conflict_msg} (project: {project}, network: {net_name})")
+
+            msg = f"found {n_conflicts} conflicts for network {self.name} in project {self.manager.config['project']}"
+            self.logger.info(msg)
+            raise RuntimeError(msg)
+        else:
+            self.logger.info(f"no conflicts found for network {self.name} in project {self.manager.config['project']}")
 
     def define_network(self, file_path: Optional[str] = None):
         """
@@ -177,6 +226,10 @@ class Network(VirshCommand):
             file_path = f"/tmp/{self.name}-network.xml"
 
         self.write_xml(file_path)
+
+        self.check_network_exists()
+
+        self.update_network_cache()
 
         # define the network
         try:
