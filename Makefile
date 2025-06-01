@@ -10,8 +10,16 @@ build:
 	@python setup.py build
 
 install:
-	@python setup.py install
+	@pip install .
 
+cleaninstall:
+	@$(MAKE) clean
+	@$(MAKE) install
+
+fullinstall:
+	@$(MAKE) clean
+	@pip uninstall boxman
+	@$(MAKE) install
 devipython:
 	@cd data/dev && PYTHONPATH=${PWD}/src:${PYTHONPATH} ipython
 
