@@ -1,7 +1,7 @@
 package = 'boxman'
 project = 'boxman'
 project_no_spaces = project.replace(' ', '')
-version = '0.8.0'
+version = '0.9.0dev'
 description = 'placeholder description for this project'
 authors = ['John Smith']
 authors_string = ', '.join(authors)
