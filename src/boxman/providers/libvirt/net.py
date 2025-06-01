@@ -8,6 +8,7 @@ import tempfile
 from jinja2 import Template, Environment, FileSystemLoader
 import xml.etree.ElementTree as ET
 
+import ipaddress
 from .commands import VirshCommand, LibVirtCommandBase
 
 from boxman import log
@@ -16,7 +17,6 @@ class Network(VirshCommand):
     """
     Class to define libvirt networks by creating XML definitions and using virsh commands.
     """
-
     def __init__(self,
                 name: str,
                 info: Dict[str, Any],
@@ -75,25 +75,38 @@ class Network(VirshCommand):
         self.mac_address = info.get(
             'mac', f"52:54:00:{':'.join(['%02x' % (i + 10) for i in range(3)])}")
 
-        # extract the ip configuration
-        ip_info = info.get('ip', {})
+        #: bool: whether the ip has been provided or dummy values are injected
+        self.ip_provided = 'ip' in info
+
         #: str: the ip address for the network
-        self.ip_address = ip_info.get('address', '192.168.122.1')
+        self.ip_address = None
+
         #: str: the netmask for the network
+        self.netmask = None
+
+        #: str: the start of dhcp range
+        self.dhcp_range_start = None
+
+        #: str: the end of dhcp range
+        self.dhcp_range_end = None
+
+        # extract the ip configuration. If the 'ip' key is not present then the
+        # otherwise mandatory keys will be set to default values. These are:
+        #  - ip_address
+        #  - netmask
+        #  - dhcp_range_start
+        #  - dhcp_range_end
+        ip_info = info.get('ip', {})
+
+        self.ip_address = ip_info.get('address', '192.168.254.1')
         self.netmask = ip_info.get('netmask', '255.255.255.0')
 
-        # extract the dhcp configuration
         dhcp_info = ip_info.get('dhcp', {}).get('range', {})
-        #: str: the start of DHCP range
-        self.dhcp_range_start = dhcp_info.get('start', '192.168.122.2')
-        #: str: the end of DHCP range
-        self.dhcp_range_end = dhcp_info.get('end', '192.168.122.254')
+        self.dhcp_range_start = dhcp_info.get('start', None)
+        self.dhcp_range_end = dhcp_info.get('end', None)
 
         #: bool: whether the network should be enabled
         self.enable = info.get('enable', True)
-
-        #: str: the network cidr notation
-        self.network = info.get('network', '')
 
     def generate_xml(self) -> str:
         """
@@ -130,7 +143,9 @@ class Network(VirshCommand):
             'dhcp_range_end': self.dhcp_range_end
         }
 
-        return template.render(**context)
+        conf_xml = template.render(**context)
+
+        return conf_xml
 
     def write_xml(self, file_path: str) -> str:
         """
@@ -159,8 +174,11 @@ class Network(VirshCommand):
 
         if 'networks' not in project_cache:
             project_cache['networks'] = {}
+
         project_cache['networks'][self.name] = {}
-        project_cache['networks'][self.name]['ip_address'] = self.ip_address
+
+        if self.ip_address:
+            project_cache['networks'][self.name]['ip_address'] = self.ip_address
         project_cache['networks'][self.name]['bridge_name'] = self.bridge_name
 
         self.manager.cache.write_projects_cache()
@@ -541,8 +559,9 @@ class Network(VirshCommand):
         Apply iptables rules for truly isolated routed networks.
 
         This method configures iptables to:
-        1. Allow vm-to-vm communication on the same bridge
-        2. Block all traffic between host and guests in both directions
+
+            - allow vm-to-vm communication on the same bridge
+            - block all traffic between host and guests in both directions
 
         Returns:
             True if successful, False otherwise
@@ -582,19 +601,20 @@ class Network(VirshCommand):
 
     def apply_nat_config(self) -> bool:
         """
-        Apply NAT configuration for networks with forward mode 'nat'.
+        Apply nat configuration for networks with forward mode 'nat'.
 
         This method:
-        1. Finds the outgoing interface (eth0, wlan0, etc.)
-        2. Gets the bridge name for this network
-        3. Allows forwarding between the bridge and outgoing interface
-        4. Enables IP masquerading for the network
+
+          - finds the outgoing interface (eth0, wlan0, etc.)
+          - gets the bridge name for this network
+          - allows forwarding between the bridge and outgoing interface
+          - enables ip masquerading for the network
 
         Returns:
             True if successful, False otherwise
         """
         try:
-            # step 1: find the outgoing interface
+            # find the outgoing interface
             cmd_executor = LibVirtCommandBase(
                 provider_config=self.provider_config,
                 override_config_use_sudo=False)
@@ -618,10 +638,10 @@ class Network(VirshCommand):
 
             self.logger.info(f"found outgoing interface: {out_iface}")
 
-            # step 2: bridge interface is already known (self.bridge_name)
+            # bridge interface is already known (self.bridge_name)
             self.logger.info(f"using bridge interface: {bridge}")
 
-            # 3. allow forwarding between interfaces
+            # allow forwarding between interfaces
             fwd1_check = f"sudo iptables -C FORWARD -i {out_iface} -o {bridge} -j ACCEPT"
             fwd1_cmd   = f"sudo iptables -I FORWARD -i {out_iface} -o {bridge} -j ACCEPT"
             if not self._ensure_rule(self, fwd1_check, fwd1_cmd):
@@ -632,24 +652,24 @@ class Network(VirshCommand):
             if not self._ensure_rule(self, fwd2_check, fwd2_cmd):
                 return False
 
-            # 4. enable nat for the virtual network
-            import ipaddress
-            try:
-                ip_interface = ipaddress.IPv4Interface(f"{self.ip_address}/{self.netmask}")
-                network_cidr = str(ip_interface.network)
+            # enable nat for the virtual network
+            if self.ip_address:
+                try:
+                    ip_interface = ipaddress.IPv4Interface(f"{self.ip_address}/{self.netmask}")
+                    network_cidr = str(ip_interface.network)
 
-                masq_check = f"sudo iptables -t nat -C POSTROUTING -s {network_cidr} -j MASQUERADE"
-                masq_cmd   = f"sudo iptables -t nat -A POSTROUTING -s {network_cidr} -j MASQUERADE"
-                if not self._ensure_rule(self, masq_check, masq_cmd):
+                    masq_check = f"sudo iptables -t nat -C POSTROUTING -s {network_cidr} -j MASQUERADE"
+                    masq_cmd   = f"sudo iptables -t nat -A POSTROUTING -s {network_cidr} -j MASQUERADE"
+                    if not self._ensure_rule(self, masq_check, masq_cmd):
+                        return False
+
+                    self.logger.info(
+                        f"successfully configured nat for network {self.name} ({network_cidr})")
+                    return True
+
+                except ValueError as exc:
+                    self.logger.error(f"error calculating network cidr: {exc}")
                     return False
-
-                self.logger.info(
-                    f"successfully configured nat for network {self.name} ({network_cidr})")
-                return True
-
-            except ValueError as exc:
-                self.logger.error(f"error calculating network cidr: {exc}")
-                return False
 
         except Exception as exc:
             self.logger.error(f"error configuring NAT for network {self.name}: {exc}")
