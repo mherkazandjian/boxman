@@ -173,11 +173,11 @@ class DestroyVM(VirshCommand):
             return True
 
         try:
-            self.logger.info(f"un-defining VM {self.name}")
+            self.logger.info(f"un-defining vm {self.name}")
 
             self.execute("undefine", self.name)
 
-            # Verify VM is no longer defined
+            # verify that the vm is no longer defined
             if not self.is_vm_defined():
                 self.logger.info(f"vm {self.name} undefined successfully")
                 return True
@@ -185,7 +185,34 @@ class DestroyVM(VirshCommand):
             self.logger.error(f"vm {self.name} is still defined after undefine")
             return False
         except RuntimeError as exc:
-            self.logger.error(f"error un-defining VM {self.name}: {exc}")
+            self.logger.error(f"error un-defining vm {self.name}: {exc}")
+            return False
+
+    def force_undefine_vm(self) -> bool:
+        """
+        Force undefine (remove) the vm (assuming it is not running).
+
+        Returns:
+            True if undefine successful, False otherwise
+        """
+        if not self.is_vm_defined():
+            self.logger.info(f"vm {self.name} is not defined, nothing to undefine")
+            return True
+
+        try:
+            self.logger.info(f"**force** un-defining vm {self.name}")
+
+            self.execute("undefine --remove-all-storage --wipe-storage --delete-storage-volume-snapshots --snapshots-metadata", self.name)
+
+            # verify that the vm is no longer defined
+            if not self.is_vm_defined():
+                self.logger.info(f"vm {self.name} undefined successfully")
+                return True
+
+            self.logger.error(f"vm {self.name} is still defined after undefine")
+            return False
+        except RuntimeError as exc:
+            self.logger.error(f"error un-defining vm {self.name}: {exc}")
             return False
 
     def delete_all_snapshots(self) -> bool:

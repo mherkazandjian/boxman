@@ -178,18 +178,22 @@ class LibVirtSession:
 
         return True
 
-    def destroy_vm(self, name: str) -> bool:
+    def destroy_vm(self, name: str, force: bool = False) -> bool:
         """
-        Destroy (remove) a VM.
+        Destroy (remove) a vm.
 
         Args:
-            name: Name of the VM to destroy
+            name: Name of the vm to destroy
+            force: Whether to forcefully destroy the vm
 
         Returns:
             True if successful, False otherwise
         """
         destroyer = DestroyVM(name=name, provider_config=self.provider_config)
-        status = destroyer.remove()
+        if not force:
+            status = destroyer.remove()
+        else:
+            status = destroyer.force_undefine_vm()
         return status
 
     def start_vm(self, vm_name: str) -> bool:

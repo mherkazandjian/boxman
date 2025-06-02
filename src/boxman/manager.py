@@ -930,6 +930,8 @@ class BoxmanManager:
                     disks=vm_info['disks']
                 )
 
+                cls.provider.destroy_vm(new_vm_name, force=True)
+
         cls.destroy_networks()
         # .. todo:: implement undo'ing the provisioning of the files (not important for now)
         #cls.provision_files()
