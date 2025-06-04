@@ -49,8 +49,8 @@ clusters:
           netmask: '255.255.255.0'
           dhcp:                   # (optional) enable DHCP server on this network
             range:                #   if set this full block needs to be specified
-              start: '10.0.10.2'
-              end: '10.0.10.254'
+              start: '10.0.10.2'  #   mandatory (if block is specified)
+              end: '10.0.10.254'  #   mandatory (if block is specified)
         enable: True
         autostart: True
 
