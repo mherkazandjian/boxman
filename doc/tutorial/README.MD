@@ -99,6 +99,7 @@ clusters:
         #!/bin/bash
         echo "This is a script inside the VM."
         date
+```
 
 Don’t worry if this looks dense—we’ll revisit the important parts as we go.
 
