@@ -7,9 +7,7 @@ Linux users and junior sysadmins with basic familiarity with virtualization, SSH
 - Laptop or workstation
 - 8 GB RAM  
 - ~50 GB free disk space  
-- Ease of use and minimal tuning preferred  
 
-This chapter walks through installing libvirt, preparing a base image, provisioning a single-node cluster with Boxman, and validating it with a simple Ansible playbook.
 
 ---
 
@@ -42,12 +40,12 @@ The end goal is a reproducible local lab environment that runs comfortably on mo
 
 ## 3. Configuration at a Glance
 
-Here is the Boxman configuration we will use later to spin up a single-machine cluster:
+Here is the minimal Boxman configuration that we will be using to spin up a single-machine cluster:
 
 ```yaml
 ---
 version: 1.0
-project: default
+project: myproject1
 provider:
   libvirt:
     uri: qemu:///system
@@ -59,17 +57,17 @@ provider:
 
 clusters:
   cluster_1:
-    workdir: ~/workspaces/default
+    workdir: ~/workspaces/myproject1
     base_image: rocky9
     proxy_host: localhost
     admin_user: 'root'
-    admin_pass: 'file://~/workspaces/default/admin_pass.txt'
+    admin_pass: 'file://~/workspaces/myproject1/admin_pass.txt'
     admin_key_name: id_ed25519_boxman
     ssh_config: ssh_config
 
     networks:
       default_network:
-        network: 1.2.3.0/24
+        network: 192.168.10.0/24
         enable: True
         autostart: True
 
@@ -160,6 +158,8 @@ Add your user to required groups:
 sudo usermod -aG libvirt,kvm $USER
 ```
 
+Note: You should restart your session for changes to take effect. (Log out then log back in)
+
 ---
 
 ### CentOS / Rocky / RHEL
@@ -182,6 +182,10 @@ Ensure libvirt is reachable via the system socket:
 
 ```bash
 virsh -c qemu:///system list
+
+ Id   Name     State
+------------------------
+ 1    rocky9   running
 ```
 
 If this works, libvirt is correctly installed.
@@ -196,7 +200,9 @@ For simplicity and consistency, keep all base images in a single location, for e
 /var/lib/libvirt/images/
 ```
 
-Make sure your user (or root) has read access, and that Boxman knows the image name (e.g. `rocky9`).
+Make sure your user (or root) has read access , and that Boxman knows the image name (e.g. `rocky9`).
+
+It is recommended to store the Disk Images somewhere easily accessible by the user(e.g. `~/boxman_vms`).
 
 ---
 
@@ -230,8 +236,8 @@ This base image will be cloned for every Boxman-managed VM.
 Example with a virtual environment:
 
 ```bash
-python3.12 -m venv venv
-source venv/bin/activate
+python3.12 -m boxman boxman_env
+source boxman_env/bin/activate
 ```
 
 ### Install Dependencies

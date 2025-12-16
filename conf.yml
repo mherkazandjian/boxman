@@ -122,4 +122,5 @@ clusters:
         export SSH_CONFIG=${HOME}/tmp/sandbox/test_cluster/ssh_config
         export GATEWAYHOST=mgmt01
         export ANSIBLE_CONFIG=${HOME}/tmp/sandbox/test_cluster/ansible.cfg
+
 ...
