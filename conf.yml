@@ -1,0 +1,126 @@
+---
+version: 1.0
+project: orski-test
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/usr/bin/python /usr/bin/virt-install'
+    virt_clone_cmd: '/usr/bin/python /usr/bin/virt-clone'
+    virsh_cmd: '/bin/virsh'
+  verbose: True
+
+clusters:
+  cluster_1:
+    workdir: ~/workspaces/boxmandev/orski-test
+    base_image: rocky9
+    proxy_host: localhost
+    admin_user: 'root'
+    admin_pass: 'file://~/workspaces/boxmandev/orski-test/admin_pass.txt'  # or use admin_key_name for key based auth
+    admin_key_name: id_ed25519_boxman    # generated automatically at provisioning time
+    ssh_config: ssh_config               # generated automatically at provisioning time
+
+    networks:
+      nat1:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:01'
+        ip:
+          address: '192.168.123.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.123.2'
+              end: '192.168.123.254'
+        enable: True
+        autostart: True
+      isolated1:
+        mode: route
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:02'
+        ip:
+          address: '10.0.10.1'
+          netmask: '255.255.255.0'
+          dhcp:                   # (optional) enable DHCP server on this network
+            range:                #   if set this full block needs to be specified
+              start: '10.0.10.2'  #   mandatory (if block is specified)
+              end: '10.0.10.254'  #   mandatory (if block is specified)
+        enable: True
+        autostart: True
+
+    vms:
+      boxman01:
+        hostname: boxman01
+        disks:
+          - name: disk01
+            driver:
+              name: qemu
+              type: qcow2
+            target: vdb
+            size: 8192
+        cpus:
+          sockets: 1
+          cores: 1
+          threads: 1
+        memory: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+            #network_source: 'cluster_1::nat1'
+            #network_source: 'myprj::cluster_1_nat1'
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'isolated1'
+      boxman02:
+        hostname: boxman02
+        disks:
+          {% for suffix in 'bcde' %}        # add disks vdb, vdc, vdd, vde
+          - name: disk{{ suffix }}
+            driver:
+              name: qemu
+              type: qcow2
+            target: vd{{ suffix }}
+            size: 8192
+          {% endfor %}
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'isolated1'
+          - name: adapter_3
+            link_state: 'up'
+            network_source: 'default'
+            is_global: True             # set to True to use the global network without expanding the network name to the project scope
+      {% for i in range(3, 8) %}
+      boxman{{ "%02d" % i }}:
+        hostname: boxman{{ "%02d" % i }}
+        disks:
+          - name: disk01
+            driver:
+              name: qemu
+              type: qcow2
+            target: vdb
+            size: 8192
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'isolated1'
+      {% endfor %}
+    files:
+      env.sh: |
+        export INVENTORY=inventory
+        export SSH_CONFIG=${HOME}/tmp/sandbox/test_cluster/ssh_config
+        export GATEWAYHOST=mgmt01
+        export ANSIBLE_CONFIG=${HOME}/tmp/sandbox/test_cluster/ansible.cfg
+
+...
