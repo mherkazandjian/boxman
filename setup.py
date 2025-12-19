@@ -35,6 +35,7 @@ setup(
     entry_points={
         'console_scripts': [
             'boxman=boxman.scripts.app:main',
+            'boxman-import-vm=boxman.scripts.import_vm:main',
         ],
     }
 )
