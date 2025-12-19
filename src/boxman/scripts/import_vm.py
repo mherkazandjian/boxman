@@ -108,14 +108,14 @@ def download_file_onedrive(url: str, dest_path: str) -> bool:
         True if successful, False otherwise
     """
     try:
-        # OneDrive URL handling is complex and may not work for all share link formats
-        # Try a basic approach for common OneDrive patterns
+        # Parse the URL to safely check the domain
+        parsed = urlparse(url)
         download_url = url
         
         # Attempt to construct direct download URL for onedrive.live.com links
-        if 'onedrive.live.com' in url and 'download' not in url:
+        if parsed.netloc == 'onedrive.live.com' and 'download' not in parsed.query:
             # Try appending download parameter
-            separator = '&' if '?' in url else '?'
+            separator = '&' if parsed.query else '?'
             download_url = f"{url}{separator}download=1"
         
         typer.echo("⚠ Note: OneDrive support is limited. Direct HTTP URLs are recommended.", err=True)
@@ -138,12 +138,22 @@ def download_image(url: str, dest_path: str) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    # Detect URL type and use appropriate download method
-    if 'drive.google.com' in url or 'docs.google.com' in url:
-        return download_file_google_drive(url, dest_path)
-    elif 'onedrive.live.com' in url or '1drv.ms' in url or 'sharepoint.com' in url:
-        return download_file_onedrive(url, dest_path)
-    else:
+    # Parse the URL to safely detect the source type
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.netloc.lower()
+        
+        # Check for Google Drive domains
+        if netloc in ['drive.google.com', 'docs.google.com']:
+            return download_file_google_drive(url, dest_path)
+        # Check for OneDrive/SharePoint domains
+        elif netloc in ['onedrive.live.com', '1drv.ms'] or netloc.endswith('.sharepoint.com'):
+            return download_file_onedrive(url, dest_path)
+        else:
+            return download_file_http(url, dest_path)
+    except Exception as e:
+        typer.echo(f"✗ Error parsing URL: {e}", err=True)
+        # Fall back to HTTP download
         return download_file_http(url, dest_path)
 
 
