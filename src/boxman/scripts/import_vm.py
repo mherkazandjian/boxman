@@ -2,17 +2,18 @@
 """
 Utility script for importing/initializing VM images from URLs.
 
-This script downloads a qcow2 image from a URL (HTTP, Google Drive, or OneDrive),
-edits the VM XML definition to use the new image and name, and defines the VM in libvirt.
+This script downloads a JSON manifest containing URLs for VM XML definition and qcow2 image,
+then downloads both files, edits the VM XML to use the new image and name, and defines the VM in libvirt.
 """
 
 import os
 import sys
 import uuid
+import json
 import tempfile
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from urllib.parse import urlparse
 
 import typer
@@ -157,6 +158,54 @@ def download_image(url: str, dest_path: str) -> bool:
         return download_file_http(url, dest_path)
 
 
+def download_manifest(manifest_url: str) -> Optional[Dict[str, Any]]:
+    """
+    Download and parse a JSON manifest file.
+    
+    The manifest should contain:
+    - xml_url: URL to the VM XML definition
+    - image_url: URL to the qcow2 disk image
+    
+    Args:
+        manifest_url: URL to the JSON manifest
+        
+    Returns:
+        Dictionary containing manifest data, or None if failed
+    """
+    try:
+        typer.echo(f"Downloading manifest from {manifest_url}...")
+        
+        response = requests.get(manifest_url, allow_redirects=True)
+        response.raise_for_status()
+        
+        manifest = response.json()
+        
+        # Validate required fields
+        if 'xml_url' not in manifest:
+            typer.echo("✗ Manifest missing required field: 'xml_url'", err=True)
+            return None
+        
+        if 'image_url' not in manifest:
+            typer.echo("✗ Manifest missing required field: 'image_url'", err=True)
+            return None
+        
+        typer.echo(f"✓ Manifest loaded successfully")
+        typer.echo(f"  XML URL: {manifest['xml_url']}")
+        typer.echo(f"  Image URL: {manifest['image_url']}")
+        
+        return manifest
+        
+    except requests.exceptions.RequestException as e:
+        typer.echo(f"✗ Failed to download manifest: {e}", err=True)
+        return None
+    except json.JSONDecodeError as e:
+        typer.echo(f"✗ Failed to parse manifest JSON: {e}", err=True)
+        return None
+    except Exception as e:
+        typer.echo(f"✗ Error loading manifest: {e}", err=True)
+        return None
+
+
 def edit_vm_xml(xml_path: str, new_vm_name: str, disk_path: str, change_uuid: bool = True) -> bool:
     """
     Edit the VM XML definition to change the name, UUID, and disk path.
@@ -279,59 +328,15 @@ def define_vm(xml_path: str, uri: str = "qemu:///system") -> bool:
         return False
 
 
-def get_template_vm_xml(template_vm: str, uri: str = "qemu:///system") -> Optional[str]:
-    """
-    Dump the XML of a template VM.
-    
-    Args:
-        template_vm: The name of the template VM
-        uri: The libvirt URI (default: qemu:///system)
-        
-    Returns:
-        The XML string if successful, None otherwise
-    """
-    try:
-        typer.echo(f"Dumping XML from template VM: {template_vm}")
-        
-        result = run(
-            f"virsh -c {uri} dumpxml {template_vm}",
-            hide=True,
-            warn=True
-        )
-        
-        if result.ok:
-            typer.echo(f"✓ Template VM XML retrieved")
-            return result.stdout
-        else:
-            typer.echo(f"✗ Failed to get template VM XML: {result.stderr}", err=True)
-            return None
-            
-    except Exception as e:
-        typer.echo(f"✗ Error getting template VM XML: {e}", err=True)
-        return None
-
-
 @app.command()
 def import_image(
-    image_url: str = typer.Argument(..., help="URL of the qcow2 image to download"),
-    vm_name: str = typer.Argument(..., help="Name for the new VM"),
+    manifest_url: str = typer.Option(..., "--url", help="URL of the JSON manifest file"),
+    vm_name: str = typer.Option(..., "--name", help="Name for the new VM"),
     disk_dir: str = typer.Option(
         None,
         "--disk-dir",
         "-d",
         help="Directory to save the disk image (default: current directory)"
-    ),
-    xml_template: Optional[str] = typer.Option(
-        None,
-        "--xml-template",
-        "-x",
-        help="Path to XML template file or name of existing VM to use as template"
-    ),
-    template_vm: Optional[str] = typer.Option(
-        None,
-        "--template-vm",
-        "-t",
-        help="Name of an existing VM to use as a template (alternative to --xml-template)"
     ),
     uri: str = typer.Option(
         "qemu:///system",
@@ -352,21 +357,24 @@ def import_image(
     ),
 ):
     """
-    Import and initialize a VM from a qcow2 image URL.
+    Import and initialize a VM from a JSON manifest.
     
-    This command downloads a qcow2 image from a URL, edits a VM XML template to use
-    the new image and name, and defines the VM in libvirt.
+    The manifest is a JSON file containing URLs for the VM XML definition and disk image:
+    {
+        "xml_url": "http://example.com/vm-definition.xml",
+        "image_url": "http://example.com/disk-image.qcow2"
+    }
+    
+    This command downloads the manifest, fetches both the XML and image,
+    edits the XML to use the new VM name and disk path, and defines the VM in libvirt.
     
     Examples:
     
-        # Import with XML template file
-        boxman-import-vm http://example.com/ubuntu.qcow2 my-ubuntu-vm --xml-template template.xml
+        # Import from a manifest
+        boxman-import-vm --url http://example.com/manifest.json --name my-ubuntu-vm
         
-        # Import using an existing VM as template
-        boxman-import-vm http://example.com/ubuntu.qcow2 my-ubuntu-vm --template-vm base-template
-        
-        # Import from Google Drive
-        boxman-import-vm https://drive.google.com/file/d/xxxxx/view my-vm --template-vm base
+        # Import with custom disk directory
+        boxman-import-vm --url http://example.com/manifest.json --name my-vm --disk-dir /var/lib/libvirt/images
     """
     
     typer.echo("=" * 70)
@@ -381,6 +389,16 @@ def import_image(
         else:
             typer.echo(f"⚠ Warning: VM '{vm_name}' already exists but --force was specified")
     
+    # Download and parse the manifest
+    typer.echo(f"\n[1/5] Loading manifest...")
+    manifest = download_manifest(manifest_url)
+    if manifest is None:
+        typer.echo("✗ Failed to load manifest", err=True)
+        raise typer.Exit(code=1)
+    
+    xml_url = manifest['xml_url']
+    image_url = manifest['image_url']
+    
     # Determine disk directory
     if disk_dir is None:
         disk_dir = os.getcwd()
@@ -389,7 +407,7 @@ def import_image(
     # Create disk directory if it doesn't exist
     os.makedirs(disk_dir, exist_ok=True)
     
-    # Determine disk filename - extract extension from URL if possible
+    # Determine disk filename - extract extension from image URL if possible
     parsed_url = urlparse(image_url)
     url_path = parsed_url.path
     url_extension = os.path.splitext(url_path)[1].lower() if url_path else ''
@@ -403,51 +421,41 @@ def import_image(
     
     disk_path = os.path.join(disk_dir, disk_filename)
     
-    # Download the image
-    typer.echo(f"\n[1/4] Downloading image...")
-    if not download_image(image_url, disk_path):
-        typer.echo("✗ Failed to download image", err=True)
-        raise typer.Exit(code=1)
-    
-    # Get or create XML template
-    typer.echo(f"\n[2/4] Preparing XML template...")
-    
-    xml_content = None
+    # Download the VM XML definition
+    typer.echo(f"\n[2/5] Downloading XML definition...")
     temp_xml_file = None
-    
-    if template_vm:
-        # Use existing VM as template
-        xml_content = get_template_vm_xml(template_vm, uri)
-        if xml_content is None:
-            typer.echo("✗ Failed to get template VM XML", err=True)
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as f:
+            temp_xml_file = f.name
+        
+        if not download_image(xml_url, temp_xml_file):
+            typer.echo("✗ Failed to download XML definition", err=True)
             raise typer.Exit(code=1)
-    elif xml_template:
-        # Use XML template file
-        xml_template_path = os.path.abspath(os.path.expanduser(xml_template))
-        if not os.path.exists(xml_template_path):
-            typer.echo(f"✗ XML template file not found: {xml_template_path}", err=True)
-            raise typer.Exit(code=1)
-        with open(xml_template_path, 'r') as f:
-            xml_content = f.read()
-        typer.echo(f"✓ Using XML template: {xml_template_path}")
-    else:
-        typer.echo("✗ Either --xml-template or --template-vm must be specified", err=True)
+        
+        typer.echo(f"✓ XML definition downloaded")
+    except Exception as e:
+        typer.echo(f"✗ Error downloading XML: {e}", err=True)
+        if temp_xml_file and os.path.exists(temp_xml_file):
+            os.unlink(temp_xml_file)
         raise typer.Exit(code=1)
     
-    # Create a temporary XML file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as f:
-        f.write(xml_content)
-        temp_xml_file = f.name
+    # Download the disk image
+    typer.echo(f"\n[3/5] Downloading disk image...")
+    if not download_image(image_url, disk_path):
+        typer.echo("✗ Failed to download disk image", err=True)
+        if temp_xml_file and os.path.exists(temp_xml_file):
+            os.unlink(temp_xml_file)
+        raise typer.Exit(code=1)
     
     try:
         # Edit the XML
-        typer.echo(f"\n[3/4] Editing VM configuration...")
+        typer.echo(f"\n[4/5] Editing VM configuration...")
         if not edit_vm_xml(temp_xml_file, vm_name, disk_path, change_uuid=not keep_uuid):
             typer.echo("✗ Failed to edit XML", err=True)
             raise typer.Exit(code=1)
         
         # Define the VM
-        typer.echo(f"\n[4/4] Defining VM in libvirt...")
+        typer.echo(f"\n[5/5] Defining VM in libvirt...")
         if not define_vm(temp_xml_file, uri):
             typer.echo("✗ Failed to define VM", err=True)
             raise typer.Exit(code=1)

@@ -2,18 +2,32 @@
 
 ## Overview
 
-`boxman-import-vm` is a command-line utility for importing and initializing virtual machine images from URLs. It automates the process of downloading qcow2 disk images, configuring VM definitions, and registering them with libvirt.
+`boxman-import-vm` is a command-line utility for importing and initializing virtual machine images from a JSON manifest. The manifest contains URLs for both the VM XML definition and the disk image. This tool automates the process of downloading both files, configuring the VM definition with the new name and disk path, and registering it with libvirt.
 
 ## Features
 
-- **Multiple Download Sources**: Support for HTTP/HTTPS URLs, Google Drive, and OneDrive
+- **JSON Manifest-based Import**: Downloads VM configuration and disk image from URLs specified in a JSON manifest
 - **Automatic XML Configuration**: Edits VM XML definitions using XPath to update:
   - VM name
   - UUID (generates new UUID by default)
   - Disk image path
+- **Multiple Download Sources**: Support for HTTP/HTTPS URLs, Google Drive, and OneDrive
 - **Safety Checks**: Verifies that VM name doesn't already exist (unless `--force` is used)
 - **Progress Indication**: Shows download progress for large files
-- **Template-based**: Uses existing VM XML or running VM as a template
+
+## Manifest Format
+
+The JSON manifest file should contain the following structure:
+
+```json
+{
+  "xml_url": "http://example.com/vm-definition.xml",
+  "image_url": "http://example.com/disk-image.qcow2"
+}
+```
+
+- **xml_url**: URL to the libvirt domain XML definition file
+- **image_url**: URL to the qcow2 disk image file
 
 ## Installation
 
@@ -28,31 +42,25 @@ python setup.py install
 ### Basic Usage
 
 ```bash
-# Import from HTTP URL using XML template file
-boxman-import-vm http://example.com/ubuntu.qcow2 my-ubuntu-vm \
-  --xml-template /path/to/template.xml
+# Import from a JSON manifest
+boxman-import-vm --url http://example.com/manifest.json --name my-ubuntu-vm
 
-# Import using an existing VM as template
-boxman-import-vm http://example.com/ubuntu.qcow2 my-ubuntu-vm \
-  --template-vm ubuntu-base-template
+# Import with custom disk directory
+boxman-import-vm --url http://example.com/manifest.json --name my-vm \
+  --disk-dir /var/lib/libvirt/images
 
-# Import from Google Drive
-boxman-import-vm https://drive.google.com/file/d/FILE_ID/view my-vm \
-  --template-vm base-template
+# Import with force flag to overwrite existing VM
+boxman-import-vm --url http://example.com/manifest.json --name existing-vm --force
 ```
 
 ### Command-Line Options
 
 ```
-Arguments:
-  IMAGE_URL    URL of the qcow2 image to download [required]
-  VM_NAME      Name for the new VM [required]
-
 Options:
+  --url URL                    URL of the JSON manifest file [required]
+  --name NAME                  Name for the new VM [required]
   --disk-dir, -d DIR           Directory to save the disk image 
                                (default: current directory)
-  --xml-template, -x FILE      Path to XML template file
-  --template-vm, -t NAME       Name of existing VM to use as template
   --uri, -u URI                Libvirt connection URI 
                                (default: qemu:///system)
   --keep-uuid                  Keep the original UUID instead of 
@@ -64,53 +72,43 @@ Options:
 
 ## Examples
 
-### Example 1: Import with Custom Disk Directory
+### Example 1: Basic Import
 
 ```bash
-boxman-import-vm http://cloud-images.ubuntu.com/releases/24.04/ubuntu-24.04.qcow2 \
-  my-ubuntu \
-  --template-vm ubuntu-base \
-  --disk-dir /var/lib/libvirt/images
+boxman-import-vm --url http://example.com/ubuntu-manifest.json --name my-ubuntu
 ```
 
 This will:
-1. Download the Ubuntu 24.04 image
-2. Save it as `/var/lib/libvirt/images/my-ubuntu.qcow2`
-3. Use the `ubuntu-base` VM as a template
-4. Create a new VM named `my-ubuntu`
+1. Download the manifest from the URL
+2. Download the VM XML definition from the xml_url in the manifest
+3. Download the disk image from the image_url in the manifest
+4. Save the disk as `my-ubuntu.qcow2` in the current directory
+5. Edit the XML to use the new VM name and disk path
+6. Define the VM in libvirt
 
-### Example 2: Import from Google Drive
-
-```bash
-# For large images hosted on Google Drive
-boxman-import-vm \
-  https://drive.google.com/file/d/1abc...xyz/view \
-  windows-10-test \
-  --template-vm windows-base \
-  --disk-dir /data/vms
-```
-
-Google Drive URLs are automatically detected and handled with the `gdown` library, which properly handles virus scan warnings for large files.
-
-### Example 3: Use XML Template File
+### Example 2: Import with Custom Disk Directory
 
 ```bash
-# First, export XML from an existing VM:
-virsh -c qemu:///system dumpxml base-template > /tmp/template.xml
-
-# Then import with that template:
-boxman-import-vm http://example.com/centos.qcow2 my-centos \
-  --xml-template /tmp/template.xml \
+boxman-import-vm --url http://example.com/centos-manifest.json --name my-centos \
   --disk-dir /var/lib/libvirt/images
 ```
+
+This will save the disk image to `/var/lib/libvirt/images/my-centos.qcow2`.
+
+### Example 3: Import from Google Drive Manifest
+
+```bash
+# Manifest hosted on Google Drive
+boxman-import-vm --url https://drive.google.com/file/d/MANIFEST_ID/view --name my-vm
+```
+
+The manifest URLs (xml_url and image_url) can also point to Google Drive or OneDrive files. The utility will handle the download appropriately.
 
 ### Example 4: Force Overwrite Existing VM
 
 ```bash
 # This will overwrite the VM if it already exists
-boxman-import-vm http://example.com/updated.qcow2 existing-vm \
-  --template-vm base \
-  --force
+boxman-import-vm --url http://example.com/updated-manifest.json --name existing-vm --force
 ```
 
 ## Workflow
@@ -118,13 +116,14 @@ boxman-import-vm http://example.com/updated.qcow2 existing-vm \
 The utility follows this workflow:
 
 1. **Validation**: Check if VM with the same name already exists (unless `--force`)
-2. **Download**: Download the qcow2 image from the specified URL
-3. **Template Preparation**: Get XML template from file or existing VM
-4. **XML Editing**: 
+2. **Download Manifest**: Download and parse the JSON manifest file
+3. **Download XML**: Download the VM XML definition from the xml_url in the manifest
+4. **Download Image**: Download the qcow2 disk image from the image_url in the manifest
+5. **XML Editing**: 
    - Change VM name to the specified name
    - Generate and set new UUID (unless `--keep-uuid`)
    - Update disk source path to point to downloaded image
-5. **VM Definition**: Define the new VM in libvirt using `virsh define`
+6. **VM Definition**: Define the new VM in libvirt using `virsh define`
 
 ## XML Editing Details
 
@@ -171,8 +170,11 @@ The utility attempts to convert share links to direct download links.
 The script provides clear error messages for common issues:
 
 - **VM Already Exists**: Stops unless `--force` is specified
-- **Template Not Found**: Validates that XML template file or template VM exists
-- **Download Failed**: Reports HTTP errors, network issues, etc.
+- **Manifest Download Failed**: Reports HTTP errors, network issues, etc.
+- **Manifest Parse Error**: Reports JSON parsing errors
+- **Missing Manifest Fields**: Validates xml_url and image_url are present
+- **XML Download Failed**: Reports download errors for XML file
+- **Image Download Failed**: Reports download errors for disk image
 - **XML Parsing Errors**: Reports issues with malformed XML
 - **Disk Path Not Found**: Verifies the disk element exists in XML
 
@@ -189,32 +191,56 @@ The script provides clear error messages for common issues:
 
 ## Tips
 
-1. **Use Template VMs**: Creating a base template VM with all desired settings (CPU, memory, network) makes it easy to import new VMs with consistent configuration.
+1. **Create Manifests**: You can create manifest files for your VM images to make importing easy and repeatable.
 
 2. **Disk Organization**: Use the `--disk-dir` option to organize VM disks in a centralized location.
 
-3. **Large Files**: For large image files (>1GB), Google Drive or OneDrive may be more reliable than direct HTTP downloads.
+3. **Large Files**: For large image files (>1GB), consider hosting the manifest, XML, and image on Google Drive or a CDN.
 
 4. **UUID Generation**: Always let the script generate a new UUID (default behavior) to avoid conflicts with other VMs.
 
-5. **Testing**: Test the import with a small image first to verify your template and settings are correct.
+5. **Testing**: Test the import with a small image first to verify your manifest and settings are correct.
+
+## Creating a Manifest
+
+To create a manifest for your VM, you'll need to:
+
+1. Export the VM XML definition (if using an existing VM):
+   ```bash
+   virsh -c qemu:///system dumpxml my-template-vm > vm-definition.xml
+   ```
+
+2. Upload both the XML file and the qcow2 image to a web server or cloud storage
+
+3. Create a JSON manifest file:
+   ```json
+   {
+     "xml_url": "http://yourserver.com/vm-definition.xml",
+     "image_url": "http://yourserver.com/disk-image.qcow2"
+   }
+   ```
+
+4. Upload the manifest file and share its URL with users
 
 ## Troubleshooting
 
 ### "VM already exists" error
 Use the `--force` flag to override, or choose a different VM name.
 
+### "Manifest missing required field" error
+Ensure your JSON manifest contains both `xml_url` and `image_url` fields.
+
 ### Google Drive "quota exceeded" error
-Google Drive may limit downloads for very popular files. Try again later or download manually.
+Google Drive may limit downloads for very popular files. Try again later or use a different hosting service.
 
 ### "Could not find disk source element" error
-Your template XML may not have the expected disk structure. Verify the template has a `<disk type='file' device='disk'>` element.
+Your VM XML may not have the expected disk structure. Verify the XML has a `<disk type='file' device='disk'>` element.
 
 ### Permission errors
 Ensure you have permission to:
 - Write to the disk directory
 - Execute virsh commands (may need sudo)
-- Read the XML template file
+- Access the manifest and resource URLs
 
 ## See Also
 

@@ -28,14 +28,12 @@ keep it simple and customizable.
 ### Import VM Images
 
 ````bash
-  # Import a VM image from a URL
-  boxman-import-vm http://example.com/ubuntu.qcow2 my-ubuntu-vm \
-    --template-vm base-template \
-    --disk-dir /var/lib/libvirt/images
+  # Import a VM from a JSON manifest
+  boxman-import-vm --url http://example.com/manifest.json --name my-ubuntu-vm
   
-  # Import from Google Drive
-  boxman-import-vm https://drive.google.com/file/d/FILE_ID/view my-vm \
-    --template-vm base-template
+  # Import with custom disk directory
+  boxman-import-vm --url http://example.com/manifest.json --name my-vm \
+    --disk-dir /var/lib/libvirt/images
 ````
 
 For more details, see [VM Import Utility Documentation](docs/import-vm-utility.md)
