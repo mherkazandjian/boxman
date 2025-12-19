@@ -25,6 +25,23 @@ keep it simple and customizable.
 
 ## Usage
 
+### Import VM Images
+
+````bash
+  # Import a VM image from a URL
+  boxman-import-vm http://example.com/ubuntu.qcow2 my-ubuntu-vm \
+    --template-vm base-template \
+    --disk-dir /var/lib/libvirt/images
+  
+  # Import from Google Drive
+  boxman-import-vm https://drive.google.com/file/d/FILE_ID/view my-vm \
+    --template-vm base-template
+````
+
+For more details, see [VM Import Utility Documentation](docs/import-vm-utility.md)
+
+### Provision and Manage VMs
+
 ````bash
   boxman provision
   boxman snapshot --name "state before kernel upgrade"
