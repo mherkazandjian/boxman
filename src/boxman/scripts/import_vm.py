@@ -10,6 +10,7 @@ import os
 import sys
 import uuid
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -43,7 +44,11 @@ def download_file_http(url: str, dest_path: str) -> bool:
         
         with open(dest_path, 'wb') as f:
             if total_size == 0:
-                f.write(response.content)
+                # No content-length header, use chunked reading
+                chunk_size = 8192
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
             else:
                 downloaded = 0
                 chunk_size = 8192
@@ -92,7 +97,8 @@ def download_file_onedrive(url: str, dest_path: str) -> bool:
     """
     Download a file from OneDrive.
     
-    OneDrive direct download links can be constructed by modifying the share URL.
+    Note: OneDrive direct download support is limited. For best results,
+    use direct download links or consider manual download for OneDrive files.
     
     Args:
         url: The OneDrive URL
@@ -102,24 +108,22 @@ def download_file_onedrive(url: str, dest_path: str) -> bool:
         True if successful, False otherwise
     """
     try:
-        # Convert OneDrive share link to direct download link
-        if '?download=1' not in url:
-            # Try to construct a direct download URL
-            if 'onedrive.live.com' in url or '1drv.ms' in url:
-                # For OneDrive, we'll try the direct download approach
-                download_url = url.replace('view.aspx', 'download.aspx')
-                if '?download=1' not in download_url:
-                    separator = '&' if '?' in download_url else '?'
-                    download_url = f"{download_url}{separator}download=1"
-            else:
-                download_url = url
-        else:
-            download_url = url
-            
+        # OneDrive URL handling is complex and may not work for all share link formats
+        # Try a basic approach for common OneDrive patterns
+        download_url = url
+        
+        # Attempt to construct direct download URL for onedrive.live.com links
+        if 'onedrive.live.com' in url and 'download' not in url:
+            # Try appending download parameter
+            separator = '&' if '?' in url else '?'
+            download_url = f"{url}{separator}download=1"
+        
+        typer.echo("⚠ Note: OneDrive support is limited. Direct HTTP URLs are recommended.", err=True)
         return download_file_http(download_url, dest_path)
         
     except Exception as e:
         typer.echo(f"✗ Error downloading from OneDrive: {e}", err=True)
+        typer.echo("  Consider using a direct HTTP download link instead.", err=True)
         return False
 
 
@@ -200,7 +204,6 @@ def edit_vm_xml(xml_path: str, new_vm_name: str, disk_path: str, change_uuid: bo
         
     except Exception as e:
         typer.echo(f"✗ Error editing XML file: {e}", err=True)
-        import traceback
         typer.echo(traceback.format_exc(), err=True)
         return False
 
@@ -224,7 +227,7 @@ def check_vm_exists(vm_name: str, uri: str = "qemu:///system") -> bool:
         )
         
         if result.ok:
-            vm_list = result.stdout.strip().split('\n')
+            vm_list = [vm for vm in result.stdout.strip().split('\n') if vm]
             return vm_name in vm_list
         
         return False
@@ -376,8 +379,18 @@ def import_image(
     # Create disk directory if it doesn't exist
     os.makedirs(disk_dir, exist_ok=True)
     
-    # Determine disk filename
-    disk_filename = f"{vm_name}.qcow2"
+    # Determine disk filename - extract extension from URL if possible
+    parsed_url = urlparse(image_url)
+    url_path = parsed_url.path
+    url_extension = os.path.splitext(url_path)[1].lower() if url_path else ''
+    
+    # Use .qcow2 as default, but respect the URL extension if it looks valid
+    if url_extension in ['.qcow2', '.qcow', '.img', '.raw']:
+        disk_filename = f"{vm_name}{url_extension}"
+    else:
+        disk_filename = f"{vm_name}.qcow2"
+        typer.echo(f"⚠ Could not determine image format from URL, using .qcow2 extension")
+    
     disk_path = os.path.join(disk_dir, disk_filename)
     
     # Download the image
