@@ -2,17 +2,17 @@
 """
 Utility script for importing/initializing VM images from URLs.
 
-This script downloads a JSON manifest containing URLs for VM XML definition and qcow2 image,
-then downloads both files, edits the VM XML to use the new image and name, and defines the VM in libvirt.
+This script downloads a .tar.gz file containing a VM package (manifest, XML, and disk image),
+extracts it, and uses the manifest to set up the VM in libvirt.
 """
 
 import os
-import sys
 import uuid
 import json
 import tempfile
+import tarfile
+import shutil
 import traceback
-from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse
 
@@ -24,185 +24,131 @@ from invoke import run
 app = typer.Typer(help="Import and initialize VM images from URLs")
 
 
-def download_file_http(url: str, dest_path: str) -> bool:
+
+def download_and_extract_package(package_url: str, extract_dir: str) -> bool:
     """
-    Download a file from an HTTP/HTTPS URL with progress indication.
+    Download and extract a .tar.gz VM package file.
     
     Args:
-        url: The URL to download from
-        dest_path: The destination path to save the file
+        package_url: URL to the .tar.gz package
+        extract_dir: Directory to extract the package to
         
     Returns:
         True if successful, False otherwise
     """
     try:
-        typer.echo(f"Downloading from {url}...")
+        typer.echo(f"Downloading VM package from {package_url}...")
         
-        response = requests.get(url, stream=True, allow_redirects=True)
+        # Download the tar.gz file
+        response = requests.get(package_url, stream=True, allow_redirects=True, timeout=30)
         response.raise_for_status()
         
-        total_size = int(response.headers.get('content-length', 0))
-        
-        with open(dest_path, 'wb') as f:
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            total_size = int(response.headers.get('content-length', 0))
+            
             if total_size == 0:
                 # No content-length header, use chunked reading
                 chunk_size = 8192
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if chunk:
-                        f.write(chunk)
+                        tmp_file.write(chunk)
             else:
                 downloaded = 0
                 chunk_size = 8192
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if chunk:
-                        f.write(chunk)
+                        tmp_file.write(chunk)
                         downloaded += len(chunk)
                         percent = (downloaded / total_size) * 100
                         typer.echo(f"\rProgress: {percent:.1f}%", nl=False)
                 typer.echo()  # New line after progress
         
-        typer.echo(f"✓ Downloaded to {dest_path}")
+        typer.echo(f"✓ Package downloaded")
+        
+        # Extract the tar.gz file
+        typer.echo(f"Extracting package...")
+        try:
+            with tarfile.open(tmp_path, 'r:gz') as tar:
+                # Security check: ensure no path traversal
+                for member in tar.getmembers():
+                    if member.name.startswith('/') or '..' in member.name:
+                        typer.echo(f"✗ Archive contains unsafe path: {member.name}", err=True)
+                        os.unlink(tmp_path)
+                        return False
+                
+                tar.extractall(path=extract_dir)
+            
+            typer.echo(f"✓ Package extracted to {extract_dir}")
+            
+        finally:
+            # Clean up the downloaded tar.gz file
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        
         return True
         
+    except requests.exceptions.RequestException as e:
+        typer.echo(f"✗ Failed to download package: {e}", err=True)
+        return False
+    except tarfile.TarError as e:
+        typer.echo(f"✗ Failed to extract package: {e}", err=True)
+        return False
     except Exception as e:
-        typer.echo(f"✗ Error downloading file: {e}", err=True)
+        typer.echo(f"✗ Error processing package: {e}", err=True)
+        typer.echo(traceback.format_exc(), err=True)
         return False
 
 
-def download_file_google_drive(url: str, dest_path: str) -> bool:
+def load_manifest_from_dir(extract_dir: str) -> Optional[Dict[str, Any]]:
     """
-    Download a file from Google Drive with support for large files.
-    
-    Args:
-        url: The Google Drive URL
-        dest_path: The destination path to save the file
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        import gdown
-        typer.echo(f"Downloading from Google Drive...")
-        gdown.download(url, dest_path, quiet=False, fuzzy=True)
-        typer.echo(f"✓ Downloaded to {dest_path}")
-        return True
-    except ImportError:
-        typer.echo("✗ gdown package not installed. Please install it with: pip install gdown", err=True)
-        return False
-    except Exception as e:
-        typer.echo(f"✗ Error downloading from Google Drive: {e}", err=True)
-        return False
-
-
-def download_file_onedrive(url: str, dest_path: str) -> bool:
-    """
-    Download a file from OneDrive.
-    
-    Note: OneDrive direct download support is limited. For best results,
-    use direct download links or consider manual download for OneDrive files.
-    
-    Args:
-        url: The OneDrive URL
-        dest_path: The destination path to save the file
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        # Parse the URL to safely check the domain
-        parsed = urlparse(url)
-        download_url = url
-        
-        # Attempt to construct direct download URL for onedrive.live.com links
-        if parsed.netloc == 'onedrive.live.com' and 'download' not in parsed.query:
-            # Try appending download parameter
-            separator = '&' if parsed.query else '?'
-            download_url = f"{url}{separator}download=1"
-        
-        typer.echo("⚠ Note: OneDrive support is limited. Direct HTTP URLs are recommended.", err=True)
-        return download_file_http(download_url, dest_path)
-        
-    except Exception as e:
-        typer.echo(f"✗ Error downloading from OneDrive: {e}", err=True)
-        typer.echo("  Consider using a direct HTTP download link instead.", err=True)
-        return False
-
-
-def download_image(url: str, dest_path: str) -> bool:
-    """
-    Download an image from a URL. Automatically detects the source type.
-    
-    Args:
-        url: The URL to download from (HTTP, Google Drive, or OneDrive)
-        dest_path: The destination path to save the file
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    # Parse the URL to safely detect the source type
-    try:
-        parsed = urlparse(url)
-        netloc = parsed.netloc.lower()
-        
-        # Check for Google Drive domains
-        if netloc in ['drive.google.com', 'docs.google.com']:
-            return download_file_google_drive(url, dest_path)
-        # Check for OneDrive/SharePoint domains
-        elif netloc in ['onedrive.live.com', '1drv.ms'] or netloc.endswith('.sharepoint.com'):
-            return download_file_onedrive(url, dest_path)
-        else:
-            return download_file_http(url, dest_path)
-    except Exception as e:
-        typer.echo(f"✗ Error parsing URL: {e}", err=True)
-        # Fall back to HTTP download
-        return download_file_http(url, dest_path)
-
-
-def download_manifest(manifest_url: str) -> Optional[Dict[str, Any]]:
-    """
-    Download and parse a JSON manifest file.
+    Load and parse a JSON manifest file from the extracted directory.
     
     The manifest should contain:
-    - xml_url: URL to the VM XML definition
-    - image_url: URL to the qcow2 disk image
+    - xml_path: Relative path to the VM XML definition file
+    - image_path: Relative path to the qcow2 disk image file
     
     Args:
-        manifest_url: URL to the JSON manifest
+        extract_dir: Directory where the package was extracted
         
     Returns:
         Dictionary containing manifest data, or None if failed
     """
     try:
-        typer.echo(f"Downloading manifest from {manifest_url}...")
+        # Look for manifest.json in the extract directory
+        manifest_path = os.path.join(extract_dir, 'manifest.json')
         
-        response = requests.get(manifest_url, allow_redirects=True)
-        response.raise_for_status()
-        
-        manifest = response.json()
-        
-        # Validate required fields
-        if 'xml_url' not in manifest:
-            typer.echo("✗ Manifest missing required field: 'xml_url'", err=True)
+        if not os.path.exists(manifest_path):
+            typer.echo(f"✗ Manifest file not found: {manifest_path}", err=True)
             return None
         
-        if 'image_url' not in manifest:
-            typer.echo("✗ Manifest missing required field: 'image_url'", err=True)
+        typer.echo(f"Reading manifest from {manifest_path}...")
+        
+        with open(manifest_path, 'r') as f:
+            manifest = json.load(f)
+        
+        # Validate required fields
+        if 'xml_path' not in manifest:
+            typer.echo("✗ Manifest missing required field: 'xml_path'", err=True)
+            return None
+        
+        if 'image_path' not in manifest:
+            typer.echo("✗ Manifest missing required field: 'image_path'", err=True)
             return None
         
         typer.echo(f"✓ Manifest loaded successfully")
-        typer.echo(f"  XML URL: {manifest['xml_url']}")
-        typer.echo(f"  Image URL: {manifest['image_url']}")
+        typer.echo(f"  XML path: {manifest['xml_path']}")
+        typer.echo(f"  Image path: {manifest['image_path']}")
         
         return manifest
         
-    except requests.exceptions.RequestException as e:
-        typer.echo(f"✗ Failed to download manifest: {e}", err=True)
-        return None
     except json.JSONDecodeError as e:
         typer.echo(f"✗ Failed to parse manifest JSON: {e}", err=True)
         return None
     except Exception as e:
         typer.echo(f"✗ Error loading manifest: {e}", err=True)
+        typer.echo(traceback.format_exc(), err=True)
         return None
 
 
@@ -330,7 +276,7 @@ def define_vm(xml_path: str, uri: str = "qemu:///system") -> bool:
 
 @app.command()
 def import_image(
-    manifest_url: str = typer.Option(..., "--url", help="URL of the JSON manifest file"),
+    package_url: str = typer.Option(..., "--url", help="URL of the .tar.gz VM package file"),
     vm_name: str = typer.Option(..., "--name", help="Name for the new VM"),
     disk_dir: str = typer.Option(
         None,
@@ -357,24 +303,29 @@ def import_image(
     ),
 ):
     """
-    Import and initialize a VM from a JSON manifest.
+    Import and initialize a VM from a .tar.gz package.
     
-    The manifest is a JSON file containing URLs for the VM XML definition and disk image:
+    The package should contain:
+    - A manifest.json file with relative paths to the XML and disk image
+    - The VM XML definition file
+    - The disk image file (qcow2)
+    
+    Manifest format:
     {
-        "xml_url": "http://example.com/vm-definition.xml",
-        "image_url": "http://example.com/disk-image.qcow2"
+        "xml_path": "vm-definition.xml",
+        "image_path": "disk-image.qcow2"
     }
     
-    This command downloads the manifest, fetches both the XML and image,
+    This command downloads the package, extracts it, reads the manifest,
     edits the XML to use the new VM name and disk path, and defines the VM in libvirt.
     
     Examples:
     
-        # Import from a manifest
-        boxman-import-vm --url http://example.com/manifest.json --name my-ubuntu-vm
+        # Import from a package
+        boxman-import-vm --url http://example.com/vm-package.tar.gz --name my-ubuntu-vm
         
         # Import with custom disk directory
-        boxman-import-vm --url http://example.com/manifest.json --name my-vm --disk-dir /var/lib/libvirt/images
+        boxman-import-vm --url http://example.com/vm-package.tar.gz --name my-vm --disk-dir /var/lib/libvirt/images
     """
     
     typer.echo("=" * 70)
@@ -389,67 +340,71 @@ def import_image(
         else:
             typer.echo(f"⚠ Warning: VM '{vm_name}' already exists but --force was specified")
     
-    # Download and parse the manifest
-    typer.echo(f"\n[1/5] Loading manifest...")
-    manifest = download_manifest(manifest_url)
-    if manifest is None:
-        typer.echo("✗ Failed to load manifest", err=True)
-        raise typer.Exit(code=1)
-    
-    xml_url = manifest['xml_url']
-    image_url = manifest['image_url']
-    
-    # Determine disk directory
-    if disk_dir is None:
-        disk_dir = os.getcwd()
-    disk_dir = os.path.abspath(os.path.expanduser(disk_dir))
-    
-    # Create disk directory if it doesn't exist
-    os.makedirs(disk_dir, exist_ok=True)
-    
-    # Determine disk filename - extract extension from image URL if possible
-    parsed_url = urlparse(image_url)
-    url_path = parsed_url.path
-    url_extension = os.path.splitext(url_path)[1].lower() if url_path else ''
-    
-    # Use .qcow2 as default, but respect the URL extension if it looks valid
-    if url_extension in ['.qcow2', '.qcow', '.img', '.raw']:
-        disk_filename = f"{vm_name}{url_extension}"
-    else:
-        disk_filename = f"{vm_name}.qcow2"
-        typer.echo(f"⚠ Could not determine image format from URL, using .qcow2 extension")
-    
-    disk_path = os.path.join(disk_dir, disk_filename)
-    
-    # Download the VM XML definition
-    typer.echo(f"\n[2/5] Downloading XML definition...")
+    # Create a temporary directory for extraction
+    extract_dir = tempfile.mkdtemp(prefix='boxman-import-')
     temp_xml_file = None
+    
     try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as f:
-            temp_xml_file = f.name
-        
-        if not download_image(xml_url, temp_xml_file):
-            typer.echo("✗ Failed to download XML definition", err=True)
+        # Download and extract the package
+        typer.echo(f"\n[1/5] Downloading and extracting package...")
+        if not download_and_extract_package(package_url, extract_dir):
+            typer.echo("✗ Failed to download or extract package", err=True)
             raise typer.Exit(code=1)
         
-        typer.echo(f"✓ XML definition downloaded")
-    except Exception as e:
-        typer.echo(f"✗ Error downloading XML: {e}", err=True)
-        if temp_xml_file and os.path.exists(temp_xml_file):
-            os.unlink(temp_xml_file)
-        raise typer.Exit(code=1)
-    
-    # Download the disk image
-    typer.echo(f"\n[3/5] Downloading disk image...")
-    if not download_image(image_url, disk_path):
-        typer.echo("✗ Failed to download disk image", err=True)
-        if temp_xml_file and os.path.exists(temp_xml_file):
-            os.unlink(temp_xml_file)
-        raise typer.Exit(code=1)
-    
-    try:
+        # Load the manifest
+        typer.echo(f"\n[2/5] Loading manifest...")
+        manifest = load_manifest_from_dir(extract_dir)
+        if manifest is None:
+            typer.echo("✗ Failed to load manifest", err=True)
+            raise typer.Exit(code=1)
+        
+        xml_rel_path = manifest['xml_path']
+        image_rel_path = manifest['image_path']
+        
+        # Construct full paths from the extracted directory
+        xml_source_path = os.path.join(extract_dir, xml_rel_path)
+        image_source_path = os.path.join(extract_dir, image_rel_path)
+        
+        # Validate that the files exist
+        if not os.path.exists(xml_source_path):
+            typer.echo(f"✗ XML file not found: {xml_source_path}", err=True)
+            raise typer.Exit(code=1)
+        
+        if not os.path.exists(image_source_path):
+            typer.echo(f"✗ Disk image file not found: {image_source_path}", err=True)
+            raise typer.Exit(code=1)
+        
+        # Determine disk directory
+        if disk_dir is None:
+            disk_dir = os.getcwd()
+        disk_dir = os.path.abspath(os.path.expanduser(disk_dir))
+        
+        # Create disk directory if it doesn't exist
+        os.makedirs(disk_dir, exist_ok=True)
+        
+        # Determine disk filename from the source image
+        image_extension = os.path.splitext(image_source_path)[1]
+        if not image_extension:
+            image_extension = '.qcow2'
+        disk_filename = f"{vm_name}{image_extension}"
+        disk_path = os.path.join(disk_dir, disk_filename)
+        
+        # Copy the disk image to the destination
+        typer.echo(f"\n[3/5] Copying disk image to {disk_path}...")
+        try:
+            shutil.copy2(image_source_path, disk_path)
+            typer.echo(f"✓ Disk image copied")
+        except Exception as e:
+            typer.echo(f"✗ Failed to copy disk image: {e}", err=True)
+            raise typer.Exit(code=1)
+        
+        # Create a temporary copy of the XML for editing
+        typer.echo(f"\n[4/5] Preparing VM configuration...")
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as f:
+            temp_xml_file = f.name
+        shutil.copy2(xml_source_path, temp_xml_file)
+        
         # Edit the XML
-        typer.echo(f"\n[4/5] Editing VM configuration...")
         if not edit_vm_xml(temp_xml_file, vm_name, disk_path, change_uuid=not keep_uuid):
             typer.echo("✗ Failed to edit XML", err=True)
             raise typer.Exit(code=1)
@@ -467,9 +422,11 @@ def import_image(
         typer.echo("=" * 70)
         
     finally:
-        # Clean up temporary XML file
+        # Clean up temporary files and directories
         if temp_xml_file and os.path.exists(temp_xml_file):
             os.unlink(temp_xml_file)
+        if os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir)
 
 
 def main():

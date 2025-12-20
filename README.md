@@ -28,11 +28,11 @@ keep it simple and customizable.
 ### Import VM Images
 
 ````bash
-  # Import a VM from a JSON manifest
-  boxman-import-vm --url http://example.com/manifest.json --name my-ubuntu-vm
+  # Import a VM from a .tar.gz package
+  boxman-import-vm --url http://example.com/vm-package.tar.gz --name my-ubuntu-vm
   
   # Import with custom disk directory
-  boxman-import-vm --url http://example.com/manifest.json --name my-vm \
+  boxman-import-vm --url http://example.com/vm-package.tar.gz --name my-vm \
     --disk-dir /var/lib/libvirt/images
 ````
 
