@@ -25,47 +25,165 @@ app = typer.Typer(help="Import and initialize VM images from URLs")
 
 
 
-def download_and_extract_package(package_url: str, extract_dir: str) -> bool:
+def download_package_http(package_url: str, dest_path: str) -> bool:
     """
-    Download and extract a .tar.gz VM package file.
+    Download a package from HTTP/HTTPS URL.
     
     Args:
-        package_url: URL to the .tar.gz package
-        extract_dir: Directory to extract the package to
+        package_url: HTTP/HTTPS URL to download from
+        dest_path: Destination path to save the file
         
     Returns:
         True if successful, False otherwise
     """
     try:
-        typer.echo(f"Downloading VM package from {package_url}...")
-        
-        # Download the tar.gz file
+        typer.echo(f"Downloading from {package_url}...")
         response = requests.get(package_url, stream=True, allow_redirects=True, timeout=30)
         response.raise_for_status()
         
-        # Save to temporary file
-        with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as tmp_file:
-            tmp_path = tmp_file.name
-            total_size = int(response.headers.get('content-length', 0))
-            
+        total_size = int(response.headers.get('content-length', 0))
+        
+        with open(dest_path, 'wb') as f:
             if total_size == 0:
                 # No content-length header, use chunked reading
                 chunk_size = 8192
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if chunk:
-                        tmp_file.write(chunk)
+                        f.write(chunk)
             else:
                 downloaded = 0
                 chunk_size = 8192
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if chunk:
-                        tmp_file.write(chunk)
+                        f.write(chunk)
                         downloaded += len(chunk)
                         percent = (downloaded / total_size) * 100
                         typer.echo(f"\rProgress: {percent:.1f}%", nl=False)
                 typer.echo()  # New line after progress
         
         typer.echo(f"✓ Package downloaded")
+        return True
+        
+    except requests.exceptions.RequestException as e:
+        typer.echo(f"✗ Failed to download package: {e}", err=True)
+        return False
+    except Exception as e:
+        typer.echo(f"✗ Error downloading package: {e}", err=True)
+        return False
+
+
+def download_package_google_drive(package_url: str, dest_path: str) -> bool:
+    """
+    Download a package from Google Drive.
+    
+    Args:
+        package_url: Google Drive URL
+        dest_path: Destination path to save the file
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        import gdown
+        typer.echo(f"Downloading from Google Drive...")
+        result = gdown.download(package_url, dest_path, quiet=False, fuzzy=True)
+        
+        # gdown.download may return None on failure without raising an exception
+        if not result or not os.path.isfile(dest_path) or os.path.getsize(dest_path) == 0:
+            typer.echo(f"✗ Error downloading from Google Drive: download did not complete successfully", err=True)
+            return False
+        
+        typer.echo(f"✓ Package downloaded from Google Drive")
+        return True
+        
+    except ImportError:
+        typer.echo("✗ gdown package not installed. Please install it with: pip install gdown", err=True)
+        return False
+    except Exception as e:
+        typer.echo(f"✗ Error downloading from Google Drive: {e}", err=True)
+        return False
+
+
+def copy_local_package(package_path: str, dest_path: str) -> bool:
+    """
+    Copy a package from local filesystem.
+    
+    Args:
+        package_path: Local filesystem path
+        dest_path: Destination path to copy to
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        typer.echo(f"Copying from local file: {package_path}...")
+        
+        if not os.path.exists(package_path):
+            typer.echo(f"✗ Local file not found: {package_path}", err=True)
+            return False
+        
+        if not os.path.isfile(package_path):
+            typer.echo(f"✗ Path is not a file: {package_path}", err=True)
+            return False
+        
+        shutil.copy2(package_path, dest_path)
+        typer.echo(f"✓ Package copied from local filesystem")
+        return True
+        
+    except Exception as e:
+        typer.echo(f"✗ Error copying local file: {e}", err=True)
+        return False
+
+
+def download_and_extract_package(package_url: str, extract_dir: str) -> bool:
+    """
+    Download and extract a .tar.gz VM package file.
+    
+    Supports:
+    - HTTP/HTTPS URLs
+    - Google Drive URLs (drive.google.com)
+    - Local file paths (file:// URLs)
+    
+    Args:
+        package_url: URL or file path to the .tar.gz package
+        extract_dir: Directory to extract the package to
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Create temporary file for the package
+        with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+        
+        # Determine source type and download/copy accordingly
+        parsed_url = urlparse(package_url)
+        
+        if parsed_url.scheme == 'file':
+            # Local file path
+            local_path = parsed_url.path
+            # On Windows, handle file:///C:/path format
+            if os.name == 'nt' and local_path.startswith('/') and len(local_path) > 2 and local_path[2] == ':':
+                local_path = local_path[1:]
+            
+            if not copy_local_package(local_path, tmp_path):
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                return False
+                
+        elif parsed_url.netloc.lower() in ['drive.google.com', 'docs.google.com']:
+            # Google Drive URL
+            if not download_package_google_drive(package_url, tmp_path):
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                return False
+                
+        else:
+            # HTTP/HTTPS URL
+            if not download_package_http(package_url, tmp_path):
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                return False
         
         # Extract the tar.gz file
         typer.echo(f"Extracting package...")
@@ -89,9 +207,6 @@ def download_and_extract_package(package_url: str, extract_dir: str) -> bool:
         
         return True
         
-    except requests.exceptions.RequestException as e:
-        typer.echo(f"✗ Failed to download package: {e}", err=True)
-        return False
     except tarfile.TarError as e:
         typer.echo(f"✗ Failed to extract package: {e}", err=True)
         return False
@@ -276,7 +391,7 @@ def define_vm(xml_path: str, uri: str = "qemu:///system") -> bool:
 
 @app.command()
 def import_image(
-    package_url: str = typer.Option(..., "--url", help="URL of the .tar.gz VM package file"),
+    package_url: str = typer.Option(..., "--url", help="URL or file path of the .tar.gz VM package (http://, https://, file://, or Google Drive)"),
     vm_name: str = typer.Option(..., "--name", help="Name for the new VM"),
     disk_dir: str = typer.Option(
         None,
@@ -305,6 +420,11 @@ def import_image(
     """
     Import and initialize a VM from a .tar.gz package.
     
+    Supports multiple source types:
+    - HTTP/HTTPS URLs: http://example.com/vm-package.tar.gz
+    - Google Drive URLs: https://drive.google.com/file/d/FILE_ID/view
+    - Local files: file:///path/to/vm-package.tar.gz
+    
     The package should contain:
     - A manifest.json file with relative paths to the XML and disk image
     - The VM XML definition file
@@ -316,13 +436,19 @@ def import_image(
         "image_path": "disk-image.qcow2"
     }
     
-    This command downloads the package, extracts it, reads the manifest,
+    This command downloads/copies the package, extracts it, reads the manifest,
     edits the XML to use the new VM name and disk path, and defines the VM in libvirt.
     
     Examples:
     
-        # Import from a package
+        # Import from HTTP URL
         boxman-import-vm --url http://example.com/vm-package.tar.gz --name my-ubuntu-vm
+        
+        # Import from Google Drive
+        boxman-import-vm --url https://drive.google.com/file/d/FILE_ID/view --name my-vm
+        
+        # Import from local file
+        boxman-import-vm --url file:///path/to/vm-package.tar.gz --name my-vm
         
         # Import with custom disk directory
         boxman-import-vm --url http://example.com/vm-package.tar.gz --name my-vm --disk-dir /var/lib/libvirt/images
