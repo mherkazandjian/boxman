@@ -37,6 +37,15 @@ class LibVirtSession:
         #: the boxman manager instance (mainly to get access to the cache)
         self.manager = None
 
+    def import_image(self,
+                     image_uri: str,
+                     image_name: str) -> bool:
+        """
+        Import an image into the libvirt storage pool.
+        """
+        breakpoint()
+        pass
+
     def define_network(self,
                        name: str = None,
                        info: Optional[Dict[str, Any]] = None,

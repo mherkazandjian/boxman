@@ -14,7 +14,8 @@ from boxman.utils.io import write_files
 from boxman import log
 
 class BoxmanManager:
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self,
+                 config: Optional[Dict[str, Any]] = None):
         """
         Initialize the BoxmanManager.
 
@@ -162,6 +163,19 @@ class BoxmanManager:
             return retval
         else:
             raise ValueError(f"Invalid network name format: {network_name}")
+
+    @staticmethod
+    def import_image(cls, cli_args) -> None:
+        """
+        Import an image into the provider's storage.
+
+        :param manager: The instance of the BoxmanManager
+        :param cli_args: The parsed arguments from the cli
+        """
+        cls.provider.import_image(
+            image_uri=cli_args.image_uri,
+            image_name=cli_args.image_name
+        )
 
     @staticmethod
     def list_projects(cls, _) -> None:

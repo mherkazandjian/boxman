@@ -13,6 +13,8 @@ keep it simple and customizable.
  - python setup.py install
  - For the libvirt provider it is necessary that the user executing boxman
    can run sudo virhs and other libvirt commands (see blow).
+ - the boxman configuration files are by default searched in `~/.config/boxman/boxman.conf` but
+   you can specify a different configuration file using the `--conf` argument.
 
 ### other pre-requisites
 
@@ -30,7 +32,7 @@ keep it simple and customizable.
 ````bash
   # Import a VM from a .tar.gz package
   boxman-import-vm --url http://example.com/vm-package.tar.gz --name my-ubuntu-vm
-  
+
   # Import with custom disk directory
   boxman-import-vm --url http://example.com/vm-package.tar.gz --name my-vm \
     --disk-dir /var/lib/libvirt/images
