@@ -12,6 +12,7 @@ from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.utils.io import write_files
+from boxman.images.cli import image_inspect
 #from boxman.abstract.providers import Providers
 from boxman.abstract.providers import ProviderSession as Session
 
@@ -315,6 +316,23 @@ def parse_args():
         type=str,
         help='the names of the vms as a csv list',
         dest='path',
+    )
+
+    #
+    # sub parser for the 'image' subcommand
+    #
+    parser_image = subparsers.add_parser('image', help='inspect and manage VM base images')
+    subparsers_image = parser_image.add_subparsers(help=f"sub-commands for boxman image")
+
+    #
+    # sub parser for the 'image inspect' subsubcommand
+    #
+    parser_image_inspect = subparsers_image.add_parser('inspect', help='inspect a base image reference')
+    parser_image_inspect.set_defaults(func=image_inspect)
+    parser_image_inspect.add_argument(
+        'base_image_ref',
+        type=str,
+        help='either a legacy VM name or an OCI reference (oci://...)',
     )
 
     return parser

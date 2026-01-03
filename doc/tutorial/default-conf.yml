@@ -1,6 +1,6 @@
 ---
 version: 1.0
-project: default
+project: myproject1
 provider:
   libvirt:
     uri: qemu:///system
@@ -12,23 +12,25 @@ provider:
 
 clusters:
   cluster_1:
-    workdir: ~/workspaces/default
+    workdir: ~/workspaces/myproject1
     base_image: rocky9
     proxy_host: localhost
     admin_user: 'root'
-    admin_pass: 'file://~/workspaces/default/admin_pass.txt'  # or use admin_key_name for key based auth
+    admin_pass: 'file://~/workspaces/myproject1/admin_pass.txt'  # or use admin_key_name for key based auth
     admin_key_name: id_ed25519_boxman    # generated automatically at provisioning time
     ssh_config: ssh_config               # generated automatically at provisioning time
 
     networks:
-      default_network:
-        network: 1.2.3.0/24
+      my_network:
+        network: 192.168.10.0/24
         enable: True
         autostart: True
+        mac: '52:54:00:00:00:02'
+
 
     vms:
-      boxman01:
-        hostname: boxman01
+      myvm01:
+        hostname: myvm01
         disks:
           - name: disk01
             driver:
@@ -44,7 +46,7 @@ clusters:
         network_adapters:
           - name: adapter_1
             link_state: 'up'
-            network_source: 'default_network'
+            network_source: 'my_network'
     files:
       hello.txt: |
         Hello, Boxman!

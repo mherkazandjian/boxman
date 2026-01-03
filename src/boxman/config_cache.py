@@ -23,6 +23,9 @@ class BoxmanCache:
         #: str: the path to the cache directory where boxman stores its data
         self.cache_dir = os.path.expanduser(DEFAULT_CACHE_DIR)
 
+        #: str: the path to the images cache directory
+        self.images_cache_dir = os.path.join(self.cache_dir, 'images')
+
         #: str: the path to the projects cache file
         self.projects_cache_file = os.path.join(self.cache_dir, 'projects.json')
 
@@ -39,6 +42,9 @@ class BoxmanCache:
         if not os.path.exists(self.cache_dir):
             os.makedirs(self.cache_dir, exist_ok=True)
             log.info(f"cache directory created at: {self.cache_dir}")
+
+        if not os.path.exists(self.images_cache_dir):
+            os.makedirs(self.images_cache_dir, exist_ok=True)
 
     def read_projects_cache(self) -> dict:
         """
