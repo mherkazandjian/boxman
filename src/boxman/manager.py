@@ -173,8 +173,9 @@ class BoxmanManager:
         :param cli_args: The parsed arguments from the cli
         """
         cls.provider.import_image(
-            image_uri=cli_args.image_uri,
-            image_name=cli_args.image_name
+            manifest_uri=cli_args.manifest_uri,
+            vm_name=cli_args.vm_name,
+            vm_dir=cli_args.vm_dir
         )
 
     @staticmethod

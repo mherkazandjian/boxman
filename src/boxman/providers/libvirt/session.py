@@ -1,6 +1,8 @@
 import os
 import time
 from typing import Dict, Any, Optional, List
+import json
+
 from .net import Network, NetworkInterface
 from .clone_vm import CloneVM
 from .destroy_vm import DestroyVM
@@ -11,6 +13,7 @@ from boxman import log
 from .snapshot import SnapshotManager
 from .commands import VirshCommand
 from .virsh_edit import VirshEdit
+from .import_image import ImageImporter
 
 class LibVirtSession:
     def __init__(self,
@@ -38,13 +41,32 @@ class LibVirtSession:
         self.manager = None
 
     def import_image(self,
-                     image_uri: str,
-                     image_name: str) -> bool:
+                     manifest_uri: str,
+                     vm_name: str,
+                     vm_dir: str) -> bool:
         """
         Import an image into the libvirt storage pool.
+
+        :param manifest_uri: URI of the manifest of the image to import
+        :param vm_name: Name to assign to the imported VM
+        :param vm_dir: Directory for the imported VM
+        :return: True if successful, False otherwise
         """
-        breakpoint()
-        pass
+        if manifest_uri.startswith('file://'):
+            manifest_path = os.path.expanduser(manifest_uri[len('file://'):])
+            with open(manifest_path, 'r') as fobj:
+                manifest = json.load(fobj)
+        elif manifest_uri.startswith('http://') or manifest_uri.startswith('https://'):
+            raise NotImplementedError('http/https image uris are not implemented yet')
+
+        image_importer = ImageImporter(
+            manifest_path=manifest_path,
+            uri=self.manager.config['uri'],
+            disk_dir=vm_dir,
+            vm_name=vm_name,
+            keep_uuid=False)
+
+        image_importer.import_image()
 
     def define_network(self,
                        name: str = None,

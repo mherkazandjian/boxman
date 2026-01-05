@@ -100,23 +100,31 @@ def parse_args():
     #
     # sub parser for importing images
     #
-    parser_import_image = subparsers.add_parser('import_image', help='import an image')
+    parser_import_image = subparsers.add_parser('import-image', help='import an image')
     parser_import_image.set_defaults(func=BoxmanManager.import_image)
 
     parser_import_image.add_argument(
         '--uri',
         type=str,
-        help='the URI of the image to import',
-        dest='image_uri',
+        help='the URI of the manifest of the image to import',
+        dest='manifest_uri',
         required=True
     )
 
     parser_import_image.add_argument(
         '--name',
         type=str,
-        help='the name to assign to the imported image',
-        dest='image_name',
+        help='the name to assign to the imported vm',
+        dest='vm_name',
         required=False    # the default is used from the manifest
+    )
+
+    parser_import_image.add_argument(
+        '--directory',
+        type=str,
+        help='the directory to download/extract the image into',
+        dest='vm_dir',
+        required=False
     )
 
     parser_import_image.add_argument(
@@ -562,6 +570,8 @@ def main():
         args.func(manager, None)
         sys.exit(0)
     else:
+        # use the config of a deployment specified on the cmd line only if
+        # not importing an image
         config = None if args.func == BoxmanManager.import_image else args.conf
         manager = BoxmanManager(config=config)
 
@@ -575,18 +585,18 @@ def main():
                 provider_type = args.provider
             else:
                 # check the uri to get the manifest and find the provider type
-                image_uri = args.image_uri
+                manifest_uri = args.manifest_uri
 
                 # if the image uri is a local file path indicated by file://, load the
                 # manifest from there, the manifest is a json file
-                if image_uri.startswith('file://'):
-                    manifest_path = image_uri[len('file://'):]
+                if manifest_uri.startswith('file://'):
+                    manifest_path = manifest_uri[len('file://'):]
                     with open(manifest_path, 'r') as fobj:
                         manifest = json.load(fobj)
-                elif image_uri.startswith('http://') or image_uri.startswith('https://'):
+                elif manifest_uri.startswith('http://') or manifest_uri.startswith('https://'):
                     raise NotImplementedError('http/https image uris are not implemented yet')
                 else:
-                    raise ValueError(f'unsupported image uri: {image_uri}')
+                    raise ValueError(f'unsupported image uri: {manifest_uri}')
                 provider_type = manifest['provider']
 
             # fetch the provider configuration from the boxman config

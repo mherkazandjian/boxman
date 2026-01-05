@@ -1,0 +1,5 @@
+{
+    "xml_path": "vm-definition.xml",
+    "image_path": "disk-image.qcow2",
+    "provider": "libvirt"
+}
