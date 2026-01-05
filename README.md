@@ -30,15 +30,15 @@ keep it simple and customizable.
 ### Import VM Images
 
 ````bash
-  # Import a VM from a .tar.gz package
-  boxman-import-vm --url http://example.com/vm-package.tar.gz --name my-ubuntu-vm
+  # download and extract the vm package from a give url
+  curl -L http://example.com/vm-package.tar.gz | tar xv -C ~/tmp/sandbox/
 
-  # Import with custom disk directory
-  boxman-import-vm --url http://example.com/vm-package.tar.gz --name my-vm \
-    --disk-dir /var/lib/libvirt/images
+  # import a vm from a disk, a directory called my-ubuntu-vm will be created in ~/myvms
+  boxman import-image --uri file://~/http://example.com/vm-package.tar.gz \
+    --directory ~/myvms  \
+    --name my-ubuntu-vm \
+    --provider libvirt
 ````
-
-For more details, see [VM Import Utility Documentation](docs/import-vm-utility.md)
 
 ### Provision and Manage VMs
 
