@@ -27,7 +27,7 @@ keep it simple and customizable.
 
 ## Usage
 
-### Import VM Images
+### Import vm images
 
 ````bash
   # download and extract the vm package from a give url
@@ -40,7 +40,7 @@ keep it simple and customizable.
     --provider libvirt
 ````
 
-### Provision and Manage VMs
+### Provision and manage vms
 
 ````bash
   boxman provision
