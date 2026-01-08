@@ -13,6 +13,8 @@ keep it simple and customizable.
  - python setup.py install
  - For the libvirt provider it is necessary that the user executing boxman
    can run sudo virhs and other libvirt commands (see blow).
+ - the boxman configuration files are by default searched in `~/.config/boxman/boxman.conf` but
+   you can specify a different configuration file using the `--conf` argument.
 
 ### other pre-requisites
 
@@ -24,6 +26,21 @@ keep it simple and customizable.
   https://github.com/mherkazandjian/boxman/blob/main/data/conf.yml
 
 ## Usage
+
+### Import vm images
+
+````bash
+  # download and extract the vm package from a give url
+  curl -L http://example.com/vm-package.tar.gz | tar xv -C ~/tmp/sandbox/
+
+  # import a vm from a disk, a directory called my-ubuntu-vm will be created in ~/myvms
+  boxman import-image --uri file://~/http://example.com/vm-package.tar.gz \
+    --directory ~/myvms  \
+    --name my-ubuntu-vm \
+    --provider libvirt
+````
+
+### Provision and manage vms
 
 ````bash
   boxman provision

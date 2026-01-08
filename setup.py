@@ -34,7 +34,7 @@ setup(
     include_package_data=True,
     entry_points={
         'console_scripts': [
-            'boxman=boxman.scripts.app:main',
+            'boxman=boxman.scripts.app:main'
         ],
     }
 )
