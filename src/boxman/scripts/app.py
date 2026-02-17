@@ -6,6 +6,8 @@ import argparse
 from argparse import RawTextHelpFormatter
 from datetime import datetime, timezone
 from multiprocess import Process
+import yaml
+import json
 
 import boxman
 from boxman.manager import BoxmanManager
@@ -80,6 +82,14 @@ def parse_args():
     )
 
     parser.add_argument(
+        '--boxman-conf',
+        type=str,
+        help='the name of the boxman configuration file',
+        dest='boxman_conf',
+        default='~/.config/boxman/boxman.yml'
+    )
+
+    parser.add_argument(
         '--version',
         action='count',
         default=0,
@@ -87,6 +97,45 @@ def parse_args():
     )
 
     subparsers = parser.add_subparsers(help=f"sub-commands for boxman")
+
+    #
+    # sub parser for importing images
+    #
+    parser_import_image = subparsers.add_parser('import-image', help='import an image')
+    parser_import_image.set_defaults(func=BoxmanManager.import_image)
+
+    parser_import_image.add_argument(
+        '--uri',
+        type=str,
+        help='the URI of the manifest of the image to import',
+        dest='manifest_uri',
+        required=True
+    )
+
+    parser_import_image.add_argument(
+        '--name',
+        type=str,
+        help='the name to assign to the imported vm',
+        dest='vm_name',
+        required=False    # the default is used from the manifest
+    )
+
+    parser_import_image.add_argument(
+        '--directory',
+        type=str,
+        help='the directory to download/extract the image into',
+        dest='vm_dir',
+        required=False
+    )
+
+    parser_import_image.add_argument(
+        '--provider',
+        type=str,
+        help='the provider to import the image into',
+        dest='provider',
+        required=False,
+        choices=['virtualbox', 'libvirt'])   # figure out how to automate this with the
+                                             # supported providers list below
 
     #
     # sub parser for listing the registered projects
@@ -302,16 +351,16 @@ def parse_args():
     #
     # sub parser for the 'import' subcommand
     #
-    parser_import = subparsers.add_parser('import', help='import the vms')
-    parser_import.set_defaults(func=import_config)
-    parser_import.add_argument(
+    parser_import_image = subparsers.add_parser('import', help='import the vms')
+    parser_import_image.set_defaults(func=import_config)
+    parser_import_image.add_argument(
         '--vms',
         type=str,
         help='the names of the vms as a csv list',
         dest='vms',
         default='all'
     )
-    parser_import.add_argument(
+    parser_import_image.add_argument(
         '--path',
         type=str,
         help='the names of the vms as a csv list',
@@ -513,6 +562,17 @@ def import_config(session: Session, cli_args):
     #[p.join() for p in processes]
     ##_ = [_take(vm) for vm in vms]
 
+def load_boxman_config(path: str) -> dict:
+    """
+    Load the boxman configuration from the specified path
+
+    :param path: The path to the configuration file
+    :return: The configuration dictionary
+    """
+    with open(path, 'r') as fobj:
+        config = yaml.safe_load(fobj.read())
+    return config
+
 
 def main():
 
@@ -528,9 +588,39 @@ def main():
         args.func(manager, None)
         sys.exit(0)
     else:
-        manager = BoxmanManager(config=args.conf)
+        # use the config of a deployment specified on the cmd line only if
+        # not importing an image
+        config = None if args.func == BoxmanManager.import_image else args.conf
+        manager = BoxmanManager(config=config)
 
-        provider_type = list(manager.config['provider'].keys())[0]
+        # load the boxman app configuration
+        boxman_config = load_boxman_config(os.path.expanduser(args.boxman_conf))
+
+        if args.func == BoxmanManager.import_image:
+
+            # if the provider is specified in the cmd line, use it
+            if args.provider:
+                provider_type = args.provider
+            else:
+                # check the uri to get the manifest and find the provider type
+                manifest_uri = args.manifest_uri
+
+                # if the image uri is a local file path indicated by file://, load the
+                # manifest from there, the manifest is a json file
+                if manifest_uri.startswith('file://'):
+                    manifest_path = manifest_uri[len('file://'):]
+                    with open(manifest_path, 'r') as fobj:
+                        manifest = json.load(fobj)
+                elif manifest_uri.startswith('http://') or manifest_uri.startswith('https://'):
+                    raise NotImplementedError('http/https image uris are not implemented yet')
+                else:
+                    raise ValueError(f'unsupported image uri: {manifest_uri}')
+                provider_type = manifest['provider']
+
+            # fetch the provider configuration from the boxman config
+            manager.config = boxman_config['providers'][provider_type]
+        else:
+            provider_type = list(manager.config['provider'].keys())[0]
 
         if provider_type == 'virtualbox':
             session = Virtualbox(manager.config)    # .. todo:: rename to VirtualBoxSession
