@@ -10,6 +10,7 @@ from jinja2 import Environment, FileSystemLoader, Template
 
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.config_cache import BoxmanCache
+from boxman.images.resolver import resolve_base_image
 from boxman.utils.io import write_files
 from boxman import log
 
@@ -39,6 +40,9 @@ class BoxmanManager:
             self.config = self.load_config(config)
 
         self.cache = BoxmanCache()
+
+        #: resolved `base_image` information (scaffolding for OCI support)
+        self.resolved_base_image = None
 
     @property
     def provider(self) -> Optional["LibVirtSession"]:
@@ -868,6 +872,11 @@ class BoxmanManager:
         workdir = os.path.abspath(os.path.expanduser(workdir))
         if not os.path.isdir(workdir):
             os.makedirs(workdir)
+
+        # Resolve base image early so validation errors surface before provisioning.
+        # This does not change the current cloning behavior yet.
+        cache = getattr(cls, "cache", None)
+        cluster["_resolved_base_image"] = resolve_base_image(cluster["base_image"], cache=cache)
 
         cls.register_project_in_cache()
 
