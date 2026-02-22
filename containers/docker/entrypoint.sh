@@ -31,20 +31,30 @@ cp /etc/boxman/ssh/id_ed25519.pub /home/qemu_user/.ssh/authorized_keys
 chmod 600 /home/qemu_user/.ssh/authorized_keys
 chown qemu_user:qemu_user /home/qemu_user/.ssh/authorized_keys
 
-# Inject global SSH public keys (from boxman.yml ssh.authorized_keys)
-# 1. BOXMAN_SSH_PUBKEY env var — may contain one or more keys (newline-separated)
-#    Supports literal key strings, e.g.:
-#      BOXMAN_SSH_PUBKEY="ssh-ed25519 AAAA... user@host"
-#    or multiple keys:
-#      BOXMAN_SSH_PUBKEY=$'ssh-ed25519 AAAA... user1\nssh-rsa BBBB... user2'
+# ---------------------------------------------------------------------------
+# Inject global SSH public keys into qemu_user's authorized_keys.
+#
+# NOTE: This entrypoint does NOT read boxman.yml directly. Keys from the
+# boxman.yml ssh.authorized_keys section are resolved on the Python side
+# by BoxmanManager.get_global_authorized_keys() and must be written to
+# ${BOXMAN_DATA_DIR}/ssh/global_authorized_keys before the container starts.
+# See BoxmanManager.write_global_authorized_keys_file().
+#
+# Two injection mechanisms:
+#   1. BOXMAN_SSH_PUBKEY env var  — passed via docker-compose.yml, supports
+#      one or more newline-separated literal key strings.
+#   2. /etc/boxman/ssh/global_authorized_keys — bind-mounted file written
+#      by the Python side after resolving boxman.yml entries.
+# ---------------------------------------------------------------------------
+
+# 1. BOXMAN_SSH_PUBKEY env var
 if [ -n "$BOXMAN_SSH_PUBKEY" ]; then
     echo "$BOXMAN_SSH_PUBKEY" >> /home/qemu_user/.ssh/authorized_keys
-    n_keys=$(echo "$BOXMAN_SSH_PUBKEY" | grep -c '^ssh-')
+    n_keys=$(echo "$BOXMAN_SSH_PUBKEY" | grep -c '^ssh-' || true)
     echo "Added ${n_keys} key(s) from BOXMAN_SSH_PUBKEY to qemu_user authorized_keys"
 fi
 
-# 2. If the host mounted a global_authorized_keys file, append all keys from it
-#    Keys can be literal strings written one per line
+# 2. global_authorized_keys file (written by BoxmanManager.write_global_authorized_keys_file)
 if [ -f /etc/boxman/ssh/global_authorized_keys ]; then
     cat /etc/boxman/ssh/global_authorized_keys >> /home/qemu_user/.ssh/authorized_keys
     echo "Added keys from /etc/boxman/ssh/global_authorized_keys to qemu_user authorized_keys"

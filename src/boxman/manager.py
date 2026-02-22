@@ -670,6 +670,30 @@ class BoxmanManager:
                 self.logger.warning(f"skipping unresolvable SSH key entry: {exc}")
         return resolved
 
+    def write_global_authorized_keys_file(self, output_path: str) -> None:
+        """
+        Resolve global SSH keys from app_config and write them to a file.
+
+        This bridges the Python-side boxman.yml config with the container
+        entrypoint, which cannot read boxman.yml directly. The entrypoint
+        reads ``global_authorized_keys`` from the bind-mounted ssh dir.
+
+        Args:
+            output_path: Path to write the authorized keys file
+                         (e.g. ``<data_dir>/ssh/global_authorized_keys``).
+        """
+        keys = self.get_global_authorized_keys()
+        if not keys:
+            self.logger.info("no global authorized keys to write")
+            return
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w") as fobj:
+            for key in keys:
+                fobj.write(key + "\n")
+        self.logger.info(
+            f"wrote {len(keys)} global authorized key(s) to {output_path}")
+
     @classmethod
     def fetch_value(cls, value) -> str:
         """
@@ -857,13 +881,21 @@ class BoxmanManager:
         Set up SSH access to all VMs.
 
         This method:
-        1. Generates SSH keys if they don't exist
-        2. Adds the public key to all vms
-        3. Writes an SSH config file for easy access
+        1. Writes global authorized keys file (resolved from boxman.yml)
+        2. Generates SSH keys if they don't exist
+        3. Adds the public key to all vms
+        4. Writes an SSH config file for easy access
 
         Returns:
             bool: True if all steps completed successfully, False otherwise
         """
+        # write global authorized keys so they can be consumed by container
+        # entrypoints or cloud-init scripts
+        for _, cluster in self.config['clusters'].items():
+            workdir = os.path.expanduser(cluster['workdir'])
+            global_keys_path = os.path.join(workdir, 'global_authorized_keys')
+            self.write_global_authorized_keys_file(global_keys_path)
+
         if not self.generate_ssh_keys():
             self.logger.error("failed to generate ssh keys")
             return False
