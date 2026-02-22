@@ -39,3 +39,14 @@ help:
 	@echo "   using make ( .. todo:: this does not work as expected, sinc the bash env vars are not preserved)"
 	@echo "   	$ make devshell"
 	@echo "   	$ cd minimal"
+
+PYTEST_FLAGS ?=
+ifeq ($(verbose),1)
+PYTEST_FLAGS += -v
+endif
+
+test: ## Run all tests
+	pytest $(PYTEST_FLAGS) tests/
+
+test-integration: ## Run docker-compose integration tests (verbose=1 for verbose output)
+	pytest $(PYTEST_FLAGS) -m integration tests/test_docker_compose.py

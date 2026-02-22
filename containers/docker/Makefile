@@ -30,8 +30,12 @@ restart:
 logs:
 	docker compose logs -f
 
-ssh: ## SSH into the container
+ssh: ## SSH into the container (pass cmd="..." to run a command non-interactively)
+ifdef cmd
+	ssh -F $(SSH_LINK) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null boxman-$(BOXMAN_INSTANCE_NAME) $(cmd)
+else
 	ssh -F $(SSH_LINK) boxman-$(BOXMAN_INSTANCE_NAME)
+endif
 
 ssh-debug: ## SSH into the container with verbose output
 	ssh -vvv -F $(SSH_LINK) boxman-$(BOXMAN_INSTANCE_NAME)

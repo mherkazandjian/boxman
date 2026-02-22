@@ -147,12 +147,26 @@ def parse_args():
     #
     parser_prov = subparsers.add_parser('provision', help='provision a configuration')
     parser_prov.set_defaults(func=BoxmanManager.provision)
+    parser_prov.add_argument(
+        '--docker-compose',
+        action='store_true',
+        default=False,
+        help='provision using the docker-compose setup',
+        dest='docker_compose'
+    )
 
     #
     # sub parser for deprovisioning a configuration
     #
     parser_deprov = subparsers.add_parser('deprovision', help='deprovision a configuration')
     parser_deprov.set_defaults(func=BoxmanManager.deprovision)
+    parser_deprov.add_argument(
+        '--docker-compose',
+        action='store_true',
+        default=False,
+        help='deprovision using the docker-compose setup',
+        dest='docker_compose'
+    )
 
     ##
     ## sub parser for the 'deprovision cluster' subsubcommand
