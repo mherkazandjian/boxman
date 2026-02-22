@@ -2,6 +2,17 @@
 # The top level boxman application configuration file, typically the default location
 # of this file is in ~/.config/boxman/boxman.yml
 
+# Global SSH configuration applied across all providers (libvirt, docker, etc.)
+# Keys listed here are injected into all managed guests/containers.
+ssh:
+  authorized_keys:
+    # Each entry can be:
+    #   - a literal public key string
+    #   - a file reference:  file://~/.ssh/id_ed25519.pub
+    #   - an env variable:   ${env:BOXMAN_SSH_PUBKEY}
+    - ${env:BOXMAN_SSH_PUBKEY}
+    # - file://~/.ssh/id_ed25519.pub
+    # - "ssh-ed25519 AAAAC3... user@host"
 
 # section for provider specific configuration
 providers:
@@ -19,4 +30,3 @@ providers:
     virsh_cmd: '/bin/virsh'
     # specify the verbosity of libvirt commands
     verbose: True
-...

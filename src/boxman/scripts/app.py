@@ -578,6 +578,9 @@ def main():
         # load the boxman app configuration
         boxman_config = load_boxman_config(os.path.expanduser(args.boxman_conf))
 
+        # make the app-level config (boxman.yml) available to the manager
+        manager.load_app_config(boxman_config)
+
         if args.func == BoxmanManager.import_image:
 
             # if the provider is specified in the cmd line, use it

@@ -11,7 +11,7 @@ SSH_LINK_DIR := $(HOME)/.ssh/config.d/boxman
 SSH_LINK := $(SSH_LINK_DIR)/boxman-$(BOXMAN_INSTANCE_NAME).conf
 
 up: ## Start the container and link ssh config
-	docker compose up --build -d
+	docker compose up -d
 	@$(MAKE) link-ssh
 
 build: ## Build the docker image

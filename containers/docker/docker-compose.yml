@@ -26,6 +26,7 @@ services:
       - ${BOXMAN_DATA_DIR:-./data}/images:/var/lib/libvirt/images
       - ${BOXMAN_DATA_DIR:-./data}/libvirt-run:/var/run/libvirt
       - ${BOXMAN_DATA_DIR:-./data}/ssh:/etc/boxman/ssh
+      - ../../:/boxman
 
     cap_add:
       - NET_ADMIN

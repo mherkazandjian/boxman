@@ -40,6 +40,9 @@ class BoxmanManager:
 
         self.cache = BoxmanCache()
 
+        #: Optional[Dict[str, Any]]: the boxman application-level config (from boxman.yml)
+        self.app_config: Optional[Dict[str, Any]] = None
+
     @property
     def provider(self) -> Optional["LibVirtSession"]:
         """

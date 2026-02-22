@@ -159,3 +159,5 @@ docs/examples
 .default_env
 data/dev/*
 *.rendered.yml
+.github
+containers/docker/data
