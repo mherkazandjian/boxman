@@ -1,55 +1,68 @@
 #!/bin/bash
 set -e
 
-# Ensure required directories exist (in case bind-mount created them as root-owned empty dirs)
+# Ensure required directories exist
 mkdir -p /var/run/libvirt /var/lib/libvirt/images /etc/boxman/ssh
 
-# Merge host and container passwd/group using nss_wrapper
-# so libvirtd can resolve both host UIDs and container system users (qemu, libvirt, etc.)
-MERGED_PASSWD=/tmp/merged_passwd
-MERGED_GROUP=/tmp/merged_group
-
-cp /etc/passwd "$MERGED_PASSWD"
-cp /etc/group "$MERGED_GROUP"
-
-# Append container system users that are missing from the host passwd
-if [ -f /etc/passwd.container ]; then
-    while IFS= read -r line; do
-        uid=$(echo "$line" | cut -d: -f3)
-        if ! grep -q "^[^:]*:[^:]*:${uid}:" "$MERGED_PASSWD"; then
-            echo "$line" >> "$MERGED_PASSWD"
-        fi
-    done < /etc/passwd.container
-fi
-if [ -f /etc/group.container ]; then
-    while IFS= read -r line; do
-        gid=$(echo "$line" | cut -d: -f3)
-        if ! grep -q "^[^:]*:[^:]*:${gid}:" "$MERGED_GROUP"; then
-            echo "$line" >> "$MERGED_GROUP"
-        fi
-    done < /etc/group.container
+# Add host user to container's /etc/passwd so libvirtd can resolve the peer UID
+if [ -n "$HOST_UID" ] && [ "$HOST_UID" != "0" ]; then
+    if ! getent group "$HOST_GID" &>/dev/null; then
+        groupadd -g "$HOST_GID" hostuser 2>/dev/null || true
+    fi
+    if ! getent passwd "$HOST_UID" &>/dev/null; then
+        useradd -u "$HOST_UID" -g "$HOST_GID" -M -s /sbin/nologin -d /nonexistent hostuser 2>/dev/null || true
+    fi
+    echo "Registered host user: uid=$HOST_UID gid=$HOST_GID"
 fi
 
-export LD_PRELOAD=/usr/lib64/libnss_wrapper.so
-export NSS_WRAPPER_PASSWD=$MERGED_PASSWD
-export NSS_WRAPPER_GROUP=$MERGED_GROUP
+# Ensure qemu_user home dir and ssh dir exist
+mkdir -p /home/qemu_user/.ssh
+chmod 700 /home/qemu_user /home/qemu_user/.ssh
+chown -R qemu_user:qemu_user /home/qemu_user
 
-# If SSH key doesn't exist yet in the bind-mounted dir, copy it from the image
+# If SSH key doesn't exist yet in the bind-mounted dir, generate it
 if [ ! -f /etc/boxman/ssh/id_ed25519 ]; then
     ssh-keygen -t ed25519 -f /etc/boxman/ssh/id_ed25519 -N "" -C "boxman-libvirt-container"
-    cp /etc/boxman/ssh/id_ed25519.pub /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
     echo "Generated new SSH key pair in /etc/boxman/ssh/"
-else
-    # Ensure authorized_keys is up to date
-    cp /etc/boxman/ssh/id_ed25519.pub /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
 fi
+
+# Install the public key for qemu_user
+cp /etc/boxman/ssh/id_ed25519.pub /home/qemu_user/.ssh/authorized_keys
+chmod 600 /home/qemu_user/.ssh/authorized_keys
+chown qemu_user:qemu_user /home/qemu_user/.ssh/authorized_keys
+
+# Make SSH keys readable by the host user
+chmod 644 /etc/boxman/ssh/id_ed25519.pub
+chmod 600 /etc/boxman/ssh/id_ed25519
+if [ -n "$HOST_UID" ]; then
+    chown "$HOST_UID" /etc/boxman/ssh/id_ed25519 /etc/boxman/ssh/id_ed25519.pub
+fi
+
+# Generate ssh_config for host-side convenience
+HOST_DATA_DIR="${BOXMAN_DATA_DIR:-./data}"
+INSTANCE_NAME="${BOXMAN_INSTANCE_NAME:-default}"
+cat > /etc/boxman/ssh/boxman.conf <<EOF
+Host boxman-${INSTANCE_NAME}
+    HostName 127.0.0.1
+    Port ${BOXMAN_SSH_PORT:-2222}
+    User qemu_user
+    IdentityFile ${HOST_DATA_DIR}/ssh/id_ed25519
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+EOF
+if [ -n "$HOST_UID" ]; then
+    chown "$HOST_UID" /etc/boxman/ssh/boxman.conf
+fi
+echo "SSH config written to ${HOST_DATA_DIR}/ssh/boxman.conf"
+
+# Regenerate SSH host keys if missing
+ssh-keygen -A 2>/dev/null || true
 
 # Clean up stale sockets
 rm -f /var/run/libvirt/libvirt-sock /var/run/libvirt/libvirt-sock-ro
 
-# Start supervisord in background (inherits NSS_WRAPPER env)
+# Start supervisord in background
 /usr/bin/supervisord -c /etc/supervisord.conf &
 SUPERVISOR_PID=$!
 
@@ -80,5 +93,4 @@ fi
 
 echo "libvirt is ready."
 
-# Keep container running by waiting on supervisord
 wait $SUPERVISOR_PID

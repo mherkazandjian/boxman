@@ -20,9 +20,9 @@ RUN dnf install -y epel-release && \
         iptables \
         nftables \
         libvirt-daemon-config-network \
-        nss_wrapper \
         openssh-server \
         openssh-clients \
+        sudo \
     && dnf clean all
 
 COPY supervisord.conf /etc/supervisord.conf
@@ -38,14 +38,16 @@ RUN ssh-keygen -A && \
         -e 's/^#PasswordAuthentication.*/PasswordAuthentication no/' \
         /etc/ssh/sshd_config
 
-# SSH key pair is generated at runtime in entrypoint.sh
-# and stored in the bind-mounted /etc/boxman/ssh/ directory
+# Create qemu user with passwordless sudo and SSH access
+RUN useradd -m -s /bin/bash qemu_user && \
+    echo 'qemu_user ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/qemu_user && \
+    chmod 440 /etc/sudoers.d/qemu_user && \
+    mkdir -p /home/qemu_user/.ssh && \
+    chmod 700 /home/qemu_user/.ssh && \
+    chown -R qemu_user:qemu_user /home/qemu_user/.ssh && \
+    usermod -aG qemu qemu_user
 
-# Save container system users that are needed at runtime.
-# The host /etc/passwd will be mounted over this at runtime,
-# so we merge needed entries via the entrypoint.
-RUN cp /etc/passwd /etc/passwd.container && \
-    cp /etc/group /etc/group.container
+# SSH key pair is generated at runtime in entrypoint.sh
 
 # Configure libvirtd: disable unix socket auth for local dev access
 RUN sed -i \
@@ -63,7 +65,10 @@ RUN echo 'cgroup_device_acl = [' >> /etc/libvirt/qemu.conf && \
     echo '    "/dev/ptmx", "/dev/kvm",' >> /etc/libvirt/qemu.conf && \
     echo '    "/dev/net/tun", "/dev/vhost-net"' >> /etc/libvirt/qemu.conf && \
     echo ']' >> /etc/libvirt/qemu.conf && \
-    echo 'cgroup_controllers = []' >> /etc/libvirt/qemu.conf
+    echo 'cgroup_controllers = []' >> /etc/libvirt/qemu.conf && \
+    echo 'user = "root"' >> /etc/libvirt/qemu.conf && \
+    echo 'group = "root"' >> /etc/libvirt/qemu.conf && \
+    echo 'dynamic_ownership = 0' >> /etc/libvirt/qemu.conf
 
 # enable default network autostart
 RUN ln -sf /etc/libvirt/qemu/networks/default.xml /etc/libvirt/qemu/networks/autostart/default.xml

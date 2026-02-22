@@ -7,6 +7,7 @@ services:
     privileged: true
     restart: unless-stopped
 
+    # expose libvirt tcp socket and qemu guest agent socket
     ports:
       - "127.0.0.1:${BOXMAN_SSH_PORT:-2222}:22"
       - "127.0.0.1:${BOXMAN_LIBVIRT_TCP_PORT:-16509}:16509"
@@ -18,11 +19,10 @@ services:
       - /dev/vhost-net:/dev/vhost-net
       - /dev/vhost-vsock:/dev/vhost-vsock
 
+    # mount host paths needed for libvirt operation
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
       - /lib/modules:/lib/modules:ro
-      - /etc/passwd:/etc/passwd:ro
-      - /etc/group:/etc/group:ro
       - ${BOXMAN_DATA_DIR:-./data}/images:/var/lib/libvirt/images
       - ${BOXMAN_DATA_DIR:-./data}/libvirt-run:/var/run/libvirt
       - ${BOXMAN_DATA_DIR:-./data}/ssh:/etc/boxman/ssh
@@ -43,6 +43,10 @@ services:
 
     environment:
       - LIBVIRT_DEFAULT_URI=qemu:///system
+      - BOXMAN_SSH_PORT=${BOXMAN_SSH_PORT:-2222}
+      - BOXMAN_DATA_DIR=${BOXMAN_DATA_DIR:-./data}
+      - BOXMAN_INSTANCE_NAME=${BOXMAN_INSTANCE_NAME:-default}
+      - HOST_UID=${HOST_UID:-1000}
 
     # ──────────────────────────────────────────────────────────────
     # USAGE:
