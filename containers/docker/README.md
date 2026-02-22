@@ -101,6 +101,24 @@ sudo virsh list --all
 virsh -c "qemu+ssh://qemu_user@127.0.0.1:2222/system?keyfile=$(pwd)/data/ssh/id_ed25519&known_hosts=/dev/null&no_verify=1" list --all
 ```
 
+### Injecting Custom SSH Keys
+
+The container accepts additional SSH public keys for `qemu_user` via:
+
+1. **`BOXMAN_SSH_PUBKEY` environment variable** — corresponds to the
+   `${env:BOXMAN_SSH_PUBKEY}` entry in `boxman.yml`'s `ssh.authorized_keys`:
+
+   ```bash
+   export BOXMAN_SSH_PUBKEY="ssh-ed25519 AAAA... user@host"
+   make up
+   ```
+
+2. **Mounted `global_authorized_keys` file** — place resolved keys (one per
+   line) into `${BOXMAN_DATA_DIR}/ssh/global_authorized_keys` before starting
+   the container. The entrypoint appends them automatically.
+
+Both methods are additive to the container-generated key pair.
+
 ## Running Multiple Instances
 
 Each instance needs unique ports and a separate data directory:

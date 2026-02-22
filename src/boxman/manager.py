@@ -646,6 +646,30 @@ class BoxmanManager:
 
         return success
 
+    def get_global_authorized_keys(self) -> list[str]:
+        """
+        Resolve and return all global SSH authorized keys from the app config.
+
+        Reads ``ssh.authorized_keys`` from :pyattr:`app_config` (the top-level
+        ``boxman.yml``), resolves each entry via :pyfunc:`fetch_value`, and
+        returns a list of public-key strings.
+
+        Returns:
+            List of resolved SSH public key strings.
+        """
+        raw_keys = (
+            (self.app_config or {})
+            .get("ssh", {})
+            .get("authorized_keys", [])
+        )
+        resolved: list[str] = []
+        for entry in raw_keys:
+            try:
+                resolved.append(self.fetch_value(entry))
+            except (ValueError, FileNotFoundError) as exc:
+                self.logger.warning(f"skipping unresolvable SSH key entry: {exc}")
+        return resolved
+
     @classmethod
     def fetch_value(cls, value) -> str:
         """

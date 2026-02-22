@@ -8,6 +8,7 @@ import yaml
 import pytest
 
 from boxman.scripts.app import load_boxman_config
+from boxman.manager import BoxmanManager
 
 
 class TestBoxmanConfOverride:
@@ -76,3 +77,79 @@ class TestBoxmanConfOverride:
         """Verify that a non-existent config path raises an error."""
         with pytest.raises(FileNotFoundError):
             load_boxman_config("/nonexistent/path/boxman.yml")
+
+    def test_global_authorized_keys_resolves_literal(self):
+        """Literal SSH keys are returned as-is."""
+        mgr = BoxmanManager()
+        mgr.app_config = {
+            "ssh": {
+                "authorized_keys": [
+                    "ssh-ed25519 AAAA_LITERAL literal@host",
+                ]
+            }
+        }
+        keys = mgr.get_global_authorized_keys()
+        assert keys == ["ssh-ed25519 AAAA_LITERAL literal@host"]
+
+    def test_global_authorized_keys_resolves_env(self, monkeypatch):
+        """${env:BOXMAN_SSH_PUBKEY} is resolved from the environment."""
+        monkeypatch.setenv("BOXMAN_SSH_PUBKEY", "ssh-ed25519 AAAA_FROM_ENV env@host")
+        mgr = BoxmanManager()
+        mgr.app_config = {
+            "ssh": {
+                "authorized_keys": ["${env:BOXMAN_SSH_PUBKEY}"]
+            }
+        }
+        keys = mgr.get_global_authorized_keys()
+        assert keys == ["ssh-ed25519 AAAA_FROM_ENV env@host"]
+
+    def test_global_authorized_keys_resolves_file(self, tmp_path):
+        """file:// references are resolved from the filesystem."""
+        pub_key_file = tmp_path / "test_key.pub"
+        pub_key_file.write_text("ssh-ed25519 AAAA_FROM_FILE file@host\n")
+        mgr = BoxmanManager()
+        mgr.app_config = {
+            "ssh": {
+                "authorized_keys": [f"file://{pub_key_file}"]
+            }
+        }
+        keys = mgr.get_global_authorized_keys()
+        assert keys == ["ssh-ed25519 AAAA_FROM_FILE file@host"]
+
+    def test_global_authorized_keys_skips_unresolvable(self):
+        """Unresolvable entries are skipped with a warning."""
+        mgr = BoxmanManager()
+        mgr.app_config = {
+            "ssh": {
+                "authorized_keys": [
+                    "${env:BOXMAN_NONEXISTENT_VAR_12345}",
+                    "ssh-ed25519 AAAA_GOOD good@host",
+                ]
+            }
+        }
+        keys = mgr.get_global_authorized_keys()
+        assert keys == ["ssh-ed25519 AAAA_GOOD good@host"]
+
+    def test_global_authorized_keys_mixed_formats(self, tmp_path, monkeypatch):
+        """Literal strings, file refs, and env vars are all resolved together."""
+        monkeypatch.setenv("BOXMAN_TEST_KEY", "ssh-ed25519 AAAA_ENV env@host")
+
+        pub_file = tmp_path / "extra.pub"
+        pub_file.write_text("ssh-rsa BBBB_FILE file@host\n")
+
+        mgr = BoxmanManager()
+        mgr.app_config = {
+            "ssh": {
+                "authorized_keys": [
+                    "ssh-ed25519 AAAA_LITERAL literal@host",
+                    "${env:BOXMAN_TEST_KEY}",
+                    f"file://{pub_file}",
+                ]
+            }
+        }
+        keys = mgr.get_global_authorized_keys()
+        assert keys == [
+            "ssh-ed25519 AAAA_LITERAL literal@host",
+            "ssh-ed25519 AAAA_ENV env@host",
+            "ssh-rsa BBBB_FILE file@host",
+        ]

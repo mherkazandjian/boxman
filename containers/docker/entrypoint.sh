@@ -31,6 +31,34 @@ cp /etc/boxman/ssh/id_ed25519.pub /home/qemu_user/.ssh/authorized_keys
 chmod 600 /home/qemu_user/.ssh/authorized_keys
 chown qemu_user:qemu_user /home/qemu_user/.ssh/authorized_keys
 
+# Inject global SSH public keys (from boxman.yml ssh.authorized_keys)
+# 1. BOXMAN_SSH_PUBKEY env var — may contain one or more keys (newline-separated)
+#    Supports literal key strings, e.g.:
+#      BOXMAN_SSH_PUBKEY="ssh-ed25519 AAAA... user@host"
+#    or multiple keys:
+#      BOXMAN_SSH_PUBKEY=$'ssh-ed25519 AAAA... user1\nssh-rsa BBBB... user2'
+if [ -n "$BOXMAN_SSH_PUBKEY" ]; then
+    echo "$BOXMAN_SSH_PUBKEY" >> /home/qemu_user/.ssh/authorized_keys
+    n_keys=$(echo "$BOXMAN_SSH_PUBKEY" | grep -c '^ssh-')
+    echo "Added ${n_keys} key(s) from BOXMAN_SSH_PUBKEY to qemu_user authorized_keys"
+fi
+
+# 2. If the host mounted a global_authorized_keys file, append all keys from it
+#    Keys can be literal strings written one per line
+if [ -f /etc/boxman/ssh/global_authorized_keys ]; then
+    cat /etc/boxman/ssh/global_authorized_keys >> /home/qemu_user/.ssh/authorized_keys
+    echo "Added keys from /etc/boxman/ssh/global_authorized_keys to qemu_user authorized_keys"
+fi
+
+# Deduplicate authorized_keys (preserve order, skip blank lines)
+if command -v awk &>/dev/null; then
+    awk 'NF && !seen[$0]++' /home/qemu_user/.ssh/authorized_keys > /home/qemu_user/.ssh/authorized_keys.tmp
+    mv /home/qemu_user/.ssh/authorized_keys.tmp /home/qemu_user/.ssh/authorized_keys
+fi
+
+chmod 600 /home/qemu_user/.ssh/authorized_keys
+chown qemu_user:qemu_user /home/qemu_user/.ssh/authorized_keys
+
 # Make SSH keys readable by the host user
 chmod 644 /etc/boxman/ssh/id_ed25519.pub
 chmod 600 /etc/boxman/ssh/id_ed25519

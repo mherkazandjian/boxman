@@ -38,11 +38,11 @@ See [boxman/containers/docker/README.md](boxman/containers/docker/README.md) for
 ## Installation
 
  - git clone
- - python setup.py install
+ - `pip install .` (or `pip install -e .` for development)
  - For the libvirt provider it is necessary that the user executing boxman
    can run sudo virsh and other libvirt commands (see below).
- - the boxman configuration files are by default searched in `~/.config/boxman/boxman.conf` but
-   you can specify a different configuration file using the `--conf` argument.
+ - The boxman application config is searched at `~/.config/boxman/boxman.yml` by default.
+   Use `--boxman-conf` to specify an alternative path.
 
 ### Other pre-requisites
 
@@ -51,7 +51,8 @@ See [boxman/containers/docker/README.md](boxman/containers/docker/README.md) for
 
 ## Sample configuration
 
-  https://github.com/mherkazandjian/boxman/blob/main/data/conf.yml
+  See [`data/templates/boxman.yml`](data/templates/boxman.yml) and
+  [`data/conf.yml`](https://github.com/mherkazandjian/boxman/blob/main/data/conf.yml)
 
 ## Usage
 
