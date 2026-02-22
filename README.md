@@ -29,13 +29,6 @@ modifying your host system. Only requires Docker with compose v2 and `/dev/kvm` 
 
 See [boxman/containers/docker/README.md](boxman/containers/docker/README.md) for full documentation.
 
-## Usage
-
-```bash
-export BOXMAN_ADMIN_PASS=$(cat ~/.onlyme/rocky-95-minimal-base-template-admin-pass)
-boxman provision
-```
-
 ## Requirements
 
 - Python 3.10+
@@ -47,11 +40,11 @@ boxman provision
  - git clone
  - python setup.py install
  - For the libvirt provider it is necessary that the user executing boxman
-   can run sudo virhs and other libvirt commands (see blow).
+   can run sudo virsh and other libvirt commands (see below).
  - the boxman configuration files are by default searched in `~/.config/boxman/boxman.conf` but
    you can specify a different configuration file using the `--conf` argument.
 
-### other pre-requisites
+### Other pre-requisites
 
     - sshpass
     - ansible
@@ -62,39 +55,34 @@ boxman provision
 
 ## Usage
 
-### Import vm images
+### Provision and manage VMs
 
 ````bash
-  # download and extract the vm package from a give url
-  curl -L http://example.com/vm-package.tar.gz | tar xv -C ~/tmp/sandbox/
-
-  # import a vm from a disk, a directory called my-ubuntu-vm will be created in ~/myvms
-  boxman import-image --uri file://~/http://example.com/vm-package.tar.gz \
-    --directory ~/myvms  \
-    --name my-ubuntu-vm \
-    --provider libvirt
+export BOXMAN_ADMIN_PASS=$(cat ~/.onlyme/rocky-95-minimal-base-template-admin-pass)
+boxman provision
+boxman snapshot --name "state before kernel upgrade"
+# ... upgrade the kernel and then end up with a kernel panic
+boxman restore --name "state before kernel upgrade"
 ````
 
-### Provision and manage vms
+### Import VM images
 
 ````bash
-  boxman provision
-  boxman snapshot --name "state before kernel upgrade"
-  # ... upgrade the kernel and then end up with a kernel panic
-  boxman restore --name "state before kernel upgrade"
+# download and extract the vm package from a given url
+curl -L http://example.com/vm-package.tar.gz | tar xv -C ~/tmp/sandbox/
+
+# import a vm from a disk, a directory called my-ubuntu-vm will be created in ~/myvms
+boxman import-image --uri file://~/http://example.com/vm-package.tar.gz \
+  --directory ~/myvms  \
+  --name my-ubuntu-vm \
+  --provider libvirt
 ````
 
 ## Development
 
- - git clone
- - hack
- - git commit and push
- - test
- - submit pull request
+### Run boxman in development mode
 
-### run boxman in development mode
-
-````
+````bash
 cd $PROJECT_ROOT
 PYTHONPATH=src:$PYTHONPATH python3 src/boxman/scripts/app.py <sub-command> <cmd-line-args>
 
@@ -109,6 +97,7 @@ make set-default-env env=~/tmp/sandbox/test_cluster/env.sh
 make set-current-env env=~/tmp/sandbox/test_cluster/env.sh
 make ping
 ````
+
 ## Contributing
 
  - git clone
