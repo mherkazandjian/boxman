@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Ensure required directories exist (in case bind-mount created them as root-owned empty dirs)
+mkdir -p /var/run/libvirt /var/lib/libvirt/images /etc/boxman/ssh
+
 # Merge host and container passwd/group using nss_wrapper
 # so libvirtd can resolve both host UIDs and container system users (qemu, libvirt, etc.)
 MERGED_PASSWD=/tmp/merged_passwd
@@ -30,6 +33,18 @@ fi
 export LD_PRELOAD=/usr/lib64/libnss_wrapper.so
 export NSS_WRAPPER_PASSWD=$MERGED_PASSWD
 export NSS_WRAPPER_GROUP=$MERGED_GROUP
+
+# If SSH key doesn't exist yet in the bind-mounted dir, copy it from the image
+if [ ! -f /etc/boxman/ssh/id_ed25519 ]; then
+    ssh-keygen -t ed25519 -f /etc/boxman/ssh/id_ed25519 -N "" -C "boxman-libvirt-container"
+    cp /etc/boxman/ssh/id_ed25519.pub /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    echo "Generated new SSH key pair in /etc/boxman/ssh/"
+else
+    # Ensure authorized_keys is up to date
+    cp /etc/boxman/ssh/id_ed25519.pub /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+fi
 
 # Clean up stale sockets
 rm -f /var/run/libvirt/libvirt-sock /var/run/libvirt/libvirt-sock-ro

@@ -21,11 +21,25 @@ RUN dnf install -y epel-release && \
         nftables \
         libvirt-daemon-config-network \
         nss_wrapper \
+        openssh-server \
+        openssh-clients \
     && dnf clean all
 
 COPY supervisord.conf /etc/supervisord.conf
 
 RUN mkdir -p /var/run/libvirt /var/lib/libvirt/images /var/log/supervisor /etc/dnsmasq.d
+
+# Configure sshd
+RUN ssh-keygen -A && \
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh && \
+    sed -i \
+        -e 's/^#PermitRootLogin.*/PermitRootLogin prohibit-password/' \
+        -e 's/^#PubkeyAuthentication.*/PubkeyAuthentication yes/' \
+        -e 's/^#PasswordAuthentication.*/PasswordAuthentication no/' \
+        /etc/ssh/sshd_config
+
+# SSH key pair is generated at runtime in entrypoint.sh
+# and stored in the bind-mounted /etc/boxman/ssh/ directory
 
 # Save container system users that are needed at runtime.
 # The host /etc/passwd will be mounted over this at runtime,

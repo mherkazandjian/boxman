@@ -3,33 +3,30 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: boxman-libvirt
+    container_name: boxman-libvirt-${BOXMAN_INSTANCE_NAME:-default}
     privileged: true
     restart: unless-stopped
 
-    # expose libvirt tcp socket and qemu guest agent socket
     ports:
-      - "127.0.0.1:16509:16509"   # libvirtd plain TCP
-      - "127.0.0.1:16514:16514"   # libvirtd TLS
+      - "127.0.0.1:${BOXMAN_SSH_PORT:-2222}:22"
+      - "127.0.0.1:${BOXMAN_LIBVIRT_TCP_PORT:-16509}:16509"
+      - "127.0.0.1:${BOXMAN_LIBVIRT_TLS_PORT:-16514}:16514"
 
-    # devices required for nested virtualization
     devices:
       - /dev/kvm:/dev/kvm
       - /dev/net/tun:/dev/net/tun
       - /dev/vhost-net:/dev/vhost-net
       - /dev/vhost-vsock:/dev/vhost-vsock
 
-    # mount host paths needed for libvirt operation
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
       - /lib/modules:/lib/modules:ro
-      - boxman-images:/var/lib/libvirt/images
-      - /var/lib/boxman/libvirt-run:/var/run/libvirt
-      # Mount host passwd/group so libvirtd can resolve any host UID connecting via the socket
       - /etc/passwd:/etc/passwd:ro
       - /etc/group:/etc/group:ro
+      - ${BOXMAN_DATA_DIR:-./data}/images:/var/lib/libvirt/images
+      - ${BOXMAN_DATA_DIR:-./data}/libvirt-run:/var/run/libvirt
+      - ${BOXMAN_DATA_DIR:-./data}/ssh:/etc/boxman/ssh
 
-    # required capabilities for networking and virtualization
     cap_add:
       - NET_ADMIN
       - NET_RAW
@@ -46,44 +43,37 @@ services:
 
     environment:
       - LIBVIRT_DEFAULT_URI=qemu:///system
-      - HOST_UID=${HOST_UID:-1000}
-      - HOST_GID=${HOST_GID:-1000}
 
+    # ──────────────────────────────────────────────────────────────
+    # USAGE:
+    #
+    # Default instance:
+    #   docker compose up --build -d
+    #
+    # Named instance with custom data dir:
+    #   BOXMAN_INSTANCE_NAME=dev01 \
+    #   BOXMAN_DATA_DIR=/home/user/boxman-instances/dev01 \
+    #   BOXMAN_SSH_PORT=2223 \
+    #   BOXMAN_LIBVIRT_TCP_PORT=16510 \
+    #   BOXMAN_LIBVIRT_TLS_PORT=16515 \
+    #   docker compose -p boxman-dev01 up --build -d
+    #
+    # Connect via socket:
+    #   virsh -c "qemu+unix:///system?socket=${BOXMAN_DATA_DIR}/libvirt-run/libvirt-sock"
+    #
+    # Connect via SSH:
+    #   ssh -F ssh_config boxman-libvirt
+    #
     # ──────────────────────────────────────────────────────────────
     # HARDENING GUIDELINES (for production / shared environments):
     #
     # 1. Remove `privileged: true` and use only the specific
     #    cap_add entries listed above.
-    #
-    # 2. Re-enable libvirt socket authentication:
-    #      auth_unix_rw = "polkit"  (or "sasl")
-    #    and remove the 0777 socket permissions.
-    #
-    # 3. Restrict socket bind-mount permissions:
-    #      chmod 0770 /var/lib/boxman/libvirt-run
-    #      chown root:<your-group> /var/lib/boxman/libvirt-run
-    #    and add your dev user to that group.
-    #
-    # 4. Use read-only root filesystem where possible:
-    #      read_only: true  (with explicit tmpfs/volume mounts)
-    #
-    # 5. Drop seccomp:unconfined / apparmor:unconfined and use
-    #    a custom seccomp profile that allows only needed syscalls.
-    #
-    # 6. Limit container resources:
-    #      deploy:
-    #        resources:
-    #          limits:
-    #            cpus: '4'
-    #            memory: 8G
-    #
-    # 7. Use TLS for remote libvirt connections (port 16514)
-    #    instead of plain TCP (port 16509).
-    #
-    # 8. Run libvirtd as a non-root user inside the container
-    #    where feasible.
+    # 2. Re-enable libvirt socket authentication.
+    # 3. Restrict socket bind-mount permissions.
+    # 4. Use read-only root filesystem where possible.
+    # 5. Drop seccomp:unconfined / apparmor:unconfined.
+    # 6. Limit container resources via deploy.resources.limits.
+    # 7. Use TLS for remote libvirt connections.
+    # 8. Run libvirtd as a non-root user where feasible.
     # ──────────────────────────────────────────────────────────────
-
-volumes:
-  boxman-images:
-  boxman-libvirt-run:
