@@ -1,6 +1,6 @@
 import time
 import re
-from telnetlib import Telnet
+import socket
 from .utils import Command
 from .utils import log
 
@@ -168,7 +168,7 @@ class Virtualbox:
         """
         Return True if the ssh server is up otherwise False
 
-        uses telnet, success criterion SSH string is read by telnet
+        Uses a plain TCP socket to connect and read the SSH banner.
         """
         is_up = False
         match_bytes = b'SSH'
@@ -176,13 +176,13 @@ class Virtualbox:
 
             print(f'attempt {attempt_no} to check ssh server status')
             try:
-                with Telnet(host, int(port)) as tn:
-                    data = tn.read_until(match_bytes, timeout=timeout)
-                    if data == match_bytes:
+                with socket.create_connection((host, int(port)), timeout=timeout) as sock:
+                    data = sock.recv(256)
+                    if match_bytes in data:
                         is_up = True
                         break
-            except EOFError:
-                print('telnet EOFError, try again')
+            except (OSError, ConnectionRefusedError, TimeoutError):
+                print('connection failed, try again')
 
             if is_up:
                 break

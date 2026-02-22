@@ -44,9 +44,12 @@ PYTEST_FLAGS ?=
 ifeq ($(verbose),1)
 PYTEST_FLAGS += -v
 endif
+ifdef pytest
+PYTEST_FLAGS += $(pytest)
+endif
 
-test: ## Run all tests
-	pytest $(PYTEST_FLAGS) tests/
+test: ## Run all tests (verbose=1, pytest_args="..." for extra flags)
+	PYTHONPATH=$(PWD)/src:$(PYTHONPATH) pytest $(PYTEST_FLAGS) $(pytest_args) tests/
 
 test-integration: ## Run docker-compose integration tests (verbose=1 for verbose output)
-	pytest $(PYTEST_FLAGS) -m integration tests/test_docker_compose.py
+	PYTHONPATH=$(PWD)/src:$(PYTHONPATH) pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_docker_compose.py

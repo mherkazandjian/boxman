@@ -1,0 +1,78 @@
+"""
+Test that --boxman-conf overrides the default ~/.config/boxman/boxman.yml.
+"""
+
+import os
+import tempfile
+import yaml
+import pytest
+
+from boxman.scripts.app import load_boxman_config
+
+
+class TestBoxmanConfOverride:
+
+    def test_custom_boxman_conf_is_loaded(self, tmp_path):
+        """Verify that load_boxman_config reads from the specified path,
+        not from ~/.config/boxman/boxman.yml."""
+        custom_config = {
+            "ssh": {
+                "authorized_keys": ["ssh-ed25519 AAAA_TEST_KEY test@boxman"]
+            },
+            "providers": {
+                "libvirt": {
+                    "uri": "qemu+tcp://custom-host/system",
+                    "use_sudo": False,
+                    "verbose": False,
+                }
+            },
+        }
+
+        conf_path = tmp_path / "custom_boxman.yml"
+        conf_path.write_text(yaml.dump(custom_config))
+
+        loaded = load_boxman_config(str(conf_path))
+
+        assert loaded == custom_config
+        assert loaded["providers"]["libvirt"]["uri"] == "qemu+tcp://custom-host/system"
+        assert loaded["ssh"]["authorized_keys"] == [
+            "ssh-ed25519 AAAA_TEST_KEY test@boxman"
+        ]
+
+    def test_custom_conf_does_not_read_default(self, tmp_path):
+        """Ensure values come from the custom file, not the default location."""
+        sentinel = "BOXMAN_TEST_SENTINEL_VALUE"
+        custom_config = {
+            "providers": {
+                "libvirt": {
+                    "uri": sentinel,
+                }
+            },
+        }
+
+        conf_path = tmp_path / "boxman_sentinel.yml"
+        conf_path.write_text(yaml.dump(custom_config))
+
+        loaded = load_boxman_config(str(conf_path))
+
+        assert loaded["providers"]["libvirt"]["uri"] == sentinel
+
+        # cross-check: the default config (if it exists) should not contain
+        # our sentinel
+        default_path = os.path.expanduser("~/.config/boxman/boxman.yml")
+        if os.path.isfile(default_path):
+            default_loaded = load_boxman_config(default_path)
+            default_uri = (
+                default_loaded
+                .get("providers", {})
+                .get("libvirt", {})
+                .get("uri", "")
+            )
+            assert default_uri != sentinel, (
+                "default config unexpectedly contains the sentinel value"
+            )
+
+    def test_missing_conf_raises(self):
+        """Verify that a non-existent config path raises an error."""
+        with pytest.raises(FileNotFoundError):
+            load_boxman_config("/nonexistent/path/boxman.yml")

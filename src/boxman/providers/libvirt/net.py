@@ -1,7 +1,7 @@
 import os
 import uuid
 import re
-import pkg_resources
+from importlib import resources as importlib_resources
 from typing import Optional, Dict, Any, Union, List
 
 import tempfile
@@ -116,7 +116,7 @@ class Network(VirshCommand):
             XML string for the network definition
         """
         # get the path to the assets directory
-        assets_path = pkg_resources.resource_filename('boxman', 'assets')
+        assets_path = str(importlib_resources.files('boxman').joinpath('assets'))
 
         # create a jinja environment
         env = Environment(
@@ -801,7 +801,7 @@ class NetworkInterface(VirshCommand):
 
         try:
             # get the path to the assets directory
-            assets_path = pkg_resources.resource_filename('boxman', 'assets')
+            assets_path = str(importlib_resources.files('boxman').joinpath('assets'))
 
             # create a jinja environment
             env = Environment(
