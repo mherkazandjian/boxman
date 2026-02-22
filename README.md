@@ -1,11 +1,46 @@
 # boxman
 
-Boxman (**box** **man**ager) is a package that can be used to manage
-infrastructure using configuration files (yaml). It is
-inspired by ``Docker Compose`` and ``vagrant``.
-The main goal is to avoid having many dependencies and to
-keep it simple and customizable.
+Boxman (**box** **man**ager) is a package that can be used to manage infrastructure using
+configuration files (yaml). It is inspired by ``Docker Compose`` and ``vagrant``.
+The main goal is to avoid having many dependencies and to keep it simple and customizable.
 
+
+## Features
+
+- Declarative VM provisioning via YAML configuration
+- Supports libvirt/KVM with QEMU
+- Network and disk management
+- Snapshot support
+- Cloud-init integration
+
+## Quick Start
+
+### Native (Host) Installation
+
+```bash
+pip install -r requirements.txt
+pip install .
+```
+
+### Docker-based Libvirt Environment
+
+Boxman includes a containerized libvirt/KVM environment for development and testing without
+modifying your host system. Only requires Docker with compose v2 and `/dev/kvm` on the host.
+
+See [boxman/containers/docker/README.md](boxman/containers/docker/README.md) for full documentation.
+
+## Usage
+
+```bash
+export BOXMAN_ADMIN_PASS=$(cat ~/.onlyme/rocky-95-minimal-base-template-admin-pass)
+boxman provision
+```
+
+## Requirements
+
+- Python 3.10+
+- libvirt with KVM/QEMU
+- For Docker mode: Docker with compose v2, `/dev/kvm` on the host
 
 ## Installation
 
@@ -81,3 +116,7 @@ make ping
  - git commit and push
  - test
  - submit pull request
+
+## License
+
+This project is licensed under the [MIT License](../LICENSE).
