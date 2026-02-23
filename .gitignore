@@ -160,3 +160,4 @@ data/dev/*
 *.rendered.yml
 .github
 containers/docker/data
+.boxman
