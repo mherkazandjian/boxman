@@ -270,10 +270,20 @@ class BoxmanManager:
         Register the project in the Boxman cache.
 
         This method saves the project configuration to the cache for later use.
+
+        Raises:
+            RuntimeError: If the project is already registered in the cache.
         """
-        self.cache.register_project(
+        success = self.cache.register_project(
             project_name=self.config['project'],
-            config_fpath=self.config_path)
+            config_fpath=self.config_path,
+            runtime=self._runtime_name)
+
+        if success is False:
+            raise RuntimeError(
+                f"Project '{self.config['project']}' is already in the cache. "
+                f"Deprovision it first with: boxman deprovision"
+            )
 
     def unregister_from_cache(self) -> None:
         """
@@ -987,7 +997,17 @@ class BoxmanManager:
         if not os.path.isdir(workdir):
             os.makedirs(workdir)
 
-        cls.register_project_in_cache()
+        # Ensure provider config reflects runtime settings.
+        # Project-level provider settings (from conf.yml) always take
+        # precedence over app-level defaults (from boxman.yml).
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
+
+        try:
+            cls.register_project_in_cache()
+        except RuntimeError as exc:
+            cls.logger.error(str(exc))
+            return
 
         cls.provision_files()
 
@@ -1047,6 +1067,12 @@ class BoxmanManager:
 
         ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
+
+        # Ensure provider config reflects runtime settings.
+        # Project-level provider settings (from conf.yml) always take
+        # precedence over app-level defaults (from boxman.yml).
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
 
         prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls.config['clusters'].items():

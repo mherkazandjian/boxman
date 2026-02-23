@@ -11,9 +11,10 @@ import os
 import sys
 import time
 import shutil
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 import invoke
+import yaml as pyyaml
 
 from boxman.runtime.base import RuntimeBase
 from boxman import log
@@ -40,6 +41,10 @@ class DockerComposeRuntime(RuntimeBase):
         #: set by the manager before calling ensure_ready()
         self.project_dir: Optional[str] = self.config.get("project_dir")
 
+        #: list[str]: workdirs from conf.yml (one per cluster) that need
+        #: to be accessible inside the container; set by the manager
+        self.workdirs: list = self.config.get("workdirs", [])
+
     @property
     def name(self) -> str:
         return "docker-compose"
@@ -47,7 +52,7 @@ class DockerComposeRuntime(RuntimeBase):
     def wrap_command(self, command: str) -> str:
         """Wrap *command* in a ``docker exec`` invocation."""
         escaped = command.replace("'", "'\\''")
-        return f"docker exec {self.container_name} bash -c '{escaped}'"
+        return f"docker exec --user root {self.container_name} bash -c '{escaped}'"
 
     def inject_into_provider_config(
         self, provider_config: Dict[str, Any]
@@ -57,45 +62,136 @@ class DockerComposeRuntime(RuntimeBase):
         return cfg
 
     # ------------------------------------------------------------------
+    # bind-mount injection
+    # ------------------------------------------------------------------
+    def _collect_bind_mount_dirs(self, abs_project_dir: str) -> List[str]:
+        """
+        Collect all unique absolute directories that must be bind-mounted
+        into the container: the project directory plus every workdir.
+        """
+        dirs = set()
+        dirs.add(abs_project_dir)
+        for wd in self.workdirs:
+            dirs.add(os.path.abspath(wd))
+        return sorted(dirs)
+
+    def _inject_bind_mounts_into_compose(
+        self, compose_path: str, bind_dirs: List[str]
+    ) -> None:
+        """
+        Read the docker-compose.yml, add ``path:path`` volume entries for
+        each directory in *bind_dirs* (if not already present), and write
+        the file back.
+        """
+        with open(compose_path, "r") as fobj:
+            compose = pyyaml.safe_load(fobj)
+
+        # Find the first (and typically only) service
+        services = compose.get("services", {})
+        if not services:
+            self.logger.warning("no services found in docker-compose.yml")
+            return
+
+        service_name = next(iter(services))
+        service = services[service_name]
+        volumes = service.setdefault("volumes", [])
+
+        # Collect existing host-side mount sources for dedup
+        existing_sources = set()
+        for vol in volumes:
+            if isinstance(vol, str) and ":" in vol:
+                src = vol.split(":")[0]
+                existing_sources.add(src)
+
+        added = []
+        for d in bind_dirs:
+            if d not in existing_sources:
+                entry = f"{d}:{d}"
+                volumes.append(entry)
+                added.append(entry)
+
+        if added:
+            self.logger.info(
+                f"injected {len(added)} bind-mount(s) into {compose_path}:")
+            for e in added:
+                self.logger.info(f"  - {e}")
+        else:
+            self.logger.info("all bind-mount dirs already present in compose file")
+
+        with open(compose_path, "w") as fobj:
+            pyyaml.dump(compose, fobj, default_flow_style=False, sort_keys=False)
+
+    # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
     def ensure_ready(self) -> None:
         """
         Make sure the docker-compose environment is up and healthy.
         """
-        if self._container_is_running():
-            self.logger.info(
-                f"runtime container '{self.container_name}' is already running")
-            self._wait_for_libvirtd()
-            return
-
         compose_path = self.get_compose_file_path()
         compose_dir = os.path.dirname(compose_path)
+        abs_project_dir = os.path.abspath(self.project_dir or os.getcwd())
+
+        # Collect directories to bind-mount and inject them into the
+        # docker-compose.yml before starting.
+        bind_dirs = self._collect_bind_mount_dirs(abs_project_dir)
+        self._inject_bind_mounts_into_compose(compose_path, bind_dirs)
+
+        # Always rewrite .env with the current paths
+        self._write_env_file(compose_dir, abs_project_dir)
+
+        # Log the compose file so the user can see what will be started
+        self._log_compose_file(compose_path)
+
+        if self._container_is_running():
+            # Check that every bind dir is accessible inside the container
+            all_accessible = all(
+                self._project_dir_accessible(d) for d in bind_dirs
+            )
+            if all_accessible:
+                self.logger.info(
+                    f"runtime container '{self.container_name}' is already "
+                    f"running and all bind-mount dirs are accessible")
+                self._wait_for_libvirtd()
+                return
+            else:
+                self.logger.info(
+                    f"some bind-mount dirs are NOT accessible "
+                    f"inside container — recreating...")
+                self._stop_compose(compose_path, compose_dir)
 
         self.logger.info(
             f"starting docker-compose environment "
             f"(compose file: {compose_path})")
 
         try:
-            # Resolve absolute BOXMAN_DATA_DIR so the entrypoint generates
-            # an absolute IdentityFile path in the SSH config.
-            # Also pass HOST_UID/HOST_GID so the entrypoint can chown
-            # generated SSH keys to be readable by the host user.
             data_dir = os.path.join(compose_dir, "data")
             abs_data_dir = os.path.abspath(data_dir)
             host_uid = os.getuid()
             host_gid = os.getgid()
 
+            env_vars = {
+                "BOXMAN_DATA_DIR": abs_data_dir,
+                "HOST_UID": str(host_uid),
+                "HOST_GID": str(host_gid),
+                "BOXMAN_PROJECT_DIR": abs_project_dir,
+            }
+
+            self.logger.info("docker compose environment variables:")
+            for k, v in env_vars.items():
+                self.logger.info(f"  {k}={v}")
+
+            compose_env = os.environ.copy()
+            compose_env.update(env_vars)
+
             invoke.run(
-                f"BOXMAN_DATA_DIR={abs_data_dir} "
-                f"HOST_UID={host_uid} "
-                f"HOST_GID={host_gid} "
                 f"docker compose "
                 f"-f {compose_path} "
                 f"--project-directory {compose_dir} "
                 f"up -d --build",
                 hide=False,
                 warn=False,
+                env=compose_env,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -107,6 +203,17 @@ class DockerComposeRuntime(RuntimeBase):
 
         self.logger.info(
             f"runtime container '{self.container_name}' is ready")
+
+    def _log_compose_file(self, compose_path: str) -> None:
+        """Log the contents of the docker-compose.yml before starting."""
+        try:
+            with open(compose_path, "r") as fobj:
+                contents = fobj.read()
+            self.logger.info(
+                f"docker-compose.yml ({compose_path}):\n"
+                f"{'─' * 60}\n{contents}{'─' * 60}")
+        except Exception as exc:
+            self.logger.warning(f"could not read compose file for logging: {exc}")
 
     def _container_is_running(self) -> bool:
         """Return True if the container is in 'running' state."""
@@ -157,6 +264,33 @@ class DockerComposeRuntime(RuntimeBase):
             f"libvirtd inside '{self.container_name}' did not become "
             f"responsive within {self.ready_timeout}s"
         )
+
+    def _project_dir_accessible(self, abs_dir: str) -> bool:
+        """Return True if *abs_dir* exists inside the container."""
+        try:
+            result = invoke.run(
+                f"docker exec --user root {self.container_name} "
+                f"test -d '{abs_dir}'",
+                hide=True,
+                warn=True,
+            )
+            return result.ok
+        except Exception:
+            return False
+
+    def _stop_compose(self, compose_path: str, compose_dir: str) -> None:
+        """Stop the docker-compose environment so it can be recreated."""
+        try:
+            invoke.run(
+                f"docker compose "
+                f"-f {compose_path} "
+                f"--project-directory {compose_dir} "
+                f"down",
+                hide=False,
+                warn=True,
+            )
+        except Exception as exc:
+            self.logger.warning(f"failed to stop compose: {exc}")
 
     # ------------------------------------------------------------------
     # compose file resolution
@@ -225,8 +359,6 @@ class DockerComposeRuntime(RuntimeBase):
         if os.path.isfile(local_compose):
             self.logger.info(
                 f"using existing runtime assets in {local_dir}")
-            # always rewrite .env with absolute paths to avoid stale relative refs
-            self._write_env_file(local_dir)
             return local_compose
 
         # find the source assets inside the package
@@ -246,10 +378,8 @@ class DockerComposeRuntime(RuntimeBase):
         for item in os.listdir(source_dir):
             src = os.path.join(source_dir, item)
             dst = os.path.join(local_dir, item)
-            # skip the data/ directory — it is created at runtime
             if item == "data":
                 continue
-            # skip .env — we generate it with absolute paths below
             if item == ".env":
                 continue
             if os.path.isdir(src):
@@ -257,21 +387,17 @@ class DockerComposeRuntime(RuntimeBase):
             else:
                 shutil.copy2(src, dst)
 
-        # write .env with absolute paths
-        self._write_env_file(local_dir)
-
         self.logger.info(f"deployed runtime assets to {local_dir}")
         return local_compose
 
-    def _write_env_file(self, runtime_dir: str) -> None:
+    def _write_env_file(self, runtime_dir: str,
+                        abs_project_dir: str = None) -> None:
         """
         Write a ``.env`` file in *runtime_dir* with absolute paths.
-
-        Docker Compose reads ``.env`` from the ``--project-directory``.
-        Using absolute paths ensures volume mounts and entrypoint
-        variables resolve correctly regardless of the caller's cwd.
         """
         abs_data_dir = os.path.abspath(os.path.join(runtime_dir, "data"))
+        if abs_project_dir is None:
+            abs_project_dir = os.path.abspath(self.project_dir or os.getcwd())
         env_path = os.path.join(runtime_dir, ".env")
         host_uid = os.getuid()
         host_gid = os.getgid()
@@ -279,24 +405,20 @@ class DockerComposeRuntime(RuntimeBase):
         with open(env_path, "w") as fobj:
             fobj.write(f"BOXMAN_INSTANCE_NAME=default\n")
             fobj.write(f"BOXMAN_DATA_DIR={abs_data_dir}\n")
+            fobj.write(f"BOXMAN_PROJECT_DIR={abs_project_dir}\n")
             fobj.write(f"BOXMAN_SSH_PORT=2222\n")
             fobj.write(f"BOXMAN_LIBVIRT_TCP_PORT=16509\n")
             fobj.write(f"BOXMAN_LIBVIRT_TLS_PORT=16514\n")
             fobj.write(f"HOST_UID={host_uid}\n")
             fobj.write(f"HOST_GID={host_gid}\n")
 
-        self.logger.debug(f"wrote .env with BOXMAN_DATA_DIR={abs_data_dir}")
+        self.logger.info(f"wrote .env: BOXMAN_PROJECT_DIR={abs_project_dir}, "
+                         f"BOXMAN_DATA_DIR={abs_data_dir}")
 
     @staticmethod
     def _find_asset_source_dir() -> Optional[str]:
         """
         Locate the bundled docker assets directory on disk.
-
-        Checks (in order):
-          1. ``boxman/assets/docker/`` via importlib.resources
-          2. ``boxman/assets/docker/`` relative to boxman.__file__
-          3. ``containers/docker/`` relative to the distribution root
-             (poetry includes these files at the top level of the wheel/sdist)
         """
         def _has_compose(d: str) -> bool:
             return os.path.isdir(d) and os.path.isfile(
@@ -307,29 +429,19 @@ class DockerComposeRuntime(RuntimeBase):
             pkg_dir = os.path.dirname(os.path.abspath(_pkg.__file__))
             log.debug(f"_find_asset_source_dir: pkg_dir = {pkg_dir}")
 
-            # 1. importlib.resources (Python 3.9+)
             if sys.version_info >= (3, 9):
                 from importlib.resources import files
                 asset_path = str(files("boxman").joinpath("assets", "docker"))
-                log.debug(f"_find_asset_source_dir: importlib candidate = {asset_path}, has_compose = {_has_compose(asset_path)}")
                 if _has_compose(asset_path):
                     return asset_path
 
-            # 2. relative to boxman.__file__ → assets/docker/
             candidate = os.path.join(pkg_dir, "assets", "docker")
-            log.debug(f"_find_asset_source_dir: assets candidate = {candidate}, has_compose = {_has_compose(candidate)}")
             if _has_compose(candidate):
                 return candidate
 
-            # 3. containers/docker/ included by poetry at the distribution root
-            #    In an installed package, pkg_dir is <site-packages>/boxman/
-            #    and the included files land at <site-packages>/containers/docker/
-            #    In an editable install, pkg_dir is <project>/src/boxman/
-            #    and the files are at <project>/containers/docker/
-            site_root = os.path.dirname(pkg_dir)  # <site-packages> or <project>/src
+            site_root = os.path.dirname(pkg_dir)
             for base in [site_root, os.path.dirname(site_root)]:
                 candidate = os.path.join(base, "containers", "docker")
-                log.debug(f"_find_asset_source_dir: containers candidate = {candidate}, has_compose = {_has_compose(candidate)}")
                 if _has_compose(candidate):
                     return candidate
 

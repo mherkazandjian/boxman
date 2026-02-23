@@ -16,6 +16,15 @@ runtime_config:
   # Optional: explicit path to docker-compose.yml. When omitted, boxman
   # uses the bundled compose file shipped with the package.
   # compose_file: ~/projects/boxman/containers/docker/docker-compose.yml
+  # Optional: project directory to bind-mount into the container.
+  # Defaults to the directory containing conf.yml. This allows the
+  # container to access workdir files (network XML, disk images, etc.)
+  # at the same absolute path as on the host.
+  # project_dir: ~/projects/my-infra
+  #
+  # Workdirs are extracted automatically from conf.yml clusters and
+  # injected as bind-mount volumes into the docker-compose.yml before
+  # the container is started. No manual configuration needed.
 
 # Global SSH configuration applied across all providers (libvirt, docker, etc.)
 # Keys listed here are injected into all managed guests/containers.
@@ -36,7 +45,7 @@ providers:
     # the libvirt connection uri
     uri: qemu:///system
     # whether to use sudo for libvirt commands
-    use_sudo: True
+    use_sudo: False
     # path to libvirt related commands
     virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
     # path to virt-clone command

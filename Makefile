@@ -59,14 +59,3 @@ test: ## Run all tests (verbose=1, pytest_args="..." for extra flags)
 
 test-integration: ## Run docker-compose integration tests (verbose=1 for verbose output)
 	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_docker_compose.py
-
-ssh-runtime: ## SSH into the docker-compose runtime container
-	@CONF_DIR=$$(pwd); \
-	SSH_DIR="$$CONF_DIR/.boxman/runtime/docker/data/ssh"; \
-	if [ -f "$$SSH_DIR/boxman.conf" ] && [ -f "$$SSH_DIR/id_ed25519" ]; then \
-		ssh -F "$$SSH_DIR/boxman.conf" -i "$$SSH_DIR/id_ed25519" boxman-default; \
-	else \
-		echo "ERROR: runtime SSH config not found at $$SSH_DIR"; \
-		echo "       run 'boxman --runtime docker-compose provision' first"; \
-		exit 1; \
-	fi

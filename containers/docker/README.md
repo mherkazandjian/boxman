@@ -50,6 +50,10 @@ containers/docker/
         ├── id_ed25519
         ├── id_ed25519.pub
         └── boxman.conf
+
+The project directory (BOXMAN_PROJECT_DIR) is also bind-mounted into the
+container at its absolute host path, so workdir files (network XML definitions,
+disk images, etc.) are accessible inside the container without path translation.
 ```
 
 ## Quick Start
@@ -171,6 +175,8 @@ Configured in `.env` or overridden on the command line:
 |---|---|---|
 | `BOXMAN_INSTANCE_NAME` | `default` | Instance name (used in container name and SSH config) |
 | `BOXMAN_DATA_DIR` | `./data` | Host directory for images, sockets, and SSH keys |
+| `BOXMAN_PROJECT_DIR` | `.` | Project directory where conf.yml lives |
+| `BOXMAN_WORKDIR` | `BOXMAN_PROJECT_DIR` | Workdir from conf.yml (disk images, network XMLs, etc.) |
 | `BOXMAN_SSH_PORT` | `2222` | Host port mapped to container SSH |
 | `BOXMAN_LIBVIRT_TCP_PORT` | `16509` | Host port for libvirt plain TCP |
 | `BOXMAN_LIBVIRT_TLS_PORT` | `16514` | Host port for libvirt TLS |

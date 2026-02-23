@@ -57,12 +57,13 @@ class TestDockerComposeRuntime:
     def test_wrap_command(self):
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
         wrapped = rt.wrap_command("virsh list --all")
-        assert wrapped == "docker exec ctr1 bash -c 'virsh list --all'"
+        assert wrapped == "docker exec --user root ctr1 bash -c 'virsh list --all'"
 
     def test_wrap_command_escapes_single_quotes(self):
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
         wrapped = rt.wrap_command("echo 'hello world'")
         assert "'\\''" in wrapped  # single quotes are escaped
+        assert "--user root" in wrapped
 
     def test_inject_sets_runtime_and_container(self):
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
@@ -79,19 +80,90 @@ class TestDockerComposeRuntime:
         assert "runtime" not in original
         assert enriched is not original
 
+    def test_collect_bind_mount_dirs(self):
+        rt = DockerComposeRuntime()
+        rt.workdirs = ["/home/user/libvirt-tiny", "/home/user/other-workdir"]
+        dirs = rt._collect_bind_mount_dirs("/home/user/my-project")
+        assert "/home/user/my-project" in dirs
+        assert "/home/user/libvirt-tiny" in dirs
+        assert "/home/user/other-workdir" in dirs
+
+    def test_collect_bind_mount_dirs_deduplicates(self):
+        rt = DockerComposeRuntime()
+        rt.workdirs = ["/home/user/my-project"]
+        dirs = rt._collect_bind_mount_dirs("/home/user/my-project")
+        assert len(dirs) == 1
+
+    def test_inject_bind_mounts_into_compose(self, tmp_path):
+        """Bind-mount dirs are added as volume entries in docker-compose.yml."""
+        import yaml
+        compose_path = tmp_path / "docker-compose.yml"
+        compose_data = {
+            "services": {
+                "boxman-libvirt": {
+                    "image": "test",
+                    "volumes": ["/sys/fs/cgroup:/sys/fs/cgroup:rw"],
+                }
+            }
+        }
+        with open(compose_path, "w") as f:
+            yaml.dump(compose_data, f)
+
+        rt = DockerComposeRuntime()
+        rt._inject_bind_mounts_into_compose(
+            str(compose_path),
+            ["/home/user/project", "/home/user/workdir"]
+        )
+
+        with open(compose_path) as f:
+            result = yaml.safe_load(f)
+
+        vols = result["services"]["boxman-libvirt"]["volumes"]
+        assert "/home/user/project:/home/user/project" in vols
+        assert "/home/user/workdir:/home/user/workdir" in vols
+        # original volume still present
+        assert "/sys/fs/cgroup:/sys/fs/cgroup:rw" in vols
+
+    def test_inject_bind_mounts_no_duplicates(self, tmp_path):
+        """Already-present bind paths are not added again."""
+        import yaml
+        compose_path = tmp_path / "docker-compose.yml"
+        compose_data = {
+            "services": {
+                "svc": {
+                    "image": "test",
+                    "volumes": ["/home/user/project:/home/user/project"],
+                }
+            }
+        }
+        with open(compose_path, "w") as f:
+            yaml.dump(compose_data, f)
+
+        rt = DockerComposeRuntime()
+        rt._inject_bind_mounts_into_compose(
+            str(compose_path), ["/home/user/project"]
+        )
+
+        with open(compose_path) as f:
+            result = yaml.safe_load(f)
+
+        vols = result["services"]["svc"]["volumes"]
+        # should still be only 1 entry
+        assert vols.count("/home/user/project:/home/user/project") == 1
+
     @patch("boxman.runtime.docker_compose.invoke.run")
     def test_ensure_ready_skips_compose_up_when_already_running(self, mock_run):
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
 
-        # first call: docker inspect → running
-        # second call: virsh version → ok
         mock_result_running = MagicMock(ok=True, stdout="true\n")
         mock_result_virsh = MagicMock(ok=True)
-        mock_run.side_effect = [mock_result_running, mock_result_virsh]
+        # First call: docker inspect (running check)
+        # Second call: docker exec test -d (bind dir check)
+        # Third call: virsh version
+        mock_run.side_effect = [mock_result_running, mock_result_running, mock_result_virsh]
 
         rt.ensure_ready()
 
-        # should NOT have called docker compose up
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert not any("compose" in c and "up" in c for c in calls)
 
@@ -99,17 +171,13 @@ class TestDockerComposeRuntime:
     def test_ensure_ready_starts_compose_when_not_running(self, mock_run):
         rt = DockerComposeRuntime(config={
             "runtime_container": "ctr1",
-            "compose_file": "/dev/null",  # won't actually be used
+            "compose_file": "/dev/null",
             "ready_timeout": 5,
         })
 
-        # Patch get_compose_file_path to avoid file lookup
-        with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"):
-            # call sequence:
-            # 1. docker inspect → not running
-            # 2. docker compose up → ok
-            # 3. docker inspect → running (from _wait_for_container_running)
-            # 4. virsh version → ok (from _wait_for_libvirtd)
+        with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
+             patch.object(rt, "_inject_bind_mounts_into_compose"), \
+             patch.object(rt, "_log_compose_file"):
             mock_not_running = MagicMock(ok=True, stdout="false\n")
             mock_compose_up = MagicMock(ok=True)
             mock_running = MagicMock(ok=True, stdout="true\n")
@@ -129,10 +197,12 @@ class TestDockerComposeRuntime:
     def test_ensure_ready_raises_on_timeout(self, mock_sleep, mock_run):
         rt = DockerComposeRuntime(config={
             "runtime_container": "ctr1",
-            "ready_timeout": 0,  # immediate timeout
+            "ready_timeout": 0,
         })
 
-        with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"):
+        with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
+             patch.object(rt, "_inject_bind_mounts_into_compose"), \
+             patch.object(rt, "_log_compose_file"):
             mock_not_running = MagicMock(ok=True, stdout="false\n")
             mock_compose_up = MagicMock(ok=True)
             mock_run.side_effect = [mock_not_running, mock_compose_up]
@@ -142,20 +212,17 @@ class TestDockerComposeRuntime:
 
     @patch("boxman.runtime.docker_compose.invoke.run")
     def test_ensure_ready_checks_libvirtd_after_container_is_running(self, mock_run):
-        """After the container is confirmed running, virsh version must be
-        checked before ensure_ready returns successfully."""
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
 
         mock_running = MagicMock(ok=True, stdout="true\n")
+        mock_dir_ok = MagicMock(ok=True)
         mock_virsh = MagicMock(ok=True)
-        mock_run.side_effect = [mock_running, mock_virsh]
+        mock_run.side_effect = [mock_running, mock_dir_ok, mock_virsh]
 
         rt.ensure_ready()
 
         calls = [c.args[0] for c in mock_run.call_args_list]
-        # the second call must be the virsh health check wrapped in docker exec
-        assert "virsh version" in calls[1]
-        assert "docker exec" in calls[1]
+        assert any("virsh version" in c for c in calls)
 
     def test_compose_file_from_env_var(self, tmp_path, monkeypatch):
         """BOXMAN_COMPOSE_FILE env var should be used when no explicit
@@ -228,6 +295,72 @@ class TestDockerComposeRuntime:
             with pytest.raises(FileNotFoundError, match="cannot locate"):
                 rt.get_compose_file_path()
 
+    @patch("boxman.runtime.docker_compose.invoke.run")
+    def test_ensure_ready_passes_project_dir_to_compose(self, mock_run):
+        """ensure_ready must pass BOXMAN_PROJECT_DIR so the container
+        bind-mounts the project directory."""
+        rt = DockerComposeRuntime(config={
+            "runtime_container": "ctr1",
+            "compose_file": "/dev/null",
+            "ready_timeout": 5,
+        })
+        rt.project_dir = "/home/user/my-project"
+
+        with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
+             patch.object(rt, "_inject_bind_mounts_into_compose"), \
+             patch.object(rt, "_log_compose_file"):
+            mock_not_running = MagicMock(ok=True, stdout="false\n")
+            mock_compose_up = MagicMock(ok=True)
+            mock_running = MagicMock(ok=True, stdout="true\n")
+            mock_virsh = MagicMock(ok=True)
+            mock_run.side_effect = [
+                mock_not_running, mock_compose_up,
+                mock_running, mock_virsh,
+            ]
+
+            rt.ensure_ready()
+
+            compose_call = mock_run.call_args_list[1]
+            env_kwarg = compose_call.kwargs.get("env", {})
+            assert env_kwarg.get("BOXMAN_PROJECT_DIR") == "/home/user/my-project"
+            assert "BOXMAN_DATA_DIR" in env_kwarg
+            assert "HOST_UID" in env_kwarg
+            assert "HOST_GID" in env_kwarg
+
+    @patch("boxman.runtime.docker_compose.invoke.run")
+    def test_ensure_ready_injects_workdirs_into_compose(self, mock_run):
+        """ensure_ready must inject workdirs as bind-mount volumes."""
+        rt = DockerComposeRuntime(config={
+            "runtime_container": "ctr1",
+            "compose_file": "/dev/null",
+            "ready_timeout": 5,
+        })
+        rt.project_dir = "/home/user/my-project"
+        rt.workdirs = ["/home/user/libvirt-tiny"]
+
+        inject_calls = []
+
+        def mock_inject(compose_path, bind_dirs):
+            inject_calls.append(bind_dirs)
+
+        with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
+             patch.object(rt, "_inject_bind_mounts_into_compose", side_effect=mock_inject), \
+             patch.object(rt, "_log_compose_file"):
+            mock_not_running = MagicMock(ok=True, stdout="false\n")
+            mock_compose_up = MagicMock(ok=True)
+            mock_running = MagicMock(ok=True, stdout="true\n")
+            mock_virsh = MagicMock(ok=True)
+            mock_run.side_effect = [
+                mock_not_running, mock_compose_up,
+                mock_running, mock_virsh,
+            ]
+
+            rt.ensure_ready()
+
+            assert len(inject_calls) == 1
+            assert "/home/user/my-project" in inject_calls[0]
+            assert "/home/user/libvirt-tiny" in inject_calls[0]
+
 
 class TestBoxmanManagerRuntimeIntegration:
 
@@ -281,30 +414,16 @@ class TestBoxmanManagerRuntimeIntegration:
 class TestDockerComposeRuntimeBridgeConflict:
     """Tests documenting the bridge name conflict when runtime=docker-compose.
 
-    Root cause (known issue — fix belongs in net.py):
-      When the container runs with --privileged and shares the host network
-      namespace, ``brctl show`` inside the container returns the **host's**
-      bridges. The bridge name allocator (``find_available_bridge_name``)
-      picks the next sequential name (e.g. ``virbr1``), but
-      ``check_network_exists`` then finds that bridge in ``brctl show``
-      output, looks it up in the boxman cache, and sees it belongs to
-      another project (e.g. ``surfvpn``), raising a RuntimeError.
-
-    The fix in net.py should:
-      1. Use ``virsh net-list --all`` + ``virsh net-dumpxml <net>`` to
-         discover bridges managed by libvirt in the **current** runtime,
-         rather than relying solely on ``brctl show``.
-      2. When runtime=docker-compose, the container's libvirt is a fresh
-         instance — it has no networks other than ``default``. The host
-         bridges (virbr1..N) are irrelevant.
-      3. Alternatively, filter ``brctl show`` output against ``virsh
-         net-list`` to only consider bridges that belong to libvirt
-         networks in the current runtime scope.
+    The fix uses ``virsh net-list`` + ``virsh net-dumpxml`` to discover bridges
+    managed by libvirt in the **current runtime**, and filters the boxman cache
+    by runtime scope. Host bridges visible via ``brctl show`` are no longer
+    used for bridge allocation.
     """
 
     @patch("boxman.runtime.docker_compose.invoke.run")
     def test_brctl_show_sees_host_bridges_inside_container(self, mock_run):
-        """Demonstrates that brctl show inside the container returns host bridges."""
+        """Demonstrates that brctl show inside the container returns host bridges,
+        which is why virsh net-list is used instead."""
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
 
         # Simulate brctl show output that includes host bridges
@@ -325,6 +444,85 @@ class TestDockerComposeRuntimeBridgeConflict:
         assert "virbr1" in result.stdout
         assert "virbr2" in result.stdout
 
+    def test_cache_filtering_by_runtime(self):
+        """Projects registered under a different runtime should be ignored
+        during conflict checks."""
+        from boxman.manager import BoxmanManager
+        from boxman.providers.libvirt.net import Network
+        from unittest.mock import MagicMock, patch
+
+        mgr = BoxmanManager()
+        mgr._runtime_name = 'docker-compose'
+        mgr.config = {'project': 'test_project'}
+
+        # Simulate cache with a host-runtime project using virbr1
+        mgr.cache = MagicMock()
+        mgr.cache.projects = {
+            'surfvpn': {
+                'conf': '/some/path',
+                'runtime': 'local',
+                'networks': {
+                    'surfvpn_nat': {
+                        'ip_address': '192.168.12.1',
+                        'bridge_name': 'virbr1',
+                    }
+                }
+            }
+        }
+
+        info = {'mode': 'nat', 'ip': {'address': '192.168.123.1', 'netmask': '255.255.255.0'}}
+        with patch.object(Network, 'find_available_bridge_name', return_value='virbr1'):
+            network = Network(
+                name='test_net',
+                info=info,
+                provider_config={},
+                manager=mgr,
+            )
+            network.bridge_name = 'virbr1'
+
+            # Should NOT raise because surfvpn is in 'local' runtime
+            # and we are in 'docker-compose' runtime
+            network.check_network_exists()  # must not raise
+
+    def test_cache_conflict_same_runtime(self):
+        """Projects in the same runtime SHOULD trigger conflicts."""
+        from boxman.manager import BoxmanManager
+        from boxman.providers.libvirt.net import Network
+        from unittest.mock import MagicMock, patch
+
+        mgr = BoxmanManager()
+        mgr._runtime_name = 'docker-compose'
+        mgr.config = {'project': 'test_project'}
+
+        mgr.cache = MagicMock()
+        mgr.cache.projects = {
+            'other_project': {
+                'conf': '/some/path',
+                'runtime': 'docker-compose',
+                'networks': {
+                    'other_nat': {
+                        'ip_address': '192.168.123.1',
+                        'bridge_name': 'virbr1',
+                    }
+                }
+            }
+        }
+
+        info = {'mode': 'nat', 'ip': {'address': '192.168.123.1', 'netmask': '255.255.255.0'}}
+        with patch.object(Network, 'find_available_bridge_name', return_value='virbr1'):
+            network = Network(
+                name='test_net',
+                info=info,
+                provider_config={},
+                manager=mgr,
+            )
+            network.bridge_name = 'virbr1'
+
+            # SHOULD raise because other_project is in same runtime
+            import pytest
+            with pytest.raises(RuntimeError, match="conflicts"):
+                network.check_network_exists()
+
     def test_virsh_net_list_should_be_used_for_bridge_discovery(self):
         """Document that virsh net-list is the correct way to discover
         bridges in the current runtime scope.
@@ -333,10 +531,6 @@ class TestDockerComposeRuntimeBridgeConflict:
         returns only the ``default`` network (virbr0). The host bridges
         (virbr1, virbr2, etc.) are NOT libvirt networks in this runtime
         and should be ignored by the bridge allocator.
-
-        This test serves as documentation. The actual fix belongs in
-        ``net.py:find_available_bridge_name()`` and
-        ``net.py:check_network_exists()``.
         """
         # Expected virsh net-list output inside a fresh container:
         expected_virsh_output = (

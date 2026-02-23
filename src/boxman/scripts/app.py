@@ -16,6 +16,7 @@ from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.utils.io import write_files
 #from boxman.abstract.providers import Providers
 from boxman.abstract.providers import ProviderSession as Session
+from boxman import log
 
 
 now = datetime.now(timezone.utc)
@@ -622,6 +623,22 @@ def main():
             conf_dir = os.path.abspath(os.path.dirname(args.conf))
             manager.runtime_instance.project_dir = conf_dir
 
+            # Extract all workdirs from the project config (one per cluster)
+            # and pass them to the runtime so they can be bind-mounted into
+            # the container.
+            if manager.config and 'clusters' in manager.config:
+                workdirs = set()
+                for cluster_name, cluster in manager.config['clusters'].items():
+                    workdir_raw = cluster.get('workdir')
+                    if workdir_raw:
+                        workdirs.add(os.path.abspath(
+                            os.path.expanduser(workdir_raw)))
+
+                if workdirs:
+                    manager.runtime_instance.workdirs = list(workdirs)
+                    for wd in workdirs:
+                        log.info(f"runtime workdir: {wd}")
+
         # ensure the runtime environment is up and ready before proceeding
         manager.runtime_instance.ensure_ready()
 
@@ -659,9 +676,15 @@ def main():
                 boxman_config.get('providers', {}).get(provider_type, {})
             )
             # enrich the project config with runtime-aware provider settings
+            # App-level (boxman.yml) settings serve as DEFAULTS;
+            # project-level (conf.yml) settings always take precedence.
             enriched_config = manager.config.copy()
             if 'provider' in enriched_config and provider_type in enriched_config['provider']:
-                enriched_config['provider'][provider_type].update(provider_conf_with_runtime)
+                project_provider = enriched_config['provider'][provider_type].copy()
+                # Start from app-level defaults, then overlay project-level on top
+                merged_provider = provider_conf_with_runtime.copy()
+                merged_provider.update(project_provider)
+                enriched_config['provider'][provider_type] = merged_provider
 
             session = LibVirtSession(enriched_config)
             session.manager = manager

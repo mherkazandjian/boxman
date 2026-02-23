@@ -210,7 +210,7 @@ class LibVirtCommandBase:
         elif self.runtime == 'docker-compose':
             # escape single quotes in the command for safe shell wrapping
             escaped = command.replace("'", "'\\''")
-            return f"docker exec {self.runtime_container} bash -c '{escaped}'"
+            return f"docker exec --user root {self.runtime_container} bash -c '{escaped}'"
         else:
             raise ValueError(f"unsupported runtime: {self.runtime}")
 

@@ -30,15 +30,85 @@ class LibVirtSession:
         #: logging.Logger: the logger instance
         self.logger = log
 
-        # get provider config
-        self.provider_config = config.get('provider', {}).get('libvirt', {})
+        # get provider config from the project configuration — these are
+        # authoritative and must never be overridden by app-level defaults.
+        self._project_provider_config = config.get('provider', {}).get('libvirt', {})
 
-        # extract commonly used provider settings
-        self.uri = self.provider_config.get('uri', 'qemu:///system')
-        self.use_sudo = self.provider_config.get('use_sudo', False)
+        #: Dict[str, Any]: the base provider config (may be enriched with
+        #: app-level or runtime settings, but project-level keys always win
+        #: via the property).
+        self._provider_config_base = self._project_provider_config.copy()
 
         #: the boxman manager instance (mainly to get access to the cache)
         self.manager = None
+
+    @property
+    def provider_config(self) -> Dict[str, Any]:
+        """
+        Return the effective provider config.
+
+        Project-level settings (from conf.yml) always take precedence
+        over app-level (boxman.yml) or runtime-injected values.
+        """
+        merged = self._provider_config_base.copy()
+        merged.update(self._project_provider_config)
+        return merged
+
+    @provider_config.setter
+    def provider_config(self, value: Dict[str, Any]) -> None:
+        """
+        Set the base provider config.
+
+        The getter will overlay project-level settings on top, so
+        project-level keys like ``use_sudo`` can never be overridden.
+        """
+        self._provider_config_base = value
+
+    @property
+    def uri(self) -> str:
+        return self.provider_config.get('uri', 'qemu:///system')
+
+    @uri.setter
+    def uri(self, value: str) -> None:
+        self._provider_config_base['uri'] = value
+
+    @property
+    def use_sudo(self) -> bool:
+        return self.provider_config.get('use_sudo', False)
+
+    @use_sudo.setter
+    def use_sudo(self, value: bool) -> None:
+        self._provider_config_base['use_sudo'] = value
+
+    def update_provider_config(self, new_config: Dict[str, Any]) -> None:
+        """
+        Update provider_config with *new_config*, but project-level settings
+        always win (enforced by the property getter).
+
+        Args:
+            new_config: Additional config keys (e.g. from boxman.yml providers
+                        section or runtime injection).
+        """
+        merged = self._provider_config_base.copy()
+        merged.update(new_config)
+        self._provider_config_base = merged
+
+    def update_provider_config_with_runtime(self) -> None:
+        """
+        Enrich provider_config with runtime metadata from the manager.
+
+        Project-level provider settings always take precedence over
+        app-level (boxman.yml) settings and runtime defaults.
+        """
+        if self.manager is None:
+            return
+
+        # Get the runtime-enriched config from the manager
+        enriched = self.manager.get_provider_config_with_runtime(
+            self.provider_config
+        )
+        # Merge, ensuring project-level keys win
+        self.update_provider_config(enriched)
 
     def import_image(self,
                      manifest_uri: str,
@@ -78,10 +148,18 @@ class LibVirtSession:
         Args:
             name: Name of the network
             info: Dictionary containing network configuration
+            workdir: Working directory for XML files (resolved to absolute
+                     path so it works inside container runtimes)
 
         Returns:
             True if successful, False otherwise
         """
+        # Resolve workdir to an absolute path so it is valid both on the
+        # host and inside a bind-mounted docker-compose container.
+        if workdir:
+            workdir = os.path.abspath(os.path.expanduser(workdir))
+            os.makedirs(workdir, exist_ok=True)
+
         network = Network(
             name=name,
             info=info,
@@ -142,7 +220,8 @@ class LibVirtSession:
             name=name,
             info=info,
             provider_config=self.provider_config,
-            assign_new_bridge=False
+            assign_new_bridge=False,
+            manager=self.manager
         )
         status = network.remove_network()
         return status

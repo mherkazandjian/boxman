@@ -20,6 +20,8 @@ services:
       - /dev/vhost-vsock:/dev/vhost-vsock
 
     # mount host paths needed for libvirt operation
+    # NOTE: project_dir and workdir bind-mounts are injected
+    # programmatically by DockerComposeRuntime before 'docker compose up'.
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
       - /lib/modules:/lib/modules:ro
@@ -47,6 +49,7 @@ services:
       - BOXMAN_SSH_PORT=${BOXMAN_SSH_PORT:-2222}
       - BOXMAN_DATA_DIR=${BOXMAN_DATA_DIR:-./data}
       - BOXMAN_INSTANCE_NAME=${BOXMAN_INSTANCE_NAME:-default}
+      - BOXMAN_PROJECT_DIR=${BOXMAN_PROJECT_DIR:-.}
       - HOST_UID=${HOST_UID:-1000}
       - HOST_GID=${HOST_GID:-1000}
       - BOXMAN_SSH_PUBKEY=${BOXMAN_SSH_PUBKEY:-}

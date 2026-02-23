@@ -4,6 +4,13 @@ set -e
 # Ensure required directories exist
 mkdir -p /var/run/libvirt /var/lib/libvirt/images /etc/boxman/ssh
 
+# Ensure the bind-mount root (common ancestor of project dir and workdirs)
+# exists inside the container.
+if [ -n "$BOXMAN_BIND_MOUNT_ROOT" ] && [ "$BOXMAN_BIND_MOUNT_ROOT" != "." ]; then
+    mkdir -p "$BOXMAN_BIND_MOUNT_ROOT"
+    echo "Ensured bind-mount root exists: $BOXMAN_BIND_MOUNT_ROOT"
+fi
+
 # Add host user to container's /etc/passwd so libvirtd can resolve the peer UID
 if [ -n "$HOST_UID" ] && [ "$HOST_UID" != "0" ]; then
     if ! getent group "$HOST_GID" &>/dev/null; then

@@ -178,3 +178,42 @@ class TestBoxmanConfOverride:
         loaded = load_boxman_config(str(conf_path))
         assert loaded["runtime"] == "docker-compose"
         assert loaded["runtime_config"]["runtime_container"] == "my-test-container"
+
+    def test_project_use_sudo_takes_precedence(self):
+        """Project-level use_sudo: False must not be overridden by app-level use_sudo: True."""
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        # Simulate project config with use_sudo: False
+        project_config = {
+            "project": "test_proj",
+            "provider": {
+                "libvirt": {
+                    "uri": "qemu:///system",
+                    "use_sudo": False,
+                    "verbose": True,
+                }
+            },
+        }
+
+        session = LibVirtSession(config=project_config)
+        assert session.provider_config["use_sudo"] is False
+        assert session.use_sudo is False
+
+        # Simulate manager with app config that has use_sudo: True
+        mgr = BoxmanManager()
+        mgr._runtime_name = "docker-compose"
+        mgr.config = project_config
+        mgr.app_config = {
+            "runtime": "docker-compose",
+            "runtime_config": {"runtime_container": "test-ctr"},
+            "providers": {"libvirt": {"use_sudo": True}},
+        }
+
+        session.manager = mgr
+        session.update_provider_config_with_runtime()
+
+        # Project-level use_sudo: False must win
+        assert session.provider_config["use_sudo"] is False
+        # But runtime keys should be injected
+        assert session.provider_config["runtime"] == "docker-compose"
+        assert session.provider_config["runtime_container"] == "test-ctr"

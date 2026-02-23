@@ -7,6 +7,9 @@ export BOXMAN_DATA_DIR := $(shell realpath $(BOXMAN_DATA_DIR))
 BOXMAN_INSTANCE_NAME ?= default
 export BOXMAN_INSTANCE_NAME
 
+BOXMAN_PROJECT_DIR ?= $(shell pwd)
+export BOXMAN_PROJECT_DIR
+
 SSH_LINK_DIR := $(HOME)/.ssh/config.d/boxman
 SSH_LINK := $(SSH_LINK_DIR)/boxman-$(BOXMAN_INSTANCE_NAME).conf
 
