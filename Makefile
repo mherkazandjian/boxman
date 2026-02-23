@@ -6,6 +6,9 @@ clean:
 	@find . -type d -name '__pycache__' -exec rm -fvr '{}' \; || true
 	@find . -type f -name '__pycache__' -exec rm -fv '{}' \; || true
 
+uninstall:
+	@pip uninstall -y boxman || true
+
 build:
 	@poetry build
 
@@ -16,9 +19,9 @@ cleaninstall:
 	@$(MAKE) clean
 	@$(MAKE) install
 
-fullinstall:
+full-reinstall:
 	@$(MAKE) clean
-	@pip uninstall -y boxman || true
+	@$(MAKE) uninstall
 	@$(MAKE) install
 devipython:
 	@cd data/dev && poetry run ipython
