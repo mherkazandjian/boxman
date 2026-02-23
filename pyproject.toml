@@ -9,7 +9,13 @@ homepage = "https://boxman.example.com"
 packages = [
     { include = "boxman", from = "src" },
 ]
-include = ["src/boxman/assets/**/*"]
+include = [
+    { path = "containers/docker/docker-compose.yml", format = ["sdist", "wheel"] },
+    { path = "containers/docker/Dockerfile", format = ["sdist", "wheel"] },
+    { path = "containers/docker/supervisord.conf", format = ["sdist", "wheel"] },
+    { path = "containers/docker/entrypoint.sh", format = ["sdist", "wheel"] },
+    { path = "containers/docker/.env", format = ["sdist", "wheel"] },
+]
 
 [tool.poetry.scripts]
 boxman = "boxman.scripts.app:main"
@@ -21,15 +27,23 @@ invoke = "*"
 Jinja2 = "*"
 multiprocess = "*"
 
+[tool.poetry.extras]
+docker-compose = ["docker"]
+
+[tool.poetry.group.runtime-docker.dependencies]
+docker = ">=7.0"
+
 [tool.poetry.group.dev.dependencies]
 pytest = "*"
 ipython = "*"
+docker = ">=7.0"
 
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
+pythonpath = ["src"]
 markers = [
     "integration: integration tests requiring Docker with compose v2 and /dev/kvm",
 ]

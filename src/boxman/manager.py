@@ -12,6 +12,7 @@ from boxman.providers.libvirt.session import LibVirtSession
 from boxman.config_cache import BoxmanCache
 from boxman.utils.io import write_files
 from boxman import log
+from boxman.runtime import create_runtime, RuntimeBase
 
 class BoxmanManager:
     def __init__(self,
@@ -33,6 +34,12 @@ class BoxmanManager:
 
         #: the logger instance
         self.logger = log
+
+        #: str: the runtime environment name ('local', 'docker-compose', etc.)
+        self._runtime_name: str = 'local'
+
+        #: Optional[RuntimeBase]: the resolved runtime instance (created lazily)
+        self._runtime_instance: Optional[RuntimeBase] = None
 
         if isinstance(config, str):
             self.config_path = config
@@ -71,6 +78,49 @@ class BoxmanManager:
             value: The provider session instance
         """
         self._provider = value
+
+    @property
+    def runtime(self) -> str:
+        """Return the runtime environment name."""
+        return self._runtime_name
+
+    @runtime.setter
+    def runtime(self, value: str) -> None:
+        """Set the runtime environment name and reset the cached instance."""
+        self._runtime_name = value
+        self._runtime_instance = None  # force re-creation
+
+    @property
+    def runtime_instance(self) -> RuntimeBase:
+        """
+        Return the runtime instance, creating it on first access.
+
+        The runtime config is taken from ``app_config`` if available.
+        """
+        if self._runtime_instance is None:
+            runtime_config = (self.app_config or {}).get("runtime_config", {})
+            self._runtime_instance = create_runtime(
+                self._runtime_name, config=runtime_config
+            )
+        return self._runtime_instance
+
+    def get_provider_config_with_runtime(
+        self, provider_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Return a copy of *provider_config* enriched with runtime metadata.
+
+        This should be called before passing the config to provider command
+        classes (``VirshCommand``, ``VirtInstallCommand``, etc.) so they
+        know how to wrap commands.
+
+        Args:
+            provider_config: The raw provider configuration dict.
+
+        Returns:
+            A new dict with ``runtime`` and related keys injected.
+        """
+        return self.runtime_instance.inject_into_provider_config(provider_config)
 
     def load_config(self, config_path: str) -> Dict[str, Any]:
         """

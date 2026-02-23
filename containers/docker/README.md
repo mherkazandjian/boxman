@@ -12,6 +12,27 @@ boxman-managed VM infrastructure.
 | KVM support on the host | `ls /dev/kvm` |
 | Nested virtualisation enabled | `cat /sys/module/kvm_intel/parameters/nested` (or `kvm_amd`) should show `Y` or `1` |
 
+## Using with `boxman --runtime`
+
+Instead of SSH-ing into the container and running commands manually, you can
+use the `--runtime docker-compose` flag from the host. Boxman will
+automatically wrap provider commands in `docker exec` calls:
+
+```bash
+# Start the container
+make up
+
+# Provision from the host — commands execute inside the container
+boxman --runtime docker-compose provision
+
+# Snapshots, control, etc. all work the same way
+boxman --runtime docker-compose snapshot take --name my-state
+boxman --runtime docker-compose control suspend
+```
+
+You can also set `runtime: docker-compose` in `~/.config/boxman/boxman.yml`
+to make it the default.
+
 ## Directory Layout
 
 ```

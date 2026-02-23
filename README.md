@@ -12,6 +12,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - Network and disk management
 - Snapshot support
 - Cloud-init integration
+- **Runtime environments**: execute provider commands locally or inside a Docker container
 
 ## Quick Start
 
@@ -27,18 +28,27 @@ pip install .
 Boxman includes a containerized libvirt/KVM environment for development and testing without
 modifying your host system. Only requires Docker with compose v2 and `/dev/kvm` on the host.
 
+```bash
+# Start the docker-compose environment
+cd containers/docker && make up
+
+# Provision using the docker-compose runtime
+boxman --runtime docker-compose provision
+```
+
 See [boxman/containers/docker/README.md](boxman/containers/docker/README.md) for full documentation.
 
 ## Requirements
 
 - Python 3.10+
-- libvirt with KVM/QEMU
-- For Docker mode: Docker with compose v2, `/dev/kvm` on the host
+- libvirt with KVM/QEMU (for local runtime)
+- For Docker runtime: Docker with compose v2, `/dev/kvm` on the host
 
 ## Installation
 
  - git clone
  - `pip install .` (or `pip install -e .` for development)
+ - For docker-compose runtime extras: `pip install '.[docker-compose]'`
  - For the libvirt provider it is necessary that the user executing boxman
    can run sudo virsh and other libvirt commands (see below).
  - The boxman application config is searched at `~/.config/boxman/boxman.yml` by default.
@@ -48,6 +58,31 @@ See [boxman/containers/docker/README.md](boxman/containers/docker/README.md) for
 
     - sshpass
     - ansible
+
+## Runtime Environments
+
+The `--runtime` flag (or `runtime:` in `boxman.yml`) controls *where* provider
+commands are executed. The runtime is orthogonal to the provider:
+
+| Runtime | Description |
+|---|---|
+| `local` (default) | Commands run directly on the host |
+| `docker-compose` | Commands run inside the boxman docker-compose container via `docker exec` |
+
+```bash
+# Local (default — same as omitting --runtime)
+boxman provision
+
+# Inside docker-compose container
+boxman --runtime docker-compose provision
+
+# Set the default in ~/.config/boxman/boxman.yml:
+#   runtime: docker-compose
+```
+
+The bundled `docker-compose.yml` is shipped with the package. To use a custom
+one, set `compose_file` in `runtime_config` or the `BOXMAN_COMPOSE_FILE`
+environment variable.
 
 ## Sample configuration
 

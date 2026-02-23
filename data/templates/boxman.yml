@@ -2,6 +2,21 @@
 # The top level boxman application configuration file, typically the default location
 # of this file is in ~/.config/boxman/boxman.yml
 
+# The default runtime environment for executing provider commands.
+# Can be overridden on the CLI with: boxman --runtime <value> <subcommand>
+# Supported values:
+#   local          - execute provider commands directly on the host (default)
+#   docker-compose - execute inside the boxman docker-compose container
+runtime: local
+
+# Runtime-specific settings (used when runtime != local)
+runtime_config:
+  # Docker container name used by 'docker exec' (docker-compose runtime)
+  runtime_container: boxman-libvirt-default
+  # Optional: explicit path to docker-compose.yml. When omitted, boxman
+  # uses the bundled compose file shipped with the package.
+  # compose_file: ~/projects/boxman/containers/docker/docker-compose.yml
+
 # Global SSH configuration applied across all providers (libvirt, docker, etc.)
 # Keys listed here are injected into all managed guests/containers.
 ssh:

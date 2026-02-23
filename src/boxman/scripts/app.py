@@ -39,6 +39,9 @@ def parse_args():
             "       # provision the configuration in the default config file (conf.yml)\n"
             "       $ boxman provision\n"
             "\n"
+            "       # provision using the docker-compose runtime environment\n"
+            "       $ boxman --runtime docker-compose provision\n"
+            "\n"
             "   snapshot\n"
             "\n"
             "     list\n"
@@ -86,6 +89,20 @@ def parse_args():
         help='the name of the boxman configuration file',
         dest='boxman_conf',
         default='~/.config/boxman/boxman.yml'
+    )
+
+    parser.add_argument(
+        '--runtime',
+        type=str,
+        help=(
+            'the runtime environment in which to execute provider commands.\n'
+            'overrides the "runtime" setting in boxman.yml.\n'
+            '  local          - run provider commands directly on the host (default)\n'
+            '  docker-compose - run inside the boxman docker-compose container\n'
+        ),
+        dest='runtime',
+        default=None,
+        choices=['local', 'docker-compose']
     )
 
     parser.add_argument(
@@ -595,6 +612,19 @@ def main():
         # make the app-level config (boxman.yml) available to the manager
         manager.load_app_config(boxman_config)
 
+        # resolve the runtime: CLI flag overrides boxman.yml default
+        runtime = args.runtime or boxman_config.get('runtime', 'local')
+        manager.runtime = runtime
+
+        # tell the runtime where the project conf.yml lives so bundled
+        # assets are deployed next to it (in .boxman/runtime/docker/)
+        if manager.runtime_instance.name == 'docker-compose':
+            conf_dir = os.path.abspath(os.path.dirname(args.conf))
+            manager.runtime_instance.project_dir = conf_dir
+
+        # ensure the runtime environment is up and ready before proceeding
+        manager.runtime_instance.ensure_ready()
+
         if args.func == BoxmanManager.import_image:
 
             # if the provider is specified in the cmd line, use it
@@ -624,10 +654,19 @@ def main():
         if provider_type == 'virtualbox':
             session = Virtualbox(manager.config)    # .. todo:: rename to VirtualBoxSession
         elif provider_type == 'libvirt':
-            session = LibVirtSession(manager.config)  # .. todo:: since the manager is needed for
-            session.manager = manager                 #           the cache probably a good idea
-            manager.provider = session                #           to pass it in full instead of
-        elif provider_type == 'docker-compose':       #           passing the config as well
+            # merge runtime metadata into the provider config from boxman.yml
+            provider_conf_with_runtime = manager.get_provider_config_with_runtime(
+                boxman_config.get('providers', {}).get(provider_type, {})
+            )
+            # enrich the project config with runtime-aware provider settings
+            enriched_config = manager.config.copy()
+            if 'provider' in enriched_config and provider_type in enriched_config['provider']:
+                enriched_config['provider'][provider_type].update(provider_conf_with_runtime)
+
+            session = LibVirtSession(enriched_config)
+            session.manager = manager
+            manager.provider = session
+        elif provider_type == 'docker-compose':
             raise NotImplementedError('docker-compose is not implemented yet')
             from boxman.docker_compose.docker_compose import DockerCompose
 

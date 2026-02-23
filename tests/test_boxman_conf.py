@@ -153,3 +153,28 @@ class TestBoxmanConfOverride:
             "ssh-ed25519 AAAA_ENV env@host",
             "ssh-rsa BBBB_FILE file@host",
         ]
+
+    def test_runtime_defaults_to_local_when_absent(self, tmp_path):
+        """When boxman.yml has no 'runtime' key, it defaults to 'local'."""
+        custom_config = {"providers": {"libvirt": {"uri": "qemu:///system"}}}
+        conf_path = tmp_path / "boxman_no_runtime.yml"
+        conf_path.write_text(yaml.dump(custom_config))
+
+        loaded = load_boxman_config(str(conf_path))
+        assert loaded.get("runtime", "local") == "local"
+
+    def test_runtime_docker_compose_is_loaded(self, tmp_path):
+        """When boxman.yml sets runtime: docker-compose, it is read correctly."""
+        custom_config = {
+            "runtime": "docker-compose",
+            "runtime_config": {
+                "runtime_container": "my-test-container",
+            },
+            "providers": {"libvirt": {"uri": "qemu:///system"}},
+        }
+        conf_path = tmp_path / "boxman_docker_rt.yml"
+        conf_path.write_text(yaml.dump(custom_config))
+
+        loaded = load_boxman_config(str(conf_path))
+        assert loaded["runtime"] == "docker-compose"
+        assert loaded["runtime_config"]["runtime_container"] == "my-test-container"

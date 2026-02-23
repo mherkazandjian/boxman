@@ -79,12 +79,23 @@ fi
 # Generate ssh_config for host-side convenience
 HOST_DATA_DIR="${BOXMAN_DATA_DIR:-./data}"
 INSTANCE_NAME="${BOXMAN_INSTANCE_NAME:-default}"
+
+# Resolve the absolute path to the SSH key for the IdentityFile directive.
+# When BOXMAN_DATA_DIR is an absolute path (e.g. set by the runtime to the
+# deployed .boxman/runtime/docker/data), use it directly.  Otherwise fall
+# back to /etc/boxman/ssh which is the container-internal bind-mount target.
+if [[ "${BOXMAN_DATA_DIR}" == /* ]]; then
+    SSH_IDENTITY_FILE="${BOXMAN_DATA_DIR}/ssh/id_ed25519"
+else
+    SSH_IDENTITY_FILE="/etc/boxman/ssh/id_ed25519"
+fi
+
 cat > /etc/boxman/ssh/boxman.conf <<EOF
 Host boxman-${INSTANCE_NAME}
     HostName 127.0.0.1
     Port ${BOXMAN_SSH_PORT:-2222}
     User qemu_user
-    IdentityFile ${HOST_DATA_DIR}/ssh/id_ed25519
+    IdentityFile ${SSH_IDENTITY_FILE}
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     LogLevel ERROR
