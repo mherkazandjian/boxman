@@ -241,6 +241,94 @@ class BoxmanManager:
         )
 
     @staticmethod
+    def create_templates(cls, cli_args) -> None:
+        """
+        Create template VMs from cloud images using cloud-init.
+
+        Reads the ``templates`` section from the project config and creates
+        each template VM that doesn't already exist.
+
+        :param cls: The BoxmanManager instance
+        :param cli_args: The parsed arguments from the cli
+        """
+        from boxman.providers.libvirt.cloudinit import CloudInitTemplate
+
+        config = cls.config
+        templates = config.get('templates', {})
+
+        if not templates:
+            cls.logger.warning("no templates defined in configuration")
+            return
+
+        # determine provider config
+        provider_type = list(config.get('provider', {}).keys())[0] if 'provider' in config else 'libvirt'
+        provider_config = config.get('provider', {}).get(provider_type, {})
+
+        # merge app-level provider config as defaults
+        if cls.app_config and 'providers' in cls.app_config:
+            app_provider = cls.app_config['providers'].get(provider_type, {})
+            merged = app_provider.copy()
+            merged.update(provider_config)
+            provider_config = merged
+
+        # inject runtime settings
+        if hasattr(cls, 'runtime_instance'):
+            provider_config = cls.runtime_instance.inject_into_provider_config(provider_config)
+
+        cls.logger.info(f"resolved provider config for templates: {provider_config}")
+
+        # determine which templates to create
+        requested = None
+        if hasattr(cli_args, 'template_names') and cli_args.template_names:
+            requested = [t.strip() for t in cli_args.template_names.split(',')]
+
+        force = getattr(cli_args, 'force', False)
+
+        # resolve a workdir for template artifacts
+        default_workdir = '~/boxman-templates'
+        for _, cluster in config.get('clusters', {}).items():
+            default_workdir = cluster.get('workdir', default_workdir)
+            break
+
+        for tpl_key, tpl_conf in templates.items():
+            if requested and tpl_key not in requested:
+                cls.logger.info(f"skipping template '{tpl_key}' (not in requested list)")
+                continue
+
+            tpl_name = tpl_conf.get('name', tpl_key)
+            image_path = tpl_conf.get('image', '')
+            cloudinit_userdata = tpl_conf.get('cloudinit', None)
+            cloudinit_metadata = tpl_conf.get('cloudinit_metadata', None)
+            tpl_memory = tpl_conf.get('memory', 2048)
+            tpl_vcpus = tpl_conf.get('vcpus', 2)
+            tpl_os_variant = tpl_conf.get('os_variant', 'generic')
+            tpl_disk_format = tpl_conf.get('disk_format', 'qcow2')
+            tpl_network = tpl_conf.get('network', 'default')
+            tpl_workdir = tpl_conf.get('workdir', default_workdir)
+
+            cls.logger.info(f"creating template '{tpl_key}' -> VM name '{tpl_name}'")
+
+            ct = CloudInitTemplate(
+                template_name=tpl_name,
+                image_path=image_path,
+                cloudinit_userdata=cloudinit_userdata,
+                cloudinit_metadata=cloudinit_metadata,
+                workdir=tpl_workdir,
+                provider_config=provider_config,
+                memory=tpl_memory,
+                vcpus=tpl_vcpus,
+                os_variant=tpl_os_variant,
+                disk_format=tpl_disk_format,
+                network=tpl_network,
+            )
+
+            success = ct.create_template(force=force)
+            if success:
+                cls.logger.info(f"template '{tpl_key}' created successfully")
+            else:
+                cls.logger.error(f"failed to create template '{tpl_key}'")
+
+    @staticmethod
     def list_projects(cls, _) -> None:
         """
         List all projects that have been provisioned

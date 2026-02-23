@@ -12,6 +12,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - Network and disk management
 - Snapshot support
 - Cloud-init integration
+- **Cloud-init template creation**: build template VMs from cloud images with inline cloud-init config
 - **Runtime environments**: execute provider commands locally or inside a Docker container
 
 ## Quick Start
@@ -38,11 +39,49 @@ boxman --runtime docker-compose provision
 
 See [boxman/containers/docker/README.md](boxman/containers/docker/README.md) for full documentation.
 
+### Create Template VMs from Cloud Images
+
+Define templates in your `conf.yml` with inline cloud-init configuration:
+
+```yaml
+templates:
+  my_ubuntu_template:
+    name: ubuntu-24.04-base-template
+    image: file:///path/to/ubuntu-24.04-server-cloudimg-amd64.img
+    os_variant: ubuntu24.04
+    memory: 2048
+    vcpus: 2
+    network: default
+    cloudinit: |
+      #cloud-config
+      hostname: my-template
+      manage_etc_hosts: true
+      ssh_pwauth: true
+      chpasswd:
+        expire: false
+        users:
+          - name: ubuntu
+            password: ubuntu
+      package_update: true
+```
+
+```bash
+# Create all templates defined in conf.yml
+boxman create-templates
+
+# Create specific templates
+boxman create-templates --templates my_ubuntu_template
+
+# Force re-creation of existing templates
+boxman create-templates --force
+```
+
 ## Requirements
 
 - Python 3.10+
 - libvirt with KVM/QEMU (for local runtime)
 - For Docker runtime: Docker with compose v2, `/dev/kvm` on the host
+- For cloud-init templates: one of `cloud-image-utils`, `genisoimage`, `mkisofs`, or `xorrisofs`
 
 ## Installation
 

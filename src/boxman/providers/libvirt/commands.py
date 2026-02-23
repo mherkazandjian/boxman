@@ -301,7 +301,7 @@ class VirtInstallCommand(LibVirtCommandBase):
         Args:
             provider_config: Dictionary containing provider-specific configuration
         """
-        super().__init__(provider_config)
+        super().__init__(provider_config=provider_config)
 
         #: str: the path to virt-install binary
         self.command_path = self.provider_config.get('virt_install_cmd', 'virt-install')

@@ -155,6 +155,28 @@ def parse_args():
                                              # supported providers list below
 
     #
+    # sub parser for creating templates from cloud images
+    #
+    parser_create_templates = subparsers.add_parser(
+        'create-templates',
+        help='create template VMs from cloud images using cloud-init')
+    parser_create_templates.set_defaults(func=BoxmanManager.create_templates)
+    parser_create_templates.add_argument(
+        '--templates',
+        type=str,
+        help='comma-separated list of template keys to create (default: all)',
+        dest='template_names',
+        default=None
+    )
+    parser_create_templates.add_argument(
+        '--force',
+        action='store_true',
+        default=False,
+        help='force creation even if VM already exists',
+        dest='force'
+    )
+
+    #
     # sub parser for listing the registered projects
     #
     parser_list = subparsers.add_parser('list', help='list all registered projects')
@@ -597,6 +619,10 @@ def main():
         print(f'v{boxman.metadata.version}')
         sys.exit(0)
 
+    if not hasattr(args, 'func'):
+        arg_parser.print_help()
+        sys.exit(1)
+
     if args.func == BoxmanManager.list_projects:
         manager = BoxmanManager(config=None)
         args.func(manager, None)
@@ -641,6 +667,11 @@ def main():
 
         # ensure the runtime environment is up and ready before proceeding
         manager.runtime_instance.ensure_ready()
+
+        # Handle create-templates — it doesn't need a full provider session
+        if args.func == BoxmanManager.create_templates:
+            args.func(manager, args)
+            sys.exit(0)
 
         if args.func == BoxmanManager.import_image:
 

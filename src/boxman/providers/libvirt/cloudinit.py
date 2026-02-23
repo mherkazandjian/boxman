@@ -1,0 +1,269 @@
+"""
+Cloud-init support for libvirt provider.
+
+Creates template VMs from cloud images by:
+1. Building a NoCloud seed ISO (user-data + meta-data)
+2. Copying the base cloud image
+3. Running virt-install --import with both disks
+"""
+
+import os
+import shutil
+import tempfile
+from typing import Optional, Dict, Any
+
+import invoke
+
+from boxman import log
+from .commands import VirshCommand, VirtInstallCommand
+
+
+DEFAULT_META_DATA = """\
+instance-id: {instance_id}
+local-hostname: {hostname}
+"""
+
+DEFAULT_USER_DATA = """\
+#cloud-config
+hostname: {hostname}
+manage_etc_hosts: true
+
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  users:
+    - name: ubuntu
+      password: ubuntu
+      type: text
+
+package_update: false
+
+write_files:
+  - path: /etc/boxman-template-marker
+    permissions: "0644"
+    content: |
+      created by boxman cloud-init template provisioning
+
+runcmd:
+  - [ sh, -c, "echo template created at $(date -Is) >> /var/log/boxman-cloudinit.log" ]
+"""
+
+DEFAULT_NETWORK_CONFIG = """\
+version: 2
+ethernets:
+  id0:
+    match:
+      driver: virtio
+    dhcp4: true
+"""
+
+
+class CloudInitTemplate:
+    """
+    Create a libvirt VM template from a cloud image + cloud-init config.
+    """
+
+    def __init__(
+        self,
+        template_name: str,
+        image_path: str,
+        cloudinit_userdata: Optional[str] = None,
+        cloudinit_metadata: Optional[str] = None,
+        workdir: Optional[str] = None,
+        provider_config: Optional[Dict[str, Any]] = None,
+        memory: int = 2048,
+        vcpus: int = 2,
+        os_variant: str = "generic",
+        disk_format: str = "qcow2",
+        network: str = "default",
+    ):
+        self.template_name = template_name
+        self.image_path = self._resolve_image_path(image_path)
+        self.cloudinit_userdata = cloudinit_userdata
+        self.cloudinit_metadata = cloudinit_metadata
+        self.workdir = os.path.expanduser(workdir) if workdir else tempfile.mkdtemp(prefix="boxman-cloudinit-")
+        self.provider_config = provider_config or {}
+        self.memory = memory
+        self.vcpus = vcpus
+        self.os_variant = os_variant
+        self.disk_format = disk_format
+        self.network = network
+        self.logger = log
+
+        self.logger.debug(f"CloudInitTemplate provider_config: {provider_config}")
+
+        self.virsh = VirshCommand(provider_config=provider_config)
+        self.virt_install = VirtInstallCommand(provider_config=provider_config)
+        self.logger.info(f"using virt-install command: {self.virt_install.command_path}")
+        self.logger.info(f"using virsh command: {self.virsh.command_path}")
+
+    @staticmethod
+    def _resolve_image_path(image_path: str) -> str:
+        if image_path.startswith("file://"):
+            image_path = image_path[len("file://"):]
+        return os.path.expanduser(image_path)
+
+    def _check_vm_exists(self) -> bool:
+        result = self.virsh.execute("list", "--all", "--name", hide=True, warn=True)
+        if result.ok:
+            names = [n.strip() for n in result.stdout.strip().split("\n") if n.strip()]
+            return self.template_name in names
+        return False
+
+    def build_seed_iso(self, nocloud_dir: str, seed_iso_path: str) -> bool:
+        self.logger.info(f"building cloud-init seed ISO: {seed_iso_path}")
+
+        network_config_path = os.path.join(nocloud_dir, "network-config")
+        network_flag = ""
+        if os.path.exists(network_config_path):
+            network_flag = f' --network-config="{network_config_path}"'
+
+        result = self.virsh.execute_shell(
+            f'cloud-localds{network_flag} "{seed_iso_path}" "{nocloud_dir}/user-data" "{nocloud_dir}/meta-data"',
+            hide=False, warn=True,
+        )
+        if result.ok:
+            self.logger.info("seed ISO created with cloud-localds")
+            return True
+
+        # Fallback: include network-config in the ISO if present
+        extra_files = ""
+        if os.path.exists(network_config_path):
+            extra_files = f' "{network_config_path}"'
+
+        for tool in ("genisoimage", "mkisofs", "xorrisofs"):
+            result = self.virsh.execute_shell(
+                f'{tool} -output "{seed_iso_path}" -volid cidata -joliet -rock '
+                f'"{nocloud_dir}/user-data" "{nocloud_dir}/meta-data"{extra_files}',
+                hide=False, warn=True,
+            )
+            if result.ok:
+                self.logger.info(f"seed ISO created with {tool}")
+                return True
+
+        self.logger.error(
+            "failed to create seed ISO. Install one of: "
+            "cloud-image-utils, genisoimage, mkisofs, or xorrisofs"
+        )
+        return False
+
+    def prepare_nocloud_dir(self, base_dir: str) -> str:
+        nocloud_dir = os.path.join(base_dir, "nocloud")
+        os.makedirs(nocloud_dir, exist_ok=True)
+
+        userdata = self.cloudinit_userdata
+        if not userdata:
+            userdata = DEFAULT_USER_DATA.format(hostname=self.template_name)
+        userdata_path = os.path.join(nocloud_dir, "user-data")
+        with open(userdata_path, "w") as fobj:
+            fobj.write(userdata)
+        self.logger.info(f"wrote user-data to {userdata_path}")
+
+        metadata = self.cloudinit_metadata
+        if not metadata:
+            metadata = DEFAULT_META_DATA.format(
+                instance_id=f"{self.template_name}-001",
+                hostname=self.template_name,
+            )
+        metadata_path = os.path.join(nocloud_dir, "meta-data")
+        with open(metadata_path, "w") as fobj:
+            fobj.write(metadata)
+        self.logger.info(f"wrote meta-data to {metadata_path}")
+
+        network_config_path = os.path.join(nocloud_dir, "network-config")
+        with open(network_config_path, "w") as fobj:
+            fobj.write(DEFAULT_NETWORK_CONFIG)
+        self.logger.info(f"wrote network-config to {network_config_path}")
+
+        return nocloud_dir
+
+    def copy_base_image(self, dst_path: str) -> bool:
+        if not os.path.exists(self.image_path):
+            self.logger.error(f"base cloud image not found: {self.image_path}")
+            return False
+
+        self.logger.info(f"copying base image {self.image_path} -> {dst_path}")
+
+        result = self.virsh.execute_shell(
+            f'rsync --sparse --progress "{self.image_path}" "{dst_path}"',
+            hide=False, warn=True,
+        )
+        if result.ok:
+            self.logger.info("base image copied (sparse-aware via rsync)")
+            return True
+
+        try:
+            shutil.copy2(self.image_path, dst_path)
+            self.logger.info("base image copied via shutil.copy2")
+            return True
+        except Exception as exc:
+            self.logger.error(f"failed to copy base image: {exc}")
+            return False
+
+    def create_template(self, force: bool = False) -> bool:
+        self.logger.info("=" * 70)
+        self.logger.info(f"creating cloud-init template: {self.template_name}")
+        self.logger.info("=" * 70)
+
+        if not force and self._check_vm_exists():
+            self.logger.error(
+                f"VM '{self.template_name}' already exists. Use force=True to override."
+            )
+            return False
+
+        template_dir = os.path.join(self.workdir, self.template_name)
+        os.makedirs(template_dir, exist_ok=True)
+
+        image_ext = os.path.splitext(self.image_path)[1] or f".{self.disk_format}"
+        dst_image_path = os.path.join(template_dir, f"{self.template_name}{image_ext}")
+        if not self.copy_base_image(dst_image_path):
+            return False
+
+        nocloud_dir = self.prepare_nocloud_dir(template_dir)
+
+        seed_iso_path = os.path.join(template_dir, "seed.iso")
+        if not self.build_seed_iso(nocloud_dir, seed_iso_path):
+            return False
+
+        self.logger.info("running virt-install to create template VM...")
+
+        try:
+            # Build the command using VirtInstallCommand which handles
+            # command_path, sudo, URI, and runtime wrapping.
+            # We use build_command + _wrap_for_runtime manually because
+            # virt-install needs two --disk flags (not supported by kwargs).
+            parts = []
+            if self.virt_install.use_sudo:
+                parts.append("sudo")
+            parts.append(self.virt_install.command_path)
+            parts.append(f"--connect={self.virt_install.uri}")
+            parts.append(f"--name={self.template_name}")
+            parts.append(f"--memory={self.memory}")
+            parts.append(f"--vcpus={self.vcpus}")
+            parts.append(f"--os-variant={self.os_variant}")
+            parts.append("--import")
+            parts.append(f"--disk=path={dst_image_path},format={self.disk_format},bus=virtio")
+            parts.append(f"--disk=path={seed_iso_path},device=cdrom")
+            parts.append(f"--network=network={self.network},model=virtio")
+            parts.append("--graphics=spice")
+            parts.append("--video=virtio")
+            parts.append("--noautoconsole")
+
+            cmd = " ".join(parts)
+            cmd = self.virt_install._wrap_for_runtime(cmd)
+
+            self.logger.info(f"executing: {cmd}")
+            result = invoke.run(cmd, hide=True, warn=True)
+            if not result.ok:
+                self.logger.error(f"virt-install failed: {result.stderr}")
+                return False
+        except Exception as exc:
+            self.logger.error(f"virt-install error: {exc}")
+            return False
+
+        self.logger.info("=" * 70)
+        self.logger.info(f"template VM '{self.template_name}' created successfully")
+        self.logger.info(f"  disk image: {dst_image_path}")
+        self.logger.info(f"  seed ISO:   {seed_iso_path}")
+        self.logger.info("=" * 70)
+        return True

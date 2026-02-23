@@ -26,6 +26,7 @@ PyYAML = "*"
 invoke = "*"
 Jinja2 = "*"
 multiprocess = "*"
+lxml = "*"
 
 [tool.poetry.extras]
 docker-compose = ["docker"]
