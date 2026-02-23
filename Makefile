@@ -7,10 +7,10 @@ clean:
 	@find . -type f -name '__pycache__' -exec rm -fv '{}' \; || true
 
 build:
-	@python setup.py build
+	@poetry build
 
-install:
-	@pip install .
+install: build
+	@poetry install
 
 cleaninstall:
 	@$(MAKE) clean
@@ -18,13 +18,13 @@ cleaninstall:
 
 fullinstall:
 	@$(MAKE) clean
-	@pip uninstall boxman
+	@pip uninstall -y boxman || true
 	@$(MAKE) install
 devipython:
-	@cd data/dev && PYTHONPATH=${PWD}/src:${PYTHONPATH} ipython
+	@cd data/dev && poetry run ipython
 
 devshell:
-	@cd data/dev && PYTHONPATH=${PWD}/src:${PYTHONPATH} bash
+	@cd data/dev && poetry run bash
 
 help:
 	@echo "For development"
@@ -49,7 +49,7 @@ PYTEST_FLAGS += $(pytest)
 endif
 
 test: ## Run all tests (verbose=1, pytest_args="..." for extra flags)
-	PYTHONPATH=$(PWD)/src:$(PYTHONPATH) pytest $(PYTEST_FLAGS) $(pytest_args) tests/
+	poetry run pytest $(PYTEST_FLAGS) $(pytest_args) tests/
 
 test-integration: ## Run docker-compose integration tests (verbose=1 for verbose output)
-	PYTHONPATH=$(PWD)/src:$(PYTHONPATH) pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_docker_compose.py
+	poetry run pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_docker_compose.py

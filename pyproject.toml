@@ -1,0 +1,39 @@
+[tool.poetry]
+name = "boxman"
+version = "0.9.0dev"
+description = "Boxman (box manager) – declarative VM/container provisioning via YAML"
+authors = ["John Smith <john@example.com>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://boxman.example.com"
+packages = [
+    { include = "boxman", from = "src" },
+]
+include = ["src/boxman/assets/**/*"]
+
+[tool.poetry.scripts]
+boxman = "boxman.scripts.app:main"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+PyYAML = "*"
+invoke = "*"
+Jinja2 = "*"
+multiprocess = "*"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+ipython = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: integration tests requiring Docker with compose v2 and /dev/kvm",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:pkg_resources",
+    "ignore:pkg_resources is deprecated:DeprecationWarning",
+]

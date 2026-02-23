@@ -43,6 +43,15 @@ class BoxmanManager:
         #: Optional[Dict[str, Any]]: the boxman application-level config (from boxman.yml)
         self.app_config: Optional[Dict[str, Any]] = None
 
+    def load_app_config(self, config: Dict[str, Any]) -> None:
+        """
+        Load the boxman application-level configuration (from boxman.yml).
+
+        Args:
+            config: The parsed boxman.yml configuration dictionary
+        """
+        self.app_config = config
+
     @property
     def provider(self) -> Optional["LibVirtSession"]:
         """
