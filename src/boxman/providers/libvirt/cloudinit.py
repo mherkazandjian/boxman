@@ -8,8 +8,14 @@ Creates template VMs from cloud images by:
 """
 
 import os
+import re
 import shutil
 import tempfile
+import time
+import json
+import base64
+import crypt
+import secrets
 from typing import Optional, Dict, Any
 
 import invoke
@@ -154,10 +160,33 @@ class CloudInitTemplate:
         userdata = self.cloudinit_userdata
         if not userdata:
             userdata = DEFAULT_USER_DATA.format(hostname=self.template_name)
+
+        # Replace ${env:VAR} placeholders with actual environment variables
+        # (run first so ${hash:${env:VAR}} resolves the env var before hashing)
+        userdata = re.sub(
+            r'\$\{env:([A-Za-z0-9_]+)\}',
+            lambda m: os.environ.get(m.group(1), ''),
+            userdata
+        )
+
+        # Replace ${hash:plaintext} placeholders with SHA-512 hashed passwords
+        def _hash_repl(m):
+            hashed = self.hash_password(m.group(1))
+            self.logger.info(f"hashed password for cloud-init user (placeholder replaced)")
+            # Wrap in single quotes so YAML doesn't interpret $ in the hash
+            return f"'{hashed}'"
+
+        userdata = re.sub(
+            r'\$\{hash:([^}]+)\}',
+            _hash_repl,
+            userdata
+        )
+
         userdata_path = os.path.join(nocloud_dir, "user-data")
         with open(userdata_path, "w") as fobj:
             fobj.write(userdata)
         self.logger.info(f"wrote user-data to {userdata_path}")
+        self.logger.debug(f"user-data content:\n{userdata}")
 
         metadata = self.cloudinit_metadata
         if not metadata:
@@ -199,6 +228,91 @@ class CloudInitTemplate:
         except Exception as exc:
             self.logger.error(f"failed to copy base image: {exc}")
             return False
+
+    def verify_and_shutdown(self) -> bool:
+        self.logger.info("verifying VM health: waiting for QEMU guest agent (this may take a few minutes while cloud-init installs it)...")
+        agent_up = False
+
+        # Wait up to 300 seconds (5 minutes) for the guest agent
+        for i in range(150):
+            result = self.virsh.execute("qemu-agent-command", self.template_name, '{"execute":"guest-ping"}', hide=True, warn=True)
+            if result.ok:
+                agent_up = True
+                break
+
+            if i > 0 and i % 15 == 0:
+                self.logger.info(f"still waiting for QEMU guest agent... ({i * 2}s elapsed)")
+
+            time.sleep(2)
+
+        if not agent_up:
+            self.logger.warning("QEMU guest agent did not respond in time. OS might not be healthy or agent is not installed.")
+        else:
+            self.logger.info("QEMU guest agent is responding. OS is healthy.")
+            self.logger.info("fetching cloud-init logs via guest agent (waiting for cloud-init to finish)...")
+
+            exec_cmd = json.dumps({
+                "execute": "guest-exec",
+                "arguments": {
+                    "path": "/bin/sh",
+                    "arg": ["-c", "cloud-init status --wait && cat /var/log/cloud-init-output.log"],
+                    "capture-output": True
+                }
+            })
+
+            res = self.virsh.execute("qemu-agent-command", self.template_name, exec_cmd, hide=True, warn=True)
+            if res.ok:
+                try:
+                    pid_info = json.loads(res.stdout.strip())
+                    pid = pid_info.get("return", {}).get("pid")
+
+                    if pid:
+                        status_cmd = json.dumps({
+                            "execute": "guest-exec-status",
+                            "arguments": {"pid": pid}
+                        })
+
+                        # Poll for completion (up to 5 minutes)
+                        for _ in range(150):
+                            status_res = self.virsh.execute("qemu-agent-command", self.template_name, status_cmd, hide=True, warn=True)
+                            if status_res.ok:
+                                status_info = json.loads(status_res.stdout.strip())
+                                ret = status_info.get("return", {})
+                                if ret.get("exited"):
+                                    out_data = ret.get("out-data", "")
+                                    if out_data:
+                                        decoded_out = base64.b64decode(out_data).decode('utf-8', errors='replace')
+                                        self.logger.info("=== Cloud-Init Output Log ===")
+                                        for line in decoded_out.splitlines():
+                                            self.logger.info(f"  {line}")
+                                        self.logger.info("=============================")
+
+                                    err_data = ret.get("err-data", "")
+                                    if err_data:
+                                        decoded_err = base64.b64decode(err_data).decode('utf-8', errors='replace')
+                                        if decoded_err.strip():
+                                            self.logger.debug(f"Guest exec stderr: {decoded_err}")
+                                    break
+                            time.sleep(2)
+                except Exception as e:
+                    self.logger.warning(f"failed to parse guest-exec output: {e}")
+            else:
+                self.logger.warning("failed to execute command via guest agent.")
+
+        self.logger.info("shutting down the template VM...")
+        self.virsh.execute("shutdown", self.template_name, hide=True, warn=True)
+
+        self.logger.info("waiting for VM to shut off...")
+        for _ in range(30):
+            result = self.virsh.execute("domstate", self.template_name, hide=True, warn=True)
+            if result.ok and "shut off" in result.stdout.strip():
+                self.logger.info("VM is successfully shut off.")
+                return True
+            time.sleep(2)
+
+        self.logger.warning("VM did not shut off gracefully. Forcing destroy...")
+        self.virsh.execute("destroy", self.template_name, hide=True, warn=True)
+        return True
 
     def create_template(self, force: bool = False) -> bool:
         self.logger.info("=" * 70)
@@ -247,6 +361,7 @@ class CloudInitTemplate:
             parts.append(f"--network=network={self.network},model=virtio")
             parts.append("--graphics=spice")
             parts.append("--video=virtio")
+            parts.append("--channel=unix,target_type=virtio,name=org.qemu.guest_agent.0")
             parts.append("--noautoconsole")
 
             cmd = " ".join(parts)
@@ -261,9 +376,18 @@ class CloudInitTemplate:
             self.logger.error(f"virt-install error: {exc}")
             return False
 
+        # Verify the VM is up and healthy, then shut it down
+        self.verify_and_shutdown()
+
         self.logger.info("=" * 70)
         self.logger.info(f"template VM '{self.template_name}' created successfully")
         self.logger.info(f"  disk image: {dst_image_path}")
         self.logger.info(f"  seed ISO:   {seed_iso_path}")
         self.logger.info("=" * 70)
         return True
+
+    @staticmethod
+    def hash_password(plain_password: str) -> str:
+        """Hash a plain-text password using SHA-512 for use in cloud-init passwd field."""
+        salt = crypt.mksalt(crypt.METHOD_SHA512)
+        return crypt.crypt(plain_password, salt)
