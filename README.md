@@ -51,6 +51,10 @@ templates:
     os_variant: ubuntu24.04
     memory: 2048
     vcpus: 2
+    # Connect to a bridge device directly (recommended for internet access).
+    # If omitted, boxman auto-resolves the bridge from the 'network' name.
+    bridge: virbr0
+    # The libvirt network name (used to auto-resolve bridge if 'bridge' not set)
     network: default
     cloudinit: |
       #cloud-config
@@ -63,6 +67,14 @@ templates:
           - name: ubuntu
             password: ubuntu
       package_update: true
+    # Optional: custom network config for cloud-init (default: DHCP via virtio)
+    # cloudinit_network_config: |
+    #   version: 2
+    #   ethernets:
+    #     id0:
+    #       match:
+    #         driver: virtio
+    #       dhcp4: true
 ```
 
 ```bash
@@ -75,6 +87,16 @@ boxman create-templates --templates my_ubuntu_template
 # Force re-creation of existing templates
 boxman create-templates --force
 ```
+
+> **Troubleshooting: Template VM has no IP address**
+>
+> - Ensure the libvirt network is active: `virsh net-list` — if `default` is
+>   inactive, run `sudo virsh net-start default`.
+> - Boxman will attempt to auto-start an inactive network, but the network
+>   must already be *defined*.
+> - Verify DHCP is working: `virsh net-dhcp-leases default`.
+> - Check cloud-init logs inside the VM via `virt-manager` console or
+>   `virsh console <vm-name>`.
 
 ## Requirements
 

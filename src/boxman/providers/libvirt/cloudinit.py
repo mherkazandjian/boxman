@@ -50,16 +50,26 @@ write_files:
     content: |
       created by boxman cloud-init template provisioning
 
+# Remove any file that disables cloud-init networking, then bring up interfaces
 runcmd:
+  - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+  - rm -f /etc/cloud/cloud.cfg.d/subiquity-disable-cloudinit-networking.cfg
+  - netplan generate || true
+  - netplan apply || true
+  - dhclient -v || true
   - [ sh, -c, "echo template created at $(date -Is) >> /var/log/boxman-cloudinit.log" ]
 """
 
 DEFAULT_NETWORK_CONFIG = """\
 version: 2
 ethernets:
-  id0:
+  all-en:
     match:
-      driver: virtio
+      name: "en*"
+    dhcp4: true
+  all-eth:
+    match:
+      name: "eth*"
     dhcp4: true
 """
 
@@ -75,6 +85,7 @@ class CloudInitTemplate:
         image_path: str,
         cloudinit_userdata: Optional[str] = None,
         cloudinit_metadata: Optional[str] = None,
+        cloudinit_network_config: Optional[str] = None,
         workdir: Optional[str] = None,
         provider_config: Optional[Dict[str, Any]] = None,
         memory: int = 2048,
@@ -82,11 +93,13 @@ class CloudInitTemplate:
         os_variant: str = "generic",
         disk_format: str = "qcow2",
         network: str = "default",
+        bridge: Optional[str] = None,
     ):
         self.template_name = template_name
         self.image_path = self._resolve_image_path(image_path)
         self.cloudinit_userdata = cloudinit_userdata
         self.cloudinit_metadata = cloudinit_metadata
+        self.cloudinit_network_config = cloudinit_network_config
         self.workdir = os.path.expanduser(workdir) if workdir else tempfile.mkdtemp(prefix="boxman-cloudinit-")
         self.provider_config = provider_config or {}
         self.memory = memory
@@ -94,6 +107,7 @@ class CloudInitTemplate:
         self.os_variant = os_variant
         self.disk_format = disk_format
         self.network = network
+        self.bridge = bridge
         self.logger = log
 
         self.logger.debug(f"CloudInitTemplate provider_config: {provider_config}")
@@ -153,6 +167,94 @@ class CloudInitTemplate:
         )
         return False
 
+    def _resolve_bridge(self) -> Optional[str]:
+        """
+        Resolve the bridge device name to use for the VM network.
+
+        Priority:
+          1. Explicit ``bridge`` parameter (e.g. 'virbr0')
+          2. Look up the bridge device from the libvirt network name
+
+        Returns:
+            The bridge device name (e.g. 'virbr0') or None if unresolvable.
+        """
+        if self.bridge:
+            self.logger.info(f"using explicit bridge device: {self.bridge}")
+            return self.bridge
+
+        # Try to discover the bridge from the libvirt network
+        net_name = self.network
+        self.logger.info(
+            f"resolving bridge device from libvirt network '{net_name}'...")
+
+        # Ensure the network is active first
+        self._ensure_network_active()
+
+        # Use virsh net-info to get the bridge name
+        result = self.virsh.execute(
+            "net-info", net_name, hide=True, warn=True)
+        if result.ok:
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.lower().startswith("bridge:"):
+                    bridge_name = line.split(":", 1)[1].strip()
+                    if bridge_name:
+                        self.logger.info(
+                            f"resolved bridge '{bridge_name}' from "
+                            f"network '{net_name}'")
+                        return bridge_name
+
+        self.logger.warning(
+            f"could not resolve bridge from network '{net_name}', "
+            f"falling back to network-based connection")
+        return None
+
+    def _ensure_network_active(self) -> bool:
+        """
+        Ensure the libvirt network used by this template is active.
+
+        Returns:
+            True if the network is active, False otherwise.
+        """
+        net_name = self.network
+        self.logger.info(f"checking if libvirt network '{net_name}' is active...")
+
+        result = self.virsh.execute(
+            "net-list", "--all", "--name", hide=True, warn=True)
+        if not result.ok:
+            self.logger.warning("could not list libvirt networks")
+            return False
+
+        existing = [n.strip() for n in result.stdout.strip().split("\n")
+                    if n.strip()]
+        if net_name not in existing:
+            self.logger.error(
+                f"libvirt network '{net_name}' does not exist. "
+                f"Create it first or specify a bridge device directly.")
+            return False
+
+        # Check if active
+        result = self.virsh.execute(
+            "net-list", "--name", hide=True, warn=True)
+        if result.ok:
+            active = [n.strip() for n in result.stdout.strip().split("\n")
+                      if n.strip()]
+            if net_name in active:
+                self.logger.info(f"libvirt network '{net_name}' is active")
+                return True
+
+        # Start it
+        self.logger.info(
+            f"libvirt network '{net_name}' is inactive, starting...")
+        result = self.virsh.execute("net-start", net_name, warn=True)
+        if result.ok:
+            self.logger.info(f"libvirt network '{net_name}' started")
+            return True
+
+        self.logger.error(
+            f"failed to start network '{net_name}': {result.stderr}")
+        return False
+
     def prepare_nocloud_dir(self, base_dir: str) -> str:
         nocloud_dir = os.path.join(base_dir, "nocloud")
         os.makedirs(nocloud_dir, exist_ok=True)
@@ -199,9 +301,13 @@ class CloudInitTemplate:
             fobj.write(metadata)
         self.logger.info(f"wrote meta-data to {metadata_path}")
 
+        # Use custom network config if provided, otherwise use default DHCP config
+        network_config = self.cloudinit_network_config
+        if not network_config:
+            network_config = DEFAULT_NETWORK_CONFIG
         network_config_path = os.path.join(nocloud_dir, "network-config")
         with open(network_config_path, "w") as fobj:
-            fobj.write(DEFAULT_NETWORK_CONFIG)
+            fobj.write(network_config)
         self.logger.info(f"wrote network-config to {network_config_path}")
 
         return nocloud_dir
@@ -314,6 +420,45 @@ class CloudInitTemplate:
         self.virsh.execute("destroy", self.template_name, hide=True, warn=True)
         return True
 
+    def _verify_dhcp_on_network(self) -> bool:
+        """
+        Verify that DHCP is enabled on the libvirt network backing this template.
+
+        Parses the network XML and checks for a <dhcp> element with a <range>.
+
+        Returns:
+            True if DHCP is configured, False otherwise.
+        """
+        net_name = self.network
+        result = self.virsh.execute(
+            "net-dumpxml", net_name, hide=True, warn=True)
+        if not result.ok:
+            self.logger.warning(
+                f"could not dump XML for network '{net_name}'")
+            return False
+
+        import xml.etree.ElementTree as ET
+        try:
+            root = ET.fromstring(result.stdout)
+            dhcp_elem = root.find(".//dhcp/range")
+            if dhcp_elem is not None:
+                start = dhcp_elem.get("start", "?")
+                end = dhcp_elem.get("end", "?")
+                self.logger.info(
+                    f"DHCP is enabled on network '{net_name}' "
+                    f"(range {start} - {end})")
+                return True
+            else:
+                self.logger.error(
+                    f"DHCP is NOT configured on network '{net_name}'. "
+                    f"The guest will not get an IP address. "
+                    f"Add a <dhcp><range .../></dhcp> block to the network, "
+                    f"or use a static IP in cloudinit_network_config.")
+                return False
+        except ET.ParseError as exc:
+            self.logger.warning(f"failed to parse network XML: {exc}")
+            return False
+
     def create_template(self, force: bool = False) -> bool:
         self.logger.info("=" * 70)
         self.logger.info(f"creating cloud-init template: {self.template_name}")
@@ -324,6 +469,14 @@ class CloudInitTemplate:
                 f"VM '{self.template_name}' already exists. Use force=True to override."
             )
             return False
+
+        # Resolve bridge device (auto-starts the network if needed)
+        bridge_device = self._resolve_bridge()
+
+        # Verify DHCP is available (warn early rather than debug a silent failure)
+        if not self.bridge:
+            # only check when using a libvirt-managed network
+            self._verify_dhcp_on_network()
 
         template_dir = os.path.join(self.workdir, self.template_name)
         os.makedirs(template_dir, exist_ok=True)
@@ -358,7 +511,13 @@ class CloudInitTemplate:
             parts.append("--import")
             parts.append(f"--disk=path={dst_image_path},format={self.disk_format},bus=virtio")
             parts.append(f"--disk=path={seed_iso_path},device=cdrom")
-            parts.append(f"--network=network={self.network},model=virtio")
+
+            # Use bridge device directly if resolved, otherwise fall back to network name
+            if bridge_device:
+                parts.append(f"--network=bridge={bridge_device},model=virtio")
+            else:
+                parts.append(f"--network=network={self.network},model=virtio")
+
             parts.append("--graphics=spice")
             parts.append("--video=virtio")
             parts.append("--channel=unix,target_type=virtio,name=org.qemu.guest_agent.0")
@@ -385,7 +544,6 @@ class CloudInitTemplate:
         self.logger.info(f"  seed ISO:   {seed_iso_path}")
         self.logger.info("=" * 70)
         return True
-
     @staticmethod
     def hash_password(plain_password: str) -> str:
         """Hash a plain-text password using SHA-512 for use in cloud-init passwd field."""

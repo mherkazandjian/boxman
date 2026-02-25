@@ -299,11 +299,13 @@ class BoxmanManager:
             image_path = tpl_conf.get('image', '')
             cloudinit_userdata = tpl_conf.get('cloudinit', None)
             cloudinit_metadata = tpl_conf.get('cloudinit_metadata', None)
+            cloudinit_network_config = tpl_conf.get('cloudinit_network_config', None)
             tpl_memory = tpl_conf.get('memory', 2048)
             tpl_vcpus = tpl_conf.get('vcpus', 2)
             tpl_os_variant = tpl_conf.get('os_variant', 'generic')
             tpl_disk_format = tpl_conf.get('disk_format', 'qcow2')
             tpl_network = tpl_conf.get('network', 'default')
+            tpl_bridge = tpl_conf.get('bridge', None)
             tpl_workdir = tpl_conf.get('workdir', default_workdir)
 
             cls.logger.info(f"creating template '{tpl_key}' -> VM name '{tpl_name}'")
@@ -313,6 +315,7 @@ class BoxmanManager:
                 image_path=image_path,
                 cloudinit_userdata=cloudinit_userdata,
                 cloudinit_metadata=cloudinit_metadata,
+                cloudinit_network_config=cloudinit_network_config,
                 workdir=tpl_workdir,
                 provider_config=provider_config,
                 memory=tpl_memory,
@@ -320,6 +323,7 @@ class BoxmanManager:
                 os_variant=tpl_os_variant,
                 disk_format=tpl_disk_format,
                 network=tpl_network,
+                bridge=tpl_bridge,
             )
 
             success = ct.create_template(force=force)
