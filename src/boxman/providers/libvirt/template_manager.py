@@ -197,7 +197,7 @@ class TemplateManager:
             f"--disk {disk_main}",
             f"--disk {disk_seed}",
             f"--network {network}",
-            "--graphics spice",
+            "--graphics vnc",
             "--video virtio",
             "--noautoconsole",
         ])

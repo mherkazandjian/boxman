@@ -997,6 +997,10 @@ class BoxmanManager:
                 f'{admin_user}@{ip_address}'
             )
 
+            # When using a non-local runtime, the VM is only reachable from
+            # inside the container, so wrap the command with docker exec.
+            cmd = self.runtime_instance.wrap_command(cmd)
+
             result = run(cmd, hide=False, warn=True)
 
             if result.ok:
@@ -1027,6 +1031,11 @@ class BoxmanManager:
         """
         self.logger.info(f"verifying ssh connection to: {hostname}")
         ssh_cmd = f'ssh -F {ssh_config_path} {hostname} hostname'
+
+        # When using a non-local runtime, the VM is only reachable from
+        # inside the container.
+        ssh_cmd = self.runtime_instance.wrap_command(ssh_cmd)
+
         result = run(ssh_cmd, hide=True, warn=True)
 
         if result.ok and result.stdout.strip():

@@ -67,10 +67,13 @@ class DockerComposeRuntime(RuntimeBase):
     def _collect_bind_mount_dirs(self, abs_project_dir: str) -> List[str]:
         """
         Collect all unique absolute directories that must be bind-mounted
-        into the container: the project directory plus every workdir.
+        into the container: the project directory plus every workdir,
+        plus /tmp so that host-side temp files (e.g. XML for virsh define)
+        are accessible inside the container.
         """
         dirs = set()
         dirs.add(abs_project_dir)
+        dirs.add("/tmp")
         for wd in self.workdirs:
             dirs.add(os.path.abspath(wd))
         return sorted(dirs)

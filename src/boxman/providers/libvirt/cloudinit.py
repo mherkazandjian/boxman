@@ -16,7 +16,10 @@ import json
 import base64
 import crypt
 import secrets
+import urllib.request
+import urllib.error
 from typing import Optional, Dict, Any
+from urllib.parse import urlparse
 
 import invoke
 
@@ -128,6 +131,8 @@ class CloudInitTemplate:
     def _resolve_image_path(image_path: str) -> str:
         if image_path.startswith("file://"):
             image_path = image_path[len("file://"):]
+        if image_path.startswith(("http://", "https://")):
+            return image_path
         return os.path.expanduser(image_path)
 
     def _check_vm_exists(self) -> bool:
@@ -320,6 +325,11 @@ class CloudInitTemplate:
         return nocloud_dir
 
     def copy_base_image(self, dst_path: str) -> bool:
+        # Check if it's a URL and needs downloading
+        if self.image_path.startswith(("http://", "https://")):
+            return self._download_image(self.image_path, dst_path)
+
+        # Local file copy
         if not os.path.exists(self.image_path):
             self.logger.error(f"base cloud image not found: {self.image_path}")
             return False
@@ -340,6 +350,56 @@ class CloudInitTemplate:
             return True
         except Exception as exc:
             self.logger.error(f"failed to copy base image: {exc}")
+            return False
+
+    def _download_image(self, url: str, dst_path: str) -> bool:
+        """Download a cloud image from a URL with progress and fallbacks."""
+        self.logger.info(f"downloading base image {url} -> {dst_path}")
+
+        # Try wget first (handles redirects, proxies, SSL better)
+        result = invoke.run(
+            f'wget --progress=dot:mega -O "{dst_path}" "{url}"',
+            hide=False, warn=True,
+        )
+        if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
+            self.logger.info("download complete (wget)")
+            return True
+
+        # Try curl as second fallback
+        result = invoke.run(
+            f'curl -L --progress-bar -o "{dst_path}" "{url}"',
+            hide=False, warn=True,
+        )
+        if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
+            self.logger.info("download complete (curl)")
+            return True
+
+        # Last resort: urllib with timeout
+        try:
+            self.logger.info("falling back to urllib download (timeout=120s)...")
+            req = urllib.request.Request(url, headers={"User-Agent": "boxman/1.0"})
+            with urllib.request.urlopen(req, timeout=120) as response:
+                total = int(response.headers.get("Content-Length", 0))
+                downloaded = 0
+                with open(dst_path, "wb") as out_file:
+                    while True:
+                        chunk = response.read(1024 * 1024)  # 1 MB chunks
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            pct = downloaded * 100 // total
+                            self.logger.info(
+                                f"  downloaded {downloaded // (1024*1024)} MB "
+                                f"/ {total // (1024*1024)} MB ({pct}%)")
+            self.logger.info("download complete (urllib)")
+            return True
+        except Exception as e:
+            self.logger.error(f"failed to download image: {e}")
+            # Clean up partial download
+            if os.path.exists(dst_path):
+                os.remove(dst_path)
             return False
 
     def verify_and_shutdown(self) -> bool:
@@ -521,7 +581,7 @@ class CloudInitTemplate:
             else:
                 parts.append(f"--network=network={self.network},model=virtio")
 
-            parts.append("--graphics=spice")
+            parts.append("--graphics=vnc")
             parts.append("--video=virtio")
             parts.append("--channel=unix,target_type=virtio,name=org.qemu.guest_agent.0")
             parts.append("--noautoconsole")

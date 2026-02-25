@@ -22,6 +22,7 @@ RUN dnf install -y epel-release && \
         libvirt-daemon-config-network \
         openssh-server \
         openssh-clients \
+        sshpass \
         sudo \
     && dnf clean all
 
