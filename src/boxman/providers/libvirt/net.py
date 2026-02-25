@@ -1,6 +1,7 @@
 import os
 import uuid
 import re
+import sys
 from importlib import resources as importlib_resources
 from typing import Optional, Dict, Any, Union, List
 
@@ -276,6 +277,15 @@ class Network(VirshCommand):
 
         self.check_network_exists()
 
+        # Verify the bridge is not already in use before defining
+        active_bridges = self._get_libvirt_bridges()
+        if self.bridge_name in active_bridges:
+            self.logger.error(
+                f"bridge '{self.bridge_name}' is already in use by another "
+                f"active network. Cannot define network '{self.name}'.")
+            self._log_bridge_usage(self.bridge_name)
+            sys.exit(1)
+
         self.update_network_cache()
 
         # define the network
@@ -483,6 +493,19 @@ class Network(VirshCommand):
         except Exception as exc:
             self.logger.warning(f"failed to read cached bridges: {exc}")
         return bridges
+
+    def _log_bridge_usage(self, bridge_name: str) -> None:
+        """Log which libvirt networks are using the given bridge."""
+        try:
+            network_names = Network.list_networks(provider_config=self.provider_config)
+            for net_name in network_names:
+                bridge = Network.get_bridge_from_network(
+                    net_name, provider_config=self.provider_config)
+                if bridge == bridge_name:
+                    self.logger.error(
+                        f"  bridge '{bridge_name}' is used by network '{net_name}'")
+        except Exception as exc:
+            self.logger.warning(f"failed to enumerate bridge usage: {exc}")
 
     @staticmethod
     def _ensure_rule(cls,

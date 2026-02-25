@@ -49,11 +49,18 @@ write_files:
     permissions: "0644"
     content: |
       created by boxman cloud-init template provisioning
+  - path: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+    permissions: "0644"
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any
 
 # Remove any file that disables cloud-init networking, then bring up interfaces
 runcmd:
   - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
   - rm -f /etc/cloud/cloud.cfg.d/subiquity-disable-cloudinit-networking.cfg
+  - systemctl daemon-reload
   - netplan generate || true
   - netplan apply || true
   - dhclient -v || true
@@ -341,7 +348,9 @@ class CloudInitTemplate:
 
         # Wait up to 300 seconds (5 minutes) for the guest agent
         for i in range(150):
-            result = self.virsh.execute("qemu-agent-command", self.template_name, '{"execute":"guest-ping"}', hide=True, warn=True)
+            result = self.virsh.execute_shell(
+                f"virsh qemu-agent-command {self.template_name} '{{\"execute\":\"guest-ping\"}}'",
+                hide=True, warn=True)
             if result.ok:
                 agent_up = True
                 break
@@ -357,30 +366,24 @@ class CloudInitTemplate:
             self.logger.info("QEMU guest agent is responding. OS is healthy.")
             self.logger.info("fetching cloud-init logs via guest agent (waiting for cloud-init to finish)...")
 
-            exec_cmd = json.dumps({
-                "execute": "guest-exec",
-                "arguments": {
-                    "path": "/bin/sh",
-                    "arg": ["-c", "cloud-init status --wait && cat /var/log/cloud-init-output.log"],
-                    "capture-output": True
-                }
-            })
+            exec_cmd = '{"execute":"guest-exec","arguments":{"path":"/bin/sh","arg":["-c","cloud-init status --wait && cat /var/log/cloud-init-output.log"],"capture-output":true}}'
 
-            res = self.virsh.execute("qemu-agent-command", self.template_name, exec_cmd, hide=True, warn=True)
+            res = self.virsh.execute_shell(
+                f"virsh qemu-agent-command {self.template_name} '{exec_cmd}'",
+                hide=True, warn=True)
             if res.ok:
                 try:
                     pid_info = json.loads(res.stdout.strip())
                     pid = pid_info.get("return", {}).get("pid")
 
                     if pid:
-                        status_cmd = json.dumps({
-                            "execute": "guest-exec-status",
-                            "arguments": {"pid": pid}
-                        })
+                        status_cmd = f'{{"execute":"guest-exec-status","arguments":{{"pid":{pid}}}}}'
 
                         # Poll for completion (up to 5 minutes)
                         for _ in range(150):
-                            status_res = self.virsh.execute("qemu-agent-command", self.template_name, status_cmd, hide=True, warn=True)
+                            status_res = self.virsh.execute_shell(
+                                f"virsh qemu-agent-command {self.template_name} '{status_cmd}'",
+                                hide=True, warn=True)
                             if status_res.ok:
                                 status_info = json.loads(status_res.stdout.strip())
                                 ret = status_info.get("return", {})
