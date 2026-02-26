@@ -3,7 +3,7 @@ Runtime environments for boxman.
 
 A *runtime* controls **where** provider commands are executed:
   - ``local``          – directly on the host (default)
-  - ``docker-compose`` – inside a boxman docker-compose container
+  - ``docker``         – inside a boxman docker-compose container
 """
 
 from boxman.runtime.base import RuntimeBase
@@ -16,7 +16,7 @@ def create_runtime(name: str, **kwargs) -> RuntimeBase:
     Factory: return a runtime instance for the given name.
 
     Args:
-        name: One of 'local', 'docker-compose'.
+        name: One of 'local', 'docker'.
         **kwargs: Passed to the runtime constructor.
 
     Returns:
@@ -27,7 +27,7 @@ def create_runtime(name: str, **kwargs) -> RuntimeBase:
     """
     runtimes = {
         "local": LocalRuntime,
-        "docker-compose": DockerComposeRuntime,
+        "docker": DockerComposeRuntime,
     }
     if name not in runtimes:
         raise ValueError(

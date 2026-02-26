@@ -17,9 +17,9 @@ class TestCreateRuntime:
         assert rt.name == "local"
 
     def test_docker_compose(self):
-        rt = create_runtime("docker-compose")
+        rt = create_runtime("docker")
         assert isinstance(rt, DockerComposeRuntime)
-        assert rt.name == "docker-compose"
+        assert rt.name == "docker"
 
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="unknown runtime"):

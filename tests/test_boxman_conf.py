@@ -164,9 +164,9 @@ class TestBoxmanConfOverride:
         assert loaded.get("runtime", "local") == "local"
 
     def test_runtime_docker_compose_is_loaded(self, tmp_path):
-        """When boxman.yml sets runtime: docker-compose, it is read correctly."""
+        """When boxman.yml sets runtime: docker, it is read correctly."""
         custom_config = {
-            "runtime": "docker-compose",
+            "runtime": "docker",
             "runtime_config": {
                 "runtime_container": "my-test-container",
             },
@@ -176,7 +176,7 @@ class TestBoxmanConfOverride:
         conf_path.write_text(yaml.dump(custom_config))
 
         loaded = load_boxman_config(str(conf_path))
-        assert loaded["runtime"] == "docker-compose"
+        assert loaded["runtime"] == "docker"
         assert loaded["runtime_config"]["runtime_container"] == "my-test-container"
 
     def test_project_use_sudo_takes_precedence(self):

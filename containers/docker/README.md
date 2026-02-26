@@ -15,7 +15,7 @@ boxman-managed VM infrastructure.
 ## Using with `boxman --runtime`
 
 Instead of SSH-ing into the container and running commands manually, you can
-use the `--runtime docker-compose` flag from the host. Boxman will
+use the `--runtime docker` flag from the host. Boxman will
 automatically wrap provider commands in `docker exec` calls:
 
 ```bash
@@ -23,14 +23,14 @@ automatically wrap provider commands in `docker exec` calls:
 make up
 
 # Provision from the host — commands execute inside the container
-boxman --runtime docker-compose provision
+boxman --runtime docker provision
 
 # Snapshots, control, etc. all work the same way
-boxman --runtime docker-compose snapshot take --name my-state
-boxman --runtime docker-compose control suspend
+boxman --runtime docker snapshot take --name my-state
+boxman --runtime docker control suspend
 ```
 
-You can also set `runtime: docker-compose` in `~/.config/boxman/boxman.yml`
+You can also set `runtime: docker` in `~/.config/boxman/boxman.yml`
 to make it the default.
 
 ## Directory Layout

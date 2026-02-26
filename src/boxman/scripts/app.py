@@ -99,11 +99,11 @@ def parse_args():
             'the runtime environment in which to execute provider commands.\n'
             'overrides the "runtime" setting in boxman.yml.\n'
             '  local          - run provider commands directly on the host (default)\n'
-            '  docker-compose - run inside the boxman docker-compose container\n'
+            '  docker         - run inside the boxman docker-compose container\n'
         ),
         dest='runtime',
         default=None,
-        choices=['local', 'docker-compose']
+        choices=['local', 'docker']
     )
 
     parser.add_argument(

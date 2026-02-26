@@ -128,17 +128,17 @@ commands are executed. The runtime is orthogonal to the provider:
 | Runtime | Description |
 |---|---|
 | `local` (default) | Commands run directly on the host |
-| `docker-compose` | Commands run inside the boxman docker-compose container via `docker exec` |
+| `docker` | Commands run inside the boxman docker-compose container via `docker exec` |
 
 ```bash
 # Local (default — same as omitting --runtime)
 boxman provision
 
 # Inside docker-compose container
-boxman --runtime docker-compose provision
+boxman --runtime docker provision
 
 # Set the default in ~/.config/boxman/boxman.yml:
-#   runtime: docker-compose
+#   runtime: docker
 ```
 
 The bundled `docker-compose.yml` is shipped with the package. To use a custom

@@ -5,8 +5,8 @@
 # The default runtime environment for executing provider commands.
 # Can be overridden on the CLI with: boxman --runtime <value> <subcommand>
 # Supported values:
-#   local          - execute provider commands directly on the host (default)
-#   docker-compose - execute inside the boxman docker-compose container
+#   local            - execute provider commands directly on the host (default)
+#   docker           - execute inside the boxman docker-compose container
 runtime: local
 
 # Runtime-specific settings (used when runtime != local)
