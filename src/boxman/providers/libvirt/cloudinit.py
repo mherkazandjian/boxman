@@ -527,11 +527,24 @@ class CloudInitTemplate:
         self.logger.info(f"creating cloud-init template: {self.template_name}")
         self.logger.info("=" * 70)
 
-        if not force and self._check_vm_exists():
-            self.logger.error(
-                f"VM '{self.template_name}' already exists. Use force=True to override."
-            )
-            return False
+        if self._check_vm_exists():
+            if not force:
+                self.logger.error(
+                    f"template VM '{self.template_name}' already exists. "
+                    f"Use --force to delete and recreate it."
+                )
+                return False
+            else:
+                self.logger.warning(
+                    f"template VM '{self.template_name}' exists, "
+                    f"destroying first (--force was specified)")
+                self.virsh.execute(
+                    "destroy", self.template_name, hide=True, warn=True)
+                self.virsh.execute(
+                    "undefine", self.template_name,
+                    "--remove-all-storage", hide=True, warn=True)
+                self.logger.info(
+                    f"template VM '{self.template_name}' has been removed")
 
         # Resolve bridge device (auto-starts the network if needed)
         bridge_device = self._resolve_bridge()

@@ -302,10 +302,47 @@ class BoxmanManager:
             default_workdir = cluster.get('workdir', default_workdir)
             break
 
+        # --- Pre-check: detect already-existing templates ----------------
+        # Build a temporary VirshCommand to query existing VMs once.
+        from boxman.providers.libvirt.commands import VirshCommand
+        _virsh = VirshCommand(provider_config=provider_config)
+        _existing_vms: set = set()
+        result = _virsh.execute("list", "--all", "--name", hide=True, warn=True)
+        if result.ok:
+            _existing_vms = {
+                v.strip() for v in result.stdout.strip().split("\n") if v.strip()
+            }
+
+        # Identify which of the requested templates already exist
+        existing_templates: list[str] = []
+        templates_to_create: list[str] = []
+
         for tpl_key, tpl_conf in templates.items():
             if requested and tpl_key not in requested:
-                self.logger.info(f"skipping template '{tpl_key}' (not in requested list)")
                 continue
+            tpl_name = tpl_conf.get('name', tpl_key)
+            if tpl_name in _existing_vms:
+                existing_templates.append(tpl_key)
+            else:
+                templates_to_create.append(tpl_key)
+
+        # If any templates already exist and --force was NOT given, error out.
+        if existing_templates and not force:
+            names = ", ".join(
+                f"'{templates[k].get('name', k)}'" for k in existing_templates
+            )
+            self.logger.error(
+                f"the following template(s) already exist: {names}. "
+                f"Use --force to delete and recreate them."
+            )
+            return
+
+        # Merge both lists (existing ones will be force-recreated)
+        all_keys = existing_templates + templates_to_create
+        # -----------------------------------------------------------------
+
+        for tpl_key in all_keys:
+            tpl_conf = templates[tpl_key]
 
             tpl_name = tpl_conf.get('name', tpl_key)
             image_path = tpl_conf.get('image', '')

@@ -119,10 +119,10 @@ class TemplateManager:
         # check if template already exists
         if self.template_exists(vm_name):
             if not force:
-                self.logger.info(
-                    f"template '{vm_name}' already exists, skipping "
-                    "(use --force to recreate)")
-                return True
+                self.logger.error(
+                    f"template '{vm_name}' already exists. "
+                    "Use --force to delete and recreate it.")
+                return False
             else:
                 self.logger.warning(
                     f"template '{vm_name}' exists, destroying first (force=True)")
