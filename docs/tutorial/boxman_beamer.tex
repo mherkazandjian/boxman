@@ -1,0 +1,380 @@
+\documentclass[aspectratio=169]{beamer}
+
+% --- Styling (simple + professional)
+\usetheme{Boadilla}
+\usecolortheme{default}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+% Listings setup
+\lstdefinestyle{boxman}{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{black!15},
+  framerule=0.5pt,
+  showstringspaces=false,
+  upquote=true,
+}
+
+\title{Getting Started with Boxman}
+\subtitle{Your first local VM cluster (libvirt/QEMU) in \textasciitilde 30 minutes}
+\author{}
+\date{}
+
+\begin{document}
+
+% --- Title
+\begin{frame}[fragile]
+  \titlepage
+\end{frame}
+
+% --- What is Boxman
+\begin{frame}[fragile]{What is Boxman?}
+\begin{itemize}
+  \item Infrastructure-as-code for \textbf{local VM clusters} on \textbf{libvirt/QEMU}.
+  \item Think: \textbf{``Docker Compose for VMs''}.
+  \item One YAML file describes:\\
+    \hspace*{1em}machines, networks, disks, and helper files.
+  \item Boxman provisions everything: networks, clones, disks, SSH access.
+\end{itemize}
+\end{frame}
+
+% --- Agenda
+\begin{frame}[fragile]{What we will do (quick path)}
+\begin{enumerate}
+  \item Install libvirt + tools
+  \item Create a base VM image (one-time)
+  \item Install Boxman
+  \item Write a minimal \texttt{conf.yml}
+  \item Provision and SSH in
+\end{enumerate}
+\end{frame}
+
+% --- Requirements
+\begin{frame}[fragile]{Prerequisites}
+\begin{columns}[T,onlytextwidth]
+  \column{0.55\textwidth}
+  \textbf{You need:}
+  \begin{itemize}
+    \item Linux host with libvirt support
+    \item \textbf{8 GB RAM} minimum
+    \item \textbf{~50 GB} free disk
+    \item \textbf{Python 3.12} (3.13 not supported)
+  \end{itemize}
+
+  \column{0.45\textwidth}
+  \textbf{System tools:}
+  \begin{itemize}
+    \item \texttt{virt-install}, \texttt{virt-clone}
+    \item \texttt{virsh}, \texttt{qemu-img}
+    \item \texttt{sshpass}
+    \item user in \texttt{libvirt} (and \texttt{kvm}) group
+  \end{itemize}
+\end{columns}
+\end{frame}
+
+% --- Install libvirt
+\begin{frame}[fragile]{Install libvirt (pick your distro)}
+\textbf{Arch:}
+\begin{lstlisting}[style=boxman]
+sudo pacman -S libvirt qemu-full virt-install virt-clone sshpass
+sudo systemctl enable --now libvirtd
+sudo usermod -aG libvirt $USER
+\end{lstlisting}
+
+\textbf{Ubuntu/Debian:}
+\begin{lstlisting}[style=boxman]
+sudo apt update
+sudo apt install -y libvirt-daemon-system libvirt-clients qemu-kvm virtinst sshpass
+sudo systemctl enable --now libvirtd
+sudo usermod -aG libvirt,kvm $USER
+\end{lstlisting}
+\vspace{0.5em}
+\textit{Log out and back in after adding groups.}
+\end{frame}
+
+% --- Verify libvirt
+\begin{frame}[fragile]{Verify libvirt works}
+\begin{lstlisting}[style=boxman]
+virsh -c qemu:///system list
+\end{lstlisting}
+\begin{itemize}
+  \item If you see a table (even empty), you're good.
+  \item If connection fails, check \texttt{systemctl status libvirtd}.
+\end{itemize}
+\end{frame}
+
+% --- Base image concept
+\begin{frame}[fragile]{Base VM image (one-time setup)}
+\begin{itemize}
+  \item Boxman \textbf{doesn't install an OS} from scratch.
+  \item It \textbf{clones a pre-existing VM} (your \emph{base image}) for each new VM.
+  \item Set it up once:
+    \begin{itemize}
+      \item install OS
+      \item enable SSH
+      \item set a password (used once for SSH key injection)
+    \end{itemize}
+\end{itemize}
+\end{frame}
+
+% --- Create base image example
+\begin{frame}[fragile]{Create a base image (example: Rocky 9)}
+\begin{lstlisting}[style=boxman]
+sudo virt-install \
+  --name rocky9 \
+  --ram 2048 \
+  --vcpus 2 \
+  --disk path=/var/lib/libvirt/images/rocky9.qcow2,size=20 \
+  --os-variant rocky9 \
+  --cdrom ~/Downloads/Rocky-9-latest-x86_64-minimal.iso \
+  --network network=default \
+  --graphics vnc
+\end{lstlisting}
+\begin{itemize}
+  \item Finish install via console, then shut down:
+\end{itemize}
+\begin{lstlisting}[style=boxman]
+virsh -c qemu:///system shutdown rocky9
+\end{lstlisting}
+\end{frame}
+
+% --- Install Boxman
+\begin{frame}[fragile]{Install Boxman (in a virtualenv)}
+\begin{lstlisting}[style=boxman]
+python3.12 -m venv boxman_env
+source boxman_env/bin/activate
+pip install -r requirements.txt
+python setup.py install
+boxman --version
+\end{lstlisting}
+\begin{itemize}
+  \item If \texttt{boxman} isn't found, your venv probably isn't active.
+\end{itemize}
+\end{frame}
+
+% --- Config: mental model
+\begin{frame}[fragile]{The config file: the mental model}
+\begin{itemize}
+  \item One YAML file describes everything.
+  \item Three top-level keys are the backbone:
+\end{itemize}
+\begin{lstlisting}[style=boxman]
+version: 1.0
+project: myproject
+provider:
+  libvirt: { ... }
+clusters:
+  my_cluster: { ... }
+\end{lstlisting}
+\vspace{0.3em}
+\begin{itemize}
+  \item Bonus: the YAML is rendered as \textbf{Jinja2} before parsing.
+\end{itemize}
+\end{frame}
+
+% --- Build first config: minimal
+\begin{frame}[fragile]{Your first config (single VM + single NAT network)}
+\small
+\begin{lstlisting}[style=boxman]
+---
+version: 1.0
+project: mylab
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/usr/bin/python /usr/bin/virt-install'
+    virt_clone_cmd:   '/usr/bin/python /usr/bin/virt-clone'
+    virsh_cmd:        '/bin/virsh'
+  verbose: True
+
+clusters:
+  cluster_1:
+    workdir: ~/workspaces/mylab
+    base_image: rocky9
+    proxy_host: localhost
+    admin_user: 'root'
+    admin_pass: 'file://~/workspaces/mylab/admin_pass.txt'
+    admin_key_name: id_ed25519_boxman
+    ssh_config: ssh_config
+
+    networks:
+      lab_net:
+        mode: nat
+        mac: '52:54:00:00:00:01'
+        ip:
+          address: '192.168.100.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range: { start: '192.168.100.2', end: '192.168.100.254' }
+        enable: True
+        autostart: True
+
+    vms:
+      lab01:
+        hostname: lab01
+        memory: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'lab_net'
+\end{lstlisting}
+\end{frame}
+
+% --- Admin pass
+\begin{frame}[fragile]{Password handling (kept simple)}
+\begin{itemize}
+  \item The password is used \textbf{once} to inject an SSH key (then key-only).
+  \item Three supported ways:
+\end{itemize}
+\vspace{0.5em}
+\begin{tabular}{@{}p{0.22\textwidth}p{0.72\textwidth}@{}}
+\toprule
+\textbf{Method} & \textbf{Example} \\
+\midrule
+Plain text & \texttt{'mysecretpass'} \\
+From file & \texttt{'file://\textasciitilde /secrets/pass.txt'} \\
+Env var & \texttt{'\$\{env:BOXMAN\_ADMIN\_PASS\}'} \\
+\bottomrule
+\end{tabular}
+\end{frame}
+
+% --- Provision
+\begin{frame}[fragile]{Provision the cluster}
+\begin{lstlisting}[style=boxman]
+boxman --conf ~/workspaces/mylab/conf.yml provision
+\end{lstlisting}
+\textbf{Behind the scenes, Boxman:}
+\begin{itemize}
+  \item renders Jinja2 \textrightarrow{} YAML
+  \item creates libvirt networks + rules
+  \item clones VMs from the base image
+  \item generates SSH keys + \texttt{ssh\_config}
+  \item waits for DHCP IPs, then injects the public key
+\end{itemize}
+\end{frame}
+
+% --- Verify + connect
+\begin{frame}[fragile]{Verify and SSH in}
+\textbf{Check the VM is running:}
+\begin{lstlisting}[style=boxman]
+virsh -c qemu:///system list
+\end{lstlisting}
+\textbf{SSH using the generated config:}
+\begin{lstlisting}[style=boxman]
+ssh -F ~/workspaces/mylab/ssh_config lab01
+\end{lstlisting}
+\begin{itemize}
+  \item The SSH config maps \texttt{lab01} \textrightarrow{} IP and key.
+\end{itemize}
+\end{frame}
+
+% --- Day-to-day
+\begin{frame}[fragile]{Day-to-day commands (the ones you actually use)}
+\begin{columns}[T,onlytextwidth]
+  \column{0.52\textwidth}
+  \textbf{Lifecycle}
+  \begin{lstlisting}[style=boxman]
+boxman --conf conf.yml provision
+boxman --conf conf.yml deprovision
+boxman --conf conf.yml list
+  \end{lstlisting}
+
+  \column{0.48\textwidth}
+  \textbf{Power + snapshots}
+  \begin{lstlisting}[style=boxman]
+boxman --conf conf.yml start
+boxman --conf conf.yml suspend pause
+boxman --conf conf.yml suspend resume
+boxman --conf conf.yml snapshot create -n snap1
+boxman --conf conf.yml snapshot restore -n snap1
+  \end{lstlisting}
+\end{columns}
+\end{frame}
+
+% --- Multi-VM idea
+\begin{frame}[fragile]{Going further: multi-VM + multi-network}
+\begin{itemize}
+  \item A common pattern: \textbf{public NAT} + \textbf{private backend}.
+  \item Example idea:
+    \begin{itemize}
+      \item \texttt{web01} has 2 NICs (public + backend)
+      \item \texttt{db01} is backend-only (isolated)
+      \item add a dedicated data disk for the DB (e.g., \texttt{/dev/vdb})
+    \end{itemize}
+  \item Keep it boring: name networks clearly, avoid subnet conflicts.
+\end{itemize}
+\end{frame}
+
+% --- Advanced features
+\begin{frame}[fragile]{Advanced features (when you want less copy-paste)}
+\textbf{Jinja2 templating inside YAML:}
+\begin{itemize}
+  \item Generate many similar VMs with loops.
+  \item Pull secrets from environment variables.
+  \item Reuse patterns for disks and NICs.
+\end{itemize}
+\vspace{0.5em}
+\begin{lstlisting}[style=boxman]
+vms:
+  {% for i in range(1, 6) %}
+  node{{ "%02d" % i }}:
+    hostname: node{{ "%02d" % i }}
+    memory: 2048
+    network_adapters:
+      - name: adapter_1
+        link_state: 'up'
+        network_source: 'my_network'
+  {% endfor %}
+\end{lstlisting}
+\end{frame}
+
+% --- Troubleshooting
+\begin{frame}[fragile]{Troubleshooting (fast checks)}
+\begin{itemize}
+  \item \textbf{Permission denied / can't connect to libvirt}
+    \begin{itemize}
+      \item Ensure you're in \texttt{libvirt} (and \texttt{kvm}) groups
+      \item Try: \texttt{virsh -c qemu:///system list}
+    \end{itemize}
+
+  \item \textbf{Hangs at ``Waiting for IP address''}
+    \begin{itemize}
+      \item DHCP/client missing in base image
+      \item Check DHCP range + base VM boots
+    \end{itemize}
+
+  \item \textbf{SSH key injection fails (missing sshpass)}
+    \begin{itemize}
+      \item Install \texttt{sshpass} for your distro
+    \end{itemize}
+\end{itemize}
+\end{frame}
+
+% --- Wrap
+\begin{frame}[fragile]{Wrap-up}
+\begin{itemize}
+  \item Boxman shines when you want repeatable local labs.
+  \item Start with one VM, then grow into multi-network setups.
+  \item Use Jinja2 templating when configs start to feel copy-pasted.
+\end{itemize}
+\vspace{0.8em}
+\textbf{One command to reset everything:}
+\begin{lstlisting}[style=boxman]
+boxman --conf conf.yml deprovision
+\end{lstlisting}
+\end{frame}
+
+\end{document}
