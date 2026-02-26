@@ -241,6 +241,21 @@ def parse_args():
     )
 
     #
+    # sub parser for the 'down' subcommand
+    #
+    parser_down = subparsers.add_parser(
+        'down',
+        help='bring down the infrastructure: save or suspend the state of all VMs')
+    parser_down.set_defaults(func=BoxmanManager.down)
+    parser_down.add_argument(
+        '--suspend',
+        action='store_true',
+        default=False,
+        help='suspend (pause) VMs instead of saving their state to disk',
+        dest='suspend'
+    )
+
+    #
     # sub parser for deprovisioning a configuration
     #
     parser_deprov = subparsers.add_parser('deprovision', help='deprovision a configuration')

@@ -1497,6 +1497,9 @@ class BoxmanManager:
           saved), start/resume them.
         - If only some VMs exist (partial state) and --force is not set,
           error out. With --force, deprovision and re-provision.
+
+        Reuses the same provider methods as ``boxman control start`` and
+        ``boxman control resume``.
         """
         config = cls.config
         expected_vms = cls._get_project_vm_names()
@@ -1543,7 +1546,6 @@ class BoxmanManager:
 
         if not non_running:
             cls.logger.info("all VMs are already running, nothing to do")
-            # Still display connection info
             cls.connect_info()
             return
 
@@ -1556,17 +1558,21 @@ class BoxmanManager:
         if hasattr(cls.provider, 'update_provider_config_with_runtime'):
             cls.provider.update_provider_config_with_runtime()
 
+        # Build workdir lookup from process_vm_list for restore operations
+        vm_workdir_map = {vm_name: workdir for vm_name, workdir in cls.process_vm_list(cli_args)}
+
         for vm_name, state in non_running.items():
             cls.logger.info(f"VM '{vm_name}' is in state '{state}'")
+            workdir = vm_workdir_map.get(vm_name, '')
 
             if state == 'paused':
                 cls.logger.info(f"resuming VM '{vm_name}'...")
                 cls.provider.resume_vm(vm_name)
+            elif state in ('saved', 'managedsave'):
+                cls.logger.info(f"restoring VM '{vm_name}' from saved state...")
+                cls.provider.restore_vm(vm_name, workdir)
             elif state in ('shut off', 'shutoff'):
                 cls.logger.info(f"starting VM '{vm_name}'...")
-                cls.provider.start_vm(vm_name)
-            elif state in ('saved', 'managedsave'):
-                cls.logger.info(f"starting VM '{vm_name}' (restoring saved state)...")
                 cls.provider.start_vm(vm_name)
             elif state in ('crashed', 'dying'):
                 cls.logger.warning(
@@ -1609,6 +1615,45 @@ class BoxmanManager:
         cls.write_ssh_config()
 
         cls.logger.info("infrastructure is up")
+
+    @staticmethod
+    def down(cls, cli_args):
+        """
+        Bring down the infrastructure by saving or suspending all VMs.
+
+        By default, saves each VM's state to disk (same as
+        ``boxman control save``). With ``--suspend``, pauses VMs in memory
+        instead (same as ``boxman control suspend``).
+
+        Reuses ``process_vm_list()`` and the same provider methods as
+        ``boxman control save`` / ``boxman control suspend``.
+        """
+        # Ensure provider config reflects runtime settings
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
+
+        vm_list = cls.process_vm_list(cli_args)
+
+        if not vm_list:
+            cls.logger.info("no VMs found in configuration")
+            return
+
+        use_suspend = getattr(cli_args, 'suspend', False)
+
+        if use_suspend:
+            cls.logger.info("suspending all VMs (--suspend)...")
+            for vm_name, _workdir in vm_list:
+                cls.logger.info(f"suspending VM '{vm_name}'...")
+                cls.provider.suspend_vm(vm_name)
+                cls.logger.info(f"VM '{vm_name}' suspended")
+        else:
+            cls.logger.info("saving the state of all VMs to disk...")
+            for vm_name, workdir in vm_list:
+                cls.logger.info(f"saving VM '{vm_name}' state to '{workdir}'...")
+                cls.provider.save_vm(vm_name, workdir)
+                cls.logger.info(f"VM '{vm_name}' state saved")
+
+        cls.logger.info("infrastructure is down")
 
     @staticmethod
     def deprovision(cls, cli_args):
