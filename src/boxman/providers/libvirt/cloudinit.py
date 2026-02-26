@@ -102,6 +102,7 @@ class CloudInitTemplate:
         vcpus: int = 2,
         os_variant: str = "generic",
         disk_format: str = "qcow2",
+        disk_size: Optional[str] = None,
         network: str = "default",
         bridge: Optional[str] = None,
     ):
@@ -116,6 +117,7 @@ class CloudInitTemplate:
         self.vcpus = vcpus
         self.os_variant = os_variant
         self.disk_format = disk_format
+        self.disk_size = disk_size
         self.network = network
         self.bridge = bridge
         self.logger = log
@@ -352,6 +354,31 @@ class CloudInitTemplate:
             self.logger.error(f"failed to copy base image: {exc}")
             return False
 
+    def _resize_disk_image(self, image_path: str, size: str) -> bool:
+        """
+        Resize a qcow2 disk image to the given size using qemu-img.
+
+        Args:
+            image_path: Path to the disk image.
+            size: Target size (e.g. '20G', '50G'). If the value is smaller
+                  than the current image size, this is a no-op (shrinking
+                  is not supported by qemu-img resize without --shrink).
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        self.logger.info(f"resizing disk image {image_path} to {size}")
+        result = self.virsh.execute_shell(
+            f'qemu-img resize "{image_path}" {size}',
+            hide=False, warn=True,
+        )
+        if result.ok:
+            self.logger.info(f"disk image resized to {size}")
+            return True
+
+        self.logger.error(f"failed to resize disk image: {result.stderr}")
+        return False
+
     def _download_image(self, url: str, dst_path: str) -> bool:
         """Download a cloud image from a URL with progress and fallbacks."""
         self.logger.info(f"downloading base image {url} -> {dst_path}")
@@ -562,6 +589,11 @@ class CloudInitTemplate:
         if not self.copy_base_image(dst_image_path):
             return False
 
+        # Resize the disk image if a target size was specified
+        if self.disk_size:
+            if not self._resize_disk_image(dst_image_path, self.disk_size):
+                return False
+
         nocloud_dir = self.prepare_nocloud_dir(template_dir)
 
         seed_iso_path = os.path.join(template_dir, "seed.iso")
@@ -620,6 +652,7 @@ class CloudInitTemplate:
         self.logger.info(f"  seed ISO:   {seed_iso_path}")
         self.logger.info("=" * 70)
         return True
+
     @staticmethod
     def hash_password(plain_password: str) -> str:
         """Hash a plain-text password using SHA-512 for use in cloud-init passwd field."""

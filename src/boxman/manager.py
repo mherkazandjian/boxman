@@ -355,6 +355,7 @@ class BoxmanManager:
             tpl_vcpus = tpl_conf.get('vcpus', 2)
             tpl_os_variant = tpl_conf.get('os_variant', 'generic')
             tpl_disk_format = tpl_conf.get('disk_format', 'qcow2')
+            tpl_disk_size = tpl_conf.get('disk_size', None)
             tpl_network = tpl_conf.get('network', 'default')
             tpl_bridge = tpl_conf.get('bridge', None)
             tpl_workdir = tpl_conf.get('workdir', default_workdir)
@@ -383,6 +384,7 @@ class BoxmanManager:
                 vcpus=tpl_vcpus,
                 os_variant=tpl_os_variant,
                 disk_format=tpl_disk_format,
+                disk_size=tpl_disk_size,
                 network=tpl_network,
                 bridge=tpl_bridge,
             )

@@ -53,6 +53,9 @@ templates:
     os_variant: ubuntu24.04
     memory: 2048
     vcpus: 2
+    # Resize the cloud image disk to the given size (requires qemu-img).
+    # The guest filesystem is grown automatically by cloud-init's growpart module.
+    disk_size: 20G
     # Connect to a bridge device directly (recommended for internet access).
     # If omitted, boxman auto-resolves the bridge from the 'network' name.
     bridge: virbr0

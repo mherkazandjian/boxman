@@ -96,7 +96,7 @@ sudo usermod -aG libvirt $USER
 \textbf{Ubuntu/Debian:}
 \begin{lstlisting}[style=boxman]
 sudo apt update
-sudo apt install -y libvirt-daemon-system libvirt-clients qemu-kvm virtinst sshpass
+sudo apt install -y libvirt-daemon-system libvirt-clients qemu-kvm virtinst sshpass bridge-utils python3-pip python3-venv
 sudo systemctl enable --now libvirtd
 sudo usermod -aG libvirt,kvm $USER
 \end{lstlisting}

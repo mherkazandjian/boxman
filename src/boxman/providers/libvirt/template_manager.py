@@ -147,6 +147,18 @@ class TemplateManager:
             self.logger.error(str(exc))
             return False
 
+        # resize disk image if a target size was specified
+        disk_size = template_config.get("disk_size")
+        if disk_size:
+            self.logger.info(f"resizing disk image to {disk_size}")
+            result = run(
+                f"qemu-img resize '{disk_path}' {disk_size}",
+                hide=False, warn=True
+            )
+            if not result.ok:
+                self.logger.error(f"failed to resize disk image: {result.stderr}")
+                return False
+
         # build cloud-init seed ISO
         cloudinit_data = template_config.get("cloudinit", "")
         if not cloudinit_data:

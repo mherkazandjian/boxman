@@ -15,6 +15,7 @@ templates:
     name: ubuntu-24.04-minimal-base-template-cloudinit
     #image: file:///dev/shm/sandbox/ubuntu-24.04-server-cloudimg-amd64.img
     image: http://cloud-images-archive.ubuntu.com/releases/noble/release-20240423/ubuntu-24.04-server-cloudimg-amd64.img
+    disk_size: 20G
     cloudinit: |
       #cloud-config
       hostname: hello-cloudinit
