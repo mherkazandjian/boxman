@@ -5,7 +5,7 @@ import sys
 import argparse
 from argparse import RawTextHelpFormatter
 from datetime import datetime, timezone
-from multiprocess import Process
+from multiprocessing import Process
 import yaml
 import json
 import shutil

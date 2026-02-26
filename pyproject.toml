@@ -25,7 +25,6 @@ python = "^3.10"
 PyYAML = "*"
 invoke = "*"
 Jinja2 = "*"
-multiprocess = "*"
 lxml = "*"
 
 [tool.poetry.extras]
