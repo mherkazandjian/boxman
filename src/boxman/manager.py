@@ -251,13 +251,29 @@ class BoxmanManager:
         :param cls: The BoxmanManager instance
         :param cli_args: The parsed arguments from the cli
         """
+        requested = None
+        if cli_args is not None and hasattr(cli_args, 'template_names') and cli_args.template_names:
+            requested = [t.strip() for t in cli_args.template_names.split(',')]
+
+        force = getattr(cli_args, 'force', False) if cli_args is not None else False
+
+        cls._create_templates_impl(requested=requested, force=force)
+
+    def _create_templates_impl(self, requested=None, force=False) -> None:
+        """
+        Internal implementation for creating template VMs.
+
+        Args:
+            requested: Optional list of template keys to create (None = all).
+            force: If True, recreate existing templates.
+        """
         from boxman.providers.libvirt.cloudinit import CloudInitTemplate
 
-        config = cls.config
+        config = self.config
         templates = config.get('templates', {})
 
         if not templates:
-            cls.logger.warning("no templates defined in configuration")
+            self.logger.warning("no templates defined in configuration")
             return
 
         # determine provider config
@@ -265,24 +281,17 @@ class BoxmanManager:
         provider_config = config.get('provider', {}).get(provider_type, {})
 
         # merge app-level provider config as defaults
-        if cls.app_config and 'providers' in cls.app_config:
-            app_provider = cls.app_config['providers'].get(provider_type, {})
+        if self.app_config and 'providers' in self.app_config:
+            app_provider = self.app_config['providers'].get(provider_type, {})
             merged = app_provider.copy()
             merged.update(provider_config)
             provider_config = merged
 
         # inject runtime settings
-        if hasattr(cls, 'runtime_instance'):
-            provider_config = cls.runtime_instance.inject_into_provider_config(provider_config)
+        if hasattr(self, 'runtime_instance'):
+            provider_config = self.runtime_instance.inject_into_provider_config(provider_config)
 
-        cls.logger.info(f"resolved provider config for templates: {provider_config}")
-
-        # determine which templates to create
-        requested = None
-        if hasattr(cli_args, 'template_names') and cli_args.template_names:
-            requested = [t.strip() for t in cli_args.template_names.split(',')]
-
-        force = getattr(cli_args, 'force', False)
+        self.logger.info(f"resolved provider config for templates: {provider_config}")
 
         # resolve a workdir for template artifacts
         default_workdir = '~/boxman-templates'
@@ -292,7 +301,7 @@ class BoxmanManager:
 
         for tpl_key, tpl_conf in templates.items():
             if requested and tpl_key not in requested:
-                cls.logger.info(f"skipping template '{tpl_key}' (not in requested list)")
+                self.logger.info(f"skipping template '{tpl_key}' (not in requested list)")
                 continue
 
             tpl_name = tpl_conf.get('name', tpl_key)
@@ -308,7 +317,7 @@ class BoxmanManager:
             tpl_bridge = tpl_conf.get('bridge', None)
             tpl_workdir = tpl_conf.get('workdir', default_workdir)
 
-            cls.logger.info(f"creating template '{tpl_key}' -> VM name '{tpl_name}'")
+            self.logger.info(f"creating template '{tpl_key}' -> VM name '{tpl_name}'")
 
             ct = CloudInitTemplate(
                 template_name=tpl_name,
@@ -328,33 +337,88 @@ class BoxmanManager:
 
             success = ct.create_template(force=force)
             if success:
-                cls.logger.info(f"template '{tpl_key}' created successfully")
+                self.logger.info(f"template '{tpl_key}' created successfully")
             else:
-                cls.logger.error(f"failed to create template '{tpl_key}'")
+                self.logger.error(f"failed to create template '{tpl_key}'")
 
-    @staticmethod
-    def list_projects(cls, _) -> None:
+    def ensure_templates_exist(self) -> bool:
         """
-        List all projects that have been provisioned
+        Check if any cluster's base_image refers to a template defined in the
+        ``templates`` section of the config. If the template VM does not exist,
+        create it automatically.
 
-        :param manager: The instance of the BoxmanManager
-        :param cli_args: The parsed arguments from the cli
+        Returns:
+            True if all required templates exist (or were created), False on failure.
         """
-        # print table header
-        header_project = "project_name"
-        header_path = "project path"
-        padding_project = 20
-        padding_path = 50
-        print(f"{header_project:<{padding_project}} | {header_path:<{padding_path}}")
+        templates = self.config.get('templates', {})
+        if not templates:
+            return True  # nothing to do
 
-        # create separator line with "+" at the intersection
-        separator_project = "-" * padding_project
-        separator_path = "-" * padding_path
-        print(f"{separator_project}-+{separator_path}")
+        # build a mapping: template VM name -> template key
+        tpl_name_to_key: Dict[str, str] = {}
+        for tpl_key, tpl_conf in templates.items():
+            vm_name = tpl_conf.get('name', tpl_key)
+            tpl_name_to_key[vm_name] = tpl_key
+            # also map by the key itself in case base_image uses the key
+            tpl_name_to_key[tpl_key] = tpl_key
 
-        # Print each project row
-        for project, project_data in cls.cache.read_projects_cache().items():
-            print(f"{project:<{padding_project}} | {project_data['conf']:<{padding_path}}")
+        # collect which templates are referenced by clusters
+        needed_template_keys: set = set()
+        for cluster_name, cluster in self.config.get('clusters', {}).items():
+            base_image = cluster.get('base_image', '')
+            if base_image in tpl_name_to_key:
+                needed_template_keys.add(tpl_name_to_key[base_image])
+
+        if not needed_template_keys:
+            return True  # no cluster uses a template as base_image
+
+        # check which of the needed templates already exist as VMs
+        missing_keys: list = []
+        for tpl_key in needed_template_keys:
+            tpl_conf = templates[tpl_key]
+            tpl_vm_name = tpl_conf.get('name', tpl_key)
+
+            # ask the provider if the VM exists
+            exists = False
+            if self.provider is not None and hasattr(self.provider, 'vm_exists'):
+                exists = self.provider.vm_exists(tpl_vm_name)
+            elif self.provider is not None:
+                # fallback: try virsh list
+                try:
+                    from boxman.providers.libvirt.commands import VirshCommand
+                    provider_type = list(self.config.get('provider', {}).keys())[0]
+                    provider_config = self.config.get('provider', {}).get(provider_type, {})
+                    if self.app_config and 'providers' in self.app_config:
+                        app_prov = self.app_config['providers'].get(provider_type, {})
+                        merged = app_prov.copy()
+                        merged.update(provider_config)
+                        provider_config = merged
+                    if hasattr(self, 'runtime_instance'):
+                        provider_config = self.runtime_instance.inject_into_provider_config(provider_config)
+                    virsh = VirshCommand(provider_config=provider_config)
+                    result = virsh.execute("list", "--all", "--name", hide=True, warn=True)
+                    if result.ok:
+                        vm_list = [v.strip() for v in result.stdout.strip().split("\n") if v.strip()]
+                        exists = tpl_vm_name in vm_list
+                except Exception as exc:
+                    self.logger.warning(f"could not check if template VM '{tpl_vm_name}' exists: {exc}")
+
+            if exists:
+                self.logger.info(f"template VM '{tpl_vm_name}' already exists, skipping creation")
+            else:
+                self.logger.info(
+                    f"template VM '{tpl_vm_name}' (key='{tpl_key}') does not exist, "
+                    f"will create it before provisioning")
+                missing_keys.append(tpl_key)
+
+        if not missing_keys:
+            return True
+
+        # create the missing templates
+        self.logger.info(f"auto-creating {len(missing_keys)} missing template(s): {missing_keys}")
+        self._create_templates_impl(requested=missing_keys, force=False)
+
+        return True
 
     ### register/un-register the project in the cache
     def register_project_in_cache(self) -> None:
@@ -384,6 +448,26 @@ class BoxmanManager:
         This method saves the project configuration to the cache for later use.
         """
         self.cache.unregister_project(project_name=self.config['project'])
+
+    @staticmethod
+    def list_projects(cls, cli_args) -> None:
+        """
+        List all registered projects.
+        """
+        if hasattr(cls.cache, 'list_projects'):
+            projects = cls.cache.list_projects()
+            if not projects:
+                cls.logger.info("No projects registered.")
+            else:
+                cls.logger.info("Registered projects:")
+                if isinstance(projects, dict):
+                    for proj_name, proj_info in projects.items():
+                        cls.logger.info(f"  - {proj_name}: {proj_info}")
+                else:
+                    for proj in projects:
+                        cls.logger.info(f"  - {proj}")
+        else:
+            cls.logger.error("BoxmanCache does not implement list_projects()")
     ### end register the project in the cache
 
     ### networks define / remove / destroy
@@ -1109,6 +1193,10 @@ class BoxmanManager:
         except RuntimeError as exc:
             cls.logger.error(str(exc))
             return
+
+        # Auto-create any template VMs that are referenced as base_image
+        # but do not yet exist.
+        cls.ensure_templates_exist()
 
         cls.provision_files()
 

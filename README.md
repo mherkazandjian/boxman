@@ -13,6 +13,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - Snapshot support
 - Cloud-init integration
 - **Cloud-init template creation**: build template VMs from cloud images with inline cloud-init config
+- **Auto-creation of templates on provision**: if a cluster's `base_image` references a template defined in the `templates` section and the template VM does not yet exist, it is automatically created before provisioning proceeds
 - **Runtime environments**: execute provider commands locally or inside a Docker container
 
 ## Quick Start
