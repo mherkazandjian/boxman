@@ -32,13 +32,26 @@ runtime_config:
 
 # Global SSH configuration applied across all providers (libvirt, docker, etc.)
 # Keys listed here are injected into all managed guests/containers.
+#
+# Config files (conf.yml, boxman.yml) are rendered as Jinja2 templates.
+# The following helper functions are available:
+#
+#   {{ env("VAR") }}                            - value of $VAR, empty string if unset
+#   {{ env("VAR", default="fallback") }}        - value of $VAR, "fallback" if unset
+#   {{ env_required("VAR") }}                   - value of $VAR, error if unset
+#   {{ env_required("VAR", "custom message") }} - value of $VAR, custom error if unset
+#   {{ env_is_set("VAR") }}                     - True/False
+#
+# Legacy format (resolved at runtime, not at template render time):
+#   ${env:VAR}         - resolved by BoxmanManager.fetch_value()
+#   file://path        - resolved by BoxmanManager.fetch_value()
 ssh:
   authorized_keys:
     # Each entry can be:
     #   - a literal public key string:  "ssh-ed25519 AAAAC3... user@host"
     #   - a file reference:             file://~/.ssh/id_ed25519.pub
-    #   - an env variable:              ${env:BOXMAN_SSH_PUBKEY}
-    - ${env:BOXMAN_SSH_PUBKEY}
+    #   - an env variable:              {{ env("BOXMAN_SSH_PUBKEY") }}
+    - {{ env("BOXMAN_SSH_PUBKEY") }}
     # - file://~/.ssh/id_ed25519.pub
     # - "ssh-ed25519 AAAAC3... user@host"
 

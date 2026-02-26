@@ -18,6 +18,7 @@ from boxman.utils.io import write_files
 #from boxman.abstract.providers import Providers
 from boxman.abstract.providers import ProviderSession as Session
 from boxman import log
+from boxman.utils.jinja_env import create_jinja_env
 
 
 now = datetime.now(timezone.utc)
@@ -631,6 +632,10 @@ def load_boxman_config(path: str) -> dict:
     """
     Load the boxman configuration from the specified path.
 
+    The file is rendered as a Jinja2 template (supporting ``{{ env() }}``,
+    ``{{ env_required() }}``, ``{{ env_is_set() }}``) before being parsed
+    as YAML.
+
     If *path* points to the default location
     (``~/.config/boxman/boxman.yml``) and the file does not exist, a new
     file is created with sensible defaults (system paths for libvirt
@@ -661,8 +666,15 @@ def load_boxman_config(path: str) -> dict:
                 f"boxman config not found: {expanded}"
             )
 
-    with open(expanded, "r") as fobj:
-        config = yaml.safe_load(fobj.read())
+    # Render as Jinja2 template to resolve {{ env() }} etc.
+    config_dir = os.path.dirname(os.path.abspath(expanded))
+    config_filename = os.path.basename(expanded)
+
+    jinja_env = create_jinja_env(config_dir)
+    template = jinja_env.get_template(config_filename)
+    rendered = template.render(environ=os.environ)
+
+    config = yaml.safe_load(rendered)
     return config
 
 

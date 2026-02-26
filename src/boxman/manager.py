@@ -13,6 +13,7 @@ from boxman.config_cache import BoxmanCache
 from boxman.utils.io import write_files
 from boxman import log
 from boxman.runtime import create_runtime, RuntimeBase
+from boxman.utils.jinja_env import create_jinja_env
 
 class BoxmanManager:
     def __init__(self,
@@ -139,15 +140,17 @@ class BoxmanManager:
         config_dir = os.path.dirname(os.path.abspath(config_path))
         config_filename = os.path.basename(config_path)
 
-        # create jinja environment with the config directory as template path
-        env = Environment(loader=FileSystemLoader(config_dir))
+        # create jinja environment with boxman helpers (env(), env_required(), etc.)
+        env = create_jinja_env(config_dir)
 
         # load the template
         template = env.get_template(config_filename)
 
-        # render the template (you can pass variables here if needed)
+        # render the template
+        # NOTE: pass os.environ as 'environ' (not 'env') to avoid shadowing
+        # the env() helper function registered in the Jinja globals.
         rendered_yaml = template.render(
-            env=os.environ,  # make environment variables available in template
+            environ=os.environ,
         )
 
         # parse the rendered yaml

@@ -121,6 +121,38 @@ boxman create-templates --force
     - sshpass
     - ansible
 
+## Environment Variables in Config Files
+
+Config files (`conf.yml`, `boxman.yml`) are rendered as Jinja2 templates before
+being parsed as YAML. The following helper functions are available:
+
+| Syntax | Description |
+|---|---|
+| `{{ env("VAR") }}` | Value of `$VAR`, empty string if unset |
+| `{{ env("VAR", default="fallback") }}` | Value of `$VAR`, `"fallback"` if unset |
+| `{{ env("VAR") \| default("fallback", true) }}` | Same, using Jinja2's built-in `default` filter |
+| `{{ env_required("VAR") }}` | Value of `$VAR`, **error** if unset or empty |
+| `{{ env_required("VAR", "custom error msg") }}` | Same, with a custom error message |
+| `{{ env_is_set("VAR") }}` | `True` / `False` — useful in conditionals |
+
+### Examples
+
+```yaml
+# conf.yml
+clusters:
+  my_cluster:
+    admin_pass: {{ env_required("BOXMAN_ADMIN_PASS", "BOXMAN_ADMIN_PASS must be set") }}
+    admin_user: {{ "admin" if env_is_set("BOXMAN_ADMIN_PASS") else "" }}
+    optional_setting: {{ env("BOXMAN_OPTIONAL", default="default_value") }}
+```
+
+> **Legacy syntax**: The `${env:VAR}` format (resolved at runtime by
+> `BoxmanManager.fetch_value()`) is still supported in `boxman.yml` fields
+> like `ssh.authorized_keys` and `admin_pass`. The old `{{ env.VAR }}` dict
+> access syntax has been renamed to `{{ environ.VAR }}` to avoid shadowing
+> the `env()` helper function. The Jinja `{{ env("VAR") }}` syntax is
+> preferred for new configurations as it supports defaults and conditionals.
+
 ## Runtime Environments
 
 The `--runtime` flag (or `runtime:` in `boxman.yml`) controls *where* provider

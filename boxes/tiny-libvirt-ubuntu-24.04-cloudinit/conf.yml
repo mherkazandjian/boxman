@@ -73,7 +73,7 @@ templates:
         - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /admin -s /bin/bash -g admin -G sudo admin" ]
         - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin" ]
         - [ sh, -c, "chmod 0440 /etc/sudoers.d/admin" ]
-        - [ sh, -c, "echo 'admin:${env:BOXMAN_ADMIN_PASS}' | chpasswd" ]
+        - [ sh, -c, "echo 'admin:{{ env("BOXMAN_ADMIN_PASS", default="boxman") }}' | chpasswd" ]
         - [ sh, -c, "mkdir -p /admin/.ssh && chmod 700 /admin/.ssh && chown -R admin:admin /admin /admin/.ssh" ]
 
 clusters:
@@ -82,7 +82,7 @@ clusters:
     base_image: ubuntu-24.04-minimal-base-template-cloudinit
     proxy_host: localhost
     admin_user: admin
-    admin_pass: ${env:BOXMAN_ADMIN_PASS}
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
     admin_key_name: id_ed25519_boxman    # generated automatically at provisioning time
     ssh_config: ssh_config               # generated automatically at provisioning time
 
