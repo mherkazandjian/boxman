@@ -184,6 +184,34 @@ def parse_args():
     parser_list = subparsers.add_parser('list', help='list all registered projects')
     parser_list.set_defaults(func=BoxmanManager.list_projects)
 
+    list_format_group = parser_list.add_mutually_exclusive_group()
+    list_format_group.add_argument(
+        '--pretty', '-p',
+        type=str,
+        nargs='?',
+        const='plain',
+        default=None,
+        choices=['plain', 'table'],
+        help='display in a human-readable format without logger prefixes (plain or table)',
+        dest='pretty'
+    )
+    list_format_group.add_argument(
+        '--json',
+        action='store_true',
+        default=False,
+        help='output the project list as JSON',
+        dest='json'
+    )
+
+    parser_list.add_argument(
+        '--color',
+        type=str,
+        default='yes',
+        choices=['yes', 'no'],
+        help='enable or disable colored output (default: yes)',
+        dest='color'
+    )
+
     #
     # sub parser for provisioning a configuration
     #
@@ -751,7 +779,7 @@ def main():
 
     if args.func == BoxmanManager.list_projects:
         manager = BoxmanManager(config=None)
-        args.func(manager, None)
+        args.func(manager, args)
         sys.exit(0)
     else:
         # use the config of a deployment specified on the cmd line only if

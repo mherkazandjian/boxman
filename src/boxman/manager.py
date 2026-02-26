@@ -1,6 +1,7 @@
 import os
 import time
 import re
+import json
 from typing import Dict, Any, Optional
 import yaml
 from multiprocessing import Pool
@@ -568,20 +569,127 @@ class BoxmanManager:
         """
         List all registered projects.
         """
-        if hasattr(cls.cache, 'list_projects'):
-            projects = cls.cache.list_projects()
-            if not projects:
-                cls.logger.info("No projects registered.")
-            else:
-                cls.logger.info("Registered projects:")
-                if isinstance(projects, dict):
-                    for proj_name, proj_info in projects.items():
-                        cls.logger.info(f"  - {proj_name}: {proj_info}")
-                else:
-                    for proj in projects:
-                        cls.logger.info(f"  - {proj}")
+        projects = cls.cache.list_projects()
+
+        pretty = getattr(cli_args, 'pretty', None) if cli_args else None
+        use_json = getattr(cli_args, 'json', False) if cli_args else False
+        use_color = getattr(cli_args, 'color', 'yes') != 'no' if cli_args else True
+
+        # --- JSON output ---
+        if use_json:
+            print(json.dumps(projects if projects else {}, indent=2, default=str))
+            return
+
+        # ANSI helpers
+        if use_color and pretty:
+            BOLD = "\033[1m"
+            CYAN = "\033[1;36m"
+            GREEN = "\033[1;32m"
+            YELLOW = "\033[1;33m"
+            DIM = "\033[2m"
+            RESET = "\033[0m"
         else:
-            cls.logger.error("BoxmanCache does not implement list_projects()")
+            BOLD = CYAN = GREEN = YELLOW = DIM = RESET = ""
+
+        if not projects:
+            if pretty:
+                print(f"{YELLOW}No projects registered.{RESET}")
+            else:
+                cls.logger.info("No projects registered.")
+            return
+
+        if pretty == 'table':
+            # Collect rows: [project, config, runtime, networks_summary]
+            rows = []
+            for proj_name, proj_info in projects.items():
+                if isinstance(proj_info, dict):
+                    conf = proj_info.get('conf', 'n/a')
+                    runtime = proj_info.get('runtime', 'n/a')
+                    networks = proj_info.get('networks', {})
+                    net_parts = []
+                    for net_name, net_info in networks.items():
+                        if isinstance(net_info, dict):
+                            ip = net_info.get('ip_address', 'n/a')
+                            bridge = net_info.get('bridge_name', 'n/a')
+                            net_parts.append(f"{net_name} (ip={ip}, br={bridge})")
+                        else:
+                            net_parts.append(net_name)
+                    nets_str = "; ".join(net_parts) if net_parts else "-"
+                else:
+                    conf = str(proj_info)
+                    runtime = "n/a"
+                    nets_str = "-"
+                rows.append((proj_name, conf, runtime, nets_str))
+
+            headers = ("PROJECT", "CONFIG", "RUNTIME", "NETWORKS")
+            # compute column widths
+            col_widths = [len(h) for h in headers]
+            for row in rows:
+                for i, cell in enumerate(row):
+                    col_widths[i] = max(col_widths[i], len(cell))
+
+            def fmt_row(cells, bold=False):
+                parts = []
+                for i, cell in enumerate(cells):
+                    parts.append(cell.ljust(col_widths[i]))
+                line = "  ".join(parts)
+                if bold:
+                    return f"{BOLD}{line}{RESET}"
+                return line
+
+            print()
+            print(fmt_row(headers, bold=True))
+            print("  ".join("-" * w for w in col_widths))
+            for row in rows:
+                print(fmt_row(row))
+            print()
+
+        elif pretty == 'plain':
+            print()
+            print(f"{BOLD}Registered projects:{RESET}")
+            print()
+            for proj_name, proj_info in projects.items():
+                print(f"  {CYAN}{proj_name}{RESET}")
+                if isinstance(proj_info, dict):
+                    conf = proj_info.get('conf', 'n/a')
+                    runtime = proj_info.get('runtime', 'n/a')
+                    print(f"    {DIM}config:{RESET}  {conf}")
+                    print(f"    {DIM}runtime:{RESET} {runtime}")
+
+                    networks = proj_info.get('networks', {})
+                    if networks:
+                        print(f"    {DIM}networks:{RESET}")
+                        for net_name, net_info in networks.items():
+                            ip = net_info.get('ip_address', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            bridge = net_info.get('bridge_name', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            print(f"      {GREEN}-{RESET} {net_name}")
+                            print(f"          {DIM}ip:{RESET} {ip}  {DIM}bridge:{RESET} {bridge}")
+                else:
+                    print(f"    {proj_info}")
+                print()
+
+        else:
+            # default logger-based output (no --pretty, no --json)
+            cls.logger.info("Registered projects:\n")
+            for proj_name, proj_info in projects.items():
+                cls.logger.info(f"  project: {proj_name}")
+                if isinstance(proj_info, dict):
+                    conf = proj_info.get('conf', 'n/a')
+                    runtime = proj_info.get('runtime', 'n/a')
+                    cls.logger.info(f"    config:  {conf}")
+                    cls.logger.info(f"    runtime: {runtime}")
+
+                    networks = proj_info.get('networks', {})
+                    if networks:
+                        cls.logger.info(f"    networks:")
+                        for net_name, net_info in networks.items():
+                            ip = net_info.get('ip_address', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            bridge = net_info.get('bridge_name', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            cls.logger.info(f"      - {net_name}")
+                            cls.logger.info(f"          ip: {ip}  bridge: {bridge}")
+                else:
+                    cls.logger.info(f"    {proj_info}")
+                cls.logger.info("")
     ### end register the project in the cache
 
     ### networks define / remove / destroy

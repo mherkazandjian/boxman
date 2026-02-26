@@ -130,3 +130,13 @@ class BoxmanCache:
 
         log.info(f"project '{project_name}' unregistered from cache (was at: {removed_path})")
         return True
+
+    def list_projects(self) -> dict:
+        """
+        List all registered projects.
+
+        Returns:
+            A dictionary of project names to their cached info,
+            or an empty dict if no projects are registered.
+        """
+        return self.read_projects_cache()
