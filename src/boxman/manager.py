@@ -317,6 +317,16 @@ class BoxmanManager:
             tpl_bridge = tpl_conf.get('bridge', None)
             tpl_workdir = tpl_conf.get('workdir', default_workdir)
 
+            # Ensure the workdir exists and is writable by the current user.
+            # Earlier steps (e.g. docker runtime) may have created it as root.
+            expanded_workdir = os.path.expanduser(tpl_workdir)
+            self._ensure_writable_dir(expanded_workdir)
+
+            # Also pre-create the template subdirectory that cloudinit.py
+            # will use, so it doesn't hit PermissionError.
+            template_subdir = os.path.join(expanded_workdir, tpl_name)
+            self._ensure_writable_dir(template_subdir)
+
             self.logger.info(f"creating template '{tpl_key}' -> VM name '{tpl_name}'")
 
             ct = CloudInitTemplate(
@@ -340,6 +350,69 @@ class BoxmanManager:
                 self.logger.info(f"template '{tpl_key}' created successfully")
             else:
                 self.logger.error(f"failed to create template '{tpl_key}'")
+
+    def _ensure_writable_dir(self, path: str) -> None:
+        """
+        Ensure *path* exists and is writable by the current user.
+
+        If the directory was created by another user (e.g. root via docker),
+        attempt to fix ownership with ``sudo chown``.  If ``sudo`` is not
+        available or fails, a clear error message is logged.
+
+        When running under a non-local runtime the directory is also
+        created inside the container so that commands executed via
+        ``docker exec`` can access it.
+
+        Args:
+            path: Absolute or user-expandable directory path.
+        """
+        path = os.path.expanduser(path)
+
+        if not os.path.exists(path):
+            try:
+                os.makedirs(path, exist_ok=True)
+            except PermissionError:
+                # parent dir may be owned by root — try sudo mkdir
+                self.logger.warning(
+                    f"cannot create '{path}' as current user, "
+                    f"trying with sudo...")
+                result = run(
+                    f"sudo mkdir -p '{path}'", hide=True, warn=True)
+                if not result.ok:
+                    raise PermissionError(
+                        f"failed to create directory '{path}' even with sudo"
+                    )
+                # fall through to chown below
+
+        # if the directory exists but is not writable, fix ownership
+        if not os.access(path, os.W_OK):
+            uid = os.getuid()
+            gid = os.getgid()
+            self.logger.info(
+                f"fixing ownership of '{path}' to {uid}:{gid} "
+                f"(was not writable by current user)")
+            result = run(
+                f"sudo chown -R {uid}:{gid} '{path}'",
+                hide=True, warn=True)
+            if not result.ok:
+                raise PermissionError(
+                    f"directory '{path}' is not writable and "
+                    f"'sudo chown' failed: {result.stderr.strip()}"
+                )
+
+        # When using a non-local runtime (e.g. docker-compose), also
+        # create the directory inside the container so that commands
+        # executed via 'docker exec' can write to it.
+        if self._runtime_name != 'local':
+            mkdir_cmd = self.runtime_instance.wrap_command(
+                f"mkdir -p '{path}'"
+            )
+            self.logger.info(f"creating directory inside runtime container: {path}")
+            result = run(mkdir_cmd, hide=True, warn=True)
+            if not result.ok:
+                self.logger.warning(
+                    f"failed to create '{path}' inside container: "
+                    f"{result.stderr.strip()}")
 
     def ensure_templates_exist(self) -> bool:
         """
@@ -1355,20 +1428,11 @@ class BoxmanManager:
         """
         retval = []
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        if hasattr(cli_args, 'vms') and cli_args.vms:
-            for cluster_name, cluster in self.config['clusters'].items():
-               workdir = os.path.expanduser(cluster['workdir'])
-               for vm_name, _ in cluster['vms'].items():
-                   full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                   retval.append((full_vm_name, workdir))
-        else:
-            vm_names = []
-            for cluster_name, cluster in self.config['clusters'].items():
-                workdir = os.path.expanduser(cluster['workdir'])
-                for vm_name, _ in cluster['vms'].items():
-                    full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                    vm_names.append((full_vm_name, workdir))
-
+        for cluster_name, cluster in self.config['clusters'].items():
+            workdir = os.path.expanduser(cluster['workdir'])
+            for vm_name, _ in cluster['vms'].items():
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                retval.append((full_vm_name, workdir))
         return retval
 
     @staticmethod
