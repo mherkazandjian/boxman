@@ -14,6 +14,7 @@ from boxman.utils.io import write_files
 from boxman import log
 from boxman.runtime import create_runtime, RuntimeBase
 from boxman.utils.jinja_env import create_jinja_env
+from boxman.providers.libvirt.commands import VirshCommand
 
 class BoxmanManager:
     def __init__(self,
@@ -1278,6 +1279,54 @@ class BoxmanManager:
 
         return True
 
+    def _get_project_vm_names(self) -> list[str]:
+        """
+        Return the list of fully-qualified VM names that would be
+        created by provisioning the current config.
+        """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        vm_names = []
+        for cluster_name, cluster in self.config.get('clusters', {}).items():
+            for vm_name in cluster.get('vms', {}).keys():
+                vm_names.append(f"{prj_name}_{cluster_name}_{vm_name}")
+        return vm_names
+
+    def _find_existing_project_vms(self) -> list[str]:
+        """
+        Query libvirt and return the subset of project VM names that
+        already exist (in any state).
+        """
+        expected = self._get_project_vm_names()
+        if not expected:
+            return []
+
+        # Resolve provider config so VirshCommand uses the right
+        # runtime / URI / sudo settings.
+        provider_type = (
+            list(self.config.get('provider', {}).keys())[0]
+            if 'provider' in self.config else 'libvirt'
+        )
+        provider_config = self.config.get('provider', {}).get(provider_type, {})
+        if self.app_config and 'providers' in self.app_config:
+            app_prov = self.app_config['providers'].get(provider_type, {})
+            merged = app_prov.copy()
+            merged.update(provider_config)
+            provider_config = merged
+        if hasattr(self, 'runtime_instance'):
+            provider_config = self.runtime_instance.inject_into_provider_config(
+                provider_config)
+
+        virsh = VirshCommand(provider_config=provider_config)
+        result = virsh.execute("list", "--all", "--name", hide=True, warn=True)
+        if not result.ok:
+            self.logger.warning("could not query existing VMs via virsh")
+            return []
+
+        existing = {
+            v.strip() for v in result.stdout.strip().split("\n") if v.strip()
+        }
+        return [vm for vm in expected if vm in existing]
+
     @staticmethod
     def provision(cls, cli_args):
 
@@ -1301,15 +1350,44 @@ class BoxmanManager:
         if hasattr(cls.provider, 'update_provider_config_with_runtime'):
             cls.provider.update_provider_config_with_runtime()
 
+        # --- Pre-check: detect already-existing project VMs -----------
+        force = getattr(cli_args, 'force', False)
+        existing_vms = cls._find_existing_project_vms()
+
+        if existing_vms:
+            names = ", ".join(f"'{v}'" for v in existing_vms)
+            if not force:
+                cls.logger.error(
+                    f"the following VM(s) already exist: {names}. "
+                    f"Use --force to deprovision them first and re-provision."
+                )
+                return
+            else:
+                cls.logger.warning(
+                    f"the following VM(s) already exist and will be "
+                    f"deprovisioned first (--force): {names}"
+                )
+                cls.deprovision(cls, cli_args)
+        # --------------------------------------------------------------
+
         try:
             cls.register_project_in_cache()
         except RuntimeError as exc:
             cls.logger.error(str(exc))
             return
 
-        # Auto-create any template VMs that are referenced as base_image
-        # but do not yet exist.
-        cls.ensure_templates_exist()
+        # --rebuild-templates: force-recreate all templates before provisioning
+        rebuild_templates = getattr(cli_args, 'rebuild_templates', False)
+        if rebuild_templates:
+            cls.logger.info(
+                "rebuilding all templates (--rebuild-templates implies --force "
+                "for create-templates)..."
+            )
+            cls._create_templates_impl(requested=None, force=True)
+        else:
+            # Auto-create any template VMs that are referenced as base_image
+            # but do not yet exist.
+            cls.ensure_templates_exist()
 
         cls.provision_files()
 

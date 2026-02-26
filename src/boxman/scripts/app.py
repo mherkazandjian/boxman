@@ -196,6 +196,20 @@ def parse_args():
         help='provision using the docker-compose setup',
         dest='docker_compose'
     )
+    parser_prov.add_argument(
+        '--force',
+        action='store_true',
+        default=False,
+        help='if VMs already exist, deprovision them first and then provision',
+        dest='force'
+    )
+    parser_prov.add_argument(
+        '--rebuild-templates',
+        action='store_true',
+        default=False,
+        help='force-rebuild all templates (destroy and recreate) before provisioning',
+        dest='rebuild_templates'
+    )
 
     #
     # sub parser for deprovisioning a configuration
@@ -704,7 +718,7 @@ def main():
         # load the boxman app configuration
         boxman_config = load_boxman_config(os.path.expanduser(args.boxman_conf))
 
-        # make the app-level config (boxman.yml) available to the manager
+        # make the app-level (boxman.yml) available to the manager
         manager.load_app_config(boxman_config)
 
         # resolve the runtime: CLI flag overrides boxman.yml default
