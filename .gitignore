@@ -161,3 +161,11 @@ data/dev/*
 .github
 containers/docker/data
 .boxman
+
+# latex
+*.aux
+*.nav
+*.pdf
+*.snm
+*.toc
+*.vrb

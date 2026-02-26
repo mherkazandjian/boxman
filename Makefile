@@ -32,6 +32,12 @@ devipython:
 devshell:
 	@cd data/dev && poetry run bash
 
+# .. todo:: this does not work as expected, since the bash env vars are not preserved. We need to source the env vars in the Makefile or use a wrapper script.
+# .. todo:: just a placeholder to be fixed later
+docs:
+	@docker run -it --rm --user $(id -u):$(id -g) --workdir="/home/${USER}" \
+		--volume="/etc/group:/etc/group:ro" --volume="/etc/passwd:/etc/passwd:ro" \
+		--volume="/etc/shadow:/etc/shadow:ro" -v $PWD:/work texlive/texlive:latest -c "cd /work/docs/tutorial && pdflatex boxman_beamer.tex"
 help:
 	@echo "For development"
 	@echo "   explicit steps"
