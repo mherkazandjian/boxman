@@ -28,6 +28,7 @@ def create_runtime(name: str, **kwargs) -> RuntimeBase:
     runtimes = {
         "local": LocalRuntime,
         "docker": DockerComposeRuntime,
+        "docker-compose": DockerComposeRuntime,
     }
     if name not in runtimes:
         raise ValueError(

@@ -19,7 +19,7 @@ class TestCreateRuntime:
     def test_docker_compose(self):
         rt = create_runtime("docker")
         assert isinstance(rt, DockerComposeRuntime)
-        assert rt.name == "docker"
+        assert rt.name == "docker-compose"
 
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="unknown runtime"):
@@ -92,7 +92,8 @@ class TestDockerComposeRuntime:
         rt = DockerComposeRuntime()
         rt.workdirs = ["/home/user/my-project"]
         dirs = rt._collect_bind_mount_dirs("/home/user/my-project")
-        assert len(dirs) == 1
+        # /tmp is always added, so expect 2: the project dir + /tmp
+        assert len(dirs) == 2
 
     def test_inject_bind_mounts_into_compose(self, tmp_path):
         """Bind-mount dirs are added as volume entries in docker-compose.yml."""
@@ -158,11 +159,15 @@ class TestDockerComposeRuntime:
         mock_result_running = MagicMock(ok=True, stdout="true\n")
         mock_result_virsh = MagicMock(ok=True)
         # First call: docker inspect (running check)
-        # Second call: docker exec test -d (bind dir check)
-        # Third call: virsh version
-        mock_run.side_effect = [mock_result_running, mock_result_running, mock_result_virsh]
+        # Second call: docker exec test -d (bind dir check) — one per bind dir
+        # Last call: virsh version
+        mock_run.side_effect = [mock_result_running, mock_result_running, mock_result_running, mock_result_virsh]
 
-        rt.ensure_ready()
+        with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
+             patch.object(rt, "_inject_bind_mounts_into_compose"), \
+             patch.object(rt, "_write_env_file"), \
+             patch.object(rt, "_log_compose_file"):
+            rt.ensure_ready()
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert not any("compose" in c and "up" in c for c in calls)
@@ -217,9 +222,13 @@ class TestDockerComposeRuntime:
         mock_running = MagicMock(ok=True, stdout="true\n")
         mock_dir_ok = MagicMock(ok=True)
         mock_virsh = MagicMock(ok=True)
-        mock_run.side_effect = [mock_running, mock_dir_ok, mock_virsh]
+        mock_run.side_effect = [mock_running, mock_dir_ok, mock_dir_ok, mock_virsh]
 
-        rt.ensure_ready()
+        with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
+             patch.object(rt, "_inject_bind_mounts_into_compose"), \
+             patch.object(rt, "_write_env_file"), \
+             patch.object(rt, "_log_compose_file"):
+            rt.ensure_ready()
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert any("virsh version" in c for c in calls)
