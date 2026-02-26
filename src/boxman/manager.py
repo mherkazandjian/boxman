@@ -1327,6 +1327,60 @@ class BoxmanManager:
         }
         return [vm for vm in expected if vm in existing]
 
+    def _get_vm_states(self) -> dict[str, str]:
+        """
+        Query libvirt and return a mapping of project VM name -> state string
+        for all project VMs that exist.
+
+        State strings are as returned by ``virsh list --all``, e.g.
+        'running', 'shut off', 'paused', 'saved', etc.
+
+        Returns:
+            Dict mapping full VM name to its state, only for VMs that exist.
+        """
+        expected = set(self._get_project_vm_names())
+        if not expected:
+            return {}
+
+        provider_type = (
+            list(self.config.get('provider', {}).keys())[0]
+            if 'provider' in self.config else 'libvirt'
+        )
+        provider_config = self.config.get('provider', {}).get(provider_type, {})
+        if self.app_config and 'providers' in self.app_config:
+            app_prov = self.app_config['providers'].get(provider_type, {})
+            merged = app_prov.copy()
+            merged.update(provider_config)
+            provider_config = merged
+        if hasattr(self, 'runtime_instance'):
+            provider_config = self.runtime_instance.inject_into_provider_config(
+                provider_config)
+
+        virsh = VirshCommand(provider_config=provider_config)
+        # Use the table output to get both name and state
+        result = virsh.execute("list", "--all", hide=True, warn=True)
+        if not result.ok:
+            self.logger.warning("could not query VM states via virsh")
+            return {}
+
+        states: dict[str, str] = {}
+        for line in result.stdout.strip().splitlines():
+            # Skip header and separator lines
+            line = line.strip()
+            if not line or line.startswith('---') or line.startswith('Id'):
+                continue
+            # Format: " Id   Name                 State"
+            # e.g.  " -    my-vm                shut off"
+            #       " 3    my-vm                running"
+            parts = line.split(None, 2)
+            if len(parts) >= 3:
+                vm_name = parts[1]
+                vm_state = parts[2].strip()
+                if vm_name in expected:
+                    states[vm_name] = vm_state
+
+        return states
+
     @staticmethod
     def provision(cls, cli_args):
 
@@ -1431,6 +1485,130 @@ class BoxmanManager:
 
         # generate ssh keys, add them to vms, and write ssh config
         cls.setup_ssh_access()
+
+    @staticmethod
+    def up(cls, cli_args):
+        """
+        Bring up the infrastructure.
+
+        - If no project VMs exist, run a full provision.
+        - If all VMs exist and are running, do nothing.
+        - If all VMs exist but some/all are not running (shut off, paused,
+          saved), start/resume them.
+        - If only some VMs exist (partial state) and --force is not set,
+          error out. With --force, deprovision and re-provision.
+        """
+        config = cls.config
+        expected_vms = cls._get_project_vm_names()
+
+        if not expected_vms:
+            cls.logger.error("no VMs defined in configuration")
+            return
+
+        vm_states = cls._get_vm_states()
+        existing_names = set(vm_states.keys())
+        expected_names = set(expected_vms)
+
+        # --- Case 1: No VMs exist → full provision ---
+        if not existing_names:
+            cls.logger.info("no existing VMs found, running full provision...")
+            cls.provision(cls, cli_args)
+            return
+
+        # --- Case 2: Partial state (some exist, some don't) ---
+        missing = expected_names - existing_names
+        if missing:
+            force = getattr(cli_args, 'force', False)
+            names_str = ", ".join(f"'{v}'" for v in sorted(missing))
+            if not force:
+                cls.logger.error(
+                    f"partial infrastructure state: the following VM(s) are "
+                    f"missing: {names_str}. Use --force to deprovision and "
+                    f"re-provision everything."
+                )
+                return
+            else:
+                cls.logger.warning(
+                    f"partial state detected (missing: {names_str}). "
+                    f"Deprovisioning and re-provisioning (--force)..."
+                )
+                cls.provision(cls, cli_args)
+                return
+
+        # --- Case 3: All VMs exist → check states ---
+        non_running = {
+            name: state for name, state in vm_states.items()
+            if state != 'running'
+        }
+
+        if not non_running:
+            cls.logger.info("all VMs are already running, nothing to do")
+            # Still display connection info
+            cls.connect_info()
+            return
+
+        # --- Start / resume VMs that are not running ---
+        cls.logger.info(
+            f"{len(non_running)} VM(s) are not running, bringing them up..."
+        )
+
+        # Ensure provider config reflects runtime settings
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
+
+        for vm_name, state in non_running.items():
+            cls.logger.info(f"VM '{vm_name}' is in state '{state}'")
+
+            if state == 'paused':
+                cls.logger.info(f"resuming VM '{vm_name}'...")
+                cls.provider.resume_vm(vm_name)
+            elif state in ('shut off', 'shutoff'):
+                cls.logger.info(f"starting VM '{vm_name}'...")
+                cls.provider.start_vm(vm_name)
+            elif state in ('saved', 'managedsave'):
+                cls.logger.info(f"starting VM '{vm_name}' (restoring saved state)...")
+                cls.provider.start_vm(vm_name)
+            elif state in ('crashed', 'dying'):
+                cls.logger.warning(
+                    f"VM '{vm_name}' is in state '{state}', "
+                    f"attempting to destroy and start...")
+                cls.provider.destroy_vm(vm_name, remove_storage=False)
+                cls.provider.start_vm(vm_name)
+            else:
+                cls.logger.warning(
+                    f"VM '{vm_name}' is in unexpected state '{state}', "
+                    f"attempting to start...")
+                cls.provider.start_vm(vm_name)
+
+        # Wait for IP addresses
+        cls.logger.info("waiting for VMs to get IP addresses...")
+        wait_time = 1
+        max_wait = 300
+        total_waited = 0
+
+        while total_waited < max_wait:
+            if cls.get_connect_info():
+                cls.logger.info(
+                    f"all VMs have IP addresses (waited {total_waited}s)")
+                break
+            cls.logger.info(
+                f"waiting {wait_time}s for IP assignment "
+                f"(total waited: {total_waited}s)")
+            time.sleep(wait_time)
+            total_waited += wait_time
+            wait_time = min(wait_time * 2, 60)
+
+        if total_waited >= max_wait:
+            cls.logger.warning(
+                "reached maximum wait time. Some VMs may not have IP addresses.")
+
+        # Display connection information
+        cls.connect_info()
+
+        # Re-write SSH config with current IPs
+        cls.write_ssh_config()
+
+        cls.logger.info("infrastructure is up")
 
     @staticmethod
     def deprovision(cls, cli_args):

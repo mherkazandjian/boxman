@@ -212,6 +212,35 @@ def parse_args():
     )
 
     #
+    # sub parser for the 'up' subcommand
+    #
+    parser_up = subparsers.add_parser(
+        'up',
+        help='bring up the infrastructure: provision if not created, start if powered off')
+    parser_up.set_defaults(func=BoxmanManager.up)
+    parser_up.add_argument(
+        '--docker-compose',
+        action='store_true',
+        default=False,
+        help='use the docker-compose setup',
+        dest='docker_compose'
+    )
+    parser_up.add_argument(
+        '--force',
+        action='store_true',
+        default=False,
+        help='if VMs already exist, deprovision them first and then provision',
+        dest='force'
+    )
+    parser_up.add_argument(
+        '--rebuild-templates',
+        action='store_true',
+        default=False,
+        help='force-rebuild all templates (destroy and recreate) before provisioning',
+        dest='rebuild_templates'
+    )
+
+    #
     # sub parser for deprovisioning a configuration
     #
     parser_deprov = subparsers.add_parser('deprovision', help='deprovision a configuration')

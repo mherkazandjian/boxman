@@ -15,6 +15,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - **Cloud-init template creation**: build template VMs from cloud images with inline cloud-init config
 - **Auto-creation of templates on provision**: if a cluster's `base_image` references a template defined in the `templates` section and the template VM does not yet exist, it is automatically created before provisioning proceeds
 - **Runtime environments**: execute provider commands locally or inside a Docker container
+- **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
 
 ## Quick Start
 
