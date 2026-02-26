@@ -1,0 +1,150 @@
+---
+version: '1.0'
+project: boxman_dev_tiny-ubuntu-24.04
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/bin/virsh'
+    verbose: True
+
+templates:
+  template1:
+    name: ubuntu-24.04-minimal-base-template-cloudinit
+    #image: file:///dev/shm/sandbox/ubuntu-24.04-server-cloudimg-amd64.img
+    image: http://cloud-images-archive.ubuntu.com/releases/noble/release-20240423/ubuntu-24.04-server-cloudimg-amd64.img
+    cloudinit: |
+      #cloud-config
+      hostname: hello-cloudinit
+      manage_etc_hosts: true
+
+      network:
+        version: 2
+        ethernets:
+          default:
+            match:
+              name: "en*"
+            dhcp4: true
+            dhcp6: false
+
+      users:
+        - name: ubuntu
+          lock_passwd: false
+          groups: [sudo]
+          sudo: "ALL=(ALL) NOPASSWD:ALL"
+          shell: /bin/bash
+
+      chpasswd:
+        expire: false
+        list: |
+          ubuntu:ubuntu
+
+      ssh_pwauth: true
+      package_update: true
+      packages:
+        - qemu-guest-agent
+        - openssh-server
+
+      write_files:
+        - path: /etc/hello-from-cloudinit
+          permissions: "0644"
+          content: |
+            hello world from cloud-init
+        - path: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+          permissions: "0644"
+          content: |
+            [Service]
+            ExecStart=
+            ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any
+
+      runcmd:
+        - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - rm -f /etc/cloud/cloud.cfg.d/subiquity-disable-cloudinit-networking.cfg
+        - systemctl daemon-reload
+        - systemctl enable --now qemu-guest-agent
+        - netplan generate || true
+        - netplan apply || true
+        - dhclient -v || true
+        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
+        - [ systemctl, enable, --now, qemu-guest-agent ]
+        # create admin user via shell commands
+        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /admin -s /bin/bash -g admin -G sudo admin" ]
+        - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin" ]
+        - [ sh, -c, "chmod 0440 /etc/sudoers.d/admin" ]
+        - [ sh, -c, "echo 'admin:${env:BOXMAN_ADMIN_PASS}' | chpasswd" ]
+        - [ sh, -c, "mkdir -p /admin/.ssh && chmod 700 /admin/.ssh && chown -R admin:admin /admin /admin/.ssh" ]
+
+clusters:
+  cluster_1:
+    workdir: ~/workspaces/boxmandev/tiny-libvrit-ubuntu-24.04-cloudinit
+    base_image: ubuntu-24.04-minimal-base-template-cloudinit
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: ${env:BOXMAN_ADMIN_PASS}
+    admin_key_name: id_ed25519_boxman    # generated automatically at provisioning time
+    ssh_config: ssh_config               # generated automatically at provisioning time
+
+    networks:
+      nat1:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:01'
+        ip:
+          address: '192.168.10.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.10.2'
+              end: '192.168.10.254'
+        enable: True
+        autostart: True
+      isolated1:
+        mode: route
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:02'
+        ip:
+          address: '10.0.10.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '10.0.10.2'
+              end: '10.0.10.254'
+        enable: True
+        autostart: True
+
+    vms:
+      boxman01:
+        hostname: boxman01
+        cpus:
+          sockets: 1
+          cores: 2
+          threads: 2
+        memory: 2048
+        disks:
+          - name: disk01
+            driver:
+              name: qemu
+              type: qcow2
+            target: vdb
+            size: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'isolated1'
+    files:
+      env.sh: |
+        export INVENTORY=inventory
+        export SSH_CONFIG=${HOME}/workspaces/boxmandev/tiny/ssh_config
+        export GATEWAYHOST=mgmt01
+        export ANSIBLE_CONFIG=${HOME}/workspaces/boxmandev/tiny/ansible.cfg
+        export ANSIBLE_INVENTORY="$INVENTORY"
+        export ANSIBLE_SSH_ARGS="-F $SSH_CONFIG"
