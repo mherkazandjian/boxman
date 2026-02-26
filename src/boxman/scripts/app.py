@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from multiprocess import Process
 import yaml
 import json
+import shutil
 
 import boxman
 from boxman.manager import BoxmanManager
@@ -598,14 +599,69 @@ def import_config(session: Session, cli_args):
     #[p.join() for p in processes]
     ##_ = [_take(vm) for vm in vms]
 
+def _default_boxman_config() -> dict:
+    """
+    Return the default boxman application configuration.
+
+    Uses system paths for virt-install, virt-clone, and virsh (resolved
+    via ``shutil.which``), with verbose and use_sudo both set to False.
+    """
+    return {
+        "runtime": "local",
+        "runtime_config": {
+            "runtime_container": "boxman-libvirt-default",
+        },
+        "ssh": {
+            "authorized_keys": [],
+        },
+        "providers": {
+            "libvirt": {
+                "uri": "qemu:///system",
+                "use_sudo": False,
+                "verbose": False,
+                "virt_install_cmd": shutil.which("virt-install") or "virt-install",
+                "virt_clone_cmd": shutil.which("virt-clone") or "virt-clone",
+                "virsh_cmd": shutil.which("virsh") or "virsh",
+            },
+        },
+    }
+
+
 def load_boxman_config(path: str) -> dict:
     """
-    Load the boxman configuration from the specified path
+    Load the boxman configuration from the specified path.
+
+    If *path* points to the default location
+    (``~/.config/boxman/boxman.yml``) and the file does not exist, a new
+    file is created with sensible defaults (system paths for libvirt
+    tools, ``verbose: False``, ``use_sudo: False``).
+
+    For any other path a :class:`FileNotFoundError` is raised when the
+    file is missing.
 
     :param path: The path to the configuration file
     :return: The configuration dictionary
     """
-    with open(path, 'r') as fobj:
+    expanded = os.path.expanduser(path)
+    default_path = os.path.expanduser("~/.config/boxman/boxman.yml")
+
+    if not os.path.isfile(expanded):
+        # Only auto-create when using the default location
+        if os.path.abspath(expanded) == os.path.abspath(default_path):
+            os.makedirs(os.path.dirname(default_path), exist_ok=True)
+            config = _default_boxman_config()
+            with open(default_path, "w") as fobj:
+                yaml.dump(config, fobj, default_flow_style=False)
+            log.info(
+                f"created default boxman config at {default_path}"
+            )
+            return config
+        else:
+            raise FileNotFoundError(
+                f"boxman config not found: {expanded}"
+            )
+
+    with open(expanded, "r") as fobj:
         config = yaml.safe_load(fobj.read())
     return config
 

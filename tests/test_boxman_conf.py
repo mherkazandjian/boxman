@@ -6,6 +6,7 @@ import os
 import tempfile
 import yaml
 import pytest
+import shutil as _shutil
 
 from boxman.scripts.app import load_boxman_config
 from boxman.manager import BoxmanManager
@@ -74,9 +75,33 @@ class TestBoxmanConfOverride:
             )
 
     def test_missing_conf_raises(self):
-        """Verify that a non-existent config path raises an error."""
+        """Verify that a non-existent *custom* config path raises an error."""
         with pytest.raises(FileNotFoundError):
             load_boxman_config("/nonexistent/path/boxman.yml")
+
+    def test_default_conf_created_when_missing(self, tmp_path, monkeypatch):
+        """When the default ~/.config/boxman/boxman.yml is missing it is
+        created automatically with sensible defaults."""
+        fake_home = tmp_path / "fakehome"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        default_path = fake_home / ".config" / "boxman" / "boxman.yml"
+        assert not default_path.exists()
+
+        loaded = load_boxman_config(str(default_path))
+
+        # file should now exist on disk
+        assert default_path.exists()
+
+        # verify defaults
+        assert loaded["providers"]["libvirt"]["use_sudo"] is False
+        assert loaded["providers"]["libvirt"]["verbose"] is False
+        assert loaded["runtime"] == "local"
+
+        # paths should be the system paths (or bare command names)
+        virsh_cmd = loaded["providers"]["libvirt"]["virsh_cmd"]
+        assert virsh_cmd == (_shutil.which("virsh") or "virsh")
 
     def test_global_authorized_keys_resolves_literal(self):
         """Literal SSH keys are returned as-is."""

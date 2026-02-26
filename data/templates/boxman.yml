@@ -1,6 +1,10 @@
 ---
 # The top level boxman application configuration file, typically the default location
 # of this file is in ~/.config/boxman/boxman.yml
+#
+# If this file does not exist at the default location, boxman will create it
+# automatically with sensible defaults (system paths for libvirt tools,
+# verbose: False, use_sudo: False).
 
 # The default runtime environment for executing provider commands.
 # Can be overridden on the CLI with: boxman --runtime <value> <subcommand>
@@ -46,11 +50,11 @@ providers:
     uri: qemu:///system
     # whether to use sudo for libvirt commands
     use_sudo: False
-    # path to libvirt related commands
-    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    # path to libvirt related commands (use system paths by default)
+    virt_install_cmd: virt-install
     # path to virt-clone command
-    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virt_clone_cmd: virt-clone
     # path to virsh command
-    virsh_cmd: '/bin/virsh'
+    virsh_cmd: virsh
     # specify the verbosity of libvirt commands
-    verbose: True
+    verbose: False
