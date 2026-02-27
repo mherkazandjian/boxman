@@ -1549,7 +1549,8 @@ class BoxmanManager:
             self.logger.error("failed to add ssh keys to some vms")
             return False
 
-        self.logger.info("\nssh access setup complete")
+        self.logger.info("")
+        self.logger.info("ssh access setup complete")
         self.logger.info("you can now connect to vms using the ssh config file")
 
         return True
@@ -1757,11 +1758,11 @@ class BoxmanManager:
             cls.logger.warning(
                 "Reached maximum wait time. Some vms may not have ip addresses.")
 
-        # display connection information
-        cls.connect_info()
-
         # generate ssh keys, add them to vms, and write ssh config
         cls.setup_ssh_access()
+
+        # display connection information (after ssh setup so connections are ready)
+        cls.connect_info()
 
     @staticmethod
     def up(cls, cli_args):
