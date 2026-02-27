@@ -6,6 +6,7 @@ import os
 import stat
 import subprocess
 import textwrap
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -187,12 +188,23 @@ class TestTaskRunner:
         exit_code = runner.run("echo_args", extra_args=["hello", "world"])
         assert exit_code == 0
 
-    def test_run_command_adhoc(self, basic_config, tmp_path):
-        out_file = tmp_path / "adhoc_out.txt"
+    @patch("boxman.task_runner.subprocess.run")
+    def test_run_command_adhoc(self, mock_run, basic_config, tmp_path):
+        mock_run.return_value = MagicMock(returncode=0)
         runner = TaskRunner(basic_config)
-        exit_code = runner.run_command(f"echo adhoc > {out_file}")
+        exit_code = runner.run_command("whoami")
         assert exit_code == 0
-        assert out_file.read_text().strip() == "adhoc"
+        called_cmd = mock_run.call_args[0][0]
+        assert called_cmd == 'ansible all -m ansible.builtin.shell -a "whoami"'
+
+    @patch("boxman.task_runner.subprocess.run")
+    def test_run_command_adhoc_with_ansible_flags(self, mock_run, basic_config, tmp_path):
+        mock_run.return_value = MagicMock(returncode=0)
+        runner = TaskRunner(basic_config)
+        exit_code = runner.run_command("whoami", ansible_flags="--limit node01")
+        assert exit_code == 0
+        called_cmd = mock_run.call_args[0][0]
+        assert called_cmd == 'ansible all -m ansible.builtin.shell -a "whoami" --limit node01'
 
     def test_sets_infra_from_project(self, basic_config):
         runner = TaskRunner(basic_config)
@@ -215,6 +227,46 @@ class TestTaskRunner:
         }
         runner = TaskRunner(config)
         assert runner.list_tasks() == []
+
+    def test_extract_placeholders(self):
+        assert TaskRunner.extract_placeholders(
+            "ansible all {flags} -m shell {more_flags} -a"
+        ) == ["flags", "more_flags"]
+        assert TaskRunner.extract_placeholders("echo hello") == []
+        assert TaskRunner.extract_placeholders("{a} {b} {c}") == ["a", "b", "c"]
+
+    @patch("boxman.task_runner.subprocess.run")
+    def test_run_with_task_flags(self, mock_run, basic_config):
+        mock_run.return_value = MagicMock(returncode=0)
+        basic_config["tasks"]["cmd"] = {
+            "description": "run a shell command",
+            "command": "ansible all {flags} -m ansible.builtin.shell {more_flags} -a",
+        }
+        runner = TaskRunner(basic_config)
+        exit_code = runner.run(
+            "cmd",
+            extra_args=["hostname"],
+            task_flags={"flags": "--limit node01", "more_flags": "--become"},
+        )
+        assert exit_code == 0
+        called_cmd = mock_run.call_args[0][0]
+        assert called_cmd == (
+            "ansible all --limit node01 -m ansible.builtin.shell --become -a hostname"
+        )
+
+    @patch("boxman.task_runner.subprocess.run")
+    def test_run_with_missing_task_flags(self, mock_run, basic_config):
+        """Unfilled placeholders are removed cleanly."""
+        mock_run.return_value = MagicMock(returncode=0)
+        basic_config["tasks"]["cmd"] = {
+            "description": "run a shell command",
+            "command": "ansible all {flags} -m ansible.builtin.shell -a",
+        }
+        runner = TaskRunner(basic_config)
+        exit_code = runner.run("cmd", extra_args=["hostname"])
+        assert exit_code == 0
+        called_cmd = mock_run.call_args[0][0]
+        assert called_cmd == "ansible all -m ansible.builtin.shell -a hostname"
 
     def test_task_workdir(self, basic_config, tmp_path):
         """Task-level workdir overrides cluster workdir."""

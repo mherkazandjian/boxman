@@ -149,8 +149,17 @@ class BoxmanManager:
         # create jinja environment with boxman helpers (env(), env_required(), etc.)
         env = create_jinja_env(config_dir)
 
-        # load the template
-        template = env.get_template(config_filename)
+        # Read raw content and convert bare {{ name }} placeholders to
+        # {name} markers before Jinja2 rendering.  Bare names (no parens,
+        # dots, pipes, etc.) are task-command placeholders, not real Jinja2
+        # expressions — real ones are function calls like {{ env("VAR") }}.
+        raw_path = os.path.join(config_dir, config_filename)
+        with open(raw_path) as fobj:
+            raw_content = fobj.read()
+        preserved = re.sub(r"\{\{\s*(\w+)\s*\}\}", r"{\1}", raw_content)
+
+        # load and render the template from the pre-processed string
+        template = env.from_string(preserved)
 
         # render the template
         # NOTE: pass os.environ as 'environ' (not 'env') to avoid shadowing
@@ -2191,10 +2200,53 @@ class BoxmanManager:
         extra_args = getattr(cli_args, "extra_args", None) or []
 
         if getattr(cli_args, "cmd", None):
-            exit_code = runner.run_command(cli_args.cmd, extra_args)
+            exit_code = runner.run_command(
+                cli_args.cmd,
+                extra_args,
+                ansible_flags=getattr(cli_args, "ansible_flags", None),
+            )
         else:
             task_name = cli_args.task_name
-            exit_code = runner.run(task_name, extra_args)
+            remaining = getattr(cli_args, "remaining_args", [])
+
+            # Parse dynamic task flags from remaining CLI args based on
+            # {placeholder} markers in the task command.
+            task_flags = {}
+            if task_name and task_name in runner.tasks:
+                task_cmd = runner.tasks[task_name].get("command", "")
+                placeholders = TaskRunner.extract_placeholders(task_cmd)
+
+                if placeholders and remaining:
+                    placeholder_set = set(placeholders)
+                    i = 0
+                    while i < len(remaining):
+                        arg = remaining[i]
+                        if arg.startswith("--"):
+                            name = arg[2:].replace("-", "_")
+                            if name not in placeholder_set:
+                                log.error(f"unrecognized argument: {arg}")
+                                import sys
+                                sys.exit(1)
+                            if i + 1 >= len(remaining):
+                                log.error(f"argument {arg}: expected a value")
+                                import sys
+                                sys.exit(1)
+                            task_flags[name] = remaining[i + 1]
+                            i += 2
+                        else:
+                            log.error(f"unrecognized argument: {arg}")
+                            import sys
+                            sys.exit(1)
+                elif remaining:
+                    log.error(
+                        f"unrecognized arguments: {' '.join(remaining)}. "
+                        f"Task '{task_name}' has no {{placeholder}} markers "
+                        f"in its command."
+                    )
+                    import sys
+                    sys.exit(1)
+
+            exit_code = runner.run(task_name, extra_args, task_flags=task_flags)
 
         if exit_code != 0:
             import sys

@@ -574,6 +574,13 @@ def parse_args():
         dest='cmd'
     )
     parser_run.add_argument(
+        '--ansible-flags',
+        type=str,
+        default=None,
+        help='flags passed to ansible for --cmd',
+        dest='ansible_flags'
+    )
+    parser_run.add_argument(
         '--cluster',
         type=str,
         default=None,
@@ -840,7 +847,26 @@ def load_boxman_config(path: str) -> dict:
 def main():
 
     arg_parser = parse_args()
-    args = arg_parser.parse_args()
+    args, remaining = arg_parser.parse_known_args()
+
+    # parse_known_args may leave '--' and trailing positional args in
+    # *remaining* when unknown flags appear before '--'.  Split them
+    # back out so that extra_args is filled correctly.
+    if "--" in remaining:
+        sep_idx = remaining.index("--")
+        extra_after = remaining[sep_idx + 1:]
+        remaining = remaining[:sep_idx]
+        if hasattr(args, "extra_args"):
+            args.extra_args = (args.extra_args or []) + extra_after
+
+    # Only the 'run' subcommand accepts dynamic task flags;
+    # all other subcommands should reject unknown arguments.
+    if remaining and (
+        not hasattr(args, "func") or args.func != BoxmanManager.run_task
+    ):
+        arg_parser.error(f"unrecognized arguments: {' '.join(remaining)}")
+
+    args.remaining_args = remaining
 
     if args.version:
         print(f'v{boxman.metadata.version}')
