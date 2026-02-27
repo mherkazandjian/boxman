@@ -1,0 +1,244 @@
+"""
+Test that --boxman-conf overrides the default ~/.config/boxman/boxman.yml.
+"""
+
+import os
+import tempfile
+import yaml
+import pytest
+import shutil as _shutil
+
+from boxman.scripts.app import load_boxman_config
+from boxman.manager import BoxmanManager
+
+
+class TestBoxmanConfOverride:
+
+    def test_custom_boxman_conf_is_loaded(self, tmp_path):
+        """Verify that load_boxman_config reads from the specified path,
+        not from ~/.config/boxman/boxman.yml."""
+        custom_config = {
+            "ssh": {
+                "authorized_keys": ["ssh-ed25519 AAAA_TEST_KEY test@boxman"]
+            },
+            "providers": {
+                "libvirt": {
+                    "uri": "qemu+tcp://custom-host/system",
+                    "use_sudo": False,
+                    "verbose": False,
+                }
+            },
+        }
+
+        conf_path = tmp_path / "custom_boxman.yml"
+        conf_path.write_text(yaml.dump(custom_config))
+
+        loaded = load_boxman_config(str(conf_path))
+
+        assert loaded == custom_config
+        assert loaded["providers"]["libvirt"]["uri"] == "qemu+tcp://custom-host/system"
+        assert loaded["ssh"]["authorized_keys"] == [
+            "ssh-ed25519 AAAA_TEST_KEY test@boxman"
+        ]
+
+    def test_custom_conf_does_not_read_default(self, tmp_path):
+        """Ensure values come from the custom file, not the default location."""
+        sentinel = "BOXMAN_TEST_SENTINEL_VALUE"
+        custom_config = {
+            "providers": {
+                "libvirt": {
+                    "uri": sentinel,
+                }
+            },
+        }
+
+        conf_path = tmp_path / "boxman_sentinel.yml"
+        conf_path.write_text(yaml.dump(custom_config))
+
+        loaded = load_boxman_config(str(conf_path))
+
+        assert loaded["providers"]["libvirt"]["uri"] == sentinel
+
+        # cross-check: the default config (if it exists) should not contain
+        # our sentinel
+        default_path = os.path.expanduser("~/.config/boxman/boxman.yml")
+        if os.path.isfile(default_path):
+            default_loaded = load_boxman_config(default_path)
+            default_uri = (
+                default_loaded
+                .get("providers", {})
+                .get("libvirt", {})
+                .get("uri", "")
+            )
+            assert default_uri != sentinel, (
+                "default config unexpectedly contains the sentinel value"
+            )
+
+    def test_missing_conf_raises(self):
+        """Verify that a non-existent *custom* config path raises an error."""
+        with pytest.raises(FileNotFoundError):
+            load_boxman_config("/nonexistent/path/boxman.yml")
+
+    def test_default_conf_created_when_missing(self, tmp_path, monkeypatch):
+        """When the default ~/.config/boxman/boxman.yml is missing it is
+        created automatically with sensible defaults."""
+        fake_home = tmp_path / "fakehome"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        default_path = fake_home / ".config" / "boxman" / "boxman.yml"
+        assert not default_path.exists()
+
+        loaded = load_boxman_config(str(default_path))
+
+        # file should now exist on disk
+        assert default_path.exists()
+
+        # verify defaults
+        assert loaded["providers"]["libvirt"]["use_sudo"] is False
+        assert loaded["providers"]["libvirt"]["verbose"] is False
+        assert loaded["runtime"] == "local"
+
+        # paths should be the system paths (or bare command names)
+        virsh_cmd = loaded["providers"]["libvirt"]["virsh_cmd"]
+        assert virsh_cmd == (_shutil.which("virsh") or "virsh")
+
+    def test_global_authorized_keys_resolves_literal(self):
+        """Literal SSH keys are returned as-is."""
+        mgr = BoxmanManager()
+        mgr.app_config = {
+            "ssh": {
+                "authorized_keys": [
+                    "ssh-ed25519 AAAA_LITERAL literal@host",
+                ]
+            }
+        }
+        keys = mgr.get_global_authorized_keys()
+        assert keys == ["ssh-ed25519 AAAA_LITERAL literal@host"]
+
+    def test_global_authorized_keys_resolves_env(self, monkeypatch):
+        """${env:BOXMAN_SSH_PUBKEY} is resolved from the environment."""
+        monkeypatch.setenv("BOXMAN_SSH_PUBKEY", "ssh-ed25519 AAAA_FROM_ENV env@host")
+        mgr = BoxmanManager()
+        mgr.app_config = {
+            "ssh": {
+                "authorized_keys": ["${env:BOXMAN_SSH_PUBKEY}"]
+            }
+        }
+        keys = mgr.get_global_authorized_keys()
+        assert keys == ["ssh-ed25519 AAAA_FROM_ENV env@host"]
+
+    def test_global_authorized_keys_resolves_file(self, tmp_path):
+        """file:// references are resolved from the filesystem."""
+        pub_key_file = tmp_path / "test_key.pub"
+        pub_key_file.write_text("ssh-ed25519 AAAA_FROM_FILE file@host\n")
+        mgr = BoxmanManager()
+        mgr.app_config = {
+            "ssh": {
+                "authorized_keys": [f"file://{pub_key_file}"]
+            }
+        }
+        keys = mgr.get_global_authorized_keys()
+        assert keys == ["ssh-ed25519 AAAA_FROM_FILE file@host"]
+
+    def test_global_authorized_keys_skips_unresolvable(self):
+        """Unresolvable entries are skipped with a warning."""
+        mgr = BoxmanManager()
+        mgr.app_config = {
+            "ssh": {
+                "authorized_keys": [
+                    "${env:BOXMAN_NONEXISTENT_VAR_12345}",
+                    "ssh-ed25519 AAAA_GOOD good@host",
+                ]
+            }
+        }
+        keys = mgr.get_global_authorized_keys()
+        assert keys == ["ssh-ed25519 AAAA_GOOD good@host"]
+
+    def test_global_authorized_keys_mixed_formats(self, tmp_path, monkeypatch):
+        """Literal strings, file refs, and env vars are all resolved together."""
+        monkeypatch.setenv("BOXMAN_TEST_KEY", "ssh-ed25519 AAAA_ENV env@host")
+
+        pub_file = tmp_path / "extra.pub"
+        pub_file.write_text("ssh-rsa BBBB_FILE file@host\n")
+
+        mgr = BoxmanManager()
+        mgr.app_config = {
+            "ssh": {
+                "authorized_keys": [
+                    "ssh-ed25519 AAAA_LITERAL literal@host",
+                    "${env:BOXMAN_TEST_KEY}",
+                    f"file://{pub_file}",
+                ]
+            }
+        }
+        keys = mgr.get_global_authorized_keys()
+        assert keys == [
+            "ssh-ed25519 AAAA_LITERAL literal@host",
+            "ssh-ed25519 AAAA_ENV env@host",
+            "ssh-rsa BBBB_FILE file@host",
+        ]
+
+    def test_runtime_defaults_to_local_when_absent(self, tmp_path):
+        """When boxman.yml has no 'runtime' key, it defaults to 'local'."""
+        custom_config = {"providers": {"libvirt": {"uri": "qemu:///system"}}}
+        conf_path = tmp_path / "boxman_no_runtime.yml"
+        conf_path.write_text(yaml.dump(custom_config))
+
+        loaded = load_boxman_config(str(conf_path))
+        assert loaded.get("runtime", "local") == "local"
+
+    def test_runtime_docker_compose_is_loaded(self, tmp_path):
+        """When boxman.yml sets runtime: docker, it is read correctly."""
+        custom_config = {
+            "runtime": "docker",
+            "runtime_config": {
+                "runtime_container": "my-test-container",
+            },
+            "providers": {"libvirt": {"uri": "qemu:///system"}},
+        }
+        conf_path = tmp_path / "boxman_docker_rt.yml"
+        conf_path.write_text(yaml.dump(custom_config))
+
+        loaded = load_boxman_config(str(conf_path))
+        assert loaded["runtime"] == "docker"
+        assert loaded["runtime_config"]["runtime_container"] == "my-test-container"
+
+    def test_project_use_sudo_takes_precedence(self):
+        """Project-level use_sudo: False must not be overridden by app-level use_sudo: True."""
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        # Simulate project config with use_sudo: False
+        project_config = {
+            "project": "test_proj",
+            "provider": {
+                "libvirt": {
+                    "uri": "qemu:///system",
+                    "use_sudo": False,
+                    "verbose": True,
+                }
+            },
+        }
+
+        session = LibVirtSession(config=project_config)
+        assert session.provider_config["use_sudo"] is False
+        assert session.use_sudo is False
+
+        # Simulate manager with app config that has use_sudo: True
+        mgr = BoxmanManager()
+        mgr._runtime_name = "docker-compose"
+        mgr.config = project_config
+        mgr.app_config = {
+            "runtime": "docker-compose",
+            "runtime_config": {"runtime_container": "test-ctr"},
+            "providers": {"libvirt": {"use_sudo": True}},
+        }
+
+        session.manager = mgr
+        session.update_provider_config_with_runtime()
+
+        # Project-level use_sudo: False must win
+        assert session.provider_config["use_sudo"] is False
+        # But runtime keys should be injected
+        assert session.provider_config["runtime"] == "docker-compose"
+        assert session.provider_config["runtime_container"] == "test-ctr"

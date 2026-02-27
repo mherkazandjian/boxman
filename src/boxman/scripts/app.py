@@ -5,9 +5,10 @@ import sys
 import argparse
 from argparse import RawTextHelpFormatter
 from datetime import datetime, timezone
-from multiprocess import Process
+from multiprocessing import Process
 import yaml
 import json
+import shutil
 
 import boxman
 from boxman.manager import BoxmanManager
@@ -16,6 +17,8 @@ from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.utils.io import write_files
 #from boxman.abstract.providers import Providers
 from boxman.abstract.providers import ProviderSession as Session
+from boxman import log
+from boxman.utils.jinja_env import create_jinja_env
 
 
 now = datetime.now(timezone.utc)
@@ -38,6 +41,9 @@ def parse_args():
             "   provision\n"
             "       # provision the configuration in the default config file (conf.yml)\n"
             "       $ boxman provision\n"
+            "\n"
+            "       # provision using the docker-compose runtime environment\n"
+            "       $ boxman --runtime docker-compose provision\n"
             "\n"
             "   snapshot\n"
             "\n"
@@ -89,6 +95,20 @@ def parse_args():
     )
 
     parser.add_argument(
+        '--runtime',
+        type=str,
+        help=(
+            'the runtime environment in which to execute provider commands.\n'
+            'overrides the "runtime" setting in boxman.yml.\n'
+            '  local          - run provider commands directly on the host (default)\n'
+            '  docker         - run inside the boxman docker-compose container\n'
+        ),
+        dest='runtime',
+        default=None,
+        choices=['local', 'docker']
+    )
+
+    parser.add_argument(
         '--version',
         action='count',
         default=0,
@@ -137,22 +157,144 @@ def parse_args():
                                              # supported providers list below
 
     #
+    # sub parser for creating templates from cloud images
+    #
+    parser_create_templates = subparsers.add_parser(
+        'create-templates',
+        help='create template VMs from cloud images using cloud-init')
+    parser_create_templates.set_defaults(func=BoxmanManager.create_templates)
+    parser_create_templates.add_argument(
+        '--templates',
+        type=str,
+        help='comma-separated list of template keys to create (default: all)',
+        dest='template_names',
+        default=None
+    )
+    parser_create_templates.add_argument(
+        '--force',
+        action='store_true',
+        default=False,
+        help='force creation even if VM already exists',
+        dest='force'
+    )
+
+    #
     # sub parser for listing the registered projects
     #
     parser_list = subparsers.add_parser('list', help='list all registered projects')
     parser_list.set_defaults(func=BoxmanManager.list_projects)
+
+    list_format_group = parser_list.add_mutually_exclusive_group()
+    list_format_group.add_argument(
+        '--pretty', '-p',
+        type=str,
+        nargs='?',
+        const='plain',
+        default=None,
+        choices=['plain', 'table'],
+        help='display in a human-readable format without logger prefixes (plain or table)',
+        dest='pretty'
+    )
+    list_format_group.add_argument(
+        '--json',
+        action='store_true',
+        default=False,
+        help='output the project list as JSON',
+        dest='json'
+    )
+
+    parser_list.add_argument(
+        '--color',
+        type=str,
+        default='yes',
+        choices=['yes', 'no'],
+        help='enable or disable colored output (default: yes)',
+        dest='color'
+    )
 
     #
     # sub parser for provisioning a configuration
     #
     parser_prov = subparsers.add_parser('provision', help='provision a configuration')
     parser_prov.set_defaults(func=BoxmanManager.provision)
+    parser_prov.add_argument(
+        '--docker-compose',
+        action='store_true',
+        default=False,
+        help='provision using the docker-compose setup',
+        dest='docker_compose'
+    )
+    parser_prov.add_argument(
+        '--force',
+        action='store_true',
+        default=False,
+        help='if VMs already exist, deprovision them first and then provision',
+        dest='force'
+    )
+    parser_prov.add_argument(
+        '--rebuild-templates',
+        action='store_true',
+        default=False,
+        help='force-rebuild all templates (destroy and recreate) before provisioning',
+        dest='rebuild_templates'
+    )
+
+    #
+    # sub parser for the 'up' subcommand
+    #
+    parser_up = subparsers.add_parser(
+        'up',
+        help='bring up the infrastructure: provision if not created, start if powered off')
+    parser_up.set_defaults(func=BoxmanManager.up)
+    parser_up.add_argument(
+        '--docker-compose',
+        action='store_true',
+        default=False,
+        help='use the docker-compose setup',
+        dest='docker_compose'
+    )
+    parser_up.add_argument(
+        '--force',
+        action='store_true',
+        default=False,
+        help='if VMs already exist, deprovision them first and then provision',
+        dest='force'
+    )
+    parser_up.add_argument(
+        '--rebuild-templates',
+        action='store_true',
+        default=False,
+        help='force-rebuild all templates (destroy and recreate) before provisioning',
+        dest='rebuild_templates'
+    )
+
+    #
+    # sub parser for the 'down' subcommand
+    #
+    parser_down = subparsers.add_parser(
+        'down',
+        help='bring down the infrastructure: save or suspend the state of all VMs')
+    parser_down.set_defaults(func=BoxmanManager.down)
+    parser_down.add_argument(
+        '--suspend',
+        action='store_true',
+        default=False,
+        help='suspend (pause) VMs instead of saving their state to disk',
+        dest='suspend'
+    )
 
     #
     # sub parser for deprovisioning a configuration
     #
     parser_deprov = subparsers.add_parser('deprovision', help='deprovision a configuration')
     parser_deprov.set_defaults(func=BoxmanManager.deprovision)
+    parser_deprov.add_argument(
+        '--docker-compose',
+        action='store_true',
+        default=False,
+        help='deprovision using the docker-compose setup',
+        dest='docker_compose'
+    )
 
     ##
     ## sub parser for the 'deprovision cluster' subsubcommand
@@ -544,15 +686,81 @@ def import_config(session: Session, cli_args):
     #[p.join() for p in processes]
     ##_ = [_take(vm) for vm in vms]
 
+def _default_boxman_config() -> dict:
+    """
+    Return the default boxman application configuration.
+
+    Uses system paths for virt-install, virt-clone, and virsh (resolved
+    via ``shutil.which``), with verbose and use_sudo both set to False.
+    """
+    return {
+        "runtime": "local",
+        "runtime_config": {
+            "runtime_container": "boxman-libvirt-default",
+        },
+        "ssh": {
+            "authorized_keys": [],
+        },
+        "providers": {
+            "libvirt": {
+                "uri": "qemu:///system",
+                "use_sudo": False,
+                "verbose": False,
+                "virt_install_cmd": shutil.which("virt-install") or "virt-install",
+                "virt_clone_cmd": shutil.which("virt-clone") or "virt-clone",
+                "virsh_cmd": shutil.which("virsh") or "virsh",
+            },
+        },
+    }
+
+
 def load_boxman_config(path: str) -> dict:
     """
-    Load the boxman configuration from the specified path
+    Load the boxman configuration from the specified path.
+
+    The file is rendered as a Jinja2 template (supporting ``{{ env() }}``,
+    ``{{ env_required() }}``, ``{{ env_is_set() }}``) before being parsed
+    as YAML.
+
+    If *path* points to the default location
+    (``~/.config/boxman/boxman.yml``) and the file does not exist, a new
+    file is created with sensible defaults (system paths for libvirt
+    tools, ``verbose: False``, ``use_sudo: False``).
+
+    For any other path a :class:`FileNotFoundError` is raised when the
+    file is missing.
 
     :param path: The path to the configuration file
     :return: The configuration dictionary
     """
-    with open(path, 'r') as fobj:
-        config = yaml.safe_load(fobj.read())
+    expanded = os.path.expanduser(path)
+    default_path = os.path.expanduser("~/.config/boxman/boxman.yml")
+
+    if not os.path.isfile(expanded):
+        # Only auto-create when using the default location
+        if os.path.abspath(expanded) == os.path.abspath(default_path):
+            os.makedirs(os.path.dirname(default_path), exist_ok=True)
+            config = _default_boxman_config()
+            with open(default_path, "w") as fobj:
+                yaml.dump(config, fobj, default_flow_style=False)
+            log.info(
+                f"created default boxman config at {default_path}"
+            )
+            return config
+        else:
+            raise FileNotFoundError(
+                f"boxman config not found: {expanded}"
+            )
+
+    # Render as Jinja2 template to resolve {{ env() }} etc.
+    config_dir = os.path.dirname(os.path.abspath(expanded))
+    config_filename = os.path.basename(expanded)
+
+    jinja_env = create_jinja_env(config_dir)
+    template = jinja_env.get_template(config_filename)
+    rendered = template.render(environ=os.environ)
+
+    config = yaml.safe_load(rendered)
     return config
 
 
@@ -565,9 +773,13 @@ def main():
         print(f'v{boxman.metadata.version}')
         sys.exit(0)
 
+    if not hasattr(args, 'func'):
+        arg_parser.print_help()
+        sys.exit(1)
+
     if args.func == BoxmanManager.list_projects:
         manager = BoxmanManager(config=None)
-        args.func(manager, None)
+        args.func(manager, args)
         sys.exit(0)
     else:
         # use the config of a deployment specified on the cmd line only if
@@ -577,6 +789,43 @@ def main():
 
         # load the boxman app configuration
         boxman_config = load_boxman_config(os.path.expanduser(args.boxman_conf))
+
+        # make the app-level (boxman.yml) available to the manager
+        manager.load_app_config(boxman_config)
+
+        # resolve the runtime: CLI flag overrides boxman.yml default
+        runtime = args.runtime or boxman_config.get('runtime', 'local')
+        manager.runtime = runtime
+
+        # tell the runtime where the project conf.yml lives so bundled
+        # assets are deployed next to it (in .boxman/runtime/docker/)
+        if manager.runtime_instance.name == 'docker-compose':
+            conf_dir = os.path.abspath(os.path.dirname(args.conf))
+            manager.runtime_instance.project_dir = conf_dir
+
+            # Extract all workdirs from the project config (one per cluster)
+            # and pass them to the runtime so they can be bind-mounted into
+            # the container.
+            if manager.config and 'clusters' in manager.config:
+                workdirs = set()
+                for cluster_name, cluster in manager.config['clusters'].items():
+                    workdir_raw = cluster.get('workdir')
+                    if workdir_raw:
+                        workdirs.add(os.path.abspath(
+                            os.path.expanduser(workdir_raw)))
+
+                if workdirs:
+                    manager.runtime_instance.workdirs = list(workdirs)
+                    for wd in workdirs:
+                        log.info(f"runtime workdir: {wd}")
+
+        # ensure the runtime environment is up and ready before proceeding
+        manager.runtime_instance.ensure_ready()
+
+        # Handle create-templates — it doesn't need a full provider session
+        if args.func == BoxmanManager.create_templates:
+            args.func(manager, args)
+            sys.exit(0)
 
         if args.func == BoxmanManager.import_image:
 
@@ -607,10 +856,25 @@ def main():
         if provider_type == 'virtualbox':
             session = Virtualbox(manager.config)    # .. todo:: rename to VirtualBoxSession
         elif provider_type == 'libvirt':
-            session = LibVirtSession(manager.config)  # .. todo:: since the manager is needed for
-            session.manager = manager                 #           the cache probably a good idea
-            manager.provider = session                #           to pass it in full instead of
-        elif provider_type == 'docker-compose':       #           passing the config as well
+            # merge runtime metadata into the provider config from boxman.yml
+            provider_conf_with_runtime = manager.get_provider_config_with_runtime(
+                boxman_config.get('providers', {}).get(provider_type, {})
+            )
+            # enrich the project config with runtime-aware provider settings
+            # App-level (boxman.yml) settings serve as DEFAULTS;
+            # project-level (conf.yml) settings always take precedence.
+            enriched_config = manager.config.copy()
+            if 'provider' in enriched_config and provider_type in enriched_config['provider']:
+                project_provider = enriched_config['provider'][provider_type].copy()
+                # Start from app-level defaults, then overlay project-level on top
+                merged_provider = provider_conf_with_runtime.copy()
+                merged_provider.update(project_provider)
+                enriched_config['provider'][provider_type] = merged_provider
+
+            session = LibVirtSession(enriched_config)
+            session.manager = manager
+            manager.provider = session
+        elif provider_type == 'docker-compose':
             raise NotImplementedError('docker-compose is not implemented yet')
             from boxman.docker_compose.docker_compose import DockerCompose
 

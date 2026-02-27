@@ -1,0 +1,146 @@
+---
+version: '1.0'
+project: boxman_dev_tiny-centos-7
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/bin/virsh'
+    verbose: True
+
+templates:
+  template1:
+    name: centos-7-minimal-base-template-cloudinit
+    image: https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2
+    #image: file:///path/to/local/CentOS-7-x86_64-GenericCloud.qcow2
+    disk_size: 20G
+    os_variant: centos7.0
+    memory: 2048
+    vcpus: 2
+    cloudinit: |
+      #cloud-config
+      hostname: hello-cloudinit
+      manage_etc_hosts: true
+
+      users:
+        - name: centos
+          lock_passwd: false
+          groups: [wheel]
+          sudo: "ALL=(ALL) NOPASSWD:ALL"
+          shell: /bin/bash
+
+      chpasswd:
+        list: |
+          centos:centos
+        expire: false
+
+      ssh_pwauth: true
+      package_update: true
+      packages:
+        - qemu-guest-agent
+        - openssh-server
+
+      growpart:
+        mode: auto
+        devices: ['/']
+
+      resize_rootfs: true
+
+      write_files:
+        - path: /etc/hello-from-cloudinit
+          permissions: "0644"
+          content: |
+            hello world from cloud-init (CentOS 7)
+
+      runcmd:
+        - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - systemctl daemon-reload
+        - systemctl enable qemu-guest-agent
+        - systemctl start qemu-guest-agent
+        - systemctl restart network || true
+        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
+        # create admin user via shell commands
+        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /home/admin -s /bin/bash admin" ]
+        - [ sh, -c, "usermod -aG wheel admin" ]
+        - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin" ]
+        - [ sh, -c, "chmod 0440 /etc/sudoers.d/admin" ]
+        - [ sh, -c, "echo 'admin:{{ env("BOXMAN_ADMIN_PASS", default="boxman") }}' | chpasswd" ]
+        - [ sh, -c, "mkdir -p /home/admin/.ssh && chmod 700 /home/admin/.ssh && chown -R admin:admin /home/admin/.ssh" ]
+        - restorecon -R /home/admin/.ssh || true
+        - restorecon /etc/sudoers.d/admin || true
+
+clusters:
+  cluster_1:
+    workdir: ~/workspaces/boxmandev/tiny-libvirt-centos-7-cloudinit
+    base_image: centos-7-minimal-base-template-cloudinit
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+    admin_key_name: id_ed25519_boxman
+    ssh_config: ssh_config
+
+    networks:
+      nat1:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:01'
+        ip:
+          address: '192.168.10.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.10.2'
+              end: '192.168.10.254'
+        enable: True
+        autostart: True
+      isolated1:
+        mode: route
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:02'
+        ip:
+          address: '10.0.10.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '10.0.10.2'
+              end: '10.0.10.254'
+        enable: True
+        autostart: True
+
+    vms:
+      boxman01:
+        hostname: boxman01
+        cpus:
+          sockets: 1
+          cores: 2
+          threads: 2
+        memory: 2048
+        disks:
+          - name: disk01
+            driver:
+              name: qemu
+              type: qcow2
+            target: vdb
+            size: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'isolated1'
+
+    files:
+      env.sh: |
+        export INVENTORY=inventory
+        export SSH_CONFIG=${HOME}/workspaces/boxmandev/tiny-libvirt-centos-7-cloudinit/ssh_config
+        export GATEWAYHOST=mgmt01
+        export ANSIBLE_CONFIG=${HOME}/workspaces/boxmandev/tiny-libvirt-centos-7-cloudinit/ansible.cfg
+        export ANSIBLE_INVENTORY="$INVENTORY"
+        export ANSIBLE_SSH_ARGS="-F $SSH_CONFIG"

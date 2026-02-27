@@ -1,6 +1,7 @@
 import os
 import time
 import re
+import json
 from typing import Dict, Any, Optional
 import yaml
 from multiprocessing import Pool
@@ -12,6 +13,9 @@ from boxman.providers.libvirt.session import LibVirtSession
 from boxman.config_cache import BoxmanCache
 from boxman.utils.io import write_files
 from boxman import log
+from boxman.runtime import create_runtime, RuntimeBase
+from boxman.utils.jinja_env import create_jinja_env
+from boxman.providers.libvirt.commands import VirshCommand
 
 class BoxmanManager:
     def __init__(self,
@@ -34,11 +38,29 @@ class BoxmanManager:
         #: the logger instance
         self.logger = log
 
+        #: str: the runtime environment name ('local', 'docker-compose', etc.)
+        self._runtime_name: str = 'local'
+
+        #: Optional[RuntimeBase]: the resolved runtime instance (created lazily)
+        self._runtime_instance: Optional[RuntimeBase] = None
+
         if isinstance(config, str):
             self.config_path = config
             self.config = self.load_config(config)
 
         self.cache = BoxmanCache()
+
+        #: Optional[Dict[str, Any]]: the boxman application-level config (from boxman.yml)
+        self.app_config: Optional[Dict[str, Any]] = None
+
+    def load_app_config(self, config: Dict[str, Any]) -> None:
+        """
+        Load the boxman application-level configuration (from boxman.yml).
+
+        Args:
+            config: The parsed boxman.yml configuration dictionary
+        """
+        self.app_config = config
 
     @property
     def provider(self) -> Optional["LibVirtSession"]:
@@ -60,6 +82,49 @@ class BoxmanManager:
         """
         self._provider = value
 
+    @property
+    def runtime(self) -> str:
+        """Return the runtime environment name."""
+        return self._runtime_name
+
+    @runtime.setter
+    def runtime(self, value: str) -> None:
+        """Set the runtime environment name and reset the cached instance."""
+        self._runtime_name = value
+        self._runtime_instance = None  # force re-creation
+
+    @property
+    def runtime_instance(self) -> RuntimeBase:
+        """
+        Return the runtime instance, creating it on first access.
+
+        The runtime config is taken from ``app_config`` if available.
+        """
+        if self._runtime_instance is None:
+            runtime_config = (self.app_config or {}).get("runtime_config", {})
+            self._runtime_instance = create_runtime(
+                self._runtime_name, config=runtime_config
+            )
+        return self._runtime_instance
+
+    def get_provider_config_with_runtime(
+        self, provider_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Return a copy of *provider_config* enriched with runtime metadata.
+
+        This should be called before passing the config to provider command
+        classes (``VirshCommand``, ``VirtInstallCommand``, etc.) so they
+        know how to wrap commands.
+
+        Args:
+            provider_config: The raw provider configuration dict.
+
+        Returns:
+            A new dict with ``runtime`` and related keys injected.
+        """
+        return self.runtime_instance.inject_into_provider_config(provider_config)
+
     def load_config(self, config_path: str) -> Dict[str, Any]:
         """
         Load configuration from a YAML file.
@@ -77,15 +142,17 @@ class BoxmanManager:
         config_dir = os.path.dirname(os.path.abspath(config_path))
         config_filename = os.path.basename(config_path)
 
-        # create jinja environment with the config directory as template path
-        env = Environment(loader=FileSystemLoader(config_dir))
+        # create jinja environment with boxman helpers (env(), env_required(), etc.)
+        env = create_jinja_env(config_dir)
 
         # load the template
         template = env.get_template(config_filename)
 
-        # render the template (you can pass variables here if needed)
+        # render the template
+        # NOTE: pass os.environ as 'environ' (not 'env') to avoid shadowing
+        # the env() helper function registered in the Jinja globals.
         rendered_yaml = template.render(
-            env=os.environ,  # make environment variables available in template
+            environ=os.environ,
         )
 
         # parse the rendered yaml
@@ -179,28 +246,304 @@ class BoxmanManager:
         )
 
     @staticmethod
-    def list_projects(cls, _) -> None:
+    def create_templates(cls, cli_args) -> None:
         """
-        List all projects that have been provisioned
+        Create template VMs from cloud images using cloud-init.
 
-        :param manager: The instance of the BoxmanManager
+        Reads the ``templates`` section from the project config and creates
+        each template VM that doesn't already exist.
+
+        :param cls: The BoxmanManager instance
         :param cli_args: The parsed arguments from the cli
         """
-        # print table header
-        header_project = "project_name"
-        header_path = "project path"
-        padding_project = 20
-        padding_path = 50
-        print(f"{header_project:<{padding_project}} | {header_path:<{padding_path}}")
+        requested = None
+        if cli_args is not None and hasattr(cli_args, 'template_names') and cli_args.template_names:
+            requested = [t.strip() for t in cli_args.template_names.split(',')]
 
-        # create separator line with "+" at the intersection
-        separator_project = "-" * padding_project
-        separator_path = "-" * padding_path
-        print(f"{separator_project}-+{separator_path}")
+        force = getattr(cli_args, 'force', False) if cli_args is not None else False
 
-        # Print each project row
-        for project, project_data in cls.cache.read_projects_cache().items():
-            print(f"{project:<{padding_project}} | {project_data['conf']:<{padding_path}}")
+        cls._create_templates_impl(requested=requested, force=force)
+
+    def _create_templates_impl(self, requested=None, force=False) -> None:
+        """
+        Internal implementation for creating template VMs.
+
+        Args:
+            requested: Optional list of template keys to create (None = all).
+            force: If True, recreate existing templates.
+        """
+        from boxman.providers.libvirt.cloudinit import CloudInitTemplate
+
+        config = self.config
+        templates = config.get('templates', {})
+
+        if not templates:
+            self.logger.warning("no templates defined in configuration")
+            return
+
+        # determine provider config
+        provider_type = list(config.get('provider', {}).keys())[0] if 'provider' in config else 'libvirt'
+        provider_config = config.get('provider', {}).get(provider_type, {})
+
+        # merge app-level provider config as defaults
+        if self.app_config and 'providers' in self.app_config:
+            app_provider = self.app_config['providers'].get(provider_type, {})
+            merged = app_provider.copy()
+            merged.update(provider_config)
+            provider_config = merged
+
+        # inject runtime settings
+        if hasattr(self, 'runtime_instance'):
+            provider_config = self.runtime_instance.inject_into_provider_config(provider_config)
+
+        self.logger.info(f"resolved provider config for templates: {provider_config}")
+
+        # resolve a workdir for template artifacts
+        default_workdir = '~/boxman-templates'
+        for _, cluster in config.get('clusters', {}).items():
+            default_workdir = cluster.get('workdir', default_workdir)
+            break
+
+        # --- Pre-check: detect already-existing templates ----------------
+        # Build a temporary VirshCommand to query existing VMs once.
+        from boxman.providers.libvirt.commands import VirshCommand
+        _virsh = VirshCommand(provider_config=provider_config)
+        _existing_vms: set = set()
+        result = _virsh.execute("list", "--all", "--name", hide=True, warn=True)
+        if result.ok:
+            _existing_vms = {
+                v.strip() for v in result.stdout.strip().split("\n") if v.strip()
+            }
+
+        # Identify which of the requested templates already exist
+        existing_templates: list[str] = []
+        templates_to_create: list[str] = []
+
+        for tpl_key, tpl_conf in templates.items():
+            if requested and tpl_key not in requested:
+                continue
+            tpl_name = tpl_conf.get('name', tpl_key)
+            if tpl_name in _existing_vms:
+                existing_templates.append(tpl_key)
+            else:
+                templates_to_create.append(tpl_key)
+
+        # If any templates already exist and --force was NOT given, error out.
+        if existing_templates and not force:
+            names = ", ".join(
+                f"'{templates[k].get('name', k)}'" for k in existing_templates
+            )
+            self.logger.error(
+                f"the following template(s) already exist: {names}. "
+                f"Use --force to delete and recreate them."
+            )
+            return
+
+        # Merge both lists (existing ones will be force-recreated)
+        all_keys = existing_templates + templates_to_create
+        # -----------------------------------------------------------------
+
+        for tpl_key in all_keys:
+            tpl_conf = templates[tpl_key]
+
+            tpl_name = tpl_conf.get('name', tpl_key)
+            image_path = tpl_conf.get('image', '')
+
+            # Common typo: 'file' instead of 'image'
+            if not image_path and 'file' in tpl_conf:
+                image_path = tpl_conf['file']
+                self.logger.warning(
+                    f"template '{tpl_key}': 'file' is not a valid key, "
+                    f"did you mean 'image'? Using '{image_path}' as the image path.")
+
+            cloudinit_userdata = tpl_conf.get('cloudinit', None)
+            cloudinit_metadata = tpl_conf.get('cloudinit_metadata', None)
+            cloudinit_network_config = tpl_conf.get('cloudinit_network_config', None)
+            tpl_memory = tpl_conf.get('memory', 2048)
+            tpl_vcpus = tpl_conf.get('vcpus', 2)
+            tpl_os_variant = tpl_conf.get('os_variant', 'generic')
+            tpl_disk_format = tpl_conf.get('disk_format', 'qcow2')
+            tpl_disk_size = tpl_conf.get('disk_size', None)
+            tpl_network = tpl_conf.get('network', 'default')
+            tpl_bridge = tpl_conf.get('bridge', None)
+            tpl_workdir = tpl_conf.get('workdir', default_workdir)
+
+            # Ensure the workdir exists and is writable by the current user.
+            # Earlier steps (e.g. docker runtime) may have created it as root.
+            expanded_workdir = os.path.expanduser(tpl_workdir)
+            self._ensure_writable_dir(expanded_workdir)
+
+            # Also pre-create the template subdirectory that cloudinit.py
+            # will use, so it doesn't hit PermissionError.
+            template_subdir = os.path.join(expanded_workdir, tpl_name)
+            self._ensure_writable_dir(template_subdir)
+
+            self.logger.info(f"creating template '{tpl_key}' -> VM name '{tpl_name}'")
+
+            ct = CloudInitTemplate(
+                template_name=tpl_name,
+                image_path=image_path,
+                cloudinit_userdata=cloudinit_userdata,
+                cloudinit_metadata=cloudinit_metadata,
+                cloudinit_network_config=cloudinit_network_config,
+                workdir=tpl_workdir,
+                provider_config=provider_config,
+                memory=tpl_memory,
+                vcpus=tpl_vcpus,
+                os_variant=tpl_os_variant,
+                disk_format=tpl_disk_format,
+                disk_size=tpl_disk_size,
+                network=tpl_network,
+                bridge=tpl_bridge,
+            )
+
+            success = ct.create_template(force=force)
+            if success:
+                self.logger.info(f"template '{tpl_key}' created successfully")
+            else:
+                self.logger.error(f"failed to create template '{tpl_key}'")
+
+    def _ensure_writable_dir(self, path: str) -> None:
+        """
+        Ensure *path* exists and is writable by the current user.
+
+        If the directory was created by another user (e.g. root via docker),
+        attempt to fix ownership with ``sudo chown``.  If ``sudo`` is not
+        available or fails, a clear error message is logged.
+
+        When running under a non-local runtime the directory is also
+        created inside the container so that commands executed via
+        ``docker exec`` can access it.
+
+        Args:
+            path: Absolute or user-expandable directory path.
+        """
+        path = os.path.expanduser(path)
+
+        if not os.path.exists(path):
+            try:
+                os.makedirs(path, exist_ok=True)
+            except PermissionError:
+                # parent dir may be owned by root — try sudo mkdir
+                self.logger.warning(
+                    f"cannot create '{path}' as current user, "
+                    f"trying with sudo...")
+                result = run(
+                    f"sudo mkdir -p '{path}'", hide=True, warn=True)
+                if not result.ok:
+                    raise PermissionError(
+                        f"failed to create directory '{path}' even with sudo"
+                    )
+                # fall through to chown below
+
+        # if the directory exists but is not writable, fix ownership
+        if not os.access(path, os.W_OK):
+            uid = os.getuid()
+            gid = os.getgid()
+            self.logger.info(
+                f"fixing ownership of '{path}' to {uid}:{gid} "
+                f"(was not writable by current user)")
+            result = run(
+                f"sudo chown -R {uid}:{gid} '{path}'",
+                hide=True, warn=True)
+            if not result.ok:
+                raise PermissionError(
+                    f"directory '{path}' is not writable and "
+                    f"'sudo chown' failed: {result.stderr.strip()}"
+                )
+
+        # When using a non-local runtime (e.g. docker-compose), also
+        # create the directory inside the container so that commands
+        # executed via 'docker exec' can write to it.
+        if self._runtime_name != 'local':
+            mkdir_cmd = self.runtime_instance.wrap_command(
+                f"mkdir -p '{path}'"
+            )
+            self.logger.info(f"creating directory inside runtime container: {path}")
+            result = run(mkdir_cmd, hide=True, warn=True)
+            if not result.ok:
+                self.logger.warning(
+                    f"failed to create '{path}' inside container: "
+                    f"{result.stderr.strip()}")
+
+    def ensure_templates_exist(self) -> bool:
+        """
+        Check if any cluster's base_image refers to a template defined in the
+        ``templates`` section of the config. If the template VM does not exist,
+        create it automatically.
+
+        Returns:
+            True if all required templates exist (or were created), False on failure.
+        """
+        templates = self.config.get('templates', {})
+        if not templates:
+            return True  # nothing to do
+
+        # build a mapping: template VM name -> template key
+        tpl_name_to_key: Dict[str, str] = {}
+        for tpl_key, tpl_conf in templates.items():
+            vm_name = tpl_conf.get('name', tpl_key)
+            tpl_name_to_key[vm_name] = tpl_key
+            # also map by the key itself in case base_image uses the key
+            tpl_name_to_key[tpl_key] = tpl_key
+
+        # collect which templates are referenced by clusters
+        needed_template_keys: set = set()
+        for cluster_name, cluster in self.config.get('clusters', {}).items():
+            base_image = cluster.get('base_image', '')
+            if base_image in tpl_name_to_key:
+                needed_template_keys.add(tpl_name_to_key[base_image])
+
+        if not needed_template_keys:
+            return True  # no cluster uses a template as base_image
+
+        # check which of the needed templates already exist as VMs
+        missing_keys: list = []
+        for tpl_key in needed_template_keys:
+            tpl_conf = templates[tpl_key]
+            tpl_vm_name = tpl_conf.get('name', tpl_key)
+
+            # ask the provider if the VM exists
+            exists = False
+            if self.provider is not None and hasattr(self.provider, 'vm_exists'):
+                exists = self.provider.vm_exists(tpl_vm_name)
+            elif self.provider is not None:
+                # fallback: try virsh list
+                try:
+                    from boxman.providers.libvirt.commands import VirshCommand
+                    provider_type = list(self.config.get('provider', {}).keys())[0]
+                    provider_config = self.config.get('provider', {}).get(provider_type, {})
+                    if self.app_config and 'providers' in self.app_config:
+                        app_prov = self.app_config['providers'].get(provider_type, {})
+                        merged = app_prov.copy()
+                        merged.update(provider_config)
+                        provider_config = merged
+                    if hasattr(self, 'runtime_instance'):
+                        provider_config = self.runtime_instance.inject_into_provider_config(provider_config)
+                    virsh = VirshCommand(provider_config=provider_config)
+                    result = virsh.execute("list", "--all", "--name", hide=True, warn=True)
+                    if result.ok:
+                        vm_list = [v.strip() for v in result.stdout.strip().split("\n") if v.strip()]
+                        exists = tpl_vm_name in vm_list
+                except Exception as exc:
+                    self.logger.warning(f"could not check if template VM '{tpl_vm_name}' exists: {exc}")
+
+            if exists:
+                self.logger.info(f"template VM '{tpl_vm_name}' already exists, skipping creation")
+            else:
+                self.logger.info(
+                    f"template VM '{tpl_vm_name}' (key='{tpl_key}') does not exist, "
+                    f"will create it before provisioning")
+                missing_keys.append(tpl_key)
+
+        if not missing_keys:
+            return True
+
+        # create the missing templates
+        self.logger.info(f"auto-creating {len(missing_keys)} missing template(s): {missing_keys}")
+        self._create_templates_impl(requested=missing_keys, force=False)
+
+        return True
 
     ### register/un-register the project in the cache
     def register_project_in_cache(self) -> None:
@@ -208,10 +551,20 @@ class BoxmanManager:
         Register the project in the Boxman cache.
 
         This method saves the project configuration to the cache for later use.
+
+        Raises:
+            RuntimeError: If the project is already registered in the cache.
         """
-        self.cache.register_project(
+        success = self.cache.register_project(
             project_name=self.config['project'],
-            config_fpath=self.config_path)
+            config_fpath=self.config_path,
+            runtime=self._runtime_name)
+
+        if success is False:
+            raise RuntimeError(
+                f"Project '{self.config['project']}' is already in the cache. "
+                f"Deprovision it first with: boxman deprovision"
+            )
 
     def unregister_from_cache(self) -> None:
         """
@@ -220,6 +573,133 @@ class BoxmanManager:
         This method saves the project configuration to the cache for later use.
         """
         self.cache.unregister_project(project_name=self.config['project'])
+
+    @staticmethod
+    def list_projects(cls, cli_args) -> None:
+        """
+        List all registered projects.
+        """
+        projects = cls.cache.list_projects()
+
+        pretty = getattr(cli_args, 'pretty', None) if cli_args else None
+        use_json = getattr(cli_args, 'json', False) if cli_args else False
+        use_color = getattr(cli_args, 'color', 'yes') != 'no' if cli_args else True
+
+        # --- JSON output ---
+        if use_json:
+            print(json.dumps(projects if projects else {}, indent=2, default=str))
+            return
+
+        # ANSI helpers
+        if use_color and pretty:
+            BOLD = "\033[1m"
+            CYAN = "\033[1;36m"
+            GREEN = "\033[1;32m"
+            YELLOW = "\033[1;33m"
+            DIM = "\033[2m"
+            RESET = "\033[0m"
+        else:
+            BOLD = CYAN = GREEN = YELLOW = DIM = RESET = ""
+
+        if not projects:
+            if pretty:
+                print(f"{YELLOW}No projects registered.{RESET}")
+            else:
+                cls.logger.info("No projects registered.")
+            return
+
+        if pretty == 'table':
+            # Collect rows: [project, config, runtime, networks_summary]
+            rows = []
+            for proj_name, proj_info in projects.items():
+                if isinstance(proj_info, dict):
+                    conf = proj_info.get('conf', 'n/a')
+                    runtime = proj_info.get('runtime', 'n/a')
+                    networks = proj_info.get('networks', {})
+                    net_parts = []
+                    for net_name, net_info in networks.items():
+                        if isinstance(net_info, dict):
+                            ip = net_info.get('ip_address', 'n/a')
+                            bridge = net_info.get('bridge_name', 'n/a')
+                            net_parts.append(f"{net_name} (ip={ip}, br={bridge})")
+                        else:
+                            net_parts.append(net_name)
+                    nets_str = "; ".join(net_parts) if net_parts else "-"
+                else:
+                    conf = str(proj_info)
+                    runtime = "n/a"
+                    nets_str = "-"
+                rows.append((proj_name, conf, runtime, nets_str))
+
+            headers = ("PROJECT", "CONFIG", "RUNTIME", "NETWORKS")
+            # compute column widths
+            col_widths = [len(h) for h in headers]
+            for row in rows:
+                for i, cell in enumerate(row):
+                    col_widths[i] = max(col_widths[i], len(cell))
+
+            def fmt_row(cells, bold=False):
+                parts = []
+                for i, cell in enumerate(cells):
+                    parts.append(cell.ljust(col_widths[i]))
+                line = "  ".join(parts)
+                if bold:
+                    return f"{BOLD}{line}{RESET}"
+                return line
+
+            print()
+            print(fmt_row(headers, bold=True))
+            print("  ".join("-" * w for w in col_widths))
+            for row in rows:
+                print(fmt_row(row))
+            print()
+
+        elif pretty == 'plain':
+            print()
+            print(f"{BOLD}Registered projects:{RESET}")
+            print()
+            for proj_name, proj_info in projects.items():
+                print(f"  {CYAN}{proj_name}{RESET}")
+                if isinstance(proj_info, dict):
+                    conf = proj_info.get('conf', 'n/a')
+                    runtime = proj_info.get('runtime', 'n/a')
+                    print(f"    {DIM}config:{RESET}  {conf}")
+                    print(f"    {DIM}runtime:{RESET} {runtime}")
+
+                    networks = proj_info.get('networks', {})
+                    if networks:
+                        print(f"    {DIM}networks:{RESET}")
+                        for net_name, net_info in networks.items():
+                            ip = net_info.get('ip_address', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            bridge = net_info.get('bridge_name', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            print(f"      {GREEN}-{RESET} {net_name}")
+                            print(f"          {DIM}ip:{RESET} {ip}  {DIM}bridge:{RESET} {bridge}")
+                else:
+                    print(f"    {proj_info}")
+                print()
+
+        else:
+            # default logger-based output (no --pretty, no --json)
+            cls.logger.info("Registered projects:\n")
+            for proj_name, proj_info in projects.items():
+                cls.logger.info(f"  project: {proj_name}")
+                if isinstance(proj_info, dict):
+                    conf = proj_info.get('conf', 'n/a')
+                    runtime = proj_info.get('runtime', 'n/a')
+                    cls.logger.info(f"    config:  {conf}")
+                    cls.logger.info(f"    runtime: {runtime}")
+
+                    networks = proj_info.get('networks', {})
+                    if networks:
+                        cls.logger.info(f"    networks:")
+                        for net_name, net_info in networks.items():
+                            ip = net_info.get('ip_address', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            bridge = net_info.get('bridge_name', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            cls.logger.info(f"      - {net_name}")
+                            cls.logger.info(f"          ip: {ip}  bridge: {bridge}")
+                else:
+                    cls.logger.info(f"    {proj_info}")
+                cls.logger.info("")
     ### end register the project in the cache
 
     ### networks define / remove / destroy
@@ -643,6 +1123,54 @@ class BoxmanManager:
 
         return success
 
+    def get_global_authorized_keys(self) -> list[str]:
+        """
+        Resolve and return all global SSH authorized keys from the app config.
+
+        Reads ``ssh.authorized_keys`` from :pyattr:`app_config` (the top-level
+        ``boxman.yml``), resolves each entry via :pyfunc:`fetch_value`, and
+        returns a list of public-key strings.
+
+        Returns:
+            List of resolved SSH public key strings.
+        """
+        raw_keys = (
+            (self.app_config or {})
+            .get("ssh", {})
+            .get("authorized_keys", [])
+        )
+        resolved: list[str] = []
+        for entry in raw_keys:
+            try:
+                resolved.append(self.fetch_value(entry))
+            except (ValueError, FileNotFoundError) as exc:
+                self.logger.warning(f"skipping unresolvable SSH key entry: {exc}")
+        return resolved
+
+    def write_global_authorized_keys_file(self, output_path: str) -> None:
+        """
+        Resolve global SSH keys from app_config and write them to a file.
+
+        This bridges the Python-side boxman.yml config with the container
+        entrypoint, which cannot read boxman.yml directly. The entrypoint
+        reads ``global_authorized_keys`` from the bind-mounted ssh dir.
+
+        Args:
+            output_path: Path to write the authorized keys file
+                         (e.g. ``<data_dir>/ssh/global_authorized_keys``).
+        """
+        keys = self.get_global_authorized_keys()
+        if not keys:
+            self.logger.info("no global authorized keys to write")
+            return
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w") as fobj:
+            for key in keys:
+                fobj.write(key + "\n")
+        self.logger.info(
+            f"wrote {len(keys)} global authorized key(s) to {output_path}")
+
     @classmethod
     def fetch_value(cls, value) -> str:
         """
@@ -771,7 +1299,7 @@ class BoxmanManager:
             bool: True if successful, False otherwise
         """
         wait_time = 1  # Start with 1 second
-        max_retries = 5
+        max_retries = 10
         max_wait = 60  # Maximum wait per attempt
 
         for attempt in range(1, max_retries + 1):
@@ -785,16 +1313,34 @@ class BoxmanManager:
                 f'{admin_user}@{ip_address}'
             )
 
-            result = run(cmd, hide=False, warn=True)
+            # When using a non-local runtime, the VM is only reachable from
+            # inside the container, so wrap the command with docker exec.
+            cmd = self.runtime_instance.wrap_command(cmd)
+
+            result = run(cmd, hide=True, warn=True)
 
             if result.ok:
+                # Log ssh-copy-id informational output
+                if result.stdout.strip():
+                    for line in result.stdout.strip().splitlines():
+                        self.logger.info(f"ssh-copy-id: {line}")
+
                 # verify we can ssh without password
                 ssh_success = self._verify_ssh_connection(hostname, ssh_conf_path)
 
                 if ssh_success:
                     return True
             else:
-                self.logger.error(f"ssh key addition failed: {result.stderr.strip()}")
+                # Log ssh-copy-id output through the logger
+                combined = (result.stderr.strip() or result.stdout.strip())
+                if combined:
+                    for line in combined.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        self.logger.error(f"ssh-copy-id: {line}")
+                else:
+                    self.logger.error("ssh key addition failed (no output)")
 
             # wait before next attempt with exponential backoff
             time.sleep(wait_time)
@@ -815,6 +1361,11 @@ class BoxmanManager:
         """
         self.logger.info(f"verifying ssh connection to: {hostname}")
         ssh_cmd = f'ssh -F {ssh_config_path} {hostname} hostname'
+
+        # When using a non-local runtime, the VM is only reachable from
+        # inside the container.
+        ssh_cmd = self.runtime_instance.wrap_command(ssh_cmd)
+
         result = run(ssh_cmd, hide=True, warn=True)
 
         if result.ok and result.stdout.strip():
@@ -830,13 +1381,21 @@ class BoxmanManager:
         Set up SSH access to all VMs.
 
         This method:
-        1. Generates SSH keys if they don't exist
-        2. Adds the public key to all vms
-        3. Writes an SSH config file for easy access
+        1. Writes global authorized keys file (resolved from boxman.yml)
+        2. Generates SSH keys if they don't exist
+        3. Adds the public key to all vms
+        4. Writes an SSH config file for easy access
 
         Returns:
             bool: True if all steps completed successfully, False otherwise
         """
+        # write global authorized keys so they can be consumed by container
+        # entrypoints or cloud-init scripts
+        for _, cluster in self.config['clusters'].items():
+            workdir = os.path.expanduser(cluster['workdir'])
+            global_keys_path = os.path.join(workdir, 'global_authorized_keys')
+            self.write_global_authorized_keys_file(global_keys_path)
+
         if not self.generate_ssh_keys():
             self.logger.error("failed to generate ssh keys")
             return False
@@ -851,6 +1410,108 @@ class BoxmanManager:
         self.logger.info("you can now connect to vms using the ssh config file")
 
         return True
+
+    def _get_project_vm_names(self) -> list[str]:
+        """
+        Return the list of fully-qualified VM names that would be
+        created by provisioning the current config.
+        """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        vm_names = []
+        for cluster_name, cluster in self.config.get('clusters', {}).items():
+            for vm_name in cluster.get('vms', {}).keys():
+                vm_names.append(f"{prj_name}_{cluster_name}_{vm_name}")
+        return vm_names
+
+    def _find_existing_project_vms(self) -> list[str]:
+        """
+        Query libvirt and return the subset of project VM names that
+        already exist (in any state).
+        """
+        expected = self._get_project_vm_names()
+        if not expected:
+            return []
+
+        # Resolve provider config so VirshCommand uses the right
+        # runtime / URI / sudo settings.
+        provider_type = (
+            list(self.config.get('provider', {}).keys())[0]
+            if 'provider' in self.config else 'libvirt'
+        )
+        provider_config = self.config.get('provider', {}).get(provider_type, {})
+        if self.app_config and 'providers' in self.app_config:
+            app_prov = self.app_config['providers'].get(provider_type, {})
+            merged = app_prov.copy()
+            merged.update(provider_config)
+            provider_config = merged
+        if hasattr(self, 'runtime_instance'):
+            provider_config = self.runtime_instance.inject_into_provider_config(
+                provider_config)
+
+        virsh = VirshCommand(provider_config=provider_config)
+        result = virsh.execute("list", "--all", "--name", hide=True, warn=True)
+        if not result.ok:
+            self.logger.warning("could not query existing VMs via virsh")
+            return []
+
+        existing = {
+            v.strip() for v in result.stdout.strip().split("\n") if v.strip()
+        }
+        return [vm for vm in expected if vm in existing]
+
+    def _get_vm_states(self) -> dict[str, str]:
+        """
+        Query libvirt and return a mapping of project VM name -> state string
+        for all project VMs that exist.
+
+        State strings are as returned by ``virsh list --all``, e.g.
+        'running', 'shut off', 'paused', 'saved', etc.
+
+        Returns:
+            Dict mapping full VM name to its state, only for VMs that exist.
+        """
+        expected = set(self._get_project_vm_names())
+        if not expected:
+            return {}
+
+        provider_type = (
+            list(self.config.get('provider', {}).keys())[0]
+            if 'provider' in self.config else 'libvirt'
+        )
+        provider_config = self.config.get('provider', {}).get(provider_type, {})
+        if self.app_config and 'providers' in self.app_config:
+            app_prov = self.app_config['providers'].get(provider_type, {})
+            merged = app_prov.copy()
+            merged.update(provider_config)
+            provider_config = merged
+        if hasattr(self, 'runtime_instance'):
+            provider_config = self.runtime_instance.inject_into_provider_config(
+                provider_config)
+
+        virsh = VirshCommand(provider_config=provider_config)
+        # Use the table output to get both name and state
+        result = virsh.execute("list", "--all", hide=True, warn=True)
+        if not result.ok:
+            self.logger.warning("could not query VM states via virsh")
+            return {}
+
+        states: dict[str, str] = {}
+        for line in result.stdout.strip().splitlines():
+            # Skip header and separator lines
+            line = line.strip()
+            if not line or line.startswith('---') or line.startswith('Id'):
+                continue
+            # Format: " Id   Name                 State"
+            # e.g.  " -    my-vm                shut off"
+            #       " 3    my-vm                running"
+            parts = line.split(None, 2)
+            if len(parts) >= 3:
+                vm_name = parts[1]
+                vm_state = parts[2].strip()
+                if vm_name in expected:
+                    states[vm_name] = vm_state
+
+        return states
 
     @staticmethod
     def provision(cls, cli_args):
@@ -869,7 +1530,50 @@ class BoxmanManager:
         if not os.path.isdir(workdir):
             os.makedirs(workdir)
 
-        cls.register_project_in_cache()
+        # Ensure provider config reflects runtime settings.
+        # Project-level provider settings (from conf.yml) always take
+        # precedence over app-level defaults (from boxman.yml).
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
+
+        # --- Pre-check: detect already-existing project VMs -----------
+        force = getattr(cli_args, 'force', False)
+        existing_vms = cls._find_existing_project_vms()
+
+        if existing_vms:
+            names = ", ".join(f"'{v}'" for v in existing_vms)
+            if not force:
+                cls.logger.error(
+                    f"the following VM(s) already exist: {names}. "
+                    f"Use --force to deprovision them first and re-provision."
+                )
+                return
+            else:
+                cls.logger.warning(
+                    f"the following VM(s) already exist and will be "
+                    f"deprovisioned first (--force): {names}"
+                )
+                cls.deprovision(cls, cli_args)
+        # --------------------------------------------------------------
+
+        try:
+            cls.register_project_in_cache()
+        except RuntimeError as exc:
+            cls.logger.error(str(exc))
+            return
+
+        # --rebuild-templates: force-recreate all templates before provisioning
+        rebuild_templates = getattr(cli_args, 'rebuild_templates', False)
+        if rebuild_templates:
+            cls.logger.info(
+                "rebuilding all templates (--rebuild-templates implies --force "
+                "for create-templates)..."
+            )
+            cls._create_templates_impl(requested=None, force=True)
+        else:
+            # Auto-create any template VMs that are referenced as base_image
+            # but do not yet exist.
+            cls.ensure_templates_exist()
 
         cls.provision_files()
 
@@ -915,6 +1619,175 @@ class BoxmanManager:
         cls.setup_ssh_access()
 
     @staticmethod
+    def up(cls, cli_args):
+        """
+        Bring up the infrastructure.
+
+        - If no project VMs exist, run a full provision.
+        - If all VMs exist and are running, do nothing.
+        - If all VMs exist but some/all are not running (shut off, paused,
+          saved), start/resume them.
+        - If only some VMs exist (partial state) and --force is not set,
+          error out. With --force, deprovision and re-provision.
+
+        Reuses the same provider methods as ``boxman control start`` and
+        ``boxman control resume``.
+        """
+        config = cls.config
+        expected_vms = cls._get_project_vm_names()
+
+        if not expected_vms:
+            cls.logger.error("no VMs defined in configuration")
+            return
+
+        vm_states = cls._get_vm_states()
+        existing_names = set(vm_states.keys())
+        expected_names = set(expected_vms)
+
+        # --- Case 1: No VMs exist → full provision ---
+        if not existing_names:
+            cls.logger.info("no existing VMs found, running full provision...")
+            cls.provision(cls, cli_args)
+            return
+
+        # --- Case 2: Partial state (some exist, some don't) ---
+        missing = expected_names - existing_names
+        if missing:
+            force = getattr(cli_args, 'force', False)
+            names_str = ", ".join(f"'{v}'" for v in sorted(missing))
+            if not force:
+                cls.logger.error(
+                    f"partial infrastructure state: the following VM(s) are "
+                    f"missing: {names_str}. Use --force to deprovision and "
+                    f"re-provision everything."
+                )
+                return
+            else:
+                cls.logger.warning(
+                    f"partial state detected (missing: {names_str}). "
+                    f"Deprovisioning and re-provisioning (--force)..."
+                )
+                cls.provision(cls, cli_args)
+                return
+
+        # --- Case 3: All VMs exist → check states ---
+        non_running = {
+            name: state for name, state in vm_states.items()
+            if state != 'running'
+        }
+
+        if not non_running:
+            cls.logger.info("all VMs are already running, nothing to do")
+            cls.connect_info()
+            return
+
+        # --- Start / resume VMs that are not running ---
+        cls.logger.info(
+            f"{len(non_running)} VM(s) are not running, bringing them up..."
+        )
+
+        # Ensure provider config reflects runtime settings
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
+
+        # Build workdir lookup from process_vm_list for restore operations
+        vm_workdir_map = {vm_name: workdir for vm_name, workdir in cls.process_vm_list(cli_args)}
+
+        for vm_name, state in non_running.items():
+            cls.logger.info(f"VM '{vm_name}' is in state '{state}'")
+            workdir = vm_workdir_map.get(vm_name, '')
+
+            if state == 'paused':
+                cls.logger.info(f"resuming VM '{vm_name}'...")
+                cls.provider.resume_vm(vm_name)
+            elif state in ('saved', 'managedsave'):
+                cls.logger.info(f"restoring VM '{vm_name}' from saved state...")
+                cls.provider.restore_vm(vm_name, workdir)
+            elif state in ('shut off', 'shutoff'):
+                cls.logger.info(f"starting VM '{vm_name}'...")
+                cls.provider.start_vm(vm_name)
+            elif state in ('crashed', 'dying'):
+                cls.logger.warning(
+                    f"VM '{vm_name}' is in state '{state}', "
+                    f"attempting to destroy and start...")
+                cls.provider.destroy_vm(vm_name, remove_storage=False)
+                cls.provider.start_vm(vm_name)
+            else:
+                cls.logger.warning(
+                    f"VM '{vm_name}' is in unexpected state '{state}', "
+                    f"attempting to start...")
+                cls.provider.start_vm(vm_name)
+
+        # Wait for IP addresses
+        cls.logger.info("waiting for VMs to get IP addresses...")
+        wait_time = 1
+        max_wait = 300
+        total_waited = 0
+
+        while total_waited < max_wait:
+            if cls.get_connect_info():
+                cls.logger.info(
+                    f"all VMs have IP addresses (waited {total_waited}s)")
+                break
+            cls.logger.info(
+                f"waiting {wait_time}s for IP assignment "
+                f"(total waited: {total_waited}s)")
+            time.sleep(wait_time)
+            total_waited += wait_time
+            wait_time = min(wait_time * 2, 60)
+
+        if total_waited >= max_wait:
+            cls.logger.warning(
+                "reached maximum wait time. Some VMs may not have IP addresses.")
+
+        # Display connection information
+        cls.connect_info()
+
+        # Re-write SSH config with current IPs
+        cls.write_ssh_config()
+
+        cls.logger.info("infrastructure is up")
+
+    @staticmethod
+    def down(cls, cli_args):
+        """
+        Bring down the infrastructure by saving or suspending all VMs.
+
+        By default, saves each VM's state to disk (same as
+        ``boxman control save``). With ``--suspend``, pauses VMs in memory
+        instead (same as ``boxman control suspend``).
+
+        Reuses ``process_vm_list()`` and the same provider methods as
+        ``boxman control save`` / ``boxman control suspend``.
+        """
+        # Ensure provider config reflects runtime settings
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
+
+        vm_list = cls.process_vm_list(cli_args)
+
+        if not vm_list:
+            cls.logger.info("no VMs found in configuration")
+            return
+
+        use_suspend = getattr(cli_args, 'suspend', False)
+
+        if use_suspend:
+            cls.logger.info("suspending all VMs (--suspend)...")
+            for vm_name, _workdir in vm_list:
+                cls.logger.info(f"suspending VM '{vm_name}'...")
+                cls.provider.suspend_vm(vm_name)
+                cls.logger.info(f"VM '{vm_name}' suspended")
+        else:
+            cls.logger.info("saving the state of all VMs to disk...")
+            for vm_name, workdir in vm_list:
+                cls.logger.info(f"saving VM '{vm_name}' state to '{workdir}'...")
+                cls.provider.save_vm(vm_name, workdir)
+                cls.logger.info(f"VM '{vm_name}' state saved")
+
+        cls.logger.info("infrastructure is down")
+
+    @staticmethod
     def deprovision(cls, cli_args):
 
         config = cls.config
@@ -929,6 +1802,12 @@ class BoxmanManager:
 
         ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
+
+        # Ensure provider config reflects runtime settings.
+        # Project-level provider settings (from conf.yml) always take
+        # precedence over app-level defaults (from boxman.yml).
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
 
         prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls.config['clusters'].items():
@@ -1022,20 +1901,11 @@ class BoxmanManager:
         """
         retval = []
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        if hasattr(cli_args, 'vms') and cli_args.vms:
-            for cluster_name, cluster in self.config['clusters'].items():
-               workdir = os.path.expanduser(cluster['workdir'])
-               for vm_name, _ in cluster['vms'].items():
-                   full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                   retval.append((full_vm_name, workdir))
-        else:
-            vm_names = []
-            for cluster_name, cluster in self.config['clusters'].items():
-                workdir = os.path.expanduser(cluster['workdir'])
-                for vm_name, _ in cluster['vms'].items():
-                    full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                    vm_names.append((full_vm_name, workdir))
-
+        for cluster_name, cluster in self.config['clusters'].items():
+            workdir = os.path.expanduser(cluster['workdir'])
+            for vm_name, _ in cluster['vms'].items():
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                retval.append((full_vm_name, workdir))
         return retval
 
     @staticmethod

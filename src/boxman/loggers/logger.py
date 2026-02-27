@@ -2,16 +2,13 @@ import logging
 import sys
 
 BLACK, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE = range(8)
-# The background is set with 40 plus the number of the color, and the
-# foreground with 30
 
-# These are the sequences need to get colored ouput
 RESET_SEQ = "\033[0m"
-COLOR_SEQ = "\033[1;%dm"
+COLOR_SEQ = "\033[%dm"
 BOLD_SEQ = "\033[1m"
 
 
-def formatter_message(message, use_color = True):
+def formatter_message(message, use_color=True):
     if use_color:
         message = message.replace("$RESET", RESET_SEQ).replace("$BOLD", BOLD_SEQ)
     else:
@@ -20,9 +17,9 @@ def formatter_message(message, use_color = True):
 
 COLORS = {
     'WARNING': YELLOW,
-    'INFO': WHITE,
+    'INFO': GREEN,
     'DEBUG': BLUE,
-    'CRITICAL': YELLOW,
+    'CRITICAL': MAGENTA,
     'ERROR': RED
 }
 
@@ -35,8 +32,14 @@ class ColoredFormatter(logging.Formatter):
     def format(self, record):
         levelname = record.levelname
         if self.use_color and levelname in COLORS:
-            levelname_color = COLOR_SEQ % (30 + COLORS[levelname]) + levelname + RESET_SEQ
-            record.levelname = levelname_color
+            color_code = 30 + COLORS[levelname]
+            levelname_color = (
+                COLOR_SEQ % color_code + BOLD_SEQ + levelname + RESET_SEQ
+            )
+            # Pad to a fixed visible width (8 chars) before adding ANSI codes
+            # so columns align. ANSI escapes add ~12 invisible chars.
+            pad = 8 - len(levelname)
+            record.levelname = levelname_color + " " * pad
         return logging.Formatter.format(self, record)
 
 
@@ -58,7 +61,7 @@ if not logger.handlers:
 
     # create formatter
     FORMAT = (
-        "[%(asctime)s %(levelname)-18s "
+        "[%(asctime)s %(levelname)s "
         "$BOLD%(filename)s{%(lineno)d}$RESET:%(funcName)s()] "
         "%(message)s"
     )

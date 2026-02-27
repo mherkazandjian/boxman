@@ -1,0 +1,53 @@
+[tool.poetry]
+name = "boxman"
+version = "0.9.0dev"
+description = "Boxman (box manager) – declarative VM/container provisioning via YAML"
+authors = ["John Smith <john@example.com>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://boxman.example.com"
+packages = [
+    { include = "boxman", from = "src" },
+]
+include = [
+    { path = "containers/docker/docker-compose.yml", format = ["sdist", "wheel"] },
+    { path = "containers/docker/Dockerfile", format = ["sdist", "wheel"] },
+    { path = "containers/docker/supervisord.conf", format = ["sdist", "wheel"] },
+    { path = "containers/docker/entrypoint.sh", format = ["sdist", "wheel"] },
+    { path = "containers/docker/.env", format = ["sdist", "wheel"] },
+]
+
+[tool.poetry.scripts]
+boxman = "boxman.scripts.app:main"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+PyYAML = "*"
+invoke = "*"
+Jinja2 = "*"
+lxml = "*"
+
+[tool.poetry.extras]
+docker-compose = ["docker"]
+
+[tool.poetry.group.runtime-docker.dependencies]
+docker = ">=7.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+ipython = "*"
+docker = ">=7.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+markers = [
+    "integration: integration tests requiring Docker with compose v2 and /dev/kvm",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:pkg_resources",
+    "ignore:pkg_resources is deprecated:DeprecationWarning",
+]

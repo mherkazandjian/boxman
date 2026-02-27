@@ -6,26 +6,38 @@ clean:
 	@find . -type d -name '__pycache__' -exec rm -fvr '{}' \; || true
 	@find . -type f -name '__pycache__' -exec rm -fv '{}' \; || true
 
-build:
-	@python setup.py build
+uninstall:
+	@pip uninstall -y boxman || true
 
-install:
-	@pip install .
+build:
+	@poetry build
+
+install: build
+	@pip install --force-reinstall dist/*.whl
+#	@poetry install
 
 cleaninstall:
 	@$(MAKE) clean
 	@$(MAKE) install
 
-fullinstall:
+full-reinstall:
 	@$(MAKE) clean
-	@pip uninstall boxman
+	@$(MAKE) uninstall
+	@poetry lock
 	@$(MAKE) install
+
 devipython:
-	@cd data/dev && PYTHONPATH=${PWD}/src:${PYTHONPATH} ipython
+	@cd data/dev && poetry run ipython
 
 devshell:
-	@cd data/dev && PYTHONPATH=${PWD}/src:${PYTHONPATH} bash
+	@cd data/dev && poetry run bash
 
+# .. todo:: this does not work as expected, since the bash env vars are not preserved. We need to source the env vars in the Makefile or use a wrapper script.
+# .. todo:: just a placeholder to be fixed later
+docs:
+	@docker run -it --rm --user $(id -u):$(id -g) --workdir="/home/${USER}" \
+		--volume="/etc/group:/etc/group:ro" --volume="/etc/passwd:/etc/passwd:ro" \
+		--volume="/etc/shadow:/etc/shadow:ro" -v $PWD:/work texlive/texlive:latest -c "cd /work/docs/tutorial && pdflatex boxman_beamer.tex"
 help:
 	@echo "For development"
 	@echo "   explicit steps"
@@ -39,3 +51,17 @@ help:
 	@echo "   using make ( .. todo:: this does not work as expected, sinc the bash env vars are not preserved)"
 	@echo "   	$ make devshell"
 	@echo "   	$ cd minimal"
+
+PYTEST_FLAGS ?=
+ifeq ($(verbose),1)
+PYTEST_FLAGS += -v
+endif
+ifdef pytest
+PYTEST_FLAGS += $(pytest)
+endif
+
+test: ## Run all tests (verbose=1, pytest_args="..." for extra flags)
+	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) tests/
+
+test-integration: ## Run docker-compose integration tests (verbose=1 for verbose output)
+	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_docker_compose.py

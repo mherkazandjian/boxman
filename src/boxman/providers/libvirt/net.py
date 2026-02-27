@@ -1,7 +1,8 @@
 import os
 import uuid
 import re
-import pkg_resources
+import sys
+from importlib import resources as importlib_resources
 from typing import Optional, Dict, Any, Union, List
 
 import tempfile
@@ -116,7 +117,7 @@ class Network(VirshCommand):
             XML string for the network definition
         """
         # get the path to the assets directory
-        assets_path = pkg_resources.resource_filename('boxman', 'assets')
+        assets_path = str(importlib_resources.files('boxman').joinpath('assets'))
 
         # create a jinja environment
         env = Environment(
@@ -158,10 +159,15 @@ class Network(VirshCommand):
             The path to the written file
         """
         xml_content = self.generate_xml()
-        with open(os.path.expanduser(file_path), 'w') as fobj:
+        abs_path = os.path.abspath(os.path.expanduser(file_path))
+        dir_path = os.path.dirname(abs_path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        with open(abs_path, 'w') as fobj:
             fobj.write(xml_content)
 
-        return file_path
+        log.info(f"wrote network XML to {abs_path} ({os.path.getsize(abs_path)} bytes)")
+        return abs_path
 
     def update_network_cache(self) -> bool:
         """
@@ -187,15 +193,30 @@ class Network(VirshCommand):
         """
         Check if there are any issues or conflicts with existing networks in the cache.
 
+        When running under a non-local runtime (e.g. docker-compose), only
+        projects registered under the **same** runtime are checked, because
+        each runtime has its own isolated libvirt instance.
+
         Returns:
             True if the network exists, False otherwise
         """
         self.manager.cache.read_projects_cache()
         projects_in_cache = self.manager.cache.projects
 
+        # Determine the current runtime scope for filtering
+        current_runtime = getattr(self.manager, '_runtime_name', 'local')
+
         conflicts = {}
         n_conflicts = 0
         for project_name, project_data in projects_in_cache.items():
+            # Skip projects from a different runtime scope
+            project_runtime = project_data.get('runtime', 'local')
+            if current_runtime != 'local' and project_runtime != current_runtime:
+                self.logger.debug(
+                    f"skipping project {project_name} (runtime={project_runtime}) "
+                    f"— current runtime is {current_runtime}")
+                continue
+
             conflicts[project_name] = {}
             if 'networks' in project_data:
                 conflicts[project_name]['networks'] = {}
@@ -243,15 +264,33 @@ class Network(VirshCommand):
         if not file_path:
             file_path = f"/tmp/{self.name}-network.xml"
 
-        self.write_xml(file_path)
+        # Resolve to an absolute path so the file is accessible both on the
+        # host and inside a bind-mounted docker-compose container.
+        file_path = os.path.abspath(os.path.expanduser(file_path))
+
+        written_path = self.write_xml(file_path)
+
+        # Verify the file was actually written before proceeding
+        if not os.path.isfile(written_path):
+            raise RuntimeError(
+                f"network XML file was not created at {written_path}")
 
         self.check_network_exists()
+
+        # Verify the bridge is not already in use before defining
+        active_bridges = self._get_libvirt_bridges()
+        if self.bridge_name in active_bridges:
+            self.logger.error(
+                f"bridge '{self.bridge_name}' is already in use by another "
+                f"active network. Cannot define network '{self.name}'.")
+            self._log_bridge_usage(self.bridge_name)
+            sys.exit(1)
 
         self.update_network_cache()
 
         # define the network
         try:
-            self.execute("net-define", file_path)
+            self.execute("net-define", written_path)
             self.execute("net-start", self.name)
             self.execute("net-autostart", self.name)
 
@@ -368,29 +407,21 @@ class Network(VirshCommand):
         """
         Find the first available virbrX name that is not in use.
 
+        Uses ``virsh net-list`` + ``virsh net-dumpxml`` to discover bridges
+        managed by libvirt in the **current runtime**, rather than ``brctl show``
+        which may leak host bridges into a container environment.
+
         Returns:
             The first available virbrX name
         """
-        # get a list of existing bridge interfaces using brctl
         try:
-            # create a shell command to execute brctl
-            cmd_executor = LibVirtCommandBase(
-                provider_config=self.provider_config,
-                override_config_use_sudo=False)
-            result = cmd_executor.execute("brctl", "show", hide=True, warn=True)
+            # Discover bridges via libvirt networks (runtime-aware)
+            existing_bridges = self._get_libvirt_bridges()
 
-            if not result.ok:
-                self.logger.warning("Failed to run brctl show, defaulting to virbr0")
-                return "virbr0"
-
-            # parse brctl output to find existing virbr bridges
-            existing_bridges = []
-            lines = result.stdout.splitlines()
-            if len(lines) > 1:  # Skip header line
-                for line in lines[1:]:
-                    parts = line.split()
-                    if parts and parts[0].startswith('virbr'):
-                        existing_bridges.append(parts[0])
+            # Also check the boxman cache for bridges registered under the
+            # same runtime scope
+            cached_bridges = self._get_cached_bridges()
+            existing_bridges.update(cached_bridges)
 
             # find the first unused virbr index
             used_indices = set()
@@ -410,6 +441,71 @@ class Network(VirshCommand):
             self.logger.error(f"Error finding available bridge name: {exc}")
             # return a default if all else fails
             return "virbr0"
+
+    def _get_libvirt_bridges(self) -> set:
+        """
+        Discover bridge names from libvirt networks using virsh commands.
+
+        This is runtime-aware: inside a docker-compose container it sees only
+        the container's libvirt networks, not host bridges.
+
+        Returns:
+            A set of bridge name strings (e.g. {'virbr0', 'virbr1'}).
+        """
+        bridges = set()
+        try:
+            network_names = Network.list_networks(provider_config=self.provider_config)
+            for net_name in network_names:
+                bridge = Network.get_bridge_from_network(
+                    net_name, provider_config=self.provider_config)
+                if bridge:
+                    bridges.add(bridge)
+        except Exception as exc:
+            self.logger.warning(f"failed to discover libvirt bridges: {exc}")
+        return bridges
+
+    def _get_cached_bridges(self) -> set:
+        """
+        Collect bridge names from the boxman cache, filtered by runtime scope.
+
+        Returns:
+            A set of bridge name strings from cached projects in the same runtime.
+        """
+        bridges = set()
+        if not self.manager:
+            return bridges
+
+        try:
+            self.manager.cache.read_projects_cache()
+            projects = self.manager.cache.projects or {}
+            current_runtime = getattr(self.manager, '_runtime_name', 'local')
+
+            for _project_name, project_data in projects.items():
+                # Only consider projects from the same runtime scope
+                project_runtime = project_data.get('runtime', 'local')
+                if current_runtime != 'local' and project_runtime != current_runtime:
+                    continue
+
+                for _net_name, net_info in project_data.get('networks', {}).items():
+                    bridge = net_info.get('bridge_name')
+                    if bridge:
+                        bridges.add(bridge)
+        except Exception as exc:
+            self.logger.warning(f"failed to read cached bridges: {exc}")
+        return bridges
+
+    def _log_bridge_usage(self, bridge_name: str) -> None:
+        """Log which libvirt networks are using the given bridge."""
+        try:
+            network_names = Network.list_networks(provider_config=self.provider_config)
+            for net_name in network_names:
+                bridge = Network.get_bridge_from_network(
+                    net_name, provider_config=self.provider_config)
+                if bridge == bridge_name:
+                    self.logger.error(
+                        f"  bridge '{bridge_name}' is used by network '{net_name}'")
+        except Exception as exc:
+            self.logger.warning(f"failed to enumerate bridge usage: {exc}")
 
     @staticmethod
     def _ensure_rule(cls,
@@ -801,7 +897,7 @@ class NetworkInterface(VirshCommand):
 
         try:
             # get the path to the assets directory
-            assets_path = pkg_resources.resource_filename('boxman', 'assets')
+            assets_path = str(importlib_resources.files('boxman').joinpath('assets'))
 
             # create a jinja environment
             env = Environment(
