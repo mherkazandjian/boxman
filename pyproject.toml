@@ -17,7 +17,7 @@ include = [
     { path = "containers/docker/entrypoint.sh", format = ["sdist", "wheel"] },
     { path = "containers/docker/.env", format = ["sdist", "wheel"] },
     { path = "containers/docker/README.md", format = ["sdist", "wheel"] },
-    { path = "boxes/*/conf.yml", format = ["sdist", "wheel"] },
+    { path = "boxes/**/*", format = ["sdist", "wheel"] },
 ]
 
 [tool.poetry.scripts]
