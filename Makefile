@@ -11,6 +11,7 @@ uninstall:
 
 build:
 	@poetry build
+	@python3 scripts/repackage_wheel.py dist/*.whl
 
 install: build
 	@pip install --force-reinstall dist/*.whl

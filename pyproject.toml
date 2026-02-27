@@ -12,9 +12,12 @@ packages = [
 include = [
     { path = "containers/docker/docker-compose.yml", format = ["sdist", "wheel"] },
     { path = "containers/docker/Dockerfile", format = ["sdist", "wheel"] },
+    { path = "containers/docker/Makefile", format = ["sdist", "wheel"] },
     { path = "containers/docker/supervisord.conf", format = ["sdist", "wheel"] },
     { path = "containers/docker/entrypoint.sh", format = ["sdist", "wheel"] },
     { path = "containers/docker/.env", format = ["sdist", "wheel"] },
+    { path = "containers/docker/README.md", format = ["sdist", "wheel"] },
+    { path = "boxes/*/conf.yml", format = ["sdist", "wheel"] },
 ]
 
 [tool.poetry.scripts]
