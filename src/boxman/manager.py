@@ -1437,16 +1437,18 @@ class BoxmanManager:
                 if ssh_success:
                     return True
             else:
-                # Log ssh-copy-id output through the logger
+                # Log ssh-copy-id output — warning for retries, error on last attempt
+                is_last = attempt == max_retries
+                log_fn = self.logger.error if is_last else self.logger.warning
                 combined = (result.stderr.strip() or result.stdout.strip())
                 if combined:
                     for line in combined.splitlines():
                         line = line.strip()
                         if not line:
                             continue
-                        self.logger.error(f"ssh-copy-id: {line}")
+                        log_fn(f"ssh-copy-id: {line}")
                 else:
-                    self.logger.error("ssh key addition failed (no output)")
+                    log_fn("ssh key addition failed (no output)")
 
             # wait before next attempt with exponential backoff
             time.sleep(wait_time)

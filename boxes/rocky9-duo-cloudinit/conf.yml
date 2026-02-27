@@ -26,51 +26,79 @@ workspace:
 templates:
   template1:
     name: rocky-9-minimal-base-template-cloudinit
-    image: https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+    image: https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+    #image: file:///path/to/local/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+    disk_size: 20G
+    os_variant: rocky9
+    memory: 2048
+    vcpus: 2
     cloudinit: |
       #cloud-config
-      hostname: rocky-cloudinit
+      hostname: hello-cloudinit
       manage_etc_hosts: true
 
-      network:
-        version: 2
-        ethernets:
-          default:
-            match:
-              name: "en*"
-            dhcp4: true
-            dhcp6: false
+      # Rocky GenericCloud images use NetworkManager — no Netplan syntax needed.
+      # cloud-init's default "dhcp on all interfaces" works out of the box.
 
       users:
-        - name: admin
+        - name: rocky
           lock_passwd: false
           groups: [wheel]
           sudo: "ALL=(ALL) NOPASSWD:ALL"
           shell: /bin/bash
+          # plain_text_passwd is the non-deprecated way to set a password
+          plain_text_passwd: rocky
 
       chpasswd:
         expire: false
-        list: |
-          admin:${env:BOXMAN_ADMIN_PASS}
 
       ssh_pwauth: true
       package_update: true
       packages:
         - qemu-guest-agent
         - openssh-server
-        - python3
+
+      # Ensure disk is grown to match the qcow2 resize (disk_size: 20G)
+      growpart:
+        mode: auto
+        devices: ['/']
+
+      resize_rootfs: true
+
+      write_files:
+        - path: /etc/hello-from-cloudinit
+          permissions: "0644"
+          content: |
+            hello world from cloud-init (Rocky Linux 9)
+        - path: /etc/NetworkManager/conf.d/90-dhcp-wait.conf
+          permissions: "0644"
+          content: |
+            [connection]
+            ipv4.dhcp-timeout=60
 
       runcmd:
+        - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - systemctl daemon-reload
         - systemctl enable --now qemu-guest-agent
-        - systemctl enable --now sshd
+        - systemctl restart NetworkManager || true
+        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
+        # create admin user via shell commands
+        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /home/admin -s /bin/bash admin" ]
+        - [ sh, -c, "usermod -aG wheel admin" ]
+        - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin" ]
+        - [ sh, -c, "chmod 0440 /etc/sudoers.d/admin" ]
+        - [ sh, -c, "echo 'admin:{{ env("BOXMAN_ADMIN_PASS", default="boxman") }}' | chpasswd" ]
         - [ sh, -c, "mkdir -p /home/admin/.ssh && chmod 700 /home/admin/.ssh && chown -R admin:admin /home/admin/.ssh" ]
+        # fix SELinux contexts after user/file creation
+        - restorecon -R /home/admin/.ssh || true
+        - restorecon /etc/sudoers.d/admin || true
 
 clusters:
   cluster_1:
     base_image: rocky-9-minimal-base-template-cloudinit
     proxy_host: localhost
     admin_user: admin
-    admin_pass: ${env:BOXMAN_ADMIN_PASS}
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
     admin_key_name: id_ed25519_boxman
     ssh_config: ssh_config
 
@@ -82,12 +110,27 @@ clusters:
           delay: '0'
         mac: '52:54:00:00:00:01'
         ip:
-          address: '192.168.50.1'
+          address: '192.168.10.1'
           netmask: '255.255.255.0'
           dhcp:
             range:
-              start: '192.168.50.2'
-              end: '192.168.50.254'
+              start: '192.168.10.2'
+              end: '192.168.10.254'
+        enable: True
+        autostart: True
+      isolated1:
+        mode: route
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:02'
+        ip:
+          address: '10.0.10.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '10.0.10.2'
+              end: '10.0.10.254'
         enable: True
         autostart: True
 
