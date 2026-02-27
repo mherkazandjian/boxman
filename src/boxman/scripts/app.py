@@ -519,6 +519,123 @@ def parse_args():
         dest='path',
     )
 
+    #
+    # sub parser for the 'run' subcommand
+    #
+    parser_run = subparsers.add_parser(
+        'run',
+        help='run tasks with the workspace environment loaded',
+        description=(
+            "Run named tasks or ad-hoc commands with environment variables\n"
+            "loaded from the workspace env file (env.sh).\n"
+            "\n"
+            "examples:\n"
+            "    # list available tasks\n"
+            "    $ boxman run --list\n"
+            "\n"
+            "    # run a named task\n"
+            "    $ boxman run ping\n"
+            "\n"
+            "    # run a task with extra arguments\n"
+            "    $ boxman run site -- --limit foo --tags=bar\n"
+            "\n"
+            "    # run an ad-hoc command with the workspace env loaded\n"
+            "    $ boxman run --cmd 'ansible all -m ping'\n"
+        ),
+        formatter_class=RawTextHelpFormatter
+    )
+    parser_run.set_defaults(func=BoxmanManager.run_task)
+
+    parser_run.add_argument(
+        'task_name',
+        type=str,
+        nargs='?',
+        default=None,
+        help='name of the task to run (defined in conf.yml tasks section)'
+    )
+    parser_run.add_argument(
+        'extra_args',
+        nargs='*',
+        default=[],
+        help='extra arguments passed to the task command'
+    )
+    parser_run.add_argument(
+        '--list', '-l',
+        action='store_true',
+        default=False,
+        help='list available tasks',
+        dest='list_tasks'
+    )
+    parser_run.add_argument(
+        '--cmd',
+        type=str,
+        default=None,
+        help='run an ad-hoc command with the workspace environment loaded',
+        dest='cmd'
+    )
+    parser_run.add_argument(
+        '--ansible-flags',
+        type=str,
+        default=None,
+        help='flags passed to ansible for --cmd',
+        dest='ansible_flags'
+    )
+    parser_run.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        help='cluster name to scope the workspace environment to',
+        dest='cluster'
+    )
+
+    # ── ps ───────────────────────────────────────────────────────────
+    parser_ps = subparsers.add_parser(
+        'ps',
+        help='show the state of VMs in the project',
+        description=(
+            "Display the current state of all VMs defined in the project\n"
+            "configuration.\n"
+            "\n"
+            "examples:\n"
+            "    $ boxman ps\n"
+        ),
+        formatter_class=RawTextHelpFormatter
+    )
+    parser_ps.set_defaults(func=BoxmanManager.ps)
+
+    # ── ssh ──────────────────────────────────────────────────────────
+    parser_ssh = subparsers.add_parser(
+        'ssh',
+        help='ssh into a VM',
+        description=(
+            "Open an interactive SSH session to a VM.\n"
+            "\n"
+            "Defaults to the gateway host (first VM) when no name is given.\n"
+            "\n"
+            "examples:\n"
+            "    $ boxman ssh\n"
+            "    $ boxman ssh cluster_1_node02\n"
+            "    $ boxman ssh node02\n"
+        ),
+        formatter_class=RawTextHelpFormatter
+    )
+    parser_ssh.set_defaults(func=BoxmanManager.ssh_session)
+
+    parser_ssh.add_argument(
+        'vm_name',
+        type=str,
+        nargs='?',
+        default=None,
+        help='VM name to ssh into (default: gateway host)'
+    )
+    parser_ssh.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        help='cluster name to scope the workspace environment to',
+        dest='cluster'
+    )
+
     return parser
 
 
@@ -778,7 +895,26 @@ def load_boxman_config(path: str) -> dict:
 def main():
 
     arg_parser = parse_args()
-    args = arg_parser.parse_args()
+    args, remaining = arg_parser.parse_known_args()
+
+    # parse_known_args may leave '--' and trailing positional args in
+    # *remaining* when unknown flags appear before '--'.  Split them
+    # back out so that extra_args is filled correctly.
+    if "--" in remaining:
+        sep_idx = remaining.index("--")
+        extra_after = remaining[sep_idx + 1:]
+        remaining = remaining[:sep_idx]
+        if hasattr(args, "extra_args"):
+            args.extra_args = (args.extra_args or []) + extra_after
+
+    # Only the 'run' subcommand accepts dynamic task flags;
+    # all other subcommands should reject unknown arguments.
+    if remaining and (
+        not hasattr(args, "func") or args.func != BoxmanManager.run_task
+    ):
+        arg_parser.error(f"unrecognized arguments: {' '.join(remaining)}")
+
+    args.remaining_args = remaining
 
     if args.version:
         print(f'v{boxman.metadata.version}')
@@ -792,6 +928,41 @@ def main():
         manager = BoxmanManager(config=None)
         args.func(manager, args)
         sys.exit(0)
+
+    # Handle 'ps' — needs config and virsh but not a full provider session
+    if args.func == BoxmanManager.ps:
+        manager = BoxmanManager(config=args.conf)
+        if not manager.config:
+            log.error("no project config found (conf.yml)")
+            sys.exit(1)
+        args.func(manager, args)
+        sys.exit(0)
+
+    # Handle 'run' — needs config but not a provider session or runtime
+    if args.func == BoxmanManager.run_task:
+        manager = BoxmanManager(config=args.conf)
+        if not manager.config:
+            log.error("no project config found (conf.yml)")
+            sys.exit(1)
+        if not manager.config.get("tasks") and not getattr(args, "cmd", None):
+            if not getattr(args, "list_tasks", False):
+                log.error(
+                    "no 'tasks' section found in conf.yml. "
+                    "Define tasks or use --cmd for ad-hoc commands."
+                )
+                sys.exit(1)
+        args.func(manager, args)
+        sys.exit(0)
+
+    # Handle 'ssh' — needs config but not a provider session or runtime
+    if args.func == BoxmanManager.ssh_session:
+        manager = BoxmanManager(config=args.conf)
+        if not manager.config:
+            log.error("no project config found (conf.yml)")
+            sys.exit(1)
+        args.func(manager, args)
+        sys.exit(0)
+
     else:
         # use the config of a deployment specified on the cmd line only if
         # not importing an image

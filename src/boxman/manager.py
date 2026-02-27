@@ -18,6 +18,7 @@ from boxman import log
 from boxman.runtime import create_runtime, RuntimeBase
 from boxman.utils.jinja_env import create_jinja_env
 from boxman.providers.libvirt.commands import VirshCommand
+from boxman.task_runner import TaskRunner
 
 class BoxmanManager:
     def __init__(self,
@@ -49,6 +50,7 @@ class BoxmanManager:
         if isinstance(config, str):
             self.config_path = config
             self.config = self.load_config(config)
+            self.resolve_workspace_defaults()
 
         self.cache = BoxmanCache()
 
@@ -147,8 +149,17 @@ class BoxmanManager:
         # create jinja environment with boxman helpers (env(), env_required(), etc.)
         env = create_jinja_env(config_dir)
 
-        # load the template
-        template = env.get_template(config_filename)
+        # Read raw content and convert bare {{ name }} placeholders to
+        # {name} markers before Jinja2 rendering.  Bare names (no parens,
+        # dots, pipes, etc.) are task-command placeholders, not real Jinja2
+        # expressions — real ones are function calls like {{ env("VAR") }}.
+        raw_path = os.path.join(config_dir, config_filename)
+        with open(raw_path) as fobj:
+            raw_content = fobj.read()
+        preserved = re.sub(r"\{\{\s*(\w+)\s*\}\}", r"{\1}", raw_content)
+
+        # load and render the template from the pre-processed string
+        template = env.from_string(preserved)
 
         # render the template
         # NOTE: pass os.environ as 'environ' (not 'env') to avoid shadowing
@@ -169,10 +180,126 @@ class BoxmanManager:
 
         return conf
 
+    def resolve_workspace_defaults(self) -> None:
+        """
+        Resolve workspace defaults for each cluster.
+
+        For each cluster:
+        - If workdir is not set, default to workspace.path / cluster_name
+
+        At the workspace level (written to workspace.path):
+        - Auto-generate env.sh, inventory/01-hosts.yml, and ansible.cfg
+        """
+        config = self.config
+        workspace = config.get('workspace', {})
+        workspace_path = workspace.get('path', '')
+        clusters = config.get('clusters', {})
+
+        # workspace-level files (written to workspace.path)
+        ws_files = workspace.setdefault('files', {})
+
+        for cluster_name, cluster in clusters.items():
+            # resolve workdir: explicit > workspace.path/cluster_name
+            if 'workdir' not in cluster:
+                if workspace_path:
+                    cluster['workdir'] = os.path.join(workspace_path, cluster_name)
+                else:
+                    self.logger.warning(
+                        f"cluster '{cluster_name}' has no workdir and "
+                        f"workspace.path is not set"
+                    )
+                    continue
+
+            workdir = cluster['workdir']
+            vms = cluster.get('vms', {})
+
+            if not vms:
+                continue
+
+            # --- env.sh (workspace-level) ---
+            if 'env.sh' not in ws_files:
+                first_vm = next(iter(vms))
+                ws_files['env.sh'] = (
+                    f"export INVENTORY=inventory\n"
+                    f"export SSH_CONFIG=ssh_config\n"
+                    f"export GATEWAYHOST={cluster_name}_{first_vm}\n"
+                    f"export ANSIBLE_CONFIG=ansible.cfg\n"
+                    f"export ANSIBLE_INVENTORY=\"$INVENTORY\"\n"
+                    f"export ANSIBLE_SSH_ARGS=\"-F $SSH_CONFIG\"\n"
+                )
+
+        # --- inventory/01-hosts.yml (workspace-level) ---
+        ws_inv_key = 'inventory/01-hosts.yml'
+        if ws_inv_key not in ws_files:
+            all_vms = []
+            for cname, cluster in clusters.items():
+                for vm_name in cluster.get('vms', {}).keys():
+                    all_vms.append((cname, vm_name))
+            if all_vms:
+                pad_width = len(str(len(all_vms) - 1)) if len(all_vms) > 1 else 1
+                lines = []
+                for i, (cname, vm) in enumerate(all_vms):
+                    alias = f"node{str(i).zfill(pad_width)}"
+                    lines.append(f'        {cname}_{vm}:\n          boxman_alias: "{alias}"')
+                host_lines = '\n'.join(lines)
+
+                # build children groups keyed by cluster name
+                cluster_groups = {}
+                for cname, vm in all_vms:
+                    cluster_groups.setdefault(cname, []).append(f'{cname}_{vm}')
+                children_lines = []
+                for cname, hosts in cluster_groups.items():
+                    children_lines.append(f'    {cname}:')
+                    children_lines.append(f'      hosts:')
+                    for h in hosts:
+                        children_lines.append(f'        {h}:')
+                children_section = '\n'.join(children_lines)
+
+                ws_files[ws_inv_key] = (
+                    f"---\n"
+                    f"all:\n"
+                    f"  hosts:\n"
+                    f"{host_lines}\n"
+                    f"  children:\n"
+                    f"{children_section}\n"
+                )
+
+        # --- ansible.cfg (workspace-level) ---
+        if 'ansible.cfg' not in ws_files:
+            ws_files['ansible.cfg'] = (
+                "[defaults]\n"
+                "host_key_checking = False\n"
+                "poll_interval = 5\n"
+                "callbacks_enabled = timer\n"
+                "forks = 10\n"
+                "nocows = 1\n"
+                "timeout = 30\n"
+                "interpreter_python = auto_silent\n"
+                "gathering = smart\n"
+                "fact_caching = jsonfile\n"
+                f"fact_caching_connection = {workspace_path}/.ansible_facts\n"
+                "fact_caching_timeout = 86400\n"
+                "ansible_managed = Ansible managed: {file} modified on "
+                "%Y-%m-%d %H:%M:%S by {uid} on {host}\n"
+                "\n"
+                "[ssh_connection]\n"
+                "pipelining = True\n"
+                "ssh_args = -o ControlMaster=auto -o ControlPersist=60s\n"
+                "control_path = /tmp/ansible-ssh-%%h-%%p-%%r\n"
+            )
+
     def provision_files(self) -> None:
         """
-        Provision files specified in the cluster configuration.
+        Provision files specified in the cluster and workspace configuration.
         """
+        # workspace-level files (e.g. env.sh) → written to workspace.path
+        workspace = self.config.get('workspace', {})
+        workspace_path = workspace.get('path', '')
+        if workspace_path:
+            if ws_files := workspace.get('files'):
+                write_files(ws_files, rootdir=workspace_path)
+
+        # cluster-level files → written to cluster workdir
         clusters = self.config['clusters']
         for cluster_name, cluster in clusters.items():
             if files := cluster.get('files'):
@@ -980,6 +1107,7 @@ class BoxmanManager:
         other connection details for all configured VMs.
         """
         self.logger.info("=== vm connection information ===")
+        ws_path = self.config.get('workspace', {}).get('path', '')
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
@@ -1004,8 +1132,9 @@ class BoxmanManager:
 
                 # get ssh connection information
                 admin_user = cluster.get('admin_user', '<placeholder>')
+                base_path = ws_path or cluster.get('workdir', '~')
                 admin_key = os.path.expanduser(os.path.join(
-                    cluster.get('workdir', '~'),
+                    base_path,
                     cluster.get('admin_key_name', 'id_ed25519_boxman')
                 ))
 
@@ -1018,10 +1147,10 @@ class BoxmanManager:
                 # show connection using ssh_config if available
                 if 'ssh_config' in cluster:
                     ssh_config = os.path.expanduser(os.path.join(
-                        cluster.get('workdir', '~'),
+                        base_path,
                         cluster.get('ssh_config', 'ssh_config')
                     ))
-                    self.logger.info(f"    via config: ssh -F {ssh_config} {hostname}")
+                    self.logger.info(f"    via config: ssh -F {ssh_config} {cluster_name}_{hostname}")
 
                 self.logger.info("")
 
@@ -1031,19 +1160,31 @@ class BoxmanManager:
         """
         Generate SSH configuration file for easy access to VMs.
 
-        Creates an SSH config file in the workdir of each cluster that allows
+        Creates an SSH config file in the workspace directory that allows
         simplified access to VMs without typing full connection details.
         """
+        ws_path = self.config.get('workspace', {}).get('path', '')
         prj_name = f'bprj__{self.config["project"]}__bprj'
+
+        # count total VMs across all clusters for zero-padded alias numbering
+        total_vms = sum(
+            len(cluster.get('vms', {}))
+            for cluster in self.config['clusters'].values()
+        )
+        pad_width = len(str(total_vms - 1)) if total_vms > 1 else 1
+        vm_counter = 0
+
         for cluster_name, cluster in self.config['clusters'].items():
+            base_path = ws_path or cluster.get('workdir', '~')
+
             # get the ssh config path
             ssh_config = os.path.expanduser(os.path.join(
-                cluster.get('workdir', '~'),
+                base_path,
                 cluster.get('ssh_config', 'ssh_config')
             ))
 
             admin_priv_key = os.path.expanduser(os.path.join(
-                cluster.get('workdir', '~'),
+                base_path,
                 cluster.get('admin_key_name', 'id_ed25519_boxman')
             ))
 
@@ -1060,6 +1201,9 @@ class BoxmanManager:
                 for vm_name, vm_info in cluster['vms'].items():
                     full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                     hostname = vm_info.get('hostname', vm_name)
+                    prefixed_host = f"{cluster_name}_{hostname}"
+                    padded_alias = f"node{str(vm_counter).zfill(pad_width)}"
+                    vm_counter += 1
 
                     # get the first ip address if available
                     ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
@@ -1067,7 +1211,7 @@ class BoxmanManager:
                     if ip_addresses:
                         first_ip = next(iter(ip_addresses.values()))
 
-                        fobj.write(f'Host {hostname}\n')
+                        fobj.write(f'Host {prefixed_host} {padded_alias}\n')
                         fobj.write(f'    Hostname {first_ip}\n')
                         fobj.write(f'    User {cluster.get("admin_user", "admin")}\n')
                         fobj.write(f'    IdentityFile {admin_priv_key}\n')
@@ -1084,27 +1228,29 @@ class BoxmanManager:
         """
         Generate SSH keys for connecting to VMs.
 
-        Creates an SSH key pair in each cluster's workdir if it doesn't already exist.
+        Creates an SSH key pair in the workspace directory if it doesn't
+        already exist.
 
         Returns:
             bool: True if successful, False otherwise
         """
         success = True
+        ws_path = self.config.get('workspace', {}).get('path', '')
 
         for _, cluster in self.config['clusters'].items():
-            workdir = os.path.expanduser(cluster['workdir'])
+            base_path = os.path.expanduser(ws_path or cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
 
-            admin_priv_key = os.path.join(workdir, admin_key_name)
-            admin_pub_key = os.path.join(workdir, f"{admin_key_name}.pub")
+            admin_priv_key = os.path.join(base_path, admin_key_name)
+            admin_pub_key = os.path.join(base_path, f"{admin_key_name}.pub")
 
-            # create workdir if it doesn't exist
-            if not os.path.isdir(workdir):
-                os.makedirs(workdir, exist_ok=True)
+            # create directory if it doesn't exist
+            if not os.path.isdir(base_path):
+                os.makedirs(base_path, exist_ok=True)
 
             # generate key pair if it doesn't exist
             if not os.path.exists(admin_priv_key):
-                self.logger.info(f"generating ssh key pair in {workdir}")
+                self.logger.info(f"generating ssh key pair in {base_path}")
 
                 try:
                     cmd = f'ssh-keygen -t ed25519 -a 100 -f {admin_priv_key} -q -N ""'
@@ -1219,12 +1365,13 @@ class BoxmanManager:
             bool: True if all VMs received the key successfully, False otherwise
         """
         all_successful = True
+        ws_path = self.config.get('workspace', {}).get('path', '')
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
-            workdir = os.path.expanduser(cluster['workdir'])
+            base_path = os.path.expanduser(ws_path or cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
-            admin_pub_key = os.path.join(workdir, f"{admin_key_name}.pub")
+            admin_pub_key = os.path.join(base_path, f"{admin_key_name}.pub")
 
             admin_user = cluster.get('admin_user', 'admin')
             admin_pass = self.fetch_value(cluster.get('admin_pass', None))
@@ -1262,13 +1409,15 @@ class BoxmanManager:
                 self.logger.info(f"adding ssh key to vm {vm_name} ({ip_address})...")
 
                 # try to add the key with exponential backoff
+                hostname = vm_info.get('hostname', vm_name)
+                prefixed_host = f"{cluster_name}_{hostname}"
                 success = self._try_add_ssh_key(
                     ip_address=ip_address,
-                    hostname=vm_info['hostname'],
+                    hostname=prefixed_host,
                     admin_user=admin_user,
                     admin_pass=admin_pass,
                     pub_key_path=admin_pub_key,
-                    ssh_conf_path=os.path.join(workdir, cluster['ssh_config'])
+                    ssh_conf_path=os.path.join(base_path, cluster['ssh_config'])
                 )
 
                 if success:
@@ -1333,16 +1482,18 @@ class BoxmanManager:
                 if ssh_success:
                     return True
             else:
-                # Log ssh-copy-id output through the logger
+                # Log ssh-copy-id output — warning for retries, error on last attempt
+                is_last = attempt == max_retries
+                log_fn = self.logger.error if is_last else self.logger.warning
                 combined = (result.stderr.strip() or result.stdout.strip())
                 if combined:
                     for line in combined.splitlines():
                         line = line.strip()
                         if not line:
                             continue
-                        self.logger.error(f"ssh-copy-id: {line}")
+                        log_fn(f"ssh-copy-id: {line}")
                 else:
-                    self.logger.error("ssh key addition failed (no output)")
+                    log_fn("ssh key addition failed (no output)")
 
             # wait before next attempt with exponential backoff
             time.sleep(wait_time)
@@ -1408,7 +1559,8 @@ class BoxmanManager:
             self.logger.error("failed to add ssh keys to some vms")
             return False
 
-        self.logger.info("\nssh access setup complete")
+        self.logger.info("")
+        self.logger.info("ssh access setup complete")
         self.logger.info("you can now connect to vms using the ssh config file")
 
         return True
@@ -1523,11 +1675,13 @@ class BoxmanManager:
         # -------------------- global config ---------------------------
 
         cluster = config['clusters'][cluster_group]
+        ws_path = config.get('workspace', {}).get('path', '')
         ssh_config = cluster['ssh_config']
         workdir = cluster['workdir']
         # -------------------- end global config -----------------------
 
-        ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
+        base_path = ws_path or workdir
+        ssh_config = os.path.expanduser(os.path.join(base_path, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
         if not os.path.isdir(workdir):
             os.makedirs(workdir)
@@ -1614,11 +1768,11 @@ class BoxmanManager:
             cls.logger.warning(
                 "Reached maximum wait time. Some vms may not have ip addresses.")
 
-        # display connection information
-        cls.connect_info()
-
         # generate ssh keys, add them to vms, and write ssh config
         cls.setup_ssh_access()
+
+        # display connection information (after ssh setup so connections are ready)
+        cls.connect_info()
 
     @staticmethod
     def up(cls, cli_args):
@@ -1798,11 +1952,13 @@ class BoxmanManager:
 
         cluster = config['clusters'][cluster_group]
         cluster_name = cluster_group
+        ws_path = config.get('workspace', {}).get('path', '')
         ssh_config = cluster['ssh_config']
         workdir = cluster['workdir']
         # -------------------- end global config -----------------------
 
-        ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
+        base_path = ws_path or workdir
+        ssh_config = os.path.expanduser(os.path.join(base_path, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
 
         # Ensure provider config reflects runtime settings.
@@ -2017,3 +2173,201 @@ class BoxmanManager:
             else:
                 cls.provider.start_vm(vm_name)
     ### end control vm functions ####
+
+    ### task runner functions ####
+
+    @staticmethod
+    def run_task(cls, cli_args):
+        """
+        Run a named task or ad-hoc command with the workspace environment.
+        """
+        runner = TaskRunner(
+            config=cls.config,
+            cluster_name=getattr(cli_args, "cluster", None),
+        )
+
+        if getattr(cli_args, "list_tasks", False):
+            tasks = runner.list_tasks()
+            if not tasks:
+                print("No tasks defined in conf.yml")
+                return
+            max_name = max(len(t["name"]) for t in tasks)
+            for task in tasks:
+                desc = task["description"]
+                print(f"  {task['name']:<{max_name}}  {desc}")
+            return
+
+        extra_args = getattr(cli_args, "extra_args", None) or []
+
+        if getattr(cli_args, "cmd", None):
+            exit_code = runner.run_command(
+                cli_args.cmd,
+                extra_args,
+                ansible_flags=getattr(cli_args, "ansible_flags", None),
+            )
+        else:
+            task_name = cli_args.task_name
+            remaining = getattr(cli_args, "remaining_args", [])
+
+            # Parse dynamic task flags from remaining CLI args based on
+            # {placeholder} markers in the task command.
+            task_flags = {}
+            if task_name and task_name in runner.tasks:
+                task_cmd = runner.tasks[task_name].get("command", "")
+                placeholders = TaskRunner.extract_placeholders(task_cmd)
+
+                if placeholders and remaining:
+                    placeholder_set = set(placeholders)
+                    i = 0
+                    while i < len(remaining):
+                        arg = remaining[i]
+                        if arg.startswith("--"):
+                            name = arg[2:].replace("-", "_")
+                            if name not in placeholder_set:
+                                log.error(f"unrecognized argument: {arg}")
+                                import sys
+                                sys.exit(1)
+                            if i + 1 >= len(remaining):
+                                log.error(f"argument {arg}: expected a value")
+                                import sys
+                                sys.exit(1)
+                            task_flags[name] = remaining[i + 1]
+                            i += 2
+                        else:
+                            log.error(f"unrecognized argument: {arg}")
+                            import sys
+                            sys.exit(1)
+                elif remaining:
+                    log.error(
+                        f"unrecognized arguments: {' '.join(remaining)}. "
+                        f"Task '{task_name}' has no {{placeholder}} markers "
+                        f"in its command."
+                    )
+                    import sys
+                    sys.exit(1)
+
+            exit_code = runner.run(task_name, extra_args, task_flags=task_flags)
+
+        if exit_code != 0:
+            import sys
+            sys.exit(exit_code)
+
+    def _get_vm_list(self) -> list[tuple[str, str, str]]:
+        """
+        Return the ordered list of VMs from the config.
+
+        Returns:
+            List of (cluster_name, vm_name, full_virsh_name) tuples.
+            The list index is the boxman VM id (0-based).
+        """
+        project = self.config.get("project", "")
+        prj_prefix = f"bprj__{project}__bprj_"
+        vms = []
+        for cluster_name, cluster in self.config.get("clusters", {}).items():
+            for vm_name in cluster.get("vms", {}).keys():
+                full_name = f"{prj_prefix}{cluster_name}_{vm_name}"
+                vms.append((cluster_name, vm_name, full_name))
+        return vms
+
+    def resolve_vm_name(self, identifier: str) -> str:
+        """
+        Resolve a VM identifier to the short name used in the workspace
+        (``{cluster}_{vm}``).
+
+        The identifier can be:
+        - A numeric boxman id (from ``boxman ps``)
+        - A VM name (returned as-is)
+
+        Raises:
+            ValueError: If the numeric id is out of range.
+        """
+        if identifier.isdigit():
+            vm_list = self._get_vm_list()
+            idx = int(identifier)
+            if idx < 0 or idx >= len(vm_list):
+                raise ValueError(
+                    f"VM id {idx} out of range (0-{len(vm_list) - 1})"
+                )
+            cluster_name, vm_name, _ = vm_list[idx]
+            return f"{cluster_name}_{vm_name}"
+        return identifier
+
+    @staticmethod
+    def ps(cls, cli_args):
+        """
+        Display the state of all project VMs in a table.
+        """
+        vm_list = cls._get_vm_list()
+
+        if not vm_list:
+            print("No VMs defined in configuration")
+            return
+
+        # Query virsh for states
+        provider_type = (
+            list(cls.config.get("provider", {}).keys())[0]
+            if "provider" in cls.config else "libvirt"
+        )
+        provider_config = cls.config.get("provider", {}).get(provider_type, {})
+        if cls.app_config and "providers" in cls.app_config:
+            app_prov = cls.app_config["providers"].get(provider_type, {})
+            merged = app_prov.copy()
+            merged.update(provider_config)
+            provider_config = merged
+
+        virsh = VirshCommand(provider_config=provider_config)
+        result = virsh.execute("list", "--all", hide=True, warn=True)
+
+        # Parse virsh output into {full_name: state}
+        vm_states: dict[str, str] = {}
+        if result.ok:
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if not line or line.startswith("---") or line.startswith("Id"):
+                    continue
+                parts = line.split(None, 2)
+                if len(parts) >= 3:
+                    vm_states[parts[1]] = parts[2].strip()
+
+        # Build table rows with 0-based ids
+        rows = []
+        for idx, (cluster_name, vm_name, full_name) in enumerate(vm_list):
+            state = vm_states.get(full_name, "not created")
+            rows.append((str(idx), cluster_name, vm_name, state))
+
+        # Print table
+        headers = ("Id", "Cluster", "VM", "State")
+        widths = [
+            max(len(headers[i]), *(len(r[i]) for r in rows))
+            for i in range(4)
+        ]
+        header_line = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
+        sep_line = "  ".join("-" * w for w in widths)
+        print(header_line)
+        print(sep_line)
+        for row in rows:
+            print("  ".join(val.ljust(w) for val, w in zip(row, widths)))
+
+    @staticmethod
+    def ssh_session(cls, cli_args):
+        """
+        Open an interactive SSH session to a VM.
+        """
+        vm_name = getattr(cli_args, "vm_name", None)
+
+        # Resolve numeric id to VM name
+        if vm_name:
+            vm_name = cls.resolve_vm_name(vm_name)
+
+        runner = TaskRunner(
+            config=cls.config,
+            cluster_name=getattr(cli_args, "cluster", None),
+        )
+
+        exit_code = runner.ssh_to_host(vm_name)
+
+        if exit_code != 0:
+            import sys
+            sys.exit(exit_code)
+
+    ### end task runner functions ####

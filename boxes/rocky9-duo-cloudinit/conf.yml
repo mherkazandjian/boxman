@@ -1,6 +1,6 @@
 ---
 version: '1.0'
-project: boxman_dev_tiny-rocky-9
+project: rocky9_duo
 provider:
   libvirt:
     uri: qemu:///system
@@ -9,6 +9,46 @@ provider:
     virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
     virsh_cmd: '/bin/virsh'
     verbose: True
+
+# workspace.path is the base directory for all cluster workdirs.
+# each cluster gets a subdirectory: workspace.path / cluster_name
+# e.g. ~/workspaces/boxman/rocky9-duo/cluster_1
+#
+# auto-generated in workspace.path:
+#   - env.sh
+#   - inventory/01-hosts.yml  (from the VMs defined across all clusters)
+#   - ansible.cfg
+#   - ssh_config              (generated at provision time by boxman)
+#   - ssh keys                (generated at provision time by boxman)
+workspace:
+  path: ~/workspaces/boxmandev/rocky9-duo
+  files:
+    ansible/site.yml: |
+      ---
+      - name: Ping all hosts
+        hosts: all
+        tasks:
+          - name: Ping
+            ansible.builtin.ping:
+
+    inventory/group_vars/all.yml: |
+      ---
+      timezone: UTC
+      base_packages:
+        - vim
+        - tmux
+        - htop
+        - tree
+
+    inventory/host_vars/cluster_1_node01.yml: |
+      ---
+      # node01-specific overrides
+      # node_role: gateway
+
+    inventory/host_vars/cluster_1_node02.yml: |
+      ---
+      # node02-specific overrides
+      # node_role: compute
 
 templates:
   template1:
@@ -80,9 +120,6 @@ templates:
         - restorecon -R /home/admin/.ssh || true
         - restorecon /etc/sudoers.d/admin || true
 
-workspace:
-  path: ~/workspaces/boxmandev/tiny-libvirt-rocky-9-cloudinit
-
 clusters:
   cluster_1:
     base_image: rocky-9-minimal-base-template-cloudinit
@@ -125,12 +162,12 @@ clusters:
         autostart: True
 
     vms:
-      boxman01:
-        hostname: boxman01
+      node01:
+        hostname: node01
         cpus:
           sockets: 1
           cores: 2
-          threads: 2
+          threads: 1
         memory: 2048
         disks:
           - name: disk01
@@ -143,7 +180,43 @@ clusters:
           - name: adapter_1
             link_state: 'up'
             network_source: 'nat1'
-          - name: adapter_2
+      node02:
+        hostname: node02
+        cpus:
+          sockets: 1
+          cores: 2
+          threads: 1
+        memory: 2048
+        disks:
+          - name: disk01
+            driver:
+              name: qemu
+              type: qcow2
+            target: vdb
+            size: 2048
+        network_adapters:
+          - name: adapter_1
             link_state: 'up'
-            network_source: 'isolated1'
+            network_source: 'nat1'
 
+
+tasks:
+  ping:
+    description: "ping all hosts via ansible"
+    command: ansible all {{ flags }} -m ansible.builtin.ping
+
+  cmd:
+    description: "run a shell command on all hosts"
+    command: ansible all {{ flags }} -m ansible.builtin.shell -a
+
+  site:
+    description: "run the full site playbook"
+    command: ansible-playbook {{ flags }} --become {{ env("ANSIBLE_SITE", default="ansible") }}/site.yml {{ tags }} --
+
+  playbook:
+    description: "run a specific playbook"
+    command: ansible-playbook {{ flags }} --become {{ env("ANSIBLE_SITE", default="ansible") }}/{{ playbook }} {{ tags }} --
+
+  ssh:
+    description: "ssh to the gateway host"
+    command: ssh -F ${SSH_CONFIG} -t ${GATEWAYHOST}

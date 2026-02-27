@@ -71,9 +71,11 @@ templates:
         - restorecon -R /home/admin/.ssh || true
         - restorecon /etc/sudoers.d/admin || true
 
+workspace:
+  path: ~/workspaces/boxmandev/tiny-libvirt-centos-7-cloudinit
+
 clusters:
   cluster_1:
-    workdir: ~/workspaces/boxmandev/tiny-libvirt-centos-7-cloudinit
     base_image: centos-7-minimal-base-template-cloudinit
     proxy_host: localhost
     admin_user: admin
@@ -136,11 +138,3 @@ clusters:
             link_state: 'up'
             network_source: 'isolated1'
 
-    files:
-      env.sh: |
-        export INVENTORY=inventory
-        export SSH_CONFIG=${HOME}/workspaces/boxmandev/tiny-libvirt-centos-7-cloudinit/ssh_config
-        export GATEWAYHOST=mgmt01
-        export ANSIBLE_CONFIG=${HOME}/workspaces/boxmandev/tiny-libvirt-centos-7-cloudinit/ansible.cfg
-        export ANSIBLE_INVENTORY="$INVENTORY"
-        export ANSIBLE_SSH_ARGS="-F $SSH_CONFIG"
