@@ -143,7 +143,7 @@ class TestEnvShGeneration:
         env_sh = config['workspace']['files']['env.sh']
         assert 'export INVENTORY=inventory' in env_sh
         assert 'export SSH_CONFIG=ssh_config' in env_sh
-        assert 'export GATEWAYHOST=node01' in env_sh
+        assert 'export GATEWAYHOST=c1_node01' in env_sh
         assert 'export ANSIBLE_CONFIG=ansible.cfg' in env_sh
         assert 'export ANSIBLE_INVENTORY="$INVENTORY"' in env_sh
         assert 'export ANSIBLE_SSH_ARGS="-F $SSH_CONFIG"' in env_sh
@@ -160,7 +160,7 @@ class TestEnvShGeneration:
         }
         mgr = _make_manager(config)
         env_sh = config['workspace']['files']['env.sh']
-        assert 'export GATEWAYHOST=alpha' in env_sh
+        assert 'export GATEWAYHOST=c1_alpha' in env_sh
 
     def test_env_sh_paths_are_relative(self):
         """SSH_CONFIG and ANSIBLE_CONFIG are relative paths (next to env.sh)."""
@@ -206,7 +206,9 @@ class TestWorkspaceInventoryGeneration:
         mgr = _make_manager(config)
         inv = config['workspace']['files']['inventory/01-hosts.yml']
         parsed = yaml.safe_load(inv)
-        assert set(parsed['all']['hosts'].keys()) == {'node01', 'node02'}
+        assert set(parsed['all']['hosts'].keys()) == {'c1_node01', 'c1_node02'}
+        assert parsed['all']['hosts']['c1_node01'] == {'boxman_alias': 'node0'}
+        assert parsed['all']['hosts']['c1_node02'] == {'boxman_alias': 'node1'}
 
     def test_workspace_inventory_aggregates_all_clusters(self):
         """Workspace-level inventory includes VMs from all clusters."""
@@ -220,7 +222,10 @@ class TestWorkspaceInventoryGeneration:
         mgr = _make_manager(config)
         inv = config['workspace']['files']['inventory/01-hosts.yml']
         parsed = yaml.safe_load(inv)
-        assert set(parsed['all']['hosts'].keys()) == {'web01', 'web02', 'db01'}
+        assert set(parsed['all']['hosts'].keys()) == {'web_web01', 'web_web02', 'db_db01'}
+        assert parsed['all']['hosts']['web_web01'] == {'boxman_alias': 'node0'}
+        assert parsed['all']['hosts']['web_web02'] == {'boxman_alias': 'node1'}
+        assert parsed['all']['hosts']['db_db01'] == {'boxman_alias': 'node2'}
 
     def test_workspace_inventory_not_overwritten_if_explicit(self):
         """User-provided workspace inventory is preserved."""

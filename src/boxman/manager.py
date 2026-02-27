@@ -213,7 +213,7 @@ class BoxmanManager:
                 ws_files['env.sh'] = (
                     f"export INVENTORY=inventory\n"
                     f"export SSH_CONFIG=ssh_config\n"
-                    f"export GATEWAYHOST={first_vm}\n"
+                    f"export GATEWAYHOST={cluster_name}_{first_vm}\n"
                     f"export ANSIBLE_CONFIG=ansible.cfg\n"
                     f"export ANSIBLE_INVENTORY=\"$INVENTORY\"\n"
                     f"export ANSIBLE_SSH_ARGS=\"-F $SSH_CONFIG\"\n"
@@ -223,10 +223,16 @@ class BoxmanManager:
         ws_inv_key = 'inventory/01-hosts.yml'
         if ws_inv_key not in ws_files:
             all_vms = []
-            for cluster in clusters.values():
-                all_vms.extend(cluster.get('vms', {}).keys())
+            for cname, cluster in clusters.items():
+                for vm_name in cluster.get('vms', {}).keys():
+                    all_vms.append((cname, vm_name))
             if all_vms:
-                host_lines = '\n'.join(f'        {vm}:' for vm in all_vms)
+                pad_width = len(str(len(all_vms) - 1)) if len(all_vms) > 1 else 1
+                lines = []
+                for i, (cname, vm) in enumerate(all_vms):
+                    alias = f"node{str(i).zfill(pad_width)}"
+                    lines.append(f'        {cname}_{vm}:\n          boxman_alias: "{alias}"')
+                host_lines = '\n'.join(lines)
                 ws_files[ws_inv_key] = (
                     f"---\n"
                     f"all:\n"
@@ -1134,6 +1140,15 @@ class BoxmanManager:
         """
         ws_path = self.config.get('workspace', {}).get('path', '')
         prj_name = f'bprj__{self.config["project"]}__bprj'
+
+        # count total VMs across all clusters for zero-padded alias numbering
+        total_vms = sum(
+            len(cluster.get('vms', {}))
+            for cluster in self.config['clusters'].values()
+        )
+        pad_width = len(str(total_vms - 1)) if total_vms > 1 else 1
+        vm_counter = 0
+
         for cluster_name, cluster in self.config['clusters'].items():
             base_path = ws_path or cluster.get('workdir', '~')
 
@@ -1161,6 +1176,9 @@ class BoxmanManager:
                 for vm_name, vm_info in cluster['vms'].items():
                     full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                     hostname = vm_info.get('hostname', vm_name)
+                    prefixed_host = f"{cluster_name}_{hostname}"
+                    padded_alias = f"node{str(vm_counter).zfill(pad_width)}"
+                    vm_counter += 1
 
                     # get the first ip address if available
                     ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
@@ -1168,7 +1186,7 @@ class BoxmanManager:
                     if ip_addresses:
                         first_ip = next(iter(ip_addresses.values()))
 
-                        fobj.write(f'Host {hostname}\n')
+                        fobj.write(f'Host {prefixed_host} {padded_alias}\n')
                         fobj.write(f'    Hostname {first_ip}\n')
                         fobj.write(f'    User {cluster.get("admin_user", "admin")}\n')
                         fobj.write(f'    IdentityFile {admin_priv_key}\n')
@@ -1366,9 +1384,11 @@ class BoxmanManager:
                 self.logger.info(f"adding ssh key to vm {vm_name} ({ip_address})...")
 
                 # try to add the key with exponential backoff
+                hostname = vm_info.get('hostname', vm_name)
+                prefixed_host = f"{cluster_name}_{hostname}"
                 success = self._try_add_ssh_key(
                     ip_address=ip_address,
-                    hostname=vm_info['hostname'],
+                    hostname=prefixed_host,
                     admin_user=admin_user,
                     admin_pass=admin_pass,
                     pub_key_path=admin_pub_key,
