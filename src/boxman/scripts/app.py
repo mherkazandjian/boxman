@@ -519,6 +519,68 @@ def parse_args():
         dest='path',
     )
 
+    #
+    # sub parser for the 'run' subcommand
+    #
+    parser_run = subparsers.add_parser(
+        'run',
+        help='run tasks with the workspace environment loaded',
+        description=(
+            "Run named tasks or ad-hoc commands with environment variables\n"
+            "loaded from the workspace env file (env.sh).\n"
+            "\n"
+            "examples:\n"
+            "    # list available tasks\n"
+            "    $ boxman run --list\n"
+            "\n"
+            "    # run a named task\n"
+            "    $ boxman run ping\n"
+            "\n"
+            "    # run a task with extra arguments\n"
+            "    $ boxman run site -- --limit foo --tags=bar\n"
+            "\n"
+            "    # run an ad-hoc command with the workspace env loaded\n"
+            "    $ boxman run --cmd 'ansible all -m ping'\n"
+        ),
+        formatter_class=RawTextHelpFormatter
+    )
+    parser_run.set_defaults(func=BoxmanManager.run_task)
+
+    parser_run.add_argument(
+        'task_name',
+        type=str,
+        nargs='?',
+        default=None,
+        help='name of the task to run (defined in conf.yml tasks section)'
+    )
+    parser_run.add_argument(
+        'extra_args',
+        nargs='*',
+        default=[],
+        help='extra arguments passed to the task command'
+    )
+    parser_run.add_argument(
+        '--list', '-l',
+        action='store_true',
+        default=False,
+        help='list available tasks',
+        dest='list_tasks'
+    )
+    parser_run.add_argument(
+        '--cmd',
+        type=str,
+        default=None,
+        help='run an ad-hoc command with the workspace environment loaded',
+        dest='cmd'
+    )
+    parser_run.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        help='cluster name to scope the workspace environment to',
+        dest='cluster'
+    )
+
     return parser
 
 
@@ -792,6 +854,23 @@ def main():
         manager = BoxmanManager(config=None)
         args.func(manager, args)
         sys.exit(0)
+
+    # Handle 'run' — needs config but not a provider session or runtime
+    if args.func == BoxmanManager.run_task:
+        manager = BoxmanManager(config=args.conf)
+        if not manager.config:
+            log.error("no project config found (conf.yml)")
+            sys.exit(1)
+        if not manager.config.get("tasks") and not getattr(args, "cmd", None):
+            if not getattr(args, "list_tasks", False):
+                log.error(
+                    "no 'tasks' section found in conf.yml. "
+                    "Define tasks or use --cmd for ad-hoc commands."
+                )
+                sys.exit(1)
+        args.func(manager, args)
+        sys.exit(0)
+
     else:
         # use the config of a deployment specified on the cmd line only if
         # not importing an image

@@ -18,6 +18,7 @@ from boxman import log
 from boxman.runtime import create_runtime, RuntimeBase
 from boxman.utils.jinja_env import create_jinja_env
 from boxman.providers.libvirt.commands import VirshCommand
+from boxman.task_runner import TaskRunner
 
 class BoxmanManager:
     def __init__(self,
@@ -49,6 +50,7 @@ class BoxmanManager:
         if isinstance(config, str):
             self.config_path = config
             self.config = self.load_config(config)
+            self.resolve_workspace_defaults()
 
         self.cache = BoxmanCache()
 
@@ -168,6 +170,88 @@ class BoxmanManager:
             self.logger.info(f"rendered YAML template written to {rendered_path}")
 
         return conf
+
+    def resolve_workspace_defaults(self) -> None:
+        """
+        Resolve workspace defaults for each cluster.
+
+        For each cluster:
+        - If workdir is not set, default to workspace.path / cluster_name
+        - Auto-generate inventory, ansible.cfg, and env.sh in the cluster's
+          files block based on the VMs defined in the cluster.
+        """
+        config = self.config
+        workspace = config.get('workspace', {})
+        workspace_path = workspace.get('path', '')
+        clusters = config.get('clusters', {})
+
+        for cluster_name, cluster in clusters.items():
+            # resolve workdir: explicit > workspace.path/cluster_name
+            if 'workdir' not in cluster:
+                if workspace_path:
+                    cluster['workdir'] = os.path.join(workspace_path, cluster_name)
+                else:
+                    self.logger.warning(
+                        f"cluster '{cluster_name}' has no workdir and "
+                        f"workspace.path is not set"
+                    )
+                    continue
+
+            workdir = cluster['workdir']
+            vms = cluster.get('vms', {})
+
+            if not vms:
+                continue
+
+            # build the auto-generated files
+            files = cluster.setdefault('files', {})
+
+            # --- inventory/01-hosts.yml ---
+            inv_key = 'inventory/01-hosts.yml'
+            if inv_key not in files:
+                host_lines = '\n'.join(f'        {vm}:' for vm in vms)
+                files[inv_key] = (
+                    f"---\n"
+                    f"all:\n"
+                    f"  hosts:\n"
+                    f"{host_lines}\n"
+                )
+
+            # --- ansible.cfg ---
+            if 'ansible.cfg' not in files:
+                files['ansible.cfg'] = (
+                    "[defaults]\n"
+                    "host_key_checking = False\n"
+                    "poll_interval = 5\n"
+                    "callbacks_enabled = timer\n"
+                    "forks = 10\n"
+                    "nocows = 1\n"
+                    "timeout = 30\n"
+                    "gathering = smart\n"
+                    "fact_caching = jsonfile\n"
+                    "fact_caching_connection = /root/.cache/ansible_facts\n"
+                    "fact_caching_timeout = 86400\n"
+                    "ansible_managed = Ansible managed: {file} modified on "
+                    "%Y-%m-%d %H:%M:%S by {uid} on {host}\n"
+                    "\n"
+                    "[ssh_connection]\n"
+                    "pipelining = True\n"
+                    "ssh_args = -o ControlMaster=auto -o ControlPersist=60s\n"
+                    "control_path = /tmp/ansible-ssh-%%h-%%p-%%r\n"
+                )
+
+            # --- env.sh ---
+            if 'env.sh' not in files:
+                expanded = os.path.expanduser(workdir)
+                first_vm = next(iter(vms))
+                files['env.sh'] = (
+                    f"export INVENTORY=inventory\n"
+                    f"export SSH_CONFIG={expanded}/ssh_config\n"
+                    f"export GATEWAYHOST={first_vm}\n"
+                    f"export ANSIBLE_CONFIG={expanded}/ansible.cfg\n"
+                    f"export ANSIBLE_INVENTORY=\"$INVENTORY\"\n"
+                    f"export ANSIBLE_SSH_ARGS=\"-F $SSH_CONFIG\"\n"
+                )
 
     def provision_files(self) -> None:
         """
@@ -2017,3 +2101,40 @@ class BoxmanManager:
             else:
                 cls.provider.start_vm(vm_name)
     ### end control vm functions ####
+
+    ### task runner functions ####
+
+    @staticmethod
+    def run_task(cls, cli_args):
+        """
+        Run a named task or ad-hoc command with the workspace environment.
+        """
+        runner = TaskRunner(
+            config=cls.config,
+            cluster_name=getattr(cli_args, "cluster", None),
+        )
+
+        if getattr(cli_args, "list_tasks", False):
+            tasks = runner.list_tasks()
+            if not tasks:
+                print("No tasks defined in conf.yml")
+                return
+            max_name = max(len(t["name"]) for t in tasks)
+            for task in tasks:
+                desc = task["description"]
+                print(f"  {task['name']:<{max_name}}  {desc}")
+            return
+
+        extra_args = getattr(cli_args, "extra_args", None) or []
+
+        if getattr(cli_args, "cmd", None):
+            exit_code = runner.run_command(cli_args.cmd, extra_args)
+        else:
+            task_name = cli_args.task_name
+            exit_code = runner.run(task_name, extra_args)
+
+        if exit_code != 0:
+            import sys
+            sys.exit(exit_code)
+
+    ### end task runner functions ####

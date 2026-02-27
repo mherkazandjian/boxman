@@ -1,0 +1,134 @@
+---
+version: '1.0'
+project: rocky9_duo
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/bin/virsh'
+    verbose: True
+
+templates:
+  template1:
+    name: rocky-9-minimal-base-template-cloudinit
+    image: https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+    cloudinit: |
+      #cloud-config
+      hostname: rocky-cloudinit
+      manage_etc_hosts: true
+
+      network:
+        version: 2
+        ethernets:
+          default:
+            match:
+              name: "en*"
+            dhcp4: true
+            dhcp6: false
+
+      users:
+        - name: admin
+          lock_passwd: false
+          groups: [wheel]
+          sudo: "ALL=(ALL) NOPASSWD:ALL"
+          shell: /bin/bash
+
+      chpasswd:
+        expire: false
+        list: |
+          admin:${env:BOXMAN_ADMIN_PASS}
+
+      ssh_pwauth: true
+      package_update: true
+      packages:
+        - qemu-guest-agent
+        - openssh-server
+        - python3
+
+      runcmd:
+        - systemctl enable --now qemu-guest-agent
+        - systemctl enable --now sshd
+        - [ sh, -c, "mkdir -p /home/admin/.ssh && chmod 700 /home/admin/.ssh && chown -R admin:admin /home/admin/.ssh" ]
+
+clusters:
+  cluster_1:
+    base_image: rocky-9-minimal-base-template-cloudinit
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: ${env:BOXMAN_ADMIN_PASS}
+    admin_key_name: id_ed25519_boxman
+    ssh_config: ssh_config
+
+    networks:
+      nat1:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:01'
+        ip:
+          address: '192.168.50.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.50.2'
+              end: '192.168.50.254'
+        enable: True
+        autostart: True
+
+    vms:
+      node01:
+        hostname: node01
+        cpus:
+          sockets: 1
+          cores: 2
+          threads: 1
+        memory: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+      node02:
+        hostname: node02
+        cpus:
+          sockets: 1
+          cores: 2
+          threads: 1
+        memory: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+
+# workspace.path is the base directory for all cluster workdirs.
+# each cluster gets a subdirectory: workspace.path / cluster_name
+# e.g. ~/workspaces/boxman/rocky9-duo/cluster_1
+#
+# the following files are auto-generated in each cluster workdir:
+#   - inventory/01-hosts.yml  (from the VMs defined in the cluster)
+#   - ansible.cfg
+#   - env.sh
+#   - ssh_config              (generated at provision time by boxman)
+workspace:
+  path: ~/workspaces/boxman/rocky9-duo
+
+tasks:
+  ping:
+    description: "ping all hosts via ansible"
+    command: >
+      ansible -i ${INVENTORY}
+      --ssh-extra-args '-F ${SSH_CONFIG}'
+      all -m ansible.builtin.ping
+
+  cmd:
+    description: "run a shell command on all hosts"
+    command: >
+      ansible -i ${INVENTORY}
+      --ssh-extra-args '-F ${SSH_CONFIG}'
+      all -m ansible.builtin.shell -a
+
+  ssh:
+    description: "ssh to the gateway host"
+    command: ssh -F ${SSH_CONFIG} -t ${GATEWAYHOST}
