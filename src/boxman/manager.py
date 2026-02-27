@@ -233,11 +233,26 @@ class BoxmanManager:
                     alias = f"node{str(i).zfill(pad_width)}"
                     lines.append(f'        {cname}_{vm}:\n          boxman_alias: "{alias}"')
                 host_lines = '\n'.join(lines)
+
+                # build children groups keyed by cluster name
+                cluster_groups = {}
+                for cname, vm in all_vms:
+                    cluster_groups.setdefault(cname, []).append(f'{cname}_{vm}')
+                children_lines = []
+                for cname, hosts in cluster_groups.items():
+                    children_lines.append(f'    {cname}:')
+                    children_lines.append(f'      hosts:')
+                    for h in hosts:
+                        children_lines.append(f'        {h}:')
+                children_section = '\n'.join(children_lines)
+
                 ws_files[ws_inv_key] = (
                     f"---\n"
                     f"all:\n"
                     f"  hosts:\n"
                     f"{host_lines}\n"
+                    f"  children:\n"
+                    f"{children_section}\n"
                 )
 
         # --- ansible.cfg (workspace-level) ---

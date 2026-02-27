@@ -209,6 +209,9 @@ class TestWorkspaceInventoryGeneration:
         assert set(parsed['all']['hosts'].keys()) == {'c1_node01', 'c1_node02'}
         assert parsed['all']['hosts']['c1_node01'] == {'boxman_alias': 'node0'}
         assert parsed['all']['hosts']['c1_node02'] == {'boxman_alias': 'node1'}
+        # cluster group
+        assert 'c1' in parsed['all']['children']
+        assert set(parsed['all']['children']['c1']['hosts'].keys()) == {'c1_node01', 'c1_node02'}
 
     def test_workspace_inventory_aggregates_all_clusters(self):
         """Workspace-level inventory includes VMs from all clusters."""
@@ -226,6 +229,10 @@ class TestWorkspaceInventoryGeneration:
         assert parsed['all']['hosts']['web_web01'] == {'boxman_alias': 'node0'}
         assert parsed['all']['hosts']['web_web02'] == {'boxman_alias': 'node1'}
         assert parsed['all']['hosts']['db_db01'] == {'boxman_alias': 'node2'}
+        # cluster groups
+        assert set(parsed['all']['children'].keys()) == {'web', 'db'}
+        assert set(parsed['all']['children']['web']['hosts'].keys()) == {'web_web01', 'web_web02'}
+        assert set(parsed['all']['children']['db']['hosts'].keys()) == {'db_db01'}
 
     def test_workspace_inventory_not_overwritten_if_explicit(self):
         """User-provided workspace inventory is preserved."""
