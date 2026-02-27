@@ -14,17 +14,11 @@ Example conf.yml::
     tasks:
       ping:
         description: "Ping all hosts via ansible"
-        command: >
-          ansible -i ${INVENTORY}
-          --ssh-extra-args '-F ${SSH_CONFIG}'
-          all -m ansible.builtin.ping
+        command: ansible all -m ansible.builtin.ping
 
       site:
         description: "Run ansible site playbook"
-        command: >
-          ansible-playbook -i ${INVENTORY}
-          --ssh-extra-args '-F ${SSH_CONFIG}'
-          --become ansible/site.yml
+        command: ansible-playbook --become ansible/site.yml
 
 Usage::
 
@@ -146,12 +140,15 @@ class TaskRunner:
         log.info(f"running task '{task_name}'")
         log.debug(f"command: {command}")
 
-        # Resolve workdir: task-level > workspace-level > cluster workdir > cwd
+        # Resolve workdir: task-level > workspace.workdir > workspace.path > cluster workdir > cwd
         workdir = task.get(
             "workdir",
             self.workspace_config.get(
                 "workdir",
-                self.cluster_config.get("workdir", None),
+                self.workspace_config.get(
+                    "path",
+                    self.cluster_config.get("workdir", None),
+                ),
             ),
         )
         if workdir:
@@ -189,7 +186,10 @@ class TaskRunner:
 
         workdir = self.workspace_config.get(
             "workdir",
-            self.cluster_config.get("workdir", None),
+            self.workspace_config.get(
+                "path",
+                self.cluster_config.get("workdir", None),
+            ),
         )
         if workdir:
             workdir = os.path.expanduser(workdir)

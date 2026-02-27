@@ -144,24 +144,15 @@ workspace:
 tasks:
   ping:
     description: "ping all hosts via ansible"
-    command: >
-      ansible -i ${INVENTORY}
-      --ssh-extra-args '-F ${SSH_CONFIG}'
-      all -m ansible.builtin.ping
+    command: ansible all -m ansible.builtin.ping
 
   site:
     description: "run ansible site playbook"
-    command: >
-      ansible-playbook -i ${INVENTORY}
-      --ssh-extra-args '-F ${SSH_CONFIG}'
-      --become ansible/site.yml
+    command: ansible-playbook --become ansible/site.yml
 
   cmd:
     description: "run a shell command on all hosts"
-    command: >
-      ansible -i ${INVENTORY}
-      --ssh-extra-args '-F ${SSH_CONFIG}'
-      all -m ansible.builtin.shell -a
+    command: ansible all -m ansible.builtin.shell -a
 
   ssh:
     description: "ssh to the gateway host"

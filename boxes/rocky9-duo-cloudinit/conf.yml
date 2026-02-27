@@ -176,17 +176,11 @@ clusters:
 tasks:
   ping:
     description: "ping all hosts via ansible"
-    command: >
-      ansible -i ${INVENTORY}
-      --ssh-extra-args '-F ${SSH_CONFIG}'
-      all -m ansible.builtin.ping
+    command: ansible all -m ansible.builtin.ping
 
   cmd:
     description: "run a shell command on all hosts"
-    command: >
-      ansible -i ${INVENTORY}
-      --ssh-extra-args '-F ${SSH_CONFIG}'
-      all -m ansible.builtin.shell -a
+    command: ansible all -m ansible.builtin.shell -a
 
   ssh:
     description: "ssh to the gateway host"

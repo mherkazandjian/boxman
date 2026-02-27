@@ -265,9 +265,10 @@ class BoxmanManager:
                 "forks = 10\n"
                 "nocows = 1\n"
                 "timeout = 30\n"
+                "interpreter_python = auto_silent\n"
                 "gathering = smart\n"
                 "fact_caching = jsonfile\n"
-                "fact_caching_connection = /root/.cache/ansible_facts\n"
+                f"fact_caching_connection = {workspace_path}/.ansible_facts\n"
                 "fact_caching_timeout = 86400\n"
                 "ansible_managed = Ansible managed: {file} modified on "
                 "%Y-%m-%d %H:%M:%S by {uid} on {host}\n"
@@ -1140,7 +1141,7 @@ class BoxmanManager:
                         base_path,
                         cluster.get('ssh_config', 'ssh_config')
                     ))
-                    self.logger.info(f"    via config: ssh -F {ssh_config} {hostname}")
+                    self.logger.info(f"    via config: ssh -F {ssh_config} {cluster_name}_{hostname}")
 
                 self.logger.info("")
 
