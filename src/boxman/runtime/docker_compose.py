@@ -448,6 +448,12 @@ class DockerComposeRuntime(RuntimeBase):
                 if _has_compose(candidate):
                     return candidate
 
+            # Wheel data-files location: <prefix>/share/boxman/containers/docker
+            candidate = os.path.join(sys.prefix, "share", "boxman",
+                                     "containers", "docker")
+            if _has_compose(candidate):
+                return candidate
+
         except Exception as exc:
             log.debug(f"_find_asset_source_dir: exception: {exc}")
 
