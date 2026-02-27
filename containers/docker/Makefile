@@ -1,3 +1,7 @@
+# Load runtime-generated .env (written by boxman's DockerComposeRuntime)
+# so that BOXMAN_INSTANCE_NAME, BOXMAN_DATA_DIR, etc. match the running container.
+-include .env
+
 export HOST_UID := $(shell id -u)
 export HOST_GID := $(shell id -g)
 
