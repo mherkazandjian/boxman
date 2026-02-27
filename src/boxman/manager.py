@@ -177,13 +177,18 @@ class BoxmanManager:
 
         For each cluster:
         - If workdir is not set, default to workspace.path / cluster_name
-        - Auto-generate inventory, ansible.cfg, and env.sh in the cluster's
+        - Auto-generate inventory and ansible.cfg in the cluster's
           files block based on the VMs defined in the cluster.
+        - Auto-generate env.sh in the workspace-level files block
+          (written to workspace.path, not the cluster workdir).
         """
         config = self.config
         workspace = config.get('workspace', {})
         workspace_path = workspace.get('path', '')
         clusters = config.get('clusters', {})
+
+        # workspace-level files (written to workspace.path)
+        ws_files = workspace.setdefault('files', {})
 
         for cluster_name, cluster in clusters.items():
             # resolve workdir: explicit > workspace.path/cluster_name
@@ -240,11 +245,11 @@ class BoxmanManager:
                     "control_path = /tmp/ansible-ssh-%%h-%%p-%%r\n"
                 )
 
-            # --- env.sh ---
-            if 'env.sh' not in files:
+            # --- env.sh (workspace-level) ---
+            if 'env.sh' not in ws_files:
                 expanded = os.path.expanduser(workdir)
                 first_vm = next(iter(vms))
-                files['env.sh'] = (
+                ws_files['env.sh'] = (
                     f"export INVENTORY=inventory\n"
                     f"export SSH_CONFIG={expanded}/ssh_config\n"
                     f"export GATEWAYHOST={first_vm}\n"
@@ -255,8 +260,16 @@ class BoxmanManager:
 
     def provision_files(self) -> None:
         """
-        Provision files specified in the cluster configuration.
+        Provision files specified in the cluster and workspace configuration.
         """
+        # workspace-level files (e.g. env.sh) → written to workspace.path
+        workspace = self.config.get('workspace', {})
+        workspace_path = workspace.get('path', '')
+        if workspace_path:
+            if ws_files := workspace.get('files'):
+                write_files(ws_files, rootdir=workspace_path)
+
+        # cluster-level files → written to cluster workdir
         clusters = self.config['clusters']
         for cluster_name, cluster in clusters.items():
             if files := cluster.get('files'):

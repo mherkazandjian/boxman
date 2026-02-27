@@ -82,14 +82,15 @@ class TestLoadWorkspaceEnv:
         result = load_workspace_env(cluster, workspace)
         assert result["INVENTORY"] == "my_inventory"
 
-    def test_falls_back_to_cluster_files_env_sh(self, tmp_path):
+    def test_falls_back_to_workspace_files_env_sh(self, tmp_path):
         env_file = tmp_path / "env.sh"
         env_file.write_text("export SSH_CONFIG=my_ssh_config\n")
-        cluster = {
-            "workdir": str(tmp_path),
+        cluster = {"workdir": str(tmp_path)}
+        workspace = {
+            "path": str(tmp_path),
             "files": {"env.sh": "export SSH_CONFIG=my_ssh_config\n"},
         }
-        result = load_workspace_env(cluster, workspace_config=None)
+        result = load_workspace_env(cluster, workspace_config=workspace)
         assert result["SSH_CONFIG"] == "my_ssh_config"
 
     def test_explicit_overrides_take_precedence(self, tmp_path):

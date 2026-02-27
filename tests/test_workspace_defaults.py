@@ -160,8 +160,8 @@ class TestAnsibleCfgGeneration:
 
 class TestEnvShGeneration:
 
-    def test_env_sh_generated(self):
-        """env.sh is auto-generated with expected exports."""
+    def test_env_sh_generated_at_workspace_level(self):
+        """env.sh is auto-generated in workspace.files with expected exports."""
         config = {
             'workspace': {'path': '/tmp/ws'},
             'clusters': {
@@ -169,7 +169,7 @@ class TestEnvShGeneration:
             },
         }
         mgr = _make_manager(config)
-        env_sh = config['clusters']['c1']['files']['env.sh']
+        env_sh = config['workspace']['files']['env.sh']
         assert 'export INVENTORY=inventory' in env_sh
         assert 'export SSH_CONFIG=' in env_sh
         assert 'ssh_config' in env_sh
@@ -178,6 +178,8 @@ class TestEnvShGeneration:
         assert 'ansible.cfg' in env_sh
         assert 'export ANSIBLE_INVENTORY="$INVENTORY"' in env_sh
         assert 'export ANSIBLE_SSH_ARGS="-F $SSH_CONFIG"' in env_sh
+        # env.sh should NOT be in the cluster files
+        assert 'env.sh' not in config['clusters']['c1'].get('files', {})
 
     def test_env_sh_gateway_is_first_vm(self):
         """GATEWAYHOST is set to the first VM in the cluster."""
@@ -188,7 +190,7 @@ class TestEnvShGeneration:
             },
         }
         mgr = _make_manager(config)
-        env_sh = config['clusters']['c1']['files']['env.sh']
+        env_sh = config['workspace']['files']['env.sh']
         assert 'export GATEWAYHOST=alpha' in env_sh
 
     def test_env_sh_paths_use_expanded_workdir(self):
@@ -200,25 +202,27 @@ class TestEnvShGeneration:
             },
         }
         mgr = _make_manager(config)
-        env_sh = config['clusters']['c1']['files']['env.sh']
+        env_sh = config['workspace']['files']['env.sh']
         expanded = os.path.expanduser('~/my/workspace/c1')
         assert f'export SSH_CONFIG={expanded}/ssh_config' in env_sh
         assert f'export ANSIBLE_CONFIG={expanded}/ansible.cfg' in env_sh
 
     def test_env_sh_not_overwritten_if_explicit(self):
-        """User-provided env.sh is preserved."""
+        """User-provided env.sh in workspace.files is preserved."""
         custom_env = "export FOO=bar\n"
         config = {
-            'workspace': {'path': '/tmp/ws'},
+            'workspace': {
+                'path': '/tmp/ws',
+                'files': {'env.sh': custom_env},
+            },
             'clusters': {
                 'c1': {
                     'vms': {'vm01': {}},
-                    'files': {'env.sh': custom_env},
                 },
             },
         }
         mgr = _make_manager(config)
-        assert config['clusters']['c1']['files']['env.sh'] == custom_env
+        assert config['workspace']['files']['env.sh'] == custom_env
 
 
 class TestEdgeCases:
@@ -266,8 +270,9 @@ class TestEdgeCases:
         files = config['clusters']['c1']['files']
         # ansible.cfg kept as-is
         assert files['ansible.cfg'] == custom_cfg
-        # inventory and env.sh auto-generated
+        # inventory auto-generated in cluster files
         assert 'inventory/01-hosts.yml' in files
-        assert 'env.sh' in files
         inv = yaml.safe_load(files['inventory/01-hosts.yml'])
         assert set(inv['all']['hosts'].keys()) == {'vm01', 'vm02'}
+        # env.sh auto-generated at workspace level
+        assert 'env.sh' in config['workspace']['files']

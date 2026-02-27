@@ -105,15 +105,16 @@ def load_workspace_env(
         log.info(f"sourcing workspace env_file: {env_file}")
         env_vars.update(source_env_file(env_file))
 
-    # 2. Fall back to cluster files.env.sh if no explicit env_file
-    elif "files" in cluster_config and "env.sh" in cluster_config["files"]:
-        env_sh_path = os.path.join(workdir, "env.sh")
+    # 2. Fall back to workspace files.env.sh if no explicit env_file
+    elif "files" in workspace_config and "env.sh" in workspace_config["files"]:
+        ws_path = os.path.expanduser(workspace_config.get("path", workdir))
+        env_sh_path = os.path.join(ws_path, "env.sh")
         if os.path.isfile(env_sh_path):
-            log.info(f"sourcing cluster env.sh: {env_sh_path}")
+            log.info(f"sourcing workspace env.sh: {env_sh_path}")
             env_vars.update(source_env_file(env_sh_path))
         else:
             log.warning(
-                f"cluster defines files.env.sh but {env_sh_path} does not exist "
+                f"workspace defines files.env.sh but {env_sh_path} does not exist "
                 f"(run 'boxman provision' first to generate it)"
             )
 
