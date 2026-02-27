@@ -22,6 +22,33 @@ provider:
 #   - ssh keys                (generated at provision time by boxman)
 workspace:
   path: ~/workspaces/boxmandev/rocky9-duo
+  files:
+    ansible/site.yml: |
+      ---
+      - name: Ping all hosts
+        hosts: all
+        tasks:
+          - name: Ping
+            ansible.builtin.ping:
+
+    inventory/group_vars/all.yml: |
+      ---
+      timezone: UTC
+      base_packages:
+        - vim
+        - tmux
+        - htop
+        - tree
+
+    inventory/host_vars/cluster_1_node01.yml: |
+      ---
+      # node01-specific overrides
+      # node_role: gateway
+
+    inventory/host_vars/cluster_1_node02.yml: |
+      ---
+      # node02-specific overrides
+      # node_role: compute
 
 templates:
   template1:
@@ -181,6 +208,14 @@ tasks:
   cmd:
     description: "run a shell command on all hosts"
     command: ansible all {{ flags }} -m ansible.builtin.shell -a
+
+  site:
+    description: "run the full site playbook"
+    command: ansible-playbook {{ flags }} --become {{ env("ANSIBLE_SITE", default="ansible") }}/site.yml {{ tags }} --
+
+  playbook:
+    description: "run a specific playbook"
+    command: ansible-playbook {{ flags }} --become {{ env("ANSIBLE_SITE", default="ansible") }}/{{ playbook }} {{ tags }} --
 
   ssh:
     description: "ssh to the gateway host"
