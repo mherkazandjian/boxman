@@ -2252,4 +2252,122 @@ class BoxmanManager:
             import sys
             sys.exit(exit_code)
 
+    def _get_vm_list(self) -> list[tuple[str, str, str]]:
+        """
+        Return the ordered list of VMs from the config.
+
+        Returns:
+            List of (cluster_name, vm_name, full_virsh_name) tuples.
+            The list index is the boxman VM id (0-based).
+        """
+        project = self.config.get("project", "")
+        prj_prefix = f"bprj__{project}__bprj_"
+        vms = []
+        for cluster_name, cluster in self.config.get("clusters", {}).items():
+            for vm_name in cluster.get("vms", {}).keys():
+                full_name = f"{prj_prefix}{cluster_name}_{vm_name}"
+                vms.append((cluster_name, vm_name, full_name))
+        return vms
+
+    def resolve_vm_name(self, identifier: str) -> str:
+        """
+        Resolve a VM identifier to the short name used in the workspace
+        (``{cluster}_{vm}``).
+
+        The identifier can be:
+        - A numeric boxman id (from ``boxman ps``)
+        - A VM name (returned as-is)
+
+        Raises:
+            ValueError: If the numeric id is out of range.
+        """
+        if identifier.isdigit():
+            vm_list = self._get_vm_list()
+            idx = int(identifier)
+            if idx < 0 or idx >= len(vm_list):
+                raise ValueError(
+                    f"VM id {idx} out of range (0-{len(vm_list) - 1})"
+                )
+            cluster_name, vm_name, _ = vm_list[idx]
+            return f"{cluster_name}_{vm_name}"
+        return identifier
+
+    @staticmethod
+    def ps(cls, cli_args):
+        """
+        Display the state of all project VMs in a table.
+        """
+        vm_list = cls._get_vm_list()
+
+        if not vm_list:
+            print("No VMs defined in configuration")
+            return
+
+        # Query virsh for states
+        provider_type = (
+            list(cls.config.get("provider", {}).keys())[0]
+            if "provider" in cls.config else "libvirt"
+        )
+        provider_config = cls.config.get("provider", {}).get(provider_type, {})
+        if cls.app_config and "providers" in cls.app_config:
+            app_prov = cls.app_config["providers"].get(provider_type, {})
+            merged = app_prov.copy()
+            merged.update(provider_config)
+            provider_config = merged
+
+        virsh = VirshCommand(provider_config=provider_config)
+        result = virsh.execute("list", "--all", hide=True, warn=True)
+
+        # Parse virsh output into {full_name: state}
+        vm_states: dict[str, str] = {}
+        if result.ok:
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if not line or line.startswith("---") or line.startswith("Id"):
+                    continue
+                parts = line.split(None, 2)
+                if len(parts) >= 3:
+                    vm_states[parts[1]] = parts[2].strip()
+
+        # Build table rows with 0-based ids
+        rows = []
+        for idx, (cluster_name, vm_name, full_name) in enumerate(vm_list):
+            state = vm_states.get(full_name, "not created")
+            rows.append((str(idx), cluster_name, vm_name, state))
+
+        # Print table
+        headers = ("Id", "Cluster", "VM", "State")
+        widths = [
+            max(len(headers[i]), *(len(r[i]) for r in rows))
+            for i in range(4)
+        ]
+        header_line = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
+        sep_line = "  ".join("-" * w for w in widths)
+        print(header_line)
+        print(sep_line)
+        for row in rows:
+            print("  ".join(val.ljust(w) for val, w in zip(row, widths)))
+
+    @staticmethod
+    def ssh_session(cls, cli_args):
+        """
+        Open an interactive SSH session to a VM.
+        """
+        vm_name = getattr(cli_args, "vm_name", None)
+
+        # Resolve numeric id to VM name
+        if vm_name:
+            vm_name = cls.resolve_vm_name(vm_name)
+
+        runner = TaskRunner(
+            config=cls.config,
+            cluster_name=getattr(cli_args, "cluster", None),
+        )
+
+        exit_code = runner.ssh_to_host(vm_name)
+
+        if exit_code != 0:
+            import sys
+            sys.exit(exit_code)
+
     ### end task runner functions ####

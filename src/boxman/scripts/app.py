@@ -588,6 +588,54 @@ def parse_args():
         dest='cluster'
     )
 
+    # ── ps ───────────────────────────────────────────────────────────
+    parser_ps = subparsers.add_parser(
+        'ps',
+        help='show the state of VMs in the project',
+        description=(
+            "Display the current state of all VMs defined in the project\n"
+            "configuration.\n"
+            "\n"
+            "examples:\n"
+            "    $ boxman ps\n"
+        ),
+        formatter_class=RawTextHelpFormatter
+    )
+    parser_ps.set_defaults(func=BoxmanManager.ps)
+
+    # ── ssh ──────────────────────────────────────────────────────────
+    parser_ssh = subparsers.add_parser(
+        'ssh',
+        help='ssh into a VM',
+        description=(
+            "Open an interactive SSH session to a VM.\n"
+            "\n"
+            "Defaults to the gateway host (first VM) when no name is given.\n"
+            "\n"
+            "examples:\n"
+            "    $ boxman ssh\n"
+            "    $ boxman ssh cluster_1_node02\n"
+            "    $ boxman ssh node02\n"
+        ),
+        formatter_class=RawTextHelpFormatter
+    )
+    parser_ssh.set_defaults(func=BoxmanManager.ssh_session)
+
+    parser_ssh.add_argument(
+        'vm_name',
+        type=str,
+        nargs='?',
+        default=None,
+        help='VM name to ssh into (default: gateway host)'
+    )
+    parser_ssh.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        help='cluster name to scope the workspace environment to',
+        dest='cluster'
+    )
+
     return parser
 
 
@@ -881,6 +929,15 @@ def main():
         args.func(manager, args)
         sys.exit(0)
 
+    # Handle 'ps' — needs config and virsh but not a full provider session
+    if args.func == BoxmanManager.ps:
+        manager = BoxmanManager(config=args.conf)
+        if not manager.config:
+            log.error("no project config found (conf.yml)")
+            sys.exit(1)
+        args.func(manager, args)
+        sys.exit(0)
+
     # Handle 'run' — needs config but not a provider session or runtime
     if args.func == BoxmanManager.run_task:
         manager = BoxmanManager(config=args.conf)
@@ -894,6 +951,15 @@ def main():
                     "Define tasks or use --cmd for ad-hoc commands."
                 )
                 sys.exit(1)
+        args.func(manager, args)
+        sys.exit(0)
+
+    # Handle 'ssh' — needs config but not a provider session or runtime
+    if args.func == BoxmanManager.ssh_session:
+        manager = BoxmanManager(config=args.conf)
+        if not manager.config:
+            log.error("no project config found (conf.yml)")
+            sys.exit(1)
         args.func(manager, args)
         sys.exit(0)
 

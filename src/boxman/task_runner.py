@@ -269,3 +269,49 @@ class TaskRunner:
         )
 
         return result.returncode
+
+    def ssh_to_host(self, vm_name: Optional[str] = None) -> int:
+        """
+        Open an interactive SSH session to a VM.
+
+        Uses SSH_CONFIG and GATEWAYHOST from the workspace environment.
+        Defaults to the gateway host when *vm_name* is not given.
+
+        Args:
+            vm_name: The VM to connect to.  If ``None``, uses GATEWAYHOST.
+
+        Returns:
+            The exit code of the ssh process.
+        """
+        host = vm_name or self.env.get("GATEWAYHOST", "")
+        if not host:
+            raise RuntimeError(
+                "no VM name given and GATEWAYHOST is not set in the workspace environment"
+            )
+
+        ssh_config = self.env.get("SSH_CONFIG", "")
+        command = f"ssh -F {ssh_config} -t {host}" if ssh_config else f"ssh -t {host}"
+
+        workdir = self.workspace_config.get(
+            "workdir",
+            self.workspace_config.get(
+                "path",
+                self.cluster_config.get("workdir", None),
+            ),
+        )
+        if workdir:
+            workdir = os.path.expanduser(workdir)
+
+        log.info(f"ssh to '{host}'")
+        self._log_env()
+        log.info(f"workdir: {workdir or os.getcwd()}")
+        log.info(f"command: {command}")
+
+        result = subprocess.run(
+            command,
+            shell=True,
+            env=self.env,
+            cwd=workdir,
+        )
+
+        return result.returncode
