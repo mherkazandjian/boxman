@@ -53,8 +53,14 @@ class TemplateManager:
         else:
             src_path = os.path.expanduser(image_uri)
 
+        if not src_path:
+            raise FileNotFoundError(
+                f"base image path is empty (uri='{image_uri}'). "
+                f"Check that 'image:' is set in the template config.")
+
         if not os.path.exists(src_path):
-            raise FileNotFoundError(f"base image not found: {src_path}")
+            raise FileNotFoundError(
+                f"base image not found: '{src_path}' (uri='{image_uri}')")
 
         # copy to dest_dir preserving the filename
         basename = os.path.basename(src_path)

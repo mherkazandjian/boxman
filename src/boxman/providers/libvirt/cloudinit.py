@@ -332,8 +332,16 @@ class CloudInitTemplate:
             return self._download_image(self.image_path, dst_path)
 
         # Local file copy
+        if not self.image_path:
+            self.logger.error(
+                "base cloud image path is empty. "
+                "Check that 'image:' (not 'file:') is set in the template config.")
+            return False
+
         if not os.path.exists(self.image_path):
-            self.logger.error(f"base cloud image not found: {self.image_path}")
+            self.logger.error(
+                f"base cloud image not found: '{self.image_path}' "
+                f"(resolved from template config 'image' field)")
             return False
 
         self.logger.info(f"copying base image {self.image_path} -> {dst_path}")

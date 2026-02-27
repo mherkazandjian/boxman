@@ -13,7 +13,8 @@ provider:
 templates:
   template1:
     name: rocky-9-minimal-base-template-cloudinit
-    image: https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+    #image: https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+    #image: file:///path/to/local/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
     disk_size: 20G
     os_variant: rocky9
     memory: 2048

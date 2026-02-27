@@ -163,7 +163,7 @@ class Virtualbox:
                                host: str = None,
                                port: str = None,
                                timeout: int = 10,
-                               n_try: int = 5,
+                               n_try: int = 10,
                                no_raise: bool = True):
         """
         Return True if the ssh server is up otherwise False
@@ -174,7 +174,7 @@ class Virtualbox:
         match_bytes = b'SSH'
         for attempt_no in range(n_try):
 
-            print(f'attempt {attempt_no} to check ssh server status')
+            log(f'attempt {attempt_no} to check ssh server status')
             try:
                 with socket.create_connection((host, int(port)), timeout=timeout) as sock:
                     data = sock.recv(256)
@@ -182,7 +182,7 @@ class Virtualbox:
                         is_up = True
                         break
             except (OSError, ConnectionRefusedError, TimeoutError):
-                print('connection failed, try again')
+                log('connection failed, try again')
 
             if is_up:
                 break

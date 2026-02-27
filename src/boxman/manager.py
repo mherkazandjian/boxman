@@ -348,6 +348,14 @@ class BoxmanManager:
 
             tpl_name = tpl_conf.get('name', tpl_key)
             image_path = tpl_conf.get('image', '')
+
+            # Common typo: 'file' instead of 'image'
+            if not image_path and 'file' in tpl_conf:
+                image_path = tpl_conf['file']
+                self.logger.warning(
+                    f"template '{tpl_key}': 'file' is not a valid key, "
+                    f"did you mean 'image'? Using '{image_path}' as the image path.")
+
             cloudinit_userdata = tpl_conf.get('cloudinit', None)
             cloudinit_metadata = tpl_conf.get('cloudinit_metadata', None)
             cloudinit_network_config = tpl_conf.get('cloudinit_network_config', None)
@@ -1291,7 +1299,7 @@ class BoxmanManager:
             bool: True if successful, False otherwise
         """
         wait_time = 1  # Start with 1 second
-        max_retries = 5
+        max_retries = 10
         max_wait = 60  # Maximum wait per attempt
 
         for attempt in range(1, max_retries + 1):
@@ -1309,16 +1317,30 @@ class BoxmanManager:
             # inside the container, so wrap the command with docker exec.
             cmd = self.runtime_instance.wrap_command(cmd)
 
-            result = run(cmd, hide=False, warn=True)
+            result = run(cmd, hide=True, warn=True)
 
             if result.ok:
+                # Log ssh-copy-id informational output
+                if result.stdout.strip():
+                    for line in result.stdout.strip().splitlines():
+                        self.logger.info(f"ssh-copy-id: {line}")
+
                 # verify we can ssh without password
                 ssh_success = self._verify_ssh_connection(hostname, ssh_conf_path)
 
                 if ssh_success:
                     return True
             else:
-                self.logger.error(f"ssh key addition failed: {result.stderr.strip()}")
+                # Log ssh-copy-id output through the logger
+                combined = (result.stderr.strip() or result.stdout.strip())
+                if combined:
+                    for line in combined.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        self.logger.error(f"ssh-copy-id: {line}")
+                else:
+                    self.logger.error("ssh key addition failed (no output)")
 
             # wait before next attempt with exponential backoff
             time.sleep(wait_time)
