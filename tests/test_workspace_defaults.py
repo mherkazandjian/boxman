@@ -74,8 +74,8 @@ class TestWorkdirResolution:
 
 class TestInventoryGeneration:
 
-    def test_inventory_contains_all_vms(self):
-        """Auto-generated inventory lists every VM in the cluster."""
+    def test_inventory_not_in_cluster_files(self):
+        """Inventory is NOT auto-generated in cluster files."""
         config = {
             'workspace': {'path': '/tmp/ws'},
             'clusters': {
@@ -83,43 +83,12 @@ class TestInventoryGeneration:
                     'vms': {
                         'node01': {'hostname': 'node01'},
                         'node02': {'hostname': 'node02'},
-                        'node03': {'hostname': 'node03'},
                     },
                 },
             },
         }
         mgr = _make_manager(config)
-        inv = config['clusters']['c1']['files']['inventory/01-hosts.yml']
-        parsed = yaml.safe_load(inv)
-        assert set(parsed['all']['hosts'].keys()) == {'node01', 'node02', 'node03'}
-
-    def test_inventory_single_vm(self):
-        """Inventory works with a single VM."""
-        config = {
-            'workspace': {'path': '/tmp/ws'},
-            'clusters': {
-                'solo': {'vms': {'only01': {}}},
-            },
-        }
-        mgr = _make_manager(config)
-        inv = config['clusters']['solo']['files']['inventory/01-hosts.yml']
-        parsed = yaml.safe_load(inv)
-        assert list(parsed['all']['hosts'].keys()) == ['only01']
-
-    def test_inventory_not_overwritten_if_explicit(self):
-        """User-provided inventory in files: block is preserved."""
-        custom_inv = "---\nall:\n  hosts:\n    custom01:\n"
-        config = {
-            'workspace': {'path': '/tmp/ws'},
-            'clusters': {
-                'c1': {
-                    'vms': {'node01': {}},
-                    'files': {'inventory/01-hosts.yml': custom_inv},
-                },
-            },
-        }
-        mgr = _make_manager(config)
-        assert config['clusters']['c1']['files']['inventory/01-hosts.yml'] == custom_inv
+        assert 'inventory/01-hosts.yml' not in config['clusters']['c1'].get('files', {})
 
 
 class TestAnsibleCfgGeneration:
@@ -225,6 +194,51 @@ class TestEnvShGeneration:
         assert config['workspace']['files']['env.sh'] == custom_env
 
 
+class TestWorkspaceInventoryGeneration:
+
+    def test_workspace_inventory_generated(self):
+        """inventory/01-hosts.yml is auto-generated in workspace.files."""
+        config = {
+            'workspace': {'path': '/tmp/ws'},
+            'clusters': {
+                'c1': {'vms': {'node01': {}, 'node02': {}}},
+            },
+        }
+        mgr = _make_manager(config)
+        inv = config['workspace']['files']['inventory/01-hosts.yml']
+        parsed = yaml.safe_load(inv)
+        assert set(parsed['all']['hosts'].keys()) == {'node01', 'node02'}
+
+    def test_workspace_inventory_aggregates_all_clusters(self):
+        """Workspace-level inventory includes VMs from all clusters."""
+        config = {
+            'workspace': {'path': '/tmp/ws'},
+            'clusters': {
+                'web': {'vms': {'web01': {}, 'web02': {}}},
+                'db': {'vms': {'db01': {}}},
+            },
+        }
+        mgr = _make_manager(config)
+        inv = config['workspace']['files']['inventory/01-hosts.yml']
+        parsed = yaml.safe_load(inv)
+        assert set(parsed['all']['hosts'].keys()) == {'web01', 'web02', 'db01'}
+
+    def test_workspace_inventory_not_overwritten_if_explicit(self):
+        """User-provided workspace inventory is preserved."""
+        custom_inv = "---\nall:\n  hosts:\n    custom01:\n"
+        config = {
+            'workspace': {
+                'path': '/tmp/ws',
+                'files': {'inventory/01-hosts.yml': custom_inv},
+            },
+            'clusters': {
+                'c1': {'vms': {'vm01': {}}},
+            },
+        }
+        mgr = _make_manager(config)
+        assert config['workspace']['files']['inventory/01-hosts.yml'] == custom_inv
+
+
 class TestEdgeCases:
 
     def test_cluster_with_no_vms_skipped(self):
@@ -270,9 +284,8 @@ class TestEdgeCases:
         files = config['clusters']['c1']['files']
         # ansible.cfg kept as-is
         assert files['ansible.cfg'] == custom_cfg
-        # inventory auto-generated in cluster files
-        assert 'inventory/01-hosts.yml' in files
-        inv = yaml.safe_load(files['inventory/01-hosts.yml'])
-        assert set(inv['all']['hosts'].keys()) == {'vm01', 'vm02'}
-        # env.sh auto-generated at workspace level
+        # inventory NOT in cluster files
+        assert 'inventory/01-hosts.yml' not in files
+        # env.sh and inventory auto-generated at workspace level
         assert 'env.sh' in config['workspace']['files']
+        assert 'inventory/01-hosts.yml' in config['workspace']['files']

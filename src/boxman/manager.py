@@ -211,17 +211,6 @@ class BoxmanManager:
             # build the auto-generated files
             files = cluster.setdefault('files', {})
 
-            # --- inventory/01-hosts.yml ---
-            inv_key = 'inventory/01-hosts.yml'
-            if inv_key not in files:
-                host_lines = '\n'.join(f'        {vm}:' for vm in vms)
-                files[inv_key] = (
-                    f"---\n"
-                    f"all:\n"
-                    f"  hosts:\n"
-                    f"{host_lines}\n"
-                )
-
             # --- ansible.cfg ---
             if 'ansible.cfg' not in files:
                 files['ansible.cfg'] = (
@@ -256,6 +245,21 @@ class BoxmanManager:
                     f"export ANSIBLE_CONFIG={expanded}/ansible.cfg\n"
                     f"export ANSIBLE_INVENTORY=\"$INVENTORY\"\n"
                     f"export ANSIBLE_SSH_ARGS=\"-F $SSH_CONFIG\"\n"
+                )
+
+        # --- inventory/01-hosts.yml (workspace-level) ---
+        ws_inv_key = 'inventory/01-hosts.yml'
+        if ws_inv_key not in ws_files:
+            all_vms = []
+            for cluster in clusters.values():
+                all_vms.extend(cluster.get('vms', {}).keys())
+            if all_vms:
+                host_lines = '\n'.join(f'        {vm}:' for vm in all_vms)
+                ws_files[ws_inv_key] = (
+                    f"---\n"
+                    f"all:\n"
+                    f"  hosts:\n"
+                    f"{host_lines}\n"
                 )
 
     def provision_files(self) -> None:
