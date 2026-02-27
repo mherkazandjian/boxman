@@ -102,15 +102,16 @@ class TaskRunner:
         from the workspace env file.  Cached after first access.
         """
         if self._env is None:
-            workspace_vars = load_workspace_env(
+            self._workspace_vars = load_workspace_env(
                 self.cluster_config, self.workspace_config
             )
             self._env = os.environ.copy()
-            self._env.update(workspace_vars)
+            self._env.update(self._workspace_vars)
 
             # Also set INFRA to the project name if not already set
             if "INFRA" not in self._env and "project" in self.config:
                 self._env["INFRA"] = self.config["project"]
+                self._workspace_vars["INFRA"] = self.config["project"]
 
         return self._env
 
@@ -128,6 +129,13 @@ class TaskRunner:
                 "description": task.get("description", ""),
             })
         return result
+
+    def _log_env(self) -> None:
+        """Log workspace environment variables at info level."""
+        # Access self.env to ensure _workspace_vars is populated
+        self.env
+        for key in sorted(self._workspace_vars):
+            log.info(f"  {key}={self._workspace_vars[key]}")
 
     @staticmethod
     def extract_placeholders(command: str) -> List[str]:
@@ -180,9 +188,6 @@ class TaskRunner:
         if extra_args:
             command = command + " " + " ".join(extra_args)
 
-        log.info(f"running task '{task_name}'")
-        log.info(f"command: {command}")
-
         # Resolve workdir: task-level > workspace.workdir > workspace.path > cluster workdir > cwd
         workdir = task.get(
             "workdir",
@@ -196,6 +201,11 @@ class TaskRunner:
         )
         if workdir:
             workdir = os.path.expanduser(workdir)
+
+        log.info(f"running task '{task_name}'")
+        self._log_env()
+        log.info(f"workdir: {workdir or os.getcwd()}")
+        log.info(f"command: {command}")
 
         result = subprocess.run(
             command,
@@ -234,8 +244,6 @@ class TaskRunner:
         if ansible_flags:
             ansible_cmd = ansible_cmd + " " + ansible_flags
 
-        log.info(f"running ad-hoc command")
-        log.info(f"command: {ansible_cmd}")
         command = ansible_cmd
 
         workdir = self.workspace_config.get(
@@ -247,6 +255,11 @@ class TaskRunner:
         )
         if workdir:
             workdir = os.path.expanduser(workdir)
+
+        log.info(f"running ad-hoc command")
+        self._log_env()
+        log.info(f"workdir: {workdir or os.getcwd()}")
+        log.info(f"command: {ansible_cmd}")
 
         result = subprocess.run(
             command,
