@@ -371,6 +371,299 @@ class TestDockerComposeRuntime:
             assert "/home/user/libvirt-tiny" in inject_calls[0]
 
 
+class TestDockerComposeDestroyRuntime:
+
+    @patch("boxman.runtime.docker_compose.invoke.run")
+    def test_destroy_runtime_cleans_data_dirs_inside_container(self, mock_run):
+        """When the container is running, destroy_runtime should exec rm -rf
+        inside it before running docker compose down."""
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        rt.project_dir = "/tmp/test-project"
+
+        mock_inspect_running = MagicMock(ok=True, stdout="true\n")
+        mock_rm = MagicMock(ok=True)
+        mock_down = MagicMock(ok=True)
+        mock_run.side_effect = [mock_inspect_running, mock_rm, mock_down]
+
+        with patch.object(rt, "get_compose_file_path",
+                          return_value="/tmp/test-project/.boxman/runtime/docker/docker-compose.yml"):
+            result = rt.destroy_runtime()
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        # Second call should be the in-container cleanup
+        assert "docker exec --user root" in calls[1]
+        assert "rm -rf" in calls[1]
+        assert "/var/run/libvirt/*" in calls[1]
+        assert "/var/lib/libvirt/images/*" in calls[1]
+        assert "/etc/boxman/ssh/*" in calls[1]
+        # Third call should be docker compose down
+        assert "down --volumes --remove-orphans" in calls[2]
+        assert result == "/tmp/test-project/.boxman"
+
+    @patch("boxman.runtime.docker_compose.invoke.run")
+    def test_destroy_runtime_skips_cleanup_when_container_not_running(self, mock_run):
+        """When the container is not running, destroy_runtime should skip
+        the in-container cleanup and go straight to docker compose down."""
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        rt.project_dir = "/tmp/test-project"
+
+        mock_inspect_not_running = MagicMock(ok=True, stdout="false\n")
+        mock_down = MagicMock(ok=True)
+        mock_run.side_effect = [mock_inspect_not_running, mock_down]
+
+        with patch.object(rt, "get_compose_file_path",
+                          return_value="/tmp/test-project/.boxman/runtime/docker/docker-compose.yml"):
+            result = rt.destroy_runtime()
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert len(calls) == 2
+        # First call is the inspect, second is compose down
+        assert "docker inspect" in calls[0]
+        assert "down --volumes --remove-orphans" in calls[1]
+        assert result == "/tmp/test-project/.boxman"
+
+    @patch("boxman.runtime.docker_compose.invoke.run")
+    def test_destroy_runtime_continues_if_cleanup_fails(self, mock_run):
+        """If the in-container cleanup fails, destroy_runtime should still
+        proceed with docker compose down."""
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        rt.project_dir = "/tmp/test-project"
+
+        mock_inspect_running = MagicMock(ok=True, stdout="true\n")
+        mock_run.side_effect = [
+            mock_inspect_running,
+            Exception("container exec failed"),
+            MagicMock(ok=True),  # compose down
+        ]
+
+        with patch.object(rt, "get_compose_file_path",
+                          return_value="/tmp/test-project/.boxman/runtime/docker/docker-compose.yml"):
+            result = rt.destroy_runtime()
+
+        # Should still return the .boxman path despite cleanup failure
+        assert result == "/tmp/test-project/.boxman"
+
+    def test_destroy_runtime_returns_none_when_no_compose_file(self, monkeypatch):
+        """When no compose file exists, destroy_runtime returns None."""
+        monkeypatch.delenv("BOXMAN_COMPOSE_FILE", raising=False)
+        rt = DockerComposeRuntime(config={
+            "compose_file": "/nonexistent/docker-compose.yml"
+        })
+        result = rt.destroy_runtime()
+        assert result is None
+
+    @patch("boxman.runtime.docker_compose.invoke.run")
+    def test_plan_destroy_runtime_with_running_container(self, mock_run, tmp_path):
+        """plan_destroy_runtime should list cleanup, compose down, and dir removal."""
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        rt.project_dir = str(tmp_path)
+
+        # Create the .boxman dir so the plan detects it
+        boxman_dir = tmp_path / ".boxman"
+        boxman_dir.mkdir()
+
+        # _container_is_running returns True
+        mock_run.return_value = MagicMock(ok=True, stdout="true\n")
+
+        with patch.object(rt, "get_compose_file_path",
+                          return_value=str(tmp_path / ".boxman/runtime/docker/docker-compose.yml")):
+            plan = rt.plan_destroy_runtime()
+
+        assert len(plan["actions"]) == 3
+        assert "clean up" in plan["actions"][0]
+        assert "tear down" in plan["actions"][1]
+        assert "remove directory" in plan["actions"][2]
+        assert len(plan["commands"]) == 2
+        assert "docker exec" in plan["commands"][0]
+        assert "down --volumes" in plan["commands"][1]
+        assert str(boxman_dir) in plan["paths_to_delete"]
+        assert plan["container_running"] is True
+
+    @patch("boxman.runtime.docker_compose.invoke.run")
+    def test_plan_destroy_runtime_container_not_running(self, mock_run, tmp_path):
+        """When container is not running, plan should omit the exec cleanup."""
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        rt.project_dir = str(tmp_path)
+
+        boxman_dir = tmp_path / ".boxman"
+        boxman_dir.mkdir()
+
+        mock_run.return_value = MagicMock(ok=True, stdout="false\n")
+
+        with patch.object(rt, "get_compose_file_path",
+                          return_value=str(tmp_path / ".boxman/runtime/docker/docker-compose.yml")):
+            plan = rt.plan_destroy_runtime()
+
+        assert len(plan["actions"]) == 2
+        assert "tear down" in plan["actions"][0]
+        assert "remove directory" in plan["actions"][1]
+        assert len(plan["commands"]) == 1
+        assert "down --volumes" in plan["commands"][0]
+        assert plan["container_running"] is False
+
+    def test_plan_destroy_runtime_no_compose_file(self, monkeypatch):
+        """When no compose file exists, plan should indicate nothing to do."""
+        monkeypatch.delenv("BOXMAN_COMPOSE_FILE", raising=False)
+        rt = DockerComposeRuntime(config={
+            "compose_file": "/nonexistent/docker-compose.yml"
+        })
+        plan = rt.plan_destroy_runtime()
+        assert "nothing to tear down" in plan["actions"][0]
+        assert plan["commands"] == []
+        assert plan["paths_to_delete"] == []
+
+
+class TestManagerDestroyRuntimeCleanup:
+    """Tests for the manager-level docker fallback when shutil.rmtree fails
+    on root-owned leftover directories."""
+
+    @staticmethod
+    def _make_cli_args(auto_accept=True):
+        args = MagicMock()
+        args.auto_accept = auto_accept
+        return args
+
+    @patch("boxman.manager.subprocess.run")
+    @patch("boxman.manager.shutil.rmtree")
+    @patch("boxman.manager.os.path.isdir")
+    def test_docker_fallback_when_boxman_dir_survives_rmtree(
+        self, mock_isdir, mock_rmtree, mock_subprocess_run
+    ):
+        """When shutil.rmtree leaves root-owned dirs behind, the manager
+        should use a throwaway docker container to clean them up."""
+        from boxman.manager import BoxmanManager
+
+        mgr = BoxmanManager()
+        mgr.runtime = "docker-compose"
+
+        mock_runtime = MagicMock(spec=DockerComposeRuntime)
+        mock_runtime.name = "docker-compose"
+        mock_runtime.destroy_runtime.return_value = "/tmp/proj/.boxman"
+        mock_runtime.plan_destroy_runtime.return_value = {
+            "actions": ["tear down docker-compose environment"],
+            "commands": ["docker compose down --volumes"],
+            "paths_to_delete": ["/tmp/proj/.boxman"],
+        }
+        mgr._runtime_instance = mock_runtime
+
+        # First isdir: True (dir exists), second: True (still exists after
+        # rmtree)
+        mock_isdir.side_effect = [True, True]
+
+        BoxmanManager.destroy_runtime(mgr, self._make_cli_args())
+
+        # shutil.rmtree called twice: initial attempt + after docker cleanup
+        assert mock_rmtree.call_count == 2
+        # docker run called with alpine rm -rf
+        mock_subprocess_run.assert_called_once()
+        docker_cmd = mock_subprocess_run.call_args[0][0]
+        assert "docker" == docker_cmd[0]
+        assert "alpine" in docker_cmd
+        assert "/cleanup/*" in docker_cmd[-1]
+
+    @patch("boxman.manager.subprocess.run")
+    @patch("boxman.manager.shutil.rmtree")
+    @patch("boxman.manager.os.path.isdir")
+    def test_no_docker_fallback_when_rmtree_succeeds(
+        self, mock_isdir, mock_rmtree, mock_subprocess_run
+    ):
+        """When shutil.rmtree fully removes .boxman, no docker fallback."""
+        from boxman.manager import BoxmanManager
+
+        mgr = BoxmanManager()
+        mgr.runtime = "docker-compose"
+
+        mock_runtime = MagicMock(spec=DockerComposeRuntime)
+        mock_runtime.name = "docker-compose"
+        mock_runtime.destroy_runtime.return_value = "/tmp/proj/.boxman"
+        mock_runtime.plan_destroy_runtime.return_value = {
+            "actions": ["tear down docker-compose environment"],
+            "commands": ["docker compose down --volumes"],
+            "paths_to_delete": ["/tmp/proj/.boxman"],
+        }
+        mgr._runtime_instance = mock_runtime
+
+        # First isdir: True (dir exists), second: False (rmtree succeeded)
+        mock_isdir.side_effect = [True, False]
+
+        BoxmanManager.destroy_runtime(mgr, self._make_cli_args())
+
+        assert mock_rmtree.call_count == 1
+        mock_subprocess_run.assert_not_called()
+
+    @patch("builtins.input", return_value="n")
+    def test_prompt_aborts_on_no(self, mock_input):
+        """When the user answers 'n', destroy_runtime should abort."""
+        from boxman.manager import BoxmanManager
+
+        mgr = BoxmanManager()
+        mgr.runtime = "docker-compose"
+
+        mock_runtime = MagicMock(spec=DockerComposeRuntime)
+        mock_runtime.name = "docker-compose"
+        mock_runtime.plan_destroy_runtime.return_value = {
+            "actions": ["tear down docker-compose environment"],
+            "commands": ["docker compose down --volumes"],
+            "paths_to_delete": ["/tmp/proj/.boxman"],
+        }
+        mgr._runtime_instance = mock_runtime
+
+        BoxmanManager.destroy_runtime(mgr, self._make_cli_args(auto_accept=False))
+
+        mock_input.assert_called_once()
+        mock_runtime.destroy_runtime.assert_not_called()
+
+    @patch("boxman.manager.shutil.rmtree")
+    @patch("boxman.manager.os.path.isdir", return_value=False)
+    @patch("builtins.input", return_value="y")
+    def test_prompt_proceeds_on_yes(self, mock_input, mock_isdir, mock_rmtree):
+        """When the user answers 'y', destroy_runtime should proceed."""
+        from boxman.manager import BoxmanManager
+
+        mgr = BoxmanManager()
+        mgr.runtime = "docker-compose"
+
+        mock_runtime = MagicMock(spec=DockerComposeRuntime)
+        mock_runtime.name = "docker-compose"
+        mock_runtime.destroy_runtime.return_value = "/tmp/proj/.boxman"
+        mock_runtime.plan_destroy_runtime.return_value = {
+            "actions": ["tear down docker-compose environment"],
+            "commands": ["docker compose down --volumes"],
+            "paths_to_delete": ["/tmp/proj/.boxman"],
+        }
+        mgr._runtime_instance = mock_runtime
+
+        BoxmanManager.destroy_runtime(mgr, self._make_cli_args(auto_accept=False))
+
+        mock_input.assert_called_once()
+        mock_runtime.destroy_runtime.assert_called_once()
+
+    @patch("boxman.manager.shutil.rmtree")
+    @patch("boxman.manager.os.path.isdir", return_value=False)
+    def test_auto_accept_skips_prompt(self, mock_isdir, mock_rmtree):
+        """With --auto-accept, no input prompt should be shown."""
+        from boxman.manager import BoxmanManager
+
+        mgr = BoxmanManager()
+        mgr.runtime = "docker-compose"
+
+        mock_runtime = MagicMock(spec=DockerComposeRuntime)
+        mock_runtime.name = "docker-compose"
+        mock_runtime.destroy_runtime.return_value = "/tmp/proj/.boxman"
+        mock_runtime.plan_destroy_runtime.return_value = {
+            "actions": ["tear down docker-compose environment"],
+            "commands": ["docker compose down --volumes"],
+            "paths_to_delete": ["/tmp/proj/.boxman"],
+        }
+        mgr._runtime_instance = mock_runtime
+
+        with patch("builtins.input") as mock_input:
+            BoxmanManager.destroy_runtime(mgr, self._make_cli_args(auto_accept=True))
+            mock_input.assert_not_called()
+
+        mock_runtime.destroy_runtime.assert_called_once()
+
+
 class TestBoxmanManagerRuntimeIntegration:
 
     def test_manager_default_runtime_is_local(self):

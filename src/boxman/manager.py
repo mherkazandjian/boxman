@@ -1,4 +1,6 @@
 import os
+import shutil
+import subprocess
 import time
 import re
 import json
@@ -1833,6 +1835,76 @@ class BoxmanManager:
         cls.unregister_from_cache()
 
         return
+
+    @staticmethod
+    def destroy_runtime(cls, cli_args):
+        """
+        Destroy the Docker Compose runtime environment and remove
+        the ``.boxman`` directory from the project directory.
+        """
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+
+        runtime = cls.runtime_instance
+        if not isinstance(runtime, DockerComposeRuntime):
+            cls.logger.warning(
+                f"destroy-runtime is only supported for the docker-compose "
+                f"runtime (current runtime: {runtime.name})")
+            return
+
+        auto_accept = getattr(cli_args, "auto_accept", False)
+        plan = runtime.plan_destroy_runtime()
+
+        if not plan["actions"]:
+            cls.logger.info("nothing to do")
+            return
+
+        # Display the plan
+        print("\nThe following actions will be performed:\n")
+        for i, action in enumerate(plan["actions"], 1):
+            print(f"  {i}. {action}")
+
+        if plan["commands"]:
+            print("\nCommands to execute:\n")
+            for cmd in plan["commands"]:
+                print(f"  $ {cmd}")
+
+        if plan["paths_to_delete"]:
+            print("\nPaths to delete:\n")
+            for p in plan["paths_to_delete"]:
+                print(f"  {p}")
+
+        print()
+
+        if not auto_accept:
+            answer = input("Proceed? [y/N] ").strip().lower()
+            if answer not in ("y", "yes"):
+                print("Aborted.")
+                return
+
+        boxman_dir = runtime.destroy_runtime()
+        if boxman_dir and os.path.isdir(boxman_dir):
+            cls.logger.info(f"removing {boxman_dir}")
+            shutil.rmtree(boxman_dir, ignore_errors=True)
+            # Root-owned files/dirs created by the Docker container may
+            # survive shutil.rmtree.  Use a throwaway container to finish
+            # the job.
+            if os.path.isdir(boxman_dir):
+                cls.logger.info(
+                    f"{boxman_dir} still exists (root-owned leftovers), "
+                    f"removing via docker")
+                abs_boxman_dir = os.path.abspath(boxman_dir)
+                subprocess.run(
+                    ["docker", "run", "--rm",
+                     "-v", f"{abs_boxman_dir}:/cleanup",
+                     "alpine", "sh", "-c", "rm -rf /cleanup/*"],
+                    check=False,
+                )
+                # The bind-mount dir itself can't be removed from inside
+                # the container, but it should now be empty.
+                shutil.rmtree(boxman_dir, ignore_errors=True)
+            cls.logger.info(f"removed {boxman_dir}")
+        else:
+            cls.logger.info("no .boxman directory to remove")
 
     ### start snapshot functions ####
     @staticmethod

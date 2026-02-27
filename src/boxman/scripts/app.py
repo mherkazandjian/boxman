@@ -284,6 +284,17 @@ def parse_args():
     )
 
     #
+    # sub parser for destroying the runtime environment
+    #
+    parser_destroy_rt = subparsers.add_parser(
+        'destroy-runtime',
+        help='destroy the docker-compose runtime environment and clean up .boxman')
+    parser_destroy_rt.add_argument(
+        '--auto-accept', '-y', action='store_true', default=False,
+        help='skip the confirmation prompt and proceed immediately')
+    parser_destroy_rt.set_defaults(func=BoxmanManager.destroy_runtime)
+
+    #
     # sub parser for deprovisioning a configuration
     #
     parser_deprov = subparsers.add_parser('deprovision', help='deprovision a configuration')
@@ -803,6 +814,11 @@ def main():
             conf_dir = os.path.abspath(os.path.dirname(args.conf))
             manager.runtime_instance.project_dir = conf_dir
 
+            # Set the project name on the runtime so Docker resources
+            # (container, volumes, network) are scoped per project.
+            if manager.config and 'project' in manager.config:
+                manager.runtime_instance.project_name = manager.config['project']
+
             # Extract all workdirs from the project config (one per cluster)
             # and pass them to the runtime so they can be bind-mounted into
             # the container.
@@ -818,6 +834,12 @@ def main():
                     manager.runtime_instance.workdirs = list(workdirs)
                     for wd in workdirs:
                         log.info(f"runtime workdir: {wd}")
+
+        # Handle destroy-runtime — tear down Docker resources without
+        # starting the container first
+        if args.func == BoxmanManager.destroy_runtime:
+            args.func(manager, args)
+            sys.exit(0)
 
         # ensure the runtime environment is up and ready before proceeding
         manager.runtime_instance.ensure_ready()

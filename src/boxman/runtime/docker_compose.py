@@ -8,6 +8,7 @@ directory next to the project's ``conf.yml``.
 """
 
 import os
+import re
 import sys
 import time
 import shutil
@@ -26,10 +27,10 @@ class DockerComposeRuntime(RuntimeBase):
         super().__init__(config)
         self.logger = log
 
-        #: str: container name used by ``docker exec``
-        self.container_name: str = self.config.get(
-            "runtime_container", "boxman-libvirt-default"
-        )
+        #: str | None: project name from conf.yml, used to scope Docker
+        #: resources (container, volumes, network) per project.
+        #: Set by the manager before calling ensure_ready().
+        self._project_name: Optional[str] = self.config.get("project_name")
 
         #: str | None: path to the compose file (None → use bundled)
         self.compose_file: Optional[str] = self.config.get("compose_file")
@@ -44,6 +45,57 @@ class DockerComposeRuntime(RuntimeBase):
         #: list[str]: workdirs from conf.yml (one per cluster) that need
         #: to be accessible inside the container; set by the manager
         self.workdirs: list = self.config.get("workdirs", [])
+
+    @property
+    def project_name(self) -> Optional[str]:
+        """Return the project name used to scope Docker resources."""
+        return self._project_name
+
+    @project_name.setter
+    def project_name(self, value: Optional[str]) -> None:
+        """Set the project name used to scope Docker resources."""
+        self._project_name = value
+
+    @staticmethod
+    def _sanitize_project_name(name: str) -> str:
+        """
+        Sanitize a project name for use as a Docker Compose project name.
+
+        Docker Compose project names must be lowercase alphanumeric
+        characters and hyphens only.
+        """
+        return re.sub(r'[^a-z0-9-]', '-', name.lower()).strip('-')
+
+    @property
+    def container_name(self) -> str:
+        """
+        Return the container name, derived from the project name when set.
+
+        Format: ``boxman-libvirt-<sanitized_project_name>``
+        Falls back to ``boxman-libvirt-default`` when no project name is set.
+        """
+        if self._project_name:
+            sanitized = self._sanitize_project_name(self._project_name)
+            return f"boxman-libvirt-{sanitized}"
+        return self.config.get("runtime_container", "boxman-libvirt-default")
+
+    @property
+    def _compose_project_name(self) -> str:
+        """Return the Docker Compose ``-p`` project name."""
+        if self._project_name:
+            return f"boxman-{self._sanitize_project_name(self._project_name)}"
+        return "boxman-default"
+
+    def _compose_base_cmd(self, compose_path: str, compose_dir: str) -> str:
+        """
+        Return the base ``docker compose`` command with project scoping.
+        """
+        return (
+            f"docker compose "
+            f"-p {self._compose_project_name} "
+            f"-f {compose_path} "
+            f"--project-directory {compose_dir}"
+        )
 
     @property
     def name(self) -> str:
@@ -188,9 +240,7 @@ class DockerComposeRuntime(RuntimeBase):
             compose_env.update(env_vars)
 
             invoke.run(
-                f"docker compose "
-                f"-f {compose_path} "
-                f"--project-directory {compose_dir} "
+                f"{self._compose_base_cmd(compose_path, compose_dir)} "
                 f"up -d --build",
                 hide=False,
                 warn=False,
@@ -285,15 +335,130 @@ class DockerComposeRuntime(RuntimeBase):
         """Stop the docker-compose environment so it can be recreated."""
         try:
             invoke.run(
-                f"docker compose "
-                f"-f {compose_path} "
-                f"--project-directory {compose_dir} "
+                f"{self._compose_base_cmd(compose_path, compose_dir)} "
                 f"down",
                 hide=False,
                 warn=True,
             )
         except Exception as exc:
             self.logger.warning(f"failed to stop compose: {exc}")
+
+    def plan_destroy_runtime(self) -> dict:
+        """
+        Build a plan describing what ``destroy_runtime`` will do.
+
+        Returns a dict with:
+          - **compose_path**: path to the compose file (or None)
+          - **container_name**: the container that will be stopped
+          - **container_running**: whether the container is currently running
+          - **boxman_dir**: the ``.boxman`` directory that will be removed
+          - **actions**: ordered list of human-readable action descriptions
+          - **commands**: ordered list of shell commands that will be executed
+          - **paths_to_delete**: list of paths that will be removed
+        """
+        plan: dict = {
+            "compose_path": None,
+            "container_name": self.container_name,
+            "container_running": False,
+            "boxman_dir": None,
+            "actions": [],
+            "commands": [],
+            "paths_to_delete": [],
+        }
+
+        try:
+            compose_path = self.get_compose_file_path()
+        except FileNotFoundError:
+            plan["actions"].append("no compose file found — nothing to tear down")
+            return plan
+
+        plan["compose_path"] = compose_path
+        compose_dir = os.path.dirname(compose_path)
+        running = self._container_is_running()
+        plan["container_running"] = running
+
+        if running:
+            plan["actions"].append(
+                f"clean up root-owned data inside container "
+                f"'{self.container_name}'")
+            clean_cmd = (
+                f"docker exec --user root {self.container_name} "
+                f"bash -c 'rm -rf /var/run/libvirt/* "
+                f"/var/lib/libvirt/images/* /etc/boxman/ssh/*'")
+            plan["commands"].append(clean_cmd)
+
+        down_cmd = (
+            f"{self._compose_base_cmd(compose_path, compose_dir)} "
+            f"down --volumes --remove-orphans")
+        plan["actions"].append(
+            f"tear down docker-compose environment "
+            f"(stop container, remove volumes & networks)")
+        plan["commands"].append(down_cmd)
+
+        base = self.project_dir or os.getcwd()
+        boxman_dir = os.path.join(base, ".boxman")
+        plan["boxman_dir"] = boxman_dir
+        if os.path.isdir(boxman_dir):
+            plan["actions"].append(f"remove directory tree {boxman_dir}")
+            plan["paths_to_delete"].append(boxman_dir)
+
+        return plan
+
+    def destroy_runtime(self) -> Optional[str]:
+        """
+        Tear down the Docker Compose environment and remove Docker
+        volumes and networks.
+
+        Returns:
+            The path to the ``.boxman`` directory (for the caller to
+            remove), or None if no compose file was found.
+        """
+        try:
+            compose_path = self.get_compose_file_path()
+        except FileNotFoundError:
+            self.logger.warning(
+                "no compose file found — nothing to tear down")
+            return None
+
+        compose_dir = os.path.dirname(compose_path)
+
+        self.logger.info(
+            f"destroying docker-compose environment "
+            f"(compose file: {compose_path})")
+
+        # Clean up root-owned files inside the container before tearing it
+        # down, otherwise shutil.rmtree on the host will silently fail on
+        # permission-denied entries (sockets, libvirt state, etc.).
+        if self._container_is_running():
+            self.logger.info(
+                f"cleaning up container data dirs inside "
+                f"'{self.container_name}'")
+            try:
+                invoke.run(
+                    f"docker exec --user root {self.container_name} "
+                    f"bash -c 'rm -rf /var/run/libvirt/* "
+                    f"/var/lib/libvirt/images/* /etc/boxman/ssh/*'",
+                    hide=False,
+                    warn=True,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    f"in-container cleanup failed: {exc}")
+
+        try:
+            invoke.run(
+                f"{self._compose_base_cmd(compose_path, compose_dir)} "
+                f"down --volumes --remove-orphans",
+                hide=False,
+                warn=True,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                f"docker compose down failed: {exc}")
+
+        # Return the .boxman directory path so the caller can remove it
+        base = self.project_dir or os.getcwd()
+        return os.path.join(base, ".boxman")
 
     # ------------------------------------------------------------------
     # compose file resolution
@@ -405,8 +570,13 @@ class DockerComposeRuntime(RuntimeBase):
         host_uid = os.getuid()
         host_gid = os.getgid()
 
+        instance_name = (
+            self._sanitize_project_name(self._project_name)
+            if self._project_name else "default"
+        )
+
         with open(env_path, "w") as fobj:
-            fobj.write(f"BOXMAN_INSTANCE_NAME=default\n")
+            fobj.write(f"BOXMAN_INSTANCE_NAME={instance_name}\n")
             fobj.write(f"BOXMAN_DATA_DIR={abs_data_dir}\n")
             fobj.write(f"BOXMAN_PROJECT_DIR={abs_project_dir}\n")
             fobj.write(f"BOXMAN_SSH_PORT=2222\n")
