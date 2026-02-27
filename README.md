@@ -199,6 +199,27 @@ boxman snapshot --name "state before kernel upgrade"
 boxman restore --name "state before kernel upgrade"
 ````
 
+### SSH into VMs
+
+```bash
+# SSH into the gateway host (first VM)
+boxman ssh
+
+# SSH into a VM by name
+boxman ssh cluster_1_node02
+
+# List VMs and their state
+boxman ps
+# Id  Cluster    VM      State
+# --  ---------  ------  -------
+# 0   cluster_1  node01  running
+# 1   cluster_1  node02  running
+
+# SSH into a VM by its id from boxman ps
+boxman ssh 0
+boxman ssh 1
+```
+
 ### Import VM images
 
 ````bash
