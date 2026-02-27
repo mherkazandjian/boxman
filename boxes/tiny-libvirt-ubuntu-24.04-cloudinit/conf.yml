@@ -77,9 +77,11 @@ templates:
         - [ sh, -c, "echo 'admin:{{ env("BOXMAN_ADMIN_PASS", default="boxman") }}' | chpasswd" ]
         - [ sh, -c, "mkdir -p /admin/.ssh && chmod 700 /admin/.ssh && chown -R admin:admin /admin /admin/.ssh" ]
 
+workspace:
+  path: ~/workspaces/boxmandev/tiny-libvirt-ubuntu-24.04-cloudinit
+
 clusters:
   cluster_1:
-    workdir: ~/workspaces/boxmandev/tiny-libvrit-ubuntu-24.04-cloudinit
     base_image: ubuntu-24.04-minimal-base-template-cloudinit
     proxy_host: localhost
     admin_user: admin
@@ -141,11 +143,3 @@ clusters:
           - name: adapter_2
             link_state: 'up'
             network_source: 'isolated1'
-    files:
-      env.sh: |
-        export INVENTORY=inventory
-        export SSH_CONFIG=${HOME}/workspaces/boxmandev/tiny/ssh_config
-        export GATEWAYHOST=mgmt01
-        export ANSIBLE_CONFIG=${HOME}/workspaces/boxmandev/tiny/ansible.cfg
-        export ANSIBLE_INVENTORY="$INVENTORY"
-        export ANSIBLE_SSH_ARGS="-F $SSH_CONFIG"

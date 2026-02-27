@@ -16,11 +16,10 @@ provider:
 #
 # auto-generated in workspace.path:
 #   - env.sh
-#
-# auto-generated in each cluster workdir:
-#   - inventory/01-hosts.yml  (from the VMs defined in the cluster)
+#   - inventory/01-hosts.yml  (from the VMs defined across all clusters)
 #   - ansible.cfg
 #   - ssh_config              (generated at provision time by boxman)
+#   - ssh keys                (generated at provision time by boxman)
 workspace:
   path: ~/workspaces/boxmandev/rocky9-duo
 

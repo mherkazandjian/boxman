@@ -93,8 +93,8 @@ class TestInventoryGeneration:
 
 class TestAnsibleCfgGeneration:
 
-    def test_ansible_cfg_generated(self):
-        """ansible.cfg is auto-generated with expected sections."""
+    def test_ansible_cfg_generated_at_workspace_level(self):
+        """ansible.cfg is auto-generated in workspace.files with expected sections."""
         config = {
             'workspace': {'path': '/tmp/ws'},
             'clusters': {
@@ -102,7 +102,7 @@ class TestAnsibleCfgGeneration:
             },
         }
         mgr = _make_manager(config)
-        cfg = config['clusters']['c1']['files']['ansible.cfg']
+        cfg = config['workspace']['files']['ansible.cfg']
         assert '[defaults]' in cfg
         assert 'host_key_checking = False' in cfg
         assert 'forks = 10' in cfg
@@ -110,21 +110,23 @@ class TestAnsibleCfgGeneration:
         assert 'fact_caching = jsonfile' in cfg
         assert '[ssh_connection]' in cfg
         assert 'pipelining = True' in cfg
+        # ansible.cfg should NOT be in the cluster files
+        assert 'ansible.cfg' not in config['clusters']['c1'].get('files', {})
 
     def test_ansible_cfg_not_overwritten_if_explicit(self):
-        """User-provided ansible.cfg is preserved."""
+        """User-provided ansible.cfg in workspace.files is preserved."""
         custom_cfg = "[defaults]\nmy_custom = true\n"
         config = {
-            'workspace': {'path': '/tmp/ws'},
+            'workspace': {
+                'path': '/tmp/ws',
+                'files': {'ansible.cfg': custom_cfg},
+            },
             'clusters': {
-                'c1': {
-                    'vms': {'vm01': {}},
-                    'files': {'ansible.cfg': custom_cfg},
-                },
+                'c1': {'vms': {'vm01': {}}},
             },
         }
         mgr = _make_manager(config)
-        assert config['clusters']['c1']['files']['ansible.cfg'] == custom_cfg
+        assert config['workspace']['files']['ansible.cfg'] == custom_cfg
 
 
 class TestEnvShGeneration:
@@ -140,11 +142,9 @@ class TestEnvShGeneration:
         mgr = _make_manager(config)
         env_sh = config['workspace']['files']['env.sh']
         assert 'export INVENTORY=inventory' in env_sh
-        assert 'export SSH_CONFIG=' in env_sh
-        assert 'ssh_config' in env_sh
+        assert 'export SSH_CONFIG=ssh_config' in env_sh
         assert 'export GATEWAYHOST=node01' in env_sh
-        assert 'export ANSIBLE_CONFIG=' in env_sh
-        assert 'ansible.cfg' in env_sh
+        assert 'export ANSIBLE_CONFIG=ansible.cfg' in env_sh
         assert 'export ANSIBLE_INVENTORY="$INVENTORY"' in env_sh
         assert 'export ANSIBLE_SSH_ARGS="-F $SSH_CONFIG"' in env_sh
         # env.sh should NOT be in the cluster files
@@ -162,8 +162,8 @@ class TestEnvShGeneration:
         env_sh = config['workspace']['files']['env.sh']
         assert 'export GATEWAYHOST=alpha' in env_sh
 
-    def test_env_sh_paths_use_expanded_workdir(self):
-        """SSH_CONFIG and ANSIBLE_CONFIG paths use the expanded workdir."""
+    def test_env_sh_paths_are_relative(self):
+        """SSH_CONFIG and ANSIBLE_CONFIG are relative paths (next to env.sh)."""
         config = {
             'workspace': {'path': '~/my/workspace'},
             'clusters': {
@@ -172,9 +172,8 @@ class TestEnvShGeneration:
         }
         mgr = _make_manager(config)
         env_sh = config['workspace']['files']['env.sh']
-        expanded = os.path.expanduser('~/my/workspace/c1')
-        assert f'export SSH_CONFIG={expanded}/ssh_config' in env_sh
-        assert f'export ANSIBLE_CONFIG={expanded}/ansible.cfg' in env_sh
+        assert 'export SSH_CONFIG=ssh_config' in env_sh
+        assert 'export ANSIBLE_CONFIG=ansible.cfg' in env_sh
 
     def test_env_sh_not_overwritten_if_explicit(self):
         """User-provided env.sh in workspace.files is preserved."""
@@ -269,23 +268,23 @@ class TestEdgeCases:
         mgr = _make_manager(config)  # should not raise
 
     def test_partial_explicit_files_are_preserved(self):
-        """Only missing files are auto-generated; explicit ones are kept."""
+        """Only missing workspace files are auto-generated; explicit ones are kept."""
         custom_cfg = "[defaults]\ncustom = yes\n"
         config = {
-            'workspace': {'path': '/tmp/ws'},
+            'workspace': {
+                'path': '/tmp/ws',
+                'files': {'ansible.cfg': custom_cfg},
+            },
             'clusters': {
                 'c1': {
                     'vms': {'vm01': {}, 'vm02': {}},
-                    'files': {'ansible.cfg': custom_cfg},
                 },
             },
         }
         mgr = _make_manager(config)
-        files = config['clusters']['c1']['files']
+        ws_files = config['workspace']['files']
         # ansible.cfg kept as-is
-        assert files['ansible.cfg'] == custom_cfg
-        # inventory NOT in cluster files
-        assert 'inventory/01-hosts.yml' not in files
+        assert ws_files['ansible.cfg'] == custom_cfg
         # env.sh and inventory auto-generated at workspace level
-        assert 'env.sh' in config['workspace']['files']
-        assert 'inventory/01-hosts.yml' in config['workspace']['files']
+        assert 'env.sh' in ws_files
+        assert 'inventory/01-hosts.yml' in ws_files

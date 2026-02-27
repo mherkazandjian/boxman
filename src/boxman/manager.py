@@ -177,10 +177,9 @@ class BoxmanManager:
 
         For each cluster:
         - If workdir is not set, default to workspace.path / cluster_name
-        - Auto-generate inventory and ansible.cfg in the cluster's
-          files block based on the VMs defined in the cluster.
-        - Auto-generate env.sh in the workspace-level files block
-          (written to workspace.path, not the cluster workdir).
+
+        At the workspace level (written to workspace.path):
+        - Auto-generate env.sh, inventory/01-hosts.yml, and ansible.cfg
         """
         config = self.config
         workspace = config.get('workspace', {})
@@ -208,41 +207,14 @@ class BoxmanManager:
             if not vms:
                 continue
 
-            # build the auto-generated files
-            files = cluster.setdefault('files', {})
-
-            # --- ansible.cfg ---
-            if 'ansible.cfg' not in files:
-                files['ansible.cfg'] = (
-                    "[defaults]\n"
-                    "host_key_checking = False\n"
-                    "poll_interval = 5\n"
-                    "callbacks_enabled = timer\n"
-                    "forks = 10\n"
-                    "nocows = 1\n"
-                    "timeout = 30\n"
-                    "gathering = smart\n"
-                    "fact_caching = jsonfile\n"
-                    "fact_caching_connection = /root/.cache/ansible_facts\n"
-                    "fact_caching_timeout = 86400\n"
-                    "ansible_managed = Ansible managed: {file} modified on "
-                    "%Y-%m-%d %H:%M:%S by {uid} on {host}\n"
-                    "\n"
-                    "[ssh_connection]\n"
-                    "pipelining = True\n"
-                    "ssh_args = -o ControlMaster=auto -o ControlPersist=60s\n"
-                    "control_path = /tmp/ansible-ssh-%%h-%%p-%%r\n"
-                )
-
             # --- env.sh (workspace-level) ---
             if 'env.sh' not in ws_files:
-                expanded = os.path.expanduser(workdir)
                 first_vm = next(iter(vms))
                 ws_files['env.sh'] = (
                     f"export INVENTORY=inventory\n"
-                    f"export SSH_CONFIG={expanded}/ssh_config\n"
+                    f"export SSH_CONFIG=ssh_config\n"
                     f"export GATEWAYHOST={first_vm}\n"
-                    f"export ANSIBLE_CONFIG={expanded}/ansible.cfg\n"
+                    f"export ANSIBLE_CONFIG=ansible.cfg\n"
                     f"export ANSIBLE_INVENTORY=\"$INVENTORY\"\n"
                     f"export ANSIBLE_SSH_ARGS=\"-F $SSH_CONFIG\"\n"
                 )
@@ -261,6 +233,29 @@ class BoxmanManager:
                     f"  hosts:\n"
                     f"{host_lines}\n"
                 )
+
+        # --- ansible.cfg (workspace-level) ---
+        if 'ansible.cfg' not in ws_files:
+            ws_files['ansible.cfg'] = (
+                "[defaults]\n"
+                "host_key_checking = False\n"
+                "poll_interval = 5\n"
+                "callbacks_enabled = timer\n"
+                "forks = 10\n"
+                "nocows = 1\n"
+                "timeout = 30\n"
+                "gathering = smart\n"
+                "fact_caching = jsonfile\n"
+                "fact_caching_connection = /root/.cache/ansible_facts\n"
+                "fact_caching_timeout = 86400\n"
+                "ansible_managed = Ansible managed: {file} modified on "
+                "%Y-%m-%d %H:%M:%S by {uid} on {host}\n"
+                "\n"
+                "[ssh_connection]\n"
+                "pipelining = True\n"
+                "ssh_args = -o ControlMaster=auto -o ControlPersist=60s\n"
+                "control_path = /tmp/ansible-ssh-%%h-%%p-%%r\n"
+            )
 
     def provision_files(self) -> None:
         """
@@ -1081,6 +1076,7 @@ class BoxmanManager:
         other connection details for all configured VMs.
         """
         self.logger.info("=== vm connection information ===")
+        ws_path = self.config.get('workspace', {}).get('path', '')
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
@@ -1105,8 +1101,9 @@ class BoxmanManager:
 
                 # get ssh connection information
                 admin_user = cluster.get('admin_user', '<placeholder>')
+                base_path = ws_path or cluster.get('workdir', '~')
                 admin_key = os.path.expanduser(os.path.join(
-                    cluster.get('workdir', '~'),
+                    base_path,
                     cluster.get('admin_key_name', 'id_ed25519_boxman')
                 ))
 
@@ -1119,7 +1116,7 @@ class BoxmanManager:
                 # show connection using ssh_config if available
                 if 'ssh_config' in cluster:
                     ssh_config = os.path.expanduser(os.path.join(
-                        cluster.get('workdir', '~'),
+                        base_path,
                         cluster.get('ssh_config', 'ssh_config')
                     ))
                     self.logger.info(f"    via config: ssh -F {ssh_config} {hostname}")
@@ -1132,19 +1129,22 @@ class BoxmanManager:
         """
         Generate SSH configuration file for easy access to VMs.
 
-        Creates an SSH config file in the workdir of each cluster that allows
+        Creates an SSH config file in the workspace directory that allows
         simplified access to VMs without typing full connection details.
         """
+        ws_path = self.config.get('workspace', {}).get('path', '')
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
+            base_path = ws_path or cluster.get('workdir', '~')
+
             # get the ssh config path
             ssh_config = os.path.expanduser(os.path.join(
-                cluster.get('workdir', '~'),
+                base_path,
                 cluster.get('ssh_config', 'ssh_config')
             ))
 
             admin_priv_key = os.path.expanduser(os.path.join(
-                cluster.get('workdir', '~'),
+                base_path,
                 cluster.get('admin_key_name', 'id_ed25519_boxman')
             ))
 
@@ -1185,27 +1185,29 @@ class BoxmanManager:
         """
         Generate SSH keys for connecting to VMs.
 
-        Creates an SSH key pair in each cluster's workdir if it doesn't already exist.
+        Creates an SSH key pair in the workspace directory if it doesn't
+        already exist.
 
         Returns:
             bool: True if successful, False otherwise
         """
         success = True
+        ws_path = self.config.get('workspace', {}).get('path', '')
 
         for _, cluster in self.config['clusters'].items():
-            workdir = os.path.expanduser(cluster['workdir'])
+            base_path = os.path.expanduser(ws_path or cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
 
-            admin_priv_key = os.path.join(workdir, admin_key_name)
-            admin_pub_key = os.path.join(workdir, f"{admin_key_name}.pub")
+            admin_priv_key = os.path.join(base_path, admin_key_name)
+            admin_pub_key = os.path.join(base_path, f"{admin_key_name}.pub")
 
-            # create workdir if it doesn't exist
-            if not os.path.isdir(workdir):
-                os.makedirs(workdir, exist_ok=True)
+            # create directory if it doesn't exist
+            if not os.path.isdir(base_path):
+                os.makedirs(base_path, exist_ok=True)
 
             # generate key pair if it doesn't exist
             if not os.path.exists(admin_priv_key):
-                self.logger.info(f"generating ssh key pair in {workdir}")
+                self.logger.info(f"generating ssh key pair in {base_path}")
 
                 try:
                     cmd = f'ssh-keygen -t ed25519 -a 100 -f {admin_priv_key} -q -N ""'
@@ -1320,12 +1322,13 @@ class BoxmanManager:
             bool: True if all VMs received the key successfully, False otherwise
         """
         all_successful = True
+        ws_path = self.config.get('workspace', {}).get('path', '')
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
-            workdir = os.path.expanduser(cluster['workdir'])
+            base_path = os.path.expanduser(ws_path or cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
-            admin_pub_key = os.path.join(workdir, f"{admin_key_name}.pub")
+            admin_pub_key = os.path.join(base_path, f"{admin_key_name}.pub")
 
             admin_user = cluster.get('admin_user', 'admin')
             admin_pass = self.fetch_value(cluster.get('admin_pass', None))
@@ -1369,7 +1372,7 @@ class BoxmanManager:
                     admin_user=admin_user,
                     admin_pass=admin_pass,
                     pub_key_path=admin_pub_key,
-                    ssh_conf_path=os.path.join(workdir, cluster['ssh_config'])
+                    ssh_conf_path=os.path.join(base_path, cluster['ssh_config'])
                 )
 
                 if success:
@@ -1624,11 +1627,13 @@ class BoxmanManager:
         # -------------------- global config ---------------------------
 
         cluster = config['clusters'][cluster_group]
+        ws_path = config.get('workspace', {}).get('path', '')
         ssh_config = cluster['ssh_config']
         workdir = cluster['workdir']
         # -------------------- end global config -----------------------
 
-        ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
+        base_path = ws_path or workdir
+        ssh_config = os.path.expanduser(os.path.join(base_path, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
         if not os.path.isdir(workdir):
             os.makedirs(workdir)
@@ -1899,11 +1904,13 @@ class BoxmanManager:
 
         cluster = config['clusters'][cluster_group]
         cluster_name = cluster_group
+        ws_path = config.get('workspace', {}).get('path', '')
         ssh_config = cluster['ssh_config']
         workdir = cluster['workdir']
         # -------------------- end global config -----------------------
 
-        ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
+        base_path = ws_path or workdir
+        ssh_config = os.path.expanduser(os.path.join(base_path, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
 
         # Ensure provider config reflects runtime settings.
