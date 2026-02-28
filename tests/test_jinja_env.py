@@ -248,3 +248,45 @@ class TestBoxmanManagerLoadConfigWithJinja:
         config = mgr.load_config(str(conf))
         assert config["via_func"] == "from_func"
         assert config["via_dict"] == "from_func"
+
+    def test_boxman_conf_file_resolved(self, tmp_path, monkeypatch):
+        """BOXMAN_CONF_FILE resolves to the absolute path of the config file."""
+        monkeypatch.delenv("BOXMAN_CONF_FILE", raising=False)
+        monkeypatch.delenv("BOXMAN_CONF_DIR", raising=False)
+        conf = tmp_path / "conf.yml"
+        conf.write_text(
+            "project: test\n"
+            'conf_file: {{ env("BOXMAN_CONF_FILE") }}\n'
+        )
+
+        mgr = BoxmanManager()
+        config = mgr.load_config(str(conf))
+        assert config["conf_file"] == str(conf)
+
+    def test_boxman_conf_dir_resolved(self, tmp_path, monkeypatch):
+        """BOXMAN_CONF_DIR resolves to the directory containing the config file."""
+        monkeypatch.delenv("BOXMAN_CONF_FILE", raising=False)
+        monkeypatch.delenv("BOXMAN_CONF_DIR", raising=False)
+        conf = tmp_path / "conf.yml"
+        conf.write_text(
+            "project: test\n"
+            'conf_dir: {{ env("BOXMAN_CONF_DIR") }}\n'
+        )
+
+        mgr = BoxmanManager()
+        config = mgr.load_config(str(conf))
+        assert config["conf_dir"] == str(tmp_path)
+
+    def test_boxman_conf_file_env_override(self, tmp_path, monkeypatch):
+        """A user-defined BOXMAN_CONF_FILE env var takes precedence."""
+        monkeypatch.setenv("BOXMAN_CONF_FILE", "/custom/override/conf.yml")
+        monkeypatch.delenv("BOXMAN_CONF_DIR", raising=False)
+        conf = tmp_path / "conf.yml"
+        conf.write_text(
+            "project: test\n"
+            'conf_file: {{ env("BOXMAN_CONF_FILE") }}\n'
+        )
+
+        mgr = BoxmanManager()
+        config = mgr.load_config(str(conf))
+        assert config["conf_file"] == "/custom/override/conf.yml"

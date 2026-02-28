@@ -242,3 +242,112 @@ class TestBoxmanConfOverride:
         # But runtime keys should be injected
         assert session.provider_config["runtime"] == "docker-compose"
         assert session.provider_config["runtime_container"] == "test-ctr"
+
+
+class TestConfigurableOutputPaths:
+    """Test that workspace.ansible_config, workspace.env_file, and
+    workspace.inventory control where generated files are written."""
+
+    @staticmethod
+    def _base_config(workspace_path, **ws_extras):
+        """Return a minimal config with one cluster and one VM."""
+        ws = {"path": workspace_path}
+        ws.update(ws_extras)
+        return {
+            "project": "test_proj",
+            "workspace": ws,
+            "clusters": {
+                "mycluster": {
+                    "vms": {"vm1": {"memory": 1024}},
+                }
+            },
+        }
+
+    def test_default_paths_unchanged(self, tmp_path):
+        """Without custom keys, files use the default relative keys."""
+        ws_path = str(tmp_path / "ws")
+        config = self._base_config(ws_path)
+
+        mgr = BoxmanManager()
+        mgr.config = config
+        mgr.resolve_workspace_defaults()
+
+        ws_files = config["workspace"]["files"]
+        assert "env.sh" in ws_files
+        assert "inventory/01-hosts.yml" in ws_files
+        assert "ansible.cfg" in ws_files
+
+    def test_custom_ansible_config_path(self, tmp_path):
+        """workspace.ansible_config redirects the ansible.cfg output key."""
+        ws_path = str(tmp_path / "ws")
+        custom_cfg = str(tmp_path / "shared" / "ansible.cfg")
+        config = self._base_config(ws_path, ansible_config=custom_cfg)
+
+        mgr = BoxmanManager()
+        mgr.config = config
+        mgr.resolve_workspace_defaults()
+
+        ws_files = config["workspace"]["files"]
+        assert custom_cfg in ws_files
+        assert "ansible.cfg" not in ws_files
+
+    def test_custom_env_file_path(self, tmp_path):
+        """workspace.env_file redirects the env.sh output key."""
+        ws_path = str(tmp_path / "ws")
+        custom_env = str(tmp_path / "shared" / "env.sh")
+        config = self._base_config(ws_path, env_file=custom_env)
+
+        mgr = BoxmanManager()
+        mgr.config = config
+        mgr.resolve_workspace_defaults()
+
+        ws_files = config["workspace"]["files"]
+        assert custom_env in ws_files
+        assert "env.sh" not in ws_files
+
+    def test_custom_inventory_path(self, tmp_path):
+        """workspace.inventory redirects inventory output to dir/01-hosts.yml."""
+        ws_path = str(tmp_path / "ws")
+        custom_inv = str(tmp_path / "shared" / "inventory")
+        config = self._base_config(ws_path, inventory=custom_inv)
+
+        mgr = BoxmanManager()
+        mgr.config = config
+        mgr.resolve_workspace_defaults()
+
+        ws_files = config["workspace"]["files"]
+        expected_key = os.path.join(custom_inv, "01-hosts.yml")
+        assert expected_key in ws_files
+        assert "inventory/01-hosts.yml" not in ws_files
+
+    def test_custom_env_file_content_uses_custom_paths(self, tmp_path):
+        """When custom paths are set, env.sh content references them."""
+        ws_path = str(tmp_path / "ws")
+        custom_inv = "../shared/inventory"
+        custom_cfg = "../shared/ansible.cfg"
+        config = self._base_config(
+            ws_path, inventory=custom_inv, ansible_config=custom_cfg
+        )
+
+        mgr = BoxmanManager()
+        mgr.config = config
+        mgr.resolve_workspace_defaults()
+
+        ws_files = config["workspace"]["files"]
+        # env.sh uses default key when env_file is not set
+        env_content = ws_files["env.sh"]
+        assert f"INVENTORY={custom_inv}" in env_content
+        assert f"ANSIBLE_CONFIG={custom_cfg}" in env_content
+
+    def test_relative_custom_path_resolved_against_workspace(self, tmp_path):
+        """A relative workspace.ansible_config is resolved against workspace.path."""
+        ws_path = str(tmp_path / "ws")
+        config = self._base_config(ws_path, ansible_config="../shared/ansible.cfg")
+
+        mgr = BoxmanManager()
+        mgr.config = config
+        mgr.resolve_workspace_defaults()
+
+        ws_files = config["workspace"]["files"]
+        expected = os.path.normpath(os.path.join(ws_path, "../shared/ansible.cfg"))
+        assert expected in ws_files

@@ -146,6 +146,12 @@ class BoxmanManager:
         config_dir = os.path.dirname(os.path.abspath(config_path))
         config_filename = os.path.basename(config_path)
 
+        # expose the config file location as env vars so templates can use
+        # {{ env("BOXMAN_CONF_FILE") }} and {{ env("BOXMAN_CONF_DIR") }}.
+        # setdefault lets a user-defined value take precedence.
+        os.environ.setdefault('BOXMAN_CONF_FILE', os.path.abspath(config_path))
+        os.environ.setdefault('BOXMAN_CONF_DIR', config_dir)
+
         # create jinja environment with boxman helpers (env(), env_required(), etc.)
         env = create_jinja_env(config_dir)
 
@@ -198,6 +204,36 @@ class BoxmanManager:
         # workspace-level files (written to workspace.path)
         ws_files = workspace.setdefault('files', {})
 
+        def _resolve_output_path(custom_path, workspace_path):
+            """Resolve a custom path: expanduser, make absolute relative to workspace.path, normpath."""
+            p = os.path.expanduser(custom_path)
+            if not os.path.isabs(p):
+                p = os.path.join(os.path.expanduser(workspace_path), p)
+            return os.path.normpath(p)
+
+        # Determine output keys for generated files based on workspace config overrides.
+        # When a custom path is set and resolves to an absolute path, os.path.join(rootdir, abs)
+        # returns the absolute path — so it naturally bypasses rootdir in write_files().
+        custom_ansible_config = workspace.get('ansible_config')
+        custom_env_file = workspace.get('env_file')
+        custom_inventory = workspace.get('inventory')
+
+        if custom_env_file and workspace_path:
+            env_sh_key = _resolve_output_path(custom_env_file, workspace_path)
+        else:
+            env_sh_key = 'env.sh'
+
+        if custom_inventory and workspace_path:
+            inv_dir = _resolve_output_path(custom_inventory, workspace_path)
+            inventory_key = os.path.join(inv_dir, '01-hosts.yml')
+        else:
+            inventory_key = 'inventory/01-hosts.yml'
+
+        if custom_ansible_config and workspace_path:
+            ansible_cfg_key = _resolve_output_path(custom_ansible_config, workspace_path)
+        else:
+            ansible_cfg_key = 'ansible.cfg'
+
         for cluster_name, cluster in clusters.items():
             # resolve workdir: explicit > workspace.path/cluster_name
             if 'workdir' not in cluster:
@@ -217,19 +253,21 @@ class BoxmanManager:
                 continue
 
             # --- env.sh (workspace-level) ---
-            if 'env.sh' not in ws_files:
+            if env_sh_key not in ws_files:
                 first_vm = next(iter(vms))
-                ws_files['env.sh'] = (
-                    f"export INVENTORY=inventory\n"
+                inv_val = custom_inventory if custom_inventory else 'inventory'
+                cfg_val = custom_ansible_config if custom_ansible_config else 'ansible.cfg'
+                ws_files[env_sh_key] = (
+                    f"export INVENTORY={inv_val}\n"
                     f"export SSH_CONFIG=ssh_config\n"
                     f"export GATEWAYHOST={cluster_name}_{first_vm}\n"
-                    f"export ANSIBLE_CONFIG=ansible.cfg\n"
+                    f"export ANSIBLE_CONFIG={cfg_val}\n"
                     f"export ANSIBLE_INVENTORY=\"$INVENTORY\"\n"
                     f"export ANSIBLE_SSH_ARGS=\"-F $SSH_CONFIG\"\n"
                 )
 
         # --- inventory/01-hosts.yml (workspace-level) ---
-        ws_inv_key = 'inventory/01-hosts.yml'
+        ws_inv_key = inventory_key
         if ws_inv_key not in ws_files:
             all_vms = []
             for cname, cluster in clusters.items():
@@ -265,8 +303,8 @@ class BoxmanManager:
                 )
 
         # --- ansible.cfg (workspace-level) ---
-        if 'ansible.cfg' not in ws_files:
-            ws_files['ansible.cfg'] = (
+        if ansible_cfg_key not in ws_files:
+            ws_files[ansible_cfg_key] = (
                 "[defaults]\n"
                 "host_key_checking = False\n"
                 "poll_interval = 5\n"

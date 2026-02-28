@@ -1,0 +1,13 @@
+---
+- name: Placeholder playbook
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: Show group variables
+      ansible.builtin.debug:
+        var: group_names
+
+    - name: Show host variables
+      ansible.builtin.debug:
+        var: inventory_hostname
+...

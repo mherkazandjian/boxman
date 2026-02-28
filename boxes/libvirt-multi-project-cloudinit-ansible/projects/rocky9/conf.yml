@@ -81,7 +81,11 @@ templates:
         - restorecon /etc/sudoers.d/admin || true
 
 workspace:
-  path: ~/workspaces/boxmandev/libvirt_project_rocky9_cloudinit_ansible
+  path: ~/workspaces/boxmandev/libvirt_multi_project_cloudinit_ansible/rocky9
+  env_file: {{ env("BOXMAN_CONF_DIR") }}/../../env.sh
+  ansible_config: {{ env("BOXMAN_CONF_DIR") }}/../../ansible.cfg
+  inventory: {{ env("BOXMAN_CONF_DIR") }}/../../inventory
+  ansible_site: {{ env("BOXMAN_CONF_DIR") }}/../../ansible/site.yml
 
 clusters:
   cluster_1:
