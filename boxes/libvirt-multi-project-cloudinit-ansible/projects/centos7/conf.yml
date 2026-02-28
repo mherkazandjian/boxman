@@ -1,6 +1,6 @@
 ---
 version: '1.0'
-project: tiny_libvirt_centos7_cloudinit
+project: libvirt_project_centos7_cloudinit_ansible
 provider:
   libvirt:
     uri: qemu:///system
@@ -72,7 +72,7 @@ templates:
         - restorecon /etc/sudoers.d/admin || true
 
 workspace:
-  path: ~/workspaces/boxmandev/tiny_libvirt_centos7_cloudinit
+  path: ~/workspaces/boxmandev/libvirt_project_centos7_cloudinit_ansible
 
 clusters:
   cluster_1:
@@ -91,12 +91,12 @@ clusters:
           delay: '0'
         mac: '52:54:00:00:00:01'
         ip:
-          address: '192.168.11.1'
+          address: '192.168.21.1'
           netmask: '255.255.255.0'
           dhcp:
             range:
-              start: '192.168.11.2'
-              end: '192.168.11.254'
+              start: '192.168.21.2'
+              end: '192.168.21.254'
         enable: True
         autostart: True
       isolated1:
@@ -106,12 +106,12 @@ clusters:
           delay: '0'
         mac: '52:54:00:00:00:02'
         ip:
-          address: '10.0.11.1'
+          address: '10.0.21.1'
           netmask: '255.255.255.0'
           dhcp:
             range:
-              start: '10.0.11.2'
-              end: '10.0.11.254'
+              start: '10.0.21.2'
+              end: '10.0.21.254'
         enable: True
         autostart: True
 
@@ -152,6 +152,7 @@ clusters:
           - name: adapter_1
             link_state: 'up'
             network_source: 'nat1'
+
 
 tasks:
   ping:

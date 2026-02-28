@@ -1,6 +1,6 @@
 ---
 version: '1.0'
-project: rocky9_duo
+project: rocky9_two_vms_cloudinit
 provider:
   libvirt:
     uri: qemu:///system
@@ -12,7 +12,7 @@ provider:
 
 # workspace.path is the base directory for all cluster workdirs.
 # each cluster gets a subdirectory: workspace.path / cluster_name
-# e.g. ~/workspaces/boxman/rocky9-duo/cluster_1
+# e.g. ~/workspaces/boxman/rocky9_two_vms_cloudinit/cluster_1
 #
 # auto-generated in workspace.path:
 #   - env.sh
@@ -21,7 +21,7 @@ provider:
 #   - ssh_config              (generated at provision time by boxman)
 #   - ssh keys                (generated at provision time by boxman)
 workspace:
-  path: ~/workspaces/boxmandev/rocky9-duo
+  path: ~/workspaces/boxmandev/rocky9_two_vms_cloudinit
   files:
     ansible/site.yml: |
       ---

@@ -1,6 +1,6 @@
 ---
 version: '1.0'
-project: boxman_dev_tiny-rocky-9
+project: tiny_libvirt_rocky9_cloudinit
 provider:
   libvirt:
     uri: qemu:///system
@@ -81,7 +81,7 @@ templates:
         - restorecon /etc/sudoers.d/admin || true
 
 workspace:
-  path: ~/workspaces/boxmandev/tiny-libvirt-rocky-9-cloudinit
+  path: ~/workspaces/boxmandev/tiny_libvirt_rocky9_cloudinit
 
 clusters:
   cluster_1:
@@ -125,12 +125,12 @@ clusters:
         autostart: True
 
     vms:
-      boxman01:
-        hostname: boxman01
+      node01:
+        hostname: node01
         cpus:
           sockets: 1
           cores: 2
-          threads: 2
+          threads: 1
         memory: 2048
         disks:
           - name: disk01
@@ -143,7 +143,3 @@ clusters:
           - name: adapter_1
             link_state: 'up'
             network_source: 'nat1'
-          - name: adapter_2
-            link_state: 'up'
-            network_source: 'isolated1'
-
