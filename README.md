@@ -264,3 +264,29 @@ make ping
 ## License
 
 This project is licensed under the [MIT License](../LICENSE).
+
+## Boxman Commands
+
+- `import-image` — import an image
+- `create-templates` — create template VMs from cloud images using cloud-init
+- `list` — list all registered projects
+- `provision` — provision a configuration
+- `up` — bring up the infrastructure (provision if not created, start if powered off)
+- `down` — bring down the infrastructure (save or suspend state)
+- `destroy-runtime` — destroy the docker-compose runtime and clean up .boxman
+- `deprovision` — deprovision a configuration
+- `snapshot` — manage snapshots of VMs
+  - `snapshot take` — take a snapshot
+  - `snapshot list` — list snapshots
+  - `snapshot restore` — restore VM state from a snapshot
+  - `snapshot delete` — delete a snapshot
+- `control` — control the state of VMs
+  - `control suspend` — suspend VMs
+  - `control resume` — resume VMs
+  - `control save` — save the state of VMs
+  - `control start` — start VMs
+- `export` — export VMs
+- `import` — import VMs
+- `run` — run tasks with the workspace environment loaded
+- `ps` — show the state of VMs in the project
+- `ssh` — ssh into a VM
