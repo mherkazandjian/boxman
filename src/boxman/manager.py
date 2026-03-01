@@ -2131,11 +2131,9 @@ class BoxmanManager:
     def snapshot_restore(cls, cli_args):
         """
         Restore the state of the VMs in the cluster from a snapshot.
-        """
-        if not cli_args.snapshot_name:
-           cls.logger.error("error: snapshot name is required")
-           return
 
+        If no snapshot name is given, each VM is restored to its latest snapshot.
+        """
         prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():

@@ -544,19 +544,28 @@ class LibVirtSession:
 
         return snapshots
 
-    def snapshot_restore(self, vm_name, snapshot_name):
+    def snapshot_restore(self, vm_name, snapshot_name=None):
         """
         Restore a VM to a specific snapshot.
 
+        If snapshot_name is None, the current (latest) snapshot is used.
+
         Args:
             vm_name (str): Name of the VM to revert
-            snapshot_name (str): Name of the snapshot to revert to
+            snapshot_name (str, optional): Name of the snapshot to revert to
 
         Returns:
             bool: True if successful, False otherwise
         """
-        self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
         snapshot_mgr = SnapshotManager(self.provider_config)
+        if snapshot_name is None:
+            snapshot_name = snapshot_mgr.get_latest_snapshot(vm_name)
+            if snapshot_name is None:
+                self.logger.error(f"no snapshots found for vm {vm_name}")
+                return False
+            self.logger.info(f"restoring latest snapshot '{snapshot_name}' for vm {vm_name}")
+        else:
+            self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
         return snapshot_mgr.snapshot_restore(vm_name, snapshot_name)
 
     def snapshot_delete(self, vm_name, snapshot_name):

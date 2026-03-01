@@ -338,7 +338,7 @@ def parse_args():
         type=str,
         help='the name of the snapshot',
         dest='snapshot_name',
-        default=now.strftime('%Y-%m-%dT%H-%M-%S')
+        default=snap_name
     )
     parser_snap_take.add_argument(
         "--description",
@@ -346,7 +346,7 @@ def parse_args():
         type=str,
         help='the description of the snapshot',
         dest='snapshot_descr',
-        default=''
+        default=f'boxman snapshot {snap_name}'
     )
     parser_snap_take.add_argument(
         '--live',
@@ -412,6 +412,15 @@ def parse_args():
         dest='snapshot_name',
         default=None
     )
+
+    #
+    # sub parser for the top-level 'restore' subcommand
+    # (shortcut for 'snapshot restore' with no --name: restores the latest snapshot)
+    #
+    parser_restore = subparsers.add_parser(
+        'restore',
+        help='restore all VMs to their latest snapshot')
+    parser_restore.set_defaults(func=BoxmanManager.snapshot_restore, snapshot_name=None)
 
     #
     # sub parser for the 'control' subcommand
