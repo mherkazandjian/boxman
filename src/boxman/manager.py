@@ -158,10 +158,29 @@ class BoxmanManager:
         # {name} markers before Jinja2 rendering.  Bare names (no parens,
         # dots, pipes, etc.) are task-command placeholders, not real Jinja2
         # expressions — real ones are function calls like {{ env("VAR") }}.
+        #
+        # IMPORTANT: variables defined by Jinja2 control flow ({% for %},
+        # {% set %}) must be excluded from this substitution so that Jinja2
+        # can render them correctly.  Without this exclusion, a loop like
+        #   {% for suffix in 'abc' %} ... disk{{ suffix }} ... {% endfor %}
+        # would have {{ suffix }} converted to {suffix} before Jinja2 runs,
+        # leaving the literal string "disk{suffix}" in the output.
         raw_path = os.path.join(config_dir, config_filename)
         with open(raw_path) as fobj:
             raw_content = fobj.read()
-        preserved = re.sub(r"\{\{\s*(\w+)\s*\}\}", r"{\1}", raw_content)
+
+        # collect all variable names introduced by jinja2 control flow
+        jinja_ctrl_vars: set = set()
+        jinja_ctrl_vars.update(re.findall(r'\{%-?\s*for\s+(\w+)\s+in\b', raw_content))
+        jinja_ctrl_vars.update(re.findall(r'\{%-?\s*set\s+(\w+)\s*=', raw_content))
+
+        def _preserve_jinja_vars(m: re.Match) -> str:
+            name = m.group(1)
+            if name in jinja_ctrl_vars:
+                return m.group(0)   # keep {{ name }} for Jinja2 to render
+            return '{' + name + '}'  # task placeholder → {name}
+
+        preserved = re.sub(r"\{\{\s*(\w+)\s*\}\}", _preserve_jinja_vars, raw_content)
 
         # load and render the template from the pre-processed string
         template = env.from_string(preserved)
@@ -465,10 +484,10 @@ class BoxmanManager:
         self.logger.info(f"resolved provider config for templates: {provider_config}")
 
         # resolve a workdir for template artifacts
+        # Templates must live in a stable location independent of any cluster
+        # workdir, so that destroying or cleaning a cluster does not delete
+        # the template disk images that other clusters may still reference.
         default_workdir = '~/boxman-templates'
-        for _, cluster in config.get('clusters', {}).items():
-            default_workdir = cluster.get('workdir', default_workdir)
-            break
 
         # --- Pre-check: detect already-existing templates ----------------
         # Build a temporary VirshCommand to query existing VMs once.
@@ -919,6 +938,30 @@ class BoxmanManager:
     ### end networks define / remove / destroy
 
     ### vms define / remove / destroy
+    def _ensure_libvirt_storage_pool(self, workdir: str) -> None:
+        """
+        Ensure the libvirt directory storage pool exists for the given workdir.
+
+        virt-clone automatically tries to define a pool for the target directory
+        when given a --file path. When multiple VMs are cloned in parallel into
+        the same directory, every process races to define the same pool and all
+        but the first fail with "pool already exists". Pre-defining the pool
+        here (sequentially, before parallel cloning begins) eliminates the race.
+        """
+        workdir = os.path.abspath(os.path.expanduser(workdir))
+        pool_name = os.path.basename(workdir)
+        virsh = VirshCommand(self.provider.provider_config)
+
+        result = virsh.execute("pool-info", pool_name, warn=True)
+        if result.ok:
+            self.logger.info(f"storage pool '{pool_name}' already exists")
+            return
+
+        self.logger.info(f"defining storage pool '{pool_name}' for {workdir}")
+        virsh.execute("pool-define-as", pool_name, "dir", "--target", workdir)
+        virsh.execute("pool-build", pool_name, warn=True)
+        virsh.execute("pool-start", pool_name, warn=True)
+
     def clone_vms(self) -> None:
         """
         Clone the VMs defined in the configuration.
@@ -935,6 +978,17 @@ class BoxmanManager:
                     vm_info = vm_info.copy()
                     new_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                     yield cluster, vm_info, new_vm_name
+
+        # Pre-define storage pools for all cluster workdirs before parallel
+        # cloning. virt-clone tries to auto-define a pool for the target
+        # directory; doing it here sequentially prevents the race condition
+        # where N parallel processes all try to define the same pool at once.
+        seen_workdirs: set = set()
+        for cluster_name, cluster in self.config['clusters'].items():
+            workdir = os.path.abspath(os.path.expanduser(cluster['workdir']))
+            if workdir not in seen_workdirs:
+                seen_workdirs.add(workdir)
+                self._ensure_libvirt_storage_pool(workdir)
 
         def _clone(cluster, vm_info, new_vm_name):
             self.logger.info(f"cloning vm {new_vm_name} from base image {cluster['base_image']}")
@@ -2326,25 +2380,57 @@ class BoxmanManager:
 
                 if placeholders and remaining:
                     placeholder_set = set(placeholders)
+                    # Python's argparse._parse_optional() returns None (positional)
+                    # for argument strings that contain a space, so a flag value
+                    # like '--limit node01' (a single bash-quoted arg) lands in
+                    # extra_args instead of remaining.  We detect this by checking
+                    # whether the next element in remaining is itself a recognised
+                    # placeholder flag; if so, the current flag's value was
+                    # consumed by argparse and is at the front of extra_args.
+                    extra_args = list(extra_args)  # mutable copy; pops are visible at runner.run()
                     i = 0
                     while i < len(remaining):
                         arg = remaining[i]
-                        if arg.startswith("--"):
-                            name = arg[2:].replace("-", "_")
-                            if name not in placeholder_set:
-                                log.error(f"unrecognized argument: {arg}")
-                                import sys
-                                sys.exit(1)
-                            if i + 1 >= len(remaining):
-                                log.error(f"argument {arg}: expected a value")
-                                import sys
-                                sys.exit(1)
-                            task_flags[name] = remaining[i + 1]
-                            i += 2
-                        else:
+                        if not arg.startswith("--"):
                             log.error(f"unrecognized argument: {arg}")
                             import sys
                             sys.exit(1)
+
+                        name = arg[2:].replace("-", "_")
+                        if name not in placeholder_set:
+                            log.error(f"unrecognized argument: {arg}")
+                            import sys
+                            sys.exit(1)
+
+                        # Determine the value for this flag.  Normal case:
+                        # remaining[i + 1] is the value.  Exception: if that
+                        # next arg is itself a recognised placeholder flag, the
+                        # value for this flag was misclassified as a positional
+                        # by argparse and sits at the front of extra_args.
+                        value = None
+                        if i + 1 < len(remaining):
+                            next_arg = remaining[i + 1]
+                            if next_arg.startswith("--"):
+                                next_name = next_arg[2:].replace("-", "_")
+                                if next_name not in placeholder_set:
+                                    # next_arg is a value that starts with --
+                                    value = next_arg
+                                    i += 2
+                                # else: next_arg is another flag → fall through
+                            else:
+                                value = next_arg
+                                i += 2
+
+                        if value is None:
+                            # Value not in remaining; consume from extra_args.
+                            if not extra_args:
+                                log.error(f"argument {arg}: expected a value")
+                                import sys
+                                sys.exit(1)
+                            value = extra_args.pop(0)
+                            i += 1
+
+                        task_flags[name] = value
                 elif remaining:
                     log.error(
                         f"unrecognized arguments: {' '.join(remaining)}. "

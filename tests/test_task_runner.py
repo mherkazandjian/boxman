@@ -6,12 +6,14 @@ import os
 import stat
 import subprocess
 import textwrap
+import types
 from unittest.mock import patch, MagicMock
 
 import pytest
 
 from boxman.utils.env_loader import source_env_file, load_workspace_env
 from boxman.task_runner import TaskRunner
+from boxman.manager import BoxmanManager
 
 
 # ---------------------------------------------------------------------------
@@ -281,3 +283,415 @@ class TestTaskRunner:
         runner = TaskRunner(basic_config)
         runner.run("check_pwd")
         assert out_file.read_text().strip() == str(task_dir)
+
+
+# ---------------------------------------------------------------------------
+# Flag-passing scenarios: {flags}, {more_flags}, and -- extra args
+# ---------------------------------------------------------------------------
+
+
+class TestTaskRunnerFlagsPassing:
+    """
+    Tests for {placeholder} flag substitution and -- extra_args in task commands.
+
+    Covers the scenarios documented in task_runner.py::
+
+        boxman run cmd --flags "--limit node01" --more-flags "--become" -- hostname
+        # resolves to:
+        # ansible all --limit node01 -m ansible.builtin.shell --become -a hostname
+    """
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        """Minimal config with tasks that use {placeholder} markers."""
+        env_file = tmp_path / "env.sh"
+        env_file.write_text("export INVENTORY=inv\n")
+        return {
+            "project": "flagtest",
+            "clusters": {"c1": {"workdir": str(tmp_path)}},
+            "workspace": {"env_file": str(env_file)},
+            "tasks": {},
+        }
+
+    def _add_task(self, config, name, command):
+        config["tasks"][name] = {"description": name, "command": command}
+
+    def _run(self, config, task_name, extra_args=None, task_flags=None):
+        with patch("boxman.task_runner.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            runner = TaskRunner(config)
+            runner.run(task_name, extra_args=extra_args, task_flags=task_flags)
+            return mock_run.call_args[0][0]
+
+    # ------------------------------------------------------------------
+    # 1. Both {flags} and {more_flags} filled
+    # ------------------------------------------------------------------
+
+    def test_both_flags_filled(self, config):
+        """Both placeholders filled → values interpolated in place."""
+        self._add_task(
+            config, "cmd",
+            "ansible all {flags} -m ansible.builtin.shell {more_flags} -a",
+        )
+        cmd = self._run(
+            config, "cmd",
+            extra_args=["hostname"],
+            task_flags={"flags": "--limit node01", "more_flags": "--become"},
+        )
+        assert cmd == (
+            "ansible all --limit node01 -m ansible.builtin.shell --become -a hostname"
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Only {flags} filled; {more_flags} absent → collapsed cleanly
+    # ------------------------------------------------------------------
+
+    def test_only_first_flag_filled(self, config):
+        """{more_flags} not provided → removed, no double-space left behind."""
+        self._add_task(
+            config, "cmd",
+            "ansible all {flags} -m ansible.builtin.shell {more_flags} -a",
+        )
+        cmd = self._run(
+            config, "cmd",
+            extra_args=["hostname"],
+            task_flags={"flags": "--limit node01"},
+        )
+        assert cmd == (
+            "ansible all --limit node01 -m ansible.builtin.shell -a hostname"
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Neither placeholder provided → both removed, no double-spaces
+    # ------------------------------------------------------------------
+
+    def test_no_flags_provided(self, config):
+        """No task_flags passed → all placeholders removed, spacing normalised."""
+        self._add_task(
+            config, "cmd",
+            "ansible all {flags} -m ansible.builtin.shell {more_flags} -a",
+        )
+        cmd = self._run(config, "cmd", extra_args=["hostname"])
+        assert cmd == "ansible all -m ansible.builtin.shell -a hostname"
+
+    # ------------------------------------------------------------------
+    # 4. Flag value contains spaces (multi-word value)
+    # ------------------------------------------------------------------
+
+    def test_flag_value_with_spaces(self, config):
+        """A flag value like '--limit node01 node02' is passed as a single token."""
+        self._add_task(config, "cmd", "ansible all {flags} -m ping")
+        cmd = self._run(
+            config, "cmd",
+            task_flags={"flags": "--limit node01 node02"},
+        )
+        assert cmd == "ansible all --limit node01 node02 -m ping"
+
+    # ------------------------------------------------------------------
+    # 5. Flag value contains dashes (--dry-run style options)
+    # ------------------------------------------------------------------
+
+    def test_flag_value_with_dashes(self, config):
+        """Flag values that are themselves dash-prefixed options work correctly."""
+        self._add_task(config, "cmd", "ansible-playbook {flags} site.yml")
+        cmd = self._run(
+            config, "cmd",
+            task_flags={"flags": "--dry-run --check"},
+        )
+        assert cmd == "ansible-playbook --dry-run --check site.yml"
+
+    # ------------------------------------------------------------------
+    # 6. -- extra_args only; command has no {placeholder}
+    # ------------------------------------------------------------------
+
+    def test_double_dash_extra_args_no_placeholders(self, config):
+        """Args after -- are appended to commands that have no placeholders."""
+        self._add_task(config, "site", "ansible-playbook site.yml")
+        cmd = self._run(
+            config, "site",
+            extra_args=["--limit", "foo", "--tags=bar"],
+        )
+        assert cmd == "ansible-playbook site.yml --limit foo --tags=bar"
+
+    # ------------------------------------------------------------------
+    # 7. Both {flags} task_flags AND -- extra_args combined
+    # ------------------------------------------------------------------
+
+    def test_flags_and_double_dash_extra_args_combined(self, config):
+        """
+        Simulates: boxman run cmd --flags "--limit node01" -- hostname
+        {flags} is replaced; then extra_args are appended at the end.
+        """
+        self._add_task(
+            config, "cmd",
+            "ansible all {flags} -m ansible.builtin.shell -a",
+        )
+        cmd = self._run(
+            config, "cmd",
+            extra_args=["hostname"],
+            task_flags={"flags": "--limit node01"},
+        )
+        assert cmd == "ansible all --limit node01 -m ansible.builtin.shell -a hostname"
+
+    # ------------------------------------------------------------------
+    # 8. {placeholder} at end of command (no trailing text)
+    # ------------------------------------------------------------------
+
+    def test_placeholder_at_end_of_command(self, config):
+        """Placeholder at the very end is replaced without trailing space."""
+        self._add_task(config, "cmd", "echo {message}")
+        cmd = self._run(config, "cmd", task_flags={"message": "hello world"})
+        assert cmd == "echo hello world"
+
+    def test_placeholder_at_end_missing(self, config):
+        """Missing placeholder at the very end leaves no trailing space."""
+        self._add_task(config, "cmd", "echo {message}")
+        cmd = self._run(config, "cmd")
+        assert cmd == "echo"
+
+    # ------------------------------------------------------------------
+    # 9. Three placeholders; only the middle one filled
+    # ------------------------------------------------------------------
+
+    def test_three_placeholders_only_middle_filled(self, config):
+        """First and last placeholders absent; middle filled → clean result."""
+        self._add_task(
+            config, "cmd",
+            "{pre_flags} ansible all {flags} -m ping {post_flags}",
+        )
+        cmd = self._run(config, "cmd", task_flags={"flags": "--limit node01"})
+        assert cmd == "ansible all --limit node01 -m ping"
+
+    # ------------------------------------------------------------------
+    # 10. Flag value is an empty string (explicitly silencing a placeholder)
+    # ------------------------------------------------------------------
+
+    def test_flag_value_empty_string(self, config):
+        """Explicitly passing '' for a flag removes the placeholder cleanly."""
+        self._add_task(
+            config, "cmd",
+            "ansible all {flags} -m ping",
+        )
+        cmd = self._run(config, "cmd", task_flags={"flags": ""})
+        assert cmd == "ansible all -m ping"
+
+    # ------------------------------------------------------------------
+    # 11. Hyphen-to-underscore key mapping (mirrors CLI behaviour in manager.py)
+    # ------------------------------------------------------------------
+
+    def test_hyphen_key_does_not_match_underscore_placeholder(self, config):
+        """
+        TaskRunner.run() receives the already-normalised key (underscore).
+        The CLI layer (manager.py) converts --more-flags → more_flags before
+        calling run().  A key still containing a hyphen would NOT match the
+        {more_flags} placeholder.
+        """
+        self._add_task(
+            config, "cmd",
+            "ansible all {more_flags} -m ping",
+        )
+        # hyphen key → no match → placeholder removed
+        cmd_no_match = self._run(
+            config, "cmd",
+            task_flags={"more-flags": "--limit node01"},
+        )
+        assert cmd_no_match == "ansible all -m ping"
+
+        # underscore key → matches → value inserted
+        cmd_match = self._run(
+            config, "cmd",
+            task_flags={"more_flags": "--limit node01"},
+        )
+        assert cmd_match == "ansible all --limit node01 -m ping"
+
+    # ------------------------------------------------------------------
+    # 12. -- extra_args with multiple tokens; flags also present
+    # ------------------------------------------------------------------
+
+    def test_multiple_extra_args_after_double_dash(self, config):
+        """
+        Simulates: boxman run cmd --flags "-v" -- arg1 arg2 arg3
+        All post-'--' tokens are appended in order.
+        """
+        self._add_task(config, "cmd", "mycommand {flags}")
+        cmd = self._run(
+            config, "cmd",
+            extra_args=["arg1", "arg2", "arg3"],
+            task_flags={"flags": "-v"},
+        )
+        assert cmd == "mycommand -v arg1 arg2 arg3"
+
+
+# ---------------------------------------------------------------------------
+# Manager-level flag parsing: argparse positional mis-classification fix
+#
+# Python's argparse._parse_optional() returns None (positional) for any
+# argument string that contains a space.  This means a bash-quoted value
+# like '--limit cluster_1_control01' (a single token with a space) lands
+# in cli_args.extra_args instead of remaining_args, which caused:
+#
+#   boxman run cmd --flags '--limit cluster_1_control01' -- hostname
+#   → ERROR: argument --flags: expected a value
+#
+# The tests below simulate the exact (remaining_args, extra_args) pairs
+# that argparse produces and verify that BoxmanManager.run_task correctly
+# recovers the flag value from extra_args when necessary.
+# ---------------------------------------------------------------------------
+
+
+def _make_cli_args(task_name, remaining_args, extra_args, cluster=None):
+    """Build a minimal Namespace that BoxmanManager.run_task expects."""
+    ns = types.SimpleNamespace(
+        task_name=task_name,
+        remaining_args=remaining_args,
+        extra_args=list(extra_args),
+        cmd=None,
+        list_tasks=False,
+        cluster=cluster,
+    )
+    return ns
+
+
+class TestRunTaskArgparseMisclassification:
+    """
+    Tests for the argparse positional-mis-classification workaround in
+    BoxmanManager.run_task.
+
+    In each scenario we construct the exact (remaining_args, extra_args)
+    that argparse produces for a given CLI invocation and verify that the
+    correct command is assembled by TaskRunner.run().
+    """
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        env_file = tmp_path / "env.sh"
+        env_file.write_text("export INVENTORY=inv\n")
+        config = {
+            "project": "flagtest",
+            "clusters": {"c1": {"workdir": str(tmp_path)}},
+            "workspace": {"env_file": str(env_file)},
+            "tasks": {
+                "cmd": {
+                    "description": "run ansible",
+                    "command": "ansible all {flags} -m ansible.builtin.shell {more_flags} -a",
+                },
+            },
+        }
+        mgr = BoxmanManager.__new__(BoxmanManager)
+        mgr.config = config
+        mgr.logger = MagicMock()
+        return mgr
+
+    def _run_task(self, manager, cli_args):
+        """Invoke run_task and return the command string passed to subprocess."""
+        with patch("boxman.task_runner.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            BoxmanManager.run_task(manager, cli_args)
+            return mock_run.call_args[0][0]
+
+    # ------------------------------------------------------------------
+    # 1. Value contains a space → argparse puts it in extra_args
+    #    CLI: boxman run cmd --flags '--limit cluster_1_control01' -- hostname
+    # ------------------------------------------------------------------
+
+    def test_space_in_flag_value_single_flag(self, manager):
+        """
+        argparse classifies '--limit cluster_1_control01' (contains space)
+        as a positional, so remaining=['--flags'] and extra_args starts with
+        the misplaced value.  run_task must recover the value from extra_args.
+        """
+        cli_args = _make_cli_args(
+            task_name="cmd",
+            remaining_args=["--flags"],
+            extra_args=["--limit cluster_1_control01", "hostname"],
+        )
+        cmd = self._run_task(manager, cli_args)
+        assert cmd == (
+            "ansible all --limit cluster_1_control01 -m ansible.builtin.shell -a hostname"
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Two flags; first value has a space (misclassified), second is ok
+    #    CLI: boxman run cmd --flags '--limit node01' --more-flags '--become' -- hostname
+    # ------------------------------------------------------------------
+
+    def test_first_flag_value_misclassified_second_normal(self, manager):
+        """
+        '--limit node01' has a space → extra_args[0].
+        '--become' has no space → stays in remaining as the value of --more-flags.
+        remaining=['--flags', '--more-flags', '--become']
+        extra_args=['--limit node01', 'hostname']
+        """
+        cli_args = _make_cli_args(
+            task_name="cmd",
+            remaining_args=["--flags", "--more-flags", "--become"],
+            extra_args=["--limit node01", "hostname"],
+        )
+        cmd = self._run_task(manager, cli_args)
+        assert cmd == (
+            "ansible all --limit node01 -m ansible.builtin.shell --become -a hostname"
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Both flag values contain spaces → both misclassified
+    #    CLI: boxman run cmd --flags '--limit node01' --more-flags '--become --check' -- hostname
+    # ------------------------------------------------------------------
+
+    def test_both_flag_values_misclassified(self, manager):
+        """
+        Both '--limit node01' and '--become --check' contain spaces.
+        remaining=['--flags', '--more-flags']
+        extra_args=['--limit node01', '--become --check', 'hostname']
+        """
+        cli_args = _make_cli_args(
+            task_name="cmd",
+            remaining_args=["--flags", "--more-flags"],
+            extra_args=["--limit node01", "--become --check", "hostname"],
+        )
+        cmd = self._run_task(manager, cli_args)
+        assert cmd == (
+            "ansible all --limit node01 -m ansible.builtin.shell --become --check -a hostname"
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Normal case: value starts with -- but has no space → stays in remaining
+    #    CLI: boxman run cmd --flags '--limit' -- hostname
+    # ------------------------------------------------------------------
+
+    def test_flag_value_starts_with_dashes_no_space(self, manager):
+        """
+        '--limit' has no space → argparse keeps it in remaining.
+        remaining=['--flags', '--limit']
+        extra_args=['hostname']
+        This tests the normal parsing path is unaffected by the fix.
+        """
+        cli_args = _make_cli_args(
+            task_name="cmd",
+            remaining_args=["--flags", "--limit"],
+            extra_args=["hostname"],
+        )
+        cmd = self._run_task(manager, cli_args)
+        assert cmd == (
+            "ansible all --limit -m ansible.builtin.shell -a hostname"
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Both flags normal (no spaces in values, both start with --)
+    #    CLI: boxman run cmd --flags '--limit' --more-flags '--become' -- hostname
+    # ------------------------------------------------------------------
+
+    def test_both_flags_normal_dashed_values(self, manager):
+        """
+        Neither value has a space; both land in remaining correctly.
+        remaining=['--flags', '--limit', '--more-flags', '--become']
+        extra_args=['hostname']
+        """
+        cli_args = _make_cli_args(
+            task_name="cmd",
+            remaining_args=["--flags", "--limit", "--more-flags", "--become"],
+            extra_args=["hostname"],
+        )
+        cmd = self._run_task(manager, cli_args)
+        assert cmd == (
+            "ansible all --limit -m ansible.builtin.shell --become -a hostname"
+        )

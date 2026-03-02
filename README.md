@@ -290,3 +290,73 @@ This project is licensed under the [MIT License](../LICENSE).
 - `run` — run tasks with the workspace environment loaded
 - `ps` — show the state of VMs in the project
 - `ssh` — ssh into a VM
+
+## Tasks
+
+Tasks are named shell commands defined in the `tasks:` section of `conf.yml`.
+They run inside the workspace environment (env vars from `env_file` are loaded
+before execution), with the working directory set to `workspace.path`.
+
+Placeholders like `{flags}` and `{tags}` are filled from CLI arguments:
+
+```yaml
+tasks:
+  ping:
+    description: "ping all hosts via ansible"
+    command: ansible all {{ flags }} -m ansible.builtin.ping
+
+  cmd:
+    description: "run a shell command on all hosts"
+    command: ansible all {{ flags }} -m ansible.builtin.shell -a
+
+  site:
+    description: "run the full site playbook"
+    command: ansible-playbook {{ flags }} --become $ANSIBLE_SITE/site.yml {{ tags }} --
+
+  playbook:
+    description: "run a specific playbook"
+    command: ansible-playbook {{ flags }} --become $ANSIBLE_SITE/{{ playbook }} {{ tags }} --
+
+  ssh:
+    description: "ssh to the gateway host"
+    command: ssh -F ${SSH_CONFIG} -t ${GATEWAYHOST}
+```
+
+> **Note on shell vs Jinja2 variables**: `$ANSIBLE_SITE`, `$SSH_CONFIG`, and
+> `$GATEWAYHOST` use shell variable syntax so they are resolved at task
+> execution time (after `env_file` is sourced). Using `{{ env("VAR") }}`
+> would resolve at config-render time, before env.sh is loaded.
+
+### Usage examples
+
+```bash
+# Ping all hosts
+boxman run ping
+
+# Ping with ansible flags (e.g. limit to one host)
+boxman run ping --flags "--limit node01"
+
+# Run a shell command on all hosts
+boxman run cmd -- hostname
+
+# Run a shell command with ansible flags
+boxman run cmd --flags "--limit node01,node02" -- uptime
+
+# Run the full site playbook
+boxman run site
+
+# Run site playbook with tags
+boxman run site -- --tags base,networking
+
+# Run site playbook limited to specific hosts and with tags
+boxman run site --flags "--limit head01" -- --tags slurm
+
+# Run a specific playbook by name
+boxman run playbook --playbook networking.yml
+
+# Run a specific playbook with tags
+boxman run playbook --playbook storage.yml -- --tags beegfs
+
+# SSH into the gateway host
+boxman run ssh
+```
