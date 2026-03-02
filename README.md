@@ -8,14 +8,14 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 ## Features
 
 - Declarative VM provisioning via YAML configuration
-- Supports libvirt/KVM with QEMU
+- Supports libvirt/KVM with QEMU (and import to VirtualBox via `import-image --provider virtualbox`)
 - Network and disk management
 - Snapshot support
 - Cloud-init integration
 - **Cloud-init template creation**: build template VMs from cloud images with inline cloud-init config
 - **Auto-creation of templates on provision**: if a cluster's `base_image` references a template defined in the `templates` section and the template VM does not yet exist, it is automatically created before provisioning proceeds
 - **Runtime environments**: execute provider commands locally or inside a Docker container
-- **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
+- **`boxman up`**: idempotent bring-up — provisions if needed, then starts/resumes VMs if powered off or paused
 
 ## Quick Start
 
@@ -32,11 +32,11 @@ Boxman includes a containerized libvirt/KVM environment for development and test
 modifying your host system. Only requires Docker with compose v2 and `/dev/kvm` on the host.
 
 ```bash
-# Start the docker-compose environment
+# Start the Docker runtime environment
 cd containers/docker && make up
 
 # Provision using the docker-compose runtime
-boxman --runtime docker-compose provision
+boxman --runtime docker provision
 ```
 
 See [boxman/containers/docker/README.md](boxman/containers/docker/README.md) for full documentation.
@@ -114,7 +114,7 @@ boxman create-templates --force
 
  - git clone
  - `pip install .` (or `pip install -e .` for development)
- - For docker-compose runtime extras: `pip install '.[docker-compose]'`
+ - For docker runtime extras (optional): `pip install '.[docker]'`
  - For the libvirt provider it is necessary that the user executing boxman
    can run sudo virsh and other libvirt commands (see below).
  - The boxman application config is searched at `~/.config/boxman/boxman.yml` by default.
@@ -165,7 +165,7 @@ commands are executed. The runtime is orthogonal to the provider:
 | Runtime | Description |
 |---|---|
 | `local` (default) | Commands run directly on the host |
-| `docker` | Commands run inside the boxman docker-compose container via `docker exec` |
+| `docker` | Commands run inside the Boxman Docker environment (container) |
 
 ```bash
 # Local (default — same as omitting --runtime)
@@ -178,7 +178,7 @@ boxman --runtime docker provision
 #   runtime: docker
 ```
 
-The bundled `docker-compose.yml` is shipped with the package. To use a custom
+The bundled Docker Compose setup is shipped with the package. To use a custom
 one, set `compose_file` in `runtime_config` or the `BOXMAN_COMPOSE_FILE`
 environment variable.
 
@@ -194,9 +194,9 @@ environment variable.
 ````bash
 export BOXMAN_ADMIN_PASS=$(cat ~/.onlyme/rocky-95-minimal-base-template-admin-pass)
 boxman provision
-boxman snapshot --name "state before kernel upgrade"
+boxman snapshot take --name "state before kernel upgrade"
 # ... upgrade the kernel and then end up with a kernel panic
-boxman restore --name "state before kernel upgrade"
+boxman snapshot restore --name "state before kernel upgrade"
 ````
 
 ### SSH into VMs
@@ -227,7 +227,7 @@ boxman ssh 1
 curl -L http://example.com/vm-package.tar.gz | tar xv -C ~/tmp/sandbox/
 
 # import a vm from a disk, a directory called my-ubuntu-vm will be created in ~/myvms
-boxman import-image --uri file://~/http://example.com/vm-package.tar.gz \
+boxman import-image --uri file:///home/$USER/tmp/sandbox/vm-package/manifest.yml \
   --directory ~/myvms  \
   --name my-ubuntu-vm \
   --provider libvirt
@@ -269,11 +269,11 @@ This project is licensed under the [MIT License](../LICENSE).
 
 - `import-image` — import an image
 - `create-templates` — create template VMs from cloud images using cloud-init
-- `list` — list all registered projects
+- `list` — list all registered projects (`--pretty plain|table`, `--json`, `--color yes|no`)
 - `provision` — provision a configuration
 - `up` — bring up the infrastructure (provision if not created, start if powered off)
-- `down` — bring down the infrastructure (save or suspend state)
-- `destroy-runtime` — destroy the docker-compose runtime and clean up .boxman
+- `down` — bring down the infrastructure (save state; use `--suspend` to pause instead)
+- `destroy-runtime` — destroy the Docker runtime environment and clean up `.boxman` (use `-y/--auto-accept` to skip confirmation)
 - `deprovision` — deprovision a configuration
 - `snapshot` — manage snapshots of VMs
   - `snapshot take` — take a snapshot

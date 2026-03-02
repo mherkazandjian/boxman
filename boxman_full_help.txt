@@ -1,0 +1,224 @@
+==============================
+boxman import-image --help
+==============================
+usage: boxman import-image [-h] --uri MANIFEST_URI [--name VM_NAME]
+                           [--directory VM_DIR]
+                           [--provider {virtualbox,libvirt}]
+
+options:
+  -h, --help            show this help message and exit
+  --uri MANIFEST_URI    the URI of the manifest of the image to import
+  --name VM_NAME        the name to assign to the imported vm
+  --directory VM_DIR    the directory to download/extract the image into
+  --provider {virtualbox,libvirt}
+                        the provider to import the image into
+
+==============================
+boxman create-templates --help
+==============================
+usage: boxman create-templates [-h] [--templates TEMPLATE_NAMES] [--force]
+
+options:
+  -h, --help            show this help message and exit
+  --templates TEMPLATE_NAMES
+                        comma-separated list of template keys to create
+                        (default: all)
+  --force               force creation even if VM already exists
+
+==============================
+boxman list --help
+==============================
+usage: boxman list [-h] [--pretty [{plain,table}] | --json] [--color {yes,no}]
+
+options:
+  -h, --help            show this help message and exit
+  --pretty, -p [{plain,table}]
+                        display in a human-readable format without logger
+                        prefixes (plain or table)
+  --json                output the project list as JSON
+  --color {yes,no}      enable or disable colored output (default: yes)
+
+==============================
+boxman provision --help
+==============================
+usage: boxman provision [-h] [--docker-compose] [--force]
+                        [--rebuild-templates]
+
+options:
+  -h, --help           show this help message and exit
+  --docker-compose     provision using the docker-compose setup
+  --force              if VMs already exist, deprovision them first and then
+                       provision
+  --rebuild-templates  force-rebuild all templates (destroy and recreate)
+                       before provisioning
+
+==============================
+boxman up --help
+==============================
+usage: boxman up [-h] [--docker-compose] [--force] [--rebuild-templates]
+
+options:
+  -h, --help           show this help message and exit
+  --docker-compose     use the docker-compose setup
+  --force              if VMs already exist, deprovision them first and then
+                       provision
+  --rebuild-templates  force-rebuild all templates (destroy and recreate)
+                       before provisioning
+
+==============================
+boxman down --help
+==============================
+usage: boxman down [-h] [--suspend]
+
+options:
+  -h, --help  show this help message and exit
+  --suspend   suspend (pause) VMs instead of saving their state to disk
+
+==============================
+boxman destroy-runtime --help
+==============================
+usage: boxman destroy-runtime [-h] [--auto-accept]
+
+options:
+  -h, --help         show this help message and exit
+  --auto-accept, -y  skip the confirmation prompt and proceed immediately
+
+==============================
+boxman deprovision --help
+==============================
+usage: boxman deprovision [-h] [--docker-compose]
+
+options:
+  -h, --help        show this help message and exit
+  --docker-compose  deprovision using the docker-compose setup
+
+==============================
+boxman snapshot --help
+==============================
+usage: boxman snapshot [-h] {take,list,restore,delete} ...
+
+positional arguments:
+  {take,list,restore,delete}
+                        sub-commands for boxman snapshot
+    take                take a snapshot
+    list                list snapshots
+    restore             restore the state of vms from snapshot
+    delete              delete a snapshot
+
+options:
+  -h, --help            show this help message and exit
+
+==============================
+boxman restore --help
+==============================
+usage: boxman restore [-h]
+
+options:
+  -h, --help  show this help message and exit
+
+==============================
+boxman control --help
+==============================
+usage: boxman control [-h] {suspend,resume,save,start} ...
+
+positional arguments:
+  {suspend,resume,save,start}
+                        sub-commands for boxman control
+    suspend             suspend vms
+    resume              resume vms
+    save                save the state of vms
+    start               start the vms
+
+options:
+  -h, --help            show this help message and exit
+
+==============================
+boxman export --help
+==============================
+usage: boxman export [-h] [--vms VMS] [--path PATH]
+
+options:
+  -h, --help   show this help message and exit
+  --vms VMS    the names of the vms as a csv list
+  --path PATH  the names of the vms as a csv list
+
+==============================
+boxman import --help
+==============================
+usage: boxman import [-h] [--vms VMS] [--path PATH]
+
+options:
+  -h, --help   show this help message and exit
+  --vms VMS    the names of the vms as a csv list
+  --path PATH  the names of the vms as a csv list
+
+==============================
+boxman run --help
+==============================
+usage: boxman run [-h] [--list] [--cmd CMD] [--ansible-flags ANSIBLE_FLAGS]
+                  [--cluster CLUSTER]
+                  [task_name] [extra_args ...]
+
+Run named tasks or ad-hoc commands with environment variables
+loaded from the workspace env file (env.sh).
+
+examples:
+    # list available tasks
+    $ boxman run --list
+
+    # run a named task
+    $ boxman run ping
+
+    # run a task with extra arguments
+    $ boxman run site -- --limit foo --tags=bar
+
+    # run an ad-hoc command with the workspace env loaded
+    $ boxman run --cmd 'ansible all -m ping'
+
+positional arguments:
+  task_name             name of the task to run (defined in conf.yml tasks section)
+  extra_args            extra arguments passed to the task command
+
+options:
+  -h, --help            show this help message and exit
+  --list, -l            list available tasks
+  --cmd CMD             run an ad-hoc command with the workspace environment loaded
+  --ansible-flags ANSIBLE_FLAGS
+                        flags passed to ansible for --cmd
+  --cluster CLUSTER     cluster name to scope the workspace environment to
+
+==============================
+boxman ps --help
+==============================
+usage: boxman ps [-h]
+
+Display the current state of all VMs defined in the project
+configuration.
+
+examples:
+    $ boxman ps
+
+options:
+  -h, --help  show this help message and exit
+
+==============================
+boxman ssh --help
+==============================
+usage: boxman ssh [-h] [--cluster CLUSTER] [vm_name]
+
+Open an interactive SSH session to a VM.
+
+Defaults to the gateway host (first VM) when no name is given.
+
+examples:
+    $ boxman ssh
+    $ boxman ssh cluster_1_node02
+    $ boxman ssh node02
+
+positional arguments:
+  vm_name            VM name to ssh into (default: gateway host)
+
+options:
+  -h, --help         show this help message and exit
+  --cluster CLUSTER  cluster name to scope the workspace environment to
+
