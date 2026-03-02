@@ -929,6 +929,7 @@ class BoxmanManager:
                     yield cluster, vm_info, new_vm_name
 
         def _clone(cluster, vm_info, new_vm_name):
+            self.logger.info(f"cloning vm {new_vm_name} from base image {cluster['base_image']}")
             self.provider.clone_vm(
                 src_vm_name=cluster['base_image'],
                 new_vm_name=new_vm_name,
@@ -936,19 +937,12 @@ class BoxmanManager:
                 workdir=cluster['workdir']
             )
 
-        # clone the vms one at a time
-        for cluster, vm_info, new_vm_name in vm_clone_tasks():
-            self.logger.info(f"cloning vm {new_vm_name} from base image {cluster['base_image']}")
-            _clone(cluster, vm_info, new_vm_name)
-            time.sleep(1)  # Add a small delay to avoid overwhelming the provider
-
-        # optionally use multiprocessing to speed up the cloning process
-        #processes = [
-        #    Process(target=_clone, args=(cluster, vm_info, new_vm_name))
-        #    for cluster, vm_info, new_vm_name in vm_clone_tasks()
-        #]
-        #[p.start() for p in processes]
-        #[p.join() for p in processes]
+        processes = [
+            Process(target=_clone, args=(cluster, vm_info, new_vm_name))
+            for cluster, vm_info, new_vm_name in vm_clone_tasks()
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
 
     def destroy_vms(self) -> None:
         """
@@ -976,46 +970,129 @@ class BoxmanManager:
         [p.join() for p in processes]
     ### end vms define / remove / destroy
 
-    def configure_network_interfaces(self) -> None:
+    def _configure_and_start_vm(
+        self, cluster_name: str, cluster: Dict[str, Any], vm_name: str, vm_info: Dict[str, Any]
+    ) -> None:
         """
-        Configure network interfaces for all VMs based on their network_adapters configuration.
+        Configure and start a single VM: cpu/mem, network interfaces, disks, then start.
 
-        This method adds network interfaces to VMs after they have been cloned,
-        connecting them to the appropriate networks.
+        Designed to be called in a separate process per VM after cloning is done.
         """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+        vm_info = vm_info.copy()
+
+        # cpu / memory
+        cpus = vm_info.get('cpus')
+        memory = vm_info.get('memory')
+        if cpus or memory:
+            self.logger.info(f"configuring cpu and memory for vm {vm_name}")
+            success = self.provider.configure_vm_cpu_memory(
+                vm_name=full_vm_name, cpus=cpus, memory_mb=memory
+            )
+            if success:
+                self.logger.info(f"successfully configured cpu and memory for vm {vm_name}")
+            else:
+                self.logger.warning(f"failed to configure cpu and memory for vm {vm_name}")
+        else:
+            self.logger.warning(f"no cpu or memory configuration for vm {vm_name}, skipping")
+
+        # network interfaces
+        if 'network_adapters' not in vm_info:
+            self.logger.warning(f"no network adapters defined for vm {vm_name}, skipping")
+        else:
+            for adapter in vm_info['network_adapters']:
+                if adapter.get('is_global', False):
+                    full_network_name = adapter['network_source']
+                else:
+                    full_network_name = self.full_network_name(
+                        project_config=self.config,
+                        cluster_name=cluster_name,
+                        network_name=adapter['network_source']
+                    )
+                adapter['network_source'] = full_network_name
+
+            self.logger.info(f"configuring network interfaces for vm {vm_name}")
+            success = self.provider.configure_vm_network_interfaces(
+                vm_name=full_vm_name,
+                network_adapters=vm_info['network_adapters']
+            )
+            if success:
+                self.logger.info(f"network interfaces configured for vm {vm_name}")
+            else:
+                self.logger.warning(f"some network interfaces could not be configured for vm {vm_name}")
+
+        # disks
+        workdir = cluster.get('workdir', '.')
+        if 'disks' not in vm_info or not vm_info['disks']:
+            self.logger.warning(f"no disks defined for vm {vm_name}, skipping")
+        else:
+            self.logger.info(f"configuring disks for vm {vm_name}")
+            success = self.provider.configure_vm_disks(
+                vm_name=full_vm_name,
+                disks=vm_info['disks'],
+                workdir=workdir,
+                disk_prefix=full_vm_name
+            )
+            if success:
+                self.logger.info(f"all disks configured for vm {vm_name}")
+            else:
+                self.logger.warning(f"some disks could not be configured for vm {vm_name}")
+
+        # start
+        self.logger.info(f"starting vm {full_vm_name}")
+        success = self.provider.start_vm(full_vm_name)
+        if success:
+            self.logger.info(f"successfully started the vm {full_vm_name}")
+        else:
+            self.logger.warning(f"failed to start the vm {full_vm_name}")
+
+    def configure_and_start_vms(self) -> None:
+        """
+        Configure (cpu/mem, network interfaces, disks) and start all VMs in parallel.
+
+        Each VM is handled in its own process so all VMs are configured and
+        started concurrently.
+        """
+        processes = [
+            Process(
+                target=self._configure_and_start_vm,
+                args=(cluster_name, cluster, vm_name, vm_info)
+            )
+            for cluster_name, cluster in self.config['clusters'].items()
+            for vm_name, vm_info in cluster['vms'].items()
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+    # Keep individual methods available for direct use / testing
+
+    def configure_network_interfaces(self) -> None:
+        """Configure network interfaces for all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
-
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 vm_info = vm_info.copy()
-
                 self.logger.info(
                     f"configuring network interfaces for VM {vm_name} in cluster {cluster_name}")
-
                 if 'network_adapters' not in vm_info:
                     self.logger.warning(f"no network adapters defined for vm {vm_name}, skipping")
                     continue
-                else:
-                    # use the fully qualified network name to which the adapter will connect to
-                    for adapter in vm_info['network_adapters']:
-
-                        if adapter.get('is_global', False):
-                            full_network_name = adapter['network_source']
-                        else:
-                            full_network_name = self.full_network_name(
-                                project_config=self.config,
-                                cluster_name=cluster_name,
-                                network_name=adapter['network_source']
-                            )
-
-                        adapter['network_source'] = full_network_name
-
+                for adapter in vm_info['network_adapters']:
+                    if adapter.get('is_global', False):
+                        full_network_name = adapter['network_source']
+                    else:
+                        full_network_name = self.full_network_name(
+                            project_config=self.config,
+                            cluster_name=cluster_name,
+                            network_name=adapter['network_source']
+                        )
+                    adapter['network_source'] = full_network_name
                 success = self.provider.configure_vm_network_interfaces(
                     vm_name=full_vm_name,
                     network_adapters=vm_info['network_adapters']
                 )
-
                 if success:
                     self.logger.info(
                         f"All network interfaces configured successfully for vm {vm_name}")
@@ -1024,87 +1101,56 @@ class BoxmanManager:
                         f"Some network interfaces could not be configured for vm {vm_name}")
 
     def configure_disks(self) -> None:
-        """
-        Configure disks for all VMs based on their disks configuration.
-
-        This method creates and attaches disks to VMs after they have been cloned.
-        """
+        """Configure disks for all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             workdir = cluster.get('workdir', '.')
-
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-
                 self.logger.info(f"configuring disks for vm {vm_name} in cluster {cluster_name}")
-
-                # check if there are disks defined in the VM configuration
                 if 'disks' not in vm_info or not vm_info['disks']:
                     self.logger.warning(f"no disks defined for vm {vm_name}, skipping")
                     continue
-
-                # configure all disks for this vm
                 success = self.provider.configure_vm_disks(
                     vm_name=full_vm_name,
                     disks=vm_info['disks'],
                     workdir=workdir,
                     disk_prefix=full_vm_name)
-
                 if success:
                     self.logger.info(f"all disks configured successfully for vm {vm_name}")
                 else:
                     self.logger.warning(f"some disks could not be configured for vm {vm_name}")
 
     def configure_cpu_mem(self) -> None:
-        """
-        Configure cpu and memory settings for all vms based on their configuration.
-
-        This method modifies the CPU and memory settings of VMs after they have been cloned.
-        """
+        """Configure CPU and memory for all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-
                 self.logger.info(
                     f"configuring cpu and memory for vm {vm_name} in cluster {cluster_name}")
-
-                # extract the cpu and memory configuration
                 cpus = vm_info.get('cpus')
                 memory = vm_info.get('memory')
-
-                # skip if neither cpu nor memory is configured
                 if not cpus and not memory:
                     self.logger.warning(
                         f"no cpu or memory configuration for vm {vm_name}, skipping")
                     continue
-
-                # configure cpu and memory
                 success = self.provider.configure_vm_cpu_memory(
-                    vm_name=full_vm_name,
-                    cpus=cpus,
-                    memory_mb=memory
+                    vm_name=full_vm_name, cpus=cpus, memory_mb=memory
                 )
-
                 if success:
                     self.logger.info(f"successfully configured cpu and memory for vm {vm_name}")
                 else:
                     self.logger.warning(f"failed to configure cpu and memory for vm {vm_name}")
 
     def start_vms(self) -> None:
-        """
-        Start all VMs in the configuration.
-
-        This powers on all VMs after they have been configured.
-        """
+        """Start all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-
                 self.logger.info(f"starting vm {full_vm_name}")
                 success = self.provider.start_vm(full_vm_name)
-
                 if success:
                     self.logger.info(f"successfully started the vm {full_vm_name}")
                 else:
@@ -1775,13 +1821,7 @@ class BoxmanManager:
 
         cls.clone_vms()
 
-        cls.configure_cpu_mem()
-
-        cls.configure_network_interfaces()
-
-        cls.configure_disks()
-
-        cls.start_vms()
+        cls.configure_and_start_vms()
 
         # use adaptive wait for ip address assignment
         cls.logger.info("waiting for vms to initialize and get the ip addresses...")
