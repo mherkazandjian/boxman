@@ -5,8 +5,6 @@
 
 Boxman is an infrastructure-as-code CLI for building and managing *local* VM clusters on top of **libvirt/QEMU**. You describe clusters in YAML (`conf.yml`), and Boxman provisions (or reuses) supporting infra, manages VM lifecycle, snapshots, exports/imports, and provides convenient “run tasks with environment loaded” workflows.
 
-This README matches the Boxman v0.10 CLI in `boxman --help` / per-command `--help`. :contentReference[oaicite:2]{index=2}
-
 ---
 
 ## Table of Contents
@@ -24,6 +22,7 @@ This README matches the Boxman v0.10 CLI in `boxman --help` / per-command `--hel
   - [4. Clone \& Install Boxman (venv)](#4-clone--install-boxman-venv)
   - [5. Use Tested Configurations (boxes/)](#5-use-tested-configurations-boxes)
   - [6. First Run (Provision → Up → SSH)](#6-first-run-provision--up--ssh)
+  - [7. CLI Overview (v0.10)](#7-cli-overview-v010)
     - [8.1 provision](#81-provision)
     - [8.2 up](#82-up)
     - [8.3 down](#83-down)
@@ -216,23 +215,17 @@ These SSH behaviors are defined in the CLI help.
 
 ---
 
-7. CLI Overview (v0.10)
+## 7. CLI Overview (v0.10)
 
-Top-level commands (from boxman --help output) include:
+Top-level commands (from `boxman --help` output) include:
 
-provision, up, down, deprovision
-
-snapshot {take,list,restore,delete}, restore
-
-control {suspend,resume,save,start}
-
-run, ps, ssh
-
-import-image, create-templates
-
-export, import
-
-destroy-runtime, list
+- `provision`, `up`, `down`, `deprovision`
+- `snapshot {take,list,restore,delete}`, `restore`
+- `control {suspend,resume,save,start}`
+- `run`, `ps`, `ssh`
+- `import-image`, `create-templates`
+- `export`, `import`
+- `destroy-runtime`, `list`
 
 This README focuses on what you’ll use day-to-day and how the pieces fit together. 
 
@@ -310,40 +303,34 @@ boxman deprovision --docker-compose
 
 ## 9. Snapshots
 
-Snapshots are under the snapshot subcommand:
+Snapshots are under the `snapshot` subcommand:
 
+```bash
 boxman snapshot list
+```
 
 Take a snapshot:
 
+```bash
 boxman snapshot take
 boxman snapshot take --name mystate1
 boxman snapshot take --vm vm1
 boxman snapshot take --vm vm1,vm2
+```
 
 Restore:
 
+```bash
 boxman snapshot restore --name mystate1
 boxman snapshot restore --vm vm1
 boxman snapshot restore --vm vm1,vm2
+```
 
 Delete:
 
+```bash
 boxman snapshot delete
-
-Snapshot subcommands confirmed by boxman snapshot --help and the usage examples in the generated help. 
-
-boxman_full_help
-
-“restore” shortcut
-
-There is also a top-level restore:
-
-boxman restore
-
-This is typically used as a “restore to latest snapshot” workflow. (The CLI does not take arguments here.) 
-
-boxman_full_help
+```
 
 ---
 
