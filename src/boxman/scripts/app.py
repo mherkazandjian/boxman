@@ -607,10 +607,25 @@ def parse_args():
             "\n"
             "examples:\n"
             "    $ boxman ps\n"
+            "    $ boxman ps -p   # include provider-specific info (virsh Id, virsh Name)\n"
         ),
         formatter_class=RawTextHelpFormatter
     )
     parser_ps.set_defaults(func=BoxmanManager.ps)
+    parser_ps.add_argument(
+        '-p',
+        action='store_true',
+        default=False,
+        help='show provider-specific information (virsh Id, virsh Name)',
+        dest='provider_info'
+    )
+    parser_ps.add_argument(
+        '--json',
+        action='store_true',
+        default=False,
+        help='output as JSON instead of a table',
+        dest='json'
+    )
 
     # ── ssh ──────────────────────────────────────────────────────────
     parser_ssh = subparsers.add_parser(

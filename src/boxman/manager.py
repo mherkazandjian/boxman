@@ -2640,12 +2640,18 @@ class BoxmanManager:
     def ps(cls, cli_args):
         """
         Display the state of all project VMs in a table.
+
+        With ``-p``, two extra columns are added showing the provider-specific
+        virsh Id and virsh Name for each VM.
         """
         vm_list = cls._get_vm_list()
 
         if not vm_list:
             print("No VMs defined in configuration")
             return
+
+        provider_info = getattr(cli_args, 'provider_info', False)
+        as_json = getattr(cli_args, 'json', False)
 
         # Query virsh for states
         provider_type = (
@@ -2662,8 +2668,8 @@ class BoxmanManager:
         virsh = VirshCommand(provider_config=provider_config)
         result = virsh.execute("list", "--all", hide=True, warn=True)
 
-        # Parse virsh output into {full_name: state}
-        vm_states: dict[str, str] = {}
+        # Parse virsh output into {full_name: (virsh_id, state)}
+        vm_info: dict[str, tuple[str, str]] = {}
         if result.ok:
             for line in result.stdout.strip().splitlines():
                 line = line.strip()
@@ -2671,24 +2677,39 @@ class BoxmanManager:
                     continue
                 parts = line.split(None, 2)
                 if len(parts) >= 3:
-                    vm_states[parts[1]] = parts[2].strip()
+                    virsh_id, virsh_name, state = parts[0], parts[1], parts[2].strip()
+                    vm_info[virsh_name] = (virsh_id, state)
 
-        # Build table rows with 0-based ids
-        rows = []
+        # Build records
+        records = []
         for idx, (cluster_name, vm_name, full_name) in enumerate(vm_list):
-            state = vm_states.get(full_name, "not created")
-            rows.append((str(idx), cluster_name, vm_name, state))
+            virsh_id, state = vm_info.get(full_name, ("-", "not created"))
+            rec = {"id": idx, "cluster": cluster_name, "vm": vm_name, "state": state}
+            if provider_info:
+                rec["virsh_id"] = virsh_id
+                rec["virsh_name"] = full_name
+            records.append(rec)
+
+        if as_json:
+            print(json.dumps(records, indent=2))
+            return
 
         # Print table
-        headers = ("Id", "Cluster", "VM", "State")
+        if provider_info:
+            headers = ("Id", "Cluster", "VM", "State", "Virsh Id", "Virsh Name")
+            rows = [(str(r["id"]), r["cluster"], r["vm"], r["state"],
+                     r["virsh_id"], r["virsh_name"]) for r in records]
+        else:
+            headers = ("Id", "Cluster", "VM", "State")
+            rows = [(str(r["id"]), r["cluster"], r["vm"], r["state"]) for r in records]
+
+        col_count = len(headers)
         widths = [
-            max(len(headers[i]), *(len(r[i]) for r in rows))
-            for i in range(4)
+            max(len(headers[i]), *(len(row[i]) for row in rows))
+            for i in range(col_count)
         ]
-        header_line = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
-        sep_line = "  ".join("-" * w for w in widths)
-        print(header_line)
-        print(sep_line)
+        print("  ".join(h.ljust(w) for h, w in zip(headers, widths)))
+        print("  ".join("-" * w for w in widths))
         for row in rows:
             print("  ".join(val.ljust(w) for val, w in zip(row, widths)))
 
