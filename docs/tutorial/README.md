@@ -23,6 +23,7 @@ Boxman is an infrastructure-as-code CLI for building and managing *local* VM clu
   - [5. Use Tested Configurations (boxes/)](#5-use-tested-configurations-boxes)
   - [6. First Run (Provision → Up → SSH)](#6-first-run-provision--up--ssh)
   - [7. CLI Overview (v0.10)](#7-cli-overview-v010)
+  - [8. Lifecycle Operations](#8-lifecycle-operations)
     - [8.1 provision](#81-provision)
     - [8.2 up](#82-up)
     - [8.3 down](#83-down)
@@ -227,11 +228,7 @@ Top-level commands (from `boxman --help` output) include:
 - `export`, `import`
 - `destroy-runtime`, `list`
 
-This README focuses on what you’ll use day-to-day and how the pieces fit together. 
-
-boxman_full_help
-
-8. Lifecycle Operations
+## 8. Lifecycle Operations
 
 ### 8.1 provision
 
