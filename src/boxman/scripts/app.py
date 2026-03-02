@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import logging
 import os
 import sys
 import argparse
@@ -959,11 +960,19 @@ def main():
 
     # Handle 'ps' — needs config and virsh but not a full provider session
     if args.func == BoxmanManager.ps:
-        manager = BoxmanManager(config=args.conf)
-        if not manager.config:
-            log.error("no project config found (conf.yml)")
-            sys.exit(1)
-        args.func(manager, args)
+        _boxman_logger = logging.getLogger('boxman')
+        _ps_json = getattr(args, 'json', False)
+        if _ps_json:
+            _boxman_logger.setLevel(logging.CRITICAL + 1)
+        try:
+            manager = BoxmanManager(config=args.conf)
+            if not manager.config:
+                _boxman_logger.setLevel(logging.DEBUG)
+                log.error("no project config found (conf.yml)")
+                sys.exit(1)
+            args.func(manager, args)
+        finally:
+            _boxman_logger.setLevel(logging.DEBUG)
         sys.exit(0)
 
     # Handle 'run' — needs config but not a provider session or runtime

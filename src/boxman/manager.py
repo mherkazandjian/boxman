@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import subprocess
@@ -2685,14 +2686,17 @@ class BoxmanManager:
         With ``-p``, two extra columns are added showing the provider-specific
         virsh Id and virsh Name for each VM.
         """
+        provider_info = getattr(cli_args, 'provider_info', False)
+        as_json = getattr(cli_args, 'json', False)
+
         vm_list = cls._get_vm_list()
 
         if not vm_list:
-            print("No VMs defined in configuration")
+            if as_json:
+                print(json.dumps([], indent=2))
+            else:
+                print("No VMs defined in configuration")
             return
-
-        provider_info = getattr(cli_args, 'provider_info', False)
-        as_json = getattr(cli_args, 'json', False)
 
         # Query virsh for states
         provider_type = (
