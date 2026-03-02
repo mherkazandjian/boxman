@@ -55,6 +55,14 @@ ssh:
     # - file://~/.ssh/id_ed25519.pub
     # - "ssh-ed25519 AAAAC3... user@host"
 
+cache:
+  # Whether to cache downloaded base images locally (default: True)
+  # When enabled, images are stored in cache_dir and reused across projects.
+  # When disabled, images are not stored locally and re-downloaded for each project.
+  enabled: True
+  # Directory to store cached base images (default: ~/.cache/boxman/images)
+  cache_dir: ~/.cache/boxman/images
+
 # section for provider specific configuration
 providers:
   # configuration for libvirt provider

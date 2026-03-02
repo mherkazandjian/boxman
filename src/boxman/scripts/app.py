@@ -853,6 +853,10 @@ def _default_boxman_config() -> dict:
         "ssh": {
             "authorized_keys": [],
         },
+        "cache": {
+            "enabled": True,
+            "cache_dir": "~/.cache/boxman/images",
+        },
         "providers": {
             "libvirt": {
                 "uri": "qemu:///system",

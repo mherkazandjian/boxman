@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 import invoke
 
 from boxman import log
+from boxman.image_cache import ImageCache
 from .commands import VirshCommand, VirtInstallCommand
 
 
@@ -105,6 +106,8 @@ class CloudInitTemplate:
         disk_size: Optional[str] = None,
         network: str = "default",
         bridge: Optional[str] = None,
+        image_checksum: Optional[str] = None,
+        image_cache: Optional[ImageCache] = None,
     ):
         self.template_name = template_name
         self.image_path = self._resolve_image_path(image_path)
@@ -120,6 +123,8 @@ class CloudInitTemplate:
         self.disk_size = disk_size
         self.network = network
         self.bridge = bridge
+        self.image_checksum = image_checksum
+        self.image_cache = image_cache
         self.logger = log
 
         self.logger.debug(f"CloudInitTemplate provider_config: {provider_config}")
@@ -327,9 +332,8 @@ class CloudInitTemplate:
         return nocloud_dir
 
     def copy_base_image(self, dst_path: str) -> bool:
-        # Check if it's a URL and needs downloading
         if self.image_path.startswith(("http://", "https://")):
-            return self._download_image(self.image_path, dst_path)
+            return self._fetch_remote_image(self.image_path, dst_path)
 
         # Local file copy
         if not self.image_path:
@@ -344,22 +348,78 @@ class CloudInitTemplate:
                 f"(resolved from template config 'image' field)")
             return False
 
-        self.logger.info(f"copying base image {self.image_path} -> {dst_path}")
+        return self._copy_local(self.image_path, dst_path)
 
+    def _fetch_remote_image(self, url: str, dst_path: str) -> bool:
+        """
+        Obtain a remote image and place it at *dst_path*.
+
+        Flow
+        ----
+        1. If caching is enabled and the image is already cached, use it.
+        2. Otherwise download (to the cache dir when caching is enabled,
+           directly to *dst_path* when it is not).
+        3. Verify the checksum if one was specified; abort on mismatch.
+        4. Copy from cache to *dst_path* (no-op when cache is disabled and
+           the download went directly to *dst_path*).
+        """
+        cache = self.image_cache
+
+        if cache and cache.enabled:
+            # Obtain (or reuse) the cached copy.
+            src = cache.ensure(url, self._download_image)
+            if src is None:
+                return False
+
+            # Verify checksum against the cached file.
+            if self.image_checksum:
+                if not self._verify_checksum(src):
+                    return False
+
+            # Copy sparse from cache to the template workdir.
+            return self._copy_local(src, dst_path)
+
+        else:
+            # No cache — download directly to dst_path.
+            if not self._download_image(url, dst_path):
+                return False
+
+            if self.image_checksum:
+                if not self._verify_checksum(dst_path):
+                    if os.path.exists(dst_path):
+                        os.remove(dst_path)
+                    return False
+
+            return True
+
+    def _verify_checksum(self, file_path: str) -> bool:
+        """Verify self.image_checksum against file_path; log and return bool."""
+        try:
+            ok = ImageCache.verify_checksum(file_path, self.image_checksum)
+        except ValueError as exc:
+            self.logger.error(str(exc))
+            return False
+        if not ok:
+            self.logger.error(
+                f"checksum verification failed for '{file_path}' — aborting")
+        return ok
+
+    def _copy_local(self, src: str, dst: str) -> bool:
+        """Sparse-copy a local file; falls back to shutil.copy2."""
+        self.logger.info(f"copying image {src} -> {dst}")
         result = self.virsh.execute_shell(
-            f'rsync --sparse --progress "{self.image_path}" "{dst_path}"',
+            f'rsync --sparse --progress "{src}" "{dst}"',
             hide=False, warn=True,
         )
         if result.ok:
-            self.logger.info("base image copied (sparse-aware via rsync)")
+            self.logger.info("image copied (sparse via rsync)")
             return True
-
         try:
-            shutil.copy2(self.image_path, dst_path)
-            self.logger.info("base image copied via shutil.copy2")
+            shutil.copy2(src, dst)
+            self.logger.info("image copied via shutil.copy2")
             return True
         except Exception as exc:
-            self.logger.error(f"failed to copy base image: {exc}")
+            self.logger.error(f"failed to copy image: {exc}")
             return False
 
     def _resize_disk_image(self, image_path: str, size: str) -> bool:

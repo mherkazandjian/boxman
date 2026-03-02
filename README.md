@@ -14,6 +14,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - Cloud-init integration
 - **Cloud-init template creation**: build template VMs from cloud images with inline cloud-init config
 - **Auto-creation of templates on provision**: if a cluster's `base_image` references a template defined in the `templates` section and the template VM does not yet exist, it is automatically created before provisioning proceeds
+- **Image caching**: downloaded cloud base images are stored in a local cache directory so the same image is only downloaded once across multiple projects
 - **Runtime environments**: execute provider commands locally or inside a Docker container
 - **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
 
@@ -102,6 +103,60 @@ boxman create-templates --force
 > - Verify DHCP is working: `virsh net-dhcp-leases default`.
 > - Check cloud-init logs inside the VM via `virt-manager` console or
 >   `virsh console <vm-name>`.
+
+### Image Caching
+
+Boxman caches downloaded cloud base images so that the same image is only
+fetched once, even when referenced from multiple projects. Caching is
+configured globally in `~/.config/boxman/boxman.yml`:
+
+```yaml
+# ~/.config/boxman/boxman.yml
+cache:
+  enabled: true                        # set to false to disable caching
+  cache_dir: ~/.cache/boxman/images    # directory where images are stored
+```
+
+Images are keyed by the filename component of their URL (e.g.
+`ubuntu-24.04-server-cloudimg-amd64.img`). A cache hit skips the download
+entirely; a cache miss downloads the file to `cache_dir` for future reuse.
+
+#### Plain URL (no checksum)
+
+```yaml
+templates:
+  ubuntu_base:
+    image: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+    # ...
+```
+
+#### URL with checksum verification
+
+Supply the image as a dict with `uri` and `checksum` keys. The checksum
+format is `algorithm:hexdigest` (any algorithm supported by Python's
+`hashlib`, e.g. `sha256`, `md5`):
+
+```yaml
+templates:
+  ubuntu_base:
+    image:
+      uri: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+      checksum: sha256:a1b2c3d4e5f6...   # full hex digest
+    # ...
+```
+
+Checksum verification behaviour:
+
+| Situation | Behaviour |
+|---|---|
+| Cache hit, checksum specified | Verify cached file; **abort** on mismatch |
+| Cache miss, checksum specified | Download, then verify; **abort** on mismatch |
+| Cache hit, no checksum | Use cached file as-is |
+| Cache miss, no checksum | Download and cache; no verification |
+| Cache disabled | Download directly to working directory on each run |
+
+> **Tip**: official Ubuntu cloud images ship a `SHA256SUMS` file alongside
+> each image — use the hash from that file to ensure image integrity.
 
 ## Requirements
 
@@ -215,6 +270,17 @@ boxman ps
 # 0   cluster_1  node01  running
 # 1   cluster_1  node02  running
 
+# Include provider-specific columns (virsh Id and Name for libvirt)
+boxman ps -p
+# Id  Cluster    VM      State    Virsh Id  Virsh Name
+# --  ---------  ------  -------  --------  ---------------------------
+# 0   cluster_1  node01  running  3         bprj__myproject__bprj_cluster_1_node01
+# 1   cluster_1  node02  running  4         bprj__myproject__bprj_cluster_1_node02
+
+# Output as JSON (combine with -p for full provider info)
+boxman ps --json
+boxman ps -p --json
+
 # SSH into a VM by its id from boxman ps
 boxman ssh 0
 boxman ssh 1
@@ -288,7 +354,7 @@ This project is licensed under the [MIT License](../LICENSE).
 - `export` — export VMs
 - `import` — import VMs
 - `run` — run tasks with the workspace environment loaded
-- `ps` — show the state of VMs in the project
+- `ps` — show the state of VMs in the project (`-p` adds provider-specific columns, `--json` outputs JSON)
 - `ssh` — ssh into a VM
 
 ## Tasks

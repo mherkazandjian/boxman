@@ -458,6 +458,10 @@ class BoxmanManager:
             force: If True, recreate existing templates.
         """
         from boxman.providers.libvirt.cloudinit import CloudInitTemplate
+        from boxman.image_cache import ImageCache
+
+        cache_conf = self.app_config.get('cache', {}) if self.app_config else {}
+        image_cache = ImageCache.from_config(cache_conf)
 
         config = self.config
         templates = config.get('templates', {})
@@ -532,7 +536,13 @@ class BoxmanManager:
             tpl_conf = templates[tpl_key]
 
             tpl_name = tpl_conf.get('name', tpl_key)
-            image_path = tpl_conf.get('image', '')
+            image_field = tpl_conf.get('image', '')
+            if isinstance(image_field, dict):
+                image_path = image_field.get('uri', '')
+                image_checksum = image_field.get('checksum', None)
+            else:
+                image_path = image_field
+                image_checksum = None
 
             # Common typo: 'file' instead of 'image'
             if not image_path and 'file' in tpl_conf:
@@ -580,6 +590,8 @@ class BoxmanManager:
                 disk_size=tpl_disk_size,
                 network=tpl_network,
                 bridge=tpl_bridge,
+                image_checksum=image_checksum,
+                image_cache=image_cache,
             )
 
             success = ct.create_template(force=force)
