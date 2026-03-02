@@ -12,7 +12,7 @@ provider:
 
 clusters:
   cluster_1:
-    workdir: ~/workspaces/boxmandev/minimal
+    # workdir: ~/workspaces/boxmandev/minimal/cluster_1  # auto-derived from workspace.path / cluster_name
     base_image: rocky-95-minimal-base-template
     proxy_host: localhost
     admin_user: 'root'
@@ -118,10 +118,62 @@ clusters:
             link_state: 'up'
             network_source: 'isolated1'
       {% endfor %}
-    files:
-      env.sh: |
-        export INVENTORY=inventory
-        export SSH_CONFIG=${HOME}/tmp/sandbox/test_cluster/ssh_config
-        export GATEWAYHOST=mgmt01
-        export ANSIBLE_CONFIG=${HOME}/tmp/sandbox/test_cluster/ansible.cfg
-...
+    # files:                                  # (optional) override auto-generated files
+    #   env.sh: |                              #   custom env.sh overrides the default
+    #     export INVENTORY=inventory
+    #     export SALTMASTER=saltmaster01
+    #     ...
+
+# workspace.path is the base directory for all cluster workdirs.
+# each cluster gets a subdirectory: workspace.path / cluster_name
+# e.g. ~/workspaces/boxmandev/minimal/cluster_1
+#
+# if a cluster defines an explicit 'workdir', that takes precedence.
+#
+# auto-generated in workspace.path (unless explicitly defined in workspace.files):
+#   - env.sh                  (INVENTORY, SSH_CONFIG, GATEWAYHOST, ANSIBLE_CONFIG, etc.)
+#   - inventory/01-hosts.yml  (from the VMs defined across all clusters)
+#   - ansible.cfg
+#   - ssh_config              (generated at provision time by boxman)
+#   - ssh keys                (generated at provision time by boxman)
+workspace:
+  path: ~/workspaces/boxmandev/minimal
+
+# tasks for 'boxman run <task>'
+# commands have access to env vars from the workspace env_file
+tasks:
+  ping:
+    description: "ping all hosts via ansible"
+    command: ansible all -m ansible.builtin.ping
+
+  site:
+    description: "run ansible site playbook"
+    command: ansible-playbook --become ansible/site.yml
+
+  cmd:
+    description: "run a shell command on all hosts"
+    command: ansible all -m ansible.builtin.shell -a
+
+  ssh:
+    description: "ssh to the gateway host"
+    command: ssh -F ${SSH_CONFIG} -t ${GATEWAYHOST}
+
+  salt-ping:
+    description: "salt test.ping on all minions"
+    command: >
+      ssh -F ${SSH_CONFIG} ${SALTMASTER}
+      "sudo salt '*' test.ping -t 120"
+
+  salt-apply:
+    description: "apply salt states on all minions"
+    command: >
+      ssh -F ${SSH_CONFIG} ${SALTMASTER}
+      "sudo salt '*' state.apply -t 120"
+
+  salt-sync:
+    description: "full salt sync (sync_all, states, pillars)"
+    command: >
+      ssh -F ${SSH_CONFIG} ${SALTMASTER} "sudo salt '*' saltutil.sync_all -t 120" &&
+      ssh -F ${SSH_CONFIG} ${SALTMASTER} "sudo salt '*' saltutil.sync_states -t 120" &&
+      ssh -F ${SSH_CONFIG} ${SALTMASTER} "sudo salt '*' saltutil.refresh_pillar -t 120" &&
+      ssh -F ${SSH_CONFIG} ${SALTMASTER} "sudo salt '*' saltutil.sync_all -t 120"

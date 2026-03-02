@@ -1,6 +1,9 @@
 import os
 import time
 from typing import Dict, Any, Optional, List
+import json
+from multiprocessing import Process, Queue
+
 from .net import Network, NetworkInterface
 from .clone_vm import CloneVM
 from .destroy_vm import DestroyVM
@@ -11,6 +14,7 @@ from boxman import log
 from .snapshot import SnapshotManager
 from .commands import VirshCommand
 from .virsh_edit import VirshEdit
+from .import_image import ImageImporter
 
 class LibVirtSession:
     def __init__(self,
@@ -27,15 +31,113 @@ class LibVirtSession:
         #: logging.Logger: the logger instance
         self.logger = log
 
-        # get provider config
-        self.provider_config = config.get('provider', {}).get('libvirt', {})
+        # get provider config from the project configuration — these are
+        # authoritative and must never be overridden by app-level defaults.
+        self._project_provider_config = config.get('provider', {}).get('libvirt', {})
 
-        # extract commonly used provider settings
-        self.uri = self.provider_config.get('uri', 'qemu:///system')
-        self.use_sudo = self.provider_config.get('use_sudo', False)
+        #: Dict[str, Any]: the base provider config (may be enriched with
+        #: app-level or runtime settings, but project-level keys always win
+        #: via the property).
+        self._provider_config_base = self._project_provider_config.copy()
 
         #: the boxman manager instance (mainly to get access to the cache)
         self.manager = None
+
+    @property
+    def provider_config(self) -> Dict[str, Any]:
+        """
+        Return the effective provider config.
+
+        Project-level settings (from conf.yml) always take precedence
+        over app-level (boxman.yml) or runtime-injected values.
+        """
+        merged = self._provider_config_base.copy()
+        merged.update(self._project_provider_config)
+        return merged
+
+    @provider_config.setter
+    def provider_config(self, value: Dict[str, Any]) -> None:
+        """
+        Set the base provider config.
+
+        The getter will overlay project-level settings on top, so
+        project-level keys like ``use_sudo`` can never be overridden.
+        """
+        self._provider_config_base = value
+
+    @property
+    def uri(self) -> str:
+        return self.provider_config.get('uri', 'qemu:///system')
+
+    @uri.setter
+    def uri(self, value: str) -> None:
+        self._provider_config_base['uri'] = value
+
+    @property
+    def use_sudo(self) -> bool:
+        return self.provider_config.get('use_sudo', False)
+
+    @use_sudo.setter
+    def use_sudo(self, value: bool) -> None:
+        self._provider_config_base['use_sudo'] = value
+
+    def update_provider_config(self, new_config: Dict[str, Any]) -> None:
+        """
+        Update provider_config with *new_config*, but project-level settings
+        always win (enforced by the property getter).
+
+        Args:
+            new_config: Additional config keys (e.g. from boxman.yml providers
+                        section or runtime injection).
+        """
+        merged = self._provider_config_base.copy()
+        merged.update(new_config)
+        self._provider_config_base = merged
+
+    def update_provider_config_with_runtime(self) -> None:
+        """
+        Enrich provider_config with runtime metadata from the manager.
+
+        Project-level provider settings always take precedence over
+        app-level (boxman.yml) settings and runtime defaults.
+        """
+        if self.manager is None:
+            return
+
+        # Get the runtime-enriched config from the manager
+        enriched = self.manager.get_provider_config_with_runtime(
+            self.provider_config
+        )
+        # Merge, ensuring project-level keys win
+        self.update_provider_config(enriched)
+
+    def import_image(self,
+                     manifest_uri: str,
+                     vm_name: str,
+                     vm_dir: str) -> bool:
+        """
+        Import an image into the libvirt storage pool.
+
+        :param manifest_uri: URI of the manifest of the image to import
+        :param vm_name: Name to assign to the imported VM
+        :param vm_dir: Directory for the imported VM
+        :return: True if successful, False otherwise
+        """
+        if manifest_uri.startswith('file://'):
+            manifest_path = os.path.expanduser(manifest_uri[len('file://'):])
+            with open(manifest_path, 'r') as fobj:
+                manifest = json.load(fobj)
+        elif manifest_uri.startswith('http://') or manifest_uri.startswith('https://'):
+            raise NotImplementedError('http/https image uris are not implemented yet')
+
+        image_importer = ImageImporter(
+            manifest_path=manifest_path,
+            uri=self.manager.config['uri'],
+            disk_dir=vm_dir,
+            vm_name=vm_name,
+            keep_uuid=False)
+
+        image_importer.import_image()
 
     def define_network(self,
                        name: str = None,
@@ -47,10 +149,18 @@ class LibVirtSession:
         Args:
             name: Name of the network
             info: Dictionary containing network configuration
+            workdir: Working directory for XML files (resolved to absolute
+                     path so it works inside container runtimes)
 
         Returns:
             True if successful, False otherwise
         """
+        # Resolve workdir to an absolute path so it is valid both on the
+        # host and inside a bind-mounted docker-compose container.
+        if workdir:
+            workdir = os.path.abspath(os.path.expanduser(workdir))
+            os.makedirs(workdir, exist_ok=True)
+
         network = Network(
             name=name,
             info=info,
@@ -111,7 +221,8 @@ class LibVirtSession:
             name=name,
             info=info,
             provider_config=self.provider_config,
-            assign_new_bridge=False
+            assign_new_bridge=False,
+            manager=self.manager
         )
         status = network.remove_network()
         return status
@@ -316,26 +427,45 @@ class LibVirtSession:
             True if all disks were configured successfully, False otherwise
         """
         disk_manager = DiskManager(vm_name=vm_name, provider_config=self.provider_config)
+        result_queue: Queue = Queue()
 
-        success = True
-        for i, disk_config in enumerate(disks):
+        def _configure(i, disk_config):
             self.logger.info(f"configuring disk {i+1} for VM {vm_name}")
-
-            if not disk_manager.configure_from_disk_config(
+            ok = disk_manager.configure_from_disk_config(
                 disk_config=disk_config,
                 workdir=workdir,
                 disk_prefix=disk_prefix
-            ):
-                self.logger.error(f"failed to configure disk {i+1} for vm {vm_name}")
-                success = False
-            else:
+            )
+            result_queue.put((i, ok))
+            if ok:
                 self.logger.info(f"successfully configured disk {i+1} for vm {vm_name}")
+            else:
+                self.logger.error(f"failed to configure disk {i+1} for vm {vm_name}")
+
+        processes = [
+            Process(target=_configure, args=(i, disk_config))
+            for i, disk_config in enumerate(disks)
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+        success = True
+        for _ in range(len(disks)):
+            _, ok = result_queue.get()
+            if not ok:
+                success = False
 
         return success
 
     def get_vm_ip_addresses(self, vm_name: str) -> Dict[str, str]:
         """
         Get all IP addresses for a VM.
+
+        Tries domifaddr sources in order: lease → arp → agent.
+        The default 'lease' source reads dnsmasq DHCP files and can return
+        empty even when the VM has an IP (e.g. if cloud-init configured the
+        address before the lease was recorded).  Falling back to 'arp' and
+        'agent' ensures we find the address regardless of how it was assigned.
 
         Args:
             vm_name: Name of the VM
@@ -353,33 +483,44 @@ class LibVirtSession:
                 self.logger.warning(f"the vm {vm_name} is not running, cannot get the ip addresses")
                 return {}
 
-            # Try domifaddr to get all interfaces and their IPs
-            result = virsh.execute("domifaddr", vm_name, warn=True)
+            def _parse_domifaddr(output: str) -> Dict[str, str]:
+                """Parse domifaddr stdout into {iface: ip} dict.
 
-            if not result.ok:
-                self.logger.error(f"failed to get interface addresses for vm {vm_name}")
-                return {}
+                Only returns routable IPv4 addresses — loopback (127.x),
+                link-local IPv6 (fe80::), and any other IPv6 addresses are
+                excluded because they are not useful SSH targets.
+                """
+                addrs = {}
+                lines = output.strip().split('\n')
+                if len(lines) > 2:
+                    for line in lines[2:]:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            iface_name = parts[0]
+                            ip_address = parts[3].split('/')[0]
+                            if (iface_name
+                                    and iface_name != '-'
+                                    and ip_address
+                                    and not ip_address.startswith('N/A')
+                                    and ':' not in ip_address        # skip IPv6
+                                    and not ip_address.startswith('127.')):  # skip loopback
+                                addrs[iface_name] = ip_address
+                return addrs
 
-            # parse the output to extract interface information
-            # output format is like:
-            # Name       MAC address          Protocol     Address
-            # ---------------------------------------------------------
-            # vnet0      52:54:00:xx:xx:xx    ipv4         192.168.122.x/24
+            # Try each source in order; return the first non-empty result.
+            for source in ('lease', 'arp', 'agent'):
+                result = virsh.execute("domifaddr", vm_name, f"--source={source}", warn=True)
+                if not result.ok:
+                    self.logger.debug(
+                        f"domifaddr --source={source} failed for {vm_name}: {result.stderr.strip()}")
+                    continue
+                addrs = _parse_domifaddr(result.stdout)
+                if addrs:
+                    self.logger.debug(
+                        f"got ip addresses for {vm_name} via source '{source}': {addrs}")
+                    return addrs
 
-            ip_addresses = {}
-            lines = result.stdout.strip().split('\n')
-
-            if len(lines) > 2:  # skip header and separator lines
-                for line in lines[2:]:
-                    parts = line.split()
-                    if len(parts) >= 4:  # name MAC Protocol Address
-                        iface_name = parts[0]
-                        ip_address = parts[3].split('/')[0]  # Remove CIDR notation
-
-                        if iface_name and ip_address and not ip_address.startswith('N/A'):
-                            ip_addresses[iface_name] = ip_address
-
-            return ip_addresses
+            return {}
 
         except Exception as exc:
             import traceback
@@ -434,19 +575,28 @@ class LibVirtSession:
 
         return snapshots
 
-    def snapshot_restore(self, vm_name, snapshot_name):
+    def snapshot_restore(self, vm_name, snapshot_name=None):
         """
         Restore a VM to a specific snapshot.
 
+        If snapshot_name is None, the current (latest) snapshot is used.
+
         Args:
             vm_name (str): Name of the VM to revert
-            snapshot_name (str): Name of the snapshot to revert to
+            snapshot_name (str, optional): Name of the snapshot to revert to
 
         Returns:
             bool: True if successful, False otherwise
         """
-        self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
         snapshot_mgr = SnapshotManager(self.provider_config)
+        if snapshot_name is None:
+            snapshot_name = snapshot_mgr.get_latest_snapshot(vm_name)
+            if snapshot_name is None:
+                self.logger.error(f"no snapshots found for vm {vm_name}")
+                return False
+            self.logger.info(f"restoring latest snapshot '{snapshot_name}' for vm {vm_name}")
+        else:
+            self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
         return snapshot_mgr.snapshot_restore(vm_name, snapshot_name)
 
     def snapshot_delete(self, vm_name, snapshot_name):

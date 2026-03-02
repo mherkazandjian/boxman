@@ -1,0 +1,9 @@
+# remove the commented lines (with #) when using this file as a template.
+# this manifest file when obtained via http(s) can be placed in any temporary location
+# and the referenced files should be obtained via http(s) as well.
+#   https://foo.example.com/manifest.json
+{
+    "xml_path": "https://foo.example.com/sample_image1/vm/vm-definition.xml",
+    "image_path": "https://foo.example.com/sample_image1/vm/disk-image.qcow2",
+    "provider": "libvirt"
+}

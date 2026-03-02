@@ -85,19 +85,20 @@ class SshConfigGenerator:
     def __init__(self, vms, identity_file=None):
         self.vms = vms
         self.identity_file = identity_file
+
     def generate(self, path=None):
         prefix_indent = ' '*4
         with open(path, 'w') as fobj:
             for vm_name, vm_info in self.vms.items():
                 fobj.write(f"Host {vm_info['hostname']}\n")
-                fobj.write("{prefix_indent}Hostname localhost\n")
-                fobj.write("{prefix_indent}User admin\n")
-                fobj.write(f"{prefix_indent}Port {vm_info['access_port']}'\n")
-                fobj.write("StrictHostKeyChecking no\n")
-                fobj.write("UserKnownHostsFile /dev/null\n")
-                fobj.write(f"IdentityFile {self.identity_file}\n")
+                fobj.write(f"{prefix_indent}Hostname localhost\n")
+                fobj.write(f"{prefix_indent}User admin\n")
+                fobj.write(f"{prefix_indent}Port {vm_info['access_port']}\n")
+                fobj.write(f"{prefix_indent}StrictHostKeyChecking no\n")
+                fobj.write(f"{prefix_indent}UserKnownHostsFile /dev/null\n")
+                fobj.write(f"{prefix_indent}IdentityFile {self.identity_file}\n")
 
 
 class AnsibleHelper:
-    def __inif__(self):
+    def __init__(self):
         pass

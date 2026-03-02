@@ -18,7 +18,7 @@ def write_files(files: Dict[str, str], rootdir: Optional[str] = None) -> None:
         else:
             fpath = _fpath
 
-        fpath = os.path.expanduser(fpath)
+        fpath = os.path.normpath(os.path.expanduser(fpath))
         log.info(f'provision file {fpath}')
 
         dirpath = os.path.dirname(fpath)

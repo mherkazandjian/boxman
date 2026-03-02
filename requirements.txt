@@ -2,3 +2,6 @@ pyaml
 multiprocess
 invoke
 lxml
+typer
+requests
+gdown

@@ -1,8 +1,6 @@
 import os
 from typing import Optional, Dict, Any, List
 import tempfile
-from jinja2 import Environment, FileSystemLoader
-import pkg_resources
 
 from .commands import LibVirtCommandBase, VirshCommand
 

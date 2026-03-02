@@ -1,10 +1,12 @@
 import os
+import shutil
+import subprocess
 import time
 import re
+import json
 from typing import Dict, Any, Optional
 import yaml
-from multiprocessing import Pool
-from multiprocessing import Process
+from multiprocessing import Pool, Process, Queue
 from invoke import run
 from jinja2 import Environment, FileSystemLoader, Template
 
@@ -13,9 +15,14 @@ from boxman.config_cache import BoxmanCache
 from boxman.images.resolver import resolve_base_image
 from boxman.utils.io import write_files
 from boxman import log
+from boxman.runtime import create_runtime, RuntimeBase
+from boxman.utils.jinja_env import create_jinja_env
+from boxman.providers.libvirt.commands import VirshCommand
+from boxman.task_runner import TaskRunner
 
 class BoxmanManager:
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self,
+                 config: Optional[Dict[str, Any]] = None):
         """
         Initialize the BoxmanManager.
 
@@ -34,14 +41,30 @@ class BoxmanManager:
         #: the logger instance
         self.logger = log
 
+        #: str: the runtime environment name ('local', 'docker-compose', etc.)
+        self._runtime_name: str = 'local'
+
+        #: Optional[RuntimeBase]: the resolved runtime instance (created lazily)
+        self._runtime_instance: Optional[RuntimeBase] = None
+
         if isinstance(config, str):
             self.config_path = config
             self.config = self.load_config(config)
+            self.resolve_workspace_defaults()
 
         self.cache = BoxmanCache()
 
-        #: resolved `base_image` information (scaffolding for OCI support)
-        self.resolved_base_image = None
+        #: Optional[Dict[str, Any]]: the boxman application-level config (from boxman.yml)
+        self.app_config: Optional[Dict[str, Any]] = None
+
+    def load_app_config(self, config: Dict[str, Any]) -> None:
+        """
+        Load the boxman application-level configuration (from boxman.yml).
+
+        Args:
+            config: The parsed boxman.yml configuration dictionary
+        """
+        self.app_config = config
 
     @property
     def provider(self) -> Optional["LibVirtSession"]:
@@ -63,6 +86,49 @@ class BoxmanManager:
         """
         self._provider = value
 
+    @property
+    def runtime(self) -> str:
+        """Return the runtime environment name."""
+        return self._runtime_name
+
+    @runtime.setter
+    def runtime(self, value: str) -> None:
+        """Set the runtime environment name and reset the cached instance."""
+        self._runtime_name = value
+        self._runtime_instance = None  # force re-creation
+
+    @property
+    def runtime_instance(self) -> RuntimeBase:
+        """
+        Return the runtime instance, creating it on first access.
+
+        The runtime config is taken from ``app_config`` if available.
+        """
+        if self._runtime_instance is None:
+            runtime_config = (self.app_config or {}).get("runtime_config", {})
+            self._runtime_instance = create_runtime(
+                self._runtime_name, config=runtime_config
+            )
+        return self._runtime_instance
+
+    def get_provider_config_with_runtime(
+        self, provider_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Return a copy of *provider_config* enriched with runtime metadata.
+
+        This should be called before passing the config to provider command
+        classes (``VirshCommand``, ``VirtInstallCommand``, etc.) so they
+        know how to wrap commands.
+
+        Args:
+            provider_config: The raw provider configuration dict.
+
+        Returns:
+            A new dict with ``runtime`` and related keys injected.
+        """
+        return self.runtime_instance.inject_into_provider_config(provider_config)
+
     def load_config(self, config_path: str) -> Dict[str, Any]:
         """
         Load configuration from a YAML file.
@@ -80,15 +146,51 @@ class BoxmanManager:
         config_dir = os.path.dirname(os.path.abspath(config_path))
         config_filename = os.path.basename(config_path)
 
-        # create jinja environment with the config directory as template path
-        env = Environment(loader=FileSystemLoader(config_dir))
+        # expose the config file location as env vars so templates can use
+        # {{ env("BOXMAN_CONF_FILE") }} and {{ env("BOXMAN_CONF_DIR") }}.
+        # setdefault lets a user-defined value take precedence.
+        os.environ.setdefault('BOXMAN_CONF_FILE', os.path.abspath(config_path))
+        os.environ.setdefault('BOXMAN_CONF_DIR', config_dir)
 
-        # load the template
-        template = env.get_template(config_filename)
+        # create jinja environment with boxman helpers (env(), env_required(), etc.)
+        env = create_jinja_env(config_dir)
 
-        # render the template (you can pass variables here if needed)
+        # Read raw content and convert bare {{ name }} placeholders to
+        # {name} markers before Jinja2 rendering.  Bare names (no parens,
+        # dots, pipes, etc.) are task-command placeholders, not real Jinja2
+        # expressions — real ones are function calls like {{ env("VAR") }}.
+        #
+        # IMPORTANT: variables defined by Jinja2 control flow ({% for %},
+        # {% set %}) must be excluded from this substitution so that Jinja2
+        # can render them correctly.  Without this exclusion, a loop like
+        #   {% for suffix in 'abc' %} ... disk{{ suffix }} ... {% endfor %}
+        # would have {{ suffix }} converted to {suffix} before Jinja2 runs,
+        # leaving the literal string "disk{suffix}" in the output.
+        raw_path = os.path.join(config_dir, config_filename)
+        with open(raw_path) as fobj:
+            raw_content = fobj.read()
+
+        # collect all variable names introduced by jinja2 control flow
+        jinja_ctrl_vars: set = set()
+        jinja_ctrl_vars.update(re.findall(r'\{%-?\s*for\s+(\w+)\s+in\b', raw_content))
+        jinja_ctrl_vars.update(re.findall(r'\{%-?\s*set\s+(\w+)\s*=', raw_content))
+
+        def _preserve_jinja_vars(m: re.Match) -> str:
+            name = m.group(1)
+            if name in jinja_ctrl_vars:
+                return m.group(0)   # keep {{ name }} for Jinja2 to render
+            return '{' + name + '}'  # task placeholder → {name}
+
+        preserved = re.sub(r"\{\{\s*(\w+)\s*\}\}", _preserve_jinja_vars, raw_content)
+
+        # load and render the template from the pre-processed string
+        template = env.from_string(preserved)
+
+        # render the template
+        # NOTE: pass os.environ as 'environ' (not 'env') to avoid shadowing
+        # the env() helper function registered in the Jinja globals.
         rendered_yaml = template.render(
-            env=os.environ,  # make environment variables available in template
+            environ=os.environ,
         )
 
         # parse the rendered yaml
@@ -103,10 +205,158 @@ class BoxmanManager:
 
         return conf
 
+    def resolve_workspace_defaults(self) -> None:
+        """
+        Resolve workspace defaults for each cluster.
+
+        For each cluster:
+        - If workdir is not set, default to workspace.path / cluster_name
+
+        At the workspace level (written to workspace.path):
+        - Auto-generate env.sh, inventory/01-hosts.yml, and ansible.cfg
+        """
+        config = self.config
+        workspace = config.get('workspace', {})
+        workspace_path = workspace.get('path', '')
+        clusters = config.get('clusters', {})
+
+        # workspace-level files (written to workspace.path)
+        ws_files = workspace.setdefault('files', {})
+
+        def _resolve_output_path(custom_path, workspace_path):
+            """Resolve a custom path: expanduser, make absolute relative to workspace.path, normpath."""
+            p = os.path.expanduser(custom_path)
+            if not os.path.isabs(p):
+                p = os.path.join(os.path.expanduser(workspace_path), p)
+            return os.path.normpath(p)
+
+        # Determine output keys for generated files based on workspace config overrides.
+        # When a custom path is set and resolves to an absolute path, os.path.join(rootdir, abs)
+        # returns the absolute path — so it naturally bypasses rootdir in write_files().
+        custom_ansible_config = workspace.get('ansible_config')
+        custom_env_file = workspace.get('env_file')
+        custom_inventory = workspace.get('inventory')
+
+        if custom_env_file and workspace_path:
+            env_sh_key = _resolve_output_path(custom_env_file, workspace_path)
+        else:
+            env_sh_key = 'env.sh'
+
+        if custom_inventory and workspace_path:
+            inv_dir = _resolve_output_path(custom_inventory, workspace_path)
+            inventory_key = os.path.join(inv_dir, '01-hosts.yml')
+        else:
+            inventory_key = 'inventory/01-hosts.yml'
+
+        if custom_ansible_config and workspace_path:
+            ansible_cfg_key = _resolve_output_path(custom_ansible_config, workspace_path)
+        else:
+            ansible_cfg_key = 'ansible.cfg'
+
+        for cluster_name, cluster in clusters.items():
+            # resolve workdir: explicit > workspace.path/cluster_name
+            if 'workdir' not in cluster:
+                if workspace_path:
+                    cluster['workdir'] = os.path.join(workspace_path, cluster_name)
+                else:
+                    self.logger.warning(
+                        f"cluster '{cluster_name}' has no workdir and "
+                        f"workspace.path is not set"
+                    )
+                    continue
+
+            workdir = cluster['workdir']
+            vms = cluster.get('vms', {})
+
+            if not vms:
+                continue
+
+            # --- env.sh (workspace-level) ---
+            if env_sh_key not in ws_files:
+                first_vm = next(iter(vms))
+                inv_val = custom_inventory if custom_inventory else 'inventory'
+                cfg_val = custom_ansible_config if custom_ansible_config else 'ansible.cfg'
+                ws_files[env_sh_key] = (
+                    f"export INVENTORY={inv_val}\n"
+                    f"export SSH_CONFIG=ssh_config\n"
+                    f"export GATEWAYHOST={cluster_name}_{first_vm}\n"
+                    f"export ANSIBLE_CONFIG={cfg_val}\n"
+                    f"export ANSIBLE_INVENTORY=\"$INVENTORY\"\n"
+                    f"export ANSIBLE_SSH_ARGS=\"-F $SSH_CONFIG\"\n"
+                )
+
+        # --- inventory/01-hosts.yml (workspace-level) ---
+        ws_inv_key = inventory_key
+        if ws_inv_key not in ws_files:
+            all_vms = []
+            for cname, cluster in clusters.items():
+                for vm_name in cluster.get('vms', {}).keys():
+                    all_vms.append((cname, vm_name))
+            if all_vms:
+                pad_width = len(str(len(all_vms) - 1)) if len(all_vms) > 1 else 1
+                lines = []
+                for i, (cname, vm) in enumerate(all_vms):
+                    alias = f"node{str(i).zfill(pad_width)}"
+                    lines.append(f'        {cname}_{vm}:\n          boxman_alias: "{alias}"')
+                host_lines = '\n'.join(lines)
+
+                # build children groups keyed by cluster name
+                cluster_groups = {}
+                for cname, vm in all_vms:
+                    cluster_groups.setdefault(cname, []).append(f'{cname}_{vm}')
+                children_lines = []
+                for cname, hosts in cluster_groups.items():
+                    children_lines.append(f'    {cname}:')
+                    children_lines.append(f'      hosts:')
+                    for h in hosts:
+                        children_lines.append(f'        {h}:')
+                children_section = '\n'.join(children_lines)
+
+                ws_files[ws_inv_key] = (
+                    f"---\n"
+                    f"all:\n"
+                    f"  hosts:\n"
+                    f"{host_lines}\n"
+                    f"  children:\n"
+                    f"{children_section}\n"
+                )
+
+        # --- ansible.cfg (workspace-level) ---
+        if ansible_cfg_key not in ws_files:
+            ws_files[ansible_cfg_key] = (
+                "[defaults]\n"
+                "host_key_checking = False\n"
+                "poll_interval = 5\n"
+                "callbacks_enabled = timer\n"
+                "forks = 10\n"
+                "nocows = 1\n"
+                "timeout = 30\n"
+                "interpreter_python = auto_silent\n"
+                "gathering = smart\n"
+                "fact_caching = jsonfile\n"
+                f"fact_caching_connection = {workspace_path}/.ansible_facts\n"
+                "fact_caching_timeout = 86400\n"
+                "ansible_managed = Ansible managed: {file} modified on "
+                "%Y-%m-%d %H:%M:%S by {uid} on {host}\n"
+                "\n"
+                "[ssh_connection]\n"
+                "pipelining = True\n"
+                "ssh_args = -o ControlMaster=auto -o ControlPersist=60s\n"
+                "control_path = /tmp/ansible-ssh-%%h-%%p-%%r\n"
+            )
+
     def provision_files(self) -> None:
         """
-        Provision files specified in the cluster configuration.
+        Provision files specified in the cluster and workspace configuration.
         """
+        # workspace-level files (e.g. env.sh) → written to workspace.path
+        workspace = self.config.get('workspace', {})
+        workspace_path = workspace.get('path', '')
+        if workspace_path:
+            if ws_files := workspace.get('files'):
+                write_files(ws_files, rootdir=workspace_path)
+
+        # cluster-level files → written to cluster workdir
         clusters = self.config['clusters']
         for cluster_name, cluster in clusters.items():
             if files := cluster.get('files'):
@@ -168,28 +418,318 @@ class BoxmanManager:
             raise ValueError(f"Invalid network name format: {network_name}")
 
     @staticmethod
-    def list_projects(cls, _) -> None:
+    def import_image(cls, cli_args) -> None:
         """
-        List all projects that have been provisioned
+        Import an image into the provider's storage.
 
         :param manager: The instance of the BoxmanManager
         :param cli_args: The parsed arguments from the cli
         """
-        # print table header
-        header_project = "project_name"
-        header_path = "project path"
-        padding_project = 20
-        padding_path = 50
-        print(f"{header_project:<{padding_project}} | {header_path:<{padding_path}}")
+        cls.provider.import_image(
+            manifest_uri=cli_args.manifest_uri,
+            vm_name=cli_args.vm_name,
+            vm_dir=cli_args.vm_dir
+        )
 
-        # create separator line with "+" at the intersection
-        separator_project = "-" * padding_project
-        separator_path = "-" * padding_path
-        print(f"{separator_project}-+{separator_path}")
+    @staticmethod
+    def create_templates(cls, cli_args) -> None:
+        """
+        Create template VMs from cloud images using cloud-init.
 
-        # Print each project row
-        for project, project_data in cls.cache.read_projects_cache().items():
-            print(f"{project:<{padding_project}} | {project_data['conf']:<{padding_path}}")
+        Reads the ``templates`` section from the project config and creates
+        each template VM that doesn't already exist.
+
+        :param cls: The BoxmanManager instance
+        :param cli_args: The parsed arguments from the cli
+        """
+        requested = None
+        if cli_args is not None and hasattr(cli_args, 'template_names') and cli_args.template_names:
+            requested = [t.strip() for t in cli_args.template_names.split(',')]
+
+        force = getattr(cli_args, 'force', False) if cli_args is not None else False
+
+        cls._create_templates_impl(requested=requested, force=force)
+
+    def _create_templates_impl(self, requested=None, force=False) -> None:
+        """
+        Internal implementation for creating template VMs.
+
+        Args:
+            requested: Optional list of template keys to create (None = all).
+            force: If True, recreate existing templates.
+        """
+        from boxman.providers.libvirt.cloudinit import CloudInitTemplate
+
+        config = self.config
+        templates = config.get('templates', {})
+
+        if not templates:
+            self.logger.warning("no templates defined in configuration")
+            return
+
+        # determine provider config
+        provider_type = list(config.get('provider', {}).keys())[0] if 'provider' in config else 'libvirt'
+        provider_config = config.get('provider', {}).get(provider_type, {})
+
+        # merge app-level provider config as defaults
+        if self.app_config and 'providers' in self.app_config:
+            app_provider = self.app_config['providers'].get(provider_type, {})
+            merged = app_provider.copy()
+            merged.update(provider_config)
+            provider_config = merged
+
+        # inject runtime settings
+        if hasattr(self, 'runtime_instance'):
+            provider_config = self.runtime_instance.inject_into_provider_config(provider_config)
+
+        self.logger.info(f"resolved provider config for templates: {provider_config}")
+
+        # resolve a workdir for template artifacts
+        # Templates must live in a stable location independent of any cluster
+        # workdir, so that destroying or cleaning a cluster does not delete
+        # the template disk images that other clusters may still reference.
+        default_workdir = '~/boxman-templates'
+
+        # --- Pre-check: detect already-existing templates ----------------
+        # Build a temporary VirshCommand to query existing VMs once.
+        from boxman.providers.libvirt.commands import VirshCommand
+        _virsh = VirshCommand(provider_config=provider_config)
+        _existing_vms: set = set()
+        result = _virsh.execute("list", "--all", "--name", hide=True, warn=True)
+        if result.ok:
+            _existing_vms = {
+                v.strip() for v in result.stdout.strip().split("\n") if v.strip()
+            }
+
+        # Identify which of the requested templates already exist
+        existing_templates: list[str] = []
+        templates_to_create: list[str] = []
+
+        for tpl_key, tpl_conf in templates.items():
+            if requested and tpl_key not in requested:
+                continue
+            tpl_name = tpl_conf.get('name', tpl_key)
+            if tpl_name in _existing_vms:
+                existing_templates.append(tpl_key)
+            else:
+                templates_to_create.append(tpl_key)
+
+        # If any templates already exist and --force was NOT given, error out.
+        if existing_templates and not force:
+            names = ", ".join(
+                f"'{templates[k].get('name', k)}'" for k in existing_templates
+            )
+            self.logger.error(
+                f"the following template(s) already exist: {names}. "
+                f"Use --force to delete and recreate them."
+            )
+            return
+
+        # Merge both lists (existing ones will be force-recreated)
+        all_keys = existing_templates + templates_to_create
+        # -----------------------------------------------------------------
+
+        for tpl_key in all_keys:
+            tpl_conf = templates[tpl_key]
+
+            tpl_name = tpl_conf.get('name', tpl_key)
+            image_path = tpl_conf.get('image', '')
+
+            # Common typo: 'file' instead of 'image'
+            if not image_path and 'file' in tpl_conf:
+                image_path = tpl_conf['file']
+                self.logger.warning(
+                    f"template '{tpl_key}': 'file' is not a valid key, "
+                    f"did you mean 'image'? Using '{image_path}' as the image path.")
+
+            cloudinit_userdata = tpl_conf.get('cloudinit', None)
+            cloudinit_metadata = tpl_conf.get('cloudinit_metadata', None)
+            cloudinit_network_config = tpl_conf.get('cloudinit_network_config', None)
+            tpl_memory = tpl_conf.get('memory', 2048)
+            tpl_vcpus = tpl_conf.get('vcpus', 2)
+            tpl_os_variant = tpl_conf.get('os_variant', 'generic')
+            tpl_disk_format = tpl_conf.get('disk_format', 'qcow2')
+            tpl_disk_size = tpl_conf.get('disk_size', None)
+            tpl_network = tpl_conf.get('network', 'default')
+            tpl_bridge = tpl_conf.get('bridge', None)
+            tpl_workdir = tpl_conf.get('workdir', default_workdir)
+
+            # Ensure the workdir exists and is writable by the current user.
+            # Earlier steps (e.g. docker runtime) may have created it as root.
+            expanded_workdir = os.path.expanduser(tpl_workdir)
+            self._ensure_writable_dir(expanded_workdir)
+
+            # Also pre-create the template subdirectory that cloudinit.py
+            # will use, so it doesn't hit PermissionError.
+            template_subdir = os.path.join(expanded_workdir, tpl_name)
+            self._ensure_writable_dir(template_subdir)
+
+            self.logger.info(f"creating template '{tpl_key}' -> VM name '{tpl_name}'")
+
+            ct = CloudInitTemplate(
+                template_name=tpl_name,
+                image_path=image_path,
+                cloudinit_userdata=cloudinit_userdata,
+                cloudinit_metadata=cloudinit_metadata,
+                cloudinit_network_config=cloudinit_network_config,
+                workdir=tpl_workdir,
+                provider_config=provider_config,
+                memory=tpl_memory,
+                vcpus=tpl_vcpus,
+                os_variant=tpl_os_variant,
+                disk_format=tpl_disk_format,
+                disk_size=tpl_disk_size,
+                network=tpl_network,
+                bridge=tpl_bridge,
+            )
+
+            success = ct.create_template(force=force)
+            if success:
+                self.logger.info(f"template '{tpl_key}' created successfully")
+            else:
+                self.logger.error(f"failed to create template '{tpl_key}'")
+
+    def _ensure_writable_dir(self, path: str) -> None:
+        """
+        Ensure *path* exists and is writable by the current user.
+
+        If the directory was created by another user (e.g. root via docker),
+        attempt to fix ownership with ``sudo chown``.  If ``sudo`` is not
+        available or fails, a clear error message is logged.
+
+        When running under a non-local runtime the directory is also
+        created inside the container so that commands executed via
+        ``docker exec`` can access it.
+
+        Args:
+            path: Absolute or user-expandable directory path.
+        """
+        path = os.path.expanduser(path)
+
+        if not os.path.exists(path):
+            try:
+                os.makedirs(path, exist_ok=True)
+            except PermissionError:
+                # parent dir may be owned by root — try sudo mkdir
+                self.logger.warning(
+                    f"cannot create '{path}' as current user, "
+                    f"trying with sudo...")
+                result = run(
+                    f"sudo mkdir -p '{path}'", hide=True, warn=True)
+                if not result.ok:
+                    raise PermissionError(
+                        f"failed to create directory '{path}' even with sudo"
+                    )
+                # fall through to chown below
+
+        # if the directory exists but is not writable, fix ownership
+        if not os.access(path, os.W_OK):
+            uid = os.getuid()
+            gid = os.getgid()
+            self.logger.info(
+                f"fixing ownership of '{path}' to {uid}:{gid} "
+                f"(was not writable by current user)")
+            result = run(
+                f"sudo chown -R {uid}:{gid} '{path}'",
+                hide=True, warn=True)
+            if not result.ok:
+                raise PermissionError(
+                    f"directory '{path}' is not writable and "
+                    f"'sudo chown' failed: {result.stderr.strip()}"
+                )
+
+        # When using a non-local runtime (e.g. docker-compose), also
+        # create the directory inside the container so that commands
+        # executed via 'docker exec' can write to it.
+        if self._runtime_name != 'local':
+            mkdir_cmd = self.runtime_instance.wrap_command(
+                f"mkdir -p '{path}'"
+            )
+            self.logger.info(f"creating directory inside runtime container: {path}")
+            result = run(mkdir_cmd, hide=True, warn=True)
+            if not result.ok:
+                self.logger.warning(
+                    f"failed to create '{path}' inside container: "
+                    f"{result.stderr.strip()}")
+
+    def ensure_templates_exist(self) -> bool:
+        """
+        Check if any cluster's base_image refers to a template defined in the
+        ``templates`` section of the config. If the template VM does not exist,
+        create it automatically.
+
+        Returns:
+            True if all required templates exist (or were created), False on failure.
+        """
+        templates = self.config.get('templates', {})
+        if not templates:
+            return True  # nothing to do
+
+        # build a mapping: template VM name -> template key
+        tpl_name_to_key: Dict[str, str] = {}
+        for tpl_key, tpl_conf in templates.items():
+            vm_name = tpl_conf.get('name', tpl_key)
+            tpl_name_to_key[vm_name] = tpl_key
+            # also map by the key itself in case base_image uses the key
+            tpl_name_to_key[tpl_key] = tpl_key
+
+        # collect which templates are referenced by clusters
+        needed_template_keys: set = set()
+        for cluster_name, cluster in self.config.get('clusters', {}).items():
+            base_image = cluster.get('base_image', '')
+            if base_image in tpl_name_to_key:
+                needed_template_keys.add(tpl_name_to_key[base_image])
+
+        if not needed_template_keys:
+            return True  # no cluster uses a template as base_image
+
+        # check which of the needed templates already exist as VMs
+        missing_keys: list = []
+        for tpl_key in needed_template_keys:
+            tpl_conf = templates[tpl_key]
+            tpl_vm_name = tpl_conf.get('name', tpl_key)
+
+            # ask the provider if the VM exists
+            exists = False
+            if self.provider is not None and hasattr(self.provider, 'vm_exists'):
+                exists = self.provider.vm_exists(tpl_vm_name)
+            elif self.provider is not None:
+                # fallback: try virsh list
+                try:
+                    from boxman.providers.libvirt.commands import VirshCommand
+                    provider_type = list(self.config.get('provider', {}).keys())[0]
+                    provider_config = self.config.get('provider', {}).get(provider_type, {})
+                    if self.app_config and 'providers' in self.app_config:
+                        app_prov = self.app_config['providers'].get(provider_type, {})
+                        merged = app_prov.copy()
+                        merged.update(provider_config)
+                        provider_config = merged
+                    if hasattr(self, 'runtime_instance'):
+                        provider_config = self.runtime_instance.inject_into_provider_config(provider_config)
+                    virsh = VirshCommand(provider_config=provider_config)
+                    result = virsh.execute("list", "--all", "--name", hide=True, warn=True)
+                    if result.ok:
+                        vm_list = [v.strip() for v in result.stdout.strip().split("\n") if v.strip()]
+                        exists = tpl_vm_name in vm_list
+                except Exception as exc:
+                    self.logger.warning(f"could not check if template VM '{tpl_vm_name}' exists: {exc}")
+
+            if exists:
+                self.logger.info(f"template VM '{tpl_vm_name}' already exists, skipping creation")
+            else:
+                self.logger.info(
+                    f"template VM '{tpl_vm_name}' (key='{tpl_key}') does not exist, "
+                    f"will create it before provisioning")
+                missing_keys.append(tpl_key)
+
+        if not missing_keys:
+            return True
+
+        # create the missing templates
+        self.logger.info(f"auto-creating {len(missing_keys)} missing template(s): {missing_keys}")
+        self._create_templates_impl(requested=missing_keys, force=False)
+
+        return True
 
     ### register/un-register the project in the cache
     def register_project_in_cache(self) -> None:
@@ -197,10 +737,20 @@ class BoxmanManager:
         Register the project in the Boxman cache.
 
         This method saves the project configuration to the cache for later use.
+
+        Raises:
+            RuntimeError: If the project is already registered in the cache.
         """
-        self.cache.register_project(
+        success = self.cache.register_project(
             project_name=self.config['project'],
-            config_fpath=self.config_path)
+            config_fpath=self.config_path,
+            runtime=self._runtime_name)
+
+        if success is False:
+            raise RuntimeError(
+                f"Project '{self.config['project']}' is already in the cache. "
+                f"Deprovision it first with: boxman deprovision"
+            )
 
     def unregister_from_cache(self) -> None:
         """
@@ -209,22 +759,153 @@ class BoxmanManager:
         This method saves the project configuration to the cache for later use.
         """
         self.cache.unregister_project(project_name=self.config['project'])
+
+    @staticmethod
+    def list_projects(cls, cli_args) -> None:
+        """
+        List all registered projects.
+        """
+        projects = cls.cache.list_projects()
+
+        pretty = getattr(cli_args, 'pretty', None) if cli_args else None
+        use_json = getattr(cli_args, 'json', False) if cli_args else False
+        use_color = getattr(cli_args, 'color', 'yes') != 'no' if cli_args else True
+
+        # --- JSON output ---
+        if use_json:
+            print(json.dumps(projects if projects else {}, indent=2, default=str))
+            return
+
+        # ANSI helpers
+        if use_color and pretty:
+            BOLD = "\033[1m"
+            CYAN = "\033[1;36m"
+            GREEN = "\033[1;32m"
+            YELLOW = "\033[1;33m"
+            DIM = "\033[2m"
+            RESET = "\033[0m"
+        else:
+            BOLD = CYAN = GREEN = YELLOW = DIM = RESET = ""
+
+        if not projects:
+            if pretty:
+                print(f"{YELLOW}No projects registered.{RESET}")
+            else:
+                cls.logger.info("No projects registered.")
+            return
+
+        if pretty == 'table':
+            # Collect rows: [project, config, runtime, networks_summary]
+            rows = []
+            for proj_name, proj_info in projects.items():
+                if isinstance(proj_info, dict):
+                    conf = proj_info.get('conf', 'n/a')
+                    runtime = proj_info.get('runtime', 'n/a')
+                    networks = proj_info.get('networks', {})
+                    net_parts = []
+                    for net_name, net_info in networks.items():
+                        if isinstance(net_info, dict):
+                            ip = net_info.get('ip_address', 'n/a')
+                            bridge = net_info.get('bridge_name', 'n/a')
+                            net_parts.append(f"{net_name} (ip={ip}, br={bridge})")
+                        else:
+                            net_parts.append(net_name)
+                    nets_str = "; ".join(net_parts) if net_parts else "-"
+                else:
+                    conf = str(proj_info)
+                    runtime = "n/a"
+                    nets_str = "-"
+                rows.append((proj_name, conf, runtime, nets_str))
+
+            headers = ("PROJECT", "CONFIG", "RUNTIME", "NETWORKS")
+            # compute column widths
+            col_widths = [len(h) for h in headers]
+            for row in rows:
+                for i, cell in enumerate(row):
+                    col_widths[i] = max(col_widths[i], len(cell))
+
+            def fmt_row(cells, bold=False):
+                parts = []
+                for i, cell in enumerate(cells):
+                    parts.append(cell.ljust(col_widths[i]))
+                line = "  ".join(parts)
+                if bold:
+                    return f"{BOLD}{line}{RESET}"
+                return line
+
+            print()
+            print(fmt_row(headers, bold=True))
+            print("  ".join("-" * w for w in col_widths))
+            for row in rows:
+                print(fmt_row(row))
+            print()
+
+        elif pretty == 'plain':
+            print()
+            print(f"{BOLD}Registered projects:{RESET}")
+            print()
+            for proj_name, proj_info in projects.items():
+                print(f"  {CYAN}{proj_name}{RESET}")
+                if isinstance(proj_info, dict):
+                    conf = proj_info.get('conf', 'n/a')
+                    runtime = proj_info.get('runtime', 'n/a')
+                    print(f"    {DIM}config:{RESET}  {conf}")
+                    print(f"    {DIM}runtime:{RESET} {runtime}")
+
+                    networks = proj_info.get('networks', {})
+                    if networks:
+                        print(f"    {DIM}networks:{RESET}")
+                        for net_name, net_info in networks.items():
+                            ip = net_info.get('ip_address', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            bridge = net_info.get('bridge_name', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            print(f"      {GREEN}-{RESET} {net_name}")
+                            print(f"          {DIM}ip:{RESET} {ip}  {DIM}bridge:{RESET} {bridge}")
+                else:
+                    print(f"    {proj_info}")
+                print()
+
+        else:
+            # default logger-based output (no --pretty, no --json)
+            cls.logger.info("Registered projects:\n")
+            for proj_name, proj_info in projects.items():
+                cls.logger.info(f"  project: {proj_name}")
+                if isinstance(proj_info, dict):
+                    conf = proj_info.get('conf', 'n/a')
+                    runtime = proj_info.get('runtime', 'n/a')
+                    cls.logger.info(f"    config:  {conf}")
+                    cls.logger.info(f"    runtime: {runtime}")
+
+                    networks = proj_info.get('networks', {})
+                    if networks:
+                        cls.logger.info(f"    networks:")
+                        for net_name, net_info in networks.items():
+                            ip = net_info.get('ip_address', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            bridge = net_info.get('bridge_name', 'n/a') if isinstance(net_info, dict) else 'n/a'
+                            cls.logger.info(f"      - {net_name}")
+                            cls.logger.info(f"          ip: {ip}  bridge: {bridge}")
+                else:
+                    cls.logger.info(f"    {proj_info}")
+                cls.logger.info("")
     ### end register the project in the cache
 
     ### networks define / remove / destroy
     def define_networks(self) -> None:
         """
-        Define the networks specified in the cluster configuration.
+        Define the networks specified in the cluster configuration (sequential).
+
+        Networks must be defined one at a time because bridge name assignment
+        (virbrX) is a shared resource: each definition must be committed to
+        libvirt and the cache before the next network picks its bridge name,
+        otherwise two concurrent processes can both select the same bridge index
+        and the second net-define fails with "bridge name already in use".
         """
         for cluster_name, cluster in self.config['clusters'].items():
             for network_name, network_info in cluster.get('networks', {}).items():
-
                 _network_name = self.full_network_name(
                     project_config=self.config,
                     cluster_name=cluster_name,
                     network_name=network_name
                 )
-
                 self.provider.define_network(
                     name=_network_name,
                     info=network_info,
@@ -234,25 +915,54 @@ class BoxmanManager:
 
     def destroy_networks(self) -> None:
         """
-        Destroy the networks specified in the cluster configuration.
+        Destroy the networks specified in the cluster configuration (parallel).
         """
-        for cluster_name, cluster in self.config['clusters'].items():
-            for network_name, network_info in cluster.get('networks', {}).items():
+        def _destroy(cluster_name, cluster, network_name, network_info):
+            _network_name = self.full_network_name(
+                project_config=self.config,
+                cluster_name=cluster_name,
+                network_name=network_name
+            )
+            self.provider.remove_network(
+                name=_network_name,
+                info=network_info
+            )
+            self.logger.info(f"removed network {_network_name} in {cluster['workdir']}")
 
-                _network_name = self.full_network_name(
-                    project_config=self.config,
-                    cluster_name=cluster_name,
-                    network_name=network_name
-                )
-
-                self.provider.remove_network(
-                    name=_network_name,
-                    info=network_info
-                )
-                self.logger.info(f"removed network {_network_name} in {cluster['workdir']}")
+        processes = [
+            Process(target=_destroy, args=(cluster_name, cluster, network_name, network_info))
+            for cluster_name, cluster in self.config['clusters'].items()
+            for network_name, network_info in cluster.get('networks', {}).items()
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
     ### end networks define / remove / destroy
 
     ### vms define / remove / destroy
+    def _ensure_libvirt_storage_pool(self, workdir: str) -> None:
+        """
+        Ensure the libvirt directory storage pool exists for the given workdir.
+
+        virt-clone automatically tries to define a pool for the target directory
+        when given a --file path. When multiple VMs are cloned in parallel into
+        the same directory, every process races to define the same pool and all
+        but the first fail with "pool already exists". Pre-defining the pool
+        here (sequentially, before parallel cloning begins) eliminates the race.
+        """
+        workdir = os.path.abspath(os.path.expanduser(workdir))
+        pool_name = os.path.basename(workdir)
+        virsh = VirshCommand(self.provider.provider_config)
+
+        result = virsh.execute("pool-info", pool_name, warn=True)
+        if result.ok:
+            self.logger.info(f"storage pool '{pool_name}' already exists")
+            return
+
+        self.logger.info(f"defining storage pool '{pool_name}' for {workdir}")
+        virsh.execute("pool-define-as", pool_name, "dir", "--target", workdir)
+        virsh.execute("pool-build", pool_name, warn=True)
+        virsh.execute("pool-start", pool_name, warn=True)
+
     def clone_vms(self) -> None:
         """
         Clone the VMs defined in the configuration.
@@ -270,7 +980,19 @@ class BoxmanManager:
                     new_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                     yield cluster, vm_info, new_vm_name
 
+        # Pre-define storage pools for all cluster workdirs before parallel
+        # cloning. virt-clone tries to auto-define a pool for the target
+        # directory; doing it here sequentially prevents the race condition
+        # where N parallel processes all try to define the same pool at once.
+        seen_workdirs: set = set()
+        for cluster_name, cluster in self.config['clusters'].items():
+            workdir = os.path.abspath(os.path.expanduser(cluster['workdir']))
+            if workdir not in seen_workdirs:
+                seen_workdirs.add(workdir)
+                self._ensure_libvirt_storage_pool(workdir)
+
         def _clone(cluster, vm_info, new_vm_name):
+            self.logger.info(f"cloning vm {new_vm_name} from base image {cluster['base_image']}")
             self.provider.clone_vm(
                 src_vm_name=cluster['base_image'],
                 new_vm_name=new_vm_name,
@@ -278,19 +1000,12 @@ class BoxmanManager:
                 workdir=cluster['workdir']
             )
 
-        # clone the vms one at a time
-        for cluster, vm_info, new_vm_name in vm_clone_tasks():
-            self.logger.info(f"cloning vm {new_vm_name} from base image {cluster['base_image']}")
-            _clone(cluster, vm_info, new_vm_name)
-            time.sleep(1)  # Add a small delay to avoid overwhelming the provider
-
-        # optionally use multiprocessing to speed up the cloning process
-        #processes = [
-        #    Process(target=_clone, args=(cluster, vm_info, new_vm_name))
-        #    for cluster, vm_info, new_vm_name in vm_clone_tasks()
-        #]
-        #[p.start() for p in processes]
-        #[p.join() for p in processes]
+        processes = [
+            Process(target=_clone, args=(cluster, vm_info, new_vm_name))
+            for cluster, vm_info, new_vm_name in vm_clone_tasks()
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
 
     def destroy_vms(self) -> None:
         """
@@ -318,46 +1033,150 @@ class BoxmanManager:
         [p.join() for p in processes]
     ### end vms define / remove / destroy
 
-    def configure_network_interfaces(self) -> None:
+    def _configure_and_start_vm(
+        self, cluster_name: str, cluster: Dict[str, Any], vm_name: str, vm_info: Dict[str, Any]
+    ) -> None:
         """
-        Configure network interfaces for all VMs based on their network_adapters configuration.
+        Configure and start a single VM: cpu/mem, network interfaces, disks, then start.
 
-        This method adds network interfaces to VMs after they have been cloned,
-        connecting them to the appropriate networks.
+        Designed to be called in a separate process per VM after cloning is done.
         """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+        vm_info = vm_info.copy()
+
+        # cpu / memory
+        cpus = vm_info.get('cpus')
+        memory = vm_info.get('memory')
+        if cpus or memory:
+            self.logger.info(f"configuring cpu and memory for vm {vm_name}")
+            success = self.provider.configure_vm_cpu_memory(
+                vm_name=full_vm_name, cpus=cpus, memory_mb=memory
+            )
+            if success:
+                self.logger.info(f"successfully configured cpu and memory for vm {vm_name}")
+            else:
+                self.logger.warning(f"failed to configure cpu and memory for vm {vm_name}")
+        else:
+            self.logger.warning(f"no cpu or memory configuration for vm {vm_name}, skipping")
+
+        # network interfaces
+        if 'network_adapters' not in vm_info:
+            self.logger.warning(f"no network adapters defined for vm {vm_name}, skipping")
+        else:
+            for adapter in vm_info['network_adapters']:
+                if adapter.get('is_global', False):
+                    full_network_name = adapter['network_source']
+                else:
+                    full_network_name = self.full_network_name(
+                        project_config=self.config,
+                        cluster_name=cluster_name,
+                        network_name=adapter['network_source']
+                    )
+                adapter['network_source'] = full_network_name
+
+            self.logger.info(f"configuring network interfaces for vm {vm_name}")
+            success = self.provider.configure_vm_network_interfaces(
+                vm_name=full_vm_name,
+                network_adapters=vm_info['network_adapters']
+            )
+            if success:
+                self.logger.info(f"network interfaces configured for vm {vm_name}")
+            else:
+                self.logger.warning(f"some network interfaces could not be configured for vm {vm_name}")
+
+        # disks
+        workdir = cluster.get('workdir', '.')
+        if 'disks' not in vm_info or not vm_info['disks']:
+            self.logger.warning(f"no disks defined for vm {vm_name}, skipping")
+        else:
+            self.logger.info(f"configuring disks for vm {vm_name}")
+            success = self.provider.configure_vm_disks(
+                vm_name=full_vm_name,
+                disks=vm_info['disks'],
+                workdir=workdir,
+                disk_prefix=full_vm_name
+            )
+            if success:
+                self.logger.info(f"all disks configured for vm {vm_name}")
+            else:
+                self.logger.warning(f"some disks could not be configured for vm {vm_name}")
+
+        # start
+        self.logger.info(f"starting vm {full_vm_name}")
+        success = self.provider.start_vm(full_vm_name)
+        if success:
+            self.logger.info(f"successfully started the vm {full_vm_name}")
+        else:
+            self.logger.warning(f"failed to start the vm {full_vm_name}")
+
+    def _destroy_vm_and_disks(
+        self, cluster_name: str, cluster: Dict[str, Any], vm_name: str, vm_info: Dict[str, Any]
+    ) -> None:
+        """
+        Fully destroy a single VM: stop/undefine, remove disks, force-cleanup.
+
+        Designed to be called in a separate process per VM during deprovision.
+        """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+        vm_info = vm_info.copy()
+
+        self.logger.info(f"destroying vm {full_vm_name}")
+        self.provider.destroy_vm(full_vm_name)
+        self.provider.destroy_disks(
+            cluster['workdir'],
+            vm_name=full_vm_name,
+            disks=vm_info.get('disks', [])
+        )
+        self.provider.destroy_vm(full_vm_name, force=True)
+
+    def configure_and_start_vms(self) -> None:
+        """
+        Configure (cpu/mem, network interfaces, disks) and start all VMs in parallel.
+
+        Each VM is handled in its own process so all VMs are configured and
+        started concurrently.
+        """
+        processes = [
+            Process(
+                target=self._configure_and_start_vm,
+                args=(cluster_name, cluster, vm_name, vm_info)
+            )
+            for cluster_name, cluster in self.config['clusters'].items()
+            for vm_name, vm_info in cluster['vms'].items()
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+    # Keep individual methods available for direct use / testing
+
+    def configure_network_interfaces(self) -> None:
+        """Configure network interfaces for all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
-
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 vm_info = vm_info.copy()
-
                 self.logger.info(
                     f"configuring network interfaces for VM {vm_name} in cluster {cluster_name}")
-
                 if 'network_adapters' not in vm_info:
                     self.logger.warning(f"no network adapters defined for vm {vm_name}, skipping")
                     continue
-                else:
-                    # use the fully qualified network name to which the adapter will connect to
-                    for adapter in vm_info['network_adapters']:
-
-                        if adapter.get('is_global', False):
-                            full_network_name = adapter['network_source']
-                        else:
-                            full_network_name = self.full_network_name(
-                                project_config=self.config,
-                                cluster_name=cluster_name,
-                                network_name=adapter['network_source']
-                            )
-
-                        adapter['network_source'] = full_network_name
-
+                for adapter in vm_info['network_adapters']:
+                    if adapter.get('is_global', False):
+                        full_network_name = adapter['network_source']
+                    else:
+                        full_network_name = self.full_network_name(
+                            project_config=self.config,
+                            cluster_name=cluster_name,
+                            network_name=adapter['network_source']
+                        )
+                    adapter['network_source'] = full_network_name
                 success = self.provider.configure_vm_network_interfaces(
                     vm_name=full_vm_name,
                     network_adapters=vm_info['network_adapters']
                 )
-
                 if success:
                     self.logger.info(
                         f"All network interfaces configured successfully for vm {vm_name}")
@@ -366,87 +1185,56 @@ class BoxmanManager:
                         f"Some network interfaces could not be configured for vm {vm_name}")
 
     def configure_disks(self) -> None:
-        """
-        Configure disks for all VMs based on their disks configuration.
-
-        This method creates and attaches disks to VMs after they have been cloned.
-        """
+        """Configure disks for all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             workdir = cluster.get('workdir', '.')
-
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-
                 self.logger.info(f"configuring disks for vm {vm_name} in cluster {cluster_name}")
-
-                # check if there are disks defined in the VM configuration
                 if 'disks' not in vm_info or not vm_info['disks']:
                     self.logger.warning(f"no disks defined for vm {vm_name}, skipping")
                     continue
-
-                # configure all disks for this vm
                 success = self.provider.configure_vm_disks(
                     vm_name=full_vm_name,
                     disks=vm_info['disks'],
                     workdir=workdir,
                     disk_prefix=full_vm_name)
-
                 if success:
                     self.logger.info(f"all disks configured successfully for vm {vm_name}")
                 else:
                     self.logger.warning(f"some disks could not be configured for vm {vm_name}")
 
     def configure_cpu_mem(self) -> None:
-        """
-        Configure cpu and memory settings for all vms based on their configuration.
-
-        This method modifies the CPU and memory settings of VMs after they have been cloned.
-        """
+        """Configure CPU and memory for all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-
                 self.logger.info(
                     f"configuring cpu and memory for vm {vm_name} in cluster {cluster_name}")
-
-                # extract the cpu and memory configuration
                 cpus = vm_info.get('cpus')
                 memory = vm_info.get('memory')
-
-                # skip if neither cpu nor memory is configured
                 if not cpus and not memory:
                     self.logger.warning(
                         f"no cpu or memory configuration for vm {vm_name}, skipping")
                     continue
-
-                # configure cpu and memory
                 success = self.provider.configure_vm_cpu_memory(
-                    vm_name=full_vm_name,
-                    cpus=cpus,
-                    memory_mb=memory
+                    vm_name=full_vm_name, cpus=cpus, memory_mb=memory
                 )
-
                 if success:
                     self.logger.info(f"successfully configured cpu and memory for vm {vm_name}")
                 else:
                     self.logger.warning(f"failed to configure cpu and memory for vm {vm_name}")
 
     def start_vms(self) -> None:
-        """
-        Start all VMs in the configuration.
-
-        This powers on all VMs after they have been configured.
-        """
+        """Start all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-
                 self.logger.info(f"starting vm {full_vm_name}")
                 success = self.provider.start_vm(full_vm_name)
-
                 if success:
                     self.logger.info(f"successfully started the vm {full_vm_name}")
                 else:
@@ -456,26 +1244,35 @@ class BoxmanManager:
         """
         Gather connection information for all VMs in all clusters.
 
-        This method attempts to get IP addresses for all VMs and returns
-        True only if all VMs have at least one IP address.
+        Queries all VMs in parallel and returns True only if every VM has at
+        least one IP address.
 
         Returns:
             True if all VMs have at least one IP address, False otherwise
         """
-        all_vms_have_ip = True
-
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self.config['clusters'].items():
-            for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+        vm_names = [
+            f"{prj_name}_{cluster_name}_{vm_name}"
+            for cluster_name, cluster in self.config['clusters'].items()
+            for vm_name in cluster['vms']
+        ]
 
-                # get the ip addresses for this vm
-                ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
+        result_queue: Queue = Queue()
 
-                # if no ip addresses found, mark as failure
-                if not ip_addresses:
-                    all_vms_have_ip = False
-                    self.logger.warning(f"vm {full_vm_name} does not have an ip address yet")
+        def _check(full_vm_name):
+            ips = self.provider.get_vm_ip_addresses(full_vm_name)
+            result_queue.put((full_vm_name, ips))
+
+        processes = [Process(target=_check, args=(n,)) for n in vm_names]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+        all_vms_have_ip = True
+        for _ in range(len(vm_names)):
+            full_vm_name, ips = result_queue.get()
+            if not ips:
+                all_vms_have_ip = False
+                self.logger.warning(f"vm {full_vm_name} does not have an ip address yet")
 
         return all_vms_have_ip
 
@@ -487,6 +1284,7 @@ class BoxmanManager:
         other connection details for all configured VMs.
         """
         self.logger.info("=== vm connection information ===")
+        ws_path = self.config.get('workspace', {}).get('path', '')
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
@@ -511,8 +1309,9 @@ class BoxmanManager:
 
                 # get ssh connection information
                 admin_user = cluster.get('admin_user', '<placeholder>')
+                base_path = ws_path or cluster.get('workdir', '~')
                 admin_key = os.path.expanduser(os.path.join(
-                    cluster.get('workdir', '~'),
+                    base_path,
                     cluster.get('admin_key_name', 'id_ed25519_boxman')
                 ))
 
@@ -525,10 +1324,10 @@ class BoxmanManager:
                 # show connection using ssh_config if available
                 if 'ssh_config' in cluster:
                     ssh_config = os.path.expanduser(os.path.join(
-                        cluster.get('workdir', '~'),
+                        base_path,
                         cluster.get('ssh_config', 'ssh_config')
                     ))
-                    self.logger.info(f"    via config: ssh -F {ssh_config} {hostname}")
+                    self.logger.info(f"    via config: ssh -F {ssh_config} {cluster_name}_{hostname}")
 
                 self.logger.info("")
 
@@ -538,19 +1337,31 @@ class BoxmanManager:
         """
         Generate SSH configuration file for easy access to VMs.
 
-        Creates an SSH config file in the workdir of each cluster that allows
+        Creates an SSH config file in the workspace directory that allows
         simplified access to VMs without typing full connection details.
         """
+        ws_path = self.config.get('workspace', {}).get('path', '')
         prj_name = f'bprj__{self.config["project"]}__bprj'
+
+        # count total VMs across all clusters for zero-padded alias numbering
+        total_vms = sum(
+            len(cluster.get('vms', {}))
+            for cluster in self.config['clusters'].values()
+        )
+        pad_width = len(str(total_vms - 1)) if total_vms > 1 else 1
+        vm_counter = 0
+
         for cluster_name, cluster in self.config['clusters'].items():
+            base_path = ws_path or cluster.get('workdir', '~')
+
             # get the ssh config path
             ssh_config = os.path.expanduser(os.path.join(
-                cluster.get('workdir', '~'),
+                base_path,
                 cluster.get('ssh_config', 'ssh_config')
             ))
 
             admin_priv_key = os.path.expanduser(os.path.join(
-                cluster.get('workdir', '~'),
+                base_path,
                 cluster.get('admin_key_name', 'id_ed25519_boxman')
             ))
 
@@ -567,6 +1378,9 @@ class BoxmanManager:
                 for vm_name, vm_info in cluster['vms'].items():
                     full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                     hostname = vm_info.get('hostname', vm_name)
+                    prefixed_host = f"{cluster_name}_{hostname}"
+                    padded_alias = f"node{str(vm_counter).zfill(pad_width)}"
+                    vm_counter += 1
 
                     # get the first ip address if available
                     ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
@@ -574,7 +1388,7 @@ class BoxmanManager:
                     if ip_addresses:
                         first_ip = next(iter(ip_addresses.values()))
 
-                        fobj.write(f'Host {hostname}\n')
+                        fobj.write(f'Host {prefixed_host} {padded_alias}\n')
                         fobj.write(f'    Hostname {first_ip}\n')
                         fobj.write(f'    User {cluster.get("admin_user", "admin")}\n')
                         fobj.write(f'    IdentityFile {admin_priv_key}\n')
@@ -591,27 +1405,29 @@ class BoxmanManager:
         """
         Generate SSH keys for connecting to VMs.
 
-        Creates an SSH key pair in each cluster's workdir if it doesn't already exist.
+        Creates an SSH key pair in the workspace directory if it doesn't
+        already exist.
 
         Returns:
             bool: True if successful, False otherwise
         """
         success = True
+        ws_path = self.config.get('workspace', {}).get('path', '')
 
         for _, cluster in self.config['clusters'].items():
-            workdir = os.path.expanduser(cluster['workdir'])
+            base_path = os.path.expanduser(ws_path or cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
 
-            admin_priv_key = os.path.join(workdir, admin_key_name)
-            admin_pub_key = os.path.join(workdir, f"{admin_key_name}.pub")
+            admin_priv_key = os.path.join(base_path, admin_key_name)
+            admin_pub_key = os.path.join(base_path, f"{admin_key_name}.pub")
 
-            # create workdir if it doesn't exist
-            if not os.path.isdir(workdir):
-                os.makedirs(workdir, exist_ok=True)
+            # create directory if it doesn't exist
+            if not os.path.isdir(base_path):
+                os.makedirs(base_path, exist_ok=True)
 
             # generate key pair if it doesn't exist
             if not os.path.exists(admin_priv_key):
-                self.logger.info(f"generating ssh key pair in {workdir}")
+                self.logger.info(f"generating ssh key pair in {base_path}")
 
                 try:
                     cmd = f'ssh-keygen -t ed25519 -a 100 -f {admin_priv_key} -q -N ""'
@@ -631,6 +1447,54 @@ class BoxmanManager:
                 self.logger.info(f"using existing ssh key pair at {admin_priv_key}")
 
         return success
+
+    def get_global_authorized_keys(self) -> list[str]:
+        """
+        Resolve and return all global SSH authorized keys from the app config.
+
+        Reads ``ssh.authorized_keys`` from :pyattr:`app_config` (the top-level
+        ``boxman.yml``), resolves each entry via :pyfunc:`fetch_value`, and
+        returns a list of public-key strings.
+
+        Returns:
+            List of resolved SSH public key strings.
+        """
+        raw_keys = (
+            (self.app_config or {})
+            .get("ssh", {})
+            .get("authorized_keys", [])
+        )
+        resolved: list[str] = []
+        for entry in raw_keys:
+            try:
+                resolved.append(self.fetch_value(entry))
+            except (ValueError, FileNotFoundError) as exc:
+                self.logger.warning(f"skipping unresolvable SSH key entry: {exc}")
+        return resolved
+
+    def write_global_authorized_keys_file(self, output_path: str) -> None:
+        """
+        Resolve global SSH keys from app_config and write them to a file.
+
+        This bridges the Python-side boxman.yml config with the container
+        entrypoint, which cannot read boxman.yml directly. The entrypoint
+        reads ``global_authorized_keys`` from the bind-mounted ssh dir.
+
+        Args:
+            output_path: Path to write the authorized keys file
+                         (e.g. ``<data_dir>/ssh/global_authorized_keys``).
+        """
+        keys = self.get_global_authorized_keys()
+        if not keys:
+            self.logger.info("no global authorized keys to write")
+            return
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w") as fobj:
+            for key in keys:
+                fobj.write(key + "\n")
+        self.logger.info(
+            f"wrote {len(keys)} global authorized key(s) to {output_path}")
 
     @classmethod
     def fetch_value(cls, value) -> str:
@@ -678,12 +1542,13 @@ class BoxmanManager:
             bool: True if all VMs received the key successfully, False otherwise
         """
         all_successful = True
+        ws_path = self.config.get('workspace', {}).get('path', '')
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
-            workdir = os.path.expanduser(cluster['workdir'])
+            base_path = os.path.expanduser(ws_path or cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
-            admin_pub_key = os.path.join(workdir, f"{admin_key_name}.pub")
+            admin_pub_key = os.path.join(base_path, f"{admin_key_name}.pub")
 
             admin_user = cluster.get('admin_user', 'admin')
             admin_pass = self.fetch_value(cluster.get('admin_pass', None))
@@ -721,13 +1586,15 @@ class BoxmanManager:
                 self.logger.info(f"adding ssh key to vm {vm_name} ({ip_address})...")
 
                 # try to add the key with exponential backoff
+                hostname = vm_info.get('hostname', vm_name)
+                prefixed_host = f"{cluster_name}_{hostname}"
                 success = self._try_add_ssh_key(
                     ip_address=ip_address,
-                    hostname=vm_info['hostname'],
+                    hostname=prefixed_host,
                     admin_user=admin_user,
                     admin_pass=admin_pass,
                     pub_key_path=admin_pub_key,
-                    ssh_conf_path=os.path.join(workdir, cluster['ssh_config'])
+                    ssh_conf_path=os.path.join(base_path, cluster['ssh_config'])
                 )
 
                 if success:
@@ -760,7 +1627,7 @@ class BoxmanManager:
             bool: True if successful, False otherwise
         """
         wait_time = 1  # Start with 1 second
-        max_retries = 5
+        max_retries = 10
         max_wait = 60  # Maximum wait per attempt
 
         for attempt in range(1, max_retries + 1):
@@ -774,16 +1641,36 @@ class BoxmanManager:
                 f'{admin_user}@{ip_address}'
             )
 
-            result = run(cmd, hide=False, warn=True)
+            # When using a non-local runtime, the VM is only reachable from
+            # inside the container, so wrap the command with docker exec.
+            cmd = self.runtime_instance.wrap_command(cmd)
+
+            result = run(cmd, hide=True, warn=True)
 
             if result.ok:
+                # Log ssh-copy-id informational output
+                if result.stdout.strip():
+                    for line in result.stdout.strip().splitlines():
+                        self.logger.info(f"ssh-copy-id: {line}")
+
                 # verify we can ssh without password
                 ssh_success = self._verify_ssh_connection(hostname, ssh_conf_path)
 
                 if ssh_success:
                     return True
             else:
-                self.logger.error(f"ssh key addition failed: {result.stderr.strip()}")
+                # Log ssh-copy-id output — warning for retries, error on last attempt
+                is_last = attempt == max_retries
+                log_fn = self.logger.error if is_last else self.logger.warning
+                combined = (result.stderr.strip() or result.stdout.strip())
+                if combined:
+                    for line in combined.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        log_fn(f"ssh-copy-id: {line}")
+                else:
+                    log_fn("ssh key addition failed (no output)")
 
             # wait before next attempt with exponential backoff
             time.sleep(wait_time)
@@ -804,6 +1691,11 @@ class BoxmanManager:
         """
         self.logger.info(f"verifying ssh connection to: {hostname}")
         ssh_cmd = f'ssh -F {ssh_config_path} {hostname} hostname'
+
+        # When using a non-local runtime, the VM is only reachable from
+        # inside the container.
+        ssh_cmd = self.runtime_instance.wrap_command(ssh_cmd)
+
         result = run(ssh_cmd, hide=True, warn=True)
 
         if result.ok and result.stdout.strip():
@@ -819,13 +1711,21 @@ class BoxmanManager:
         Set up SSH access to all VMs.
 
         This method:
-        1. Generates SSH keys if they don't exist
-        2. Adds the public key to all vms
-        3. Writes an SSH config file for easy access
+        1. Writes global authorized keys file (resolved from boxman.yml)
+        2. Generates SSH keys if they don't exist
+        3. Adds the public key to all vms
+        4. Writes an SSH config file for easy access
 
         Returns:
             bool: True if all steps completed successfully, False otherwise
         """
+        # write global authorized keys so they can be consumed by container
+        # entrypoints or cloud-init scripts
+        for _, cluster in self.config['clusters'].items():
+            workdir = os.path.expanduser(cluster['workdir'])
+            global_keys_path = os.path.join(workdir, 'global_authorized_keys')
+            self.write_global_authorized_keys_file(global_keys_path)
+
         if not self.generate_ssh_keys():
             self.logger.error("failed to generate ssh keys")
             return False
@@ -836,10 +1736,113 @@ class BoxmanManager:
             self.logger.error("failed to add ssh keys to some vms")
             return False
 
-        self.logger.info("\nssh access setup complete")
+        self.logger.info("")
+        self.logger.info("ssh access setup complete")
         self.logger.info("you can now connect to vms using the ssh config file")
 
         return True
+
+    def _get_project_vm_names(self) -> list[str]:
+        """
+        Return the list of fully-qualified VM names that would be
+        created by provisioning the current config.
+        """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        vm_names = []
+        for cluster_name, cluster in self.config.get('clusters', {}).items():
+            for vm_name in cluster.get('vms', {}).keys():
+                vm_names.append(f"{prj_name}_{cluster_name}_{vm_name}")
+        return vm_names
+
+    def _find_existing_project_vms(self) -> list[str]:
+        """
+        Query libvirt and return the subset of project VM names that
+        already exist (in any state).
+        """
+        expected = self._get_project_vm_names()
+        if not expected:
+            return []
+
+        # Resolve provider config so VirshCommand uses the right
+        # runtime / URI / sudo settings.
+        provider_type = (
+            list(self.config.get('provider', {}).keys())[0]
+            if 'provider' in self.config else 'libvirt'
+        )
+        provider_config = self.config.get('provider', {}).get(provider_type, {})
+        if self.app_config and 'providers' in self.app_config:
+            app_prov = self.app_config['providers'].get(provider_type, {})
+            merged = app_prov.copy()
+            merged.update(provider_config)
+            provider_config = merged
+        if hasattr(self, 'runtime_instance'):
+            provider_config = self.runtime_instance.inject_into_provider_config(
+                provider_config)
+
+        virsh = VirshCommand(provider_config=provider_config)
+        result = virsh.execute("list", "--all", "--name", hide=True, warn=True)
+        if not result.ok:
+            self.logger.warning("could not query existing VMs via virsh")
+            return []
+
+        existing = {
+            v.strip() for v in result.stdout.strip().split("\n") if v.strip()
+        }
+        return [vm for vm in expected if vm in existing]
+
+    def _get_vm_states(self) -> dict[str, str]:
+        """
+        Query libvirt and return a mapping of project VM name -> state string
+        for all project VMs that exist.
+
+        State strings are as returned by ``virsh list --all``, e.g.
+        'running', 'shut off', 'paused', 'saved', etc.
+
+        Returns:
+            Dict mapping full VM name to its state, only for VMs that exist.
+        """
+        expected = set(self._get_project_vm_names())
+        if not expected:
+            return {}
+
+        provider_type = (
+            list(self.config.get('provider', {}).keys())[0]
+            if 'provider' in self.config else 'libvirt'
+        )
+        provider_config = self.config.get('provider', {}).get(provider_type, {})
+        if self.app_config and 'providers' in self.app_config:
+            app_prov = self.app_config['providers'].get(provider_type, {})
+            merged = app_prov.copy()
+            merged.update(provider_config)
+            provider_config = merged
+        if hasattr(self, 'runtime_instance'):
+            provider_config = self.runtime_instance.inject_into_provider_config(
+                provider_config)
+
+        virsh = VirshCommand(provider_config=provider_config)
+        # Use the table output to get both name and state
+        result = virsh.execute("list", "--all", hide=True, warn=True)
+        if not result.ok:
+            self.logger.warning("could not query VM states via virsh")
+            return {}
+
+        states: dict[str, str] = {}
+        for line in result.stdout.strip().splitlines():
+            # Skip header and separator lines
+            line = line.strip()
+            if not line or line.startswith('---') or line.startswith('Id'):
+                continue
+            # Format: " Id   Name                 State"
+            # e.g.  " -    my-vm                shut off"
+            #       " 3    my-vm                running"
+            parts = line.split(None, 2)
+            if len(parts) >= 3:
+                vm_name = parts[1]
+                vm_state = parts[2].strip()
+                if vm_name in expected:
+                    states[vm_name] = vm_state
+
+        return states
 
     @staticmethod
     def provision(cls, cli_args):
@@ -849,21 +1852,61 @@ class BoxmanManager:
         # -------------------- global config ---------------------------
 
         cluster = config['clusters'][cluster_group]
+        ws_path = config.get('workspace', {}).get('path', '')
         ssh_config = cluster['ssh_config']
         workdir = cluster['workdir']
         # -------------------- end global config -----------------------
 
-        ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
+        base_path = ws_path or workdir
+        ssh_config = os.path.expanduser(os.path.join(base_path, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
         if not os.path.isdir(workdir):
             os.makedirs(workdir)
 
-        # Resolve base image early so validation errors surface before provisioning.
-        # This does not change the current cloning behavior yet.
-        cache = getattr(cls, "cache", None)
-        cluster["_resolved_base_image"] = resolve_base_image(cluster["base_image"], cache=cache)
+        # Ensure provider config reflects runtime settings.
+        # Project-level provider settings (from conf.yml) always take
+        # precedence over app-level defaults (from boxman.yml).
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
 
-        cls.register_project_in_cache()
+        # --- Pre-check: detect already-existing project VMs -----------
+        force = getattr(cli_args, 'force', False)
+        existing_vms = cls._find_existing_project_vms()
+
+        if existing_vms:
+            names = ", ".join(f"'{v}'" for v in existing_vms)
+            if not force:
+                cls.logger.error(
+                    f"the following VM(s) already exist: {names}. "
+                    f"Use --force to deprovision them first and re-provision."
+                )
+                return
+            else:
+                cls.logger.warning(
+                    f"the following VM(s) already exist and will be "
+                    f"deprovisioned first (--force): {names}"
+                )
+                cls.deprovision(cls, cli_args)
+        # --------------------------------------------------------------
+
+        try:
+            cls.register_project_in_cache()
+        except RuntimeError as exc:
+            cls.logger.error(str(exc))
+            return
+
+        # --rebuild-templates: force-recreate all templates before provisioning
+        rebuild_templates = getattr(cli_args, 'rebuild_templates', False)
+        if rebuild_templates:
+            cls.logger.info(
+                "rebuilding all templates (--rebuild-templates implies --force "
+                "for create-templates)..."
+            )
+            cls._create_templates_impl(requested=None, force=True)
+        else:
+            # Auto-create any template VMs that are referenced as base_image
+            # but do not yet exist.
+            cls.ensure_templates_exist()
 
         cls.provision_files()
 
@@ -871,13 +1914,7 @@ class BoxmanManager:
 
         cls.clone_vms()
 
-        cls.configure_cpu_mem()
-
-        cls.configure_network_interfaces()
-
-        cls.configure_disks()
-
-        cls.start_vms()
+        cls.configure_and_start_vms()
 
         # use adaptive wait for ip address assignment
         cls.logger.info("waiting for vms to initialize and get the ip addresses...")
@@ -902,11 +1939,180 @@ class BoxmanManager:
             cls.logger.warning(
                 "Reached maximum wait time. Some vms may not have ip addresses.")
 
-        # display connection information
-        cls.connect_info()
-
         # generate ssh keys, add them to vms, and write ssh config
         cls.setup_ssh_access()
+
+        # display connection information (after ssh setup so connections are ready)
+        cls.connect_info()
+
+    @staticmethod
+    def up(cls, cli_args):
+        """
+        Bring up the infrastructure.
+
+        - If no project VMs exist, run a full provision.
+        - If all VMs exist and are running, do nothing.
+        - If all VMs exist but some/all are not running (shut off, paused,
+          saved), start/resume them.
+        - If only some VMs exist (partial state) and --force is not set,
+          error out. With --force, deprovision and re-provision.
+
+        Reuses the same provider methods as ``boxman control start`` and
+        ``boxman control resume``.
+        """
+        config = cls.config
+        expected_vms = cls._get_project_vm_names()
+
+        if not expected_vms:
+            cls.logger.error("no VMs defined in configuration")
+            return
+
+        vm_states = cls._get_vm_states()
+        existing_names = set(vm_states.keys())
+        expected_names = set(expected_vms)
+
+        # --- Case 1: No VMs exist → full provision ---
+        if not existing_names:
+            cls.logger.info("no existing VMs found, running full provision...")
+            cls.provision(cls, cli_args)
+            return
+
+        # --- Case 2: Partial state (some exist, some don't) ---
+        missing = expected_names - existing_names
+        if missing:
+            force = getattr(cli_args, 'force', False)
+            names_str = ", ".join(f"'{v}'" for v in sorted(missing))
+            if not force:
+                cls.logger.error(
+                    f"partial infrastructure state: the following VM(s) are "
+                    f"missing: {names_str}. Use --force to deprovision and "
+                    f"re-provision everything."
+                )
+                return
+            else:
+                cls.logger.warning(
+                    f"partial state detected (missing: {names_str}). "
+                    f"Deprovisioning and re-provisioning (--force)..."
+                )
+                cls.provision(cls, cli_args)
+                return
+
+        # --- Case 3: All VMs exist → check states ---
+        non_running = {
+            name: state for name, state in vm_states.items()
+            if state != 'running'
+        }
+
+        if not non_running:
+            cls.logger.info("all VMs are already running, nothing to do")
+            cls.connect_info()
+            return
+
+        # --- Start / resume VMs that are not running ---
+        cls.logger.info(
+            f"{len(non_running)} VM(s) are not running, bringing them up..."
+        )
+
+        # Ensure provider config reflects runtime settings
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
+
+        # Build workdir lookup from process_vm_list for restore operations
+        vm_workdir_map = {vm_name: workdir for vm_name, workdir in cls.process_vm_list(cli_args)}
+
+        for vm_name, state in non_running.items():
+            cls.logger.info(f"VM '{vm_name}' is in state '{state}'")
+            workdir = vm_workdir_map.get(vm_name, '')
+
+            if state == 'paused':
+                cls.logger.info(f"resuming VM '{vm_name}'...")
+                cls.provider.resume_vm(vm_name)
+            elif state in ('saved', 'managedsave'):
+                cls.logger.info(f"restoring VM '{vm_name}' from saved state...")
+                cls.provider.restore_vm(vm_name, workdir)
+            elif state in ('shut off', 'shutoff'):
+                cls.logger.info(f"starting VM '{vm_name}'...")
+                cls.provider.start_vm(vm_name)
+            elif state in ('crashed', 'dying'):
+                cls.logger.warning(
+                    f"VM '{vm_name}' is in state '{state}', "
+                    f"attempting to destroy and start...")
+                cls.provider.destroy_vm(vm_name, remove_storage=False)
+                cls.provider.start_vm(vm_name)
+            else:
+                cls.logger.warning(
+                    f"VM '{vm_name}' is in unexpected state '{state}', "
+                    f"attempting to start...")
+                cls.provider.start_vm(vm_name)
+
+        # Wait for IP addresses
+        cls.logger.info("waiting for VMs to get IP addresses...")
+        wait_time = 1
+        max_wait = 300
+        total_waited = 0
+
+        while total_waited < max_wait:
+            if cls.get_connect_info():
+                cls.logger.info(
+                    f"all VMs have IP addresses (waited {total_waited}s)")
+                break
+            cls.logger.info(
+                f"waiting {wait_time}s for IP assignment "
+                f"(total waited: {total_waited}s)")
+            time.sleep(wait_time)
+            total_waited += wait_time
+            wait_time = min(wait_time * 2, 60)
+
+        if total_waited >= max_wait:
+            cls.logger.warning(
+                "reached maximum wait time. Some VMs may not have IP addresses.")
+
+        # Display connection information
+        cls.connect_info()
+
+        # Re-write SSH config with current IPs
+        cls.write_ssh_config()
+
+        cls.logger.info("infrastructure is up")
+
+    @staticmethod
+    def down(cls, cli_args):
+        """
+        Bring down the infrastructure by saving or suspending all VMs.
+
+        By default, saves each VM's state to disk (same as
+        ``boxman control save``). With ``--suspend``, pauses VMs in memory
+        instead (same as ``boxman control suspend``).
+
+        Reuses ``process_vm_list()`` and the same provider methods as
+        ``boxman control save`` / ``boxman control suspend``.
+        """
+        # Ensure provider config reflects runtime settings
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
+
+        vm_list = cls.process_vm_list(cli_args)
+
+        if not vm_list:
+            cls.logger.info("no VMs found in configuration")
+            return
+
+        use_suspend = getattr(cli_args, 'suspend', False)
+
+        if use_suspend:
+            cls.logger.info("suspending all VMs (--suspend)...")
+            for vm_name, _workdir in vm_list:
+                cls.logger.info(f"suspending VM '{vm_name}'...")
+                cls.provider.suspend_vm(vm_name)
+                cls.logger.info(f"VM '{vm_name}' suspended")
+        else:
+            cls.logger.info("saving the state of all VMs to disk...")
+            for vm_name, workdir in vm_list:
+                cls.logger.info(f"saving VM '{vm_name}' state to '{workdir}'...")
+                cls.provider.save_vm(vm_name, workdir)
+                cls.logger.info(f"VM '{vm_name}' state saved")
+
+        cls.logger.info("infrastructure is down")
 
     @staticmethod
     def deprovision(cls, cli_args):
@@ -917,29 +2123,31 @@ class BoxmanManager:
 
         cluster = config['clusters'][cluster_group]
         cluster_name = cluster_group
+        ws_path = config.get('workspace', {}).get('path', '')
         ssh_config = cluster['ssh_config']
         workdir = cluster['workdir']
         # -------------------- end global config -----------------------
 
-        ssh_config = os.path.expanduser(os.path.join(workdir, ssh_config))
+        base_path = ws_path or workdir
+        ssh_config = os.path.expanduser(os.path.join(base_path, ssh_config))
         workdir = os.path.abspath(os.path.expanduser(workdir))
 
-        prj_name = f'bprj__{cls.config["project"]}__bprj'
-        for cluster_name, cluster in cls.config['clusters'].items():
-            for vm_name, vm_info in cluster['vms'].items():
+        # Ensure provider config reflects runtime settings.
+        # Project-level provider settings (from conf.yml) always take
+        # precedence over app-level defaults (from boxman.yml).
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
 
-                vm_info = vm_info.copy()
-                new_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-
-                cls.provider.destroy_vm(new_vm_name)
-
-                cls.provider.destroy_disks(
-                    cluster['workdir'],
-                    vm_name=new_vm_name,
-                    disks=vm_info['disks']
-                )
-
-                cls.provider.destroy_vm(new_vm_name, force=True)
+        processes = [
+            Process(
+                target=cls._destroy_vm_and_disks,
+                args=(cluster_name, cluster, vm_name, vm_info)
+            )
+            for cluster_name, cluster in cls.config['clusters'].items()
+            for vm_name, vm_info in cluster['vms'].items()
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
 
         cls.destroy_networks()
         # .. todo:: implement undo'ing the provisioning of the files (not important for now)
@@ -948,6 +2156,76 @@ class BoxmanManager:
         cls.unregister_from_cache()
 
         return
+
+    @staticmethod
+    def destroy_runtime(cls, cli_args):
+        """
+        Destroy the Docker Compose runtime environment and remove
+        the ``.boxman`` directory from the project directory.
+        """
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+
+        runtime = cls.runtime_instance
+        if not isinstance(runtime, DockerComposeRuntime):
+            cls.logger.warning(
+                f"destroy-runtime is only supported for the docker-compose "
+                f"runtime (current runtime: {runtime.name})")
+            return
+
+        auto_accept = getattr(cli_args, "auto_accept", False)
+        plan = runtime.plan_destroy_runtime()
+
+        if not plan["actions"]:
+            cls.logger.info("nothing to do")
+            return
+
+        # Display the plan
+        print("\nThe following actions will be performed:\n")
+        for i, action in enumerate(plan["actions"], 1):
+            print(f"  {i}. {action}")
+
+        if plan["commands"]:
+            print("\nCommands to execute:\n")
+            for cmd in plan["commands"]:
+                print(f"  $ {cmd}")
+
+        if plan["paths_to_delete"]:
+            print("\nPaths to delete:\n")
+            for p in plan["paths_to_delete"]:
+                print(f"  {p}")
+
+        print()
+
+        if not auto_accept:
+            answer = input("Proceed? [y/N] ").strip().lower()
+            if answer not in ("y", "yes"):
+                print("Aborted.")
+                return
+
+        boxman_dir = runtime.destroy_runtime()
+        if boxman_dir and os.path.isdir(boxman_dir):
+            cls.logger.info(f"removing {boxman_dir}")
+            shutil.rmtree(boxman_dir, ignore_errors=True)
+            # Root-owned files/dirs created by the Docker container may
+            # survive shutil.rmtree.  Use a throwaway container to finish
+            # the job.
+            if os.path.isdir(boxman_dir):
+                cls.logger.info(
+                    f"{boxman_dir} still exists (root-owned leftovers), "
+                    f"removing via docker")
+                abs_boxman_dir = os.path.abspath(boxman_dir)
+                subprocess.run(
+                    ["docker", "run", "--rm",
+                     "-v", f"{abs_boxman_dir}:/cleanup",
+                     "alpine", "sh", "-c", "rm -rf /cleanup/*"],
+                    check=False,
+                )
+                # The bind-mount dir itself can't be removed from inside
+                # the container, but it should now be empty.
+                shutil.rmtree(boxman_dir, ignore_errors=True)
+            cls.logger.info(f"removed {boxman_dir}")
+        else:
+            cls.logger.info("no .boxman directory to remove")
 
     ### start snapshot functions ####
     @staticmethod
@@ -980,11 +2258,9 @@ class BoxmanManager:
     def snapshot_restore(cls, cli_args):
         """
         Restore the state of the VMs in the cluster from a snapshot.
-        """
-        if not cli_args.snapshot_name:
-           cls.logger.error("error: snapshot name is required")
-           return
 
+        If no snapshot name is given, each VM is restored to its latest snapshot.
+        """
         prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
@@ -1016,20 +2292,11 @@ class BoxmanManager:
         """
         retval = []
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        if hasattr(cli_args, 'vms') and cli_args.vms:
-            for cluster_name, cluster in self.config['clusters'].items():
-               workdir = os.path.expanduser(cluster['workdir'])
-               for vm_name, _ in cluster['vms'].items():
-                   full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                   retval.append((full_vm_name, workdir))
-        else:
-            vm_names = []
-            for cluster_name, cluster in self.config['clusters'].items():
-                workdir = os.path.expanduser(cluster['workdir'])
-                for vm_name, _ in cluster['vms'].items():
-                    full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                    vm_names.append((full_vm_name, workdir))
-
+        for cluster_name, cluster in self.config['clusters'].items():
+            workdir = os.path.expanduser(cluster['workdir'])
+            for vm_name, _ in cluster['vms'].items():
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                retval.append((full_vm_name, workdir))
         return retval
 
     @staticmethod
@@ -1069,3 +2336,233 @@ class BoxmanManager:
             else:
                 cls.provider.start_vm(vm_name)
     ### end control vm functions ####
+
+    ### task runner functions ####
+
+    @staticmethod
+    def run_task(cls, cli_args):
+        """
+        Run a named task or ad-hoc command with the workspace environment.
+        """
+        runner = TaskRunner(
+            config=cls.config,
+            cluster_name=getattr(cli_args, "cluster", None),
+        )
+
+        if getattr(cli_args, "list_tasks", False):
+            tasks = runner.list_tasks()
+            if not tasks:
+                print("No tasks defined in conf.yml")
+                return
+            max_name = max(len(t["name"]) for t in tasks)
+            for task in tasks:
+                desc = task["description"]
+                print(f"  {task['name']:<{max_name}}  {desc}")
+            return
+
+        extra_args = getattr(cli_args, "extra_args", None) or []
+
+        if getattr(cli_args, "cmd", None):
+            exit_code = runner.run_command(
+                cli_args.cmd,
+                extra_args,
+                ansible_flags=getattr(cli_args, "ansible_flags", None),
+            )
+        else:
+            task_name = cli_args.task_name
+            remaining = getattr(cli_args, "remaining_args", [])
+
+            # Parse dynamic task flags from remaining CLI args based on
+            # {placeholder} markers in the task command.
+            task_flags = {}
+            if task_name and task_name in runner.tasks:
+                task_cmd = runner.tasks[task_name].get("command", "")
+                placeholders = TaskRunner.extract_placeholders(task_cmd)
+
+                if placeholders and remaining:
+                    placeholder_set = set(placeholders)
+                    # Python's argparse._parse_optional() returns None (positional)
+                    # for argument strings that contain a space, so a flag value
+                    # like '--limit node01' (a single bash-quoted arg) lands in
+                    # extra_args instead of remaining.  We detect this by checking
+                    # whether the next element in remaining is itself a recognised
+                    # placeholder flag; if so, the current flag's value was
+                    # consumed by argparse and is at the front of extra_args.
+                    extra_args = list(extra_args)  # mutable copy; pops are visible at runner.run()
+                    i = 0
+                    while i < len(remaining):
+                        arg = remaining[i]
+                        if not arg.startswith("--"):
+                            log.error(f"unrecognized argument: {arg}")
+                            import sys
+                            sys.exit(1)
+
+                        name = arg[2:].replace("-", "_")
+                        if name not in placeholder_set:
+                            log.error(f"unrecognized argument: {arg}")
+                            import sys
+                            sys.exit(1)
+
+                        # Determine the value for this flag.  Normal case:
+                        # remaining[i + 1] is the value.  Exception: if that
+                        # next arg is itself a recognised placeholder flag, the
+                        # value for this flag was misclassified as a positional
+                        # by argparse and sits at the front of extra_args.
+                        value = None
+                        if i + 1 < len(remaining):
+                            next_arg = remaining[i + 1]
+                            if next_arg.startswith("--"):
+                                next_name = next_arg[2:].replace("-", "_")
+                                if next_name not in placeholder_set:
+                                    # next_arg is a value that starts with --
+                                    value = next_arg
+                                    i += 2
+                                # else: next_arg is another flag → fall through
+                            else:
+                                value = next_arg
+                                i += 2
+
+                        if value is None:
+                            # Value not in remaining; consume from extra_args.
+                            if not extra_args:
+                                log.error(f"argument {arg}: expected a value")
+                                import sys
+                                sys.exit(1)
+                            value = extra_args.pop(0)
+                            i += 1
+
+                        task_flags[name] = value
+                elif remaining:
+                    log.error(
+                        f"unrecognized arguments: {' '.join(remaining)}. "
+                        f"Task '{task_name}' has no {{placeholder}} markers "
+                        f"in its command."
+                    )
+                    import sys
+                    sys.exit(1)
+
+            exit_code = runner.run(task_name, extra_args, task_flags=task_flags)
+
+        if exit_code != 0:
+            import sys
+            sys.exit(exit_code)
+
+    def _get_vm_list(self) -> list[tuple[str, str, str]]:
+        """
+        Return the ordered list of VMs from the config.
+
+        Returns:
+            List of (cluster_name, vm_name, full_virsh_name) tuples.
+            The list index is the boxman VM id (0-based).
+        """
+        project = self.config.get("project", "")
+        prj_prefix = f"bprj__{project}__bprj_"
+        vms = []
+        for cluster_name, cluster in self.config.get("clusters", {}).items():
+            for vm_name in cluster.get("vms", {}).keys():
+                full_name = f"{prj_prefix}{cluster_name}_{vm_name}"
+                vms.append((cluster_name, vm_name, full_name))
+        return vms
+
+    def resolve_vm_name(self, identifier: str) -> str:
+        """
+        Resolve a VM identifier to the short name used in the workspace
+        (``{cluster}_{vm}``).
+
+        The identifier can be:
+        - A numeric boxman id (from ``boxman ps``)
+        - A VM name (returned as-is)
+
+        Raises:
+            ValueError: If the numeric id is out of range.
+        """
+        if identifier.isdigit():
+            vm_list = self._get_vm_list()
+            idx = int(identifier)
+            if idx < 0 or idx >= len(vm_list):
+                raise ValueError(
+                    f"VM id {idx} out of range (0-{len(vm_list) - 1})"
+                )
+            cluster_name, vm_name, _ = vm_list[idx]
+            return f"{cluster_name}_{vm_name}"
+        return identifier
+
+    @staticmethod
+    def ps(cls, cli_args):
+        """
+        Display the state of all project VMs in a table.
+        """
+        vm_list = cls._get_vm_list()
+
+        if not vm_list:
+            print("No VMs defined in configuration")
+            return
+
+        # Query virsh for states
+        provider_type = (
+            list(cls.config.get("provider", {}).keys())[0]
+            if "provider" in cls.config else "libvirt"
+        )
+        provider_config = cls.config.get("provider", {}).get(provider_type, {})
+        if cls.app_config and "providers" in cls.app_config:
+            app_prov = cls.app_config["providers"].get(provider_type, {})
+            merged = app_prov.copy()
+            merged.update(provider_config)
+            provider_config = merged
+
+        virsh = VirshCommand(provider_config=provider_config)
+        result = virsh.execute("list", "--all", hide=True, warn=True)
+
+        # Parse virsh output into {full_name: state}
+        vm_states: dict[str, str] = {}
+        if result.ok:
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if not line or line.startswith("---") or line.startswith("Id"):
+                    continue
+                parts = line.split(None, 2)
+                if len(parts) >= 3:
+                    vm_states[parts[1]] = parts[2].strip()
+
+        # Build table rows with 0-based ids
+        rows = []
+        for idx, (cluster_name, vm_name, full_name) in enumerate(vm_list):
+            state = vm_states.get(full_name, "not created")
+            rows.append((str(idx), cluster_name, vm_name, state))
+
+        # Print table
+        headers = ("Id", "Cluster", "VM", "State")
+        widths = [
+            max(len(headers[i]), *(len(r[i]) for r in rows))
+            for i in range(4)
+        ]
+        header_line = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
+        sep_line = "  ".join("-" * w for w in widths)
+        print(header_line)
+        print(sep_line)
+        for row in rows:
+            print("  ".join(val.ljust(w) for val, w in zip(row, widths)))
+
+    @staticmethod
+    def ssh_session(cls, cli_args):
+        """
+        Open an interactive SSH session to a VM.
+        """
+        vm_name = getattr(cli_args, "vm_name", None)
+
+        # Resolve numeric id to VM name
+        if vm_name:
+            vm_name = cls.resolve_vm_name(vm_name)
+
+        runner = TaskRunner(
+            config=cls.config,
+            cluster_name=getattr(cli_args, "cluster", None),
+        )
+
+        exit_code = runner.ssh_to_host(vm_name)
+
+        if exit_code != 0:
+            import sys
+            sys.exit(exit_code)
+
+    ### end task runner functions ####

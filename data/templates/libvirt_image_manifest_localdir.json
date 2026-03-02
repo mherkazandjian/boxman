@@ -1,0 +1,12 @@
+# remove the commented lines (with #) when using this file as a template
+# this file should be placed in the ROOTDIR of the vm image package
+# ROOTDIR/manifest.json
+# the referenced files should be placed in paths relative to the ROOTDIR specified
+# in the manifest.json file, for example
+#   ROOTDIR/vm/vm-definition.xml
+#   ROOTDIR/vm/disk-image.qcow2
+{
+    "xml_path": "vm/vm-definition.xml",
+    "image_path": "vm/disk-image.qcow2",
+    "provider": "libvirt"
+}

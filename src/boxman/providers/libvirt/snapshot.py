@@ -75,6 +75,22 @@ class SnapshotManager:
             self.logger.error(f"error creating snapshot for vm {vm_name}: {exc}")
             return False
 
+    def get_latest_snapshot(self, vm_name: str) -> Optional[str]:
+        """
+        Get the name of the current (latest) snapshot for a VM.
+
+        Args:
+            vm_name: Name of the VM
+
+        Returns:
+            str: Name of the current snapshot, or None if none exists
+        """
+        result = self.virsh.execute("snapshot-current", vm_name, "--name")
+        if result.ok:
+            name = result.stdout.strip()
+            return name if name else None
+        return None
+
     def list_snapshots(self, vm_name: str) -> List[Dict[str, str]]:
         """
         List all snapshots for a vm.

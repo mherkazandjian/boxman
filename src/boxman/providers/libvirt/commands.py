@@ -36,6 +36,13 @@ class LibVirtCommandBase:
         #: str: Command executable path
         self.command_path = None
 
+        #: str: The runtime environment ('local', 'docker-compose', etc.)
+        self.runtime = self.provider_config.get('runtime', 'local')
+
+        #: str: The docker-compose container name for remote execution
+        self.runtime_container = self.provider_config.get(
+            'runtime_container', 'boxman-libvirt-default')
+
         # override use_sudo if provided
         if override_config_use_sudo is not None:
             self.use_sudo = override_config_use_sudo
@@ -97,6 +104,7 @@ class LibVirtCommandBase:
             RuntimeError: If the command fails and warn is False
         """
         command = self.build_command(*args, **kwargs)
+        command = self._wrap_for_runtime(command)
 
         if self.verbose:
             self.logger.info(f"executing: {command}")
@@ -150,6 +158,9 @@ class LibVirtCommandBase:
         if self.use_sudo and not command.startswith("sudo "):
             command = f"sudo {command}"
 
+        # wrap for runtime environment
+        command = self._wrap_for_runtime(command)
+
         if self.verbose:
             self.logger.info(f"Executing shell command: {command}")
 
@@ -179,6 +190,29 @@ class LibVirtCommandBase:
                 self.logger.error(error_message)
                 raise RuntimeError(error_message)
             return exc.result
+
+    def _wrap_for_runtime(self, command: str) -> str:
+        """
+        Wrap a command string for execution in the configured runtime environment.
+
+        For 'local' runtime, the command is returned unchanged.
+        For 'docker-compose' runtime, the command is wrapped in a
+        ``docker exec`` invocation targeting the runtime container.
+
+        Args:
+            command: The command string to wrap
+
+        Returns:
+            The (possibly wrapped) command string
+        """
+        if self.runtime == 'local':
+            return command
+        elif self.runtime == 'docker-compose':
+            # escape single quotes in the command for safe shell wrapping
+            escaped = command.replace("'", "'\\''")
+            return f"docker exec --user root {self.runtime_container} bash -c '{escaped}'"
+        else:
+            raise ValueError(f"unsupported runtime: {self.runtime}")
 
 
 class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
@@ -267,7 +301,7 @@ class VirtInstallCommand(LibVirtCommandBase):
         Args:
             provider_config: Dictionary containing provider-specific configuration
         """
-        super().__init__(provider_config)
+        super().__init__(provider_config=provider_config)
 
         #: str: the path to virt-install binary
         self.command_path = self.provider_config.get('virt_install_cmd', 'virt-install')

@@ -74,7 +74,8 @@ class BoxmanCache:
 
     def register_project(self,
                          project_name: str,
-                         config_fpath: str) -> bool:
+                         config_fpath: str,
+                         runtime: str = 'local') -> bool:
         """
         Register a project in the cache.
 
@@ -82,7 +83,8 @@ class BoxmanCache:
 
         Args:
             project_name: Name of the project
-            project_data: Data associated with the project
+            config_fpath: Path to the project configuration file
+            runtime: The runtime environment name (e.g. 'local', 'docker-compose')
         """
         # if the projects.json file does not exist, create it else load it
         # assuming that it is a valid JSON file
@@ -100,13 +102,14 @@ class BoxmanCache:
             return False
 
         self.projects[project_name] = {
-            'conf': os.path.abspath(os.path.expanduser(config_fpath))
+            'conf': os.path.abspath(os.path.expanduser(config_fpath)),
+            'runtime': runtime,
         }
 
         with open(self.projects_cache_file, 'w') as fobj:
             json.dump(self.projects, fobj, indent=4)
 
-        log.info(f"project '{project_name}' registered in cache with path: {config_fpath}")
+        log.info(f"project '{project_name}' registered in cache with path: {config_fpath}, runtime: {runtime}")
 
     def unregister_project(self, project_name: str) -> bool:
         """
@@ -133,3 +136,13 @@ class BoxmanCache:
 
         log.info(f"project '{project_name}' unregistered from cache (was at: {removed_path})")
         return True
+
+    def list_projects(self) -> dict:
+        """
+        List all registered projects.
+
+        Returns:
+            A dictionary of project names to their cached info,
+            or an empty dict if no projects are registered.
+        """
+        return self.read_projects_cache()
