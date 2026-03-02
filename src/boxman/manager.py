@@ -2034,10 +2034,8 @@ class BoxmanManager:
         # Build workdir lookup from process_vm_list for restore operations
         vm_workdir_map = {vm_name: workdir for vm_name, workdir in cls.process_vm_list(cli_args)}
 
-        for vm_name, state in non_running.items():
+        def _bring_up(vm_name, state, workdir):
             cls.logger.info(f"VM '{vm_name}' is in state '{state}'")
-            workdir = vm_workdir_map.get(vm_name, '')
-
             if state == 'paused':
                 cls.logger.info(f"resuming VM '{vm_name}'...")
                 cls.provider.resume_vm(vm_name)
@@ -2058,6 +2056,16 @@ class BoxmanManager:
                     f"VM '{vm_name}' is in unexpected state '{state}', "
                     f"attempting to start...")
                 cls.provider.start_vm(vm_name)
+
+        processes = [
+            Process(
+                target=_bring_up,
+                args=(vm_name, state, vm_workdir_map.get(vm_name, ''))
+            )
+            for vm_name, state in non_running.items()
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
 
         # Wait for IP addresses
         cls.logger.info("waiting for VMs to get IP addresses...")
@@ -2115,16 +2123,31 @@ class BoxmanManager:
 
         if use_suspend:
             cls.logger.info("suspending all VMs (--suspend)...")
-            for vm_name, _workdir in vm_list:
+
+            def _suspend(vm_name):
                 cls.logger.info(f"suspending VM '{vm_name}'...")
                 cls.provider.suspend_vm(vm_name)
                 cls.logger.info(f"VM '{vm_name}' suspended")
+
+            processes = [
+                Process(target=_suspend, args=(vm_name,))
+                for vm_name, _ in vm_list
+            ]
         else:
             cls.logger.info("saving the state of all VMs to disk...")
-            for vm_name, workdir in vm_list:
+
+            def _save(vm_name, workdir):
                 cls.logger.info(f"saving VM '{vm_name}' state to '{workdir}'...")
                 cls.provider.save_vm(vm_name, workdir)
                 cls.logger.info(f"VM '{vm_name}' state saved")
+
+            processes = [
+                Process(target=_save, args=(vm_name, workdir))
+                for vm_name, workdir in vm_list
+            ]
+
+        [p.start() for p in processes]
+        [p.join() for p in processes]
 
         cls.logger.info("infrastructure is down")
 
