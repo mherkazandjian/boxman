@@ -78,7 +78,7 @@ templates:
         - [ sh, -c, "mkdir -p /admin/.ssh && chmod 700 /admin/.ssh && chown -R admin:admin /admin /admin/.ssh" ]
 
 workspace:
-  path: ~/workspaces/boxmandev/tiny-libvirt-ubuntu-24.04-cloudinit
+  path: ~/workspaces/boxmandev/ten-tiny-libvirt-ubuntu-24.04-cloudinit
 
 clusters:
   cluster_1:
@@ -122,8 +122,9 @@ clusters:
         autostart: True
 
     vms:
-      boxman01:
-        hostname: boxman01
+{% for i in range(1, 11) %}
+      boxman{{ "%02d" % i }}:
+        hostname: boxman{{ "%02d" % i }}
         cpus:
           sockets: 1
           cores: 2
@@ -143,3 +144,4 @@ clusters:
           - name: adapter_2
             link_state: 'up'
             network_source: 'isolated1'
+{% endfor %}

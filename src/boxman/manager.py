@@ -6,8 +6,7 @@ import re
 import json
 from typing import Dict, Any, Optional
 import yaml
-from multiprocessing import Pool
-from multiprocessing import Process
+from multiprocessing import Pool, Process, Queue
 from invoke import run
 from jinja2 import Environment, FileSystemLoader, Template
 
@@ -872,17 +871,21 @@ class BoxmanManager:
     ### networks define / remove / destroy
     def define_networks(self) -> None:
         """
-        Define the networks specified in the cluster configuration.
+        Define the networks specified in the cluster configuration (sequential).
+
+        Networks must be defined one at a time because bridge name assignment
+        (virbrX) is a shared resource: each definition must be committed to
+        libvirt and the cache before the next network picks its bridge name,
+        otherwise two concurrent processes can both select the same bridge index
+        and the second net-define fails with "bridge name already in use".
         """
         for cluster_name, cluster in self.config['clusters'].items():
             for network_name, network_info in cluster.get('networks', {}).items():
-
                 _network_name = self.full_network_name(
                     project_config=self.config,
                     cluster_name=cluster_name,
                     network_name=network_name
                 )
-
                 self.provider.define_network(
                     name=_network_name,
                     info=network_info,
@@ -892,22 +895,27 @@ class BoxmanManager:
 
     def destroy_networks(self) -> None:
         """
-        Destroy the networks specified in the cluster configuration.
+        Destroy the networks specified in the cluster configuration (parallel).
         """
-        for cluster_name, cluster in self.config['clusters'].items():
-            for network_name, network_info in cluster.get('networks', {}).items():
+        def _destroy(cluster_name, cluster, network_name, network_info):
+            _network_name = self.full_network_name(
+                project_config=self.config,
+                cluster_name=cluster_name,
+                network_name=network_name
+            )
+            self.provider.remove_network(
+                name=_network_name,
+                info=network_info
+            )
+            self.logger.info(f"removed network {_network_name} in {cluster['workdir']}")
 
-                _network_name = self.full_network_name(
-                    project_config=self.config,
-                    cluster_name=cluster_name,
-                    network_name=network_name
-                )
-
-                self.provider.remove_network(
-                    name=_network_name,
-                    info=network_info
-                )
-                self.logger.info(f"removed network {_network_name} in {cluster['workdir']}")
+        processes = [
+            Process(target=_destroy, args=(cluster_name, cluster, network_name, network_info))
+            for cluster_name, cluster in self.config['clusters'].items()
+            for network_name, network_info in cluster.get('networks', {}).items()
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
     ### end networks define / remove / destroy
 
     ### vms define / remove / destroy
@@ -1047,6 +1055,27 @@ class BoxmanManager:
         else:
             self.logger.warning(f"failed to start the vm {full_vm_name}")
 
+    def _destroy_vm_and_disks(
+        self, cluster_name: str, cluster: Dict[str, Any], vm_name: str, vm_info: Dict[str, Any]
+    ) -> None:
+        """
+        Fully destroy a single VM: stop/undefine, remove disks, force-cleanup.
+
+        Designed to be called in a separate process per VM during deprovision.
+        """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+        vm_info = vm_info.copy()
+
+        self.logger.info(f"destroying vm {full_vm_name}")
+        self.provider.destroy_vm(full_vm_name)
+        self.provider.destroy_disks(
+            cluster['workdir'],
+            vm_name=full_vm_name,
+            disks=vm_info.get('disks', [])
+        )
+        self.provider.destroy_vm(full_vm_name, force=True)
+
     def configure_and_start_vms(self) -> None:
         """
         Configure (cpu/mem, network interfaces, disks) and start all VMs in parallel.
@@ -1160,26 +1189,35 @@ class BoxmanManager:
         """
         Gather connection information for all VMs in all clusters.
 
-        This method attempts to get IP addresses for all VMs and returns
-        True only if all VMs have at least one IP address.
+        Queries all VMs in parallel and returns True only if every VM has at
+        least one IP address.
 
         Returns:
             True if all VMs have at least one IP address, False otherwise
         """
-        all_vms_have_ip = True
-
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self.config['clusters'].items():
-            for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+        vm_names = [
+            f"{prj_name}_{cluster_name}_{vm_name}"
+            for cluster_name, cluster in self.config['clusters'].items()
+            for vm_name in cluster['vms']
+        ]
 
-                # get the ip addresses for this vm
-                ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
+        result_queue: Queue = Queue()
 
-                # if no ip addresses found, mark as failure
-                if not ip_addresses:
-                    all_vms_have_ip = False
-                    self.logger.warning(f"vm {full_vm_name} does not have an ip address yet")
+        def _check(full_vm_name):
+            ips = self.provider.get_vm_ip_addresses(full_vm_name)
+            result_queue.put((full_vm_name, ips))
+
+        processes = [Process(target=_check, args=(n,)) for n in vm_names]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+        all_vms_have_ip = True
+        for _ in range(len(vm_names)):
+            full_vm_name, ips = result_queue.get()
+            if not ips:
+                all_vms_have_ip = False
+                self.logger.warning(f"vm {full_vm_name} does not have an ip address yet")
 
         return all_vms_have_ip
 
@@ -2045,22 +2083,16 @@ class BoxmanManager:
         if hasattr(cls.provider, 'update_provider_config_with_runtime'):
             cls.provider.update_provider_config_with_runtime()
 
-        prj_name = f'bprj__{cls.config["project"]}__bprj'
-        for cluster_name, cluster in cls.config['clusters'].items():
-            for vm_name, vm_info in cluster['vms'].items():
-
-                vm_info = vm_info.copy()
-                new_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-
-                cls.provider.destroy_vm(new_vm_name)
-
-                cls.provider.destroy_disks(
-                    cluster['workdir'],
-                    vm_name=new_vm_name,
-                    disks=vm_info['disks']
-                )
-
-                cls.provider.destroy_vm(new_vm_name, force=True)
+        processes = [
+            Process(
+                target=cls._destroy_vm_and_disks,
+                args=(cluster_name, cluster, vm_name, vm_info)
+            )
+            for cluster_name, cluster in cls.config['clusters'].items()
+            for vm_name, vm_info in cluster['vms'].items()
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
 
         cls.destroy_networks()
         # .. todo:: implement undo'ing the provisioning of the files (not important for now)
