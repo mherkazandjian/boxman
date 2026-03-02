@@ -17,10 +17,16 @@ the corresponding CLI flags use hyphens::
         command: ansible all {{ flags }} -m ansible.builtin.shell {{ more_flags }} -a
 
     # CLI
-    boxman run cmd --flags "--limit node01" --more-flags "--become" -- hostname
+    boxman run cmd --flags "--limit node01" --more-flags "--become" -- curl ifconfig.me
 
     # resolves to:
-    # ansible all --limit node01 -m ansible.builtin.shell --become -a hostname
+    # ansible all --limit node01 -m ansible.builtin.shell --become -a 'curl ifconfig.me'
+
+All tokens after ``--`` are space-joined and shell-quoted as **one argument**.
+This means ``-- curl ifconfig.me`` passes ``'curl ifconfig.me'`` as a single
+value — exactly what ansible's ``-a`` expects.  For flags that must remain
+separate tokens (e.g. ansible-playbook ``--limit``, ``--tags``) use dedicated
+``{{ placeholder }}`` markers instead of ``--``.
 
 Placeholders that are not provided on the CLI are removed (replaced with
 the empty string).  The ``{{ name }}`` syntax is converted to ``{name}``
@@ -39,17 +45,18 @@ Example conf.yml::
 
       site:
         description: "Run ansible site playbook"
-        command: ansible-playbook --become ansible/site.yml
+        command: ansible-playbook {{ flags }} --become ansible/site.yml {{ tags }}
 
 Usage::
 
     boxman run ping
     boxman run ping --flags "--limit node01"
-    boxman run site -- --limit foo --tags=bar
+    boxman run site --flags "--limit head01" --tags "--tags slurm"
 """
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 from typing import Dict, Any, List, Optional
@@ -184,9 +191,14 @@ class TaskRunner:
         command = re.sub(r"\{(\w+)\}", _replace, command)
         command = re.sub(r" {2,}", " ", command).strip()
 
-        # Append extra args
+        # Append extra args as a single shell-quoted token.
+        # Everything after -- on the CLI is one logical argument (e.g. a shell
+        # command for ansible's -a).  Join the tokens with spaces and quote the
+        # result so the receiving shell treats the whole thing as one argument:
+        #   -- curl ifconfig.me  →  'curl ifconfig.me'  (one arg to -a)
+        #   -- hostname          →  hostname             (no quoting needed)
         if extra_args:
-            command = command + " " + " ".join(extra_args)
+            command = command + " " + shlex.quote(" ".join(extra_args))
 
         # Resolve workdir: task-level > workspace.workdir > workspace.path > cluster workdir > cwd
         workdir = task.get(

@@ -405,13 +405,37 @@ class TestTaskRunnerFlagsPassing:
     # ------------------------------------------------------------------
 
     def test_double_dash_extra_args_no_placeholders(self, config):
-        """Args after -- are appended to commands that have no placeholders."""
-        self._add_task(config, "site", "ansible-playbook site.yml")
+        """
+        Multiple tokens after -- are joined and quoted as ONE shell argument.
+        This is the correct behaviour for ansible -a which takes a single string.
+
+            boxman run cmd -- curl ifconfig.me
+            → ansible ... -a 'curl ifconfig.me'   ✓  (-a gets one arg)
+        """
+        self._add_task(config, "cmd", "ansible all -m ansible.builtin.shell -a")
         cmd = self._run(
-            config, "site",
-            extra_args=["--limit", "foo", "--tags=bar"],
+            config, "cmd",
+            extra_args=["curl", "ifconfig.me"],
         )
-        assert cmd == "ansible-playbook site.yml --limit foo --tags=bar"
+        assert cmd == "ansible all -m ansible.builtin.shell -a 'curl ifconfig.me'"
+
+    def test_extra_arg_single_word_no_quoting(self, config):
+        """A single, simple extra_arg needs no quoting."""
+        self._add_task(config, "site", "ansible-playbook site.yml")
+        cmd = self._run(config, "site", extra_args=["hostname"])
+        assert cmd == "ansible-playbook site.yml hostname"
+
+    def test_extra_arg_with_embedded_space_is_shell_quoted(self, config):
+        """
+        A single extra_arg that already contains a space (from bash 'curl ifconfig.me')
+        is also quoted correctly.
+        """
+        self._add_task(config, "cmd", "ansible all -m ansible.builtin.shell -a")
+        cmd = self._run(
+            config, "cmd",
+            extra_args=["curl ifconfig.me"],  # single arg with a space
+        )
+        assert cmd == "ansible all -m ansible.builtin.shell -a 'curl ifconfig.me'"
 
     # ------------------------------------------------------------------
     # 7. Both {flags} task_flags AND -- extra_args combined
@@ -508,10 +532,10 @@ class TestTaskRunnerFlagsPassing:
     # 12. -- extra_args with multiple tokens; flags also present
     # ------------------------------------------------------------------
 
-    def test_multiple_extra_args_after_double_dash(self, config):
+    def test_multiple_extra_args_joined_as_one(self, config):
         """
         Simulates: boxman run cmd --flags "-v" -- arg1 arg2 arg3
-        All post-'--' tokens are appended in order.
+        All post-'--' tokens are joined and quoted as a single shell argument.
         """
         self._add_task(config, "cmd", "mycommand {flags}")
         cmd = self._run(
@@ -519,7 +543,7 @@ class TestTaskRunnerFlagsPassing:
             extra_args=["arg1", "arg2", "arg3"],
             task_flags={"flags": "-v"},
         )
-        assert cmd == "mycommand -v arg1 arg2 arg3"
+        assert cmd == "mycommand -v 'arg1 arg2 arg3'"
 
 
 # ---------------------------------------------------------------------------

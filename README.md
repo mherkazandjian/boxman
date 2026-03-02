@@ -333,30 +333,44 @@ tasks:
 # Ping all hosts
 boxman run ping
 
-# Ping with ansible flags (e.g. limit to one host)
+# Ping with ansible flags (limit to one host)
 boxman run ping --flags "--limit node01"
 
 # Run a shell command on all hosts
 boxman run cmd -- hostname
 
-# Run a shell command with ansible flags
-boxman run cmd --flags "--limit node01,node02" -- uptime
+# Run a multi-word shell command — everything after -- is joined into one
+# argument, so ansible's -a receives the full string as a single value
+boxman run cmd -- curl ifconfig.me
+boxman run cmd -- uname -a
+
+# Combine ansible flags with a multi-word shell command
+boxman run cmd --flags "--limit cluster_1_control01" -- curl ifconfig.me
 
 # Run the full site playbook
 boxman run site
 
-# Run site playbook with tags
-boxman run site -- --tags base,networking
+# Run site playbook limited to specific hosts
+boxman run site --flags "--limit head01"
+
+# Run site playbook with tags (use --tags placeholder, not --)
+boxman run site --tags "--tags base,networking"
 
 # Run site playbook limited to specific hosts and with tags
-boxman run site --flags "--limit head01" -- --tags slurm
+boxman run site --flags "--limit head01" --tags "--tags slurm"
 
 # Run a specific playbook by name
 boxman run playbook --playbook networking.yml
 
 # Run a specific playbook with tags
-boxman run playbook --playbook storage.yml -- --tags beegfs
+boxman run playbook --playbook storage.yml --tags "--tags beegfs"
 
 # SSH into the gateway host
 boxman run ssh
 ```
+
+> **`--` joins all tokens into one argument**: everything after `--` is
+> space-joined and shell-quoted as a single string.  This is ideal for
+> `cmd` where the shell command (e.g. `curl ifconfig.me`) must arrive as
+> one argument to ansible's `-a`.  For ansible-playbook flags (`--limit`,
+> `--tags`, etc.) use the `--flags` / `--tags` placeholders instead.
