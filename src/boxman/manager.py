@@ -1932,6 +1932,35 @@ class BoxmanManager:
 
         cls.configure_and_start_vms()
 
+        # Ensure all VMs are actually running after the parallel start.
+        # With many VMs starting simultaneously, some may fail due to resource
+        # contention. Retry starting any that are not in 'running' state.
+        cls.logger.info("verifying all VMs are running after parallel start...")
+        for _round in range(1, 21):
+            vm_states = cls._get_vm_states()
+            not_running = {
+                name: state for name, state in vm_states.items()
+                if state != 'running'
+            }
+            if not not_running:
+                cls.logger.info("all VMs are running")
+                break
+            cls.logger.info(
+                f"round {_round}: {len(not_running)} VM(s) not yet running "
+                f"({', '.join(f'{n}={s}' for n, s in not_running.items())}), retrying..."
+            )
+            for _vm_name in not_running:
+                cls.provider.start_vm(_vm_name)
+            time.sleep(3)
+        else:
+            vm_states = cls._get_vm_states()
+            still_down = {n: s for n, s in vm_states.items() if s != 'running'}
+            if still_down:
+                cls.logger.warning(
+                    f"gave up after 20 rounds; the following VMs are still not running: "
+                    f"{', '.join(f'{n}={s}' for n, s in still_down.items())}"
+                )
+
         # use adaptive wait for ip address assignment
         cls.logger.info("waiting for vms to initialize and get the ip addresses...")
         wait_time = 1  # Start with 1 second
