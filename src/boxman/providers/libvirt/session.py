@@ -1,4 +1,5 @@
 import os
+import glob as _glob
 import time
 from typing import Dict, Any, Optional, List
 import json
@@ -265,27 +266,39 @@ class LibVirtSession:
         """
         Destroy disks associated with the VM.
 
+        Removes:
+        - The primary boot disk ({vm_name}.qcow2)
+        - Any extra named disks ({vm_name}_{disk}.qcow2)
+        - All snapshot artifacts: external overlay files (e.g.
+          {vm_name}.2026-03-02T15:36:54, {vm_name}.1772465824) and memory
+          snapshot raw files ({vm_name}_snapshot_*.raw)
+
         Args:
-            vm_name: Name of the VM
-            vm_info: VM configuration information
+            workdir: Directory where disk images are stored
+            vm_name: Full name of the VM
+            disks: Extra disk configurations from the cluster config
 
         Returns:
             True if successful, False otherwise
         """
-        boot_disk = os.path.expanduser(
-            os.path.join(workdir, f'{vm_name}.qcow2'))
+        workdir = os.path.expanduser(workdir)
 
+        boot_disk = os.path.join(workdir, f'{vm_name}.qcow2')
         if os.path.isfile(boot_disk):
             os.remove(boot_disk)
 
         for disk in disks:
-            disk_path = os.path.expanduser(
-                os.path.join(
-                    workdir,
-                    f'{vm_name}_{disk["name"]}.qcow2')
-                )
+            disk_path = os.path.join(workdir, f'{vm_name}_{disk["name"]}.qcow2')
             if os.path.isfile(disk_path):
                 os.remove(disk_path)
+
+        # remove snapshot artifacts: overlay files with timestamp/hash suffixes
+        # and memory snapshot .raw files — anything prefixed with vm_name that
+        # is still on disk after the named qcow2 files were removed above
+        for leftover in _glob.glob(os.path.join(workdir, f'{vm_name}*')):
+            if os.path.isfile(leftover):
+                log.info(f"removing snapshot artifact: {leftover}")
+                os.remove(leftover)
 
         return True
 
@@ -598,6 +611,61 @@ class LibVirtSession:
         else:
             self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
         return snapshot_mgr.snapshot_restore(vm_name, snapshot_name)
+
+    def eject_cdrom(self, vm_name: str) -> None:
+        """
+        Eject cloud-init seed ISO media from a VM's cdrom drive(s).
+
+        Only ejects cdroms whose source file is the seed ISO itself or a
+        qcow2 overlay of it (filenames that start with ``seed``).  Other
+        cdrom ISOs that may be intentionally mounted are left untouched.
+
+        Called after provisioning completes (once cloud-init has run and the VM
+        has an IP address) so the seed ISO is never present during snapshot
+        operations.  Uses ``--force`` to bypass the guest kernel's tray lock.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        result = virsh.execute("domblklist", vm_name, "--details", warn=True)
+        if not result.ok:
+            return
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            # domblklist --details columns: Type  Device  Target  Source
+            if len(parts) >= 3 and parts[1] == 'cdrom':
+                target = parts[2]
+                source = parts[3] if len(parts) >= 4 else '-'
+                if source == '-':
+                    self.logger.debug(f"cdrom {target} on {vm_name} is already empty")
+                    continue
+                basename = os.path.basename(source)
+                if not basename.startswith('seed'):
+                    self.logger.debug(
+                        f"skipping non-seed cdrom {target} on {vm_name} (source: {source})")
+                    continue
+                self.logger.info(f"ejecting seed cdrom {target} from {vm_name} (was: {source})")
+                eject_result = virsh.execute(
+                    "change-media", vm_name, target,
+                    "--eject", "--force", "--live", "--config",
+                    warn=True)
+                if not eject_result.ok:
+                    self.logger.warning(
+                        f"failed to eject cdrom {target} from {vm_name}: "
+                        f"{eject_result.stderr.strip()}")
+
+    def get_latest_snapshot(self, vm_name):
+        """Return the current snapshot name for a VM, or None if none exists."""
+        snapshot_mgr = SnapshotManager(self.provider_config)
+        return snapshot_mgr.get_latest_snapshot(vm_name)
+
+    def validate_snapshot(self, vm_name, snapshot_name):
+        """
+        Validate that a snapshot is intact and can be safely restored.
+
+        Returns:
+            tuple[bool, List[str]]: (valid, errors)
+        """
+        snapshot_mgr = SnapshotManager(self.provider_config)
+        return snapshot_mgr.validate_snapshot(vm_name, snapshot_name)
 
     def snapshot_delete(self, vm_name, snapshot_name):
         """

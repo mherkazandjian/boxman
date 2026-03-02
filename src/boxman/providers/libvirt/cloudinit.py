@@ -654,10 +654,31 @@ class CloudInitTemplate:
         # Verify the VM is up and healthy, then shut it down
         self.verify_and_shutdown()
 
+        # Eject the seed ISO from the template's persistent config.
+        # The VM is now shut off, so cloud-init has finished and the cdrom
+        # is no longer needed.  Removing it here ensures that VMs cloned
+        # from this template are created without the cdrom, eliminating
+        # qcow2-overlay and tray-lock issues during snapshot operations.
+        blklist = self.virsh.execute(
+            "domblklist", self.template_name, "--details", warn=True)
+        if blklist.ok:
+            for line in blklist.stdout.splitlines():
+                parts = line.split()
+                # columns: Type  Device  Target  Source
+                if len(parts) >= 4 and parts[1] == 'cdrom':
+                    target, source = parts[2], parts[3]
+                    if os.path.basename(source).startswith('seed'):
+                        self.logger.info(
+                            f"ejecting seed cdrom '{target}' from template "
+                            f"'{self.template_name}' (was: {source})")
+                        self.virsh.execute(
+                            "change-media", self.template_name, target,
+                            "--eject", "--config",
+                            warn=True)
+
         self.logger.info("=" * 70)
         self.logger.info(f"template VM '{self.template_name}' created successfully")
         self.logger.info(f"  disk image: {dst_image_path}")
-        self.logger.info(f"  seed ISO:   {seed_iso_path}")
         self.logger.info("=" * 70)
         return True
 

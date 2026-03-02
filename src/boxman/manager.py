@@ -927,6 +927,11 @@ class BoxmanManager:
                 info=network_info
             )
             self.logger.info(f"removed network {_network_name} in {cluster['workdir']}")
+            xml_path = os.path.expanduser(
+                os.path.join(cluster['workdir'], f'{_network_name}_net_define.xml'))
+            if os.path.isfile(xml_path):
+                os.remove(xml_path)
+                self.logger.info(f"removed network XML {xml_path}")
 
         processes = [
             Process(target=_destroy, args=(cluster_name, cluster, network_name, network_info))
@@ -1938,6 +1943,16 @@ class BoxmanManager:
             cls.logger.warning(
                 "Reached maximum wait time. Some vms may not have ip addresses.")
 
+        # Eject cdrom (seed.iso) from every VM now that cloud-init has run.
+        # This prevents snapshot-related failures caused by qcow2-over-raw
+        # backing chain issues and tray-lock errors on subsequent snapshots.
+        cls.logger.info("ejecting cdrom (seed.iso) from all VMs post-provisioning...")
+        prj_name = f'bprj__{config["project"]}__bprj'
+        for _cluster_name, _cluster in config['clusters'].items():
+            for _vm_name, _ in _cluster['vms'].items():
+                _full_vm_name = f"{prj_name}_{_cluster_name}_{_vm_name}"
+                cls.provider.eject_cdrom(_full_vm_name)
+
         # generate ssh keys, add them to vms, and write ssh config
         cls.setup_ssh_access()
 
@@ -2241,30 +2256,142 @@ class BoxmanManager:
     @staticmethod
     def snapshot_take(cls, cli_args):
         """
-        Take a snapshot of the VMs in the cluster.
+        Take a snapshot of every VM in the cluster (parallel), then verify each one.
         """
         prj_name = f'bprj__{cls.config["project"]}__bprj'
-        for cluster_name, cluster in cls.config['clusters'].items():
-            for vm_name, _ in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                cls.provider.snapshot_take(
-                    vm_name=full_vm_name,
-                    vm_dir=os.path.expanduser(cluster['workdir']),
-                    snapshot_name=cli_args.snapshot_name,
-                    description=cli_args.snapshot_descr)
+
+        vm_targets = [
+            (
+                f"{prj_name}_{cluster_name}_{vm_name}",
+                os.path.expanduser(cluster['workdir']),
+            )
+            for cluster_name, cluster in cls.config['clusters'].items()
+            for vm_name, _ in cluster['vms'].items()
+        ]
+
+        def _take(full_vm_name, vm_dir, snapshot_name, description):
+            cls.provider.snapshot_take(
+                vm_name=full_vm_name,
+                vm_dir=vm_dir,
+                snapshot_name=snapshot_name,
+                description=description)
+
+        processes = [
+            Process(target=_take, args=(full_vm_name, vm_dir,
+                                        cli_args.snapshot_name, cli_args.snapshot_descr))
+            for full_vm_name, vm_dir in vm_targets
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+        # Verify every snapshot in the main process after all takes complete.
+        cls.logger.info("verifying snapshots after take...")
+        all_ok = True
+        for full_vm_name, _ in vm_targets:
+            valid, errors = cls.provider.validate_snapshot(
+                full_vm_name, cli_args.snapshot_name)
+            if valid:
+                cls.logger.info(f"snapshot ok: {full_vm_name} / '{cli_args.snapshot_name}'")
+            else:
+                all_ok = False
+                for err in errors:
+                    cls.logger.error(
+                        f"snapshot invalid: {full_vm_name} / '{cli_args.snapshot_name}': {err}")
+
+        if all_ok:
+            cls.logger.info("all snapshots verified successfully")
+        else:
+            cls.logger.error("one or more snapshots failed verification — check errors above")
 
     @staticmethod
     def snapshot_restore(cls, cli_args):
         """
-        Restore the state of the VMs in the cluster from a snapshot.
+        Restore the state of every VM in the cluster from a snapshot (parallel).
 
-        If no snapshot name is given, each VM is restored to its latest snapshot.
+        Workflow
+        --------
+        1. Resolve snapshot names in the main process (use latest if not specified).
+        2. Pre-validate ALL resolved snapshots; abort if any are invalid.
+        3. Run parallel restores, tracking per-VM success via a Queue.
+        4. Retry failed VMs in subsequent rounds until ALL succeed.
         """
         prj_name = f'bprj__{cls.config["project"]}__bprj'
+
+        # ── 1. Resolve snapshot names ────────────────────────────────────────
+        vm_targets = []  # list of (full_vm_name, resolved_snapshot_name)
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                cls.provider.snapshot_restore(full_vm_name, cli_args.snapshot_name)
+                snap_name = cli_args.snapshot_name
+                if not snap_name:
+                    snap_name = cls.provider.get_latest_snapshot(full_vm_name)
+                    if snap_name is None:
+                        cls.logger.error(
+                            f"no snapshot found for {full_vm_name}, aborting restore")
+                        return
+                    cls.logger.info(
+                        f"resolved latest snapshot for {full_vm_name}: '{snap_name}'")
+                vm_targets.append((full_vm_name, snap_name))
+
+        # ── 2. Pre-validate all snapshots ────────────────────────────────────
+        cls.logger.info("pre-validating snapshots before restore...")
+        abort = False
+        for full_vm_name, snap_name in vm_targets:
+            valid, errors = cls.provider.validate_snapshot(full_vm_name, snap_name)
+            if valid:
+                cls.logger.info(f"snapshot ok: {full_vm_name} / '{snap_name}'")
+            else:
+                abort = True
+                for err in errors:
+                    cls.logger.error(
+                        f"snapshot invalid: {full_vm_name} / '{snap_name}': {err}")
+
+        if abort:
+            cls.logger.error(
+                "aborting restore — one or more snapshots have errors (see above)")
+            return
+
+        # ── 3 & 4. Parallel restore with retry until all succeed ─────────────
+        def _restore(full_vm_name, snapshot_name, queue):
+            ok = cls.provider.snapshot_restore(full_vm_name, snapshot_name)
+            queue.put((full_vm_name, snapshot_name, ok))
+
+        pending = list(vm_targets)
+        max_rounds = 20
+
+        for round_num in range(1, max_rounds + 1):
+            cls.logger.info(
+                f"restore round {round_num}: {len(pending)} VM(s) to restore")
+
+            q = Queue()
+            processes = [
+                Process(target=_restore, args=(vm, snap, q))
+                for vm, snap in pending
+            ]
+            [p.start() for p in processes]
+            [p.join() for p in processes]
+
+            failed = []
+            while not q.empty():
+                vm, snap, ok = q.get()
+                if ok:
+                    cls.logger.info(f"restored: {vm} to '{snap}'")
+                else:
+                    cls.logger.warning(f"failed: {vm} to '{snap}', will retry")
+                    failed.append((vm, snap))
+
+            if not failed:
+                cls.logger.info("all VMs restored successfully")
+                return
+
+            pending = failed
+            if round_num < max_rounds:
+                cls.logger.info(f"{len(failed)} VM(s) failed, retrying in 3s...")
+                time.sleep(3)
+
+        cls.logger.error(
+            f"restore gave up after {max_rounds} rounds. "
+            f"still failing: {[vm for vm, _ in pending]}")
 
 
     @staticmethod
