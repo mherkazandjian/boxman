@@ -20,6 +20,7 @@ templates:
     os_variant: centos7.0
     memory: 2048
     vcpus: 2
+    cloudinit_done_marker: /var/log/hello-cloudinit.log
     cloudinit: |
       #cloud-config
       hostname: hello-cloudinit
@@ -54,23 +55,28 @@ templates:
           permissions: "0644"
           content: |
             hello world from cloud-init (CentOS 7)
+        - path: /etc/sysconfig/qemu-ga
+          permissions: "0644"
+          content: |
+            # Allow boxman to run cloud-init status via guest-exec
+            BLOCK_RPCS=
 
       runcmd:
         - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - setenforce 0 || true
+        - [ sh, -c, "sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config || true" ]
         - systemctl daemon-reload
-        - systemctl enable qemu-guest-agent
-        - systemctl start qemu-guest-agent
+        - systemctl restart qemu-guest-agent || true
+        - systemctl enable --now qemu-guest-agent
         - systemctl restart network || true
-        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
         # create admin user via shell commands
-        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /home/admin -s /bin/bash admin" ]
+        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /admin -s /bin/bash admin" ]
         - [ sh, -c, "usermod -aG wheel admin" ]
         - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin" ]
         - [ sh, -c, "chmod 0440 /etc/sudoers.d/admin" ]
         - [ sh, -c, "echo 'admin:{{ env("BOXMAN_ADMIN_PASS", default="boxman") }}' | chpasswd" ]
-        - [ sh, -c, "mkdir -p /home/admin/.ssh && chmod 700 /home/admin/.ssh && chown -R admin:admin /home/admin/.ssh" ]
-        - restorecon -R /home/admin/.ssh || true
-        - restorecon /etc/sudoers.d/admin || true
+        - [ sh, -c, "mkdir -p /admin/.ssh && chmod 700 /admin/.ssh && chown -R admin:admin /admin/.ssh" ]
+        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
 
 workspace:
   path: ~/workspaces/boxmandev/tiny_libvirt_centos7_cloudinit
@@ -92,12 +98,12 @@ clusters:
           delay: '0'
         mac: '52:54:00:00:00:01'
         ip:
-          address: '192.168.11.1'
+          address: '192.168.10.1'
           netmask: '255.255.255.0'
           dhcp:
             range:
-              start: '192.168.11.2'
-              end: '192.168.11.254'
+              start: '192.168.10.2'
+              end: '192.168.10.254'
         enable: True
         autostart: True
       isolated1:
@@ -107,12 +113,12 @@ clusters:
           delay: '0'
         mac: '52:54:00:00:00:02'
         ip:
-          address: '10.0.11.1'
+          address: '10.0.10.1'
           netmask: '255.255.255.0'
           dhcp:
             range:
-              start: '10.0.11.2'
-              end: '10.0.11.254'
+              start: '10.0.10.2'
+              end: '10.0.10.254'
         enable: True
         autostart: True
 
