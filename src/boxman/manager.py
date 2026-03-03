@@ -555,6 +555,7 @@ class BoxmanManager:
             cloudinit_userdata = tpl_conf.get('cloudinit', None)
             cloudinit_metadata = tpl_conf.get('cloudinit_metadata', None)
             cloudinit_network_config = tpl_conf.get('cloudinit_network_config', None)
+            cloudinit_done_marker = tpl_conf.get('cloudinit_done_marker', None)
             tpl_memory = tpl_conf.get('memory', 2048)
             tpl_vcpus = tpl_conf.get('vcpus', 2)
             tpl_os_variant = tpl_conf.get('os_variant', 'generic')
@@ -582,6 +583,7 @@ class BoxmanManager:
                 cloudinit_userdata=cloudinit_userdata,
                 cloudinit_metadata=cloudinit_metadata,
                 cloudinit_network_config=cloudinit_network_config,
+                cloudinit_done_marker=cloudinit_done_marker,
                 workdir=tpl_workdir,
                 provider_config=provider_config,
                 memory=tpl_memory,

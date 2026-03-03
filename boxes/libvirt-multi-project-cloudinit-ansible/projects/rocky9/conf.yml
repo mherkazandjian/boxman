@@ -33,11 +33,11 @@ templates:
           groups: [wheel]
           sudo: "ALL=(ALL) NOPASSWD:ALL"
           shell: /bin/bash
-          # plain_text_passwd is the non-deprecated way to set a password
-          plain_text_passwd: rocky
 
       chpasswd:
         expire: false
+        list: |
+          rocky:rocky
 
       ssh_pwauth: true
       package_update: true

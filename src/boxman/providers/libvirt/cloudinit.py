@@ -97,6 +97,7 @@ class CloudInitTemplate:
         cloudinit_userdata: Optional[str] = None,
         cloudinit_metadata: Optional[str] = None,
         cloudinit_network_config: Optional[str] = None,
+        cloudinit_done_marker: Optional[str] = None,
         workdir: Optional[str] = None,
         provider_config: Optional[Dict[str, Any]] = None,
         memory: int = 2048,
@@ -114,6 +115,7 @@ class CloudInitTemplate:
         self.cloudinit_userdata = cloudinit_userdata
         self.cloudinit_metadata = cloudinit_metadata
         self.cloudinit_network_config = cloudinit_network_config
+        self.cloudinit_done_marker = cloudinit_done_marker
         self.workdir = os.path.expanduser(workdir) if workdir else tempfile.mkdtemp(prefix="boxman-cloudinit-")
         self.provider_config = provider_config or {}
         self.memory = memory
@@ -320,14 +322,26 @@ class CloudInitTemplate:
             fobj.write(metadata)
         self.logger.info(f"wrote meta-data to {metadata_path}")
 
-        # Use custom network config if provided, otherwise use default DHCP config
+        # Use custom network config if provided, otherwise use default DHCP config.
+        # Set cloudinit_network_config to "disabled" to skip the network-config
+        # file entirely (useful for distros like Rocky/CentOS where the default
+        # netplan v2 config can conflict with NetworkManager).
         network_config = self.cloudinit_network_config
-        if not network_config:
-            network_config = DEFAULT_NETWORK_CONFIG
-        network_config_path = os.path.join(nocloud_dir, "network-config")
-        with open(network_config_path, "w") as fobj:
-            fobj.write(network_config)
-        self.logger.info(f"wrote network-config to {network_config_path}")
+        if network_config and network_config.strip().lower() == "disabled":
+            self.logger.info("network-config disabled by user — skipping")
+            # Remove any stale network-config from a previous run so
+            # build_seed_iso does not accidentally include it.
+            stale = os.path.join(nocloud_dir, "network-config")
+            if os.path.exists(stale):
+                os.remove(stale)
+                self.logger.info(f"removed stale network-config: {stale}")
+        else:
+            if not network_config:
+                network_config = DEFAULT_NETWORK_CONFIG
+            network_config_path = os.path.join(nocloud_dir, "network-config")
+            with open(network_config_path, "w") as fobj:
+                fobj.write(network_config)
+            self.logger.info(f"wrote network-config to {network_config_path}")
 
         return nocloud_dir
 
@@ -497,6 +511,136 @@ class CloudInitTemplate:
                 os.remove(dst_path)
             return False
 
+    def _wait_cloudinit_fallback(self, seconds: int = 180) -> None:
+        """
+        Time-based fallback: wait *seconds* for cloud-init to finish when
+        we cannot poll via ``guest-exec`` (e.g. Rocky/RHEL where the
+        guest agent blacklists ``guest-exec``).
+
+        While waiting, periodically ping the guest agent to confirm the VM
+        is still alive.
+        """
+        self.logger.info(
+            f"waiting {seconds}s for cloud-init to finish "
+            f"(guest-exec unavailable, using time-based fallback)...")
+        for i in range(0, seconds, 10):
+            time.sleep(10)
+            # Confirm the VM is still responsive
+            ping = self.virsh.execute_shell(
+                f"virsh qemu-agent-command {self.template_name} "
+                f"'{{\"execute\":\"guest-ping\"}}'",
+                hide=True, warn=True)
+            if not ping.ok:
+                self.logger.warning(
+                    f"guest agent stopped responding after {i + 10}s — "
+                    f"VM may have crashed")
+                break
+            elapsed = i + 10
+            if elapsed % 30 == 0:
+                self.logger.info(
+                    f"still waiting for cloud-init... ({elapsed}s / {seconds}s)")
+        self.logger.info("fallback wait complete")
+
+    def _poll_done_marker(self, marker_path: str, max_wait: int = 120) -> bool:
+        """
+        Poll for *marker_path* inside the guest via ``guest-exec`` with
+        exponential back-off.
+
+        Returns True if the marker was found, False on timeout.
+        """
+        self.logger.info(
+            f"polling for done marker: {marker_path} "
+            f"(exponential back-off, max {max_wait}s)...")
+
+        delay = 1          # initial delay in seconds
+        elapsed = 0
+
+        while elapsed < max_wait:
+            check_cmd = (
+                '{"execute":"guest-exec","arguments":'
+                '{"path":"/bin/sh","arg":["-c",'
+                '"test -f ' + marker_path + ' && echo MARKER_FOUND || echo MARKER_MISSING"],'
+                '"capture-output":true}}'
+            )
+            res = self.virsh.execute_shell(
+                f"virsh qemu-agent-command {self.template_name} '{check_cmd}'",
+                hide=True, warn=True)
+
+            if res.ok:
+                found = self._guest_exec_output(res.stdout)
+                if found is not None and "MARKER_FOUND" in found:
+                    self.logger.info(
+                        f"done marker found: {marker_path} "
+                        f"(after ~{elapsed}s)")
+                    return True
+
+            time.sleep(delay)
+            elapsed += delay
+            delay = min(delay * 2, 16)  # cap at 16s
+            if elapsed % 15 < delay:
+                self.logger.info(
+                    f"still waiting for {marker_path}... "
+                    f"(~{elapsed}s / {max_wait}s)")
+
+        self.logger.error(
+            f"done marker {marker_path} not found after {max_wait}s")
+        return False
+
+    def _guest_exec_output(self, guest_exec_stdout: str) -> Optional[str]:
+        """
+        Run guest-exec-status for a just-started guest-exec and return the
+        decoded stdout, or None on failure.
+        """
+        try:
+            pid = json.loads(guest_exec_stdout.strip()).get(
+                "return", {}).get("pid")
+            if not pid:
+                return None
+            status_cmd = (
+                f'{{"execute":"guest-exec-status",'
+                f'"arguments":{{"pid":{pid}}}}}'
+            )
+            for _ in range(10):
+                status_res = self.virsh.execute_shell(
+                    f"virsh qemu-agent-command {self.template_name} "
+                    f"'{status_cmd}'",
+                    hide=True, warn=True)
+                if not status_res.ok:
+                    return None
+                ret = json.loads(
+                    status_res.stdout.strip()).get("return", {})
+                if ret.get("exited"):
+                    out_data = ret.get("out-data", "")
+                    if out_data:
+                        return base64.b64decode(out_data).decode(
+                            'utf-8', errors='replace').strip()
+                    return ""
+                time.sleep(1)
+        except Exception:
+            pass
+        return None
+
+    def _fetch_cloudinit_log(self) -> None:
+        """Fetch and display the cloud-init output log via guest-exec."""
+        log_script = 'cat /var/log/cloud-init-output.log 2>/dev/null'
+        exec_cmd = (
+            '{"execute":"guest-exec","arguments":'
+            '{"path":"/bin/sh","arg":["-c","'
+            + log_script
+            + '"],"capture-output":true}}'
+        )
+        res = self.virsh.execute_shell(
+            f"virsh qemu-agent-command {self.template_name} '{exec_cmd}'",
+            hide=True, warn=True)
+        if not res.ok:
+            return
+        output = self._guest_exec_output(res.stdout)
+        if output:
+            self.logger.info("=== Cloud-Init Output Log ===")
+            for line in output.splitlines():
+                self.logger.info(f"  {line}")
+            self.logger.info("=============================")
+
     def verify_and_shutdown(self) -> bool:
         self.logger.info("verifying VM health: waiting for QEMU guest agent (this may take a few minutes while cloud-init installs it)...")
         agent_up = False
@@ -517,51 +661,74 @@ class CloudInitTemplate:
 
         if not agent_up:
             self.logger.warning("QEMU guest agent did not respond in time. OS might not be healthy or agent is not installed.")
+            # Even without the agent we should give cloud-init a chance
+            self._wait_cloudinit_fallback(seconds=180)
         else:
             self.logger.info("QEMU guest agent is responding. OS is healthy.")
-            self.logger.info("fetching cloud-init logs via guest agent (waiting for cloud-init to finish)...")
 
-            exec_cmd = '{"execute":"guest-exec","arguments":{"path":"/bin/sh","arg":["-c","cloud-init status --wait && cat /var/log/cloud-init-output.log"],"capture-output":true}}'
+            # Wait for guest-exec to become available.  On distros like
+            # Rocky/RHEL the agent starts with BLOCK_RPCS that forbid
+            # guest-exec.  Cloud-init reconfigures the agent (write_files
+            # + systemctl restart) during runcmd — once guest-exec works,
+            # cloud-init is nearly done.
+            #
+            # We do NOT poll for marker files (boot-finished, result.json)
+            # because some cloud-init configs disable cloud-init during
+            # runcmd (touch /etc/cloud/cloud-init.disabled) which can
+            # prevent those markers from being written.
+            guest_exec_ok = False
+            self.logger.info(
+                "waiting for guest-exec to become available "
+                "(cloud-init must reconfigure the agent first)...")
 
-            res = self.virsh.execute_shell(
-                f"virsh qemu-agent-command {self.template_name} '{exec_cmd}'",
-                hide=True, warn=True)
-            if res.ok:
-                try:
-                    pid_info = json.loads(res.stdout.strip())
-                    pid = pid_info.get("return", {}).get("pid")
+            for attempt in range(24):  # up to ~120s (24 * 5s)
+                exec_cmd = (
+                    '{"execute":"guest-exec","arguments":'
+                    '{"path":"/bin/sh","arg":["-c","echo ok"],'
+                    '"capture-output":true}}'
+                )
+                res = self.virsh.execute_shell(
+                    f"virsh qemu-agent-command {self.template_name} '{exec_cmd}'",
+                    hide=True, warn=True)
+                if res.ok:
+                    guest_exec_ok = True
+                    self.logger.info("guest-exec is available")
+                    break
+                if attempt == 0 and res.stderr and res.stderr.strip():
+                    self.logger.debug(
+                        f"guest-exec error: {res.stderr.strip()}")
+                if attempt > 0 and attempt % 6 == 0:
+                    self.logger.info(
+                        f"still waiting for guest-exec... "
+                        f"({attempt * 5}s elapsed)")
+                time.sleep(5)
 
-                    if pid:
-                        status_cmd = f'{{"execute":"guest-exec-status","arguments":{{"pid":{pid}}}}}'
-
-                        # Poll for completion (up to 5 minutes)
-                        for _ in range(150):
-                            status_res = self.virsh.execute_shell(
-                                f"virsh qemu-agent-command {self.template_name} '{status_cmd}'",
-                                hide=True, warn=True)
-                            if status_res.ok:
-                                status_info = json.loads(status_res.stdout.strip())
-                                ret = status_info.get("return", {})
-                                if ret.get("exited"):
-                                    out_data = ret.get("out-data", "")
-                                    if out_data:
-                                        decoded_out = base64.b64decode(out_data).decode('utf-8', errors='replace')
-                                        self.logger.info("=== Cloud-Init Output Log ===")
-                                        for line in decoded_out.splitlines():
-                                            self.logger.info(f"  {line}")
-                                        self.logger.info("=============================")
-
-                                    err_data = ret.get("err-data", "")
-                                    if err_data:
-                                        decoded_err = base64.b64decode(err_data).decode('utf-8', errors='replace')
-                                        if decoded_err.strip():
-                                            self.logger.debug(f"Guest exec stderr: {decoded_err}")
-                                    break
-                            time.sleep(2)
-                except Exception as e:
-                    self.logger.warning(f"failed to parse guest-exec output: {e}")
+            if guest_exec_ok:
+                # guest-exec availability means cloud-init has already
+                # restarted the agent (via runcmd).  Now wait for the
+                # remaining runcmd entries to finish.
+                if self.cloudinit_done_marker:
+                    found = self._poll_done_marker(self.cloudinit_done_marker)
+                    if not found:
+                        self.logger.error(
+                            f"cloud-init done marker '{self.cloudinit_done_marker}' "
+                            f"was not found — cloud-init may have failed")
+                        return False
+                    self._fetch_cloudinit_log()
+                else:
+                    self.logger.error(
+                        "cloudinit_done_marker is not configured in the "
+                        "template config — cannot verify cloud-init completion. "
+                        "Set cloudinit_done_marker to a file path created by "
+                        "the last runcmd entry.")
+                    return False
             else:
-                self.logger.warning("failed to execute command via guest agent.")
+                self.logger.warning(
+                    "guest-exec unavailable after retries (some distros "
+                    "like Rocky/RHEL blacklist it by default). "
+                    "To fix: add BLOCK_RPCS= to /etc/sysconfig/qemu-ga "
+                    "via cloud-init write_files and restart the agent.")
+                self._wait_cloudinit_fallback(seconds=120)
 
         self.logger.info("shutting down the template VM...")
         self.virsh.execute("shutdown", self.template_name, hide=True, warn=True)
