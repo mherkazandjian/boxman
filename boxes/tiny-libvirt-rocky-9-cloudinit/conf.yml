@@ -13,7 +13,9 @@ provider:
 templates:
   template1:
     name: rocky-9-minimal-base-template-cloudinit
-    image: https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+    image:
+      uri: https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base-9.7-20251123.2.x86_64.qcow2
+      checksum: sha256:15d81d3434b298142b2fdd8fb54aef2662684db5c082cc191c3c79762ed6360c
     #image: file:///path/to/local/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
     disk_size: 20G
     os_variant: rocky9
