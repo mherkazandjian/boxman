@@ -13,12 +13,14 @@ provider:
 templates:
   template1:
     name: centos-7-minimal-base-template-cloudinit
-    image: https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2
-    #image: file:///path/to/local/CentOS-7-x86_64-GenericCloud.qcow2
+    image:
+      uri: https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2
+      checksum: sha256:284aab2b23d91318f169ff464bce4d53404a15a0618ceb34562838c59af4adea
     disk_size: 20G
     os_variant: centos7.0
     memory: 2048
     vcpus: 2
+    cloudinit_done_marker: /var/log/hello-cloudinit.log
     cloudinit: |
       #cloud-config
       hostname: hello-cloudinit
@@ -53,23 +55,28 @@ templates:
           permissions: "0644"
           content: |
             hello world from cloud-init (CentOS 7)
+        - path: /etc/sysconfig/qemu-ga
+          permissions: "0644"
+          content: |
+            # Allow boxman to run cloud-init status via guest-exec
+            BLOCK_RPCS=
 
       runcmd:
         - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - setenforce 0 || true
+        - [ sh, -c, "sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config || true" ]
         - systemctl daemon-reload
-        - systemctl enable qemu-guest-agent
-        - systemctl start qemu-guest-agent
+        - systemctl restart qemu-guest-agent || true
+        - systemctl enable --now qemu-guest-agent
         - systemctl restart network || true
-        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
         # create admin user via shell commands
-        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /home/admin -s /bin/bash admin" ]
+        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /admin -s /bin/bash admin" ]
         - [ sh, -c, "usermod -aG wheel admin" ]
         - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin" ]
         - [ sh, -c, "chmod 0440 /etc/sudoers.d/admin" ]
         - [ sh, -c, "echo 'admin:{{ env("BOXMAN_ADMIN_PASS", default="boxman") }}' | chpasswd" ]
-        - [ sh, -c, "mkdir -p /home/admin/.ssh && chmod 700 /home/admin/.ssh && chown -R admin:admin /home/admin/.ssh" ]
-        - restorecon -R /home/admin/.ssh || true
-        - restorecon /etc/sudoers.d/admin || true
+        - [ sh, -c, "mkdir -p /admin/.ssh && chmod 700 /admin/.ssh && chown -R admin:admin /admin/.ssh" ]
+        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
 
 workspace:
   path: ~/workspaces/boxmandev/libvirt_multi_project_cloudinit_ansible/centos7
