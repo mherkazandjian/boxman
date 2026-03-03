@@ -1709,7 +1709,7 @@ class BoxmanManager:
             bool: True if successful, False otherwise
         """
         self.logger.info(f"verifying ssh connection to: {hostname}")
-        ssh_cmd = f'ssh -F {ssh_config_path} {hostname} hostname'
+        ssh_cmd = f'ssh -o BatchMode=yes -F {ssh_config_path} {hostname} hostname'
 
         # When using a non-local runtime, the VM is only reachable from
         # inside the container.

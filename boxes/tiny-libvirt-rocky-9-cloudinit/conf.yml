@@ -35,7 +35,7 @@ templates:
           sudo: ALL=(ALL) NOPASSWD:ALL
           shell: /bin/bash
         - name: admin
-          plain_text_passwd: boxman
+          plain_text_passwd: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
           lock_passwd: false
           sudo: ALL=(ALL) NOPASSWD:ALL
           shell: /bin/bash
@@ -75,15 +75,14 @@ templates:
       runcmd:
         - touch /etc/cloud/cloud-init.disabled
         - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - setenforce 0 || true
+        - [ sh, -c, "sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config || true" ]
         - systemctl daemon-reload
         - systemctl restart qemu-guest-agent || true
         - systemctl enable --now qemu-guest-agent
         - systemctl restart NetworkManager || true
+        - [ sh, -c, "mkdir -p /admin/.ssh && chmod 700 /admin/.ssh && chown -R admin:admin /admin/.ssh" ]
         - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
-      #        - [ sh, -c, "mkdir -p /home/admin/.ssh && chmod 700 /home/admin/.ssh && chown -R admin:admin /home/admin/.ssh" ]
-      #        # fix SELinux contexts after user/file creation
-      #        - restorecon -R /home/admin/.ssh || true
-      #        - restorecon /etc/sudoers.d/admin || true
 
 
 #      #cloud-config
