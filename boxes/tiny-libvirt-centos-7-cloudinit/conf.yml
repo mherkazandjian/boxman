@@ -13,8 +13,9 @@ provider:
 templates:
   template1:
     name: centos-7-minimal-base-template-cloudinit
-    image: https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2
-    #image: file:///path/to/local/CentOS-7-x86_64-GenericCloud.qcow2
+    image:
+      uri: https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2
+      checksum: sha256:284aab2b23d91318f169ff464bce4d53404a15a0618ceb34562838c59af4adea
     disk_size: 20G
     os_variant: centos7.0
     memory: 2048
