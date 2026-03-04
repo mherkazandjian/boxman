@@ -56,7 +56,6 @@ Usage::
 
 import os
 import re
-import shlex
 import subprocess
 import sys
 from typing import Dict, Any, List, Optional
@@ -191,14 +190,11 @@ class TaskRunner:
         command = re.sub(r"\{(\w+)\}", _replace, command)
         command = re.sub(r" {2,}", " ", command).strip()
 
-        # Append extra args as a single shell-quoted token.
-        # Everything after -- on the CLI is one logical argument (e.g. a shell
-        # command for ansible's -a).  Join the tokens with spaces and quote the
-        # result so the receiving shell treats the whole thing as one argument:
-        #   -- curl ifconfig.me  →  'curl ifconfig.me'  (one arg to -a)
-        #   -- hostname          →  hostname             (no quoting needed)
+        # Append extra arguments (everything after -- on the CLI) as separate
+        # tokens.  The command is executed via shell=True so each token appears
+        # exactly as the user typed it — no additional quoting is added.
         if extra_args:
-            command = command + " " + shlex.quote(" ".join(extra_args))
+            command = command + " " + " ".join(extra_args)
 
         # Resolve workdir: task-level > workspace.workdir > workspace.path > cluster workdir > cwd
         workdir = task.get(

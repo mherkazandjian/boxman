@@ -72,6 +72,20 @@ test:
 test-integration:
 	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_docker_compose.py
 
+#@help: run box provisioning integration tests (verbose=1, pytest_args="..." for extra flags)
+test-provision:
+	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_provision_boxes.py
+
+################
+#@group: \033[0;32mboxes\033[0m
+#@help: deprovision all boxes that have a conf.yml
+boxes-deprovision:
+	@for conf in boxes/*/conf.yml; do \
+		dir=$$(dirname "$$conf"); \
+		echo "==> Deprovisioning $$dir"; \
+		boxman --conf "$$conf" deprovision || true; \
+	done
+
 ################
 #@help: show this help message
 help:
