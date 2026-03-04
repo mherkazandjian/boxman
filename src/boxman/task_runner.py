@@ -22,11 +22,20 @@ the corresponding CLI flags use hyphens::
     # resolves to:
     # ansible all --limit node01 -m ansible.builtin.shell --become -a 'curl ifconfig.me'
 
-All tokens after ``--`` are space-joined and shell-quoted as **one argument**.
-This means ``-- curl ifconfig.me`` passes ``'curl ifconfig.me'`` as a single
-value — exactly what ansible's ``-a`` expects.  For flags that must remain
-separate tokens (e.g. ansible-playbook ``--limit``, ``--tags``) use dedicated
-``{{ placeholder }}`` markers instead of ``--``.
+By default, tokens after ``--`` are appended as separate arguments.  For
+tasks where they should be joined into a single shell-quoted argument
+(e.g. ansible ad-hoc ``-a``), set ``extra_args_mode: quoted``::
+
+    tasks:
+      cmd:
+        description: "run a shell command on all hosts"
+        command: ansible all -m ansible.builtin.shell -a
+        extra_args_mode: quoted    # joins extra args into one quoted string
+
+      site:
+        description: "run the site playbook"
+        command: ansible-playbook site.yml
+        # extra_args_mode: append  (default — keeps tokens separate)
 
 Placeholders that are not provided on the CLI are removed (replaced with
 the empty string).  The ``{{ name }}`` syntax is converted to ``{name}``
@@ -190,11 +199,16 @@ class TaskRunner:
         command = re.sub(r"\{(\w+)\}", _replace, command)
         command = re.sub(r" {2,}", " ", command).strip()
 
-        # Append extra arguments (everything after -- on the CLI) as separate
-        # tokens.  The command is executed via shell=True so each token appears
-        # exactly as the user typed it — no additional quoting is added.
+        # Append extra arguments (everything after -- on the CLI).
+        # "quoted" mode joins them into a single shell-quoted argument
+        # (useful for ansible -a); default "append" keeps them as separate tokens.
         if extra_args:
-            command = command + " " + " ".join(extra_args)
+            mode = task.get("extra_args_mode", "append")
+            if mode == "quoted":
+                import shlex
+                command = command + " " + shlex.quote(" ".join(extra_args))
+            else:
+                command = command + " " + " ".join(extra_args)
 
         # Resolve workdir: task-level > workspace.workdir > workspace.path > cluster workdir > cwd
         workdir = task.get(

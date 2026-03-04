@@ -152,3 +152,25 @@ clusters:
             link_state: 'up'
             network_source: 'isolated1'
 {% endfor %}
+
+tasks:
+  ping:
+    description: "ping all hosts via ansible"
+    command: ansible all {{ flags }} -m ansible.builtin.ping
+
+  cmd:
+    description: "run a shell command on all hosts"
+    command: ansible all {{ flags }} -m ansible.builtin.shell -a
+    extra_args_mode: quoted
+
+  site:
+    description: "run the full site playbook"
+    command: ansible-playbook {{ flags }} --become {{ env("ANSIBLE_SITE", default="ansible") }}/site.yml {{ tags }} --
+
+  playbook:
+    description: "run a specific playbook"
+    command: ansible-playbook {{ flags }} --become {{ env("ANSIBLE_SITE", default="ansible") }}/{{ playbook }} {{ tags }} --
+
+  ssh:
+    description: "ssh to the gateway host"
+    command: ssh -F ${SSH_CONFIG} -t ${GATEWAYHOST}

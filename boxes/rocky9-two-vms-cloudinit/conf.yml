@@ -212,6 +212,7 @@ tasks:
   cmd:
     description: "run a shell command on all hosts"
     command: ansible all {{ flags }} -m ansible.builtin.shell -a
+    extra_args_mode: quoted
 
   site:
     description: "run the full site playbook"

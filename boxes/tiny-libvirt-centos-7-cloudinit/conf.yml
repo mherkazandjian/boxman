@@ -159,24 +159,3 @@ clusters:
           - name: adapter_1
             link_state: 'up'
             network_source: 'nat1'
-
-tasks:
-  ping:
-    description: "ping all hosts via ansible"
-    command: ansible all {{ flags }} -m ansible.builtin.ping
-
-  cmd:
-    description: "run a shell command on all hosts"
-    command: ansible all {{ flags }} -m ansible.builtin.shell -a
-
-  site:
-    description: "run the full site playbook"
-    command: ansible-playbook {{ flags }} --become {{ env("ANSIBLE_SITE", default="ansible") }}/site.yml {{ tags }} --
-
-  playbook:
-    description: "run a specific playbook"
-    command: ansible-playbook {{ flags }} --become {{ env("ANSIBLE_SITE", default="ansible") }}/{{ playbook }} {{ tags }} --
-
-  ssh:
-    description: "ssh to the gateway host"
-    command: ssh -F ${SSH_CONFIG} -t ${GATEWAYHOST}
