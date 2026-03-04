@@ -154,7 +154,10 @@ DNF:
 \begin{lstlisting}
 sudo dnf install -y python3 python3-pip
 \end{lstlisting}
+\vspace{-0.4em}
+{\footnotesize\color{black!60}\textit{Hint: Some DNF-based distros may only provide Python 3.9; Boxman needs 3.10+, so consider conda or pyenv.}}
 
+\vspace{0.4em}
 We will use a virtual environment to isolate dependencies.
 
 \end{frame}
@@ -181,7 +184,7 @@ Install dependencies and project:
 
 \begin{lstlisting}
 pip install -r requirements.txt
-pip install .
+make install
 \end{lstlisting}
 
 Verify installation:
@@ -244,6 +247,8 @@ Start infrastructure:
 \begin{lstlisting}
 boxman up
 \end{lstlisting}
+\vspace{-0.4em}
+{\footnotesize\color{black!60}\textit{provision already starts the cluster, up can provision and start in case it wasn't provisioned.}}
 
 Check status:
 
@@ -254,7 +259,7 @@ boxman ps
 Direct libvirt check:
 
 \begin{lstlisting}
-virsh list
+virsh -c qemu:///system list
 \end{lstlisting}
 
 \end{frame}
@@ -266,13 +271,13 @@ virsh list
 SSH into VM:
 
 \begin{lstlisting}
-boxman ssh --vm node1
+boxman ssh 
 \end{lstlisting}
 
 Run a command on all nodes:
 
 \begin{lstlisting}
-boxman run --cluster "uptime"
+boxman run --cmd "uptime"
 \end{lstlisting}
 
 Great for automation and quick testing.
@@ -319,12 +324,6 @@ Destroy completely:
 
 \begin{lstlisting}
 boxman deprovision
-\end{lstlisting}
-
-Remove Docker runtime (if used):
-
-\begin{lstlisting}
-boxman destroy-runtime -y
 \end{lstlisting}
 
 \end{frame}
