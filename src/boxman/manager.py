@@ -2680,6 +2680,50 @@ class BoxmanManager:
             return f"{cluster_name}_{vm_name}"
         return identifier
 
+    def show_conf(self, cli_args, merged_provider=None):
+        """
+        Display the effective merged configuration.
+
+        Shows the merged provider config and the rendered project config.
+        With ``--json``, outputs a single JSON object.
+        """
+        as_json = getattr(cli_args, 'json', False)
+
+        # Read the rendered config file
+        rendered_config = None
+        if self.config_path:
+            config_dir = os.path.dirname(os.path.abspath(self.config_path))
+            config_basename = os.path.splitext(os.path.basename(self.config_path))[0]
+            rendered_path = os.path.join(config_dir, f"{config_basename}.rendered.yml")
+            if os.path.isfile(rendered_path):
+                with open(rendered_path) as fobj:
+                    rendered_config = fobj.read()
+
+        if as_json:
+            output = {
+                "provider": merged_provider or {},
+                "rendered_config": yaml.safe_load(rendered_config) if rendered_config else None,
+            }
+            print(json.dumps(output, indent=2, default=str))
+            return
+
+        # Plain text output
+        print("Provider config")
+        print("───────────────")
+        if merged_provider:
+            for key, value in merged_provider.items():
+                print(f"  {key}: {value}")
+        else:
+            print("  (none)")
+
+        print()
+        print("Rendered config")
+        print("───────────────")
+        if rendered_config:
+            print(rendered_config)
+        else:
+            print("  (conf.rendered.yml not found — run 'boxman provision' first)")
+
     @staticmethod
     def ps(cls, cli_args):
         """

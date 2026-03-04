@@ -628,6 +628,31 @@ def parse_args():
         dest='json'
     )
 
+    # ── conf ─────────────────────────────────────────────────────────
+    parser_conf = subparsers.add_parser(
+        'conf',
+        help='show the effective configuration',
+        description=(
+            "Display the effective merged configuration that boxman will use.\n"
+            "\n"
+            "Shows the merged provider config (defaults + boxman.yml + conf.yml)\n"
+            "and the rendered project config (conf.rendered.yml).\n"
+            "\n"
+            "examples:\n"
+            "    $ boxman conf\n"
+            "    $ boxman conf --json\n"
+        ),
+        formatter_class=RawTextHelpFormatter
+    )
+    parser_conf.set_defaults(func=BoxmanManager.show_conf)
+    parser_conf.add_argument(
+        '--json',
+        action='store_true',
+        default=False,
+        help='output as JSON',
+        dest='json'
+    )
+
     # ── ssh ──────────────────────────────────────────────────────────
     parser_ssh = subparsers.add_parser(
         'ssh',
@@ -973,6 +998,30 @@ def main():
             args.func(manager, args)
         finally:
             _boxman_logger.setLevel(logging.DEBUG)
+        sys.exit(0)
+
+    # Handle 'conf' — show effective merged configuration
+    if args.func == BoxmanManager.show_conf:
+        manager = BoxmanManager(config=args.conf)
+        if not manager.config:
+            log.error("no project config found (conf.yml)")
+            sys.exit(1)
+        boxman_config = load_boxman_config(os.path.expanduser(args.boxman_conf))
+        manager.load_app_config(boxman_config)
+        runtime = args.runtime or boxman_config.get('runtime', 'local')
+        manager.runtime = runtime
+        # Compute merged provider config (same logic as provision path)
+        provider_type = (
+            list(manager.config.get('provider', {}).keys())[0]
+            if 'provider' in manager.config else 'libvirt'
+        )
+        provider_conf_with_runtime = manager.get_provider_config_with_runtime(
+            boxman_config.get('providers', {}).get(provider_type, {})
+        )
+        project_provider = manager.config.get('provider', {}).get(provider_type, {})
+        merged_provider = provider_conf_with_runtime.copy()
+        merged_provider.update(project_provider)
+        args.func(manager, args, merged_provider=merged_provider)
         sys.exit(0)
 
     # Handle 'run' — needs config but not a provider session or runtime
