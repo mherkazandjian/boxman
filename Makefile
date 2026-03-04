@@ -10,6 +10,24 @@ clean:
 	@find . -type d -name '__pycache__' -exec rm -fvr '{}' \; || true
 	@find . -type f -name '__pycache__' -exec rm -fv '{}' \; || true
 
+#@help: remove .boxman directories (prompts before deleting)
+dev-clean:
+	@dirs=$$(find . -type d -name '.boxman' 2>/dev/null); \
+	if [ -z "$$dirs" ]; then \
+		echo "No .boxman directories found."; \
+	else \
+		echo "Found .boxman directories:"; \
+		echo "$$dirs"; \
+		echo ""; \
+		printf "Delete all? [y/N] "; \
+		read ans; \
+		if [ "$$ans" = "y" ] || [ "$$ans" = "Y" ]; then \
+			echo "$$dirs" | xargs sudo rm -rfv; \
+		else \
+			echo "Aborted."; \
+		fi; \
+	fi
+
 #@help: uninstall boxman package
 uninstall:
 	@pip uninstall -y boxman || true
