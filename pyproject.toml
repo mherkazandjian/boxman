@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "boxman"
-version = "1.0.0"
+version = "1.0.1.dev0"
 description = "Boxman (box manager) – declarative VM/container provisioning via YAML"
 authors = ["Mher Kazandjian <mherkazandjian@gmail.com>"]
 license = "MIT"
