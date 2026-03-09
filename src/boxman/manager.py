@@ -1011,13 +1011,35 @@ class BoxmanManager:
                 self._ensure_libvirt_storage_pool(workdir)
 
         def _clone(cluster, vm_info, new_vm_name):
-            self.logger.info(f"cloning vm {new_vm_name} from base image {cluster['base_image']}")
-            self.provider.clone_vm(
-                src_vm_name=cluster['base_image'],
-                new_vm_name=new_vm_name,
-                info=vm_info,
-                workdir=cluster['workdir']
-            )
+            max_retries = 5
+            boxman_logger = logging.getLogger('boxman')
+            for attempt in range(1, max_retries + 1):
+                last_attempt = attempt == max_retries
+                try:
+                    # Suppress error-level logs on all retryable attempts so
+                    # that transient pool-busy failures don't appear as errors.
+                    # Only the final attempt logs errors normally.
+                    if not last_attempt:
+                        boxman_logger.setLevel(logging.CRITICAL)
+                    self.provider.clone_vm(
+                        src_vm_name=cluster['base_image'],
+                        new_vm_name=new_vm_name,
+                        info=vm_info,
+                        workdir=cluster['workdir']
+                    )
+                    boxman_logger.setLevel(logging.DEBUG)
+                    return
+                except Exception as e:
+                    boxman_logger.setLevel(logging.DEBUG)
+                    if not last_attempt:
+                        delay = attempt * 2
+                        self.logger.warning(
+                            f"clone {new_vm_name} failed (attempt {attempt}/{max_retries}), "
+                            f"retrying in {delay}s"
+                        )
+                        time.sleep(delay)
+                    else:
+                        raise
 
         processes = [
             Process(target=_clone, args=(cluster, vm_info, new_vm_name))
