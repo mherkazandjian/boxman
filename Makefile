@@ -39,6 +39,7 @@ build:
 
 #@help: build and install the package
 install: build
+	@pip install poetry
 	@pip install --force-reinstall dist/*.whl
 #	@poetry install
 
