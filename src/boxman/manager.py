@@ -2330,7 +2330,9 @@ class BoxmanManager:
         [p.join() for p in processes]
 
         cls.destroy_networks()
-        cls.deprovision_files()
+
+        if getattr(cli_args, 'cleanup', False):
+            cls.deprovision_files()
 
         cls.unregister_from_cache()
 

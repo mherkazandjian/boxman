@@ -307,6 +307,13 @@ def parse_args():
         help='deprovision using the docker-compose setup',
         dest='docker_compose'
     )
+    parser_deprov.add_argument(
+        '--cleanup',
+        action='store_true',
+        default=False,
+        help='also remove provisioned files, SSH keys, and empty directories',
+        dest='cleanup'
+    )
 
     ##
     ## sub parser for the 'deprovision cluster' subsubcommand
