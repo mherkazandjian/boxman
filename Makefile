@@ -34,12 +34,12 @@ uninstall:
 
 #@help: build the package with poetry
 build:
+	@pip install poetry
 	@poetry build
 	@python3 scripts/repackage_wheel.py dist/*.whl
 
 #@help: build and install the package
 install: build
-	@pip install poetry
 	@pip install --force-reinstall dist/*.whl
 #	@poetry install
 
