@@ -362,6 +362,83 @@ class BoxmanManager:
             if files := cluster.get('files'):
                 write_files(files, rootdir=cluster['workdir'])
 
+    def deprovision_files(self) -> None:
+        """
+        Remove files and directories created during provisioning.
+
+        This includes:
+        - Files listed under workspace.files and cluster.files
+        - Generated SSH keys and ssh_config
+        - Cluster workdirs (if empty after cleanup)
+        """
+        workspace = self.config.get('workspace', {})
+        workspace_path = workspace.get('path', '')
+
+        # Remove files listed in workspace.files
+        if workspace_path:
+            if ws_files := workspace.get('files'):
+                self._remove_files(ws_files, rootdir=workspace_path)
+
+        clusters = self.config['clusters']
+        for cluster_name, cluster in clusters.items():
+            base_path = workspace_path or cluster.get('workdir', '')
+            base_path = os.path.expanduser(base_path)
+
+            # Remove files listed in cluster.files
+            if files := cluster.get('files'):
+                self._remove_files(files, rootdir=cluster['workdir'])
+
+            # Remove generated SSH keys
+            admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
+            ssh_key_files = {
+                admin_key_name: "",
+                f"{admin_key_name}.pub": "",
+            }
+            self._remove_files(ssh_key_files, rootdir=base_path)
+
+            # Remove generated ssh_config
+            ssh_config_name = cluster.get('ssh_config', 'ssh_config')
+            self._remove_files({ssh_config_name: ""}, rootdir=base_path)
+
+            # Remove cluster workdir if empty
+            cluster_workdir = os.path.expanduser(cluster.get('workdir', ''))
+            if cluster_workdir and os.path.isdir(cluster_workdir):
+                try:
+                    os.rmdir(cluster_workdir)
+                    log.info(f'removed empty directory {cluster_workdir}')
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _remove_files(files: Dict[str, str], rootdir: str = None) -> None:
+        rootdir_abs = os.path.normpath(os.path.expanduser(rootdir)) if rootdir else None
+        candidate_dirs: set = set()
+        for _fpath in files:
+            if rootdir:
+                fpath = os.path.join(rootdir, _fpath)
+            else:
+                fpath = _fpath
+            fpath = os.path.normpath(os.path.expanduser(fpath))
+            if os.path.exists(fpath):
+                os.remove(fpath)
+                log.info(f'removed file {fpath}')
+            # Collect all ancestor directories up to (but excluding) rootdir,
+            # even if the file was already gone — the dirs may still be empty.
+            dirpath = os.path.dirname(fpath)
+            while dirpath and dirpath != os.path.sep:
+                if rootdir_abs and dirpath == rootdir_abs:
+                    break
+                candidate_dirs.add(dirpath)
+                dirpath = os.path.dirname(dirpath)
+
+        # Remove empty directories (deepest first)
+        for dirpath in sorted(candidate_dirs, key=len, reverse=True):
+            try:
+                os.rmdir(dirpath)
+                log.info(f'removed empty directory {dirpath}')
+            except OSError:
+                pass
+
     @classmethod
     def full_network_name(cls,
                           project_config: Dict[str, Any],
@@ -2253,8 +2330,7 @@ class BoxmanManager:
         [p.join() for p in processes]
 
         cls.destroy_networks()
-        # .. todo:: implement undo'ing the provisioning of the files (not important for now)
-        #cls.provision_files()
+        cls.deprovision_files()
 
         cls.unregister_from_cache()
 
