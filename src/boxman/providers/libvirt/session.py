@@ -510,11 +510,13 @@ class LibVirtSession:
                         parts = line.split()
                         if len(parts) >= 4:
                             iface_name = parts[0]
-                            ip_address = parts[3].split('/')[0]
+                            raw_address = parts[3]
+                            if raw_address.startswith('N/A') or raw_address == '-':
+                                continue
+                            ip_address = raw_address.split('/')[0]
                             if (iface_name
                                     and iface_name != '-'
                                     and ip_address
-                                    and not ip_address.startswith('N/A')
                                     and ':' not in ip_address        # skip IPv6
                                     and not ip_address.startswith('127.')):  # skip loopback
                                 addrs[iface_name] = ip_address

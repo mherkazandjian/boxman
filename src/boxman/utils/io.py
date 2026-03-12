@@ -20,9 +20,10 @@ def write_files(files: Dict[str, str], rootdir: Optional[str] = None) -> None:
 
         fpath = os.path.normpath(os.path.expanduser(fpath))
 
-        # Do not overwrite an existing env.sh
-        if os.path.basename(fpath) == 'env.sh' and os.path.exists(fpath):
-            log.warning(f'env.sh already exists, skipping: {fpath}')
+        # Do not overwrite existing env.sh or ansible.cfg
+        basename = os.path.basename(fpath)
+        if basename in ('env.sh', 'ansible.cfg') and os.path.exists(fpath):
+            log.warning(f'{basename} already exists, skipping: {fpath}')
             continue
 
         log.info(f'provision file {fpath}')
