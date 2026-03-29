@@ -743,6 +743,24 @@ class BoxmanManager:
                     f"failed to create '{path}' inside container: "
                     f"{result.stderr.strip()}")
 
+    def validate_base_images(self) -> None:
+        """
+        Validate that every VM has a ``base_image`` — either from its own
+        config or inherited from the cluster level.  Raises ``ValueError``
+        listing all VMs that are missing one.
+        """
+        missing = []
+        for cluster_name, cluster in self.config.get('clusters', {}).items():
+            cluster_base = cluster.get('base_image', '')
+            for vm_name, vm_info in cluster.get('vms', {}).items():
+                if not vm_info.get('base_image') and not cluster_base:
+                    missing.append(f"{cluster_name}.vms.{vm_name}")
+        if missing:
+            raise ValueError(
+                f"the following VM(s) have no base_image (set it at the "
+                f"cluster or VM level): {', '.join(missing)}"
+            )
+
     def ensure_templates_exist(self) -> bool:
         """
         Check if any cluster's base_image refers to a template defined in the
@@ -764,12 +782,16 @@ class BoxmanManager:
             # also map by the key itself in case base_image uses the key
             tpl_name_to_key[tpl_key] = tpl_key
 
-        # collect which templates are referenced by clusters
+        # collect which templates are referenced by clusters or individual VMs
         needed_template_keys: set = set()
         for cluster_name, cluster in self.config.get('clusters', {}).items():
             base_image = cluster.get('base_image', '')
             if base_image in tpl_name_to_key:
                 needed_template_keys.add(tpl_name_to_key[base_image])
+            for vm_name, vm_info in cluster.get('vms', {}).items():
+                vm_base = vm_info.get('base_image', '')
+                if vm_base and vm_base in tpl_name_to_key:
+                    needed_template_keys.add(tpl_name_to_key[vm_base])
 
         if not needed_template_keys:
             return True  # no cluster uses a template as base_image
@@ -1098,8 +1120,14 @@ class BoxmanManager:
                     # Only the final attempt logs errors normally.
                     if not last_attempt:
                         boxman_logger.setLevel(logging.CRITICAL)
+                    src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
+                    if not src_vm_name:
+                        raise ValueError(
+                            f"no base_image for VM '{new_vm_name}': "
+                            f"set base_image at the cluster or VM level"
+                        )
                     self.provider.clone_vm(
-                        src_vm_name=cluster['base_image'],
+                        src_vm_name=src_vm_name,
                         new_vm_name=new_vm_name,
                         info=vm_info,
                         workdir=cluster['workdir']
@@ -2025,6 +2053,12 @@ class BoxmanManager:
             # Auto-create any template VMs that are referenced as base_image
             # but do not yet exist.
             cls.ensure_templates_exist()
+
+        try:
+            cls.validate_base_images()
+        except ValueError as exc:
+            cls.logger.error(str(exc))
+            return
 
         cls.provision_files()
 
