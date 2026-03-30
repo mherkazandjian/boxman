@@ -143,6 +143,12 @@ clusters:
               type: qcow2
             target: vdb
             size: 2048
+          #- name: disk02
+          #  driver:
+          #    name: qemu
+          #    type: qcow2
+          #  target: vdc
+          #  size: 2048
         network_adapters:
           - name: adapter_1
             link_state: 'up'

@@ -64,8 +64,17 @@ class TestVMStateDiffer:
             'sockets': 1,
             'cores': 2,
             'threads': 2,
-            'total_vcpus': 4
+            'total_vcpus': 4,
+            'current_vcpus': 4,  # no @current attr → falls back to total
         }
+
+    @patch.object(VirshEdit, 'get_domain_xml', return_value=SAMPLE_DOMAIN_XML_WITH_MAX)
+    def test_get_actual_cpu_with_max(self, mock_xml):
+        """When //vcpu has current='4' and text=16, current_vcpus should be 4."""
+        differ = self._make_differ()
+        cpu = differ.get_actual_cpu('test-vm')
+        assert cpu['total_vcpus'] == 16
+        assert cpu['current_vcpus'] == 4
 
     @patch.object(VirshEdit, 'get_domain_xml', return_value=SAMPLE_DOMAIN_XML)
     def test_get_actual_memory_mb(self, mock_xml):
@@ -100,7 +109,7 @@ class TestVMStateDiffer:
 
     @patch.object(VMStateDiffer, 'get_vm_state', return_value='running')
     @patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
-        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4})
+        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4, 'current_vcpus': 4})
     @patch.object(VMStateDiffer, 'get_actual_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
@@ -129,7 +138,7 @@ class TestVMStateDiffer:
 
     @patch.object(VMStateDiffer, 'get_vm_state', return_value='running')
     @patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
-        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4})
+        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4, 'current_vcpus': 4})
     @patch.object(VMStateDiffer, 'get_actual_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
@@ -150,7 +159,7 @@ class TestVMStateDiffer:
 
     @patch.object(VMStateDiffer, 'get_vm_state', return_value='shut off')
     @patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
-        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4})
+        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4, 'current_vcpus': 4})
     @patch.object(VMStateDiffer, 'get_actual_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
@@ -173,7 +182,7 @@ class TestVMStateDiffer:
 
     @patch.object(VMStateDiffer, 'get_vm_state', return_value='running')
     @patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
-        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4})
+        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4, 'current_vcpus': 4})
     @patch.object(VMStateDiffer, 'get_actual_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
@@ -202,7 +211,7 @@ class TestVMStateDiffer:
 
     @patch.object(VMStateDiffer, 'get_vm_state', return_value='running')
     @patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
-        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4})
+        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4, 'current_vcpus': 4})
     @patch.object(VMStateDiffer, 'get_actual_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
@@ -231,7 +240,7 @@ class TestVMStateDiffer:
 
     @patch.object(VMStateDiffer, 'get_vm_state', return_value='running')
     @patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
-        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4})
+        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4, 'current_vcpus': 4})
     @patch.object(VMStateDiffer, 'get_actual_memory_mb', return_value=4096)
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=4096)
@@ -438,7 +447,7 @@ class TestVMStateDifferMaxDiff:
 
     @patch.object(VMStateDiffer, 'get_vm_state', return_value='running')
     @patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
-        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4})
+        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4, 'current_vcpus': 4})
     @patch.object(VMStateDiffer, 'get_actual_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=16)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=16384)
@@ -461,7 +470,7 @@ class TestVMStateDifferMaxDiff:
 
     @patch.object(VMStateDiffer, 'get_vm_state', return_value='running')
     @patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
-        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4})
+        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4, 'current_vcpus': 4})
     @patch.object(VMStateDiffer, 'get_actual_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
@@ -484,7 +493,7 @@ class TestVMStateDifferMaxDiff:
 
     @patch.object(VMStateDiffer, 'get_vm_state', return_value='running')
     @patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
-        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4})
+        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4, 'current_vcpus': 4})
     @patch.object(VMStateDiffer, 'get_actual_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
@@ -507,7 +516,7 @@ class TestVMStateDifferMaxDiff:
 
     @patch.object(VMStateDiffer, 'get_vm_state', return_value='running')
     @patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
-        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4})
+        'sockets': 1, 'cores': 2, 'threads': 2, 'total_vcpus': 4, 'current_vcpus': 4})
     @patch.object(VMStateDiffer, 'get_actual_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
@@ -527,6 +536,33 @@ class TestVMStateDifferMaxDiff:
         )
         assert diff['max_vcpus_changed'] is False
         assert diff['max_memory_changed'] is False
+
+    @patch.object(VMStateDiffer, 'get_vm_state', return_value='running')
+    @patch.object(VMStateDiffer, 'get_actual_cpu', return_value={
+        'sockets': 4, 'cores': 2, 'threads': 2, 'total_vcpus': 16, 'current_vcpus': 4})
+    @patch.object(VMStateDiffer, 'get_actual_memory_mb', return_value=2048)
+    @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=16)
+    @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=16384)
+    @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[])
+    def test_diff_vm_scaled_sockets_no_false_cpu_change(
+            self, mock_disks, mock_max_mem, mock_max_cpu,
+            mock_mem, mock_cpu, mock_state):
+        """When XML sockets are scaled for max_vcpus (4*2*2=16) but desired
+        sockets=1 with same cores/threads (1*2*2=4 current), cpu_changed
+        should be False — the effective vCPU count hasn't changed."""
+        differ = self._make_differ()
+        diff = differ.diff_vm(
+            domain_name='test-vm',
+            desired_cpus={'sockets': 1, 'cores': 2, 'threads': 2},
+            desired_memory_mb=2048,
+            desired_disks=[],
+            workdir='/data',
+            disk_prefix='vm',
+            desired_max_vcpus=16,
+            desired_max_memory_mb=16384
+        )
+        assert diff['cpu_changed'] is False
+        assert diff['max_vcpus_changed'] is False
 
 
 # ---------------------------------------------------------------------------

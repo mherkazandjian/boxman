@@ -35,19 +35,31 @@ class VMStateDiffer:
         Get actual CPU topology from the domain XML.
 
         Returns:
-            Dict with 'sockets', 'cores', 'threads', 'total_vcpus' keys.
+            Dict with 'sockets', 'cores', 'threads', 'total_vcpus',
+            'current_vcpus' keys.  ``total_vcpus`` is the max ceiling
+            (``//vcpu`` text) and ``current_vcpus`` is the active count
+            (``//vcpu/@current``, falling back to ``total_vcpus``).
         """
         xml_content = self.virsh_edit.get_domain_xml(domain_name)
 
         vcpu_values = self.virsh_edit.find_xpath_values(xml_content, '//vcpu')
         total_vcpus = int(vcpu_values[0]) if vcpu_values else 1
 
+        from lxml import etree
+        tree = etree.fromstring(xml_content.encode('utf-8'))
+
+        # current active vCPU count (falls back to max when not set)
+        vcpu_elements = tree.xpath('//vcpu')
+        current_vcpus = total_vcpus
+        if vcpu_elements:
+            current_attr = vcpu_elements[0].get('current')
+            if current_attr is not None:
+                current_vcpus = int(current_attr)
+
         sockets = 1
         cores = 1
         threads = 1
 
-        from lxml import etree
-        tree = etree.fromstring(xml_content.encode('utf-8'))
         topology = tree.xpath('//cpu/topology')
         if topology:
             sockets = int(topology[0].get('sockets', '1'))
@@ -58,7 +70,8 @@ class VMStateDiffer:
             'sockets': sockets,
             'cores': cores,
             'threads': threads,
-            'total_vcpus': total_vcpus
+            'total_vcpus': total_vcpus,
+            'current_vcpus': current_vcpus,
         }
 
     def get_actual_memory_mb(self, domain_name: str) -> int:
@@ -215,8 +228,16 @@ class VMStateDiffer:
         actual_cpus = self.get_actual_cpu(domain_name)
         cpu_changed = False
         if desired_cpus:
+            desired_total = (desired_cpus.get('sockets', 1) *
+                             desired_cpus.get('cores', 1) *
+                             desired_cpus.get('threads', 1))
+            # Compare effective vCPU count and core/thread shape.
+            # Sockets in XML may be scaled up to satisfy max_vcpus, so
+            # comparing raw sockets would produce false positives.
+            actual_current = actual_cpus.get(
+                'current_vcpus', actual_cpus['total_vcpus'])
             cpu_changed = (
-                desired_cpus.get('sockets', 1) != actual_cpus['sockets'] or
+                desired_total != actual_current or
                 desired_cpus.get('cores', 1) != actual_cpus['cores'] or
                 desired_cpus.get('threads', 1) != actual_cpus['threads']
             )
