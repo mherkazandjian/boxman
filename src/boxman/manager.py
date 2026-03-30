@@ -1280,6 +1280,23 @@ class BoxmanManager:
         )
         self.provider.destroy_vm(full_vm_name, force=True)
 
+    def _destroy_removed_vm(self, full_vm_name: str, workdir: str) -> None:
+        """
+        Destroy a VM that has been removed from the config.
+
+        Uses destroy_vm + destroy_disks with an empty disk list since we
+        no longer have the disk config for this VM. The glob-based cleanup
+        in destroy_disks catches all {vm_name}* artifacts.
+        """
+        self.logger.info(f"removing VM {full_vm_name} (no longer in config)")
+        self.provider.destroy_vm(full_vm_name)
+        self.provider.destroy_disks(
+            workdir,
+            vm_name=full_vm_name,
+            disks=[]
+        )
+        self.provider.destroy_vm(full_vm_name, force=True)
+
     def configure_and_start_vms(self) -> None:
         """
         Configure (cpu/mem, network interfaces, disks) and start all VMs in parallel.
@@ -1938,6 +1955,40 @@ class BoxmanManager:
             v.strip() for v in result.stdout.strip().split("\n") if v.strip()
         }
         return [vm for vm in expected if vm in existing]
+
+    def _find_all_existing_project_vms(self) -> list[str]:
+        """
+        Query libvirt and return ALL VM names that belong to this project
+        (match the project prefix), regardless of whether they appear in
+        the current config.
+        """
+        project = self.config.get("project", "")
+        prj_prefix = f"bprj__{project}__bprj_"
+
+        provider_type = (
+            list(self.config.get('provider', {}).keys())[0]
+            if 'provider' in self.config else 'libvirt'
+        )
+        provider_config = self.config.get('provider', {}).get(provider_type, {})
+        if self.app_config and 'providers' in self.app_config:
+            app_prov = self.app_config['providers'].get(provider_type, {})
+            merged = app_prov.copy()
+            merged.update(provider_config)
+            provider_config = merged
+        if hasattr(self, 'runtime_instance'):
+            provider_config = self.runtime_instance.inject_into_provider_config(
+                provider_config)
+
+        virsh = VirshCommand(provider_config=provider_config)
+        result = virsh.execute("list", "--all", "--name", hide=True, warn=True)
+        if not result.ok:
+            self.logger.warning("could not query existing VMs via virsh")
+            return []
+
+        return [
+            v.strip() for v in result.stdout.strip().split("\n")
+            if v.strip() and v.strip().startswith(prj_prefix)
+        ]
 
     def _get_vm_states(self) -> dict[str, str]:
         """
@@ -3213,9 +3264,14 @@ class BoxmanManager:
           - CPU/memory changes are applied (hot if possible, cold otherwise)
           - New disks are created and attached
           - Existing disks are resized (grow only)
+          - Removed VMs (in libvirt but no longer in config) are destroyed
+
+        Use --dry-run to preview changes without applying them.
+        Use --yes to skip the confirmation prompt for VM removal.
         """
         config = cls.config
         dry_run = getattr(cli_args, 'dry_run', False)
+        auto_accept = getattr(cli_args, 'yes', False)
 
         cluster_group = list(config['clusters'].keys())[0]
         cluster = config['clusters'][cluster_group]
@@ -3227,24 +3283,43 @@ class BoxmanManager:
 
         # --- categorize VMs ---
         expected_vms = set(cls._get_project_vm_names())
-        existing_vms = set(cls._find_existing_project_vms())
+        all_existing_vms = set(cls._find_all_existing_project_vms())
 
-        if not expected_vms:
-            cls.logger.error("no VMs defined in configuration")
+        new_vm_names = expected_vms - all_existing_vms
+        update_vm_names = expected_vms & all_existing_vms
+        removed_vm_names = all_existing_vms - expected_vms
+
+        if not new_vm_names and not update_vm_names and not removed_vm_names:
+            cls.logger.info("no VMs to add, update, or remove")
             return
 
-        new_vm_names = expected_vms - existing_vms
-        update_vm_names = expected_vms & existing_vms
+        # --- summary ---
+        if new_vm_names:
+            short = [n.split('_')[-1] for n in sorted(new_vm_names)]
+            cls.logger.info(f"VM(s) to add: {', '.join(short)}")
+        if update_vm_names:
+            short = [n.split('_')[-1] for n in sorted(update_vm_names)]
+            cls.logger.info(f"VM(s) to update: {', '.join(short)}")
+        if removed_vm_names:
+            short = [n.split('_')[-1] for n in sorted(removed_vm_names)]
+            cls.logger.info(f"VM(s) to remove: {', '.join(short)}")
 
-        if not new_vm_names and not update_vm_names:
-            cls.logger.info("no VMs to update or add")
-            return
+        # --- confirmation for destructive removal ---
+        if removed_vm_names and not dry_run and not auto_accept:
+            short = [n.split('_')[-1] for n in sorted(removed_vm_names)]
+            print(
+                f"\nThe following VM(s) will be permanently destroyed: "
+                f"{', '.join(short)}")
+            print(
+                "This will stop the VM(s), remove their disks, and "
+                "clean up all associated resources.\n")
+            answer = input("Proceed? [y/N] ").strip().lower()
+            if answer not in ("y", "yes"):
+                print("Aborted.")
+                return
 
         # --- handle new VMs ---
         if new_vm_names:
-            short_names = [n.split('_')[-1] for n in sorted(new_vm_names)]
-            cls.logger.info(f"new VM(s) to add: {', '.join(short_names)}")
-
             if dry_run:
                 cls.logger.info("[dry-run] would clone and configure new VMs")
             else:
@@ -3333,6 +3408,28 @@ class BoxmanManager:
                 cls.logger.error(f"failed: {', '.join(failed)}")
                 for vm_name in failed:
                     cls.logger.error(f"  {vm_name}: {results[vm_name]['details']}")
+
+        # --- handle removed VMs ---
+        if removed_vm_names:
+            if dry_run:
+                cls.logger.info("[dry-run] would destroy the following VMs:")
+                for vm_name in sorted(removed_vm_names):
+                    cls.logger.info(f"  {vm_name}")
+            else:
+                processes = [
+                    Process(
+                        target=cls._destroy_removed_vm,
+                        args=(vm_name, workdir)
+                    )
+                    for vm_name in removed_vm_names
+                ]
+                [p.start() for p in processes]
+                [p.join() for p in processes]
+
+                short = [n.split('_')[-1] for n in sorted(removed_vm_names)]
+                cls.logger.info(
+                    f"removed {len(removed_vm_names)} VM(s): "
+                    f"{', '.join(short)}")
 
         # regenerate SSH config and display connect info
         if not dry_run:

@@ -274,7 +274,7 @@ def parse_args():
     #
     parser_update = subparsers.add_parser(
         'update',
-        help='apply config changes to already-provisioned VMs (CPU, memory, disks, new VMs)')
+        help='apply config changes to already-provisioned VMs (CPU, memory, disks, add/remove VMs)')
     parser_update.set_defaults(func=BoxmanManager.update)
     parser_update.add_argument(
         '--dry-run',
@@ -289,6 +289,13 @@ def parse_args():
         default=False,
         help='use the docker-compose setup',
         dest='docker_compose'
+    )
+    parser_update.add_argument(
+        '--yes', '-y',
+        action='store_true',
+        default=False,
+        help='skip confirmation prompt for VM removal',
+        dest='yes'
     )
 
     #
