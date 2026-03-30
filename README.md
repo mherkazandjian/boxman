@@ -17,6 +17,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - **Image caching**: downloaded cloud base images are stored in a local cache directory so the same image is only downloaded once across multiple projects
 - **Runtime environments**: execute provider commands locally or inside a Docker container
 - **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
+- **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow disks
 
 ## Quick Start
 
@@ -352,10 +353,54 @@ This project is licensed under the [MIT License](../LICENSE).
   - `control save` — save the state of VMs
   - `control start` — start VMs
 - `export` — export VMs
+- `update` — apply config changes to a running project (add/remove VMs, update CPU/memory/disks)
 - `import` — import VMs
 - `run` — run tasks with the workspace environment loaded
 - `ps` — show the state of VMs in the project (`-p` adds provider-specific columns, `--json` outputs JSON)
 - `ssh` — ssh into a VM
+
+## Updating a Running Project
+
+The `update` command applies incremental changes to an already-provisioned project.
+Edit `conf.yml` and run `boxman update` to reconcile the live state with the config.
+
+### What can be updated
+
+- **Add VMs**: add new VM entries to a cluster's `vms:` section — they will be
+  cloned from the base template, configured, and started
+- **Remove VMs**: remove VM entries from the config — running VMs will be
+  shut down, undefined, and their disks cleaned up
+- **CPU and memory**: change `cpus` or `memory` on existing VMs — applied live
+  (hot-plug) when possible, otherwise a restart is flagged
+- **Add disks**: add new disk entries to a VM's `disks:` section — they will be
+  created and attached
+- **Grow disks**: increase the `size` of an existing disk — the disk image is
+  resized in place (shrinking is not supported)
+
+### What cannot be updated
+
+- **Networks**: adding, removing, or modifying network definitions requires a
+  full deprovision/provision cycle
+- **Network adapters on existing VMs**: changing `network_adapters` on a VM that
+  is already provisioned is not applied by update
+- **Base image / template**: changing the `base_image` of an existing VM has no
+  effect — the VM was already cloned from the original template
+- **Hostname**: changing the `hostname` of an existing VM is not applied
+  (cloud-init ran at first boot only)
+- **Disk shrinking**: existing disks can only be grown, never shrunk
+
+### Usage
+
+```bash
+# Preview what would change without applying
+boxman update --dry-run
+
+# Apply changes (prompts for confirmation before destroying VMs)
+boxman update
+
+# Apply changes without confirmation prompt
+boxman update --yes
+```
 
 ## Tasks
 
