@@ -270,6 +270,28 @@ def parse_args():
     )
 
     #
+    # sub parser for the 'update' subcommand
+    #
+    parser_update = subparsers.add_parser(
+        'update',
+        help='apply config changes to already-provisioned VMs (CPU, memory, disks, new VMs)')
+    parser_update.set_defaults(func=BoxmanManager.update)
+    parser_update.add_argument(
+        '--dry-run',
+        action='store_true',
+        default=False,
+        help='show what would change without applying modifications',
+        dest='dry_run'
+    )
+    parser_update.add_argument(
+        '--docker-compose',
+        action='store_true',
+        default=False,
+        help='use the docker-compose setup',
+        dest='docker_compose'
+    )
+
+    #
     # sub parser for the 'down' subcommand
     #
     parser_down = subparsers.add_parser(

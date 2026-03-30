@@ -134,6 +134,8 @@ clusters:
           cores: 2
           threads: 2
         memory: 2048
+        max_vcpus: 16       # max vCPU ceiling for hot-scaling (default: sockets*cores*threads)
+        max_memory: 16384   # max memory ceiling in MB for hot-scaling (default: same as memory)
         disks:
           - name: disk01
             driver:

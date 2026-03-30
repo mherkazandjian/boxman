@@ -188,7 +188,7 @@ clusters:
         hostname: node02
         cpus:
           sockets: 1
-          cores: 2
+          cores: 4
           threads: 1
         memory: 2048
         disks:

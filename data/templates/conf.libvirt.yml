@@ -69,6 +69,8 @@ clusters:
           cores: 1
           threads: 1
         memory: 2048
+        # max_vcpus: 16       # max vCPU ceiling for hot-scaling (default: sockets*cores*threads)
+        # max_memory: 16384   # max memory ceiling in MB for hot-scaling (default: same as memory)
         network_adapters:
           - name: adapter_1
             link_state: 'up'

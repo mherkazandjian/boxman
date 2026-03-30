@@ -889,7 +889,9 @@ class LibVirtSession:
     def configure_vm_cpu_memory(self,
                                 vm_name: str,
                                 cpus: Optional[Dict[str, int]] = None,
-                                memory_mb: Optional[int] = None) -> bool:
+                                memory_mb: Optional[int] = None,
+                                max_vcpus: Optional[int] = None,
+                                max_memory_mb: Optional[int] = None) -> bool:
         """
         Configure cpu and memory settings for a vm.
 
@@ -897,9 +899,270 @@ class LibVirtSession:
             vm_name: Name of the vm
             cpus: Dictionary with 'sockets', 'cores', 'threads' keys
             memory_mb: Memory in MB
+            max_vcpus: Maximum vCPU ceiling for hot-scaling
+            max_memory_mb: Maximum memory ceiling in MB for hot-scaling
 
         Returns:
             True if successful, False otherwise
         """
         editor = VirshEdit(provider_config=self.provider_config)
-        return editor.configure_cpu_memory(vm_name, cpus, memory_mb)
+        return editor.configure_cpu_memory(
+            vm_name, cpus, memory_mb,
+            max_vcpus=max_vcpus, max_memory_mb=max_memory_mb)
+
+    ### update operations (for `boxman update`)
+
+    def shutdown_and_wait(self, vm_name: str, timeout: int = 60) -> bool:
+        """
+        Gracefully shut down a VM and wait until it reaches 'shut off' state.
+
+        Falls back to virsh destroy (force stop) if the timeout is exceeded.
+
+        Args:
+            vm_name: Name of the VM
+            timeout: Maximum seconds to wait for graceful shutdown
+
+        Returns:
+            True if the VM is shut off, False otherwise
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+
+        # check current state
+        result = virsh.execute('domstate', vm_name, warn=True)
+        if result.ok and 'shut off' in result.stdout:
+            return True
+
+        # attempt graceful shutdown
+        self.logger.info(f"shutting down VM {vm_name}...")
+        virsh.execute('shutdown', vm_name, warn=True)
+
+        # poll for shut off
+        waited = 0
+        poll_interval = 2
+        while waited < timeout:
+            time.sleep(poll_interval)
+            waited += poll_interval
+            result = virsh.execute('domstate', vm_name, warn=True)
+            if result.ok and 'shut off' in result.stdout:
+                self.logger.info(f"VM {vm_name} is shut off after {waited}s")
+                return True
+
+        # force stop as fallback
+        self.logger.warning(
+            f"VM {vm_name} did not shut off within {timeout}s, forcing stop")
+        virsh.execute('destroy', vm_name, warn=True)
+        time.sleep(2)
+
+        result = virsh.execute('domstate', vm_name, warn=True)
+        if result.ok and 'shut off' in result.stdout:
+            return True
+
+        self.logger.error(f"failed to shut off VM {vm_name}")
+        return False
+
+    def update_vm_cpu_memory(self,
+                             vm_name: str,
+                             cpus: Optional[Dict[str, int]],
+                             memory_mb: Optional[int],
+                             vm_state: str,
+                             actual_cpus: Dict[str, int],
+                             actual_memory_mb: int,
+                             max_vcpus: Optional[int] = None,
+                             max_memory_mb: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Apply CPU and/or memory changes, choosing hot or cold path.
+
+        Args:
+            vm_name: Full VM domain name
+            cpus: Desired CPU topology (sockets, cores, threads) or None
+            memory_mb: Desired memory in MiB or None
+            vm_state: Current VM state string
+            actual_cpus: Current CPU topology dict
+            actual_memory_mb: Current memory in MiB
+            max_vcpus: Desired max vCPU ceiling or None
+            max_memory_mb: Desired max memory ceiling in MiB or None
+
+        Returns:
+            Dict with 'success', 'method' ('hot'/'cold'), 'restart_needed' keys
+        """
+        editor = VirshEdit(provider_config=self.provider_config)
+        is_running = vm_state == 'running'
+
+        if not is_running:
+            # VM is stopped — use cold XML redefine
+            success = editor.configure_cpu_memory(
+                vm_name, cpus, memory_mb,
+                max_vcpus=max_vcpus, max_memory_mb=max_memory_mb)
+            return {'success': success, 'method': 'cold', 'restart_needed': False}
+
+        # VM is running — update persistent config and apply live where
+        # possible. Libvirt does NOT allow raising the live maximum vCPU
+        # or memory ceiling on a running VM, so increases beyond the
+        # current max require a restart.
+        #
+        # Strategy:
+        # 1. Update the persistent (inactive) config in ONE shot via
+        #    virsh dumpxml --inactive + modify + virsh define.
+        # 2. For changes within the current live ceiling: hot-set live.
+        # 3. For changes exceeding the ceiling: flag restart_needed.
+
+        # --- Step 1: update persistent config (inactive XML) ---
+        xml_content = editor.get_domain_xml(vm_name, inactive=True)
+        modifications = []
+
+        desired_total = None
+        if cpus:
+            sockets = cpus.get('sockets', 1)
+            cores = cpus.get('cores', 1)
+            threads = cpus.get('threads', 1)
+            desired_total = sockets * cores * threads
+
+            effective_max_vcpus = max_vcpus or desired_total
+            if max_vcpus is not None and max_vcpus < desired_total:
+                effective_max_vcpus = desired_total
+
+            modifications.append(('//vcpu', 'text', str(effective_max_vcpus)))
+
+            if effective_max_vcpus > desired_total:
+                # libvirt requires topology product == max vcpu count.
+                # scale sockets so that sockets * cores * threads == max.
+                cores_x_threads = cores * threads
+                if effective_max_vcpus % cores_x_threads == 0:
+                    max_sockets = effective_max_vcpus // cores_x_threads
+                    modifications.extend([
+                        ('//cpu/topology', 'sockets', str(max_sockets)),
+                        ('//cpu/topology', 'cores', str(cores)),
+                        ('//cpu/topology', 'threads', str(threads)),
+                    ])
+                else:
+                    # can't express with given cores*threads, remove topology
+                    from lxml import etree
+                    tree = etree.fromstring(xml_content.encode('utf-8'))
+                    for topo in tree.xpath('//cpu/topology'):
+                        topo.getparent().remove(topo)
+                    xml_content = etree.tostring(
+                        tree, encoding='unicode', pretty_print=True)
+
+                modifications.append(
+                    ('//vcpu', 'current', str(desired_total)))
+            else:
+                modifications.extend([
+                    ('//cpu/topology', 'sockets', str(sockets)),
+                    ('//cpu/topology', 'cores', str(cores)),
+                    ('//cpu/topology', 'threads', str(threads)),
+                ])
+
+        if memory_mb is not None and (memory_mb != actual_memory_mb or max_memory_mb is not None):
+            effective_max_memory = max_memory_mb or memory_mb
+            if max_memory_mb is not None and max_memory_mb < memory_mb:
+                effective_max_memory = memory_mb
+            max_memory_kib = effective_max_memory * 1024
+            current_memory_kib = memory_mb * 1024
+            modifications.extend([
+                ('//memory', 'text', str(max_memory_kib)),
+                ('//currentMemory', 'text', str(current_memory_kib)),
+            ])
+
+        if modifications:
+            modified_xml = editor.modify_xml_xpath(xml_content, modifications)
+            if not editor.redefine_domain(vm_name, modified_xml):
+                self.logger.error(
+                    f"VM {vm_name}: failed to update persistent config")
+                return {'success': False, 'method': 'hot', 'restart_needed': False}
+
+        # --- Step 2 & 3: live changes ---
+        restart_needed = False
+        success = True
+
+        if cpus and desired_total:
+            current_max = actual_cpus.get('total_vcpus', 1)
+            if desired_total <= current_max:
+                if not editor.hot_set_vcpus(vm_name, desired_total):
+                    # hot-unplug may not be supported; fall back to restart
+                    self.logger.info(
+                        f"VM {vm_name}: live vCPU change failed, "
+                        f"will restart to apply")
+                    restart_needed = True
+            else:
+                # live max can't be raised on a running VM
+                restart_needed = True
+
+        if memory_mb is not None and memory_mb != actual_memory_mb:
+            from .vm_differ import VMStateDiffer
+            differ = VMStateDiffer(provider_config=self.provider_config)
+            current_max_mem = differ.get_max_memory_mb(vm_name)
+
+            if memory_mb <= current_max_mem:
+                if not editor.hot_set_memory(vm_name, memory_mb):
+                    # hot memory change failed; fall back to restart
+                    self.logger.info(
+                        f"VM {vm_name}: live memory change failed, "
+                        f"will restart to apply")
+                    restart_needed = True
+            else:
+                # live max can't be raised on a running VM
+                restart_needed = True
+
+        if restart_needed:
+            self.logger.info(
+                f"VM {vm_name}: persistent config updated. "
+                f"Restart needed for changes to take effect "
+                f"(live max ceiling cannot be raised on a running VM).")
+
+        method = 'cold' if restart_needed else 'hot'
+        return {'success': success, 'method': method, 'restart_needed': restart_needed}
+
+    def update_vm_disks(self,
+                        vm_name: str,
+                        new_disks: List[Dict[str, Any]],
+                        resize_disks: List[Dict[str, Any]],
+                        workdir: str,
+                        disk_prefix: str,
+                        vm_running: bool) -> bool:
+        """
+        Apply disk changes: create+attach new disks and resize existing ones.
+
+        Args:
+            vm_name: Full VM domain name
+            new_disks: List of disk configs to create and attach
+            resize_disks: List of dicts with target, source, desired_size_mb
+            workdir: Working directory for disk images
+            disk_prefix: Prefix for disk image filenames
+            vm_running: Whether the VM is currently running
+
+        Returns:
+            True if all operations succeeded, False otherwise
+        """
+        success = True
+        disk_manager = DiskManager(vm_name=vm_name, provider_config=self.provider_config)
+
+        # create and attach new disks
+        for disk_config in new_disks:
+            self.logger.info(
+                f"adding new disk '{disk_config.get('name', 'disk')}' "
+                f"to VM {vm_name}")
+            if not disk_manager.configure_from_disk_config(
+                disk_config=disk_config,
+                workdir=workdir,
+                disk_prefix=disk_prefix
+            ):
+                self.logger.error(
+                    f"failed to add disk '{disk_config.get('name')}' to {vm_name}")
+                success = False
+
+        # resize existing disks
+        for resize_info in resize_disks:
+            self.logger.info(
+                f"resizing disk {resize_info['target']} on {vm_name} from "
+                f"{resize_info['current_size_mb']}M to {resize_info['desired_size_mb']}M")
+            if not disk_manager.resize_disk(
+                disk_path=resize_info['source'],
+                target_dev=resize_info['target'],
+                new_size_mb=resize_info['desired_size_mb'],
+                vm_running=vm_running
+            ):
+                self.logger.error(
+                    f"failed to resize disk {resize_info['target']} on {vm_name}")
+                success = False
+
+        return success

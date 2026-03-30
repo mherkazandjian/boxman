@@ -1194,10 +1194,13 @@ class BoxmanManager:
         # cpu / memory
         cpus = vm_info.get('cpus')
         memory = vm_info.get('memory')
+        max_vcpus = vm_info.get('max_vcpus')
+        max_memory = vm_info.get('max_memory')
         if cpus or memory:
             self.logger.info(f"configuring cpu and memory for vm {vm_name}")
             success = self.provider.configure_vm_cpu_memory(
-                vm_name=full_vm_name, cpus=cpus, memory_mb=memory
+                vm_name=full_vm_name, cpus=cpus, memory_mb=memory,
+                max_vcpus=max_vcpus, max_memory_mb=max_memory
             )
             if success:
                 self.logger.info(f"successfully configured cpu and memory for vm {vm_name}")
@@ -2961,3 +2964,379 @@ class BoxmanManager:
             sys.exit(exit_code)
 
     ### end task runner functions ####
+
+    ### update (runtime modification) functions ####
+
+    def _clone_and_configure_new_vms(self, new_vm_names: set) -> None:
+        """
+        Clone and configure only the VMs whose full names are in new_vm_names.
+
+        Reuses the same logic as provision (clone + configure + start) but
+        filters to just the specified VMs.
+        """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+
+        # pre-define storage pools for workdirs of new VMs
+        seen_workdirs: set = set()
+        for cluster_name, cluster in self.config['clusters'].items():
+            for vm_name in cluster['vms']:
+                full = f"{prj_name}_{cluster_name}_{vm_name}"
+                if full in new_vm_names:
+                    workdir = os.path.abspath(os.path.expanduser(cluster['workdir']))
+                    if workdir not in seen_workdirs:
+                        seen_workdirs.add(workdir)
+                        self._ensure_libvirt_storage_pool(workdir)
+
+        # clone new VMs (parallel with retry)
+        def _clone(cluster, vm_info, new_vm_name):
+            max_retries = 5
+            boxman_logger = logging.getLogger('boxman')
+            for attempt in range(1, max_retries + 1):
+                last_attempt = attempt == max_retries
+                try:
+                    if not last_attempt:
+                        boxman_logger.setLevel(logging.CRITICAL)
+                    src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
+                    if not src_vm_name:
+                        raise ValueError(
+                            f"no base_image for VM '{new_vm_name}': "
+                            f"set base_image at the cluster or VM level"
+                        )
+                    self.provider.clone_vm(
+                        src_vm_name=src_vm_name,
+                        new_vm_name=new_vm_name,
+                        info=vm_info,
+                        workdir=cluster['workdir']
+                    )
+                    boxman_logger.setLevel(logging.DEBUG)
+                    return
+                except Exception as e:
+                    boxman_logger.setLevel(logging.DEBUG)
+                    if not last_attempt:
+                        delay = attempt * 2
+                        self.logger.warning(
+                            f"clone {new_vm_name} failed (attempt {attempt}/{max_retries}), "
+                            f"retrying in {delay}s"
+                        )
+                        time.sleep(delay)
+                    else:
+                        raise
+
+        clone_tasks = []
+        for cluster_name, cluster in self.config['clusters'].items():
+            for vm_name, vm_info in cluster['vms'].items():
+                full = f"{prj_name}_{cluster_name}_{vm_name}"
+                if full in new_vm_names:
+                    clone_tasks.append((cluster, vm_info.copy(), full))
+
+        processes = [
+            Process(target=_clone, args=(cluster, vm_info, new_vm_name))
+            for cluster, vm_info, new_vm_name in clone_tasks
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+        # configure and start new VMs (parallel)
+        configure_tasks = []
+        for cluster_name, cluster in self.config['clusters'].items():
+            for vm_name, vm_info in cluster['vms'].items():
+                full = f"{prj_name}_{cluster_name}_{vm_name}"
+                if full in new_vm_names:
+                    configure_tasks.append((cluster_name, cluster, vm_name, vm_info))
+
+        processes = [
+            Process(
+                target=self._configure_and_start_vm,
+                args=(cluster_name, cluster, vm_name, vm_info)
+            )
+            for cluster_name, cluster, vm_name, vm_info in configure_tasks
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+    def _update_single_vm(
+        self,
+        cluster_name: str,
+        cluster: Dict[str, Any],
+        vm_name: str,
+        vm_info: Dict[str, Any],
+        result_queue: Queue,
+        dry_run: bool = False,
+    ) -> None:
+        """
+        Diff and apply updates to a single existing VM. Runs in its own process.
+
+        Results are put into result_queue as:
+            (vm_name, {'status': 'no_change'|'updated'|'needs_restart'|'failed', 'details': str})
+        """
+        from boxman.providers.libvirt.vm_differ import VMStateDiffer
+
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+        workdir = os.path.abspath(os.path.expanduser(cluster.get('workdir', '.')))
+
+        try:
+            differ = VMStateDiffer(provider_config=self.provider.provider_config)
+            diff = differ.diff_vm(
+                domain_name=full_vm_name,
+                desired_cpus=vm_info.get('cpus'),
+                desired_memory_mb=vm_info.get('memory'),
+                desired_disks=vm_info.get('disks'),
+                workdir=workdir,
+                disk_prefix=full_vm_name,
+                desired_max_vcpus=vm_info.get('max_vcpus'),
+                desired_max_memory_mb=vm_info.get('max_memory')
+            )
+
+            has_changes = (
+                diff['cpu_changed'] or
+                diff['memory_changed'] or
+                diff['max_vcpus_changed'] or
+                diff['max_memory_changed'] or
+                diff['new_disks'] or
+                diff['resize_disks']
+            )
+
+            if not has_changes:
+                self.logger.info(f"VM {vm_name}: no changes detected")
+                result_queue.put((vm_name, {'status': 'no_change', 'details': ''}))
+                return
+
+            # log the diff
+            changes = []
+            if diff['cpu_changed']:
+                changes.append(
+                    f"CPU: {diff['actual_cpus']} -> {diff['desired_cpus']}")
+            if diff['memory_changed']:
+                changes.append(
+                    f"memory: {diff['actual_memory_mb']}M -> {diff['desired_memory_mb']}M")
+            if diff['max_vcpus_changed']:
+                changes.append(
+                    f"max_vcpus: {diff['actual_max_vcpus']} -> {diff['desired_max_vcpus']}")
+            if diff['max_memory_changed']:
+                changes.append(
+                    f"max_memory: {diff['actual_max_memory_mb']}M -> {diff['desired_max_memory_mb']}M")
+            if diff['new_disks']:
+                names = [d.get('name', '?') for d in diff['new_disks']]
+                changes.append(f"new disks: {', '.join(names)}")
+            if diff['resize_disks']:
+                resizes = [
+                    f"{r['target']} {r['current_size_mb']}M->{r['desired_size_mb']}M"
+                    for r in diff['resize_disks']
+                ]
+                changes.append(f"resize disks: {', '.join(resizes)}")
+
+            self.logger.info(f"VM {vm_name}: changes detected: {'; '.join(changes)}")
+
+            if dry_run:
+                result_queue.put((vm_name, {
+                    'status': 'dry_run',
+                    'details': '; '.join(changes)
+                }))
+                return
+
+            # apply changes
+            vm_running = diff['vm_state'] == 'running'
+            restart_needed = False
+
+            # CPU / memory / max ceilings
+            if (diff['cpu_changed'] or diff['memory_changed'] or
+                    diff['max_vcpus_changed'] or diff['max_memory_changed']):
+                cpu_mem_result = self.provider.update_vm_cpu_memory(
+                    vm_name=full_vm_name,
+                    cpus=diff['desired_cpus'] if diff['cpu_changed'] else None,
+                    memory_mb=diff['desired_memory_mb'] if diff['memory_changed'] else None,
+                    vm_state=diff['vm_state'],
+                    actual_cpus=diff['actual_cpus'],
+                    actual_memory_mb=diff['actual_memory_mb'],
+                    max_vcpus=diff.get('desired_max_vcpus'),
+                    max_memory_mb=diff.get('desired_max_memory_mb')
+                )
+                if not cpu_mem_result['success']:
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': 'CPU/memory update failed'
+                    }))
+                    return
+                if cpu_mem_result['restart_needed']:
+                    restart_needed = True
+
+            # disks
+            if diff['new_disks'] or diff['resize_disks']:
+                disk_ok = self.provider.update_vm_disks(
+                    vm_name=full_vm_name,
+                    new_disks=diff['new_disks'],
+                    resize_disks=diff['resize_disks'],
+                    workdir=workdir,
+                    disk_prefix=full_vm_name,
+                    vm_running=vm_running
+                )
+                if not disk_ok:
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': 'disk update failed'
+                    }))
+                    return
+
+            # handle restart if needed
+            if restart_needed and vm_running:
+                self.logger.info(
+                    f"VM {vm_name}: restarting to apply changes "
+                    f"(live max ceiling cannot be raised)")
+                self.provider.shutdown_and_wait(full_vm_name)
+                self.provider.start_vm(full_vm_name)
+                result_queue.put((vm_name, {
+                    'status': 'updated',
+                    'details': '; '.join(changes) + ' (restarted)'
+                }))
+            else:
+                result_queue.put((vm_name, {
+                    'status': 'updated',
+                    'details': '; '.join(changes)
+                }))
+
+        except Exception as exc:
+            self.logger.error(f"VM {vm_name}: update failed: {exc}")
+            result_queue.put((vm_name, {
+                'status': 'failed',
+                'details': str(exc)
+            }))
+
+    @staticmethod
+    def update(cls, cli_args):
+        """
+        Apply config changes to already-provisioned VMs.
+
+        Compares the desired state in conf.yml against actual VM state in
+        libvirt and applies only the changes needed:
+          - New VMs in config are cloned, configured, and started
+          - CPU/memory changes are applied (hot if possible, cold otherwise)
+          - New disks are created and attached
+          - Existing disks are resized (grow only)
+        """
+        config = cls.config
+        dry_run = getattr(cli_args, 'dry_run', False)
+
+        cluster_group = list(config['clusters'].keys())[0]
+        cluster = config['clusters'][cluster_group]
+        workdir = os.path.abspath(os.path.expanduser(cluster['workdir']))
+
+        # ensure provider config reflects runtime settings
+        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
+            cls.provider.update_provider_config_with_runtime()
+
+        # --- categorize VMs ---
+        expected_vms = set(cls._get_project_vm_names())
+        existing_vms = set(cls._find_existing_project_vms())
+
+        if not expected_vms:
+            cls.logger.error("no VMs defined in configuration")
+            return
+
+        new_vm_names = expected_vms - existing_vms
+        update_vm_names = expected_vms & existing_vms
+
+        if not new_vm_names and not update_vm_names:
+            cls.logger.info("no VMs to update or add")
+            return
+
+        # --- handle new VMs ---
+        if new_vm_names:
+            short_names = [n.split('_')[-1] for n in sorted(new_vm_names)]
+            cls.logger.info(f"new VM(s) to add: {', '.join(short_names)}")
+
+            if dry_run:
+                cls.logger.info("[dry-run] would clone and configure new VMs")
+            else:
+                # ensure templates exist
+                cls.ensure_templates_exist()
+                try:
+                    cls.validate_base_images()
+                except ValueError as exc:
+                    cls.logger.error(str(exc))
+                    return
+
+                cls._clone_and_configure_new_vms(new_vm_names)
+
+                # wait for IPs on new VMs
+                cls.logger.info("waiting for new VMs to get IP addresses...")
+                wait_time = 1
+                max_wait = 300
+                total_waited = 0
+                while total_waited < max_wait:
+                    all_have_ips = True
+                    for vm_name in new_vm_names:
+                        ips = cls.provider.get_vm_ip_addresses(vm_name)
+                        if not ips:
+                            all_have_ips = False
+                            break
+                    if all_have_ips:
+                        cls.logger.info(
+                            f"all new VMs have IP addresses (waited {total_waited}s)")
+                        break
+                    time.sleep(wait_time)
+                    total_waited += wait_time
+                    wait_time = min(wait_time * 2, 60)
+
+                # eject cdrom on new VMs
+                for vm_name in new_vm_names:
+                    cls.provider.eject_cdrom(vm_name)
+
+        # --- handle existing VMs ---
+        if update_vm_names:
+            prj_name = f'bprj__{config["project"]}__bprj'
+            result_queue: Queue = Queue()
+
+            update_tasks = []
+            for cluster_name, cluster_cfg in config['clusters'].items():
+                for vm_name, vm_info in cluster_cfg['vms'].items():
+                    full = f"{prj_name}_{cluster_name}_{vm_name}"
+                    if full in update_vm_names:
+                        update_tasks.append(
+                            (cluster_name, cluster_cfg, vm_name, vm_info))
+
+            processes = [
+                Process(
+                    target=cls._update_single_vm,
+                    args=(cluster_name, cluster_cfg, vm_name, vm_info,
+                          result_queue, dry_run)
+                )
+                for cluster_name, cluster_cfg, vm_name, vm_info in update_tasks
+            ]
+            [p.start() for p in processes]
+            [p.join() for p in processes]
+
+            # collect and print results
+            results = {}
+            while not result_queue.empty():
+                vm_name, result = result_queue.get()
+                results[vm_name] = result
+
+            # print summary
+            no_change = [n for n, r in results.items() if r['status'] == 'no_change']
+            updated = [n for n, r in results.items() if r['status'] == 'updated']
+            failed = [n for n, r in results.items() if r['status'] == 'failed']
+            dry_run_items = [n for n, r in results.items() if r['status'] == 'dry_run']
+
+            if dry_run_items:
+                cls.logger.info("--- dry-run summary ---")
+                for vm_name in dry_run_items:
+                    cls.logger.info(f"  {vm_name}: {results[vm_name]['details']}")
+
+            if no_change:
+                cls.logger.info(f"no changes: {', '.join(no_change)}")
+            if updated:
+                cls.logger.info(f"updated: {', '.join(updated)}")
+                for vm_name in updated:
+                    cls.logger.info(f"  {vm_name}: {results[vm_name]['details']}")
+            if failed:
+                cls.logger.error(f"failed: {', '.join(failed)}")
+                for vm_name in failed:
+                    cls.logger.error(f"  {vm_name}: {results[vm_name]['details']}")
+
+        # regenerate SSH config and display connect info
+        if not dry_run:
+            cls.setup_ssh_access()
+            cls.connect_info()
+
+    ### end update functions ####
