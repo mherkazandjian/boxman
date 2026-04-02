@@ -200,6 +200,73 @@ class VMStateDiffer:
 
         return os.path.expanduser(disk_path)
 
+    def get_actual_cdroms(self, domain_name: str) -> List[Dict[str, Any]]:
+        """
+        Get actual CDROM devices attached to a VM, excluding seed ISOs.
+
+        Returns:
+            List of dicts with 'target' and 'source' keys.
+        """
+        result = self.virsh.execute('domblklist', domain_name, '--details', warn=True)
+        if not result.ok:
+            return []
+
+        cdroms = []
+        lines = result.stdout.strip().split('\n')
+        for line in lines[2:]:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            device = parts[1]
+            target = parts[2]
+            source = parts[3] if len(parts) >= 4 else '-'
+
+            if device != 'cdrom':
+                continue
+            if source == '-':
+                continue
+            if os.path.basename(source).startswith('seed'):
+                continue
+
+            cdroms.append({
+                'target': target,
+                'source': source,
+            })
+
+        return cdroms
+
+    def get_actual_shared_folders(self, domain_name: str) -> List[Dict[str, Any]]:
+        """
+        Get actual filesystem (shared folder) devices from domain XML.
+
+        Returns:
+            List of dicts with 'name', 'host_path', and 'readonly' keys.
+        """
+        from lxml import etree
+
+        xml_content = self.virsh_edit.get_domain_xml(domain_name)
+        tree = etree.fromstring(xml_content.encode('utf-8'))
+
+        folders = []
+        for fs_elem in tree.xpath('//devices/filesystem'):
+            source_elem = fs_elem.find('source')
+            target_elem = fs_elem.find('target')
+            if source_elem is None or target_elem is None:
+                continue
+
+            host_path = source_elem.get('dir', '')
+            name = target_elem.get('dir', '')
+            readonly = fs_elem.find('readonly') is not None
+
+            if name and host_path:
+                folders.append({
+                    'name': name,
+                    'host_path': host_path,
+                    'readonly': readonly,
+                })
+
+        return folders
+
     def diff_vm(self,
                 domain_name: str,
                 desired_cpus: Optional[Dict[str, int]],
@@ -208,7 +275,9 @@ class VMStateDiffer:
                 workdir: str,
                 disk_prefix: str,
                 desired_max_vcpus: Optional[int] = None,
-                desired_max_memory_mb: Optional[int] = None) -> Dict[str, Any]:
+                desired_max_memory_mb: Optional[int] = None,
+                desired_shared_folders: Optional[List[Dict[str, Any]]] = None,
+                desired_cdroms: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """
         Compute the diff between desired config and actual VM state.
 
@@ -220,6 +289,8 @@ class VMStateDiffer:
               - max_memory_changed, desired_max_memory_mb, actual_max_memory_mb
               - new_disks: list of disk configs to create and attach
               - resize_disks: list of dicts with target, source, current_size_mb, desired_size_mb
+              - new_cdroms, removed_cdroms, changed_cdroms
+              - new_shared_folders, removed_shared_folders, changed_shared_folders
               - vm_state: current VM state string
         """
         vm_state = self.get_vm_state(domain_name)
@@ -293,6 +364,71 @@ class VMStateDiffer:
                         f"Shrinking is not supported, skipping."
                     )
 
+        # --- CDROM diff ---
+        actual_cdroms = self.get_actual_cdroms(domain_name)
+        actual_cdrom_by_source = {c['source']: c for c in actual_cdroms}
+        actual_cdrom_sources = set(actual_cdrom_by_source.keys())
+
+        new_cdroms = []
+        changed_cdroms = []
+        desired_cdrom_sources = set()
+
+        for cdrom_config in (desired_cdroms or []):
+            source = os.path.abspath(os.path.expanduser(cdrom_config.get('source', '')))
+            desired_cdrom_sources.add(source)
+
+            if source not in actual_cdrom_sources:
+                # check if there's an existing cdrom with a different source
+                # that should be swapped (match by target if specified)
+                target = cdrom_config.get('target')
+                if target:
+                    actual_for_target = next(
+                        (c for c in actual_cdroms if c['target'] == target), None)
+                    if actual_for_target and actual_for_target['source'] != source:
+                        changed_cdroms.append({
+                            'target': target,
+                            'source': source,
+                        })
+                        continue
+                new_cdroms.append(cdrom_config)
+
+        removed_cdroms = [
+            c for c in actual_cdroms
+            if c['source'] not in desired_cdrom_sources
+            and not any(
+                ch['target'] == c['target'] for ch in changed_cdroms
+            )
+        ]
+
+        # --- Shared folder diff ---
+        actual_folders = self.get_actual_shared_folders(domain_name)
+        actual_folder_by_name = {f['name']: f for f in actual_folders}
+        actual_folder_names = set(actual_folder_by_name.keys())
+
+        new_shared_folders = []
+        changed_shared_folders = []
+        desired_folder_names = set()
+
+        for folder_config in (desired_shared_folders or []):
+            name = folder_config.get('name', '')
+            desired_folder_names.add(name)
+            host_path = os.path.abspath(
+                os.path.expanduser(folder_config.get('host_path', '')))
+            readonly = folder_config.get('readonly', False)
+
+            if name not in actual_folder_names:
+                new_shared_folders.append(folder_config)
+            else:
+                actual = actual_folder_by_name[name]
+                if (actual['host_path'] != host_path or
+                        actual['readonly'] != readonly):
+                    changed_shared_folders.append(folder_config)
+
+        removed_shared_folders = [
+            f for f in actual_folders
+            if f['name'] not in desired_folder_names
+        ]
+
         return {
             'cpu_changed': cpu_changed,
             'desired_cpus': desired_cpus,
@@ -308,5 +444,11 @@ class VMStateDiffer:
             'actual_max_memory_mb': actual_max_memory_mb,
             'new_disks': new_disks,
             'resize_disks': resize_disks,
+            'new_cdroms': new_cdroms,
+            'removed_cdroms': removed_cdroms,
+            'changed_cdroms': changed_cdroms,
+            'new_shared_folders': new_shared_folders,
+            'removed_shared_folders': removed_shared_folders,
+            'changed_shared_folders': changed_shared_folders,
             'vm_state': vm_state
         }

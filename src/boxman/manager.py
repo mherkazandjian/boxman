@@ -1251,6 +1251,30 @@ class BoxmanManager:
             else:
                 self.logger.warning(f"some disks could not be configured for vm {vm_name}")
 
+        # shared folders (must be before start for virtiofs memfd backing)
+        if vm_info.get('shared_folders'):
+            self.logger.info(f"configuring shared folders for vm {vm_name}")
+            success = self.provider.configure_vm_shared_folders(
+                vm_name=full_vm_name,
+                shared_folders=vm_info['shared_folders']
+            )
+            if success:
+                self.logger.info(f"shared folders configured for vm {vm_name}")
+            else:
+                self.logger.warning(f"some shared folders could not be configured for vm {vm_name}")
+
+        # cdroms
+        if vm_info.get('cdroms'):
+            self.logger.info(f"configuring CDROMs for vm {vm_name}")
+            success = self.provider.configure_vm_cdroms(
+                vm_name=full_vm_name,
+                cdroms=vm_info['cdroms']
+            )
+            if success:
+                self.logger.info(f"CDROMs configured for vm {vm_name}")
+            else:
+                self.logger.warning(f"some CDROMs could not be configured for vm {vm_name}")
+
         # start
         self.logger.info(f"starting vm {full_vm_name}")
         success = self.provider.start_vm(full_vm_name)
@@ -3136,7 +3160,9 @@ class BoxmanManager:
                 workdir=workdir,
                 disk_prefix=full_vm_name,
                 desired_max_vcpus=vm_info.get('max_vcpus'),
-                desired_max_memory_mb=vm_info.get('max_memory')
+                desired_max_memory_mb=vm_info.get('max_memory'),
+                desired_shared_folders=vm_info.get('shared_folders'),
+                desired_cdroms=vm_info.get('cdroms'),
             )
 
             has_changes = (
@@ -3145,7 +3171,13 @@ class BoxmanManager:
                 diff['max_vcpus_changed'] or
                 diff['max_memory_changed'] or
                 diff['new_disks'] or
-                diff['resize_disks']
+                diff['resize_disks'] or
+                diff['new_cdroms'] or
+                diff['removed_cdroms'] or
+                diff['changed_cdroms'] or
+                diff['new_shared_folders'] or
+                diff['removed_shared_folders'] or
+                diff['changed_shared_folders']
             )
 
             if not has_changes:
@@ -3176,6 +3208,24 @@ class BoxmanManager:
                     for r in diff['resize_disks']
                 ]
                 changes.append(f"resize disks: {', '.join(resizes)}")
+            if diff['new_cdroms']:
+                names = [c.get('name', '?') for c in diff['new_cdroms']]
+                changes.append(f"new cdroms: {', '.join(names)}")
+            if diff['removed_cdroms']:
+                targets = [c['target'] for c in diff['removed_cdroms']]
+                changes.append(f"remove cdroms: {', '.join(targets)}")
+            if diff['changed_cdroms']:
+                swaps = [f"{c['target']}->{c['source']}" for c in diff['changed_cdroms']]
+                changes.append(f"change cdroms: {', '.join(swaps)}")
+            if diff['new_shared_folders']:
+                names = [f.get('name', '?') for f in diff['new_shared_folders']]
+                changes.append(f"new shared folders: {', '.join(names)}")
+            if diff['removed_shared_folders']:
+                names = [f['name'] for f in diff['removed_shared_folders']]
+                changes.append(f"remove shared folders: {', '.join(names)}")
+            if diff['changed_shared_folders']:
+                names = [f.get('name', '?') for f in diff['changed_shared_folders']]
+                changes.append(f"change shared folders: {', '.join(names)}")
 
             self.logger.info(f"VM {vm_name}: changes detected: {'; '.join(changes)}")
 
@@ -3228,6 +3278,41 @@ class BoxmanManager:
                         'details': 'disk update failed'
                     }))
                     return
+
+            # cdroms
+            if diff['new_cdroms'] or diff['removed_cdroms'] or diff['changed_cdroms']:
+                cdrom_ok = self.provider.update_vm_cdroms(
+                    vm_name=full_vm_name,
+                    new_cdroms=diff['new_cdroms'],
+                    removed_cdroms=diff['removed_cdroms'],
+                    changed_cdroms=diff['changed_cdroms'],
+                    vm_running=vm_running
+                )
+                if not cdrom_ok:
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': 'CDROM update failed'
+                    }))
+                    return
+
+            # shared folders
+            if (diff['new_shared_folders'] or diff['removed_shared_folders'] or
+                    diff['changed_shared_folders']):
+                folder_result = self.provider.update_vm_shared_folders(
+                    vm_name=full_vm_name,
+                    new_folders=diff['new_shared_folders'],
+                    removed_folders=diff['removed_shared_folders'],
+                    changed_folders=diff['changed_shared_folders'],
+                    vm_running=vm_running
+                )
+                if not folder_result['success']:
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': 'shared folder update failed'
+                    }))
+                    return
+                if folder_result.get('restart_needed'):
+                    restart_needed = True
 
             # handle restart if needed
             if restart_needed and vm_running:

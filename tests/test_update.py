@@ -116,7 +116,10 @@ class TestVMStateDiffer:
     @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[
         {'target': 'vdb', 'source': '/data/vm_disk01.qcow2', 'size_mb': 2048}
     ])
-    def test_diff_vm_no_changes(self, mock_disks, mock_max_mem, mock_max_cpu,
+    @patch.object(VMStateDiffer, 'get_actual_cdroms', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_shared_folders', return_value=[])
+    def test_diff_vm_no_changes(self, mock_folders, mock_cdroms, mock_disks,
+                                 mock_max_mem, mock_max_cpu,
                                  mock_mem, mock_cpu, mock_state):
         differ = self._make_differ()
         diff = differ.diff_vm(
@@ -143,7 +146,10 @@ class TestVMStateDiffer:
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[])
-    def test_diff_vm_cpu_changed(self, mock_disks, mock_max_mem, mock_max_cpu,
+    @patch.object(VMStateDiffer, 'get_actual_cdroms', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_shared_folders', return_value=[])
+    def test_diff_vm_cpu_changed(self, mock_folders, mock_cdroms, mock_disks,
+                                  mock_max_mem, mock_max_cpu,
                                   mock_mem, mock_cpu, mock_state):
         differ = self._make_differ()
         diff = differ.diff_vm(
@@ -164,7 +170,10 @@ class TestVMStateDiffer:
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[])
-    def test_diff_vm_memory_changed(self, mock_disks, mock_max_mem, mock_max_cpu,
+    @patch.object(VMStateDiffer, 'get_actual_cdroms', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_shared_folders', return_value=[])
+    def test_diff_vm_memory_changed(self, mock_folders, mock_cdroms, mock_disks,
+                                     mock_max_mem, mock_max_cpu,
                                      mock_mem, mock_cpu, mock_state):
         differ = self._make_differ()
         diff = differ.diff_vm(
@@ -189,7 +198,10 @@ class TestVMStateDiffer:
     @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[
         {'target': 'vdb', 'source': '/data/vm_disk01.qcow2', 'size_mb': 2048}
     ])
-    def test_diff_vm_new_disk(self, mock_disks, mock_max_mem, mock_max_cpu,
+    @patch.object(VMStateDiffer, 'get_actual_cdroms', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_shared_folders', return_value=[])
+    def test_diff_vm_new_disk(self, mock_folders, mock_cdroms, mock_disks,
+                               mock_max_mem, mock_max_cpu,
                                mock_mem, mock_cpu, mock_state):
         differ = self._make_differ()
         diff = differ.diff_vm(
@@ -218,7 +230,10 @@ class TestVMStateDiffer:
     @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[
         {'target': 'vdb', 'source': '/data/vm_disk01.qcow2', 'size_mb': 2048}
     ])
-    def test_diff_vm_resize_disk(self, mock_disks, mock_max_mem, mock_max_cpu,
+    @patch.object(VMStateDiffer, 'get_actual_cdroms', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_shared_folders', return_value=[])
+    def test_diff_vm_resize_disk(self, mock_folders, mock_cdroms, mock_disks,
+                                  mock_max_mem, mock_max_cpu,
                                   mock_mem, mock_cpu, mock_state):
         differ = self._make_differ()
         diff = differ.diff_vm(
@@ -247,7 +262,10 @@ class TestVMStateDiffer:
     @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[
         {'target': 'vdb', 'source': '/data/vm_disk01.qcow2', 'size_mb': 4096}
     ])
-    def test_diff_vm_shrink_disk_ignored(self, mock_disks, mock_max_mem, mock_max_cpu,
+    @patch.object(VMStateDiffer, 'get_actual_cdroms', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_shared_folders', return_value=[])
+    def test_diff_vm_shrink_disk_ignored(self, mock_folders, mock_cdroms, mock_disks,
+                                          mock_max_mem, mock_max_cpu,
                                           mock_mem, mock_cpu, mock_state):
         """Shrinking disks should be skipped with a warning."""
         differ = self._make_differ()
@@ -452,7 +470,10 @@ class TestVMStateDifferMaxDiff:
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=16)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=16384)
     @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[])
-    def test_diff_vm_no_max_change(self, mock_disks, mock_max_mem, mock_max_cpu,
+    @patch.object(VMStateDiffer, 'get_actual_cdroms', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_shared_folders', return_value=[])
+    def test_diff_vm_no_max_change(self, mock_folders, mock_cdroms, mock_disks,
+                                    mock_max_mem, mock_max_cpu,
                                     mock_mem, mock_cpu, mock_state):
         differ = self._make_differ()
         diff = differ.diff_vm(
@@ -475,7 +496,10 @@ class TestVMStateDifferMaxDiff:
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[])
-    def test_diff_vm_max_vcpus_changed(self, mock_disks, mock_max_mem, mock_max_cpu,
+    @patch.object(VMStateDiffer, 'get_actual_cdroms', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_shared_folders', return_value=[])
+    def test_diff_vm_max_vcpus_changed(self, mock_folders, mock_cdroms, mock_disks,
+                                       mock_max_mem, mock_max_cpu,
                                        mock_mem, mock_cpu, mock_state):
         differ = self._make_differ()
         diff = differ.diff_vm(
@@ -498,7 +522,10 @@ class TestVMStateDifferMaxDiff:
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[])
-    def test_diff_vm_max_memory_changed(self, mock_disks, mock_max_mem, mock_max_cpu,
+    @patch.object(VMStateDiffer, 'get_actual_cdroms', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_shared_folders', return_value=[])
+    def test_diff_vm_max_memory_changed(self, mock_folders, mock_cdroms, mock_disks,
+                                        mock_max_mem, mock_max_cpu,
                                         mock_mem, mock_cpu, mock_state):
         differ = self._make_differ()
         diff = differ.diff_vm(
@@ -521,7 +548,10 @@ class TestVMStateDifferMaxDiff:
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=4)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=2048)
     @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[])
-    def test_diff_vm_no_max_change_when_omitted(self, mock_disks, mock_max_mem, mock_max_cpu,
+    @patch.object(VMStateDiffer, 'get_actual_cdroms', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_shared_folders', return_value=[])
+    def test_diff_vm_no_max_change_when_omitted(self, mock_folders, mock_cdroms, mock_disks,
+                                                 mock_max_mem, mock_max_cpu,
                                                  mock_mem, mock_cpu, mock_state):
         """When max values are not specified in config, no max change should be detected."""
         differ = self._make_differ()
@@ -544,8 +574,10 @@ class TestVMStateDifferMaxDiff:
     @patch.object(VMStateDiffer, 'get_max_vcpus', return_value=16)
     @patch.object(VMStateDiffer, 'get_max_memory_mb', return_value=16384)
     @patch.object(VMStateDiffer, 'get_actual_disks', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_cdroms', return_value=[])
+    @patch.object(VMStateDiffer, 'get_actual_shared_folders', return_value=[])
     def test_diff_vm_scaled_sockets_no_false_cpu_change(
-            self, mock_disks, mock_max_mem, mock_max_cpu,
+            self, mock_folders, mock_cdroms, mock_disks, mock_max_mem, mock_max_cpu,
             mock_mem, mock_cpu, mock_state):
         """When XML sockets are scaled for max_vcpus (4*2*2=16) but desired
         sockets=1 with same cores/threads (1*2*2=4 current), cpu_changed

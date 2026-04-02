@@ -9,6 +9,8 @@ from .net import Network, NetworkInterface
 from .clone_vm import CloneVM
 from .destroy_vm import DestroyVM
 from .disk import DiskManager
+from .cdrom import CDROMManager
+from .shared_folder import SharedFolderManager
 from datetime import datetime
 
 from boxman import log
@@ -469,6 +471,196 @@ class LibVirtSession:
                 success = False
 
         return success
+
+    def configure_vm_cdroms(self,
+                            vm_name: str,
+                            cdroms: List[Dict[str, Any]]) -> bool:
+        """
+        Configure all CDROM devices for a VM.
+
+        Args:
+            vm_name: Name of the VM
+            cdroms: List of CDROM configurations
+
+        Returns:
+            True if all CDROMs were configured successfully, False otherwise
+        """
+        cdrom_manager = CDROMManager(vm_name=vm_name, provider_config=self.provider_config)
+        success = True
+        for i, cdrom_config in enumerate(cdroms):
+            self.logger.info(
+                f"configuring CDROM {i+1} ('{cdrom_config.get('name', '?')}') "
+                f"for VM {vm_name}")
+            if not cdrom_manager.configure_from_config(cdrom_config):
+                self.logger.error(
+                    f"failed to configure CDROM {i+1} for VM {vm_name}")
+                success = False
+            else:
+                self.logger.info(
+                    f"successfully configured CDROM {i+1} for VM {vm_name}")
+        return success
+
+    def update_vm_cdroms(self,
+                         vm_name: str,
+                         new_cdroms: List[Dict[str, Any]],
+                         removed_cdroms: List[Dict[str, Any]],
+                         changed_cdroms: List[Dict[str, Any]],
+                         vm_running: bool) -> bool:
+        """
+        Apply CDROM changes: attach new, detach removed, swap changed.
+
+        Args:
+            vm_name: Full VM domain name
+            new_cdroms: CDROM configs to attach
+            removed_cdroms: CDROM entries to detach (dicts with 'target')
+            changed_cdroms: CDROM entries with changed source
+                            (dicts with 'target' and 'source')
+            vm_running: Whether the VM is currently running
+
+        Returns:
+            True if all operations succeeded, False otherwise
+        """
+        cdrom_manager = CDROMManager(vm_name=vm_name, provider_config=self.provider_config)
+        success = True
+
+        for cdrom_config in new_cdroms:
+            name = cdrom_config.get('name', '?')
+            self.logger.info(f"attaching new CDROM '{name}' to VM {vm_name}")
+            if not cdrom_manager.configure_from_config(cdrom_config):
+                self.logger.error(f"failed to attach CDROM '{name}' to {vm_name}")
+                success = False
+
+        for entry in removed_cdroms:
+            target = entry['target']
+            self.logger.info(f"detaching CDROM {target} from VM {vm_name}")
+            if not cdrom_manager.detach_cdrom(target):
+                self.logger.error(f"failed to detach CDROM {target} from {vm_name}")
+                success = False
+
+        for entry in changed_cdroms:
+            target = entry['target']
+            source = entry['source']
+            self.logger.info(
+                f"changing CDROM media on {target} to {source} on VM {vm_name}")
+            if not cdrom_manager.change_media(target, source):
+                self.logger.error(
+                    f"failed to change CDROM media on {target} on {vm_name}")
+                success = False
+
+        return success
+
+    def configure_vm_shared_folders(self,
+                                    vm_name: str,
+                                    shared_folders: List[Dict[str, Any]]) -> bool:
+        """
+        Configure all shared folders for a VM.
+
+        Args:
+            vm_name: Name of the VM
+            shared_folders: List of shared folder configurations
+
+        Returns:
+            True if all shared folders were configured successfully, False otherwise
+        """
+        folder_manager = SharedFolderManager(
+            vm_name=vm_name, provider_config=self.provider_config)
+        success = True
+        for i, folder_config in enumerate(shared_folders):
+            name = folder_config.get('name', '?')
+            self.logger.info(
+                f"configuring shared folder {i+1} ('{name}') for VM {vm_name}")
+            result = folder_manager.configure_from_config(folder_config)
+            if not result['success']:
+                self.logger.error(
+                    f"failed to configure shared folder '{name}' for VM {vm_name}")
+                success = False
+            else:
+                if result.get('restart_needed'):
+                    self.logger.info(
+                        f"shared folder '{name}' configured for VM {vm_name} "
+                        f"(restart needed)")
+                else:
+                    self.logger.info(
+                        f"successfully configured shared folder '{name}' "
+                        f"for VM {vm_name}")
+        return success
+
+    def update_vm_shared_folders(self,
+                                 vm_name: str,
+                                 new_folders: List[Dict[str, Any]],
+                                 removed_folders: List[Dict[str, Any]],
+                                 changed_folders: List[Dict[str, Any]],
+                                 vm_running: bool) -> Dict[str, Any]:
+        """
+        Apply shared folder changes: attach new, detach removed, re-attach changed.
+
+        Args:
+            vm_name: Full VM domain name
+            new_folders: Folder configs to attach
+            removed_folders: Folder entries to detach (dicts with 'name', 'host_path')
+            changed_folders: Folder configs with changed host_path or readonly
+            vm_running: Whether the VM is currently running
+
+        Returns:
+            Dict with 'success' (bool) and 'restart_needed' (bool)
+        """
+        folder_manager = SharedFolderManager(
+            vm_name=vm_name, provider_config=self.provider_config)
+        success = True
+        restart_needed = False
+
+        for folder_config in new_folders:
+            name = folder_config.get('name', '?')
+            self.logger.info(f"attaching new shared folder '{name}' to VM {vm_name}")
+            result = folder_manager.configure_from_config(folder_config)
+            if not result['success']:
+                self.logger.error(
+                    f"failed to attach shared folder '{name}' to {vm_name}")
+                success = False
+            if result.get('restart_needed'):
+                restart_needed = True
+
+        for entry in removed_folders:
+            name = entry['name']
+            host_path = entry.get('host_path', '')
+            readonly = entry.get('readonly', False)
+            self.logger.info(f"detaching shared folder '{name}' from VM {vm_name}")
+            result = folder_manager.detach_shared_folder(name, host_path, readonly)
+            if not result['success']:
+                self.logger.error(
+                    f"failed to detach shared folder '{name}' from {vm_name}")
+                success = False
+            if result.get('restart_needed'):
+                restart_needed = True
+
+        for folder_config in changed_folders:
+            name = folder_config.get('name', '?')
+            self.logger.info(
+                f"updating shared folder '{name}' on VM {vm_name}")
+            # Detach the old version first (get current state from XML)
+            current_folders = folder_manager.get_attached_shared_folders()
+            current = next((f for f in current_folders if f['name'] == name), None)
+            if current:
+                detach_result = folder_manager.detach_shared_folder(
+                    name, current['host_path'], current['readonly'])
+                if not detach_result['success']:
+                    self.logger.error(
+                        f"failed to detach old shared folder '{name}' from {vm_name}")
+                    success = False
+                    continue
+                if detach_result.get('restart_needed'):
+                    restart_needed = True
+
+            # Attach the new version
+            result = folder_manager.configure_from_config(folder_config)
+            if not result['success']:
+                self.logger.error(
+                    f"failed to re-attach shared folder '{name}' to {vm_name}")
+                success = False
+            if result.get('restart_needed'):
+                restart_needed = True
+
+        return {'success': success, 'restart_needed': restart_needed}
 
     def get_vm_ip_addresses(self, vm_name: str) -> Dict[str, str]:
         """
