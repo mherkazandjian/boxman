@@ -1,0 +1,27 @@
+- name: Simple play to verify host, install a package and update a config line
+  hosts: default
+  become: true
+  gather_facts: false
+
+  vars:
+    package_name: htop
+    config_file: /etc/myapp.conf
+    config_regexp: '^option='
+    config_line: 'option=true'
+
+  tasks:
+    - name: Ping the host
+      ping:
+
+    - name: Install a package
+      package:
+        name: "{{ package_name }}"
+        state: present
+
+    - name: Ensure configuration line is present
+      lineinfile:
+        path: "{{ config_file }}"
+        regexp: "{{ config_regexp }}"
+        line: "{{ config_line }}"
+        create: yes
+        backup: yes
