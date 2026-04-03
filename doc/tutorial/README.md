@@ -91,7 +91,7 @@ boxman --version
 ## 1.3 The Configuration File
 
 Everything in Boxman is driven by a single YAML file. Here's what we'll use for Chapter 1
-([conf/tutorial1.yml](conf/tutorial1.yml)):
+([tutorial1/conf.yml](tutorial1/conf.yml)):
 
 ```yaml
 version: '1.0'
@@ -182,8 +182,8 @@ graph TD
 ## 1.4 Provision
 
 ```bash
-cd doc/tutorial/conf
-boxman --conf tutorial1.yml provision
+cd doc/tutorial/tutorial1
+boxman provision
 ```
 
 Behind the scenes, boxman:
@@ -199,7 +199,7 @@ Behind the scenes, boxman:
 Verify it's running:
 
 ```bash
-boxman --conf tutorial1.yml ps
+boxman ps
 ```
 
 ```
@@ -211,7 +211,7 @@ cluster_1  node01  running   192.168.10.xxx
 ## 1.5 SSH In
 
 ```bash
-boxman --conf tutorial1.yml ssh
+boxman ssh
 ```
 
 You're now inside `node01`. Poke around:
@@ -228,13 +228,13 @@ exit
 ## 1.6 Take a Snapshot
 
 ```bash
-boxman --conf tutorial1.yml snapshot take --name "clean-state"
+boxman snapshot take --name "clean-state"
 ```
 
 List it:
 
 ```bash
-boxman --conf tutorial1.yml snapshot list
+boxman snapshot list
 ```
 
 ```
@@ -250,7 +250,7 @@ This captures the **entire VM state** -- disk, memory, running processes -- all 
 SSH in and cause some damage:
 
 ```bash
-boxman --conf tutorial1.yml ssh
+boxman ssh
 
 # Inside the VM:
 sudo rm -rf /usr/bin/python3 /etc/hostname /var/log/*
@@ -261,7 +261,7 @@ exit
 Try SSH again -- things are visibly wrong:
 
 ```bash
-boxman --conf tutorial1.yml ssh
+boxman ssh
 # hostname is gone, python is missing, logs are wiped
 cat /etc/motd   # "everything is broken"
 exit
@@ -270,13 +270,13 @@ exit
 ## 1.8 Restore
 
 ```bash
-boxman --conf tutorial1.yml snapshot restore --name "clean-state"
+boxman snapshot restore --name "clean-state"
 ```
 
 Now SSH back in:
 
 ```bash
-boxman --conf tutorial1.yml ssh
+boxman ssh
 
 # Everything is back:
 python3 --version    # works
@@ -316,11 +316,17 @@ In this chapter we'll scale the cluster **without reprovisioning** -- add a seco
 a new disk, and hot-scale CPU and memory. The VMs stay up throughout.
 
 We start from the same config as Chapter 1. The final scaled config is at
-[conf/tutorial2-scaled.yml](conf/tutorial2-scaled.yml).
+[tutorial2/conf-scaled.yml](tutorial2/conf-scaled.yml) for reference.
+
+```bash
+cd doc/tutorial/tutorial2
+boxman provision
+```
 
 ## 2.1 Add a Second VM
 
-Edit your `tutorial1.yml` (or switch to `tutorial2-scaled.yml`) and add `node02` under `vms`:
+Edit your `conf.yml` and add `node02` under `vms` (or switch to `conf-scaled.yml`
+which has all changes pre-applied):
 
 ```yaml
     vms:
@@ -352,19 +358,19 @@ Edit your `tutorial1.yml` (or switch to `tutorial2-scaled.yml`) and add `node02`
 Preview what will change:
 
 ```bash
-boxman --conf tutorial2-scaled.yml update --dry-run
+boxman update --dry-run
 ```
 
 Apply:
 
 ```bash
-boxman --conf tutorial2-scaled.yml update
+boxman update
 ```
 
 Verify both VMs are running:
 
 ```bash
-boxman --conf tutorial2-scaled.yml ps
+boxman ps
 ```
 
 ```
@@ -410,16 +416,16 @@ In the same config, add a second disk to `node01`:
 ```
 
 ```bash
-boxman --conf tutorial2-scaled.yml update --dry-run
+boxman update --dry-run
 # Shows: node01: add disk disk02 (4096 MB)
 
-boxman --conf tutorial2-scaled.yml update
+boxman update
 ```
 
 Verify inside the VM:
 
 ```bash
-boxman --conf tutorial2-scaled.yml ssh node01
+boxman ssh node01
 lsblk
 # NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
 # vda    252:0    0   20G  0 disk /
@@ -444,13 +450,13 @@ This is where `max_vcpus` and `max_memory` pay off. Change `node01`'s resources:
 ```
 
 ```bash
-boxman --conf tutorial2-scaled.yml update
+boxman update
 ```
 
 Verify -- the VM is still up:
 
 ```bash
-boxman --conf tutorial2-scaled.yml ssh node01
+boxman ssh node01
 nproc       # 8 (4 cores x 2 threads)
 free -m     # ~4GB
 uptime      # still counting from original boot
@@ -464,8 +470,8 @@ creation time -- the QEMU process was started with headroom for scaling.
 ## 2.4 Snapshot the Whole Cluster
 
 ```bash
-boxman --conf tutorial2-scaled.yml snapshot take --name "cluster-good-state"
-boxman --conf tutorial2-scaled.yml snapshot list
+boxman snapshot take --name "cluster-good-state"
+boxman snapshot list
 ```
 
 Both `node01` and `node02` are captured.
@@ -477,7 +483,7 @@ Let's put some real state in the VMs so the restore feels meaningful.
 **On node01** -- start a web server:
 
 ```bash
-boxman --conf tutorial2-scaled.yml ssh node01
+boxman ssh node01
 
 mkdir -p /tmp/webapp
 cat > /tmp/webapp/index.html << 'HTML'
@@ -497,7 +503,7 @@ exit
 **On node02** -- create a database:
 
 ```bash
-boxman --conf tutorial2-scaled.yml ssh node02
+boxman ssh node02
 
 sudo apt install -y sqlite3
 sqlite3 /tmp/mydata.db << 'SQL'
@@ -518,7 +524,7 @@ exit
 Now take a snapshot that captures all of this:
 
 ```bash
-boxman --conf tutorial2-scaled.yml snapshot take --name "apps-running"
+boxman snapshot take --name "apps-running"
 ```
 
 ## 2.6 Nuke Everything, Restore Everything
@@ -527,12 +533,12 @@ Destroy both VMs from the inside:
 
 ```bash
 # Terminal 1: nuke node01
-boxman --conf tutorial2-scaled.yml ssh node01
+boxman ssh node01
 sudo rm -rf /etc /usr /var /bin /sbin /tmp/webapp
 # Connection drops -- the VM is wrecked
 
 # Terminal 2: nuke node02
-boxman --conf tutorial2-scaled.yml ssh node02
+boxman ssh node02
 sudo rm -rf /etc /usr /var /bin /sbin /tmp/mydata.db
 # Connection drops
 ```
@@ -540,20 +546,20 @@ sudo rm -rf /etc /usr /var /bin /sbin /tmp/mydata.db
 Both VMs are now unrecoverable through normal means. Restore:
 
 ```bash
-boxman --conf tutorial2-scaled.yml snapshot restore --name "apps-running"
+boxman snapshot restore --name "apps-running"
 ```
 
 Verify:
 
 ```bash
 # Web server on node01
-boxman --conf tutorial2-scaled.yml ssh node01
+boxman ssh node01
 curl -s localhost:8080 | head -3
 # <html> ... "node01 is alive" ... 
 exit
 
 # Database on node02
-boxman --conf tutorial2-scaled.yml ssh node02
+boxman ssh node02
 sqlite3 /tmp/mydata.db "SELECT * FROM experiments;"
 # 1|baseline|PASS|...
 # 2|stress-test|PASS|...
@@ -571,7 +577,7 @@ Boxman doesn't just provision VMs -- it generates a complete ansible workspace. 
 chapter we'll use it to bootstrap a cluster, deploy a live terminal demo, break it, and
 resurrect it.
 
-The full config for this chapter is at [conf/tutorial3.yml](conf/tutorial3.yml).
+The full config for this chapter is at [tutorial3/conf.yml](tutorial3/conf.yml).
 
 ## 3.1 The Workspace
 
@@ -666,18 +672,20 @@ sequenceDiagram
     Ansible-->>You: SUCCESS
 ```
 
-## 3.2 Provision with Chapter 3 Config
+## 3.2 Provision
 
 If you're continuing from Chapter 2, deprovision first:
 
 ```bash
-boxman --conf tutorial2-scaled.yml deprovision --cleanup
+cd doc/tutorial/tutorial2
+boxman deprovision --cleanup
 ```
 
 Then provision with the Chapter 3 config:
 
 ```bash
-boxman --conf tutorial3.yml provision
+cd doc/tutorial/tutorial3
+boxman provision
 ```
 
 ## 3.3 Running Commands
@@ -685,7 +693,7 @@ boxman --conf tutorial3.yml provision
 List available tasks:
 
 ```bash
-boxman --conf tutorial3.yml run --list
+boxman run --list
 ```
 
 ```
@@ -702,14 +710,14 @@ Run them:
 
 ```bash
 # Ping all hosts
-boxman --conf tutorial3.yml run ping
+boxman run ping
 
 # Run a command on all hosts
-boxman --conf tutorial3.yml run cmd -- hostname
-boxman --conf tutorial3.yml run cmd -- uptime
+boxman run cmd -- hostname
+boxman run cmd -- uptime
 
 # Limit to a single host
-boxman --conf tutorial3.yml run cmd -- --limit node01 free -m
+boxman run cmd -- --limit node01 free -m
 ```
 
 ## 3.4 Bootstrap the Cluster
@@ -717,7 +725,7 @@ boxman --conf tutorial3.yml run cmd -- --limit node01 free -m
 Install packages (including cmatrix) on all nodes:
 
 ```bash
-boxman --conf tutorial3.yml run bootstrap
+boxman run bootstrap
 ```
 
 This runs the `ansible/bootstrap.yml` playbook, which installs `vim`, `tmux`, `htop`,
@@ -731,13 +739,13 @@ destroy everything, and watch the Matrix resurrect.
 ### Step 1: Start the Matrix
 
 ```bash
-boxman --conf tutorial3.yml run cmatrix-start
+boxman run cmatrix-start
 ```
 
 SSH into a node and attach to the tmux session to see it:
 
 ```bash
-boxman --conf tutorial3.yml ssh node01
+boxman ssh node01
 tmux attach -t matrix
 ```
 
@@ -750,7 +758,7 @@ Detach from tmux with `Ctrl-b d`, then `exit` the SSH session.
 The `--live` flag captures the VM state **including running processes and memory**:
 
 ```bash
-boxman --conf tutorial3.yml snapshot take --live --name "matrix-running"
+boxman snapshot take --live --name "matrix-running"
 ```
 
 The Matrix is still running inside the VMs while the snapshot is taken.
@@ -760,7 +768,7 @@ The Matrix is still running inside the VMs while the snapshot is taken.
 Open a separate terminal and nuke node01:
 
 ```bash
-boxman --conf tutorial3.yml ssh node01
+boxman ssh node01
 sudo rm -rf /usr /bin /etc /var /sbin
 # Connection drops. The Matrix is dead.
 ```
@@ -768,7 +776,7 @@ sudo rm -rf /usr /bin /etc /var /sbin
 Do the same to node02:
 
 ```bash
-boxman --conf tutorial3.yml ssh node02
+boxman ssh node02
 sudo rm -rf /usr /bin /etc /var /sbin
 # Connection drops.
 ```
@@ -778,7 +786,7 @@ Both VMs are completely destroyed. No SSH, no processes, nothing.
 ### Step 4: Restore
 
 ```bash
-boxman --conf tutorial3.yml snapshot restore --name "matrix-running"
+boxman snapshot restore --name "matrix-running"
 ```
 
 ### Step 5: The Matrix Lives
@@ -786,7 +794,7 @@ boxman --conf tutorial3.yml snapshot restore --name "matrix-running"
 SSH back into node01 and reattach to the tmux session:
 
 ```bash
-boxman --conf tutorial3.yml ssh node01
+boxman ssh node01
 tmux attach -t matrix
 ```
 
@@ -817,13 +825,13 @@ graph LR
 
 ```bash
 # One-time setup
-boxman --conf tutorial3.yml provision
-boxman --conf tutorial3.yml run bootstrap
-boxman --conf tutorial3.yml snapshot take --name "golden"
+boxman provision
+boxman run bootstrap
+boxman snapshot take --name "golden"
 
 # Daily workflow
 #   ... experiment, break things, test ideas ...
-boxman --conf tutorial3.yml restore    # back to golden in seconds
+boxman restore    # back to golden in seconds
 #   ... experiment again ...
 ```
 
@@ -840,7 +848,7 @@ Your entire dev environment is:
 When you're done with the tutorial:
 
 ```bash
-boxman --conf tutorial3.yml deprovision --cleanup
+boxman deprovision --cleanup
 ```
 
 This removes all VMs, networks, SSH keys, and generated workspace files.
@@ -864,5 +872,3 @@ This removes all VMs, networks, SSH keys, and generated workspace files.
 | `boxman run --list` | List available tasks |
 | `boxman run <task> [-- args]` | Run a named task |
 | `boxman deprovision --cleanup` | Tear everything down |
-
-All commands accept `--conf <file>` to specify the config file (defaults to `conf.yml` in the current directory).
