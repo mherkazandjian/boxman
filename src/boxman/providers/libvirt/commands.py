@@ -1,4 +1,5 @@
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+import os
 import invoke
 from boxman import log
 
@@ -42,6 +43,14 @@ class LibVirtCommandBase:
         #: str: The docker-compose container name for remote execution
         self.runtime_container = self.provider_config.get(
             'runtime_container', 'boxman-libvirt-default')
+
+        #: List[str]: Commands that should never get sudo prepended
+        self.sudo_skip_commands: List[str] = self.provider_config.get(
+            'sudo_skip_commands', [])
+
+        #: List[str]: Commands that should always get sudo prepended
+        self.force_sudo_commands: List[str] = self.provider_config.get(
+            'force_sudo_commands', [])
 
         # override use_sudo if provided
         if override_config_use_sudo is not None:
@@ -136,6 +145,28 @@ class LibVirtCommandBase:
                 raise RuntimeError(error_message)
             return exc.result
 
+    def _should_use_sudo_for_command(self, command: str) -> bool:
+        """
+        Decide whether *command* should be run with sudo.
+
+        Resolution order (first match wins):
+        1. ``force_sudo_commands`` — always sudo regardless of ``use_sudo``
+        2. ``sudo_skip_commands`` — never sudo regardless of ``use_sudo``
+        3. Fall back to the global ``use_sudo`` flag.
+
+        Matching is done against the basename of the first token in the
+        command string (e.g. ``/usr/bin/qemu-img resize …`` matches
+        ``qemu-img``).
+        """
+        first_token = command.split()[0] if command.strip() else ''
+        cmd_name = os.path.basename(first_token)
+
+        if cmd_name in self.force_sudo_commands:
+            return True
+        if cmd_name in self.sudo_skip_commands:
+            return False
+        return self.use_sudo
+
     def execute_shell(self, command: str, hide: bool = True, warn: bool = False) -> invoke.runners.Result:
         """
         Execute a raw shell command.
@@ -154,9 +185,10 @@ class LibVirtCommandBase:
         Raises:
             RuntimeError: If the command fails and warn is False
         """
-        # add sudo if needed
-        if self.use_sudo and not command.startswith("sudo "):
-            command = f"sudo {command}"
+        # add sudo if needed (respects force_sudo_commands / sudo_skip_commands)
+        if not command.startswith("sudo "):
+            if self._should_use_sudo_for_command(command):
+                command = f"sudo {command}"
 
         # wrap for runtime environment
         command = self._wrap_for_runtime(command)

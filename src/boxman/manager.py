@@ -129,6 +129,40 @@ class BoxmanManager:
         """
         return self.runtime_instance.inject_into_provider_config(provider_config)
 
+    @staticmethod
+    def _merge_provider_configs(global_config: Dict[str, Any],
+                                local_config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Merge global (app-level) and local (project-level) provider configs.
+
+        Scalar keys: local overrides global (standard dict.update behaviour).
+
+        ``sudo_skip_commands`` / ``force_sudo_commands``: per-command merging.
+        If a command appears in a local list it is removed from the opposite
+        global list so that the local setting wins.  Commands that only appear
+        in the global lists are preserved.
+        """
+        merged = global_config.copy()
+        # pull out the sudo command lists before the scalar update clobbers them
+        g_skip = set(global_config.get('sudo_skip_commands', []))
+        g_force = set(global_config.get('force_sudo_commands', []))
+        l_skip = set(local_config.get('sudo_skip_commands', []))
+        l_force = set(local_config.get('force_sudo_commands', []))
+
+        # scalar overrides
+        merged.update(local_config)
+
+        # per-command merge: local wins over global for any given command
+        all_local = l_skip | l_force
+        final_skip = (g_skip - all_local) | l_skip
+        final_force = (g_force - all_local) | l_force
+        # if a command ended up in both after merge, force wins
+        final_skip -= final_force
+
+        merged['sudo_skip_commands'] = sorted(final_skip)
+        merged['force_sudo_commands'] = sorted(final_force)
+        return merged
+
     def load_config(self, config_path: str) -> Dict[str, Any]:
         """
         Load configuration from a YAML file.
@@ -555,9 +589,7 @@ class BoxmanManager:
         # merge app-level provider config as defaults
         if self.app_config and 'providers' in self.app_config:
             app_provider = self.app_config['providers'].get(provider_type, {})
-            merged = app_provider.copy()
-            merged.update(provider_config)
-            provider_config = merged
+            provider_config = self._merge_provider_configs(app_provider, provider_config)
 
         # inject runtime settings
         if hasattr(self, 'runtime_instance'):
@@ -814,9 +846,7 @@ class BoxmanManager:
                     provider_config = self.config.get('provider', {}).get(provider_type, {})
                     if self.app_config and 'providers' in self.app_config:
                         app_prov = self.app_config['providers'].get(provider_type, {})
-                        merged = app_prov.copy()
-                        merged.update(provider_config)
-                        provider_config = merged
+                        provider_config = self._merge_provider_configs(app_prov, provider_config)
                     if hasattr(self, 'runtime_instance'):
                         provider_config = self.runtime_instance.inject_into_provider_config(provider_config)
                     virsh = VirshCommand(provider_config=provider_config)
@@ -1962,9 +1992,7 @@ class BoxmanManager:
         provider_config = self.config.get('provider', {}).get(provider_type, {})
         if self.app_config and 'providers' in self.app_config:
             app_prov = self.app_config['providers'].get(provider_type, {})
-            merged = app_prov.copy()
-            merged.update(provider_config)
-            provider_config = merged
+            provider_config = self._merge_provider_configs(app_prov, provider_config)
         if hasattr(self, 'runtime_instance'):
             provider_config = self.runtime_instance.inject_into_provider_config(
                 provider_config)
@@ -1996,9 +2024,7 @@ class BoxmanManager:
         provider_config = self.config.get('provider', {}).get(provider_type, {})
         if self.app_config and 'providers' in self.app_config:
             app_prov = self.app_config['providers'].get(provider_type, {})
-            merged = app_prov.copy()
-            merged.update(provider_config)
-            provider_config = merged
+            provider_config = self._merge_provider_configs(app_prov, provider_config)
         if hasattr(self, 'runtime_instance'):
             provider_config = self.runtime_instance.inject_into_provider_config(
                 provider_config)
@@ -2036,9 +2062,7 @@ class BoxmanManager:
         provider_config = self.config.get('provider', {}).get(provider_type, {})
         if self.app_config and 'providers' in self.app_config:
             app_prov = self.app_config['providers'].get(provider_type, {})
-            merged = app_prov.copy()
-            merged.update(provider_config)
-            provider_config = merged
+            provider_config = self._merge_provider_configs(app_prov, provider_config)
         if hasattr(self, 'runtime_instance'):
             provider_config = self.runtime_instance.inject_into_provider_config(
                 provider_config)
@@ -2964,9 +2988,7 @@ class BoxmanManager:
         provider_config = cls.config.get("provider", {}).get(provider_type, {})
         if cls.app_config and "providers" in cls.app_config:
             app_prov = cls.app_config["providers"].get(provider_type, {})
-            merged = app_prov.copy()
-            merged.update(provider_config)
-            provider_config = merged
+            provider_config = BoxmanManager._merge_provider_configs(app_prov, provider_config)
 
         virsh = VirshCommand(provider_config=provider_config)
         result = virsh.execute("list", "--all", hide=True, warn=True)
