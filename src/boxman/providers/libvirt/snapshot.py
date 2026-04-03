@@ -7,7 +7,6 @@ This module provides functionality to manage VM snapshots using command-line too
 
 import os
 import time
-from datetime import datetime
 from typing import Dict, Any, List, Optional
 from .commands import VirshCommand
 from xml.etree import ElementTree as ET
@@ -291,9 +290,118 @@ class SnapshotManager:
             self.logger.error(f"error listing snapshots for vm {vm_name}: {exc}")
             return []
 
+    def _get_snapshot_overlay_files(self, vm_name: str) -> Dict[str, str]:
+        """
+        Return a mapping of snapshot_name -> set of overlay file paths
+        for every external snapshot on *vm_name*.
+        """
+        result = self.virsh.execute(
+            "snapshot-list", vm_name, "--name", warn=True)
+        if not result.ok:
+            return {}
+
+        overlays: Dict[str, List[str]] = {}
+        for snap in result.stdout.strip().splitlines():
+            snap = snap.strip()
+            if not snap:
+                continue
+            xml_result = self.virsh.execute(
+                "snapshot-dumpxml", vm_name, snap, warn=True)
+            if not xml_result.ok:
+                continue
+            try:
+                root = ET.fromstring(xml_result.stdout)
+                files = []
+                for disk in root.findall(".//disks/disk"):
+                    if disk.get("snapshot") != "external":
+                        continue
+                    source = disk.find("source")
+                    if source is not None and source.get("file"):
+                        files.append(source.get("file"))
+                if files:
+                    overlays[snap] = files
+            except ET.ParseError:
+                continue
+        return overlays
+
+    def _preserve_snapshot_overlays(self, vm_name: str) -> List[tuple]:
+        """
+        Back up overlay files that belong to snapshots and may be deleted
+        by ``snapshot-revert``.
+
+        libvirt deletes the overlay of the *current* snapshot when
+        reverting to an earlier one.  This method copies those files so
+        they can be restored afterwards, keeping every snapshot reachable.
+
+        Returns a list of (original_path, backup_path) tuples.
+        """
+        all_overlays = self._get_snapshot_overlay_files(vm_name)
+
+        # collect every overlay file referenced by any snapshot
+        files_to_preserve: set = set()
+        for files in all_overlays.values():
+            files_to_preserve.update(files)
+
+        pairs = [(f, f + '.preserve') for f in sorted(files_to_preserve)
+                 if os.path.isfile(f)]
+        if not pairs:
+            return []
+
+        # batch all copies into one command → one sudo prompt
+        sudo = "sudo " if self.use_sudo else ""
+        cmd = " && ".join(
+            f"{sudo}rsync -aW --sparse '{src}' '{dst}'"
+            for src, dst in pairs)
+        result = self.virsh.execute_shell(cmd, warn=True)
+        if result.ok:
+            for src, _ in pairs:
+                self.logger.debug(f"preserved snapshot overlay: {src}")
+            return pairs
+
+        self.logger.warning(
+            f"failed to preserve overlays for {vm_name}: {result.stderr}")
+        return []
+
+    def _restore_preserved_overlays(self, preserved: List[tuple]) -> None:
+        """
+        Restore overlay files that were deleted during revert and clean
+        up backup files that are no longer needed.
+        """
+        if not preserved:
+            return
+
+        sudo = "sudo " if self.use_sudo else ""
+
+        to_restore = [(o, b) for o, b in preserved
+                      if not os.path.isfile(o) and os.path.isfile(b)]
+        to_cleanup = [b for o, b in preserved
+                      if os.path.isfile(o) and os.path.isfile(b)]
+
+        if to_restore:
+            cmd = " && ".join(
+                f"{sudo}rsync -aW --sparse --remove-source-files '{b}' '{o}'"
+                for o, b in to_restore)
+            result = self.virsh.execute_shell(cmd, warn=True)
+            if result.ok:
+                for o, _ in to_restore:
+                    self.logger.info(
+                        f"restored overlay deleted by revert: {o}")
+            else:
+                self.logger.warning(
+                    f"failed to restore overlays: {result.stderr}")
+
+        if to_cleanup:
+            cmd = " && ".join(
+                f"{sudo}rm -f '{b}'" for b in to_cleanup)
+            self.virsh.execute_shell(cmd, warn=True)
+
     def snapshot_restore(self, vm_name: str, snapshot_name: str) -> bool:
         """
         Revert a VM to a specific snapshot.
+
+        Before reverting, overlay files referenced by all snapshots are
+        backed up.  After the revert any overlays that libvirt deleted
+        are restored so that every snapshot remains reachable.
 
         Retries up to 3 times on write-lock contention errors, which can
         occur transiently when multiple snapshot-reverts run in parallel and
@@ -307,6 +415,8 @@ class SnapshotManager:
         Returns:
             bool: True if successful, False otherwise
         """
+        preserved = self._preserve_snapshot_overlays(vm_name)
+
         max_retries = 3
         last_stderr = ''
 
@@ -317,6 +427,7 @@ class SnapshotManager:
 
                 if result.ok:
                     self.logger.info(f"vm {vm_name} reverted to snapshot '{snapshot_name}'")
+                    self._restore_preserved_overlays(preserved)
                     return True
 
                 last_stderr = result.stderr or ''
@@ -332,8 +443,10 @@ class SnapshotManager:
             except Exception as exc:
                 self.logger.error(
                     f"error reverting vm {vm_name} to snapshot '{snapshot_name}': {exc}")
+                self._restore_preserved_overlays(preserved)
                 return False
 
+        self._restore_preserved_overlays(preserved)
         self.logger.error(
             f"failed to revert vm {vm_name} to snapshot '{snapshot_name}': {last_stderr}")
         return False

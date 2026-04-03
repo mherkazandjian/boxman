@@ -167,7 +167,8 @@ class LibVirtCommandBase:
             return False
         return self.use_sudo
 
-    def execute_shell(self, command: str, hide: bool = True, warn: bool = False) -> invoke.runners.Result:
+    def execute_shell(self, command: str, hide: bool = True, warn: bool = False,
+                      force_sudo: bool = False) -> invoke.runners.Result:
         """
         Execute a raw shell command.
 
@@ -178,6 +179,8 @@ class LibVirtCommandBase:
             command: The full shell command to execute
             hide: Whether to hide command output
             warn: Whether to warn instead of raising exceptions
+            force_sudo: When True, prepend sudo regardless of sudo_skip_commands
+                        (still requires use_sudo to be True)
 
         Returns:
             Result of the command execution
@@ -187,7 +190,7 @@ class LibVirtCommandBase:
         """
         # add sudo if needed (respects force_sudo_commands / sudo_skip_commands)
         if not command.startswith("sudo "):
-            if self._should_use_sudo_for_command(command):
+            if (force_sudo and self.use_sudo) or self._should_use_sudo_for_command(command):
                 command = f"sudo {command}"
 
         # wrap for runtime environment
