@@ -91,7 +91,7 @@ boxman --version
 ## 1.3 The Configuration File
 
 Everything in Boxman is driven by a single YAML file. Here's what we'll use for Chapter 1
-([conf/chapter1.yml](conf/chapter1.yml)):
+([conf/tutorial1.yml](conf/tutorial1.yml)):
 
 ```yaml
 version: '1.0'
@@ -153,13 +153,13 @@ clusters:
 
 ```mermaid
 graph TD
-    A["<b>conf.yml</b><br/>single source of truth"] --> T["<b>Template</b><br/>Ubuntu 24.04 cloud image<br/>+ cloud-init baking"]
-    A --> C["<b>Cluster: cluster_1</b>"]
-    C --> N["<b>Network: nat1</b><br/>192.168.10.0/24<br/>NAT + DHCP"]
-    C --> V["<b>VM: node01</b><br/>2 cores, 2GB RAM<br/>max: 16 vCPU, 16GB"]
+    A["conf.yml\nsingle source of truth"] --> T["Template\nUbuntu 24.04 cloud image\n+ cloud-init baking"]
+    A --> C["Cluster: cluster_1"]
+    C --> N["Network: nat1\n192.168.10.0/24\nNAT + DHCP"]
+    C --> V["VM: node01\n2 cores, 2GB RAM\nmax: 16 vCPU, 16GB"]
     V -->|"cloned from"| T
     V -->|"connected to"| N
-    V --> D["<b>Disk: disk01</b><br/>2GB qcow2"]
+    V --> D["Disk: disk01\n2GB qcow2"]
 
     style A fill:#3498db,color:#fff,stroke:none
     style T fill:#9b59b6,color:#fff,stroke:none
@@ -183,7 +183,7 @@ graph TD
 
 ```bash
 cd doc/tutorial/conf
-boxman --conf chapter1.yml provision
+boxman --conf tutorial1.yml provision
 ```
 
 Behind the scenes, boxman:
@@ -199,7 +199,7 @@ Behind the scenes, boxman:
 Verify it's running:
 
 ```bash
-boxman --conf chapter1.yml ps
+boxman --conf tutorial1.yml ps
 ```
 
 ```
@@ -211,7 +211,7 @@ cluster_1  node01  running   192.168.10.xxx
 ## 1.5 SSH In
 
 ```bash
-boxman --conf chapter1.yml ssh
+boxman --conf tutorial1.yml ssh
 ```
 
 You're now inside `node01`. Poke around:
@@ -228,13 +228,13 @@ exit
 ## 1.6 Take a Snapshot
 
 ```bash
-boxman --conf chapter1.yml snapshot take --name "clean-state"
+boxman --conf tutorial1.yml snapshot take --name "clean-state"
 ```
 
 List it:
 
 ```bash
-boxman --conf chapter1.yml snapshot list
+boxman --conf tutorial1.yml snapshot list
 ```
 
 ```
@@ -250,7 +250,7 @@ This captures the **entire VM state** -- disk, memory, running processes -- all 
 SSH in and cause some damage:
 
 ```bash
-boxman --conf chapter1.yml ssh
+boxman --conf tutorial1.yml ssh
 
 # Inside the VM:
 sudo rm -rf /usr/bin/python3 /etc/hostname /var/log/*
@@ -261,7 +261,7 @@ exit
 Try SSH again -- things are visibly wrong:
 
 ```bash
-boxman --conf chapter1.yml ssh
+boxman --conf tutorial1.yml ssh
 # hostname is gone, python is missing, logs are wiped
 cat /etc/motd   # "everything is broken"
 exit
@@ -270,13 +270,13 @@ exit
 ## 1.8 Restore
 
 ```bash
-boxman --conf chapter1.yml snapshot restore --name "clean-state"
+boxman --conf tutorial1.yml snapshot restore --name "clean-state"
 ```
 
 Now SSH back in:
 
 ```bash
-boxman --conf chapter1.yml ssh
+boxman --conf tutorial1.yml ssh
 
 # Everything is back:
 python3 --version    # works
@@ -316,11 +316,11 @@ In this chapter we'll scale the cluster **without reprovisioning** -- add a seco
 a new disk, and hot-scale CPU and memory. The VMs stay up throughout.
 
 We start from the same config as Chapter 1. The final scaled config is at
-[conf/chapter2-scaled.yml](conf/chapter2-scaled.yml).
+[conf/tutorial2-scaled.yml](conf/tutorial2-scaled.yml).
 
 ## 2.1 Add a Second VM
 
-Edit your `chapter1.yml` (or switch to `chapter2-scaled.yml`) and add `node02` under `vms`:
+Edit your `tutorial1.yml` (or switch to `tutorial2-scaled.yml`) and add `node02` under `vms`:
 
 ```yaml
     vms:
@@ -352,19 +352,19 @@ Edit your `chapter1.yml` (or switch to `chapter2-scaled.yml`) and add `node02` u
 Preview what will change:
 
 ```bash
-boxman --conf chapter2-scaled.yml update --dry-run
+boxman --conf tutorial2-scaled.yml update --dry-run
 ```
 
 Apply:
 
 ```bash
-boxman --conf chapter2-scaled.yml update
+boxman --conf tutorial2-scaled.yml update
 ```
 
 Verify both VMs are running:
 
 ```bash
-boxman --conf chapter2-scaled.yml ps
+boxman --conf tutorial2-scaled.yml ps
 ```
 
 ```
@@ -379,8 +379,8 @@ cluster_1  node02  running   192.168.10.y
 ```mermaid
 graph LR
     subgraph "NAT Network: 192.168.10.0/24"
-        N1["<b>node01</b><br/>4 vCPU, 4GB RAM<br/>disk01 + disk02"]
-        N2["<b>node02</b><br/>4 vCPU, 2GB RAM<br/>disk01"]
+        N1["node01\n4 vCPU, 4GB RAM\ndisk01 + disk02"]
+        N2["node02\n4 vCPU, 2GB RAM\ndisk01"]
     end
     H["Host"] -->|"boxman ssh node01"| N1
     H -->|"boxman ssh node02"| N2
@@ -410,16 +410,16 @@ In the same config, add a second disk to `node01`:
 ```
 
 ```bash
-boxman --conf chapter2-scaled.yml update --dry-run
+boxman --conf tutorial2-scaled.yml update --dry-run
 # Shows: node01: add disk disk02 (4096 MB)
 
-boxman --conf chapter2-scaled.yml update
+boxman --conf tutorial2-scaled.yml update
 ```
 
 Verify inside the VM:
 
 ```bash
-boxman --conf chapter2-scaled.yml ssh node01
+boxman --conf tutorial2-scaled.yml ssh node01
 lsblk
 # NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
 # vda    252:0    0   20G  0 disk /
@@ -444,13 +444,13 @@ This is where `max_vcpus` and `max_memory` pay off. Change `node01`'s resources:
 ```
 
 ```bash
-boxman --conf chapter2-scaled.yml update
+boxman --conf tutorial2-scaled.yml update
 ```
 
 Verify -- the VM is still up:
 
 ```bash
-boxman --conf chapter2-scaled.yml ssh node01
+boxman --conf tutorial2-scaled.yml ssh node01
 nproc       # 8 (4 cores x 2 threads)
 free -m     # ~4GB
 uptime      # still counting from original boot
@@ -464,8 +464,8 @@ creation time -- the QEMU process was started with headroom for scaling.
 ## 2.4 Snapshot the Whole Cluster
 
 ```bash
-boxman --conf chapter2-scaled.yml snapshot take --name "cluster-good-state"
-boxman --conf chapter2-scaled.yml snapshot list
+boxman --conf tutorial2-scaled.yml snapshot take --name "cluster-good-state"
+boxman --conf tutorial2-scaled.yml snapshot list
 ```
 
 Both `node01` and `node02` are captured.
@@ -477,7 +477,7 @@ Let's put some real state in the VMs so the restore feels meaningful.
 **On node01** -- start a web server:
 
 ```bash
-boxman --conf chapter2-scaled.yml ssh node01
+boxman --conf tutorial2-scaled.yml ssh node01
 
 mkdir -p /tmp/webapp
 cat > /tmp/webapp/index.html << 'HTML'
@@ -497,7 +497,7 @@ exit
 **On node02** -- create a database:
 
 ```bash
-boxman --conf chapter2-scaled.yml ssh node02
+boxman --conf tutorial2-scaled.yml ssh node02
 
 sudo apt install -y sqlite3
 sqlite3 /tmp/mydata.db << 'SQL'
@@ -518,7 +518,7 @@ exit
 Now take a snapshot that captures all of this:
 
 ```bash
-boxman --conf chapter2-scaled.yml snapshot take --name "apps-running"
+boxman --conf tutorial2-scaled.yml snapshot take --name "apps-running"
 ```
 
 ## 2.6 Nuke Everything, Restore Everything
@@ -527,12 +527,12 @@ Destroy both VMs from the inside:
 
 ```bash
 # Terminal 1: nuke node01
-boxman --conf chapter2-scaled.yml ssh node01
+boxman --conf tutorial2-scaled.yml ssh node01
 sudo rm -rf /etc /usr /var /bin /sbin /tmp/webapp
 # Connection drops -- the VM is wrecked
 
 # Terminal 2: nuke node02
-boxman --conf chapter2-scaled.yml ssh node02
+boxman --conf tutorial2-scaled.yml ssh node02
 sudo rm -rf /etc /usr /var /bin /sbin /tmp/mydata.db
 # Connection drops
 ```
@@ -540,20 +540,20 @@ sudo rm -rf /etc /usr /var /bin /sbin /tmp/mydata.db
 Both VMs are now unrecoverable through normal means. Restore:
 
 ```bash
-boxman --conf chapter2-scaled.yml snapshot restore --name "apps-running"
+boxman --conf tutorial2-scaled.yml snapshot restore --name "apps-running"
 ```
 
 Verify:
 
 ```bash
 # Web server on node01
-boxman --conf chapter2-scaled.yml ssh node01
+boxman --conf tutorial2-scaled.yml ssh node01
 curl -s localhost:8080 | head -3
 # <html> ... "node01 is alive" ... 
 exit
 
 # Database on node02
-boxman --conf chapter2-scaled.yml ssh node02
+boxman --conf tutorial2-scaled.yml ssh node02
 sqlite3 /tmp/mydata.db "SELECT * FROM experiments;"
 # 1|baseline|PASS|...
 # 2|stress-test|PASS|...
@@ -571,7 +571,7 @@ Boxman doesn't just provision VMs -- it generates a complete ansible workspace. 
 chapter we'll use it to bootstrap a cluster, deploy a live terminal demo, break it, and
 resurrect it.
 
-The full config for this chapter is at [conf/chapter3.yml](conf/chapter3.yml).
+The full config for this chapter is at [conf/tutorial3.yml](conf/tutorial3.yml).
 
 ## 3.1 The Workspace
 
@@ -659,7 +659,7 @@ sequenceDiagram
 
     You->>Boxman: boxman run ping
     Boxman->>Workspace: source env.sh
-    Workspace-->>Boxman: SSH_CONFIG, INVENTORY,<br/>ANSIBLE_CONFIG, GATEWAYHOST
+    Workspace-->>Boxman: SSH_CONFIG, INVENTORY, ANSIBLE_CONFIG, GATEWAYHOST
     Boxman->>Ansible: ansible all -m ping
     Ansible->>VMs: SSH (via generated ssh_config)
     VMs-->>Ansible: pong
@@ -671,13 +671,13 @@ sequenceDiagram
 If you're continuing from Chapter 2, deprovision first:
 
 ```bash
-boxman --conf chapter2-scaled.yml deprovision --cleanup
+boxman --conf tutorial2-scaled.yml deprovision --cleanup
 ```
 
 Then provision with the Chapter 3 config:
 
 ```bash
-boxman --conf chapter3.yml provision
+boxman --conf tutorial3.yml provision
 ```
 
 ## 3.3 Running Commands
@@ -685,7 +685,7 @@ boxman --conf chapter3.yml provision
 List available tasks:
 
 ```bash
-boxman --conf chapter3.yml run --list
+boxman --conf tutorial3.yml run --list
 ```
 
 ```
@@ -702,14 +702,14 @@ Run them:
 
 ```bash
 # Ping all hosts
-boxman --conf chapter3.yml run ping
+boxman --conf tutorial3.yml run ping
 
 # Run a command on all hosts
-boxman --conf chapter3.yml run cmd -- hostname
-boxman --conf chapter3.yml run cmd -- uptime
+boxman --conf tutorial3.yml run cmd -- hostname
+boxman --conf tutorial3.yml run cmd -- uptime
 
 # Limit to a single host
-boxman --conf chapter3.yml run cmd -- --limit node01 free -m
+boxman --conf tutorial3.yml run cmd -- --limit node01 free -m
 ```
 
 ## 3.4 Bootstrap the Cluster
@@ -717,7 +717,7 @@ boxman --conf chapter3.yml run cmd -- --limit node01 free -m
 Install packages (including cmatrix) on all nodes:
 
 ```bash
-boxman --conf chapter3.yml run bootstrap
+boxman --conf tutorial3.yml run bootstrap
 ```
 
 This runs the `ansible/bootstrap.yml` playbook, which installs `vim`, `tmux`, `htop`,
@@ -731,13 +731,13 @@ destroy everything, and watch the Matrix resurrect.
 ### Step 1: Start the Matrix
 
 ```bash
-boxman --conf chapter3.yml run cmatrix-start
+boxman --conf tutorial3.yml run cmatrix-start
 ```
 
 SSH into a node and attach to the tmux session to see it:
 
 ```bash
-boxman --conf chapter3.yml ssh node01
+boxman --conf tutorial3.yml ssh node01
 tmux attach -t matrix
 ```
 
@@ -750,7 +750,7 @@ Detach from tmux with `Ctrl-b d`, then `exit` the SSH session.
 The `--live` flag captures the VM state **including running processes and memory**:
 
 ```bash
-boxman --conf chapter3.yml snapshot take --live --name "matrix-running"
+boxman --conf tutorial3.yml snapshot take --live --name "matrix-running"
 ```
 
 The Matrix is still running inside the VMs while the snapshot is taken.
@@ -760,7 +760,7 @@ The Matrix is still running inside the VMs while the snapshot is taken.
 Open a separate terminal and nuke node01:
 
 ```bash
-boxman --conf chapter3.yml ssh node01
+boxman --conf tutorial3.yml ssh node01
 sudo rm -rf /usr /bin /etc /var /sbin
 # Connection drops. The Matrix is dead.
 ```
@@ -768,7 +768,7 @@ sudo rm -rf /usr /bin /etc /var /sbin
 Do the same to node02:
 
 ```bash
-boxman --conf chapter3.yml ssh node02
+boxman --conf tutorial3.yml ssh node02
 sudo rm -rf /usr /bin /etc /var /sbin
 # Connection drops.
 ```
@@ -778,7 +778,7 @@ Both VMs are completely destroyed. No SSH, no processes, nothing.
 ### Step 4: Restore
 
 ```bash
-boxman --conf chapter3.yml snapshot restore --name "matrix-running"
+boxman --conf tutorial3.yml snapshot restore --name "matrix-running"
 ```
 
 ### Step 5: The Matrix Lives
@@ -786,7 +786,7 @@ boxman --conf chapter3.yml snapshot restore --name "matrix-running"
 SSH back into node01 and reattach to the tmux session:
 
 ```bash
-boxman --conf chapter3.yml ssh node01
+boxman --conf tutorial3.yml ssh node01
 tmux attach -t matrix
 ```
 
@@ -802,10 +802,10 @@ Here's the workflow that makes Boxman shine for daily development:
 
 ```mermaid
 graph LR
-    P["<b>1. Provision</b><br/>boxman provision"] --> B["<b>2. Bootstrap</b><br/>boxman run bootstrap"]
-    B --> S["<b>3. Snapshot</b><br/>boxman snapshot take<br/>--name golden"]
-    S --> E["<b>4. Experiment</b><br/>break things,<br/>test ideas"]
-    E --> R["<b>5. Restore</b><br/>boxman restore"]
+    P["1. Provision\nboxman provision"] --> B["2. Bootstrap\nboxman run bootstrap"]
+    B --> S["3. Snapshot\nboxman snapshot take\n--name golden"]
+    S --> E["4. Experiment\nbreak things,\ntest ideas"]
+    E --> R["5. Restore\nboxman restore"]
     R --> E
 
     style P fill:#3498db,color:#fff,stroke:none
@@ -817,13 +817,13 @@ graph LR
 
 ```bash
 # One-time setup
-boxman --conf chapter3.yml provision
-boxman --conf chapter3.yml run bootstrap
-boxman --conf chapter3.yml snapshot take --name "golden"
+boxman --conf tutorial3.yml provision
+boxman --conf tutorial3.yml run bootstrap
+boxman --conf tutorial3.yml snapshot take --name "golden"
 
 # Daily workflow
 #   ... experiment, break things, test ideas ...
-boxman --conf chapter3.yml restore    # back to golden in seconds
+boxman --conf tutorial3.yml restore    # back to golden in seconds
 #   ... experiment again ...
 ```
 
@@ -840,7 +840,7 @@ Your entire dev environment is:
 When you're done with the tutorial:
 
 ```bash
-boxman --conf chapter3.yml deprovision --cleanup
+boxman --conf tutorial3.yml deprovision --cleanup
 ```
 
 This removes all VMs, networks, SSH keys, and generated workspace files.
