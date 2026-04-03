@@ -1,4 +1,5 @@
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+import os
 import invoke
 from boxman import log
 
@@ -35,6 +36,21 @@ class LibVirtCommandBase:
 
         #: str: Command executable path
         self.command_path = None
+
+        #: str: The runtime environment ('local', 'docker-compose', etc.)
+        self.runtime = self.provider_config.get('runtime', 'local')
+
+        #: str: The docker-compose container name for remote execution
+        self.runtime_container = self.provider_config.get(
+            'runtime_container', 'boxman-libvirt-default')
+
+        #: List[str]: Commands that should never get sudo prepended
+        self.sudo_skip_commands: List[str] = self.provider_config.get(
+            'sudo_skip_commands', [])
+
+        #: List[str]: Commands that should always get sudo prepended
+        self.force_sudo_commands: List[str] = self.provider_config.get(
+            'force_sudo_commands', [])
 
         # override use_sudo if provided
         if override_config_use_sudo is not None:
@@ -97,6 +113,7 @@ class LibVirtCommandBase:
             RuntimeError: If the command fails and warn is False
         """
         command = self.build_command(*args, **kwargs)
+        command = self._wrap_for_runtime(command)
 
         if self.verbose:
             self.logger.info(f"executing: {command}")
@@ -128,7 +145,30 @@ class LibVirtCommandBase:
                 raise RuntimeError(error_message)
             return exc.result
 
-    def execute_shell(self, command: str, hide: bool = True, warn: bool = False) -> invoke.runners.Result:
+    def _should_use_sudo_for_command(self, command: str) -> bool:
+        """
+        Decide whether *command* should be run with sudo.
+
+        Resolution order (first match wins):
+        1. ``force_sudo_commands`` — always sudo regardless of ``use_sudo``
+        2. ``sudo_skip_commands`` — never sudo regardless of ``use_sudo``
+        3. Fall back to the global ``use_sudo`` flag.
+
+        Matching is done against the basename of the first token in the
+        command string (e.g. ``/usr/bin/qemu-img resize …`` matches
+        ``qemu-img``).
+        """
+        first_token = command.split()[0] if command.strip() else ''
+        cmd_name = os.path.basename(first_token)
+
+        if cmd_name in self.force_sudo_commands:
+            return True
+        if cmd_name in self.sudo_skip_commands:
+            return False
+        return self.use_sudo
+
+    def execute_shell(self, command: str, hide: bool = True, warn: bool = False,
+                      force_sudo: bool = False) -> invoke.runners.Result:
         """
         Execute a raw shell command.
 
@@ -139,6 +179,8 @@ class LibVirtCommandBase:
             command: The full shell command to execute
             hide: Whether to hide command output
             warn: Whether to warn instead of raising exceptions
+            force_sudo: When True, prepend sudo regardless of sudo_skip_commands
+                        (still requires use_sudo to be True)
 
         Returns:
             Result of the command execution
@@ -146,9 +188,13 @@ class LibVirtCommandBase:
         Raises:
             RuntimeError: If the command fails and warn is False
         """
-        # add sudo if needed
-        if self.use_sudo and not command.startswith("sudo "):
-            command = f"sudo {command}"
+        # add sudo if needed (respects force_sudo_commands / sudo_skip_commands)
+        if not command.startswith("sudo "):
+            if (force_sudo and self.use_sudo) or self._should_use_sudo_for_command(command):
+                command = f"sudo {command}"
+
+        # wrap for runtime environment
+        command = self._wrap_for_runtime(command)
 
         if self.verbose:
             self.logger.info(f"Executing shell command: {command}")
@@ -179,6 +225,29 @@ class LibVirtCommandBase:
                 self.logger.error(error_message)
                 raise RuntimeError(error_message)
             return exc.result
+
+    def _wrap_for_runtime(self, command: str) -> str:
+        """
+        Wrap a command string for execution in the configured runtime environment.
+
+        For 'local' runtime, the command is returned unchanged.
+        For 'docker-compose' runtime, the command is wrapped in a
+        ``docker exec`` invocation targeting the runtime container.
+
+        Args:
+            command: The command string to wrap
+
+        Returns:
+            The (possibly wrapped) command string
+        """
+        if self.runtime == 'local':
+            return command
+        elif self.runtime == 'docker-compose':
+            # escape single quotes in the command for safe shell wrapping
+            escaped = command.replace("'", "'\\''")
+            return f"docker exec --user root {self.runtime_container} bash -c '{escaped}'"
+        else:
+            raise ValueError(f"unsupported runtime: {self.runtime}")
 
 
 class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
@@ -267,7 +336,7 @@ class VirtInstallCommand(LibVirtCommandBase):
         Args:
             provider_config: Dictionary containing provider-specific configuration
         """
-        super().__init__(provider_config)
+        super().__init__(provider_config=provider_config)
 
         #: str: the path to virt-install binary
         self.command_path = self.provider_config.get('virt_install_cmd', 'virt-install')

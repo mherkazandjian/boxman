@@ -26,7 +26,6 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-setup.cfg
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -159,3 +158,14 @@ docs/examples
 .default_env
 data/dev/*
 *.rendered.yml
+.github
+containers/docker/data
+.boxman
+
+# latex
+*.aux
+*.nav
+*.pdf
+*.snm
+*.toc
+*.vrb

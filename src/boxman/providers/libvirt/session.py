@@ -1,16 +1,23 @@
 import os
+import glob as _glob
 import time
 from typing import Dict, Any, Optional, List
+import json
+from multiprocessing import Process, Queue
+
 from .net import Network, NetworkInterface
 from .clone_vm import CloneVM
 from .destroy_vm import DestroyVM
 from .disk import DiskManager
+from .cdrom import CDROMManager
+from .shared_folder import SharedFolderManager
 from datetime import datetime
 
 from boxman import log
 from .snapshot import SnapshotManager
 from .commands import VirshCommand
 from .virsh_edit import VirshEdit
+from .import_image import ImageImporter
 
 class LibVirtSession:
     def __init__(self,
@@ -27,15 +34,113 @@ class LibVirtSession:
         #: logging.Logger: the logger instance
         self.logger = log
 
-        # get provider config
-        self.provider_config = config.get('provider', {}).get('libvirt', {})
+        # get provider config from the project configuration — these are
+        # authoritative and must never be overridden by app-level defaults.
+        self._project_provider_config = config.get('provider', {}).get('libvirt', {})
 
-        # extract commonly used provider settings
-        self.uri = self.provider_config.get('uri', 'qemu:///system')
-        self.use_sudo = self.provider_config.get('use_sudo', False)
+        #: Dict[str, Any]: the base provider config (may be enriched with
+        #: app-level or runtime settings, but project-level keys always win
+        #: via the property).
+        self._provider_config_base = self._project_provider_config.copy()
 
         #: the boxman manager instance (mainly to get access to the cache)
         self.manager = None
+
+    @property
+    def provider_config(self) -> Dict[str, Any]:
+        """
+        Return the effective provider config.
+
+        Project-level settings (from conf.yml) always take precedence
+        over app-level (boxman.yml) or runtime-injected values.
+        """
+        merged = self._provider_config_base.copy()
+        merged.update(self._project_provider_config)
+        return merged
+
+    @provider_config.setter
+    def provider_config(self, value: Dict[str, Any]) -> None:
+        """
+        Set the base provider config.
+
+        The getter will overlay project-level settings on top, so
+        project-level keys like ``use_sudo`` can never be overridden.
+        """
+        self._provider_config_base = value
+
+    @property
+    def uri(self) -> str:
+        return self.provider_config.get('uri', 'qemu:///system')
+
+    @uri.setter
+    def uri(self, value: str) -> None:
+        self._provider_config_base['uri'] = value
+
+    @property
+    def use_sudo(self) -> bool:
+        return self.provider_config.get('use_sudo', False)
+
+    @use_sudo.setter
+    def use_sudo(self, value: bool) -> None:
+        self._provider_config_base['use_sudo'] = value
+
+    def update_provider_config(self, new_config: Dict[str, Any]) -> None:
+        """
+        Update provider_config with *new_config*, but project-level settings
+        always win (enforced by the property getter).
+
+        Args:
+            new_config: Additional config keys (e.g. from boxman.yml providers
+                        section or runtime injection).
+        """
+        merged = self._provider_config_base.copy()
+        merged.update(new_config)
+        self._provider_config_base = merged
+
+    def update_provider_config_with_runtime(self) -> None:
+        """
+        Enrich provider_config with runtime metadata from the manager.
+
+        Project-level provider settings always take precedence over
+        app-level (boxman.yml) settings and runtime defaults.
+        """
+        if self.manager is None:
+            return
+
+        # Get the runtime-enriched config from the manager
+        enriched = self.manager.get_provider_config_with_runtime(
+            self.provider_config
+        )
+        # Merge, ensuring project-level keys win
+        self.update_provider_config(enriched)
+
+    def import_image(self,
+                     manifest_uri: str,
+                     vm_name: str,
+                     vm_dir: str) -> bool:
+        """
+        Import an image into the libvirt storage pool.
+
+        :param manifest_uri: URI of the manifest of the image to import
+        :param vm_name: Name to assign to the imported VM
+        :param vm_dir: Directory for the imported VM
+        :return: True if successful, False otherwise
+        """
+        if manifest_uri.startswith('file://'):
+            manifest_path = os.path.expanduser(manifest_uri[len('file://'):])
+            with open(manifest_path, 'r') as fobj:
+                manifest = json.load(fobj)
+        elif manifest_uri.startswith('http://') or manifest_uri.startswith('https://'):
+            raise NotImplementedError('http/https image uris are not implemented yet')
+
+        image_importer = ImageImporter(
+            manifest_path=manifest_path,
+            uri=self.manager.config['uri'],
+            disk_dir=vm_dir,
+            vm_name=vm_name,
+            keep_uuid=False)
+
+        image_importer.import_image()
 
     def define_network(self,
                        name: str = None,
@@ -47,10 +152,18 @@ class LibVirtSession:
         Args:
             name: Name of the network
             info: Dictionary containing network configuration
+            workdir: Working directory for XML files (resolved to absolute
+                     path so it works inside container runtimes)
 
         Returns:
             True if successful, False otherwise
         """
+        # Resolve workdir to an absolute path so it is valid both on the
+        # host and inside a bind-mounted docker-compose container.
+        if workdir:
+            workdir = os.path.abspath(os.path.expanduser(workdir))
+            os.makedirs(workdir, exist_ok=True)
+
         network = Network(
             name=name,
             info=info,
@@ -111,7 +224,8 @@ class LibVirtSession:
             name=name,
             info=info,
             provider_config=self.provider_config,
-            assign_new_bridge=False
+            assign_new_bridge=False,
+            manager=self.manager
         )
         status = network.remove_network()
         return status
@@ -154,27 +268,39 @@ class LibVirtSession:
         """
         Destroy disks associated with the VM.
 
+        Removes:
+        - The primary boot disk ({vm_name}.qcow2)
+        - Any extra named disks ({vm_name}_{disk}.qcow2)
+        - All snapshot artifacts: external overlay files (e.g.
+          {vm_name}.2026-03-02T15:36:54, {vm_name}.1772465824) and memory
+          snapshot raw files ({vm_name}_snapshot_*.raw)
+
         Args:
-            vm_name: Name of the VM
-            vm_info: VM configuration information
+            workdir: Directory where disk images are stored
+            vm_name: Full name of the VM
+            disks: Extra disk configurations from the cluster config
 
         Returns:
             True if successful, False otherwise
         """
-        boot_disk = os.path.expanduser(
-            os.path.join(workdir, f'{vm_name}.qcow2'))
+        workdir = os.path.expanduser(workdir)
 
+        boot_disk = os.path.join(workdir, f'{vm_name}.qcow2')
         if os.path.isfile(boot_disk):
             os.remove(boot_disk)
 
         for disk in disks:
-            disk_path = os.path.expanduser(
-                os.path.join(
-                    workdir,
-                    f'{vm_name}_{disk["name"]}.qcow2')
-                )
+            disk_path = os.path.join(workdir, f'{vm_name}_{disk["name"]}.qcow2')
             if os.path.isfile(disk_path):
                 os.remove(disk_path)
+
+        # remove snapshot artifacts: overlay files with timestamp/hash suffixes
+        # and memory snapshot .raw files — anything prefixed with vm_name that
+        # is still on disk after the named qcow2 files were removed above
+        for leftover in _glob.glob(os.path.join(workdir, f'{vm_name}*')):
+            if os.path.isfile(leftover):
+                log.info(f"removing snapshot artifact: {leftover}")
+                os.remove(leftover)
 
         return True
 
@@ -316,26 +442,235 @@ class LibVirtSession:
             True if all disks were configured successfully, False otherwise
         """
         disk_manager = DiskManager(vm_name=vm_name, provider_config=self.provider_config)
+        result_queue: Queue = Queue()
 
-        success = True
-        for i, disk_config in enumerate(disks):
+        def _configure(i, disk_config):
             self.logger.info(f"configuring disk {i+1} for VM {vm_name}")
-
-            if not disk_manager.configure_from_disk_config(
+            ok = disk_manager.configure_from_disk_config(
                 disk_config=disk_config,
                 workdir=workdir,
                 disk_prefix=disk_prefix
-            ):
-                self.logger.error(f"failed to configure disk {i+1} for vm {vm_name}")
-                success = False
-            else:
+            )
+            result_queue.put((i, ok))
+            if ok:
                 self.logger.info(f"successfully configured disk {i+1} for vm {vm_name}")
+            else:
+                self.logger.error(f"failed to configure disk {i+1} for vm {vm_name}")
+
+        processes = [
+            Process(target=_configure, args=(i, disk_config))
+            for i, disk_config in enumerate(disks)
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+        success = True
+        for _ in range(len(disks)):
+            _, ok = result_queue.get()
+            if not ok:
+                success = False
 
         return success
+
+    def configure_vm_cdroms(self,
+                            vm_name: str,
+                            cdroms: List[Dict[str, Any]]) -> bool:
+        """
+        Configure all CDROM devices for a VM.
+
+        Args:
+            vm_name: Name of the VM
+            cdroms: List of CDROM configurations
+
+        Returns:
+            True if all CDROMs were configured successfully, False otherwise
+        """
+        cdrom_manager = CDROMManager(vm_name=vm_name, provider_config=self.provider_config)
+        success = True
+        for i, cdrom_config in enumerate(cdroms):
+            self.logger.info(
+                f"configuring CDROM {i+1} ('{cdrom_config.get('name', '?')}') "
+                f"for VM {vm_name}")
+            if not cdrom_manager.configure_from_config(cdrom_config):
+                self.logger.error(
+                    f"failed to configure CDROM {i+1} for VM {vm_name}")
+                success = False
+            else:
+                self.logger.info(
+                    f"successfully configured CDROM {i+1} for VM {vm_name}")
+        return success
+
+    def update_vm_cdroms(self,
+                         vm_name: str,
+                         new_cdroms: List[Dict[str, Any]],
+                         removed_cdroms: List[Dict[str, Any]],
+                         changed_cdroms: List[Dict[str, Any]],
+                         vm_running: bool) -> bool:
+        """
+        Apply CDROM changes: attach new, detach removed, swap changed.
+
+        Args:
+            vm_name: Full VM domain name
+            new_cdroms: CDROM configs to attach
+            removed_cdroms: CDROM entries to detach (dicts with 'target')
+            changed_cdroms: CDROM entries with changed source
+                            (dicts with 'target' and 'source')
+            vm_running: Whether the VM is currently running
+
+        Returns:
+            True if all operations succeeded, False otherwise
+        """
+        cdrom_manager = CDROMManager(vm_name=vm_name, provider_config=self.provider_config)
+        success = True
+
+        for cdrom_config in new_cdroms:
+            name = cdrom_config.get('name', '?')
+            self.logger.info(f"attaching new CDROM '{name}' to VM {vm_name}")
+            if not cdrom_manager.configure_from_config(cdrom_config):
+                self.logger.error(f"failed to attach CDROM '{name}' to {vm_name}")
+                success = False
+
+        for entry in removed_cdroms:
+            target = entry['target']
+            self.logger.info(f"detaching CDROM {target} from VM {vm_name}")
+            if not cdrom_manager.detach_cdrom(target):
+                self.logger.error(f"failed to detach CDROM {target} from {vm_name}")
+                success = False
+
+        for entry in changed_cdroms:
+            target = entry['target']
+            source = entry['source']
+            self.logger.info(
+                f"changing CDROM media on {target} to {source} on VM {vm_name}")
+            if not cdrom_manager.change_media(target, source):
+                self.logger.error(
+                    f"failed to change CDROM media on {target} on {vm_name}")
+                success = False
+
+        return success
+
+    def configure_vm_shared_folders(self,
+                                    vm_name: str,
+                                    shared_folders: List[Dict[str, Any]]) -> bool:
+        """
+        Configure all shared folders for a VM.
+
+        Args:
+            vm_name: Name of the VM
+            shared_folders: List of shared folder configurations
+
+        Returns:
+            True if all shared folders were configured successfully, False otherwise
+        """
+        folder_manager = SharedFolderManager(
+            vm_name=vm_name, provider_config=self.provider_config)
+        success = True
+        for i, folder_config in enumerate(shared_folders):
+            name = folder_config.get('name', '?')
+            self.logger.info(
+                f"configuring shared folder {i+1} ('{name}') for VM {vm_name}")
+            result = folder_manager.configure_from_config(folder_config)
+            if not result['success']:
+                self.logger.error(
+                    f"failed to configure shared folder '{name}' for VM {vm_name}")
+                success = False
+            else:
+                if result.get('restart_needed'):
+                    self.logger.info(
+                        f"shared folder '{name}' configured for VM {vm_name} "
+                        f"(restart needed)")
+                else:
+                    self.logger.info(
+                        f"successfully configured shared folder '{name}' "
+                        f"for VM {vm_name}")
+        return success
+
+    def update_vm_shared_folders(self,
+                                 vm_name: str,
+                                 new_folders: List[Dict[str, Any]],
+                                 removed_folders: List[Dict[str, Any]],
+                                 changed_folders: List[Dict[str, Any]],
+                                 vm_running: bool) -> Dict[str, Any]:
+        """
+        Apply shared folder changes: attach new, detach removed, re-attach changed.
+
+        Args:
+            vm_name: Full VM domain name
+            new_folders: Folder configs to attach
+            removed_folders: Folder entries to detach (dicts with 'name', 'host_path')
+            changed_folders: Folder configs with changed host_path or readonly
+            vm_running: Whether the VM is currently running
+
+        Returns:
+            Dict with 'success' (bool) and 'restart_needed' (bool)
+        """
+        folder_manager = SharedFolderManager(
+            vm_name=vm_name, provider_config=self.provider_config)
+        success = True
+        restart_needed = False
+
+        for folder_config in new_folders:
+            name = folder_config.get('name', '?')
+            self.logger.info(f"attaching new shared folder '{name}' to VM {vm_name}")
+            result = folder_manager.configure_from_config(folder_config)
+            if not result['success']:
+                self.logger.error(
+                    f"failed to attach shared folder '{name}' to {vm_name}")
+                success = False
+            if result.get('restart_needed'):
+                restart_needed = True
+
+        for entry in removed_folders:
+            name = entry['name']
+            host_path = entry.get('host_path', '')
+            readonly = entry.get('readonly', False)
+            self.logger.info(f"detaching shared folder '{name}' from VM {vm_name}")
+            result = folder_manager.detach_shared_folder(name, host_path, readonly)
+            if not result['success']:
+                self.logger.error(
+                    f"failed to detach shared folder '{name}' from {vm_name}")
+                success = False
+            if result.get('restart_needed'):
+                restart_needed = True
+
+        for folder_config in changed_folders:
+            name = folder_config.get('name', '?')
+            self.logger.info(
+                f"updating shared folder '{name}' on VM {vm_name}")
+            # Detach the old version first (get current state from XML)
+            current_folders = folder_manager.get_attached_shared_folders()
+            current = next((f for f in current_folders if f['name'] == name), None)
+            if current:
+                detach_result = folder_manager.detach_shared_folder(
+                    name, current['host_path'], current['readonly'])
+                if not detach_result['success']:
+                    self.logger.error(
+                        f"failed to detach old shared folder '{name}' from {vm_name}")
+                    success = False
+                    continue
+                if detach_result.get('restart_needed'):
+                    restart_needed = True
+
+            # Attach the new version
+            result = folder_manager.configure_from_config(folder_config)
+            if not result['success']:
+                self.logger.error(
+                    f"failed to re-attach shared folder '{name}' to {vm_name}")
+                success = False
+            if result.get('restart_needed'):
+                restart_needed = True
+
+        return {'success': success, 'restart_needed': restart_needed}
 
     def get_vm_ip_addresses(self, vm_name: str) -> Dict[str, str]:
         """
         Get all IP addresses for a VM.
+
+        Tries domifaddr sources in order: lease → arp → agent.
+        The default 'lease' source reads dnsmasq DHCP files and can return
+        empty even when the VM has an IP (e.g. if cloud-init configured the
+        address before the lease was recorded).  Falling back to 'arp' and
+        'agent' ensures we find the address regardless of how it was assigned.
 
         Args:
             vm_name: Name of the VM
@@ -353,33 +688,46 @@ class LibVirtSession:
                 self.logger.warning(f"the vm {vm_name} is not running, cannot get the ip addresses")
                 return {}
 
-            # Try domifaddr to get all interfaces and their IPs
-            result = virsh.execute("domifaddr", vm_name, warn=True)
+            def _parse_domifaddr(output: str) -> Dict[str, str]:
+                """Parse domifaddr stdout into {iface: ip} dict.
 
-            if not result.ok:
-                self.logger.error(f"failed to get interface addresses for vm {vm_name}")
-                return {}
+                Only returns routable IPv4 addresses — loopback (127.x),
+                link-local IPv6 (fe80::), and any other IPv6 addresses are
+                excluded because they are not useful SSH targets.
+                """
+                addrs = {}
+                lines = output.strip().split('\n')
+                if len(lines) > 2:
+                    for line in lines[2:]:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            iface_name = parts[0]
+                            raw_address = parts[3]
+                            if raw_address.startswith('N/A') or raw_address == '-':
+                                continue
+                            ip_address = raw_address.split('/')[0]
+                            if (iface_name
+                                    and iface_name != '-'
+                                    and ip_address
+                                    and ':' not in ip_address        # skip IPv6
+                                    and not ip_address.startswith('127.')):  # skip loopback
+                                addrs[iface_name] = ip_address
+                return addrs
 
-            # parse the output to extract interface information
-            # output format is like:
-            # Name       MAC address          Protocol     Address
-            # ---------------------------------------------------------
-            # vnet0      52:54:00:xx:xx:xx    ipv4         192.168.122.x/24
+            # Try each source in order; return the first non-empty result.
+            for source in ('lease', 'arp', 'agent'):
+                result = virsh.execute("domifaddr", vm_name, f"--source={source}", warn=True)
+                if not result.ok:
+                    self.logger.debug(
+                        f"domifaddr --source={source} failed for {vm_name}: {result.stderr.strip()}")
+                    continue
+                addrs = _parse_domifaddr(result.stdout)
+                if addrs:
+                    self.logger.debug(
+                        f"got ip addresses for {vm_name} via source '{source}': {addrs}")
+                    return addrs
 
-            ip_addresses = {}
-            lines = result.stdout.strip().split('\n')
-
-            if len(lines) > 2:  # skip header and separator lines
-                for line in lines[2:]:
-                    parts = line.split()
-                    if len(parts) >= 4:  # name MAC Protocol Address
-                        iface_name = parts[0]
-                        ip_address = parts[3].split('/')[0]  # Remove CIDR notation
-
-                        if iface_name and ip_address and not ip_address.startswith('N/A'):
-                            ip_addresses[iface_name] = ip_address
-
-            return ip_addresses
+            return {}
 
         except Exception as exc:
             import traceback
@@ -434,20 +782,84 @@ class LibVirtSession:
 
         return snapshots
 
-    def snapshot_restore(self, vm_name, snapshot_name):
+    def snapshot_restore(self, vm_name, snapshot_name=None):
         """
         Restore a VM to a specific snapshot.
 
+        If snapshot_name is None, the current (latest) snapshot is used.
+
         Args:
             vm_name (str): Name of the VM to revert
-            snapshot_name (str): Name of the snapshot to revert to
+            snapshot_name (str, optional): Name of the snapshot to revert to
 
         Returns:
             bool: True if successful, False otherwise
         """
-        self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
         snapshot_mgr = SnapshotManager(self.provider_config)
+        if snapshot_name is None:
+            snapshot_name = snapshot_mgr.get_latest_snapshot(vm_name)
+            if snapshot_name is None:
+                self.logger.error(f"no snapshots found for vm {vm_name}")
+                return False
+            self.logger.info(f"restoring latest snapshot '{snapshot_name}' for vm {vm_name}")
+        else:
+            self.logger.info(f"reverting the vm {vm_name} to snapshot {snapshot_name}")
         return snapshot_mgr.snapshot_restore(vm_name, snapshot_name)
+
+    def eject_cdrom(self, vm_name: str) -> None:
+        """
+        Eject cloud-init seed ISO media from a VM's cdrom drive(s).
+
+        Only ejects cdroms whose source file is the seed ISO itself or a
+        qcow2 overlay of it (filenames that start with ``seed``).  Other
+        cdrom ISOs that may be intentionally mounted are left untouched.
+
+        Called after provisioning completes (once cloud-init has run and the VM
+        has an IP address) so the seed ISO is never present during snapshot
+        operations.  Uses ``--force`` to bypass the guest kernel's tray lock.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        result = virsh.execute("domblklist", vm_name, "--details", warn=True)
+        if not result.ok:
+            return
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            # domblklist --details columns: Type  Device  Target  Source
+            if len(parts) >= 3 and parts[1] == 'cdrom':
+                target = parts[2]
+                source = parts[3] if len(parts) >= 4 else '-'
+                if source == '-':
+                    self.logger.debug(f"cdrom {target} on {vm_name} is already empty")
+                    continue
+                basename = os.path.basename(source)
+                if not basename.startswith('seed'):
+                    self.logger.debug(
+                        f"skipping non-seed cdrom {target} on {vm_name} (source: {source})")
+                    continue
+                self.logger.info(f"ejecting seed cdrom {target} from {vm_name} (was: {source})")
+                eject_result = virsh.execute(
+                    "change-media", vm_name, target,
+                    "--eject", "--force", "--live", "--config",
+                    warn=True)
+                if not eject_result.ok:
+                    self.logger.warning(
+                        f"failed to eject cdrom {target} from {vm_name}: "
+                        f"{eject_result.stderr.strip()}")
+
+    def get_latest_snapshot(self, vm_name):
+        """Return the current snapshot name for a VM, or None if none exists."""
+        snapshot_mgr = SnapshotManager(self.provider_config)
+        return snapshot_mgr.get_latest_snapshot(vm_name)
+
+    def validate_snapshot(self, vm_name, snapshot_name):
+        """
+        Validate that a snapshot is intact and can be safely restored.
+
+        Returns:
+            tuple[bool, List[str]]: (valid, errors)
+        """
+        snapshot_mgr = SnapshotManager(self.provider_config)
+        return snapshot_mgr.validate_snapshot(vm_name, snapshot_name)
 
     def snapshot_delete(self, vm_name, snapshot_name):
         """
@@ -669,7 +1081,9 @@ class LibVirtSession:
     def configure_vm_cpu_memory(self,
                                 vm_name: str,
                                 cpus: Optional[Dict[str, int]] = None,
-                                memory_mb: Optional[int] = None) -> bool:
+                                memory_mb: Optional[int] = None,
+                                max_vcpus: Optional[int] = None,
+                                max_memory_mb: Optional[int] = None) -> bool:
         """
         Configure cpu and memory settings for a vm.
 
@@ -677,9 +1091,270 @@ class LibVirtSession:
             vm_name: Name of the vm
             cpus: Dictionary with 'sockets', 'cores', 'threads' keys
             memory_mb: Memory in MB
+            max_vcpus: Maximum vCPU ceiling for hot-scaling
+            max_memory_mb: Maximum memory ceiling in MB for hot-scaling
 
         Returns:
             True if successful, False otherwise
         """
         editor = VirshEdit(provider_config=self.provider_config)
-        return editor.configure_cpu_memory(vm_name, cpus, memory_mb)
+        return editor.configure_cpu_memory(
+            vm_name, cpus, memory_mb,
+            max_vcpus=max_vcpus, max_memory_mb=max_memory_mb)
+
+    ### update operations (for `boxman update`)
+
+    def shutdown_and_wait(self, vm_name: str, timeout: int = 60) -> bool:
+        """
+        Gracefully shut down a VM and wait until it reaches 'shut off' state.
+
+        Falls back to virsh destroy (force stop) if the timeout is exceeded.
+
+        Args:
+            vm_name: Name of the VM
+            timeout: Maximum seconds to wait for graceful shutdown
+
+        Returns:
+            True if the VM is shut off, False otherwise
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+
+        # check current state
+        result = virsh.execute('domstate', vm_name, warn=True)
+        if result.ok and 'shut off' in result.stdout:
+            return True
+
+        # attempt graceful shutdown
+        self.logger.info(f"shutting down VM {vm_name}...")
+        virsh.execute('shutdown', vm_name, warn=True)
+
+        # poll for shut off
+        waited = 0
+        poll_interval = 2
+        while waited < timeout:
+            time.sleep(poll_interval)
+            waited += poll_interval
+            result = virsh.execute('domstate', vm_name, warn=True)
+            if result.ok and 'shut off' in result.stdout:
+                self.logger.info(f"VM {vm_name} is shut off after {waited}s")
+                return True
+
+        # force stop as fallback
+        self.logger.warning(
+            f"VM {vm_name} did not shut off within {timeout}s, forcing stop")
+        virsh.execute('destroy', vm_name, warn=True)
+        time.sleep(2)
+
+        result = virsh.execute('domstate', vm_name, warn=True)
+        if result.ok and 'shut off' in result.stdout:
+            return True
+
+        self.logger.error(f"failed to shut off VM {vm_name}")
+        return False
+
+    def update_vm_cpu_memory(self,
+                             vm_name: str,
+                             cpus: Optional[Dict[str, int]],
+                             memory_mb: Optional[int],
+                             vm_state: str,
+                             actual_cpus: Dict[str, int],
+                             actual_memory_mb: int,
+                             max_vcpus: Optional[int] = None,
+                             max_memory_mb: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Apply CPU and/or memory changes, choosing hot or cold path.
+
+        Args:
+            vm_name: Full VM domain name
+            cpus: Desired CPU topology (sockets, cores, threads) or None
+            memory_mb: Desired memory in MiB or None
+            vm_state: Current VM state string
+            actual_cpus: Current CPU topology dict
+            actual_memory_mb: Current memory in MiB
+            max_vcpus: Desired max vCPU ceiling or None
+            max_memory_mb: Desired max memory ceiling in MiB or None
+
+        Returns:
+            Dict with 'success', 'method' ('hot'/'cold'), 'restart_needed' keys
+        """
+        editor = VirshEdit(provider_config=self.provider_config)
+        is_running = vm_state == 'running'
+
+        if not is_running:
+            # VM is stopped — use cold XML redefine
+            success = editor.configure_cpu_memory(
+                vm_name, cpus, memory_mb,
+                max_vcpus=max_vcpus, max_memory_mb=max_memory_mb)
+            return {'success': success, 'method': 'cold', 'restart_needed': False}
+
+        # VM is running — update persistent config and apply live where
+        # possible. Libvirt does NOT allow raising the live maximum vCPU
+        # or memory ceiling on a running VM, so increases beyond the
+        # current max require a restart.
+        #
+        # Strategy:
+        # 1. Update the persistent (inactive) config in ONE shot via
+        #    virsh dumpxml --inactive + modify + virsh define.
+        # 2. For changes within the current live ceiling: hot-set live.
+        # 3. For changes exceeding the ceiling: flag restart_needed.
+
+        # --- Step 1: update persistent config (inactive XML) ---
+        xml_content = editor.get_domain_xml(vm_name, inactive=True)
+        modifications = []
+
+        desired_total = None
+        if cpus:
+            sockets = cpus.get('sockets', 1)
+            cores = cpus.get('cores', 1)
+            threads = cpus.get('threads', 1)
+            desired_total = sockets * cores * threads
+
+            effective_max_vcpus = max_vcpus or desired_total
+            if max_vcpus is not None and max_vcpus < desired_total:
+                effective_max_vcpus = desired_total
+
+            modifications.append(('//vcpu', 'text', str(effective_max_vcpus)))
+
+            if effective_max_vcpus > desired_total:
+                # libvirt requires topology product == max vcpu count.
+                # scale sockets so that sockets * cores * threads == max.
+                cores_x_threads = cores * threads
+                if effective_max_vcpus % cores_x_threads == 0:
+                    max_sockets = effective_max_vcpus // cores_x_threads
+                    modifications.extend([
+                        ('//cpu/topology', 'sockets', str(max_sockets)),
+                        ('//cpu/topology', 'cores', str(cores)),
+                        ('//cpu/topology', 'threads', str(threads)),
+                    ])
+                else:
+                    # can't express with given cores*threads, remove topology
+                    from lxml import etree
+                    tree = etree.fromstring(xml_content.encode('utf-8'))
+                    for topo in tree.xpath('//cpu/topology'):
+                        topo.getparent().remove(topo)
+                    xml_content = etree.tostring(
+                        tree, encoding='unicode', pretty_print=True)
+
+                modifications.append(
+                    ('//vcpu', 'current', str(desired_total)))
+            else:
+                modifications.extend([
+                    ('//cpu/topology', 'sockets', str(sockets)),
+                    ('//cpu/topology', 'cores', str(cores)),
+                    ('//cpu/topology', 'threads', str(threads)),
+                ])
+
+        if memory_mb is not None and (memory_mb != actual_memory_mb or max_memory_mb is not None):
+            effective_max_memory = max_memory_mb or memory_mb
+            if max_memory_mb is not None and max_memory_mb < memory_mb:
+                effective_max_memory = memory_mb
+            max_memory_kib = effective_max_memory * 1024
+            current_memory_kib = memory_mb * 1024
+            modifications.extend([
+                ('//memory', 'text', str(max_memory_kib)),
+                ('//currentMemory', 'text', str(current_memory_kib)),
+            ])
+
+        if modifications:
+            modified_xml = editor.modify_xml_xpath(xml_content, modifications)
+            if not editor.redefine_domain(vm_name, modified_xml):
+                self.logger.error(
+                    f"VM {vm_name}: failed to update persistent config")
+                return {'success': False, 'method': 'hot', 'restart_needed': False}
+
+        # --- Step 2 & 3: live changes ---
+        restart_needed = False
+        success = True
+
+        if cpus and desired_total:
+            current_max = actual_cpus.get('total_vcpus', 1)
+            if desired_total <= current_max:
+                if not editor.hot_set_vcpus(vm_name, desired_total):
+                    # hot-unplug may not be supported; fall back to restart
+                    self.logger.info(
+                        f"VM {vm_name}: live vCPU change failed, "
+                        f"will restart to apply")
+                    restart_needed = True
+            else:
+                # live max can't be raised on a running VM
+                restart_needed = True
+
+        if memory_mb is not None and memory_mb != actual_memory_mb:
+            from .vm_differ import VMStateDiffer
+            differ = VMStateDiffer(provider_config=self.provider_config)
+            current_max_mem = differ.get_max_memory_mb(vm_name)
+
+            if memory_mb <= current_max_mem:
+                if not editor.hot_set_memory(vm_name, memory_mb):
+                    # hot memory change failed; fall back to restart
+                    self.logger.info(
+                        f"VM {vm_name}: live memory change failed, "
+                        f"will restart to apply")
+                    restart_needed = True
+            else:
+                # live max can't be raised on a running VM
+                restart_needed = True
+
+        if restart_needed:
+            self.logger.info(
+                f"VM {vm_name}: persistent config updated. "
+                f"Restart needed for changes to take effect "
+                f"(live max ceiling cannot be raised on a running VM).")
+
+        method = 'cold' if restart_needed else 'hot'
+        return {'success': success, 'method': method, 'restart_needed': restart_needed}
+
+    def update_vm_disks(self,
+                        vm_name: str,
+                        new_disks: List[Dict[str, Any]],
+                        resize_disks: List[Dict[str, Any]],
+                        workdir: str,
+                        disk_prefix: str,
+                        vm_running: bool) -> bool:
+        """
+        Apply disk changes: create+attach new disks and resize existing ones.
+
+        Args:
+            vm_name: Full VM domain name
+            new_disks: List of disk configs to create and attach
+            resize_disks: List of dicts with target, source, desired_size_mb
+            workdir: Working directory for disk images
+            disk_prefix: Prefix for disk image filenames
+            vm_running: Whether the VM is currently running
+
+        Returns:
+            True if all operations succeeded, False otherwise
+        """
+        success = True
+        disk_manager = DiskManager(vm_name=vm_name, provider_config=self.provider_config)
+
+        # create and attach new disks
+        for disk_config in new_disks:
+            self.logger.info(
+                f"adding new disk '{disk_config.get('name', 'disk')}' "
+                f"to VM {vm_name}")
+            if not disk_manager.configure_from_disk_config(
+                disk_config=disk_config,
+                workdir=workdir,
+                disk_prefix=disk_prefix
+            ):
+                self.logger.error(
+                    f"failed to add disk '{disk_config.get('name')}' to {vm_name}")
+                success = False
+
+        # resize existing disks
+        for resize_info in resize_disks:
+            self.logger.info(
+                f"resizing disk {resize_info['target']} on {vm_name} from "
+                f"{resize_info['current_size_mb']}M to {resize_info['desired_size_mb']}M")
+            if not disk_manager.resize_disk(
+                disk_path=resize_info['source'],
+                target_dev=resize_info['target'],
+                new_size_mb=resize_info['desired_size_mb'],
+                vm_running=vm_running
+            ):
+                self.logger.error(
+                    f"failed to resize disk {resize_info['target']} on {vm_name}")
+                success = False
+
+        return success

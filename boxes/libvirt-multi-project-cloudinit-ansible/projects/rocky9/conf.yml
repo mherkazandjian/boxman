@@ -1,0 +1,193 @@
+---
+version: '1.0'
+project: libvirt_project_rocky9_cloudinit_ansible
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/bin/virsh'
+    verbose: True
+
+templates:
+  template1:
+    name: rocky-9.7-minimal-base-template-cloudinit
+    image:
+      uri: https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base-9.7-20251123.2.x86_64.qcow2
+      checksum: sha256:15d81d3434b298142b2fdd8fb54aef2662684db5c082cc191c3c79762ed6360c
+    #image: file:///path/to/local/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2
+    disk_size: 20G
+    os_variant: rocky9
+    memory: 2048
+    vcpus: 2
+    cloudinit_network_config: disabled
+    cloudinit_done_marker: /var/log/hello-cloudinit.log
+    cloudinit: |
+      #cloud-config
+      hostname: hello-cloudinit
+      manage_etc_hosts: true
+
+      users:
+        - name: rocky
+          plain_text_passwd: rocky
+          lock_passwd: false
+          sudo: ALL=(ALL) NOPASSWD:ALL
+          shell: /bin/bash
+        - name: admin
+          plain_text_passwd: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+          lock_passwd: false
+          sudo: ALL=(ALL) NOPASSWD:ALL
+          shell: /bin/bash
+          homedir: /admin
+
+      ssh_pwauth: true
+
+      package_update: true
+      packages:
+        - vim
+        - curl
+        - qemu-guest-agent
+        - openssh-server
+
+      growpart:
+        mode: auto
+        devices: ['/']
+
+      resize_rootfs: true
+
+      write_files:
+        - path: /etc/hello-from-cloudinit
+          permissions: "0644"
+          content: |
+            hello world from cloud-init (Rocky Linux 9)
+        - path: /etc/NetworkManager/conf.d/90-dhcp-wait.conf
+          permissions: "0644"
+          content: |
+            [connection]
+            ipv4.dhcp-timeout=60
+        - path: /etc/sysconfig/qemu-ga
+          permissions: "0644"
+          content: |
+            # Allow boxman to run cloud-init status via guest-exec
+            BLOCK_RPCS=
+
+      runcmd:
+        - touch /etc/cloud/cloud-init.disabled
+        - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - setenforce 0 || true
+        - [ sh, -c, "sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config || true" ]
+        - systemctl daemon-reload
+        - systemctl restart qemu-guest-agent || true
+        - systemctl enable --now qemu-guest-agent
+        - systemctl restart NetworkManager || true
+        - [ sh, -c, "mkdir -p /admin/.ssh && chmod 700 /admin/.ssh && chown -R admin:admin /admin/.ssh" ]
+        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
+
+workspace:
+  path: ~/workspaces/boxmandev/libvirt_multi_project_cloudinit_ansible/rocky9
+  env_file: {{ env("BOXMAN_CONF_DIR") }}/../../env.sh
+  ansible_config: {{ env("BOXMAN_CONF_DIR") }}/../../ansible.cfg
+  inventory: {{ env("BOXMAN_CONF_DIR") }}/../../inventory
+  ansible_site: {{ env("BOXMAN_CONF_DIR") }}/../../ansible/site.yml
+
+clusters:
+  cluster_1:
+    base_image: rocky-9.7-minimal-base-template-cloudinit
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+    admin_key_name: id_ed25519_boxman
+    ssh_config: ssh_config
+
+    networks:
+      nat1:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:01'
+        ip:
+          address: '192.168.20.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.20.2'
+              end: '192.168.20.254'
+        enable: True
+        autostart: True
+      isolated1:
+        mode: route
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:02'
+        ip:
+          address: '10.0.20.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '10.0.20.2'
+              end: '10.0.20.254'
+        enable: True
+        autostart: True
+
+    vms:
+      node01:
+        hostname: node01
+        cpus:
+          sockets: 1
+          cores: 2
+          threads: 1
+        memory: 2048
+        disks:
+          - name: disk01
+            driver:
+              name: qemu
+              type: qcow2
+            target: vdb
+            size: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+      node02:
+        hostname: node02
+        cpus:
+          sockets: 1
+          cores: 2
+          threads: 1
+        memory: 2048
+        disks:
+          - name: disk01
+            driver:
+              name: qemu
+              type: qcow2
+            target: vdb
+            size: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+
+
+tasks:
+  ping:
+    description: "ping all hosts via ansible"
+    command: ansible all {{ flags }} -m ansible.builtin.ping
+
+  cmd:
+    description: "run a shell command on all hosts"
+    command: ansible all {{ flags }} -m ansible.builtin.shell -a
+
+  site:
+    description: "run the full site playbook"
+    command: ansible-playbook {{ flags }} --become {{ env("ANSIBLE_SITE", default="ansible") }}/site.yml {{ tags }} --
+
+  playbook:
+    description: "run a specific playbook"
+    command: ansible-playbook {{ flags }} --become {{ env("ANSIBLE_SITE", default="ansible") }}/{{ playbook }} {{ tags }} --
+
+  ssh:
+    description: "ssh to the gateway host"
+    command: ssh -F ${SSH_CONFIG} -t ${GATEWAYHOST}

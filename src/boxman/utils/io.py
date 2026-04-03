@@ -18,7 +18,14 @@ def write_files(files: Dict[str, str], rootdir: Optional[str] = None) -> None:
         else:
             fpath = _fpath
 
-        fpath = os.path.expanduser(fpath)
+        fpath = os.path.normpath(os.path.expanduser(fpath))
+
+        # Do not overwrite existing env.sh or ansible.cfg
+        basename = os.path.basename(fpath)
+        if basename in ('env.sh', 'ansible.cfg') and os.path.exists(fpath):
+            log.warning(f'{basename} already exists, skipping: {fpath}')
+            continue
+
         log.info(f'provision file {fpath}')
 
         dirpath = os.path.dirname(fpath)

@@ -1,8 +1,6 @@
 import os
 from typing import Optional, Dict, Any, List
 import tempfile
-from jinja2 import Environment, FileSystemLoader
-import pkg_resources
 
 from .commands import LibVirtCommandBase, VirshCommand
 
@@ -72,6 +70,7 @@ class DiskManager(VirshCommand):
                    target_dev: str,
                    driver_name: str = 'qemu',
                    driver_type: str = 'qcow2',
+                   bus: str = 'virtio',
                    persistent: bool = True) -> bool:
         """
         Attach a disk to the VM.
@@ -81,6 +80,7 @@ class DiskManager(VirshCommand):
             target_dev: Target device name (e.g., 'vdb')
             driver_name: Name of the disk driver (default: qemu)
             driver_type: Type of the disk driver (default: qcow2)
+            bus: Disk bus type (default: virtio)
             persistent: Whether to make the attachment persistent
 
         Returns:
@@ -92,7 +92,8 @@ class DiskManager(VirshCommand):
                 disk_path=disk_path,
                 target_dev=target_dev,
                 driver_name=driver_name,
-                driver_type=driver_type
+                driver_type=driver_type,
+                bus=bus
             )
 
             # Create a temporary file for the XML
@@ -124,7 +125,8 @@ class DiskManager(VirshCommand):
                           disk_path: str,
                           target_dev: str,
                           driver_name: str,
-                          driver_type: str) -> str:
+                          driver_type: str,
+                          bus: str = 'virtio') -> str:
         """
         Generate XML for disk attachment.
 
@@ -133,15 +135,15 @@ class DiskManager(VirshCommand):
             target_dev: Target device name
             driver_name: Name of the disk driver
             driver_type: Type of the disk driver
+            bus: Disk bus type (default: virtio)
 
         Returns:
             XML string for disk attachment
         """
-        # Simple XML template for disk attachment
         return f"""<disk type='file' device='disk'>
   <driver name='{driver_name}' type='{driver_type}'/>
   <source file='{os.path.abspath(os.path.expanduser(disk_path))}'/>
-  <target dev='{target_dev}'/>
+  <target dev='{target_dev}' bus='{bus}'/>
 </disk>"""
 
     def configure_from_disk_config(self,
@@ -169,8 +171,9 @@ class DiskManager(VirshCommand):
             driver_name = driver.get("name", "qemu")
             driver_type = driver.get("type", "qcow2")
 
-            # get target device
+            # get target device and bus
             target_dev = disk_config.get("target", "vdb")
+            bus = disk_config.get("bus", "virtio")
 
             # create disk path
             if disk_prefix:
@@ -191,7 +194,8 @@ class DiskManager(VirshCommand):
                 disk_path=disk_path,
                 target_dev=target_dev,
                 driver_name=driver_name,
-                driver_type=driver_type
+                driver_type=driver_type,
+                bus=bus
             ):
                 self.logger.error(f"Failed to attach disk {disk_path} to VM {self.vm_name}")
                 return False
@@ -201,3 +205,86 @@ class DiskManager(VirshCommand):
         except Exception as exc:
             self.logger.error(f"error configuring disk from config: {exc}")
             return False
+
+    def resize_disk_offline(self, disk_path: str, new_size_mb: int) -> bool:
+        """
+        Resize a disk image using qemu-img resize. Only grows.
+
+        Args:
+            disk_path: Path to the disk image
+            new_size_mb: New size in MiB (must be larger than current)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            cmd = f"qemu-img resize {disk_path} {new_size_mb}M"
+            self.logger.info(f"resizing disk image: {cmd}")
+
+            cmd_executor = LibVirtCommandBase(
+                provider_config=self.provider_config,
+                override_config_use_sudo=False)
+            result = cmd_executor.execute_shell(cmd)
+
+            if not result.ok:
+                self.logger.error(f"failed to resize disk image: {result.stderr}")
+                return False
+
+            self.logger.info(f"successfully resized disk image {disk_path} to {new_size_mb}M")
+            return True
+        except Exception as exc:
+            self.logger.error(f"error resizing disk image: {exc}")
+            return False
+
+    def resize_disk_online(self, target_dev: str, new_size_mb: int) -> bool:
+        """
+        Resize a block device on a running VM using virsh blockresize.
+
+        Args:
+            target_dev: Target device name (e.g., 'vdb')
+            new_size_mb: New size in MiB
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            result = self.execute(
+                'blockresize', self.vm_name,
+                target_dev, f"--size={new_size_mb}M")
+
+            if not result.ok:
+                self.logger.error(
+                    f"failed to online resize {target_dev} on {self.vm_name}: "
+                    f"{result.stderr}")
+                return False
+
+            self.logger.info(
+                f"online resized {target_dev} on {self.vm_name} to {new_size_mb}M")
+            return True
+        except Exception as exc:
+            self.logger.error(f"error in online disk resize: {exc}")
+            return False
+
+    def resize_disk(self,
+                    disk_path: str,
+                    target_dev: str,
+                    new_size_mb: int,
+                    vm_running: bool) -> bool:
+        """
+        Resize a disk: offline resize always, plus online resize if VM is running.
+
+        Args:
+            disk_path: Path to the disk image
+            target_dev: Target device name (e.g., 'vdb')
+            new_size_mb: New size in MiB
+            vm_running: Whether the VM is currently running
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if vm_running:
+            # For running VMs, use virsh blockresize which handles both
+            # the image and the hypervisor-level resize.
+            return self.resize_disk_online(target_dev, new_size_mb)
+        else:
+            return self.resize_disk_offline(disk_path, new_size_mb)
