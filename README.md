@@ -59,6 +59,25 @@ What happens on first `up`:
   runtime — the container already executes libvirt commands as root via
   `docker exec --user root`.
 
+**SSH access to VMs**: under the docker runtime, VM IPs live on libvirt's
+internal NAT network, which only exists inside the container. The
+generated `ssh_config` therefore includes a `Host boxman-libvirt-jump`
+stanza and a `ProxyJump boxman-libvirt-jump` directive on every VM
+entry, so host-side `ssh`, `scp`, and ansible transparently hop through
+the container. The jump stanza uses the container's auto-generated
+`qemu_user` key (bind-mounted at `.boxman/runtime/docker/data/ssh/id_ed25519`)
+and a per-project SSH port so multiple boxman projects coexist without
+collision. This works for clusters of any size — one jump host serves
+every VM.
+
+```bash
+boxman --runtime=docker up
+boxman --runtime=docker ssh           # gateway host
+boxman --runtime=docker ssh boxman02  # any VM in the cluster
+# equivalent direct form:
+ssh -F <workspace.path>/ssh_config cluster_1_boxman02
+```
+
 See [boxes/tiny-libvirt-ubuntu-24.04-cloudinit-docker-runtime/conf.yml](boxes/tiny-libvirt-ubuntu-24.04-cloudinit-docker-runtime/conf.yml)
 for a ready-to-run example, and [containers/docker/README.md](containers/docker/README.md)
 for the container internals.

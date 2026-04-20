@@ -974,21 +974,15 @@ class BoxmanManager:
                     )
                 # fall through to chown below
 
-        # if the directory exists but is not writable, fix ownership
-        if not os.access(path, os.W_OK):
-            uid = os.getuid()
-            gid = os.getgid()
-            self.logger.info(
-                f"fixing ownership of '{path}' to {uid}:{gid} "
-                f"(was not writable by current user)")
-            result = run(
-                f"sudo chown -R {uid}:{gid} '{path}'",
-                hide=True, warn=True)
-            if not result.ok:
-                raise PermissionError(
-                    f"directory '{path}' is not writable and "
-                    f"'sudo chown' failed: {result.stderr.strip()}"
-                )
+        # Two failure modes to repair here:
+        #   1. The directory itself is not writable by us (e.g. created
+        #      as root by docker compose mount).
+        #   2. The directory IS writable but contains stale entries
+        #      owned by another user (typically root, left over from a
+        #      previous docker-runtime run). Tools like `genisoimage`
+        #      open their output with O_TRUNC and need write access on
+        #      the existing file, not just the parent dir.
+        self._normalize_ownership(path)
 
         # When using a non-local runtime (e.g. docker-compose), also
         # create the directory inside the container so that commands
@@ -1007,6 +1001,111 @@ class BoxmanManager:
         # Mark the directory as owned by the current runtime so that a
         # later cross-runtime reuse triggers the collision prompt.
         self._write_runtime_sentinel(path, self._runtime_name)
+
+    def _normalize_ownership(self, path: str) -> None:
+        """
+        Make sure *path* and its top-level entries are usable by the
+        current user.
+
+        Strategy (cheapest path first, sudo last resort):
+
+        1. If the directory itself is not writable by us, escalate
+           straight to ``sudo chown -R``.
+        2. Else, scan the top-level entries; if any are owned by
+           another user, try to remove them (``unlink`` for files,
+           ``shutil.rmtree`` for dirs). This works WITHOUT sudo as
+           long as the parent dir is user-writable, because ``unlink``
+           only needs write+exec on the parent, not on the file.
+        3. If unlink/rmtree fails (e.g. nested foreign-owned tree we
+           can't traverse), fall back to ``sudo chown -R``.
+        4. If sudo also fails, raise ``PermissionError`` with a
+           copy-pasteable fix command.
+
+        Foreign-owned files inside boxman workdirs are always either
+        stale build artifacts (seed.iso, qcow2 disk images) or stale
+        provisioning files we are about to regenerate, so removing
+        them is safe.
+        """
+        my_uid = os.getuid()
+        my_gid = os.getgid()
+
+        # Fast path: directory itself isn't writable → straight to sudo.
+        dir_writable = os.access(path, os.W_OK)
+
+        foreign_entries: list = []
+        if dir_writable:
+            try:
+                for entry in os.scandir(path):
+                    try:
+                        if entry.stat(
+                            follow_symlinks=False
+                        ).st_uid != my_uid:
+                            foreign_entries.append(entry)
+                    except OSError:
+                        # Can't stat → treat as foreign so we attempt
+                        # the recovery path.
+                        foreign_entries.append(entry)
+            except OSError:
+                # Can't scandir → fall through to sudo chown.
+                dir_writable = False
+
+        if dir_writable and not foreign_entries:
+            return
+
+        # Try the cheap path first: just unlink/rmtree the foreign
+        # entries. No sudo needed when the parent dir is writable.
+        unrecoverable: list = []
+        if dir_writable and foreign_entries:
+            for entry in foreign_entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        shutil.rmtree(entry.path)
+                    else:
+                        os.unlink(entry.path)
+                    self.logger.info(
+                        f"removed stale foreign-owned entry: "
+                        f"{entry.path}")
+                except OSError as exc:
+                    unrecoverable.append((entry.path, exc))
+
+            if not unrecoverable:
+                return
+
+        # Fall back to sudo chown -R.
+        self.logger.info(
+            f"fixing ownership of '{path}' to {my_uid}:{my_gid} "
+            f"via sudo chown -R "
+            f"(directory not writable or contained foreign entries "
+            f"that could not be removed)"
+        )
+        result = run(
+            f"sudo -n chown -R {my_uid}:{my_gid} '{path}'",
+            hide=True, warn=True,
+        )
+        if result.ok:
+            return
+
+        # Sudo failed — emit an actionable error so the user knows
+        # exactly what to fix.
+        offenders = "\n  ".join(
+            sorted(set(
+                [path]
+                + [p for p, _ in unrecoverable]
+                + [e.path for e in foreign_entries]
+            ))
+        )
+        stderr = (result.stderr or "").strip()
+        raise PermissionError(
+            f"could not normalise ownership of '{path}'.\n"
+            f"sudo chown failed: {stderr or '(no stderr)'}\n"
+            f"\n"
+            f"Run one of these to fix manually:\n"
+            f"  sudo chown -R {my_uid}:{my_gid} '{path}'\n"
+            f"  sudo rm -rf '{path}'   "
+            f"# safe — boxman will recreate it\n"
+            f"\n"
+            f"Affected paths:\n  {offenders}"
+        )
 
     def validate_base_images(self) -> None:
         """
@@ -1786,12 +1885,47 @@ class BoxmanManager:
 
             self.logger.info("")
 
+    #: Alias of the ProxyJump stanza written into ``ssh_config`` when the
+    #: docker runtime is active. Kept as a class constant so tests and
+    #: downstream tooling can grep for it reliably.
+    SSH_JUMP_HOST_ALIAS = "boxman-libvirt-jump"
+
+    def _docker_ssh_jump_stanza(self) -> Optional[str]:
+        """
+        Return the ``Host boxman-libvirt-jump`` block to prepend to
+        ``ssh_config`` when the docker runtime is active, or ``None``
+        when the runtime is ``local`` (VMs are directly reachable from
+        the host in that case).
+        """
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+
+        if not isinstance(self.runtime_instance, DockerComposeRuntime):
+            return None
+
+        rt = self.runtime_instance
+        return (
+            f"Host {self.SSH_JUMP_HOST_ALIAS}\n"
+            f"    HostName     127.0.0.1\n"
+            f"    Port         {rt.ssh_port}\n"
+            f"    User         qemu_user\n"
+            f"    IdentityFile {rt.ssh_identity_path}\n"
+            f"    StrictHostKeyChecking no\n"
+            f"    UserKnownHostsFile /dev/null\n"
+            f"\n\n"
+        )
+
     def write_ssh_config(self) -> None:
         """
         Generate SSH configuration file for easy access to VMs.
 
         Creates an SSH config file in the workspace directory that allows
         simplified access to VMs without typing full connection details.
+
+        Under the docker runtime, a ``Host boxman-libvirt-jump`` stanza
+        is prepended and each VM block gets a ``ProxyJump`` directive so
+        that host-side ``ssh``, ``scp`` and ansible transparently hop
+        through the libvirt container to reach VMs on libvirt's internal
+        NAT network.
         """
         ws_path = self.config.get('workspace', {}).get('path', '')
         prj_name = f'bprj__{self.config["project"]}__bprj'
@@ -1803,6 +1937,8 @@ class BoxmanManager:
         )
         pad_width = len(str(total_vms - 1)) if total_vms > 1 else 1
         vm_counter = 0
+
+        jump_stanza = self._docker_ssh_jump_stanza()
 
         for cluster_name, cluster in self.config['clusters'].items():
             base_path = ws_path or cluster.get('workdir', '~')
@@ -1827,6 +1963,10 @@ class BoxmanManager:
                 fobj.write('    UserKnownHostsFile /dev/null\n')
                 fobj.write('\n\n')
 
+                # docker runtime: jump host stanza
+                if jump_stanza:
+                    fobj.write(jump_stanza)
+
                 # write host-specific configurations
                 for vm_name, vm_info in cluster['vms'].items():
                     full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
@@ -1845,6 +1985,9 @@ class BoxmanManager:
                         fobj.write(f'    Hostname {first_ip}\n')
                         fobj.write(f'    User {cluster.get("admin_user", "admin")}\n')
                         fobj.write(f'    IdentityFile {admin_priv_key}\n')
+                        if jump_stanza:
+                            fobj.write(
+                                f'    ProxyJump {self.SSH_JUMP_HOST_ALIAS}\n')
                         fobj.write('\n\n')
                     else:
                         self.logger.warning(
@@ -2146,7 +2289,19 @@ class BoxmanManager:
         ssh_cmd = f'ssh -o BatchMode=yes -F {ssh_config_path} {hostname} hostname'
 
         # When using a non-local runtime, the VM is only reachable from
-        # inside the container.
+        # inside the container. The shared ssh_config contains a
+        # ProxyJump directive aimed at the host-side published SSH port
+        # (e.g. 127.0.0.1:2417), which is *not* reachable from inside
+        # the container's own netns — there, 127.0.0.1:2417 is a dead
+        # port. Override ProxyJump/ProxyCommand to "none" so the
+        # in-container ssh hits the VM IP directly (via the `Hostname`
+        # directive in the VM's Host block).
+        if self._runtime_name != 'local':
+            ssh_cmd = (
+                f'ssh -o BatchMode=yes -o ProxyJump=none '
+                f'-o ProxyCommand=none -F {ssh_config_path} '
+                f'{hostname} hostname'
+            )
         ssh_cmd = self.runtime_instance.wrap_command(ssh_cmd)
 
         result = run(ssh_cmd, hide=True, warn=True)
@@ -2834,6 +2989,37 @@ class BoxmanManager:
         is_docker = isinstance(runtime, DockerComposeRuntime)
         runtime_plan = runtime.plan_destroy_runtime() if is_docker else None
 
+        # --------- "nothing to do" short-circuit --------------------
+        # Avoid prompting the user (and avoid spinning up the runtime
+        # just to discover there's nothing to deprovision) when every
+        # piece of state this command would touch is already gone.
+        project_name = config.get('project')
+        in_cache = bool(
+            project_name
+            and project_name in (cls.cache.projects or {})
+        )
+        ws_present = bool(workspace_path and os.path.exists(workspace_path))
+        boxman_dir_present = bool(
+            is_docker and runtime_plan
+            and runtime_plan.get("boxman_dir")
+            and os.path.isdir(runtime_plan["boxman_dir"])
+        )
+        container_present = bool(
+            is_docker and runtime_plan
+            and runtime_plan.get("container_running")
+        )
+        templates_present = any(
+            os.path.exists(d) for d in template_dirs
+        )
+
+        if not (in_cache or ws_present or boxman_dir_present
+                or container_present or templates_present):
+            cls.logger.info(
+                f"nothing to do — project '{project_name or '?'}' "
+                f"is not registered, no workspace dir, no runtime "
+                f"state on disk")
+            return
+
         # --------- build the action plan for the user ---------------
         print("\nThe following actions will be performed:\n")
         step = 1
@@ -2875,10 +3061,16 @@ class BoxmanManager:
         # ------------- execute --------------------------------------
         # 1. Best-effort: start the runtime so we can run virsh to
         #    deprovision VMs. If it fails (port conflict, docker daemon
-        #    unreachable, …) we still want to tear down docker state and
+        #    unreachable, libvirtd unresponsive in a zombie mount
+        #    namespace, …) we still want to tear down docker state and
         #    nuke the workspace — so we skip the VM-level step instead
-        #    of aborting.
+        #    of aborting. A short ready_timeout keeps the failure path
+        #    snappy: if the runtime is broken, we don't want to wait a
+        #    full minute during destroy.
         runtime_up = True
+        if is_docker:
+            runtime.ready_timeout = min(
+                getattr(runtime, "ready_timeout", 60), 10)
         try:
             runtime.ensure_ready()
         except Exception as exc:

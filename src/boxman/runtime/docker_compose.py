@@ -207,8 +207,21 @@ class DockerComposeRuntime(RuntimeBase):
                 self.logger.info(
                     f"runtime container '{self.container_name}' is already "
                     f"running and all bind-mount dirs are accessible")
-                self._wait_for_libvirtd()
-                return
+                # A container can be "running" yet have libvirtd holding
+                # sockets in a mount namespace whose bind-mount source was
+                # unlinked on the host (e.g. after an aborted destroy or
+                # `make boxes-clean`). In that state `virsh` inside the
+                # container sees an empty /run/libvirt and hangs. Detect
+                # the condition with a bounded wait and fall through to
+                # stop+recreate instead of propagating the timeout.
+                try:
+                    self._wait_for_libvirtd()
+                    return
+                except RuntimeError as exc:
+                    self.logger.warning(
+                        f"container is running but libvirtd is not "
+                        f"responsive ({exc}) — recreating...")
+                    self._stop_compose(compose_path, compose_dir)
             else:
                 self.logger.info(
                     f"some bind-mount dirs are NOT accessible "
@@ -623,6 +636,30 @@ class DockerComposeRuntime(RuntimeBase):
         digest = hashlib.md5(instance_name.encode()).hexdigest()
         return int(digest[:4], 16) % 1000
 
+    def _instance_name(self) -> str:
+        """Return the sanitised instance name used for port derivation
+        and the compose/container naming scheme."""
+        if self._project_name:
+            return self._sanitize_project_name(self._project_name)
+        return "default"
+
+    @property
+    def ssh_port(self) -> int:
+        """The host port on which the libvirt container's sshd is
+        published (``127.0.0.1:<ssh_port> → container:22``)."""
+        return 2222 + self._derive_port_offset(self._instance_name())
+
+    @property
+    def ssh_identity_path(self) -> str:
+        """Absolute host path to the container-generated SSH private
+        key (bind-mounted from ``/etc/boxman/ssh/id_ed25519`` and chowned
+        to the current host user by ``containers/docker/entrypoint.sh``).
+        Used as the ``IdentityFile`` of the ProxyJump stanza that
+        ``write_ssh_config`` emits for the docker runtime."""
+        return os.path.join(
+            self._get_local_runtime_dir(), "data", "ssh", "id_ed25519"
+        )
+
     def _write_env_file(self, runtime_dir: str,
                         abs_project_dir: str = None) -> None:
         """
@@ -635,10 +672,7 @@ class DockerComposeRuntime(RuntimeBase):
         host_uid = os.getuid()
         host_gid = os.getgid()
 
-        instance_name = (
-            self._sanitize_project_name(self._project_name)
-            if self._project_name else "default"
-        )
+        instance_name = self._instance_name()
         offset = self._derive_port_offset(instance_name)
         ssh_port = 2222 + offset
         tcp_port = 16509 + offset

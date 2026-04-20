@@ -558,3 +558,268 @@ class TestCollectWorkdirs:
             },
         }
         assert mgr.collect_workdirs() == [shared]
+
+
+class TestWriteSshConfig:
+    """Tests for BoxmanManager.write_ssh_config covering both the
+    local and docker (ProxyJump) runtime output formats."""
+
+    @staticmethod
+    def _make_manager(tmp_path, runtime_name="local"):
+        from unittest.mock import MagicMock
+        mgr = BoxmanManager()
+        mgr.config = {
+            "project": "test-proj",
+            "workspace": {"path": str(tmp_path)},
+            "clusters": {
+                "cluster_1": {
+                    "workdir": str(tmp_path / "cluster_1"),
+                    "admin_user": "admin",
+                    "admin_key_name": "id_ed25519_boxman",
+                    "ssh_config": "ssh_config",
+                    "vms": {
+                        "vm1": {"hostname": "vm1"},
+                        "vm2": {"hostname": "vm2"},
+                    },
+                },
+            },
+        }
+        mgr._runtime_name = runtime_name
+        # Stub provider.get_vm_ip_addresses so write_ssh_config gets IPs.
+        mgr.provider = MagicMock()
+        mgr.provider.get_vm_ip_addresses.side_effect = (
+            lambda full_name: {"vnet0": "192.168.11.91"}
+            if full_name.endswith("_vm1")
+            else {"vnet0": "192.168.11.92"}
+        )
+        return mgr
+
+    def test_local_runtime_emits_no_jump_stanza(self, tmp_path):
+        mgr = self._make_manager(tmp_path, runtime_name="local")
+        mgr.write_ssh_config()
+
+        content = (tmp_path / "ssh_config").read_text()
+        assert "Host boxman-libvirt-jump" not in content
+        assert "ProxyJump" not in content
+        # Regression: VM entries still look like they used to.
+        assert "Host cluster_1_vm1" in content
+        assert "Hostname 192.168.11.91" in content
+        assert "IdentityFile" in content
+
+    def test_docker_runtime_emits_jump_stanza_and_proxyjump(self, tmp_path):
+        from unittest.mock import PropertyMock, patch
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+
+        mgr = self._make_manager(tmp_path, runtime_name="docker-compose")
+        # Wire a real DockerComposeRuntime instance whose ssh_port /
+        # ssh_identity_path are stubbed — we don't want to touch the
+        # per-project hash here.
+        rt = DockerComposeRuntime(
+            config={"project_name": "test-proj"}
+        )
+        mgr._runtime_instance = rt
+
+        with patch.object(
+            DockerComposeRuntime, "ssh_port",
+            new_callable=PropertyMock, return_value=2678,
+        ), patch.object(
+            DockerComposeRuntime, "ssh_identity_path",
+            new_callable=PropertyMock,
+            return_value="/abs/path/.boxman/runtime/docker/data/ssh/id_ed25519",
+        ):
+            mgr.write_ssh_config()
+
+        content = (tmp_path / "ssh_config").read_text()
+        # Jump host appears exactly once, before the VM blocks.
+        assert content.count("Host boxman-libvirt-jump") == 1
+        assert "Port         2678" in content
+        assert "User         qemu_user" in content
+        assert (
+            "IdentityFile /abs/path/.boxman/runtime/docker/data/ssh/id_ed25519"
+            in content
+        )
+        # Every VM block has ProxyJump pointing at the jump alias.
+        assert content.count("ProxyJump boxman-libvirt-jump") == 2
+        # VM entries still contain the libvirt-network IP as HostName —
+        # ProxyJump lets OpenSSH reach it.
+        assert "Hostname 192.168.11.91" in content
+        assert "Hostname 192.168.11.92" in content
+        # Ordering: jump host stanza appears before either VM block.
+        jump_idx = content.index("Host boxman-libvirt-jump")
+        vm_idx = content.index("Host cluster_1_vm1")
+        assert jump_idx < vm_idx
+
+
+class TestDockerComposeSshPort:
+    """Tests for the ssh_port / ssh_identity_path properties added so
+    write_ssh_config can emit a ProxyJump stanza without re-deriving
+    the per-project port offset."""
+
+    def test_default_instance_uses_2222(self):
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+        rt = DockerComposeRuntime()
+        assert rt.ssh_port == 2222
+
+    def test_per_project_port_is_deterministic_and_offset(self):
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+        rt1 = DockerComposeRuntime(config={"project_name": "alpha"})
+        rt2 = DockerComposeRuntime(config={"project_name": "alpha"})
+        rt3 = DockerComposeRuntime(config={"project_name": "beta"})
+        assert rt1.ssh_port == rt2.ssh_port
+        assert rt1.ssh_port != 2222
+        assert 2222 < rt1.ssh_port < 2222 + 1000
+        # Different project names almost always hash to different
+        # offsets (collision chance is ~1/1000).
+        assert rt1.ssh_port != rt3.ssh_port
+
+    def test_ssh_identity_path_lives_under_project_runtime_dir(self, tmp_path):
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+        rt = DockerComposeRuntime(
+            config={"project_name": "proj", "project_dir": str(tmp_path)},
+        )
+        rt.project_dir = str(tmp_path)
+        expected_suffix = os.path.join(
+            ".boxman", "runtime", "docker", "data", "ssh", "id_ed25519",
+        )
+        assert rt.ssh_identity_path.endswith(expected_suffix)
+        assert str(tmp_path) in rt.ssh_identity_path
+
+
+class TestNormalizeOwnership:
+    """Tests for BoxmanManager._normalize_ownership — the helper that
+    fixes stale root-owned entries inside otherwise-user-writable
+    workdirs without escalating to sudo when not strictly needed."""
+
+    def test_clean_user_owned_tree_is_a_noop(self, tmp_path, monkeypatch):
+        """No foreign entries → no unlink, no sudo, nothing logged."""
+        from unittest.mock import patch
+        (tmp_path / "a.txt").write_text("hi")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "b.txt").write_text("hi")
+
+        mgr = BoxmanManager()
+
+        run_calls: list = []
+
+        def _capture_run(cmd, *_a, **_kw):
+            run_calls.append(cmd)
+            from unittest.mock import MagicMock
+            return MagicMock(ok=True, stderr="", stdout="")
+
+        monkeypatch.setattr("boxman.manager.run", _capture_run)
+        mgr._normalize_ownership(str(tmp_path))
+
+        # No sudo invoked.
+        assert all("sudo" not in c for c in run_calls), run_calls
+        # Entries untouched.
+        assert (tmp_path / "a.txt").exists()
+        assert (tmp_path / "sub" / "b.txt").exists()
+
+    def test_foreign_owned_file_is_unlinked_no_sudo(
+        self, tmp_path, monkeypatch
+    ):
+        """Stale root-owned file inside user-writable dir → unlinked
+        directly, no sudo escalation."""
+        from unittest.mock import patch
+        stale = tmp_path / "seed.iso"
+        stale.write_bytes(b"stale")
+
+        mgr = BoxmanManager()
+
+        run_calls: list = []
+
+        def _capture_run(cmd, *_a, **_kw):
+            run_calls.append(cmd)
+            from unittest.mock import MagicMock
+            return MagicMock(ok=True, stderr="", stdout="")
+
+        monkeypatch.setattr("boxman.manager.run", _capture_run)
+
+        # Pretend the file is owned by uid=0 (root) by patching scandir
+        # to return an entry whose stat reports st_uid=0.
+        real_scandir = os.scandir
+
+        class _FakeEntry:
+            def __init__(self, real, fake_uid):
+                self._real = real
+                self.path = real.path
+                self.name = real.name
+                self._fake_uid = fake_uid
+            def stat(self, follow_symlinks=False):
+                real_stat = self._real.stat(follow_symlinks=follow_symlinks)
+                # st_uid is read-only; build a tuple-like proxy.
+                class _Stat:
+                    pass
+                s = _Stat()
+                s.st_uid = self._fake_uid
+                return s
+            def is_dir(self, follow_symlinks=False):
+                return self._real.is_dir(follow_symlinks=follow_symlinks)
+
+        def _fake_scandir(p):
+            for e in real_scandir(p):
+                yield _FakeEntry(e, fake_uid=0)
+
+        monkeypatch.setattr("boxman.manager.os.scandir", _fake_scandir)
+        mgr._normalize_ownership(str(tmp_path))
+
+        # File got removed without sudo.
+        assert not stale.exists()
+        assert all("sudo" not in c for c in run_calls), run_calls
+
+    def test_unwritable_dir_falls_back_to_sudo_chown(
+        self, tmp_path, monkeypatch
+    ):
+        """When the parent dir itself is not writable, the cheap path
+        is impossible — sudo chown -R must be invoked."""
+        from unittest.mock import MagicMock
+        mgr = BoxmanManager()
+
+        run_calls: list = []
+
+        def _capture_run(cmd, *_a, **_kw):
+            run_calls.append(cmd)
+            return MagicMock(ok=True, stderr="", stdout="")
+
+        monkeypatch.setattr("boxman.manager.run", _capture_run)
+        # Pretend the dir is not writable.
+        monkeypatch.setattr(
+            "boxman.manager.os.access",
+            lambda p, mode: False if p == str(tmp_path) else True,
+        )
+
+        mgr._normalize_ownership(str(tmp_path))
+
+        assert any(
+            "sudo -n chown -R" in c and str(tmp_path) in c
+            for c in run_calls
+        ), run_calls
+
+    def test_sudo_failure_raises_with_actionable_message(
+        self, tmp_path, monkeypatch
+    ):
+        """When the cheap path can't run AND sudo fails, the user gets
+        a copy-pasteable fix command in the exception."""
+        from unittest.mock import MagicMock
+        mgr = BoxmanManager()
+
+        def _failing_run(cmd, *_a, **_kw):
+            return MagicMock(
+                ok=False, stderr="sudo: a password is required\n",
+                stdout="",
+            )
+
+        monkeypatch.setattr("boxman.manager.run", _failing_run)
+        monkeypatch.setattr(
+            "boxman.manager.os.access",
+            lambda p, mode: False,
+        )
+
+        with pytest.raises(PermissionError) as exc_info:
+            mgr._normalize_ownership(str(tmp_path))
+
+        msg = str(exc_info.value)
+        assert "sudo chown -R" in msg
+        assert "sudo rm -rf" in msg
+        assert str(tmp_path) in msg
+        assert "password is required" in msg
