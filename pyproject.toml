@@ -19,6 +19,10 @@ include = [
     { path = "containers/docker/README.md", format = ["sdist", "wheel"] },
     { path = "boxes/**/*", format = ["sdist", "wheel"] },
 ]
+exclude = [
+    "containers/docker/data/**",
+    "**/.boxman/**",
+]
 
 [tool.poetry.scripts]
 boxman = "boxman.scripts.app:main"

@@ -182,7 +182,8 @@ class TestDockerComposeRuntime:
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
              patch.object(rt, "_inject_bind_mounts_into_compose"), \
-             patch.object(rt, "_log_compose_file"):
+             patch.object(rt, "_log_compose_file"), \
+             patch.object(rt, "verify_workdirs_accessible"):
             mock_not_running = MagicMock(ok=True, stdout="false\n")
             mock_compose_up = MagicMock(ok=True)
             mock_running = MagicMock(ok=True, stdout="true\n")
@@ -317,7 +318,8 @@ class TestDockerComposeRuntime:
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
              patch.object(rt, "_inject_bind_mounts_into_compose"), \
-             patch.object(rt, "_log_compose_file"):
+             patch.object(rt, "_log_compose_file"), \
+             patch.object(rt, "verify_workdirs_accessible"):
             mock_not_running = MagicMock(ok=True, stdout="false\n")
             mock_compose_up = MagicMock(ok=True)
             mock_running = MagicMock(ok=True, stdout="true\n")
@@ -354,7 +356,8 @@ class TestDockerComposeRuntime:
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
              patch.object(rt, "_inject_bind_mounts_into_compose", side_effect=mock_inject), \
-             patch.object(rt, "_log_compose_file"):
+             patch.object(rt, "_log_compose_file"), \
+             patch.object(rt, "verify_workdirs_accessible"):
             mock_not_running = MagicMock(ok=True, stdout="false\n")
             mock_compose_up = MagicMock(ok=True)
             mock_running = MagicMock(ok=True, stdout="true\n")
@@ -369,6 +372,62 @@ class TestDockerComposeRuntime:
             assert len(inject_calls) == 1
             assert "/home/user/my-project" in inject_calls[0]
             assert "/home/user/libvirt-tiny" in inject_calls[0]
+
+
+class TestVerifyWorkdirsAccessible:
+
+    @patch("boxman.runtime.docker_compose.invoke.run")
+    def test_passes_when_all_dirs_accessible(self, mock_run):
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        mock_run.return_value = MagicMock(ok=True)
+
+        rt.verify_workdirs_accessible([
+            "/home/user/project", "/home/user/templates"
+        ])
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert len(calls) == 2
+        assert all("docker exec --user root ctr1" in c for c in calls)
+        assert all("test -d" in c and "-w" in c for c in calls)
+
+    @patch("boxman.runtime.docker_compose.invoke.run")
+    def test_raises_listing_missing_dirs(self, mock_run):
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        mock_run.side_effect = [
+            MagicMock(ok=True),
+            MagicMock(ok=False),
+            MagicMock(ok=False),
+        ]
+
+        with patch.object(rt, "get_compose_file_path",
+                          return_value="/tmp/docker-compose.yml"):
+            with pytest.raises(RuntimeError) as exc_info:
+                rt.verify_workdirs_accessible([
+                    "/home/user/ok",
+                    "/home/user/missing1",
+                    "/home/user/missing2",
+                ])
+
+        msg = str(exc_info.value)
+        assert "/home/user/missing1" in msg
+        assert "/home/user/missing2" in msg
+        assert "/home/user/ok" not in msg
+        assert "ctr1" in msg
+
+    @patch("boxman.runtime.docker_compose.invoke.run")
+    def test_defaults_to_collected_bind_mount_dirs(self, mock_run):
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        rt.project_dir = "/home/user/my-project"
+        rt.workdirs = ["/home/user/libvirt-tiny"]
+        mock_run.return_value = MagicMock(ok=True)
+
+        rt.verify_workdirs_accessible()
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        joined = "\n".join(calls)
+        assert "/home/user/my-project" in joined
+        assert "/home/user/libvirt-tiny" in joined
+        assert "/tmp" in joined
 
 
 class TestDockerComposeDestroyRuntime:
@@ -546,9 +605,12 @@ class TestManagerDestroyRuntimeCleanup:
         }
         mgr._runtime_instance = mock_runtime
 
-        # First isdir: True (dir exists), second: True (still exists after
-        # rmtree)
-        mock_isdir.side_effect = [True, True]
+        # isdir calls:
+        # 1. destroy_runtime: "is boxman_dir present?" → True
+        # 2. _force_rmtree enter guard → True
+        # 3. _force_rmtree post-shutil.rmtree check → True (still there)
+        # 4. _force_rmtree final check → False (docker cleaned it)
+        mock_isdir.side_effect = [True, True, True, False]
 
         BoxmanManager.destroy_runtime(mgr, self._make_cli_args())
 
@@ -583,8 +645,11 @@ class TestManagerDestroyRuntimeCleanup:
         }
         mgr._runtime_instance = mock_runtime
 
-        # First isdir: True (dir exists), second: False (rmtree succeeded)
-        mock_isdir.side_effect = [True, False]
+        # isdir calls:
+        # 1. destroy_runtime: "is boxman_dir present?" → True
+        # 2. _force_rmtree enter guard → True
+        # 3. _force_rmtree post-shutil.rmtree check → False (rmtree worked)
+        mock_isdir.side_effect = [True, True, False]
 
         BoxmanManager.destroy_runtime(mgr, self._make_cli_args())
 

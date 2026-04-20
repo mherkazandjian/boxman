@@ -351,3 +351,210 @@ class TestConfigurableOutputPaths:
         ws_files = config["workspace"]["files"]
         expected = os.path.normpath(os.path.join(ws_path, "../shared/ansible.cfg"))
         assert expected in ws_files
+
+
+class TestRuntimeCollisionPrompt:
+    """Tests for the .boxman-runtime sentinel + cross-runtime prompt."""
+
+    def test_no_prompt_on_matching_sentinel(self, tmp_path, monkeypatch):
+        wd = tmp_path / "workdir"
+        wd.mkdir()
+        (wd / BoxmanManager.RUNTIME_SENTINEL_FILENAME).write_text(
+            "docker-compose\n")
+        (wd / "env.sh").write_text("export X=1\n")
+
+        mgr = BoxmanManager()
+
+        def _fail_prompt(*_a, **_kw):
+            raise AssertionError("no prompt expected when sentinel matches")
+
+        monkeypatch.setattr("builtins.input", _fail_prompt)
+        assert mgr._prompt_workdir_runtime_collision(
+            str(wd), "docker-compose") == str(wd)
+
+    def test_prompt_fires_on_mismatched_sentinel(self, tmp_path, monkeypatch):
+        wd = tmp_path / "workdir"
+        wd.mkdir()
+        (wd / BoxmanManager.RUNTIME_SENTINEL_FILENAME).write_text("local\n")
+        (wd / "env.sh").write_text("export X=1\n")
+
+        mgr = BoxmanManager()
+        monkeypatch.setattr("builtins.input", lambda *_: "y")
+
+        result = mgr._prompt_workdir_runtime_collision(
+            str(wd), "docker-compose")
+        assert result == f"{wd}-docker-runtime"
+
+    def test_prompt_no_keeps_original_path(self, tmp_path, monkeypatch):
+        wd = tmp_path / "workdir"
+        wd.mkdir()
+        (wd / BoxmanManager.RUNTIME_SENTINEL_FILENAME).write_text("local\n")
+        (wd / "env.sh").write_text("export X=1\n")
+
+        mgr = BoxmanManager()
+        monkeypatch.setattr("builtins.input", lambda *_: "n")
+
+        result = mgr._prompt_workdir_runtime_collision(
+            str(wd), "docker-compose")
+        assert result == str(wd)
+
+    def test_missing_sentinel_with_contents_prompts(self, tmp_path, monkeypatch):
+        """Legacy workdirs (no sentinel) with provisioning artifacts should
+        also trigger the prompt — they were created before sentinels existed."""
+        wd = tmp_path / "workdir"
+        wd.mkdir()
+        (wd / "env.sh").write_text("legacy\n")
+
+        mgr = BoxmanManager()
+        monkeypatch.setattr("builtins.input", lambda *_: "y")
+
+        assert mgr._prompt_workdir_runtime_collision(
+            str(wd), "docker-compose") == f"{wd}-docker-runtime"
+
+    def test_empty_dir_is_not_a_collision(self, tmp_path, monkeypatch):
+        """An existing-but-empty directory has nothing to conflict with."""
+        wd = tmp_path / "workdir"
+        wd.mkdir()
+
+        mgr = BoxmanManager()
+
+        def _fail_prompt(*_a, **_kw):
+            raise AssertionError("empty dir should not prompt")
+
+        monkeypatch.setattr("builtins.input", _fail_prompt)
+        assert mgr._prompt_workdir_runtime_collision(
+            str(wd), "docker-compose") == str(wd)
+
+    def test_nonexistent_dir_is_not_a_collision(self, tmp_path, monkeypatch):
+        mgr = BoxmanManager()
+
+        def _fail_prompt(*_a, **_kw):
+            raise AssertionError("missing dir should not prompt")
+
+        monkeypatch.setattr("builtins.input", _fail_prompt)
+        missing = str(tmp_path / "not-there")
+        assert mgr._prompt_workdir_runtime_collision(
+            missing, "docker-compose") == missing
+
+    def test_write_sentinel_records_runtime_name(self, tmp_path):
+        wd = tmp_path / "workdir"
+        wd.mkdir()
+        mgr = BoxmanManager()
+
+        mgr._write_runtime_sentinel(str(wd), "docker-compose")
+
+        sentinel = wd / BoxmanManager.RUNTIME_SENTINEL_FILENAME
+        assert sentinel.read_text().strip() == "docker-compose"
+
+    def test_write_sentinel_noop_on_missing_dir(self, tmp_path):
+        """Writing to a non-existent dir is a silent no-op."""
+        mgr = BoxmanManager()
+        mgr._write_runtime_sentinel(
+            str(tmp_path / "not-there"), "docker-compose")  # must not raise
+
+    def test_reconcile_rewrites_workspace_and_derived_clusters(
+        self, tmp_path, monkeypatch
+    ):
+        """When the user accepts the suffix on workspace.path, derived
+        cluster workdirs should be rewritten to track the new root."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / BoxmanManager.RUNTIME_SENTINEL_FILENAME).write_text("local\n")
+
+        mgr = BoxmanManager()
+        mgr.config = {
+            "workspace": {"path": str(ws)},
+            "clusters": {
+                "cluster_1": {"workdir": str(ws / "cluster_1")},
+                "cluster_2": {"workdir": "/elsewhere/independent"},
+            },
+        }
+        monkeypatch.setattr("builtins.input", lambda *_: "y")
+
+        mgr.reconcile_workdirs_with_runtime("docker-compose")
+
+        new_ws = f"{ws}-docker-runtime"
+        assert mgr.config["workspace"]["path"] == new_ws
+        assert mgr.config["clusters"]["cluster_1"]["workdir"] == \
+            f"{new_ws}/cluster_1"
+        # cluster_2 lives outside workspace.path — untouched (and its
+        # path doesn't exist on disk, so no further prompt fires).
+        assert mgr.config["clusters"]["cluster_2"]["workdir"] == \
+            "/elsewhere/independent"
+
+    def test_reconcile_is_noop_for_local_runtime(self, tmp_path, monkeypatch):
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / BoxmanManager.RUNTIME_SENTINEL_FILENAME).write_text(
+            "docker-compose\n")
+
+        mgr = BoxmanManager()
+        mgr.config = {"workspace": {"path": str(ws)}}
+
+        def _fail_prompt(*_a, **_kw):
+            raise AssertionError("local runtime must not prompt")
+
+        monkeypatch.setattr("builtins.input", _fail_prompt)
+        mgr.reconcile_workdirs_with_runtime("local")
+        assert mgr.config["workspace"]["path"] == str(ws)
+
+    def test_reconcile_rewrites_template_workdir(self, tmp_path, monkeypatch):
+        tpl_wd = tmp_path / "tpl"
+        tpl_wd.mkdir()
+        (tpl_wd / BoxmanManager.RUNTIME_SENTINEL_FILENAME).write_text(
+            "local\n")
+        (tpl_wd / "some.img").write_bytes(b"")
+
+        mgr = BoxmanManager()
+        mgr.config = {
+            "templates": {
+                "t1": {"workdir": str(tpl_wd), "name": "t1"},
+            },
+        }
+        monkeypatch.setattr("builtins.input", lambda *_: "y")
+
+        mgr.reconcile_workdirs_with_runtime("docker-compose")
+
+        assert mgr.config["templates"]["t1"]["workdir"] == \
+            f"{tpl_wd}-docker-runtime"
+
+
+class TestCollectWorkdirs:
+
+    def test_collects_cluster_and_template_workdirs(self, tmp_path):
+        mgr = BoxmanManager()
+        mgr.config = {
+            "clusters": {
+                "c1": {"workdir": str(tmp_path / "c1")},
+                "c2": {"workdir": str(tmp_path / "c2")},
+            },
+            "templates": {
+                "t1": {"workdir": str(tmp_path / "tpl1")},
+                "t2": {},  # falls back to default
+            },
+        }
+
+        dirs = mgr.collect_workdirs()
+
+        assert str(tmp_path / "c1") in dirs
+        assert str(tmp_path / "c2") in dirs
+        assert str(tmp_path / "tpl1") in dirs
+        default_tpl = os.path.abspath(
+            os.path.expanduser("~/boxman-templates"))
+        assert default_tpl in dirs
+
+    def test_returns_empty_when_no_clusters_or_templates(self):
+        mgr = BoxmanManager()
+        mgr.config = {}
+        assert mgr.collect_workdirs() == []
+
+    def test_deduplicates(self, tmp_path):
+        mgr = BoxmanManager()
+        shared = str(tmp_path / "shared")
+        mgr.config = {
+            "clusters": {
+                "c1": {"workdir": shared},
+                "c2": {"workdir": shared},
+            },
+        }
+        assert mgr.collect_workdirs() == [shared]

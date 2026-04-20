@@ -325,6 +325,24 @@ def parse_args():
     parser_destroy_rt.set_defaults(func=BoxmanManager.destroy_runtime)
 
     #
+    # sub parser for the full-teardown 'destroy' command
+    #
+    parser_destroy = subparsers.add_parser(
+        'destroy',
+        help=('nuke everything provisioned by this config: VMs, networks, '
+              'generated files, the docker runtime (if used) and the '
+              'workspace workdir. Prompts [y/N] unless -y is given.'))
+    parser_destroy.add_argument(
+        '--auto-accept', '-y', action='store_true', default=False,
+        help='skip the confirmation prompt and proceed immediately')
+    parser_destroy.add_argument(
+        '--templates', action='store_true', default=False,
+        help=('also remove template workdirs (~/boxman-templates by '
+              'default, or a per-template workdir override). Off by '
+              'default because templates are often shared across projects.'))
+    parser_destroy.set_defaults(func=BoxmanManager.destroy)
+
+    #
     # sub parser for deprovisioning a configuration
     #
     parser_deprov = subparsers.add_parser('deprovision', help='deprovision a configuration')
@@ -1101,6 +1119,15 @@ def main():
         runtime = args.runtime or boxman_config.get('runtime', 'local')
         manager.runtime = runtime
 
+        # If any workdir on disk was previously owned by a different
+        # runtime, prompt the user to switch to a runtime-specific path
+        # before we lock it into the bind-mount list. Skip for destroy
+        # (we're about to nuke the workdir anyway — prompting would be
+        # absurd, especially with -y).
+        if args.func != BoxmanManager.destroy:
+            manager.reconcile_workdirs_with_runtime(
+                manager.runtime_instance.name)
+
         # tell the runtime where the project conf.yml lives so bundled
         # assets are deployed next to it (in .boxman/runtime/docker/)
         if manager.runtime_instance.name == 'docker-compose':
@@ -1112,21 +1139,28 @@ def main():
             if manager.config and 'project' in manager.config:
                 manager.runtime_instance.project_name = manager.config['project']
 
-            # Extract all workdirs from the project config (one per cluster)
-            # and pass them to the runtime so they can be bind-mounted into
-            # the container.
-            if manager.config and 'clusters' in manager.config:
-                workdirs = set()
-                for cluster_name, cluster in manager.config['clusters'].items():
-                    workdir_raw = cluster.get('workdir')
-                    if workdir_raw:
-                        workdirs.add(os.path.abspath(
-                            os.path.expanduser(workdir_raw)))
-
-                if workdirs:
-                    manager.runtime_instance.workdirs = list(workdirs)
-                    for wd in workdirs:
-                        log.info(f"runtime workdir: {wd}")
+            # Collect every workdir from the project config (clusters and
+            # templates) and pass them to the runtime so they can be
+            # bind-mounted into the container. Template workdirs must be
+            # included — otherwise qemu-img/rsync inside the container can
+            # not see files copied to the host-side template directory.
+            workdirs = manager.collect_workdirs()
+            if workdirs:
+                manager.runtime_instance.workdirs = workdirs
+                # Pre-create each bind-mount dir on the host AS THE
+                # CURRENT USER. Without this, `docker compose up` would
+                # create the missing host directory (as root) when it
+                # sets up the bind mount, and subsequent host-side
+                # file writes (env.sh, ssh_config, …) would hit
+                # PermissionError. If the dir already exists as root
+                # from an earlier failed run, _ensure_writable_dir fixes
+                # ownership via `sudo chown`.
+                for wd in workdirs:
+                    log.info(f"runtime workdir: {wd}")
+                    try:
+                        manager._ensure_writable_dir(wd)
+                    except Exception as exc:
+                        log.warning(f"could not prepare {wd}: {exc}")
 
         # Handle destroy-runtime — tear down Docker resources without
         # starting the container first
@@ -1134,8 +1168,14 @@ def main():
             args.func(manager, args)
             sys.exit(0)
 
-        # ensure the runtime environment is up and ready before proceeding
-        manager.runtime_instance.ensure_ready()
+        # Commands that manage the runtime themselves (they start it
+        # best-effort rather than hard-requiring it, so they still work
+        # when the runtime is broken or unreachable).
+        manages_own_runtime = args.func == BoxmanManager.destroy
+
+        if not manages_own_runtime:
+            # ensure the runtime environment is up and ready before proceeding
+            manager.runtime_instance.ensure_ready()
 
         # Handle create-templates — it doesn't need a full provider session
         if args.func == BoxmanManager.create_templates:

@@ -379,6 +379,225 @@ class BoxmanManager:
                 "control_path = /tmp/ansible-ssh-%%h-%%p-%%r\n"
             )
 
+    def collect_workdirs(self) -> list:
+        """
+        Return the absolute paths of every workdir referenced by the project
+        config: ``workspace.path`` (if set), one per cluster, plus one per
+        template (falling back to the shared default ``~/boxman-templates``
+        when a template doesn't set its own ``workdir``).
+
+        The list is de-duplicated and path-expanded; callers use it to
+        bind-mount host directories into the runtime container and to
+        enforce runtime/workdir sentinel checks.
+        """
+        dirs: set = set()
+        config = self.config or {}
+
+        ws_path = (config.get('workspace') or {}).get('path')
+        if ws_path:
+            dirs.add(os.path.abspath(os.path.expanduser(ws_path)))
+
+        for cluster in (config.get('clusters') or {}).values():
+            wd = cluster.get('workdir')
+            if wd:
+                dirs.add(os.path.abspath(os.path.expanduser(wd)))
+
+        templates = config.get('templates') or {}
+        if templates:
+            default_tpl_wd = os.path.abspath(
+                os.path.expanduser('~/boxman-templates'))
+            for tpl in templates.values():
+                wd = tpl.get('workdir')
+                if wd:
+                    dirs.add(os.path.abspath(os.path.expanduser(wd)))
+                else:
+                    dirs.add(default_tpl_wd)
+
+        return sorted(dirs)
+
+    #: Filename of the marker written inside every workdir to record which
+    #: runtime most recently provisioned it. Used to detect cross-runtime
+    #: reuse (e.g. a workdir first used with 'local' then re-used with
+    #: 'docker-compose') and prompt the user to switch to a separate path.
+    RUNTIME_SENTINEL_FILENAME = '.boxman-runtime'
+
+    @staticmethod
+    def _canonical_runtime_name(name: Optional[str]) -> Optional[str]:
+        """
+        Normalise runtime names so ``docker``, ``docker-compose`` and
+        any historical variant collapse to a single canonical form used
+        for sentinel comparisons. Without this, a sentinel written as
+        ``docker`` (the CLI flag) would be seen as mismatching against
+        the internal runtime instance name ``docker-compose``.
+        """
+        if not name:
+            return name
+        n = name.strip().lower()
+        if n in ('docker', 'docker-compose'):
+            return 'docker-compose'
+        return n
+
+    def _read_runtime_sentinel(self, path: str) -> Optional[str]:
+        """Return the runtime name recorded in *path*'s sentinel, or None."""
+        sentinel = os.path.join(path, self.RUNTIME_SENTINEL_FILENAME)
+        try:
+            with open(sentinel, 'r') as fobj:
+                return fobj.read().strip() or None
+        except OSError:
+            return None
+
+    def _write_runtime_sentinel(self, path: str, runtime: str) -> None:
+        """
+        Record that *path* is owned by *runtime* by writing a
+        ``.boxman-runtime`` marker. Failures are non-fatal: the worst case
+        is that the user sees the collision prompt again on the next run.
+        """
+        if not path or not os.path.isdir(path):
+            return
+        sentinel = os.path.join(path, self.RUNTIME_SENTINEL_FILENAME)
+        try:
+            with open(sentinel, 'w') as fobj:
+                fobj.write(f"{runtime.strip()}\n")
+        except OSError as exc:
+            self.logger.debug(f"could not write {sentinel}: {exc}")
+
+    @staticmethod
+    def _runtime_suffix_for(runtime: str) -> str:
+        """Return the suffix appended to a suggested path, e.g.
+        'docker-runtime' for a docker-compose runtime."""
+        base = runtime.split('-')[0]  # 'docker-compose' -> 'docker'
+        return f"{base}-runtime"
+
+    def _prompt_workdir_runtime_collision(
+        self, path: str, runtime: str
+    ) -> str:
+        """
+        If *path* already exists on disk and was last used by a different
+        runtime, interactively prompt the user to switch to a
+        runtime-specific alternative like ``<path>-docker-runtime``.
+
+        Returns the path to use for this session (either *path* unchanged
+        or the suggested alternative). The user's choice is not persisted
+        to ``conf.yml``; a hint is logged so they can update it manually.
+        """
+        if not path:
+            return path
+        expanded = os.path.abspath(os.path.expanduser(path))
+
+        if not os.path.isdir(expanded):
+            return path
+
+        # a dir that contains only our sentinel (or is empty) cannot
+        # conflict — skip the prompt.
+        try:
+            entries = [
+                e for e in os.listdir(expanded)
+                if e != self.RUNTIME_SENTINEL_FILENAME
+            ]
+        except OSError:
+            return path
+
+        previous = self._read_runtime_sentinel(expanded)
+        if (self._canonical_runtime_name(previous)
+                == self._canonical_runtime_name(runtime)):
+            return path
+        if not entries and previous is None:
+            return path
+
+        suggested = f"{expanded.rstrip(os.sep)}-" \
+                    f"{self._runtime_suffix_for(runtime)}"
+
+        print()
+        print(
+            f"workdir '{expanded}' was last used with runtime "
+            f"'{previous or 'unknown'}' (current runtime: '{runtime}')."
+        )
+        print(
+            "Mixing artifacts across runtimes can cause confusing "
+            "failures (paths baked into ansible.cfg, ssh_config, etc.)."
+        )
+        try:
+            answer = input(
+                f"Use a runtime-specific path "
+                f"'{suggested}' for this run? [y/N]: "
+            ).strip().lower()
+        except EOFError:
+            answer = ''
+
+        if answer in ('y', 'yes'):
+            self.logger.info(
+                f"hint: update conf.yml to use '{suggested}' to persist "
+                f"this choice across runs"
+            )
+            return suggested
+
+        self.logger.warning(
+            f"continuing with '{expanded}' despite runtime mismatch "
+            f"(previous: '{previous or 'unknown'}', current: '{runtime}')"
+        )
+        return path
+
+    def reconcile_workdirs_with_runtime(self, runtime_name: str) -> None:
+        """
+        For each workdir referenced by the project config
+        (``workspace.path``, per-cluster ``workdir``, per-template
+        ``workdir``), detect cross-runtime collisions and rewrite the
+        path in-memory when the user accepts a suffixed alternative.
+
+        No-op for the ``local`` runtime — it is the historical default
+        and doesn't need to be quarantined away from a user's existing
+        layouts.
+        """
+        if runtime_name == 'local':
+            return
+
+        config = self.config or {}
+        workspace = config.setdefault('workspace', {})
+        old_ws_path = workspace.get('path')
+
+        if old_ws_path:
+            old_abs = os.path.abspath(os.path.expanduser(old_ws_path))
+            new_path = self._prompt_workdir_runtime_collision(
+                old_abs, runtime_name)
+            new_abs = os.path.abspath(os.path.expanduser(new_path))
+            if new_abs != old_abs:
+                workspace['path'] = new_abs
+                # Migrate cluster workdirs that live underneath the old
+                # workspace path so they track the rewritten root.
+                for cluster in (config.get('clusters') or {}).values():
+                    wd = cluster.get('workdir')
+                    if not wd:
+                        continue
+                    wd_abs = os.path.abspath(os.path.expanduser(wd))
+                    if wd_abs == old_abs:
+                        cluster['workdir'] = new_abs
+                    elif wd_abs.startswith(old_abs + os.sep):
+                        cluster['workdir'] = (
+                            new_abs + wd_abs[len(old_abs):]
+                        )
+
+        # Clusters whose workdir is explicitly set outside of
+        # workspace.path still need an individual collision check.
+        for cluster in (config.get('clusters') or {}).values():
+            wd = cluster.get('workdir')
+            if not wd:
+                continue
+            wd_abs = os.path.abspath(os.path.expanduser(wd))
+            new_path = self._prompt_workdir_runtime_collision(
+                wd_abs, runtime_name)
+            new_abs = os.path.abspath(os.path.expanduser(new_path))
+            if new_abs != wd_abs:
+                cluster['workdir'] = new_abs
+
+        for tpl in (config.get('templates') or {}).values():
+            wd = tpl.get('workdir') or '~/boxman-templates'
+            wd_abs = os.path.abspath(os.path.expanduser(wd))
+            new_path = self._prompt_workdir_runtime_collision(
+                wd_abs, runtime_name)
+            new_abs = os.path.abspath(os.path.expanduser(new_path))
+            if new_abs != wd_abs:
+                tpl['workdir'] = new_abs
+
     def provision_files(self) -> None:
         """
         Provision files specified in the cluster and workspace configuration.
@@ -389,12 +608,22 @@ class BoxmanManager:
         if workspace_path:
             if ws_files := workspace.get('files'):
                 write_files(ws_files, rootdir=workspace_path)
+            self._write_runtime_sentinel(
+                os.path.abspath(os.path.expanduser(workspace_path)),
+                self._runtime_name,
+            )
 
         # cluster-level files → written to cluster workdir
         clusters = self.config['clusters']
         for cluster_name, cluster in clusters.items():
             if files := cluster.get('files'):
                 write_files(files, rootdir=cluster['workdir'])
+            wd = cluster.get('workdir')
+            if wd:
+                self._write_runtime_sentinel(
+                    os.path.abspath(os.path.expanduser(wd)),
+                    self._runtime_name,
+                )
 
     def deprovision_files(self) -> None:
         """
@@ -774,6 +1003,10 @@ class BoxmanManager:
                 self.logger.warning(
                     f"failed to create '{path}' inside container: "
                     f"{result.stderr.strip()}")
+
+        # Mark the directory as owned by the current runtime so that a
+        # later cross-runtime reuse triggers the collision prompt.
+        self._write_runtime_sentinel(path, self._runtime_name)
 
     def validate_base_images(self) -> None:
         """
@@ -2521,28 +2754,179 @@ class BoxmanManager:
 
         boxman_dir = runtime.destroy_runtime()
         if boxman_dir and os.path.isdir(boxman_dir):
-            cls.logger.info(f"removing {boxman_dir}")
-            shutil.rmtree(boxman_dir, ignore_errors=True)
-            # Root-owned files/dirs created by the Docker container may
-            # survive shutil.rmtree.  Use a throwaway container to finish
-            # the job.
-            if os.path.isdir(boxman_dir):
-                cls.logger.info(
-                    f"{boxman_dir} still exists (root-owned leftovers), "
-                    f"removing via docker")
-                abs_boxman_dir = os.path.abspath(boxman_dir)
-                subprocess.run(
-                    ["docker", "run", "--rm",
-                     "-v", f"{abs_boxman_dir}:/cleanup",
-                     "alpine", "sh", "-c", "rm -rf /cleanup/*"],
-                    check=False,
-                )
-                # The bind-mount dir itself can't be removed from inside
-                # the container, but it should now be empty.
-                shutil.rmtree(boxman_dir, ignore_errors=True)
-            cls.logger.info(f"removed {boxman_dir}")
+            cls._force_rmtree(boxman_dir)
         else:
             cls.logger.info("no .boxman directory to remove")
+
+    @staticmethod
+    def _force_rmtree(path: str) -> None:
+        """
+        Remove *path* and everything under it. Falls back to a throwaway
+        ``docker run --rm alpine rm -rf`` when ``shutil.rmtree`` leaves
+        root-owned leftovers (created by the libvirt container running
+        as root). Safe to call for any absolute path — emits info/warning
+        logs, never raises.
+        """
+        if not path or not os.path.isdir(path):
+            log.info(f"{path} does not exist — nothing to remove")
+            return
+
+        abs_path = os.path.abspath(path)
+        log.info(f"removing {abs_path}")
+        shutil.rmtree(abs_path, ignore_errors=True)
+        if not os.path.isdir(abs_path):
+            log.info(f"removed {abs_path}")
+            return
+
+        log.info(
+            f"{abs_path} still exists (root-owned leftovers), "
+            f"removing via docker")
+        result = subprocess.run(
+            ["docker", "run", "--rm",
+             "-v", f"{abs_path}:/cleanup",
+             "alpine", "sh", "-c", "rm -rf /cleanup/* /cleanup/.[!.]* || true"],
+            check=False,
+        )
+        if result.returncode != 0:
+            log.warning(
+                f"docker alpine rm -rf exited with {result.returncode}")
+        # The bind-mount dir itself can't be removed from inside the
+        # container, but it should now be empty.
+        shutil.rmtree(abs_path, ignore_errors=True)
+        if os.path.isdir(abs_path):
+            log.warning(f"{abs_path} could not be fully removed")
+        else:
+            log.info(f"removed {abs_path}")
+
+    @staticmethod
+    def destroy(cls, cli_args):
+        """
+        Full-teardown command: deprovision VMs and networks, tear down
+        the docker-compose runtime (if used), and ``rm -rf`` the
+        workspace workdir. Optionally also removes template workdirs
+        when ``--templates`` is passed. Prompts for confirmation unless
+        ``--auto-accept`` is set.
+
+        This is the inverse of ``boxman up`` — it aims to leave the
+        machine in the state it was in before the project was first
+        provisioned.
+        """
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+
+        auto_accept = getattr(cli_args, "auto_accept", False)
+        wipe_templates = getattr(cli_args, "templates", False)
+
+        config = cls.config or {}
+        workspace_path = (config.get('workspace') or {}).get('path', '')
+        if workspace_path:
+            workspace_path = os.path.abspath(
+                os.path.expanduser(workspace_path))
+
+        template_dirs: list = []
+        if wipe_templates:
+            for tpl in (config.get('templates') or {}).values():
+                wd = tpl.get('workdir') or '~/boxman-templates'
+                template_dirs.append(
+                    os.path.abspath(os.path.expanduser(wd)))
+            template_dirs = sorted(set(template_dirs))
+
+        runtime = cls.runtime_instance
+        is_docker = isinstance(runtime, DockerComposeRuntime)
+        runtime_plan = runtime.plan_destroy_runtime() if is_docker else None
+
+        # --------- build the action plan for the user ---------------
+        print("\nThe following actions will be performed:\n")
+        step = 1
+        print(f"  {step}. destroy every VM and network defined in "
+              f"'{cls.config_path}'")
+        step += 1
+        print(f"  {step}. remove generated provisioning files "
+              f"(env.sh, ansible.cfg, inventory, ssh_config, SSH keys)")
+        step += 1
+        if is_docker and runtime_plan and runtime_plan["actions"]:
+            for action in runtime_plan["actions"]:
+                print(f"  {step}. {action}")
+                step += 1
+        if workspace_path:
+            print(f"  {step}. remove workspace workdir tree '{workspace_path}'")
+            step += 1
+        for tpl_dir in template_dirs:
+            print(f"  {step}. remove template workdir '{tpl_dir}'")
+            step += 1
+
+        paths = []
+        if is_docker and runtime_plan:
+            paths.extend(runtime_plan.get("paths_to_delete", []))
+        if workspace_path:
+            paths.append(workspace_path)
+        paths.extend(template_dirs)
+        if paths:
+            print("\nPaths to delete:\n")
+            for p in paths:
+                print(f"  {p}")
+
+        print()
+        if not auto_accept:
+            answer = input("Proceed? [y/N] ").strip().lower()
+            if answer not in ("y", "yes"):
+                print("Aborted.")
+                return
+
+        # ------------- execute --------------------------------------
+        # 1. Best-effort: start the runtime so we can run virsh to
+        #    deprovision VMs. If it fails (port conflict, docker daemon
+        #    unreachable, …) we still want to tear down docker state and
+        #    nuke the workspace — so we skip the VM-level step instead
+        #    of aborting.
+        runtime_up = True
+        try:
+            runtime.ensure_ready()
+        except Exception as exc:
+            runtime_up = False
+            cls.logger.warning(
+                f"runtime could not be started ({exc}) — "
+                f"skipping VM-level deprovision")
+
+        # 2. deprovision VMs + networks + provisioning files (only when
+        #    the runtime and provider session are available)
+        if runtime_up and cls.provider is not None:
+            cleanup_args = type("Args", (), {
+                "cleanup": True,
+                "docker_compose": getattr(cli_args, "docker_compose", False),
+            })()
+            try:
+                cls.deprovision(cls, cleanup_args)
+            except Exception as exc:
+                cls.logger.warning(f"deprovision raised: {exc} — continuing")
+
+        # 3. tear down the docker runtime (reuses _force_rmtree for the
+        #    .boxman dir, no double prompt)
+        if is_docker:
+            try:
+                boxman_dir = runtime.destroy_runtime()
+                if boxman_dir and os.path.isdir(boxman_dir):
+                    cls._force_rmtree(boxman_dir)
+            except Exception as exc:
+                cls.logger.warning(f"destroy_runtime raised: {exc}")
+
+        # 4. unregister the project from the boxman cache. We do this
+        #    unconditionally (in addition to whatever deprovision did)
+        #    so that stale cache entries left over from earlier failed
+        #    runs don't block the next `up`.
+        try:
+            cls.unregister_from_cache()
+        except Exception as exc:
+            cls.logger.warning(f"unregister_from_cache raised: {exc}")
+
+        # 5. nuke the workspace workdir
+        if workspace_path:
+            cls._force_rmtree(workspace_path)
+
+        # 6. nuke template workdirs (only when --templates was passed)
+        for tpl_dir in template_dirs:
+            cls._force_rmtree(tpl_dir)
+
+        cls.logger.info("destroy complete")
 
     ### start snapshot functions ####
     @staticmethod

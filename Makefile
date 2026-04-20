@@ -97,12 +97,27 @@ test-provision:
 
 ################
 #@group: \033[0;32mboxes\033[0m
-#@help: deprovision all boxes that have a conf.yml
+#@help: deprovision all boxes that have a conf.yml (also cleans .boxman dirs)
 boxes-deprovision:
 	@for conf in boxes/*/conf.yml; do \
 		dir=$$(dirname "$$conf"); \
 		echo "==> Deprovisioning $$dir"; \
 		boxman --conf "$$conf" deprovision || true; \
+	done
+	@$(MAKE) boxes-clean
+
+#@help: remove .boxman/ directories under boxes/ (uses alpine via docker for root-owned leftovers)
+boxes-clean:
+	@for bdir in boxes/*/.boxman; do \
+		[ -d "$$bdir" ] || continue; \
+		echo "==> Cleaning $$bdir"; \
+		rm -rf "$$bdir" 2>/dev/null || true; \
+		if [ -d "$$bdir" ]; then \
+			abs=$$(cd "$$(dirname "$$bdir")" && pwd)/.boxman; \
+			echo "    root-owned leftovers — removing via docker alpine"; \
+			docker run --rm -v "$$abs:/cleanup" alpine sh -c 'rm -rf /cleanup/*' || true; \
+			rm -rf "$$bdir" 2>/dev/null || true; \
+		fi; \
 	done
 
 ################

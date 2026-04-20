@@ -58,7 +58,7 @@ class Network(VirshCommand):
             if not bridge_name:
                 bridge_name = self.find_available_bridge_name()
         else:
-            if bridge_name := self.get_bridge_from_network(name):
+            if bridge_name := Network.get_bridge_from_network(name, provider_config=self.provider_config):
                 self.logger.info(f"found existing bridge {bridge_name} for network {name}")
             else:
                 self.logger.warning(f"no existing bridge found for network {name}, "

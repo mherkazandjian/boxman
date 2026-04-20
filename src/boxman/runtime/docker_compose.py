@@ -254,8 +254,57 @@ class DockerComposeRuntime(RuntimeBase):
         self._wait_for_container_running()
         self._wait_for_libvirtd()
 
+        # Refuse to proceed if any bind-mount dir is not visible and
+        # writable inside the container. Without this check, downstream
+        # commands (rsync, qemu-img) would run against directories that
+        # only exist in the container's overlay filesystem, producing
+        # confusing "No such file or directory" errors after a host-side
+        # copy appeared to succeed.
+        self.verify_workdirs_accessible(bind_dirs)
+
         self.logger.info(
             f"runtime container '{self.container_name}' is ready")
+
+    def verify_workdirs_accessible(
+        self, bind_dirs: Optional[List[str]] = None
+    ) -> None:
+        """
+        Verify that every bind-mount directory is reachable and writable
+        inside the runtime container.
+
+        Raises ``RuntimeError`` listing every path that fails the check so
+        the user can correct the docker-compose volume configuration
+        before rsync or qemu-img is invoked.
+        """
+        if bind_dirs is None:
+            abs_project_dir = os.path.abspath(
+                self.project_dir or os.getcwd())
+            bind_dirs = self._collect_bind_mount_dirs(abs_project_dir)
+
+        failures: List[str] = []
+        for path in bind_dirs:
+            check = invoke.run(
+                f"docker exec --user root {self.container_name} "
+                f"test -d '{path}' -a -w '{path}'",
+                hide=True, warn=True,
+            )
+            if not check.ok:
+                failures.append(path)
+
+        if failures:
+            lines = "\n".join(f"  - {p}" for p in failures)
+            raise RuntimeError(
+                "the following workdirs are not accessible inside "
+                f"container '{self.container_name}':\n{lines}\n"
+                "each path must exist on the host and be bind-mounted "
+                "into the container at the same absolute path. "
+                f"check the volumes section of {self.get_compose_file_path()} "
+                "and that the host directories exist and are writable."
+            )
+
+        self.logger.info(
+            f"verified {len(bind_dirs)} workdir(s) accessible inside "
+            f"container '{self.container_name}'")
 
     def _log_compose_file(self, compose_path: str) -> None:
         """Log the contents of the docker-compose.yml before starting."""
@@ -558,6 +607,22 @@ class DockerComposeRuntime(RuntimeBase):
         self.logger.info(f"deployed runtime assets to {local_dir}")
         return local_compose
 
+    @staticmethod
+    def _derive_port_offset(instance_name: str) -> int:
+        """
+        Return a deterministic 0–999 offset derived from *instance_name*.
+
+        Without this, every boxman project on the same host would try to
+        bind the same SSH / libvirt TCP / TLS host ports and collide.
+        The ``default`` instance always maps to offset 0 so legacy
+        single-project setups keep their 2222 / 16509 / 16514 ports.
+        """
+        if not instance_name or instance_name == "default":
+            return 0
+        import hashlib
+        digest = hashlib.md5(instance_name.encode()).hexdigest()
+        return int(digest[:4], 16) % 1000
+
     def _write_env_file(self, runtime_dir: str,
                         abs_project_dir: str = None) -> None:
         """
@@ -574,19 +639,25 @@ class DockerComposeRuntime(RuntimeBase):
             self._sanitize_project_name(self._project_name)
             if self._project_name else "default"
         )
+        offset = self._derive_port_offset(instance_name)
+        ssh_port = 2222 + offset
+        tcp_port = 16509 + offset
+        tls_port = 16514 + offset
 
         with open(env_path, "w") as fobj:
             fobj.write(f"BOXMAN_INSTANCE_NAME={instance_name}\n")
             fobj.write(f"BOXMAN_DATA_DIR={abs_data_dir}\n")
             fobj.write(f"BOXMAN_PROJECT_DIR={abs_project_dir}\n")
-            fobj.write(f"BOXMAN_SSH_PORT=2222\n")
-            fobj.write(f"BOXMAN_LIBVIRT_TCP_PORT=16509\n")
-            fobj.write(f"BOXMAN_LIBVIRT_TLS_PORT=16514\n")
+            fobj.write(f"BOXMAN_SSH_PORT={ssh_port}\n")
+            fobj.write(f"BOXMAN_LIBVIRT_TCP_PORT={tcp_port}\n")
+            fobj.write(f"BOXMAN_LIBVIRT_TLS_PORT={tls_port}\n")
             fobj.write(f"HOST_UID={host_uid}\n")
             fobj.write(f"HOST_GID={host_gid}\n")
 
-        self.logger.info(f"wrote .env: BOXMAN_PROJECT_DIR={abs_project_dir}, "
-                         f"BOXMAN_DATA_DIR={abs_data_dir}")
+        self.logger.info(
+            f"wrote .env: BOXMAN_PROJECT_DIR={abs_project_dir}, "
+            f"BOXMAN_DATA_DIR={abs_data_dir}, "
+            f"ports={ssh_port}/{tcp_port}/{tls_port}")
 
     @staticmethod
     def _find_asset_source_dir() -> Optional[str]:

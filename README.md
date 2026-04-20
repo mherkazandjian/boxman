@@ -32,16 +32,36 @@ pip install .
 
 Boxman includes a containerized libvirt/KVM environment for development and testing without
 modifying your host system. Only requires Docker with compose v2 and `/dev/kvm` on the host.
+Boxman brings the container up automatically — no manual `docker compose up` needed.
 
 ```bash
-# Start the docker-compose environment
-cd containers/docker && make up
-
-# Provision using the docker-compose runtime
-boxman --runtime docker-compose provision
+# Minimal end-to-end flow for a brand new machine
+cd boxes/tiny-libvirt-ubuntu-24.04-cloudinit-docker-runtime
+boxman --runtime=docker up          # provision VMs inside the docker runtime
+boxman --runtime=docker destroy -y  # tear down everything, no prompt
 ```
 
-See [boxman/containers/docker/README.md](boxman/containers/docker/README.md) for full documentation.
+What happens on first `up`:
+
+- The libvirt container image is built (`docker compose up -d --build`) and
+  started. Per-project host ports are derived from the project name so
+  multiple boxman projects on the same host do not collide on `2222 / 16509 / 16514`.
+- `workspace.path`, every cluster `workdir`, and the template `workdir`
+  are bind-mounted into the container at the same absolute path, so
+  `virsh`, `qemu-img`, and `rsync` inside the container see the same
+  file layout as the host.
+- Each workdir is tagged with a `.boxman-runtime` sentinel recording
+  which runtime owns it. Running `boxman --runtime=docker up` against a
+  workdir that was previously used with `--runtime=local` (or vice
+  versa) triggers an interactive prompt suggesting a runtime-specific
+  alternative path (e.g. `~/workspaces/myproj-docker-runtime`).
+- In `conf.yml`, set `provider.libvirt.use_sudo: False` for the docker
+  runtime — the container already executes libvirt commands as root via
+  `docker exec --user root`.
+
+See [boxes/tiny-libvirt-ubuntu-24.04-cloudinit-docker-runtime/conf.yml](boxes/tiny-libvirt-ubuntu-24.04-cloudinit-docker-runtime/conf.yml)
+for a ready-to-run example, and [containers/docker/README.md](containers/docker/README.md)
+for the container internals.
 
 ### Create Template VMs from Cloud Images
 
@@ -227,8 +247,11 @@ commands are executed. The runtime is orthogonal to the provider:
 # Local (default — same as omitting --runtime)
 boxman provision
 
-# Inside docker-compose container
-boxman --runtime docker provision
+# Inside the boxman libvirt container
+boxman --runtime=docker up
+
+# Nuke everything set up under the docker runtime
+boxman --runtime=docker destroy -y
 
 # Set the default in ~/.config/boxman/boxman.yml:
 #   runtime: docker
@@ -237,6 +260,11 @@ boxman --runtime docker provision
 The bundled `docker-compose.yml` is shipped with the package. To use a custom
 one, set `compose_file` in `runtime_config` or the `BOXMAN_COMPOSE_FILE`
 environment variable.
+
+**Cleaning up leftover state**: if a previous docker run left root-owned
+files under `boxes/<name>/.boxman/` (libvirt runtime data), `make
+boxes-clean` removes them via a throwaway `alpine` container. The same
+fallback is used automatically by `destroy` and `destroy-runtime`.
 
 ## Sample configuration
 
@@ -341,6 +369,9 @@ This project is licensed under the [MIT License](../LICENSE).
 - `up` — bring up the infrastructure (provision if not created, start if powered off)
 - `down` — bring down the infrastructure (save or suspend state)
 - `destroy-runtime` — destroy the docker-compose runtime and clean up .boxman
+- `destroy` — full teardown (VMs + networks + files + runtime + workspace
+  workdir) with a `[y/N]` prompt; use `-y`/`--auto-accept` to skip the prompt
+  and `--templates` to also remove template workdirs
 - `deprovision` — deprovision a configuration
 - `snapshot` — manage snapshots of VMs
   - `snapshot take` — take a snapshot

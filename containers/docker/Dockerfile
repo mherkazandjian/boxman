@@ -24,6 +24,7 @@ RUN dnf install -y epel-release && \
         openssh-clients \
         sshpass \
         sudo \
+        rsync \
     && dnf clean all
 
 COPY supervisord.conf /etc/supervisord.conf
