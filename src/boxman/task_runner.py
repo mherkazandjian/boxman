@@ -6,6 +6,19 @@ conf.yml.  They run with environment variables loaded from the workspace
 env file, giving them access to variables like INVENTORY, SSH_CONFIG,
 GATEWAYHOST, etc.
 
+Security note
+-------------
+``subprocess.run(..., shell=True)`` is used intentionally: task commands
+come from the project owner's own ``conf.yml`` and routinely include
+pipelines, redirects, and command substitution that require a shell.
+The trust boundary is "whoever wrote conf.yml can run anything they
+like" — the same privilege level as running shell scripts by hand.
+
+As defense in depth, VM / cluster names flowing into shell commands go
+through :func:`_validate_safe_name` so externally-derived identifiers
+(e.g. from a CI variable) can't sneak shell metacharacters into an
+``ssh`` invocation.
+
 Task commands may contain ``{{ placeholder }}`` markers that are filled
 from CLI flags at invocation time.  Placeholder names use underscores;
 the corresponding CLI flags use hyphens::
@@ -66,11 +79,32 @@ Usage::
 import os
 import re
 import subprocess
-import sys
-from typing import Dict, Any, List, Optional
+from typing import Any
 
 from boxman import log
 from boxman.utils.env_loader import load_workspace_env
+
+
+#: Names (VMs, clusters, hosts) that will be interpolated into a shell
+#: command must match this pattern. Alphanumerics, underscore, hyphen,
+#: dot — nothing that a shell treats specially. Rejects backticks,
+#: semicolons, ``$(…)``, whitespace, quotes, etc.
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _validate_safe_name(name: str, kind: str = "name") -> None:
+    """
+    Raise :class:`ValueError` when *name* is empty or contains characters
+    that could be interpreted by a shell.
+
+    Used at the boundary where user-supplied identifiers (typically VM
+    or cluster names) get interpolated into shell commands under
+    ``subprocess.run(..., shell=True)``.
+    """
+    if not name or not SAFE_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"unsafe {kind} {name!r}: must match {SAFE_NAME_RE.pattern}"
+        )
 
 
 class TaskRunner:
@@ -85,12 +119,12 @@ class TaskRunner:
 
     def __init__(
         self,
-        config: Dict[str, Any],
-        cluster_name: Optional[str] = None,
+        config: dict[str, Any],
+        cluster_name: str | None = None,
     ):
         self.config = config
-        self.tasks: Dict[str, Dict[str, Any]] = config.get("tasks", {})
-        self.workspace_config: Dict[str, Any] = config.get("workspace", {})
+        self.tasks: dict[str, dict[str, Any]] = config.get("tasks", {})
+        self.workspace_config: dict[str, Any] = config.get("workspace", {})
 
         # Resolve cluster for env loading
         clusters = config.get("clusters", {})
@@ -106,10 +140,10 @@ class TaskRunner:
         )
 
         # Lazily loaded
-        self._env: Optional[Dict[str, str]] = None
+        self._env: dict[str, str] | None = None
 
     @property
-    def env(self) -> Dict[str, str]:
+    def env(self) -> dict[str, str]:
         """
         Return the merged environment for task execution.
 
@@ -130,7 +164,7 @@ class TaskRunner:
 
         return self._env
 
-    def list_tasks(self) -> List[Dict[str, str]]:
+    def list_tasks(self) -> list[dict[str, str]]:
         """
         Return a list of task summaries.
 
@@ -153,7 +187,7 @@ class TaskRunner:
             log.info(f"  {key}={self._workspace_vars[key]}")
 
     @staticmethod
-    def extract_placeholders(command: str) -> List[str]:
+    def extract_placeholders(command: str) -> list[str]:
         """Return placeholder names found in *command*.
 
         Placeholders use the ``{name}`` syntax (single curly braces).
@@ -163,8 +197,8 @@ class TaskRunner:
     def run(
         self,
         task_name: str,
-        extra_args: Optional[List[str]] = None,
-        task_flags: Optional[Dict[str, str]] = None,
+        extra_args: list[str] | None = None,
+        task_flags: dict[str, str] | None = None,
     ) -> int:
         """
         Execute a named task.
@@ -241,8 +275,8 @@ class TaskRunner:
     def run_command(
         self,
         command: str,
-        extra_args: Optional[List[str]] = None,
-        ansible_flags: Optional[str] = None,
+        extra_args: list[str] | None = None,
+        ansible_flags: str | None = None,
     ) -> int:
         """
         Execute an ad-hoc command with the workspace environment loaded.
@@ -278,7 +312,7 @@ class TaskRunner:
         if workdir:
             workdir = os.path.expanduser(workdir)
 
-        log.info(f"running ad-hoc command")
+        log.info("running ad-hoc command")
         self._log_env()
         log.info(f"workdir: {workdir or os.getcwd()}")
         log.info(f"command: {ansible_cmd}")
@@ -292,7 +326,7 @@ class TaskRunner:
 
         return result.returncode
 
-    def ssh_to_host(self, vm_name: Optional[str] = None) -> int:
+    def ssh_to_host(self, vm_name: str | None = None) -> int:
         """
         Open an interactive SSH session to a VM.
 
@@ -310,6 +344,10 @@ class TaskRunner:
             raise RuntimeError(
                 "no VM name given and GATEWAYHOST is not set in the workspace environment"
             )
+        # Host is interpolated into a shell command under shell=True —
+        # guard against shell metacharacters leaking in from external
+        # callers (CI variables, automation).
+        _validate_safe_name(host, kind="vm/host name")
 
         ssh_config = self.env.get("SSH_CONFIG", "")
         command = f"ssh -F {ssh_config} -t {host}" if ssh_config else f"ssh -t {host}"

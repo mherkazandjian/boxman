@@ -1,6 +1,5 @@
-import os
 import time
-from typing import Optional, Dict, Any, List, Union
+from typing import Any
 
 from .commands import VirshCommand
 
@@ -14,7 +13,7 @@ class DestroyVM(VirshCommand):
     """
     def __init__(self,
                  name: str,
-                 provider_config: Optional[Dict[str, Any]] = None):
+                 provider_config: dict[str, Any] | None = None):
         """
         Initialize the VM destruction operation.
 
@@ -76,7 +75,7 @@ class DestroyVM(VirshCommand):
             return False
 
     def shutdown_vm(self,
-                    timeout: Optional[int] = None,
+                    timeout: int | None = None,
                     force: bool = False) -> bool:
         """
         Shutdown a VM gracefully or by force if requested.
@@ -158,8 +157,8 @@ class DestroyVM(VirshCommand):
             return False
 
     def destroy_vm(self,
-                   force: Optional[bool] = None,
-                   timeout: Optional[int] = None) -> bool:
+                   force: bool | None = None,
+                   timeout: int | None = None) -> bool:
         """
         Stop a running VM either gracefully or by force.
 
@@ -301,7 +300,7 @@ class DestroyVM(VirshCommand):
             self.logger.error(f"error handling snapshots for VM {self.name}: {exc}")
             return False
 
-    def remove(self, force: Optional[bool] = None) -> bool:
+    def remove(self, force: bool | None = None) -> bool:
         """
         Completely destroy the VM: shutdown, force destroy if needed, and undefine.
 

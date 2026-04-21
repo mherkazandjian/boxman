@@ -7,8 +7,8 @@ A *runtime* controls **where** provider commands are executed:
 """
 
 from boxman.runtime.base import RuntimeBase
-from boxman.runtime.local import LocalRuntime
 from boxman.runtime.docker_compose import DockerComposeRuntime
+from boxman.runtime.local import LocalRuntime
 
 
 def create_runtime(name: str, **kwargs) -> RuntimeBase:

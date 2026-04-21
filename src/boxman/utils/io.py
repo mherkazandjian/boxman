@@ -1,9 +1,9 @@
 import os
-from typing import Dict, Optional
 
 from boxman import log
 
-def write_files(files: Dict[str, str], rootdir: Optional[str] = None) -> None:
+
+def write_files(files: dict[str, str], rootdir: str | None = None) -> None:
     """
     Write files to the filesystem. The files are specified as a dictionary
     where the keys are the file paths and the values are the file contents.

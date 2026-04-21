@@ -1,10 +1,8 @@
 import os
-from typing import Optional, Dict, Any, List
 import tempfile
+from typing import Any
 
 from .commands import VirshCommand
-
-from boxman import log
 
 
 class CDROMManager(VirshCommand):
@@ -15,13 +13,13 @@ class CDROMManager(VirshCommand):
     and swapping media in existing CDROM slots.
     """
 
-    def __init__(self, vm_name: str, provider_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, vm_name: str, provider_config: dict[str, Any] | None = None):
         super().__init__(provider_config)
         self.vm_name = vm_name
 
     def attach_cdrom(self,
                      source_path: str,
-                     target_dev: Optional[str] = None,
+                     target_dev: str | None = None,
                      persistent: bool = True) -> bool:
         """
         Attach an ISO image as a CDROM device to the VM.
@@ -146,7 +144,7 @@ class CDROMManager(VirshCommand):
             self.logger.error(f"error changing CDROM media: {e}")
             return False
 
-    def configure_from_config(self, cdrom_config: Dict[str, Any]) -> bool:
+    def configure_from_config(self, cdrom_config: dict[str, Any]) -> bool:
         """
         Configure a CDROM device from a configuration dictionary.
 
@@ -164,7 +162,7 @@ class CDROMManager(VirshCommand):
         target = cdrom_config.get('target')
         return self.attach_cdrom(source_path=source, target_dev=target)
 
-    def get_attached_cdroms(self) -> List[Dict[str, Any]]:
+    def get_attached_cdroms(self) -> list[dict[str, Any]]:
         """
         Get all CDROM devices currently attached to the VM.
 
@@ -218,7 +216,7 @@ class CDROMManager(VirshCommand):
   <readonly/>
 </disk>"""
 
-    def _find_next_available_target(self) -> Optional[str]:
+    def _find_next_available_target(self) -> str | None:
         """
         Find the next available IDE target device for a CDROM.
 

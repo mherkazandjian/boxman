@@ -7,18 +7,18 @@ containing a VM package (manifest, XML, and disk image), extracts it, and
 uses the manifest to set up the VM in libvirt.
 """
 
-import os
-import uuid
 import json
+import os
 import shutil
 import traceback
-from typing import Optional, Dict, Any, Callable
-from urllib.parse import urlparse
+import uuid
+from collections.abc import Callable
+from typing import Any
 
 from lxml import etree
-from invoke import run
 
 from boxman import log
+from boxman.utils.shell import run
 
 
 class ImageDownloaderUtils:
@@ -46,11 +46,11 @@ class ImageImporter:
         self,
         manifest_path: str = None,
         uri: str = "qemu:///system",
-        disk_dir: Optional[str] = None,
-        vm_name: Optional[str] = None,
+        disk_dir: str | None = None,
+        vm_name: str | None = None,
         force: bool = False,
         keep_uuid: bool = False,
-        progress_callback: Optional[Callable[[str], None]] = None
+        progress_callback: Callable[[str], None] | None = None
     ):
         """
         Initialize the ImageImporter.
@@ -96,7 +96,7 @@ class ImageImporter:
         """Log a debug message."""
         self.logger.debug(message)
 
-    def load_manifest(self, manifest_path: str) -> Optional[Dict[str, Any]]:
+    def load_manifest(self, manifest_path: str) -> dict[str, Any] | None:
         """
         Load and parse a json manifest file.
 
@@ -113,7 +113,7 @@ class ImageImporter:
 
             self._log_info(f"reading the manifest from {manifest_path}...")
 
-            with open(manifest_path, 'r') as fobj:
+            with open(manifest_path) as fobj:
                 manifest = json.load(fobj)
 
             if 'xml_path' not in manifest:
@@ -253,7 +253,7 @@ class ImageImporter:
             self._log_error(f"Error defining VM: {exc}")
             return False
 
-    def load_xml(self, fpath: str) -> Optional[etree._ElementTree]:
+    def load_xml(self, fpath: str) -> etree._ElementTree | None:
         """
         Load and parse an XML file.
 

@@ -1,14 +1,9 @@
-import time
 import re
 import socket
-from .utils import Command
-from .utils import log
+import time
 
-from . import vbox_natnetwork
-from . import vbox_showvminfo
-from . import vbox_modifyvm
-from . import vbox_list
-from . import vbox_snapshot
+from . import vbox_list, vbox_modifyvm, vbox_natnetwork, vbox_showvminfo, vbox_snapshot
+from .utils import Command, log
 
 
 class Virtualbox:

@@ -1,6 +1,10 @@
-from lxml import etree, html
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Any
+
+from lxml import etree
+
 from boxman import log
+from boxman.exceptions import ProvisionError
+
 from .commands import VirshCommand
 
 
@@ -9,7 +13,7 @@ class VirshEdit:
     Class to edit libvirt domain xml using xpath expressions.
     """
 
-    def __init__(self, provider_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, provider_config: dict[str, Any] | None = None):
         """
         initialize the virshedit class.
 
@@ -42,13 +46,15 @@ class VirshEdit:
                 args.append('--inactive')
             result = self.virsh.execute(*args)
             return result.stdout
-        except Exception as exc:
+        except (RuntimeError, OSError) as exc:
             self.logger.error(f"failed to get xml for domain {domain_name}: {exc}")
-            raise
+            raise ProvisionError(
+                f"failed to dump xml for domain '{domain_name}': {exc}"
+            ) from exc
 
     def modify_xml_xpath(self,
                         xml_content: str,
-                        modifications: List[Tuple[str, str, str]]) -> str:
+                        modifications: list[tuple[str, str, str]]) -> str:
         """
         Modify xml content using xpath expressions.
 
@@ -79,9 +85,9 @@ class VirshEdit:
                             topology_element = etree.Element('topology')
                             cpu_element.append(topology_element)
                             elements = [topology_element]
-                            self.logger.info(f"created new topology element under cpu")
+                            self.logger.info("created new topology element under cpu")
                         else:
-                            self.logger.warning(f"no cpu element found to add topology to")
+                            self.logger.warning("no cpu element found to add topology to")
                             continue
                     else:
                         self.logger.warning(f"no elements found for xpath: {xpath}")
@@ -104,7 +110,7 @@ class VirshEdit:
             self.logger.error(f"failed to modify xml: {exc}")
             raise
 
-    def find_xpath_values(self, xml_content: str, xpath: str) -> List[str]:
+    def find_xpath_values(self, xml_content: str, xpath: str) -> list[str]:
         """
         Find values using xpath expressions.
 
@@ -140,10 +146,10 @@ class VirshEdit:
 
     def configure_cpu_memory(self,
                            domain_name: str,
-                           cpus: Optional[Dict[str, int]] = None,
-                           memory_mb: Optional[int] = None,
-                           max_vcpus: Optional[int] = None,
-                           max_memory_mb: Optional[int] = None) -> bool:
+                           cpus: dict[str, int] | None = None,
+                           memory_mb: int | None = None,
+                           max_vcpus: int | None = None,
+                           max_memory_mb: int | None = None) -> bool:
         """
         Configure cpu and memory settings for a domain.
 
@@ -274,8 +280,8 @@ class VirshEdit:
         """
         try:
             # write xml to temporary file
-            import tempfile
             import os
+            import tempfile
 
             with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as tmp_file:
                 tmp_file.write(xml_content)

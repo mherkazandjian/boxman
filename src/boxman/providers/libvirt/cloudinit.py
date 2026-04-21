@@ -5,84 +5,38 @@ Creates template VMs from cloud images by:
 1. Building a NoCloud seed ISO (user-data + meta-data)
 2. Copying the base cloud image
 3. Running virt-install --import with both disks
+
+Preset user-data / meta-data / network-config strings and the
+``hash_password`` helper were moved to
+:mod:`boxman.providers.libvirt.cloudinit_presets` in Phase 2.7 to shrink
+this module. They remain importable from here for backwards
+compatibility.
 """
 
+import base64
+import json
 import os
 import re
 import shutil
 import tempfile
 import time
-import json
-import base64
-import crypt
-import secrets
-import urllib.request
 import urllib.error
-from typing import Optional, Dict, Any
-from urllib.parse import urlparse
+import urllib.request
+from typing import Any
 
 import invoke
 
 from boxman import log
 from boxman.image_cache import ImageCache
+from boxman.utils.shell import run as _shell_run
+
+from .cloudinit_presets import (  # noqa: F401 — re-exported for back-compat
+    DEFAULT_META_DATA,
+    DEFAULT_NETWORK_CONFIG,
+    DEFAULT_USER_DATA,
+    hash_password as _hash_password,
+)
 from .commands import VirshCommand, VirtInstallCommand
-
-
-DEFAULT_META_DATA = """\
-instance-id: {instance_id}
-local-hostname: {hostname}
-"""
-
-DEFAULT_USER_DATA = """\
-#cloud-config
-hostname: {hostname}
-manage_etc_hosts: true
-
-ssh_pwauth: true
-chpasswd:
-  expire: false
-  users:
-    - name: ubuntu
-      password: ubuntu
-      type: text
-
-package_update: false
-
-write_files:
-  - path: /etc/boxman-template-marker
-    permissions: "0644"
-    content: |
-      created by boxman cloud-init template provisioning
-  - path: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
-    permissions: "0644"
-    content: |
-      [Service]
-      ExecStart=
-      ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any
-
-# Remove any file that disables cloud-init networking, then bring up interfaces
-runcmd:
-  - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
-  - rm -f /etc/cloud/cloud.cfg.d/subiquity-disable-cloudinit-networking.cfg
-  - systemctl daemon-reload
-  - netplan generate || true
-  - netplan apply || true
-  - dhclient -v || true
-  - [ sh, -c, "echo template created at $(date -Is) >> /var/log/boxman-cloudinit.log" ]
-"""
-
-DEFAULT_NETWORK_CONFIG = """\
-version: 2
-ethernets:
-  all-en:
-    match:
-      name: "en*"
-    dhcp4: true
-  all-eth:
-    match:
-      name: "eth*"
-    dhcp4: true
-"""
 
 
 class CloudInitTemplate:
@@ -94,21 +48,21 @@ class CloudInitTemplate:
         self,
         template_name: str,
         image_path: str,
-        cloudinit_userdata: Optional[str] = None,
-        cloudinit_metadata: Optional[str] = None,
-        cloudinit_network_config: Optional[str] = None,
-        cloudinit_done_marker: Optional[str] = None,
-        workdir: Optional[str] = None,
-        provider_config: Optional[Dict[str, Any]] = None,
+        cloudinit_userdata: str | None = None,
+        cloudinit_metadata: str | None = None,
+        cloudinit_network_config: str | None = None,
+        cloudinit_done_marker: str | None = None,
+        workdir: str | None = None,
+        provider_config: dict[str, Any] | None = None,
         memory: int = 2048,
         vcpus: int = 2,
         os_variant: str = "generic",
         disk_format: str = "qcow2",
-        disk_size: Optional[str] = None,
+        disk_size: str | None = None,
         network: str = "default",
-        bridge: Optional[str] = None,
-        image_checksum: Optional[str] = None,
-        image_cache: Optional[ImageCache] = None,
+        bridge: str | None = None,
+        image_checksum: str | None = None,
+        image_cache: ImageCache | None = None,
     ):
         self.template_name = template_name
         self.image_path = self._resolve_image_path(image_path)
@@ -188,7 +142,7 @@ class CloudInitTemplate:
         )
         return False
 
-    def _resolve_bridge(self) -> Optional[str]:
+    def _resolve_bridge(self) -> str | None:
         """
         Resolve the bridge device name to use for the VM network.
 
@@ -295,7 +249,7 @@ class CloudInitTemplate:
         # Replace ${hash:plaintext} placeholders with SHA-512 hashed passwords
         def _hash_repl(m):
             hashed = self.hash_password(m.group(1))
-            self.logger.info(f"hashed password for cloud-init user (placeholder replaced)")
+            self.logger.info("hashed password for cloud-init user (placeholder replaced)")
             # Wrap in single quotes so YAML doesn't interpret $ in the hash
             return f"'{hashed}'"
 
@@ -466,7 +420,7 @@ class CloudInitTemplate:
         self.logger.info(f"downloading base image {url} -> {dst_path}")
 
         # Try wget first (handles redirects, proxies, SSL better)
-        result = invoke.run(
+        result = _shell_run(
             f'wget --progress=dot:mega -O "{dst_path}" "{url}"',
             hide=False, warn=True,
         )
@@ -475,7 +429,7 @@ class CloudInitTemplate:
             return True
 
         # Try curl as second fallback
-        result = invoke.run(
+        result = _shell_run(
             f'curl -L --progress-bar -o "{dst_path}" "{url}"',
             hide=False, warn=True,
         )
@@ -586,7 +540,7 @@ class CloudInitTemplate:
             f"done marker {marker_path} not found after {max_wait}s")
         return False
 
-    def _guest_exec_output(self, guest_exec_stdout: str) -> Optional[str]:
+    def _guest_exec_output(self, guest_exec_stdout: str) -> str | None:
         """
         Run guest-exec-status for a just-started guest-exec and return the
         decoded stdout, or None on failure.
@@ -870,7 +824,7 @@ class CloudInitTemplate:
             cmd = self.virt_install._wrap_for_runtime(cmd)
 
             self.logger.info(f"executing: {cmd}")
-            result = invoke.run(cmd, hide=True, warn=True)
+            result = _shell_run(cmd, hide=True, warn=True)
             if not result.ok:
                 self.logger.error(f"virt-install failed: {result.stderr}")
                 return False
@@ -911,6 +865,9 @@ class CloudInitTemplate:
 
     @staticmethod
     def hash_password(plain_password: str) -> str:
-        """Hash a plain-text password using SHA-512 for use in cloud-init passwd field."""
-        salt = crypt.mksalt(crypt.METHOD_SHA512)
-        return crypt.crypt(plain_password, salt)
+        """Hash a plain-text password using SHA-512 for use in cloud-init passwd field.
+
+        Delegates to :func:`boxman.providers.libvirt.cloudinit_presets.hash_password`
+        so the ``crypt`` dependency lives in one place (see Phase 2.7).
+        """
+        return _hash_password(plain_password)

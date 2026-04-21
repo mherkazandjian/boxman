@@ -50,11 +50,34 @@ class TestWriteFilesEnvShSkip:
         assert env_file.read_text() == "original\n"
         assert (tmp_path / "ansible.cfg").read_text() == "[defaults]\n"
 
-    def test_non_env_sh_files_always_overwritten(self, tmp_path):
+    def test_non_special_files_always_overwritten(self, tmp_path):
+        """
+        Files that are NOT in the preserve-on-exists list (env.sh /
+        ansible.cfg — see commit b7fb700) should be overwritten on every
+        write_files call. Use inventory/hosts.yml as a representative
+        "ordinary" file.
+        """
+        (tmp_path / "inventory").mkdir()
+        hosts = tmp_path / "inventory" / "hosts.yml"
+        hosts.write_text("old content\n")
+        write_files(
+            {"inventory/hosts.yml": "new content\n"},
+            rootdir=str(tmp_path),
+        )
+        assert hosts.read_text() == "new content\n"
+
+    def test_ansible_cfg_preserved_when_exists(self, tmp_path):
+        """
+        ``ansible.cfg`` is preserved the same way as ``env.sh`` (added
+        in commit b7fb700). Regression guard so a future refactor that
+        narrows the preserve list doesn't silently clobber user-edited
+        ansible.cfg files.
+        """
         cfg = tmp_path / "ansible.cfg"
-        cfg.write_text("old config\n")
-        write_files({"ansible.cfg": "new config\n"}, rootdir=str(tmp_path))
-        assert cfg.read_text() == "new config\n"
+        cfg.write_text("[defaults]\nhost_key_checking = False\n")
+        write_files({"ansible.cfg": "[defaults]\n"}, rootdir=str(tmp_path))
+        # Original content survives — not overwritten.
+        assert "host_key_checking = False" in cfg.read_text()
 
 
 # ---------------------------------------------------------------------------

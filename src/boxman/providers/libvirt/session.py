@@ -1,27 +1,27 @@
-import os
-import glob as _glob
-import time
-from typing import Dict, Any, Optional, List
 import json
+import os
+import time
 from multiprocessing import Process, Queue
-
-from .net import Network, NetworkInterface
-from .clone_vm import CloneVM
-from .destroy_vm import DestroyVM
-from .disk import DiskManager
-from .cdrom import CDROMManager
-from .shared_folder import SharedFolderManager
-from datetime import datetime
+from typing import Any
 
 from boxman import log
-from .snapshot import SnapshotManager
+
+from .cdrom import CDROMManager
+from .clone_vm import CloneVM
 from .commands import VirshCommand
-from .virsh_edit import VirshEdit
+from .destroy_vm import DestroyVM
+from .disk import DiskManager
+from .disk_cleanup import remove_vm_disks
 from .import_image import ImageImporter
+from .net import Network, NetworkInterface
+from .shared_folder import SharedFolderManager
+from .snapshot import SnapshotManager
+from .virsh_edit import VirshEdit
+
 
 class LibVirtSession:
     def __init__(self,
-                 config: Optional[Dict[str, Any]] = None):
+                 config: dict[str, Any] | None = None):
         """
         Initialize the LibVirtSession.
 
@@ -47,7 +47,7 @@ class LibVirtSession:
         self.manager = None
 
     @property
-    def provider_config(self) -> Dict[str, Any]:
+    def provider_config(self) -> dict[str, Any]:
         """
         Return the effective provider config.
 
@@ -59,7 +59,7 @@ class LibVirtSession:
         return merged
 
     @provider_config.setter
-    def provider_config(self, value: Dict[str, Any]) -> None:
+    def provider_config(self, value: dict[str, Any]) -> None:
         """
         Set the base provider config.
 
@@ -84,7 +84,7 @@ class LibVirtSession:
     def use_sudo(self, value: bool) -> None:
         self._provider_config_base['use_sudo'] = value
 
-    def update_provider_config(self, new_config: Dict[str, Any]) -> None:
+    def update_provider_config(self, new_config: dict[str, Any]) -> None:
         """
         Update provider_config with *new_config*, but project-level settings
         always win (enforced by the property getter).
@@ -128,7 +128,7 @@ class LibVirtSession:
         """
         if manifest_uri.startswith('file://'):
             manifest_path = os.path.expanduser(manifest_uri[len('file://'):])
-            with open(manifest_path, 'r') as fobj:
+            with open(manifest_path) as fobj:
                 manifest = json.load(fobj)
         elif manifest_uri.startswith('http://') or manifest_uri.startswith('https://'):
             raise NotImplementedError('http/https image uris are not implemented yet')
@@ -144,8 +144,8 @@ class LibVirtSession:
 
     def define_network(self,
                        name: str = None,
-                       info: Optional[Dict[str, Any]] = None,
-                       workdir: Optional[str] = None) -> bool:
+                       info: dict[str, Any] | None = None,
+                       workdir: str | None = None) -> bool:
         """
         Define a network that can be used to be attached to the interfaces of vms.
 
@@ -176,7 +176,7 @@ class LibVirtSession:
 
     def destroy_network(self,
                         name: str = None,
-                        info: Optional[Dict[str, Any]] = None) -> bool:
+                        info: dict[str, Any] | None = None) -> bool:
         """
         Destroy a network.
 
@@ -193,7 +193,7 @@ class LibVirtSession:
 
     def undefine_network(self,
                          name: str = None,
-                         info: Optional[Dict[str, Any]] = None) -> bool:
+                         info: dict[str, Any] | None = None) -> bool:
         """
         Undefine a network.
 
@@ -210,7 +210,7 @@ class LibVirtSession:
 
     def remove_network(self,
                        name: str = None,
-                       info: Optional[Dict[str, Any]] = None) -> bool:
+                       info: dict[str, Any] | None = None) -> bool:
         """
         Complete removal of a network: destroy and undefine.
 
@@ -233,7 +233,7 @@ class LibVirtSession:
     def clone_vm(self,
                  new_vm_name: str,
                  src_vm_name: str,
-                 info: Dict[str, Any],
+                 info: dict[str, Any],
                  workdir: str) -> bool:
         """
         Clone a VM.
@@ -263,7 +263,7 @@ class LibVirtSession:
     def destroy_disks(self,
                       workdir : str,
                       vm_name: str,
-                      disks: List[Dict[str, str]],
+                      disks: list[dict[str, str]],
                       ) -> bool:
         """
         Destroy disks associated with the VM.
@@ -283,26 +283,8 @@ class LibVirtSession:
         Returns:
             True if successful, False otherwise
         """
-        workdir = os.path.expanduser(workdir)
-
-        boot_disk = os.path.join(workdir, f'{vm_name}.qcow2')
-        if os.path.isfile(boot_disk):
-            os.remove(boot_disk)
-
-        for disk in disks:
-            disk_path = os.path.join(workdir, f'{vm_name}_{disk["name"]}.qcow2')
-            if os.path.isfile(disk_path):
-                os.remove(disk_path)
-
-        # remove snapshot artifacts: overlay files with timestamp/hash suffixes
-        # and memory snapshot .raw files — anything prefixed with vm_name that
-        # is still on disk after the named qcow2 files were removed above
-        for leftover in _glob.glob(os.path.join(workdir, f'{vm_name}*')):
-            if os.path.isfile(leftover):
-                log.info(f"removing snapshot artifact: {leftover}")
-                os.remove(leftover)
-
-        return True
+        # Delegates to the pure-filesystem helper extracted in Phase 2.6.
+        return remove_vm_disks(workdir, vm_name, disks)
 
     def destroy_vm(self, name: str, force: bool = False) -> bool:
         """
@@ -370,7 +352,7 @@ class LibVirtSession:
                               vm_name: str,
                               network_source: str,
                               link_state: str = 'active',
-                              mac_address: Optional[str] = None,
+                              mac_address: str | None = None,
                               model: str = 'virtio') -> bool:
         """
         Add a network interface to a VM.
@@ -396,7 +378,7 @@ class LibVirtSession:
 
     def configure_vm_network_interfaces(self,
                                        vm_name: str,
-                                       network_adapters: List[Dict[str, Any]]) -> bool:
+                                       network_adapters: list[dict[str, Any]]) -> bool:
         """
         Configure all network interfaces for a VM.
 
@@ -426,7 +408,7 @@ class LibVirtSession:
 
     def configure_vm_disks(self,
                            vm_name: str,
-                           disks: List[Dict[str, Any]],
+                           disks: list[dict[str, Any]],
                            workdir: str,
                            disk_prefix: str = "") -> bool:
         """
@@ -474,7 +456,7 @@ class LibVirtSession:
 
     def configure_vm_cdroms(self,
                             vm_name: str,
-                            cdroms: List[Dict[str, Any]]) -> bool:
+                            cdroms: list[dict[str, Any]]) -> bool:
         """
         Configure all CDROM devices for a VM.
 
@@ -502,9 +484,9 @@ class LibVirtSession:
 
     def update_vm_cdroms(self,
                          vm_name: str,
-                         new_cdroms: List[Dict[str, Any]],
-                         removed_cdroms: List[Dict[str, Any]],
-                         changed_cdroms: List[Dict[str, Any]],
+                         new_cdroms: list[dict[str, Any]],
+                         removed_cdroms: list[dict[str, Any]],
+                         changed_cdroms: list[dict[str, Any]],
                          vm_running: bool) -> bool:
         """
         Apply CDROM changes: attach new, detach removed, swap changed.
@@ -551,7 +533,7 @@ class LibVirtSession:
 
     def configure_vm_shared_folders(self,
                                     vm_name: str,
-                                    shared_folders: List[Dict[str, Any]]) -> bool:
+                                    shared_folders: list[dict[str, Any]]) -> bool:
         """
         Configure all shared folders for a VM.
 
@@ -587,10 +569,10 @@ class LibVirtSession:
 
     def update_vm_shared_folders(self,
                                  vm_name: str,
-                                 new_folders: List[Dict[str, Any]],
-                                 removed_folders: List[Dict[str, Any]],
-                                 changed_folders: List[Dict[str, Any]],
-                                 vm_running: bool) -> Dict[str, Any]:
+                                 new_folders: list[dict[str, Any]],
+                                 removed_folders: list[dict[str, Any]],
+                                 changed_folders: list[dict[str, Any]],
+                                 vm_running: bool) -> dict[str, Any]:
         """
         Apply shared folder changes: attach new, detach removed, re-attach changed.
 
@@ -662,7 +644,7 @@ class LibVirtSession:
 
         return {'success': success, 'restart_needed': restart_needed}
 
-    def get_vm_ip_addresses(self, vm_name: str) -> Dict[str, str]:
+    def get_vm_ip_addresses(self, vm_name: str) -> dict[str, str]:
         """
         Get all IP addresses for a VM.
 
@@ -688,7 +670,7 @@ class LibVirtSession:
                 self.logger.warning(f"the vm {vm_name} is not running, cannot get the ip addresses")
                 return {}
 
-            def _parse_domifaddr(output: str) -> Dict[str, str]:
+            def _parse_domifaddr(output: str) -> dict[str, str]:
                 """Parse domifaddr stdout into {iface: ip} dict.
 
                 Only returns routable IPv4 addresses — loopback (127.x),
@@ -1080,10 +1062,10 @@ class LibVirtSession:
 
     def configure_vm_cpu_memory(self,
                                 vm_name: str,
-                                cpus: Optional[Dict[str, int]] = None,
-                                memory_mb: Optional[int] = None,
-                                max_vcpus: Optional[int] = None,
-                                max_memory_mb: Optional[int] = None) -> bool:
+                                cpus: dict[str, int] | None = None,
+                                memory_mb: int | None = None,
+                                max_vcpus: int | None = None,
+                                max_memory_mb: int | None = None) -> bool:
         """
         Configure cpu and memory settings for a vm.
 
@@ -1154,13 +1136,13 @@ class LibVirtSession:
 
     def update_vm_cpu_memory(self,
                              vm_name: str,
-                             cpus: Optional[Dict[str, int]],
-                             memory_mb: Optional[int],
+                             cpus: dict[str, int] | None,
+                             memory_mb: int | None,
                              vm_state: str,
-                             actual_cpus: Dict[str, int],
+                             actual_cpus: dict[str, int],
                              actual_memory_mb: int,
-                             max_vcpus: Optional[int] = None,
-                             max_memory_mb: Optional[int] = None) -> Dict[str, Any]:
+                             max_vcpus: int | None = None,
+                             max_memory_mb: int | None = None) -> dict[str, Any]:
         """
         Apply CPU and/or memory changes, choosing hot or cold path.
 
@@ -1306,8 +1288,8 @@ class LibVirtSession:
 
     def update_vm_disks(self,
                         vm_name: str,
-                        new_disks: List[Dict[str, Any]],
-                        resize_disks: List[Dict[str, Any]],
+                        new_disks: list[dict[str, Any]],
+                        resize_disks: list[dict[str, Any]],
                         workdir: str,
                         disk_prefix: str,
                         vm_running: bool) -> bool:

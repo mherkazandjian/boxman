@@ -12,7 +12,8 @@ by boxman (e.g. conf.yml):
 """
 
 import os
-from jinja2 import Environment, FileSystemLoader, Undefined
+
+from jinja2 import Environment, FileSystemLoader
 
 
 def env(var_name: str, default: str = "") -> str:

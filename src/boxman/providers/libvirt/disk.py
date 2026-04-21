@@ -1,6 +1,6 @@
 import os
-from typing import Optional, Dict, Any, List
 import tempfile
+from typing import Any
 
 from .commands import LibVirtCommandBase, VirshCommand
 
@@ -12,7 +12,7 @@ class DiskManager(VirshCommand):
     This class handles creating disk images with qemu-img and attaching them to VMs.
     """
 
-    def __init__(self, vm_name: str, provider_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, vm_name: str, provider_config: dict[str, Any] | None = None):
         """
         Initialize the disk manager.
 
@@ -147,7 +147,7 @@ class DiskManager(VirshCommand):
 </disk>"""
 
     def configure_from_disk_config(self,
-                                  disk_config: Dict[str, Any],
+                                  disk_config: dict[str, Any],
                                   workdir: str,
                                   disk_prefix: str = "") -> bool:
         """

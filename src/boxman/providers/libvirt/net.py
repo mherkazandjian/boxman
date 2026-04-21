@@ -1,18 +1,19 @@
+import ipaddress
 import os
-import uuid
 import re
 import sys
-from importlib import resources as importlib_resources
-from typing import Optional, Dict, Any, Union, List
-
 import tempfile
-from jinja2 import Template, Environment, FileSystemLoader
+import uuid
 import xml.etree.ElementTree as ET
+from importlib import resources as importlib_resources
+from typing import Any
 
-import ipaddress
-from .commands import VirshCommand, LibVirtCommandBase
+from jinja2 import Environment, FileSystemLoader
 
 from boxman import log
+
+from .commands import LibVirtCommandBase, VirshCommand
+
 
 class Network(VirshCommand):
     """
@@ -20,9 +21,9 @@ class Network(VirshCommand):
     """
     def __init__(self,
                 name: str,
-                info: Dict[str, Any],
+                info: dict[str, Any],
                 assign_new_bridge: bool = True,
-                provider_config: Optional[Dict[str, Any]] = None,
+                provider_config: dict[str, Any] | None = None,
                 manager = None):
         """
         Initialize the network definition with a dictionary-based configuration.
@@ -251,7 +252,7 @@ class Network(VirshCommand):
         else:
             self.logger.info(f"no conflicts found for network {self.name} in project {self.manager.config['project']}")
 
-    def define_network(self, file_path: Optional[str] = None):
+    def define_network(self, file_path: str | None = None):
         """
         Define the network using virsh.
 
@@ -308,7 +309,7 @@ class Network(VirshCommand):
             return False
 
     def define_and_start(self,
-                        file_path: Optional[str] = None,
+                        file_path: str | None = None,
                         autostart: bool = True) -> bool:
         """
         Define and start the network in one operation.
@@ -773,7 +774,7 @@ class Network(VirshCommand):
 
     @staticmethod
     def get_bridge_from_network(network_name: str,
-                                provider_config: Optional[Dict[str, Any]] = None) -> Optional[str]:
+                                provider_config: dict[str, Any] | None = None) -> str | None:
         """
         Fetch the bridge name of a network
 
@@ -824,8 +825,8 @@ class Network(VirshCommand):
             return None
 
     @staticmethod
-    def list_networks(provider_config: Optional[Dict[str, Any]] = None,
-                      active_only: bool = False) -> List[str]:
+    def list_networks(provider_config: dict[str, Any] | None = None,
+                      active_only: bool = False) -> list[str]:
         """
         Return the names of libvirt networks.
 
@@ -861,7 +862,7 @@ class NetworkInterface(VirshCommand):
     """
     def __init__(self,
                  vm_name: str,
-                 provider_config: Optional[Dict[str, Any]] = None):
+                 provider_config: dict[str, Any] | None = None):
         """
         Initialize the network interface manager.
 
@@ -880,7 +881,7 @@ class NetworkInterface(VirshCommand):
     def add_interface(self,
                       network_source: str,
                       link_state: str = 'active',
-                      mac_address: Optional[str] = None,
+                      mac_address: str | None = None,
                       model: str = 'virtio') -> bool:
         """
         Add a network interface to the VM.
@@ -944,7 +945,7 @@ class NetworkInterface(VirshCommand):
             return False
 
     def configure_from_config(self,
-                              adapter_config: Dict[str, Any]) -> bool:
+                              adapter_config: dict[str, Any]) -> bool:
         """
         Configure a network interface from configuration.
 

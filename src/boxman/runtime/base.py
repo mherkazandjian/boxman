@@ -3,7 +3,7 @@ Abstract base for runtime environments.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
+from typing import Any
 
 
 class RuntimeBase(ABC):
@@ -11,7 +11,7 @@ class RuntimeBase(ABC):
     A runtime wraps provider commands so they execute in the right place.
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         self.config = config or {}
 
     @abstractmethod
@@ -38,8 +38,8 @@ class RuntimeBase(ABC):
         """
 
     def inject_into_provider_config(
-        self, provider_config: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, provider_config: dict[str, Any]
+    ) -> dict[str, Any]:
         """
         Return a **copy** of *provider_config* enriched with runtime
         information so that ``LibVirtCommandBase`` (and friends) can

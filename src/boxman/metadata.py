@@ -1,4 +1,5 @@
-from importlib.metadata import version as _get_version, PackageNotFoundError
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _get_version
 
 package = 'boxman'
 project = 'boxman'

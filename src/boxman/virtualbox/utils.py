@@ -1,16 +1,15 @@
-import os
+import datetime as dt
+import shlex
 import sys
 import time
-import datetime as dt
-from subprocess import Popen, PIPE
-import shlex
+from subprocess import PIPE, Popen
 
 from boxman import log
 
 now = dt.datetime.fromtimestamp(time.time())
 
 
-class Command(object):
+class Command:
     def __init__(self, cmd):
         self.cmd = cmd
         self.stdout = None
@@ -36,7 +35,7 @@ class Command(object):
             pipe = None
 
         cmd = self.cmd
-        log.info('>>> {}'.format(cmd))
+        log.info(f'>>> {cmd}')
         process = Popen(
             shlex.split(cmd),
             stdout=pipe,

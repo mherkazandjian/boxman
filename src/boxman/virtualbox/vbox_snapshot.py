@@ -1,6 +1,7 @@
-from .utils import Command
 import datetime
 from datetime import datetime
+
+from .utils import Command
 
 
 class Snapshot:

@@ -1,17 +1,25 @@
 """
 Template manager for creating base VM templates from cloud images
 with cloud-init configuration.
+
+WARNING: this module is not currently wired into the CLI or BoxmanManager,
+and its ``create_template`` orchestration calls ``ci.build_seed_iso()``
+with no positional args while ``CloudInitTemplate.build_seed_iso`` now
+requires two. The guarded methods (``_resolve_image_path``,
+``template_exists``, the early-exit branches of ``create_template``,
+and ``_wait_and_shutdown``) are covered by ``tests/test_libvirt_template_manager.py``.
+The rest of ``create_template`` needs a follow-up pass before this
+module is put into service.
 """
 
 import os
 import shutil
-from typing import Optional, Dict, Any
-
-from invoke import run
+from typing import Any
 
 from boxman import log
-from boxman.providers.libvirt.cloudinit import CloudInit
-from boxman.providers.libvirt.commands import VirtInstallCommand, VirshCommand
+from boxman.utils.shell import run
+from boxman.providers.libvirt.cloudinit import CloudInitTemplate
+from boxman.providers.libvirt.commands import VirshCommand, VirtInstallCommand
 
 
 class TemplateManager:
@@ -22,7 +30,7 @@ class TemplateManager:
     3. Running virt-install --import to create the template VM
     """
 
-    def __init__(self, provider_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, provider_config: dict[str, Any] | None = None):
         """
         Args:
             provider_config: Provider configuration dict (uri, use_sudo, etc.)
@@ -96,7 +104,7 @@ class TemplateManager:
 
     def create_template(self,
                         template_name: str,
-                        template_config: Dict[str, Any],
+                        template_config: dict[str, Any],
                         workdir: str,
                         force: bool = False,
                         wait_for_cloudinit: bool = True) -> bool:
@@ -172,11 +180,14 @@ class TemplateManager:
                 f"no 'cloudinit' user-data specified for template '{template_name}'")
             return False
 
-        ci = CloudInit(
-            user_data=cloudinit_data,
-            meta_data=template_config.get("meta_data"),
-            network_config=template_config.get("network_config"),
+        ci = CloudInitTemplate(
+            template_name=vm_name,
+            image_path=disk_path,
+            cloudinit_userdata=cloudinit_data,
+            cloudinit_metadata=template_config.get("meta_data"),
+            cloudinit_network_config=template_config.get("network_config"),
             workdir=template_workdir,
+            provider_config=self.provider_config,
         )
 
         try:
@@ -257,7 +268,7 @@ class TemplateManager:
         return True
 
     def _wait_and_shutdown(self, vm_name: str,
-                           template_config: Dict[str, Any]) -> None:
+                           template_config: dict[str, Any]) -> None:
         """
         Wait for cloud-init to finish inside the VM, then shut it down
         so it can be used as a template for cloning.

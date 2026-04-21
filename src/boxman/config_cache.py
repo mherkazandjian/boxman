@@ -1,5 +1,5 @@
-import os
 import json
+import os
 
 from boxman import log
 
@@ -48,7 +48,7 @@ class BoxmanCache:
             log.warning(f"no projects cache file found at {self.projects_cache_file}")
             return {}
 
-        with open(self.projects_cache_file, 'r') as fobj:
+        with open(self.projects_cache_file) as fobj:
             self.projects = json.load(fobj)
 
         return self.projects
@@ -80,14 +80,13 @@ class BoxmanCache:
             config_fpath: Path to the project configuration file
             runtime: The runtime environment name (e.g. 'local', 'docker-compose')
         """
-        # if the projects.json file does not exist, create it else load it
-        # assuming that it is a valid JSON file
-        if not os.path.exists(self.projects_cache_file):
-            with open(self.projects_cache_file, 'w') as fobj:
-                self.projects = {}
-                fobj.write('{}')
-        else:
-            self.read_projects_cache()
+        # Single-pass: try to read the cache; treat missing file as empty.
+        # Avoids a separate os.path.exists stat call before the read.
+        try:
+            with open(self.projects_cache_file) as fobj:
+                self.projects = json.load(fobj)
+        except FileNotFoundError:
+            self.projects = {}
 
         # if the project already exists, log an error and return
         if project_name in self.projects:

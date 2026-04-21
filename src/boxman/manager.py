@@ -1,28 +1,30 @@
+import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
-import re
-import json
-from typing import Dict, Any, Optional
-import yaml
-from multiprocessing import Pool, Process, Queue
-from invoke import run
-from jinja2 import Environment, FileSystemLoader, Template
+from multiprocessing import Process, Queue
+from typing import Any, Optional
 
-from boxman.providers.libvirt.session import LibVirtSession
-from boxman.config_cache import BoxmanCache
-from boxman.utils.io import write_files
+import yaml
+from boxman.utils.shell import run
+
 from boxman import log
-from boxman.runtime import create_runtime, RuntimeBase
-from boxman.utils.jinja_env import create_jinja_env
+from boxman.config_cache import BoxmanCache
 from boxman.providers.libvirt.commands import VirshCommand
+from boxman.providers.libvirt.session import LibVirtSession
+from boxman.runtime import RuntimeBase, create_runtime
 from boxman.task_runner import TaskRunner
+from boxman.utils.io import write_files
+from boxman.utils.jinja_env import create_jinja_env
+from boxman.utils.references import resolve_reference
+
 
 class BoxmanManager:
     def __init__(self,
-                 config: Optional[Dict[str, Any]] = None):
+                 config: dict[str, Any] | None = None):
         """
         Initialize the BoxmanManager.
 
@@ -30,10 +32,10 @@ class BoxmanManager:
             config: Optional configuration dictionary or path to config file
         """
         #: Optional[str]: the path to the configuration file if one was provided
-        self.config_path: Optional[str] = None
+        self.config_path: str | None = None
 
         #: Optional[Dict[str, Any]]: the loaded configuration dictionary
-        self.config: Optional[Dict[str, Any]] = None
+        self.config: dict[str, Any] | None = None
 
         #: the private backing field for the provider property
         self._provider = None
@@ -45,7 +47,7 @@ class BoxmanManager:
         self._runtime_name: str = 'local'
 
         #: Optional[RuntimeBase]: the resolved runtime instance (created lazily)
-        self._runtime_instance: Optional[RuntimeBase] = None
+        self._runtime_instance: RuntimeBase | None = None
 
         if isinstance(config, str):
             self.config_path = config
@@ -55,9 +57,9 @@ class BoxmanManager:
         self.cache = BoxmanCache()
 
         #: Optional[Dict[str, Any]]: the boxman application-level config (from boxman.yml)
-        self.app_config: Optional[Dict[str, Any]] = None
+        self.app_config: dict[str, Any] | None = None
 
-    def load_app_config(self, config: Dict[str, Any]) -> None:
+    def load_app_config(self, config: dict[str, Any]) -> None:
         """
         Load the boxman application-level configuration (from boxman.yml).
 
@@ -112,8 +114,8 @@ class BoxmanManager:
         return self._runtime_instance
 
     def get_provider_config_with_runtime(
-        self, provider_config: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, provider_config: dict[str, Any]
+    ) -> dict[str, Any]:
         """
         Return a copy of *provider_config* enriched with runtime metadata.
 
@@ -130,8 +132,8 @@ class BoxmanManager:
         return self.runtime_instance.inject_into_provider_config(provider_config)
 
     @staticmethod
-    def _merge_provider_configs(global_config: Dict[str, Any],
-                                local_config: Dict[str, Any]) -> Dict[str, Any]:
+    def _merge_provider_configs(global_config: dict[str, Any],
+                                local_config: dict[str, Any]) -> dict[str, Any]:
         """
         Merge global (app-level) and local (project-level) provider configs.
 
@@ -163,7 +165,7 @@ class BoxmanManager:
         merged['force_sudo_commands'] = sorted(final_force)
         return merged
 
-    def load_config(self, config_path: str) -> Dict[str, Any]:
+    def load_config(self, config_path: str) -> dict[str, Any]:
         """
         Load configuration from a YAML file.
 
@@ -341,7 +343,7 @@ class BoxmanManager:
                 children_lines = []
                 for cname, hosts in cluster_groups.items():
                     children_lines.append(f'    {cname}:')
-                    children_lines.append(f'      hosts:')
+                    children_lines.append('      hosts:')
                     for h in hosts:
                         children_lines.append(f'        {h}:')
                 children_section = '\n'.join(children_lines)
@@ -422,7 +424,7 @@ class BoxmanManager:
     RUNTIME_SENTINEL_FILENAME = '.boxman-runtime'
 
     @staticmethod
-    def _canonical_runtime_name(name: Optional[str]) -> Optional[str]:
+    def _canonical_runtime_name(name: str | None) -> str | None:
         """
         Normalise runtime names so ``docker``, ``docker-compose`` and
         any historical variant collapse to a single canonical form used
@@ -437,11 +439,11 @@ class BoxmanManager:
             return 'docker-compose'
         return n
 
-    def _read_runtime_sentinel(self, path: str) -> Optional[str]:
+    def _read_runtime_sentinel(self, path: str) -> str | None:
         """Return the runtime name recorded in *path*'s sentinel, or None."""
         sentinel = os.path.join(path, self.RUNTIME_SENTINEL_FILENAME)
         try:
-            with open(sentinel, 'r') as fobj:
+            with open(sentinel) as fobj:
                 return fobj.read().strip() or None
         except OSError:
             return None
@@ -673,7 +675,7 @@ class BoxmanManager:
                     pass
 
     @staticmethod
-    def _remove_files(files: Dict[str, str], rootdir: str = None) -> None:
+    def _remove_files(files: dict[str, str], rootdir: str = None) -> None:
         rootdir_abs = os.path.normpath(os.path.expanduser(rootdir)) if rootdir else None
         candidate_dirs: set = set()
         for _fpath in files:
@@ -704,7 +706,7 @@ class BoxmanManager:
 
     @classmethod
     def full_network_name(cls,
-                          project_config: Dict[str, Any],
+                          project_config: dict[str, Any],
                           cluster_name: str = None,
                           network_name: str = None) -> str:
         """
@@ -798,8 +800,8 @@ class BoxmanManager:
             requested: Optional list of template keys to create (None = all).
             force: If True, recreate existing templates.
         """
-        from boxman.providers.libvirt.cloudinit import CloudInitTemplate
         from boxman.image_cache import ImageCache
+        from boxman.providers.libvirt.cloudinit import CloudInitTemplate
 
         cache_conf = self.app_config.get('cache', {}) if self.app_config else {}
         image_cache = ImageCache.from_config(cache_conf)
@@ -1139,7 +1141,7 @@ class BoxmanManager:
             return True  # nothing to do
 
         # build a mapping: template VM name -> template key
-        tpl_name_to_key: Dict[str, str] = {}
+        tpl_name_to_key: dict[str, str] = {}
         for tpl_key, tpl_conf in templates.items():
             vm_name = tpl_conf.get('name', tpl_key)
             tpl_name_to_key[vm_name] = tpl_key
@@ -1352,7 +1354,7 @@ class BoxmanManager:
 
                     networks = proj_info.get('networks', {})
                     if networks:
-                        cls.logger.info(f"    networks:")
+                        cls.logger.info("    networks:")
                         for net_name, net_info in networks.items():
                             ip = net_info.get('ip_address', 'n/a') if isinstance(net_info, dict) else 'n/a'
                             bridge = net_info.get('bridge_name', 'n/a') if isinstance(net_info, dict) else 'n/a'
@@ -1496,7 +1498,7 @@ class BoxmanManager:
                     )
                     boxman_logger.setLevel(logging.DEBUG)
                     return
-                except Exception as e:
+                except Exception:
                     boxman_logger.setLevel(logging.DEBUG)
                     if not last_attempt:
                         delay = attempt * 2
@@ -1542,7 +1544,7 @@ class BoxmanManager:
     ### end vms define / remove / destroy
 
     def _configure_and_start_vm(
-        self, cluster_name: str, cluster: Dict[str, Any], vm_name: str, vm_info: Dict[str, Any]
+        self, cluster_name: str, cluster: dict[str, Any], vm_name: str, vm_info: dict[str, Any]
     ) -> None:
         """
         Configure and start a single VM: cpu/mem, network interfaces, disks, then start.
@@ -1646,7 +1648,7 @@ class BoxmanManager:
             self.logger.warning(f"failed to start the vm {full_vm_name}")
 
     def _destroy_vm_and_disks(
-        self, cluster_name: str, cluster: Dict[str, Any], vm_name: str, vm_info: Dict[str, Any]
+        self, cluster_name: str, cluster: dict[str, Any], vm_name: str, vm_info: dict[str, Any]
     ) -> None:
         """
         Fully destroy a single VM: stop/undefine, remove disks, force-cleanup.
@@ -1890,7 +1892,7 @@ class BoxmanManager:
     #: downstream tooling can grep for it reliably.
     SSH_JUMP_HOST_ALIAS = "boxman-libvirt-jump"
 
-    def _docker_ssh_jump_stanza(self) -> Optional[str]:
+    def _docker_ssh_jump_stanza(self) -> str | None:
         """
         Return the ``Host boxman-libvirt-jump`` block to prepend to
         ``ssh_config`` when the docker runtime is active, or ``None``
@@ -2095,38 +2097,18 @@ class BoxmanManager:
     @classmethod
     def fetch_value(cls, value) -> str:
         """
-        Get the value referenced by *value*.
+        Resolve a config reference (``${env:VAR}`` / ``file://…``) to its
+        concrete value, or return the literal as-is.
 
-        supported reference formats:
-          - Environment variable:  '${env:ENV_VAR_NAME}'
-          - File contents:         'file:///abs/or/relative/path'
-          -                        'file://~/path/to/file'
-
-        for any other string the input is returned unchanged.
+        Thin wrapper around :func:`boxman.utils.references.resolve_reference`
+        — kept on the class so external callers importing
+        ``BoxmanManager.fetch_value`` keep working (Phase 2.4 extraction).
 
         Raises:
             ValueError: If the environment variable is not set.
             FileNotFoundError: If the referenced file does not exist.
         """
-        if isinstance(value, str):
-            # ${env:VAR}
-            env_match = re.fullmatch(r"\$\{env:(.+)\}", value)
-            if env_match:
-                var = env_match.group(1)
-                if var not in os.environ:
-                    raise ValueError(f"environment variable '{var}' is not set")
-                return os.environ[var]
-
-            # file:///path/to/file
-            if value.startswith("file://"):
-                path = os.path.expanduser(value[len("file://"):])
-                if not os.path.isfile(path):
-                    raise FileNotFoundError(f"referenced file does not exist: {path}")
-                with open(path, "r") as fobj:
-                    return fobj.read().rstrip("\n")
-
-        # default: return as-is
-        return value
+        return resolve_reference(value)
 
     def add_ssh_keys_to_vms(self) -> bool:
         """
@@ -2505,24 +2487,42 @@ class BoxmanManager:
         if hasattr(cls.provider, 'update_provider_config_with_runtime'):
             cls.provider.update_provider_config_with_runtime()
 
-        # --- Pre-check: detect already-existing project VMs -----------
+        # --- Pre-check: detect state that would block a clean provision ---
+        # Block on either (a) live VMs from this project, or (b) a stale
+        # cache entry with no live VMs. The second case used to slip
+        # through --force: _find_existing_project_vms was empty so
+        # deprovision was skipped, then register_project_in_cache
+        # rejected the duplicate entry. Treat both as "needs force".
         force = getattr(cli_args, 'force', False)
         existing_vms = cls._find_existing_project_vms()
+        cls.cache.read_projects_cache()
+        project_name = config.get('project')
+        in_cache = bool(
+            project_name
+            and project_name in (cls.cache.projects or {})
+        )
 
-        if existing_vms:
-            names = ", ".join(f"'{v}'" for v in existing_vms)
+        if existing_vms or in_cache:
+            reasons: list[str] = []
+            if existing_vms:
+                names = ", ".join(f"'{v}'" for v in existing_vms)
+                reasons.append(f"existing VM(s): {names}")
+            if in_cache:
+                reasons.append(
+                    f"project '{project_name}' is already registered in the cache")
+            summary = "; ".join(reasons)
+
             if not force:
                 cls.logger.error(
-                    f"the following VM(s) already exist: {names}. "
-                    f"Use --force to deprovision them first and re-provision."
+                    f"cannot provision — {summary}. "
+                    f"Use --force to deprovision first and re-provision."
                 )
                 return
-            else:
-                cls.logger.warning(
-                    f"the following VM(s) already exist and will be "
-                    f"deprovisioned first (--force): {names}"
-                )
-                cls.deprovision(cls, cli_args)
+
+            cls.logger.warning(
+                f"state will be deprovisioned first (--force): {summary}"
+            )
+            cls.deprovision(cls, cli_args)
         # --------------------------------------------------------------
 
         try:
@@ -2994,6 +2994,11 @@ class BoxmanManager:
         # just to discover there's nothing to deprovision) when every
         # piece of state this command would touch is already gone.
         project_name = config.get('project')
+        # BoxmanCache defers the read, so .projects is None until we ask.
+        # Without this load, the "in_cache" check silently treats every
+        # project as absent and the command reports "nothing to do" even
+        # for a properly registered project — see the rocky9 repro.
+        cls.cache.read_projects_cache()
         in_cache = bool(
             project_name
             and project_name in (cls.cache.projects or {})
@@ -3683,7 +3688,7 @@ class BoxmanManager:
                     )
                     boxman_logger.setLevel(logging.DEBUG)
                     return
-                except Exception as e:
+                except Exception:
                     boxman_logger.setLevel(logging.DEBUG)
                     if not last_attempt:
                         delay = attempt * 2
@@ -3730,9 +3735,9 @@ class BoxmanManager:
     def _update_single_vm(
         self,
         cluster_name: str,
-        cluster: Dict[str, Any],
+        cluster: dict[str, Any],
         vm_name: str,
-        vm_info: Dict[str, Any],
+        vm_info: dict[str, Any],
         result_queue: Queue,
         dry_run: bool = False,
     ) -> None:

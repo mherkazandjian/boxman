@@ -9,50 +9,51 @@ directory next to the project's ``conf.yml``.
 
 import os
 import re
+import shutil
 import sys
 import time
-import shutil
-from typing import Dict, Any, Optional, List
+from typing import Any
 
 import invoke
 import yaml as pyyaml
 
-from boxman.runtime.base import RuntimeBase
 from boxman import log
+from boxman.runtime.base import RuntimeBase
+from boxman.utils.shell import run as _shell_run
 
 
 class DockerComposeRuntime(RuntimeBase):
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.logger = log
 
         #: str | None: project name from conf.yml, used to scope Docker
         #: resources (container, volumes, network) per project.
         #: Set by the manager before calling ensure_ready().
-        self._project_name: Optional[str] = self.config.get("project_name")
+        self._project_name: str | None = self.config.get("project_name")
 
         #: str | None: path to the compose file (None → use bundled)
-        self.compose_file: Optional[str] = self.config.get("compose_file")
+        self.compose_file: str | None = self.config.get("compose_file")
 
         #: int: max seconds to wait for the container to become ready
         self.ready_timeout: int = self.config.get("ready_timeout", 60)
 
         #: str | None: the project directory where conf.yml lives;
         #: set by the manager before calling ensure_ready()
-        self.project_dir: Optional[str] = self.config.get("project_dir")
+        self.project_dir: str | None = self.config.get("project_dir")
 
         #: list[str]: workdirs from conf.yml (one per cluster) that need
         #: to be accessible inside the container; set by the manager
         self.workdirs: list = self.config.get("workdirs", [])
 
     @property
-    def project_name(self) -> Optional[str]:
+    def project_name(self) -> str | None:
         """Return the project name used to scope Docker resources."""
         return self._project_name
 
     @project_name.setter
-    def project_name(self, value: Optional[str]) -> None:
+    def project_name(self, value: str | None) -> None:
         """Set the project name used to scope Docker resources."""
         self._project_name = value
 
@@ -107,8 +108,8 @@ class DockerComposeRuntime(RuntimeBase):
         return f"docker exec --user root {self.container_name} bash -c '{escaped}'"
 
     def inject_into_provider_config(
-        self, provider_config: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, provider_config: dict[str, Any]
+    ) -> dict[str, Any]:
         cfg = super().inject_into_provider_config(provider_config)
         cfg["runtime_container"] = self.container_name
         return cfg
@@ -116,7 +117,7 @@ class DockerComposeRuntime(RuntimeBase):
     # ------------------------------------------------------------------
     # bind-mount injection
     # ------------------------------------------------------------------
-    def _collect_bind_mount_dirs(self, abs_project_dir: str) -> List[str]:
+    def _collect_bind_mount_dirs(self, abs_project_dir: str) -> list[str]:
         """
         Collect all unique absolute directories that must be bind-mounted
         into the container: the project directory plus every workdir,
@@ -131,14 +132,14 @@ class DockerComposeRuntime(RuntimeBase):
         return sorted(dirs)
 
     def _inject_bind_mounts_into_compose(
-        self, compose_path: str, bind_dirs: List[str]
+        self, compose_path: str, bind_dirs: list[str]
     ) -> None:
         """
         Read the docker-compose.yml, add ``path:path`` volume entries for
         each directory in *bind_dirs* (if not already present), and write
         the file back.
         """
-        with open(compose_path, "r") as fobj:
+        with open(compose_path) as fobj:
             compose = pyyaml.safe_load(fobj)
 
         # Find the first (and typically only) service
@@ -224,8 +225,8 @@ class DockerComposeRuntime(RuntimeBase):
                     self._stop_compose(compose_path, compose_dir)
             else:
                 self.logger.info(
-                    f"some bind-mount dirs are NOT accessible "
-                    f"inside container — recreating...")
+                    "some bind-mount dirs are NOT accessible "
+                    "inside container — recreating...")
                 self._stop_compose(compose_path, compose_dir)
 
         self.logger.info(
@@ -252,7 +253,7 @@ class DockerComposeRuntime(RuntimeBase):
             compose_env = os.environ.copy()
             compose_env.update(env_vars)
 
-            invoke.run(
+            _shell_run(
                 f"{self._compose_base_cmd(compose_path, compose_dir)} "
                 f"up -d --build",
                 hide=False,
@@ -279,7 +280,7 @@ class DockerComposeRuntime(RuntimeBase):
             f"runtime container '{self.container_name}' is ready")
 
     def verify_workdirs_accessible(
-        self, bind_dirs: Optional[List[str]] = None
+        self, bind_dirs: list[str] | None = None
     ) -> None:
         """
         Verify that every bind-mount directory is reachable and writable
@@ -294,9 +295,9 @@ class DockerComposeRuntime(RuntimeBase):
                 self.project_dir or os.getcwd())
             bind_dirs = self._collect_bind_mount_dirs(abs_project_dir)
 
-        failures: List[str] = []
+        failures: list[str] = []
         for path in bind_dirs:
-            check = invoke.run(
+            check = _shell_run(
                 f"docker exec --user root {self.container_name} "
                 f"test -d '{path}' -a -w '{path}'",
                 hide=True, warn=True,
@@ -322,7 +323,7 @@ class DockerComposeRuntime(RuntimeBase):
     def _log_compose_file(self, compose_path: str) -> None:
         """Log the contents of the docker-compose.yml before starting."""
         try:
-            with open(compose_path, "r") as fobj:
+            with open(compose_path) as fobj:
                 contents = fobj.read()
             self.logger.info(
                 f"docker-compose.yml ({compose_path}):\n"
@@ -333,7 +334,7 @@ class DockerComposeRuntime(RuntimeBase):
     def _container_is_running(self) -> bool:
         """Return True if the container is in 'running' state."""
         try:
-            result = invoke.run(
+            result = _shell_run(
                 f"docker inspect -f '{{{{.State.Running}}}}' "
                 f"{self.container_name}",
                 hide=True,
@@ -367,7 +368,7 @@ class DockerComposeRuntime(RuntimeBase):
         interval = 3
         while time.monotonic() < deadline:
             check_cmd = self.wrap_command("virsh version")
-            result = invoke.run(check_cmd, hide=True, warn=True)
+            result = _shell_run(check_cmd, hide=True, warn=True)
             if result.ok:
                 self.logger.info("libvirtd is responsive inside the container")
                 return
@@ -383,7 +384,7 @@ class DockerComposeRuntime(RuntimeBase):
     def _project_dir_accessible(self, abs_dir: str) -> bool:
         """Return True if *abs_dir* exists inside the container."""
         try:
-            result = invoke.run(
+            result = _shell_run(
                 f"docker exec --user root {self.container_name} "
                 f"test -d '{abs_dir}'",
                 hide=True,
@@ -396,7 +397,7 @@ class DockerComposeRuntime(RuntimeBase):
     def _stop_compose(self, compose_path: str, compose_dir: str) -> None:
         """Stop the docker-compose environment so it can be recreated."""
         try:
-            invoke.run(
+            _shell_run(
                 f"{self._compose_base_cmd(compose_path, compose_dir)} "
                 f"down",
                 hide=False,
@@ -453,8 +454,8 @@ class DockerComposeRuntime(RuntimeBase):
             f"{self._compose_base_cmd(compose_path, compose_dir)} "
             f"down --volumes --remove-orphans")
         plan["actions"].append(
-            f"tear down docker-compose environment "
-            f"(stop container, remove volumes & networks)")
+            "tear down docker-compose environment "
+            "(stop container, remove volumes & networks)")
         plan["commands"].append(down_cmd)
 
         base = self.project_dir or os.getcwd()
@@ -466,7 +467,7 @@ class DockerComposeRuntime(RuntimeBase):
 
         return plan
 
-    def destroy_runtime(self) -> Optional[str]:
+    def destroy_runtime(self) -> str | None:
         """
         Tear down the Docker Compose environment and remove Docker
         volumes and networks.
@@ -496,7 +497,7 @@ class DockerComposeRuntime(RuntimeBase):
                 f"cleaning up container data dirs inside "
                 f"'{self.container_name}'")
             try:
-                invoke.run(
+                _shell_run(
                     f"docker exec --user root {self.container_name} "
                     f"bash -c 'rm -rf /var/run/libvirt/* "
                     f"/var/lib/libvirt/images/* /etc/boxman/ssh/*'",
@@ -508,7 +509,7 @@ class DockerComposeRuntime(RuntimeBase):
                     f"in-container cleanup failed: {exc}")
 
         try:
-            invoke.run(
+            _shell_run(
                 f"{self._compose_base_cmd(compose_path, compose_dir)} "
                 f"down --volumes --remove-orphans",
                 hide=False,
@@ -573,7 +574,7 @@ class DockerComposeRuntime(RuntimeBase):
         base = self.project_dir or os.getcwd()
         return os.path.join(base, ".boxman", "runtime", "docker")
 
-    def _deploy_bundled_assets(self) -> Optional[str]:
+    def _deploy_bundled_assets(self) -> str | None:
         """
         Copy the bundled docker assets from the package into
         ``.boxman/runtime/docker/`` next to the project's conf.yml.
@@ -694,7 +695,7 @@ class DockerComposeRuntime(RuntimeBase):
             f"ports={ssh_port}/{tcp_port}/{tls_port}")
 
     @staticmethod
-    def _find_asset_source_dir() -> Optional[str]:
+    def _find_asset_source_dir() -> str | None:
         """
         Locate the bundled docker assets directory on disk.
         """
@@ -707,11 +708,10 @@ class DockerComposeRuntime(RuntimeBase):
             pkg_dir = os.path.dirname(os.path.abspath(_pkg.__file__))
             log.debug(f"_find_asset_source_dir: pkg_dir = {pkg_dir}")
 
-            if sys.version_info >= (3, 9):
-                from importlib.resources import files
-                asset_path = str(files("boxman").joinpath("assets", "docker"))
-                if _has_compose(asset_path):
-                    return asset_path
+            from importlib.resources import files
+            asset_path = str(files("boxman").joinpath("assets", "docker"))
+            if _has_compose(asset_path):
+                return asset_path
 
             candidate = os.path.join(pkg_dir, "assets", "docker")
             if _has_compose(candidate):

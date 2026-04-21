@@ -406,13 +406,15 @@ class TestTaskRunnerFlagsPassing:
 
     def test_double_dash_extra_args_no_placeholders(self, config):
         """
-        Multiple tokens after -- are joined and quoted as ONE shell argument.
-        This is the correct behaviour for ansible -a which takes a single string.
+        Multiple tokens after -- are joined and quoted as ONE shell argument
+        when ``extra_args_mode: quoted`` is set on the task. This is the
+        correct behaviour for ansible -a which takes a single string.
 
             boxman run cmd -- curl ifconfig.me
             → ansible ... -a 'curl ifconfig.me'   ✓  (-a gets one arg)
         """
         self._add_task(config, "cmd", "ansible all -m ansible.builtin.shell -a")
+        config["tasks"]["cmd"]["extra_args_mode"] = "quoted"
         cmd = self._run(
             config, "cmd",
             extra_args=["curl", "ifconfig.me"],
@@ -427,10 +429,12 @@ class TestTaskRunnerFlagsPassing:
 
     def test_extra_arg_with_embedded_space_is_shell_quoted(self, config):
         """
-        A single extra_arg that already contains a space (from bash 'curl ifconfig.me')
-        is also quoted correctly.
+        Under ``extra_args_mode: quoted``, a single extra_arg that
+        already contains a space (from bash 'curl ifconfig.me') is
+        also quoted correctly.
         """
         self._add_task(config, "cmd", "ansible all -m ansible.builtin.shell -a")
+        config["tasks"]["cmd"]["extra_args_mode"] = "quoted"
         cmd = self._run(
             config, "cmd",
             extra_args=["curl ifconfig.me"],  # single arg with a space
@@ -535,9 +539,11 @@ class TestTaskRunnerFlagsPassing:
     def test_multiple_extra_args_joined_as_one(self, config):
         """
         Simulates: boxman run cmd --flags "-v" -- arg1 arg2 arg3
-        All post-'--' tokens are joined and quoted as a single shell argument.
+        Under ``extra_args_mode: quoted``, all post-'--' tokens are joined
+        and quoted as a single shell argument.
         """
         self._add_task(config, "cmd", "mycommand {flags}")
+        config["tasks"]["cmd"]["extra_args_mode"] = "quoted"
         cmd = self._run(
             config, "cmd",
             extra_args=["arg1", "arg2", "arg3"],

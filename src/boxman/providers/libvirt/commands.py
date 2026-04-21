@@ -1,7 +1,11 @@
-from typing import Dict, Any, Optional, List
 import os
+from typing import Any
+
 import invoke
+
 from boxman import log
+from boxman.utils.shell import run as _shell_run
+
 
 class LibVirtCommandBase:
     """
@@ -12,8 +16,8 @@ class LibVirtCommandBase:
     and error management.
     """
     def __init__(self,
-                 override_config_use_sudo: Optional[bool] = None,
-                 provider_config: Optional[Dict[str, Any]] = None):
+                 override_config_use_sudo: bool | None = None,
+                 provider_config: dict[str, Any] | None = None):
         """
         Initialize a Command with provider configuration.
 
@@ -45,11 +49,11 @@ class LibVirtCommandBase:
             'runtime_container', 'boxman-libvirt-default')
 
         #: List[str]: Commands that should never get sudo prepended
-        self.sudo_skip_commands: List[str] = self.provider_config.get(
+        self.sudo_skip_commands: list[str] = self.provider_config.get(
             'sudo_skip_commands', [])
 
         #: List[str]: Commands that should always get sudo prepended
-        self.force_sudo_commands: List[str] = self.provider_config.get(
+        self.force_sudo_commands: list[str] = self.provider_config.get(
             'force_sudo_commands', [])
 
         # override use_sudo if provided
@@ -119,7 +123,7 @@ class LibVirtCommandBase:
             self.logger.info(f"executing: {command}")
 
         try:
-            result = invoke.run(command, hide=hide, warn=warn)
+            result = _shell_run(command, hide=hide, warn=warn)
 
             if not result.ok and not warn:
                 error_message = (
@@ -200,7 +204,7 @@ class LibVirtCommandBase:
             self.logger.info(f"Executing shell command: {command}")
 
         try:
-            result = invoke.run(command, hide=hide, warn=warn)
+            result = _shell_run(command, hide=hide, warn=warn)
 
             if not result.ok and not warn:
                 error_message = (
@@ -255,7 +259,7 @@ class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
     Class for executing virsh commands for managing libvirt domains,
     networks, storage, etc.
     """
-    def __init__(self, provider_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, provider_config: dict[str, Any] | None = None):
         """
         Initialize a virsh command executor.
 
@@ -329,7 +333,7 @@ class VirtInstallCommand(LibVirtCommandBase):
     virtual machines.
     """
 
-    def __init__(self, provider_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, provider_config: dict[str, Any] | None = None):
         """
         Initialize a virt-install command executor.
 
@@ -368,7 +372,7 @@ class VirtCloneCommand(LibVirtCommandBase):
     virtual machines.
     """
 
-    def __init__(self, provider_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, provider_config: dict[str, Any] | None = None):
         """
         Initialize a virt-clone command executor.
 

@@ -9,12 +9,11 @@ for task execution.
 import os
 import shlex
 import subprocess
-from typing import Dict, Optional
 
 from boxman import log
 
 
-def source_env_file(env_file_path: str) -> Dict[str, str]:
+def source_env_file(env_file_path: str) -> dict[str, str]:
     """
     Source a shell environment file and return the exported variables.
 
@@ -53,7 +52,7 @@ def source_env_file(env_file_path: str) -> Dict[str, str]:
         )
 
     # Parse null-delimited env output (handles values with newlines)
-    sourced_env: Dict[str, str] = {}
+    sourced_env: dict[str, str] = {}
     for entry in result.stdout.split("\0"):
         if not entry:
             continue
@@ -63,7 +62,7 @@ def source_env_file(env_file_path: str) -> Dict[str, str]:
 
     # Return only new/changed variables
     current_env = os.environ
-    new_vars: Dict[str, str] = {}
+    new_vars: dict[str, str] = {}
     for key, value in sourced_env.items():
         if current_env.get(key) != value:
             new_vars[key] = value
@@ -72,9 +71,9 @@ def source_env_file(env_file_path: str) -> Dict[str, str]:
 
 
 def load_workspace_env(
-    cluster_config: Dict,
-    workspace_config: Optional[Dict] = None,
-) -> Dict[str, str]:
+    cluster_config: dict,
+    workspace_config: dict | None = None,
+) -> dict[str, str]:
     """
     Load environment variables for a workspace from the cluster and
     workspace configuration.
@@ -94,7 +93,7 @@ def load_workspace_env(
     Returns:
         A merged dict of environment variables ready for task execution.
     """
-    env_vars: Dict[str, str] = {}
+    env_vars: dict[str, str] = {}
     workspace_config = workspace_config or {}
     workdir = os.path.expanduser(cluster_config.get("workdir", "."))
 

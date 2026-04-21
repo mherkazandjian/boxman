@@ -1,8 +1,9 @@
 import os
-from typing import Optional, Dict, Any
+from typing import Any
+
 from boxman import log
 
-from .commands import VirtCloneCommand, VirshCommand
+from .commands import VirshCommand, VirtCloneCommand
 
 
 class CloneVM:
@@ -13,9 +14,9 @@ class CloneVM:
     def __init__(self,
                 src_vm_name: str,
                 new_vm_name: str,
-                info: Dict[str, Any],
-                workdir: Optional[str] = None,
-                provider_config: Optional[Dict[str, Any]] = None):
+                info: dict[str, Any],
+                workdir: str | None = None,
+                provider_config: dict[str, Any] | None = None):
         """
         Initialize the VM cloning operation.
 

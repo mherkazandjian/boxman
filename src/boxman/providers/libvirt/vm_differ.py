@@ -1,7 +1,8 @@
 import os
-from typing import Dict, Any, Optional, List
+from typing import Any
 
 from boxman import log
+
 from .commands import VirshCommand
 from .virsh_edit import VirshEdit
 
@@ -12,7 +13,7 @@ class VMStateDiffer:
     and produces a structured diff describing what needs to change.
     """
 
-    def __init__(self, provider_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, provider_config: dict[str, Any] | None = None):
         self.virsh = VirshCommand(provider_config)
         self.virsh_edit = VirshEdit(provider_config)
         self.provider_config = provider_config
@@ -30,7 +31,7 @@ class VMStateDiffer:
             return 'unknown'
         return result.stdout.strip()
 
-    def get_actual_cpu(self, domain_name: str) -> Dict[str, int]:
+    def get_actual_cpu(self, domain_name: str) -> dict[str, int]:
         """
         Get actual CPU topology from the domain XML.
 
@@ -112,7 +113,7 @@ class VMStateDiffer:
             return 0
         return int(memory_values[0]) // 1024
 
-    def get_actual_disks(self, domain_name: str) -> List[Dict[str, Any]]:
+    def get_actual_disks(self, domain_name: str) -> list[dict[str, Any]]:
         """
         Get actual disk info from virsh domblklist + virsh domblkinfo.
 
@@ -183,7 +184,7 @@ class VMStateDiffer:
             return 0
 
     @staticmethod
-    def _expected_disk_path(disk_config: Dict[str, Any],
+    def _expected_disk_path(disk_config: dict[str, Any],
                             workdir: str,
                             disk_prefix: str) -> str:
         """
@@ -200,7 +201,7 @@ class VMStateDiffer:
 
         return os.path.expanduser(disk_path)
 
-    def get_actual_cdroms(self, domain_name: str) -> List[Dict[str, Any]]:
+    def get_actual_cdroms(self, domain_name: str) -> list[dict[str, Any]]:
         """
         Get actual CDROM devices attached to a VM, excluding seed ISOs.
 
@@ -235,7 +236,7 @@ class VMStateDiffer:
 
         return cdroms
 
-    def get_actual_shared_folders(self, domain_name: str) -> List[Dict[str, Any]]:
+    def get_actual_shared_folders(self, domain_name: str) -> list[dict[str, Any]]:
         """
         Get actual filesystem (shared folder) devices from domain XML.
 
@@ -269,15 +270,15 @@ class VMStateDiffer:
 
     def diff_vm(self,
                 domain_name: str,
-                desired_cpus: Optional[Dict[str, int]],
-                desired_memory_mb: Optional[int],
-                desired_disks: Optional[List[Dict[str, Any]]],
+                desired_cpus: dict[str, int] | None,
+                desired_memory_mb: int | None,
+                desired_disks: list[dict[str, Any]] | None,
                 workdir: str,
                 disk_prefix: str,
-                desired_max_vcpus: Optional[int] = None,
-                desired_max_memory_mb: Optional[int] = None,
-                desired_shared_folders: Optional[List[Dict[str, Any]]] = None,
-                desired_cdroms: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                desired_max_vcpus: int | None = None,
+                desired_max_memory_mb: int | None = None,
+                desired_shared_folders: list[dict[str, Any]] | None = None,
+                desired_cdroms: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """
         Compute the diff between desired config and actual VM state.
 

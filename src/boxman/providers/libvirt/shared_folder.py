@@ -1,11 +1,9 @@
 import os
-from typing import Optional, Dict, Any, List
 import tempfile
+from typing import Any
 
 from .commands import VirshCommand
 from .virsh_edit import VirshEdit
-
-from boxman import log
 
 
 class SharedFolderManager(VirshCommand):
@@ -17,7 +15,7 @@ class SharedFolderManager(VirshCommand):
     hotplug support.
     """
 
-    def __init__(self, vm_name: str, provider_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, vm_name: str, provider_config: dict[str, Any] | None = None):
         super().__init__(provider_config)
         self.vm_name = vm_name
 
@@ -25,7 +23,7 @@ class SharedFolderManager(VirshCommand):
                              name: str,
                              host_path: str,
                              readonly: bool = False,
-                             persistent: bool = True) -> Dict[str, Any]:
+                             persistent: bool = True) -> dict[str, Any]:
         """
         Attach a host directory as a virtiofs filesystem to the VM.
 
@@ -100,7 +98,7 @@ class SharedFolderManager(VirshCommand):
             return {'success': False, 'restart_needed': False}
 
     def detach_shared_folder(self, name: str, host_path: str,
-                             readonly: bool = False) -> Dict[str, Any]:
+                             readonly: bool = False) -> dict[str, Any]:
         """
         Detach a shared folder from the VM.
 
@@ -162,7 +160,7 @@ class SharedFolderManager(VirshCommand):
                 os.unlink(temp_path)
             return {'success': False, 'restart_needed': False}
 
-    def ensure_memfd_backing(self) -> Dict[str, Any]:
+    def ensure_memfd_backing(self) -> dict[str, Any]:
         """
         Ensure the VM has memfd memory backing required by virtiofs.
 
@@ -222,7 +220,7 @@ class SharedFolderManager(VirshCommand):
                 f"error ensuring memfd backing for VM {self.vm_name}: {e}")
             return {'success': False, 'restart_needed': False}
 
-    def configure_from_config(self, folder_config: Dict[str, Any]) -> Dict[str, Any]:
+    def configure_from_config(self, folder_config: dict[str, Any]) -> dict[str, Any]:
         """
         Configure a shared folder from a configuration dictionary.
 
@@ -265,7 +263,7 @@ class SharedFolderManager(VirshCommand):
             'restart_needed': restart_needed,
         }
 
-    def get_attached_shared_folders(self) -> List[Dict[str, Any]]:
+    def get_attached_shared_folders(self) -> list[dict[str, Any]]:
         """
         Get all filesystem (shared folder) devices currently attached to the VM.
 

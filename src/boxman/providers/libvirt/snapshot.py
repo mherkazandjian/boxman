@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Snapshot module for libvirt provider.
 This module provides functionality to manage VM snapshots using command-line tools.
@@ -7,18 +6,20 @@ This module provides functionality to manage VM snapshots using command-line too
 
 import os
 import time
-from typing import Dict, Any, List, Optional
-from .commands import VirshCommand
+from typing import Any
 from xml.etree import ElementTree as ET
 
 from boxman import log
+
+from .commands import VirshCommand
+
 
 class SnapshotManager:
     """
     Class to manage snapshots of VMs in libvirt using virsh commands.
     """
 
-    def __init__(self, provider_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, provider_config: dict[str, Any] | None = None):
         """
         Initialize the snapshot manager.
 
@@ -112,7 +113,7 @@ class SnapshotManager:
                     f"failed to switch cdrom {target} on {vm_name} "
                     f"back to raw ISO '{raw_iso}': {change_result.stderr}")
 
-    def _cdrom_diskspec_args(self, vm_name: str) -> List[str]:
+    def _cdrom_diskspec_args(self, vm_name: str) -> list[str]:
         """
         Return --diskspec args that exclude cdrom devices from a snapshot.
 
@@ -180,7 +181,7 @@ class SnapshotManager:
             self.logger.error(f"error creating snapshot for vm {vm_name}: {exc}")
             return False
 
-    def get_latest_snapshot(self, vm_name: str) -> Optional[str]:
+    def get_latest_snapshot(self, vm_name: str) -> str | None:
         """
         Get the name of the current (latest) snapshot for a VM.
 
@@ -253,7 +254,7 @@ class SnapshotManager:
 
         return len(errors) == 0, errors
 
-    def list_snapshots(self, vm_name: str) -> List[Dict[str, str]]:
+    def list_snapshots(self, vm_name: str) -> list[dict[str, str]]:
         """
         List all snapshots for a vm.
 
@@ -290,7 +291,7 @@ class SnapshotManager:
             self.logger.error(f"error listing snapshots for vm {vm_name}: {exc}")
             return []
 
-    def _get_snapshot_overlay_files(self, vm_name: str) -> Dict[str, str]:
+    def _get_snapshot_overlay_files(self, vm_name: str) -> dict[str, str]:
         """
         Return a mapping of snapshot_name -> set of overlay file paths
         for every external snapshot on *vm_name*.
@@ -300,7 +301,7 @@ class SnapshotManager:
         if not result.ok:
             return {}
 
-        overlays: Dict[str, List[str]] = {}
+        overlays: dict[str, list[str]] = {}
         for snap in result.stdout.strip().splitlines():
             snap = snap.strip()
             if not snap:
@@ -324,7 +325,7 @@ class SnapshotManager:
                 continue
         return overlays
 
-    def _preserve_snapshot_overlays(self, vm_name: str) -> List[tuple]:
+    def _preserve_snapshot_overlays(self, vm_name: str) -> list[tuple]:
         """
         Back up overlay files that belong to snapshots and may be deleted
         by ``snapshot-revert``.
@@ -362,7 +363,7 @@ class SnapshotManager:
             f"failed to preserve overlays for {vm_name}: {result.stderr}")
         return []
 
-    def _restore_preserved_overlays(self, preserved: List[tuple]) -> None:
+    def _restore_preserved_overlays(self, preserved: list[tuple]) -> None:
         """
         Restore overlay files that were deleted during revert and clean
         up backup files that are no longer needed.

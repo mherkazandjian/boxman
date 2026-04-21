@@ -17,7 +17,7 @@ Usage
 
 import hashlib
 import os
-from typing import Callable, Optional
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 from boxman import log
@@ -61,7 +61,7 @@ class ImageCache:
         self,
         url: str,
         download_fn: Callable[[str, str], bool],
-    ) -> Optional[str]:
+    ) -> str | None:
         """
         Return the local path of the cached image for *url*.
 
