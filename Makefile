@@ -95,6 +95,10 @@ test-integration:
 test-provision:
 	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_provision_boxes.py
 
+#@help: count lines of code per category (code/tests/docs/conf/templates/boxes/shell/docker/make/claude)
+loc:
+	@python3 scripts/count_loc.py
+
 ################
 #@group: \033[0;32mboxes\033[0m
 #@help: deprovision all boxes that have a conf.yml (also cleans .boxman dirs)
