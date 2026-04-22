@@ -126,6 +126,113 @@ sudo virsh list --all
 virsh -c "qemu+ssh://qemu_user@127.0.0.1:2222/system?keyfile=$(pwd)/data/ssh/id_ed25519&known_hosts=/dev/null&no_verify=1" list --all
 ```
 
+### Connecting virt-manager
+
+The same three transports work for `virt-manager` — just pass the URI with
+`-c`. Pick the simplest one that matches your setup.
+
+> **Do not use `qemu+tcp://` or `qemu+tls://`.** The compose file publishes
+> host ports `16509` / `16514`, but libvirtd inside the container is not
+> configured to listen on them. Those connections will refuse or hang.
+
+#### Local host
+
+1. **Unix socket** (no auth, fastest — uses the bind-mounted socket):
+
+   ```bash
+   # From containers/docker/ with the default instance up
+   virt-manager -c "qemu+unix:///system?socket=$(pwd)/data/libvirt-run/libvirt-sock"
+   ```
+
+   For a runtime provisioned by a boxman project (e.g. `boxman --runtime=docker up`
+   inside `boxes/myproj/`), the socket lives at:
+
+   ```bash
+   virt-manager -c "qemu+unix:///system?socket=$PWD/.boxman/runtime/docker/data/libvirt-run/libvirt-sock"
+   ```
+
+2. **qemu+ssh** (uses the generated ED25519 key and published SSH port):
+
+   ```bash
+   virt-manager -c "qemu+ssh://qemu_user@127.0.0.1:2222/system?keyfile=$(pwd)/data/ssh/id_ed25519&no_verify=1&known_hosts=/dev/null"
+   ```
+
+   For a boxman-project runtime, the SSH port is not necessarily `2222` —
+   each project gets a deterministic md5-based offset on `2222/16509/16514`
+   so multiple projects coexist on the same host. Read the actual value
+   from `<project>/.boxman/runtime/docker/.env`:
+
+   ```bash
+   cat boxes/myproj/.boxman/runtime/docker/.env
+   # BOXMAN_SSH_PORT=3069
+   # BOXMAN_LIBVIRT_TCP_PORT=17356
+   # BOXMAN_LIBVIRT_TLS_PORT=17361
+
+   virt-manager -c "qemu+ssh://qemu_user@127.0.0.1:3069/system?keyfile=$PWD/boxes/myproj/.boxman/runtime/docker/data/ssh/id_ed25519&no_verify=1&known_hosts=/dev/null"
+   ```
+
+3. **Via the SSH config alias** — once `make link-ssh` has symlinked the
+   generated stanza into `~/.ssh/config.d/boxman/` (or you've added
+   `Include ./data/ssh/boxman.conf` to `~/.ssh/config` manually):
+
+   ```bash
+   virt-manager -c "qemu+ssh://boxman-default/system"
+   ```
+
+#### Remote host
+
+Scenario: the boxman docker runtime is running on `work-desktop.lan`
+(remote user `mher`) for project `myproj`; your local machine runs
+`virt-manager`. There are two clean approaches.
+
+**A. SSH config with ProxyJump (recommended — reusable)**
+
+Find the remote project's SSH port and copy down the container's key:
+
+```bash
+# Discover the per-project SSH port on the remote
+ssh mher@work-desktop.lan 'grep BOXMAN_SSH_PORT ~/projects/myproj/.boxman/runtime/docker/.env'
+# BOXMAN_SSH_PORT=3069
+
+# Fetch the container-side SSH key to the local machine
+scp mher@work-desktop.lan:~/projects/myproj/.boxman/runtime/docker/data/ssh/id_ed25519 \
+    ~/.ssh/boxman-myproj-id_ed25519
+chmod 600 ~/.ssh/boxman-myproj-id_ed25519
+```
+
+Add a stanza to `~/.ssh/config` on the local machine:
+
+```
+Host boxman-myproj-remote
+    HostName 127.0.0.1
+    Port 3069
+    User qemu_user
+    ProxyJump mher@work-desktop.lan
+    IdentityFile ~/.ssh/boxman-myproj-id_ed25519
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+```
+
+Then connect:
+
+```bash
+virt-manager -c "qemu+ssh://boxman-myproj-remote/system"
+```
+
+**B. Manual port-forward (ad-hoc — no SSH config edits)**
+
+```bash
+# Keep this running for the session
+ssh -N -L 13069:127.0.0.1:3069 mher@work-desktop.lan &
+
+# Point virt-manager at the local tunnel endpoint
+virt-manager -c "qemu+ssh://qemu_user@127.0.0.1:13069/system?keyfile=$HOME/.ssh/boxman-myproj-id_ed25519&no_verify=1&known_hosts=/dev/null"
+```
+
+In both cases the `qemu_user` SSH key must be available locally — either
+`scp`'d down (as above) or copied from the remote project's
+`.boxman/runtime/docker/data/ssh/id_ed25519`.
+
 ### Injecting Custom SSH Keys
 
 The container accepts additional SSH public keys for `qemu_user` via:

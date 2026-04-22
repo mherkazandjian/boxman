@@ -78,6 +78,11 @@ boxman --runtime=docker ssh boxman02  # any VM in the cluster
 ssh -F <workspace.path>/ssh_config cluster_1_boxman02
 ```
 
+To point a local `virt-manager` at the libvirt inside the docker runtime —
+same host or a remote docker-runtime host — see
+[Connecting virt-manager](containers/docker/README.md#connecting-virt-manager)
+in the container README.
+
 See [boxes/tiny-libvirt-ubuntu-24.04-cloudinit-docker-runtime/conf.yml](boxes/tiny-libvirt-ubuntu-24.04-cloudinit-docker-runtime/conf.yml)
 for a ready-to-run example, and [containers/docker/README.md](containers/docker/README.md)
 for the container internals.
