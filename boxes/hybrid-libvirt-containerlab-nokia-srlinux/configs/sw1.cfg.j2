@@ -1,0 +1,36 @@
+// Minimal Nokia SR Linux startup-config for sw1.
+//
+// Rendered by boxman via Jinja2 before `containerlab deploy`. boxman's
+// env() / env_required() helpers are available. SR Linux accepts a
+// newline-separated sequence of `set` commands as its startup config
+// (same form you would type at the `sr_cli` prompt in configuration
+// mode).
+//
+set / system information location "boxman-lab {{ env('BOXMAN_LAB_NAME', default='srlab') }}"
+set / system information contact  "boxman"
+//
+// SR Linux's first data port is `ethernet-1/1` (wired to the shared
+// host bridge `clab_mgmt` via containerlab's `host:` endpoint).
+//
+set / interface ethernet-1/1 admin-state enable
+set / interface ethernet-1/1 description "uplink-to-host01-via-shared-bridge"
+set / interface ethernet-1/1 vlan-tagging false
+set / interface ethernet-1/1 subinterface 0 admin-state enable
+set / interface ethernet-1/1 subinterface 0 ipv4 admin-state enable
+set / interface ethernet-1/1 subinterface 0 ipv4 address 192.0.2.1/24
+//
+// Attach the subinterface to the default network-instance so host01 can
+// reach it at L3. (SR Linux is network-instance centric; you can skip
+// this for pure L2 forwarding, but then the SVI-equivalent address
+// above would not be reachable.)
+//
+set / network-instance default type ip-vrf
+set / network-instance default admin-state enable
+set / network-instance default interface ethernet-1/1.0
+//
+// Enable SSH management (containerlab already does this by default on
+// the mgmt0 interface, but be explicit here).
+//
+set / system ssh-server admin-state enable
+//
+// Commit is applied implicitly when the config is loaded at boot.

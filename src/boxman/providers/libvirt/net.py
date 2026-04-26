@@ -882,7 +882,8 @@ class NetworkInterface(VirshCommand):
                       network_source: str,
                       link_state: str = 'active',
                       mac_address: str | None = None,
-                      model: str = 'virtio') -> bool:
+                      model: str = 'virtio',
+                      source_type: str = 'network') -> bool:
         """
         Add a network interface to the VM.
 
@@ -891,6 +892,9 @@ class NetworkInterface(VirshCommand):
             link_state: State of the link ('active' or 'inactive')
             mac_address: Optional MAC address for the interface
             model: NIC model (default: virtio)
+            source_type: ``'network'`` (libvirt-managed network, default) or
+                ``'bridge'`` (attach to an existing host Linux bridge, used
+                for shared-bridge L2 glue with external lab tools).
 
         Returns:
             True if successful, False otherwise
@@ -915,7 +919,8 @@ class NetworkInterface(VirshCommand):
                 'network_source': network_source,
                 'link_state': link_state,
                 'mac_address': mac_address,
-                'model': model
+                'model': model,
+                'source_type': source_type,
             }
 
             xml_content = template.render(**context)
@@ -959,10 +964,12 @@ class NetworkInterface(VirshCommand):
         link_state = adapter_config['link_state']
         mac_address = adapter_config.get('mac', None)
         model = adapter_config.get('model', 'virtio')
+        source_type = adapter_config.get('source_type', 'network')
 
         return self.add_interface(
             network_source=network_source,
             link_state=link_state,
             mac_address=mac_address,
-            model=model
+            model=model,
+            source_type=source_type,
         )

@@ -1,0 +1,158 @@
+---
+# Hybrid libvirt + containerlab topology with a Nokia SR Linux switch.
+#
+# Same shape as the Arista cEOS and Cisco IOSvL2 examples (host01 Ubuntu
+# VM + one switch on the shared bridge `clab_mgmt`), but the switch is
+# Nokia SR Linux running as a native container — no vrnetlab wrapping
+# needed and no account required to pull the image.
+#
+# Usage:
+#   cd boxes/hybrid-libvirt-containerlab-nokia-srlinux
+#   boxman up                      # brings up VM + shared bridge + SR Linux lab
+#   boxman netlab inspect
+#   $(boxman netlab ssh sw1)       # default creds: admin / NokiaSrl1!
+#   boxman ssh host01
+#   boxman destroy
+
+version: '1.0'
+project: hybrid_libvirt_containerlab_nokia_srlinux
+
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+    verbose: True
+
+templates:
+  template1:
+    name: ubuntu-24.04-minimal-base-template-cloudinit
+    image:
+      uri: http://cloud-images-archive.ubuntu.com/releases/noble/release-20240423/ubuntu-24.04-server-cloudimg-amd64.img
+      checksum: sha256:32a9d30d18803da72f5936cf2b7b9efcb4d0bb63c67933f17e3bdfd1751de3f3
+    disk_size: 20G
+    os_variant: ubuntu24.04
+    memory: 2048
+    vcpus: 2
+    cloudinit_done_marker: /var/log/hello-cloudinit.log
+    cloudinit: |
+      #cloud-config
+      hostname: hello-cloudinit
+      manage_etc_hosts: true
+
+      network:
+        version: 2
+        ethernets:
+          default:
+            match:
+              name: "en*"
+            dhcp4: true
+            dhcp6: false
+
+      users:
+        - name: ubuntu
+          lock_passwd: false
+          groups: [sudo]
+          sudo: "ALL=(ALL) NOPASSWD:ALL"
+          shell: /bin/bash
+
+      chpasswd:
+        expire: false
+        list: |
+          ubuntu:ubuntu
+
+      ssh_pwauth: true
+      package_update: true
+      packages:
+        - qemu-guest-agent
+        - openssh-server
+        - lldpd
+        - iputils-ping
+        - tcpdump
+        - vlan
+
+      runcmd:
+        - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - rm -f /etc/cloud/cloud.cfg.d/subiquity-disable-cloudinit-networking.cfg
+        - systemctl daemon-reload
+        - systemctl enable --now qemu-guest-agent
+        - systemctl enable --now lldpd
+        - netplan generate || true
+        - netplan apply || true
+        - dhclient -v || true
+        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /admin -s /bin/bash -G sudo admin" ]
+        - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin && chmod 0440 /etc/sudoers.d/admin" ]
+        - [ sh, -c, "echo 'admin:{{ env("BOXMAN_ADMIN_PASS", default="boxman") }}' | chpasswd" ]
+        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
+
+workspace:
+  path: ~/workspaces/boxmandev/hybrid-libvirt-containerlab-nokia-srlinux
+
+# ─── shared bridges (host-level L2 glue between libvirt VMs and the lab) ──
+shared_networks:
+  clab_mgmt:
+    bridge: clab_mgmt
+    stp: false
+    disable_netfilter: true
+
+clusters:
+  cluster_1:
+    base_image: ubuntu-24.04-minimal-base-template-cloudinit
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+    admin_key_name: id_ed25519_boxman
+    ssh_config: ssh_config
+
+    networks:
+      nat1:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:01'
+        ip:
+          address: '192.168.10.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.10.2'
+              end: '192.168.10.254'
+        enable: True
+        autostart: True
+
+    vms:
+      host01:
+        hostname: host01
+        cpus: { sockets: 1, cores: 2, threads: 2 }
+        memory: 2048
+        disks:
+          - name: disk01
+            driver: { name: qemu, type: qcow2 }
+            target: vdb
+            size: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'           # mgmt / internet
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'clab_mgmt'      # shared bridge -> same L2 as sw1
+
+# ─── containerlab topology (network gear) ─────────────────────────────────
+containerlab:
+  enabled: true
+  lab_name: srlab
+  topology:
+    nodes:
+      sw1:
+        kind: nokia_srlinux
+        image: ghcr.io/nokia/srlinux:24.10.1
+        type: ixrd3l                         # SR Linux platform variant
+        startup-config: configs/sw1.cfg.j2
+    links:
+      # SR Linux port naming is `ethernet-1/N`. Containerlab abbreviates
+      # with `eN` on the topology side, but the full name works too.
+      - endpoints: ["sw1:e1-1", "host:clab_mgmt"]

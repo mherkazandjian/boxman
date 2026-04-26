@@ -746,4 +746,55 @@ def parse_args():
         dest='cluster'
     )
 
+    # ── netlab (containerlab) ────────────────────────────────────────
+    parser_netlab = subparsers.add_parser(
+        'netlab',
+        help='manage the containerlab network-gear topology',
+        description=(
+            "Drive the containerlab lab declared under the 'containerlab:'\n"
+            "block in conf.yml. Useful for tearing the lab down and bringing\n"
+            "it back up without re-provisioning libvirt VMs.\n"
+            "\n"
+            "examples:\n"
+            "    $ boxman netlab deploy\n"
+            "    $ boxman netlab destroy\n"
+            "    $ boxman netlab inspect\n"
+            "    $ boxman netlab ssh sw1\n"
+            "    $ $(boxman netlab ssh sw1)    # drop into the vendor CLI\n"
+        ),
+        formatter_class=RawTextHelpFormatter,
+    )
+    subparsers_netlab = parser_netlab.add_subparsers(
+        help="sub-commands for boxman netlab")
+
+    parser_netlab_deploy = subparsers_netlab.add_parser(
+        'deploy', help='render topology and deploy the containerlab lab')
+    parser_netlab_deploy.set_defaults(func=BoxmanManager.netlab_deploy)
+
+    parser_netlab_destroy = subparsers_netlab.add_parser(
+        'destroy', help='tear down the containerlab lab (leaves VMs alone)')
+    parser_netlab_destroy.set_defaults(func=BoxmanManager.netlab_destroy)
+
+    parser_netlab_inspect = subparsers_netlab.add_parser(
+        'inspect', help='print containerlab inspect --format json')
+    parser_netlab_inspect.set_defaults(func=BoxmanManager.netlab_inspect)
+
+    parser_netlab_ssh = subparsers_netlab.add_parser(
+        'ssh',
+        help='print the ssh command for a lab node (e.g. $(boxman netlab ssh sw1))'
+    )
+    parser_netlab_ssh.set_defaults(func=BoxmanManager.netlab_ssh)
+    parser_netlab_ssh.add_argument(
+        'node',
+        type=str,
+        help='lab node name as declared in containerlab.topology.nodes',
+    )
+    parser_netlab_ssh.add_argument(
+        '--user',
+        type=str,
+        default=None,
+        help='override the ssh user (default: node login-user or "admin")',
+        dest='user',
+    )
+
     return parser

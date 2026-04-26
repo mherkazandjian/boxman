@@ -1,0 +1,36 @@
+! Minimal Arista EOS startup-config for sw1.
+!
+! Rendered by boxman via Jinja2 before `containerlab deploy`. The
+! env() / env_required() helpers from boxman's jinja environment are
+! available here — useful for injecting per-deployment secrets or
+! VLANs without rewriting the template.
+!
+hostname sw1
+!
+no aaa root
+!
+username admin privilege 15 role network-admin secret 0 {{ env("BOXMAN_CEOS_ADMIN_PASS", default="admin") }}
+!
+! Ethernet1 connects to the shared Linux bridge `clab_mgmt`, which the
+! libvirt VM host01 is also attached to. Put it in access mode on a lab
+! VLAN so host01 gets DHCP from the switch SVI.
+vlan 10
+   name lab-mgmt
+!
+interface Ethernet1
+   description uplink-to-host01-via-shared-bridge
+   switchport mode access
+   switchport access vlan 10
+!
+interface Vlan10
+   ip address 192.0.2.1/24
+!
+ip routing
+!
+! DHCP server for host01's second NIC.
+ip dhcp relay information option
+!
+management api http-commands
+   no shutdown
+!
+end

@@ -1,0 +1,164 @@
+---
+# Hybrid libvirt + containerlab topology.
+#
+# One Ubuntu libvirt VM (host01) and one Arista cEOS switch (sw1) share
+# a Linux bridge on the host (`clab_mgmt`). They sit in the same L2
+# broadcast domain, so host01 can discover sw1 via LLDP, get DHCP from
+# it, trade dot1q-tagged traffic, etc.
+#
+# Prereqs:
+#   - libvirt + qemu-kvm
+#   - Docker
+#   - containerlab (bash -c "$(curl -sL https://get.containerlab.dev)")
+#   - Arista cEOS image: download the 64-bit Lab tarball (free with an
+#     Arista account) and import it:
+#       docker import cEOS-lab-4.32.0F.tar ceos:4.32.0F
+#
+# Usage:
+#   cd boxes/hybrid-libvirt-containerlab-arista-ceos
+#   boxman up                      # brings up VM + shared bridge + cEOS lab
+#   boxman netlab inspect          # dump lab state
+#   $(boxman netlab ssh sw1)       # drop into Arista CLI: sw1#
+#   boxman ssh host01              # ssh into the libvirt VM
+#   # from host01: lldpctl (sees sw1 as a neighbor), ping 192.0.2.1, ...
+#   boxman destroy                 # tears down lab + VM (bridge stays)
+
+version: '1.0'
+project: hybrid_libvirt_containerlab_arista_ceos
+
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+    verbose: True
+
+templates:
+  template1:
+    name: ubuntu-24.04-minimal-base-template-cloudinit
+    image:
+      uri: http://cloud-images-archive.ubuntu.com/releases/noble/release-20240423/ubuntu-24.04-server-cloudimg-amd64.img
+      checksum: sha256:32a9d30d18803da72f5936cf2b7b9efcb4d0bb63c67933f17e3bdfd1751de3f3
+    disk_size: 20G
+    os_variant: ubuntu24.04
+    memory: 2048
+    vcpus: 2
+    cloudinit_done_marker: /var/log/hello-cloudinit.log
+    cloudinit: |
+      #cloud-config
+      hostname: hello-cloudinit
+      manage_etc_hosts: true
+
+      network:
+        version: 2
+        ethernets:
+          default:
+            match:
+              name: "en*"
+            dhcp4: true
+            dhcp6: false
+
+      users:
+        - name: ubuntu
+          lock_passwd: false
+          groups: [sudo]
+          sudo: "ALL=(ALL) NOPASSWD:ALL"
+          shell: /bin/bash
+
+      chpasswd:
+        expire: false
+        list: |
+          ubuntu:ubuntu
+
+      ssh_pwauth: true
+      package_update: true
+      packages:
+        - qemu-guest-agent
+        - openssh-server
+        - lldpd
+        - iputils-ping
+        - tcpdump
+
+      runcmd:
+        - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - rm -f /etc/cloud/cloud.cfg.d/subiquity-disable-cloudinit-networking.cfg
+        - systemctl daemon-reload
+        - systemctl enable --now qemu-guest-agent
+        - systemctl enable --now lldpd
+        - netplan generate || true
+        - netplan apply || true
+        - dhclient -v || true
+        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /admin -s /bin/bash -G sudo admin" ]
+        - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin && chmod 0440 /etc/sudoers.d/admin" ]
+        - [ sh, -c, "echo 'admin:{{ env("BOXMAN_ADMIN_PASS", default="boxman") }}' | chpasswd" ]
+        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
+
+workspace:
+  path: ~/workspaces/boxmandev/hybrid-libvirt-containerlab-arista-ceos
+
+# ─── shared bridges (host-level L2 glue between libvirt VMs and the lab) ──
+shared_networks:
+  clab_mgmt:
+    bridge: clab_mgmt           # actual Linux bridge name on the host
+    stp: false
+    disable_netfilter: true
+
+clusters:
+  cluster_1:
+    base_image: ubuntu-24.04-minimal-base-template-cloudinit
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+    admin_key_name: id_ed25519_boxman
+    ssh_config: ssh_config
+
+    networks:
+      nat1:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:01'
+        ip:
+          address: '192.168.10.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.10.2'
+              end: '192.168.10.254'
+        enable: True
+        autostart: True
+
+    vms:
+      host01:
+        hostname: host01
+        cpus: { sockets: 1, cores: 2, threads: 2 }
+        memory: 2048
+        disks:
+          - name: disk01
+            driver: { name: qemu, type: qcow2 }
+            target: vdb
+            size: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'            # mgmt/internet via libvirt NAT
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'clab_mgmt'       # shared bridge -> L2 into the lab
+
+# ─── containerlab topology (network gear) ─────────────────────────────────
+containerlab:
+  enabled: true
+  lab_name: netlab
+  topology:
+    nodes:
+      sw1:
+        kind: arista_ceos
+        image: ceos:4.32.0F
+        startup-config: configs/sw1.cfg.j2
+    links:
+      # sw1's Ethernet1 lands on the same host bridge as host01's second NIC.
+      - endpoints: ["sw1:eth1", "host:clab_mgmt"]

@@ -266,6 +266,7 @@ class TestNetworkInterfaceConfigureFromConfig:
             link_state="active",
             mac_address="52:54:00:ff:ff:ff",
             model="e1000",
+            source_type="network",
         )
 
     def test_model_defaults_to_virtio(self):

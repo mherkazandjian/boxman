@@ -13,6 +13,7 @@ from boxman.utils.shell import run
 
 from boxman import log
 from boxman.config_cache import BoxmanCache
+from boxman.netlab import ContainerlabManager, shared_bridges
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.runtime import RuntimeBase, create_runtime
@@ -48,6 +49,10 @@ class BoxmanManager:
 
         #: Optional[RuntimeBase]: the resolved runtime instance (created lazily)
         self._runtime_instance: RuntimeBase | None = None
+
+        #: Optional[ContainerlabManager]: created lazily when conf.yml has a
+        #: ``containerlab:`` block (see :meth:`netlab`).
+        self._netlab: ContainerlabManager | None = None
 
         if isinstance(config, str):
             self.config_path = config
@@ -112,6 +117,31 @@ class BoxmanManager:
                 self._runtime_name, config=runtime_config
             )
         return self._runtime_instance
+
+    @property
+    def netlab(self) -> ContainerlabManager | None:
+        """Return the ContainerlabManager for this project, or ``None``.
+
+        Created lazily on first access when ``conf.yml`` has a
+        ``containerlab:`` block with ``enabled: true`` (default).
+        """
+        if self._netlab is not None:
+            return self._netlab
+        if not self.config:
+            return None
+        lab_config = self.config.get("containerlab")
+        if not lab_config or not lab_config.get("enabled", True):
+            return None
+
+        workspace_path = (self.config.get("workspace", {}) or {}).get("path")
+        workdir = workspace_path or os.path.dirname(self.config_path or ".") or "."
+        jinja_env = create_jinja_env(os.path.expanduser(workdir))
+        self._netlab = ContainerlabManager(
+            lab_config=lab_config,
+            workdir=os.path.expanduser(workdir),
+            jinja_env=jinja_env,
+        )
+        return self._netlab
 
     def get_provider_config_with_runtime(
         self, provider_config: dict[str, Any]
@@ -759,6 +789,36 @@ class BoxmanManager:
         else:
             raise ValueError(f"Invalid network name format: {network_name}")
 
+    def resolve_adapter_network(self,
+                                adapter: dict[str, Any],
+                                cluster_name: str) -> None:
+        """Mutate *adapter* in place so ``network_source`` is fully qualified.
+
+        Resolution precedence:
+
+        1. If ``network_source`` names an entry in top-level
+           ``shared_networks:``, rewrite to the host Linux bridge name
+           and set ``source_type: 'bridge'``.
+        2. Else if ``is_global`` is true on the adapter, leave as-is.
+        3. Else apply cluster/project namespacing via
+           :meth:`full_network_name`.
+        """
+        name = adapter['network_source']
+        shared = (self.config or {}).get('shared_networks')
+        if shared_bridges.is_shared_bridge(name, shared):
+            adapter['network_source'] = shared_bridges.resolve_bridge(name, shared)
+            adapter['source_type'] = 'bridge'
+            return
+
+        if adapter.get('is_global', False):
+            return
+
+        adapter['network_source'] = self.full_network_name(
+            project_config=self.config,
+            cluster_name=cluster_name,
+            network_name=name,
+        )
+
     @staticmethod
     def import_image(cls, cli_args) -> None:
         """
@@ -1366,6 +1426,70 @@ class BoxmanManager:
     ### end register the project in the cache
 
     ### networks define / remove / destroy
+    def ensure_shared_bridges(self) -> None:
+        """Create host Linux bridges declared under top-level ``shared_networks:``.
+
+        Idempotent and cross-project safe. No-op when ``shared_networks`` is
+        absent. Bridges are intentionally *not* removed on destroy — multiple
+        boxman projects can share the same bridge.
+        """
+        shared = (self.config or {}).get('shared_networks')
+        if not shared:
+            return
+        self.logger.info(f"ensuring {len(shared)} shared bridge(s) exist on host")
+        shared_bridges.ensure(shared)
+
+    def deploy_netlab(self) -> None:
+        """Render and deploy the containerlab topology, if configured.
+
+        No-op when there's no ``containerlab:`` block or ``enabled: false``.
+        Runs preflight first so a missing ``containerlab`` / ``docker`` binary
+        surfaces a clear error before any shell-out is attempted.
+        """
+        netlab = self.netlab
+        if netlab is None:
+            return
+        netlab.preflight()
+        source_root = os.path.dirname(self.config_path) if self.config_path else None
+        netlab.render_topology(source_root=source_root)
+        netlab.deploy()
+
+    def destroy_netlab(self) -> None:
+        """Tear down the containerlab lab, if configured.
+
+        Ordered before libvirt/network teardown in ``deprovision`` so lab
+        container veths release their hold on shared bridges first.
+        """
+        netlab = self.netlab
+        if netlab is None:
+            return
+        try:
+            netlab.preflight()
+        except Exception as exc:
+            # Binary missing post-hoc is survivable — we still want to tear
+            # down libvirt state even if containerlab is no longer on PATH.
+            self.logger.warning(f"skipping containerlab destroy: {exc}")
+            return
+        netlab.destroy()
+
+    def ensure_netlab_up(self) -> None:
+        """Idempotent reconciliation of the containerlab lab state.
+
+        Called from ``boxman up`` so `down`/`up` cycles (or a host reboot)
+        bring the lab back alongside the VMs. Deploys fresh if absent,
+        starts stopped nodes if some containers linger, no-ops if already
+        running.
+        """
+        netlab = self.netlab
+        if netlab is None:
+            return
+        netlab.preflight()
+        # Render the topology so ensure_up has a .clab.yml to deploy from
+        # if the lab is missing entirely.
+        source_root = os.path.dirname(self.config_path) if self.config_path else None
+        netlab.render_topology(source_root=source_root)
+        netlab.ensure_up()
+
     def define_networks(self) -> None:
         """
         Define the networks specified in the cluster configuration (sequential).
@@ -1578,15 +1702,7 @@ class BoxmanManager:
             self.logger.warning(f"no network adapters defined for vm {vm_name}, skipping")
         else:
             for adapter in vm_info['network_adapters']:
-                if adapter.get('is_global', False):
-                    full_network_name = adapter['network_source']
-                else:
-                    full_network_name = self.full_network_name(
-                        project_config=self.config,
-                        cluster_name=cluster_name,
-                        network_name=adapter['network_source']
-                    )
-                adapter['network_source'] = full_network_name
+                self.resolve_adapter_network(adapter, cluster_name)
 
             self.logger.info(f"configuring network interfaces for vm {vm_name}")
             success = self.provider.configure_vm_network_interfaces(
@@ -1718,15 +1834,7 @@ class BoxmanManager:
                     self.logger.warning(f"no network adapters defined for vm {vm_name}, skipping")
                     continue
                 for adapter in vm_info['network_adapters']:
-                    if adapter.get('is_global', False):
-                        full_network_name = adapter['network_source']
-                    else:
-                        full_network_name = self.full_network_name(
-                            project_config=self.config,
-                            cluster_name=cluster_name,
-                            network_name=adapter['network_source']
-                        )
-                    adapter['network_source'] = full_network_name
+                    self.resolve_adapter_network(adapter, cluster_name)
                 success = self.provider.configure_vm_network_interfaces(
                     vm_name=full_vm_name,
                     network_adapters=vm_info['network_adapters']
@@ -2552,6 +2660,8 @@ class BoxmanManager:
 
         cls.provision_files()
 
+        cls.ensure_shared_bridges()
+
         cls.define_networks()
 
         cls.clone_vms()
@@ -2626,6 +2736,9 @@ class BoxmanManager:
         # display connection information (after ssh setup so connections are ready)
         cls.connect_info()
 
+        # render and deploy the containerlab topology (no-op if not configured)
+        cls.deploy_netlab()
+
     @staticmethod
     def up(cls, cli_args):
         """
@@ -2685,7 +2798,12 @@ class BoxmanManager:
         }
 
         if not non_running:
-            cls.logger.info("all VMs are already running, nothing to do")
+            cls.logger.info("all VMs are already running")
+            # Still reconcile shared bridges + lab — a host reboot or a
+            # manual `docker stop` may have left lab containers down
+            # even though the VMs stayed up.
+            cls.ensure_shared_bridges()
+            cls.ensure_netlab_up()
             cls.connect_info()
             return
 
@@ -2697,6 +2815,9 @@ class BoxmanManager:
         # Ensure provider config reflects runtime settings
         if hasattr(cls.provider, 'update_provider_config_with_runtime'):
             cls.provider.update_provider_config_with_runtime()
+
+        # Shared bridges must exist before VMs attach to them on boot.
+        cls.ensure_shared_bridges()
 
         # Build workdir lookup from process_vm_list for restore operations
         vm_workdir_map = {vm_name: workdir for vm_name, workdir in cls.process_vm_list(cli_args)}
@@ -2755,6 +2876,10 @@ class BoxmanManager:
         if total_waited >= max_wait:
             cls.logger.warning(
                 "reached maximum wait time. Some VMs may not have IP addresses.")
+
+        # Reconcile the containerlab lab after the VMs are up so the
+        # shared bridges have live endpoints on both sides.
+        cls.ensure_netlab_up()
 
         # Display connection information
         cls.connect_info()
@@ -2841,6 +2966,10 @@ class BoxmanManager:
         # precedence over app-level defaults (from boxman.yml).
         if hasattr(cls.provider, 'update_provider_config_with_runtime'):
             cls.provider.update_provider_config_with_runtime()
+
+        # Tear down the containerlab lab first so its veths release any
+        # shared bridges before we touch libvirt state.
+        cls.destroy_netlab()
 
         processes = [
             Process(
@@ -3642,6 +3771,52 @@ class BoxmanManager:
             sys.exit(exit_code)
 
     ### end task runner functions ####
+
+    ### netlab (containerlab) CLI handlers ####
+
+    @staticmethod
+    def netlab_deploy(cls, cli_args):
+        """``boxman netlab deploy`` — render topology and deploy the lab."""
+        if cls.netlab is None:
+            cls.logger.error(
+                "no 'containerlab:' block in conf.yml (or enabled: false)")
+            return
+        cls.deploy_netlab()
+
+    @staticmethod
+    def netlab_destroy(cls, cli_args):
+        """``boxman netlab destroy`` — destroy only the containerlab lab."""
+        if cls.netlab is None:
+            cls.logger.error(
+                "no 'containerlab:' block in conf.yml (or enabled: false)")
+            return
+        cls.destroy_netlab()
+
+    @staticmethod
+    def netlab_inspect(cls, cli_args):
+        """``boxman netlab inspect`` — print lab state as JSON."""
+        if cls.netlab is None:
+            cls.logger.error(
+                "no 'containerlab:' block in conf.yml (or enabled: false)")
+            return
+        cls.netlab.preflight()
+        print(json.dumps(cls.netlab.inspect(), indent=2))
+
+    @staticmethod
+    def netlab_ssh(cls, cli_args):
+        """``boxman netlab ssh <node>`` — print ssh command for a lab node."""
+        if cls.netlab is None:
+            cls.logger.error(
+                "no 'containerlab:' block in conf.yml (or enabled: false)")
+            return
+        node_name = getattr(cli_args, "node", None)
+        if not node_name:
+            cls.logger.error("missing required argument: node name")
+            return
+        user = getattr(cli_args, "user", None)
+        print(cls.netlab.ssh_command(node_name, user=user))
+
+    ### end netlab CLI handlers ####
 
     ### update (runtime modification) functions ####
 
