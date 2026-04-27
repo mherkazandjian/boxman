@@ -2050,20 +2050,23 @@ class BoxmanManager:
 
         jump_stanza = self._docker_ssh_jump_stanza()
 
+        # Group clusters by their resolved ssh_config path. When
+        # workspace.path is set every cluster resolves to the SAME path,
+        # so we must write each unique path once with all relevant VM
+        # blocks — opening 'w' once per cluster would have the later
+        # iteration truncate the earlier one's entries.
+        groups: dict[str, list[tuple[str, dict, str]]] = {}
         for cluster_name, cluster in self.config['clusters'].items():
             base_path = ws_path or cluster.get('workdir', '~')
-
-            # get the ssh config path
             ssh_config = os.path.expanduser(os.path.join(
                 base_path,
                 cluster.get('ssh_config', 'ssh_config')
             ))
+            groups.setdefault(ssh_config, []).append(
+                (cluster_name, cluster, base_path)
+            )
 
-            admin_priv_key = os.path.expanduser(os.path.join(
-                base_path,
-                cluster.get('admin_key_name', 'id_ed25519_boxman')
-            ))
-
+        for ssh_config, clusters_in_group in groups.items():
             self.logger.info(f"writing ssh config to {ssh_config}")
 
             with open(ssh_config, 'w') as fobj:
@@ -2077,32 +2080,37 @@ class BoxmanManager:
                 if jump_stanza:
                     fobj.write(jump_stanza)
 
-                # write host-specific configurations
-                for vm_name, vm_info in cluster['vms'].items():
-                    full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                    hostname = vm_info.get('hostname', vm_name)
-                    prefixed_host = f"{cluster_name}_{hostname}"
-                    padded_alias = f"node{str(vm_counter).zfill(pad_width)}"
-                    vm_counter += 1
+                for cluster_name, cluster, base_path in clusters_in_group:
+                    admin_priv_key = os.path.expanduser(os.path.join(
+                        base_path,
+                        cluster.get('admin_key_name', 'id_ed25519_boxman')
+                    ))
 
-                    # get the first ip address if available
-                    ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
+                    for vm_name, vm_info in cluster['vms'].items():
+                        full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                        hostname = vm_info.get('hostname', vm_name)
+                        prefixed_host = f"{cluster_name}_{hostname}"
+                        padded_alias = f"node{str(vm_counter).zfill(pad_width)}"
+                        vm_counter += 1
 
-                    if ip_addresses:
-                        first_ip = next(iter(ip_addresses.values()))
+                        # get the first ip address if available
+                        ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
 
-                        fobj.write(f'Host {prefixed_host} {padded_alias}\n')
-                        fobj.write(f'    Hostname {first_ip}\n')
-                        fobj.write(f'    User {cluster.get("admin_user", "admin")}\n')
-                        fobj.write(f'    IdentityFile {admin_priv_key}\n')
-                        if jump_stanza:
-                            fobj.write(
-                                f'    ProxyJump {self.SSH_JUMP_HOST_ALIAS}\n')
-                        fobj.write('\n\n')
-                    else:
-                        self.logger.warning(
-                            f"no ip address available for the vm {vm_name}, "
-                            "skipping SSH config entry")
+                        if ip_addresses:
+                            first_ip = next(iter(ip_addresses.values()))
+
+                            fobj.write(f'Host {prefixed_host} {padded_alias}\n')
+                            fobj.write(f'    Hostname {first_ip}\n')
+                            fobj.write(f'    User {cluster.get("admin_user", "admin")}\n')
+                            fobj.write(f'    IdentityFile {admin_priv_key}\n')
+                            if jump_stanza:
+                                fobj.write(
+                                    f'    ProxyJump {self.SSH_JUMP_HOST_ALIAS}\n')
+                            fobj.write('\n\n')
+                        else:
+                            self.logger.warning(
+                                f"no ip address available for the vm {vm_name}, "
+                                "skipping SSH config entry")
 
             self.logger.info(f"ssh config file written to {ssh_config}")
             self.logger.info(f"to connect: ssh -F {ssh_config} <hostname>")
@@ -2574,20 +2582,6 @@ class BoxmanManager:
     def provision(cls, cli_args):
 
         config = cls.config
-        cluster_group = list(config['clusters'].keys())[0]  # one cluster supported for now
-        # -------------------- global config ---------------------------
-
-        cluster = config['clusters'][cluster_group]
-        ws_path = config.get('workspace', {}).get('path', '')
-        ssh_config = cluster['ssh_config']
-        workdir = cluster['workdir']
-        # -------------------- end global config -----------------------
-
-        base_path = ws_path or workdir
-        ssh_config = os.path.expanduser(os.path.join(base_path, ssh_config))
-        workdir = os.path.abspath(os.path.expanduser(workdir))
-        if not os.path.isdir(workdir):
-            os.makedirs(workdir)
 
         # Ensure provider config reflects runtime settings.
         # Project-level provider settings (from conf.yml) always take
@@ -2805,6 +2799,10 @@ class BoxmanManager:
             cls.ensure_shared_bridges()
             cls.ensure_netlab_up()
             cls.connect_info()
+            # Re-write SSH config in case IPs changed (DHCP renewals after
+            # a host reboot, manual virsh net cycle, etc.) or in case the
+            # file is missing/stale from an older boxman version.
+            cls.write_ssh_config()
             return
 
         # --- Start / resume VMs that are not running ---
@@ -2945,21 +2943,6 @@ class BoxmanManager:
 
     @staticmethod
     def deprovision(cls, cli_args):
-
-        config = cls.config
-        cluster_group = list(config['clusters'].keys())[0]  # one cluster supported for now
-        # -------------------- global config ---------------------------
-
-        cluster = config['clusters'][cluster_group]
-        cluster_name = cluster_group
-        ws_path = config.get('workspace', {}).get('path', '')
-        ssh_config = cluster['ssh_config']
-        workdir = cluster['workdir']
-        # -------------------- end global config -----------------------
-
-        base_path = ws_path or workdir
-        ssh_config = os.path.expanduser(os.path.join(base_path, ssh_config))
-        workdir = os.path.abspath(os.path.expanduser(workdir))
 
         # Ensure provider config reflects runtime settings.
         # Project-level provider settings (from conf.yml) always take
@@ -4135,10 +4118,6 @@ class BoxmanManager:
         config = cls.config
         dry_run = getattr(cli_args, 'dry_run', False)
         auto_accept = getattr(cli_args, 'yes', False)
-
-        cluster_group = list(config['clusters'].keys())[0]
-        cluster = config['clusters'][cluster_group]
-        workdir = os.path.abspath(os.path.expanduser(cluster['workdir']))
 
         # ensure provider config reflects runtime settings
         if hasattr(cls.provider, 'update_provider_config_with_runtime'):

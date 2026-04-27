@@ -1,0 +1,39 @@
+// Minimal Nokia SR Linux startup-config for the inter-cluster router.
+//
+// Rendered by boxman via Jinja2 before `containerlab deploy`. boxman's
+// env() / env_required() helpers are available. SR Linux accepts a
+// newline-separated sequence of `set` commands as its startup config
+// (same form you would type at the `sr_cli` prompt in configuration
+// mode).
+//
+set / system information location "boxman-lab {{ env('BOXMAN_LAB_NAME', default='netlab') }}"
+set / system information contact  "boxman"
+//
+// ethernet-1/1 -> bx_inter_a (cluster_1 transit), 10.10.1.1/24
+// ethernet-1/2 -> bx_inter_b (cluster_2 transit), 10.10.2.1/24
+//
+set / interface ethernet-1/1 admin-state enable
+set / interface ethernet-1/1 description "to-cluster-1-via-bx_inter_a"
+set / interface ethernet-1/1 vlan-tagging false
+set / interface ethernet-1/1 subinterface 0 admin-state enable
+set / interface ethernet-1/1 subinterface 0 ipv4 admin-state enable
+set / interface ethernet-1/1 subinterface 0 ipv4 address 10.10.1.1/24
+//
+set / interface ethernet-1/2 admin-state enable
+set / interface ethernet-1/2 description "to-cluster-2-via-bx_inter_b"
+set / interface ethernet-1/2 vlan-tagging false
+set / interface ethernet-1/2 subinterface 0 admin-state enable
+set / interface ethernet-1/2 subinterface 0 ipv4 admin-state enable
+set / interface ethernet-1/2 subinterface 0 ipv4 address 10.10.2.1/24
+//
+// SR Linux is network-instance centric: both transit subinterfaces must
+// be attached to a routed network-instance for L3 forwarding between
+// them to work.
+//
+set / network-instance default type ip-vrf
+set / network-instance default admin-state enable
+set / network-instance default interface ethernet-1/1.0
+set / network-instance default interface ethernet-1/2.0
+//
+set / system ssh-server admin-state enable
+//

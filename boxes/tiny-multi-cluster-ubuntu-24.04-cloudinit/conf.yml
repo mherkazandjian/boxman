@@ -1,0 +1,211 @@
+---
+# Tiny two-cluster box. Two fully-isolated clusters from a single conf.yml,
+# no containerlab, no shared bridges — the simplest demo that boxman's
+# per-cluster network namespacing actually isolates traffic.
+#
+# Layout:
+#
+#   cluster_1                                cluster_2
+#     vm1 -- nat1      (192.168.10.0/24)       vm1 -- nat1      (192.168.20.0/24)
+#               libvirt NAT                              libvirt NAT
+#         -- isolated1 (10.0.10.0/24)               -- isolated1 (10.0.20.0/24)
+#               libvirt route (no NAT,                   libvirt route (no NAT,
+#                no path to/from outside)                 no path to/from outside)
+#
+# Both clusters declare networks literally called `nat1` and `isolated1`;
+# boxman namespaces them as separate libvirt networks
+# (`bprj__…__clstr__cluster_1__clstr__nat1` vs `…__cluster_2__clstr__nat1`,
+# same for isolated1), so vm1@cluster_1 and vm1@cluster_2 cannot reach
+# each other at L2 — even though both NICs say `network_source: nat1`
+# (or `isolated1`). The isolated1 networks have no NAT and no return
+# route from the host, so traffic sourced from a VM stays inside its
+# cluster's bridge.
+#
+# Verify after `boxman up`:
+#
+#   $ boxman ssh cluster_1_vm1
+#   cluster_1_vm1$ ping <cluster_2_vm1's 192.168.20.x address>   # fails
+#   cluster_1_vm1$ ping 8.8.8.8                                  # works (own NAT to internet)
+#
+# To later let the two clusters talk to each other, see
+# `boxes/multi-cluster-routed-via-frr/` (containerlab router on shared
+# bridges).
+
+version: '1.0'
+project: tiny_multi_cluster_ubuntu_24_04
+
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+    verbose: True
+
+templates:
+  template1:
+    name: ubuntu-24.04-minimal-base-template-cloudinit
+    image:
+      uri: http://cloud-images-archive.ubuntu.com/releases/noble/release-20240423/ubuntu-24.04-server-cloudimg-amd64.img
+      checksum: sha256:32a9d30d18803da72f5936cf2b7b9efcb4d0bb63c67933f17e3bdfd1751de3f3
+    disk_size: 20G
+    os_variant: ubuntu24.04
+    memory: 1024
+    vcpus: 1
+    cloudinit_done_marker: /var/log/hello-cloudinit.log
+    cloudinit: |
+      #cloud-config
+      hostname: hello-cloudinit
+      manage_etc_hosts: true
+
+      network:
+        version: 2
+        ethernets:
+          default:
+            match:
+              name: "en*"
+            dhcp4: true
+            dhcp6: false
+
+      users:
+        - name: ubuntu
+          lock_passwd: false
+          groups: [sudo]
+          sudo: "ALL=(ALL) NOPASSWD:ALL"
+          shell: /bin/bash
+
+      chpasswd:
+        expire: false
+        list: |
+          ubuntu:ubuntu
+
+      ssh_pwauth: true
+      package_update: true
+      packages:
+        - qemu-guest-agent
+        - openssh-server
+        - iputils-ping
+
+      runcmd:
+        - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - rm -f /etc/cloud/cloud.cfg.d/subiquity-disable-cloudinit-networking.cfg
+        - systemctl daemon-reload
+        - systemctl enable --now qemu-guest-agent
+        - netplan generate || true
+        - netplan apply || true
+        - dhclient -v || true
+        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /admin -s /bin/bash -G sudo admin" ]
+        - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin && chmod 0440 /etc/sudoers.d/admin" ]
+        - [ sh, -c, "echo 'admin:{{ env('BOXMAN_ADMIN_PASS', default='boxman') }}' | chpasswd" ]
+        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
+
+workspace:
+  path: ~/workspaces/boxmandev/tiny-multi-cluster-ubuntu-24.04-cloudinit
+
+clusters:
+  cluster_1:
+    base_image: ubuntu-24.04-minimal-base-template-cloudinit
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+    admin_key_name: id_ed25519_boxman
+    ssh_config: ssh_config
+
+    networks:
+      nat1:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:01:01'
+        ip:
+          address: '192.168.10.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.10.2'
+              end: '192.168.10.254'
+        enable: True
+        autostart: True
+      isolated1:
+        mode: route
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:01:02'
+        ip:
+          address: '10.0.10.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '10.0.10.2'
+              end: '10.0.10.254'
+        enable: True
+        autostart: True
+
+    vms:
+      vm1:
+        hostname: vm1
+        cpus: { sockets: 1, cores: 1, threads: 1 }
+        memory: 1024
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'isolated1'
+
+  cluster_2:
+    base_image: ubuntu-24.04-minimal-base-template-cloudinit
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+    admin_key_name: id_ed25519_boxman
+    ssh_config: ssh_config
+
+    networks:
+      nat1:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:02:01'
+        ip:
+          address: '192.168.20.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.20.2'
+              end: '192.168.20.254'
+        enable: True
+        autostart: True
+      isolated1:
+        mode: route
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:02:02'
+        ip:
+          address: '10.0.20.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '10.0.20.2'
+              end: '10.0.20.254'
+        enable: True
+        autostart: True
+
+    vms:
+      vm1:
+        hostname: vm1
+        cpus: { sockets: 1, cores: 1, threads: 1 }
+        memory: 1024
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'isolated1'

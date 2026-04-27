@@ -1,0 +1,34 @@
+! Minimal Arista EOS startup-config for the inter-cluster router.
+!
+! Rendered by boxman via Jinja2 before `containerlab deploy`. The
+! env() / env_required() helpers from boxman's jinja environment are
+! available here.
+!
+hostname {{ env("BOXMAN_CEOS_HOSTNAME", default="router-ceos") }}
+!
+no aaa root
+!
+username admin privilege 15 role network-admin secret 0 {{ env("BOXMAN_CEOS_ADMIN_PASS", default="admin") }}
+!
+ip routing
+!
+! Ethernet1 connects to the cluster_1 transit bridge (bx_inter_a).
+! Ethernet2 connects to the cluster_2 transit bridge (bx_inter_b).
+!
+interface Ethernet1
+   description to-cluster-1-via-bx_inter_a
+   no switchport
+   ip address 10.10.1.1/24
+!
+interface Ethernet2
+   description to-cluster-2-via-bx_inter_b
+   no switchport
+   ip address 10.10.2.1/24
+!
+! Both transit subnets are directly connected; the FIB has the routes
+! automatically. Add `router bgp` / `router ospf` blocks here to extend.
+!
+management api http-commands
+   no shutdown
+!
+end

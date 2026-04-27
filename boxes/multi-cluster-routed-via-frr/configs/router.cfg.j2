@@ -1,0 +1,31 @@
+! Minimal FRR startup-config for the inter-cluster router.
+!
+! Rendered by boxman via Jinja2 before `containerlab deploy`. boxman's
+! env() / env_required() helpers are available.
+!
+! This file lands at /etc/frr/frr.conf inside the router container. The
+! kernel-side address assignments and IP forwarding sysctl are applied
+! by the topology's `exec:` block — they are duplicated here as FRR
+! interface stanzas so the FRR config self-documents the routing setup
+! and so `vtysh -c 'show ip route'` produces meaningful output.
+!
+frr defaults traditional
+hostname {{ env("BOXMAN_FRR_HOSTNAME", default="router-frr") }}
+log syslog informational
+service integrated-vtysh-config
+!
+ip forwarding
+!
+interface eth1
+ description to-cluster-1-via-bx_inter_a
+ ip address 10.10.1.1/24
+!
+interface eth2
+ description to-cluster-2-via-bx_inter_b
+ ip address 10.10.2.1/24
+!
+! Both transit subnets are directly connected to the router; no static
+! routes or routing protocols are needed for the demo. Add `router bgp`
+! / `router ospf` blocks here to extend the example.
+!
+end
