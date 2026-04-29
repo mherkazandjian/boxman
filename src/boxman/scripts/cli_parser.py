@@ -746,4 +746,55 @@ def parse_args():
         dest='cluster'
     )
 
+    # ── pxe-boot ─────────────────────────────────────────────────────
+    parser_pxe = subparsers.add_parser(
+        'pxe-boot',
+        help='set a VM to network-boot and optionally wait for SSH',
+        description=(
+            "Set a VM's boot order to [network, hd], start it, and\n"
+            "optionally poll for SSH availability after PXE provisioning.\n"
+            "\n"
+            "Requires a Cobbler (or compatible) PXE provisioning server on\n"
+            "the same libvirt network as the VM.\n"
+            "\n"
+            "examples:\n"
+            "    # Boot from network, don't wait\n"
+            "    $ boxman pxe-boot --vm pxe-test01\n"
+            "\n"
+            "    # Boot from network and wait for SSH, then restore boot order\n"
+            "    $ boxman pxe-boot --vm pxe-test01 --expected-ip 192.168.123.50 "
+            "--restore-after\n"
+        ),
+        formatter_class=RawTextHelpFormatter
+    )
+    parser_pxe.set_defaults(func=BoxmanManager.pxe_boot)
+    parser_pxe.add_argument(
+        '--vm',
+        type=str,
+        required=True,
+        help='full domain name of the VM to PXE boot',
+        dest='vm'
+    )
+    parser_pxe.add_argument(
+        '--expected-ip',
+        type=str,
+        default=None,
+        help='IP address to poll for SSH after the OS is installed',
+        dest='expected_ip'
+    )
+    parser_pxe.add_argument(
+        '--wait-timeout',
+        type=int,
+        default=600,
+        help='maximum seconds to wait for SSH (default: 600)',
+        dest='wait_timeout'
+    )
+    parser_pxe.add_argument(
+        '--restore-after',
+        action='store_true',
+        default=False,
+        help='restore boot order to [hd] after SSH becomes available',
+        dest='restore_after'
+    )
+
     return parser

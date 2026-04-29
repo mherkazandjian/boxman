@@ -57,6 +57,7 @@ clusters:
     vms:
       boxman01:
         hostname: boxman01
+        # boot_order: [network, hd]   # PXE boot: boot from network first, then disk
         disks:
           - name: disk01
             driver:
