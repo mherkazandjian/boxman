@@ -154,3 +154,89 @@ def _find_pulled_oci_files(out_dir: Path) -> tuple[Optional[Path], Optional[Path
     metadata_path = metadata if metadata.is_file() else None
 
     return qcow2, metadata_path
+
+
+def push_oci_image(
+    image_ref: str,
+    qcow2_path: str,
+    metadata_path: Optional[str] = None,
+) -> None:
+    """Push a local qcow2 image and optional metadata to an OCI registry.
+
+    Supports authentication via oras-supported methods:
+    - Environment variables: ORAS_USERNAME, ORAS_PASSWORD
+    - Config file: ~/.oras/config.json
+    - Interactive prompt if credentials are needed
+
+    Args:
+        image_ref: OCI image reference (e.g. "registry.com/repo:tag")
+        qcow2_path: Path to the qcow2 file to push
+        metadata_path: Optional path to vmimage.json metadata file
+
+    Raises:
+        ValueError: If image_ref is invalid
+        RuntimeError: If file validation fails or oras push command fails
+        FileNotFoundError: If oras CLI is not found
+    """
+
+    if not image_ref or not str(image_ref).strip():
+        raise ValueError("image_ref must be a non-empty string")
+
+    _oras_push(image_ref=image_ref, qcow2_path=qcow2_path, metadata_path=metadata_path)
+
+
+def _oras_push(image_ref: str, qcow2_path: str, metadata_path: Optional[str] = None) -> None:
+    """Push an OCI artifact to a registry using oras (with optional authentication).
+
+    Args:
+        image_ref: OCI image reference (e.g. "registry.com/repo:tag")
+        qcow2_path: Path to the qcow2 file to push
+        metadata_path: Optional path to vmimage.json metadata file
+
+    Raises:
+        RuntimeError: If file validation fails or oras push command fails
+        FileNotFoundError: If oras CLI is not found
+    """
+
+    # Validate files exist
+    qcow2_file = Path(qcow2_path)
+    if not qcow2_file.is_file():
+        raise RuntimeError(f"qcow2 file not found: {qcow2_path}")
+
+    files_to_push = [str(qcow2_file)]
+
+    if metadata_path is not None:
+        metadata_file = Path(metadata_path)
+        if not metadata_file.is_file():
+            raise RuntimeError(f"metadata file not found: {metadata_path}")
+        files_to_push.append(str(metadata_file))
+
+    cmd = ["oras", "push", image_ref] + files_to_push
+
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "oras CLI not found. Please install 'oras' and ensure it is on PATH."
+        ) from exc
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "oras push failed for '{ref}'.\n"
+            "command: {cmd}\n"
+            "exit code: {code}\n"
+            "stdout:\n{stdout}\n"
+            "stderr:\n{stderr}\n".format(
+                ref=image_ref,
+                cmd=" ".join(cmd),
+                code=result.returncode,
+                stdout=(result.stdout or "").strip(),
+                stderr=(result.stderr or "").strip(),
+            )
+        )

@@ -14,7 +14,7 @@ from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.virtualbox.vboxmanage import Virtualbox
 from boxman.utils.io import write_files
-from boxman.images.cli import image_inspect
+from boxman.images.cli import image_inspect, image_push
 #from boxman.abstract.providers import Providers
 from boxman.abstract.providers import ProviderSession as Session
 
@@ -384,6 +384,31 @@ def parse_args():
         help='either a legacy VM name or an OCI reference (oci://...)',
     )
 
+    #
+    # sub parser for the 'image push' subsubcommand
+    #
+    parser_image_push = subparsers_image.add_parser('push', help='push a VM image to an OCI registry')
+    parser_image_push.set_defaults(func=image_push)
+    parser_image_push.add_argument(
+        'image_ref',
+        type=str,
+        help='OCI image reference (e.g., registry.com/repo:tag)',
+    )
+    parser_image_push.add_argument(
+        '--qcow2',
+        type=str,
+        help='path to the qcow2 disk image file',
+        dest='qcow2',
+        required=True
+    )
+    parser_image_push.add_argument(
+        '--metadata',
+        type=str,
+        help='optional path to vmimage.json metadata file',
+        dest='metadata',
+        required=False
+    )
+
     return parser
 
 
@@ -586,6 +611,11 @@ def main():
     if args.func == BoxmanManager.list_projects:
         manager = BoxmanManager(config=None)
         args.func(manager, None)
+        sys.exit(0)
+    elif args.func in (image_inspect, image_push):
+        # image commands don't need a full manager with config
+        manager = BoxmanManager(config=None)
+        args.func(manager, args)
         sys.exit(0)
     else:
         # use the config of a deployment specified on the cmd line only if

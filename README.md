@@ -20,12 +20,42 @@ keep it simple and customizable.
 
     - sshpass
     - ansible
+    - oras (for OCI image push/pull operations)
 
 ## Sample configuration
 
   https://github.com/mherkazandjian/boxman/blob/main/data/conf.yml
 
 ## Usage
+
+### Manage VM images (OCI Registry)
+
+#### Pull a VM image from an OCI registry
+
+````bash
+  # Inspect an OCI image reference to see what will be used
+  boxman image inspect oci://registry.example.com/my-vms/ubuntu:latest
+  
+  # Use an OCI image as base_image in your cluster configuration
+  # (the image will be automatically pulled on first provision)
+  # conf.yml:
+  #   clusters:
+  #     my-cluster:
+  #       base_image: oci://registry.example.com/my-vms/ubuntu:latest
+````
+
+#### Push a VM image to an OCI registry
+
+````bash
+  # Push a local qcow2 disk image to an OCI registry
+  boxman image push registry.example.com/my-vms/ubuntu:latest \
+    --qcow2 /path/to/disk.qcow2
+  
+  # Push with optional metadata (vmimage.json)
+  boxman image push registry.example.com/my-vms/ubuntu:latest \
+    --qcow2 /path/to/disk.qcow2 \
+    --metadata /path/to/vmimage.json
+````
 
 ### Import vm images
 

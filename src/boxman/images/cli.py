@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from boxman.config_cache import BoxmanCache
-from boxman.images.resolver import ResolvedBaseImage, resolve_base_image
+from boxman.images.resolver import ResolvedBaseImage, resolve_base_image, push_oci_image
 
 
 def format_image_inspect(resolved: ResolvedBaseImage, cache_dir: str | None) -> str:
@@ -74,3 +74,26 @@ def image_inspect(manager, cli_args) -> None:
             cache_dir = str(p.parent)
 
     print(format_image_inspect(resolved=resolved, cache_dir=cache_dir), end="")
+
+
+def image_push(manager, cli_args) -> None:
+    """Entry point for `boxman image push` CLI.
+
+    Pushes a qcow2 image and optional metadata to an OCI registry.
+    """
+
+    qcow2_path = cli_args.qcow2
+    image_ref = cli_args.image_ref
+
+    metadata_path = getattr(cli_args, "metadata", None)
+
+    try:
+        push_oci_image(
+            image_ref=image_ref,
+            qcow2_path=qcow2_path,
+            metadata_path=metadata_path,
+        )
+        print(f"Successfully pushed image to {image_ref}", flush=True)
+    except (ValueError, RuntimeError) as e:
+        print(f"Error pushing image: {e}", flush=True)
+        raise SystemExit(1) from e
