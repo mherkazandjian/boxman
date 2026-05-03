@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 import argparse
-import json
 import logging
 import os
 import shutil
@@ -16,6 +15,7 @@ import boxman
 from boxman import log
 from boxman.abstract.providers import ProviderSession as Session
 from boxman.manager import BoxmanManager
+from boxman.providers.libvirt.import_image import ImageImporter
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.scripts.cli_parser import parse_args
 from boxman.utils.jinja_env import create_jinja_env
@@ -470,20 +470,18 @@ def main():
             if args.provider:
                 provider_type = args.provider
             else:
-                # check the uri to get the manifest and find the provider type
-                manifest_uri = args.manifest_uri
-
-                # if the image uri is a local file path indicated by file://, load the
-                # manifest from there, the manifest is a json file
-                if manifest_uri.startswith('file://'):
-                    manifest_path = manifest_uri[len('file://'):]
-                    with open(manifest_path) as fobj:
-                        manifest = json.load(fobj)
-                elif manifest_uri.startswith('http://') or manifest_uri.startswith('https://'):
-                    raise NotImplementedError('http/https image uris are not implemented yet')
-                else:
-                    raise ValueError(f'unsupported image uri: {manifest_uri}')
+                # Fetch the manifest (file:// or http(s)://) once to discover
+                # the provider type. The downloaded path is reused below to
+                # avoid re-fetching the manifest in the provider session.
+                try:
+                    manifest, manifest_local_path = ImageImporter.load_manifest_from_uri(
+                        args.manifest_uri)
+                except ValueError as exc:
+                    log.error(str(exc))
+                    sys.exit(2)
                 provider_type = manifest['provider']
+                # Stash the resolved local path so the session reuses it.
+                args.manifest_local_path = manifest_local_path
 
             # fetch the provider configuration from the boxman config
             manager.config = boxman_config['providers'][provider_type]

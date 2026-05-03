@@ -10,6 +10,7 @@ uses the manifest to set up the VM in libvirt.
 import json
 import os
 import shutil
+import tempfile
 import traceback
 import uuid
 from collections.abc import Callable
@@ -18,7 +19,11 @@ from typing import Any
 from lxml import etree
 
 from boxman import log
+from boxman.utils.http_download import download_url
 from boxman.utils.shell import run
+
+SUPPORTED_PROVIDERS = ("libvirt",)
+REQUIRED_MANIFEST_KEYS = ("xml_path", "image_path", "provider")
 
 
 class ImageDownloaderUtils:
@@ -96,15 +101,46 @@ class ImageImporter:
         """Log a debug message."""
         self.logger.debug(message)
 
+    @staticmethod
+    def _validate_manifest(manifest: Any, source: str) -> None:
+        """Validate a parsed manifest dict; raise ValueError on any issue.
+
+        *source* is included in error messages (path or URI of the manifest).
+        Required keys: xml_path, image_path, provider.
+        provider must be one of SUPPORTED_PROVIDERS.
+        xml_path / image_path must be non-empty strings.
+        """
+        if not isinstance(manifest, dict):
+            raise ValueError(
+                f"manifest at {source!r} must be a JSON object, "
+                f"got {type(manifest).__name__}"
+            )
+        for key in REQUIRED_MANIFEST_KEYS:
+            if key not in manifest:
+                raise ValueError(
+                    f"manifest at {source!r} missing required field {key!r}"
+                )
+        for key in ("xml_path", "image_path"):
+            value = manifest[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"manifest at {source!r} field {key!r} must be a "
+                    f"non-empty string, got {value!r}"
+                )
+        provider = manifest["provider"]
+        if not isinstance(provider, str) or provider.lower() not in SUPPORTED_PROVIDERS:
+            raise ValueError(
+                f"manifest at {source!r} provider {provider!r} not supported "
+                f"(supported: {', '.join(SUPPORTED_PROVIDERS)})"
+            )
+
     def load_manifest(self, manifest_path: str) -> dict[str, Any] | None:
         """
         Load and parse a json manifest file.
 
-        Args:
-            manifest_path: the path to the manifest file
-
-        Returns:
-            dictionary containing manifest data, or None if failed
+        Returns the parsed manifest dict, or None on any error (logs the
+        error first). For a strict (raising) variant that also accepts
+        http(s):// URIs, see :meth:`load_manifest_from_uri`.
         """
         try:
             if not os.path.exists(manifest_path):
@@ -116,24 +152,16 @@ class ImageImporter:
             with open(manifest_path) as fobj:
                 manifest = json.load(fobj)
 
-            if 'xml_path' not in manifest:
-                self._log_error("Manifest missing required field: 'xml_path'")
+            try:
+                self._validate_manifest(manifest, manifest_path)
+            except ValueError as exc:
+                self._log_error(str(exc))
                 return None
-
-            if 'image_path' not in manifest:
-                self._log_error("Manifest missing required field: 'image_path'")
-                return None
-
-            if 'provider' in manifest:
-                if manifest['provider'].lower() != 'libvirt':
-                    self._log_error(
-                        f"Manifest provider '{manifest['provider']}' is not supported.")
-                    return None
 
             self._log_info("Manifest loaded successfully")
             self._log_info(f"  XML path: {manifest['xml_path']}")
             self._log_info(f"  Image path: {manifest['image_path']}")
-            self._log_info(f"  Provider: {manifest.get('provider', 'libvirt')}")
+            self._log_info(f"  Provider: {manifest['provider']}")
 
             return manifest
 
@@ -144,6 +172,43 @@ class ImageImporter:
             self._log_error(f"Error loading manifest: {exc}")
             self._log_debug(traceback.format_exc())
             return None
+
+    @classmethod
+    def load_manifest_from_uri(cls, uri: str) -> tuple[dict[str, Any], str]:
+        """Load a manifest from a file://, http://, or https:// URI.
+
+        Returns ``(manifest_dict, local_path)`` where ``local_path`` is the
+        on-disk location of the manifest (the original path for ``file://``
+        or a freshly-downloaded temp file for HTTP URIs). Callers use the
+        local path to resolve manifest-relative ``xml_path`` / ``image_path``.
+
+        Raises ``ValueError`` for unsupported schemes, download failures,
+        bad JSON, or schema-validation failures.
+        """
+        if uri.startswith("file://"):
+            local_path = os.path.expanduser(uri[len("file://"):])
+            if not os.path.exists(local_path):
+                raise ValueError(f"manifest file not found: {local_path}")
+        elif uri.startswith("http://") or uri.startswith("https://"):
+            tmp_dir = tempfile.mkdtemp(prefix="boxman-manifest-")
+            local_path = os.path.join(tmp_dir, "manifest.json")
+            log.info(f"fetching remote manifest {uri} -> {local_path}")
+            if not download_url(uri, local_path):
+                raise ValueError(f"failed to download manifest from {uri}")
+        else:
+            raise ValueError(
+                f"unsupported manifest URI scheme: {uri!r} "
+                "(supported: file://, http://, https://)"
+            )
+
+        try:
+            with open(local_path) as fobj:
+                manifest = json.load(fobj)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"failed to parse manifest JSON at {uri}: {exc}") from exc
+
+        cls._validate_manifest(manifest, uri)
+        return manifest, local_path
 
     def edit_vm_xml(self,
                     xml_path: str,
