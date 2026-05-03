@@ -795,6 +795,45 @@ class BoxmanManager:
             raise SystemExit(1) from exc
 
     @staticmethod
+    def pxe_boot(cls, cli_args):
+        """
+        Set boot order to network-first on a VM, start it, optionally wait
+        for SSH, and optionally restore the boot order afterwards.
+
+        Designed to be used with a Cobbler PXE provisioning server.
+        """
+        session = cls.provider
+        vm_name = cli_args.vm
+
+        cls.logger.info(f"setting boot order to [network, hd] for '{vm_name}'")
+        if not session.set_boot_order(vm_name, ['network', 'hd']):
+            cls.logger.error(f"failed to set boot order for '{vm_name}'")
+            return False
+
+        cls.logger.info(f"starting VM '{vm_name}'")
+        if not session.start_vm(vm_name):
+            cls.logger.error(f"failed to start VM '{vm_name}'")
+            return False
+
+        if cli_args.expected_ip:
+            ok = session.wait_for_ssh(
+                cli_args.expected_ip,
+                timeout=cli_args.wait_timeout,
+            )
+            if not ok:
+                cls.logger.error(
+                    f"SSH timeout waiting for '{vm_name}' at "
+                    f"{cli_args.expected_ip}")
+                return False
+
+            if cli_args.restore_after:
+                cls.logger.info(
+                    f"restoring boot order to [hd] for '{vm_name}'")
+                session.restore_boot_order(vm_name)
+
+        return True
+
+    @staticmethod
     def create_templates(cls, cli_args) -> None:
         """
         Create template VMs from cloud images using cloud-init.

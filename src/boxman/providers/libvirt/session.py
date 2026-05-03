@@ -235,16 +235,33 @@ class LibVirtSession:
                  info: dict[str, Any],
                  workdir: str) -> bool:
         """
-        Clone a VM.
+        Clone a VM, or create a bare PXE-boot VM if boot_order starts with 'network'.
 
         Args:
             new_vm_name: Name of the new VM
-            src_vm_name: Name of the source VM
+            src_vm_name: Name of the source VM (unused when boot_order is network-first)
             info: VM configuration information
+            workdir: Working directory for disk images
 
         Returns:
             True if successful, False otherwise
         """
+        boot_order = info.get('boot_order', ['hd'])
+        if boot_order and boot_order[0] == 'network':
+            from .bare_vm import BareVM
+            bare = BareVM(
+                vm_name=new_vm_name,
+                info=info,
+                provider_config=self.provider_config,
+                workdir=workdir,
+            )
+            status = bare.create()
+            if not status:
+                raise RuntimeError(
+                    f"Failed to create bare PXE VM '{new_vm_name}'"
+                )
+            return True
+
         cloner = CloneVM(
             src_vm_name=src_vm_name,
             new_vm_name=new_vm_name,
@@ -284,6 +301,76 @@ class LibVirtSession:
         """
         # Delegates to the pure-filesystem helper extracted in Phase 2.6.
         return remove_vm_disks(workdir, vm_name, disks)
+
+    def set_boot_order(self, vm_name: str, order: list[str]) -> bool:
+        """
+        Set the boot device order for a VM.
+
+        Args:
+            vm_name: Name of the VM
+            order: List of boot devices in priority order, e.g. ['network', 'hd']
+
+        Returns:
+            True if successful
+        """
+        from lxml import etree
+
+        editor = VirshEdit(self.provider_config)
+        xml_content = editor.get_domain_xml(vm_name, inactive=True)
+
+        tree = etree.fromstring(xml_content.encode('utf-8'))
+        os_elem = tree.find('os')
+        if os_elem is None:
+            os_elem = etree.SubElement(tree, 'os')
+        for b in os_elem.findall('boot'):
+            os_elem.remove(b)
+        for dev in order:
+            boot = etree.SubElement(os_elem, 'boot')
+            boot.set('dev', dev)
+
+        modified_xml = etree.tostring(tree, encoding='unicode', pretty_print=True)
+        self.logger.info(
+            f"setting boot order for '{vm_name}' to {order}")
+        return editor.redefine_domain(vm_name, modified_xml)
+
+    def restore_boot_order(self, vm_name: str) -> bool:
+        """Restore boot order to ['hd'] (local disk only)."""
+        return self.set_boot_order(vm_name, ['hd'])
+
+    def wait_for_ssh(self,
+                     ip: str,
+                     port: int = 22,
+                     timeout: int = 600,
+                     interval: int = 10) -> bool:
+        """
+        Poll for SSH availability on a host.
+
+        Args:
+            ip: IP address to connect to
+            port: SSH port (default: 22)
+            timeout: Maximum seconds to wait
+            interval: Seconds between retries
+
+        Returns:
+            True if SSH becomes available before timeout
+        """
+        import socket
+        import time
+
+        elapsed = 0
+        while elapsed < timeout:
+            try:
+                with socket.create_connection((ip, port), timeout=5):
+                    self.logger.info(
+                        f"SSH available on {ip}:{port} after {elapsed}s")
+                    return True
+            except OSError:
+                self.logger.info(
+                    f"SSH not yet available on {ip}, retrying in {interval}s...")
+                time.sleep(interval)
+                elapsed += interval
+        self.logger.error(f"SSH timeout after {timeout}s on {ip}:{port}")
+        return False
 
     def destroy_vm(self, name: str, force: bool = False) -> bool:
         """
