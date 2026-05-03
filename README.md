@@ -16,6 +16,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - **Auto-creation of templates on provision**: if a cluster's `base_image` references a template defined in the `templates` section and the template VM does not yet exist, it is automatically created before provisioning proceeds
 - **Image caching**: downloaded cloud base images are stored in a local cache directory so the same image is only downloaded once across multiple projects
 - **Image import**: define a libvirt VM from a pre-built `(disk + XML)` package described by a JSON manifest, served from disk or over HTTP/HTTPS — see [Image Management](doc/image-management.md)
+- **Image push to OCI registries** (via `oras`): publish qcow2 disks + optional `vmimage.json` metadata as OCI artifacts with `boxman image push` — see [Image Management](doc/image-management.md)
 - **Runtime environments**: execute provider commands locally or inside a Docker container
 - **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
 - **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow disks
