@@ -11,6 +11,7 @@ runtime and provider machinery they sit on top of.
 | **Image cache** | Download a base cloud image once; reuse across projects | Automatic — used by templates |
 | **Template creation** | Build a cloud-init-customised template VM from a base cloud image | `boxman create-templates` |
 | **Image import** | Define a libvirt VM from a pre-built `(disk + XML)` package described by a JSON manifest | `boxman import-image` |
+| **Image push (OCI)** | Publish a qcow2 + optional metadata to an OCI registry via `oras` | `boxman image push` |
 
 The first two cover the common "spin up VMs from a public cloud image"
 flow. The third is for moving an already-built VM (an exported lab VM,
@@ -150,6 +151,53 @@ Two starter manifests live under `data/templates/`:
 - `libvirt_image_manifest_localdir.json` — local package layout
 - `libvirt_image_manifest_web.json` — HTTP-served package (note the
   limitation above)
+
+---
+
+## `boxman image push` (OCI registry)
+
+Push a qcow2 image (and optional `vmimage.json` metadata) to an OCI
+registry using [oras](https://oras.land/). Useful for distributing
+pre-built VM images via the same registries that hold container images.
+
+### Usage
+
+```bash
+boxman image push registry.example.com/my-vms/ubuntu:latest \
+  --qcow2    /path/to/disk.qcow2 \
+  --metadata /path/to/vmimage.json   # optional
+```
+
+### Flags
+
+| Flag | Required | Notes |
+|---|---|---|
+| `image_ref` (positional) | yes | OCI reference, e.g. `registry.example.com/repo:tag` |
+| `--qcow2` | yes | Path to the qcow2 disk image file |
+| `--metadata` | no | Path to a `vmimage.json` metadata file |
+
+### Authentication
+
+Authentication is delegated to oras and follows oras-supported methods:
+
+- Environment variables: `ORAS_USERNAME`, `ORAS_PASSWORD`
+- Config file: `~/.oras/config.json` (e.g. populated by `oras login`)
+- Interactive prompt at push time if no credentials are configured
+
+### Prerequisites
+
+- The [`oras`](https://oras.land/docs/installation) CLI must be on `PATH`.
+- A reachable OCI registry that accepts artifact pushes.
+
+### Errors
+
+| Error | Cause |
+|---|---|
+| `image_ref must be a non-empty string` | Positional ref was empty |
+| `qcow2 file not found: <path>` | `--qcow2` path does not exist |
+| `metadata file not found: <path>` | `--metadata` path does not exist |
+| `oras CLI not found` | Install `oras` and ensure it is on `PATH` |
+| `oras push failed for '<ref>'.` | Registry rejected the push (auth, permissions, or quota); inspect the included stderr in the error message |
 
 ---
 
