@@ -1,5 +1,10 @@
+{% if source_type == 'bridge' %}
+<interface type='bridge'>
+  <source bridge='{{ network_source }}'/>
+{% else %}
 <interface type='network'>
   <source network='{{ network_source }}'/>
+{% endif %}
   <model type='{{ model }}'/>
   <link state='{{ link_state }}'/>
   {% if mac_address %}

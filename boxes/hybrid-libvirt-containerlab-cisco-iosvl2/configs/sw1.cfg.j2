@@ -1,0 +1,44 @@
+! Minimal Cisco IOSvL2 (Catalyst-style) startup-config for sw1.
+!
+! Rendered by boxman via Jinja2 before `containerlab deploy`. boxman's
+! env() / env_required() helpers are available here.
+!
+hostname sw1
+!
+no aaa new-model
+!
+username admin privilege 15 secret {{ env("BOXMAN_CISCO_ADMIN_PASS", default="admin") }}
+enable secret {{ env("BOXMAN_CISCO_ENABLE_PASS", default="admin") }}
+!
+! VLAN 10 is the lab mgmt segment; host01 (the libvirt VM) will get a
+! DHCP lease from the SVI below.
+vlan 10
+ name lab-mgmt
+!
+! GigabitEthernet0/1 uplinks to the shared host bridge `clab_mgmt`, which
+! is also where host01's second NIC lives. Access mode, VLAN 10.
+interface GigabitEthernet0/1
+ description uplink-to-host01-via-shared-bridge
+ switchport
+ switchport mode access
+ switchport access vlan 10
+ no shutdown
+!
+interface Vlan10
+ ip address 192.0.2.1 255.255.255.0
+ no shutdown
+!
+ip routing
+!
+! On-box DHCP pool for VLAN 10 so host01 gets an address from sw1.
+ip dhcp excluded-address 192.0.2.1
+ip dhcp pool LAB-MGMT
+ network 192.0.2.0 255.255.255.0
+ default-router 192.0.2.1
+ lease 0 1
+!
+line vty 0 4
+ login local
+ transport input ssh
+!
+end
