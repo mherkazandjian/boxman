@@ -767,7 +767,7 @@ class BoxmanManager:
         :param manager: The instance of the BoxmanManager
         :param cli_args: The parsed arguments from the cli
         """
-        cls.provider.import_image(
+        self.provider.import_image(
             manifest_uri=cli_args.manifest_uri,
             vm_name=cli_args.vm_name,
             vm_dir=cli_args.vm_dir,
@@ -1289,7 +1289,7 @@ class BoxmanManager:
             if pretty:
                 print(f"{YELLOW}No projects registered.{RESET}")
             else:
-                cls.logger.info("No projects registered.")
+                self.logger.info("No projects registered.")
             return
 
         if pretty == 'table':
@@ -1364,26 +1364,26 @@ class BoxmanManager:
 
         else:
             # default logger-based output (no --pretty, no --json)
-            cls.logger.info("Registered projects:\n")
+            self.logger.info("Registered projects:\n")
             for proj_name, proj_info in projects.items():
-                cls.logger.info(f"  project: {proj_name}")
+                self.logger.info(f"  project: {proj_name}")
                 if isinstance(proj_info, dict):
                     conf = proj_info.get('conf', 'n/a')
                     runtime = proj_info.get('runtime', 'n/a')
-                    cls.logger.info(f"    config:  {conf}")
-                    cls.logger.info(f"    runtime: {runtime}")
+                    self.logger.info(f"    config:  {conf}")
+                    self.logger.info(f"    runtime: {runtime}")
 
                     networks = proj_info.get('networks', {})
                     if networks:
-                        cls.logger.info("    networks:")
+                        self.logger.info("    networks:")
                         for net_name, net_info in networks.items():
                             ip = net_info.get('ip_address', 'n/a') if isinstance(net_info, dict) else 'n/a'
                             bridge = net_info.get('bridge_name', 'n/a') if isinstance(net_info, dict) else 'n/a'
-                            cls.logger.info(f"      - {net_name}")
-                            cls.logger.info(f"          ip: {ip}  bridge: {bridge}")
+                            self.logger.info(f"      - {net_name}")
+                            self.logger.info(f"          ip: {ip}  bridge: {bridge}")
                 else:
-                    cls.logger.info(f"    {proj_info}")
-                cls.logger.info("")
+                    self.logger.info(f"    {proj_info}")
+                self.logger.info("")
     ### end register the project in the cache
 
     ### networks define / remove / destroy
@@ -2505,8 +2505,8 @@ class BoxmanManager:
         # Ensure provider config reflects runtime settings.
         # Project-level provider settings (from conf.yml) always take
         # precedence over app-level defaults (from boxman.yml).
-        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
-            cls.provider.update_provider_config_with_runtime()
+        if hasattr(self.provider, 'update_provider_config_with_runtime'):
+            self.provider.update_provider_config_with_runtime()
 
         # --- Pre-check: detect state that would block a clean provision ---
         # Block on either (a) live VMs from this project, or (b) a stale
@@ -2534,13 +2534,13 @@ class BoxmanManager:
             summary = "; ".join(reasons)
 
             if not force:
-                cls.logger.error(
+                self.logger.error(
                     f"cannot provision — {summary}. "
                     f"Use --force to deprovision first and re-provision."
                 )
                 return
 
-            cls.logger.warning(
+            self.logger.warning(
                 f"state will be deprovisioned first (--force): {summary}"
             )
             cls.deprovision(cls, cli_args)
@@ -2549,13 +2549,13 @@ class BoxmanManager:
         try:
             cls.register_project_in_cache()
         except RuntimeError as exc:
-            cls.logger.error(str(exc))
+            self.logger.error(str(exc))
             return
 
         # --rebuild-templates: force-recreate all templates before provisioning
         rebuild_templates = getattr(cli_args, 'rebuild_templates', False)
         if rebuild_templates:
-            cls.logger.info(
+            self.logger.info(
                 "rebuilding all templates (--rebuild-templates implies --force "
                 "for create-templates)..."
             )
@@ -2568,7 +2568,7 @@ class BoxmanManager:
         try:
             cls.validate_base_images()
         except ValueError as exc:
-            cls.logger.error(str(exc))
+            self.logger.error(str(exc))
             return
 
         cls.provision_files()
@@ -2582,7 +2582,7 @@ class BoxmanManager:
         # Ensure all VMs are actually running after the parallel start.
         # With many VMs starting simultaneously, some may fail due to resource
         # contention. Retry starting any that are not in 'running' state.
-        cls.logger.info("verifying all VMs are running after parallel start...")
+        self.logger.info("verifying all VMs are running after parallel start...")
         for _round in range(1, 21):
             vm_states = cls._get_vm_states()
             not_running = {
@@ -2590,26 +2590,26 @@ class BoxmanManager:
                 if state != 'running'
             }
             if not not_running:
-                cls.logger.info("all VMs are running")
+                self.logger.info("all VMs are running")
                 break
-            cls.logger.info(
+            self.logger.info(
                 f"round {_round}: {len(not_running)} VM(s) not yet running "
                 f"({', '.join(f'{n}={s}' for n, s in not_running.items())}), retrying..."
             )
             for _vm_name in not_running:
-                cls.provider.start_vm(_vm_name)
+                self.provider.start_vm(_vm_name)
             time.sleep(3)
         else:
             vm_states = cls._get_vm_states()
             still_down = {n: s for n, s in vm_states.items() if s != 'running'}
             if still_down:
-                cls.logger.warning(
+                self.logger.warning(
                     f"gave up after 20 rounds; the following VMs are still not running: "
                     f"{', '.join(f'{n}={s}' for n, s in still_down.items())}"
                 )
 
         # use adaptive wait for ip address assignment
-        cls.logger.info("waiting for vms to initialize and get the ip addresses...")
+        self.logger.info("waiting for vms to initialize and get the ip addresses...")
         wait_time = 1  # Start with 1 second
         max_wait = 600  # Maximum total wait time (10 minutes)
         total_waited = 0
@@ -2617,29 +2617,29 @@ class BoxmanManager:
         while total_waited < max_wait:
             # check if all vms have ip addresses
             if cls.get_connect_info():
-                cls.logger.info(f"All vms have ip addresses (waited {total_waited}s)")
+                self.logger.info(f"All vms have ip addresses (waited {total_waited}s)")
                 break
 
             # if we get here, at least one vm doesn't have an ip yet
-            cls.logger.info(f"wait {wait_time}s for ip assignment (total waited: {total_waited}s)")
+            self.logger.info(f"wait {wait_time}s for ip assignment (total waited: {total_waited}s)")
             time.sleep(wait_time)
             total_waited += wait_time
             # double the wait time up to 1 minute max per iteration
             wait_time = min(wait_time * 2, 60)
 
         if total_waited >= max_wait:
-            cls.logger.warning(
+            self.logger.warning(
                 "Reached maximum wait time. Some vms may not have ip addresses.")
 
         # Eject cdrom (seed.iso) from every VM now that cloud-init has run.
         # This prevents snapshot-related failures caused by qcow2-over-raw
         # backing chain issues and tray-lock errors on subsequent snapshots.
-        cls.logger.info("ejecting cdrom (seed.iso) from all VMs post-provisioning...")
+        self.logger.info("ejecting cdrom (seed.iso) from all VMs post-provisioning...")
         prj_name = f'bprj__{config["project"]}__bprj'
         for _cluster_name, _cluster in config['clusters'].items():
             for _vm_name, _ in _cluster['vms'].items():
                 _full_vm_name = f"{prj_name}_{_cluster_name}_{_vm_name}"
-                cls.provider.eject_cdrom(_full_vm_name)
+                self.provider.eject_cdrom(_full_vm_name)
 
         # generate ssh keys, add them to vms, and write ssh config
         cls.setup_ssh_access()
@@ -2666,7 +2666,7 @@ class BoxmanManager:
         expected_vms = cls._get_project_vm_names()
 
         if not expected_vms:
-            cls.logger.error("no VMs defined in configuration")
+            self.logger.error("no VMs defined in configuration")
             return
 
         vm_states = cls._get_vm_states()
@@ -2675,7 +2675,7 @@ class BoxmanManager:
 
         # --- Case 1: No VMs exist → full provision ---
         if not existing_names:
-            cls.logger.info("no existing VMs found, running full provision...")
+            self.logger.info("no existing VMs found, running full provision...")
             cls.provision(cls, cli_args)
             return
 
@@ -2685,14 +2685,14 @@ class BoxmanManager:
             force = getattr(cli_args, 'force', False)
             names_str = ", ".join(f"'{v}'" for v in sorted(missing))
             if not force:
-                cls.logger.error(
+                self.logger.error(
                     f"partial infrastructure state: the following VM(s) are "
                     f"missing: {names_str}. Use --force to deprovision and "
                     f"re-provision everything."
                 )
                 return
             else:
-                cls.logger.warning(
+                self.logger.warning(
                     f"partial state detected (missing: {names_str}). "
                     f"Deprovisioning and re-provisioning (--force)..."
                 )
@@ -2706,44 +2706,44 @@ class BoxmanManager:
         }
 
         if not non_running:
-            cls.logger.info("all VMs are already running, nothing to do")
+            self.logger.info("all VMs are already running, nothing to do")
             cls.connect_info()
             return
 
         # --- Start / resume VMs that are not running ---
-        cls.logger.info(
+        self.logger.info(
             f"{len(non_running)} VM(s) are not running, bringing them up..."
         )
 
         # Ensure provider config reflects runtime settings
-        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
-            cls.provider.update_provider_config_with_runtime()
+        if hasattr(self.provider, 'update_provider_config_with_runtime'):
+            self.provider.update_provider_config_with_runtime()
 
         # Build workdir lookup from process_vm_list for restore operations
         vm_workdir_map = {vm_name: workdir for vm_name, workdir in cls.process_vm_list(cli_args)}
 
         def _bring_up(vm_name, state, workdir):
-            cls.logger.info(f"VM '{vm_name}' is in state '{state}'")
+            self.logger.info(f"VM '{vm_name}' is in state '{state}'")
             if state == 'paused':
-                cls.logger.info(f"resuming VM '{vm_name}'...")
-                cls.provider.resume_vm(vm_name)
+                self.logger.info(f"resuming VM '{vm_name}'...")
+                self.provider.resume_vm(vm_name)
             elif state in ('saved', 'managedsave'):
-                cls.logger.info(f"restoring VM '{vm_name}' from saved state...")
-                cls.provider.restore_vm(vm_name, workdir)
+                self.logger.info(f"restoring VM '{vm_name}' from saved state...")
+                self.provider.restore_vm(vm_name, workdir)
             elif state in ('shut off', 'shutoff'):
-                cls.logger.info(f"starting VM '{vm_name}'...")
-                cls.provider.start_vm(vm_name)
+                self.logger.info(f"starting VM '{vm_name}'...")
+                self.provider.start_vm(vm_name)
             elif state in ('crashed', 'dying'):
-                cls.logger.warning(
+                self.logger.warning(
                     f"VM '{vm_name}' is in state '{state}', "
                     f"attempting to destroy and start...")
-                cls.provider.destroy_vm(vm_name, remove_storage=False)
-                cls.provider.start_vm(vm_name)
+                self.provider.destroy_vm(vm_name, remove_storage=False)
+                self.provider.start_vm(vm_name)
             else:
-                cls.logger.warning(
+                self.logger.warning(
                     f"VM '{vm_name}' is in unexpected state '{state}', "
                     f"attempting to start...")
-                cls.provider.start_vm(vm_name)
+                self.provider.start_vm(vm_name)
 
         processes = [
             Process(
@@ -2756,17 +2756,17 @@ class BoxmanManager:
         [p.join() for p in processes]
 
         # Wait for IP addresses
-        cls.logger.info("waiting for VMs to get IP addresses...")
+        self.logger.info("waiting for VMs to get IP addresses...")
         wait_time = 1
         max_wait = 300
         total_waited = 0
 
         while total_waited < max_wait:
             if cls.get_connect_info():
-                cls.logger.info(
+                self.logger.info(
                     f"all VMs have IP addresses (waited {total_waited}s)")
                 break
-            cls.logger.info(
+            self.logger.info(
                 f"waiting {wait_time}s for IP assignment "
                 f"(total waited: {total_waited}s)")
             time.sleep(wait_time)
@@ -2774,7 +2774,7 @@ class BoxmanManager:
             wait_time = min(wait_time * 2, 60)
 
         if total_waited >= max_wait:
-            cls.logger.warning(
+            self.logger.warning(
                 "reached maximum wait time. Some VMs may not have IP addresses.")
 
         # Display connection information
@@ -2783,7 +2783,7 @@ class BoxmanManager:
         # Re-write SSH config with current IPs
         cls.write_ssh_config()
 
-        cls.logger.info("infrastructure is up")
+        self.logger.info("infrastructure is up")
 
     @staticmethod
     def down(cls, cli_args):
@@ -2798,36 +2798,36 @@ class BoxmanManager:
         ``boxman control save`` / ``boxman control suspend``.
         """
         # Ensure provider config reflects runtime settings
-        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
-            cls.provider.update_provider_config_with_runtime()
+        if hasattr(self.provider, 'update_provider_config_with_runtime'):
+            self.provider.update_provider_config_with_runtime()
 
         vm_list = cls.process_vm_list(cli_args)
 
         if not vm_list:
-            cls.logger.info("no VMs found in configuration")
+            self.logger.info("no VMs found in configuration")
             return
 
         use_suspend = getattr(cli_args, 'suspend', False)
 
         if use_suspend:
-            cls.logger.info("suspending all VMs (--suspend)...")
+            self.logger.info("suspending all VMs (--suspend)...")
 
             def _suspend(vm_name):
-                cls.logger.info(f"suspending VM '{vm_name}'...")
-                cls.provider.suspend_vm(vm_name)
-                cls.logger.info(f"VM '{vm_name}' suspended")
+                self.logger.info(f"suspending VM '{vm_name}'...")
+                self.provider.suspend_vm(vm_name)
+                self.logger.info(f"VM '{vm_name}' suspended")
 
             processes = [
                 Process(target=_suspend, args=(vm_name,))
                 for vm_name, _ in vm_list
             ]
         else:
-            cls.logger.info("saving the state of all VMs to disk...")
+            self.logger.info("saving the state of all VMs to disk...")
 
             def _save(vm_name, workdir):
-                cls.logger.info(f"saving VM '{vm_name}' state to '{workdir}'...")
-                cls.provider.save_vm(vm_name, workdir)
-                cls.logger.info(f"VM '{vm_name}' state saved")
+                self.logger.info(f"saving VM '{vm_name}' state to '{workdir}'...")
+                self.provider.save_vm(vm_name, workdir)
+                self.logger.info(f"VM '{vm_name}' state saved")
 
             processes = [
                 Process(target=_save, args=(vm_name, workdir))
@@ -2837,7 +2837,7 @@ class BoxmanManager:
         [p.start() for p in processes]
         [p.join() for p in processes]
 
-        cls.logger.info("infrastructure is down")
+        self.logger.info("infrastructure is down")
 
     @staticmethod
     def deprovision(cls, cli_args):
@@ -2860,8 +2860,8 @@ class BoxmanManager:
         # Ensure provider config reflects runtime settings.
         # Project-level provider settings (from conf.yml) always take
         # precedence over app-level defaults (from boxman.yml).
-        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
-            cls.provider.update_provider_config_with_runtime()
+        if hasattr(self.provider, 'update_provider_config_with_runtime'):
+            self.provider.update_provider_config_with_runtime()
 
         processes = [
             Process(
@@ -2893,7 +2893,7 @@ class BoxmanManager:
 
         runtime = cls.runtime_instance
         if not isinstance(runtime, DockerComposeRuntime):
-            cls.logger.warning(
+            self.logger.warning(
                 f"destroy-runtime is only supported for the docker-compose "
                 f"runtime (current runtime: {runtime.name})")
             return
@@ -2902,7 +2902,7 @@ class BoxmanManager:
         plan = runtime.plan_destroy_runtime()
 
         if not plan["actions"]:
-            cls.logger.info("nothing to do")
+            self.logger.info("nothing to do")
             return
 
         # Display the plan
@@ -2932,7 +2932,7 @@ class BoxmanManager:
         if boxman_dir and os.path.isdir(boxman_dir):
             cls._force_rmtree(boxman_dir)
         else:
-            cls.logger.info("no .boxman directory to remove")
+            self.logger.info("no .boxman directory to remove")
 
     @staticmethod
     def _force_rmtree(path: str) -> None:
@@ -3040,7 +3040,7 @@ class BoxmanManager:
 
         if not (in_cache or ws_present or boxman_dir_present
                 or container_present or templates_present):
-            cls.logger.info(
+            self.logger.info(
                 f"nothing to do — project '{project_name or '?'}' "
                 f"is not registered, no workspace dir, no runtime "
                 f"state on disk")
@@ -3101,13 +3101,13 @@ class BoxmanManager:
             runtime.ensure_ready()
         except Exception as exc:
             runtime_up = False
-            cls.logger.warning(
+            self.logger.warning(
                 f"runtime could not be started ({exc}) — "
                 f"skipping VM-level deprovision")
 
         # 2. deprovision VMs + networks + provisioning files (only when
         #    the runtime and provider session are available)
-        if runtime_up and cls.provider is not None:
+        if runtime_up and self.provider is not None:
             cleanup_args = type("Args", (), {
                 "cleanup": True,
                 "docker_compose": getattr(cli_args, "docker_compose", False),
@@ -3115,7 +3115,7 @@ class BoxmanManager:
             try:
                 cls.deprovision(cls, cleanup_args)
             except Exception as exc:
-                cls.logger.warning(f"deprovision raised: {exc} — continuing")
+                self.logger.warning(f"deprovision raised: {exc} — continuing")
 
         # 3. tear down the docker runtime (reuses _force_rmtree for the
         #    .boxman dir, no double prompt)
@@ -3125,7 +3125,7 @@ class BoxmanManager:
                 if boxman_dir and os.path.isdir(boxman_dir):
                     cls._force_rmtree(boxman_dir)
             except Exception as exc:
-                cls.logger.warning(f"destroy_runtime raised: {exc}")
+                self.logger.warning(f"destroy_runtime raised: {exc}")
 
         # 4. unregister the project from the boxman cache. We do this
         #    unconditionally (in addition to whatever deprovision did)
@@ -3134,7 +3134,7 @@ class BoxmanManager:
         try:
             cls.unregister_from_cache()
         except Exception as exc:
-            cls.logger.warning(f"unregister_from_cache raised: {exc}")
+            self.logger.warning(f"unregister_from_cache raised: {exc}")
 
         # 5. nuke the workspace workdir
         if workspace_path:
@@ -3144,7 +3144,7 @@ class BoxmanManager:
         for tpl_dir in template_dirs:
             cls._force_rmtree(tpl_dir)
 
-        cls.logger.info("destroy complete")
+        self.logger.info("destroy complete")
 
     ### start snapshot functions ####
     @staticmethod
@@ -3156,7 +3156,7 @@ class BoxmanManager:
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                cls.provider.snapshot_list(full_vm_name)
+                self.provider.snapshot_list(full_vm_name)
 
     @staticmethod
     def snapshot_take(cls, cli_args):
@@ -3175,7 +3175,7 @@ class BoxmanManager:
         ]
 
         def _take(full_vm_name, vm_dir, snapshot_name, description):
-            cls.provider.snapshot_take(
+            self.provider.snapshot_take(
                 vm_name=full_vm_name,
                 vm_dir=vm_dir,
                 snapshot_name=snapshot_name,
@@ -3190,23 +3190,23 @@ class BoxmanManager:
         [p.join() for p in processes]
 
         # Verify every snapshot in the main process after all takes complete.
-        cls.logger.info("verifying snapshots after take...")
+        self.logger.info("verifying snapshots after take...")
         all_ok = True
         for full_vm_name, _ in vm_targets:
-            valid, errors = cls.provider.validate_snapshot(
+            valid, errors = self.provider.validate_snapshot(
                 full_vm_name, cli_args.snapshot_name)
             if valid:
-                cls.logger.info(f"snapshot ok: {full_vm_name} / '{cli_args.snapshot_name}'")
+                self.logger.info(f"snapshot ok: {full_vm_name} / '{cli_args.snapshot_name}'")
             else:
                 all_ok = False
                 for err in errors:
-                    cls.logger.error(
+                    self.logger.error(
                         f"snapshot invalid: {full_vm_name} / '{cli_args.snapshot_name}': {err}")
 
         if all_ok:
-            cls.logger.info("all snapshots verified successfully")
+            self.logger.info("all snapshots verified successfully")
         else:
-            cls.logger.error("one or more snapshots failed verification — check errors above")
+            self.logger.error("one or more snapshots failed verification — check errors above")
 
     @staticmethod
     def snapshot_restore(cls, cli_args):
@@ -3229,43 +3229,43 @@ class BoxmanManager:
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 snap_name = cli_args.snapshot_name
                 if not snap_name:
-                    snap_name = cls.provider.get_latest_snapshot(full_vm_name)
+                    snap_name = self.provider.get_latest_snapshot(full_vm_name)
                     if snap_name is None:
-                        cls.logger.error(
+                        self.logger.error(
                             f"no snapshot found for {full_vm_name}, aborting restore")
                         return
-                    cls.logger.info(
+                    self.logger.info(
                         f"resolved latest snapshot for {full_vm_name}: '{snap_name}'")
                 vm_targets.append((full_vm_name, snap_name))
 
         # ── 2. Pre-validate all snapshots ────────────────────────────────────
-        cls.logger.info("pre-validating snapshots before restore...")
+        self.logger.info("pre-validating snapshots before restore...")
         abort = False
         for full_vm_name, snap_name in vm_targets:
-            valid, errors = cls.provider.validate_snapshot(full_vm_name, snap_name)
+            valid, errors = self.provider.validate_snapshot(full_vm_name, snap_name)
             if valid:
-                cls.logger.info(f"snapshot ok: {full_vm_name} / '{snap_name}'")
+                self.logger.info(f"snapshot ok: {full_vm_name} / '{snap_name}'")
             else:
                 abort = True
                 for err in errors:
-                    cls.logger.error(
+                    self.logger.error(
                         f"snapshot invalid: {full_vm_name} / '{snap_name}': {err}")
 
         if abort:
-            cls.logger.error(
+            self.logger.error(
                 "aborting restore — one or more snapshots have errors (see above)")
             return
 
         # ── 3 & 4. Parallel restore with retry until all succeed ─────────────
         def _restore(full_vm_name, snapshot_name, queue):
-            ok = cls.provider.snapshot_restore(full_vm_name, snapshot_name)
+            ok = self.provider.snapshot_restore(full_vm_name, snapshot_name)
             queue.put((full_vm_name, snapshot_name, ok))
 
         pending = list(vm_targets)
         max_rounds = 20
 
         for round_num in range(1, max_rounds + 1):
-            cls.logger.info(
+            self.logger.info(
                 f"restore round {round_num}: {len(pending)} VM(s) to restore")
 
             q = Queue()
@@ -3280,21 +3280,21 @@ class BoxmanManager:
             while not q.empty():
                 vm, snap, ok = q.get()
                 if ok:
-                    cls.logger.info(f"restored: {vm} to '{snap}'")
+                    self.logger.info(f"restored: {vm} to '{snap}'")
                 else:
-                    cls.logger.warning(f"failed: {vm} to '{snap}', will retry")
+                    self.logger.warning(f"failed: {vm} to '{snap}', will retry")
                     failed.append((vm, snap))
 
             if not failed:
-                cls.logger.info("all VMs restored successfully")
+                self.logger.info("all VMs restored successfully")
                 return
 
             pending = failed
             if round_num < max_rounds:
-                cls.logger.info(f"{len(failed)} VM(s) failed, retrying in 3s...")
+                self.logger.info(f"{len(failed)} VM(s) failed, retrying in 3s...")
                 time.sleep(3)
 
-        cls.logger.error(
+        self.logger.error(
             f"restore gave up after {max_rounds} rounds. "
             f"still failing: {[vm for vm, _ in pending]}")
 
@@ -3305,15 +3305,15 @@ class BoxmanManager:
         Delete a snapshot of the VMs in the cluster.
         """
         if not cli_args.snapshot_name:
-            cls.logger.error("error: Snapshot name is required")
+            self.logger.error("error: Snapshot name is required")
             return
 
         prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                cls.provider.snapshot_delete(full_vm_name, cli_args.snapshot_name)
-                cls.logger.info(f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
+                self.provider.snapshot_delete(full_vm_name, cli_args.snapshot_name)
+                self.logger.info(f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
     ### end snapshot functions ####
 
     ### start control vm functions ####
@@ -3336,8 +3336,8 @@ class BoxmanManager:
         Suspend (pause) the VMs in the cluster.
         """
         for vm_name, _ in cls.process_vm_list(cli_args):
-            cls.provider.suspend_vm(vm_name)
-            cls.logger.info(f"vm {vm_name} suspended")
+            self.provider.suspend_vm(vm_name)
+            self.logger.info(f"vm {vm_name} suspended")
 
     @staticmethod
     def resume_vm(cls, cli_args):
@@ -3345,8 +3345,8 @@ class BoxmanManager:
         Resume previously suspended VMs in the cluster.
         """
         for vm_name, _ in cls.process_vm_list(cli_args):
-            cls.provider.resume_vm(vm_name)
-            cls.logger.info(f"VM {vm_name} resumed")
+            self.provider.resume_vm(vm_name)
+            self.logger.info(f"VM {vm_name} resumed")
 
     @staticmethod
     def save_vm(cls, cli_args):
@@ -3354,7 +3354,7 @@ class BoxmanManager:
         Save the state of the VMs in the cluster to a file.
         """
         for vm_name, workdir in cls.process_vm_list(cli_args):
-            cls.provider.save_vm(vm_name, workdir)
+            self.provider.save_vm(vm_name, workdir)
 
     @staticmethod
     def start_vm(cls, cli_args):
@@ -3363,9 +3363,9 @@ class BoxmanManager:
         """
         for vm_name, workdir in cls.process_vm_list(cli_args):
             if cli_args.restore:
-                cls.provider.restore_vm(vm_name, workdir)
+                self.provider.restore_vm(vm_name, workdir)
             else:
-                cls.provider.start_vm(vm_name)
+                self.provider.start_vm(vm_name)
     ### end control vm functions ####
 
     ### task runner functions ####
@@ -3987,8 +3987,8 @@ class BoxmanManager:
         workdir = os.path.abspath(os.path.expanduser(cluster['workdir']))
 
         # ensure provider config reflects runtime settings
-        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
-            cls.provider.update_provider_config_with_runtime()
+        if hasattr(self.provider, 'update_provider_config_with_runtime'):
+            self.provider.update_provider_config_with_runtime()
 
         # --- categorize VMs ---
         expected_vms = set(cls._get_project_vm_names())
@@ -3999,19 +3999,19 @@ class BoxmanManager:
         removed_vm_names = all_existing_vms - expected_vms
 
         if not new_vm_names and not update_vm_names and not removed_vm_names:
-            cls.logger.info("no VMs to add, update, or remove")
+            self.logger.info("no VMs to add, update, or remove")
             return
 
         # --- summary ---
         if new_vm_names:
             short = [n.split('_')[-1] for n in sorted(new_vm_names)]
-            cls.logger.info(f"VM(s) to add: {', '.join(short)}")
+            self.logger.info(f"VM(s) to add: {', '.join(short)}")
         if update_vm_names:
             short = [n.split('_')[-1] for n in sorted(update_vm_names)]
-            cls.logger.info(f"VM(s) to update: {', '.join(short)}")
+            self.logger.info(f"VM(s) to update: {', '.join(short)}")
         if removed_vm_names:
             short = [n.split('_')[-1] for n in sorted(removed_vm_names)]
-            cls.logger.info(f"VM(s) to remove: {', '.join(short)}")
+            self.logger.info(f"VM(s) to remove: {', '.join(short)}")
 
         # --- confirmation for destructive removal ---
         if removed_vm_names and not dry_run and not auto_accept:
@@ -4030,32 +4030,32 @@ class BoxmanManager:
         # --- handle new VMs ---
         if new_vm_names:
             if dry_run:
-                cls.logger.info("[dry-run] would clone and configure new VMs")
+                self.logger.info("[dry-run] would clone and configure new VMs")
             else:
                 # ensure templates exist
                 cls.ensure_templates_exist()
                 try:
                     cls.validate_base_images()
                 except ValueError as exc:
-                    cls.logger.error(str(exc))
+                    self.logger.error(str(exc))
                     return
 
                 cls._clone_and_configure_new_vms(new_vm_names)
 
                 # wait for IPs on new VMs
-                cls.logger.info("waiting for new VMs to get IP addresses...")
+                self.logger.info("waiting for new VMs to get IP addresses...")
                 wait_time = 1
                 max_wait = 300
                 total_waited = 0
                 while total_waited < max_wait:
                     all_have_ips = True
                     for vm_name in new_vm_names:
-                        ips = cls.provider.get_vm_ip_addresses(vm_name)
+                        ips = self.provider.get_vm_ip_addresses(vm_name)
                         if not ips:
                             all_have_ips = False
                             break
                     if all_have_ips:
-                        cls.logger.info(
+                        self.logger.info(
                             f"all new VMs have IP addresses (waited {total_waited}s)")
                         break
                     time.sleep(wait_time)
@@ -4064,7 +4064,7 @@ class BoxmanManager:
 
                 # eject cdrom on new VMs
                 for vm_name in new_vm_names:
-                    cls.provider.eject_cdrom(vm_name)
+                    self.provider.eject_cdrom(vm_name)
 
         # --- handle existing VMs ---
         if update_vm_names:
@@ -4103,27 +4103,27 @@ class BoxmanManager:
             dry_run_items = [n for n, r in results.items() if r['status'] == 'dry_run']
 
             if dry_run_items:
-                cls.logger.info("--- dry-run summary ---")
+                self.logger.info("--- dry-run summary ---")
                 for vm_name in dry_run_items:
-                    cls.logger.info(f"  {vm_name}: {results[vm_name]['details']}")
+                    self.logger.info(f"  {vm_name}: {results[vm_name]['details']}")
 
             if no_change:
-                cls.logger.info(f"no changes: {', '.join(no_change)}")
+                self.logger.info(f"no changes: {', '.join(no_change)}")
             if updated:
-                cls.logger.info(f"updated: {', '.join(updated)}")
+                self.logger.info(f"updated: {', '.join(updated)}")
                 for vm_name in updated:
-                    cls.logger.info(f"  {vm_name}: {results[vm_name]['details']}")
+                    self.logger.info(f"  {vm_name}: {results[vm_name]['details']}")
             if failed:
-                cls.logger.error(f"failed: {', '.join(failed)}")
+                self.logger.error(f"failed: {', '.join(failed)}")
                 for vm_name in failed:
-                    cls.logger.error(f"  {vm_name}: {results[vm_name]['details']}")
+                    self.logger.error(f"  {vm_name}: {results[vm_name]['details']}")
 
         # --- handle removed VMs ---
         if removed_vm_names:
             if dry_run:
-                cls.logger.info("[dry-run] would destroy the following VMs:")
+                self.logger.info("[dry-run] would destroy the following VMs:")
                 for vm_name in sorted(removed_vm_names):
-                    cls.logger.info(f"  {vm_name}")
+                    self.logger.info(f"  {vm_name}")
             else:
                 processes = [
                     Process(
@@ -4136,7 +4136,7 @@ class BoxmanManager:
                 [p.join() for p in processes]
 
                 short = [n.split('_')[-1] for n in sorted(removed_vm_names)]
-                cls.logger.info(
+                self.logger.info(
                     f"removed {len(removed_vm_names)} VM(s): "
                     f"{', '.join(short)}")
 
@@ -4146,3 +4146,41 @@ class BoxmanManager:
             cls.connect_info()
 
     ### end update functions ####
+
+    def pxe_boot(self, cli_args):
+        """
+        Set boot order to network-first on a VM, start it, optionally wait
+        for SSH, and optionally restore the boot order afterwards.
+
+        Designed to be used with a Cobbler PXE provisioning server.
+        """
+        session = self.provider
+        vm_name = cli_args.vm
+
+        self.logger.info(f"setting boot order to [network, hd] for '{vm_name}'")
+        if not session.set_boot_order(vm_name, ['network', 'hd']):
+            self.logger.error(f"failed to set boot order for '{vm_name}'")
+            return False
+
+        self.logger.info(f"starting VM '{vm_name}'")
+        if not session.start_vm(vm_name):
+            self.logger.error(f"failed to start VM '{vm_name}'")
+            return False
+
+        if cli_args.expected_ip:
+            ok = session.wait_for_ssh(
+                cli_args.expected_ip,
+                timeout=cli_args.wait_timeout,
+            )
+            if not ok:
+                self.logger.error(
+                    f"SSH timeout waiting for '{vm_name}' at "
+                    f"{cli_args.expected_ip}")
+                return False
+
+            if cli_args.restore_after:
+                self.logger.info(
+                    f"restoring boot order to [hd] for '{vm_name}'")
+                session.restore_boot_order(vm_name)
+
+        return True
