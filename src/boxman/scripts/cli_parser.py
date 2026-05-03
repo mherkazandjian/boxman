@@ -164,6 +164,41 @@ def parse_args():
                                              # supported providers list below
 
     #
+    # sub parser for the 'image' subcommand (OCI registry image operations)
+    #
+    parser_image = subparsers.add_parser(
+        'image',
+        help='OCI registry image operations (push, ...)')
+    subparsers_image = parser_image.add_subparsers(help='sub-commands for boxman image')
+
+    #
+    # sub parser for the 'image push' subsubcommand
+    #
+    parser_image_push = subparsers_image.add_parser(
+        'push',
+        help='push a qcow2 image (and optional metadata) to an OCI registry')
+    parser_image_push.set_defaults(func=BoxmanManager.push_image)
+    parser_image_push.add_argument(
+        'image_ref',
+        type=str,
+        help='OCI image reference (e.g. registry.example.com/repo:tag)'
+    )
+    parser_image_push.add_argument(
+        '--qcow2',
+        type=str,
+        help='path to the qcow2 disk image file to push',
+        dest='qcow2',
+        required=True
+    )
+    parser_image_push.add_argument(
+        '--metadata',
+        type=str,
+        help='optional path to a vmimage.json metadata file',
+        dest='metadata',
+        required=False
+    )
+
+    #
     # sub parser for creating templates from cloud images
     #
     parser_create_templates = subparsers.add_parser(

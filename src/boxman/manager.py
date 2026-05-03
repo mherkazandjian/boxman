@@ -775,6 +775,26 @@ class BoxmanManager:
         )
 
     @staticmethod
+    def push_image(_cls, cli_args) -> None:
+        """
+        Push a qcow2 image (and optional metadata) to an OCI registry.
+
+        Provider-agnostic — delegates to the ``oras`` CLI. ``_cls`` is unused
+        but kept for signature consistency with the other CLI dispatchers.
+        """
+        from boxman.providers.libvirt.oci_push import push_oci_image
+        try:
+            push_oci_image(
+                image_ref=cli_args.image_ref,
+                qcow2_path=cli_args.qcow2,
+                metadata_path=getattr(cli_args, 'metadata', None),
+            )
+            print(f"successfully pushed image to {cli_args.image_ref}", flush=True)
+        except (ValueError, RuntimeError) as exc:
+            print(f"error pushing image: {exc}", flush=True)
+            raise SystemExit(1) from exc
+
+    @staticmethod
     def create_templates(cls, cli_args) -> None:
         """
         Create template VMs from cloud images using cloud-init.
