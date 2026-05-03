@@ -15,6 +15,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - **Cloud-init template creation**: build template VMs from cloud images with inline cloud-init config
 - **Auto-creation of templates on provision**: if a cluster's `base_image` references a template defined in the `templates` section and the template VM does not yet exist, it is automatically created before provisioning proceeds
 - **Image caching**: downloaded cloud base images are stored in a local cache directory so the same image is only downloaded once across multiple projects
+- **Image import**: define a libvirt VM from a pre-built `(disk + XML)` package described by a JSON manifest, served from disk or over HTTP/HTTPS — see [Image Management](doc/image-management.md)
 - **Runtime environments**: execute provider commands locally or inside a Docker container
 - **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
 - **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow disks
@@ -341,16 +342,26 @@ boxman ssh 1
 
 ### Import VM images
 
-````bash
-# download and extract the vm package from a given url
-curl -L http://example.com/vm-package.tar.gz | tar xv -C ~/tmp/sandbox/
+`boxman import-image` defines a libvirt VM from a pre-built package
+(disk image + domain XML + manifest). The manifest URI can be a local
+file or an HTTP(S) URL:
 
-# import a vm from a disk, a directory called my-ubuntu-vm will be created in ~/myvms
-boxman import-image --uri file://~/http://example.com/vm-package.tar.gz \
-  --directory ~/myvms  \
-  --name my-ubuntu-vm \
+````bash
+# Local package (manifest + relative disk + xml on disk)
+boxman import-image \
+  --uri file:///srv/vm-packages/vendor-vm/manifest.json \
+  --directory ~/myvms \
+  --name my-imported-vm \
   --provider libvirt
+
+# Remote manifest (downloaded once, cached)
+boxman import-image \
+  --uri https://internal.example.com/vms/lab-appliance-01/manifest.json \
+  --directory ~/myvms \
+  --name lab-appliance-01
 ````
+
+Manifest schema and full reference: see [doc/image-management.md](doc/image-management.md).
 
 ## Development
 
