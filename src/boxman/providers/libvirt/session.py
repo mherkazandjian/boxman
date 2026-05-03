@@ -1,4 +1,3 @@
-import json
 import os
 import time
 from multiprocessing import Process, Queue
@@ -117,24 +116,24 @@ class LibVirtSession:
     def import_image(self,
                      manifest_uri: str,
                      vm_name: str,
-                     vm_dir: str) -> bool:
+                     vm_dir: str,
+                     manifest_local_path: str | None = None) -> bool:
         """
         Import an image into the libvirt storage pool.
 
-        :param manifest_uri: URI of the manifest of the image to import
+        :param manifest_uri: URI of the manifest (file://, http://, https://)
         :param vm_name: Name to assign to the imported VM
         :param vm_dir: Directory for the imported VM
+        :param manifest_local_path: optional pre-resolved local path of the
+            manifest (passed by the CLI when it already fetched the manifest
+            to determine the provider type — avoids a second HTTP request).
         :return: True if successful, False otherwise
         """
-        if manifest_uri.startswith('file://'):
-            manifest_path = os.path.expanduser(manifest_uri[len('file://'):])
-            with open(manifest_path) as fobj:
-                manifest = json.load(fobj)
-        elif manifest_uri.startswith('http://') or manifest_uri.startswith('https://'):
-            raise NotImplementedError('http/https image uris are not implemented yet')
+        if manifest_local_path is None:
+            _, manifest_local_path = ImageImporter.load_manifest_from_uri(manifest_uri)
 
         image_importer = ImageImporter(
-            manifest_path=manifest_path,
+            manifest_path=manifest_local_path,
             uri=self.manager.config['uri'],
             disk_dir=vm_dir,
             vm_name=vm_name,

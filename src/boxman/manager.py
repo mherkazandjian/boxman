@@ -770,7 +770,8 @@ class BoxmanManager:
         cls.provider.import_image(
             manifest_uri=cli_args.manifest_uri,
             vm_name=cli_args.vm_name,
-            vm_dir=cli_args.vm_dir
+            vm_dir=cli_args.vm_dir,
+            manifest_local_path=getattr(cli_args, 'manifest_local_path', None),
         )
 
     @staticmethod
