@@ -20,6 +20,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - **Runtime environments**: execute provider commands locally or inside a Docker container
 - **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
 - **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow disks
+- **Disk reclaim and storage hygiene**: `boxman storage` inspects qcow2 footprint, runs guest-side fstrim, compacts qcow2 files, and compresses snapshot memory dumps with zstd — see [Disk Reclaim and Storage](doc/storage.md)
 
 ## Quick Start
 
@@ -304,10 +305,16 @@ fallback is used automatically by `destroy` and `destroy-runtime`.
 ````bash
 export BOXMAN_ADMIN_PASS=$(cat ~/.onlyme/rocky-95-minimal-base-template-admin-pass)
 boxman provision
-boxman snapshot --name "state before kernel upgrade"
+boxman snapshot take --name "pre-upgrade" --compress-memory
 # ... upgrade the kernel and then end up with a kernel panic
-boxman restore --name "state before kernel upgrade"
+boxman restore --name "pre-upgrade"
 ````
+
+The `--compress-memory` flag zstd-compresses the snapshot memory dump
+(typically a ~71% reduction at sub-second/GB). Restore decompresses
+transparently — no flag needed at revert time. See
+[Disk Reclaim and Storage](doc/storage.md) for the full reclaim
+workflow and the `boxman storage` subcommand.
 
 ### SSH into VMs
 
@@ -364,6 +371,46 @@ boxman import-image \
 
 Manifest schema and full reference: see [doc/image-management.md](doc/image-management.md).
 
+### Disk reclaim and storage hygiene
+
+VM qcow2 files can balloon to several times their real footprint over a
+project's lifetime — guest deletes don't propagate without
+`discard='unmap'`, sparse holes never get reclaimed, and snapshot memory
+dumps land uncompressed at full RAM size. `boxman storage` addresses all
+three:
+
+```bash
+# Read-only — see where space is going (per-disk + snapshot memory)
+boxman storage df
+
+# Run fstrim inside every running guest (via qemu-guest-agent)
+boxman storage trim
+
+# Compact qcow2 files. Auto-shuts down running VMs and restarts them.
+# `auto` picks virt-sparsify when snapshots exist, qemu-img convert otherwise.
+boxman storage compact
+
+# Trim → compact → restart in one go
+boxman storage optimize
+
+# Compress snapshot memory .raw files (zstd, ~71% reduction at level 3).
+# Restore is transparent — no flag needed at revert.
+boxman snapshot take --name pre-upgrade --compress-memory
+boxman storage compress-snapshots          # apply retroactively
+```
+
+`discard='unmap'` is now the default for *new* VMs across all four
+disk-creation paths (`disk.py`, `bare_vm.py`, `cloudinit.py`,
+`template_manager.py`). Existing VMs need a `virsh edit` + reboot to
+pick it up — `boxman storage trim` warns when the attribute is missing.
+
+The bundled docker runtime image already ships `guestfs-tools` (for
+`virt-sparsify`) and `zstd`. On the local runtime, install both on
+the host before the first `compact` / `compress-snapshots`.
+
+Full reference, flag matrix, and troubleshooting:
+[doc/storage.md](doc/storage.md).
+
 ## Development
 
 ### Run boxman in development mode
@@ -410,10 +457,20 @@ This project is licensed under the [MIT License](../LICENSE).
   and `--templates` to also remove template workdirs
 - `deprovision` — deprovision a configuration
 - `snapshot` — manage snapshots of VMs
-  - `snapshot take` — take a snapshot
+  - `snapshot take` — take a snapshot (`--compress-memory` zstd-compresses
+    the memory dump; restore decompresses transparently)
   - `snapshot list` — list snapshots
   - `snapshot restore` — restore VM state from a snapshot
   - `snapshot delete` — delete a snapshot
+- `storage` — inspect and reclaim qcow2 disk space
+  - `storage df` — per-VM table of virtual / allocated size, chain depth,
+    snapshot count, snapshot memory total, reclaim estimate
+  - `storage trim` — guest-side `fstrim` via `virsh domfstrim`
+  - `storage compact` — host-side qcow2 reclaim (sparsify or
+    `qemu-img convert`); auto-shuts down running VMs by default
+  - `storage optimize` — orchestrator: trim → compact → restart
+  - `storage compress-snapshots` — zstd-compress (or `--decompress`)
+    snapshot memory `.raw` files retroactively
 - `control` — control the state of VMs
   - `control suspend` — suspend VMs
   - `control resume` — resume VMs

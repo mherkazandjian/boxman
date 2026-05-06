@@ -306,6 +306,9 @@ Rocky Linux 9.6
 - `supervisor` — process manager (libvirtd, virtlogd, sshd, dnsmasq)
 - `openssh-server` — SSH access
 - `dnsmasq`, `bridge-utils`, `iptables`, `nftables` — networking
+- `guestfs-tools` — `virt-sparsify` for `boxman storage compact`
+- `zstd` — snapshot memory compression for
+  `boxman snapshot take --compress-memory` and `boxman storage compress-snapshots`
 
 ### Users
 
