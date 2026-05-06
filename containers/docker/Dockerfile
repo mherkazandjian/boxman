@@ -25,6 +25,8 @@ RUN dnf install -y epel-release && \
         sshpass \
         sudo \
         rsync \
+        guestfs-tools \
+        zstd \
     && dnf clean all
 
 COPY supervisord.conf /etc/supervisord.conf

@@ -3325,12 +3325,17 @@ class BoxmanManager:
             for vm_name, _ in cluster['vms'].items()
         ]
 
+        compress_memory = getattr(cli_args, 'compress_memory', False)
+        compress_level = getattr(cli_args, 'memory_compress_level', 3)
+
         def _take(full_vm_name, vm_dir, snapshot_name, description):
             cls.provider.snapshot_take(
                 vm_name=full_vm_name,
                 vm_dir=vm_dir,
                 snapshot_name=snapshot_name,
-                description=description)
+                description=description,
+                compress_memory=compress_memory,
+                compress_level=compress_level)
 
         processes = [
             Process(target=_take, args=(full_vm_name, vm_dir,
@@ -3466,6 +3471,228 @@ class BoxmanManager:
                 cls.provider.snapshot_delete(full_vm_name, cli_args.snapshot_name)
                 cls.logger.info(f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
     ### end snapshot functions ####
+
+    ### start storage functions ####
+    @staticmethod
+    def _storage_targets(cls, cli_args=None):
+        """Yield ``(full_vm_name, workdir, vm_info)`` for every VM in every cluster."""
+        prj_name = f'bprj__{cls.config["project"]}__bprj'
+        for cluster_name, cluster in cls.config['clusters'].items():
+            workdir = os.path.expanduser(cluster['workdir'])
+            for vm_name, vm_info in cluster['vms'].items():
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                yield full_vm_name, workdir, vm_info or {}
+
+    @staticmethod
+    def _format_bytes(num: int | None) -> str:
+        if num is None:
+            return "-"
+        for unit in ("B", "K", "M", "G", "T"):
+            if abs(num) < 1024.0:
+                return f"{num:.1f}{unit}"
+            num /= 1024.0
+        return f"{num:.1f}P"
+
+    @staticmethod
+    def storage_df(cls, cli_args):
+        """
+        Per-VM disk usage table: virtual size, allocated, chain depth,
+        snapshots, snapshot memory (.raw) total, estimated reclaim.
+        """
+        from boxman.providers.libvirt.storage import vm_disk_paths
+
+        storage = cls.provider.storage
+        rows = []
+        snap_mem_total_per_vm: dict[str, int] = {}
+        for full_vm_name, workdir, vm_info in cls._storage_targets(cls, cli_args):
+            disks = vm_disk_paths(workdir, full_vm_name, vm_info)
+            snap_count = storage.count_snapshots(full_vm_name)
+            mem_files = storage.snapshot_memory_files(workdir, full_vm_name)
+            mem_total = sum(os.path.getsize(p) for p in mem_files if os.path.isfile(p))
+            snap_mem_total_per_vm[full_vm_name] = mem_total
+            for disk_path in disks:
+                if not os.path.isfile(disk_path):
+                    continue
+                info = storage.disk_info(disk_path)
+                chain = storage.disk_chain(disk_path)
+                measure = storage.disk_measure(disk_path)
+                disk_size = info.get('actual-size')
+                virtual = info.get('virtual-size')
+                required = measure.get('required')
+                reclaim_est = (disk_size - required
+                               if disk_size is not None and required is not None
+                               else None)
+                rows.append({
+                    'vm': full_vm_name,
+                    'disk': os.path.basename(disk_path),
+                    'virtual': virtual,
+                    'allocated': disk_size,
+                    'chain': len(chain),
+                    'snapshots': snap_count,
+                    'snap_mem': mem_total,
+                    'reclaim_est': reclaim_est,
+                })
+
+        # render
+        header = (f"{'VM':<48}{'DISK':<28}{'VIRTUAL':>10}{'ALLOC':>10}"
+                  f"{'CHAIN':>6}{'SNAPS':>7}{'SNAPMEM':>10}{'RECLAIM~':>10}")
+        cls.logger.info(header)
+        cls.logger.info("-" * len(header))
+        for row in rows:
+            line = (
+                f"{row['vm']:<48}"
+                f"{row['disk']:<28}"
+                f"{cls._format_bytes(row['virtual']):>10}"
+                f"{cls._format_bytes(row['allocated']):>10}"
+                f"{row['chain']:>6}"
+                f"{row['snapshots']:>7}"
+                f"{cls._format_bytes(row['snap_mem']):>10}"
+                f"{cls._format_bytes(row['reclaim_est']):>10}"
+            )
+            cls.logger.info(line)
+        if not rows:
+            cls.logger.info("(no qcow2 disks found on host)")
+
+    @staticmethod
+    def storage_trim(cls, cli_args):
+        """
+        Run ``virsh domfstrim`` (qemu-guest-agent) on every running VM.
+        Warns when a VM's disks lack ``discard='unmap'`` — fstrim will succeed
+        but nothing will be returned to the host.
+        """
+        storage = cls.provider.storage
+        for full_vm_name, _workdir, _vm_info in cls._storage_targets(cls, cli_args):
+            if not storage.is_running(full_vm_name):
+                cls.logger.warning(
+                    f"skip trim: vm {full_vm_name} is not running")
+                continue
+            if not storage.has_discard_unmap(full_vm_name):
+                cls.logger.warning(
+                    f"vm {full_vm_name}: no discard='unmap' on disks — fstrim "
+                    f"will not reclaim host space. fix: edit the domain XML "
+                    f"(`virsh edit {full_vm_name}`) or recreate via "
+                    f"`boxman destroy && boxman up`.")
+            if getattr(cli_args, 'dry_run', False):
+                cls.logger.info(f"[dry-run] would fstrim: {full_vm_name}")
+                continue
+            storage.fstrim_guest(full_vm_name)
+
+    @staticmethod
+    def _compact_one_vm(provider_config, full_vm_name, workdir, vm_info,
+                        method, drop_snapshots, no_shutdown, dry_run):
+        """Worker target for parallel compact — must be picklable."""
+        from boxman.providers.libvirt.storage import StorageManager, vm_disk_paths
+
+        storage = StorageManager(provider_config)
+        disks = [p for p in vm_disk_paths(workdir, full_vm_name, vm_info)
+                 if os.path.isfile(p)]
+        if not disks:
+            log.info(f"compact: no disks found for {full_vm_name}, skipping")
+            return
+
+        was_running = storage.is_running(full_vm_name)
+        if was_running:
+            if no_shutdown:
+                log.error(
+                    f"compact: vm {full_vm_name} is running and --no-shutdown "
+                    f"was passed; skipping")
+                return
+            if dry_run:
+                log.info(f"[dry-run] would shutdown {full_vm_name}")
+            else:
+                if not storage.shutdown_and_wait(full_vm_name):
+                    log.error(f"compact: shutdown failed for {full_vm_name}, skipping")
+                    return
+
+        has_snapshots = storage.count_snapshots(full_vm_name) > 0
+        for disk_path in disks:
+            before = storage.disk_info(disk_path).get('actual-size', 0)
+            if dry_run:
+                measure = storage.disk_measure(disk_path)
+                est = measure.get('required')
+                log.info(
+                    f"[dry-run] {full_vm_name}: would compact {os.path.basename(disk_path)} "
+                    f"method={method} allocated={before} estimated_after={est}")
+                continue
+            ok = storage.compact_disk(
+                disk_path,
+                method=method,
+                has_snapshots=has_snapshots,
+                drop_snapshots=drop_snapshots)
+            after = storage.disk_info(disk_path).get('actual-size', 0)
+            if ok:
+                log.info(
+                    f"compact ok: {full_vm_name}/{os.path.basename(disk_path)} "
+                    f"{before} -> {after}")
+            else:
+                log.error(
+                    f"compact failed: {full_vm_name}/{os.path.basename(disk_path)}")
+
+        if was_running and not no_shutdown and not dry_run:
+            if not storage.start(full_vm_name):
+                log.error(f"compact: failed to restart {full_vm_name}")
+
+    @staticmethod
+    def storage_compact(cls, cli_args):
+        """
+        Compact every VM's qcow2 file(s). Auto-shuts down running VMs by
+        default (use ``--no-shutdown`` to skip running VMs instead). Refuses
+        chain-flattening methods when snapshots exist unless
+        ``--drop-snapshots`` is passed.
+        """
+        targets = list(cls._storage_targets(cls, cli_args))
+        method = getattr(cli_args, 'method', 'auto')
+        drop_snapshots = getattr(cli_args, 'drop_snapshots', False)
+        no_shutdown = getattr(cli_args, 'no_shutdown', False)
+        dry_run = getattr(cli_args, 'dry_run', False)
+
+        provider_config = cls.provider.provider_config
+        processes = [
+            Process(
+                target=BoxmanManager._compact_one_vm,
+                args=(provider_config, full_vm_name, workdir, vm_info,
+                      method, drop_snapshots, no_shutdown, dry_run))
+            for full_vm_name, workdir, vm_info in targets
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+    @staticmethod
+    def storage_optimize(cls, cli_args):
+        """
+        Trim every running VM (via guest agent) and compact every VM's
+        qcow2 file(s). Auto-shutdown semantics from ``storage_compact`` apply.
+        """
+        if not getattr(cli_args, 'skip_trim', False):
+            cls.logger.info("storage optimize: phase 1 — trim (guest fstrim)")
+            cls.storage_trim(cls, cli_args)
+        else:
+            cls.logger.info("storage optimize: skipping trim phase (--skip-trim)")
+
+        if not getattr(cli_args, 'skip_compact', False):
+            cls.logger.info("storage optimize: phase 2 — compact (host qcow2)")
+            cls.storage_compact(cls, cli_args)
+        else:
+            cls.logger.info("storage optimize: skipping compact phase (--skip-compact)")
+
+    @staticmethod
+    def storage_compress_snapshots(cls, cli_args):
+        """
+        zstd-compress every snapshot's memory ``.raw`` file (or decompress
+        with ``--decompress``). Use this retroactively on snapshots that
+        were taken without ``--compress-memory``.
+        """
+        decompress = getattr(cli_args, 'decompress', False)
+        level = getattr(cli_args, 'level', 3)
+        action = "decompress" if decompress else "compress"
+        for full_vm_name, _workdir, _vm_info in cls._storage_targets(cls, cli_args):
+            cls.logger.info(f"storage {action}-snapshots: {full_vm_name}")
+            processed, total = cls.provider.compress_snapshots_memory(
+                full_vm_name, level=level, decompress=decompress)
+            cls.logger.info(
+                f"  {action}ed {processed}/{total} snapshot memory file(s) "
+                f"for {full_vm_name}")
+    ### end storage functions ####
 
     ### start control vm functions ####
     def process_vm_list(self, cli_args):

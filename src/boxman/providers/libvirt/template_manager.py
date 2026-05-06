@@ -204,7 +204,7 @@ class TemplateManager:
 
         # build disk arguments — virt-install accepts multiple --disk flags
         # so we construct the raw command string
-        disk_main = f"path={disk_path},format=qcow2,bus=virtio"
+        disk_main = f"path={disk_path},format=qcow2,bus=virtio,discard=unmap"
         disk_seed = f"path={seed_iso_path},device=cdrom"
 
         cmd_parts = []

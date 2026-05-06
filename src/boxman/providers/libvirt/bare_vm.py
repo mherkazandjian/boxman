@@ -54,7 +54,7 @@ class BareVM:
         parts.append(f"--name={self.vm_name}")
         parts.append(f"--memory={memory}")
         parts.append(f"--vcpus={vcpus}")
-        parts.append(f"--disk=path={disk_path},format=qcow2,bus=virtio")
+        parts.append(f"--disk=path={disk_path},format=qcow2,bus=virtio,discard=unmap")
         parts.append(f"--network=network={network},model=virtio")
         parts.append("--boot=network,hd")
         parts.append("--os-variant=detect=on,require=off")

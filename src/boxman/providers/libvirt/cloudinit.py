@@ -806,7 +806,7 @@ class CloudInitTemplate:
             parts.append(f"--vcpus={self.vcpus}")
             parts.append(f"--os-variant={self.os_variant}")
             parts.append("--import")
-            parts.append(f"--disk=path={dst_image_path},format={self.disk_format},bus=virtio")
+            parts.append(f"--disk=path={dst_image_path},format={self.disk_format},bus=virtio,discard=unmap")
             parts.append(f"--disk=path={seed_iso_path},device=cdrom")
 
             # Use bridge device directly if resolved, otherwise fall back to network name

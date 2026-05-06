@@ -15,6 +15,7 @@ from .import_image import ImageImporter
 from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
+from .storage import StorageManager, vm_disk_paths
 from .virsh_edit import VirshEdit
 
 
@@ -808,7 +809,9 @@ class LibVirtSession:
                       vm_name=None,
                       vm_dir=None,
                       snapshot_name=None,
-                      description=None):
+                      description=None,
+                      compress_memory: bool = False,
+                      compress_level: int = 3):
         """
         Create a snapshot of a specific VM
 
@@ -817,6 +820,10 @@ class LibVirtSession:
             vm_dir (str): Directory for the VM
             snapshot_name (str): Name for the snapshot
             description (str, optional): Description for the snapshot
+            compress_memory: zstd-compress the memory ``.raw`` file after
+                a successful snapshot. The next ``snapshot restore``
+                decompresses it transparently.
+            compress_level: zstd level (default 3).
 
         Returns:
             bool: True if successful, False otherwise
@@ -828,7 +835,22 @@ class LibVirtSession:
             vm_name=vm_name,
             vm_dir=vm_dir,
             snapshot_name=snapshot_name,
-            description=description)
+            description=description,
+            compress_memory=compress_memory,
+            compress_level=compress_level)
+
+    def compress_snapshots_memory(self,
+                                  vm_name: str,
+                                  level: int = 3,
+                                  decompress: bool = False) -> tuple[int, int]:
+        """
+        Compress (or decompress, if ``decompress=True``) every snapshot's
+        memory ``.raw`` file for *vm_name*. Returns ``(processed, total)``.
+        """
+        snapshot_mgr = SnapshotManager(self.provider_config)
+        if decompress:
+            return snapshot_mgr.decompress_all_memory(vm_name)
+        return snapshot_mgr.compress_all_memory(vm_name, level=level)
 
     def snapshot_list(self, vm_name=None):
         """
@@ -944,6 +966,11 @@ class LibVirtSession:
         snapshot_mgr = SnapshotManager(self.provider_config)
         return snapshot_mgr.delete_snapshot(vm_name, snapshot_name)
     # end snapshots
+
+    @property
+    def storage(self) -> StorageManager:
+        """A fresh :class:`StorageManager` bound to this session's provider config."""
+        return StorageManager(self.provider_config)
 
     ### control vm
     def suspend_vm(self, vm_name: str) -> bool:

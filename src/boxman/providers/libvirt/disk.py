@@ -141,7 +141,7 @@ class DiskManager(VirshCommand):
             XML string for disk attachment
         """
         return f"""<disk type='file' device='disk'>
-  <driver name='{driver_name}' type='{driver_type}'/>
+  <driver name='{driver_name}' type='{driver_type}' discard='unmap'/>
   <source file='{os.path.abspath(os.path.expanduser(disk_path))}'/>
   <target dev='{target_dev}' bus='{bus}'/>
 </disk>"""

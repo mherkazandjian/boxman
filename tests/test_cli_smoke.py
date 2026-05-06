@@ -81,11 +81,114 @@ class TestSubcommandHelps:
         "destroy",
         "snapshot",
         "list",
+        "storage",
     ])
     def test_subcommand_help_exits_zero(self, subcommand: str, capsys):
         assert _run_cli([subcommand, "--help"]) == 0
         out = capsys.readouterr().out
         assert subcommand in out or "usage" in out.lower()
+
+    @pytest.mark.parametrize("subverb",
+                             ["df", "trim", "compact", "optimize",
+                              "compress-snapshots"])
+    def test_storage_subverb_help_exits_zero(self, subverb: str, capsys):
+        assert _run_cli(["storage", subverb, "--help"]) == 0
+        out = capsys.readouterr().out
+        assert subverb in out or "usage" in out.lower()
+
+
+class TestStorageDispatch:
+    """Storage subverbs must wire to the correct BoxmanManager methods."""
+
+    def test_storage_df_dispatch(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(["storage", "df"])
+        assert args.func is BoxmanManager.storage_df
+        assert args.vms == "all"
+
+    def test_storage_trim_dispatch(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(["storage", "trim"])
+        assert args.func is BoxmanManager.storage_trim
+        assert args.dry_run is False
+
+    def test_storage_compact_defaults(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(["storage", "compact"])
+        assert args.func is BoxmanManager.storage_compact
+        assert args.method == "auto"
+        assert args.no_shutdown is False
+        assert args.drop_snapshots is False
+        assert args.dry_run is False
+
+    def test_storage_compact_flags(self):
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args([
+            "storage", "compact",
+            "--method", "convert-compressed",
+            "--drop-snapshots",
+            "--no-shutdown",
+            "--dry-run",
+        ])
+        assert args.method == "convert-compressed"
+        assert args.drop_snapshots is True
+        assert args.no_shutdown is True
+        assert args.dry_run is True
+
+    def test_storage_optimize_dispatch(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(["storage", "optimize", "--skip-trim"])
+        assert args.func is BoxmanManager.storage_optimize
+        assert args.skip_trim is True
+        assert args.skip_compact is False
+
+    def test_storage_compact_rejects_bad_method(self):
+        import pytest as _pytest
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        with _pytest.raises(SystemExit):
+            parser.parse_args(["storage", "compact", "--method", "nuke-from-orbit"])
+
+    def test_storage_compress_snapshots_dispatch(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(["storage", "compress-snapshots"])
+        assert args.func is BoxmanManager.storage_compress_snapshots
+        assert args.level == 3
+        assert args.decompress is False
+
+    def test_storage_compress_snapshots_decompress_flag(self):
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(["storage", "compress-snapshots",
+                                  "--decompress", "--level", "10"])
+        assert args.decompress is True
+        assert args.level == 10
+
+    def test_snapshot_take_compress_memory_flag(self):
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(["snapshot", "take", "--compress-memory",
+                                  "--memory-compress-level", "5"])
+        assert args.compress_memory is True
+        assert args.memory_compress_level == 5
+
+    def test_snapshot_take_compress_memory_default_off(self):
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(["snapshot", "take"])
+        assert args.compress_memory is False
+        assert args.memory_compress_level == 3
 
 
 class TestInvalidArgs:

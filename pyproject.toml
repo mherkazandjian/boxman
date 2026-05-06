@@ -55,8 +55,9 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+addopts = "-m 'not slow and not integration'"
 markers = [
-    "integration: integration tests requiring Docker with compose v2 and /dev/kvm",
+    "integration: integration tests requiring Docker with compose v2 and /dev/kvm; excluded from default runs",
     "unit: fast unit tests that do not touch external systems",
     "smoke: CLI-level smoke tests (argparse, --help, config dry-run)",
     "regression: regression guards for fixes landed in git history",

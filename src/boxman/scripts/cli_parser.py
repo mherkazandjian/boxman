@@ -455,6 +455,20 @@ def parse_args():
         help='take a snapshot without stopping the vm',
         dest='live',
     )
+    parser_snap_take.add_argument(
+        '--compress-memory',
+        action='store_true',
+        dest='compress_memory',
+        help='zstd-compress the memory .raw file after the snapshot is '
+             'created (decompressed transparently on restore)',
+    )
+    parser_snap_take.add_argument(
+        '--memory-compress-level',
+        type=int,
+        default=3,
+        dest='memory_compress_level',
+        help='zstd compression level (default 3 — sweet spot)',
+    )
 
     #
     # sub parser for the 'snapshot list' subsubcommand
@@ -517,6 +531,170 @@ def parse_args():
         'restore',
         help='restore all VMs to their latest snapshot')
     parser_restore.set_defaults(func=BoxmanManager.snapshot_restore, snapshot_name=None)
+
+    #
+    # sub parser for the 'storage' subcommand
+    #
+    parser_storage = subparsers.add_parser(
+        'storage', help='inspect and reclaim qcow2 disk space')
+
+    subparsers_storage = parser_storage.add_subparsers(
+        help='sub-commands for boxman storage')
+
+    #
+    # sub parser for the 'storage df' subsubcommand
+    #
+    parser_storage_df = subparsers_storage.add_parser(
+        'df', help='show per-vm disk usage and reclaim estimate')
+    parser_storage_df.set_defaults(func=BoxmanManager.storage_df)
+    parser_storage_df.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all',
+    )
+
+    #
+    # sub parser for the 'storage trim' subsubcommand
+    #
+    parser_storage_trim = subparsers_storage.add_parser(
+        'trim',
+        help='run fstrim inside running guests via qemu-guest-agent')
+    parser_storage_trim.set_defaults(func=BoxmanManager.storage_trim)
+    parser_storage_trim.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all',
+    )
+    parser_storage_trim.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='print what would be done; do not run fstrim',
+    )
+
+    #
+    # sub parser for the 'storage compact' subsubcommand
+    #
+    parser_storage_compact = subparsers_storage.add_parser(
+        'compact',
+        help='reclaim qcow2 space (sparsify or qemu-img convert)')
+    parser_storage_compact.set_defaults(func=BoxmanManager.storage_compact)
+    parser_storage_compact.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all',
+    )
+    parser_storage_compact.add_argument(
+        '--method',
+        choices=['auto', 'sparsify', 'convert', 'convert-compressed'],
+        default='auto',
+        dest='method',
+        help='compaction method (auto picks sparsify when snapshots exist, '
+             'convert otherwise)',
+    )
+    parser_storage_compact.add_argument(
+        '--no-shutdown',
+        action='store_true',
+        dest='no_shutdown',
+        help='do not auto-shutdown running vms; skip them instead',
+    )
+    parser_storage_compact.add_argument(
+        '--drop-snapshots',
+        action='store_true',
+        dest='drop_snapshots',
+        help='allow chain-flattening methods (convert/convert-compressed) '
+             'when snapshots exist',
+    )
+    parser_storage_compact.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='print before/after estimates; do not write',
+    )
+
+    #
+    # sub parser for the 'storage optimize' subsubcommand
+    #
+    parser_storage_optimize = subparsers_storage.add_parser(
+        'optimize',
+        help='trim guests then compact qcow2 files (orchestrator)')
+    parser_storage_optimize.set_defaults(func=BoxmanManager.storage_optimize)
+    parser_storage_optimize.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all',
+    )
+    parser_storage_optimize.add_argument(
+        '--method',
+        choices=['auto', 'sparsify', 'convert', 'convert-compressed'],
+        default='auto',
+        dest='method',
+    )
+    parser_storage_optimize.add_argument(
+        '--skip-trim',
+        action='store_true',
+        dest='skip_trim',
+        help='skip the guest-side fstrim phase',
+    )
+    parser_storage_optimize.add_argument(
+        '--skip-compact',
+        action='store_true',
+        dest='skip_compact',
+        help='skip the host-side qcow2 compact phase',
+    )
+    parser_storage_optimize.add_argument(
+        '--no-shutdown',
+        action='store_true',
+        dest='no_shutdown',
+        help='do not auto-shutdown running vms during compact',
+    )
+    parser_storage_optimize.add_argument(
+        '--drop-snapshots',
+        action='store_true',
+        dest='drop_snapshots',
+    )
+    parser_storage_optimize.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+    )
+
+    #
+    # sub parser for the 'storage compress-snapshots' subsubcommand
+    #
+    parser_storage_compress = subparsers_storage.add_parser(
+        'compress-snapshots',
+        help='zstd-compress (or decompress) snapshot memory .raw files')
+    parser_storage_compress.set_defaults(
+        func=BoxmanManager.storage_compress_snapshots)
+    parser_storage_compress.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all',
+    )
+    parser_storage_compress.add_argument(
+        '--level',
+        type=int,
+        default=3,
+        dest='level',
+        help='zstd compression level (default 3)',
+    )
+    parser_storage_compress.add_argument(
+        '--decompress',
+        action='store_true',
+        dest='decompress',
+        help='decompress .raw.zst back to .raw instead of compressing',
+    )
 
     #
     # sub parser for the 'control' subcommand

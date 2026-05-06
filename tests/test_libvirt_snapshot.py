@@ -338,6 +338,7 @@ class TestSnapshotRestore:
         preserved_pairs = [("/overlays/a", "/overlays/a.preserve")]
         with patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=preserved_pairs) as preserve, \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", return_value=_result()) as execute, \
              patch.object(sm, "_restore_preserved_overlays") as restore:
             assert sm.snapshot_restore("vm01", "snap1") is True
@@ -349,6 +350,7 @@ class TestSnapshotRestore:
 
     def test_restore_called_even_when_revert_fails(self, sm: SnapshotManager):
         with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
                           return_value=_result(ok=False, stderr="boom")), \
              patch.object(sm, "_restore_preserved_overlays") as restore:
@@ -362,6 +364,7 @@ class TestSnapshotRestore:
             _result(ok=True),
         ]
         with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=results), \
              patch.object(sm, "_restore_preserved_overlays"), \
              patch("boxman.providers.libvirt.snapshot.time.sleep"):
@@ -369,6 +372,7 @@ class TestSnapshotRestore:
 
     def test_does_not_retry_on_non_lock_error(self, sm: SnapshotManager):
         with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
                           return_value=_result(ok=False, stderr="bad name")) as execute, \
              patch.object(sm, "_restore_preserved_overlays"), \
@@ -378,10 +382,153 @@ class TestSnapshotRestore:
 
     def test_exception_still_calls_restore(self, sm: SnapshotManager):
         with patch.object(sm, "_preserve_snapshot_overlays", return_value=[("a", "b")]), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=RuntimeError("x")), \
              patch.object(sm, "_restore_preserved_overlays") as restore:
             assert sm.snapshot_restore("vm01", "snap1") is False
         restore.assert_called_once()
+
+
+class TestMemoryCompression:
+    """zstd compression of the snapshot .raw memory file."""
+
+    def test_compress_no_op_when_already_compressed(self, sm: SnapshotManager,
+                                                    tmp_path: Path):
+        zst = tmp_path / "vm01_snapshot_s.raw.zst"
+        zst.write_bytes(b"compressed")
+        # raw doesn't exist; .zst does → idempotent True
+        with patch.object(sm.virsh, "execute_shell") as shell:
+            assert sm.compress_memory_file(str(tmp_path / "vm01_snapshot_s.raw")) is True
+        shell.assert_not_called()
+
+    def test_compress_runs_zstd_when_available(self, sm: SnapshotManager,
+                                               tmp_path: Path):
+        raw = tmp_path / "vm01_snapshot_s.raw"
+        raw.write_bytes(b"x" * 1024)
+        with patch.object(sm, "_is_zstd_available", return_value=True), \
+             patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
+            assert sm.compress_memory_file(str(raw), level=3) is True
+        cmd = shell.call_args.args[0]
+        assert "zstd -3 -T0 --rm" in cmd
+        assert str(raw) in cmd
+        assert f"{raw}.zst" in cmd
+
+    def test_compress_refuses_when_zstd_missing(self, sm: SnapshotManager,
+                                                tmp_path: Path):
+        raw = tmp_path / "vm01_snapshot_s.raw"
+        raw.write_bytes(b"x")
+        with patch.object(sm, "_is_zstd_available", return_value=False), \
+             patch.object(sm.logger, "error") as err:
+            assert sm.compress_memory_file(str(raw)) is False
+        assert any("zstd" in c.args[0] for c in err.call_args_list)
+
+    def test_decompress_no_op_when_raw_present(self, sm: SnapshotManager,
+                                              tmp_path: Path):
+        raw = tmp_path / "vm01_snapshot_s.raw"
+        zst = tmp_path / "vm01_snapshot_s.raw.zst"
+        raw.write_bytes(b"x")
+        zst.write_bytes(b"y")
+        with patch.object(sm.virsh, "execute_shell") as shell:
+            assert sm.decompress_memory_file(str(raw)) is True
+        shell.assert_not_called()
+
+    def test_decompress_runs_zstd(self, sm: SnapshotManager, tmp_path: Path):
+        raw = tmp_path / "vm01_snapshot_s.raw"
+        zst = tmp_path / "vm01_snapshot_s.raw.zst"
+        zst.write_bytes(b"x")
+        # raw doesn't exist
+        with patch.object(sm, "_is_zstd_available", return_value=True), \
+             patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
+            assert sm.decompress_memory_file(str(raw), keep_zst=True) is True
+        cmd = shell.call_args.args[0]
+        assert "zstd -d" in cmd
+        assert "-k" in cmd
+        assert str(zst) in cmd
+
+    def test_create_snapshot_compresses_when_requested(self, sm: SnapshotManager,
+                                                      tmp_path: Path):
+        with patch.object(sm, "_flatten_cdrom_overlays"), \
+             patch.object(sm, "_cdrom_diskspec_args", return_value=[]), \
+             patch.object(sm.virsh, "execute", return_value=_result()), \
+             patch.object(sm, "compress_memory_file", return_value=True) as compress:
+            assert sm.create_snapshot(
+                "vm01", str(tmp_path), "snap1", "desc",
+                compress_memory=True, compress_level=10) is True
+        compress.assert_called_once()
+        path_arg, kwargs = compress.call_args.args[0], compress.call_args.kwargs
+        assert path_arg == str(tmp_path / "vm01_snapshot_snap1.raw")
+        assert kwargs.get("level") == 10
+
+    def test_create_snapshot_does_not_compress_by_default(self, sm: SnapshotManager,
+                                                         tmp_path: Path):
+        with patch.object(sm, "_flatten_cdrom_overlays"), \
+             patch.object(sm, "_cdrom_diskspec_args", return_value=[]), \
+             patch.object(sm.virsh, "execute", return_value=_result()), \
+             patch.object(sm, "compress_memory_file") as compress:
+            sm.create_snapshot("vm01", str(tmp_path), "snap1", "desc")
+        compress.assert_not_called()
+
+    def test_compress_all_memory_iterates_snapshots(self, sm: SnapshotManager,
+                                                   tmp_path: Path):
+        # two snapshots; one .raw on disk, one already compressed (no .raw)
+        m1 = tmp_path / "vm01_snapshot_a.raw"
+        m1.write_bytes(b"x")
+        m2 = tmp_path / "vm01_snapshot_b.raw"  # NOT created → already compressed
+
+        with patch.object(sm, "list_snapshots",
+                          return_value=[{"name": "a", "description": ""},
+                                        {"name": "b", "description": ""}]), \
+             patch.object(sm, "_memory_path_from_xml",
+                          side_effect=[str(m1), str(m2)]), \
+             patch.object(sm, "compress_memory_file", return_value=True) as compress:
+            compressed, total = sm.compress_all_memory("vm01")
+        assert (compressed, total) == (1, 1)
+        compress.assert_called_once()
+
+
+class TestSnapshotRestoreCompressed:
+    """snapshot_restore must transparently decompress .raw.zst before revert."""
+
+    def test_decompresses_when_only_zst_on_disk(self, sm: SnapshotManager,
+                                                tmp_path: Path):
+        zst = tmp_path / "vm01_snapshot_s.raw.zst"
+        zst.write_bytes(b"x")
+        raw = str(tmp_path / "vm01_snapshot_s.raw")
+        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+             patch.object(sm, "_restore_preserved_overlays"), \
+             patch.object(sm, "_memory_path_from_xml", return_value=raw), \
+             patch.object(sm, "decompress_memory_file",
+                          return_value=True) as decomp, \
+             patch.object(sm, "_recompress_after_revert") as recomp, \
+             patch.object(sm.virsh, "execute", return_value=_result()):
+            assert sm.snapshot_restore("vm01", "s") is True
+        decomp.assert_called_once_with(raw, keep_zst=True)
+        recomp.assert_called_once()
+
+    def test_does_not_decompress_when_raw_present(self, sm: SnapshotManager,
+                                                  tmp_path: Path):
+        raw_path = tmp_path / "vm01_snapshot_s.raw"
+        raw_path.write_bytes(b"x")
+        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+             patch.object(sm, "_restore_preserved_overlays"), \
+             patch.object(sm, "_memory_path_from_xml", return_value=str(raw_path)), \
+             patch.object(sm, "decompress_memory_file") as decomp, \
+             patch.object(sm.virsh, "execute", return_value=_result()):
+            assert sm.snapshot_restore("vm01", "s") is True
+        decomp.assert_not_called()
+
+    def test_recompress_after_revert_removes_raw(self, sm: SnapshotManager,
+                                                 tmp_path: Path):
+        raw = tmp_path / "vm01_snapshot_s.raw"
+        zst = tmp_path / "vm01_snapshot_s.raw.zst"
+        raw.write_bytes(b"x")
+        zst.write_bytes(b"y")
+        with patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
+            sm._recompress_after_revert(str(raw), decompressed_for_revert=True)
+        # When .zst exists, recompress_after_revert just rm's the .raw
+        assert shell.call_count == 1
+        assert "rm -f" in shell.call_args.args[0]
+        assert str(raw) in shell.call_args.args[0]
 
 
 class TestDeleteSnapshot:

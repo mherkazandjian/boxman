@@ -138,7 +138,9 @@ class SnapshotManager:
                         vm_name: str,
                         vm_dir: str,
                         snapshot_name: str,
-                        description: str) -> bool:
+                        description: str,
+                        compress_memory: bool = False,
+                        compress_level: int = 3) -> bool:
         """
         Create a snapshot of a VM.
 
@@ -147,6 +149,13 @@ class SnapshotManager:
             vm_dir: Directory where the VM is located
             snapshot_name: Name for the snapshot
             description: Description for the snapshot
+            compress_memory: If True, zstd-compress the .raw memory file
+                after successful snapshot creation. The libvirt snapshot
+                metadata still references the original .raw path; the
+                ``snapshot_restore`` path detects the .raw.zst sibling and
+                decompresses transparently.
+            compress_level: zstd compression level (default 3 — sweet spot
+                of ~71% reduction at sub-second/GB on commodity CPUs).
 
         Returns:
             bool: True if successful, False otherwise
@@ -159,6 +168,7 @@ class SnapshotManager:
             self._flatten_cdrom_overlays(vm_name)
 
             snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
+            mem_path = os.path.join(vm_dir, snap_fname)
             # Exclude cdroms from the snapshot so no new qcow2 overlay is
             # created for them (they stay at the raw ISO after this call).
             cdrom_args = self._cdrom_diskspec_args(vm_name)
@@ -168,11 +178,16 @@ class SnapshotManager:
                 f"--name {snapshot_name}",
                 f"--description '{description}'",
                 "--atomic",
-                f"--memspec={os.path.join(vm_dir, snap_fname)}",
+                f"--memspec={mem_path}",
                 *cdrom_args)
 
             if result.ok:
                 self.logger.info(f"snapshot '{snapshot_name}' created for vm {vm_name}")
+                if compress_memory:
+                    if not self.compress_memory_file(mem_path, level=compress_level):
+                        self.logger.warning(
+                            f"snapshot '{snapshot_name}' for vm {vm_name}: memory "
+                            f"compression failed; .raw kept on disk")
                 return True
             else:
                 self.logger.error(f"failed to create snapshot for vm {vm_name}: {result.stderr}")
@@ -180,6 +195,138 @@ class SnapshotManager:
         except Exception as exc:
             self.logger.error(f"error creating snapshot for vm {vm_name}: {exc}")
             return False
+
+    # ── memory file compression (zstd) ──────────────────────────────────
+    #
+    # libvirt's --memspec writes a raw memory dump that's typically the
+    # full RAM size of the VM (multi-GB).  zstd -3 reduces this by ~71%
+    # at sub-second/GB.  We keep the libvirt snapshot metadata pointing
+    # at the original .raw path; the .raw.zst sits next to it.  At
+    # restore time, snapshot_restore checks for the sibling and
+    # decompresses just-in-time before issuing snapshot-revert.
+
+    def _is_zstd_available(self) -> bool:
+        """Whether ``zstd`` is reachable in the configured runtime."""
+        result = self.virsh.execute_shell("command -v zstd", warn=True, hide=True)
+        return result.ok
+
+    def _memory_path_from_xml(self, vm_name: str, snapshot_name: str) -> str | None:
+        """Return the memory file path libvirt has recorded for a snapshot."""
+        result = self.virsh.execute(
+            "snapshot-dumpxml", vm_name, snapshot_name, warn=True)
+        if not result.ok:
+            return None
+        try:
+            root = ET.fromstring(result.stdout)
+        except ET.ParseError:
+            return None
+        memory_elem = root.find("memory")
+        if memory_elem is None:
+            return None
+        path = memory_elem.get("file")
+        return path or None
+
+    def compress_memory_file(self,
+                             raw_path: str,
+                             level: int = 3,
+                             threads: int = 0) -> bool:
+        """
+        zstd-compress *raw_path* in place to ``<raw_path>.zst`` (and remove
+        the .raw on success — ``--rm``).
+
+        Idempotent: if .raw is already gone and .raw.zst exists, returns True.
+        """
+        zst_path = f"{raw_path}.zst"
+        if not os.path.isfile(raw_path):
+            if os.path.isfile(zst_path):
+                return True
+            self.logger.warning(f"memory file not found: {raw_path}")
+            return False
+        if not self._is_zstd_available():
+            self.logger.error(
+                "zstd not found in runtime — install zstd in the docker "
+                "image / host before using --compress-memory")
+            return False
+        sudo = "sudo " if self.use_sudo else ""
+        cmd = (f"{sudo}zstd -{level} -T{threads} --rm -q -f "
+               f"-o '{zst_path}' '{raw_path}'")
+        self.logger.info(f"compressing memory file {raw_path} (zstd -{level})")
+        result = self.virsh.execute_shell(cmd, warn=True)
+        if not result.ok:
+            self.logger.error(
+                f"zstd compress failed for {raw_path}: {result.stderr.strip()}")
+            return False
+        return True
+
+    def compress_all_memory(self, vm_name: str, level: int = 3) -> tuple[int, int]:
+        """
+        Compress every snapshot's memory ``.raw`` file for *vm_name*.
+
+        Returns ``(compressed, total)`` — total counts snapshots that *had*
+        an uncompressed memory file at start; compressed counts ones we
+        successfully shrunk. Snapshots whose memory was already compressed
+        (or absent) are not counted.
+        """
+        compressed = 0
+        candidates = 0
+        for snap in self.list_snapshots(vm_name):
+            mem_path = self._memory_path_from_xml(vm_name, snap['name'])
+            if not mem_path:
+                continue
+            if not os.path.isfile(mem_path):
+                continue  # already compressed or missing
+            candidates += 1
+            if self.compress_memory_file(mem_path, level=level):
+                compressed += 1
+        return compressed, candidates
+
+    def decompress_all_memory(self, vm_name: str) -> tuple[int, int]:
+        """Inverse of :meth:`compress_all_memory`."""
+        decompressed = 0
+        candidates = 0
+        for snap in self.list_snapshots(vm_name):
+            mem_path = self._memory_path_from_xml(vm_name, snap['name'])
+            if not mem_path:
+                continue
+            if not os.path.isfile(f"{mem_path}.zst"):
+                continue
+            if os.path.isfile(mem_path):
+                continue  # already decompressed
+            candidates += 1
+            if self.decompress_memory_file(mem_path, keep_zst=False):
+                decompressed += 1
+        return decompressed, candidates
+
+    def decompress_memory_file(self,
+                               raw_path: str,
+                               keep_zst: bool = True) -> bool:
+        """
+        Decompress ``<raw_path>.zst`` → ``<raw_path>``.
+
+        ``keep_zst`` defaults to True because callers (snapshot_restore)
+        typically want to re-compress after revert; storing both during
+        the revert is a small price for cheap recompression.
+        """
+        zst_path = f"{raw_path}.zst"
+        if not os.path.isfile(zst_path):
+            return False
+        if os.path.isfile(raw_path):
+            return True  # already decompressed
+        if not self._is_zstd_available():
+            self.logger.error(
+                "zstd not found in runtime — cannot decompress memory file")
+            return False
+        sudo = "sudo " if self.use_sudo else ""
+        keep_flag = "-k " if keep_zst else ""
+        cmd = (f"{sudo}zstd -d {keep_flag}-q -f "
+               f"-o '{raw_path}' '{zst_path}'")
+        self.logger.info(f"decompressing memory file {zst_path}")
+        result = self.virsh.execute_shell(cmd, warn=True)
+        if not result.ok:
+            self.logger.error(
+                f"zstd decompress failed for {zst_path}: {result.stderr.strip()}")
+            return False
+        return True
 
     def get_latest_snapshot(self, vm_name: str) -> str | None:
         """
@@ -404,6 +551,12 @@ class SnapshotManager:
         backed up.  After the revert any overlays that libvirt deleted
         are restored so that every snapshot remains reachable.
 
+        Compressed memory: if the snapshot's ``.raw`` memory file is missing
+        but a ``.raw.zst`` sibling exists (created by ``snapshot take
+        --compress-memory`` or ``storage compress-snapshots``), it is
+        decompressed in-place before the revert and re-compressed afterwards
+        so the next revert remains compressed.
+
         Retries up to 3 times on write-lock contention errors, which can
         occur transiently when multiple snapshot-reverts run in parallel and
         QEMU races to acquire an exclusive lock while creating the new disk
@@ -418,8 +571,23 @@ class SnapshotManager:
         """
         preserved = self._preserve_snapshot_overlays(vm_name)
 
+        # Just-in-time decompress if the memory file was zstd'd.
+        mem_path = self._memory_path_from_xml(vm_name, snapshot_name)
+        decompressed_for_revert = False
+        if mem_path and not os.path.isfile(mem_path) and os.path.isfile(f"{mem_path}.zst"):
+            self.logger.info(
+                f"memory file is compressed; decompressing before revert: "
+                f"{mem_path}.zst")
+            if self.decompress_memory_file(mem_path, keep_zst=True):
+                decompressed_for_revert = True
+            else:
+                self.logger.error(
+                    f"could not decompress memory for {vm_name}/{snapshot_name}; "
+                    f"revert will likely fail")
+
         max_retries = 3
         last_stderr = ''
+        success = False
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -428,8 +596,8 @@ class SnapshotManager:
 
                 if result.ok:
                     self.logger.info(f"vm {vm_name} reverted to snapshot '{snapshot_name}'")
-                    self._restore_preserved_overlays(preserved)
-                    return True
+                    success = True
+                    break
 
                 last_stderr = result.stderr or ''
                 if 'write' in last_stderr and 'lock' in last_stderr and attempt < max_retries:
@@ -445,12 +613,40 @@ class SnapshotManager:
                 self.logger.error(
                     f"error reverting vm {vm_name} to snapshot '{snapshot_name}': {exc}")
                 self._restore_preserved_overlays(preserved)
+                self._recompress_after_revert(mem_path, decompressed_for_revert)
                 return False
 
         self._restore_preserved_overlays(preserved)
+        self._recompress_after_revert(mem_path, decompressed_for_revert)
+
+        if success:
+            return True
+
         self.logger.error(
             f"failed to revert vm {vm_name} to snapshot '{snapshot_name}': {last_stderr}")
         return False
+
+    def _recompress_after_revert(self,
+                                 mem_path: str | None,
+                                 decompressed_for_revert: bool) -> None:
+        """
+        Re-compress the memory ``.raw`` file (and remove it) if we
+        decompressed it for this revert. Best-effort — failures are
+        warnings, not errors.
+        """
+        if not (decompressed_for_revert and mem_path and os.path.isfile(mem_path)):
+            return
+        zst_path = f"{mem_path}.zst"
+        if os.path.isfile(zst_path):
+            # We kept the .zst around during revert, so delete the
+            # decompressed copy rather than re-running zstd.
+            sudo = "sudo " if self.use_sudo else ""
+            self.virsh.execute_shell(f"{sudo}rm -f '{mem_path}'", warn=True)
+            return
+        # No .zst on disk (unusual) — re-compress from scratch.
+        if not self.compress_memory_file(mem_path):
+            self.logger.warning(
+                f"could not re-compress memory file after revert: {mem_path}")
 
     def delete_snapshot(self, vm_name: str, snapshot_name: str) -> bool:
         """
