@@ -533,18 +533,322 @@ class TestSnapshotRestoreCompressed:
 
 class TestDeleteSnapshot:
 
-    def test_success(self, sm: SnapshotManager):
-        with patch.object(sm.virsh, "execute", return_value=_result()):
+    def test_internal_snapshot_uses_simple_path(self, sm: SnapshotManager):
+        """If virsh accepts the plain delete, no external dance happens."""
+        def fake(*args, **_kwargs):
+            return _result()  # snapshot-info ok, snapshot-delete ok
+        with patch.object(sm.virsh, "execute", side_effect=fake):
             assert sm.delete_snapshot("vm01", "snap1") is True
 
-    def test_failure(self, sm: SnapshotManager):
+    def test_missing_snapshot_returns_false(self, sm: SnapshotManager):
         with patch.object(sm.virsh, "execute",
-                          return_value=_result(ok=False, stderr="x")):
+                          return_value=_result(ok=False, stderr="not found")):
             assert sm.delete_snapshot("vm01", "snap1") is False
 
-    def test_exception(self, sm: SnapshotManager):
-        with patch.object(sm.virsh, "execute", side_effect=RuntimeError("x")):
-            assert sm.delete_snapshot("vm01", "snap1") is False
+    def test_external_with_no_chain_falls_back(self, sm: SnapshotManager):
+        """External-snapshot error triggers _delete_external_snapshot."""
+        def fake(*args, **_kwargs):
+            verb = args[0]
+            if verb == "snapshot-info":
+                return _result()
+            if verb == "snapshot-delete":
+                return _result(ok=False,
+                               stderr="deletion of external snapshots is not supported")
+            return _result()
+        with patch.object(sm.virsh, "execute", side_effect=fake), \
+             patch.object(sm, "_delete_external_snapshot",
+                          return_value=True) as ext:
+            assert sm.delete_snapshot("vm01", "snap1") is True
+        ext.assert_called_once_with("vm01", "snap1")
+
+    def test_external_non_current_refuses_with_collapse_hint(
+            self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute",
+                          return_value=_result(ok=False,
+                                               stderr="external snapshots not supported")), \
+             patch.object(sm, "_chain_order",
+                          return_value=["snap1", "snap2", "snap3"]), \
+             patch.object(sm.logger, "error") as err:
+            # Try deleting snap1 — it's not the most-recent
+            # _delete_external_snapshot is invoked by delete_snapshot
+            assert sm._delete_external_snapshot("vm01", "snap1") is False
+        msgs = " ".join(c.args[0] for c in err.call_args_list)
+        assert "collapse --to" in msgs
+        assert "newer snapshots" in msgs
+
+    def test_external_only_snapshot_uses_blockcommit(
+            self, sm: SnapshotManager):
+        with patch.object(sm, "_chain_order", return_value=["snap1"]), \
+             patch.object(sm, "_collapse_only_external_snapshot_online",
+                          return_value=True) as collapse_only:
+            assert sm._delete_external_snapshot("vm01", "snap1") is True
+        collapse_only.assert_called_once_with("vm01", "snap1")
+
+    def test_external_most_recent_with_parent_calls_collapse_to(
+            self, sm: SnapshotManager):
+        with patch.object(sm, "_chain_order",
+                          return_value=["snap1", "snap2", "snap3"]), \
+             patch.object(sm, "collapse_to", return_value=True) as collapse:
+            # Deleting snap3 (most-recent) collapses everything newer than
+            # its parent (snap2) into the head — i.e. just drops snap3.
+            assert sm._delete_external_snapshot("vm01", "snap3") is True
+        collapse.assert_called_once_with("vm01", "snap2", dry_run=False)
+
+
+class TestDeleteOnlyExternalSnapshot:
+    """Online deletion of the only external snapshot via blockcommit."""
+
+    def test_blockcommit_per_disk(self, sm: SnapshotManager):
+        executed: list[str] = []
+
+        def fake_execute(*args, **_kwargs):
+            executed.append(args[0])
+            if args[0] == "domblklist":
+                return _result(stdout=(
+                    " Type   Device   Target   Source\n"
+                    "------------------------------------\n"
+                    " file   disk     vda      /p/vm01.qcow2\n"
+                    " file   disk     vdb      /p/vm01_data.qcow2\n"
+                ))
+            if args[0] == "snapshot-dumpxml":
+                return _result(stdout=(
+                    "<domainsnapshot><disks/></domainsnapshot>"
+                ))
+            return _result()
+
+        with patch.object(sm.virsh, "execute", side_effect=fake_execute), \
+             patch.object(sm.virsh, "execute_shell", return_value=_result()):
+            assert sm._collapse_only_external_snapshot_online(
+                "vm01", "snap1") is True
+
+        # Two blockcommit calls (one per data disk)
+        assert executed.count("blockcommit") == 2
+        # Cleanup metadata at the end
+        assert "snapshot-delete" in executed
+
+    def test_blockcommit_failure_aborts(self, sm: SnapshotManager):
+        def fake_execute(*args, **_kwargs):
+            if args[0] == "domblklist":
+                return _result(stdout=(
+                    " Type Device Target Source\n"
+                    "----\n"
+                    " file disk   vda    /p/vm01.qcow2\n"
+                ))
+            if args[0] == "blockcommit":
+                return _result(ok=False, stderr="boom")
+            return _result()
+
+        with patch.object(sm.virsh, "execute", side_effect=fake_execute):
+            assert sm._collapse_only_external_snapshot_online(
+                "vm01", "snap1") is False
+
+
+class TestChainOrder:
+
+    def test_topological_sort_oldest_first(self, sm: SnapshotManager):
+        # snap1 → snap2 → snap3 (snap1 is base, snap3 is head)
+        xml_for = {
+            "snap1": "<domainsnapshot><name>snap1</name></domainsnapshot>",
+            "snap2": (
+                "<domainsnapshot><name>snap2</name>"
+                "<parent><name>snap1</name></parent></domainsnapshot>"),
+            "snap3": (
+                "<domainsnapshot><name>snap3</name>"
+                "<parent><name>snap2</name></parent></domainsnapshot>"),
+        }
+
+        def fake(*args, **_kwargs):
+            if args[0] == "snapshot-list":
+                return _result(stdout="snap1\nsnap2\nsnap3\n")
+            if args[0] == "snapshot-dumpxml":
+                return _result(stdout=xml_for[args[2]])
+            return _result()
+
+        with patch.object(sm.virsh, "execute", side_effect=fake):
+            assert sm._chain_order("vm01") == ["snap1", "snap2", "snap3"]
+
+    def test_returns_empty_when_no_snapshots(self, sm: SnapshotManager):
+        with patch.object(sm, "list_snapshots", return_value=[]):
+            assert sm._chain_order("vm01") == []
+
+
+class TestStripBackingStoreCache:
+
+    DOMAIN_XML_WITH_BACKING_STORE = """\
+<domain>
+  <devices>
+    <disk type='file' device='disk'>
+      <source file='/p/vm01.qcow2'/>
+      <backingStore type='file'>
+        <source file='/p/vm01.snap2.qcow2'/>
+        <backingStore/>
+      </backingStore>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <source file='/p/seed.iso'/>
+    </disk>
+  </devices>
+</domain>
+"""
+
+    def test_strips_backing_store_and_redefines(
+            self, sm: SnapshotManager, tmp_path: Path):
+        defined_xml: list[str] = []
+
+        def fake_execute(*args, **_kwargs):
+            if args[0] == "dumpxml":
+                return _result(stdout=self.DOMAIN_XML_WITH_BACKING_STORE)
+            if args[0] == "define":
+                # Read the temp file the manager just wrote
+                with open(args[1]) as f:
+                    defined_xml.append(f.read())
+                return _result()
+            return _result()
+
+        with patch.object(sm.virsh, "execute", side_effect=fake_execute):
+            assert sm._strip_backing_store_cache("vm01") is True
+
+        assert defined_xml, "virsh define was never called"
+        assert "<backingStore" not in defined_xml[0]
+
+    def test_no_op_when_no_backing_store(self, sm: SnapshotManager):
+        plain_xml = ("<domain><devices>"
+                     "<disk type='file' device='disk'>"
+                     "<source file='/p/vm01.qcow2'/>"
+                     "</disk></devices></domain>")
+
+        def fake_execute(*args, **_kwargs):
+            if args[0] == "dumpxml":
+                return _result(stdout=plain_xml)
+            return _result()
+
+        with patch.object(sm.virsh, "execute", side_effect=fake_execute) as exe:
+            assert sm._strip_backing_store_cache("vm01") is True
+        verbs = [c.args[0] for c in exe.call_args_list]
+        assert "define" not in verbs
+
+
+class TestQemuImgRebase:
+
+    def test_command_format(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute_shell",
+                          return_value=_result()) as shell:
+            assert sm._qemu_img_rebase("/p/head.qcow2", "/p/base.qcow2") is True
+        cmd = shell.call_args.args[0]
+        assert "qemu-img rebase" in cmd
+        assert "-p" in cmd
+        assert "-F qcow2" in cmd
+        assert "/p/head.qcow2" in cmd
+        assert "/p/base.qcow2" in cmd
+
+    def test_failure_returns_false(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute_shell",
+                          return_value=_result(ok=False, stderr="boom")):
+            assert sm._qemu_img_rebase("/p/h", "/p/b") is False
+
+
+class TestCollapseTo:
+
+    def test_no_op_when_target_is_head(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute", return_value=_result()), \
+             patch.object(sm, "_chain_order",
+                          return_value=["snap1", "snap2"]), \
+             patch.object(sm, "_qemu_img_rebase") as rebase:
+            # snap2 is already the head — nothing to drop
+            assert sm.collapse_to("vm01", "snap2") is True
+        rebase.assert_not_called()
+
+    def test_dry_run_does_not_rebase(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute", return_value=_result()), \
+             patch.object(sm, "_chain_order",
+                          return_value=["snap1", "snap2", "snap3"]), \
+             patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", "/p/vm01.qcow2")]), \
+             patch.object(sm, "_overlay_path_for_snapshot",
+                          return_value="/p/vm01.snap1.qcow2"), \
+             patch.object(sm, "_qemu_img_rebase") as rebase, \
+             patch.object(sm, "_strip_backing_store_cache") as strip:
+            assert sm.collapse_to("vm01", "snap1", dry_run=True) is True
+        rebase.assert_not_called()
+        strip.assert_not_called()
+
+    def test_target_not_in_chain_fails(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute", return_value=_result()), \
+             patch.object(sm, "_chain_order",
+                          return_value=["snap1", "snap2"]):
+            assert sm.collapse_to("vm01", "ghost") is False
+
+    def test_missing_target_snapshot_fails(self, sm: SnapshotManager):
+        # snapshot-info fails outright
+        with patch.object(sm.virsh, "execute",
+                          return_value=_result(ok=False, stderr="no such")):
+            assert sm.collapse_to("vm01", "snap1") is False
+
+    def test_happy_path_rebases_and_cleans(self, sm: SnapshotManager,
+                                           tmp_path: Path):
+        # Fake disk + overlay layout
+        head = tmp_path / "vm01.qcow2"
+        head.write_bytes(b"head")
+        snap1_overlay = tmp_path / "vm01.snap1.qcow2"
+        snap1_overlay.write_bytes(b"o1")
+        snap2_overlay = tmp_path / "vm01.snap2.qcow2"
+        snap2_overlay.write_bytes(b"o2")
+        snap3_overlay = tmp_path / "vm01.snap3.qcow2"
+        snap3_overlay.write_bytes(b"o3")
+        # memory file for snap3
+        mem3 = tmp_path / "vm01_snapshot_snap3.raw"
+        mem3.write_bytes(b"m3")
+
+        executed: list[tuple] = []
+        shell_executed: list[str] = []
+
+        def fake_execute(*args, **_kwargs):
+            executed.append(args)
+            if args[0] == "snapshot-info":
+                return _result()
+            return _result()
+
+        def fake_shell(cmd, *_a, **_kw):
+            shell_executed.append(cmd)
+            return _result()
+
+        # Returns the right overlay path for (target, disk)
+        overlay_map = {
+            ("snap1", "vda"): str(snap1_overlay),
+            ("snap2", "vda"): str(snap2_overlay),
+            ("snap3", "vda"): str(snap3_overlay),
+        }
+
+        with patch.object(sm.virsh, "execute", side_effect=fake_execute), \
+             patch.object(sm.virsh, "execute_shell", side_effect=fake_shell), \
+             patch.object(sm, "_chain_order",
+                          return_value=["snap1", "snap2", "snap3"]), \
+             patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", str(head))]), \
+             patch.object(sm, "_overlay_path_for_snapshot",
+                          side_effect=lambda _vm, snap, disk: overlay_map[(snap, disk)]), \
+             patch.object(sm, "_qemu_img_rebase",
+                          return_value=True) as rebase, \
+             patch.object(sm, "_strip_backing_store_cache",
+                          return_value=True) as strip, \
+             patch.object(sm, "_memory_path_from_xml",
+                          side_effect=lambda _vm, snap: str(tmp_path / f"vm01_snapshot_{snap}.raw")):
+            assert sm.collapse_to("vm01", "snap1") is True
+
+        # Rebased the head onto snap1's overlay
+        rebase.assert_called_once_with(str(head), str(snap1_overlay))
+        # Stripped backingStore cache
+        strip.assert_called_once()
+        # Cleaned up snap2 + snap3's overlay files via shell rm
+        rms = [c for c in shell_executed if "rm -f" in c]
+        assert any(str(snap2_overlay) in c for c in rms)
+        assert any(str(snap3_overlay) in c for c in rms)
+        # And snap3's memory file
+        assert any(str(mem3) in c for c in rms)
+        # snapshot-delete --metadata called for snap2 and snap3
+        meta_calls = [c for c in executed
+                      if c[0] == "snapshot-delete" and "--metadata" in c]
+        assert len(meta_calls) == 2
 
 
 class TestFlattenCdromOverlays:

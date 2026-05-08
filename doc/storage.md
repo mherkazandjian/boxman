@@ -14,6 +14,7 @@ section has the quick-start.
 | `boxman storage compact` | host-side qcow2 reclaim — `virt-sparsify --in-place` (preserves snapshot chain) or `qemu-img convert [-c]` (flattens it) | off — auto-shutdown by default | yes |
 | `boxman storage optimize` | orchestrator: `trim` → `compact` → restart | manages itself | yes |
 | `boxman storage compress-snapshots` | zstd-compress (or `--decompress`) snapshot memory `.raw` files retroactively | any | yes |
+| `boxman snapshot collapse --to <name>` | merge snapshots newer than `<name>` into the live head; `<name>` and older remain revertable | off — auto-shutdown by default | yes |
 
 `boxman snapshot take --compress-memory` is the *primary* surface for
 memory compression — it runs at snapshot creation time so no `.raw` is
@@ -187,6 +188,87 @@ verb.
 | `--no-shutdown` | Don't auto-shutdown; running VMs are skipped during compact |
 | `--drop-snapshots` | Same as `compact` |
 | `--dry-run` | Same as `compact` |
+
+---
+
+## `boxman snapshot collapse --to <name>`
+
+The big-reclaim hammer when bloat lives in **older overlays** that
+`storage compact` (which only operates on the head) can't touch — e.g.
+long-lived snapshots taken while a daemon was writing continuously.
+
+`qemu-img rebase` walks the chain and merges every cluster from the
+snapshots between `<name>` and the live head into a new active overlay
+whose backing is `<name>`'s overlay. Where intermediates wrote zero
+clusters (RAID5 sync, mkfs, etc.), rebase writes sparse holes — so the
+reclaim is often dramatic with little wall time.
+
+What survives:
+
+- **`<name>` and older snapshots remain revertable** — their overlays
+  are untouched, and the rebased head still has `<name>`'s overlay as
+  its backing.
+- **The live state of the VM** — semantically unchanged, just stored in
+  a different file layout.
+
+What is permanently lost:
+
+- **Every snapshot strictly newer than `<name>`** — their qcow2 overlay
+  files are unlinked, their `.raw` / `.raw.zst` memory dumps are
+  unlinked, and their libvirt metadata is cleared with
+  `virsh snapshot-delete --metadata`.
+- The ability to revert to a mid-chain state above `<name>`.
+
+### Usage
+
+```bash
+# Show what would be merged; no writes
+boxman snapshot collapse --to before-slurm --dry-run
+
+# Merge everything between before-slurm and the live head into the head
+boxman snapshot collapse --to before-slurm
+
+# Skip the destructive-action confirmation prompt
+boxman snapshot collapse --to before-slurm --yes
+
+# Refuse if any VM is running (default = auto-shutdown then restart)
+boxman snapshot collapse --to before-slurm --no-shutdown
+```
+
+### Flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--to <name>` | required | The oldest snapshot to keep revertable |
+| `--vms` | `all` | VM scope |
+| `--no-shutdown` | off | Refuse if running (default = auto-shutdown via `virsh shutdown`, fall back to `destroy` after 120 s) |
+| `--dry-run` | off | List what would be merged per VM; no writes |
+| `-y` / `--yes` | off | Skip the destructive-action confirmation prompt |
+
+### Implementation notes
+
+After `qemu-img rebase`, libvirt's domain XML still has cached
+`<backingStore>` children that point at files we just deleted. Without
+clearing them, `virsh start` errors out. `snapshot collapse` parses the
+domain XML with `xml.etree.ElementTree`, removes every `<backingStore>`
+under each `<disk device='disk'>`, writes the cleaned XML to a temp
+file, and runs `virsh define` to refresh libvirt's view. Regex won't
+work — `<backingStore>` elements nest.
+
+### Relationship with `snapshot delete`
+
+`boxman snapshot delete --name <X>` is a thin wrapper around `collapse`:
+
+- If `<X>` is the only snapshot → online deletion via
+  `virsh blockcommit --active --pivot --wait` (no shutdown, sub-second
+  per disk).
+- If `<X>` is the most-recent and there are older snapshots →
+  `collapse_to(parent_of_X)` — drops just `<X>` while keeping the
+  parent and older revertable.
+- If `<X>` is non-current with newer snapshots above it → refused
+  with a pointer to `snapshot collapse`. Single-snapshot rebase in the
+  middle of a chain is out of v1 scope; the user should drop the
+  newer snapshots first or use `collapse` to take them all in one step.
 
 ---
 

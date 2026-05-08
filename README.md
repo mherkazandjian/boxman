@@ -371,6 +371,88 @@ boxman import-image \
 
 Manifest schema and full reference: see [doc/image-management.md](doc/image-management.md).
 
+### Healthy snapshot + reclaim workflows
+
+The right ops, in order, for the snapshot lifecycle and disk hygiene:
+
+- **Per-snapshot ritual** (online, lossless, seconds):
+  - `boxman storage trim` — guest fstrim returns free clusters to the host
+    *before* the head freezes into a read-only overlay
+  - `boxman snapshot take --name <step> --compress-memory` — zstd
+    (~71% reduction) the RAM dump immediately after the snapshot
+- **Periodic maintenance** (between snapshots, lossless):
+  - `boxman storage trim` — same as above, periodically
+  - `boxman storage compact` — sparsify the live head once it has bulked
+    up; preserves all snapshots
+  - `boxman storage compress-snapshots` — retroactively compress any
+    `.raw` memory files that pre-date `--compress-memory`
+- **When older overlays grow** (lossy, drops some history):
+  - `boxman snapshot collapse --to <stable-snap>` — merges every snapshot
+    between `<stable-snap>` and the live head into the head; `<stable-snap>`
+    and older snapshots remain revertable. Auto-shuts down the VM
+    (`qemu-img rebase` is offline-only) and restarts it after.
+
+The "promote stable, drop pre-stable" pattern: take `pre-step-N` and
+`post-step-N` while iterating; once step N is validated, run `snapshot
+collapse --to post-step-N` to drop the noise. You keep one revertable
+point per *stable milestone*, not one per attempt — total disk cost
+stays bounded by milestone count.
+
+```
+═════════════════════════════════════════════════════════════════
+  Per-snapshot ritual                Periodic maintenance
+─────────────────────────────────────────────────────────────────
+  storage trim                       storage trim
+       │                             storage compact
+       ▼                             storage compress-snapshots
+  snapshot take                              │
+       --compress-memory                     │
+                                             ▼
+                              ┌────────────────────────────────┐
+                              │ storage df shows older         │
+                              │ overlays growing despite       │
+                              │ compact?  → collapse           │
+                              └────────────────────────────────┘
+═════════════════════════════════════════════════════════════════
+
+  Snapshot chain before/after `boxman snapshot collapse --to step3`:
+
+    Before:
+      base ◄ step1 ◄ step2 ◄ step3 ◄ step4 ◄ step5 ◄ active
+       (ro)  (ro)    (ro)    (ro)    (ro)    (ro)    (rw)
+              │       │       │       │       │       │
+           revertable      revertable       intermediates writes
+                                            (full of overlay growth)
+
+    After:
+      base ◄ step1 ◄ step2 ◄ step3 ◄ active'
+                                       │
+                                       └─ writes from step4 + step5 +
+                                          old active are merged in
+                                          (zero-clusters skipped, so
+                                           reclaim is often dramatic)
+
+  step1, step2, step3 still revertable.
+  step4, step5 are gone — both their qcow2 overlays AND their .raw / .raw.zst
+  memory files are deleted, and libvirt's snapshot metadata is cleared.
+═════════════════════════════════════════════════════════════════
+```
+
+Two distinct growth modes drive what to use when:
+
+- **RAM dumps** (~equal to allocated guest RAM × snapshot count): mostly
+  killed by `--compress-memory` / `storage compress-snapshots`. ~71%
+  reduction at zstd-3, sub-second per GB. Cold-boot snapshots are also
+  ~3× cheaper than warm — buffer/page cache fills RAM during operation.
+- **Disk overlay growth** (depends on guest write rate during each
+  snapshot's lifetime): the head shrinks via `storage compact`
+  (`virt-sparsify`), but `virt-sparsify` operates on *one file* — the
+  head — and can't safely touch read-only intermediates. If your bloat
+  lives in *older* overlays (e.g. background daemons writing during
+  long-lived snapshots), `compact` won't reclaim it. The only tool
+  that does is `snapshot collapse`, which trades intermediate
+  revertability for bulk reclaim.
+
 ### Disk reclaim and storage hygiene
 
 VM qcow2 files can balloon to several times their real footprint over a
@@ -461,7 +543,13 @@ This project is licensed under the [MIT License](../LICENSE).
     the memory dump; restore decompresses transparently)
   - `snapshot list` — list snapshots
   - `snapshot restore` — restore VM state from a snapshot
-  - `snapshot delete` — delete a snapshot
+  - `snapshot delete` — delete a snapshot (handles external snapshots via
+    `virsh blockcommit` for the simple case; non-current external snapshots
+    must be dropped via `snapshot collapse`)
+  - `snapshot collapse --to <name>` — merge every snapshot newer than
+    `<name>` into the live head; `<name>` and older remain revertable.
+    Auto-shuts down the VM and restarts after (`qemu-img rebase` is
+    offline). The big-reclaim hammer when older overlays have grown.
 - `storage` — inspect and reclaim qcow2 disk space
   - `storage df` — per-VM table of virtual / allocated size, chain depth,
     snapshot count, snapshot memory total, reclaim estimate

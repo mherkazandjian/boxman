@@ -839,6 +839,18 @@ class LibVirtSession:
             compress_memory=compress_memory,
             compress_level=compress_level)
 
+    def snapshot_collapse(self,
+                          vm_name: str,
+                          target: str,
+                          dry_run: bool = False) -> bool:
+        """
+        Collapse snapshots newer than *target* into the live head; *target*
+        and older snapshots remain revertable. VM must be offline (the
+        BoxmanManager orchestrator handles shutdown/restart).
+        """
+        snapshot_mgr = SnapshotManager(self.provider_config)
+        return snapshot_mgr.collapse_to(vm_name, target, dry_run=dry_run)
+
     def compress_snapshots_memory(self,
                                   vm_name: str,
                                   level: int = 3,

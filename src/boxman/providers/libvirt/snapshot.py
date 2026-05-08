@@ -650,26 +650,381 @@ class SnapshotManager:
 
     def delete_snapshot(self, vm_name: str, snapshot_name: str) -> bool:
         """
-        Delete a specific snapshot.
+        Delete a snapshot.
 
-        Args:
-            vm_name: Name of the VM
-            snapshot_name: Name of the snapshot to delete
+        Internal (libvirt-native) snapshots are removed by ``virsh
+        snapshot-delete`` directly. External snapshots — which is what
+        boxman creates via ``snapshot-create-as --memspec`` — are not
+        deletable that way; libvirt errors with "deletion of external
+        snapshots is not supported". For external snapshots we dispatch:
 
-        Returns:
-            bool: True if successful, False otherwise
+        - **Only external snapshot**: ``virsh blockcommit --active --pivot``
+          per disk merges the overlay back into base while online; then
+          we remove the overlay/memory files and clear the libvirt
+          metadata with ``--metadata``.
+        - **Most-recent external snapshot with older snapshots above**:
+          equivalent to :meth:`collapse_to` against the parent — the VM
+          is shut down, ``qemu-img rebase`` rewires the chain, and the
+          dropped snapshot's files + metadata are cleaned up.
+        - **Non-current external snapshot**: refused with a clear
+          pointer to ``boxman snapshot collapse --to <name>``; rebasing
+          a middle layer while preserving both ends is out of v1 scope.
         """
-        try:
-            # use virsh snapshot-delete to delete the snapshot
-            result = self.virsh.execute("snapshot-delete", vm_name, snapshot_name)
-
-            if result.ok:
-                self.logger.info(f"snapshot '{snapshot_name}' deleted from vm {vm_name}")
-                return True
-            else:
-                self.logger.error(
-                    f"failed to delete snapshot '{snapshot_name}' from vm {vm_name}: {result.stderr}")
-                return False
-        except Exception as exc:
-            self.logger.error(f"error deleting snapshot '{snapshot_name}' from vm {vm_name}: {exc}")
+        info = self.virsh.execute("snapshot-info", vm_name, snapshot_name, warn=True)
+        if not info.ok:
+            self.logger.error(
+                f"snapshot '{snapshot_name}' not found on vm {vm_name}: "
+                f"{info.stderr.strip()}")
             return False
+
+        # Try the native delete first — works for internal snapshots.
+        simple = self.virsh.execute(
+            "snapshot-delete", vm_name, snapshot_name, warn=True)
+        if simple.ok:
+            self.logger.info(f"snapshot '{snapshot_name}' deleted from vm {vm_name}")
+            return True
+
+        err_lower = (simple.stderr or "").lower()
+        if "external" not in err_lower and "not supported" not in err_lower:
+            self.logger.error(
+                f"snapshot-delete failed: {simple.stderr.strip()}")
+            return False
+
+        # External snapshot — needs the rebase/blockcommit dance.
+        return self._delete_external_snapshot(vm_name, snapshot_name)
+
+    def _delete_external_snapshot(self,
+                                  vm_name: str,
+                                  snapshot_name: str) -> bool:
+        chain = self._chain_order(vm_name)
+        if snapshot_name not in chain:
+            self.logger.error(
+                f"snapshot {snapshot_name} not in chain for vm {vm_name}")
+            return False
+
+        idx = chain.index(snapshot_name)
+
+        # v1: only the most-recent external snapshot is directly deletable.
+        if idx != len(chain) - 1:
+            newer = chain[idx + 1:]
+            self.logger.error(
+                f"cannot delete external snapshot '{snapshot_name}' from "
+                f"{vm_name}: it has newer snapshots above it ({newer}). "
+                f"use `boxman snapshot collapse --to "
+                f"{chain[idx - 1] if idx > 0 else snapshot_name}` to drop "
+                f"it (and the snapshots above it) in one step.")
+            return False
+
+        if idx == 0:
+            # Only snapshot in the chain — collapse it back to base online.
+            return self._collapse_only_external_snapshot_online(
+                vm_name, snapshot_name)
+
+        # Most-recent with older snapshots above base — collapse_to(parent)
+        # drops just this one snapshot while keeping older ones revertable.
+        parent = chain[idx - 1]
+        return self.collapse_to(vm_name, parent, dry_run=False)
+
+    def _collapse_only_external_snapshot_online(self,
+                                                vm_name: str,
+                                                snapshot_name: str) -> bool:
+        """
+        Online deletion of the only external snapshot via
+        ``virsh blockcommit --active --pivot``. After this, the chain is
+        a single base qcow2 again.
+        """
+        disks = self._data_disk_targets(vm_name)
+        if not disks:
+            self.logger.error(f"no data disks found for vm {vm_name}")
+            return False
+
+        for disk_target, _src in disks:
+            commit = self.virsh.execute(
+                "blockcommit", vm_name, disk_target,
+                "--active", "--pivot", "--wait", "--verbose",
+                warn=True)
+            if not commit.ok:
+                self.logger.error(
+                    f"blockcommit failed for {vm_name}/{disk_target}: "
+                    f"{commit.stderr.strip()}")
+                return False
+
+        sudo = "sudo " if self.use_sudo else ""
+        for disk_target, _src in disks:
+            overlay = self._overlay_path_for_snapshot(
+                vm_name, snapshot_name, disk_target)
+            if overlay and os.path.isfile(overlay):
+                self.virsh.execute_shell(f"{sudo}rm -f '{overlay}'", warn=True)
+
+        mem_path = self._memory_path_from_xml(vm_name, snapshot_name)
+        if mem_path:
+            for path in (mem_path, f"{mem_path}.zst"):
+                if os.path.isfile(path):
+                    self.virsh.execute_shell(f"{sudo}rm -f '{path}'", warn=True)
+
+        meta = self.virsh.execute(
+            "snapshot-delete", vm_name, snapshot_name, "--metadata", warn=True)
+        if not meta.ok:
+            self.logger.warning(
+                f"files cleaned for {snapshot_name} but metadata delete "
+                f"failed: {meta.stderr.strip()}")
+        self.logger.info(
+            f"external snapshot '{snapshot_name}' deleted from vm {vm_name}")
+        return True
+
+    # ── snapshot collapse (qemu-img rebase) ─────────────────────────────
+    #
+    # collapse_to(target) merges every snapshot strictly newer than
+    # *target* into the live head, dropping their overlays and metadata.
+    # *target* and older snapshots remain revertable. The VM must be off
+    # because qemu-img rebase is offline-only — the BoxmanManager
+    # orchestrator handles shutdown/start.
+
+    def _chain_order(self, vm_name: str) -> list[str]:
+        """
+        Return all snapshot names for *vm_name* in chain order, oldest
+        first. Built from each snapshot's ``<parent>`` element so it
+        works for any tree topology, but boxman only takes linear chains.
+        """
+        snaps = self.list_snapshots(vm_name)
+        if not snaps:
+            return []
+
+        parents: dict[str, str | None] = {}
+        for snap in snaps:
+            xml_result = self.virsh.execute(
+                "snapshot-dumpxml", vm_name, snap['name'], warn=True)
+            if not xml_result.ok:
+                continue
+            try:
+                root = ET.fromstring(xml_result.stdout)
+            except ET.ParseError:
+                continue
+            parent_name_elem = root.find("parent/name")
+            parents[snap['name']] = (
+                parent_name_elem.text if parent_name_elem is not None else None)
+
+        children: dict[str | None, list[str]] = {}
+        for name, parent in parents.items():
+            children.setdefault(parent, []).append(name)
+
+        ordered: list[str] = []
+        queue: list[str | None] = [None]
+        while queue:
+            current = queue.pop(0)
+            for child in children.get(current, []):
+                ordered.append(child)
+                queue.append(child)
+        return ordered
+
+    def _data_disk_targets(self, vm_name: str) -> list[tuple[str, str]]:
+        """
+        Return ``[(target_name, source_path), ...]`` for each
+        ``<disk device='disk'>`` of *vm_name* (excludes cdroms).
+        """
+        result = self.virsh.execute(
+            "domblklist", vm_name, "--details", warn=True)
+        if not result.ok:
+            return []
+        disks: list[tuple[str, str]] = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            # columns: Type Device Target Source
+            if parts[1] != 'disk':
+                continue
+            disks.append((parts[2], parts[3]))
+        return disks
+
+    def _overlay_path_for_snapshot(self,
+                                   vm_name: str,
+                                   snapshot_name: str,
+                                   disk_target: str) -> str | None:
+        """Source file recorded for *disk_target* in the snapshot XML."""
+        result = self.virsh.execute(
+            "snapshot-dumpxml", vm_name, snapshot_name, warn=True)
+        if not result.ok:
+            return None
+        try:
+            root = ET.fromstring(result.stdout)
+        except ET.ParseError:
+            return None
+        for disk in root.findall(".//disks/disk"):
+            if disk.get("name") == disk_target:
+                source = disk.find("source")
+                if source is not None:
+                    return source.get("file")
+        return None
+
+    def _qemu_img_rebase(self,
+                         head_path: str,
+                         new_base_path: str) -> bool:
+        """
+        ``qemu-img rebase -p -b <new_base> -F qcow2 <head>`` — VM must
+        be offline. ``-p`` shows progress. The rebase merges intermediate
+        overlays' content into *head* so reading *head* alone produces
+        the same view as the original chain did.
+        """
+        sudo = "sudo " if self.use_sudo else ""
+        cmd = (f"{sudo}qemu-img rebase -p "
+               f"-b '{new_base_path}' -F qcow2 '{head_path}'")
+        self.logger.info(f"rebasing {head_path} onto {new_base_path}")
+        result = self.virsh.execute_shell(cmd, warn=True, hide=False)
+        if not result.ok:
+            self.logger.error(
+                f"qemu-img rebase failed for {head_path}: "
+                f"{result.stderr.strip()}")
+            return False
+        return True
+
+    def _strip_backing_store_cache(self, vm_name: str) -> bool:
+        """
+        Remove cached ``<backingStore>`` children from each ``<disk
+        device='disk'>`` in *vm_name*'s domain XML and ``virsh define``
+        the cleaned XML.
+
+        After modifying the qcow2 chain externally (rebase / blockcommit),
+        libvirt's cached backingStore points at files that no longer exist
+        and ``virsh start`` fails until the cache is cleared. Use a real
+        XML parser — nested elements break naive regex.
+        """
+        import tempfile
+
+        result = self.virsh.execute("dumpxml", vm_name, warn=True)
+        if not result.ok:
+            self.logger.error(
+                f"dumpxml failed for {vm_name}: {result.stderr.strip()}")
+            return False
+        try:
+            root = ET.fromstring(result.stdout)
+        except ET.ParseError as exc:
+            self.logger.error(f"could not parse domain XML for {vm_name}: {exc}")
+            return False
+
+        modified = False
+        for disk in root.findall(".//disk"):
+            if disk.get("device") not in ("disk", None):
+                continue
+            for backing in list(disk.findall("backingStore")):
+                disk.remove(backing)
+                modified = True
+
+        if not modified:
+            return True
+
+        new_xml = ET.tostring(root, encoding="unicode")
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".xml", delete=False) as tmp:
+            tmp.write(new_xml)
+            tmp_path = tmp.name
+        try:
+            define_result = self.virsh.execute("define", tmp_path, warn=True)
+            if not define_result.ok:
+                self.logger.error(
+                    f"virsh define failed: {define_result.stderr.strip()}")
+                return False
+            self.logger.info(
+                f"stripped cached <backingStore> from {vm_name} domain XML")
+            return True
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    def collapse_to(self,
+                    vm_name: str,
+                    target_name: str,
+                    dry_run: bool = False) -> bool:
+        """
+        Collapse all snapshots strictly newer than *target_name* into the
+        live head. *target_name* and older snapshots remain revertable.
+
+        Workflow per disk: ``qemu-img rebase`` the head onto the target
+        snapshot's overlay so the rebased head's read-alone view equals
+        what the full chain produced. Then strip ``<backingStore>``
+        cache, ``virsh define``, delete the dropped snapshots' overlay
+        and memory files, and clear their libvirt metadata.
+
+        VM must be offline. Returns True on success.
+        """
+        info = self.virsh.execute(
+            "snapshot-info", vm_name, target_name, warn=True)
+        if not info.ok:
+            self.logger.error(
+                f"target snapshot '{target_name}' not found on vm "
+                f"{vm_name}: {info.stderr.strip()}")
+            return False
+
+        chain = self._chain_order(vm_name)
+        if target_name not in chain:
+            self.logger.error(
+                f"snapshot '{target_name}' not in chain for vm {vm_name}")
+            return False
+
+        target_idx = chain.index(target_name)
+        drop_set = chain[target_idx + 1:]
+
+        if not drop_set:
+            self.logger.info(
+                f"snapshot '{target_name}' is already the most-recent on "
+                f"vm {vm_name}; nothing to collapse")
+            return True
+
+        disks = self._data_disk_targets(vm_name)
+        if not disks:
+            self.logger.error(f"no data disks found for vm {vm_name}")
+            return False
+
+        if dry_run:
+            self.logger.info(
+                f"[dry-run] {vm_name}: would drop {len(drop_set)} snapshot(s) "
+                f"({drop_set}); kept '{target_name}' and older")
+            for disk_target, source in disks:
+                new_base = self._overlay_path_for_snapshot(
+                    vm_name, target_name, disk_target)
+                self.logger.info(
+                    f"[dry-run]   would rebase {source} onto {new_base}")
+            return True
+
+        # Per-disk rebase — must succeed for every disk before we touch metadata.
+        for disk_target, head_path in disks:
+            new_base = self._overlay_path_for_snapshot(
+                vm_name, target_name, disk_target)
+            if not new_base:
+                self.logger.error(
+                    f"cannot find overlay for disk '{disk_target}' in "
+                    f"snapshot '{target_name}' of vm {vm_name}")
+                return False
+            if not self._qemu_img_rebase(head_path, new_base):
+                return False
+
+        if not self._strip_backing_store_cache(vm_name):
+            return False
+
+        sudo = "sudo " if self.use_sudo else ""
+        for snap in drop_set:
+            for disk_target, _ in disks:
+                overlay = self._overlay_path_for_snapshot(
+                    vm_name, snap, disk_target)
+                if overlay and os.path.isfile(overlay):
+                    self.virsh.execute_shell(
+                        f"{sudo}rm -f '{overlay}'", warn=True)
+            mem_path = self._memory_path_from_xml(vm_name, snap)
+            if mem_path:
+                for path in (mem_path, f"{mem_path}.zst"):
+                    if os.path.isfile(path):
+                        self.virsh.execute_shell(
+                            f"{sudo}rm -f '{path}'", warn=True)
+            meta = self.virsh.execute(
+                "snapshot-delete", vm_name, snap, "--metadata", warn=True)
+            if not meta.ok:
+                self.logger.warning(
+                    f"could not clear metadata for snapshot '{snap}' on "
+                    f"{vm_name}: {meta.stderr.strip()}")
+
+        self.logger.info(
+            f"collapsed {len(drop_set)} snapshot(s) on vm {vm_name}; "
+            f"'{target_name}' preserved as new oldest revertable point")
+        return True

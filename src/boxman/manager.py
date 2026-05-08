@@ -3470,6 +3470,86 @@ class BoxmanManager:
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 cls.provider.snapshot_delete(full_vm_name, cli_args.snapshot_name)
                 cls.logger.info(f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
+
+    @staticmethod
+    def _collapse_one_vm(provider_config, full_vm_name, workdir, vm_info,
+                         target, no_shutdown, dry_run):
+        """Worker target for parallel snapshot collapse — must be picklable."""
+        from boxman.providers.libvirt.snapshot import SnapshotManager
+        from boxman.providers.libvirt.storage import StorageManager
+
+        snapshot_mgr = SnapshotManager(provider_config)
+        storage = StorageManager(provider_config)
+
+        if dry_run:
+            snapshot_mgr.collapse_to(full_vm_name, target, dry_run=True)
+            return
+
+        was_running = storage.is_running(full_vm_name)
+        if was_running:
+            if no_shutdown:
+                log.error(
+                    f"collapse: vm {full_vm_name} is running and "
+                    f"--no-shutdown was passed; skipping")
+                return
+            if not storage.shutdown_and_wait(full_vm_name):
+                log.error(
+                    f"collapse: shutdown failed for {full_vm_name}, skipping")
+                return
+
+        ok = snapshot_mgr.collapse_to(full_vm_name, target, dry_run=False)
+
+        if was_running:
+            if not storage.start(full_vm_name):
+                log.error(f"collapse: failed to restart {full_vm_name}")
+
+        if ok:
+            log.info(
+                f"collapse ok: {full_vm_name} — kept '{target}' and older")
+        else:
+            log.error(f"collapse failed: {full_vm_name}")
+
+    @staticmethod
+    def snapshot_collapse(cls, cli_args):
+        """
+        Collapse snapshots newer than ``--to`` into the live head per VM.
+
+        Auto-shuts down running VMs by default (qemu-img rebase is
+        offline-only). Use ``--no-shutdown`` to skip running VMs instead.
+        Snapshots older than the target remain revertable; everything
+        between target and head is merged into head and dropped.
+        """
+        target = cli_args.target
+        dry_run = getattr(cli_args, 'dry_run', False)
+        no_shutdown = getattr(cli_args, 'no_shutdown', False)
+        yes = getattr(cli_args, 'yes', False)
+
+        targets = list(cls._storage_targets(cls, cli_args))
+
+        if not yes and not dry_run:
+            cls.logger.warning(
+                f"about to collapse all snapshots newer than '{target}' "
+                f"on {len(targets)} vm(s). This is irreversible — run "
+                f"with --dry-run first if unsure, or pass --yes to skip "
+                f"this prompt.")
+            try:
+                confirm = input("continue? [y/N]: ").strip().lower()
+            except EOFError:
+                confirm = ''
+            if confirm != 'y':
+                cls.logger.info("aborted")
+                return
+
+        provider_config = cls.provider.provider_config
+        processes = [
+            Process(
+                target=BoxmanManager._collapse_one_vm,
+                args=(provider_config, full_vm_name, workdir, vm_info,
+                      target, no_shutdown, dry_run))
+            for full_vm_name, workdir, vm_info in targets
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
     ### end snapshot functions ####
 
     ### start storage functions ####

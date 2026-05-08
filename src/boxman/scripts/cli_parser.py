@@ -524,6 +524,49 @@ def parse_args():
     )
 
     #
+    # sub parser for the 'snapshot collapse' subsubcommand
+    #
+    parser_snap_collapse = subparsers_snap.add_parser(
+        'collapse',
+        help='merge snapshots newer than --to into the live head '
+             '(target snapshot remains revertable)')
+    parser_snap_collapse.set_defaults(func=BoxmanManager.snapshot_collapse)
+    parser_snap_collapse.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all',
+    )
+    parser_snap_collapse.add_argument(
+        '--to',
+        type=str,
+        required=True,
+        dest='target',
+        help='oldest snapshot to keep revertable; everything between '
+             'this and the live head is merged into the head and dropped',
+    )
+    parser_snap_collapse.add_argument(
+        '--no-shutdown',
+        action='store_true',
+        dest='no_shutdown',
+        help='skip running VMs instead of auto-shutting them down '
+             '(rebase requires the VM offline)',
+    )
+    parser_snap_collapse.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='print what would be merged; no writes',
+    )
+    parser_snap_collapse.add_argument(
+        '-y', '--yes',
+        action='store_true',
+        dest='yes',
+        help='skip the destructive-action confirmation prompt',
+    )
+
+    #
     # sub parser for the top-level 'restore' subcommand
     # (shortcut for 'snapshot restore' with no --name: restores the latest snapshot)
     #

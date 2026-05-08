@@ -190,6 +190,42 @@ class TestStorageDispatch:
         assert args.compress_memory is False
         assert args.memory_compress_level == 3
 
+    def test_snapshot_collapse_requires_to(self):
+        import pytest as _pytest
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        with _pytest.raises(SystemExit):
+            parser.parse_args(["snapshot", "collapse"])
+
+    def test_snapshot_collapse_dispatch(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(
+            ["snapshot", "collapse", "--to", "before-slurm"])
+        assert args.func is BoxmanManager.snapshot_collapse
+        assert args.target == "before-slurm"
+        assert args.dry_run is False
+        assert args.no_shutdown is False
+        assert args.yes is False
+
+    def test_snapshot_collapse_all_flags(self):
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args([
+            "snapshot", "collapse",
+            "--to", "before-slurm",
+            "--vms", "node01,node02",
+            "--no-shutdown",
+            "--dry-run",
+            "--yes",
+        ])
+        assert args.target == "before-slurm"
+        assert args.vms == "node01,node02"
+        assert args.no_shutdown is True
+        assert args.dry_run is True
+        assert args.yes is True
+
 
 class TestInvalidArgs:
 
