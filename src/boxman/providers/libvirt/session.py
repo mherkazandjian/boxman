@@ -839,6 +839,18 @@ class LibVirtSession:
             compress_memory=compress_memory,
             compress_level=compress_level)
 
+    def snapshot_log_data(self, vm_name: str) -> dict:
+        """
+        Return data for ``boxman snapshot log`` aggregation:
+        ``{'chain': [...detailed snapshot dicts in chain order...],
+            'current': name | None}``.
+        """
+        snapshot_mgr = SnapshotManager(self.provider_config)
+        return {
+            'chain': snapshot_mgr.list_snapshots_detailed(vm_name),
+            'current': snapshot_mgr.get_latest_snapshot(vm_name),
+        }
+
     def snapshot_collapse(self,
                           vm_name: str,
                           target: str,

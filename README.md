@@ -541,7 +541,12 @@ This project is licensed under the [MIT License](../LICENSE).
 - `snapshot` — manage snapshots of VMs
   - `snapshot take` — take a snapshot (`--compress-memory` zstd-compresses
     the memory dump; restore decompresses transparently)
-  - `snapshot list` — list snapshots
+  - `snapshot list` — list snapshots per VM
+  - `snapshot log` — git-log-style aggregated view across all VMs:
+    one row per unique snapshot name, with the list of VMs participating
+    in each, ordered newest-first. ASCII tree with `|/` transitions when
+    VM chains diverge. `--json` for machine output, `-n N` for limit,
+    `--no-graph` to drop the leftmost column
   - `snapshot restore` — restore VM state from a snapshot
   - `snapshot delete` — delete a snapshot (handles external snapshots via
     `virsh blockcommit` for the simple case; non-current external snapshots

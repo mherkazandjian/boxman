@@ -389,6 +389,114 @@ class TestSnapshotRestore:
         restore.assert_called_once()
 
 
+class TestSnapshotInfo:
+    """Parser for `virsh snapshot-info` text output."""
+
+    SAMPLE_OUTPUT = """\
+Name:           snap1
+Domain:         vm01
+Current:        yes
+State:          running
+Location:       external
+Parent:         baseline
+Children:       0
+Descendants:    0
+Metadata:       yes
+Creation Time:  2026-04-22 18:30:00 +0200
+"""
+
+    def test_returns_none_on_virsh_failure(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute",
+                          return_value=_result(ok=False, stderr="not found")):
+            assert sm.snapshot_info("vm01", "ghost") is None
+
+    def test_parses_known_keys(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute",
+                          return_value=_result(stdout=self.SAMPLE_OUTPUT)):
+            info = sm.snapshot_info("vm01", "snap1")
+        assert info is not None
+        assert info["name"] == "snap1"
+        assert info["domain"] == "vm01"
+        assert info["current"] is True
+        assert info["state"] == "running"
+        assert info["location"] == "external"
+        assert info["parent"] == "baseline"
+        assert info["children"] == 0
+        assert info["descendants"] == 0
+        assert info["metadata"] is True
+        assert info["creation_time"] == "2026-04-22 18:30:00 +0200"
+
+    def test_parent_dash_maps_to_none(self, sm: SnapshotManager):
+        out = self.SAMPLE_OUTPUT.replace("Parent:         baseline",
+                                         "Parent:         -")
+        with patch.object(sm.virsh, "execute",
+                          return_value=_result(stdout=out)):
+            info = sm.snapshot_info("vm01", "snap1")
+        assert info["parent"] is None
+
+    def test_current_no_maps_to_false(self, sm: SnapshotManager):
+        out = self.SAMPLE_OUTPUT.replace("Current:        yes",
+                                         "Current:        no")
+        with patch.object(sm.virsh, "execute",
+                          return_value=_result(stdout=out)):
+            info = sm.snapshot_info("vm01", "snap1")
+        assert info["current"] is False
+
+    def test_creation_time_string_compares_correctly(self,
+                                                     sm: SnapshotManager):
+        # Same format as libvirt — lexicographic compare matches chronological.
+        a = "2026-04-22 18:30:00 +0200"
+        b = "2026-04-23 09:00:00 +0200"
+        assert b > a  # used by manager.snapshot_log as a tiebreaker
+
+
+class TestListSnapshotsDetailed:
+
+    def test_empty_when_no_snapshots(self, sm: SnapshotManager):
+        with patch.object(sm, "list_snapshots", return_value=[]):
+            assert sm.list_snapshots_detailed("vm01") == []
+
+    def test_orders_by_chain_oldest_first_with_depth(self, sm: SnapshotManager):
+        with patch.object(sm, "_chain_order",
+                          return_value=["snap1", "snap2", "snap3"]), \
+             patch.object(sm, "list_snapshots", return_value=[
+                 {"name": "snap2", "description": "two"},
+                 {"name": "snap1", "description": "one"},
+                 {"name": "snap3", "description": "three"},
+             ]), \
+             patch.object(sm, "snapshot_info",
+                          side_effect=lambda _vm, name: {
+                              "creation_time": f"2026-04-2{name[-1]} 00:00:00",
+                              "parent": None if name == "snap1" else
+                                        f"snap{int(name[-1]) - 1}",
+                          }):
+            rows = sm.list_snapshots_detailed("vm01")
+        assert [r["name"] for r in rows] == ["snap1", "snap2", "snap3"]
+        assert [r["depth"] for r in rows] == [0, 1, 2]
+        # Description matches via lookup table, not chain order.
+        assert {r["name"]: r["description"] for r in rows} == {
+            "snap1": "one", "snap2": "two", "snap3": "three"
+        }
+        assert rows[0]["parent"] is None
+        assert rows[1]["parent"] == "snap1"
+        assert rows[2]["parent"] == "snap2"
+
+    def test_handles_missing_snapshot_info(self, sm: SnapshotManager):
+        with patch.object(sm, "_chain_order", return_value=["snap1"]), \
+             patch.object(sm, "list_snapshots",
+                          return_value=[{"name": "snap1", "description": "x"}]), \
+             patch.object(sm, "snapshot_info", return_value=None):
+            rows = sm.list_snapshots_detailed("vm01")
+        # Missing info → creation_time/parent are None but the row is still emitted.
+        assert rows == [{
+            "name": "snap1",
+            "description": "x",
+            "creation_time": None,
+            "parent": None,
+            "depth": 0,
+        }]
+
+
 class TestMemoryCompression:
     """zstd compression of the snapshot .raw memory file."""
 

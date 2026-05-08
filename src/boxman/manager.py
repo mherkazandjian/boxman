@@ -3310,6 +3310,134 @@ class BoxmanManager:
                 cls.provider.snapshot_list(full_vm_name)
 
     @staticmethod
+    def snapshot_log(cls, cli_args):
+        """
+        Aggregated git-log-style view of snapshots across every VM.
+
+        Each unique snapshot name becomes one row showing description,
+        creation time, the list of VMs that have it, and a ``← current``
+        marker if it's the current snapshot for any VM. Default ordering
+        is newest-first by chain depth (with creation_time as tiebreaker);
+        ``--reverse`` flips it. ``--no-graph`` suppresses the leftmost
+        ``*``/``|`` column; ``--json`` emits machine-readable output
+        matching the shape of ``boxman ps --json``.
+        """
+        from boxman.utils.snapshot_graph import render_graph
+
+        prj_name = f'bprj__{cls.config["project"]}__bprj'
+        prj_prefix = f'{prj_name}_'
+
+        # 1. Per-VM data.
+        per_vm: dict[str, dict] = {}
+        for cluster_name, cluster in cls.config['clusters'].items():
+            for vm_name, _ in cluster['vms'].items():
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                data = cls.provider.snapshot_log_data(full_vm_name)
+                per_vm[full_vm_name] = data
+
+        if not any(d.get('chain') for d in per_vm.values()):
+            cls.logger.info("no snapshots found")
+            return
+
+        # 2. Aggregate by snapshot name.
+        aggregated: dict[str, dict] = {}
+        for full_vm_name, data in per_vm.items():
+            short_vm = full_vm_name[len(prj_prefix):] \
+                if full_vm_name.startswith(prj_prefix) else full_vm_name
+            current = data.get('current')
+            for snap in data.get('chain', []):
+                name = snap['name']
+                entry = aggregated.setdefault(name, {
+                    'name': name,
+                    'description': snap.get('description', ''),
+                    'creation_time': snap.get('creation_time'),
+                    'parent': snap.get('parent'),
+                    'depth': snap.get('depth', 0),
+                    'vms': [],
+                    'current_for': [],
+                })
+                entry['vms'].append(short_vm)
+                # Take the max depth seen across VMs (handles partial-take
+                # divergence where some VMs have a deeper chain).
+                entry['depth'] = max(entry['depth'], snap.get('depth', 0))
+                ct = snap.get('creation_time')
+                if ct and (not entry.get('creation_time')
+                           or ct > entry['creation_time']):
+                    entry['creation_time'] = ct
+                # Description and parent: first-write-wins; usually
+                # consistent across VMs for a given snapshot name.
+                if not entry.get('description'):
+                    entry['description'] = snap.get('description', '')
+                if not entry.get('parent'):
+                    entry['parent'] = snap.get('parent')
+                if current == name:
+                    entry['current_for'].append(short_vm)
+
+        # 3. Sort: newest-first by depth desc, then creation_time desc.
+        rows = sorted(
+            aggregated.values(),
+            key=lambda r: (r['depth'], r.get('creation_time') or ''),
+            reverse=True,
+        )
+
+        max_count = getattr(cli_args, 'max_count', None)
+        if max_count is not None and max_count >= 0:
+            rows = rows[:max_count]
+
+        if getattr(cli_args, 'reverse', False):
+            rows = list(reversed(rows))
+
+        # 4. Render.
+        if getattr(cli_args, 'as_json', False):
+            payload = [
+                {
+                    'name': r['name'],
+                    'description': r['description'],
+                    'creation_time': r.get('creation_time'),
+                    'parent': r.get('parent'),
+                    'depth': r['depth'],
+                    'vms': sorted(r['vms']),
+                    'current_for': sorted(r['current_for']),
+                }
+                for r in rows
+            ]
+            print(json.dumps(payload, indent=2))
+            return
+
+        if getattr(cli_args, 'no_graph', False):
+            entries: list[tuple[str, dict | None]] = [('', r) for r in rows]
+        else:
+            entries = render_graph(rows)
+
+        # Column widths (only over real rows — transitions skip the columns).
+        real = [r for _, r in entries if r is not None]
+        name_w = max((len(r['name']) for r in real), default=4)
+        time_w = max((len(r.get('creation_time') or '') for r in real),
+                     default=10)
+
+        for prefix, row in entries:
+            if row is None:
+                print(prefix)
+                continue
+            current_for = row['current_for']
+            vms_total = len(row['vms'])
+            cur_marker = ''
+            if current_for:
+                if len(current_for) == vms_total:
+                    cur_marker = '  ← current'
+                else:
+                    cur_marker = f"  ← current ({len(current_for)}/{vms_total})"
+            vm_list = ','.join(sorted(row['vms']))
+            description = row.get('description') or ''
+            ctime = row.get('creation_time') or '?'
+            print(
+                f"{prefix}{row['name']:<{name_w}}  "
+                f"{ctime:<{time_w}}  "
+                f"\"{description}\"  "
+                f"[{vm_list}]{cur_marker}"
+            )
+
+    @staticmethod
     def snapshot_take(cls, cli_args):
         """
         Take a snapshot of every VM in the cluster (parallel), then verify each one.

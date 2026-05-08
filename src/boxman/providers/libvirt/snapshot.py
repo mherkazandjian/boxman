@@ -344,6 +344,74 @@ class SnapshotManager:
             return name if name else None
         return None
 
+    def snapshot_info(self,
+                      vm_name: str,
+                      snapshot_name: str) -> dict | None:
+        """
+        Parse ``virsh snapshot-info`` text output into a dict.
+
+        Returns ``None`` if the snapshot is unknown or virsh fails. Keys::
+
+            name, domain, current (bool), state, location,
+            parent (str|None — '-' is mapped to None),
+            children (int), descendants (int), metadata (bool),
+            creation_time (raw string from libvirt).
+
+        Creation time is reported by ``snapshot-info`` only — it is not
+        present in ``snapshot-dumpxml``. We keep it as the libvirt-formatted
+        string (e.g. ``2026-04-22 18:30:00 +0200``) so callers can sort it
+        lexicographically and humans can read it.
+        """
+        result = self.virsh.execute(
+            "snapshot-info", vm_name, snapshot_name, warn=True)
+        if not result.ok:
+            return None
+        info: dict = {}
+        for line in result.stdout.splitlines():
+            if ':' not in line:
+                continue
+            key, _, val = line.partition(':')
+            info[key.strip().lower().replace(' ', '_')] = val.strip()
+        info['current'] = info.get('current', '').lower() == 'yes'
+        info['metadata'] = info.get('metadata', '').lower() == 'yes'
+        for k in ('children', 'descendants'):
+            try:
+                info[k] = int(info.get(k, 0))
+            except (TypeError, ValueError):
+                info[k] = 0
+        if info.get('parent') in ('-', ''):
+            info['parent'] = None
+        return info
+
+    def list_snapshots_detailed(self, vm_name: str) -> list[dict]:
+        """
+        Return per-snapshot dicts for *vm_name* in chain order
+        (oldest first, head last).
+
+        Each dict has keys ``name``, ``description``, ``creation_time``,
+        ``parent``, ``depth`` (0 = oldest). Reuses :meth:`_chain_order`
+        for ordering, :meth:`list_snapshots` for descriptions, and
+        :meth:`snapshot_info` for creation_time.
+        """
+        chain = self._chain_order(vm_name)
+        if not chain:
+            return []
+        descriptions = {
+            s['name']: s.get('description', '')
+            for s in self.list_snapshots(vm_name)
+        }
+        rows: list[dict] = []
+        for depth, name in enumerate(chain):
+            info = self.snapshot_info(vm_name, name) or {}
+            rows.append({
+                'name': name,
+                'description': descriptions.get(name, ''),
+                'creation_time': info.get('creation_time'),
+                'parent': info.get('parent'),
+                'depth': depth,
+            })
+        return rows
+
     def validate_snapshot(self, vm_name: str, snapshot_name: str):
         """
         Validate that a snapshot is intact and can be safely restored.

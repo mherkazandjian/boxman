@@ -484,6 +484,47 @@ def parse_args():
     )
 
     #
+    # sub parser for the 'snapshot log' subsubcommand
+    #
+    parser_snap_log = subparsers_snap.add_parser(
+        'log',
+        help='git-log-style aggregated snapshot view across all vms')
+    parser_snap_log.set_defaults(func=BoxmanManager.snapshot_log)
+    parser_snap_log.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list',
+        dest='vms',
+        default='all',
+    )
+    parser_snap_log.add_argument(
+        '-n', '--max',
+        type=int,
+        default=None,
+        dest='max_count',
+        help='show at most N entries (newest first; pair with --reverse '
+             'for the oldest N)',
+    )
+    parser_snap_log.add_argument(
+        '--json',
+        action='store_true',
+        dest='as_json',
+        help='emit machine-readable JSON instead of the text table',
+    )
+    parser_snap_log.add_argument(
+        '--reverse',
+        action='store_true',
+        dest='reverse',
+        help='oldest first',
+    )
+    parser_snap_log.add_argument(
+        '--no-graph',
+        action='store_true',
+        dest='no_graph',
+        help='suppress the leftmost graph column (useful for piping)',
+    )
+
+    #
     # sub parser for the 'snapshot restore' subsubcommand
     #
     parser_snap_restore = subparsers_snap.add_parser('restore', help='restore the state of vms from snapshot')

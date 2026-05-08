@@ -209,6 +209,35 @@ class TestStorageDispatch:
         assert args.no_shutdown is False
         assert args.yes is False
 
+    def test_snapshot_log_dispatch(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(["snapshot", "log"])
+        assert args.func is BoxmanManager.snapshot_log
+        assert args.vms == "all"
+        assert args.max_count is None
+        assert args.as_json is False
+        assert args.reverse is False
+        assert args.no_graph is False
+
+    def test_snapshot_log_all_flags(self):
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args([
+            "snapshot", "log",
+            "--vms", "node01,node02",
+            "-n", "5",
+            "--json",
+            "--reverse",
+            "--no-graph",
+        ])
+        assert args.vms == "node01,node02"
+        assert args.max_count == 5
+        assert args.as_json is True
+        assert args.reverse is True
+        assert args.no_graph is True
+
     def test_snapshot_collapse_all_flags(self):
         from boxman.scripts.app import parse_args
         parser = parse_args()
