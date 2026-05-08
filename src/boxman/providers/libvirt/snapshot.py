@@ -383,34 +383,93 @@ class SnapshotManager:
             info['parent'] = None
         return info
 
+    def _parse_snapshot_xml(self, xml_text: str) -> dict:
+        """
+        Pull description / parent / creation_time out of a single
+        ``<domainsnapshot>`` XML in one pass.
+
+        Creation time comes from the ``<creationTime>`` element (Unix
+        epoch seconds) — that's the format that exists on every libvirt
+        version. ``virsh snapshot-info``'s text output adds a "Creation
+        Time:" line on newer libvirt only, so the XML is the portable
+        source.
+        """
+        from datetime import datetime
+
+        out: dict = {}
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError:
+            return out
+        desc_elem = root.find("description")
+        if desc_elem is not None and desc_elem.text:
+            out['description'] = desc_elem.text
+        parent_elem = root.find("parent/name")
+        if parent_elem is not None and parent_elem.text:
+            out['parent'] = parent_elem.text
+        ct_elem = root.find("creationTime")
+        if ct_elem is not None and ct_elem.text:
+            try:
+                ts = int(ct_elem.text.strip())
+                out['creation_time'] = datetime.fromtimestamp(ts).strftime(
+                    '%Y-%m-%d %H:%M:%S')
+            except (ValueError, OSError):
+                pass
+        return out
+
     def list_snapshots_detailed(self, vm_name: str) -> list[dict]:
         """
         Return per-snapshot dicts for *vm_name* in chain order
-        (oldest first, head last).
+        (oldest first, head last) in a single pass.
 
-        Each dict has keys ``name``, ``description``, ``creation_time``,
-        ``parent``, ``depth`` (0 = oldest). Reuses :meth:`_chain_order`
-        for ordering, :meth:`list_snapshots` for descriptions, and
-        :meth:`snapshot_info` for creation_time.
+        Each dict: ``{name, description, creation_time, parent, depth}``.
+        Calls ``snapshot-list`` once, then ``snapshot-dumpxml`` once per
+        snapshot — everything else is parsed out of the XML via
+        :meth:`_parse_snapshot_xml`.
         """
-        chain = self._chain_order(vm_name)
-        if not chain:
+        list_result = self.virsh.execute(
+            "snapshot-list", vm_name, "--name", warn=True)
+        if not list_result.ok:
             return []
-        descriptions = {
-            s['name']: s.get('description', '')
-            for s in self.list_snapshots(vm_name)
-        }
-        rows: list[dict] = []
-        for depth, name in enumerate(chain):
-            info = self.snapshot_info(vm_name, name) or {}
-            rows.append({
+        names = [n.strip() for n in list_result.stdout.splitlines() if n.strip()]
+        if not names:
+            return []
+
+        parsed: dict[str, dict] = {}
+        for name in names:
+            xml_result = self.virsh.execute(
+                "snapshot-dumpxml", vm_name, name, warn=True)
+            parsed[name] = (self._parse_snapshot_xml(xml_result.stdout)
+                            if xml_result.ok else {})
+
+        # Topological sort by parent → child.
+        children: dict[str | None, list[str]] = {}
+        for name in names:
+            parent = parsed[name].get('parent')
+            children.setdefault(parent, []).append(name)
+
+        ordered: list[str] = []
+        queue: list[str | None] = list(children.get(None, []))
+        while queue:
+            n = queue.pop(0)
+            ordered.append(n)
+            queue.extend(children.get(n, []))
+        # Defensive: pick up any snapshot whose parent isn't visible
+        # (e.g. libvirt-orphaned metadata) — append in original list order.
+        for name in names:
+            if name not in ordered:
+                ordered.append(name)
+
+        return [
+            {
                 'name': name,
-                'description': descriptions.get(name, ''),
-                'creation_time': info.get('creation_time'),
-                'parent': info.get('parent'),
+                'description': parsed[name].get('description', ''),
+                'creation_time': parsed[name].get('creation_time'),
+                'parent': parsed[name].get('parent'),
                 'depth': depth,
-            })
-        return rows
+            }
+            for depth, name in enumerate(ordered)
+        ]
 
     def validate_snapshot(self, vm_name: str, snapshot_name: str):
         """

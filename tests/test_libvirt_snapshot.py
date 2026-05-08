@@ -450,47 +450,120 @@ Creation Time:  2026-04-22 18:30:00 +0200
         assert b > a  # used by manager.snapshot_log as a tiebreaker
 
 
+class TestParseSnapshotXml:
+
+    XML_FULL = """\
+<domainsnapshot>
+  <name>snap1</name>
+  <description>before slurm</description>
+  <state>running</state>
+  <parent><name>baseline</name></parent>
+  <creationTime>1714568400</creationTime>
+  <disks/>
+</domainsnapshot>
+"""
+
+    XML_NO_PARENT = """\
+<domainsnapshot>
+  <name>baseline</name>
+  <description>initial</description>
+  <creationTime>1714568000</creationTime>
+</domainsnapshot>
+"""
+
+    XML_NO_CREATION_TIME = """\
+<domainsnapshot>
+  <name>old</name>
+  <description>legacy</description>
+  <parent><name>x</name></parent>
+</domainsnapshot>
+"""
+
+    def test_parses_all_fields(self, sm: SnapshotManager):
+        out = sm._parse_snapshot_xml(self.XML_FULL)
+        assert out["description"] == "before slurm"
+        assert out["parent"] == "baseline"
+        # Unix-epoch parsing works regardless of libvirt version.
+        assert out["creation_time"].startswith("2024-")  # 1714568400 = 2024-05-01
+        assert "20" in out["creation_time"]
+
+    def test_no_parent_returns_dict_without_parent(self, sm: SnapshotManager):
+        out = sm._parse_snapshot_xml(self.XML_NO_PARENT)
+        assert "parent" not in out
+        assert out["description"] == "initial"
+
+    def test_no_creation_time_omits_field(self, sm: SnapshotManager):
+        out = sm._parse_snapshot_xml(self.XML_NO_CREATION_TIME)
+        assert "creation_time" not in out
+        assert out["parent"] == "x"
+
+    def test_returns_empty_on_bad_xml(self, sm: SnapshotManager):
+        assert sm._parse_snapshot_xml("not xml") == {}
+
+
 class TestListSnapshotsDetailed:
 
+    def _xml_for(self, snap_name: str, parent: str | None,
+                 epoch: int = 1714568400) -> str:
+        parent_block = (f"<parent><name>{parent}</name></parent>"
+                        if parent else "")
+        return (f"<domainsnapshot><name>{snap_name}</name>"
+                f"<description>desc-{snap_name}</description>"
+                f"{parent_block}"
+                f"<creationTime>{epoch}</creationTime></domainsnapshot>")
+
     def test_empty_when_no_snapshots(self, sm: SnapshotManager):
-        with patch.object(sm, "list_snapshots", return_value=[]):
+        with patch.object(sm.virsh, "execute",
+                          return_value=_result(stdout="\n")):
+            assert sm.list_snapshots_detailed("vm01") == []
+
+    def test_failure_returns_empty_list(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute",
+                          return_value=_result(ok=False, stderr="boom")):
             assert sm.list_snapshots_detailed("vm01") == []
 
     def test_orders_by_chain_oldest_first_with_depth(self, sm: SnapshotManager):
-        with patch.object(sm, "_chain_order",
-                          return_value=["snap1", "snap2", "snap3"]), \
-             patch.object(sm, "list_snapshots", return_value=[
-                 {"name": "snap2", "description": "two"},
-                 {"name": "snap1", "description": "one"},
-                 {"name": "snap3", "description": "three"},
-             ]), \
-             patch.object(sm, "snapshot_info",
-                          side_effect=lambda _vm, name: {
-                              "creation_time": f"2026-04-2{name[-1]} 00:00:00",
-                              "parent": None if name == "snap1" else
-                                        f"snap{int(name[-1]) - 1}",
-                          }):
+        # Listed by virsh out of order → topo sort restores chain.
+        list_xml_map = {
+            "snap2": self._xml_for("snap2", "snap1", 1714000200),
+            "snap1": self._xml_for("snap1", None, 1714000100),
+            "snap3": self._xml_for("snap3", "snap2", 1714000300),
+        }
+
+        def fake(*args, **_kwargs):
+            verb = args[0]
+            if verb == "snapshot-list":
+                return _result(stdout="snap2\nsnap1\nsnap3\n")
+            if verb == "snapshot-dumpxml":
+                return _result(stdout=list_xml_map[args[2]])
+            return _result()
+
+        with patch.object(sm.virsh, "execute", side_effect=fake):
             rows = sm.list_snapshots_detailed("vm01")
         assert [r["name"] for r in rows] == ["snap1", "snap2", "snap3"]
         assert [r["depth"] for r in rows] == [0, 1, 2]
-        # Description matches via lookup table, not chain order.
-        assert {r["name"]: r["description"] for r in rows} == {
-            "snap1": "one", "snap2": "two", "snap3": "three"
-        }
         assert rows[0]["parent"] is None
         assert rows[1]["parent"] == "snap1"
         assert rows[2]["parent"] == "snap2"
+        # creation_time gets populated from <creationTime> regardless of
+        # libvirt version.
+        assert all(r["creation_time"] for r in rows)
 
-    def test_handles_missing_snapshot_info(self, sm: SnapshotManager):
-        with patch.object(sm, "_chain_order", return_value=["snap1"]), \
-             patch.object(sm, "list_snapshots",
-                          return_value=[{"name": "snap1", "description": "x"}]), \
-             patch.object(sm, "snapshot_info", return_value=None):
+    def test_handles_missing_xml(self, sm: SnapshotManager):
+        # snapshot-list returns one name; snapshot-dumpxml fails for it.
+        def fake(*args, **_kwargs):
+            if args[0] == "snapshot-list":
+                return _result(stdout="snap1\n")
+            if args[0] == "snapshot-dumpxml":
+                return _result(ok=False, stderr="oops")
+            return _result()
+
+        with patch.object(sm.virsh, "execute", side_effect=fake):
             rows = sm.list_snapshots_detailed("vm01")
-        # Missing info → creation_time/parent are None but the row is still emitted.
+        # Defensive fallback emits the row with empty/None fields.
         assert rows == [{
             "name": "snap1",
-            "description": "x",
+            "description": "",
             "creation_time": None,
             "parent": None,
             "depth": 0,

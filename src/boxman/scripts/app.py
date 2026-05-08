@@ -341,6 +341,14 @@ def main():
             _boxman_logger.setLevel(logging.DEBUG)
         sys.exit(0)
 
+    # 'snapshot log' is a viewer command — suppress INFO logging across the
+    # whole run so only the rendered tree (or JSON) reaches the user. virsh
+    # execute spam from per-VM snapshot-dumpxml/info/current calls would
+    # otherwise drown the few lines of actual output. The dispatch then
+    # falls through to the regular provider-setup path below.
+    if args.func == BoxmanManager.snapshot_log:
+        logging.getLogger('boxman').setLevel(logging.CRITICAL + 1)
+
     # Handle 'conf' — show effective merged configuration
     if args.func == BoxmanManager.show_conf:
         manager = BoxmanManager(config=args.conf)
