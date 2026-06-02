@@ -252,3 +252,101 @@ class TestCloneVMDelegation:
                    return_value=mock_cloner):
             with pytest.raises(RuntimeError, match="Failed to clone"):
                 s.clone_vm("new-vm", "src", {}, str(tmp_path))
+
+
+class TestVmExists:
+
+    def test_true_when_name_in_list(self):
+        s = _session({})
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.return_value = _result(
+                stdout="other-vm\nrocky-template\n")
+            assert s.vm_exists("rocky-template") is True
+
+    def test_false_when_name_absent(self):
+        s = _session({})
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.return_value = _result(stdout="other\n")
+            assert s.vm_exists("missing") is False
+
+    def test_false_on_virsh_failure(self):
+        s = _session({})
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.return_value = _result(ok=False)
+            assert s.vm_exists("x") is False
+
+
+class TestTemplateDisksPresent:
+    """Guards the broken-template detection that prevents virt-clone from
+    failing inscrutably when the libvirt domain still exists but its
+    backing qcow2 has been deleted."""
+
+    XML_HEALTHY_TEMPLATE = """\
+<domain>
+  <devices>
+    <disk type='file' device='disk'>
+      <source file='{disk_path}'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+  </devices>
+</domain>"""
+
+    XML_BROKEN_TEMPLATE = """\
+<domain>
+  <devices>
+    <disk type='file' device='disk'>
+      <source file='/this/path/will/not/exist.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+  </devices>
+</domain>"""
+
+    XML_CDROM_ONLY = """\
+<domain>
+  <devices>
+    <disk type='file' device='cdrom'>
+      <source file='/path/never-mind-i-am-missing.iso'/>
+      <target dev='hdc' bus='ide'/>
+    </disk>
+  </devices>
+</domain>"""
+
+    def test_true_when_data_disk_present(self, tmp_path: Path):
+        disk = tmp_path / "template.qcow2"
+        disk.write_bytes(b"qcow2-stub")
+        xml = self.XML_HEALTHY_TEMPLATE.format(disk_path=str(disk))
+        s = _session({})
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.return_value = _result(stdout=xml)
+            assert s.template_disks_present("rocky-template") is True
+
+    def test_false_when_data_disk_missing(self):
+        s = _session({})
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.return_value = _result(
+                stdout=self.XML_BROKEN_TEMPLATE)
+            assert s.template_disks_present("rocky-template") is False
+
+    def test_ignores_missing_cdrom_iso(self):
+        """A missing seed.iso is normal post-template-build; do not
+        report the template as broken just because of an absent cdrom."""
+        s = _session({})
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.return_value = _result(
+                stdout=self.XML_CDROM_ONLY)
+            assert s.template_disks_present("rocky-template") is True
+
+    def test_true_when_dumpxml_fails(self):
+        """Unknown domain → no claim about disks → True (do not block)."""
+        s = _session({})
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.return_value = _result(
+                ok=False, stderr="domain not found")
+            assert s.template_disks_present("ghost") is True
+
+    def test_true_when_xml_unparseable(self):
+        s = _session({})
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.return_value = _result(
+                stdout="not xml at all")
+            assert s.template_disks_present("x") is True

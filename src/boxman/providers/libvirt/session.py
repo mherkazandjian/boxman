@@ -2,6 +2,7 @@ import os
 import time
 from multiprocessing import Process, Queue
 from typing import Any
+from xml.etree import ElementTree as ET
 
 from boxman import log
 
@@ -276,6 +277,48 @@ class LibVirtSession:
             raise RuntimeError(
                 f"Failed to clone VM {src_vm_name} to {new_vm_name}"
             )
+
+    def vm_exists(self, vm_name: str) -> bool:
+        """Whether a domain named *vm_name* is registered with libvirt."""
+        virsh = VirshCommand(provider_config=self.provider_config)
+        result = virsh.execute("list", "--all", "--name", hide=True, warn=True)
+        if not result.ok:
+            return False
+        names = [v.strip() for v in result.stdout.splitlines() if v.strip()]
+        return vm_name in names
+
+    def template_disks_present(self, vm_name: str) -> bool:
+        """
+        Whether every ``<disk device='disk'>`` source file referenced in
+        *vm_name*'s domain XML exists on the host filesystem. Returns
+        True if the domain is unknown (no claim about disks). CDROM
+        sources are ignored — a missing seed.iso is normal.
+
+        Detects the broken-template state where the libvirt domain is
+        still registered after its backing qcow2 was deleted; virt-clone
+        from such a "template" fails inscrutably ("cannot open directory
+        ...: No such file or directory").
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        result = virsh.execute("dumpxml", vm_name, hide=True, warn=True)
+        if not result.ok:
+            return True  # nothing to check
+        try:
+            root = ET.fromstring(result.stdout)
+        except ET.ParseError:
+            return True
+        for disk in root.findall(".//disk"):
+            if disk.get('device') != 'disk':
+                continue
+            source = disk.find("source")
+            if source is None:
+                continue
+            path = source.get('file')
+            if path and not os.path.isfile(path):
+                self.logger.warning(
+                    f"template '{vm_name}': disk file missing on host: {path}")
+                return False
+        return True
 
     def destroy_disks(self,
                       workdir : str,

@@ -1283,7 +1283,8 @@ class BoxmanManager:
             return True  # no cluster uses a template as base_image
 
         # check which of the needed templates already exist as VMs
-        missing_keys: list = []
+        missing_keys: list = []      # template VM not registered at all
+        broken_keys: list = []       # registered, but backing disk gone
         for tpl_key in needed_template_keys:
             tpl_conf = templates[tpl_key]
             tpl_vm_name = tpl_conf.get('name', tpl_key)
@@ -1312,19 +1313,45 @@ class BoxmanManager:
                     self.logger.warning(f"could not check if template VM '{tpl_vm_name}' exists: {exc}")
 
             if exists:
-                self.logger.info(f"template VM '{tpl_vm_name}' already exists, skipping creation")
+                # The domain is registered, but its backing qcow2 file may
+                # have been deleted out from under libvirt. virt-clone then
+                # fails inscrutably during provision; detect it up-front and
+                # rebuild via the existing force-recreate path which already
+                # does destroy + undefine --remove-all-storage on its own.
+                disks_ok = True
+                if (self.provider is not None
+                        and hasattr(self.provider, 'template_disks_present')):
+                    try:
+                        disks_ok = self.provider.template_disks_present(tpl_vm_name)
+                    except Exception as exc:
+                        self.logger.warning(
+                            f"could not verify template '{tpl_vm_name}' disks: {exc}")
+                if not disks_ok:
+                    self.logger.warning(
+                        f"template VM '{tpl_vm_name}' is registered with libvirt "
+                        f"but its disk file is missing on the host — rebuilding "
+                        f"the template (force=True will destroy the orphan domain)")
+                    broken_keys.append(tpl_key)
+                else:
+                    self.logger.info(
+                        f"template VM '{tpl_vm_name}' already exists, skipping creation")
             else:
                 self.logger.info(
                     f"template VM '{tpl_vm_name}' (key='{tpl_key}') does not exist, "
                     f"will create it before provisioning")
                 missing_keys.append(tpl_key)
 
-        if not missing_keys:
+        if not missing_keys and not broken_keys:
             return True
 
-        # create the missing templates
-        self.logger.info(f"auto-creating {len(missing_keys)} missing template(s): {missing_keys}")
-        self._create_templates_impl(requested=missing_keys, force=False)
+        if missing_keys:
+            self.logger.info(
+                f"auto-creating {len(missing_keys)} missing template(s): {missing_keys}")
+            self._create_templates_impl(requested=missing_keys, force=False)
+        if broken_keys:
+            self.logger.info(
+                f"auto-rebuilding {len(broken_keys)} broken template(s): {broken_keys}")
+            self._create_templates_impl(requested=broken_keys, force=True)
 
         return True
 
@@ -1694,12 +1721,30 @@ class BoxmanManager:
                     else:
                         raise
 
+        clone_tasks = list(vm_clone_tasks())
         processes = [
             Process(target=_clone, args=(cluster, vm_info, new_vm_name))
-            for cluster, vm_info, new_vm_name in vm_clone_tasks()
+            for cluster, vm_info, new_vm_name in clone_tasks
         ]
         [p.start() for p in processes]
         [p.join() for p in processes]
+
+        # Abort provision if any clone subprocess exited non-zero. Without
+        # this check, the subsequent configure / start / wait-for-IP steps
+        # all spam errors against VMs that were never defined, and the
+        # wait-for-IP loop in particular looks like a hang.
+        failed = [
+            (task[2], p.exitcode)
+            for task, p in zip(clone_tasks, processes)
+            if p.exitcode != 0
+        ]
+        if failed:
+            names = ', '.join(name for name, _ in failed)
+            raise RuntimeError(
+                f"clone failed for {len(failed)} VM(s) ({names}); aborting "
+                f"provision. See the virt-clone error logged above for the "
+                f"underlying cause (typically a missing template disk or a "
+                f"libvirt storage pool issue).")
 
     def destroy_vms(self) -> None:
         """
@@ -4366,6 +4411,20 @@ class BoxmanManager:
         ]
         [p.start() for p in processes]
         [p.join() for p in processes]
+
+        # Abort the update if any clone subprocess exited non-zero — same
+        # guard as :meth:`clone_vms` to prevent downstream configure/start
+        # steps from running against VMs that were never defined.
+        failed = [
+            (task[2], p.exitcode)
+            for task, p in zip(clone_tasks, processes)
+            if p.exitcode != 0
+        ]
+        if failed:
+            names = ', '.join(name for name, _ in failed)
+            raise RuntimeError(
+                f"clone failed for {len(failed)} new VM(s) ({names}); "
+                f"aborting update. See the virt-clone error logged above.")
 
         # configure and start new VMs (parallel)
         configure_tasks = []

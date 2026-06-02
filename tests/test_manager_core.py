@@ -274,3 +274,197 @@ class TestGetProviderConfigWithRuntime:
         mgr.runtime = "docker-compose"
         enriched = mgr.get_provider_config_with_runtime({"uri": "qemu:///system"})
         assert enriched["runtime"] == "docker-compose"
+
+
+class TestCheckTemplatesForClusters:
+    """
+    Regression for the recovery path when a template's libvirt domain
+    exists but its backing qcow2 has been deleted. The check must
+    detect this and rebuild the template with ``force=True`` so that
+    cloudinit.create_template's destroy+undefine path runs.
+    """
+
+    @staticmethod
+    def _mgr_with_template(tmp_path: Path):
+        from unittest.mock import MagicMock, patch as _patch
+        with _patch("boxman.manager.BoxmanCache"):
+            m = BoxmanManager()
+        m.config = {
+            'project': 'demo',
+            'templates': {
+                'tpl1': {
+                    'name': 'rocky-template',
+                    'image': 'file:///tmp/x.qcow2',
+                },
+            },
+            'clusters': {
+                'cluster_1': {
+                    'workdir': str(tmp_path),
+                    'base_image': 'rocky-template',
+                    'vms': {'node01': {}},
+                },
+            },
+        }
+        m._provider = MagicMock()
+        m._provider.provider_config = {}
+        return m
+
+    def test_broken_template_triggers_force_rebuild(self, tmp_path: Path):
+        """Domain exists + disks missing → rebuild via force=True."""
+        from unittest.mock import patch as _patch
+        m = self._mgr_with_template(tmp_path)
+        m._provider.vm_exists.return_value = True
+        m._provider.template_disks_present.return_value = False
+
+        captured: list = []
+
+        def fake_impl(*args, **kwargs):
+            captured.append((args, kwargs))
+
+        with _patch.object(m, '_create_templates_impl', side_effect=fake_impl):
+            ok = m.ensure_templates_exist()
+        assert ok is True
+        # Exactly one call — for the broken template — with force=True
+        assert len(captured) == 1
+        _args, kwargs = captured[0]
+        assert kwargs.get('force') is True
+        assert kwargs.get('requested') == ['tpl1']
+
+    def test_healthy_template_skips_rebuild(self, tmp_path: Path):
+        from unittest.mock import patch as _patch
+        m = self._mgr_with_template(tmp_path)
+        m._provider.vm_exists.return_value = True
+        m._provider.template_disks_present.return_value = True
+        with _patch.object(m, '_create_templates_impl') as impl:
+            ok = m.ensure_templates_exist()
+        assert ok is True
+        impl.assert_not_called()
+
+    def test_missing_template_force_false(self, tmp_path: Path):
+        """Domain absent → rebuild via the regular force=False path."""
+        from unittest.mock import patch as _patch
+        m = self._mgr_with_template(tmp_path)
+        m._provider.vm_exists.return_value = False  # not registered
+        captured: list = []
+        with _patch.object(m, '_create_templates_impl',
+                           side_effect=lambda *a, **kw: captured.append(kw)):
+            ok = m.ensure_templates_exist()
+        assert ok is True
+        assert len(captured) == 1
+        assert captured[0].get('force') is False
+        assert captured[0].get('requested') == ['tpl1']
+
+
+class TestCloneVmsExitCodeGuard:
+    """
+    Regression: a failed clone subprocess used to leave provision running
+    on past the failure — configure/start/wait-for-IP then ran against
+    VMs that were never defined and the wait-for-IP loop looked like a
+    hang. clone_vms must now raise after joining if any subprocess
+    exited non-zero.
+    """
+
+    @staticmethod
+    def _fake_process(exitcode: int):
+        from unittest.mock import MagicMock
+        proc = MagicMock()
+        proc.exitcode = exitcode
+        proc.start = MagicMock()
+        proc.join = MagicMock()
+        return proc
+
+    def _mgr_with_one_vm(self, tmp_path: Path):
+        with patch("boxman.manager.BoxmanCache"):
+            m = BoxmanManager()
+        m.config = {
+            'project': 'demo',
+            'clusters': {
+                'cluster_1': {
+                    'workdir': str(tmp_path),
+                    'base_image': 'tpl',
+                    'vms': {'node01': {}},
+                },
+            },
+        }
+        # provider must expose provider_config (referenced by storage-pool helper)
+        from unittest.mock import MagicMock
+        m._provider = MagicMock()
+        m._provider.provider_config = {}
+        return m
+
+    def test_raises_when_clone_subprocess_fails(self, tmp_path: Path):
+        from unittest.mock import patch as _patch
+        m = self._mgr_with_one_vm(tmp_path)
+        fake = self._fake_process(exitcode=1)
+        with _patch.object(m, '_ensure_libvirt_storage_pool'), \
+             _patch("boxman.manager.Process", return_value=fake):
+            with pytest.raises(RuntimeError, match="clone failed for 1 VM"):
+                m.clone_vms()
+
+    def test_no_raise_when_all_clones_succeed(self, tmp_path: Path):
+        from unittest.mock import patch as _patch
+        m = self._mgr_with_one_vm(tmp_path)
+        fake = self._fake_process(exitcode=0)
+        with _patch.object(m, '_ensure_libvirt_storage_pool'), \
+             _patch("boxman.manager.Process", return_value=fake):
+            # No exception, no return value either.
+            m.clone_vms()
+
+
+class TestCloneAndConfigureNewVmsExitCodeGuard:
+    """
+    Mirror of TestCloneVmsExitCodeGuard but for the `update` path
+    (_clone_and_configure_new_vms). Same silent-failure bug if any
+    clone subprocess exits non-zero — the configure/start steps would
+    otherwise run against VMs that were never defined.
+    """
+
+    @staticmethod
+    def _fake_process(exitcode: int):
+        from unittest.mock import MagicMock
+        proc = MagicMock()
+        proc.exitcode = exitcode
+        proc.start = MagicMock()
+        proc.join = MagicMock()
+        return proc
+
+    def _mgr_with_one_vm(self, tmp_path: Path):
+        from unittest.mock import MagicMock, patch as _patch
+        with _patch("boxman.manager.BoxmanCache"):
+            m = BoxmanManager()
+        m.config = {
+            'project': 'demo',
+            'clusters': {
+                'cluster_1': {
+                    'workdir': str(tmp_path),
+                    'base_image': 'tpl',
+                    'vms': {'node01': {}},
+                },
+            },
+        }
+        m._provider = MagicMock()
+        m._provider.provider_config = {}
+        return m
+
+    def test_raises_when_clone_subprocess_fails(self, tmp_path: Path):
+        from unittest.mock import patch as _patch
+        m = self._mgr_with_one_vm(tmp_path)
+        fake = self._fake_process(exitcode=1)
+        new_vm_names = {'bprj__demo__bprj_cluster_1_node01'}
+        with _patch.object(m, '_ensure_libvirt_storage_pool'), \
+             _patch("boxman.manager.Process", return_value=fake):
+            with pytest.raises(RuntimeError, match="clone failed for 1 new VM"):
+                m._clone_and_configure_new_vms(new_vm_names)
+
+    def test_no_raise_when_all_clones_succeed(self, tmp_path: Path):
+        """When clones succeed, control should move into the configure
+        phase — patch _configure_and_start_vm so we don't depend on the
+        rest of the orchestration."""
+        from unittest.mock import patch as _patch
+        m = self._mgr_with_one_vm(tmp_path)
+        fake = self._fake_process(exitcode=0)
+        new_vm_names = {'bprj__demo__bprj_cluster_1_node01'}
+        with _patch.object(m, '_ensure_libvirt_storage_pool'), \
+             _patch.object(m, '_configure_and_start_vm'), \
+             _patch("boxman.manager.Process", return_value=fake):
+            m._clone_and_configure_new_vms(new_vm_names)
