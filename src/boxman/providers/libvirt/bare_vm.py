@@ -36,6 +36,7 @@ class BareVM:
         memory = self.info.get('memory', 2048)
         vcpus = self.info.get('vcpus', 2)
         network = self._get_network()
+        mac = self._get_mac()
 
         # Create empty disk image
         qemu_img_cmd = f'qemu-img create -f qcow2 "{disk_path}" {disk_size}G'
@@ -55,7 +56,12 @@ class BareVM:
         parts.append(f"--memory={memory}")
         parts.append(f"--vcpus={vcpus}")
         parts.append(f"--disk=path={disk_path},format=qcow2,bus=virtio,discard=unmap")
-        parts.append(f"--network=network={network},model=virtio")
+        net_arg = f"--network=network={network},model=virtio"
+        if mac:
+            # A fixed MAC lets a provisioning server (e.g. Cobbler/dhcpd) bind
+            # this VM to a known system entry / lease by hardware address.
+            net_arg += f",mac={mac}"
+        parts.append(net_arg)
         parts.append("--boot=network,hd")
         parts.append("--os-variant=detect=on,require=off")
         parts.append("--graphics=vnc")
@@ -80,3 +86,8 @@ class BareVM:
     def _get_network(self) -> str:
         networks = self.info.get('networks', [{}])
         return networks[0].get('name', 'default') if networks else 'default'
+
+    def _get_mac(self) -> str | None:
+        """Optional fixed MAC for the first network, if declared in config."""
+        networks = self.info.get('networks', [{}])
+        return networks[0].get('mac') if networks else None
