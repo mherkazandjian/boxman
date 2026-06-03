@@ -1644,6 +1644,20 @@ class BoxmanManager:
                 for vm_name, vm_info in cluster['vms'].items():
                     vm_info = vm_info.copy()
                     new_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                    # Bare PXE-boot VMs attach via the `networks` key (not
+                    # network_adapters), so qualify the network name to the full
+                    # libvirt network name here (adapters get this via
+                    # resolve_adapter_network).
+                    nets = vm_info.get('networks')
+                    if nets:
+                        vm_info['networks'] = [
+                            {**n, 'name': self.full_network_name(
+                                project_config=self.config,
+                                cluster_name=cluster_name,
+                                network_name=n['name'])}
+                            if isinstance(n, dict) and 'name' in n else n
+                            for n in nets
+                        ]
                     yield cluster, vm_info, new_vm_name
 
         # Pre-define storage pools for all cluster workdirs before parallel
