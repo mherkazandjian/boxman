@@ -1987,10 +1987,14 @@ class BoxmanManager:
             True if all VMs have at least one IP address, False otherwise
         """
         prj_name = f'bprj__{self.config["project"]}__bprj'
+        # Skip network-boot (PXE) VMs: a diskless BareVM has no OS at `up` time,
+        # so it never gets an IP — including it here would make the provision
+        # IP-wait loop spin the full max_wait (~10 min) every time.
         vm_names = [
             f"{prj_name}_{cluster_name}_{vm_name}"
             for cluster_name, cluster in self.config['clusters'].items()
-            for vm_name in cluster['vms']
+            for vm_name, vm_info in cluster['vms'].items()
+            if (vm_info.get('boot_order') or ['hd'])[0] != 'network'
         ]
 
         result_queue: Queue = Queue()
