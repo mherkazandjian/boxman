@@ -599,23 +599,43 @@ class SnapshotManager:
                 continue
         return overlays
 
-    def _preserve_snapshot_overlays(self, vm_name: str) -> list[tuple]:
+    def _preserve_snapshot_overlays(self,
+                                    vm_name: str,
+                                    snapshot_name: str) -> list[tuple]:
         """
-        Back up overlay files that belong to snapshots and may be deleted
-        by ``snapshot-revert``.
+        Back up the overlay files that ``snapshot-revert`` to
+        *snapshot_name* can delete, so they can be restored afterwards
+        and every snapshot stays reachable.
 
-        libvirt deletes the overlay of the *current* snapshot when
-        reverting to an earlier one.  This method copies those files so
-        they can be restored afterwards, keeping every snapshot reachable.
+        Reverting recreates the target snapshot's own overlay (and may
+        drop overlays newer than it in the chain), so only those are at
+        risk -- overlays of snapshots *older* than the target are backing
+        files the target depends on and are never touched.  Backing up
+        just the target-and-newer overlays avoids full-copying the whole
+        chain on every restore (e.g. restoring the latest snapshot copies
+        one overlay per disk instead of one per disk per snapshot).
+
+        If the target is not found in the chain order (orphaned/missing
+        metadata), fall back to preserving every overlay -- safe but slow.
 
         Returns a list of (original_path, backup_path) tuples.
         """
         all_overlays = self._get_snapshot_overlay_files(vm_name)
 
-        # collect every overlay file referenced by any snapshot
+        # only overlays that revert can delete: the target and any newer
+        # snapshots in the (oldest-first) chain.  Older snapshots are
+        # backing files the target relies on and are left untouched.
+        order = self._chain_order(vm_name)
+        if snapshot_name in order:
+            at_risk = set(order[order.index(snapshot_name):])
+        else:
+            at_risk = set(all_overlays)
+
+        # collect the overlay files referenced by the at-risk snapshots
         files_to_preserve: set = set()
-        for files in all_overlays.values():
-            files_to_preserve.update(files)
+        for snap, files in all_overlays.items():
+            if snap in at_risk:
+                files_to_preserve.update(files)
 
         pairs = [(f, f + '.preserve') for f in sorted(files_to_preserve)
                  if os.path.isfile(f)]
@@ -667,7 +687,7 @@ class SnapshotManager:
 
         if to_cleanup:
             cmd = " && ".join(
-                f"{sudo}rm -f '{b}'" for b in to_cleanup)
+                f"rm -f '{b}'" for b in to_cleanup)
             self.virsh.execute_shell(cmd, warn=True)
 
     def snapshot_restore(self, vm_name: str, snapshot_name: str) -> bool:
@@ -696,7 +716,7 @@ class SnapshotManager:
         Returns:
             bool: True if successful, False otherwise
         """
-        preserved = self._preserve_snapshot_overlays(vm_name)
+        preserved = self._preserve_snapshot_overlays(vm_name, snapshot_name)
 
         # Just-in-time decompress if the memory file was zstd'd.
         mem_path = self._memory_path_from_xml(vm_name, snapshot_name)
@@ -767,8 +787,7 @@ class SnapshotManager:
         if os.path.isfile(zst_path):
             # We kept the .zst around during revert, so delete the
             # decompressed copy rather than re-running zstd.
-            sudo = "sudo " if self.use_sudo else ""
-            self.virsh.execute_shell(f"{sudo}rm -f '{mem_path}'", warn=True)
+            self.virsh.execute_shell(f"rm -f '{mem_path}'", warn=True)
             return
         # No .zst on disk (unusual) — re-compress from scratch.
         if not self.compress_memory_file(mem_path):
@@ -876,18 +895,17 @@ class SnapshotManager:
                     f"{commit.stderr.strip()}")
                 return False
 
-        sudo = "sudo " if self.use_sudo else ""
         for disk_target, _src in disks:
             overlay = self._overlay_path_for_snapshot(
                 vm_name, snapshot_name, disk_target)
             if overlay and os.path.isfile(overlay):
-                self.virsh.execute_shell(f"{sudo}rm -f '{overlay}'", warn=True)
+                self.virsh.execute_shell(f"rm -f '{overlay}'", warn=True)
 
         mem_path = self._memory_path_from_xml(vm_name, snapshot_name)
         if mem_path:
             for path in (mem_path, f"{mem_path}.zst"):
                 if os.path.isfile(path):
-                    self.virsh.execute_shell(f"{sudo}rm -f '{path}'", warn=True)
+                    self.virsh.execute_shell(f"rm -f '{path}'", warn=True)
 
         meta = self.virsh.execute(
             "snapshot-delete", vm_name, snapshot_name, "--metadata", warn=True)
@@ -1130,20 +1148,19 @@ class SnapshotManager:
         if not self._strip_backing_store_cache(vm_name):
             return False
 
-        sudo = "sudo " if self.use_sudo else ""
         for snap in drop_set:
             for disk_target, _ in disks:
                 overlay = self._overlay_path_for_snapshot(
                     vm_name, snap, disk_target)
                 if overlay and os.path.isfile(overlay):
                     self.virsh.execute_shell(
-                        f"{sudo}rm -f '{overlay}'", warn=True)
+                        f"rm -f '{overlay}'", warn=True)
             mem_path = self._memory_path_from_xml(vm_name, snap)
             if mem_path:
                 for path in (mem_path, f"{mem_path}.zst"):
                     if os.path.isfile(path):
                         self.virsh.execute_shell(
-                            f"{sudo}rm -f '{path}'", warn=True)
+                            f"rm -f '{path}'", warn=True)
             meta = self.virsh.execute(
                 "snapshot-delete", vm_name, snap, "--metadata", warn=True)
             if not meta.ok:

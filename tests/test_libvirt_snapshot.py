@@ -243,8 +243,9 @@ class TestGetSnapshotOverlayFiles:
 class TestPreserveSnapshotOverlays:
 
     def test_no_overlays_returns_empty_list(self, sm: SnapshotManager):
-        with patch.object(sm, "_get_snapshot_overlay_files", return_value={}):
-            assert sm._preserve_snapshot_overlays("vm01") == []
+        with patch.object(sm, "_get_snapshot_overlay_files", return_value={}), \
+             patch.object(sm, "_chain_order", return_value=["s"]):
+            assert sm._preserve_snapshot_overlays("vm01", "s") == []
 
     def test_overlays_batched_into_single_rsync_command(
         self, sm: SnapshotManager, tmp_path: Path
@@ -254,11 +255,13 @@ class TestPreserveSnapshotOverlays:
         overlay2 = tmp_path / "o2.qcow2"
         overlay2.write_bytes(b"x")
 
+        # reverting to s1 (oldest) preserves s1 and the newer s2
         with patch.object(
             sm, "_get_snapshot_overlay_files",
             return_value={"s1": [str(overlay1)], "s2": [str(overlay2)]},
-        ), patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
-            preserved = sm._preserve_snapshot_overlays("vm01")
+        ), patch.object(sm, "_chain_order", return_value=["s1", "s2"]), \
+                patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
+            preserved = sm._preserve_snapshot_overlays("vm01", "s1")
 
         # one single command for BOTH overlays (regression: 057eb7d)
         assert shell.call_count == 1
@@ -271,12 +274,59 @@ class TestPreserveSnapshotOverlays:
             [str(overlay1), str(overlay2)]
         )
 
+    def test_preserves_only_target_and_newer(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        # chain: s1 (oldest) -> s2 -> s3 (newest), one overlay each
+        overlays = {}
+        for name in ("s1", "s2", "s3"):
+            f = tmp_path / f"{name}.qcow2"
+            f.write_bytes(b"x")
+            overlays[name] = [str(f)]
+
+        # restoring the latest snapshot backs up ONLY its own overlay
+        # (the regression this narrowing fixes)
+        with patch.object(sm, "_get_snapshot_overlay_files", return_value=overlays), \
+                patch.object(sm, "_chain_order", return_value=["s1", "s2", "s3"]), \
+                patch.object(sm.virsh, "execute_shell", return_value=_result()):
+            preserved = sm._preserve_snapshot_overlays("vm01", "s3")
+        assert [p[0] for p in preserved] == overlays["s3"]
+
+        # restoring a middle snapshot backs up it + the newer one, not the older
+        with patch.object(sm, "_get_snapshot_overlay_files", return_value=overlays), \
+                patch.object(sm, "_chain_order", return_value=["s1", "s2", "s3"]), \
+                patch.object(sm.virsh, "execute_shell", return_value=_result()):
+            preserved = sm._preserve_snapshot_overlays("vm01", "s2")
+        backed_up = sorted(p[0] for p in preserved)
+        assert backed_up == sorted(overlays["s2"] + overlays["s3"])
+        assert overlays["s1"][0] not in backed_up
+
+    def test_falls_back_to_all_when_target_not_in_chain(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        overlays = {}
+        for name in ("s1", "s2"):
+            f = tmp_path / f"{name}.qcow2"
+            f.write_bytes(b"x")
+            overlays[name] = [str(f)]
+
+        # orphaned/missing metadata: target absent from chain order ->
+        # preserve everything (safe but slow fallback)
+        with patch.object(sm, "_get_snapshot_overlay_files", return_value=overlays), \
+                patch.object(sm, "_chain_order", return_value=[]), \
+                patch.object(sm.virsh, "execute_shell", return_value=_result()):
+            preserved = sm._preserve_snapshot_overlays("vm01", "gone")
+        assert sorted(p[0] for p in preserved) == sorted(
+            overlays["s1"] + overlays["s2"]
+        )
+
     def test_skips_missing_files(self, sm: SnapshotManager, tmp_path: Path):
         with patch.object(
             sm, "_get_snapshot_overlay_files",
             return_value={"s": ["/does/not/exist.qcow2"]},
-        ), patch.object(sm.virsh, "execute_shell") as shell:
-            preserved = sm._preserve_snapshot_overlays("vm01")
+        ), patch.object(sm, "_chain_order", return_value=["s"]), \
+                patch.object(sm.virsh, "execute_shell") as shell:
+            preserved = sm._preserve_snapshot_overlays("vm01", "s")
         assert preserved == []
         shell.assert_not_called()
 
@@ -286,8 +336,9 @@ class TestPreserveSnapshotOverlays:
         overlay.write_bytes(b"x")
         with patch.object(
             sm, "_get_snapshot_overlay_files", return_value={"s": [str(overlay)]}
-        ), patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
-            sm._preserve_snapshot_overlays("vm01")
+        ), patch.object(sm, "_chain_order", return_value=["s"]), \
+                patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
+            sm._preserve_snapshot_overlays("vm01", "s")
         assert shell.call_args.args[0].startswith("sudo rsync")
 
 
@@ -328,6 +379,22 @@ class TestRestorePreservedOverlays:
         # one rm cleanup call
         assert any("rm -f" in c and str(backup) in c for c in calls)
 
+    def test_cleanup_rm_is_not_sudo_prefixed(self, tmp_path: Path):
+        """Cleanup rm must not be sudo-prefixed even when use_sudo=True —
+        unlinking needs dir-write perms, not root, and a sudo that needs a
+        password would silently leak the .preserve files (see TestRmNeverSudo).
+        """
+        sm = SnapshotManager({"use_sudo": True})
+        overlay = tmp_path / "o.qcow2"
+        overlay.write_bytes(b"x")  # original still present -> backup is cleanup
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"x")
+        with patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
+            sm._restore_preserved_overlays([(str(overlay), str(backup))])
+        cmd = shell.call_args.args[0]
+        assert cmd.startswith("rm -f")
+        assert "sudo " not in cmd
+
 
 class TestSnapshotRestore:
     """End-to-end wiring for snapshot_restore (regression: 057eb7d)."""
@@ -343,7 +410,7 @@ class TestSnapshotRestore:
              patch.object(sm, "_restore_preserved_overlays") as restore:
             assert sm.snapshot_restore("vm01", "snap1") is True
 
-        preserve.assert_called_once_with("vm01")
+        preserve.assert_called_once_with("vm01", "snap1")
         execute.assert_called_once()
         assert execute.call_args.args[0] == "snapshot-revert"
         restore.assert_called_once_with(preserved_pairs)
