@@ -188,55 +188,54 @@ class TestForceUndefine:
         assert "destroy" not in calls
 
 
-class TestDeleteAllSnapshots:
-
-    def test_noop_when_vm_not_defined(self, dv: DestroyVM):
-        with patch.object(dv, "is_vm_defined", return_value=False):
-            assert dv.delete_all_snapshots() is True
-
-    def test_noop_when_no_snapshots(self, dv: DestroyVM):
-        with patch.object(dv, "is_vm_defined", return_value=True), \
-             patch.object(dv, "execute", return_value=_result(stdout="\n")):
-            assert dv.delete_all_snapshots() is True
-
-    def test_deletes_all_and_returns_true(self, dv: DestroyVM):
-        def fake(*args, **_kwargs):
-            if args[0] == "snapshot-list":
-                return _result(stdout="snap1\nsnap2\n")
-            return _result()
-        with patch.object(dv, "is_vm_defined", return_value=True), \
-             patch.object(dv, "execute", side_effect=fake) as execute:
-            assert dv.delete_all_snapshots() is True
-        deletes = [c for c in execute.call_args_list if c.args[0] == "snapshot-delete"]
-        assert len(deletes) == 2
-
-    def test_individual_failure_returns_false(self, dv: DestroyVM):
-        def fake(*args, **_kwargs):
-            if args[0] == "snapshot-list":
-                return _result(stdout="snap1\n")
-            return _result(ok=False, stderr="nope")
-        with patch.object(dv, "is_vm_defined", return_value=True), \
-             patch.object(dv, "execute", side_effect=fake):
-            assert dv.delete_all_snapshots() is False
-
-
 class TestRemove:
+    """`remove()` delegates undefine to force_undefine_vm (atomic
+    --snapshots-metadata) and must never iterate per-snapshot
+    `virsh snapshot-delete`, which wedges running/paused domains with saved
+    external snapshots (regression: the 10-VM teardown lock-timeout pileup)."""
 
-    def test_full_happy_path(self, dv: DestroyVM):
+    def test_delegates_to_force_undefine(self, dv: DestroyVM):
         with patch.object(dv, "is_vm_running", return_value=False), \
-             patch.object(dv, "delete_all_snapshots", return_value=True), \
-             patch.object(dv, "undefine_vm", return_value=True):
+             patch.object(dv, "force_undefine_vm", return_value=True) as fu:
             assert dv.remove() is True
+            fu.assert_called_once()
 
-    def test_destroy_failure_short_circuits(self, dv: DestroyVM):
+    def test_non_force_attempts_graceful_shutdown_first(self, dv: DestroyVM):
         with patch.object(dv, "is_vm_running", return_value=True), \
-             patch.object(dv, "destroy_vm", return_value=False):
-            assert dv.remove() is False
+             patch.object(dv, "shutdown_vm", return_value=True) as graceful, \
+             patch.object(dv, "force_undefine_vm", return_value=True) as fu:
+            assert dv.remove(force=None) is True
+            _a, kwargs = graceful.call_args
+            assert kwargs["force"] is False  # graceful only; fu force-kills the rest
+            fu.assert_called_once()
 
-    def test_snapshot_delete_failure_does_not_block_undefine(self, dv: DestroyVM):
-        """Deliberate behavior: attempt undefine even if snapshot cleanup fails."""
+    def test_force_skips_graceful_shutdown(self, dv: DestroyVM):
+        with patch.object(dv, "is_vm_running", return_value=True), \
+             patch.object(dv, "shutdown_vm") as graceful, \
+             patch.object(dv, "force_undefine_vm", return_value=True) as fu:
+            assert dv.remove(force=True) is True
+            graceful.assert_not_called()
+            fu.assert_called_once()
+
+    def test_paused_vm_is_force_killed_and_undefined(self, dv: DestroyVM):
+        """A paused VM (is_vm_running False, is_vm_shut_off False) must still be
+        force-killed and undefined — the bug that left boxman04 wedged."""
+        # is_vm_running False -> graceful skipped; force_undefine_vm runs for real
         with patch.object(dv, "is_vm_running", return_value=False), \
-             patch.object(dv, "delete_all_snapshots", return_value=False), \
-             patch.object(dv, "undefine_vm", return_value=True) as undefine:
+             patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
+             patch.object(dv, "is_vm_shut_off", return_value=False), \
+             patch.object(dv, "execute", return_value=_result()) as execute:
             assert dv.remove() is True
-            undefine.assert_called_once()
+        calls = [c.args[0] for c in execute.call_args_list]
+        assert "destroy" in calls  # force-killed the paused domain
+        assert any("undefine" in c and "--snapshots-metadata" in c for c in calls)
+
+    def test_never_issues_per_snapshot_snapshot_delete(self, dv: DestroyVM):
+        with patch.object(dv, "is_vm_running", return_value=False), \
+             patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
+             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "execute", return_value=_result()) as execute:
+            assert dv.remove() is True
+        commands = [c.args[0] for c in execute.call_args_list]
+        assert not any(c.startswith("snapshot-delete") for c in commands)
+        assert any("--snapshots-metadata" in c for c in commands)
