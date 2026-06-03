@@ -54,7 +54,7 @@ class TestSnapshotOverlayPreservation_057eb7d:
 
         call_order: list[str] = []
 
-        def record_preserve(_vm):
+        def record_preserve(_vm, _snap):
             call_order.append("preserve")
             return [("/overlay.qcow2", "/overlay.qcow2.preserve")]
 
@@ -88,11 +88,13 @@ class TestSnapshotOverlayPreservation_057eb7d:
         c = tmp_path / "c.qcow2"
         c.write_bytes(b"x")
 
+        # revert to the oldest snapshot preserves it and both newer ones
         with patch.object(
             sm, "_get_snapshot_overlay_files",
             return_value={"s1": [str(a)], "s2": [str(b)], "s3": [str(c)]},
-        ), patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
-            sm._preserve_snapshot_overlays("vm01")
+        ), patch.object(sm, "_chain_order", return_value=["s1", "s2", "s3"]), \
+                patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
+            sm._preserve_snapshot_overlays("vm01", "s1")
 
         assert shell.call_count == 1
         cmd = shell.call_args.args[0]
@@ -225,6 +227,33 @@ class TestSudoSkipCommands_380b776:
             "sudo_skip_commands": ["virsh"],
         })
         assert cmd._should_use_sudo_for_command("/usr/bin/virsh list") is False
+
+
+class TestRmNeverSudo:
+    """`rm` must never be sudo-wrapped: unlinking needs dir-write perms, not
+    root. Hosts whose sudoers lacks a passwordless `rm` rule would otherwise
+    fail snapshot cleanup silently and leak overlay/.preserve files."""
+
+    def test_rm_not_sudo_even_with_use_sudo_true(self):
+        cmd = LibVirtCommandBase(provider_config={"use_sudo": True})
+        assert cmd._should_use_sudo_for_command("rm -f '/ws/x.preserve'") is False
+
+    def test_rm_not_sudo_full_path(self):
+        cmd = LibVirtCommandBase(provider_config={"use_sudo": True})
+        assert cmd._should_use_sudo_for_command("/bin/rm -f '/ws/x'") is False
+
+    def test_force_sudo_can_still_override_rm(self):
+        """An explicit force_sudo_commands entry still wins (escape hatch)."""
+        cmd = LibVirtCommandBase(provider_config={
+            "use_sudo": True,
+            "force_sudo_commands": ["rm"],
+        })
+        assert cmd._should_use_sudo_for_command("rm -f '/ws/x'") is True
+
+    def test_other_commands_still_sudo(self):
+        """The never-sudo rule is scoped to rm; qemu-img still gets sudo."""
+        cmd = LibVirtCommandBase(provider_config={"use_sudo": True})
+        assert cmd._should_use_sudo_for_command("qemu-img info /x") is True
 
 
 # ---------------------------------------------------------------------------

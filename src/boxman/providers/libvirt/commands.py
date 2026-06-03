@@ -15,6 +15,14 @@ class LibVirtCommandBase:
     virt-install, virt-clone, etc. It handles configuration, command execution,
     and error management.
     """
+
+    #: Commands that never need root in boxman's file model. Deleting a file
+    #: only requires write permission on its parent dir (boxman-owned), so
+    #: ``rm`` must not be sudo-wrapped — otherwise a host whose sudoers lacks a
+    #: passwordless ``rm`` rule would fail cleanup silently. Overridable per
+    #: command via ``force_sudo_commands``.
+    _NEVER_SUDO_COMMANDS: frozenset = frozenset({'rm'})
+
     def __init__(self,
                  override_config_use_sudo: bool | None = None,
                  provider_config: dict[str, Any] | None = None):
@@ -155,8 +163,12 @@ class LibVirtCommandBase:
 
         Resolution order (first match wins):
         1. ``force_sudo_commands`` — always sudo regardless of ``use_sudo``
-        2. ``sudo_skip_commands`` — never sudo regardless of ``use_sudo``
-        3. Fall back to the global ``use_sudo`` flag.
+        2. ``rm`` — never sudo: unlinking a file needs write permission on the
+           (boxman-owned) parent directory, not root. Prepending a sudo that
+           may require an interactive password would only make cleanup fail
+           silently and leak overlay/.preserve files.
+        3. ``sudo_skip_commands`` — never sudo regardless of ``use_sudo``
+        4. Fall back to the global ``use_sudo`` flag.
 
         Matching is done against the basename of the first token in the
         command string (e.g. ``/usr/bin/qemu-img resize …`` matches
@@ -167,7 +179,7 @@ class LibVirtCommandBase:
 
         if cmd_name in self.force_sudo_commands:
             return True
-        if cmd_name in self.sudo_skip_commands:
+        if cmd_name in self._NEVER_SUDO_COMMANDS or cmd_name in self.sudo_skip_commands:
             return False
         return self.use_sudo
 
