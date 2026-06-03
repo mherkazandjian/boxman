@@ -31,7 +31,10 @@ class BareVM:
 
     def create(self) -> bool:
         """Create the bare VM."""
-        disk_path = os.path.join(self.workdir, f'{self.vm_name}.qcow2')
+        # expanduser: the cluster workdir may contain a literal '~' (it is not
+        # expanded upstream), and qemu-img/virt-install do not expand it.
+        disk_path = os.path.expanduser(
+            os.path.join(self.workdir, f'{self.vm_name}.qcow2'))
         disk_size = self._get_disk_size_gb()
         memory = self.info.get('memory', 2048)
         vcpus = self.info.get('vcpus', 2)
