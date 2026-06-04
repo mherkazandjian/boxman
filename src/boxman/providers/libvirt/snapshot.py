@@ -694,9 +694,12 @@ class SnapshotManager:
         """
         Revert a VM to a specific snapshot.
 
-        Before reverting, overlay files referenced by all snapshots are
-        backed up.  After the revert any overlays that libvirt deleted
-        are restored so that every snapshot remains reachable.
+        Before reverting, the overlay files that ``snapshot-revert`` can
+        delete are backed up — the target snapshot's overlays and any newer
+        ones in the chain (see :meth:`_preserve_snapshot_overlays`, which
+        falls back to backing up every overlay if the target isn't found in
+        the chain). After the revert any overlays libvirt deleted are
+        restored so that every snapshot remains reachable.
 
         Compressed memory: if the snapshot's ``.raw`` memory file is missing
         but a ``.raw.zst`` sibling exists (created by ``snapshot take
