@@ -7,25 +7,22 @@ stays smaller and these presets can be imported directly (e.g. by tests)
 without pulling in the whole ``CloudInitTemplate`` class.
 
 Also houses :func:`hash_password`, the SHA-512 ``crypt`` wrapper used by
-``${hash:plaintext}`` placeholder substitution. Keeping it here makes
-the dependency on the deprecated :mod:`crypt` module visible in one
-place — Phase 2.8 will replace ``crypt`` with a ``passlib`` equivalent
-before Python 3.13 drops it from stdlib.
+``${hash:plaintext}`` placeholder substitution. Uses :mod:`passlib`
+rather than stdlib :mod:`crypt` because:
+
+- :mod:`crypt` is removed from stdlib in Python 3.13.
+- :mod:`crypt` dynamically links against the system's ``libcrypt.so``;
+  on hosts where ``libcrypt`` is provided by libxcrypt without the
+  legacy ``crypt()`` symbol (and where ``libxcrypt-compat`` is not
+  installed — or, more commonly, where a conda Python ships its own
+  ``libcrypt`` that masks the system one), ``import crypt`` fails at
+  load time with ``undefined symbol: crypt``. :mod:`passlib` is pure
+  Python and side-steps the ABI problem entirely.
 """
 
 from __future__ import annotations
 
-import crypt  # deprecated in 3.13 — replace with passlib in a later pass
-import warnings
-
-# Silence the 3.12 DeprecationWarning at import time; boxman still supports
-# 3.10 where crypt is the standard path. The replacement work is tracked
-# in PROPOSALS.md.
-warnings.filterwarnings(
-    "ignore",
-    message=r"'crypt' is deprecated.*",
-    category=DeprecationWarning,
-)
+from passlib.hash import sha512_crypt
 
 
 DEFAULT_META_DATA = """\
@@ -96,5 +93,4 @@ def hash_password(plain_password: str) -> str:
     hashes differently each time. That is intended — it prevents the
     hash from revealing identical reused passwords.
     """
-    salt = crypt.mksalt(crypt.METHOD_SHA512)
-    return crypt.crypt(plain_password, salt)
+    return sha512_crypt.hash(plain_password)

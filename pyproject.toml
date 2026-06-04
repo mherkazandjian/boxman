@@ -33,6 +33,11 @@ PyYAML = "^6.0"
 invoke = "^2.2"
 Jinja2 = "^3.1"
 lxml = "^5.0"
+# Pure-Python crypt() replacement for cloud-init password hashes. Stdlib
+# `crypt` was removed in Python 3.13 and breaks at import on hosts where
+# libcrypt was rebuilt without the legacy symbol (common with conda
+# Pythons on RHEL 9 / Rocky 9).
+passlib = "^1.7"
 
 [tool.poetry.extras]
 docker-compose = ["docker"]
