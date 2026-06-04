@@ -848,6 +848,36 @@ def parse_args():
     )
 
     #
+    # sub parser for the 'control reboot' subsubcommand
+    #
+    parser_ctrl_reboot = subparsers_ctrl.add_parser(
+        'reboot',
+        help='cold-reboot vms (power-cycle so firmware/boot order re-runs)',
+        description=(
+            "Cold-reboot (power-cycle) one or more VMs: force them off, then\n"
+            "start them again so the firmware runs from scratch and\n"
+            "re-evaluates the boot order from the domain XML.\n"
+            "\n"
+            "For a VM declared with 'boot_order: [network, hd]' in conf.yml\n"
+            "this re-triggers the PXE network boot -- the way to (re)provision\n"
+            "a diskless target once its provisioning server is ready.\n"
+            "\n"
+            "examples:\n"
+            "    # re-PXE just the diskless target\n"
+            "    $ boxman control reboot --vms pxe-target\n"
+        ),
+        formatter_class=RawTextHelpFormatter
+    )
+    parser_ctrl_reboot.set_defaults(func=BoxmanManager.reboot_vm)
+    parser_ctrl_reboot.add_argument(
+        '--vms',
+        type=str,
+        help='the names of the vms as a csv list (short or full names)',
+        dest='vms',
+        default='all'
+    )
+
+    #
     # sub parser for the 'export' subcommand
     #
     parser_export = subparsers.add_parser('export', help='export the vms')
@@ -1041,57 +1071,6 @@ def parse_args():
         default=None,
         help='cluster name to scope the workspace environment to',
         dest='cluster'
-    )
-
-    # ── pxe-boot ─────────────────────────────────────────────────────
-    parser_pxe = subparsers.add_parser(
-        'pxe-boot',
-        help='set a VM to network-boot and optionally wait for SSH',
-        description=(
-            "Set a VM's boot order to [network, hd], start it, and\n"
-            "optionally poll for SSH availability after PXE provisioning.\n"
-            "\n"
-            "Requires a Cobbler (or compatible) PXE provisioning server on\n"
-            "the same libvirt network as the VM.\n"
-            "\n"
-            "examples:\n"
-            "    # Boot from network, don't wait\n"
-            "    $ boxman pxe-boot --vm pxe-test01\n"
-            "\n"
-            "    # Boot from network and wait for SSH, then restore boot order\n"
-            "    $ boxman pxe-boot --vm pxe-test01 --expected-ip 192.168.123.50 "
-            "--restore-after\n"
-        ),
-        formatter_class=RawTextHelpFormatter
-    )
-    parser_pxe.set_defaults(func=BoxmanManager.pxe_boot)
-    parser_pxe.add_argument(
-        '--vm',
-        type=str,
-        required=True,
-        help='full domain name of the VM to PXE boot',
-        dest='vm'
-    )
-    parser_pxe.add_argument(
-        '--expected-ip',
-        type=str,
-        default=None,
-        help='IP address to poll for SSH after the OS is installed',
-        dest='expected_ip'
-    )
-    parser_pxe.add_argument(
-        '--wait-timeout',
-        type=int,
-        default=600,
-        help='maximum seconds to wait for SSH (default: 600)',
-        dest='wait_timeout'
-    )
-    parser_pxe.add_argument(
-        '--restore-after',
-        action='store_true',
-        default=False,
-        help='restore boot order to [hd] after SSH becomes available',
-        dest='restore_after'
     )
 
     # ── netlab (containerlab) ────────────────────────────────────────

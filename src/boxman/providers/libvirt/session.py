@@ -435,6 +435,41 @@ class LibVirtSession:
             self.logger.error(traceback.format_exc())
             return False
 
+    def reboot_vm(self, vm_name: str) -> bool:
+        """
+        Cold-reboot a VM: force it off (if running) then start it again.
+
+        Unlike a guest-initiated ``virsh reboot``, this power-cycles the
+        domain so the firmware runs from scratch and re-evaluates the boot
+        order declared in the domain XML.  For a VM defined with
+        ``boot_order: [network, hd]`` this re-triggers the PXE network boot,
+        which is the documented way to (re)provision a diskless target once
+        its provisioning server (e.g. Cobbler) is ready.
+
+        Args:
+            vm_name: Name of the VM to reboot
+
+        Returns:
+            True if the VM is running after the reboot, False otherwise
+        """
+        try:
+            virsh = VirshCommand(provider_config=self.provider_config)
+
+            result = virsh.execute("domstate", vm_name, warn=True)
+            if result.ok and "running" in result.stdout:
+                self.logger.info(f"forcing off vm {vm_name} before reboot")
+                virsh.execute("destroy", vm_name, warn=True)
+                # brief settle so the domain reaches 'shut off' before restart
+                time.sleep(2)
+
+            return self.start_vm(vm_name)
+
+        except Exception as exc:
+            import traceback
+            self.logger.error(f"error rebooting vm {vm_name}: {exc}")
+            self.logger.error(traceback.format_exc())
+            return False
+
     def add_network_interface(self,
                               vm_name: str,
                               network_source: str,

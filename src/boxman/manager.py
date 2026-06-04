@@ -855,45 +855,6 @@ class BoxmanManager:
             raise SystemExit(1) from exc
 
     @staticmethod
-    def pxe_boot(cls, cli_args):
-        """
-        Set boot order to network-first on a VM, start it, optionally wait
-        for SSH, and optionally restore the boot order afterwards.
-
-        Designed to be used with a Cobbler PXE provisioning server.
-        """
-        session = cls.provider
-        vm_name = cli_args.vm
-
-        cls.logger.info(f"setting boot order to [network, hd] for '{vm_name}'")
-        if not session.set_boot_order(vm_name, ['network', 'hd']):
-            cls.logger.error(f"failed to set boot order for '{vm_name}'")
-            return False
-
-        cls.logger.info(f"starting VM '{vm_name}'")
-        if not session.start_vm(vm_name):
-            cls.logger.error(f"failed to start VM '{vm_name}'")
-            return False
-
-        if cli_args.expected_ip:
-            ok = session.wait_for_ssh(
-                cli_args.expected_ip,
-                timeout=cli_args.wait_timeout,
-            )
-            if not ok:
-                cls.logger.error(
-                    f"SSH timeout waiting for '{vm_name}' at "
-                    f"{cli_args.expected_ip}")
-                return False
-
-            if cli_args.restore_after:
-                cls.logger.info(
-                    f"restoring boot order to [hd] for '{vm_name}'")
-                session.restore_boot_order(vm_name)
-
-        return True
-
-    @staticmethod
     def create_templates(cls, cli_args) -> None:
         """
         Create template VMs from cloud images using cloud-init.
@@ -3970,6 +3931,34 @@ class BoxmanManager:
                 cls.provider.restore_vm(vm_name, workdir)
             else:
                 cls.provider.start_vm(vm_name)
+
+    @staticmethod
+    def reboot_vm(cls, cli_args):
+        """
+        Cold-reboot VMs (force off, then start) so the firmware runs again.
+
+        For a VM declared with ``boot_order: [network, hd]`` in conf.yml this
+        re-triggers the PXE network boot -- the documented way to (re)provision
+        a diskless target once its provisioning server (e.g. Cobbler) is ready.
+
+        Honors ``--vms`` (csv of short or full domain names; ``all`` = every
+        VM); this lets the demo re-PXE just ``pxe-target`` without disturbing
+        the Cobbler host.
+        """
+        requested = getattr(cli_args, 'vms', 'all') or 'all'
+        selectors = None if requested == 'all' else {
+            s.strip() for s in requested.split(',') if s.strip()
+        }
+        for vm_name, _ in cls.process_vm_list(cli_args):
+            short_name = vm_name.rsplit('_', 1)[-1]
+            if selectors is not None and not (
+                    vm_name in selectors or short_name in selectors):
+                continue
+            cls.logger.info(f"rebooting vm {vm_name}")
+            if cls.provider.reboot_vm(vm_name):
+                cls.logger.info(f"vm {vm_name} rebooted")
+            else:
+                cls.logger.warning(f"failed to reboot vm {vm_name}")
     ### end control vm functions ####
 
     ### task runner functions ####

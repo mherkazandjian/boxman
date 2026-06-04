@@ -228,6 +228,51 @@ class TestStartVM:
             assert s.start_vm("vm01") is False
 
 
+class TestRebootVM:
+    """Cold reboot: force off (if running) then start again."""
+
+    @patch("boxman.providers.libvirt.session.time.sleep", return_value=None)
+    def test_forces_off_running_vm_then_starts(self, _sleep):
+        s = _session({})
+        mock_virsh = MagicMock()
+        mock_virsh.execute.side_effect = [
+            _result(stdout="running\n"),    # reboot_vm: domstate -> running
+            _result(ok=True),               # reboot_vm: destroy (force off)
+            _result(stdout="shut off\n"),   # start_vm: domstate
+            _result(ok=True),               # start_vm: start
+            _result(stdout="running\n"),    # start_vm: verify
+        ]
+        with patch("boxman.providers.libvirt.session.VirshCommand",
+                   return_value=mock_virsh):
+            assert s.reboot_vm("vm01") is True
+        calls = [c.args[0] for c in mock_virsh.execute.call_args_list]
+        assert calls[0] == "domstate"
+        assert calls[1] == "destroy"     # power-cycled, not graceful reboot
+        assert "start" in calls
+
+    @patch("boxman.providers.libvirt.session.time.sleep", return_value=None)
+    def test_skips_destroy_when_already_off(self, _sleep):
+        s = _session({})
+        mock_virsh = MagicMock()
+        mock_virsh.execute.side_effect = [
+            _result(stdout="shut off\n"),   # reboot_vm: domstate -> off
+            _result(stdout="shut off\n"),   # start_vm: domstate
+            _result(ok=True),               # start_vm: start
+            _result(stdout="running\n"),    # start_vm: verify
+        ]
+        with patch("boxman.providers.libvirt.session.VirshCommand",
+                   return_value=mock_virsh):
+            assert s.reboot_vm("vm01") is True
+        calls = [c.args[0] for c in mock_virsh.execute.call_args_list]
+        assert "destroy" not in calls     # nothing to force off
+
+    def test_exception_returns_false(self):
+        s = _session({})
+        with patch("boxman.providers.libvirt.session.VirshCommand",
+                   side_effect=RuntimeError("x")):
+            assert s.reboot_vm("vm01") is False
+
+
 class TestCloneVMDelegation:
 
     def test_calls_cloneVM_with_expected_args(self, tmp_path: Path):
