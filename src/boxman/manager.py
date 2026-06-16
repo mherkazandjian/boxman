@@ -271,15 +271,73 @@ class BoxmanManager:
 
         return conf
 
+    @staticmethod
+    def _render_inventory(host_aliases, cluster_groups) -> str:
+        """
+        Render an Ansible ``01-hosts.yml`` body.
+
+        Args:
+            host_aliases: iterable of ``(host_key, boxman_alias)`` placed under
+                ``all.hosts``.
+            cluster_groups: mapping of group name → list of host keys, rendered
+                as ``all.children.<group>.hosts``.
+
+        Returns:
+            The YAML text (identical in shape to what boxman has always
+            generated for the combined workspace inventory).
+        """
+        host_lines = '\n'.join(
+            f'        {host}:\n          boxman_alias: "{alias}"'
+            for host, alias in host_aliases
+        )
+        children_lines: list[str] = []
+        for group, hosts in cluster_groups.items():
+            children_lines.append(f'    {group}:')
+            children_lines.append('      hosts:')
+            for host in hosts:
+                children_lines.append(f'        {host}:')
+        children_section = '\n'.join(children_lines)
+        return (
+            f"---\n"
+            f"all:\n"
+            f"  hosts:\n"
+            f"{host_lines}\n"
+            f"  children:\n"
+            f"{children_section}\n"
+        )
+
+    @staticmethod
+    def _cluster_inventory_key(cluster: dict) -> str:
+        """
+        Resolve the ``files`` key for a cluster's own ``01-hosts.yml``.
+
+        Honors a per-cluster ``inventory:`` override (relative to the cluster
+        workdir, or absolute); otherwise defaults to ``inventory/01-hosts.yml``
+        under the cluster workdir. The key is consumed by ``provision_files``,
+        which writes cluster files with ``rootdir=cluster['workdir']`` — so an
+        absolute override naturally bypasses the workdir, mirroring how the
+        workspace-level custom inventory path is handled.
+        """
+        inv = cluster.get('inventory')
+        if inv:
+            inv = os.path.normpath(os.path.expanduser(str(inv)))
+            return os.path.join(inv, '01-hosts.yml')
+        return os.path.join('inventory', '01-hosts.yml')
+
     def resolve_workspace_defaults(self) -> None:
         """
         Resolve workspace defaults for each cluster.
 
         For each cluster:
         - If workdir is not set, default to workspace.path / cluster_name
+        - Auto-generate a per-cluster ``inventory/01-hosts.yml`` (location
+          overridable via the cluster's ``inventory:`` key) containing ONLY
+          that cluster's hosts, so per-cluster Ansible runs are isolated.
 
         At the workspace level (written to workspace.path):
-        - Auto-generate env.sh, inventory/01-hosts.yml, and ansible.cfg
+        - Auto-generate env.sh, ansible.cfg, and a combined
+          inventory/01-hosts.yml spanning every cluster (used for
+          project-wide ops and ``boxman ssh`` alias resolution).
         """
         config = self.config
         workspace = config.get('workspace', {})
@@ -351,41 +409,56 @@ class BoxmanManager:
                     f"export ANSIBLE_SSH_ARGS=\"-F $SSH_CONFIG\"\n"
                 )
 
-        # --- inventory/01-hosts.yml (workspace-level) ---
-        ws_inv_key = inventory_key
-        if ws_inv_key not in ws_files:
-            all_vms = []
-            for cname, cluster in clusters.items():
-                for vm_name in cluster.get('vms', {}).keys():
-                    all_vms.append((cname, vm_name))
-            if all_vms:
-                pad_width = len(str(len(all_vms) - 1)) if len(all_vms) > 1 else 1
-                lines = []
-                for i, (cname, vm) in enumerate(all_vms):
-                    alias = f"node{str(i).zfill(pad_width)}"
-                    lines.append(f'        {cname}_{vm}:\n          boxman_alias: "{alias}"')
-                host_lines = '\n'.join(lines)
+        # --- inventory generation ---
+        # Build the project-wide ordering of (cluster, vm) once so a given
+        # host's boxman_alias is identical in the combined workspace inventory
+        # and in the per-cluster inventory below (and lines up with the
+        # node<N> aliases written into ssh_config).
+        all_vms = [
+            (cname, vm_name)
+            for cname, cluster in clusters.items()
+            for vm_name in cluster.get('vms', {})
+        ]
+        pad_width = len(str(len(all_vms) - 1)) if len(all_vms) > 1 else 1
+        alias_of = {
+            (cname, vm): f"node{str(i).zfill(pad_width)}"
+            for i, (cname, vm) in enumerate(all_vms)
+        }
 
-                # build children groups keyed by cluster name
-                cluster_groups = {}
-                for cname, vm in all_vms:
-                    cluster_groups.setdefault(cname, []).append(f'{cname}_{vm}')
-                children_lines = []
-                for cname, hosts in cluster_groups.items():
-                    children_lines.append(f'    {cname}:')
-                    children_lines.append('      hosts:')
-                    for h in hosts:
-                        children_lines.append(f'        {h}:')
-                children_section = '\n'.join(children_lines)
+        # Combined workspace inventory (every cluster's hosts). Kept for
+        # project-wide ops and `boxman ssh <alias>` resolution. NOTE: because
+        # it merges all clusters under all.hosts, an Ansible consumer that
+        # iterates groups['all'] would see every cluster — which is why each
+        # cluster also gets its own scoped inventory below.
+        if all_vms and inventory_key not in ws_files:
+            host_aliases = [(f'{c}_{v}', alias_of[(c, v)]) for c, v in all_vms]
+            cluster_groups: dict[str, list[str]] = {}
+            for c, v in all_vms:
+                cluster_groups.setdefault(c, []).append(f'{c}_{v}')
+            ws_files[inventory_key] = self._render_inventory(
+                host_aliases, cluster_groups)
 
-                ws_files[ws_inv_key] = (
-                    f"---\n"
-                    f"all:\n"
-                    f"  hosts:\n"
-                    f"{host_lines}\n"
-                    f"  children:\n"
-                    f"{children_section}\n"
-                )
+        # Per-cluster inventory (only that cluster's hosts). This is what a
+        # `run --cluster <name>` (via the cluster's `inventory:` override, see
+        # load_workspace_env) or a per-cluster Ansible tree should consume, so
+        # groups['all'] never spans clusters. Written under the cluster's own
+        # inventory dir: `cluster.inventory` if set, else <workdir>/inventory.
+        for cluster_name, cluster in clusters.items():
+            cluster_vms = list(cluster.get('vms', {}))
+            if not cluster_vms or 'workdir' not in cluster:
+                continue
+            cluster_files = cluster.setdefault('files', {})
+            cluster_inv_key = self._cluster_inventory_key(cluster)
+            if cluster_inv_key in cluster_files:
+                continue
+            host_aliases = [
+                (f'{cluster_name}_{v}', alias_of[(cluster_name, v)])
+                for v in cluster_vms
+            ]
+            cluster_files[cluster_inv_key] = self._render_inventory(
+                host_aliases,
+                {cluster_name: [f'{cluster_name}_{v}' for v in cluster_vms]},
+            )
 
         # --- ansible.cfg (workspace-level) ---
         if ansible_cfg_key not in ws_files:
@@ -3483,20 +3556,76 @@ class BoxmanManager:
             )
 
     @staticmethod
-    def snapshot_take(cls, cli_args):
+    def _select_vm_targets(cls, cli_args):
         """
-        Take a snapshot of every VM in the cluster (parallel), then verify each one.
+        Resolve the VMs selected by the ``--cluster`` / ``--vms`` flags.
+
+        Returns a list of ``(full_vm_name, cluster_name, vm_name, workdir)``
+        tuples, filtered by:
+
+        * ``--cluster <name>`` — restrict to a single cluster (raises
+          :class:`ValueError` if the cluster is unknown);
+        * ``--vms <csv>`` — restrict to specific VMs, each matched against
+          either the bare VM name (``node01``) or the cluster-qualified short
+          name (``cluster_1_node01``). The default ``'all'`` selects every VM.
+
+        Both filters compose: ``--cluster cluster_2 --vms node01`` selects
+        only ``cluster_2``'s ``node01``. With neither flag the result is every
+        VM in every cluster — preserving the previous whole-project behaviour.
         """
         prj_name = f'bprj__{cls.config["project"]}__bprj'
 
-        vm_targets = [
-            (
-                f"{prj_name}_{cluster_name}_{vm_name}",
-                os.path.expanduser(cluster['workdir']),
+        cluster_filter = getattr(cli_args, 'cluster', None)
+        vms_raw = getattr(cli_args, 'vms', None)
+        if vms_raw is None:
+            vms_raw = 'all'
+
+        vm_filter: set | None = None
+        if isinstance(vms_raw, (list, tuple)):
+            vm_filter = {str(v).strip() for v in vms_raw if str(v).strip()}
+        elif str(vms_raw).strip().lower() != 'all':
+            vm_filter = {v.strip() for v in str(vms_raw).split(',') if v.strip()}
+        if vm_filter is not None and not vm_filter:
+            vm_filter = None
+
+        clusters = cls.config['clusters']
+        if cluster_filter is not None and cluster_filter not in clusters:
+            raise ValueError(
+                f"cluster '{cluster_filter}' not found in config "
+                f"(available: {', '.join(clusters) or '(none)'})"
             )
-            for cluster_name, cluster in cls.config['clusters'].items()
-            for vm_name, _ in cluster['vms'].items()
+
+        targets = []
+        for cluster_name, cluster in clusters.items():
+            if cluster_filter is not None and cluster_name != cluster_filter:
+                continue
+            workdir = os.path.expanduser(cluster['workdir'])
+            for vm_name in cluster.get('vms', {}):
+                short_name = f"{cluster_name}_{vm_name}"
+                if vm_filter is not None and not (
+                    vm_name in vm_filter or short_name in vm_filter
+                ):
+                    continue
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                targets.append((full_vm_name, cluster_name, vm_name, workdir))
+        return targets
+
+    @staticmethod
+    def snapshot_take(cls, cli_args):
+        """
+        Take a snapshot of the selected VMs (parallel), then verify each one.
+
+        Honours ``--cluster`` / ``--vms`` so a single cluster (or VM) can be
+        snapshotted independently in a multi-cluster project.
+        """
+        vm_targets = [
+            (full_vm_name, workdir)
+            for full_vm_name, _cluster_name, _vm_name, workdir
+            in cls._select_vm_targets(cls, cli_args)
         ]
+        if not vm_targets:
+            cls.logger.warning("no VMs matched the given --cluster/--vms selection")
+            return
 
         compress_memory = getattr(cli_args, 'compress_memory', False)
         compress_level = getattr(cli_args, 'memory_compress_level', 3)
@@ -3540,7 +3669,10 @@ class BoxmanManager:
     @staticmethod
     def snapshot_restore(cls, cli_args):
         """
-        Restore the state of every VM in the cluster from a snapshot (parallel).
+        Restore the state of the selected VMs from a snapshot (parallel).
+
+        Honours ``--cluster`` / ``--vms`` so a single cluster (or VM) can be
+        rolled back independently in a multi-cluster project.
 
         Workflow
         --------
@@ -3549,23 +3681,24 @@ class BoxmanManager:
         3. Run parallel restores, tracking per-VM success via a Queue.
         4. Retry failed VMs in subsequent rounds until ALL succeed.
         """
-        prj_name = f'bprj__{cls.config["project"]}__bprj'
+        selected = cls._select_vm_targets(cls, cli_args)
+        if not selected:
+            cls.logger.warning("no VMs matched the given --cluster/--vms selection")
+            return
 
         # ── 1. Resolve snapshot names ────────────────────────────────────────
         vm_targets = []  # list of (full_vm_name, resolved_snapshot_name)
-        for cluster_name, cluster in cls.config['clusters'].items():
-            for vm_name, _ in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                snap_name = cli_args.snapshot_name
-                if not snap_name:
-                    snap_name = cls.provider.get_latest_snapshot(full_vm_name)
-                    if snap_name is None:
-                        cls.logger.error(
-                            f"no snapshot found for {full_vm_name}, aborting restore")
-                        return
-                    cls.logger.info(
-                        f"resolved latest snapshot for {full_vm_name}: '{snap_name}'")
-                vm_targets.append((full_vm_name, snap_name))
+        for full_vm_name, _cluster_name, _vm_name, _workdir in selected:
+            snap_name = cli_args.snapshot_name
+            if not snap_name:
+                snap_name = cls.provider.get_latest_snapshot(full_vm_name)
+                if snap_name is None:
+                    cls.logger.error(
+                        f"no snapshot found for {full_vm_name}, aborting restore")
+                    return
+                cls.logger.info(
+                    f"resolved latest snapshot for {full_vm_name}: '{snap_name}'")
+            vm_targets.append((full_vm_name, snap_name))
 
         # ── 2. Pre-validate all snapshots ────────────────────────────────────
         cls.logger.info("pre-validating snapshots before restore...")
@@ -3631,18 +3764,23 @@ class BoxmanManager:
     @staticmethod
     def snapshot_delete(cls, cli_args):
         """
-        Delete a snapshot of the VMs in the cluster.
+        Delete a snapshot of the selected VMs.
+
+        Honours ``--cluster`` / ``--vms`` so a snapshot can be removed from a
+        single cluster (or VM) in a multi-cluster project.
         """
         if not cli_args.snapshot_name:
             cls.logger.error("error: Snapshot name is required")
             return
 
-        prj_name = f'bprj__{cls.config["project"]}__bprj'
-        for cluster_name, cluster in cls.config['clusters'].items():
-            for vm_name, _ in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                cls.provider.snapshot_delete(full_vm_name, cli_args.snapshot_name)
-                cls.logger.info(f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
+        targets = cls._select_vm_targets(cls, cli_args)
+        if not targets:
+            cls.logger.warning("no VMs matched the given --cluster/--vms selection")
+            return
+
+        for full_vm_name, _cluster_name, _vm_name, _workdir in targets:
+            cls.provider.snapshot_delete(full_vm_name, cli_args.snapshot_name)
+            cls.logger.info(f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
 
     @staticmethod
     def _collapse_one_vm(provider_config, full_vm_name, workdir, vm_info,

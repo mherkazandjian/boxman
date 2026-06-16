@@ -84,7 +84,14 @@ def load_workspace_env(
     2. If the cluster's ``files`` section contains ``env.sh``, write it to
        the workdir (if not already present) and source it.
     3. Explicit keys in ``workspace_config`` (``gateway_host``, ``ssh_config``,
-       ``inventory``, ``salt_master``) override any sourced values.
+       ``inventory``, ``salt_master``, ``ansible_config``) override any
+       sourced values.
+    4. The same keys declared under the *cluster* (``cluster_config``) are
+       layered on top of the workspace ones, so a ``run --cluster <name>``
+       (or ``ssh --cluster``) targets that cluster's own inventory / gateway
+       / ssh_config rather than the shared workspace defaults. This is what
+       makes multi-cluster projects inventory-isolated at the operations
+       layer.
 
     Args:
         cluster_config: A single cluster's configuration dict (from conf.yml).
@@ -117,7 +124,10 @@ def load_workspace_env(
                 f"(run 'boxman provision' first to generate it)"
             )
 
-    # 3. Explicit workspace overrides
+    # 3. Explicit overrides. Workspace-level keys apply first; the same keys
+    #    declared on the cluster are layered on top (cluster is more specific,
+    #    so it wins). This lets each cluster in a multi-cluster project point
+    #    at its own inventory / gateway / ssh_config tree.
     override_map = {
         "gateway_host": "GATEWAYHOST",
         "salt_master": "SALTMASTER",
@@ -125,10 +135,9 @@ def load_workspace_env(
         "inventory": "INVENTORY",
         "ansible_config": "ANSIBLE_CONFIG",
     }
-    for yaml_key, env_key in override_map.items():
-        if yaml_key in workspace_config:
-            env_vars[env_key] = os.path.expanduser(
-                str(workspace_config[yaml_key])
-            )
+    for source in (workspace_config, cluster_config):
+        for yaml_key, env_key in override_map.items():
+            if yaml_key in source:
+                env_vars[env_key] = os.path.expanduser(str(source[yaml_key]))
 
     return env_vars

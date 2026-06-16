@@ -430,6 +430,13 @@ def parse_args():
         default='all'
     )
     parser_snap_take.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        dest='cluster',
+        help='restrict the snapshot to a single cluster',
+    )
+    parser_snap_take.add_argument(
         '--name',
         type=str,
         help='the name of the snapshot',
@@ -537,6 +544,13 @@ def parse_args():
         default='all'
     )
     parser_snap_restore.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        dest='cluster',
+        help='restrict the restore to a single cluster',
+    )
+    parser_snap_restore.add_argument(
         '--name',
         type=str,
         help='the name of the snapshot',
@@ -555,6 +569,13 @@ def parse_args():
         help='the names of the vms as a csv list',
         dest='vms',
         default='all'
+    )
+    parser_snap_delete.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        dest='cluster',
+        help='restrict the delete to a single cluster',
     )
     parser_snap_delete.add_argument(
         '--name',

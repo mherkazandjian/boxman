@@ -114,6 +114,33 @@ class TestLoadWorkspaceEnv:
         assert result["SALTMASTER"] == "salt01"
         assert len(result) == 1
 
+    def test_cluster_override_wins_over_workspace(self, tmp_path):
+        """A per-cluster inventory/gateway override beats the workspace one."""
+        cluster = {
+            "workdir": str(tmp_path),
+            "inventory": "inventory_cluster_2",
+            "gateway_host": "cluster_2_service01",
+        }
+        workspace = {"inventory": "shared_inventory", "gateway_host": "ws_gw"}
+        result = load_workspace_env(cluster, workspace)
+        assert result["INVENTORY"] == "inventory_cluster_2"
+        assert result["GATEWAYHOST"] == "cluster_2_service01"
+
+    def test_cluster_override_applied_without_workspace_value(self, tmp_path):
+        """A cluster override applies even when the workspace omits the key."""
+        cluster = {"workdir": str(tmp_path), "inventory": "inventory_cluster_1"}
+        workspace = {"gateway_host": "ws_gw"}
+        result = load_workspace_env(cluster, workspace)
+        assert result["INVENTORY"] == "inventory_cluster_1"
+        assert result["GATEWAYHOST"] == "ws_gw"
+
+    def test_workspace_override_used_when_cluster_silent(self, tmp_path):
+        """Without a cluster override, the workspace value is still honored."""
+        cluster = {"workdir": str(tmp_path)}
+        workspace = {"inventory": "shared_inventory"}
+        result = load_workspace_env(cluster, workspace)
+        assert result["INVENTORY"] == "shared_inventory"
+
 
 # ---------------------------------------------------------------------------
 # TaskRunner tests
