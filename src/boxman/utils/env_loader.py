@@ -91,7 +91,11 @@ def load_workspace_env(
        (or ``ssh --cluster``) targets that cluster's own inventory / gateway
        / ssh_config rather than the shared workspace defaults. This is what
        makes multi-cluster projects inventory-isolated at the operations
-       layer.
+       layer. A relative cluster ``inventory`` / ``ssh_config`` /
+       ``ansible_config`` is resolved against the cluster's ``workdir`` (tasks
+       usually run from ``workspace.path``, so a bare relative path would
+       otherwise miss), and a repointed ``INVENTORY`` is mirrored to
+       ``ANSIBLE_INVENTORY`` (which ansible actually reads).
 
     Args:
         cluster_config: A single cluster's configuration dict (from conf.yml).
@@ -128,16 +132,41 @@ def load_workspace_env(
     #    declared on the cluster are layered on top (cluster is more specific,
     #    so it wins). This lets each cluster in a multi-cluster project point
     #    at its own inventory / gateway / ssh_config tree.
-    override_map = {
+    #
+    #    Path-valued keys are resolved against the *cluster* workdir when they
+    #    come from the cluster and are relative — a cluster's `inventory: foo`
+    #    lives under its workdir, but tasks usually run from workspace.path, so
+    #    leaving it relative would point at the wrong place. Workspace-level
+    #    keys keep their historical expanduser-only handling. Plain values
+    #    (gateway/salt host) are never path-resolved.
+    value_overrides = {
         "gateway_host": "GATEWAYHOST",
         "salt_master": "SALTMASTER",
+    }
+    path_overrides = {
         "ssh_config": "SSH_CONFIG",
         "inventory": "INVENTORY",
         "ansible_config": "ANSIBLE_CONFIG",
     }
-    for source in (workspace_config, cluster_config):
-        for yaml_key, env_key in override_map.items():
+
+    def _apply(source: dict, base: str | None) -> None:
+        for yaml_key, env_key in value_overrides.items():
             if yaml_key in source:
                 env_vars[env_key] = os.path.expanduser(str(source[yaml_key]))
+        for yaml_key, env_key in path_overrides.items():
+            if yaml_key not in source:
+                continue
+            val = os.path.expanduser(str(source[yaml_key]))
+            if base and not os.path.isabs(val):
+                val = os.path.normpath(os.path.join(base, val))
+            env_vars[env_key] = val
+            # ansible consults ANSIBLE_INVENTORY (which env.sh seeds from
+            # INVENTORY); keep it in step so a repointed inventory actually
+            # takes effect for `run --cluster`.
+            if env_key == "INVENTORY":
+                env_vars["ANSIBLE_INVENTORY"] = val
+
+    _apply(workspace_config, None)
+    _apply(cluster_config, workdir)
 
     return env_vars

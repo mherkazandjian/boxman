@@ -123,7 +123,9 @@ class TestLoadWorkspaceEnv:
         }
         workspace = {"inventory": "shared_inventory", "gateway_host": "ws_gw"}
         result = load_workspace_env(cluster, workspace)
-        assert result["INVENTORY"] == "inventory_cluster_2"
+        # a relative cluster inventory is resolved against the cluster workdir
+        assert result["INVENTORY"] == str(tmp_path / "inventory_cluster_2")
+        # gateway_host is a plain value, never path-resolved
         assert result["GATEWAYHOST"] == "cluster_2_service01"
 
     def test_cluster_override_applied_without_workspace_value(self, tmp_path):
@@ -131,11 +133,26 @@ class TestLoadWorkspaceEnv:
         cluster = {"workdir": str(tmp_path), "inventory": "inventory_cluster_1"}
         workspace = {"gateway_host": "ws_gw"}
         result = load_workspace_env(cluster, workspace)
-        assert result["INVENTORY"] == "inventory_cluster_1"
+        assert result["INVENTORY"] == str(tmp_path / "inventory_cluster_1")
         assert result["GATEWAYHOST"] == "ws_gw"
 
+    def test_cluster_inventory_repoints_ansible_inventory(self, tmp_path):
+        """A repointed INVENTORY is mirrored to ANSIBLE_INVENTORY (ansible reads it)."""
+        cluster = {"workdir": str(tmp_path), "inventory": "inventory"}
+        result = load_workspace_env(cluster, {})
+        assert result["INVENTORY"] == str(tmp_path / "inventory")
+        assert result["ANSIBLE_INVENTORY"] == result["INVENTORY"]
+
+    def test_cluster_absolute_inventory_left_untouched(self, tmp_path):
+        """An absolute cluster inventory is used as-is, not joined to workdir."""
+        abs_inv = str(tmp_path / "elsewhere" / "inv")
+        cluster = {"workdir": str(tmp_path), "inventory": abs_inv}
+        result = load_workspace_env(cluster, {})
+        assert result["INVENTORY"] == abs_inv
+
     def test_workspace_override_used_when_cluster_silent(self, tmp_path):
-        """Without a cluster override, the workspace value is still honored."""
+        """Without a cluster override, the workspace value is still honored
+        (and kept relative, since tasks run from workspace.path)."""
         cluster = {"workdir": str(tmp_path)}
         workspace = {"inventory": "shared_inventory"}
         result = load_workspace_env(cluster, workspace)

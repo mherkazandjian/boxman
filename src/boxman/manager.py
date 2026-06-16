@@ -439,16 +439,44 @@ class BoxmanManager:
                 host_aliases, cluster_groups)
 
         # Per-cluster inventory (only that cluster's hosts). This is what a
-        # `run --cluster <name>` (via the cluster's `inventory:` override, see
-        # load_workspace_env) or a per-cluster Ansible tree should consume, so
+        # `run --cluster <name>` consumes (load_workspace_env repoints
+        # INVENTORY/ANSIBLE_INVENTORY at the cluster's `inventory:`), so
         # groups['all'] never spans clusters. Written under the cluster's own
         # inventory dir: `cluster.inventory` if set, else <workdir>/inventory.
+        ws_path_abs = (os.path.abspath(os.path.expanduser(workspace_path))
+                       if workspace_path else os.path.abspath('.'))
+        combined_inv_abs = os.path.abspath(
+            os.path.join(ws_path_abs, inventory_key))
         for cluster_name, cluster in clusters.items():
             cluster_vms = list(cluster.get('vms', {}))
             if not cluster_vms or 'workdir' not in cluster:
                 continue
-            cluster_files = cluster.setdefault('files', {})
+            workdir_abs = os.path.abspath(os.path.expanduser(cluster['workdir']))
             cluster_inv_key = self._cluster_inventory_key(cluster)
+            cluster_inv_abs = os.path.abspath(
+                os.path.join(workdir_abs, cluster_inv_key))
+
+            # Guard: if this cluster's inventory resolves to the same file as
+            # the combined workspace inventory (e.g. cluster.workdir ==
+            # workspace.path), writing it would clobber the combined file that
+            # `boxman ssh <alias>` relies on. Skip it and leave the combined
+            # one intact rather than silently overwriting it.
+            if cluster_inv_abs == combined_inv_abs:
+                self.logger.warning(
+                    f"cluster '{cluster_name}' inventory resolves to the "
+                    f"combined workspace inventory ({combined_inv_abs}); "
+                    f"skipping its per-cluster inventory to avoid overwriting "
+                    f"it. Give the cluster a distinct workdir or `inventory:` "
+                    f"to isolate it.")
+                continue
+
+            # Auto-wire `cluster.inventory` (default <workdir>/inventory) so
+            # `run --cluster <name>` repoints at this tree without the user
+            # having to declare it; load_workspace_env resolves the relative
+            # value against the cluster workdir.
+            cluster.setdefault('inventory', 'inventory')
+
+            cluster_files = cluster.setdefault('files', {})
             if cluster_inv_key in cluster_files:
                 continue
             host_aliases = [
