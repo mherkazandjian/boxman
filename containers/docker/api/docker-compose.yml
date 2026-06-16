@@ -1,0 +1,59 @@
+# Boxman API stack: redis + api + worker.
+#
+# This layers on top of the existing boxman libvirt container
+# (../docker-compose.yml). Bring that up first so the worker can drive libvirt
+# through the docker-compose runtime:
+#
+#   cd containers/docker && docker compose up --build -d        # libvirt
+#   cd containers/docker/api && docker compose up --build -d    # api + worker + redis
+#
+# The api/worker drive the `boxman` CLI; with BOXMAN_API runtime set to
+# docker-compose they `docker exec` into the boxman-libvirt container (hence the
+# docker.sock mount). For a host-libvirt deployment, drop the socket mount and
+# register projects with runtime=local instead.
+#
+# SECURITY: mounting the docker socket grants control of the host docker daemon.
+# Keep the API bound to localhost and behind auth (it is, by default).
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: boxman-api:latest
+  environment: &common-env
+    BOXMAN_API_REDIS_URL: redis://redis:6379/0
+    BOXMAN_API_DATABASE_URL: sqlite:////data/api.db
+    BOXMAN_API_JOB_LOG_DIR: /data/jobs
+    BOXMAN_API_BOOTSTRAP_ADMIN_USER: ${BOXMAN_API_ADMIN_USER:-admin}
+    BOXMAN_API_BOOTSTRAP_ADMIN_PASSWORD: ${BOXMAN_API_ADMIN_PASSWORD:-}
+    BOXMAN_API_JWT_SECRET: ${BOXMAN_API_JWT_SECRET:-change-me}
+    PYTHONPATH: /boxman/src
+  volumes: &common-volumes
+    - ../../../:/boxman                              # boxman source (importable)
+    - api-data:/data                                 # shared sqlite db + job logs
+    - ${HOME}/.config/boxman:/root/.config/boxman    # boxman.yml + project cache
+    - ${HOME}:${HOME}                                # project confs / workdirs at same paths
+    - /var/run/docker.sock:/var/run/docker.sock      # docker-compose runtime → libvirt container
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: boxman-api-redis
+    restart: unless-stopped
+
+  boxman-api:
+    <<: *common
+    container_name: boxman-api
+    depends_on: [redis]
+    ports:
+      - "127.0.0.1:${BOXMAN_API_PORT:-8080}:8080"
+    command: ["uvicorn", "boxman.api.main:app", "--host", "0.0.0.0", "--port", "8080"]
+
+  boxman-worker:
+    <<: *common
+    container_name: boxman-api-worker
+    depends_on: [redis]
+    command: ["celery", "-A", "boxman.api.jobs.celery_app", "worker", "--loglevel=info"]
+
+volumes:
+  api-data:
