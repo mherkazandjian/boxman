@@ -84,7 +84,18 @@ def load_workspace_env(
     2. If the cluster's ``files`` section contains ``env.sh``, write it to
        the workdir (if not already present) and source it.
     3. Explicit keys in ``workspace_config`` (``gateway_host``, ``ssh_config``,
-       ``inventory``, ``salt_master``) override any sourced values.
+       ``inventory``, ``salt_master``, ``ansible_config``) override any
+       sourced values.
+    4. The same keys declared under the *cluster* (``cluster_config``) are
+       layered on top of the workspace ones, so a ``run --cluster <name>``
+       (or ``ssh --cluster``) targets that cluster's own inventory / gateway
+       / ssh_config rather than the shared workspace defaults. This is what
+       makes multi-cluster projects inventory-isolated at the operations
+       layer. A relative cluster ``inventory`` / ``ssh_config`` /
+       ``ansible_config`` is resolved against the cluster's ``workdir`` (tasks
+       usually run from ``workspace.path``, so a bare relative path would
+       otherwise miss), and a repointed ``INVENTORY`` is mirrored to
+       ``ANSIBLE_INVENTORY`` (which ansible actually reads).
 
     Args:
         cluster_config: A single cluster's configuration dict (from conf.yml).
@@ -117,18 +128,45 @@ def load_workspace_env(
                 f"(run 'boxman provision' first to generate it)"
             )
 
-    # 3. Explicit workspace overrides
-    override_map = {
+    # 3. Explicit overrides. Workspace-level keys apply first; the same keys
+    #    declared on the cluster are layered on top (cluster is more specific,
+    #    so it wins). This lets each cluster in a multi-cluster project point
+    #    at its own inventory / gateway / ssh_config tree.
+    #
+    #    Path-valued keys are resolved against the *cluster* workdir when they
+    #    come from the cluster and are relative — a cluster's `inventory: foo`
+    #    lives under its workdir, but tasks usually run from workspace.path, so
+    #    leaving it relative would point at the wrong place. Workspace-level
+    #    keys keep their historical expanduser-only handling. Plain values
+    #    (gateway/salt host) are never path-resolved.
+    value_overrides = {
         "gateway_host": "GATEWAYHOST",
         "salt_master": "SALTMASTER",
+    }
+    path_overrides = {
         "ssh_config": "SSH_CONFIG",
         "inventory": "INVENTORY",
         "ansible_config": "ANSIBLE_CONFIG",
     }
-    for yaml_key, env_key in override_map.items():
-        if yaml_key in workspace_config:
-            env_vars[env_key] = os.path.expanduser(
-                str(workspace_config[yaml_key])
-            )
+
+    def _apply(source: dict, base: str | None) -> None:
+        for yaml_key, env_key in value_overrides.items():
+            if yaml_key in source:
+                env_vars[env_key] = os.path.expanduser(str(source[yaml_key]))
+        for yaml_key, env_key in path_overrides.items():
+            if yaml_key not in source:
+                continue
+            val = os.path.expanduser(str(source[yaml_key]))
+            if base and not os.path.isabs(val):
+                val = os.path.normpath(os.path.join(base, val))
+            env_vars[env_key] = val
+            # ansible consults ANSIBLE_INVENTORY (which env.sh seeds from
+            # INVENTORY); keep it in step so a repointed inventory actually
+            # takes effect for `run --cluster`.
+            if env_key == "INVENTORY":
+                env_vars["ANSIBLE_INVENTORY"] = val
+
+    _apply(workspace_config, None)
+    _apply(cluster_config, workdir)
 
     return env_vars

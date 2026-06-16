@@ -190,6 +190,42 @@ class TestStorageDispatch:
         assert args.compress_memory is False
         assert args.memory_compress_level == 3
 
+    def test_snapshot_take_cluster_scope(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(
+            ["snapshot", "take", "--cluster", "cluster_2", "--vms", "node01"])
+        assert args.func is BoxmanManager.snapshot_take
+        assert args.cluster == "cluster_2"
+        assert args.vms == "node01"
+
+    def test_snapshot_take_cluster_defaults_none(self):
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(["snapshot", "take"])
+        assert args.cluster is None
+        assert args.vms == "all"
+
+    def test_snapshot_restore_cluster_scope(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(
+            ["snapshot", "restore", "--cluster", "cluster_1", "--name", "s1"])
+        assert args.func is BoxmanManager.snapshot_restore
+        assert args.cluster == "cluster_1"
+        assert args.snapshot_name == "s1"
+
+    def test_snapshot_delete_cluster_scope(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(
+            ["snapshot", "delete", "--cluster", "cluster_2", "--name", "s1"])
+        assert args.func is BoxmanManager.snapshot_delete
+        assert args.cluster == "cluster_2"
+
     def test_snapshot_collapse_requires_to(self):
         import pytest as _pytest
         from boxman.scripts.app import parse_args

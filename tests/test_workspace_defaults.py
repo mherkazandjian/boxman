@@ -7,6 +7,7 @@ import yaml
 import pytest
 
 from boxman.manager import BoxmanManager
+from boxman.utils.env_loader import load_workspace_env
 
 
 def _make_manager(config):
@@ -72,10 +73,15 @@ class TestWorkdirResolution:
         assert 'files' not in config['clusters']['orphan']
 
 
-class TestInventoryGeneration:
+class TestPerClusterInventoryGeneration:
+    """
+    Each cluster gets its own inventory/01-hosts.yml containing ONLY that
+    cluster's hosts, so a per-cluster Ansible run never sees another cluster's
+    hosts under groups['all'] (the multi-cluster isolation fix).
+    """
 
-    def test_inventory_not_in_cluster_files(self):
-        """Inventory is NOT auto-generated in cluster files."""
+    def test_per_cluster_inventory_generated_in_cluster_files(self):
+        """A cluster's own 01-hosts.yml is auto-generated under its files."""
         config = {
             'workspace': {'path': '/tmp/ws'},
             'clusters': {
@@ -88,7 +94,169 @@ class TestInventoryGeneration:
             },
         }
         mgr = _make_manager(config)
-        assert 'inventory/01-hosts.yml' not in config['clusters']['c1'].get('files', {})
+        cfiles = config['clusters']['c1']['files']
+        assert 'inventory/01-hosts.yml' in cfiles
+        parsed = yaml.safe_load(cfiles['inventory/01-hosts.yml'])
+        assert set(parsed['all']['hosts'].keys()) == {'c1_node01', 'c1_node02'}
+        assert 'c1' in parsed['all']['children']
+
+    def test_per_cluster_inventory_only_own_hosts(self):
+        """Each cluster's inventory excludes the other cluster's hosts."""
+        config = {
+            'workspace': {'path': '/tmp/ws'},
+            'clusters': {
+                'cluster_1': {'vms': {'service01': {}, 'node01': {}}},
+                'cluster_2': {'vms': {'service01': {}, 'node01': {}}},
+            },
+        }
+        mgr = _make_manager(config)
+        inv1 = yaml.safe_load(
+            config['clusters']['cluster_1']['files']['inventory/01-hosts.yml'])
+        inv2 = yaml.safe_load(
+            config['clusters']['cluster_2']['files']['inventory/01-hosts.yml'])
+        assert set(inv1['all']['hosts']) == {'cluster_1_service01', 'cluster_1_node01'}
+        assert set(inv2['all']['hosts']) == {'cluster_2_service01', 'cluster_2_node01'}
+        # no cross-cluster leakage
+        assert all('cluster_2' not in h for h in inv1['all']['hosts'])
+        assert all('cluster_1' not in h for h in inv2['all']['hosts'])
+        # only the owning cluster's group appears
+        assert set(inv1['all']['children']) == {'cluster_1'}
+        assert set(inv2['all']['children']) == {'cluster_2'}
+
+    def test_per_cluster_aliases_match_combined(self):
+        """
+        A host's boxman_alias is identical in the per-cluster inventory and the
+        combined workspace inventory (consistent, project-wide numbering).
+        """
+        config = {
+            'workspace': {'path': '/tmp/ws'},
+            'clusters': {
+                'cluster_1': {'vms': {'service01': {}, 'node01': {}}},
+                'cluster_2': {'vms': {'service01': {}, 'node01': {}}},
+            },
+        }
+        mgr = _make_manager(config)
+        combined = yaml.safe_load(
+            config['workspace']['files']['inventory/01-hosts.yml'])
+        inv2 = yaml.safe_load(
+            config['clusters']['cluster_2']['files']['inventory/01-hosts.yml'])
+        # cluster_2 hosts come after cluster_1 in the global ordering → node2/node3
+        assert inv2['all']['hosts']['cluster_2_service01']['boxman_alias'] == 'node2'
+        assert (inv2['all']['hosts']['cluster_2_service01']['boxman_alias']
+                == combined['all']['hosts']['cluster_2_service01']['boxman_alias'])
+
+    def test_per_cluster_inventory_honors_cluster_inventory_override(self):
+        """A cluster's `inventory:` key relocates its generated 01-hosts.yml."""
+        config = {
+            'workspace': {'path': '/tmp/ws'},
+            'clusters': {
+                'cluster_2': {
+                    'inventory': 'inventory_cluster_2',
+                    'vms': {'node01': {}},
+                },
+            },
+        }
+        mgr = _make_manager(config)
+        cfiles = config['clusters']['cluster_2']['files']
+        assert 'inventory_cluster_2/01-hosts.yml' in cfiles
+        assert 'inventory/01-hosts.yml' not in cfiles
+
+    def test_per_cluster_inventory_not_overwritten_if_explicit(self):
+        """A user-provided cluster inventory file is preserved."""
+        custom = "---\nall:\n  hosts:\n    mine:\n"
+        config = {
+            'workspace': {'path': '/tmp/ws'},
+            'clusters': {
+                'c1': {
+                    'files': {'inventory/01-hosts.yml': custom},
+                    'vms': {'node01': {}},
+                },
+            },
+        }
+        mgr = _make_manager(config)
+        assert config['clusters']['c1']['files']['inventory/01-hosts.yml'] == custom
+
+    def test_no_per_cluster_inventory_without_workdir(self):
+        """A cluster with no resolvable workdir gets no generated inventory."""
+        config = {
+            'clusters': {
+                'orphan': {'vms': {'vm01': {}}},
+            },
+        }
+        mgr = _make_manager(config)
+        assert 'files' not in config['clusters']['orphan']
+
+
+class TestPerClusterInventoryAutoWire:
+    """
+    The generated per-cluster inventory is auto-wired to `cluster.inventory`
+    so `run --cluster <name>` actually consumes it, and a cluster whose
+    inventory would collide with the combined file is skipped rather than
+    clobbering it.
+    """
+
+    def test_default_cluster_inventory_auto_wired(self):
+        """A cluster without an explicit inventory gets `inventory:` set."""
+        config = {
+            'workspace': {'path': '/tmp/ws'},
+            'clusters': {'c1': {'vms': {'n01': {}}}},
+        }
+        _make_manager(config)
+        assert config['clusters']['c1']['inventory'] == 'inventory'
+
+    def test_explicit_cluster_inventory_preserved(self):
+        """An explicit cluster `inventory:` is not overwritten by auto-wiring."""
+        config = {
+            'workspace': {'path': '/tmp/ws'},
+            'clusters': {'c1': {'inventory': 'inv_custom', 'vms': {'n01': {}}}},
+        }
+        _make_manager(config)
+        assert config['clusters']['c1']['inventory'] == 'inv_custom'
+
+    def test_collision_skips_per_cluster_and_preserves_combined(self):
+        """
+        When a cluster's workdir equals workspace.path, its inventory resolves
+        to the combined file; it must be skipped (not auto-wired, not written)
+        so the combined inventory `boxman ssh` relies on is preserved.
+        """
+        config = {
+            'workspace': {'path': '/tmp/ws'},
+            'clusters': {
+                'c1': {'workdir': '/tmp/ws', 'vms': {'n01': {}}},
+                'c2': {'workdir': '/tmp/ws/c2', 'vms': {'n01': {}}},
+            },
+        }
+        _make_manager(config)
+        combined = yaml.safe_load(
+            config['workspace']['files']['inventory/01-hosts.yml'])
+        assert set(combined['all']['hosts']) == {'c1_n01', 'c2_n01'}
+        # c1 collided → not auto-wired and no clobbering file written
+        c1 = config['clusters']['c1']
+        assert 'inventory' not in c1
+        assert 'inventory/01-hosts.yml' not in c1.get('files', {})
+        # c2 (distinct workdir) is isolated normally
+        assert config['clusters']['c2']['inventory'] == 'inventory'
+
+    def test_generated_inventory_is_what_run_cluster_consumes(self, tmp_path):
+        """
+        End-to-end: after resolving defaults, load_workspace_env points
+        INVENTORY (absolute) at the very dir the per-cluster 01-hosts.yml was
+        generated into — i.e. fix 1 and fix 2 actually connect.
+        """
+        ws = tmp_path / 'ws'
+        config = {
+            'workspace': {'path': str(ws)},
+            'clusters': {
+                'cluster_2': {'vms': {'service01': {}, 'node01': {}}},
+            },
+        }
+        _make_manager(config)
+        cluster = config['clusters']['cluster_2']
+        env = load_workspace_env(cluster, config['workspace'])
+        assert env['INVENTORY'] == str(ws / 'cluster_2' / 'inventory')
+        assert env['ANSIBLE_INVENTORY'] == env['INVENTORY']
+        # the generated file lives under that exact inventory dir
+        assert 'inventory/01-hosts.yml' in cluster['files']
 
 
 class TestAnsibleCfgGeneration:
