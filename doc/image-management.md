@@ -261,12 +261,14 @@ clusters:
     base_image: ubuntu-24.04-oci-base-template-cloudinit
 ```
 
-### Directly as `base_image` (pre-baked images)
+### Directly as `base_image`
 
 Reference the registry straight from a cluster- or VM-level `base_image`. Boxman
 synthesizes an implicit template (named `boxman-oci-<…>`), pulls the image and
-clones from it. This path runs **no** cloud-init, so the image must already be
-ready to boot:
+clones from it. The synthesized template carries no explicit cloud-init, so the
+template build applies boxman's **default** cloud-init (creates a default user,
+reconfigures networking) — point it at a cloud-init-enabled cloud image. Use the
+template `image.uri` form above when you need custom cloud-init:
 
 ```yaml
 clusters:

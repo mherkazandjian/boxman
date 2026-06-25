@@ -14,6 +14,7 @@ compatibility.
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -97,6 +98,23 @@ class CloudInitTemplate:
         if image_path.startswith(("http://", "https://", "oci://")):
             return image_path
         return os.path.expanduser(image_path)
+
+    @staticmethod
+    def _oci_cache_url(image_ref: str) -> str:
+        """Build a collision-free cache URL for an OCI ref.
+
+        ``ImageCache`` keys by the URL basename, so two ``oci://`` refs that
+        share a final ``repo:tag`` but differ in registry host or repo path
+        (e.g. ``regA/team1/ubuntu:latest`` vs ``regB/team2/ubuntu:latest``)
+        would collide on one cache file — and the OCI path carries no checksum
+        to catch it. Encode a hash of the FULL ref into the basename so distinct
+        images map to distinct cache files.
+        """
+        ref = image_ref[len("oci://"):] if image_ref.startswith("oci://") else image_ref
+        digest = hashlib.sha256(ref.encode("utf-8")).hexdigest()[:16]
+        tail = ref.rsplit("/", 1)[-1]
+        safe = "".join(c if (c.isalnum() or c in "._-") else "-" for c in tail)
+        return f"oci-cache:///{safe}-{digest}.qcow2"
 
     def _check_vm_exists(self) -> bool:
         result = self.virsh.execute("list", "--all", "--name", hide=True, warn=True)
@@ -305,9 +323,13 @@ class CloudInitTemplate:
 
         if self.image_path.startswith("oci://"):
             # Pull the qcow2 from an OCI registry via oras, reusing the same
-            # cache + checksum + sparse-copy machinery as the http(s) path.
+            # cache + sparse-copy machinery as the http(s) path. The cache is
+            # keyed by a collision-free URL derived from the FULL ref (registry
+            # host + repo path + tag), not just the mutable repo:tag basename.
+            ref = self.image_path
             return self._fetch_remote_image(
-                self.image_path, dst_path, download_fn=self._download_oci_image)
+                self._oci_cache_url(ref), dst_path,
+                download_fn=lambda _url, dst: self._download_oci_image(ref, dst))
 
         # Local file copy
         if not self.image_path:
@@ -476,25 +498,30 @@ class CloudInitTemplate:
                 os.remove(dst_path)
             return False
 
-    def _download_oci_image(self, url: str, dst_path: str) -> bool:
+    def _download_oci_image(self, image_ref: str, dst_path: str) -> bool:
         """Pull a qcow2 from an OCI registry (via oras) to *dst_path*.
 
-        Mirrors the :meth:`_download_image` contract (write *dst_path*, return a
-        bool) so it can be used as the ``download_fn`` of
-        :meth:`_fetch_remote_image`. oras pulls the artifact into a temp dir;
-        the qcow2 it contains is then moved to *dst_path*.
+        Used as the ``download_fn`` of :meth:`_fetch_remote_image` for oci://
+        sources (mirrors the :meth:`_download_image` contract: write *dst_path*,
+        return a bool). oras pulls into a temp dir on the SAME filesystem as
+        *dst_path*, then the qcow2 is atomically renamed into place — so an
+        interrupted multi-GB pull can never leave a truncated file that a later
+        run would treat as a valid (checksum-less) cache hit.
         """
         from boxman.providers.libvirt.oci_pull import pull_oci_image
 
-        self.logger.info(f"pulling base image from OCI registry {url} -> {dst_path}")
-        tmp_dir = tempfile.mkdtemp(prefix="boxman-oci-pull-")
+        self.logger.info(
+            f"pulling base image from OCI registry {image_ref} -> {dst_path}")
+        dst_dir = os.path.dirname(os.path.abspath(dst_path))
+        os.makedirs(dst_dir, exist_ok=True)
+        tmp_dir = tempfile.mkdtemp(prefix=".boxman-oci-pull-", dir=dst_dir)
         try:
-            qcow2 = pull_oci_image(url, tmp_dir)
-            shutil.move(qcow2, dst_path)
+            qcow2 = pull_oci_image(image_ref, tmp_dir)
+            os.replace(qcow2, dst_path)  # atomic rename on the same filesystem
             self.logger.info("OCI image pull complete")
             return True
         except (RuntimeError, ValueError, OSError) as exc:
-            self.logger.error(f"failed to pull OCI image '{url}': {exc}")
+            self.logger.error(f"failed to pull OCI image '{image_ref}': {exc}")
             if os.path.exists(dst_path):
                 os.remove(dst_path)
             return False

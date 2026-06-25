@@ -8,8 +8,8 @@
 #
 # An OCI base image can be wired in two ways:
 #   (A) on a template's `image.uri` (used below) — supports full cloud-init.
-#   (B) directly as `base_image: oci://…` on a cluster/VM — pre-baked images, no
-#       cloud-init customization (boxman synthesizes an implicit template).
+#   (B) directly as `base_image: oci://…` on a cluster/VM — boxman synthesizes an
+#       implicit template that applies the DEFAULT cloud-init (no customization).
 version: '1.0'
 project: boxman_dev_tiny-ubuntu-24.04-oci
 provider:

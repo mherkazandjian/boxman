@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from boxman import log
+
 
 # ── metadata sidecar (vmimage.json) ──────────────────────────────────────────
 
@@ -60,41 +62,6 @@ def _metadata_from_dict(raw: dict) -> VmImageMetadata:
     )
 
 
-def load_vmimage_metadata(path: Optional[str]) -> VmImageMetadata:
-    """Load ``vmimage.json`` metadata, returning defaults when absent.
-
-    Args:
-        path: Path to a ``vmimage.json`` file, or ``None``.
-
-    Returns:
-        Parsed :class:`VmImageMetadata`; defaults when *path* is ``None`` or the
-        file does not exist.
-
-    Raises:
-        ValueError: If the file exists but is not a valid JSON object.
-    """
-    if path is None:
-        return VmImageMetadata()
-
-    path = os.path.expanduser(path)
-    if not os.path.isfile(path):
-        return VmImageMetadata()
-
-    try:
-        with open(path, "r") as fobj:
-            raw = json.load(fobj)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid vmimage.json in '{path}': {exc}") from exc
-
-    if raw is None:
-        return VmImageMetadata()
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"invalid vmimage.json in '{path}': expected a JSON object")
-
-    return _metadata_from_dict(raw)
-
-
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -106,12 +73,17 @@ def _strip_scheme(image_ref: str) -> str:
 
 
 def _repo_without_tag(ref: str) -> str:
-    """Return the repository part of an OCI ref (drop a trailing ``:tag``).
+    """Return the repository part of an OCI ref (drop a trailing ``:tag`` or
+    ``@digest``).
 
     Handles registries with a port (e.g. ``localhost:5000/repo:tag`` ->
     ``localhost:5000/repo``) by only treating a colon that follows the last
-    ``/`` as the tag separator.
+    ``/`` as the tag separator, and digest-pinned refs
+    (``repo@sha256:<hex>``) whose digest ``:`` must not be mistaken for a tag.
     """
+    # Digest-pinned ref: the repository is everything before '@'.
+    if "@" in ref:
+        return ref.split("@", 1)[0]
     slash = ref.rfind("/")
     tail = ref[slash + 1:]
     if ":" in tail:
@@ -129,6 +101,11 @@ def _find_qcow2(out_dir: Path) -> Optional[Path]:
     if preferred.is_file():
         return preferred
     candidates = sorted(out_dir.glob("*.qcow2"))
+    if len(candidates) > 1:
+        log.warning(
+            f"OCI artifact in '{out_dir}' has multiple qcow2 files and no "
+            f"'disk.qcow2'; using '{candidates[0].name}'. Name the base disk "
+            f"'disk.qcow2' to make this unambiguous.")
     return candidates[0] if candidates else None
 
 
@@ -191,7 +168,7 @@ def pull_oci_image(image_ref: str, out_dir: str) -> str:
         raise ValueError("image_ref must be a non-empty string")
 
     ref = _strip_scheme(str(image_ref).strip())
-    out = Path(os.path.expanduser(out_dir))
+    out = Path(os.path.expanduser(out_dir)).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
     _run_oras(["oras", "pull", ref, "-o", str(out)], action="pull", ref=ref)
@@ -231,6 +208,12 @@ def _fetch_vmimage_metadata(ref: str, layers: list) -> Optional[VmImageMetadata]
         return None
 
     if result.returncode != 0 or not result.stdout:
+        # Distinguish in the logs: a non-zero blob fetch (e.g. auth/network)
+        # is not the same as "image has no metadata", but inspect must not fail.
+        log.debug(
+            f"could not fetch vmimage.json blob for '{ref}' "
+            f"(oras blob fetch rc={result.returncode}); "
+            f"metadata will be reported as <none>")
         return None
 
     try:
@@ -284,10 +267,29 @@ def inspect_oci_image(image_ref: str) -> dict:
             "digest": layer.get("digest", ""),
         })
 
+    # An image index (multi-arch manifest list) carries `manifests` instead of
+    # `layers`; surface those so inspect doesn't report an empty artifact.
+    index_manifests = []
+    for entry in manifest.get("manifests", []) or []:
+        platform = entry.get("platform", {}) or {}
+        plat = "/".join(
+            part for part in (
+                platform.get("os"),
+                platform.get("architecture"),
+                platform.get("variant"),
+            ) if part)
+        index_manifests.append({
+            "media_type": entry.get("mediaType", ""),
+            "size": entry.get("size", 0),
+            "digest": entry.get("digest", ""),
+            "platform": plat,
+        })
+
     return {
         "image_ref": ref,
         "media_type": manifest.get("mediaType", ""),
         "layers": layers,
+        "manifests": index_manifests,
         "annotations": manifest.get("annotations", {}) or {},
         "metadata": _fetch_vmimage_metadata(ref, layers),
     }
@@ -308,6 +310,15 @@ def format_inspect(summary: dict) -> str:
         lines.append(
             f"  - {title} "
             f"({layer.get('media_type', '')}, {layer.get('size', 0)} bytes)")
+
+    manifests = summary.get("manifests") or []
+    if manifests:
+        lines.append(f"manifests (image index): {len(manifests)}")
+        for entry in manifests:
+            plat = entry.get("platform") or "unknown"
+            lines.append(
+                f"  - {plat} "
+                f"({entry.get('media_type', '')}, {entry.get('size', 0)} bytes)")
 
     annotations = summary.get("annotations") or {}
     if annotations:

@@ -14,12 +14,11 @@ from unittest.mock import patch
 import pytest
 
 from boxman.manager import BoxmanManager
-from boxman.providers.libvirt import oci_pull
 from boxman.providers.libvirt.oci_pull import (
     VmImageMetadata,
+    _repo_without_tag,
     format_inspect,
     inspect_oci_image,
-    load_vmimage_metadata,
     pull_oci_image,
 )
 
@@ -201,39 +200,96 @@ class TestInspectOciImage:
                 inspect_oci_image("reg/repo:tag")
 
 
-# ── load_vmimage_metadata ─────────────────────────────────────────────────────
+# ── _repo_without_tag (tag/digest/port parsing) ───────────────────────────────
 
 
-class TestLoadVmImageMetadata:
-    def test_none_returns_defaults(self):
-        md = load_vmimage_metadata(None)
+class TestRepoWithoutTag:
+    def test_plain_tag(self):
+        assert _repo_without_tag("reg.com/team/ubuntu:latest") == "reg.com/team/ubuntu"
+
+    def test_registry_with_port(self):
+        assert _repo_without_tag("localhost:5000/repo:tag") == "localhost:5000/repo"
+
+    def test_no_tag(self):
+        assert _repo_without_tag("reg.com/team/ubuntu") == "reg.com/team/ubuntu"
+
+    def test_digest_pinned_ref(self):
+        # the ':' inside the digest must NOT be treated as a tag separator
+        assert _repo_without_tag(
+            "reg.com/team/ubuntu@sha256:abcdef0123456789") == "reg.com/team/ubuntu"
+
+    def test_digest_with_port(self):
+        assert _repo_without_tag(
+            "localhost:5000/repo@sha256:abc") == "localhost:5000/repo"
+
+
+# ── metadata mapping ──────────────────────────────────────────────────────────
+
+
+class TestMetadataFromDict:
+    def test_defaults(self):
+        from boxman.providers.libvirt.oci_pull import _metadata_from_dict
+        md = _metadata_from_dict({})
         assert md == VmImageMetadata()
         assert md.firmware == "uefi"
         assert md.disk_bus == "virtio"
 
-    def test_missing_file_returns_defaults(self, tmp_path: Path):
-        md = load_vmimage_metadata(str(tmp_path / "nope.json"))
-        assert md.firmware == "uefi"
-
-    def test_bios_honored(self, tmp_path: Path):
-        p = tmp_path / "vmimage.json"
-        p.write_text(json.dumps({"firmware": "bios", "machine": "q35", "arch": "x86_64"}))
-        md = load_vmimage_metadata(str(p))
+    def test_known_fields_and_unknown_ignored(self):
+        from boxman.providers.libvirt.oci_pull import _metadata_from_dict
+        md = _metadata_from_dict(
+            {"firmware": "bios", "machine": "q35", "arch": "x86_64", "extra": "ignored"})
         assert md.firmware == "bios"
         assert md.machine == "q35"
         assert md.arch == "x86_64"
 
-    def test_invalid_json_raises(self, tmp_path: Path):
-        p = tmp_path / "vmimage.json"
-        p.write_text("{not valid")
-        with pytest.raises(ValueError, match="invalid vmimage.json"):
-            load_vmimage_metadata(str(p))
 
-    def test_non_object_json_raises(self, tmp_path: Path):
-        p = tmp_path / "vmimage.json"
-        p.write_text("[1, 2, 3]")
-        with pytest.raises(ValueError, match="expected a JSON object"):
-            load_vmimage_metadata(str(p))
+# ── inspect: image index + digest refs ────────────────────────────────────────
+
+
+class TestInspectImageIndex:
+    def test_multi_arch_index_surfaced(self):
+        index = json.dumps({
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                 "size": 100, "digest": "sha256:amd",
+                 "platform": {"os": "linux", "architecture": "amd64"}},
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                 "size": 101, "digest": "sha256:arm",
+                 "platform": {"os": "linux", "architecture": "arm64"}},
+            ],
+        })
+        fake = _FakeRun(returncode=0, stdout=index)
+        with patch("boxman.providers.libvirt.oci_pull.subprocess.run", side_effect=fake):
+            summary = inspect_oci_image("reg/repo:multi")
+        assert summary["layers"] == []
+        assert len(summary["manifests"]) == 2
+        plats = [m["platform"] for m in summary["manifests"]]
+        assert "linux/amd64" in plats and "linux/arm64" in plats
+        # no vmimage.json layer -> no blob fetch attempted
+        assert all(c[:3] != ["oras", "blob", "fetch"] for c in fake.calls)
+        out = format_inspect(summary)
+        assert "manifests (image index): 2" in out
+        assert "linux/amd64" in out
+
+
+class TestInspectDigestRef:
+    def test_blob_fetch_drops_ref_digest(self):
+        def handler(cmd):
+            if cmd[:3] == ["oras", "manifest", "fetch"]:
+                return _MANIFEST
+            if cmd[:3] == ["oras", "blob", "fetch"]:
+                return json.dumps({"firmware": "uefi"})
+            return ""
+
+        fake = _FakeRun(returncode=0, handler=handler)
+        with patch("boxman.providers.libvirt.oci_pull.subprocess.run", side_effect=fake):
+            summary = inspect_oci_image("oci://reg/boxman/ubuntu@sha256:deadbeef")
+        blob_calls = [c for c in fake.calls if c[:3] == ["oras", "blob", "fetch"]]
+        assert blob_calls
+        # the repo must drop the ref's @digest; the blob ref uses the LAYER digest
+        assert blob_calls[0][3] == "reg/boxman/ubuntu@sha256:bbb"
+        assert summary["metadata"] is not None
 
 
 # ── format_inspect ────────────────────────────────────────────────────────────
@@ -293,3 +349,37 @@ class TestInspectImageCli:
         assert excinfo.value.code == 1
         out = capsys.readouterr().out
         assert "error inspecting image" in out
+
+
+# ── CloudInitTemplate._oci_cache_url (collision-free cache key) ────────────────
+
+
+class TestOciCacheUrl:
+    """The OCI cache key must not collide for distinct refs sharing a repo:tag."""
+
+    def test_distinct_registries_same_tail_do_not_collide(self):
+        import os
+        from urllib.parse import urlparse
+        from boxman.providers.libvirt.cloudinit import CloudInitTemplate
+
+        a = CloudInitTemplate._oci_cache_url("oci://regA/team1/ubuntu:latest")
+        b = CloudInitTemplate._oci_cache_url("oci://regB/team2/ubuntu:latest")
+        assert a != b
+        # ImageCache keys by basename — those must differ too
+        base_a = os.path.basename(urlparse(a).path)
+        base_b = os.path.basename(urlparse(b).path)
+        assert base_a != base_b
+        assert base_a.endswith(".qcow2") and ":" not in base_a
+
+    def test_same_ref_is_stable(self):
+        from boxman.providers.libvirt.cloudinit import CloudInitTemplate
+
+        ref = "oci://reg/repo:tag"
+        assert (CloudInitTemplate._oci_cache_url(ref)
+                == CloudInitTemplate._oci_cache_url(ref))
+
+    def test_scheme_optional(self):
+        from boxman.providers.libvirt.cloudinit import CloudInitTemplate
+
+        assert (CloudInitTemplate._oci_cache_url("oci://reg/repo:tag")
+                == CloudInitTemplate._oci_cache_url("reg/repo:tag"))

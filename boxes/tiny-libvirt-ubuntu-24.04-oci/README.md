@@ -69,8 +69,8 @@ boxman ssh boxman01      # log into the VM
 
 ## Alternative: OCI image directly as `base_image`
 
-For a **pre-baked** image (no cloud-init customization needed), skip the
-`templates:` block and reference the registry straight from the cluster:
+Skip the `templates:` block and reference the registry straight from the
+cluster:
 
 ```yaml
 clusters:
@@ -79,8 +79,10 @@ clusters:
 ```
 
 boxman synthesizes an implicit template (named `boxman-oci-<…>`), pulls the
-image and clones from it. Use the template `image.uri` form above when you need
-cloud-init to run.
+image and clones from it. The implicit template applies boxman's **default**
+cloud-init (default user + networking), so point it at a cloud-init-enabled
+cloud image. Use the template `image.uri` form above when you need custom
+cloud-init.
 
 ## Tearing down
 

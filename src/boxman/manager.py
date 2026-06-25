@@ -1378,7 +1378,8 @@ class BoxmanManager:
         ``boxman-oci-ubuntu-24.04-latest-<8 hex>``. The hash keeps distinct refs
         that share a tag/name from colliding.
         """
-        ref = image_ref[len('oci://'):] if image_ref.startswith('oci://') else image_ref
+        from boxman.providers.libvirt.oci_pull import _strip_scheme
+        ref = _strip_scheme(image_ref)
         digest = hashlib.sha256(ref.encode('utf-8')).hexdigest()[:8]
         readable = ref.rsplit('/', 1)[-1]  # e.g. 'ubuntu-24.04:latest'
         safe = "".join(c if (c.isalnum() or c in '._-') else '-' for c in readable)
@@ -1396,10 +1397,11 @@ class BoxmanManager:
         :meth:`ensure_templates_exist` + clone pipeline then handles the rest.
 
         Idempotent: repeated refs map to the same template; non-OCI base images
-        are left untouched. Templates synthesized here carry no cloud-init, so the
-        pulled image is expected to be ready-to-boot (pre-baked); use an explicit
-        ``templates`` entry with ``image.uri: oci://…`` when you need cloud-init
-        customization.
+        are left untouched. Templates synthesized here specify no explicit
+        cloud-init, so the template build applies boxman's DEFAULT cloud-init
+        (default user, networking) — the pulled image should therefore be a
+        cloud-init-enabled cloud image. Use an explicit ``templates`` entry with
+        ``image.uri: oci://…`` when you need custom cloud-init.
         """
         clusters = self.config.get('clusters', {})
         if not clusters:
@@ -4973,6 +4975,9 @@ class BoxmanManager:
             if dry_run:
                 cls.logger.info("[dry-run] would clone and configure new VMs")
             else:
+                # expand any `base_image: oci://…` into implicit templates
+                # before resolving/cloning (the clone path needs a VM name).
+                cls._expand_oci_base_images()
                 # ensure templates exist
                 cls.ensure_templates_exist()
                 try:
