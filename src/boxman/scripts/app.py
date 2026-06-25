@@ -324,6 +324,11 @@ def main():
         args.func(None, args)
         sys.exit(0)
 
+    # Handle 'image inspect' — provider-agnostic; no project config needed.
+    if args.func == BoxmanManager.inspect_image:
+        args.func(None, args)
+        sys.exit(0)
+
     # Handle 'ps' — needs config and virsh but not a full provider session
     if args.func == BoxmanManager.ps:
         _boxman_logger = logging.getLogger('boxman')

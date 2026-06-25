@@ -199,6 +199,19 @@ def parse_args():
     )
 
     #
+    # sub parser for the 'image inspect' subsubcommand
+    #
+    parser_image_inspect = subparsers_image.add_parser(
+        'inspect',
+        help='inspect an OCI image reference (manifest + vmimage.json metadata)')
+    parser_image_inspect.set_defaults(func=BoxmanManager.inspect_image)
+    parser_image_inspect.add_argument(
+        'image_ref',
+        type=str,
+        help='OCI image reference (e.g. oci://registry.example.com/repo:tag)'
+    )
+
+    #
     # sub parser for creating templates from cloud images
     #
     parser_create_templates = subparsers.add_parser(

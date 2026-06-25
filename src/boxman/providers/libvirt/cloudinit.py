@@ -94,7 +94,7 @@ class CloudInitTemplate:
     def _resolve_image_path(image_path: str) -> str:
         if image_path.startswith("file://"):
             image_path = image_path[len("file://"):]
-        if image_path.startswith(("http://", "https://")):
+        if image_path.startswith(("http://", "https://", "oci://")):
             return image_path
         return os.path.expanduser(image_path)
 
@@ -303,6 +303,12 @@ class CloudInitTemplate:
         if self.image_path.startswith(("http://", "https://")):
             return self._fetch_remote_image(self.image_path, dst_path)
 
+        if self.image_path.startswith("oci://"):
+            # Pull the qcow2 from an OCI registry via oras, reusing the same
+            # cache + checksum + sparse-copy machinery as the http(s) path.
+            return self._fetch_remote_image(
+                self.image_path, dst_path, download_fn=self._download_oci_image)
+
         # Local file copy
         if not self.image_path:
             self.logger.error(
@@ -318,7 +324,7 @@ class CloudInitTemplate:
 
         return self._copy_local(self.image_path, dst_path)
 
-    def _fetch_remote_image(self, url: str, dst_path: str) -> bool:
+    def _fetch_remote_image(self, url: str, dst_path: str, download_fn=None) -> bool:
         """
         Obtain a remote image and place it at *dst_path*.
 
@@ -330,12 +336,17 @@ class CloudInitTemplate:
         3. Verify the checksum if one was specified; abort on mismatch.
         4. Copy from cache to *dst_path* (no-op when cache is disabled and
            the download went directly to *dst_path*).
+
+        *download_fn* selects how the image is obtained on a cache miss; it
+        defaults to the http(s) downloader. The OCI path passes
+        :meth:`_download_oci_image` instead.
         """
+        download_fn = download_fn or self._download_image
         cache = self.image_cache
 
         if cache and cache.enabled:
             # Obtain (or reuse) the cached copy.
-            src = cache.ensure(url, self._download_image)
+            src = cache.ensure(url, download_fn)
             if src is None:
                 return False
 
@@ -349,7 +360,7 @@ class CloudInitTemplate:
 
         else:
             # No cache — download directly to dst_path.
-            if not self._download_image(url, dst_path):
+            if not download_fn(url, dst_path):
                 return False
 
             if self.image_checksum:
@@ -464,6 +475,31 @@ class CloudInitTemplate:
             if os.path.exists(dst_path):
                 os.remove(dst_path)
             return False
+
+    def _download_oci_image(self, url: str, dst_path: str) -> bool:
+        """Pull a qcow2 from an OCI registry (via oras) to *dst_path*.
+
+        Mirrors the :meth:`_download_image` contract (write *dst_path*, return a
+        bool) so it can be used as the ``download_fn`` of
+        :meth:`_fetch_remote_image`. oras pulls the artifact into a temp dir;
+        the qcow2 it contains is then moved to *dst_path*.
+        """
+        from boxman.providers.libvirt.oci_pull import pull_oci_image
+
+        self.logger.info(f"pulling base image from OCI registry {url} -> {dst_path}")
+        tmp_dir = tempfile.mkdtemp(prefix="boxman-oci-pull-")
+        try:
+            qcow2 = pull_oci_image(url, tmp_dir)
+            shutil.move(qcow2, dst_path)
+            self.logger.info("OCI image pull complete")
+            return True
+        except (RuntimeError, ValueError, OSError) as exc:
+            self.logger.error(f"failed to pull OCI image '{url}': {exc}")
+            if os.path.exists(dst_path):
+                os.remove(dst_path)
+            return False
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def _wait_cloudinit_fallback(self, seconds: int = 180) -> None:
         """
@@ -773,7 +809,12 @@ class CloudInitTemplate:
         template_dir = os.path.join(self.workdir, self.template_name)
         os.makedirs(template_dir, exist_ok=True)
 
-        image_ext = os.path.splitext(self.image_path)[1] or f".{self.disk_format}"
+        if self.image_path.startswith("oci://"):
+            # An OCI ref has no meaningful file extension (and may contain a
+            # ':tag'); name the pulled disk after the template + disk format.
+            image_ext = f".{self.disk_format}"
+        else:
+            image_ext = os.path.splitext(self.image_path)[1] or f".{self.disk_format}"
         dst_image_path = os.path.join(template_dir, f"{self.template_name}{image_ext}")
         if not self.copy_base_image(dst_image_path):
             return False
