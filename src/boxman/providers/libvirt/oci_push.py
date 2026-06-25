@@ -48,7 +48,7 @@ def _oras_push(
         RuntimeError: If file validation fails or oras push command fails.
         FileNotFoundError: Wrapped as RuntimeError when oras is not on PATH.
     """
-    qcow2_file = Path(qcow2_path)
+    qcow2_file = Path(os.path.expanduser(qcow2_path))
     if not qcow2_file.is_file():
         raise RuntimeError(f"qcow2 file not found: {qcow2_path}")
 
@@ -63,23 +63,27 @@ def _oras_push(
     # Pairing a symlink-resolved directory with the symlink's own basename would
     # point oras at a non-existent file, and "same directory" should mean the
     # directory the files were placed in, not their symlink targets.
-    qcow2_abs = Path(os.path.abspath(qcow2_path))
-    work_dir = str(qcow2_abs.parent)
+    qcow2_abs = Path(os.path.abspath(qcow2_file))
+    work_dir = qcow2_abs.parent
     files_to_push = [qcow2_abs.name]
 
     if metadata_path is not None:
-        metadata_arg = Path(metadata_path)
-        # A bare relative metadata path is interpreted as co-located with the
-        # qcow2 (honouring the co-location contract below), not resolved against
-        # the process CWD — otherwise `--metadata vmimage.json` would only work
-        # when invoked from the qcow2's own directory.
+        metadata_arg = Path(os.path.expanduser(metadata_path))
+        # A relative metadata path is interpreted relative to the qcow2's
+        # directory (honouring the co-location contract below), not the process
+        # CWD — otherwise `--metadata vmimage.json` would only work when invoked
+        # from the qcow2's own directory. The full relative path is kept (not
+        # just its basename), so one that escapes that directory (e.g.
+        # `sub/vmimage.json`) fails the same-directory check with a clear error
+        # instead of being silently flattened onto a same-named file next to the
+        # qcow2.
         if metadata_arg.is_absolute():
-            metadata_abs = Path(os.path.abspath(metadata_path))
+            metadata_abs = Path(os.path.abspath(metadata_arg))
         else:
-            metadata_abs = qcow2_abs.parent / metadata_arg.name
+            metadata_abs = Path(os.path.normpath(work_dir / metadata_arg))
         if not metadata_abs.is_file():
             raise RuntimeError(f"metadata file not found: {metadata_path}")
-        if str(metadata_abs.parent) != work_dir:
+        if metadata_abs.parent != work_dir:
             raise RuntimeError(
                 "qcow2 and metadata must be in the same directory to push "
                 f"(qcow2 dir: {work_dir}, metadata: {metadata_abs})")
@@ -90,7 +94,7 @@ def _oras_push(
     try:
         result = subprocess.run(
             cmd,
-            cwd=work_dir,
+            cwd=str(work_dir),
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

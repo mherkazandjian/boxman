@@ -166,6 +166,46 @@ class TestPushOciImage:
         assert fake.last_cmd[3] == "disk.qcow2"
         assert (Path(cwd) / fake.last_cmd[3]).is_file()
 
+    def test_relative_metadata_with_subdir_rejected(self, tmp_path: Path, monkeypatch):
+        """A relative --metadata with directory components keeps its full path
+        and is rejected by the co-location check — it is NOT flattened onto a
+        same-named decoy sitting next to the qcow2."""
+        qcow2 = tmp_path / "disk.qcow2"
+        qcow2.write_bytes(b"qcow2 data")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "vmimage.json").write_text("{}")
+        # a decoy with the same basename right next to the qcow2
+        (tmp_path / "vmimage.json").write_text('{"decoy": true}')
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(RuntimeError, match="same directory"):
+            push_oci_image(
+                image_ref="registry.com/repo:tag",
+                qcow2_path=str(qcow2),
+                metadata_path="sub/vmimage.json",
+            )
+
+    def test_tilde_metadata_expanded(self, tmp_path: Path, monkeypatch):
+        """A `~`-prefixed metadata path is expanded before the absoluteness
+        check (so it is not treated as a literal `~` directory)."""
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        qcow2 = home / "disk.qcow2"
+        qcow2.write_bytes(b"qcow2 data")
+        (home / "vmimage.json").write_text("{}")
+        fake = _FakeRun(returncode=0)
+        with patch(
+            "boxman.providers.libvirt.oci_push.subprocess.run", side_effect=fake
+        ):
+            push_oci_image(
+                image_ref="registry.com/repo:tag",
+                qcow2_path=str(qcow2),
+                metadata_path="~/vmimage.json",
+            )
+        assert "vmimage.json" in fake.last_cmd
+        assert fake.last_kwargs.get("cwd") == str(home)
+
     def test_missing_qcow2_raises(self):
         with pytest.raises(RuntimeError, match="qcow2 file not found"):
             push_oci_image(
