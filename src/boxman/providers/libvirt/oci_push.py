@@ -51,19 +51,31 @@ def _oras_push(
     if not qcow2_file.is_file():
         raise RuntimeError(f"qcow2 file not found: {qcow2_path}")
 
-    files_to_push = [str(qcow2_file)]
+    # oras rejects absolute file paths: the path becomes the artifact's layer
+    # title (org.opencontainers.image.title) and an absolute title would enable
+    # path traversal on pull. Push from the file's directory using basenames so
+    # the titles are clean relative names (e.g. 'disk.qcow2') that the pull side
+    # recreates safely.
+    work_dir = str(qcow2_file.resolve().parent)
+    files_to_push = [qcow2_file.name]
 
     if metadata_path is not None:
         metadata_file = Path(metadata_path)
         if not metadata_file.is_file():
             raise RuntimeError(f"metadata file not found: {metadata_path}")
-        files_to_push.append(str(metadata_file))
+        if str(metadata_file.resolve().parent) != work_dir:
+            raise RuntimeError(
+                "qcow2 and metadata must be in the same directory to push "
+                f"(qcow2 dir: {work_dir}, metadata dir: "
+                f"{metadata_file.resolve().parent})")
+        files_to_push.append(metadata_file.name)
 
     cmd = ["oras", "push", image_ref] + files_to_push
 
     try:
         result = subprocess.run(
             cmd,
+            cwd=work_dir,
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

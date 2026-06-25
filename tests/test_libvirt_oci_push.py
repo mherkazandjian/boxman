@@ -32,9 +32,10 @@ class _FakeRun:
         self.stdout = stdout
         self.stderr = stderr
 
-    def __call__(self, cmd, **_kwargs):
+    def __call__(self, cmd, **kwargs):
         # Stash the most recent invocation so tests can inspect it.
         self.last_cmd = cmd
+        self.last_kwargs = kwargs
         return SimpleNamespace(
             returncode=self.returncode, stdout=self.stdout, stderr=self.stderr
         )
@@ -52,7 +53,10 @@ class TestPushOciImage:
         ):
             push_oci_image(image_ref="registry.com/repo:tag", qcow2_path=str(qcow2))
         assert fake.last_cmd[:3] == ["oras", "push", "registry.com/repo:tag"]
-        assert fake.last_cmd[3] == str(qcow2)
+        # pushed by basename from the file's dir (oras rejects absolute paths)
+        assert fake.last_cmd[3] == "disk.qcow2"
+        assert fake.last_kwargs.get("cwd") == str(qcow2.resolve().parent)
+        assert str(qcow2) not in fake.last_cmd  # no absolute path leaks in
 
     def test_qcow2_and_metadata(self, tmp_path: Path):
         qcow2 = tmp_path / "disk.qcow2"
@@ -69,8 +73,26 @@ class TestPushOciImage:
                 metadata_path=str(metadata),
             )
         assert fake.last_cmd[:3] == ["oras", "push", "registry.com/repo:v1.0"]
-        assert str(qcow2) in fake.last_cmd
-        assert str(metadata) in fake.last_cmd
+        assert "disk.qcow2" in fake.last_cmd
+        assert "vmimage.json" in fake.last_cmd
+        assert fake.last_kwargs.get("cwd") == str(qcow2.resolve().parent)
+        # only basenames, never absolute paths (oras rejects those)
+        assert str(qcow2) not in fake.last_cmd
+        assert str(metadata) not in fake.last_cmd
+
+    def test_metadata_in_different_dir_raises(self, tmp_path: Path):
+        qcow2 = tmp_path / "disk.qcow2"
+        qcow2.write_bytes(b"qcow2 data")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        metadata = sub / "vmimage.json"
+        metadata.write_text("{}")
+        with pytest.raises(RuntimeError, match="same directory"):
+            push_oci_image(
+                image_ref="registry.com/repo:tag",
+                qcow2_path=str(qcow2),
+                metadata_path=str(metadata),
+            )
 
     def test_missing_qcow2_raises(self):
         with pytest.raises(RuntimeError, match="qcow2 file not found"):
