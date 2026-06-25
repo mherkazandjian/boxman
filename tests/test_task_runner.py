@@ -158,6 +158,37 @@ class TestLoadWorkspaceEnv:
         result = load_workspace_env(cluster, workspace)
         assert result["INVENTORY"] == "shared_inventory"
 
+    def test_cluster_ssh_config_resolves_against_workspace_root(self, tmp_path):
+        """A relative cluster ssh_config resolves against workspace.path (where
+        write_ssh_config writes the single shared file), NOT the per-cluster
+        workdir — otherwise `boxman ssh`/`run` reference a file never created."""
+        ws = tmp_path
+        cluster = {
+            "workdir": str(ws / "cluster_1"),
+            "ssh_config": "ssh_config",
+            "inventory": "inventory",
+        }
+        workspace = {"path": str(ws)}
+        result = load_workspace_env(cluster, workspace)
+        assert result["SSH_CONFIG"] == str(ws / "ssh_config")
+        # inventory stays per-cluster (workdir) — multi-cluster isolation intact
+        assert result["INVENTORY"] == str(ws / "cluster_1" / "inventory")
+
+    def test_cluster_ssh_config_without_workspace_path_uses_workdir(self, tmp_path):
+        """Without workspace.path, ssh_config falls back to the cluster workdir,
+        mirroring write_ssh_config's `base = workspace.path or cluster.workdir`."""
+        cluster = {"workdir": str(tmp_path), "ssh_config": "ssh_config"}
+        result = load_workspace_env(cluster, {})
+        assert result["SSH_CONFIG"] == str(tmp_path / "ssh_config")
+
+    def test_cluster_absolute_ssh_config_left_untouched(self, tmp_path):
+        """An absolute cluster ssh_config is used as-is, not joined to anything."""
+        abs_cfg = str(tmp_path / "elsewhere" / "ssh_config")
+        cluster = {"workdir": str(tmp_path / "cluster_1"), "ssh_config": abs_cfg}
+        workspace = {"path": str(tmp_path)}
+        result = load_workspace_env(cluster, workspace)
+        assert result["SSH_CONFIG"] == abs_cfg
+
 
 # ---------------------------------------------------------------------------
 # TaskRunner tests
