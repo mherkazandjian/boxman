@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -56,19 +57,33 @@ def _oras_push(
     # path traversal on pull. Push from the file's directory using basenames so
     # the titles are clean relative names (e.g. 'disk.qcow2') that the pull side
     # recreates safely.
-    work_dir = str(qcow2_file.resolve().parent)
-    files_to_push = [qcow2_file.name]
+    #
+    # Use absolute-but-unresolved paths (os.path.abspath does not follow
+    # symlinks): cwd + basename then name *exactly* the file the user passed.
+    # Pairing a symlink-resolved directory with the symlink's own basename would
+    # point oras at a non-existent file, and "same directory" should mean the
+    # directory the files were placed in, not their symlink targets.
+    qcow2_abs = Path(os.path.abspath(qcow2_path))
+    work_dir = str(qcow2_abs.parent)
+    files_to_push = [qcow2_abs.name]
 
     if metadata_path is not None:
-        metadata_file = Path(metadata_path)
-        if not metadata_file.is_file():
+        metadata_arg = Path(metadata_path)
+        # A bare relative metadata path is interpreted as co-located with the
+        # qcow2 (honouring the co-location contract below), not resolved against
+        # the process CWD — otherwise `--metadata vmimage.json` would only work
+        # when invoked from the qcow2's own directory.
+        if metadata_arg.is_absolute():
+            metadata_abs = Path(os.path.abspath(metadata_path))
+        else:
+            metadata_abs = qcow2_abs.parent / metadata_arg.name
+        if not metadata_abs.is_file():
             raise RuntimeError(f"metadata file not found: {metadata_path}")
-        if str(metadata_file.resolve().parent) != work_dir:
+        if str(metadata_abs.parent) != work_dir:
             raise RuntimeError(
                 "qcow2 and metadata must be in the same directory to push "
-                f"(qcow2 dir: {work_dir}, metadata dir: "
-                f"{metadata_file.resolve().parent})")
-        files_to_push.append(metadata_file.name)
+                f"(qcow2 dir: {work_dir}, metadata: {metadata_abs})")
+        files_to_push.append(metadata_abs.name)
 
     cmd = ["oras", "push", image_ref] + files_to_push
 

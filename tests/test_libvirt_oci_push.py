@@ -94,6 +94,78 @@ class TestPushOciImage:
                 metadata_path=str(metadata),
             )
 
+    def test_relative_metadata_resolved_against_qcow2_dir(self, tmp_path: Path, monkeypatch):
+        """A bare relative --metadata is co-located with the qcow2, not the CWD.
+
+        Invoking from an unrelated directory must still find vmimage.json sitting
+        next to the qcow2 (the co-location contract), not raise 'not found'.
+        """
+        qcow2 = tmp_path / "disk.qcow2"
+        metadata = tmp_path / "vmimage.json"
+        qcow2.write_bytes(b"qcow2 data")
+        metadata.write_text("{}")
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        monkeypatch.chdir(other)
+        fake = _FakeRun(returncode=0)
+        with patch(
+            "boxman.providers.libvirt.oci_push.subprocess.run", side_effect=fake
+        ):
+            push_oci_image(
+                image_ref="registry.com/repo:tag",
+                qcow2_path=str(qcow2),
+                metadata_path="vmimage.json",  # bare, NOT relative to the CWD
+            )
+        assert fake.last_kwargs.get("cwd") == os.path.dirname(
+            os.path.abspath(str(qcow2))
+        )
+        assert "disk.qcow2" in fake.last_cmd
+        assert "vmimage.json" in fake.last_cmd
+
+    def test_symlink_qcow2_basename_resolvable_from_cwd(self, tmp_path: Path):
+        """cwd and basename must come from the same (unresolved) path.
+
+        A symlink whose name/dir differ from its target previously paired a
+        resolved cwd with the symlink's basename, naming a file that does not
+        exist there.
+        """
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        target = real_dir / "disk.qcow2"
+        target.write_bytes(b"qcow2 data")
+        link_dir = tmp_path / "links"
+        link_dir.mkdir()
+        link = link_dir / "mydisk.qcow2"
+        link.symlink_to(target)
+        fake = _FakeRun(returncode=0)
+        with patch(
+            "boxman.providers.libvirt.oci_push.subprocess.run", side_effect=fake
+        ):
+            push_oci_image(image_ref="registry.com/repo:tag", qcow2_path=str(link))
+        cwd = fake.last_kwargs.get("cwd")
+        pushed = fake.last_cmd[3]
+        assert pushed == "mydisk.qcow2"
+        assert cwd == str(link_dir)
+        # basename must actually open relative to cwd (oras follows the symlink)
+        assert (Path(cwd) / pushed).is_file()
+
+    def test_relative_qcow2_from_other_cwd(self, tmp_path: Path, monkeypatch):
+        """A relative qcow2 path anchors to the process CWD; cwd+basename then
+        resolve to the real file regardless of where oras is launched from."""
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "disk.qcow2").write_bytes(b"qcow2 data")
+        monkeypatch.chdir(data)
+        fake = _FakeRun(returncode=0)
+        with patch(
+            "boxman.providers.libvirt.oci_push.subprocess.run", side_effect=fake
+        ):
+            push_oci_image(image_ref="registry.com/repo:tag", qcow2_path="disk.qcow2")
+        cwd = fake.last_kwargs.get("cwd")
+        assert cwd == str(data)
+        assert fake.last_cmd[3] == "disk.qcow2"
+        assert (Path(cwd) / fake.last_cmd[3]).is_file()
+
     def test_missing_qcow2_raises(self):
         with pytest.raises(RuntimeError, match="qcow2 file not found"):
             push_oci_image(
