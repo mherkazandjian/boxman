@@ -256,6 +256,57 @@ class TestPullOciImage:
             with pytest.raises(RuntimeError, match="zstd|could not read OCI layer"):
                 pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
 
+    def test_pull_containerdisk_skips_symlink_member(self, tmp_path: Path):
+        # a symlink named like a qcow2 must be ignored, not followed/recreated
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            info = tarfile.TarInfo("disk/evil.qcow2")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "/etc/passwd"
+            tar.addfile(info)
+        out_dir = tmp_path / "out"
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": buf.getvalue()}))
+        with _patch_run(fake):
+            with pytest.raises(RuntimeError, match="no qcow2"):
+                pull_oci_image("reg/repo:tag", str(out_dir))
+        assert not (out_dir / "evil.qcow2").exists()
+
+    def test_pull_containerdisk_neutralizes_traversal_name(self, tmp_path: Path):
+        # a regular member with a traversing name is written by basename only
+        layer = _gztar({"../../../../etc/evil.qcow2": b"DISKDATA"})
+        out_dir = tmp_path / "out"
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            qcow2 = pull_oci_image("reg/repo:tag", str(out_dir))
+        assert Path(qcow2) == out_dir / "evil.qcow2"  # no traversal out of out_dir
+        assert Path(qcow2).read_bytes() == b"DISKDATA"
+
+    def test_pull_containerdisk_nested_index(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(oci_pull, "_host_arch", lambda: "amd64")
+        layer = _gztar({"disk/d.qcow2": b"NESTED"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={
+                "reg/repo:tag": _index_manifest([("sha256:inner", "linux", "amd64")]),
+                "reg/repo@sha256:inner": _index_manifest([("sha256:plat", "linux", "amd64")]),
+                "reg/repo@sha256:plat": _image_manifest(["sha256:layer"]),
+            },
+            blobs={"reg/repo@sha256:layer": layer}))
+        with _patch_run(fake):
+            qcow2 = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(qcow2).read_bytes() == b"NESTED"
+
+    def test_pull_index_without_host_arch_raises(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(oci_pull, "_host_arch", lambda: "amd64")
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _index_manifest([("sha256:arm", "linux", "arm64")])}))
+        with _patch_run(fake):
+            with pytest.raises(RuntimeError, match="no manifest for linux/amd64"):
+                pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+
     # ── error handling ────────────────────────────────────────────────────────
 
     def test_pull_empty_ref_raises(self):
@@ -574,3 +625,55 @@ class TestOciCacheUrl:
 
         assert (CloudInitTemplate._oci_cache_url("oci://reg/repo:tag")
                 == CloudInitTemplate._oci_cache_url("reg/repo:tag"))
+
+
+# ── _select_index_digest / _host_arch / _resolve_image_manifest ───────────────
+
+
+class TestSelectIndexDigest:
+    def test_picks_host_arch(self, monkeypatch):
+        monkeypatch.setattr(oci_pull, "_host_arch", lambda: "amd64")
+        manifest = json.loads(_index_manifest([
+            ("sha256:arm", "linux", "arm64"),
+            ("sha256:amd", "linux", "amd64"),
+        ]))
+        assert oci_pull._select_index_digest(manifest) == "sha256:amd"
+
+    def test_skips_attestation_unknown(self, monkeypatch):
+        monkeypatch.setattr(oci_pull, "_host_arch", lambda: "amd64")
+        manifest = {"manifests": [
+            {"digest": "sha256:att", "platform": {"architecture": "unknown"}},
+            {"digest": "sha256:amd", "platform": {"os": "linux", "architecture": "amd64"}},
+        ]}
+        assert oci_pull._select_index_digest(manifest) == "sha256:amd"
+
+    def test_no_host_arch_returns_none(self, monkeypatch):
+        monkeypatch.setattr(oci_pull, "_host_arch", lambda: "amd64")
+        manifest = json.loads(_index_manifest([("sha256:arm", "linux", "arm64")]))
+        assert oci_pull._select_index_digest(manifest) is None
+
+    def test_empty_index_returns_none(self):
+        assert oci_pull._select_index_digest({"manifests": []}) is None
+
+
+class TestHostArch:
+    def test_known_arch_mapped(self, monkeypatch):
+        monkeypatch.setattr(oci_pull.platform, "machine", lambda: "x86_64")
+        assert oci_pull._host_arch() == "amd64"
+
+    def test_unknown_arch_falls_back_to_raw(self, monkeypatch):
+        # an unmapped machine must NOT masquerade as amd64
+        monkeypatch.setattr(oci_pull.platform, "machine", lambda: "riscv64")
+        assert oci_pull._host_arch() == "riscv64"
+
+
+class TestResolveImageManifest:
+    def test_nested_index_too_deep_raises(self, monkeypatch):
+        monkeypatch.setattr(oci_pull, "_host_arch", lambda: "amd64")
+        idx = _index_manifest([("sha256:x", "linux", "amd64")])
+        # every resolved manifest is itself an index -> exceeds the depth cap
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": idx, "reg/repo@sha256:x": idx}))
+        with _patch_run(fake):
+            with pytest.raises(RuntimeError, match="nests deeper"):
+                oci_pull._resolve_image_manifest("reg/repo:tag", json.loads(idx))

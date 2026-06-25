@@ -272,7 +272,11 @@ manifest on pull:
   `oci://quay.io/containerdisks/ubuntu:24.04`. This lets boxman launch VMs from
   the large existing ecosystem of containerDisk images. Multi-arch references
   are resolved to the host architecture, then the carrying layer is fetched and
-  the qcow2 extracted. (Layers compressed with zstd are not yet supported.)
+  the qcow2 extracted. Extraction needs transient scratch space of roughly
+  2–3× the qcow2 size (the compressed layer plus the inflated disk) in the
+  pull/cache directory; any image layers stacked above the disk layer are
+  downloaded and discarded, so prefer single-layer containerDisks. Layers
+  compressed with zstd are not yet supported.
 
 ### As a template `image.uri` (recommended)
 

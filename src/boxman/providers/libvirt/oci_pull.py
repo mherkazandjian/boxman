@@ -172,21 +172,33 @@ _ARCH_MAP = {
 
 
 def _host_arch() -> str:
-    """Return the host's OCI architecture (e.g. ``amd64``), defaulting to amd64."""
-    return _ARCH_MAP.get(platform.machine().lower(), "amd64")
+    """Return the host's OCI architecture (e.g. ``amd64``).
+
+    An unmapped machine falls back to the raw ``platform.machine()`` value rather
+    than masquerading as amd64, so an index that lacks the host's architecture
+    fails to match and raises a clear error instead of silently selecting a
+    wrong-architecture disk.
+    """
+    machine = platform.machine().lower()
+    return _ARCH_MAP.get(machine, machine)
 
 
 def _fetch_manifest(ref: str) -> dict:
     """Fetch and parse an OCI manifest via ``oras manifest fetch``.
 
     Raises:
-        ValueError: If the manifest is not valid JSON.
+        ValueError: If the manifest is empty or not valid JSON.
         RuntimeError: If oras is missing or the fetch fails.
     """
     result = _run_oras(
         ["oras", "manifest", "fetch", ref], action="manifest fetch", ref=ref)
+    stdout = (result.stdout or "").strip()
+    if not stdout:
+        # An empty response (vs a parse/transport error) would otherwise become
+        # {} and resurface later as a misleading "no qcow2" failure.
+        raise ValueError(f"empty manifest response from oras for '{ref}'")
     try:
-        return json.loads(result.stdout or "{}")
+        return json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise ValueError(f"could not parse manifest for '{ref}': {exc}") from exc
 
@@ -202,52 +214,57 @@ def _manifest_has_qcow2_title(manifest: dict) -> bool:
 
 
 def _manifest_kind(manifest: dict) -> str:
-    """Classify a manifest: ``image-index`` | ``artifact`` | ``image`` | ``unknown``."""
+    """Classify a manifest: ``image-index`` | ``artifact`` | ``image`` | ``unknown``.
+
+    A container-image config takes precedence over a ``*.qcow2`` layer title, so
+    a containerDisk that happens to annotate a layer title is still treated as an
+    image (its embedded qcow2 is extracted) rather than mis-pulled as a raw
+    artifact (which would yield a compressed layer tarball, not a real qcow2).
+    """
     if manifest.get("manifests"):
         return "image-index"
-    if _manifest_has_qcow2_title(manifest):
-        return "artifact"
     if (manifest.get("config") or {}).get("mediaType", "") in _CONTAINER_CONFIG_TYPES:
         return "image"
+    if _manifest_has_qcow2_title(manifest):
+        return "artifact"
     return "unknown"
 
 
 def _select_index_digest(manifest: dict) -> Optional[str]:
-    """Pick the platform manifest digest from an image index for the host arch.
+    """Pick the ``linux/<host-arch>`` manifest digest from an image index.
 
-    Prefers ``linux/<host-arch>``; falls back to the first ``linux`` entry, then
-    the first non-attestation entry. Entries with ``architecture == 'unknown'``
-    (attestation/SBOM manifests) are skipped.
+    Matches strictly on the host OS/architecture — selecting a different
+    architecture would yield a disk that cannot boot here. Attestation/SBOM
+    entries (``architecture == 'unknown'`` or no platform) simply do not match.
+    Returns ``None`` when the index carries no manifest for this host.
     """
-    entries = [
-        e for e in (manifest.get("manifests", []) or [])
-        if (e.get("platform") or {}).get("architecture") not in (None, "unknown")
-    ]
     host = _host_arch()
-    for entry in entries:
+    for entry in manifest.get("manifests", []) or []:
         plat = entry.get("platform") or {}
         if plat.get("os") == "linux" and plat.get("architecture") == host:
             return entry.get("digest")
-    for entry in entries:
-        if (entry.get("platform") or {}).get("os") == "linux":
-            return entry.get("digest")
-    return entries[0].get("digest") if entries else None
+    return None
 
 
-def _resolve_image_manifest(ref: str, manifest: dict) -> dict:
+def _resolve_image_manifest(ref: str, manifest: dict, _max_depth: int = 5) -> dict:
     """Resolve a possibly-multi-arch manifest to a concrete image manifest.
 
-    If *manifest* is an image index, fetch the host-platform manifest it points
-    at; otherwise return it unchanged.
+    Follows image indexes to the host-platform manifest, including nested
+    indexes (index -> index) up to *_max_depth* hops; a non-index manifest is
+    returned unchanged.
     """
-    if not manifest.get("manifests"):
-        return manifest
-    digest = _select_index_digest(manifest)
-    if not digest:
-        raise RuntimeError(
-            f"image index for '{ref}' has no usable linux manifest entry")
     repo = _repo_without_tag(ref)
-    return _fetch_manifest(f"{repo}@{digest}")
+    for _ in range(_max_depth):
+        if not manifest.get("manifests"):
+            return manifest
+        digest = _select_index_digest(manifest)
+        if not digest:
+            raise RuntimeError(
+                f"image index for '{ref}' has no manifest for "
+                f"linux/{_host_arch()}")
+        manifest = _fetch_manifest(f"{repo}@{digest}")
+    raise RuntimeError(
+        f"image index for '{ref}' nests deeper than {_max_depth} levels")
 
 
 def _is_disk_qcow2(name: str) -> bool:
@@ -276,17 +293,23 @@ def _extract_qcow2_from_layer(blob_path: Path, out_dir: Path) -> Optional[Path]:
     """
     chosen: Optional[Path] = None
     chosen_is_disk = False
+    writing: Optional[Path] = None
     try:
         with open(blob_path, "rb") as raw, tarfile.open(fileobj=raw, mode="r|*") as tar:
             for member in tar:
+                # isfile() is False for symlinks/hardlinks/dirs/devices, so only
+                # real file content is ever read; basename() neutralises any
+                # absolute / '..' member name — no member can write outside out_dir.
                 if not (member.isfile() and member.name.endswith(".qcow2")):
                     continue
                 src = tar.extractfile(member)
                 if src is None:
                     continue
                 dest = out_dir / os.path.basename(member.name)
-                with open(dest, "wb") as fh:
+                writing = dest
+                with src, open(dest, "wb") as fh:
                     shutil.copyfileobj(src, fh, 1024 * 1024)
+                writing = None
                 is_disk = _is_disk_qcow2(member.name)
                 if chosen is None or (is_disk and not chosen_is_disk):
                     if chosen is not None and chosen != dest:
@@ -297,9 +320,14 @@ def _extract_qcow2_from_layer(blob_path: Path, out_dir: Path) -> Optional[Path]:
                 if chosen_is_disk:
                     break  # a disk/*.qcow2 is the best match; stop scanning
     except tarfile.ReadError as exc:
+        # a partially written qcow2 from a truncated stream must not be left
+        # behind where it could later be mistaken for a complete disk
+        if writing is not None:
+            writing.unlink(missing_ok=True)
         raise RuntimeError(
-            f"could not read OCI layer tarball '{blob_path.name}': {exc}. "
-            "Layers compressed with zstd are not currently supported.") from exc
+            f"could not read OCI layer tarball '{blob_path.name}': {exc} "
+            "(only gzip/bzip2/xz-compressed layers are supported; zstd is "
+            "not)") from exc
     return chosen
 
 
@@ -350,7 +378,8 @@ def pull_oci_image(image_ref: str, out_dir: str) -> str:
         Absolute path to the qcow2 file.
 
     Raises:
-        ValueError: If *image_ref* is empty.
+        ValueError: If *image_ref* is empty, or the registry returns an empty
+            or unparseable manifest.
         RuntimeError: If oras is missing, a registry call fails, or no qcow2
             can be obtained from the image.
     """
@@ -366,7 +395,7 @@ def pull_oci_image(image_ref: str, out_dir: str) -> str:
     # a fallback. Resolve a multi-arch index to the host-platform manifest.
     manifest = _resolve_image_manifest(ref, _fetch_manifest(ref))
 
-    if _manifest_has_qcow2_title(manifest):
+    if _manifest_kind(manifest) == "artifact":
         # boxman/oras artifact: a titled qcow2 layer that `oras pull` extracts.
         _run_oras(["oras", "pull", ref, "-o", str(out)], action="pull", ref=ref)
         qcow2 = _find_qcow2(out)
