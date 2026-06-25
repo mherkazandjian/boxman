@@ -12,10 +12,13 @@ runtime and provider machinery they sit on top of.
 | **Template creation** | Build a cloud-init-customised template VM from a base cloud image | `boxman create-templates` |
 | **Image import** | Define a libvirt VM from a pre-built `(disk + XML)` package described by a JSON manifest | `boxman import-image` |
 | **Image push (OCI)** | Publish a qcow2 + optional metadata to an OCI registry via `oras` | `boxman image push` |
+| **Image inspect (OCI)** | Inspect an OCI reference's manifest + `vmimage.json` metadata | `boxman image inspect` |
+| **OCI base image** | Use an OCI image as a template / VM base, pulled on `boxman up` | `image.uri: oci://…` or `base_image: oci://…` |
 
 The first two cover the common "spin up VMs from a public cloud image"
 flow. The third is for moving an already-built VM (an exported lab VM,
-a vendor appliance, etc.) onto a libvirt host.
+a vendor appliance, etc.) onto a libvirt host. The OCI features distribute
+and consume VM images through the same registries that hold container images.
 
 ---
 
@@ -198,6 +201,80 @@ Authentication is delegated to oras and follows oras-supported methods:
 | `metadata file not found: <path>` | `--metadata` path does not exist |
 | `oras CLI not found` | Install `oras` and ensure it is on `PATH` |
 | `oras push failed for '<ref>'.` | Registry rejected the push (auth, permissions, or quota); inspect the included stderr in the error message |
+
+---
+
+## `boxman image inspect` (OCI registry)
+
+Inspect an OCI image reference **without downloading the full qcow2**. Fetches
+the manifest with `oras manifest fetch` and, when a `vmimage.json` layer is
+present, fetches just that small blob to surface its metadata.
+
+### Usage
+
+```bash
+boxman image inspect oci://registry.example.com/my-vms/ubuntu:latest
+```
+
+```
+image_ref: registry.example.com/my-vms/ubuntu:latest
+media_type: application/vnd.oci.image.manifest.v1+json
+layers: 2
+  - disk.qcow2 (application/octet-stream, 678331904 bytes)
+  - vmimage.json (application/json, 96 bytes)
+metadata:
+  firmware: uefi
+  machine: None
+  disk_bus: virtio
+  net_model: virtio
+```
+
+The `oci://` scheme is optional (`registry.example.com/repo:tag` also works).
+Authentication and prerequisites are the same as `boxman image push` above.
+
+---
+
+## OCI registry base images
+
+An OCI image can serve as the base for boxman-built VMs in two ways. Both pull
+the qcow2 with `oras` and reuse the image cache above, so the download happens
+once. The artifact is expected to contain a `disk.qcow2` (any `*.qcow2` is
+accepted as a fallback). A worked example lives in
+`boxes/tiny-libvirt-ubuntu-24.04-oci`.
+
+### As a template `image.uri` (recommended)
+
+Point a template's `image.uri` at an `oci://` reference. The image is pulled and
+cached on the first `boxman up` / `boxman create-templates`, then a template VM
+is built from it — with cloud-init, exactly like an http(s) base image:
+
+```yaml
+templates:
+  template1:
+    name: ubuntu-24.04-oci-base-template-cloudinit
+    image:
+      uri: oci://registry.example.com/boxman/ubuntu-24.04:latest
+    os_variant: ubuntu24.04
+    cloudinit: | ...
+clusters:
+  cluster_1:
+    base_image: ubuntu-24.04-oci-base-template-cloudinit
+```
+
+### Directly as `base_image`
+
+Reference the registry straight from a cluster- or VM-level `base_image`. Boxman
+synthesizes an implicit template (named `boxman-oci-<…>`), pulls the image and
+clones from it. The synthesized template carries no explicit cloud-init, so the
+template build applies boxman's **default** cloud-init (creates a default user,
+reconfigures networking) — point it at a cloud-init-enabled cloud image. Use the
+template `image.uri` form above when you need custom cloud-init:
+
+```yaml
+clusters:
+  cluster_1:
+    base_image: oci://registry.example.com/boxman/ubuntu-24.04:latest
+```
 
 ---
 

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -956,6 +957,27 @@ class BoxmanManager:
             raise SystemExit(1) from exc
 
     @staticmethod
+    def inspect_image(_cls, cli_args) -> None:
+        """
+        Inspect an OCI image reference: print its manifest summary and, when a
+        ``vmimage.json`` sidecar is present, its metadata.
+
+        Provider-agnostic — delegates to the ``oras`` CLI (manifest fetch, no
+        full blob download). ``_cls`` is unused but kept for signature
+        consistency with the other CLI dispatchers.
+        """
+        from boxman.providers.libvirt.oci_pull import (
+            format_inspect,
+            inspect_oci_image,
+        )
+        try:
+            summary = inspect_oci_image(cli_args.image_ref)
+            print(format_inspect(summary), end="", flush=True)
+        except (ValueError, RuntimeError) as exc:
+            print(f"error inspecting image: {exc}", flush=True)
+            raise SystemExit(1) from exc
+
+    @staticmethod
     def pxe_boot(cls, cli_args):
         """
         Set boot order to network-first on a VM, start it, optionally wait
@@ -1347,6 +1369,70 @@ class BoxmanManager:
                 f"the following VM(s) have no base_image (set it at the "
                 f"cluster or VM level): {', '.join(missing)}"
             )
+
+    @staticmethod
+    def _oci_template_name(image_ref: str) -> str:
+        """Derive a deterministic, libvirt-safe template VM name from an OCI ref.
+
+        e.g. ``oci://registry.example.com/boxman/ubuntu-24.04:latest`` ->
+        ``boxman-oci-ubuntu-24.04-latest-<8 hex>``. The hash keeps distinct refs
+        that share a tag/name from colliding.
+        """
+        from boxman.providers.libvirt.oci_pull import _strip_scheme
+        ref = _strip_scheme(image_ref)
+        digest = hashlib.sha256(ref.encode('utf-8')).hexdigest()[:8]
+        readable = ref.rsplit('/', 1)[-1]  # e.g. 'ubuntu-24.04:latest'
+        safe = "".join(c if (c.isalnum() or c in '._-') else '-' for c in readable)
+        safe = safe.strip('-.') or 'image'
+        return f"boxman-oci-{safe}-{digest}"
+
+    def _expand_oci_base_images(self) -> None:
+        """Expand ``base_image: oci://…`` references into implicit templates.
+
+        The clone path can only clone an existing libvirt VM by name, so a direct
+        ``oci://`` base image cannot be cloned as-is. For each unique OCI ref found
+        in a cluster- or VM-level ``base_image``, synthesize a ``templates`` entry
+        that pulls the qcow2 from the registry (via the ``oci://`` template-image
+        path) and rewrite the ``base_image`` to that template's name. The existing
+        :meth:`ensure_templates_exist` + clone pipeline then handles the rest.
+
+        Idempotent: repeated refs map to the same template; non-OCI base images
+        are left untouched. Templates synthesized here specify no explicit
+        cloud-init, so the template build applies boxman's DEFAULT cloud-init
+        (default user, networking) — the pulled image should therefore be a
+        cloud-init-enabled cloud image. Use an explicit ``templates`` entry with
+        ``image.uri: oci://…`` when you need custom cloud-init.
+        """
+        clusters = self.config.get('clusters', {})
+        if not clusters:
+            return
+
+        templates = self.config.setdefault('templates', {})
+        ref_to_name: dict[str, str] = {}
+
+        def _resolve(base_image):
+            if not isinstance(base_image, str) or not base_image.startswith('oci://'):
+                return base_image
+            tpl_name = ref_to_name.get(base_image)
+            if tpl_name is None:
+                tpl_name = self._oci_template_name(base_image)
+                ref_to_name[base_image] = tpl_name
+                if tpl_name not in templates:
+                    templates[tpl_name] = {
+                        'name': tpl_name,
+                        'image': {'uri': base_image},
+                    }
+                    self.logger.info(
+                        f"expanded base_image '{base_image}' -> "
+                        f"implicit template '{tpl_name}'")
+            return tpl_name
+
+        for cluster in clusters.values():
+            if 'base_image' in cluster:
+                cluster['base_image'] = _resolve(cluster.get('base_image'))
+            for vm_info in cluster.get('vms', {}).values():
+                if 'base_image' in vm_info:
+                    vm_info['base_image'] = _resolve(vm_info.get('base_image'))
 
     def ensure_templates_exist(self) -> bool:
         """
@@ -2838,6 +2924,10 @@ class BoxmanManager:
         except RuntimeError as exc:
             cls.logger.error(str(exc))
             return
+
+        # Expand any `base_image: oci://…` references into implicit templates
+        # before template build / cloning (the clone path needs a VM name).
+        cls._expand_oci_base_images()
 
         # --rebuild-templates: force-recreate all templates before provisioning
         rebuild_templates = getattr(cli_args, 'rebuild_templates', False)
@@ -4885,6 +4975,9 @@ class BoxmanManager:
             if dry_run:
                 cls.logger.info("[dry-run] would clone and configure new VMs")
             else:
+                # expand any `base_image: oci://…` into implicit templates
+                # before resolving/cloning (the clone path needs a VM name).
+                cls._expand_oci_base_images()
                 # ensure templates exist
                 cls.ensure_templates_exist()
                 try:

@@ -370,3 +370,26 @@ class TestConfigDryRun:
         data = yaml.safe_load(rendered)
         # bare minimum: has a project key or something structurally similar
         assert isinstance(data, (dict, type(None)))
+
+
+class TestImageDispatch:
+    """`image` subverbs must wire to the correct BoxmanManager methods."""
+
+    def test_image_inspect_dispatch(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(["image", "inspect", "oci://reg/repo:tag"])
+        assert args.func is BoxmanManager.inspect_image
+        assert args.image_ref == "oci://reg/repo:tag"
+
+    def test_image_push_dispatch(self):
+        from boxman.manager import BoxmanManager
+        from boxman.scripts.app import parse_args
+        parser = parse_args()
+        args = parser.parse_args(
+            ["image", "push", "reg/repo:tag", "--qcow2", "/tmp/disk.qcow2"])
+        assert args.func is BoxmanManager.push_image
+        assert args.image_ref == "reg/repo:tag"
+        assert args.qcow2 == "/tmp/disk.qcow2"
+        assert args.metadata is None
