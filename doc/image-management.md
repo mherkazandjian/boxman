@@ -208,7 +208,10 @@ Authentication is delegated to oras and follows oras-supported methods:
 
 Inspect an OCI image reference **without downloading the full qcow2**. Fetches
 the manifest with `oras manifest fetch` and, when a `vmimage.json` layer is
-present, fetches just that small blob to surface its metadata.
+present, fetches just that small blob to surface its metadata. The `kind` line
+classifies the reference: `artifact` (a boxman/oras titled-qcow2 artifact),
+`image` / `image-index` (a container image — a candidate KubeVirt containerDisk
+whose embedded `/disk/*.qcow2` is extracted on pull), or `unknown`.
 
 ### Usage
 
@@ -218,6 +221,7 @@ boxman image inspect oci://registry.example.com/my-vms/ubuntu:latest
 
 ```
 image_ref: registry.example.com/my-vms/ubuntu:latest
+kind: artifact
 media_type: application/vnd.oci.image.manifest.v1+json
 layers: 2
   - disk.qcow2 (application/octet-stream, 678331904 bytes)
@@ -229,6 +233,22 @@ metadata:
   net_model: virtio
 ```
 
+A KubeVirt containerDisk instead reports it is a container image:
+
+```bash
+boxman image inspect oci://quay.io/containerdisks/ubuntu:24.04
+```
+
+```
+image_ref: quay.io/containerdisks/ubuntu:24.04
+kind: image-index
+  (container image — if it is a KubeVirt-style containerDisk, boxman extracts
+   the embedded /disk/*.qcow2 on pull)
+manifests (image index): 2
+  - linux/amd64 (application/vnd.oci.image.manifest.v1+json, 525 bytes)
+  - linux/arm64 (application/vnd.oci.image.manifest.v1+json, 525 bytes)
+```
+
 The `oci://` scheme is optional (`registry.example.com/repo:tag` also works).
 Authentication and prerequisites are the same as `boxman image push` above.
 
@@ -236,11 +256,27 @@ Authentication and prerequisites are the same as `boxman image push` above.
 
 ## OCI registry base images
 
-An OCI image can serve as the base for boxman-built VMs in two ways. Both pull
-the qcow2 with `oras` and reuse the image cache above, so the download happens
-once. The artifact is expected to contain a `disk.qcow2` (any `*.qcow2` is
-accepted as a fallback). A worked example lives in
+An OCI image can serve as the base for boxman-built VMs in two ways (template
+`image.uri` or direct `base_image`). Both reuse the image cache above, so the
+download happens once. A worked example lives in
 `boxes/tiny-libvirt-ubuntu-24.04-oci`.
+
+Two registry source layouts are supported, detected automatically from the
+manifest on pull:
+
+- **boxman / oras artifact** — a qcow2 stored as a titled OCI layer (what
+  `boxman image push` produces). Expected to contain a `disk.qcow2` (any
+  `*.qcow2` is accepted as a fallback).
+- **container image / KubeVirt containerDisk** — a qcow2 embedded in a container
+  image's filesystem at `/disk/*.qcow2`, e.g.
+  `oci://quay.io/containerdisks/ubuntu:24.04`. This lets boxman launch VMs from
+  the large existing ecosystem of containerDisk images. Multi-arch references
+  are resolved to the host architecture, then the carrying layer is fetched and
+  the qcow2 extracted. Extraction needs transient scratch space of roughly
+  2–3× the qcow2 size (the compressed layer plus the inflated disk) in the
+  pull/cache directory; any image layers stacked above the disk layer are
+  downloaded and discarded, so prefer single-layer containerDisks. Layers
+  compressed with zstd are not yet supported.
 
 ### As a template `image.uri` (recommended)
 
