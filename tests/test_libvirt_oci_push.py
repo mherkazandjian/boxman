@@ -32,9 +32,10 @@ class _FakeRun:
         self.stdout = stdout
         self.stderr = stderr
 
-    def __call__(self, cmd, **_kwargs):
+    def __call__(self, cmd, **kwargs):
         # Stash the most recent invocation so tests can inspect it.
         self.last_cmd = cmd
+        self.last_kwargs = kwargs
         return SimpleNamespace(
             returncode=self.returncode, stdout=self.stdout, stderr=self.stderr
         )
@@ -52,7 +53,12 @@ class TestPushOciImage:
         ):
             push_oci_image(image_ref="registry.com/repo:tag", qcow2_path=str(qcow2))
         assert fake.last_cmd[:3] == ["oras", "push", "registry.com/repo:tag"]
-        assert fake.last_cmd[3] == str(qcow2)
+        # pushed by basename from the file's dir (oras rejects absolute paths)
+        assert fake.last_cmd[3] == "disk.qcow2"
+        assert fake.last_kwargs.get("cwd") == os.path.dirname(
+            os.path.abspath(str(qcow2))
+        )
+        assert str(qcow2) not in fake.last_cmd  # no absolute path leaks in
 
     def test_qcow2_and_metadata(self, tmp_path: Path):
         qcow2 = tmp_path / "disk.qcow2"
@@ -69,8 +75,140 @@ class TestPushOciImage:
                 metadata_path=str(metadata),
             )
         assert fake.last_cmd[:3] == ["oras", "push", "registry.com/repo:v1.0"]
-        assert str(qcow2) in fake.last_cmd
-        assert str(metadata) in fake.last_cmd
+        assert "disk.qcow2" in fake.last_cmd
+        assert "vmimage.json" in fake.last_cmd
+        assert fake.last_kwargs.get("cwd") == os.path.dirname(
+            os.path.abspath(str(qcow2))
+        )
+        # only basenames, never absolute paths (oras rejects those)
+        assert str(qcow2) not in fake.last_cmd
+        assert str(metadata) not in fake.last_cmd
+
+    def test_metadata_in_different_dir_raises(self, tmp_path: Path):
+        qcow2 = tmp_path / "disk.qcow2"
+        qcow2.write_bytes(b"qcow2 data")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        metadata = sub / "vmimage.json"
+        metadata.write_text("{}")
+        with pytest.raises(RuntimeError, match="same directory"):
+            push_oci_image(
+                image_ref="registry.com/repo:tag",
+                qcow2_path=str(qcow2),
+                metadata_path=str(metadata),
+            )
+
+    def test_relative_metadata_resolved_against_qcow2_dir(self, tmp_path: Path, monkeypatch):
+        """A bare relative --metadata is co-located with the qcow2, not the CWD.
+
+        Invoking from an unrelated directory must still find vmimage.json sitting
+        next to the qcow2 (the co-location contract), not raise 'not found'.
+        """
+        qcow2 = tmp_path / "disk.qcow2"
+        metadata = tmp_path / "vmimage.json"
+        qcow2.write_bytes(b"qcow2 data")
+        metadata.write_text("{}")
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        monkeypatch.chdir(other)
+        fake = _FakeRun(returncode=0)
+        with patch(
+            "boxman.providers.libvirt.oci_push.subprocess.run", side_effect=fake
+        ):
+            push_oci_image(
+                image_ref="registry.com/repo:tag",
+                qcow2_path=str(qcow2),
+                metadata_path="vmimage.json",  # bare, NOT relative to the CWD
+            )
+        assert fake.last_kwargs.get("cwd") == os.path.dirname(
+            os.path.abspath(str(qcow2))
+        )
+        assert "disk.qcow2" in fake.last_cmd
+        assert "vmimage.json" in fake.last_cmd
+
+    def test_symlink_qcow2_basename_resolvable_from_cwd(self, tmp_path: Path):
+        """cwd and basename must come from the same (unresolved) path.
+
+        A symlink whose name/dir differ from its target previously paired a
+        resolved cwd with the symlink's basename, naming a file that does not
+        exist there.
+        """
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        target = real_dir / "disk.qcow2"
+        target.write_bytes(b"qcow2 data")
+        link_dir = tmp_path / "links"
+        link_dir.mkdir()
+        link = link_dir / "mydisk.qcow2"
+        link.symlink_to(target)
+        fake = _FakeRun(returncode=0)
+        with patch(
+            "boxman.providers.libvirt.oci_push.subprocess.run", side_effect=fake
+        ):
+            push_oci_image(image_ref="registry.com/repo:tag", qcow2_path=str(link))
+        cwd = fake.last_kwargs.get("cwd")
+        pushed = fake.last_cmd[3]
+        assert pushed == "mydisk.qcow2"
+        assert cwd == str(link_dir)
+        # basename must actually open relative to cwd (oras follows the symlink)
+        assert (Path(cwd) / pushed).is_file()
+
+    def test_relative_qcow2_from_other_cwd(self, tmp_path: Path, monkeypatch):
+        """A relative qcow2 path anchors to the process CWD; cwd+basename then
+        resolve to the real file regardless of where oras is launched from."""
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "disk.qcow2").write_bytes(b"qcow2 data")
+        monkeypatch.chdir(data)
+        fake = _FakeRun(returncode=0)
+        with patch(
+            "boxman.providers.libvirt.oci_push.subprocess.run", side_effect=fake
+        ):
+            push_oci_image(image_ref="registry.com/repo:tag", qcow2_path="disk.qcow2")
+        cwd = fake.last_kwargs.get("cwd")
+        assert cwd == str(data)
+        assert fake.last_cmd[3] == "disk.qcow2"
+        assert (Path(cwd) / fake.last_cmd[3]).is_file()
+
+    def test_relative_metadata_with_subdir_rejected(self, tmp_path: Path, monkeypatch):
+        """A relative --metadata with directory components keeps its full path
+        and is rejected by the co-location check — it is NOT flattened onto a
+        same-named decoy sitting next to the qcow2."""
+        qcow2 = tmp_path / "disk.qcow2"
+        qcow2.write_bytes(b"qcow2 data")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "vmimage.json").write_text("{}")
+        # a decoy with the same basename right next to the qcow2
+        (tmp_path / "vmimage.json").write_text('{"decoy": true}')
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(RuntimeError, match="same directory"):
+            push_oci_image(
+                image_ref="registry.com/repo:tag",
+                qcow2_path=str(qcow2),
+                metadata_path="sub/vmimage.json",
+            )
+
+    def test_tilde_metadata_expanded(self, tmp_path: Path, monkeypatch):
+        """A `~`-prefixed metadata path is expanded before the absoluteness
+        check (so it is not treated as a literal `~` directory)."""
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        qcow2 = home / "disk.qcow2"
+        qcow2.write_bytes(b"qcow2 data")
+        (home / "vmimage.json").write_text("{}")
+        fake = _FakeRun(returncode=0)
+        with patch(
+            "boxman.providers.libvirt.oci_push.subprocess.run", side_effect=fake
+        ):
+            push_oci_image(
+                image_ref="registry.com/repo:tag",
+                qcow2_path=str(qcow2),
+                metadata_path="~/vmimage.json",
+            )
+        assert "vmimage.json" in fake.last_cmd
+        assert fake.last_kwargs.get("cwd") == str(home)
 
     def test_missing_qcow2_raises(self):
         with pytest.raises(RuntimeError, match="qcow2 file not found"):
