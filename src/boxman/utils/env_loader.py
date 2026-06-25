@@ -87,15 +87,19 @@ def load_workspace_env(
        ``inventory``, ``salt_master``, ``ansible_config``) override any
        sourced values.
     4. The same keys declared under the *cluster* (``cluster_config``) are
-       layered on top of the workspace ones, so a ``run --cluster <name>``
-       (or ``ssh --cluster``) targets that cluster's own inventory / gateway
-       / ssh_config rather than the shared workspace defaults. This is what
+       layered on top of the workspace ones, so a ``boxman run --cluster
+       <name>`` (or ``boxman ssh --cluster``) targets that cluster's own
+       inventory / gateway / ssh_config rather than the shared workspace
+       defaults. This is what
        makes multi-cluster projects inventory-isolated at the operations
-       layer. A relative cluster ``inventory`` / ``ssh_config`` /
-       ``ansible_config`` is resolved against the cluster's ``workdir`` (tasks
-       usually run from ``workspace.path``, so a bare relative path would
-       otherwise miss), and a repointed ``INVENTORY`` is mirrored to
-       ``ANSIBLE_INVENTORY`` (which ansible actually reads).
+       layer. A relative cluster ``inventory`` / ``ansible_config`` is resolved
+       against the cluster's ``workdir`` (tasks usually run from
+       ``workspace.path``, so a bare relative path would otherwise miss). A
+       relative cluster ``ssh_config`` instead resolves against the workspace
+       root, because ``write_ssh_config`` writes a single shared ssh_config
+       there (``base = workspace.path or cluster.workdir``) rather than one per
+       cluster. A repointed ``INVENTORY`` is mirrored to ``ANSIBLE_INVENTORY``
+       (which ansible actually reads).
 
     Args:
         cluster_config: A single cluster's configuration dict (from conf.yml).
@@ -107,6 +111,14 @@ def load_workspace_env(
     env_vars: dict[str, str] = {}
     workspace_config = workspace_config or {}
     workdir = os.path.expanduser(cluster_config.get("workdir", "."))
+    # A relative cluster ``ssh_config`` resolves against the workspace root,
+    # because ``write_ssh_config`` writes one shared ssh_config there
+    # (``base = workspace.path or cluster.workdir``) rather than per cluster.
+    ws_path = (
+        os.path.expanduser(workspace_config["path"])
+        if workspace_config.get("path")
+        else None
+    )
 
     # 1. Source explicit env_file from workspace config
     env_file = workspace_config.get("env_file")
@@ -149,7 +161,7 @@ def load_workspace_env(
         "ansible_config": "ANSIBLE_CONFIG",
     }
 
-    def _apply(source: dict, base: str | None) -> None:
+    def _apply(source: dict, base: str | None, ssh_base: str | None = None) -> None:
         for yaml_key, env_key in value_overrides.items():
             if yaml_key in source:
                 env_vars[env_key] = os.path.expanduser(str(source[yaml_key]))
@@ -157,8 +169,15 @@ def load_workspace_env(
             if yaml_key not in source:
                 continue
             val = os.path.expanduser(str(source[yaml_key]))
-            if base and not os.path.isabs(val):
-                val = os.path.normpath(os.path.join(base, val))
+            # ssh_config is shared at the workspace root (write_ssh_config uses
+            # base = workspace.path or cluster.workdir and groups all clusters
+            # onto one file), unlike inventory which is written per-cluster. So
+            # a relative cluster ssh_config resolves against ssh_base (the
+            # workspace root); resolving it against the cluster workdir would
+            # point `boxman ssh` / `run` at a file that was never created.
+            resolve_base = ssh_base if (env_key == "SSH_CONFIG" and ssh_base) else base
+            if resolve_base and not os.path.isabs(val):
+                val = os.path.normpath(os.path.join(resolve_base, val))
             env_vars[env_key] = val
             # ansible consults ANSIBLE_INVENTORY (which env.sh seeds from
             # INVENTORY); keep it in step so a repointed inventory actually
@@ -167,6 +186,6 @@ def load_workspace_env(
                 env_vars["ANSIBLE_INVENTORY"] = val
 
     _apply(workspace_config, None)
-    _apply(cluster_config, workdir)
+    _apply(cluster_config, workdir, ssh_base=ws_path or workdir)
 
     return env_vars
