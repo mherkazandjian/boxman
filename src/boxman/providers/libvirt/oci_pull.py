@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import shutil
 import subprocess
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -146,11 +149,197 @@ def _run_oras(cmd: list, action: str, ref: str) -> subprocess.CompletedProcess:
     return result
 
 
+# ── container image / KubeVirt containerDisk support ─────────────────────────
+
+
+# OCI / docker container-image config media types. A manifest whose config is
+# one of these is a runnable container image (and therefore a candidate
+# KubeVirt containerDisk) rather than a boxman oras artifact.
+_CONTAINER_CONFIG_TYPES = {
+    "application/vnd.oci.image.config.v1+json",
+    "application/vnd.docker.container.image.v1+json",
+}
+
+# Map the host machine to an OCI platform architecture for multi-arch indexes.
+_ARCH_MAP = {
+    "x86_64": "amd64",
+    "amd64": "amd64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+    "ppc64le": "ppc64le",
+    "s390x": "s390x",
+}
+
+
+def _host_arch() -> str:
+    """Return the host's OCI architecture (e.g. ``amd64``), defaulting to amd64."""
+    return _ARCH_MAP.get(platform.machine().lower(), "amd64")
+
+
+def _fetch_manifest(ref: str) -> dict:
+    """Fetch and parse an OCI manifest via ``oras manifest fetch``.
+
+    Raises:
+        ValueError: If the manifest is not valid JSON.
+        RuntimeError: If oras is missing or the fetch fails.
+    """
+    result = _run_oras(
+        ["oras", "manifest", "fetch", ref], action="manifest fetch", ref=ref)
+    try:
+        return json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"could not parse manifest for '{ref}': {exc}") from exc
+
+
+def _manifest_has_qcow2_title(manifest: dict) -> bool:
+    """True if any layer is a titled ``*.qcow2`` (boxman/oras artifact convention)."""
+    for layer in manifest.get("layers", []) or []:
+        title = (layer.get("annotations", {}) or {}).get(
+            "org.opencontainers.image.title", "")
+        if title.endswith(".qcow2"):
+            return True
+    return False
+
+
+def _manifest_kind(manifest: dict) -> str:
+    """Classify a manifest: ``image-index`` | ``artifact`` | ``image`` | ``unknown``."""
+    if manifest.get("manifests"):
+        return "image-index"
+    if _manifest_has_qcow2_title(manifest):
+        return "artifact"
+    if (manifest.get("config") or {}).get("mediaType", "") in _CONTAINER_CONFIG_TYPES:
+        return "image"
+    return "unknown"
+
+
+def _select_index_digest(manifest: dict) -> Optional[str]:
+    """Pick the platform manifest digest from an image index for the host arch.
+
+    Prefers ``linux/<host-arch>``; falls back to the first ``linux`` entry, then
+    the first non-attestation entry. Entries with ``architecture == 'unknown'``
+    (attestation/SBOM manifests) are skipped.
+    """
+    entries = [
+        e for e in (manifest.get("manifests", []) or [])
+        if (e.get("platform") or {}).get("architecture") not in (None, "unknown")
+    ]
+    host = _host_arch()
+    for entry in entries:
+        plat = entry.get("platform") or {}
+        if plat.get("os") == "linux" and plat.get("architecture") == host:
+            return entry.get("digest")
+    for entry in entries:
+        if (entry.get("platform") or {}).get("os") == "linux":
+            return entry.get("digest")
+    return entries[0].get("digest") if entries else None
+
+
+def _resolve_image_manifest(ref: str, manifest: dict) -> dict:
+    """Resolve a possibly-multi-arch manifest to a concrete image manifest.
+
+    If *manifest* is an image index, fetch the host-platform manifest it points
+    at; otherwise return it unchanged.
+    """
+    if not manifest.get("manifests"):
+        return manifest
+    digest = _select_index_digest(manifest)
+    if not digest:
+        raise RuntimeError(
+            f"image index for '{ref}' has no usable linux manifest entry")
+    repo = _repo_without_tag(ref)
+    return _fetch_manifest(f"{repo}@{digest}")
+
+
+def _is_disk_qcow2(name: str) -> bool:
+    """True if *name* is a qcow2 under a ``disk/`` directory (containerDisk layout)."""
+    norm = name.replace("\\", "/").lstrip("./")
+    return norm.endswith(".qcow2") and ("/disk/" in "/" + norm)
+
+
+def _blob_fetch_to_file(repo: str, digest: str, dest: Path) -> None:
+    """Fetch a layer blob by digest to *dest* via ``oras blob fetch``."""
+    _run_oras(
+        ["oras", "blob", "fetch", f"{repo}@{digest}", "--output", str(dest)],
+        action="blob fetch", ref=f"{repo}@{digest}")
+
+
+def _extract_qcow2_from_layer(blob_path: Path, out_dir: Path) -> Optional[Path]:
+    """Extract an embedded qcow2 from a single (compressed) layer tarball.
+
+    Streams the tar (``r|*`` auto-detects gzip/bzip2/xz; zstd is unsupported and
+    surfaces a clear error). Prefers a ``disk/*.qcow2`` (KubeVirt containerDisk
+    convention) over any other ``*.qcow2``, and stops as soon as a ``disk/`` one
+    is found. Only the basename is used for the output file, so a malicious
+    member name cannot traverse outside *out_dir*.
+
+    Returns the path to the extracted qcow2, or ``None`` if the layer has none.
+    """
+    chosen: Optional[Path] = None
+    chosen_is_disk = False
+    try:
+        with open(blob_path, "rb") as raw, tarfile.open(fileobj=raw, mode="r|*") as tar:
+            for member in tar:
+                if not (member.isfile() and member.name.endswith(".qcow2")):
+                    continue
+                src = tar.extractfile(member)
+                if src is None:
+                    continue
+                dest = out_dir / os.path.basename(member.name)
+                with open(dest, "wb") as fh:
+                    shutil.copyfileobj(src, fh, 1024 * 1024)
+                is_disk = _is_disk_qcow2(member.name)
+                if chosen is None or (is_disk and not chosen_is_disk):
+                    if chosen is not None and chosen != dest:
+                        chosen.unlink(missing_ok=True)  # drop the less-preferred one
+                    chosen, chosen_is_disk = dest, is_disk
+                elif dest != chosen:
+                    dest.unlink(missing_ok=True)
+                if chosen_is_disk:
+                    break  # a disk/*.qcow2 is the best match; stop scanning
+    except tarfile.ReadError as exc:
+        raise RuntimeError(
+            f"could not read OCI layer tarball '{blob_path.name}': {exc}. "
+            "Layers compressed with zstd are not currently supported.") from exc
+    return chosen
+
+
+def _extract_embedded_qcow2(ref: str, manifest: dict, out_dir: Path) -> Optional[Path]:
+    """Extract the qcow2 embedded in a container image's layers.
+
+    Layers are scanned from topmost to bottom (so an upper layer's disk wins);
+    the first layer that yields a qcow2 is used.
+    """
+    repo = _repo_without_tag(ref)
+    layers = manifest.get("layers", []) or []
+    blob_path = out_dir / ".boxman-layer.blob"
+    for layer in reversed(layers):
+        digest = layer.get("digest")
+        if not digest:
+            continue
+        try:
+            _blob_fetch_to_file(repo, digest, blob_path)
+            qcow2 = _extract_qcow2_from_layer(blob_path, out_dir)
+        finally:
+            blob_path.unlink(missing_ok=True)
+        if qcow2 is not None:
+            return qcow2
+    return None
+
+
 # ── public interface ─────────────────────────────────────────────────────────
 
 
 def pull_oci_image(image_ref: str, out_dir: str) -> str:
-    """Pull an OCI image artifact and return the local qcow2 path.
+    """Pull an OCI image and return the local qcow2 path.
+
+    Two source layouts are supported:
+
+    * **boxman / oras artifact** — a qcow2 stored as a titled OCI layer
+      (``oras push disk.qcow2``); fetched with ``oras pull``.
+    * **container image / KubeVirt containerDisk** — a qcow2 embedded inside a
+      container image's filesystem (conventionally ``/disk/*.qcow2``, e.g.
+      ``quay.io/containerdisks/...``); the carrying layer is fetched and the
+      qcow2 extracted from it.
 
     Args:
         image_ref: OCI reference, with or without an ``oci://`` scheme
@@ -158,11 +347,12 @@ def pull_oci_image(image_ref: str, out_dir: str) -> str:
         out_dir: Directory to pull the artifact into (created if needed).
 
     Returns:
-        Absolute path to the pulled qcow2 file.
+        Absolute path to the qcow2 file.
 
     Raises:
         ValueError: If *image_ref* is empty.
-        RuntimeError: If oras is missing, the pull fails, or no qcow2 is found.
+        RuntimeError: If oras is missing, a registry call fails, or no qcow2
+            can be obtained from the image.
     """
     if not image_ref or not str(image_ref).strip():
         raise ValueError("image_ref must be a non-empty string")
@@ -171,13 +361,30 @@ def pull_oci_image(image_ref: str, out_dir: str) -> str:
     out = Path(os.path.expanduser(out_dir)).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
-    _run_oras(["oras", "pull", ref, "-o", str(out)], action="pull", ref=ref)
+    # Fetch the manifest first: this is the initial registry call, so a bad ref
+    # / auth / network failure surfaces clearly here instead of being masked by
+    # a fallback. Resolve a multi-arch index to the host-platform manifest.
+    manifest = _resolve_image_manifest(ref, _fetch_manifest(ref))
 
-    qcow2 = _find_qcow2(out)
+    if _manifest_has_qcow2_title(manifest):
+        # boxman/oras artifact: a titled qcow2 layer that `oras pull` extracts.
+        _run_oras(["oras", "pull", ref, "-o", str(out)], action="pull", ref=ref)
+        qcow2 = _find_qcow2(out)
+        if qcow2 is None:
+            raise RuntimeError(
+                f"OCI image '{ref}' pulled to '{out}', but no qcow2 was found "
+                "(expected 'disk.qcow2' or any '*.qcow2').")
+        return str(qcow2)
+
+    # Otherwise treat it as a container image (e.g. KubeVirt containerDisk) and
+    # extract the qcow2 embedded in its layers.
+    qcow2 = _extract_embedded_qcow2(ref, manifest, out)
     if qcow2 is None:
         raise RuntimeError(
-            f"OCI image '{ref}' pulled to '{out}', but no qcow2 was found "
-            "(expected 'disk.qcow2' or any '*.qcow2').")
+            f"OCI image '{ref}' has no qcow2: it is neither a boxman artifact "
+            "(a titled '*.qcow2' layer) nor a container image with an embedded "
+            "'*.qcow2' (expected a KubeVirt-style containerDisk carrying "
+            "'/disk/*.qcow2').")
     return str(qcow2)
 
 
@@ -237,9 +444,12 @@ def inspect_oci_image(image_ref: str) -> dict:
         image_ref: OCI reference, with or without an ``oci://`` scheme.
 
     Returns:
-        A summary dict with keys ``image_ref``, ``media_type``, ``layers``
-        (each ``{title, media_type, size, digest}``), ``annotations`` and
-        ``metadata`` (a :class:`VmImageMetadata` or ``None``).
+        A summary dict with keys ``image_ref``, ``kind`` (``artifact`` |
+        ``image`` | ``image-index`` | ``unknown``), ``media_type``, ``layers``
+        (each ``{title, media_type, size, digest}``), ``manifests``,
+        ``annotations`` and ``metadata`` (a :class:`VmImageMetadata` or
+        ``None``). For a container image / image index, the embedded qcow2 is
+        not downloaded here; it is extracted on ``pull``.
 
     Raises:
         ValueError: If *image_ref* is empty or the manifest is not valid JSON.
@@ -249,13 +459,7 @@ def inspect_oci_image(image_ref: str) -> dict:
         raise ValueError("image_ref must be a non-empty string")
 
     ref = _strip_scheme(str(image_ref).strip())
-
-    result = _run_oras(
-        ["oras", "manifest", "fetch", ref], action="manifest fetch", ref=ref)
-    try:
-        manifest = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"could not parse manifest for '{ref}': {exc}") from exc
+    manifest = _fetch_manifest(ref)
 
     layers = []
     for layer in manifest.get("layers", []) or []:
@@ -271,12 +475,12 @@ def inspect_oci_image(image_ref: str) -> dict:
     # `layers`; surface those so inspect doesn't report an empty artifact.
     index_manifests = []
     for entry in manifest.get("manifests", []) or []:
-        platform = entry.get("platform", {}) or {}
+        plat_info = entry.get("platform", {}) or {}
         plat = "/".join(
             part for part in (
-                platform.get("os"),
-                platform.get("architecture"),
-                platform.get("variant"),
+                plat_info.get("os"),
+                plat_info.get("architecture"),
+                plat_info.get("variant"),
             ) if part)
         index_manifests.append({
             "media_type": entry.get("mediaType", ""),
@@ -287,6 +491,7 @@ def inspect_oci_image(image_ref: str) -> dict:
 
     return {
         "image_ref": ref,
+        "kind": _manifest_kind(manifest),
         "media_type": manifest.get("mediaType", ""),
         "layers": layers,
         "manifests": index_manifests,
@@ -298,6 +503,14 @@ def inspect_oci_image(image_ref: str) -> dict:
 def format_inspect(summary: dict) -> str:
     """Render an :func:`inspect_oci_image` summary as human-readable text."""
     lines = [f"image_ref: {summary.get('image_ref', '')}"]
+
+    kind = summary.get("kind")
+    if kind:
+        lines.append(f"kind: {kind}")
+        if kind in ("image", "image-index"):
+            lines.append(
+                "  (container image — if it is a KubeVirt-style containerDisk, "
+                "boxman extracts the embedded /disk/*.qcow2 on pull)")
 
     media_type = summary.get("media_type")
     if media_type:

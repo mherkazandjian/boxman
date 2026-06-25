@@ -6,7 +6,9 @@ Counterpart to ``test_libvirt_oci_push.py``. The ``oras`` CLI is stubbed via
 
 from __future__ import annotations
 
+import io
 import json
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,6 +16,7 @@ from unittest.mock import patch
 import pytest
 
 from boxman.manager import BoxmanManager
+from boxman.providers.libvirt import oci_pull
 from boxman.providers.libvirt.oci_pull import (
     VmImageMetadata,
     _repo_without_tag,
@@ -50,54 +53,210 @@ class _FakeRun:
         return SimpleNamespace(returncode=self.returncode, stdout=out, stderr=self.stderr)
 
 
+def _gztar(members: dict) -> bytes:
+    """Build a gzip-compressed tar (``{member_name: bytes}``) as a byte string."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _artifact_manifest(titles=("disk.qcow2",)) -> str:
+    """A boxman/oras artifact manifest with titled ``*.qcow2`` layer(s)."""
+    return json.dumps({
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "layers": [
+            {
+                "mediaType": "application/octet-stream",
+                "size": 1,
+                "digest": f"sha256:{t}",
+                "annotations": {"org.opencontainers.image.title": t},
+            }
+            for t in titles
+        ],
+    })
+
+
+def _image_manifest(layer_digests) -> str:
+    """A container-image manifest (no titles) carrying *layer_digests*."""
+    return json.dumps({
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json"},
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "size": 1,
+                "digest": d,
+            }
+            for d in layer_digests
+        ],
+    })
+
+
+def _index_manifest(entries) -> str:
+    """A multi-arch image index. *entries* = list of ``(digest, os, arch)``."""
+    return json.dumps({
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "size": 1,
+                "digest": d,
+                "platform": {"os": o, "architecture": a},
+            }
+            for d, o, a in entries
+        ],
+    })
+
+
+def _oras_handler(manifests=None, blobs=None, pull_files=None):
+    """Build a ``_FakeRun`` handler dispatching on the oras subcommand.
+
+    - ``oras manifest fetch <ref>`` -> ``manifests[ref]`` (JSON; default ``{}``)
+    - ``oras blob fetch <ref> --output <p>`` -> writes ``blobs[ref]`` to ``<p>``
+    - ``oras pull <ref> -o <dir>`` -> writes each of ``pull_files`` into ``<dir>``
+    """
+    manifests = manifests or {}
+    blobs = blobs or {}
+    pull_files = pull_files or {}
+
+    def handler(cmd):
+        if cmd[:3] == ["oras", "manifest", "fetch"]:
+            return manifests.get(cmd[3], "{}")
+        if cmd[:3] == ["oras", "blob", "fetch"]:
+            data = blobs.get(cmd[3])
+            if data is not None:
+                Path(cmd[cmd.index("--output") + 1]).write_bytes(data)
+            return ""
+        if cmd[:2] == ["oras", "pull"]:
+            d = Path(cmd[cmd.index("-o") + 1])
+            d.mkdir(parents=True, exist_ok=True)
+            for name, content in pull_files.items():
+                (d / name).write_bytes(content)
+            return "pulled"
+        return ""
+
+    return handler
+
+
 # ── pull_oci_image ────────────────────────────────────────────────────────────
 
 
+def _patch_run(fake):
+    return patch("boxman.providers.libvirt.oci_pull.subprocess.run", side_effect=fake)
+
+
 class TestPullOciImage:
-    def test_pull_finds_disk_qcow2(self, tmp_path: Path):
-        out_dir = tmp_path / "out"
+    # ── boxman / oras artifact path (titled qcow2 layer) ──────────────────────
 
-        def handler(cmd):
-            d = Path(cmd[cmd.index("-o") + 1])
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "disk.qcow2").write_bytes(b"qcow2")
-            (d / "vmimage.json").write_text("{}")
-            return "pulled"
-
-        fake = _FakeRun(returncode=0, handler=handler)
-        with patch("boxman.providers.libvirt.oci_pull.subprocess.run", side_effect=fake):
-            qcow2 = pull_oci_image("oci://reg/repo:tag", str(out_dir))
+    def test_pull_artifact_finds_disk_qcow2(self, tmp_path: Path):
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _artifact_manifest(("disk.qcow2",))},
+            pull_files={"disk.qcow2": b"qcow2", "vmimage.json": b"{}"}))
+        with _patch_run(fake):
+            qcow2 = pull_oci_image("oci://reg/repo:tag", str(tmp_path / "out"))
         assert qcow2.endswith("disk.qcow2")
-        # scheme is stripped before being handed to oras
-        assert fake.calls[0][:3] == ["oras", "pull", "reg/repo:tag"]
+        pulls = [c for c in fake.calls if c[:2] == ["oras", "pull"]]
+        assert pulls and pulls[0][2] == "reg/repo:tag"  # oci:// scheme stripped
 
-    def test_pull_falls_back_to_any_qcow2(self, tmp_path: Path):
-        out_dir = tmp_path / "out"
-
-        def handler(cmd):
-            d = Path(cmd[cmd.index("-o") + 1])
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "ubuntu-24.04.qcow2").write_bytes(b"qcow2")
-            return "pulled"
-
-        fake = _FakeRun(returncode=0, handler=handler)
-        with patch("boxman.providers.libvirt.oci_pull.subprocess.run", side_effect=fake):
-            qcow2 = pull_oci_image("reg/repo:tag", str(out_dir))
+    def test_pull_artifact_falls_back_to_any_qcow2(self, tmp_path: Path):
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _artifact_manifest(("ubuntu-24.04.qcow2",))},
+            pull_files={"ubuntu-24.04.qcow2": b"qcow2"}))
+        with _patch_run(fake):
+            qcow2 = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
         assert qcow2.endswith("ubuntu-24.04.qcow2")
 
-    def test_pull_without_qcow2_raises(self, tmp_path: Path):
-        out_dir = tmp_path / "out"
-
-        def handler(cmd):
-            d = Path(cmd[cmd.index("-o") + 1])
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "readme.txt").write_text("no disk here")
-            return "pulled"
-
-        fake = _FakeRun(returncode=0, handler=handler)
-        with patch("boxman.providers.libvirt.oci_pull.subprocess.run", side_effect=fake):
+    def test_pull_artifact_without_qcow2_raises(self, tmp_path: Path):
+        # manifest advertises a qcow2 layer, but oras pull yields no qcow2
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _artifact_manifest(("disk.qcow2",))},
+            pull_files={"readme.txt": b"no disk here"}))
+        with _patch_run(fake):
             with pytest.raises(RuntimeError, match="no qcow2 was found"):
-                pull_oci_image("reg/repo:tag", str(out_dir))
+                pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+
+    # ── container image / KubeVirt containerDisk path (embedded qcow2) ────────
+
+    def test_pull_containerdisk_extracts_embedded_qcow2(self, tmp_path: Path):
+        layer = _gztar({"disk/ubuntu-24.04.qcow2": b"QCOWDATA", "etc/hostname": b"h"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:layer1"])},
+            blobs={"reg/repo@sha256:layer1": layer}))
+        with _patch_run(fake):
+            qcow2 = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(qcow2).name == "ubuntu-24.04.qcow2"
+        assert Path(qcow2).read_bytes() == b"QCOWDATA"
+        blobs = [c for c in fake.calls if c[:3] == ["oras", "blob", "fetch"]]
+        assert blobs and blobs[0][3] == "reg/repo@sha256:layer1"
+
+    def test_pull_containerdisk_from_multiarch_index(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(oci_pull, "_host_arch", lambda: "amd64")
+        layer = _gztar({"disk/disk.qcow2": b"AMD64DISK"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={
+                "reg/repo:tag": _index_manifest([
+                    ("sha256:armmanifest", "linux", "arm64"),
+                    ("sha256:amdmanifest", "linux", "amd64"),
+                ]),
+                "reg/repo@sha256:amdmanifest": _image_manifest(["sha256:amdlayer"]),
+            },
+            blobs={"reg/repo@sha256:amdlayer": layer}))
+        with _patch_run(fake):
+            qcow2 = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(qcow2).read_bytes() == b"AMD64DISK"
+        # the amd64 platform manifest (not arm64) was resolved
+        assert ["oras", "manifest", "fetch", "reg/repo@sha256:amdmanifest"] in fake.calls
+        assert ["oras", "manifest", "fetch", "reg/repo@sha256:armmanifest"] not in fake.calls
+
+    def test_pull_containerdisk_prefers_disk_dir(self, tmp_path: Path):
+        # a root-level qcow2 AND a disk/*.qcow2 — the disk/ one must win
+        layer = _gztar({"root.qcow2": b"ROOT", "disk/real.qcow2": b"DISK"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            qcow2 = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(qcow2).name == "real.qcow2"
+        assert Path(qcow2).read_bytes() == b"DISK"
+        # the non-preferred extraction is cleaned up
+        assert not (tmp_path / "out" / "root.qcow2").exists()
+
+    def test_pull_containerdisk_upper_layer_wins(self, tmp_path: Path):
+        lower = _gztar({"disk/foo.qcow2": b"OLD"})
+        upper = _gztar({"disk/foo.qcow2": b"NEW"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:lower", "sha256:upper"])},
+            blobs={"reg/repo@sha256:lower": lower, "reg/repo@sha256:upper": upper}))
+        with _patch_run(fake):
+            qcow2 = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(qcow2).read_bytes() == b"NEW"
+        # layers are scanned top-down; the upper hit short-circuits the lower
+        fetched = [c[3] for c in fake.calls if c[:3] == ["oras", "blob", "fetch"]]
+        assert fetched == ["reg/repo@sha256:upper"]
+
+    def test_pull_containerdisk_no_qcow2_raises(self, tmp_path: Path):
+        layer = _gztar({"etc/hostname": b"host", "readme": b"x"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            with pytest.raises(RuntimeError, match="no qcow2"):
+                pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+
+    def test_pull_unreadable_layer_raises(self, tmp_path: Path):
+        # a zstd-compressed (or otherwise non-tar) blob can't be read by tarfile
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": b"\x28\xb5\x2f\xfd not a tar"}))
+        with _patch_run(fake):
+            with pytest.raises(RuntimeError, match="zstd|could not read OCI layer"):
+                pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+
+    # ── error handling ────────────────────────────────────────────────────────
 
     def test_pull_empty_ref_raises(self):
         with pytest.raises(ValueError, match="image_ref must be a non-empty string"):
@@ -112,12 +271,13 @@ class TestPullOciImage:
                 pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
 
     def test_pull_oras_failure_includes_stderr(self, tmp_path: Path):
+        # the first registry call is the manifest fetch, so a bad ref surfaces there
         fake = _FakeRun(returncode=1, stdout="", stderr="manifest unknown")
         with patch("boxman.providers.libvirt.oci_pull.subprocess.run", side_effect=fake):
             with pytest.raises(RuntimeError) as excinfo:
                 pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
         msg = str(excinfo.value)
-        assert "oras pull failed" in msg
+        assert "oras manifest fetch failed" in msg
         assert "manifest unknown" in msg
 
 
@@ -198,6 +358,37 @@ class TestInspectOciImage:
         with patch("boxman.providers.libvirt.oci_pull.subprocess.run", side_effect=fake):
             with pytest.raises(ValueError, match="could not parse manifest"):
                 inspect_oci_image("reg/repo:tag")
+
+    def test_inspect_reports_kind_artifact(self):
+        fake = _FakeRun(stdout=_artifact_manifest(("disk.qcow2",)))
+        with _patch_run(fake):
+            summary = inspect_oci_image("reg/repo:tag")
+        assert summary["kind"] == "artifact"
+
+    def test_inspect_reports_kind_image(self):
+        fake = _FakeRun(stdout=_image_manifest(["sha256:l"]))
+        with _patch_run(fake):
+            summary = inspect_oci_image("reg/repo:tag")
+        assert summary["kind"] == "image"
+
+    def test_inspect_reports_kind_image_index(self):
+        fake = _FakeRun(stdout=_index_manifest([("sha256:m", "linux", "amd64")]))
+        with _patch_run(fake):
+            summary = inspect_oci_image("reg/repo:tag")
+        assert summary["kind"] == "image-index"
+        assert summary["manifests"]  # index entries are surfaced
+
+    def test_format_inspect_shows_kind_and_containerdisk_hint(self):
+        text = format_inspect({
+            "image_ref": "reg/repo:tag",
+            "kind": "image-index",
+            "layers": [],
+            "manifests": [
+                {"platform": "linux/amd64", "media_type": "", "size": 0, "digest": "d"},
+            ],
+        })
+        assert "kind: image-index" in text
+        assert "containerDisk" in text
 
 
 # ── _repo_without_tag (tag/digest/port parsing) ───────────────────────────────
