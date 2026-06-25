@@ -55,7 +55,9 @@ class TestPushOciImage:
         assert fake.last_cmd[:3] == ["oras", "push", "registry.com/repo:tag"]
         # pushed by basename from the file's dir (oras rejects absolute paths)
         assert fake.last_cmd[3] == "disk.qcow2"
-        assert fake.last_kwargs.get("cwd") == str(qcow2.resolve().parent)
+        assert fake.last_kwargs.get("cwd") == os.path.dirname(
+            os.path.abspath(str(qcow2))
+        )
         assert str(qcow2) not in fake.last_cmd  # no absolute path leaks in
 
     def test_qcow2_and_metadata(self, tmp_path: Path):
@@ -75,7 +77,9 @@ class TestPushOciImage:
         assert fake.last_cmd[:3] == ["oras", "push", "registry.com/repo:v1.0"]
         assert "disk.qcow2" in fake.last_cmd
         assert "vmimage.json" in fake.last_cmd
-        assert fake.last_kwargs.get("cwd") == str(qcow2.resolve().parent)
+        assert fake.last_kwargs.get("cwd") == os.path.dirname(
+            os.path.abspath(str(qcow2))
+        )
         # only basenames, never absolute paths (oras rejects those)
         assert str(qcow2) not in fake.last_cmd
         assert str(metadata) not in fake.last_cmd
