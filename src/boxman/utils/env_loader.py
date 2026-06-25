@@ -87,9 +87,10 @@ def load_workspace_env(
        ``inventory``, ``salt_master``, ``ansible_config``) override any
        sourced values.
     4. The same keys declared under the *cluster* (``cluster_config``) are
-       layered on top of the workspace ones, so a ``run --cluster <name>``
-       (or ``ssh --cluster``) targets that cluster's own inventory / gateway
-       / ssh_config rather than the shared workspace defaults. This is what
+       layered on top of the workspace ones, so a ``boxman run --cluster
+       <name>`` (or ``boxman ssh --cluster``) targets that cluster's own
+       inventory / gateway / ssh_config rather than the shared workspace
+       defaults. This is what
        makes multi-cluster projects inventory-isolated at the operations
        layer. A relative cluster ``inventory`` / ``ansible_config`` is resolved
        against the cluster's ``workdir`` (tasks usually run from

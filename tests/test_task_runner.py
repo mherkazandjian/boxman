@@ -189,6 +189,17 @@ class TestLoadWorkspaceEnv:
         result = load_workspace_env(cluster, workspace)
         assert result["SSH_CONFIG"] == abs_cfg
 
+    def test_workspace_level_relative_ssh_config_stays_unresolved(self):
+        """A workspace-level (non-cluster) relative ssh_config is applied with
+        base=None and left as-is. The ssh_base workspace-root resolution only
+        kicks in for a *cluster* override; write_ssh_config never consumes a
+        workspace-level ssh_config, so there is nothing to anchor it to here."""
+        result = load_workspace_env(
+            cluster_config={"workdir": "/some/workdir"},
+            workspace_config={"path": "/ws", "ssh_config": "ssh_config"},
+        )
+        assert result["SSH_CONFIG"] == "ssh_config"
+
 
 # ---------------------------------------------------------------------------
 # TaskRunner tests
