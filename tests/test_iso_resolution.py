@@ -32,6 +32,11 @@ class TestResolveIsos:
         with pytest.raises(ValueError, match="missing 'uri'"):
             mgr._resolve_isos()
 
+    def test_raises_when_iso_conf_is_null(self):
+        mgr = _manager_with_config({"isos": {"talos-omni": None}})
+        with pytest.raises(ValueError, match="must be a mapping"):
+            mgr._resolve_isos()
+
     def test_calls_image_cache_ensure(self):
         mgr = _manager_with_config({
             "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}
@@ -72,6 +77,7 @@ class TestResolveIsos:
             mock_cache_cls.verify_checksum = MagicMock(return_value=True)
             result = mgr._resolve_isos()
         assert result == {"talos-omni": "/cache/talos.iso"}
+        mock_cache_cls.verify_checksum.assert_called_once_with("/cache/talos.iso", "sha256:abc123")
 
     def test_raises_on_checksum_mismatch(self):
         mgr = _manager_with_config({

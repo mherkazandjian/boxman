@@ -1440,16 +1440,15 @@ class BoxmanManager:
 
     def _download_iso(self, url: str, dst_path: str) -> bool:
         """Download an ISO from a URL, trying wget then curl."""
-        from boxman.utils.shell import run as _shell_run
         self.logger.info(f"downloading ISO {url} -> {dst_path}")
-        result = _shell_run(
+        result = run(
             f'wget --progress=dot:mega -O "{dst_path}" "{url}"',
             hide=False, warn=True,
         )
         if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
             self.logger.info("ISO download complete (wget)")
             return True
-        result = _shell_run(
+        result = run(
             f'curl -L --progress-bar -o "{dst_path}" "{url}"',
             hide=False, warn=True,
         )
@@ -1473,6 +1472,10 @@ class BoxmanManager:
 
         resolved: dict[str, str] = {}
         for name, iso_conf in isos_conf.items():
+            if not isinstance(iso_conf, dict):
+                raise ValueError(
+                    f"iso '{name}' must be a mapping with at least a 'uri' key"
+                )
             uri = iso_conf.get("uri")
             if not uri:
                 raise ValueError(f"iso '{name}' missing 'uri'")
@@ -1503,7 +1506,7 @@ class BoxmanManager:
         """
         cdroms = vm_info.get("cdroms", [])
         if not cdroms:
-            return vm_info
+            return {**vm_info}
 
         resolved_cdroms = []
         for cdrom in cdroms:
