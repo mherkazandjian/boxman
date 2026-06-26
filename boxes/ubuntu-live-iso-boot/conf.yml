@@ -1,0 +1,62 @@
+# Example: boot a VM directly from the Ubuntu 24.04 live-server ISO
+#
+# This is the simplest end-to-end exercise of boxman's ISO-boot support: it
+# uses a real, public, checksummed ISO (no registration/Omni needed, unlike the
+# talos-iso-boot box). boxman downloads + verifies the ISO once, then creates a
+# VM with the ISO attached as a CDROM and firmware boot order hd,cdrom — the
+# empty disk falls through to the CDROM on first boot, so the VM live-boots the
+# Ubuntu installer/live environment.
+#
+# It does NOT install or configure an OS (no cloud-init/SSH): the goal is to
+# verify the ISO-boot path itself. See README.md for how to test/verify.
+#
+version: '1.0'
+project: boxman_dev_ubuntu-live-iso-boot
+
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: true
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+
+isos:
+  ubuntu-noble-live:
+    # Ubuntu 24.04.4 LTS live-server (amd64). Update the point release + checksum
+    # from https://releases.ubuntu.com/24.04/SHA256SUMS when a newer one ships.
+    uri: https://releases.ubuntu.com/24.04/ubuntu-24.04.4-live-server-amd64.iso
+    checksum: sha256:e907d92eeec9df64163a7e454cbc8d7755e8ddc7ed42f99dbc80c40f1a138433
+
+workspace:
+  path: ~/workspaces/ubuntu-live-iso-boot
+
+clusters:
+  live:
+    workdir: ~/workspaces/ubuntu-live-iso-boot
+    networks:
+      live-net:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:96:01'
+        ip:
+          address: '192.168.150.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.150.2'
+              end: '192.168.150.254'
+        enable: True
+        autostart: True
+    vms:
+      ubuntu-live01:
+        vcpus: 2
+        memory: 4096
+        boot_order: [cdrom, hd]
+        disk_size: 16G            # empty boot disk; the live ISO boots to RAM
+        networks:
+          - name: live-net
+        cdroms:
+          - name: ubuntu-noble-live
