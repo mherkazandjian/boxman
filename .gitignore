@@ -169,3 +169,6 @@ containers/docker/data
 *.snm
 *.toc
 *.vrb
+
+# superpowers scratch
+.superpowers/
