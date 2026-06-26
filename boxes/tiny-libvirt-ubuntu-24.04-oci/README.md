@@ -36,19 +36,21 @@ boxman up
 ```
 
 On first run boxman builds the template: it pulls
-`docker.io/tedezed/ubuntu-container-disk:24.04`, extracts the embedded
-`/disk/*.qcow2` into `~/.cache/boxman/images`, imports it as the template VM
-`ubuntu-24.04-oci-base-template-cloudinit`, then clones `boxman01` from it.
-Subsequent runs reuse the cached image.
+`docker.io/tedezed/ubuntu-container-disk:24.04`, extracts the VM disk embedded
+under `/disk/` (here `disk/ubuntu.img`) into `~/.cache/boxman/images`, imports it
+as the template VM `ubuntu-24.04-oci-base-template-cloudinit`, then clones
+`boxman01` from it. Subsequent runs reuse the cached image.
 
 ```bash
 boxman image inspect oci://docker.io/tedezed/ubuntu-container-disk:24.04  # kind: image
 boxman ssh boxman01                                                       # log into the VM
 ```
 
-> The default containerDisk is single-arch (amd64); pulling it extracts the
-> qcow2 and needs transient scratch space of a few GB in `~/.cache/boxman/images`
-> (the compressed layer plus the inflated disk).
+> The default containerDisk is single-arch (amd64) and is a third-party
+> community image on Docker Hub (its `:24.04` tag is mutable). Pulling it extracts
+> the disk image and needs transient scratch space of a few GB in
+> `~/.cache/boxman/images` (the compressed layer plus the inflated disk). To pin
+> or self-host the base, publish your own artifact (see below).
 
 ## Alternative: publish and use your own base image
 

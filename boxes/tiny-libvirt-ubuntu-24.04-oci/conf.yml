@@ -4,9 +4,9 @@
 # Same single-VM Ubuntu 24.04 box as tiny-libvirt-ubuntu-24.04-cloudinit, but the
 # template's base image is pulled from an OCI registry via `oras` instead of over
 # http(s). The default `oci://` reference below is a public Docker Hub
-# containerDisk (the qcow2 is embedded at /disk/); it is fetched + cached the
-# first time `boxman up` builds the template — no publish step required. To use
-# your own qcow2 published as an OCI artifact instead, see README.md.
+# containerDisk (a VM disk image embedded under /disk/); it is fetched + cached
+# the first time `boxman up` builds the template — no publish step required. To
+# use your own qcow2 published as an OCI artifact instead, see README.md.
 #
 # An OCI base image can be wired in two ways:
 #   (A) on a template's `image.uri` (used below) — supports full cloud-init.
@@ -28,10 +28,11 @@ templates:
     name: ubuntu-24.04-oci-base-template-cloudinit
     image:
       # A public KubeVirt-style containerDisk on Docker Hub: the Ubuntu 24.04
-      # qcow2 is embedded at /disk/ inside the container image. boxman pulls it
-      # via oras, extracts the qcow2, and caches it under ~/.cache/boxman/images
-      # on the first `boxman up`. No `boxman image push` is needed for a public
-      # image; to publish your own qcow2 as an OCI artifact instead, see README.md.
+      # VM disk is embedded under /disk/ (as disk/ubuntu.img) inside the container
+      # image. boxman pulls it via oras, extracts the disk image, and caches it
+      # under ~/.cache/boxman/images on the first `boxman up`. No `boxman image
+      # push` is needed for a public image; to publish your own qcow2 as an OCI
+      # artifact instead, see README.md.
       uri: oci://docker.io/tedezed/ubuntu-container-disk:24.04
     disk_size: 20G
     os_variant: ubuntu24.04
