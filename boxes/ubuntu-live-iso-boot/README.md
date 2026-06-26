@@ -1,18 +1,21 @@
 # ubuntu-live-iso-boot
 
 The simplest **end-to-end test of boxman's ISO-boot support**. It boots a single
-VM straight from the public, checksummed **Ubuntu 24.04 live-server ISO** — no
-template, no clone, no cloud-init, no registration service (unlike
-[`talos-iso-boot`](../talos-iso-boot), which needs an Omni instance).
+VM straight from the public, checksummed **Ubuntu 24.04 desktop ("Try Ubuntu")
+live ISO** — no template, no clone, no cloud-init, no registration service
+(unlike [`talos-iso-boot`](../talos-iso-boot), which needs an Omni instance).
 
 What boxman does on `boxman up`:
 
-1. downloads `ubuntu-24.04.4-live-server-amd64.iso` and verifies its SHA256
+1. downloads `ubuntu-24.04.4-desktop-amd64.iso` and verifies its SHA256
    (cached under `~/.cache/boxman/images`, so it is fetched only once),
 2. creates an empty 16G boot disk and runs `virt-install` with the ISO attached
    as a CDROM and firmware boot order `hd,cdrom`,
 3. the empty disk is not bootable, so the VM **falls through to the CDROM** and
-   live-boots the Ubuntu installer/live environment.
+   live-boots the Ubuntu **"Try Ubuntu"** desktop — a usable live GNOME session,
+   no install. (For a lighter ~3.4 GB test that boots the server installer
+   instead, swap the ISO in [`conf.yml`](conf.yml) to the live-server one noted
+   there.)
 
 It intentionally does **not** install or log into an OS — the point is to verify
 the ISO-boot path itself.
@@ -22,7 +25,8 @@ the ISO-boot path itself.
 - libvirt/KVM working (`virsh -c qemu:///system list`), and `sudo` for
   `qemu:///system` (the box uses `use_sudo: true`).
 - `wget` or `curl` on `PATH` (boxman uses them to fetch the ISO).
-- ~3.4 GB of network + disk for the ISO, plus a few GB for the VM disk.
+- ~6.2 GB of network + disk for the ISO, plus a few GB for the VM disk. The VM
+  gets 4 GB RAM (the Ubuntu desktop live minimum).
 - The **local** runtime (ISO boot is not supported under docker-compose yet).
 
 ## Bring it up
@@ -32,7 +36,7 @@ cd boxes/ubuntu-live-iso-boot
 boxman up
 ```
 
-> First run downloads ~3.4 GB and boots a VM — give it a few minutes. Re-runs
+> First run downloads ~6.2 GB and boots a VM — give it a few minutes. Re-runs
 > reuse the cached, checksum-verified ISO.
 
 ## How to test / verify
@@ -69,7 +73,8 @@ virsh -c qemu:///system vncdisplay "$V"     # e.g. :0
 virt-viewer -c qemu:///system "$V"          # or: remote-viewer vnc://127.0.0.1:5900
 ```
 
-You should see the Ubuntu live-server boot menu / subiquity installer.
+You should see the Ubuntu boot menu, then the **"Try Ubuntu" welcome screen /
+GNOME live desktop**.
 
 **5. (Automated signal) the live environment requests DHCP** — once it boots,
 the installer brings up networking and gets a lease from the box's NAT network:
