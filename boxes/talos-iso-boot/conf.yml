@@ -1,0 +1,72 @@
+# Example: 3-node Talos Linux cluster booted from ISO
+#
+# Boot flow:
+#   1. boxman downloads and caches the ISO (once, shared by all VMs)
+#   2. Each VM starts with the ISO as CDROM, boot order: cdrom then hd
+#   3. Talos live-boots from ISO, registers with Omni
+#   4. Omni pushes machine config; Talos installs to disk and reboots
+#
+# Replace the ISO uri/checksum with the actual Omni ISO for your instance.
+# Download via: omnictl download iso --output /tmp/omni-talos.iso
+#
+version: '1.0'
+project: boxman_dev_talos-iso-boot
+
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: true
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+
+isos:
+  talos-omni:
+    uri: https://factory.talos.dev/image/talos-omni-placeholder.iso
+    checksum: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+workspace:
+  path: ~/workspaces/talos-iso-boot
+
+clusters:
+  talos:
+    workdir: ~/workspaces/talos-iso-boot
+    networks:
+      talos-net:
+        type: nat
+        cidr: 192.168.100.0/24
+        dhcp: true
+    vms:
+      cp-01:
+        vcpus: 2
+        memory: 4096
+        boot_order: [cdrom, hd]
+        disks:
+          - name: disk01
+            size: 50
+        networks:
+          - name: talos-net
+        cdroms:
+          - name: talos-omni
+      cp-02:
+        vcpus: 2
+        memory: 4096
+        boot_order: [cdrom, hd]
+        disks:
+          - name: disk01
+            size: 50
+        networks:
+          - name: talos-net
+        cdroms:
+          - name: talos-omni
+      cp-03:
+        vcpus: 2
+        memory: 4096
+        boot_order: [cdrom, hd]
+        disks:
+          - name: disk01
+            size: 50
+        networks:
+          - name: talos-net
+        cdroms:
+          - name: talos-omni
