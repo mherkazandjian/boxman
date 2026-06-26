@@ -13,6 +13,7 @@ from .destroy_vm import DestroyVM
 from .disk import DiskManager
 from .disk_cleanup import remove_vm_disks
 from .import_image import ImageImporter
+from .iso_boot_vm import IsoBootVM
 from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
@@ -267,7 +268,6 @@ class LibVirtSession:
             return True
 
         if boot_order and boot_order[0] == 'cdrom':
-            from .iso_boot_vm import IsoBootVM
             iso_path = info.get('_resolved_iso_path')
             if not iso_path:
                 raise RuntimeError(

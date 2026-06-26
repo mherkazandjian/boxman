@@ -190,7 +190,7 @@ class TestCloneVmIsoBootDispatch:
         session._project_provider_config = {}
         return session
 
-    @patch("boxman.providers.libvirt.iso_boot_vm.IsoBootVM")
+    @patch("boxman.providers.libvirt.session.IsoBootVM")
     def test_cdrom_boot_order_dispatches_to_iso_boot_vm(self, mock_iso_cls, tmp_path):
         mock_iso_cls.return_value.create.return_value = True
         session = self._make_session()
@@ -214,7 +214,7 @@ class TestCloneVmIsoBootDispatch:
         )
         mock_iso_cls.return_value.create.assert_called_once()
 
-    @patch("boxman.providers.libvirt.iso_boot_vm.IsoBootVM")
+    @patch("boxman.providers.libvirt.session.IsoBootVM")
     def test_raises_when_resolved_iso_path_missing(self, mock_iso_cls, tmp_path):
         session = self._make_session()
         info = {"boot_order": ["cdrom", "hd"]}
@@ -226,7 +226,7 @@ class TestCloneVmIsoBootDispatch:
                 workdir=str(tmp_path),
             )
 
-    @patch("boxman.providers.libvirt.iso_boot_vm.IsoBootVM")
+    @patch("boxman.providers.libvirt.session.IsoBootVM")
     def test_raises_when_iso_boot_vm_create_fails(self, mock_iso_cls, tmp_path):
         mock_iso_cls.return_value.create.return_value = False
         session = self._make_session()
