@@ -1,7 +1,7 @@
 """Unit tests for BoxmanManager ISO resolution helpers."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -48,8 +48,45 @@ class TestResolveIsos:
             result = mgr._resolve_isos()
         assert result == {"talos-omni": "/cache/talos.iso"}
         mock_cache.ensure.assert_called_once_with(
-            "https://example.com/talos.iso", mgr._download_iso
+            "https://example.com/talos.iso", mgr._download_iso, filename=ANY
         )
+
+    def test_iso_cache_filename_disambiguates_shared_basename(self):
+        # two distinct ISOs sharing a basename must map to distinct cache files
+        a = BoxmanManager._iso_cache_filename(
+            "talos-a", "https://factory.example.com/a/metal-amd64.iso")
+        b = BoxmanManager._iso_cache_filename(
+            "talos-b", "https://factory.example.com/b/metal-amd64.iso")
+        assert a != b
+        assert a.endswith(".iso") and "/" not in a
+
+    def test_evicts_cache_file_on_checksum_mismatch(self, tmp_path):
+        bad = tmp_path / "talos-omni-deadbeef.iso"
+        bad.write_bytes(b"corrupt")
+        mgr = _manager_with_config({
+            "isos": {"talos-omni": {
+                "uri": "https://example.com/talos.iso",
+                "checksum": "sha256:abc123",
+            }}
+        })
+        with patch("boxman.manager.ImageCache") as mock_cache_cls:
+            mock_cache = MagicMock()
+            mock_cache.enabled = True
+            mock_cache.ensure.return_value = str(bad)
+            mock_cache_cls.from_config.return_value = mock_cache
+            mock_cache_cls.verify_checksum = MagicMock(return_value=False)
+            with pytest.raises(RuntimeError, match="Checksum mismatch"):
+                mgr._resolve_isos()
+        # the poisoned file is removed so a later run re-downloads
+        assert not bad.exists()
+
+    def test_raises_under_non_local_runtime(self):
+        mgr = _manager_with_config({
+            "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}
+        })
+        mgr._runtime_name = "docker"
+        with pytest.raises(RuntimeError, match="not yet supported under the 'docker' runtime"):
+            mgr._resolve_isos()
 
     def test_raises_when_download_fails(self):
         mgr = _manager_with_config({
@@ -145,3 +182,70 @@ class TestInjectResolvedIso:
         result = mgr._inject_resolved_iso(vm_info, {})
         assert result["cdroms"][0]["source"] == "/local/talos.iso"
         assert result["_resolved_iso_path"] == "/local/talos.iso"
+
+    def test_resolves_string_cdrom_shorthand(self):
+        # `cdroms: [talos-omni]` (list of strings) is a natural YAML shorthand
+        mgr = _manager_with_config({})
+        vm_info = {"boot_order": ["cdrom", "hd"], "cdroms": ["talos-omni"]}
+        result = mgr._inject_resolved_iso(vm_info, {"talos-omni": "/cache/talos.iso"})
+        assert result["cdroms"][0] == {"name": "talos-omni", "source": "/cache/talos.iso"}
+        assert result["_resolved_iso_path"] == "/cache/talos.iso"
+
+    def test_raises_on_invalid_cdrom_entry(self):
+        mgr = _manager_with_config({})
+        vm_info = {"boot_order": ["cdrom", "hd"], "cdroms": [{"foo": "bar"}]}
+        with pytest.raises(ValueError, match="invalid cdroms entry"):
+            mgr._inject_resolved_iso(vm_info, {})
+
+
+class TestResolvedNetworkNames:
+    def test_namespaces_first_nic(self):
+        mgr = _manager_with_config({"project": "myproj"})
+        names = mgr._resolved_network_names(
+            "talos", {"networks": [{"name": "talos-net"}]})
+        assert names == ["bprj__myproj__bprj__clstr__talos__clstr__talos-net"]
+
+    def test_empty_when_no_networks(self):
+        mgr = _manager_with_config({"project": "myproj"})
+        assert mgr._resolved_network_names("talos", {}) == []
+
+
+class TestValidateBaseImages:
+    def _mgr(self, clusters, isos=None):
+        cfg = {"project": "p", "clusters": clusters}
+        if isos is not None:
+            cfg["isos"] = isos
+        return _manager_with_config(cfg)
+
+    def test_cdrom_boot_without_cdroms_is_invalid(self):
+        mgr = self._mgr(
+            {"talos": {"vms": {"cp-01": {"boot_order": ["cdrom", "hd"]}}}},
+            isos={"talos-omni": {"uri": "x"}})
+        with pytest.raises(ValueError, match="invalid 'cdroms:'"):
+            mgr.validate_base_images()
+
+    def test_cdrom_boot_unknown_iso_is_invalid(self):
+        mgr = self._mgr(
+            {"talos": {"vms": {"cp-01": {
+                "boot_order": ["cdrom", "hd"],
+                "cdroms": [{"name": "nope"}]}}}},
+            isos={"talos-omni": {"uri": "x"}})
+        with pytest.raises(ValueError, match="unknown iso 'nope'"):
+            mgr.validate_base_images()
+
+    def test_cdrom_boot_valid_passes(self):
+        mgr = self._mgr(
+            {"talos": {"vms": {"cp-01": {
+                "boot_order": ["cdrom", "hd"],
+                "cdroms": [{"name": "talos-omni"}]}}}},
+            isos={"talos-omni": {"uri": "x"}})
+        mgr.validate_base_images()  # no raise
+
+    def test_hd_boot_still_requires_base_image(self):
+        mgr = self._mgr({"c": {"vms": {"v": {}}}})
+        with pytest.raises(ValueError, match="no base_image"):
+            mgr.validate_base_images()
+
+    def test_network_boot_needs_no_base_image(self):
+        mgr = self._mgr({"c": {"vms": {"v": {"boot_order": ["network", "hd"]}}}})
+        mgr.validate_base_images()  # no raise

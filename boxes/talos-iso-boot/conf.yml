@@ -2,9 +2,11 @@
 #
 # Boot flow:
 #   1. boxman downloads and caches the ISO (once, shared by all VMs)
-#   2. Each VM starts with the ISO as CDROM, boot order: cdrom then hd
+#   2. Each VM is created with the ISO attached as a CDROM; firmware boot order
+#      is hd,cdrom so the empty disk falls through to the ISO on first boot
 #   3. Talos live-boots from ISO, registers with Omni
-#   4. Omni pushes machine config; Talos installs to disk and reboots
+#   4. Omni pushes machine config; Talos installs to disk and reboots — the now
+#      bootable disk is used instead of re-running the installer
 #
 # Replace the ISO uri/checksum with the actual Omni ISO for your instance.
 # Download via: omnictl download iso --output /tmp/omni-talos.iso
@@ -33,17 +35,26 @@ clusters:
     workdir: ~/workspaces/talos-iso-boot
     networks:
       talos-net:
-        type: nat
-        cidr: 192.168.100.0/24
-        dhcp: true
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:64:01'
+        ip:
+          address: '192.168.100.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.100.2'
+              end: '192.168.100.254'
+        enable: True
+        autostart: True
     vms:
       cp-01:
         vcpus: 2
         memory: 4096
         boot_order: [cdrom, hd]
-        disks:
-          - name: disk01
-            size: 50
+        disk_size: 50G              # primary boot disk (unit-suffixed, like templates)
         networks:
           - name: talos-net
         cdroms:
@@ -52,9 +63,7 @@ clusters:
         vcpus: 2
         memory: 4096
         boot_order: [cdrom, hd]
-        disks:
-          - name: disk01
-            size: 50
+        disk_size: 50G
         networks:
           - name: talos-net
         cdroms:
@@ -63,9 +72,7 @@ clusters:
         vcpus: 2
         memory: 4096
         boot_order: [cdrom, hd]
-        disks:
-          - name: disk01
-            size: 50
+        disk_size: 50G
         networks:
           - name: talos-net
         cdroms:

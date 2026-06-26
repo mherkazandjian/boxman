@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.providers.libvirt.direct_vm import normalize_disk_size
 from boxman.providers.libvirt.iso_boot_vm import IsoBootVM
 
 pytestmark = pytest.mark.unit
@@ -23,7 +24,7 @@ def _make_iso_vm(tmp_path: Path, iso_path: str = "/fake/talos.iso", **info_overr
     info = dict(
         memory=2048,
         vcpus=2,
-        disks=[{"name": "disk01", "size": 20}],
+        disk_size="20G",
         networks=[{"name": "default"}],
     )
     info.update(info_overrides)
@@ -36,59 +37,99 @@ def _make_iso_vm(tmp_path: Path, iso_path: str = "/fake/talos.iso", **info_overr
     )
 
 
-class TestGetDiskSizeGb:
-    def test_returns_first_disk_size(self, tmp_path):
-        vm = _make_iso_vm(tmp_path, disks=[{"name": "disk01", "size": 50}])
-        assert vm._get_disk_size_gb() == 50
+class TestNormalizeDiskSize:
+    def test_int_is_gib(self):
+        assert normalize_disk_size(50) == "50G"
 
-    def test_defaults_to_20_when_no_disks(self, tmp_path):
-        vm = _make_iso_vm(tmp_path, disks=[])
-        assert vm._get_disk_size_gb() == 20
+    def test_bare_numeric_string_is_gib(self):
+        assert normalize_disk_size("50") == "50G"
 
-    def test_defaults_to_20_when_size_missing(self, tmp_path):
-        vm = _make_iso_vm(tmp_path, disks=[{"name": "disk01"}])
-        assert vm._get_disk_size_gb() == 20
+    def test_unit_suffixed_passes_through(self):
+        assert normalize_disk_size("51200M") == "51200M"
+        assert normalize_disk_size("50G") == "50G"
+
+    def test_none_and_empty_use_default(self):
+        assert normalize_disk_size(None) == "20G"
+        assert normalize_disk_size("") == "20G"
+        assert normalize_disk_size(True) == "20G"
 
 
-class TestGetNetwork:
-    def test_returns_first_network_name(self, tmp_path):
+class TestBootDiskSize:
+    def test_reads_disk_size_field(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, disk_size="50G")
+        assert vm._boot_disk_size() == "50G"
+
+    def test_int_disk_size_is_gib(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, disk_size=40)
+        assert vm._boot_disk_size() == "40G"
+
+    def test_defaults_to_20g_when_absent(self, tmp_path):
+        vm = _make_iso_vm(tmp_path)
+        vm.info.pop("disk_size", None)
+        assert vm._boot_disk_size() == "20G"
+
+
+class TestNetworks:
+    def test_returns_raw_network_names(self, tmp_path):
         vm = _make_iso_vm(tmp_path, networks=[{"name": "talos-net"}])
-        assert vm._get_network() == "talos-net"
+        assert vm._networks() == ["talos-net"]
+
+    def test_prefers_resolved_networks(self, tmp_path):
+        vm = _make_iso_vm(
+            tmp_path,
+            networks=[{"name": "talos-net"}],
+            _resolved_networks=["bprj__p__bprj__clstr__talos__clstr__talos-net"],
+        )
+        assert vm._networks() == ["bprj__p__bprj__clstr__talos__clstr__talos-net"]
 
     def test_defaults_to_default_when_no_networks(self, tmp_path):
         vm = _make_iso_vm(tmp_path, networks=[])
-        assert vm._get_network() == "default"
-
-    def test_defaults_to_default_when_name_missing(self, tmp_path):
-        vm = _make_iso_vm(tmp_path, networks=[{}])
-        assert vm._get_network() == "default"
+        assert vm._networks() == ["default"]
 
 
 class TestIsoBootVMCreate:
-    @patch("boxman.providers.libvirt.iso_boot_vm._shell_run")
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_create_success(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=True)
         vm = _make_iso_vm(tmp_path, iso_path="/data/talos.iso")
         assert vm.create() is True
         assert mock_run.call_count == 2
 
-    @patch("boxman.providers.libvirt.iso_boot_vm._shell_run")
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_virt_install_cmd_contains_cdrom_and_boot(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=True)
         vm = _make_iso_vm(tmp_path, iso_path="/data/talos.iso")
         vm.create()
         virt_install_call = mock_run.call_args_list[1][0][0]
         assert "--cdrom=/data/talos.iso" in virt_install_call
-        assert "--boot=cdrom,hd" in virt_install_call
+        # hd first so an installed disk is preferred over re-running the installer
+        assert "--boot=hd,cdrom" in virt_install_call
 
-    @patch("boxman.providers.libvirt.iso_boot_vm._shell_run")
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_uses_resolved_network_name(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        full = "bprj__p__bprj__clstr__talos__clstr__talos-net"
+        vm = _make_iso_vm(tmp_path, _resolved_networks=[full])
+        vm.create()
+        virt_install_call = mock_run.call_args_list[1][0][0]
+        assert f"--network=network={full},model=virtio" in virt_install_call
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_disk_size_in_qemu_img_cmd(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path, disk_size="50G")
+        vm.create()
+        qemu_img_call = mock_run.call_args_list[0][0][0]
+        assert qemu_img_call.endswith(" 50G")
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_create_fails_on_qemu_img_error(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=False, stderr="no space left")
         vm = _make_iso_vm(tmp_path)
         assert vm.create() is False
         assert mock_run.call_count == 1
 
-    @patch("boxman.providers.libvirt.iso_boot_vm._shell_run")
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_create_fails_on_virt_install_error(self, mock_run, tmp_path):
         mock_run.side_effect = [_result(ok=True), _result(ok=False, stderr="permission denied")]
         vm = _make_iso_vm(tmp_path)

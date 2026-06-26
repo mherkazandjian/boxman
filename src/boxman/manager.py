@@ -3,11 +3,13 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
 from multiprocessing import Process, Queue
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import yaml
 from boxman.utils.shell import run
@@ -1353,26 +1355,81 @@ class BoxmanManager:
             f"Affected paths:\n  {offenders}"
         )
 
+    @staticmethod
+    def _is_diskless_boot(vm_info: dict) -> bool:
+        """True if a VM boots from network (PXE) or cdrom (ISO).
+
+        Such VMs are created directly via ``virt-install`` and need no
+        ``base_image`` to clone from.
+        """
+        boot_order = vm_info.get('boot_order', ['hd'])
+        return bool(boot_order) and boot_order[0] in ('network', 'cdrom')
+
+    @staticmethod
+    def _validate_cdrom_boot(vm_info: dict, iso_names: set) -> tuple[bool, str]:
+        """Validate an ISO-boot VM's ``cdroms:`` up front.
+
+        Returns ``(ok, reason)``. An ISO-boot VM must declare a first cdrom that
+        either references a known ``isos:`` entry or carries an explicit local
+        ``source:``.
+        """
+        cdroms = vm_info.get('cdroms')
+        if not cdroms:
+            return False, "boot_order starts with 'cdrom' but no 'cdroms:' are defined"
+        first = cdroms[0]
+        if isinstance(first, str):
+            name = first
+        elif isinstance(first, dict) and first.get('name'):
+            name = first['name']
+        elif isinstance(first, dict) and first.get('source'):
+            return True, ""  # explicit local source, nothing to resolve
+        else:
+            return False, f"first cdroms entry {first!r} has neither a name nor a source"
+        if name not in iso_names:
+            return False, f"cdroms references unknown iso '{name}' (declare it under isos:)"
+        return True, ""
+
     def validate_base_images(self) -> None:
         """
-        Validate that every VM has a ``base_image`` — either from its own
-        config or inherited from the cluster level.  Raises ``ValueError``
-        listing all VMs that are missing one.
+        Validate VM boot configuration up front, before any parallel cloning.
+
+        - ``hd``-boot VMs (the default) must have a ``base_image`` — from the VM
+          or inherited from the cluster.
+        - ``cdrom``-boot (ISO) VMs must declare a valid ``cdroms:`` entry
+          referencing a known ``isos:`` entry (or an explicit ``source:``).
+        - ``network``-boot (PXE) VMs need neither.
+
+        Raises ``ValueError`` aggregating every problem found.
         """
+        iso_names = set((self.config.get('isos') or {}).keys())
         missing = []
+        invalid = []
         for cluster_name, cluster in self.config.get('clusters', {}).items():
             cluster_base = cluster.get('base_image', '')
             for vm_name, vm_info in cluster.get('vms', {}).items():
+                loc = f"{cluster_name}.vms.{vm_name}"
                 boot_order = vm_info.get('boot_order', ['hd'])
-                if boot_order and boot_order[0] in ('network', 'cdrom'):
+                first_boot = boot_order[0] if boot_order else 'hd'
+                if first_boot == 'cdrom':
+                    ok, reason = self._validate_cdrom_boot(vm_info, iso_names)
+                    if not ok:
+                        invalid.append(f"{loc} ({reason})")
                     continue
+                if first_boot == 'network':
+                    continue  # PXE boot needs no base_image
                 if not vm_info.get('base_image') and not cluster_base:
-                    missing.append(f"{cluster_name}.vms.{vm_name}")
+                    missing.append(loc)
+        errors = []
         if missing:
-            raise ValueError(
-                f"the following VM(s) have no base_image (set it at the "
-                f"cluster or VM level): {', '.join(missing)}"
-            )
+            errors.append(
+                "the following VM(s) have no base_image (set it at the cluster "
+                f"or VM level): {', '.join(missing)}")
+        if invalid:
+            errors.append(
+                "the following ISO-boot VM(s) have an invalid 'cdroms:' "
+                f"configuration: {', '.join(invalid)}")
+        if errors:
+            raise ValueError("; ".join(errors))
 
     @staticmethod
     def _oci_template_name(image_ref: str) -> str:
@@ -1439,17 +1496,25 @@ class BoxmanManager:
                     vm_info['base_image'] = _resolve(vm_info.get('base_image'))
 
     def _download_iso(self, url: str, dst_path: str) -> bool:
-        """Download an ISO from a URL, trying wget then curl."""
+        """Download an ISO from a URL, trying wget then curl.
+
+        The URL and destination are shell-quoted (a config-supplied URL may
+        contain ``$``/backticks). curl uses ``--fail`` so an HTTP 4xx/5xx error
+        page is not written and accepted as a valid ISO (wget already fails on
+        HTTP errors).
+        """
         self.logger.info(f"downloading ISO {url} -> {dst_path}")
+        q_url = shlex.quote(url)
+        q_dst = shlex.quote(dst_path)
         result = run(
-            f'wget --progress=dot:mega -O "{dst_path}" "{url}"',
+            f'wget --progress=dot:mega -O {q_dst} {q_url}',
             hide=False, warn=True,
         )
         if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
             self.logger.info("ISO download complete (wget)")
             return True
         result = run(
-            f'curl -L --progress-bar -o "{dst_path}" "{url}"',
+            f'curl -fL --progress-bar -o {q_dst} {q_url}',
             hide=False, warn=True,
         )
         if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
@@ -1457,6 +1522,22 @@ class BoxmanManager:
             return True
         self.logger.error(f"failed to download ISO from {url}")
         return False
+
+    @staticmethod
+    def _iso_cache_filename(name: str, uri: str) -> str:
+        """Collision-free cache filename for an ISO.
+
+        Factory ISOs frequently share a basename (e.g. ``metal-amd64.iso``),
+        which would collide in the basename-keyed cache; disambiguate with the
+        declared iso name plus a short hash of the URI.
+        """
+        base = os.path.basename(urlparse(uri).path)
+        ext = os.path.splitext(base)[1] or ".iso"
+        safe = "".join(
+            c if (c.isalnum() or c in "._-") else "-" for c in str(name)
+        ).strip("-.") or "iso"
+        digest = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:8]
+        return f"{safe}-{digest}{ext}"
 
     def _resolve_isos(self) -> dict[str, str]:
         """Download and cache all ISOs declared in the ``isos:`` config section.
@@ -1466,6 +1547,17 @@ class BoxmanManager:
         isos_conf = self.config.get("isos", {}) if self.config else {}
         if not isos_conf:
             return {}
+
+        # ISO boot needs the file visible to the in-container virt-install; the
+        # host cache dir is not bind-mounted under a containerized runtime. Fail
+        # fast with guidance instead of a confusing missing-file error later.
+        runtime_name = getattr(self, "_runtime_name", "local") or "local"
+        if runtime_name != "local":
+            raise RuntimeError(
+                f"ISO boot ('isos:') is not yet supported under the "
+                f"'{runtime_name}' runtime; use the local runtime "
+                f"(the downloaded ISO is not visible inside the libvirt container)."
+            )
 
         cache_conf = (self.app_config or {}).get("cache", {})
         cache = ImageCache.from_config(cache_conf)
@@ -1480,14 +1572,30 @@ class BoxmanManager:
             if not uri:
                 raise ValueError(f"iso '{name}' missing 'uri'")
             checksum = iso_conf.get("checksum")
+            filename = self._iso_cache_filename(name, uri)
 
-            local_path = cache.ensure(uri, self._download_iso)
+            local_path = cache.ensure(uri, self._download_iso, filename=filename)
             if local_path is None:
-                raise RuntimeError(
-                    f"Failed to download ISO '{name}' from {uri}"
-                )
+                if not cache.enabled:
+                    # Caching disabled: download directly to a stable path so the
+                    # ISO is still available to virt-install (re-downloaded each
+                    # run). Mirrors the base-image direct-download fallback.
+                    local_path = cache.cache_path_for(uri, filename=filename)
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    if not self._download_iso(uri, local_path):
+                        raise RuntimeError(
+                            f"Failed to download ISO '{name}' from {uri}")
+                else:
+                    raise RuntimeError(
+                        f"Failed to download ISO '{name}' from {uri}")
 
             if checksum and not ImageCache.verify_checksum(local_path, checksum):
+                # Evict the bad file so a later run re-downloads instead of
+                # re-failing forever against the poisoned cache entry.
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
                 raise RuntimeError(f"Checksum mismatch for ISO '{name}'")
 
             resolved[name] = local_path
@@ -1500,7 +1608,9 @@ class BoxmanManager:
         """Resolve ``cdroms:`` name references and inject ``_resolved_iso_path``.
 
         Returns a shallow copy of vm_info with:
-        - Each cdrom entry using ``name:`` expanded to ``source: <local_path>``
+        - Each cdrom entry expanded to carry ``source: <local_path>``. Entries
+          may be a plain string (an iso name), a ``{name: <iso>}`` mapping, or a
+          ``{source: <local path>}`` mapping; anything else is a clear error.
         - ``_resolved_iso_path`` set to ``cdroms[0]['source']`` when
           ``boot_order[0] == 'cdrom'``
         """
@@ -1508,18 +1618,30 @@ class BoxmanManager:
         if not cdroms:
             return {**vm_info}
 
+        def _resolve_name(iso_name: str) -> str:
+            if iso_name not in resolved_isos:
+                raise ValueError(
+                    f"cdroms references unknown iso '{iso_name}'. "
+                    f"Declare it in the 'isos:' section."
+                )
+            return resolved_isos[iso_name]
+
         resolved_cdroms = []
         for cdrom in cdroms:
-            if "name" in cdrom:
-                iso_name = cdrom["name"]
-                if iso_name not in resolved_isos:
-                    raise ValueError(
-                        f"cdroms references unknown iso '{iso_name}'. "
-                        f"Declare it in the 'isos:' section."
-                    )
-                resolved_cdroms.append({**cdrom, "source": resolved_isos[iso_name]})
-            else:
+            if isinstance(cdrom, str):
+                resolved_cdroms.append(
+                    {"name": cdrom, "source": _resolve_name(cdrom)})
+            elif isinstance(cdrom, dict) and cdrom.get("name"):
+                resolved_cdroms.append(
+                    {**cdrom, "source": _resolve_name(cdrom["name"])})
+            elif isinstance(cdrom, dict) and cdrom.get("source"):
                 resolved_cdroms.append(cdrom)
+            else:
+                raise ValueError(
+                    f"invalid cdroms entry {cdrom!r}: expected a string iso "
+                    f"name, a {{name: <iso>}} mapping, or a {{source: <path>}} "
+                    f"mapping"
+                )
 
         result = {**vm_info, "cdroms": resolved_cdroms}
 
@@ -1530,6 +1652,45 @@ class BoxmanManager:
                 result["_resolved_iso_path"] = first_source
 
         return result
+
+    def _resolved_network_names(self, cluster_name: str, vm_info: dict) -> list[str]:
+        """Fully-qualified libvirt names for a VM's ``networks:`` (first-NIC list).
+
+        Direct-boot VMs (ISO/PXE) attach networks at ``virt-install`` time, so
+        the raw cluster-network name must be namespaced exactly as cluster
+        networks are defined (``bprj__…__clstr__…__<name>``).
+        """
+        names = []
+        for net in vm_info.get("networks") or []:
+            if isinstance(net, dict) and net.get("name"):
+                names.append(self.full_network_name(
+                    project_config=self.config,
+                    cluster_name=cluster_name,
+                    network_name=net["name"],
+                ))
+        return names
+
+    def _resolve_iso_config(self) -> None:
+        """Resolve ISO/cdrom/network references for direct-boot VMs, in place.
+
+        Downloads+caches declared ``isos:``, expands each VM's ``cdroms:`` to
+        local sources, sets ``_resolved_iso_path`` for cdrom-boot VMs, and
+        namespaces ``networks:`` into ``_resolved_networks``. Mutating
+        ``self.config`` means both the clone subprocesses and the later
+        configure/start step observe the resolved values (otherwise the resolved
+        ISO source never reaches the CDROM-attach path). Idempotent.
+        """
+        clusters = self.config.get("clusters", {})
+        if not clusters:
+            return
+        resolved_isos = self._resolve_isos()
+        for cluster_name, cluster in clusters.items():
+            for vm_name, vm_info in cluster.get("vms", {}).items():
+                resolved = self._inject_resolved_iso(vm_info, resolved_isos)
+                if self._is_diskless_boot(resolved):
+                    resolved["_resolved_networks"] = self._resolved_network_names(
+                        cluster_name, resolved)
+                cluster["vms"][vm_name] = resolved
 
     def ensure_templates_exist(self) -> bool:
         """
@@ -1980,8 +2141,7 @@ class BoxmanManager:
                     if not last_attempt:
                         boxman_logger.setLevel(logging.CRITICAL)
                     src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
-                    boot_order = vm_info.get('boot_order', ['hd'])
-                    if not src_vm_name and not (boot_order and boot_order[0] in ('network', 'cdrom')):
+                    if not src_vm_name and not self._is_diskless_boot(vm_info):
                         raise ValueError(
                             f"no base_image for VM '{new_vm_name}': "
                             f"set base_image at the cluster or VM level"
@@ -2006,9 +2166,11 @@ class BoxmanManager:
                     else:
                         raise
 
-        resolved_isos = self._resolve_isos()
+        # resolve isos/cdroms/networks in place so both the clone subprocesses
+        # and the later configure/start step see the resolved values
+        self._resolve_iso_config()
         clone_tasks = [
-            (cluster, self._inject_resolved_iso(vm_info, resolved_isos), new_vm_name)
+            (cluster, vm_info, new_vm_name)
             for cluster, vm_info, new_vm_name in vm_clone_tasks()
         ]
         processes = [
@@ -2137,12 +2299,19 @@ class BoxmanManager:
             else:
                 self.logger.warning(f"some shared folders could not be configured for vm {vm_name}")
 
-        # cdroms
-        if vm_info.get('cdroms'):
+        # cdroms — the cdrom-boot ISO is already attached by virt-install at
+        # create time, so attach only any *additional* cdroms here (avoids a
+        # spurious "missing source" failure and a duplicate attach)
+        boot_iso = vm_info.get('_resolved_iso_path')
+        extra_cdroms = [
+            c for c in (vm_info.get('cdroms') or [])
+            if not (isinstance(c, dict) and boot_iso and c.get('source') == boot_iso)
+        ]
+        if extra_cdroms:
             self.logger.info(f"configuring CDROMs for vm {vm_name}")
             success = self.provider.configure_vm_cdroms(
                 vm_name=full_vm_name,
-                cdroms=vm_info['cdroms']
+                cdroms=extra_cdroms
             )
             if success:
                 self.logger.info(f"CDROMs configured for vm {vm_name}")
@@ -4731,8 +4900,7 @@ class BoxmanManager:
                     if not last_attempt:
                         boxman_logger.setLevel(logging.CRITICAL)
                     src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
-                    boot_order = vm_info.get('boot_order', ['hd'])
-                    if not src_vm_name and not (boot_order and boot_order[0] in ('network', 'cdrom')):
+                    if not src_vm_name and not self._is_diskless_boot(vm_info):
                         raise ValueError(
                             f"no base_image for VM '{new_vm_name}': "
                             f"set base_image at the cluster or VM level"
@@ -4757,13 +4925,15 @@ class BoxmanManager:
                     else:
                         raise
 
-        resolved_isos = self._resolve_isos()
+        # resolve isos/cdroms/networks in place so both the clone subprocesses
+        # and the configure/start step below see the resolved values
+        self._resolve_iso_config()
         clone_tasks = []
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
                 full = f"{prj_name}_{cluster_name}_{vm_name}"
                 if full in new_vm_names:
-                    clone_tasks.append((cluster, self._inject_resolved_iso(vm_info.copy(), resolved_isos), full))
+                    clone_tasks.append((cluster, vm_info, full))
 
         processes = [
             Process(target=_clone, args=(cluster, vm_info, new_vm_name))

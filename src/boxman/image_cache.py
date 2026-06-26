@@ -45,37 +45,44 @@ class ImageCache:
 
     # ── public interface ────────────────────────────────────────────────────
 
-    def cache_path_for(self, url: str) -> str:
-        """Return the local path where *url* would be cached."""
-        filename = os.path.basename(urlparse(url).path) or "image"
-        return os.path.join(self.cache_dir, filename)
+    def cache_path_for(self, url: str, filename: str | None = None) -> str:
+        """Return the local path where *url* would be cached.
 
-    def is_cached(self, url: str) -> bool:
+        By default the cache key is the URL basename; pass *filename* to
+        disambiguate sources that share a basename (e.g. factory ISOs all named
+        ``metal-amd64.iso``).
+        """
+        name = filename or os.path.basename(urlparse(url).path) or "image"
+        return os.path.join(self.cache_dir, name)
+
+    def is_cached(self, url: str, filename: str | None = None) -> bool:
         """Return True if a non-empty cached file exists for *url*."""
         if not self.enabled:
             return False
-        p = self.cache_path_for(url)
+        p = self.cache_path_for(url, filename)
         return os.path.isfile(p) and os.path.getsize(p) > 0
 
     def ensure(
         self,
         url: str,
         download_fn: Callable[[str, str], bool],
+        filename: str | None = None,
     ) -> str | None:
         """
         Return the local path of the cached image for *url*.
 
         If the image is not yet cached, call ``download_fn(url, dst_path)``
         to download it.  Returns ``None`` if the download fails or cache is
-        disabled (callers handle the no-cache path themselves).
+        disabled (callers handle the no-cache path themselves). Pass *filename*
+        to override the basename-derived cache key (collision avoidance).
         """
         if not self.enabled:
             return None
 
         os.makedirs(self.cache_dir, exist_ok=True)
-        dst = self.cache_path_for(url)
+        dst = self.cache_path_for(url, filename)
 
-        if self.is_cached(url):
+        if self.is_cached(url, filename):
             self.logger.info(f"cache hit: {dst}")
             return dst
 
