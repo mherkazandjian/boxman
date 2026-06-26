@@ -14,6 +14,7 @@ from boxman.utils.shell import run
 
 from boxman import log
 from boxman.config_cache import BoxmanCache
+from boxman.image_cache import ImageCache
 from boxman.netlab import ContainerlabManager, shared_bridges
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.providers.libvirt.session import LibVirtSession
@@ -1433,6 +1434,96 @@ class BoxmanManager:
             for vm_info in cluster.get('vms', {}).values():
                 if 'base_image' in vm_info:
                     vm_info['base_image'] = _resolve(vm_info.get('base_image'))
+
+    def _download_iso(self, url: str, dst_path: str) -> bool:
+        """Download an ISO from a URL, trying wget then curl."""
+        from boxman.utils.shell import run as _shell_run
+        self.logger.info(f"downloading ISO {url} -> {dst_path}")
+        result = _shell_run(
+            f'wget --progress=dot:mega -O "{dst_path}" "{url}"',
+            hide=False, warn=True,
+        )
+        if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
+            self.logger.info("ISO download complete (wget)")
+            return True
+        result = _shell_run(
+            f'curl -L --progress-bar -o "{dst_path}" "{url}"',
+            hide=False, warn=True,
+        )
+        if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
+            self.logger.info("ISO download complete (curl)")
+            return True
+        self.logger.error(f"failed to download ISO from {url}")
+        return False
+
+    def _resolve_isos(self) -> dict[str, str]:
+        """Download and cache all ISOs declared in the ``isos:`` config section.
+
+        Returns a mapping of iso_name -> local_file_path.
+        """
+        isos_conf = self.config.get("isos", {}) if self.config else {}
+        if not isos_conf:
+            return {}
+
+        cache_conf = (self.app_config or {}).get("cache", {})
+        cache = ImageCache.from_config(cache_conf)
+
+        resolved: dict[str, str] = {}
+        for name, iso_conf in isos_conf.items():
+            uri = iso_conf.get("uri")
+            if not uri:
+                raise ValueError(f"iso '{name}' missing 'uri'")
+            checksum = iso_conf.get("checksum")
+
+            local_path = cache.ensure(uri, self._download_iso)
+            if local_path is None:
+                raise RuntimeError(
+                    f"Failed to download ISO '{name}' from {uri}"
+                )
+
+            if checksum and not ImageCache.verify_checksum(local_path, checksum):
+                raise RuntimeError(f"Checksum mismatch for ISO '{name}'")
+
+            resolved[name] = local_path
+
+        return resolved
+
+    def _inject_resolved_iso(
+        self, vm_info: dict, resolved_isos: dict[str, str]
+    ) -> dict:
+        """Resolve ``cdroms:`` name references and inject ``_resolved_iso_path``.
+
+        Returns a shallow copy of vm_info with:
+        - Each cdrom entry using ``name:`` expanded to ``source: <local_path>``
+        - ``_resolved_iso_path`` set to ``cdroms[0]['source']`` when
+          ``boot_order[0] == 'cdrom'``
+        """
+        cdroms = vm_info.get("cdroms", [])
+        if not cdroms:
+            return vm_info
+
+        resolved_cdroms = []
+        for cdrom in cdroms:
+            if "name" in cdrom:
+                iso_name = cdrom["name"]
+                if iso_name not in resolved_isos:
+                    raise ValueError(
+                        f"cdroms references unknown iso '{iso_name}'. "
+                        f"Declare it in the 'isos:' section."
+                    )
+                resolved_cdroms.append({**cdrom, "source": resolved_isos[iso_name]})
+            else:
+                resolved_cdroms.append(cdrom)
+
+        result = {**vm_info, "cdroms": resolved_cdroms}
+
+        boot_order = vm_info.get("boot_order", ["hd"])
+        if boot_order and boot_order[0] == "cdrom" and resolved_cdroms:
+            first_source = resolved_cdroms[0].get("source")
+            if first_source:
+                result["_resolved_iso_path"] = first_source
+
+        return result
 
     def ensure_templates_exist(self) -> bool:
         """
