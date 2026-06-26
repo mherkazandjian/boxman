@@ -1,4 +1,4 @@
-"""Pull and inspect qcow2 VM images from an OCI registry via the ``oras`` CLI.
+"""Pull and inspect VM disk images from an OCI registry via the ``oras`` CLI.
 
 Counterpart to :mod:`boxman.providers.libvirt.oci_push`. A VM image is stored as
 a plain OCI artifact: a qcow2 blob, optionally accompanied by a ``vmimage.json``
@@ -267,10 +267,41 @@ def _resolve_image_manifest(ref: str, manifest: dict, _max_depth: int = 5) -> di
         f"image index for '{ref}' nests deeper than {_max_depth} levels")
 
 
-def _is_disk_qcow2(name: str) -> bool:
-    """True if *name* is a qcow2 under a ``disk/`` directory (containerDisk layout)."""
-    norm = name.replace("\\", "/").lstrip("./")
-    return norm.endswith(".qcow2") and ("/disk/" in "/" + norm)
+# A KubeVirt containerDisk carries the VM disk under a *root-level* ``disk/``
+# directory, named freely (commonly ``disk/<name>.img`` — often a qcow2 with a
+# ``.img`` name — sometimes with no extension at all). Root-level ``disk/``
+# membership is therefore the only reliable signal: matching on a disk-image
+# extension anywhere in the rootfs would false-positive on ordinary files such
+# as ``/boot/initrd.img``. The extracted disk's *content* is validated as qcow2
+# separately (see ``_is_qcow2``).
+_QCOW2_MAGIC = b"QFI\xfb"
+
+
+def _is_disk_candidate(name: str) -> bool:
+    """True if a tar member could be the containerDisk's VM disk.
+
+    A candidate is any path under a *root-level* ``disk/`` directory, excluding
+    overlay ``.wh.`` whiteout markers (deletion tombstones, never real content).
+    The leading ``./`` some tars prefix is stripped first; note ``str.lstrip``
+    must NOT be used for that — it strips a character set and would eat the dot
+    of a root-level ``.wh.`` name.
+    """
+    norm = name.replace("\\", "/")
+    if norm.startswith("./"):
+        norm = norm[2:]
+    if not norm.startswith("disk/"):
+        return False
+    base = os.path.basename(norm)
+    return bool(base) and not base.startswith(".wh.")
+
+
+def _is_qcow2(path: Path) -> bool:
+    """True if *path* begins with the qcow2 magic (``QFI\\xfb``)."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == _QCOW2_MAGIC
+    except OSError:
+        return False
 
 
 def _blob_fetch_to_file(repo: str, digest: str, dest: Path) -> None:
@@ -280,19 +311,22 @@ def _blob_fetch_to_file(repo: str, digest: str, dest: Path) -> None:
         action="blob fetch", ref=f"{repo}@{digest}")
 
 
-def _extract_qcow2_from_layer(blob_path: Path, out_dir: Path) -> Optional[Path]:
-    """Extract an embedded qcow2 from a single (compressed) layer tarball.
+def _extract_disk_from_layer(blob_path: Path, out_dir: Path) -> Optional[Path]:
+    """Extract the embedded VM disk image from a single (compressed) layer tarball.
 
     Streams the tar (``r|*`` auto-detects gzip/bzip2/xz; zstd is unsupported and
-    surfaces a clear error). Prefers a ``disk/*.qcow2`` (KubeVirt containerDisk
-    convention) over any other ``*.qcow2``, and stops as soon as a ``disk/`` one
-    is found. Only the basename is used for the output file, so a malicious
-    member name cannot traverse outside *out_dir*.
+    surfaces a clear error). Considers only real files under a root-level
+    ``disk/`` directory (the KubeVirt containerDisk convention) and keeps the
+    *largest* of them — the VM disk dwarfs any sidecar (README/checksum/metadata)
+    that may share the directory. Smaller candidates are discarded from the tar
+    header's size alone, so only the running best is ever written. Overlay
+    ``.wh.`` whiteout markers are ignored. Only the basename is used for the
+    output file, so a malicious member name cannot traverse outside *out_dir*.
 
-    Returns the path to the extracted qcow2, or ``None`` if the layer has none.
+    Returns the path to the extracted disk image, or ``None`` if the layer has none.
     """
     chosen: Optional[Path] = None
-    chosen_is_disk = False
+    chosen_size = -1
     writing: Optional[Path] = None
     try:
         with open(blob_path, "rb") as raw, tarfile.open(fileobj=raw, mode="r|*") as tar:
@@ -300,7 +334,11 @@ def _extract_qcow2_from_layer(blob_path: Path, out_dir: Path) -> Optional[Path]:
                 # isfile() is False for symlinks/hardlinks/dirs/devices, so only
                 # real file content is ever read; basename() neutralises any
                 # absolute / '..' member name — no member can write outside out_dir.
-                if not (member.isfile() and member.name.endswith(".qcow2")):
+                if not (member.isfile() and _is_disk_candidate(member.name)):
+                    continue
+                # The disk is the largest file under disk/; a smaller candidate is
+                # rejected from its header without extracting it.
+                if member.size <= chosen_size:
                     continue
                 src = tar.extractfile(member)
                 if src is None:
@@ -310,17 +348,11 @@ def _extract_qcow2_from_layer(blob_path: Path, out_dir: Path) -> Optional[Path]:
                 with src, open(dest, "wb") as fh:
                     shutil.copyfileobj(src, fh, 1024 * 1024)
                 writing = None
-                is_disk = _is_disk_qcow2(member.name)
-                if chosen is None or (is_disk and not chosen_is_disk):
-                    if chosen is not None and chosen != dest:
-                        chosen.unlink(missing_ok=True)  # drop the less-preferred one
-                    chosen, chosen_is_disk = dest, is_disk
-                elif dest != chosen:
-                    dest.unlink(missing_ok=True)
-                if chosen_is_disk:
-                    break  # a disk/*.qcow2 is the best match; stop scanning
+                if chosen is not None and chosen != dest:
+                    chosen.unlink(missing_ok=True)  # drop the smaller earlier disk
+                chosen, chosen_size = dest, member.size
     except tarfile.ReadError as exc:
-        # a partially written qcow2 from a truncated stream must not be left
+        # a partially written disk from a truncated stream must not be left
         # behind where it could later be mistaken for a complete disk
         if writing is not None:
             writing.unlink(missing_ok=True)
@@ -331,11 +363,14 @@ def _extract_qcow2_from_layer(blob_path: Path, out_dir: Path) -> Optional[Path]:
     return chosen
 
 
-def _extract_embedded_qcow2(ref: str, manifest: dict, out_dir: Path) -> Optional[Path]:
-    """Extract the qcow2 embedded in a container image's layers.
+def _extract_embedded_disk(ref: str, manifest: dict, out_dir: Path) -> Optional[Path]:
+    """Extract the VM disk image embedded in a container image's layers.
 
     Layers are scanned from topmost to bottom (so an upper layer's disk wins);
-    the first layer that yields a qcow2 is used.
+    the first layer that yields a disk image is used. Overlay whiteouts are
+    honoured only within a layer, not across layers — containerDisks are built
+    ``FROM scratch`` as a single layer, so a disk deleted by an upper-layer
+    whiteout is not expected.
     """
     repo = _repo_without_tag(ref)
     layers = manifest.get("layers", []) or []
@@ -346,11 +381,11 @@ def _extract_embedded_qcow2(ref: str, manifest: dict, out_dir: Path) -> Optional
             continue
         try:
             _blob_fetch_to_file(repo, digest, blob_path)
-            qcow2 = _extract_qcow2_from_layer(blob_path, out_dir)
+            disk = _extract_disk_from_layer(blob_path, out_dir)
         finally:
             blob_path.unlink(missing_ok=True)
-        if qcow2 is not None:
-            return qcow2
+        if disk is not None:
+            return disk
     return None
 
 
@@ -358,16 +393,18 @@ def _extract_embedded_qcow2(ref: str, manifest: dict, out_dir: Path) -> Optional
 
 
 def pull_oci_image(image_ref: str, out_dir: str) -> str:
-    """Pull an OCI image and return the local qcow2 path.
+    """Pull an OCI image and return the local path to its VM disk (a qcow2).
 
     Two source layouts are supported:
 
     * **boxman / oras artifact** — a qcow2 stored as a titled OCI layer
       (``oras push disk.qcow2``); fetched with ``oras pull``.
-    * **container image / KubeVirt containerDisk** — a qcow2 embedded inside a
-      container image's filesystem (conventionally ``/disk/*.qcow2``, e.g.
-      ``quay.io/containerdisks/...``); the carrying layer is fetched and the
-      qcow2 extracted from it.
+    * **container image / KubeVirt containerDisk** — a VM disk embedded under a
+      root-level ``disk/`` directory inside a container image (named freely,
+      commonly ``disk/<name>.img``, e.g. ``quay.io/containerdisks/...``); the
+      carrying layer is fetched and the disk extracted from it. The extracted
+      disk's content must be qcow2 — raw and other formats are rejected with a
+      clear error rather than silently producing an unbootable VM.
 
     Args:
         image_ref: OCI reference, with or without an ``oci://`` scheme
@@ -375,13 +412,14 @@ def pull_oci_image(image_ref: str, out_dir: str) -> str:
         out_dir: Directory to pull the artifact into (created if needed).
 
     Returns:
-        Absolute path to the qcow2 file.
+        Absolute path to the local VM disk (qcow2 content; the file name may end
+        in ``.img`` or have no extension when taken from a containerDisk).
 
     Raises:
         ValueError: If *image_ref* is empty, or the registry returns an empty
             or unparseable manifest.
-        RuntimeError: If oras is missing, a registry call fails, or no qcow2
-            can be obtained from the image.
+        RuntimeError: If oras is missing, a registry call fails, no usable disk
+            can be obtained, or the embedded disk is not in qcow2 format.
     """
     if not image_ref or not str(image_ref).strip():
         raise ValueError("image_ref must be a non-empty string")
@@ -406,15 +444,23 @@ def pull_oci_image(image_ref: str, out_dir: str) -> str:
         return str(qcow2)
 
     # Otherwise treat it as a container image (e.g. KubeVirt containerDisk) and
-    # extract the qcow2 embedded in its layers.
-    qcow2 = _extract_embedded_qcow2(ref, manifest, out)
-    if qcow2 is None:
+    # extract the VM disk image embedded in its layers.
+    disk = _extract_embedded_disk(ref, manifest, out)
+    if disk is None:
         raise RuntimeError(
-            f"OCI image '{ref}' has no qcow2: it is neither a boxman artifact "
+            f"OCI image '{ref}' has no VM disk: it is neither a boxman artifact "
             "(a titled '*.qcow2' layer) nor a container image with an embedded "
-            "'*.qcow2' (expected a KubeVirt-style containerDisk carrying "
-            "'/disk/*.qcow2').")
-    return str(qcow2)
+            "disk (expected a KubeVirt-style containerDisk carrying a file under "
+            "a root-level '/disk/' directory, e.g. '/disk/<name>.img').")
+    if not _is_qcow2(disk):
+        disk.unlink(missing_ok=True)  # don't cache a disk we can't boot
+        raise RuntimeError(
+            f"OCI image '{ref}' embeds a VM disk that is not in qcow2 format. "
+            "boxman imports containerDisk disks as qcow2; raw and other formats "
+            "are not yet supported. Convert it to qcow2 (e.g. `qemu-img convert "
+            "-O qcow2`) and publish it as a boxman OCI artifact with "
+            "`boxman image push --qcow2 ...`.")
+    return str(disk)
 
 
 def _fetch_vmimage_metadata(ref: str, layers: list) -> Optional[VmImageMetadata]:
@@ -539,7 +585,7 @@ def format_inspect(summary: dict) -> str:
         if kind in ("image", "image-index"):
             lines.append(
                 "  (container image — if it is a KubeVirt-style containerDisk, "
-                "boxman extracts the embedded /disk/*.qcow2 on pull)")
+                "boxman extracts the VM disk under /disk/ on pull)")
 
     media_type = summary.get("media_type")
     if media_type:

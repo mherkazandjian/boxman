@@ -28,6 +28,10 @@ from boxman.providers.libvirt.oci_pull import (
 
 pytestmark = pytest.mark.unit
 
+# Embedded containerDisk disks are validated as qcow2 by content, so fake disks
+# in the extraction tests must carry the qcow2 magic.
+_QCOW2 = b"QFI\xfb"
+
 
 class _FakeRun:
     """A fake ``subprocess.run`` side-effect for the oras CLI.
@@ -182,20 +186,69 @@ class TestPullOciImage:
     # ── container image / KubeVirt containerDisk path (embedded qcow2) ────────
 
     def test_pull_containerdisk_extracts_embedded_qcow2(self, tmp_path: Path):
-        layer = _gztar({"disk/ubuntu-24.04.qcow2": b"QCOWDATA", "etc/hostname": b"h"})
+        layer = _gztar({"disk/ubuntu-24.04.qcow2": _QCOW2 + b"QCOWDATA", "etc/hostname": b"h"})
         fake = _FakeRun(handler=_oras_handler(
             manifests={"reg/repo:tag": _image_manifest(["sha256:layer1"])},
             blobs={"reg/repo@sha256:layer1": layer}))
         with _patch_run(fake):
             qcow2 = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
         assert Path(qcow2).name == "ubuntu-24.04.qcow2"
-        assert Path(qcow2).read_bytes() == b"QCOWDATA"
+        assert Path(qcow2).read_bytes() == _QCOW2 + b"QCOWDATA"
         blobs = [c for c in fake.calls if c[:3] == ["oras", "blob", "fetch"]]
         assert blobs and blobs[0][3] == "reg/repo@sha256:layer1"
 
+    def test_pull_containerdisk_extracts_img_under_disk(self, tmp_path: Path):
+        # KubeVirt containerDisks commonly name the disk *.img under /disk/
+        layer = _gztar({"disk/ubuntu.img": _QCOW2 + b"IMGDISK", "etc/hostname": b"h"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            disk = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(disk).name == "ubuntu.img"
+        assert Path(disk).read_bytes() == _QCOW2 + b"IMGDISK"
+
+    def test_pull_containerdisk_disk_file_without_extension(self, tmp_path: Path):
+        # the disk under /disk/ may have no extension at all
+        layer = _gztar({"disk/downloaded": _QCOW2 + b"NOEXTDISK"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            disk = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(disk).name == "downloaded"
+        assert Path(disk).read_bytes() == _QCOW2 + b"NOEXTDISK"
+
+    def test_pull_containerdisk_skips_whiteout_marker(self, tmp_path: Path):
+        # an overlay .wh. whiteout next to the real disk must be ignored
+        layer = _gztar({"disk/.wh.old-cloudimg.img": b"", "disk/ubuntu.img": _QCOW2 + b"REAL"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            disk = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(disk).name == "ubuntu.img"
+        assert Path(disk).read_bytes() == _QCOW2 + b"REAL"
+        assert not (tmp_path / "out" / ".wh.old-cloudimg.img").exists()
+
+    def test_pull_containerdisk_ignores_disk_extension_outside_disk_dir(self, tmp_path: Path):
+        # a disk-extension file OUTSIDE a root-level disk/ (e.g. /boot/initrd.img)
+        # must be ignored entirely; only files under disk/ are candidates
+        layer = _gztar({
+            "boot/initrd.img": b"NOT-A-DISK" * 10,  # larger, but not under disk/
+            "disk/ubuntu.img": _QCOW2 + b"REAL"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            disk = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(disk).name == "ubuntu.img"
+        assert Path(disk).read_bytes() == _QCOW2 + b"REAL"
+        assert not (tmp_path / "out" / "initrd.img").exists()
+
     def test_pull_containerdisk_from_multiarch_index(self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr(oci_pull, "_host_arch", lambda: "amd64")
-        layer = _gztar({"disk/disk.qcow2": b"AMD64DISK"})
+        layer = _gztar({"disk/disk.qcow2": _QCOW2 + b"AMD64DISK"})
         fake = _FakeRun(handler=_oras_handler(
             manifests={
                 "reg/repo:tag": _index_manifest([
@@ -207,33 +260,33 @@ class TestPullOciImage:
             blobs={"reg/repo@sha256:amdlayer": layer}))
         with _patch_run(fake):
             qcow2 = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
-        assert Path(qcow2).read_bytes() == b"AMD64DISK"
+        assert Path(qcow2).read_bytes() == _QCOW2 + b"AMD64DISK"
         # the amd64 platform manifest (not arm64) was resolved
         assert ["oras", "manifest", "fetch", "reg/repo@sha256:amdmanifest"] in fake.calls
         assert ["oras", "manifest", "fetch", "reg/repo@sha256:armmanifest"] not in fake.calls
 
     def test_pull_containerdisk_prefers_disk_dir(self, tmp_path: Path):
         # a root-level qcow2 AND a disk/*.qcow2 — the disk/ one must win
-        layer = _gztar({"root.qcow2": b"ROOT", "disk/real.qcow2": b"DISK"})
+        layer = _gztar({"root.qcow2": _QCOW2 + b"ROOT", "disk/real.qcow2": _QCOW2 + b"DISK"})
         fake = _FakeRun(handler=_oras_handler(
             manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
             blobs={"reg/repo@sha256:l": layer}))
         with _patch_run(fake):
             qcow2 = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
         assert Path(qcow2).name == "real.qcow2"
-        assert Path(qcow2).read_bytes() == b"DISK"
-        # the non-preferred extraction is cleaned up
+        assert Path(qcow2).read_bytes() == _QCOW2 + b"DISK"
+        # the root-level qcow2 is not under disk/, so it is never extracted
         assert not (tmp_path / "out" / "root.qcow2").exists()
 
     def test_pull_containerdisk_upper_layer_wins(self, tmp_path: Path):
-        lower = _gztar({"disk/foo.qcow2": b"OLD"})
-        upper = _gztar({"disk/foo.qcow2": b"NEW"})
+        lower = _gztar({"disk/foo.qcow2": _QCOW2 + b"OLD"})
+        upper = _gztar({"disk/foo.qcow2": _QCOW2 + b"NEW"})
         fake = _FakeRun(handler=_oras_handler(
             manifests={"reg/repo:tag": _image_manifest(["sha256:lower", "sha256:upper"])},
             blobs={"reg/repo@sha256:lower": lower, "reg/repo@sha256:upper": upper}))
         with _patch_run(fake):
             qcow2 = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
-        assert Path(qcow2).read_bytes() == b"NEW"
+        assert Path(qcow2).read_bytes() == _QCOW2 + b"NEW"
         # layers are scanned top-down; the upper hit short-circuits the lower
         fetched = [c[3] for c in fake.calls if c[:3] == ["oras", "blob", "fetch"]]
         assert fetched == ["reg/repo@sha256:upper"]
@@ -244,8 +297,38 @@ class TestPullOciImage:
             manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
             blobs={"reg/repo@sha256:l": layer}))
         with _patch_run(fake):
-            with pytest.raises(RuntimeError, match="no qcow2"):
+            with pytest.raises(RuntimeError, match="no VM disk"):
                 pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+
+    def test_pull_containerdisk_rejects_non_qcow2_disk(self, tmp_path: Path):
+        # a disk under /disk/ whose content is NOT qcow2 (e.g. raw) must be
+        # rejected with a clear error, not imported as a (broken) qcow2
+        out_dir = tmp_path / "out"
+        layer = _gztar({"disk/raw.img": b"RAWDISKDATA-not-qcow2"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            with pytest.raises(RuntimeError, match="not in qcow2 format"):
+                pull_oci_image("reg/repo:tag", str(out_dir))
+        # the non-bootable disk must not be left behind in the cache dir
+        assert not (out_dir / "raw.img").exists()
+
+    def test_pull_containerdisk_picks_largest_under_disk(self, tmp_path: Path):
+        # a sidecar (checksum/metadata) sharing disk/ must not be picked over the
+        # disk just because it appears first; the largest member wins
+        layer = _gztar({
+            "disk/SHA256SUMS": b"deadbeef",            # first, but tiny
+            "disk/ubuntu.img": _QCOW2 + b"X" * 100})   # the real, larger disk
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            disk = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(disk).name == "ubuntu.img"
+        assert Path(disk).read_bytes() == _QCOW2 + b"X" * 100
+        # the smaller sidecar that was provisionally extracted is cleaned up
+        assert not (tmp_path / "out" / "SHA256SUMS").exists()
 
     def test_pull_unreadable_layer_raises(self, tmp_path: Path):
         # a zstd-compressed (or otherwise non-tar) blob can't be read by tarfile
@@ -269,13 +352,13 @@ class TestPullOciImage:
             manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
             blobs={"reg/repo@sha256:l": buf.getvalue()}))
         with _patch_run(fake):
-            with pytest.raises(RuntimeError, match="no qcow2"):
+            with pytest.raises(RuntimeError, match="no VM disk"):
                 pull_oci_image("reg/repo:tag", str(out_dir))
         assert not (out_dir / "evil.qcow2").exists()
 
     def test_pull_containerdisk_neutralizes_traversal_name(self, tmp_path: Path):
-        # a regular member with a traversing name is written by basename only
-        layer = _gztar({"../../../../etc/evil.qcow2": b"DISKDATA"})
+        # a disk/ member with a traversing name is written by basename only
+        layer = _gztar({"disk/../../../../etc/evil.qcow2": _QCOW2 + b"DISKDATA"})
         out_dir = tmp_path / "out"
         fake = _FakeRun(handler=_oras_handler(
             manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
@@ -283,11 +366,11 @@ class TestPullOciImage:
         with _patch_run(fake):
             qcow2 = pull_oci_image("reg/repo:tag", str(out_dir))
         assert Path(qcow2) == out_dir / "evil.qcow2"  # no traversal out of out_dir
-        assert Path(qcow2).read_bytes() == b"DISKDATA"
+        assert Path(qcow2).read_bytes() == _QCOW2 + b"DISKDATA"
 
     def test_pull_containerdisk_nested_index(self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr(oci_pull, "_host_arch", lambda: "amd64")
-        layer = _gztar({"disk/d.qcow2": b"NESTED"})
+        layer = _gztar({"disk/d.qcow2": _QCOW2 + b"NESTED"})
         fake = _FakeRun(handler=_oras_handler(
             manifests={
                 "reg/repo:tag": _index_manifest([("sha256:inner", "linux", "amd64")]),
@@ -297,7 +380,7 @@ class TestPullOciImage:
             blobs={"reg/repo@sha256:layer": layer}))
         with _patch_run(fake):
             qcow2 = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
-        assert Path(qcow2).read_bytes() == b"NESTED"
+        assert Path(qcow2).read_bytes() == _QCOW2 + b"NESTED"
 
     def test_pull_index_without_host_arch_raises(self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr(oci_pull, "_host_arch", lambda: "amd64")
