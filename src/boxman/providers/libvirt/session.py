@@ -13,6 +13,7 @@ from .destroy_vm import DestroyVM
 from .disk import DiskManager
 from .disk_cleanup import remove_vm_disks
 from .import_image import ImageImporter
+from .iso_boot_vm import IsoBootVM
 from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
@@ -237,11 +238,13 @@ class LibVirtSession:
                  info: dict[str, Any],
                  workdir: str) -> bool:
         """
-        Clone a VM, or create a bare PXE-boot VM if boot_order starts with 'network'.
+        Clone a VM, create a bare PXE-boot VM, or create an ISO-boot VM,
+        depending on boot_order[0]: 'network' → BareVM, 'cdrom' → IsoBootVM,
+        anything else → CloneVM.
 
         Args:
             new_vm_name: Name of the new VM
-            src_vm_name: Name of the source VM (unused when boot_order is network-first)
+            src_vm_name: Name of the source VM (unused when boot_order is network-first or cdrom-first)
             info: VM configuration information
             workdir: Working directory for disk images
 
@@ -261,6 +264,29 @@ class LibVirtSession:
             if not status:
                 raise RuntimeError(
                     f"Failed to create bare PXE VM '{new_vm_name}'"
+                )
+            return True
+
+        if boot_order and boot_order[0] == 'cdrom':
+            iso_path = info.get('_resolved_iso_path')
+            if not iso_path:
+                raise RuntimeError(
+                    f"boot_order {boot_order} starts with 'cdrom' but "
+                    f"'_resolved_iso_path' is not set in info for VM "
+                    f"'{new_vm_name}'. Ensure the vm's cdroms: entry references a "
+                    f"named iso from the isos: section."
+                )
+            iso_vm = IsoBootVM(
+                vm_name=new_vm_name,
+                info=info,
+                provider_config=self.provider_config,
+                workdir=workdir,
+                iso_path=iso_path,
+            )
+            status = iso_vm.create()
+            if not status:
+                raise RuntimeError(
+                    f"Failed to create ISO-boot VM '{new_vm_name}'"
                 )
             return True
 

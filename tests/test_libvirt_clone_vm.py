@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from boxman.providers.libvirt.clone_vm import CloneVM
+from boxman.providers.libvirt.session import LibVirtSession
 
 
 pytestmark = pytest.mark.unit
@@ -178,3 +179,62 @@ class TestCloneWrapper:
     def test_returns_true_on_successful_create(self, clone: CloneVM):
         with patch.object(clone, "create_clone", return_value=True):
             assert clone.clone() is True
+
+
+class TestCloneVmIsoBootDispatch:
+    """clone_vm delegates to IsoBootVM when boot_order starts with 'cdrom'."""
+
+    def _make_session(self):
+        session = LibVirtSession.__new__(LibVirtSession)
+        session._provider_config_base = {"uri": "qemu:///system", "use_sudo": False}
+        session._project_provider_config = {}
+        return session
+
+    @patch("boxman.providers.libvirt.session.IsoBootVM")
+    def test_cdrom_boot_order_dispatches_to_iso_boot_vm(self, mock_iso_cls, tmp_path):
+        mock_iso_cls.return_value.create.return_value = True
+        session = self._make_session()
+        info = {
+            "boot_order": ["cdrom", "hd"],
+            "_resolved_iso_path": "/cache/talos.iso",
+        }
+        result = session.clone_vm(
+            new_vm_name="cp-01",
+            src_vm_name=None,
+            info=info,
+            workdir=str(tmp_path),
+        )
+        assert result is True
+        mock_iso_cls.assert_called_once_with(
+            vm_name="cp-01",
+            info=info,
+            provider_config=session.provider_config,
+            workdir=str(tmp_path),
+            iso_path="/cache/talos.iso",
+        )
+        mock_iso_cls.return_value.create.assert_called_once()
+
+    @patch("boxman.providers.libvirt.session.IsoBootVM")
+    def test_raises_when_resolved_iso_path_missing(self, mock_iso_cls, tmp_path):
+        session = self._make_session()
+        info = {"boot_order": ["cdrom", "hd"]}
+        with pytest.raises(RuntimeError, match="_resolved_iso_path"):
+            session.clone_vm(
+                new_vm_name="cp-01",
+                src_vm_name=None,
+                info=info,
+                workdir=str(tmp_path),
+            )
+
+    @patch("boxman.providers.libvirt.session.IsoBootVM")
+    def test_raises_when_iso_boot_vm_create_fails(self, mock_iso_cls, tmp_path):
+        mock_iso_cls.return_value.create.return_value = False
+        session = self._make_session()
+        info = {"boot_order": ["cdrom", "hd"], "_resolved_iso_path": "/cache/talos.iso"}
+        with pytest.raises(RuntimeError, match="Failed to create ISO-boot VM"):
+            session.clone_vm(
+                new_vm_name="cp-01",
+                src_vm_name=None,
+                info=info,
+                workdir=str(tmp_path),
+            )

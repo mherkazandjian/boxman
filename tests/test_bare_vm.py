@@ -30,7 +30,7 @@ def _make_bare_vm(tmp_path: Path, **info_overrides) -> BareVM:
     info = dict(
         memory=2048,
         vcpus=2,
-        disks=[{'name': 'disk01', 'size': 20}],
+        disk_size='20G',
         networks=[{'name': 'default'}],
     )
     info.update(info_overrides)
@@ -42,39 +42,41 @@ def _make_bare_vm(tmp_path: Path, **info_overrides) -> BareVM:
     )
 
 
-class TestGetDiskSizeGb:
+class TestBootDiskSize:
 
-    def test_returns_first_disk_size(self, tmp_path):
-        vm = _make_bare_vm(tmp_path, disks=[{'name': 'disk01', 'size': 40}])
-        assert vm._get_disk_size_gb() == 40
+    def test_reads_disk_size_field(self, tmp_path):
+        vm = _make_bare_vm(tmp_path, disk_size='40G')
+        assert vm._boot_disk_size() == '40G'
 
-    def test_defaults_to_20_when_no_disks(self, tmp_path):
-        vm = _make_bare_vm(tmp_path, disks=[])
-        assert vm._get_disk_size_gb() == 20
+    def test_int_disk_size_is_gib(self, tmp_path):
+        vm = _make_bare_vm(tmp_path, disk_size=30)
+        assert vm._boot_disk_size() == '30G'
 
-    def test_defaults_to_20_when_size_missing(self, tmp_path):
-        vm = _make_bare_vm(tmp_path, disks=[{'name': 'disk01'}])
-        assert vm._get_disk_size_gb() == 20
+    def test_defaults_to_20g_when_absent(self, tmp_path):
+        vm = _make_bare_vm(tmp_path)
+        vm.info.pop('disk_size', None)
+        assert vm._boot_disk_size() == '20G'
 
 
-class TestGetNetwork:
+class TestNetworks:
 
-    def test_returns_first_network_name(self, tmp_path):
+    def test_returns_raw_network_names(self, tmp_path):
         vm = _make_bare_vm(tmp_path, networks=[{'name': 'mgmt'}])
-        assert vm._get_network() == 'mgmt'
+        assert vm._networks() == ['mgmt']
+
+    def test_prefers_resolved_networks(self, tmp_path):
+        vm = _make_bare_vm(
+            tmp_path, networks=[{'name': 'mgmt'}], _resolved_networks=['bprj__p__mgmt'])
+        assert vm._networks() == ['bprj__p__mgmt']
 
     def test_defaults_to_default_when_no_networks(self, tmp_path):
         vm = _make_bare_vm(tmp_path, networks=[])
-        assert vm._get_network() == 'default'
-
-    def test_defaults_to_default_when_name_missing(self, tmp_path):
-        vm = _make_bare_vm(tmp_path, networks=[{}])
-        assert vm._get_network() == 'default'
+        assert vm._networks() == ['default']
 
 
 class TestBareVMCreate:
 
-    @patch('boxman.providers.libvirt.bare_vm._shell_run')
+    @patch('boxman.providers.libvirt.direct_vm._shell_run')
     def test_create_success(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=True)
         vm = _make_bare_vm(tmp_path)
@@ -82,7 +84,7 @@ class TestBareVMCreate:
         assert result is True
         assert mock_run.call_count == 2
 
-    @patch('boxman.providers.libvirt.bare_vm._shell_run')
+    @patch('boxman.providers.libvirt.direct_vm._shell_run')
     def test_create_fails_on_qemu_img_error(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=False, stderr="no space left")
         vm = _make_bare_vm(tmp_path)
@@ -90,7 +92,7 @@ class TestBareVMCreate:
         assert result is False
         assert mock_run.call_count == 1  # stops after qemu-img failure
 
-    @patch('boxman.providers.libvirt.bare_vm._shell_run')
+    @patch('boxman.providers.libvirt.direct_vm._shell_run')
     def test_create_fails_on_virt_install_error(self, mock_run, tmp_path):
         ok_result = _result(ok=True)
         fail_result = _result(ok=False, stderr="virt-install error")
@@ -100,17 +102,17 @@ class TestBareVMCreate:
         assert result is False
         assert mock_run.call_count == 2
 
-    @patch('boxman.providers.libvirt.bare_vm._shell_run')
+    @patch('boxman.providers.libvirt.direct_vm._shell_run')
     def test_qemu_img_command_contains_disk_path(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=True)
-        vm = _make_bare_vm(tmp_path, disks=[{'name': 'disk01', 'size': 30}])
+        vm = _make_bare_vm(tmp_path, disk_size='30G')
         vm.create()
         first_call_cmd = mock_run.call_args_list[0][0][0]
         assert "qemu-img create" in first_call_cmd
         assert "30G" in first_call_cmd
         assert "pxe-test01.qcow2" in first_call_cmd
 
-    @patch('boxman.providers.libvirt.bare_vm._shell_run')
+    @patch('boxman.providers.libvirt.direct_vm._shell_run')
     def test_virt_install_command_contains_pxe_flags(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=True)
         vm = _make_bare_vm(tmp_path)

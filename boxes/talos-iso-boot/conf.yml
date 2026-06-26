@@ -1,0 +1,79 @@
+# Example: 3-node Talos Linux cluster booted from ISO
+#
+# Boot flow:
+#   1. boxman downloads and caches the ISO (once, shared by all VMs)
+#   2. Each VM is created with the ISO attached as a CDROM; firmware boot order
+#      is hd,cdrom so the empty disk falls through to the ISO on first boot
+#   3. Talos live-boots from ISO, registers with Omni
+#   4. Omni pushes machine config; Talos installs to disk and reboots — the now
+#      bootable disk is used instead of re-running the installer
+#
+# Replace the ISO uri/checksum with the actual Omni ISO for your instance.
+# Download via: omnictl download iso --output /tmp/omni-talos.iso
+#
+version: '1.0'
+project: boxman_dev_talos-iso-boot
+
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: true
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+
+isos:
+  talos-omni:
+    uri: https://factory.talos.dev/image/talos-omni-placeholder.iso
+    checksum: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+workspace:
+  path: ~/workspaces/talos-iso-boot
+
+clusters:
+  talos:
+    workdir: ~/workspaces/talos-iso-boot
+    networks:
+      talos-net:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:64:01'
+        ip:
+          address: '192.168.100.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.100.2'
+              end: '192.168.100.254'
+        enable: True
+        autostart: True
+    vms:
+      cp-01:
+        vcpus: 2
+        memory: 4096
+        boot_order: [cdrom, hd]
+        disk_size: 50G              # primary boot disk (unit-suffixed, like templates)
+        networks:
+          - name: talos-net
+        cdroms:
+          - name: talos-omni
+      cp-02:
+        vcpus: 2
+        memory: 4096
+        boot_order: [cdrom, hd]
+        disk_size: 50G
+        networks:
+          - name: talos-net
+        cdroms:
+          - name: talos-omni
+      cp-03:
+        vcpus: 2
+        memory: 4096
+        boot_order: [cdrom, hd]
+        disk_size: 50G
+        networks:
+          - name: talos-net
+        cdroms:
+          - name: talos-omni
