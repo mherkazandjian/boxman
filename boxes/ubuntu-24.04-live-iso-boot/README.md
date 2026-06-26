@@ -1,4 +1,4 @@
-# ubuntu-live-iso-boot
+# ubuntu-24.04-live-iso-boot
 
 The simplest **end-to-end test of boxman's ISO-boot support**. It boots a single
 VM straight from the public, checksummed **Ubuntu 24.04 desktop ("Try Ubuntu")
@@ -32,7 +32,7 @@ the ISO-boot path itself.
 ## Bring it up
 
 ```bash
-cd boxes/ubuntu-live-iso-boot
+cd boxes/ubuntu-24.04-live-iso-boot
 boxman up
 ```
 
@@ -41,7 +41,7 @@ boxman up
 
 ## How to test / verify
 
-Let `V=bprj__boxman_dev_ubuntu-live-iso-boot__bprj_live_ubuntu-live01` (the
+Let `V=bprj__boxman_dev_ubuntu-24.04-live-iso-boot__bprj_live_ubuntu-live01` (the
 fully-qualified libvirt name; `virsh list` shows it).
 
 **1. ISO was downloaded and checksum-verified** — the `boxman up` log shows
@@ -81,7 +81,7 @@ the installer brings up networking and gets a lease from the box's NAT network:
 
 ```bash
 virsh -c qemu:///system net-dhcp-leases \
-  bprj__boxman_dev_ubuntu-live-iso-boot__bprj__clstr__live__clstr__live-net
+  bprj__boxman_dev_ubuntu-24.04-live-iso-boot__bprj__clstr__live__clstr__live-net
 ```
 
 A lease for the VM's MAC confirms it booted far enough to configure the network
