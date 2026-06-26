@@ -1363,6 +1363,9 @@ class BoxmanManager:
         for cluster_name, cluster in self.config.get('clusters', {}).items():
             cluster_base = cluster.get('base_image', '')
             for vm_name, vm_info in cluster.get('vms', {}).items():
+                boot_order = vm_info.get('boot_order', ['hd'])
+                if boot_order and boot_order[0] in ('network', 'cdrom'):
+                    continue
                 if not vm_info.get('base_image') and not cluster_base:
                     missing.append(f"{cluster_name}.vms.{vm_name}")
         if missing:
@@ -1974,7 +1977,8 @@ class BoxmanManager:
                     if not last_attempt:
                         boxman_logger.setLevel(logging.CRITICAL)
                     src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
-                    if not src_vm_name:
+                    boot_order = vm_info.get('boot_order', ['hd'])
+                    if not src_vm_name and not (boot_order and boot_order[0] in ('network', 'cdrom')):
                         raise ValueError(
                             f"no base_image for VM '{new_vm_name}': "
                             f"set base_image at the cluster or VM level"
@@ -1999,7 +2003,11 @@ class BoxmanManager:
                     else:
                         raise
 
-        clone_tasks = list(vm_clone_tasks())
+        resolved_isos = self._resolve_isos()
+        clone_tasks = [
+            (cluster, self._inject_resolved_iso(vm_info, resolved_isos), new_vm_name)
+            for cluster, vm_info, new_vm_name in vm_clone_tasks()
+        ]
         processes = [
             Process(target=_clone, args=(cluster, vm_info, new_vm_name))
             for cluster, vm_info, new_vm_name in clone_tasks
@@ -4720,7 +4728,8 @@ class BoxmanManager:
                     if not last_attempt:
                         boxman_logger.setLevel(logging.CRITICAL)
                     src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
-                    if not src_vm_name:
+                    boot_order = vm_info.get('boot_order', ['hd'])
+                    if not src_vm_name and not (boot_order and boot_order[0] in ('network', 'cdrom')):
                         raise ValueError(
                             f"no base_image for VM '{new_vm_name}': "
                             f"set base_image at the cluster or VM level"
@@ -4745,12 +4754,13 @@ class BoxmanManager:
                     else:
                         raise
 
+        resolved_isos = self._resolve_isos()
         clone_tasks = []
         for cluster_name, cluster in self.config['clusters'].items():
             for vm_name, vm_info in cluster['vms'].items():
                 full = f"{prj_name}_{cluster_name}_{vm_name}"
                 if full in new_vm_names:
-                    clone_tasks.append((cluster, vm_info.copy(), full))
+                    clone_tasks.append((cluster, self._inject_resolved_iso(vm_info.copy(), resolved_isos), full))
 
         processes = [
             Process(target=_clone, args=(cluster, vm_info, new_vm_name))
