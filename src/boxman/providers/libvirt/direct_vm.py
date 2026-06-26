@@ -9,6 +9,7 @@ applies to both.
 """
 
 import os
+import shlex
 from typing import Any
 
 from boxman import log
@@ -104,7 +105,7 @@ class DirectInstallVM:
         memory = self.info.get("memory") or 2048
         vcpus = self.info.get("vcpus") or 2
 
-        qemu_img_cmd = f'qemu-img create -f qcow2 "{disk_path}" {disk_size}'
+        qemu_img_cmd = f'qemu-img create -f qcow2 {shlex.quote(disk_path)} {disk_size}'
         qemu_img_cmd = self.virsh._wrap_for_runtime(qemu_img_cmd)
         result = _shell_run(qemu_img_cmd, hide=True, warn=True)
         if not result.ok:
@@ -120,7 +121,7 @@ class DirectInstallVM:
         parts.append(f"--memory={memory}")
         parts.append(f"--vcpus={vcpus}")
         parts.append(
-            f"--disk=path={disk_path},format=qcow2,bus=virtio,discard=unmap")
+            f"--disk=path={shlex.quote(disk_path)},format=qcow2,bus=virtio,discard=unmap")
         for net in self._networks():
             parts.append(f"--network=network={net},model=virtio")
         parts.extend(self._media_args())

@@ -271,9 +271,10 @@ class LibVirtSession:
             iso_path = info.get('_resolved_iso_path')
             if not iso_path:
                 raise RuntimeError(
-                    f"boot_order is [cdrom, hd] but '_resolved_iso_path' is not set "
-                    f"in info for VM '{new_vm_name}'. Ensure the vm's cdroms: entry "
-                    f"references a named iso from the isos: section."
+                    f"boot_order {boot_order} starts with 'cdrom' but "
+                    f"'_resolved_iso_path' is not set in info for VM "
+                    f"'{new_vm_name}'. Ensure the vm's cdroms: entry references a "
+                    f"named iso from the isos: section."
                 )
             iso_vm = IsoBootVM(
                 vm_name=new_vm_name,

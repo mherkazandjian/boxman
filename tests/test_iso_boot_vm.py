@@ -115,6 +115,14 @@ class TestIsoBootVMCreate:
         assert f"--network=network={full},model=virtio" in virt_install_call
 
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_iso_path_with_space_is_shell_quoted(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path, iso_path="/data/my isos/talos.iso")
+        vm.create()
+        virt_install_call = mock_run.call_args_list[1][0][0]
+        assert "--cdrom='/data/my isos/talos.iso'" in virt_install_call
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_disk_size_in_qemu_img_cmd(self, mock_run, tmp_path):
         mock_run.return_value = _result(ok=True)
         vm = _make_iso_vm(tmp_path, disk_size="50G")

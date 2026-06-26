@@ -37,6 +37,14 @@ class TestResolveIsos:
         with pytest.raises(ValueError, match="must be a mapping"):
             mgr._resolve_isos()
 
+    def test_raises_when_isos_section_is_not_a_mapping(self):
+        # `isos: some-string` / `isos: [..]` must give a clear ValueError, not an
+        # AttributeError from calling .items() on a non-dict
+        for bad in ("oops", [{"uri": "x"}]):
+            mgr = _manager_with_config({"isos": bad})
+            with pytest.raises(ValueError, match="'isos:' must be a mapping"):
+                mgr._resolve_isos()
+
     def test_calls_image_cache_ensure(self):
         mgr = _manager_with_config({
             "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}

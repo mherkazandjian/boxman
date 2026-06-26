@@ -1,5 +1,6 @@
 """Create a VM that boots from an install ISO (e.g. Talos Linux)."""
 
+import shlex
 from typing import Any
 
 from .direct_vm import DirectInstallVM
@@ -33,7 +34,7 @@ class IsoBootVM(DirectInstallVM):
         self.iso_path = iso_path
 
     def _media_args(self) -> list[str]:
-        return [f"--cdrom={self.iso_path}"]
+        return [f"--cdrom={shlex.quote(self.iso_path)}"]
 
     def _describe(self) -> str:
         return f"ISO-boot VM '{self.vm_name}'"

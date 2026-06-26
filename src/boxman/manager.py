@@ -1547,6 +1547,10 @@ class BoxmanManager:
         isos_conf = self.config.get("isos", {}) if self.config else {}
         if not isos_conf:
             return {}
+        if not isinstance(isos_conf, dict):
+            raise ValueError(
+                "'isos:' must be a mapping of <name>: {uri: ..., checksum: ...}, "
+                f"got {type(isos_conf).__name__}")
 
         # ISO boot needs the file visible to the in-container virt-install; the
         # host cache dir is not bind-mounted under a containerized runtime. Fail
