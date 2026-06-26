@@ -193,6 +193,50 @@ class TestPullOciImage:
         blobs = [c for c in fake.calls if c[:3] == ["oras", "blob", "fetch"]]
         assert blobs and blobs[0][3] == "reg/repo@sha256:layer1"
 
+    def test_pull_containerdisk_extracts_img_under_disk(self, tmp_path: Path):
+        # KubeVirt containerDisks commonly name the disk *.img under /disk/
+        layer = _gztar({"disk/ubuntu.img": b"IMGDISK", "etc/hostname": b"h"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            disk = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(disk).name == "ubuntu.img"
+        assert Path(disk).read_bytes() == b"IMGDISK"
+
+    def test_pull_containerdisk_disk_file_without_extension(self, tmp_path: Path):
+        # the disk under /disk/ may have no extension at all
+        layer = _gztar({"disk/downloaded": b"NOEXTDISK"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            disk = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(disk).name == "downloaded"
+        assert Path(disk).read_bytes() == b"NOEXTDISK"
+
+    def test_pull_containerdisk_skips_whiteout_marker(self, tmp_path: Path):
+        # an overlay .wh. whiteout next to the real disk must be ignored
+        layer = _gztar({"disk/.wh.old-cloudimg.img": b"", "disk/ubuntu.img": b"REAL"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            disk = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(disk).name == "ubuntu.img"
+        assert Path(disk).read_bytes() == b"REAL"
+        assert not (tmp_path / "out" / ".wh.old-cloudimg.img").exists()
+
+    def test_pull_containerdisk_prefers_disk_dir_over_extension(self, tmp_path: Path):
+        # a disk-extension file outside disk/ loses to a file under disk/
+        layer = _gztar({"data/cloud.img": b"ELSEWHERE", "disk/ubuntu.img": b"REAL"})
+        fake = _FakeRun(handler=_oras_handler(
+            manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
+            blobs={"reg/repo@sha256:l": layer}))
+        with _patch_run(fake):
+            disk = pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
+        assert Path(disk).read_bytes() == b"REAL"
+
     def test_pull_containerdisk_from_multiarch_index(self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr(oci_pull, "_host_arch", lambda: "amd64")
         layer = _gztar({"disk/disk.qcow2": b"AMD64DISK"})
@@ -244,7 +288,7 @@ class TestPullOciImage:
             manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
             blobs={"reg/repo@sha256:l": layer}))
         with _patch_run(fake):
-            with pytest.raises(RuntimeError, match="no qcow2"):
+            with pytest.raises(RuntimeError, match="no VM disk"):
                 pull_oci_image("reg/repo:tag", str(tmp_path / "out"))
 
     def test_pull_unreadable_layer_raises(self, tmp_path: Path):
@@ -269,7 +313,7 @@ class TestPullOciImage:
             manifests={"reg/repo:tag": _image_manifest(["sha256:l"])},
             blobs={"reg/repo@sha256:l": buf.getvalue()}))
         with _patch_run(fake):
-            with pytest.raises(RuntimeError, match="no qcow2"):
+            with pytest.raises(RuntimeError, match="no VM disk"):
                 pull_oci_image("reg/repo:tag", str(out_dir))
         assert not (out_dir / "evil.qcow2").exists()
 
