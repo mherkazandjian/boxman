@@ -130,6 +130,8 @@ class DirectInstallVM:
         parts.append("--graphics=vnc")
         parts.append("--noautoconsole")
         parts.append("--wait=0")
+        for extra in self.info.get("virt_install_extra_args", []):
+            parts.append(extra)
 
         cmd = " ".join(parts)
         cmd = self.virt_install._wrap_for_runtime(cmd)
