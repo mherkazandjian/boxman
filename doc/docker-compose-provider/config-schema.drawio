@@ -1,0 +1,150 @@
+<mxfile host="app.diagrams.net" modified="2026-01-08T00:00:00.000Z" agent="Boxman Design" version="21.0.0" type="device">
+  <diagram id="config-schema" name="Config Schema v2.0">
+    <mxGraphModel dx="1422" dy="762" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        
+        <!-- Root -->
+        <mxCell id="root" value="conf.yml (v2.0)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=14;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="480" y="40" width="200" height="60" as="geometry" />
+        </mxCell>
+        
+        <!-- Top Level Keys -->
+        <mxCell id="version" value="version: '2.0'" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11" vertex="1" parent="1">
+          <mxGeometry x="40" y="160" width="140" height="40" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="project" value="project: my_lab" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11" vertex="1" parent="1">
+          <mxGeometry x="220" y="160" width="140" height="40" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="provider" value="provider:" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="400" y="160" width="140" height="40" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="shared_networks" value="shared_networks:" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="580" y="160" width="160" height="40" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="clusters" value="clusters:" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="780" y="160" width="140" height="40" as="geometry" />
+        </mxCell>
+        
+        <!-- Provider Details -->
+        <mxCell id="provider_libvirt" value="libvirt:&#xa;  uri: qemu:///system&#xa;  use_sudo: false" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=left;spacingLeft=10" vertex="1" parent="1">
+          <mxGeometry x="320" y="260" width="180" height="70" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="provider_docker" value="docker-compose:&#xa;  project_name: my_lab" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=10;align=left;spacingLeft=10" vertex="1" parent="1">
+          <mxGeometry x="520" y="260" width="180" height="50" as="geometry" />
+        </mxCell>
+        
+        <!-- Shared Networks Details -->
+        <mxCell id="shared_net_detail" value="app_bridge:&#xa;  bridge: br-app&#xa;  stp: false&#xa;  disable_netfilter: true" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=left;spacingLeft=10" vertex="1" parent="1">
+          <mxGeometry x="580" y="260" width="180" height="80" as="geometry" />
+        </mxCell>
+        
+        <!-- Cluster A (Libvirt) -->
+        <mxCell id="cluster_a" value="compute:&#xa;  provider: libvirt" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="720" y="260" width="180" height="50" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="cluster_a_workdir" value="workdir: ~/workspaces/...&#xa;base_image: ubuntu-24.04&#xa;admin_user: admin" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=9;align=left;spacingLeft=10" vertex="1" parent="1">
+          <mxGeometry x="720" y="330" width="180" height="60" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="cluster_a_networks" value="networks:&#xa;  mgmt:&#xa;    mode: nat&#xa;    network: 192.168.10.0/24" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=9;align=left;spacingLeft=10" vertex="1" parent="1">
+          <mxGeometry x="720" y="410" width="180" height="70" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="cluster_a_boxes" value="boxes:&#xa;  node01:&#xa;    hostname: node01&#xa;    cpus: {sockets: 1, cores: 2}&#xa;    memory: 2048&#xa;    network_adapters:&#xa;      - name: eth0&#xa;        network_source: mgmt&#xa;      - name: eth1&#xa;        network_source: app_bridge" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;align=left;spacingLeft=10" vertex="1" parent="1">
+          <mxGeometry x="720" y="500" width="220" height="140" as="geometry" />
+        </mxCell>
+        
+        <!-- Cluster B (Docker-Compose) -->
+        <mxCell id="cluster_b" value="services:&#xa;  provider: docker-compose" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="40" y="360" width="220" height="50" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="cluster_b_workdir" value="workdir: ~/workspaces/.../services" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=9;align=left;spacingLeft=10" vertex="1" parent="1">
+          <mxGeometry x="40" y="430" width="220" height="40" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="cluster_b_networks" value="networks:&#xa;  backend:&#xa;    driver: bridge&#xa;    subnet: 172.20.0.0/24" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=9;align=left;spacingLeft=10" vertex="1" parent="1">
+          <mxGeometry x="40" y="490" width="220" height="70" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="cluster_b_boxes" value="boxes:&#xa;  web:&#xa;    image: nginx:latest&#xa;    ports: ['8080:80']&#xa;    networks: [backend, app_bridge]&#xa;    depends_on: [api]&#xa;  api:&#xa;    image: myapp/api:latest&#xa;    networks: [backend]&#xa;  db:&#xa;    image: postgres:16&#xa;    volumes:&#xa;      - name: pg_data&#xa;        container_path: /var/lib/postgresql&#xa;        size: 10G&#xa;    networks: [backend]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=9;align=left;spacingLeft=10" vertex="1" parent="1">
+          <mxGeometry x="40" y="580" width="320" height="200" as="geometry" />
+        </mxCell>
+        
+        <!-- Connections -->
+        <mxCell id="edge1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="root" target="version">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="root" target="project">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="root" target="provider">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="root" target="shared_networks">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="root" target="clusters">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="provider" target="provider_libvirt">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="provider" target="provider_docker">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="shared_networks" target="shared_net_detail">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="clusters" target="cluster_a">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="clusters" target="cluster_b">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="cluster_a" target="cluster_a_workdir">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="cluster_a_workdir" target="cluster_a_networks">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="cluster_a_networks" target="cluster_a_boxes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="cluster_b" target="cluster_b_workdir">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge15" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="cluster_b_workdir" target="cluster_b_networks">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;" edge="1" parent="1" source="cluster_b_networks" target="cluster_b_boxes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
