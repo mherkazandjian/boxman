@@ -1,0 +1,68 @@
+# Boxman prerequisites checker
+
+A guided "doctor" that verifies a host is ready to run boxman and, for anything
+that's missing, prints the exact fix for your distro and offers to run it.
+
+Boxman drives libvirt/KVM through the `virsh` / `virt-install` / `virt-clone` /
+`qemu-img` command-line tools and needs a handful of host-level things in place
+(a running `libvirtd`, group membership, a `default` NAT network, a cloud-init
+seed-ISO tool, `sshpass`, sudo rights, …). Installing the Python package — e.g.
+`pip install boxman` inside a conda env — does **not** set any of that up. This
+script checks all of it in one pass.
+
+## Usage
+
+```bash
+# From the repo root (no boxman install required to run the checker):
+python3 scripts/installer/check_prerequisites.py
+```
+
+The script is **standard-library only** and never imports boxman, so you can run
+it before boxman's own dependencies are installed. It runs on Python 3.6+ (its
+first check tells you if your Python is too old for boxman, which needs ≥ 3.10).
+
+### Options
+
+| Flag | Effect |
+|------|--------|
+| `--runtime {auto,local,docker}` | Which runtime's prerequisites to check. Default `auto` reads `runtime:` from `~/.config/boxman/boxman.yml`, falling back to `local`. |
+| `--check-only` | Report only — never prompt, never change anything. Good for CI. |
+| `--yes` / `-y` | Assume "yes" to every fix prompt (sudo may still ask for your password). |
+| `--verbose` | Show extra detail. |
+
+Exit code is `0` when no blocking `FAIL` remains, `1` otherwise.
+
+## How the guided fixes work
+
+For each problem it can fix, the checker:
+
+1. explains what's wrong,
+2. prints the exact command(s) for your detected distro (Arch / Debian-Ubuntu /
+   Fedora-RHEL-Rocky), and
+3. asks `Run this now? [y/N]`.
+
+**Nothing on your system is changed unless you answer yes** (or pass `--yes`).
+Commands that need root are run through `sudo`, which prompts for your password
+as usual. Fixes that add you to a group (e.g. `libvirt`, `kvm`, `docker`) are
+flagged as needing a logout/login before they take effect — re-run the checker
+afterwards to confirm.
+
+## What it checks
+
+- **Environment** — Python ≥ 3.10, `boxman` on PATH (+ active conda/venv), and
+  that boxman's Python deps import (`lxml` in particular needs system
+  libxml2/libxslt).
+- **Virtualization hardware** — CPU VT-x/AMD-V, `/dev/kvm` presence and access,
+  and nested virt when running inside a VM.
+- **Local runtime** — the `virsh`/`virt-install`/`virt-clone`/`qemu-img`/QEMU
+  tools, `libvirtd` running, `virsh -c qemu:///system` connectivity, `libvirt`
+  and `kvm` group membership, the `default` NAT network, a cloud-init seed-ISO
+  tool, `sshpass`, `rsync`, the OpenSSH client, and your **sudo rights**
+  (including the footgun where cleanup silently no-ops if `sudo qemu-img`/`rm`
+  aren't passwordless).
+- **Docker runtime** (when selected) — Docker Engine + Compose v2 reachable and
+  `/dev/kvm` on the host.
+- **Optional features** — `ansible`, `zstd`, `virt-sparsify`, `oras`,
+  `containerlab` (reported but never blocking).
+- **Config & capacity** — `~/.config/boxman` and the image cache are writable,
+  free disk space, and total RAM.
