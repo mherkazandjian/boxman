@@ -95,8 +95,16 @@ test-integration:
 test-provision:
 	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_provision_boxes.py
 
-#@help: count lines of code per category (code/tests/docs/conf/templates/boxes/shell/docker/make/claude)
+#@help: count lines of code with cloc via docker (git-tracked files only)
 loc:
+	@if ! command -v docker >/dev/null 2>&1; then \
+		echo "docker is required for 'make loc' (cloc runs via the aldanial/cloc image)."; \
+		exit 1; \
+	fi
+	@docker run --rm -v "$$PWD:/work" -w /work aldanial/cloc $$(git ls-files)
+
+#@help: count lines of code per category (custom counter: code/tests/docs/...)
+loc-detailed:
 	@python3 scripts/count_loc.py
 
 ################

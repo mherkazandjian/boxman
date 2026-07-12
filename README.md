@@ -208,6 +208,12 @@ Checksum verification behaviour:
 
 ## Requirements
 
+> **New here?** Run the guided prerequisites checker first — it verifies
+> everything below and offers to install or fix anything that's missing:
+> ```bash
+> python3 scripts/installer/check_prerequisites.py
+> ```
+
 - Python 3.10+
 - libvirt with KVM/QEMU (for local runtime)
 - For Docker runtime: Docker with compose v2, `/dev/kvm` on the host
