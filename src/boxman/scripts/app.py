@@ -15,11 +15,10 @@ import boxman
 from boxman import log
 from boxman.abstract.providers import ProviderSession as Session
 from boxman.manager import BoxmanManager
+from boxman.providers import create_session, primary_provider_type
 from boxman.providers.libvirt.import_image import ImageImporter
-from boxman.providers.libvirt.session import LibVirtSession
 from boxman.scripts.cli_parser import parse_args
 from boxman.utils.jinja_env import create_jinja_env
-from boxman.virtualbox.vboxmanage import Virtualbox
 
 now = datetime.now(timezone.utc)
 snap_name = now.strftime('%Y-%m-%dT%H:%M:%S')
@@ -365,10 +364,7 @@ def main():
         runtime = args.runtime or boxman_config.get('runtime', 'local')
         manager.runtime = runtime
         # Compute merged provider config (same logic as provision path)
-        provider_type = (
-            list(manager.config.get('provider', {}).keys())[0]
-            if 'provider' in manager.config else 'libvirt'
-        )
+        provider_type = primary_provider_type(manager.config)
         provider_conf_with_runtime = manager.get_provider_config_with_runtime(
             boxman_config.get('providers', {}).get(provider_type, {})
         )
@@ -504,31 +500,45 @@ def main():
             # fetch the provider configuration from the boxman config
             manager.config = boxman_config['providers'][provider_type]
         else:
-            provider_type = list(manager.config['provider'].keys())[0]
+            provider_type = primary_provider_type(manager.config)
 
-        if provider_type == 'virtualbox':
-            session = Virtualbox(manager.config)    # .. todo:: rename to VirtualBoxSession
-        elif provider_type == 'libvirt':
-            # merge runtime metadata into the provider config from boxman.yml
-            provider_conf_with_runtime = manager.get_provider_config_with_runtime(
-                boxman_config.get('providers', {}).get(provider_type, {})
+        # Build a session for every provider declared in the project config
+        # via the registry (import-image keeps its single-provider flow —
+        # the provider type comes from the manifest / CLI flag above).
+        if args.func == BoxmanManager.import_image:
+            provider_types = [provider_type]
+        else:
+            provider_types = (
+                list(manager.config.get('provider', {}).keys()) or [provider_type]
             )
-            # enrich the project config with runtime-aware provider settings
-            # App-level (boxman.yml) settings serve as DEFAULTS;
-            # project-level (conf.yml) settings always take precedence.
-            enriched_config = manager.config.copy()
-            if 'provider' in enriched_config and provider_type in enriched_config['provider']:
-                project_provider = enriched_config['provider'][provider_type].copy()
-                # Start from app-level defaults, then overlay project-level on top
-                merged_provider = provider_conf_with_runtime.copy()
-                merged_provider.update(project_provider)
-                enriched_config['provider'][provider_type] = merged_provider
 
-            session = LibVirtSession(enriched_config)
+        for _ptype in provider_types:
+            if _ptype == 'libvirt':
+                # merge runtime metadata into the provider config from boxman.yml
+                provider_conf_with_runtime = manager.get_provider_config_with_runtime(
+                    boxman_config.get('providers', {}).get(_ptype, {})
+                )
+                # enrich the project config with runtime-aware provider settings
+                # App-level (boxman.yml) settings serve as DEFAULTS;
+                # project-level (conf.yml) settings always take precedence.
+                enriched_config = manager.config.copy()
+                if 'provider' in enriched_config and _ptype in enriched_config['provider']:
+                    project_provider = enriched_config['provider'][_ptype].copy()
+                    # Start from app-level defaults, then overlay project-level on top
+                    merged_provider = provider_conf_with_runtime.copy()
+                    merged_provider.update(project_provider)
+                    enriched_config['provider'][_ptype] = merged_provider
+                session_config = enriched_config
+            else:
+                session_config = manager.config
+
+            try:
+                session = create_session(_ptype, session_config)
+            except (NotImplementedError, ValueError) as exc:
+                log.error(str(exc))
+                sys.exit(2)
             session.manager = manager
-            manager.provider = session
-        elif provider_type == 'docker-compose':
-            raise NotImplementedError('docker-compose is not implemented yet')
+            manager.register_session(_ptype, session)
 
         args.func(manager, args)
 
