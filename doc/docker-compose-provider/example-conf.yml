@@ -13,12 +13,15 @@ provider:
   docker-compose:
     project_name: hybrid_web_app
 
-# Shared networks for L2 connectivity between VMs and containers
+# Shared networks for L2 connectivity between VMs and containers.
+# Netfilter stays enabled host-wide; boxman inserts scoped per-bridge
+# accept rules instead (design.md decision D8). Setting
+# disable_netfilter: true is an explicit, discouraged opt-in.
 shared_networks:
   app_bridge:
     bridge: br-app
     stp: false
-    disable_netfilter: true
+    disable_netfilter: false
 
 # Workspace configuration
 workspace:

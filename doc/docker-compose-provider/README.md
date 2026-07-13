@@ -61,6 +61,13 @@ Open these files with [draw.io](https://app.diagrams.net/) or any compatible edi
   - Environment variables and secrets
   - Task definitions
 
+### Implementation Plan & Decisions
+
+- **[implementation-plan.md](implementation-plan.md)** - Phased plan grounded against `main`; one tracking issue per phase (#48–#57)
+- **[adr-001-per-cluster-provider.md](adr-001-per-cluster-provider.md)** - ADR: provider granularity is per-cluster, not per-box
+- **[spike/](spike/)** - Netfilter spike: `poc.sh` scenario matrix + `findings.md` (**run 2026-07-13 — scoped per-bridge rules confirmed** vs the global `bridge-nf-call-iptables=0`)
+- **[../../boxes/dc-provider-staging/](../../boxes/dc-provider-staging/)** - The epic's staging/testing VM (docker + nested libvirt pre-baked, snapshot-resettable)
+
 ## Key Design Decisions
 
 ### 1. Per-Cluster Provider Model
@@ -77,6 +84,9 @@ Containers attach to host-level Linux bridges via macvlan, providing full L2 adj
 - v2.0 configs with libvirt-only produce identical behavior to v1.0
 - Mixed providers are new functionality in v2.0
 
+### 5. Scoped Netfilter Rules (no global disable)
+Shared bridges keep `bridge-nf-call-iptables=1`; per-bridge physdev accept rules allow lab frames. The former global disable is an explicit, discouraged opt-in (decision D8 in [design.md](design.md), evidence in [spike/findings.md](spike/findings.md)).
+
 ## Implementation Phases
 
 1. **Phase 0**: Design & Validation (this phase)
@@ -92,11 +102,11 @@ Containers attach to host-level Linux bridges via macvlan, providing full L2 adj
 
 ## Next Steps
 
-1. Review design documents with the team
-2. Validate architecture diagrams
-3. Test example configuration
-4. Begin Phase 1 implementation (Provider Registry)
+1. ~~Run the netfilter spike~~ — executed 2026-07-13 in the staging VM ([spike/findings.md](spike/findings.md))
+2. Merge the Phase 0 PR into the epic feature branch `feat/docker-compose-provider` — closes Phase 0 ([#48](https://github.com/mherkazandjian/boxman/issues/48)); the feature branch accumulates all phases and merges into `main` after one final epic review
+3. Begin Phase 1 — provider registry ([#49](https://github.com/mherkazandjian/boxman/issues/49))
 
 ## Related Issues
 
-- GitHub Issue #42: [master plan for adding docker compose as a provider](https://github.com/Orski174/boxman/issues/42)
+- Epic — GitHub Issue [#42](https://github.com/mherkazandjian/boxman/issues/42): master plan for adding docker compose as a provider
+- Phase tracking issues: [#48](https://github.com/mherkazandjian/boxman/issues/48)–[#57](https://github.com/mherkazandjian/boxman/issues/57) (one per phase, see [implementation-plan.md](implementation-plan.md))
