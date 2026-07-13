@@ -9,8 +9,11 @@
 #   - git/make/python3/pip/venv      (running boxman + its test suite inside)
 #   - br_netfilter loaded at boot    (spike scenarios need it)
 #
-# The template is built with --cpu host-passthrough so nested KVM works
-# (verify inside with: egrep -c 'vmx|svm' /proc/cpuinfo).
+# Nested KVM: verified working (vmx exposed in the guest) via virt-install's
+# default host-model CPU. Note: virt_install_extra_args is currently silently
+# ignored on the cloud-init template path (boxman hard-codes its virt-install
+# args there — see the #48 drift log); the key is kept for when boxman honors
+# it. Verify inside with: egrep -c 'vmx|svm' /proc/cpuinfo.
 #
 # Workflow: `boxman up`, bootstrap per README.md, snapshot the pristine
 # state, then restore between destructive test runs.
@@ -35,6 +38,8 @@ templates:
     os_variant: ubuntu24.04
     memory: 4096
     vcpus: 4
+    # currently a no-op on the cloud-init template path (see #48 drift log);
+    # kept so the intent applies automatically once boxman supports it
     virt_install_extra_args:
       - '--cpu host-passthrough'
     cloudinit_done_marker: /var/log/dc-staging-cloudinit.log

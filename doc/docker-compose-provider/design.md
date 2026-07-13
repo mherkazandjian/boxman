@@ -644,6 +644,6 @@ Questions" section.
 
 ## Next Steps
 
-1. Run the netfilter spike ([spike/poc.sh](spike/poc.sh)) on a docker lab host and record [spike/findings.md](spike/findings.md)
-2. Merge this design (PR → `main`), closing Phase 0 ([#48](https://github.com/mherkazandjian/boxman/issues/48))
+1. ~~Run the netfilter spike~~ — executed 2026-07-13 in the staging VM; results in [spike/findings.md](spike/findings.md)
+2. Merge the Phase 0 PR into the epic feature branch `feat/docker-compose-provider`, closing Phase 0 ([#48](https://github.com/mherkazandjian/boxman/issues/48)). The feature branch accumulates all phase work; a single final review merges it into `main` at epic end.
 3. Begin Phase 1 — provider registry ([#49](https://github.com/mherkazandjian/boxman/issues/49)); full phase map in [implementation-plan.md](implementation-plan.md)

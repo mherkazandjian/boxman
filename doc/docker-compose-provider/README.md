@@ -102,8 +102,8 @@ Shared bridges keep `bridge-nf-call-iptables=1`; per-bridge physdev accept rules
 
 ## Next Steps
 
-1. Run the netfilter spike ([spike/poc.sh](spike/poc.sh)) on a docker lab host and fill in [spike/findings.md](spike/findings.md)
-2. Merge the design PR — closes Phase 0 ([#48](https://github.com/mherkazandjian/boxman/issues/48))
+1. ~~Run the netfilter spike~~ — executed 2026-07-13 in the staging VM ([spike/findings.md](spike/findings.md))
+2. Merge the Phase 0 PR into the epic feature branch `feat/docker-compose-provider` — closes Phase 0 ([#48](https://github.com/mherkazandjian/boxman/issues/48)); the feature branch accumulates all phases and merges into `main` after one final epic review
 3. Begin Phase 1 — provider registry ([#49](https://github.com/mherkazandjian/boxman/issues/49))
 
 ## Related Issues

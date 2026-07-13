@@ -8,7 +8,7 @@ place to test every change across the epic's phases. A single Ubuntu 24.04 VM
 | capability | why |
 |---|---|
 | docker + compose v2 | provider lifecycle work (phases 3–7), netfilter spike ([#48](https://github.com/mherkazandjian/boxman/issues/48)) |
-| libvirt/qemu-kvm + virtinst (nested — template built with `--cpu host-passthrough`) | hybrid VM↔container e2e (phases 4/8): boxman *inside* the VM provisions nested VMs next to containers |
+| libvirt/qemu-kvm + virtinst (nested KVM — verified: `vmx` exposed via virt-install's default host-model CPU) | hybrid VM↔container e2e (phases 4/8): boxman *inside* the VM provisions nested VMs next to containers |
 | git, make, python3 + pip/venv | clone boxman, install it, run the test suite inside |
 | `br_netfilter` loaded at boot | spike scenarios manipulate `bridge-nf-call-iptables` |
 
@@ -59,7 +59,7 @@ $SSH 'lsmod | grep br_netfilter'                 # netfilter module loaded
 ## Run the Phase 0 netfilter spike
 
 ```bash
-$SSH 'cd ~/boxman && git fetch origin dc-provider/phase-0-design-closure && git checkout dc-provider/phase-0-design-closure'
+$SSH 'cd ~/boxman && git fetch origin feat/docker-compose-provider && git checkout feat/docker-compose-provider'
 $SSH 'cd ~/boxman && sudo bash doc/docker-compose-provider/spike/poc.sh --with-docker-restart --emulate-docker-policy'
 ```
 

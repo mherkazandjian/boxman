@@ -230,7 +230,7 @@ fi
 # ── scenario 7: idempotency of the rule-management pattern ───────────────
 echo "=== scenario 7: iptables -C check-before-insert is idempotent ==="
 add_fwd_rule; add_fwd_rule
-count=$(iptables -S FORWARD | grep -cF -- "--physdev-is-bridged" || true)
+count=$(iptables -S FORWARD | grep -cF -- "-i $BR -o $BR -m physdev --physdev-is-bridged -j ACCEPT" || true)
 [ "$count" -eq 1 ] && record "7-idempotent-insert" "works" "works" \
                    || record "7-idempotent-insert" "works" "blocked"
 del_fwd_rule
