@@ -15,11 +15,12 @@ import yaml
 from boxman.utils.shell import run
 
 from boxman import log
+from boxman.abstract.providers import ProviderSession
 from boxman.config_cache import BoxmanCache
 from boxman.image_cache import ImageCache
 from boxman.netlab import ContainerlabManager, shared_bridges
+from boxman.providers import primary_provider_type
 from boxman.providers.libvirt.commands import VirshCommand
-from boxman.providers.libvirt.session import LibVirtSession
 from boxman.runtime import RuntimeBase, create_runtime
 from boxman.task_runner import TaskRunner
 from boxman.utils.io import write_files
@@ -42,8 +43,15 @@ class BoxmanManager:
         #: Optional[Dict[str, Any]]: the loaded configuration dictionary
         self.config: dict[str, Any] | None = None
 
-        #: the private backing field for the provider property
+        #: the private backing field for the provider property (the
+        #: default session — see :meth:`register_session`)
         self._provider = None
+
+        #: Dict[str, ProviderSession]: live sessions keyed by provider
+        #: type ('libvirt', 'virtualbox', …); populated by
+        #: :meth:`register_session` and consumed by
+        #: :meth:`session_for_cluster`
+        self._sessions: dict[str, ProviderSession] = {}
 
         #: the logger instance
         self.logger = log
@@ -78,24 +86,126 @@ class BoxmanManager:
         self.app_config = config
 
     @property
-    def provider(self) -> Optional["LibVirtSession"]:
+    def provider(self) -> Optional["ProviderSession"]:
         """
-        Get the current provider session.
+        Get the default provider session (compat shim).
+
+        Cluster-scoped flows should use :meth:`session_for_cluster`
+        instead; this property remains for call sites that are
+        provider-type specific (import-image, template management) or
+        genuinely single-session.
 
         Returns:
-            The provider session instance or None if not initialized
+            The default provider session instance or None if not
+            initialized
         """
         return self._provider
 
     @provider.setter
-    def provider(self, value: "LibVirtSession") -> None:
+    def provider(self, value: "ProviderSession") -> None:
         """
-        Set the provider session.
+        Set the default provider session (compat shim).
+
+        Prefer :meth:`register_session`. The setter keeps older call
+        sites and tests working: the assigned session is also registered
+        under the project's primary provider type so that
+        :meth:`session_for_cluster` resolves it.
 
         Args:
             value: The provider session instance
         """
         self._provider = value
+        if value is not None:
+            self._get_sessions()[primary_provider_type(self.config)] = value
+
+    def _get_sessions(self) -> dict[str, "ProviderSession"]:
+        """
+        Return the provider-type → session map, creating it if needed.
+
+        Managers are sometimes constructed with ``__new__`` in tests
+        (bypassing ``__init__``); the lazy guard keeps the session map
+        available on those instances too.
+        """
+        if not hasattr(self, '_sessions'):
+            self._sessions = {}
+        return self._sessions
+
+    def register_session(self, provider_type: str, session: "ProviderSession") -> None:
+        """
+        Register a live *session* for *provider_type*.
+
+        The first registered session also becomes the default session
+        returned by the legacy :attr:`provider` property.
+
+        Args:
+            provider_type: The provider type name (e.g. ``libvirt``).
+            session: The constructed provider session.
+        """
+        self._get_sessions()[provider_type] = session
+        if getattr(self, '_provider', None) is None:
+            self._provider = session
+
+    def provider_type_for_cluster(self, cluster_name: str) -> str:
+        """
+        Resolve the provider type that manages *cluster_name*.
+
+        A per-cluster ``provider:`` key wins (config schema v2.0 makes
+        this official in Phase 2 of the docker-compose provider epic);
+        otherwise the project's primary provider type applies.
+
+        Args:
+            cluster_name: The cluster name as it appears under
+                ``clusters:`` in the project config.
+
+        Returns:
+            The provider type name.
+        """
+        cluster = ((self.config or {}).get('clusters') or {}).get(cluster_name) or {}
+        return cluster.get('provider') or primary_provider_type(self.config)
+
+    def session_for_cluster(self, cluster_name: str) -> "ProviderSession":
+        """
+        Return the provider session that manages *cluster_name*.
+
+        Args:
+            cluster_name: The cluster name as it appears under
+                ``clusters:`` in the project config.
+
+        Returns:
+            The provider session registered for the cluster's provider
+            type.
+
+        Raises:
+            ValueError: If no session is registered for the cluster's
+                provider type.
+        """
+        provider_type = self.provider_type_for_cluster(cluster_name)
+        session = self._get_sessions().get(provider_type)
+        if session is None:
+            raise ValueError(
+                f"no provider session registered for provider "
+                f"'{provider_type}' (needed by cluster '{cluster_name}')"
+            )
+        return session
+
+    def _vm_cluster_map(self) -> dict[str, str]:
+        """
+        Map every full VM name of this project to its cluster name.
+
+        Uses the same name construction as the provision/destroy flows
+        (``bprj__<project>__bprj_<cluster>_<vm>``) so call sites that
+        only hold a full VM name (e.g. the post-provision start retry
+        loop) can resolve the owning cluster without parsing names.
+
+        Returns:
+            Mapping of full VM name to cluster name.
+        """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        return {
+            f"{prj_name}_{cluster_name}_{vm_name}": cluster_name
+            for cluster_name, cluster in ((self.config or {}).get('clusters') or {}).items()
+            for vm_name in (cluster.get('vms') or {}).keys()
+        }
 
     @property
     def runtime(self) -> str:
