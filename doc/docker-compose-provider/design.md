@@ -395,13 +395,16 @@ idempotent per-bridge rule instead:
 iptables -I FORWARD 1 -i <bridge> -o <bridge> -m physdev --physdev-is-bridged -j ACCEPT
 ```
 
-(on docker hosts the `DOCKER-USER` chain is preferred if the spike confirms it
-works and persists across docker restarts). Rationale: the previous global
-`bridge-nf-call-iptables=0` weakens docker/k8s bridge filtering host-wide, is
-never restored, and a docker/kubelet restart silently reverts it — breaking
-the lab. `disable_netfilter: true` remains available as an explicit opt-in
-with a loud warning. Evidence: [spike/findings.md](spike/findings.md);
-implementation: Phase 4
+(`FORWARD` is the default — it works without docker; the `DOCKER-USER` chain
+is a spike-validated alternative on docker hosts and survives docker
+restarts). Rationale: the previous global `bridge-nf-call-iptables=0` weakens
+docker/k8s bridge filtering host-wide, is never restored, and silently
+reverts on any reboot (the `br_netfilter` module defaults the sysctl to 1 on
+load) or on kubernetes hosts (kubelet enforces `=1`) — breaking the lab.
+Spike note: modern docker (29.x) itself does *not* reset it on daemon
+restart. `disable_netfilter: true` remains available as an explicit opt-in
+with a loud warning. Evidence: [spike/findings.md](spike/findings.md)
+(executed 2026-07-13, all scenarios pass); implementation: Phase 4
 ([#52](https://github.com/mherkazandjian/boxman/issues/52)).
 
 ---

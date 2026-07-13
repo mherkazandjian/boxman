@@ -65,7 +65,8 @@ Open these files with [draw.io](https://app.diagrams.net/) or any compatible edi
 
 - **[implementation-plan.md](implementation-plan.md)** - Phased plan grounded against `main`; one tracking issue per phase (#48–#57)
 - **[adr-001-per-cluster-provider.md](adr-001-per-cluster-provider.md)** - ADR: provider granularity is per-cluster, not per-box
-- **[spike/](spike/)** - Netfilter spike: `poc.sh` scenario matrix + `findings.md` (scoped per-bridge rules vs the global `bridge-nf-call-iptables=0`)
+- **[spike/](spike/)** - Netfilter spike: `poc.sh` scenario matrix + `findings.md` (**run 2026-07-13 — scoped per-bridge rules confirmed** vs the global `bridge-nf-call-iptables=0`)
+- **[../../boxes/dc-provider-staging/](../../boxes/dc-provider-staging/)** - The epic's staging/testing VM (docker + nested libvirt pre-baked, snapshot-resettable)
 
 ## Key Design Decisions
 

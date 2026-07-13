@@ -39,14 +39,14 @@ boxman up            # first run: downloads the cloud image, builds the
 ## Bootstrap (once per fresh VM)
 
 ```bash
-SSH="ssh -F ~/workspaces/boxmandev/dc-provider-staging/staging/ssh_config stage01"
+SSH="ssh -F ~/workspaces/boxmandev/dc-provider-staging/ssh_config staging_stage01"
 $SSH 'git clone https://github.com/mherkazandjian/boxman.git ~/boxman'
 $SSH 'cd ~/boxman && python3 -m venv ~/.venv-boxman && ~/.venv-boxman/bin/pip install -e . pytest'
 $SSH 'cd ~/boxman && PYTHONPATH=src ~/.venv-boxman/bin/python -m pytest tests/ -m unit -q'   # sanity
 ```
 
-*(the ssh_config path is printed by `boxman up`; adjust if your workspace
-differs)*
+*(the exact ssh_config path + host alias are printed at the end of
+`boxman up` — the alias is `<cluster>_<vm>`, i.e. `staging_stage01`)*
 
 ## Sanity checks inside
 
