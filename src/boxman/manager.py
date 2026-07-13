@@ -188,6 +188,27 @@ class BoxmanManager:
             )
         return session
 
+    def session_for_vm(self, full_vm_name: str) -> "ProviderSession":
+        """
+        Resolve the provider session that manages *full_vm_name*.
+
+        Convenience for flow helpers that only hold a full VM name
+        (``bprj__<project>__bprj_<cluster>_<vm>``). Names that cannot be
+        derived from the current config (e.g. VMs already removed from
+        it) fall back to the default session.
+
+        Args:
+            full_vm_name: The full (project-prefixed) VM name.
+
+        Returns:
+            The provider session managing the VM's cluster, or the
+            default session when the name is not in the config.
+        """
+        cluster_name = self._vm_cluster_map().get(full_vm_name)
+        if cluster_name is None:
+            return self.provider
+        return self.session_for_cluster(cluster_name)
+
     def _vm_cluster_map(self) -> dict[str, str]:
         """
         Map every full VM name of this project to its cluster name.
@@ -1042,6 +1063,8 @@ class BoxmanManager:
         :param manager: The instance of the BoxmanManager
         :param cli_args: The parsed arguments from the cli
         """
+        # Phase 1 (#49): stays on the default session — import-image is a
+        # single-provider flow (the type comes from the manifest / CLI).
         cls.provider.import_image(
             manifest_uri=cli_args.manifest_uri,
             vm_name=cli_args.vm_name,
@@ -1849,6 +1872,8 @@ class BoxmanManager:
             tpl_vm_name = tpl_conf.get('name', tpl_key)
 
             # ask the provider if the VM exists
+            # Phase 1 (#49): template management stays on the default
+            # session — templates are project-level and libvirt-only.
             exists = False
             if self.provider is not None and hasattr(self.provider, 'vm_exists'):
                 exists = self.provider.vm_exists(tpl_vm_name)
@@ -2153,7 +2178,7 @@ class BoxmanManager:
                     cluster_name=cluster_name,
                     network_name=network_name
                 )
-                self.provider.define_network(
+                self.session_for_cluster(cluster_name).define_network(
                     name=_network_name,
                     info=network_info,
                     workdir=cluster['workdir']
@@ -2170,7 +2195,7 @@ class BoxmanManager:
                 cluster_name=cluster_name,
                 network_name=network_name
             )
-            self.provider.remove_network(
+            self.session_for_cluster(cluster_name).remove_network(
                 name=_network_name,
                 info=network_info
             )
@@ -2203,6 +2228,7 @@ class BoxmanManager:
         """
         workdir = os.path.abspath(os.path.expanduser(workdir))
         pool_name = os.path.basename(workdir)
+        # Phase 1 (#49): default session — libvirt storage pools by nature.
         virsh = VirshCommand(self.provider.provider_config)
 
         result = virsh.execute("pool-info", pool_name, warn=True)
@@ -2260,7 +2286,7 @@ class BoxmanManager:
                             f"no base_image for VM '{new_vm_name}': "
                             f"set base_image at the cluster or VM level"
                         )
-                    self.provider.clone_vm(
+                    self.session_for_vm(new_vm_name).clone_vm(
                         src_vm_name=src_vm_name,
                         new_vm_name=new_vm_name,
                         info=vm_info,
@@ -2324,7 +2350,7 @@ class BoxmanManager:
 
         def _destroy(full_vm_name, cluster_name, vm_name):
             self.logger.info(f"Destroying VM {vm_name} in cluster {cluster_name}")
-            self.provider.destroy_vm(
+            self.session_for_cluster(cluster_name).destroy_vm(
                 name=full_vm_name,
                 remove_storage=True
             )
@@ -2356,7 +2382,7 @@ class BoxmanManager:
         max_memory = vm_info.get('max_memory')
         if cpus or memory:
             self.logger.info(f"configuring cpu and memory for vm {vm_name}")
-            success = self.provider.configure_vm_cpu_memory(
+            success = self.session_for_cluster(cluster_name).configure_vm_cpu_memory(
                 vm_name=full_vm_name, cpus=cpus, memory_mb=memory,
                 max_vcpus=max_vcpus, max_memory_mb=max_memory
             )
@@ -2375,7 +2401,7 @@ class BoxmanManager:
                 self.resolve_adapter_network(adapter, cluster_name)
 
             self.logger.info(f"configuring network interfaces for vm {vm_name}")
-            success = self.provider.configure_vm_network_interfaces(
+            success = self.session_for_cluster(cluster_name).configure_vm_network_interfaces(
                 vm_name=full_vm_name,
                 network_adapters=vm_info['network_adapters']
             )
@@ -2390,7 +2416,7 @@ class BoxmanManager:
             self.logger.warning(f"no disks defined for vm {vm_name}, skipping")
         else:
             self.logger.info(f"configuring disks for vm {vm_name}")
-            success = self.provider.configure_vm_disks(
+            success = self.session_for_cluster(cluster_name).configure_vm_disks(
                 vm_name=full_vm_name,
                 disks=vm_info['disks'],
                 workdir=workdir,
@@ -2404,7 +2430,7 @@ class BoxmanManager:
         # shared folders (must be before start for virtiofs memfd backing)
         if vm_info.get('shared_folders'):
             self.logger.info(f"configuring shared folders for vm {vm_name}")
-            success = self.provider.configure_vm_shared_folders(
+            success = self.session_for_cluster(cluster_name).configure_vm_shared_folders(
                 vm_name=full_vm_name,
                 shared_folders=vm_info['shared_folders']
             )
@@ -2423,7 +2449,7 @@ class BoxmanManager:
         ]
         if extra_cdroms:
             self.logger.info(f"configuring CDROMs for vm {vm_name}")
-            success = self.provider.configure_vm_cdroms(
+            success = self.session_for_cluster(cluster_name).configure_vm_cdroms(
                 vm_name=full_vm_name,
                 cdroms=extra_cdroms
             )
@@ -2434,7 +2460,7 @@ class BoxmanManager:
 
         # start
         self.logger.info(f"starting vm {full_vm_name}")
-        success = self.provider.start_vm(full_vm_name)
+        success = self.session_for_cluster(cluster_name).start_vm(full_vm_name)
         if success:
             self.logger.info(f"successfully started the vm {full_vm_name}")
         else:
@@ -2453,13 +2479,14 @@ class BoxmanManager:
         vm_info = vm_info.copy()
 
         self.logger.info(f"destroying vm {full_vm_name}")
-        self.provider.destroy_vm(full_vm_name)
-        self.provider.destroy_disks(
+        session = self.session_for_cluster(cluster_name)
+        session.destroy_vm(full_vm_name)
+        session.destroy_disks(
             cluster['workdir'],
             vm_name=full_vm_name,
             disks=vm_info.get('disks', [])
         )
-        self.provider.destroy_vm(full_vm_name, force=True)
+        session.destroy_vm(full_vm_name, force=True)
 
     def _destroy_removed_vm(self, full_vm_name: str, workdir: str) -> None:
         """
@@ -2470,6 +2497,9 @@ class BoxmanManager:
         in destroy_disks catches all {vm_name}* artifacts.
         """
         self.logger.info(f"removing VM {full_vm_name} (no longer in config)")
+        # Phase 1 (#49): stays on the default session — the VM is gone
+        # from the config, so its cluster (and provider) can no longer be
+        # resolved. Revisited in Phase 3 (#51).
         self.provider.destroy_vm(full_vm_name)
         self.provider.destroy_disks(
             workdir,
@@ -2512,7 +2542,7 @@ class BoxmanManager:
                     continue
                 for adapter in vm_info['network_adapters']:
                     self.resolve_adapter_network(adapter, cluster_name)
-                success = self.provider.configure_vm_network_interfaces(
+                success = self.session_for_cluster(cluster_name).configure_vm_network_interfaces(
                     vm_name=full_vm_name,
                     network_adapters=vm_info['network_adapters']
                 )
@@ -2534,7 +2564,7 @@ class BoxmanManager:
                 if 'disks' not in vm_info or not vm_info['disks']:
                     self.logger.warning(f"no disks defined for vm {vm_name}, skipping")
                     continue
-                success = self.provider.configure_vm_disks(
+                success = self.session_for_cluster(cluster_name).configure_vm_disks(
                     vm_name=full_vm_name,
                     disks=vm_info['disks'],
                     workdir=workdir,
@@ -2558,7 +2588,7 @@ class BoxmanManager:
                     self.logger.warning(
                         f"no cpu or memory configuration for vm {vm_name}, skipping")
                     continue
-                success = self.provider.configure_vm_cpu_memory(
+                success = self.session_for_cluster(cluster_name).configure_vm_cpu_memory(
                     vm_name=full_vm_name, cpus=cpus, memory_mb=memory
                 )
                 if success:
@@ -2573,7 +2603,7 @@ class BoxmanManager:
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 self.logger.info(f"starting vm {full_vm_name}")
-                success = self.provider.start_vm(full_vm_name)
+                success = self.session_for_cluster(cluster_name).start_vm(full_vm_name)
                 if success:
                     self.logger.info(f"successfully started the vm {full_vm_name}")
                 else:
@@ -2599,7 +2629,7 @@ class BoxmanManager:
         result_queue: Queue = Queue()
 
         def _check(full_vm_name):
-            ips = self.provider.get_vm_ip_addresses(full_vm_name)
+            ips = self.session_for_vm(full_vm_name).get_vm_ip_addresses(full_vm_name)
             result_queue.put((full_vm_name, ips))
 
         processes = [Process(target=_check, args=(n,)) for n in vm_names]
@@ -2637,7 +2667,7 @@ class BoxmanManager:
                 self.logger.info(f"vm: {vm_name} (hostname: {hostname})")
 
                 # get the ip addresses for all interfaces
-                ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
+                ip_addresses = self.session_for_cluster(cluster_name).get_vm_ip_addresses(full_vm_name)
 
                 if ip_addresses:
                     self.logger.info("  ip addresses:")
@@ -2771,7 +2801,7 @@ class BoxmanManager:
                         vm_counter += 1
 
                         # get the first ip address if available
-                        ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
+                        ip_addresses = self.session_for_cluster(cluster_name).get_vm_ip_addresses(full_vm_name)
 
                         if ip_addresses:
                             first_ip = next(iter(ip_addresses.values()))
@@ -2942,7 +2972,7 @@ class BoxmanManager:
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
 
                 # get the ip addresses for this vm
-                ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
+                ip_addresses = self.session_for_cluster(cluster_name).get_vm_ip_addresses(full_vm_name)
 
                 if not ip_addresses:
                     self.logger.warning(
@@ -3260,11 +3290,12 @@ class BoxmanManager:
 
         config = cls.config
 
-        # Ensure provider config reflects runtime settings.
+        # Ensure provider configs reflect runtime settings.
         # Project-level provider settings (from conf.yml) always take
         # precedence over app-level defaults (from boxman.yml).
-        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
-            cls.provider.update_provider_config_with_runtime()
+        for _session in cls._get_sessions().values():
+            if hasattr(_session, 'update_provider_config_with_runtime'):
+                _session.update_provider_config_with_runtime()
 
         # --- Pre-check: detect state that would block a clean provision ---
         # Block on either (a) live VMs from this project, or (b) a stale
@@ -3361,7 +3392,7 @@ class BoxmanManager:
                 f"({', '.join(f'{n}={s}' for n, s in not_running.items())}), retrying..."
             )
             for _vm_name in not_running:
-                cls.provider.start_vm(_vm_name)
+                cls.session_for_vm(_vm_name).start_vm(_vm_name)
             time.sleep(3)
         else:
             vm_states = cls._get_vm_states()
@@ -3403,7 +3434,7 @@ class BoxmanManager:
         for _cluster_name, _cluster in config['clusters'].items():
             for _vm_name, _ in _cluster['vms'].items():
                 _full_vm_name = f"{prj_name}_{_cluster_name}_{_vm_name}"
-                cls.provider.eject_cdrom(_full_vm_name)
+                cls.session_for_cluster(_cluster_name).eject_cdrom(_full_vm_name)
 
         # generate ssh keys, add them to vms, and write ssh config
         cls.setup_ssh_access()
@@ -3491,9 +3522,10 @@ class BoxmanManager:
             f"{len(non_running)} VM(s) are not running, bringing them up..."
         )
 
-        # Ensure provider config reflects runtime settings
-        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
-            cls.provider.update_provider_config_with_runtime()
+        # Ensure provider configs reflect runtime settings
+        for _session in cls._get_sessions().values():
+            if hasattr(_session, 'update_provider_config_with_runtime'):
+                _session.update_provider_config_with_runtime()
 
         # Shared bridges must exist before VMs attach to them on boot.
         cls.ensure_shared_bridges()
@@ -3502,27 +3534,28 @@ class BoxmanManager:
         vm_workdir_map = {vm_name: workdir for vm_name, workdir in cls.process_vm_list(cli_args)}
 
         def _bring_up(vm_name, state, workdir):
+            session = cls.session_for_vm(vm_name)
             cls.logger.info(f"VM '{vm_name}' is in state '{state}'")
             if state == 'paused':
                 cls.logger.info(f"resuming VM '{vm_name}'...")
-                cls.provider.resume_vm(vm_name)
+                session.resume_vm(vm_name)
             elif state in ('saved', 'managedsave'):
                 cls.logger.info(f"restoring VM '{vm_name}' from saved state...")
-                cls.provider.restore_vm(vm_name, workdir)
+                session.restore_vm(vm_name, workdir)
             elif state in ('shut off', 'shutoff'):
                 cls.logger.info(f"starting VM '{vm_name}'...")
-                cls.provider.start_vm(vm_name)
+                session.start_vm(vm_name)
             elif state in ('crashed', 'dying'):
                 cls.logger.warning(
                     f"VM '{vm_name}' is in state '{state}', "
                     f"attempting to destroy and start...")
-                cls.provider.destroy_vm(vm_name, remove_storage=False)
-                cls.provider.start_vm(vm_name)
+                session.destroy_vm(vm_name, remove_storage=False)
+                session.start_vm(vm_name)
             else:
                 cls.logger.warning(
                     f"VM '{vm_name}' is in unexpected state '{state}', "
                     f"attempting to start...")
-                cls.provider.start_vm(vm_name)
+                session.start_vm(vm_name)
 
         processes = [
             Process(
@@ -3580,9 +3613,10 @@ class BoxmanManager:
         Reuses ``process_vm_list()`` and the same provider methods as
         ``boxman control save`` / ``boxman control suspend``.
         """
-        # Ensure provider config reflects runtime settings
-        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
-            cls.provider.update_provider_config_with_runtime()
+        # Ensure provider configs reflect runtime settings
+        for _session in cls._get_sessions().values():
+            if hasattr(_session, 'update_provider_config_with_runtime'):
+                _session.update_provider_config_with_runtime()
 
         vm_list = cls.process_vm_list(cli_args)
 
@@ -3597,7 +3631,7 @@ class BoxmanManager:
 
             def _suspend(vm_name):
                 cls.logger.info(f"suspending VM '{vm_name}'...")
-                cls.provider.suspend_vm(vm_name)
+                cls.session_for_vm(vm_name).suspend_vm(vm_name)
                 cls.logger.info(f"VM '{vm_name}' suspended")
 
             processes = [
@@ -3609,7 +3643,7 @@ class BoxmanManager:
 
             def _save(vm_name, workdir):
                 cls.logger.info(f"saving VM '{vm_name}' state to '{workdir}'...")
-                cls.provider.save_vm(vm_name, workdir)
+                cls.session_for_vm(vm_name).save_vm(vm_name, workdir)
                 cls.logger.info(f"VM '{vm_name}' state saved")
 
             processes = [
@@ -3625,11 +3659,12 @@ class BoxmanManager:
     @staticmethod
     def deprovision(cls, cli_args):
 
-        # Ensure provider config reflects runtime settings.
+        # Ensure provider configs reflect runtime settings.
         # Project-level provider settings (from conf.yml) always take
         # precedence over app-level defaults (from boxman.yml).
-        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
-            cls.provider.update_provider_config_with_runtime()
+        for _session in cls._get_sessions().values():
+            if hasattr(_session, 'update_provider_config_with_runtime'):
+                _session.update_provider_config_with_runtime()
 
         # Tear down the containerlab lab first so its veths release any
         # shared bridges before we touch libvirt state.
@@ -3928,7 +3963,7 @@ class BoxmanManager:
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                cls.provider.snapshot_list(full_vm_name)
+                cls.session_for_cluster(cluster_name).snapshot_list(full_vm_name)
 
     @staticmethod
     def snapshot_log(cls, cli_args):
@@ -3953,7 +3988,7 @@ class BoxmanManager:
         for cluster_name, cluster in cls.config['clusters'].items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                data = cls.provider.snapshot_log_data(full_vm_name)
+                data = cls.session_for_cluster(cluster_name).snapshot_log_data(full_vm_name)
                 per_vm[full_vm_name] = data
 
         if not any(d.get('chain') for d in per_vm.values()):
@@ -4134,7 +4169,7 @@ class BoxmanManager:
         compress_level = getattr(cli_args, 'memory_compress_level', 3)
 
         def _take(full_vm_name, vm_dir, snapshot_name, description):
-            cls.provider.snapshot_take(
+            cls.session_for_vm(full_vm_name).snapshot_take(
                 vm_name=full_vm_name,
                 vm_dir=vm_dir,
                 snapshot_name=snapshot_name,
@@ -4154,7 +4189,7 @@ class BoxmanManager:
         cls.logger.info("verifying snapshots after take...")
         all_ok = True
         for full_vm_name, _ in vm_targets:
-            valid, errors = cls.provider.validate_snapshot(
+            valid, errors = cls.session_for_vm(full_vm_name).validate_snapshot(
                 full_vm_name, cli_args.snapshot_name)
             if valid:
                 cls.logger.info(f"snapshot ok: {full_vm_name} / '{cli_args.snapshot_name}'")
@@ -4194,7 +4229,7 @@ class BoxmanManager:
         for full_vm_name, _cluster_name, _vm_name, _workdir in selected:
             snap_name = cli_args.snapshot_name
             if not snap_name:
-                snap_name = cls.provider.get_latest_snapshot(full_vm_name)
+                snap_name = cls.session_for_vm(full_vm_name).get_latest_snapshot(full_vm_name)
                 if snap_name is None:
                     cls.logger.error(
                         f"no snapshot found for {full_vm_name}, aborting restore")
@@ -4207,7 +4242,7 @@ class BoxmanManager:
         cls.logger.info("pre-validating snapshots before restore...")
         abort = False
         for full_vm_name, snap_name in vm_targets:
-            valid, errors = cls.provider.validate_snapshot(full_vm_name, snap_name)
+            valid, errors = cls.session_for_vm(full_vm_name).validate_snapshot(full_vm_name, snap_name)
             if valid:
                 cls.logger.info(f"snapshot ok: {full_vm_name} / '{snap_name}'")
             else:
@@ -4223,7 +4258,7 @@ class BoxmanManager:
 
         # ── 3 & 4. Parallel restore with retry until all succeed ─────────────
         def _restore(full_vm_name, snapshot_name, queue):
-            ok = cls.provider.snapshot_restore(full_vm_name, snapshot_name)
+            ok = cls.session_for_vm(full_vm_name).snapshot_restore(full_vm_name, snapshot_name)
             queue.put((full_vm_name, snapshot_name, ok))
 
         pending = list(vm_targets)
@@ -4282,7 +4317,7 @@ class BoxmanManager:
             return
 
         for full_vm_name, _cluster_name, _vm_name, _workdir in targets:
-            cls.provider.snapshot_delete(full_vm_name, cli_args.snapshot_name)
+            cls.session_for_cluster(_cluster_name).snapshot_delete(full_vm_name, cli_args.snapshot_name)
             cls.logger.info(f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
 
     @staticmethod
@@ -4354,6 +4389,8 @@ class BoxmanManager:
                 cls.logger.info("aborted")
                 return
 
+        # Phase 1 (#49): snapshot collapse stays on the default session —
+        # it manipulates qcow2 chains via libvirt-specific managers.
         provider_config = cls.provider.provider_config
         processes = [
             Process(
@@ -4581,7 +4618,7 @@ class BoxmanManager:
         action = "decompress" if decompress else "compress"
         for full_vm_name, _workdir, _vm_info in cls._storage_targets(cls, cli_args):
             cls.logger.info(f"storage {action}-snapshots: {full_vm_name}")
-            processed, total = cls.provider.compress_snapshots_memory(
+            processed, total = cls.session_for_vm(full_vm_name).compress_snapshots_memory(
                 full_vm_name, level=level, decompress=decompress)
             cls.logger.info(
                 f"  {action}ed {processed}/{total} snapshot memory file(s) "
@@ -4608,7 +4645,7 @@ class BoxmanManager:
         Suspend (pause) the VMs in the cluster.
         """
         for vm_name, _ in cls.process_vm_list(cli_args):
-            cls.provider.suspend_vm(vm_name)
+            cls.session_for_vm(vm_name).suspend_vm(vm_name)
             cls.logger.info(f"vm {vm_name} suspended")
 
     @staticmethod
@@ -4617,7 +4654,7 @@ class BoxmanManager:
         Resume previously suspended VMs in the cluster.
         """
         for vm_name, _ in cls.process_vm_list(cli_args):
-            cls.provider.resume_vm(vm_name)
+            cls.session_for_vm(vm_name).resume_vm(vm_name)
             cls.logger.info(f"VM {vm_name} resumed")
 
     @staticmethod
@@ -4626,7 +4663,7 @@ class BoxmanManager:
         Save the state of the VMs in the cluster to a file.
         """
         for vm_name, workdir in cls.process_vm_list(cli_args):
-            cls.provider.save_vm(vm_name, workdir)
+            cls.session_for_vm(vm_name).save_vm(vm_name, workdir)
 
     @staticmethod
     def start_vm(cls, cli_args):
@@ -4635,9 +4672,9 @@ class BoxmanManager:
         """
         for vm_name, workdir in cls.process_vm_list(cli_args):
             if cli_args.restore:
-                cls.provider.restore_vm(vm_name, workdir)
+                cls.session_for_vm(vm_name).restore_vm(vm_name, workdir)
             else:
-                cls.provider.start_vm(vm_name)
+                cls.session_for_vm(vm_name).start_vm(vm_name)
     ### end control vm functions ####
 
     ### task runner functions ####
@@ -5019,7 +5056,7 @@ class BoxmanManager:
                             f"no base_image for VM '{new_vm_name}': "
                             f"set base_image at the cluster or VM level"
                         )
-                    self.provider.clone_vm(
+                    self.session_for_vm(new_vm_name).clone_vm(
                         src_vm_name=src_vm_name,
                         new_vm_name=new_vm_name,
                         info=vm_info,
@@ -5317,9 +5354,13 @@ class BoxmanManager:
         dry_run = getattr(cli_args, 'dry_run', False)
         auto_accept = getattr(cli_args, 'yes', False)
 
-        # ensure provider config reflects runtime settings
-        if hasattr(cls.provider, 'update_provider_config_with_runtime'):
-            cls.provider.update_provider_config_with_runtime()
+        # ensure provider configs reflect runtime settings
+        # Phase 1 (#49): the update/diff flow below stays on the default
+        # session — it is deeply libvirt-shaped (VMStateDiffer, virsh
+        # edits) and only libvirt clusters can exist until Phase 3 (#51).
+        for _session in cls._get_sessions().values():
+            if hasattr(_session, 'update_provider_config_with_runtime'):
+                _session.update_provider_config_with_runtime()
 
         # --- categorize VMs ---
         expected_vms = set(cls._get_project_vm_names())
