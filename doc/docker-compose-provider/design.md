@@ -13,6 +13,7 @@ This document describes the design for adding docker-compose as a first-class pr
 5. [Volume Management](#volume-management)
 6. [Implementation Phases](#implementation-phases)
 7. [Breaking Changes & Versioning](#breaking-changes--versioning)
+8. [Decisions (Phase 0)](#decisions-phase-0)
 
 ---
 
@@ -230,7 +231,7 @@ shared_networks:
   app_bridge:
     bridge: br-app
     stp: false
-    disable_netfilter: true
+    disable_netfilter: false   # default — scoped per-bridge rules instead (decision D8)
 
 clusters:
   compute:
@@ -360,7 +361,7 @@ graph LR
 ```mermaid
 graph TB
     subgraph SharedNetworks["Shared Networks (L2)"]
-        SB1["br-app<br/>shared_bridges.py<br/>bridge-nf-call-iptables=0"]
+        SB1["br-app<br/>shared_bridges.py<br/>scoped physdev accept rules (D8)"]
     end
     
     subgraph LibvirtIsolation["Libvirt Cluster Networks"]
@@ -383,6 +384,25 @@ graph TB
     LN1 -.->|Isolated| VM
     DN1 -.->|Isolated| Container
 ```
+
+### Netfilter Policy (decision D8)
+
+`shared_bridges.ensure()` keeps the host-global `bridge-nf-call-iptables`
+**untouched** by default. Lab frames on a shared bridge are allowed by an
+idempotent per-bridge rule instead:
+
+```
+iptables -I FORWARD 1 -i <bridge> -o <bridge> -m physdev --physdev-is-bridged -j ACCEPT
+```
+
+(on docker hosts the `DOCKER-USER` chain is preferred if the spike confirms it
+works and persists across docker restarts). Rationale: the previous global
+`bridge-nf-call-iptables=0` weakens docker/k8s bridge filtering host-wide, is
+never restored, and a docker/kubelet restart silently reverts it — breaking
+the lab. `disable_netfilter: true` remains available as an explicit opt-in
+with a loud warning. Evidence: [spike/findings.md](spike/findings.md);
+implementation: Phase 4
+([#52](https://github.com/mherkazandjian/boxman/issues/52)).
 
 ---
 
@@ -599,23 +619,28 @@ def normalize_v2_config(config):
 
 ---
 
-## Open Questions
+## Decisions (Phase 0)
 
-1. **Container health checks**: Should boxman wait for container health checks before proceeding (like it waits for VM IPs)? Or just wait for `docker compose ps` to show `running`?
+Ratified on [#48](https://github.com/mherkazandjian/boxman/issues/48). See also
+[adr-001-per-cluster-provider.md](adr-001-per-cluster-provider.md) and
+[spike/findings.md](spike/findings.md). These supersede the former "Open
+Questions" section.
 
-2. **Container SSH**: Should boxman generate SSH config entries for containers (via `docker exec`), or only for VMs? The `boxman ssh` command would need a different code path for containers.
-
-3. **Snapshot semantics**: `docker commit` creates an image from a running container — this is different from libvirt's external snapshots with qcow2 overlays. Should we document the difference, or abstract it?
-
-4. **Build context**: When a box has `build: { context: ./api }`, the build context path is relative to the conf.yml directory. Should boxman resolve this, or pass it through to docker compose?
-
-5. **Compose file location**: Generated `docker-compose.yml` goes under `<cluster_workdir>/docker-compose.yml`. Should it also be written to `.boxman/` alongside the runtime assets?
+| # | Question | Decision |
+|---|---|---|
+| D1 | Container readiness | `docker compose up --wait` + per-cluster `readiness_timeout` (default 120s): waits for `healthy` when a healthcheck exists, `running` otherwise — no custom polling loop. |
+| D2 | Container access | `boxman ssh <cluster>.<box>` transparently uses `docker exec -it` — no sshd sidecars. Ansible reaches containers via the `community.docker` connection plugin. `write_ssh_config` stays VM-only. |
+| D3 | Snapshot semantics | `docker commit`-backed: `take` commits + tags `boxman/<project>_<box>:<snap>`; `restore` regenerates the compose file with snapshot tags + `up --force-recreate`; `list`/`delete` = image ls/rmi + metadata JSON in the cluster workdir. **Volumes are not snapshotted** — documented loudly. |
+| D4 | `build.context` | Resolved by boxman to an absolute path (relative to the conf.yml directory) at generation time — the generated compose file lives in the cluster workdir, so passing relative paths through would silently break. |
+| D5 | Compose file location | `<cluster_workdir>/docker-compose.yml` — inspectable and hand-runnable (`docker compose -f … ps`), same debuggability philosophy as the `.rendered.yml` dump. |
+| D6 | Provider granularity | Per-cluster only; per-box rejected ([ADR-001](adr-001-per-cluster-provider.md)). A box of another provider is a one-box cluster. |
+| D7 | Compose passthrough | `compose_extra:` escape hatch (per-box and per-cluster), deep-merged verbatim into the generated file — keeps the boxman dialect small without blocking on unsupported compose features. |
+| D8 | Netfilter | Shared bridges keep host-global `bridge-nf-call-iptables` untouched by default (`disable_netfilter` defaults to `false`); per-bridge scoped physdev accept rules allow lab frames. Global disable = explicit opt-in with loud warning. See [Netfilter Policy](#netfilter-policy-decision-d8). Implemented in Phase 4 ([#52](https://github.com/mherkazandjian/boxman/issues/52)). |
 
 ---
 
 ## Next Steps
 
-1. Review this design document with the team
-2. Validate the architecture diagrams
-3. Create example conf.yml for acceptance testing
-4. Begin Phase 1 implementation (Provider Registry)
+1. Run the netfilter spike ([spike/poc.sh](spike/poc.sh)) on a docker lab host and record [spike/findings.md](spike/findings.md)
+2. Merge this design (PR → `main`), closing Phase 0 ([#48](https://github.com/mherkazandjian/boxman/issues/48))
+3. Begin Phase 1 — provider registry ([#49](https://github.com/mherkazandjian/boxman/issues/49)); full phase map in [implementation-plan.md](implementation-plan.md)
