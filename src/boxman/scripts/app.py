@@ -295,6 +295,11 @@ def main():
     try:
         _main()
     except ConfigError as exc:
+        # A viewer command (e.g. ``snapshot log``) raises the boxman logger
+        # to CRITICAL+1 to silence INFO spam before the config is loaded; if
+        # loading then fails, restore a level that lets this error through so
+        # it is not swallowed (exit 2 with empty output).
+        logging.getLogger('boxman').setLevel(logging.ERROR)
         log.error(str(exc))
         sys.exit(2)
 

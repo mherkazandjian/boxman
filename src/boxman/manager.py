@@ -20,7 +20,7 @@ from boxman.config_cache import BoxmanCache
 from boxman.exceptions import ConfigError
 from boxman.image_cache import ImageCache
 from boxman.netlab import ContainerlabManager, shared_bridges
-from boxman.providers import primary_provider_type
+from boxman.providers import PROVIDERS, primary_provider_type
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.runtime import RuntimeBase, create_runtime
 from boxman.task_runner import TaskRunner
@@ -446,15 +446,25 @@ class BoxmanManager:
         Dispatch on the config's ``version:`` key and return the config in
         boxman's internal (v1.0) shape.
 
-        - No ``version:`` key or ``'1.0'`` → returned unchanged (v1.0 is
-          supported indefinitely and stays byte-identical).
-        - ``'2.0'`` → :meth:`normalize_v2_config` (per-cluster
-          ``boxes:``→``vms:`` for libvirt clusters, schema validation).
+        - No ``version:`` key, ``'1.0'`` (or the unquoted YAML numeric
+          ``1`` / ``1.0``) → returned unchanged (v1.0 is supported
+          indefinitely and stays byte-identical).
+        - ``'2.0'`` (or unquoted ``2`` / ``2.0``) → :meth:`normalize_v2_config`
+          (per-cluster ``boxes:``→``vms:`` for libvirt clusters, schema
+          validation).
         - anything else → :class:`~boxman.exceptions.ConfigError`.
 
+        The value is compared as a string so unquoted YAML numerics work:
+        ``version: 2`` and ``version: 2.0`` both select v2.0. Quoting
+        (``version: '2.0'``) is still recommended — see
+        ``doc/docker-compose-provider/config-schema.md``.
+
         Args:
-            conf: The parsed project configuration (may be ``None`` for an
-                empty file).
+            conf: The parsed project configuration. A non-mapping root
+                (``None``, list, scalar — e.g. an empty file) is returned
+                unchanged rather than raising, so malformed input surfaces
+                later through the normal path, not as an ``AttributeError``
+                here.
 
         Returns:
             The version-normalized configuration.
@@ -462,14 +472,14 @@ class BoxmanManager:
         Raises:
             ConfigError: If ``version:`` is set to an unsupported value.
         """
-        if not conf:
+        if not isinstance(conf, dict):
             return conf
 
-        version = str(conf.get('version', '1.0'))
-        if version == '1.0':
+        version = str(conf.get('version', '1.0')).strip()
+        if version in ('1', '1.0'):
             self._warn_on_v1_boxes(conf)
             return conf
-        if version == '2.0':
+        if version in ('2', '2.0'):
             return self.normalize_v2_config(conf)
 
         raise ConfigError(
@@ -481,18 +491,20 @@ class BoxmanManager:
         """
         Warn when a v1.0 config uses the v2.0-only ``boxes:`` key.
 
-        In v1.0 nothing reads ``boxes:``, so such a cluster would silently
-        appear to have no VMs. This is a log-only nudge toward
-        ``version: '2.0'`` — it does not change v1.0 provisioning
-        behaviour.
+        In v1.0 nothing reads ``boxes:``, so such boxes are silently
+        ignored — including in a partial migration where a cluster carries
+        both ``vms:`` (provisioned) and ``boxes:`` (dropped). The warning
+        fires whenever ``boxes:`` is present, regardless of ``vms:``. It is
+        a log-only nudge toward ``version: '2.0'`` and does not change v1.0
+        provisioning behaviour.
         """
         for cluster_name, cluster in (conf.get('clusters') or {}).items():
-            if isinstance(cluster, dict) and 'boxes' in cluster and 'vms' not in cluster:
+            if isinstance(cluster, dict) and 'boxes' in cluster:
                 self.logger.warning(
                     f"cluster '{cluster_name}' uses 'boxes:' but the config "
                     f"is v1.0 — 'boxes:' is only recognised under "
-                    f"version: '2.0'. Add \"version: '2.0'\" or rename "
-                    f"'boxes:' to 'vms:'."
+                    f"version: '2.0', so these boxes are ignored. Add "
+                    f"\"version: '2.0'\" or rename 'boxes:' to 'vms:'."
                 )
 
     def normalize_v2_config(self, conf: dict[str, Any]) -> dict[str, Any]:
@@ -510,8 +522,20 @@ class BoxmanManager:
           both ``boxes:`` and ``vms:`` is ambiguous and rejected.
         - **docker-compose** clusters: ``boxes:`` is kept as-is (consumed
           by the Phase 3 ``DockerComposeSession``); ``vms:`` is rejected.
+        - any **other** provider (the legacy ``virtualbox``, or an unknown
+          value / typo) is rejected — v2.0 supports only ``libvirt`` and
+          ``docker-compose`` today, and silently leaving ``boxes:``
+          untouched would provision an empty cluster.
 
-        The config is mutated in place and also returned.
+        A per-box ``provider:`` key is a config error (ADR-001): providers
+        are declared at the cluster level only.
+
+        The config is **mutated in place** and also returned; it is meant
+        to run once over a freshly parsed config (``load_config`` re-parses
+        each call). Re-running over an already-normalized dict — whose
+        ``boxes:`` were popped but whose ``version:`` stays ``'2.0'`` —
+        would treat the renamed ``vms:`` as a legacy key and emit a
+        spurious deprecation warning.
 
         Args:
             conf: The parsed v2.0 project configuration.
@@ -520,7 +544,8 @@ class BoxmanManager:
             The normalized configuration (same object).
 
         Raises:
-            ConfigError: On an ambiguous or provider-incompatible cluster.
+            ConfigError: On an ambiguous, provider-incompatible, or
+                unknown-provider cluster, or a per-box ``provider:``.
         """
         for cluster_name, cluster in (conf.get('clusters') or {}).items():
             if not isinstance(cluster, dict):
@@ -529,6 +554,11 @@ class BoxmanManager:
             provider = cluster.get('provider') or primary_provider_type(conf)
             has_boxes = 'boxes' in cluster
             has_vms = 'vms' in cluster
+
+            # ADR-001: a `provider:` on an individual box is a config error;
+            # inspect both the boxes: mapping and the legacy vms: mapping.
+            self._reject_per_box_provider(cluster_name, cluster.get('boxes'))
+            self._reject_per_box_provider(cluster_name, cluster.get('vms'))
 
             if provider == 'libvirt':
                 if has_boxes and has_vms:
@@ -547,12 +577,43 @@ class BoxmanManager:
             elif provider == 'docker-compose':
                 if has_vms:
                     raise ConfigError(
-                        f"cluster '{cluster_name}' is a docker-compose "
-                        f"cluster and must use 'boxes:', not 'vms:'."
+                        f"cluster '{cluster_name}' declares 'vms:'; "
+                        f"docker-compose clusters only support 'boxes:'."
                     )
                 # 'boxes:' is kept verbatim for the docker-compose provider.
+            elif provider in PROVIDERS:
+                # a registered provider not yet wired for v2.0 (virtualbox)
+                raise ConfigError(
+                    f"cluster '{cluster_name}': provider '{provider}' is "
+                    f"not supported under config version '2.0' yet — use "
+                    f"version: '1.0' with 'vms:' for '{provider}' clusters."
+                )
+            else:
+                raise ConfigError(
+                    f"cluster '{cluster_name}': unknown provider "
+                    f"'{provider}' (known: {', '.join(sorted(PROVIDERS))})."
+                )
 
         return conf
+
+    @staticmethod
+    def _reject_per_box_provider(cluster_name: str, boxes: Any) -> None:
+        """
+        Raise if any box in *boxes* declares a ``provider:`` key.
+
+        ADR-001 assigns per-box-provider validation to Phase 2: a provider
+        is a cluster-level concern, so a ``provider:`` inside an individual
+        box (which ``provider_type_for_cluster`` would silently ignore) is
+        rejected rather than accepted and dropped.
+        """
+        for box_name, box in (boxes or {}).items():
+            if isinstance(box, dict) and 'provider' in box:
+                raise ConfigError(
+                    f"box '{box_name}' in cluster '{cluster_name}' declares "
+                    f"a 'provider:' key — per-box providers are not "
+                    f"supported (ADR-001); declare 'provider:' on the "
+                    f"cluster instead."
+                )
 
     @staticmethod
     def _render_inventory(host_aliases, cluster_groups) -> str:
