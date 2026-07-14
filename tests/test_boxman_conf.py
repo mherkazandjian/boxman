@@ -2,6 +2,7 @@
 Test that --boxman-conf overrides the default ~/.config/boxman/boxman.yml.
 """
 
+import logging
 import os
 import tempfile
 import yaml
@@ -10,6 +11,7 @@ import shutil as _shutil
 
 from boxman.scripts.app import load_boxman_config
 from boxman.manager import BoxmanManager
+from boxman.exceptions import ConfigError
 
 
 class TestBoxmanConfOverride:
@@ -823,3 +825,186 @@ class TestNormalizeOwnership:
         assert "sudo rm -rf" in msg
         assert str(tmp_path) in msg
         assert "password is required" in msg
+
+
+class TestConfigSchemaV2:
+    """
+    Config schema versioning — Phase 2 of the docker-compose provider epic
+    (https://github.com/mherkazandjian/boxman/issues/50).
+
+    ``BoxmanManager.load_config`` dispatches on the top-level ``version:``
+    key and normalizes v2.0 configs into the internal (v1.0) shape:
+    libvirt clusters get ``boxes:`` renamed to ``vms:``; docker-compose
+    clusters keep ``boxes:``; unsupported versions / ambiguous clusters
+    raise :class:`ConfigError`. v1.0 stays byte-identical.
+    """
+
+    @staticmethod
+    def _mgr():
+        return BoxmanManager()
+
+    @staticmethod
+    def _cfg(version=None, top_provider='libvirt', cluster=None):
+        cfg = {'project': 'p', 'clusters': {'c': cluster or {}}}
+        if version is not None:
+            cfg['version'] = version
+        if top_provider is not None:
+            cfg['provider'] = {top_provider: {}}
+        return cfg
+
+    # --- v1.0: unchanged --------------------------------------------------
+
+    def test_v1_no_version_key_returns_unchanged(self):
+        cfg = self._cfg(cluster={'vms': {'v1': {'hostname': 'v1'}}})
+        out = self._mgr()._apply_config_version(cfg)
+        assert out is cfg
+        assert out['clusters']['c'] == {'vms': {'v1': {'hostname': 'v1'}}}
+
+    def test_v1_explicit_version_returns_unchanged(self):
+        cfg = self._cfg(version='1.0', cluster={'vms': {'v1': {}}})
+        out = self._mgr()._apply_config_version(cfg)
+        assert 'vms' in out['clusters']['c']
+        assert 'boxes' not in out['clusters']['c']
+
+    def test_v1_boxes_key_warns(self, captured_logs):
+        cfg = self._cfg(version='1.0', cluster={'boxes': {'b1': {}}})
+        with captured_logs.at_level(logging.WARNING, logger='boxman'):
+            self._mgr()._apply_config_version(cfg)
+        assert any(
+            "boxes" in r.message and "2.0" in r.message
+            for r in captured_logs.records
+        )
+
+    def test_empty_config_is_tolerated(self):
+        assert self._mgr()._apply_config_version(None) is None
+        assert self._mgr()._apply_config_version({}) == {}
+
+    # --- v2.0 libvirt: boxes -> vms --------------------------------------
+
+    def test_v2_libvirt_boxes_renamed_to_vms(self):
+        cfg = self._cfg(version='2.0', top_provider='libvirt',
+                        cluster={'boxes': {'node01': {'hostname': 'node01'}}})
+        out = self._mgr().normalize_v2_config(cfg)
+        assert out['clusters']['c']['vms'] == {'node01': {'hostname': 'node01'}}
+        assert 'boxes' not in out['clusters']['c']
+
+    def test_v2_libvirt_only_equals_v1_shape(self):
+        """AC: a v2.0 libvirt-only config normalizes to the exact internal
+        shape of its v1.0 equivalent."""
+        v2 = self._cfg(version='2.0', cluster={'boxes': {'n': {'memory': 2048}}})
+        v1 = self._cfg(version='1.0', cluster={'vms': {'n': {'memory': 2048}}})
+        out2 = self._mgr()._apply_config_version(v2)
+        out1 = self._mgr()._apply_config_version(v1)
+        assert out2['clusters'] == out1['clusters']
+
+    def test_v2_libvirt_vms_accepted_with_warning(self, captured_logs):
+        cfg = self._cfg(version='2.0', top_provider='libvirt',
+                        cluster={'vms': {'n': {}}})
+        with captured_logs.at_level(logging.WARNING, logger='boxman'):
+            out = self._mgr()._apply_config_version(cfg)
+        assert out['clusters']['c']['vms'] == {'n': {}}
+        assert any(
+            "legacy 'vms:'" in r.message or "vms:" in r.message
+            for r in captured_logs.records if r.levelno >= logging.WARNING
+        )
+
+    def test_v2_libvirt_boxes_and_vms_is_error(self):
+        cfg = self._cfg(version='2.0', top_provider='libvirt',
+                        cluster={'boxes': {}, 'vms': {}})
+        with pytest.raises(ConfigError, match=r"both 'boxes:' and 'vms:'"):
+            self._mgr()._apply_config_version(cfg)
+
+    # --- v2.0 docker-compose: boxes kept ---------------------------------
+
+    def test_v2_docker_compose_keeps_boxes(self):
+        cfg = self._cfg(version='2.0', top_provider='docker-compose',
+                        cluster={'provider': 'docker-compose',
+                                 'boxes': {'web': {'image': 'nginx'}}})
+        out = self._mgr().normalize_v2_config(cfg)
+        assert out['clusters']['c']['boxes'] == {'web': {'image': 'nginx'}}
+        assert 'vms' not in out['clusters']['c']
+
+    def test_v2_docker_compose_vms_is_error(self):
+        cfg = self._cfg(version='2.0', top_provider='docker-compose',
+                        cluster={'provider': 'docker-compose', 'vms': {}})
+        with pytest.raises(ConfigError, match=r"must use 'boxes:', not 'vms:'"):
+            self._mgr()._apply_config_version(cfg)
+
+    # --- per-cluster provider defaulting to the top-level primary --------
+
+    def test_v2_cluster_without_provider_uses_libvirt_primary(self):
+        """Top-level primary is libvirt → an un-annotated cluster is
+        libvirt → boxes renamed to vms."""
+        cfg = self._cfg(version='2.0', top_provider='libvirt',
+                        cluster={'boxes': {'n': {}}})
+        out = self._mgr().normalize_v2_config(cfg)
+        assert 'vms' in out['clusters']['c']
+
+    def test_v2_cluster_without_provider_uses_dc_primary(self):
+        """Top-level primary is docker-compose → an un-annotated cluster is
+        docker-compose → boxes kept as-is."""
+        cfg = self._cfg(version='2.0', top_provider='docker-compose',
+                        cluster={'boxes': {'web': {}}})
+        out = self._mgr().normalize_v2_config(cfg)
+        assert 'boxes' in out['clusters']['c']
+        assert 'vms' not in out['clusters']['c']
+
+    # --- unsupported version ---------------------------------------------
+
+    def test_unsupported_version_raises(self):
+        cfg = self._cfg(version='3.0', cluster={'vms': {}})
+        with pytest.raises(ConfigError, match=r"unsupported config version: '3.0'"):
+            self._mgr()._apply_config_version(cfg)
+
+    def test_unsupported_version_lists_supported(self):
+        cfg = self._cfg(version='banana', cluster={})
+        with pytest.raises(ConfigError, match=r"'1.0', '2.0'"):
+            self._mgr()._apply_config_version(cfg)
+
+    # --- end-to-end through load_config ----------------------------------
+
+    def test_load_config_normalizes_v2_and_writes_rendered(self, tmp_path):
+        conf = {
+            'version': '2.0',
+            'project': 'e2e',
+            'provider': {'libvirt': {'uri': 'qemu:///system'}},
+            'clusters': {'compute': {'boxes': {'node01': {'hostname': 'node01'}}}},
+        }
+        path = tmp_path / 'conf.yml'
+        path.write_text(yaml.dump(conf))
+
+        mgr = BoxmanManager()
+        loaded = mgr.load_config(str(path))
+
+        # v2.0 boxes: normalized to internal vms:
+        assert loaded['clusters']['compute']['vms'] == {'node01': {'hostname': 'node01'}}
+        assert 'boxes' not in loaded['clusters']['compute']
+        # AC: the .rendered.yml debug dump is still written
+        assert (tmp_path / 'conf.rendered.yml').exists()
+
+    def test_load_config_dollar_var_survives_preprocessing(self, tmp_path):
+        """A docker-compose ``${VAR}`` interpolation must survive the bare
+        ``{{ name }}`` -> ``{name}`` task-placeholder preprocessing."""
+        conf = {
+            'version': '2.0',
+            'project': 'compose_env',
+            'provider': {'docker-compose': {}},
+            'clusters': {
+                'services': {
+                    'provider': 'docker-compose',
+                    'boxes': {
+                        'web': {
+                            'image': 'nginx',
+                            'environment': ['DB_HOST=${DB_HOST}', 'ESC=$${LITERAL}'],
+                        }
+                    },
+                }
+            },
+        }
+        path = tmp_path / 'conf.yml'
+        path.write_text(yaml.dump(conf))
+
+        loaded = BoxmanManager().load_config(str(path))
+        env = loaded['clusters']['services']['boxes']['web']['environment']
+        assert 'DB_HOST=${DB_HOST}' in env
+        assert 'ESC=$${LITERAL}' in env

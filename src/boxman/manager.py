@@ -17,6 +17,7 @@ from boxman.utils.shell import run
 from boxman import log
 from boxman.abstract.providers import ProviderSession
 from boxman.config_cache import BoxmanCache
+from boxman.exceptions import ConfigError
 from boxman.image_cache import ImageCache
 from boxman.netlab import ContainerlabManager, shared_bridges
 from boxman.providers import primary_provider_type
@@ -432,6 +433,124 @@ class BoxmanManager:
         with open(rendered_path, 'w') as fobj:
             fobj.write(rendered_yaml)
             self.logger.info(f"rendered YAML template written to {rendered_path}")
+
+        # apply schema-version handling (v2.0 boxes:→vms: normalization etc.)
+        # before returning, so every downstream consumer sees the internal
+        # (v1.0-shaped) config regardless of the on-disk schema version.
+        conf = self._apply_config_version(conf)
+
+        return conf
+
+    def _apply_config_version(self, conf: dict[str, Any] | None) -> dict[str, Any] | None:
+        """
+        Dispatch on the config's ``version:`` key and return the config in
+        boxman's internal (v1.0) shape.
+
+        - No ``version:`` key or ``'1.0'`` → returned unchanged (v1.0 is
+          supported indefinitely and stays byte-identical).
+        - ``'2.0'`` → :meth:`normalize_v2_config` (per-cluster
+          ``boxes:``→``vms:`` for libvirt clusters, schema validation).
+        - anything else → :class:`~boxman.exceptions.ConfigError`.
+
+        Args:
+            conf: The parsed project configuration (may be ``None`` for an
+                empty file).
+
+        Returns:
+            The version-normalized configuration.
+
+        Raises:
+            ConfigError: If ``version:`` is set to an unsupported value.
+        """
+        if not conf:
+            return conf
+
+        version = str(conf.get('version', '1.0'))
+        if version == '1.0':
+            self._warn_on_v1_boxes(conf)
+            return conf
+        if version == '2.0':
+            return self.normalize_v2_config(conf)
+
+        raise ConfigError(
+            f"unsupported config version: '{version}' "
+            f"(supported: '1.0', '2.0')"
+        )
+
+    def _warn_on_v1_boxes(self, conf: dict[str, Any]) -> None:
+        """
+        Warn when a v1.0 config uses the v2.0-only ``boxes:`` key.
+
+        In v1.0 nothing reads ``boxes:``, so such a cluster would silently
+        appear to have no VMs. This is a log-only nudge toward
+        ``version: '2.0'`` — it does not change v1.0 provisioning
+        behaviour.
+        """
+        for cluster_name, cluster in (conf.get('clusters') or {}).items():
+            if isinstance(cluster, dict) and 'boxes' in cluster and 'vms' not in cluster:
+                self.logger.warning(
+                    f"cluster '{cluster_name}' uses 'boxes:' but the config "
+                    f"is v1.0 — 'boxes:' is only recognised under "
+                    f"version: '2.0'. Add \"version: '2.0'\" or rename "
+                    f"'boxes:' to 'vms:'."
+                )
+
+    def normalize_v2_config(self, conf: dict[str, Any]) -> dict[str, Any]:
+        """
+        Normalize a v2.0 config into boxman's internal (v1.0) shape.
+
+        For each cluster the effective provider is
+        ``cluster.get('provider') or primary_provider_type(conf)`` (the
+        same resolution :meth:`provider_type_for_cluster` uses). Then, per
+        the design compatibility matrix:
+
+        - **libvirt** clusters: ``boxes:`` is renamed to ``vms:`` so the
+          ~35 existing libvirt call sites are untouched; a cluster still
+          using ``vms:`` is accepted with a deprecation warning; declaring
+          both ``boxes:`` and ``vms:`` is ambiguous and rejected.
+        - **docker-compose** clusters: ``boxes:`` is kept as-is (consumed
+          by the Phase 3 ``DockerComposeSession``); ``vms:`` is rejected.
+
+        The config is mutated in place and also returned.
+
+        Args:
+            conf: The parsed v2.0 project configuration.
+
+        Returns:
+            The normalized configuration (same object).
+
+        Raises:
+            ConfigError: On an ambiguous or provider-incompatible cluster.
+        """
+        for cluster_name, cluster in (conf.get('clusters') or {}).items():
+            if not isinstance(cluster, dict):
+                continue
+
+            provider = cluster.get('provider') or primary_provider_type(conf)
+            has_boxes = 'boxes' in cluster
+            has_vms = 'vms' in cluster
+
+            if provider == 'libvirt':
+                if has_boxes and has_vms:
+                    raise ConfigError(
+                        f"cluster '{cluster_name}' declares both 'boxes:' "
+                        f"and 'vms:' — use one (prefer 'boxes:' in v2.0)."
+                    )
+                if has_boxes:
+                    cluster['vms'] = cluster.pop('boxes')
+                elif has_vms:
+                    self.logger.warning(
+                        f"cluster '{cluster_name}' uses the legacy 'vms:' "
+                        f"key under version: '2.0' — 'boxes:' is the "
+                        f"preferred generic key. 'vms:' remains accepted."
+                    )
+            elif provider == 'docker-compose':
+                if has_vms:
+                    raise ConfigError(
+                        f"cluster '{cluster_name}' is a docker-compose "
+                        f"cluster and must use 'boxes:', not 'vms:'."
+                    )
+                # 'boxes:' is kept verbatim for the docker-compose provider.
 
         return conf
 
