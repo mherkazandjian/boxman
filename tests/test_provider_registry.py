@@ -160,3 +160,112 @@ class TestPerClusterResolution:
             'bprj__proj__bprj_cluster_a_vm2': 'cluster_a',
             'bprj__proj__bprj_cluster_b_vm1': 'cluster_b',
         }
+
+    def test_vm_cluster_map_empty_without_project(self):
+        """import-image-style slice configs lack ``project``; the map is
+        empty so callers fall back to the default session (not KeyError)."""
+        manager = self._manager({
+            'provider': {'libvirt': {}},
+            'clusters': {'c': {'vms': {'v': {}}}},
+        })
+        assert manager._vm_cluster_map() == {}
+
+    def test_vm_cluster_map_empty_when_config_none(self):
+        manager = BoxmanManager()  # config is None
+        assert manager._vm_cluster_map() == {}
+
+    def test_first_registered_stays_default_when_second_type_registers(self):
+        """A single-registration test can't tell first-wins from last-wins;
+        register two *different* types and pin that the first stays default."""
+        manager = self._manager({'provider': {'libvirt': {}}, 'clusters': {}})
+        first, second = object(), object()
+        manager.register_session('libvirt', first)
+        manager.register_session('virtualbox', second)
+        assert manager.provider is first
+        assert manager._get_sessions()['virtualbox'] is second
+
+    def test_direct_provider_poke_resolves_through_threaded_flows(self):
+        """Call sites/tests that assign ``_provider`` directly (bypassing
+        the setter — the ``test_manager_core`` pattern) must still resolve
+        the same session through ``session_for_cluster``/``session_for_vm``;
+        otherwise the shim's keep-listed and threaded halves diverge."""
+        manager = self._manager({
+            'project': 'proj',
+            'provider': {'libvirt': {}},
+            'clusters': {'cluster_a': {'vms': {'vm1': {}}}},
+        })
+        mock = object()
+        manager._provider = mock  # direct poke, no register_session/setter
+        assert manager.session_for_cluster('cluster_a') is mock
+        assert manager.session_for_vm('bprj__proj__bprj_cluster_a_vm1') is mock
+
+    def test_provider_poke_does_not_mask_missing_nonprimary_session(self):
+        """The ``_provider`` fallback is scoped to the *primary* type; a
+        cluster with a non-primary provider override and no registered
+        session still fails with the friendly per-cluster error."""
+        manager = self._manager({
+            'project': 'proj',
+            'provider': {'libvirt': {}},
+            'clusters': {
+                'services': {'provider': 'docker-compose', 'vms': {'c1': {}}},
+            },
+        })
+        manager._provider = object()
+        with pytest.raises(ValueError, match=r"'docker-compose'.*'services'"):
+            manager.session_for_cluster('services')
+
+    def test_setter_is_new_safe(self):
+        """A ``__new__``-built manager (no ``__init__``, so no ``config``)
+        can still take a direct ``provider`` assignment — the setter must
+        not dereference a missing ``config``."""
+        manager = BoxmanManager.__new__(BoxmanManager)
+        sentinel = object()
+        manager.provider = sentinel
+        assert manager.provider is sentinel
+        assert manager._get_sessions()['libvirt'] is sentinel
+
+
+class TestSessionForVm:
+    """``session_for_vm`` is the highest-traffic new resolver (~12 threaded
+    call sites route through it); pin both the map-hit and the
+    not-in-config fallback that the removed-VM flows rely on."""
+
+    @staticmethod
+    def _manager(config):
+        manager = BoxmanManager()
+        manager.config = config
+        return manager
+
+    def test_maps_full_name_to_its_cluster_session(self):
+        manager = self._manager({
+            'project': 'proj',
+            'provider': {'libvirt': {}},
+            'clusters': {'cluster_a': {'vms': {'vm1': {}}}},
+        })
+        session = object()
+        manager.register_session('libvirt', session)
+        assert manager.session_for_vm('bprj__proj__bprj_cluster_a_vm1') is session
+
+    def test_unknown_name_falls_back_to_default_session(self):
+        """VMs no longer in the config (e.g. removed then destroyed) are not
+        in the cluster map and resolve to the default session."""
+        manager = self._manager({
+            'project': 'proj',
+            'provider': {'libvirt': {}},
+            'clusters': {'cluster_a': {'vms': {'vm1': {}}}},
+        })
+        default = object()
+        manager.register_session('libvirt', default)
+        assert manager.session_for_vm('bprj__proj__bprj_cluster_a_ghost') is default
+
+    def test_underivable_config_returns_default_without_raising(self):
+        """A provider-slice config (import-image) has no ``project`` — the
+        fallback must be reached instead of raising ``KeyError``."""
+        manager = self._manager({'uri': 'qemu:///system'})
+        default = object()
+        manager.provider = default
+        assert manager.session_for_vm('bprj__x__bprj_c_v') is default
+
+    def test_none_config_returns_default_without_raising(self):
+        manager = BoxmanManager()  # config is None, no default registered
+        assert manager.session_for_vm('bprj__x__bprj_c_v') is None

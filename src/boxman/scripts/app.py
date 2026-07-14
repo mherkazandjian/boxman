@@ -511,6 +511,14 @@ def main():
             provider_types = (
                 list(manager.config.get('provider', {}).keys()) or [provider_type]
             )
+            # Also cover any cluster-level ``provider:`` override so a mixed
+            # config fails fast with the friendly registry error (exit 2)
+            # instead of a mid-provision traceback when a cluster resolves
+            # to a provider no session was built for.
+            for _cluster_name in (manager.config.get('clusters') or {}):
+                _cluster_type = manager.provider_type_for_cluster(_cluster_name)
+                if _cluster_type not in provider_types:
+                    provider_types.append(_cluster_type)
 
         for _ptype in provider_types:
             if _ptype == 'libvirt':
@@ -518,16 +526,24 @@ def main():
                 provider_conf_with_runtime = manager.get_provider_config_with_runtime(
                     boxman_config.get('providers', {}).get(_ptype, {})
                 )
-                # enrich the project config with runtime-aware provider settings
-                # App-level (boxman.yml) settings serve as DEFAULTS;
-                # project-level (conf.yml) settings always take precedence.
+                # Enrich the project config with runtime-aware provider
+                # settings. App-level (boxman.yml) settings serve as
+                # DEFAULTS; project-level (conf.yml) settings always take
+                # precedence. The libvirt block is built unconditionally so
+                # a project without a ``provider:`` section (now defaulted
+                # to libvirt by primary_provider_type) still inherits the
+                # runtime URI/sudo defaults instead of silently falling back
+                # to a local qemu:///system.
                 enriched_config = manager.config.copy()
-                if 'provider' in enriched_config and _ptype in enriched_config['provider']:
-                    project_provider = enriched_config['provider'][_ptype].copy()
-                    # Start from app-level defaults, then overlay project-level on top
-                    merged_provider = provider_conf_with_runtime.copy()
-                    merged_provider.update(project_provider)
-                    enriched_config['provider'][_ptype] = merged_provider
+                existing_provider = enriched_config.get('provider') or {}
+                project_provider = (existing_provider.get(_ptype) or {}).copy()
+                # Start from app-level defaults, then overlay project-level on top
+                merged_provider = provider_conf_with_runtime.copy()
+                merged_provider.update(project_provider)
+                enriched_config['provider'] = {
+                    **existing_provider,
+                    _ptype: merged_provider,
+                }
                 session_config = enriched_config
             else:
                 session_config = manager.config

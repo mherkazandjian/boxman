@@ -50,7 +50,15 @@ class BoxmanManager:
         #: Dict[str, ProviderSession]: live sessions keyed by provider
         #: type ('libvirt', 'virtualbox', …); populated by
         #: :meth:`register_session` and consumed by
-        #: :meth:`session_for_cluster`
+        #: :meth:`session_for_cluster`.
+        #:
+        #: .. note:: Keying by provider *type* is correct for Phase 1:
+        #:    a libvirt host has one connection, so two libvirt clusters
+        #:    share one session. The per-cluster session model ADR-001
+        #:    needs (one docker-compose *project* per cluster) re-keys
+        #:    this map by cluster in Phase 3 (#51); the
+        #:    :meth:`session_for_cluster` / :meth:`session_for_vm` seam
+        #:    keeps every call site unchanged when that lands.
         self._sessions: dict[str, ProviderSession] = {}
 
         #: the logger instance
@@ -116,7 +124,11 @@ class BoxmanManager:
         """
         self._provider = value
         if value is not None:
-            self._get_sessions()[primary_provider_type(self.config)] = value
+            # ``getattr`` keeps the setter safe on ``__new__``-built
+            # managers (used in tests), which have no ``config`` yet.
+            self._get_sessions()[
+                primary_provider_type(getattr(self, 'config', None))
+            ] = value
 
     def _get_sessions(self) -> dict[str, "ProviderSession"]:
         """
@@ -181,14 +193,22 @@ class BoxmanManager:
         """
         provider_type = self.provider_type_for_cluster(cluster_name)
         session = self._get_sessions().get(provider_type)
-        if session is None:
-            raise ValueError(
-                f"no provider session registered for provider "
-                f"'{provider_type}' (needed by cluster '{cluster_name}')"
-            )
-        return session
+        if session is not None:
+            return session
+        # Compat parity: when nothing is registered for the project's
+        # *primary* type but a default session was assigned directly
+        # (older tests / call sites poke ``_provider`` without going
+        # through :meth:`register_session`), resolve to it — exactly
+        # what the old single ``self.provider`` did for every flow.
+        default = getattr(self, '_provider', None)
+        if default is not None and provider_type == primary_provider_type(self.config):
+            return default
+        raise ValueError(
+            f"no provider session registered for provider "
+            f"'{provider_type}' (needed by cluster '{cluster_name}')"
+        )
 
-    def session_for_vm(self, full_vm_name: str) -> "ProviderSession":
+    def session_for_vm(self, full_vm_name: str) -> Optional["ProviderSession"]:
         """
         Resolve the provider session that manages *full_vm_name*.
 
@@ -202,7 +222,10 @@ class BoxmanManager:
 
         Returns:
             The provider session managing the VM's cluster, or the
-            default session when the name is not in the config.
+            default session when the name is not in the config. May be
+            ``None`` when the name is unknown and no default session has
+            been registered — the same NoneType behaviour the old
+            ``self.provider`` call sites had.
         """
         cluster_name = self._vm_cluster_map().get(full_vm_name)
         if cluster_name is None:
@@ -219,12 +242,18 @@ class BoxmanManager:
         loop) can resolve the owning cluster without parsing names.
 
         Returns:
-            Mapping of full VM name to cluster name.
+            Mapping of full VM name to cluster name. Empty when the
+            config is unset or has no ``project`` (e.g. the import-image
+            provider-slice config) so :meth:`session_for_vm` cleanly
+            falls back to the default session instead of raising.
         """
-        prj_name = f'bprj__{self.config["project"]}__bprj'
+        config = self.config or {}
+        if 'project' not in config:
+            return {}
+        prj_name = f'bprj__{config["project"]}__bprj'
         return {
             f"{prj_name}_{cluster_name}_{vm_name}": cluster_name
-            for cluster_name, cluster in ((self.config or {}).get('clusters') or {}).items()
+            for cluster_name, cluster in (config.get('clusters') or {}).items()
             for vm_name in (cluster.get('vms') or {}).keys()
         }
 
@@ -1121,7 +1150,7 @@ class BoxmanManager:
 
         Designed to be used with a Cobbler PXE provisioning server.
         """
-        session = cls.provider
+        session = cls.provider  # Phase 1 (#49): single-VM PXE flow stays on the default session until Phase 3
         vm_name = cli_args.vm
 
         cls.logger.info(f"setting boot order to [network, hd] for '{vm_name}'")
@@ -1881,7 +1910,7 @@ class BoxmanManager:
                 # fallback: try virsh list
                 try:
                     from boxman.providers.libvirt.commands import VirshCommand
-                    provider_type = list(self.config.get('provider', {}).keys())[0]
+                    provider_type = primary_provider_type(self.config)
                     provider_config = self.config.get('provider', {}).get(provider_type, {})
                     if self.app_config and 'providers' in self.app_config:
                         app_prov = self.app_config['providers'].get(provider_type, {})
@@ -3178,10 +3207,7 @@ class BoxmanManager:
 
         # Resolve provider config so VirshCommand uses the right
         # runtime / URI / sudo settings.
-        provider_type = (
-            list(self.config.get('provider', {}).keys())[0]
-            if 'provider' in self.config else 'libvirt'
-        )
+        provider_type = primary_provider_type(self.config)
         provider_config = self.config.get('provider', {}).get(provider_type, {})
         if self.app_config and 'providers' in self.app_config:
             app_prov = self.app_config['providers'].get(provider_type, {})
@@ -3210,10 +3236,7 @@ class BoxmanManager:
         project = self.config.get("project", "")
         prj_prefix = f"bprj__{project}__bprj_"
 
-        provider_type = (
-            list(self.config.get('provider', {}).keys())[0]
-            if 'provider' in self.config else 'libvirt'
-        )
+        provider_type = primary_provider_type(self.config)
         provider_config = self.config.get('provider', {}).get(provider_type, {})
         if self.app_config and 'providers' in self.app_config:
             app_prov = self.app_config['providers'].get(provider_type, {})
@@ -3248,10 +3271,7 @@ class BoxmanManager:
         if not expected:
             return {}
 
-        provider_type = (
-            list(self.config.get('provider', {}).keys())[0]
-            if 'provider' in self.config else 'libvirt'
-        )
+        provider_type = primary_provider_type(self.config)
         provider_config = self.config.get('provider', {}).get(provider_type, {})
         if self.app_config and 'providers' in self.app_config:
             app_prov = self.app_config['providers'].get(provider_type, {})
@@ -4432,7 +4452,7 @@ class BoxmanManager:
         """
         from boxman.providers.libvirt.storage import vm_disk_paths
 
-        storage = cls.provider.storage
+        storage = cls.provider.storage  # Phase 1 (#49): storage_df stays on the default session until Phase 3
         rows = []
         snap_mem_total_per_vm: dict[str, int] = {}
         for full_vm_name, workdir, vm_info in cls._storage_targets(cls, cli_args):
@@ -4491,7 +4511,7 @@ class BoxmanManager:
         Warns when a VM's disks lack ``discard='unmap'`` — fstrim will succeed
         but nothing will be returned to the host.
         """
-        storage = cls.provider.storage
+        storage = cls.provider.storage  # Phase 1 (#49): storage_trim stays on the default session until Phase 3
         for full_vm_name, _workdir, _vm_info in cls._storage_targets(cls, cli_args):
             if not storage.is_running(full_vm_name):
                 cls.logger.warning(
@@ -4577,7 +4597,7 @@ class BoxmanManager:
         no_shutdown = getattr(cli_args, 'no_shutdown', False)
         dry_run = getattr(cli_args, 'dry_run', False)
 
-        provider_config = cls.provider.provider_config
+        provider_config = cls.provider.provider_config  # Phase 1 (#49): storage_compact stays on the default session until Phase 3
         processes = [
             Process(
                 target=BoxmanManager._compact_one_vm,
@@ -4892,10 +4912,7 @@ class BoxmanManager:
             return
 
         # Query virsh for states
-        provider_type = (
-            list(cls.config.get("provider", {}).keys())[0]
-            if "provider" in cls.config else "libvirt"
-        )
+        provider_type = primary_provider_type(cls.config)
         provider_config = cls.config.get("provider", {}).get(provider_type, {})
         if cls.app_config and "providers" in cls.app_config:
             app_prov = cls.app_config["providers"].get(provider_type, {})
