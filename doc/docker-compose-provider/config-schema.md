@@ -1,0 +1,149 @@
+# Boxman configuration schema — versioning (v1.0 & v2.0)
+
+Boxman project configs (`conf.yml`) carry an optional top-level `version:`
+key. It selects how boxman interprets the rest of the file. **v1.0 is
+supported indefinitely and is unaffected by this document** — everything
+below is additive.
+
+This is the reference for the schema-version handling introduced in
+Phase 2 of the docker-compose provider epic
+([#50](https://github.com/mherkazandjian/boxman/issues/50)). It lives
+alongside [`design.md`](./design.md) (see *Configuration Schema v2.0* and
+*Breaking Changes & Versioning*).
+
+## Version detection
+
+`BoxmanManager.load_config` renders the Jinja template, parses the YAML,
+then calls `_apply_config_version(conf)` before returning — so **every
+downstream consumer sees the internal (v1.0-shaped) config**, regardless
+of the on-disk schema version.
+
+| `version:` value | Behaviour |
+|---|---|
+| absent | treated as **v1.0** — returned unchanged |
+| `'1.0'` (or unquoted `1` / `1.0`) | **v1.0** — returned unchanged |
+| `'2.0'` (or unquoted `2` / `2.0`) | **v2.0** — normalized (see below) |
+| anything else | `ConfigError: unsupported config version: '<x>' (supported: '1.0', '2.0')` → CLI logs it and exits 2 |
+
+The value is compared as a string, so unquoted YAML numerics are accepted
+(`version: 2` and `version: 2.0` both select v2.0). **Quoting is still
+recommended** — write `version: '2.0'` — to avoid surprises from YAML's
+numeric coercion (e.g. a future `version: 2.10` would parse as the float
+`2.1`).
+
+## What v2.0 adds
+
+1. **`boxes:` as the generic per-cluster key.** v1.0 uses `vms:`; v2.0
+   uses `boxes:` (a VM *or* a container is a "box"). For **libvirt**
+   clusters boxman renames `boxes:` → `vms:` at load time, so the entire
+   existing libvirt code path is untouched.
+2. **Per-cluster `provider:`.** Each cluster may declare its own
+   `provider:` (`libvirt` or `docker-compose`). It defaults to the
+   **top-level primary provider** (the first key under the top-level
+   `provider:` mapping). This key is already honoured by the Phase 1
+   provider registry (`provider_type_for_cluster`).
+
+A v2.0 config that uses only libvirt behaves **exactly** like its v1.0
+equivalent.
+
+## Normalization rules (compatibility matrix)
+
+For each cluster, the effective provider is
+`cluster.get('provider') or <top-level primary provider>`. Then:
+
+| cluster provider | `boxes:` | `vms:` | result |
+|---|:---:|:---:|---|
+| libvirt | ✓ | – | `boxes:` renamed to `vms:` |
+| libvirt | – | ✓ | accepted with a **deprecation warning** (prefer `boxes:`) |
+| libvirt | ✓ | ✓ | **`ConfigError`** — ambiguous, declare one |
+| docker-compose | ✓ | – | `boxes:` kept as-is (consumed by the Phase 3 `DockerComposeSession`) |
+| docker-compose | – | ✓ | **`ConfigError`** — docker-compose clusters must use `boxes:` |
+| `virtualbox` | any | any | **`ConfigError`** — not supported under v2.0 yet; use `version: '1.0'` + `vms:` |
+| unknown / typo | any | any | **`ConfigError`** — unknown provider (guards against silent empty clusters) |
+
+Only `libvirt` and `docker-compose` are wired for v2.0. The legacy
+`virtualbox` provider stays on v1.0 syntax for now, and an unknown value
+(e.g. a typo `libvrit`) is rejected rather than left to silently provision
+an empty cluster.
+
+A **per-box `provider:`** key is also rejected (`ConfigError`) — providers
+are a cluster-level concern (ADR-001), so `boxes: { web: { provider: … } }`
+is a config error, not a silently-ignored field.
+
+A v1.0 config that uses `boxes:` gets a one-line warning (nothing reads
+`boxes:` in v1.0, so those boxes are silently ignored — including in a
+partial migration that still has a sibling `vms:`) — provisioning behaviour
+is unchanged.
+
+### Not yet runnable: docker-compose / mixed configs
+
+A v2.0 config with a docker-compose cluster **parses and normalizes**, but
+is **not runnable until Phase 3** (`DockerComposeSession`). Running
+`boxman provision` / `up` on one exits **2** at session build with the
+friendly "docker-compose provider … lands in Phase 3 (#51)" message (the
+registry has no docker-compose session yet), rather than provisioning
+anything. Pure-libvirt v2.0 configs are fully runnable.
+
+### Why `boxman conf` still shows `boxes:`
+
+Normalization (`boxes:` → `vms:`) happens on the in-memory config **after**
+the `.rendered.yml` debug dump is written. `boxman conf` and `.rendered.yml`
+therefore intentionally show the **pre-normalization** shape — a fidelity
+view of what you wrote (`boxes:`), not boxman's internal `vms:` form. This
+is by design; the internal normalization is what the provisioning flows act
+on.
+
+## Templating caveat for compose values (`environment:`, `command:`)
+
+`load_config` pre-processes bare `{{ name }}` tokens into `{name}` task
+placeholders before Jinja render (see the comment block in
+`load_config`). This is a **whole-file** text substitution with no
+awareness of YAML structure, so it also touches docker-compose cluster
+blocks.
+
+Safe / unsafe forms inside a compose `environment:` or `command:` value:
+
+| Form | Matched by preprocessing? | Verdict |
+|---|---|---|
+| `${VAR}`, `$${VAR}` | no (`$`/braces differ) | **safe** — use these for compose-time interpolation |
+| `{{ env("VAR") }}`, `{{ a.b }}`, `{{ x \| y }}` | no (contains non-word chars) | **safe** — rendered by Jinja as usual |
+| `{{ word }}` (a single bare word) | **yes** → rewritten to `{word}` | **avoid** — becomes the literal string `{word}` |
+
+**Rule of thumb:** in docker-compose clusters, use `${VAR}` /
+`$${VAR}` for interpolation and never a bare single-word `{{ word }}`.
+(A structure-aware exemption for compose blocks is deferred to Phase 3,
+where these values are actually consumed.)
+
+## Examples
+
+v1.0 (unchanged, supported indefinitely):
+
+```yaml
+project: my_lab
+provider:
+  libvirt:
+    uri: qemu:///system
+clusters:
+  compute:
+    vms:
+      node01:
+        hostname: node01
+```
+
+v2.0, libvirt-only (behaves identically to the v1.0 above):
+
+```yaml
+version: '2.0'
+project: my_lab
+provider:
+  libvirt:
+    uri: qemu:///system
+clusters:
+  compute:
+    boxes:
+      node01:
+        hostname: node01
+```
+
+v2.0, mixed providers: see
+[`example-conf.yml`](./example-conf.yml).

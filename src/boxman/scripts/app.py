@@ -14,6 +14,7 @@ import yaml
 import boxman
 from boxman import log
 from boxman.abstract.providers import ProviderSession as Session
+from boxman.exceptions import ConfigError
 from boxman.manager import BoxmanManager
 from boxman.providers import create_session, primary_provider_type
 from boxman.providers.libvirt.import_image import ImageImporter
@@ -282,6 +283,28 @@ def load_boxman_config(path: str) -> dict:
 
 
 def main():
+    """
+    CLI entry point.
+
+    Thin wrapper that translates config-schema errors
+    (:class:`~boxman.exceptions.ConfigError`, e.g. an unsupported
+    ``version:`` or an invalid v2.0 cluster) into a clean ``log.error`` +
+    exit 2, instead of surfacing a traceback. All other flow (including
+    the ``sys.exit()`` calls throughout) lives in :func:`_main`.
+    """
+    try:
+        _main()
+    except ConfigError as exc:
+        # A viewer command (e.g. ``snapshot log``) raises the boxman logger
+        # to CRITICAL+1 to silence INFO spam before the config is loaded; if
+        # loading then fails, restore a level that lets this error through so
+        # it is not swallowed (exit 2 with empty output).
+        logging.getLogger('boxman').setLevel(logging.ERROR)
+        log.error(str(exc))
+        sys.exit(2)
+
+
+def _main():
 
     arg_parser = parse_args()
     args, remaining = arg_parser.parse_known_args()
