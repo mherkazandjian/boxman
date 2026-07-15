@@ -255,8 +255,10 @@ class BoxmanManager:
             if not self._is_compose_cluster(name)
         }
 
+    @property
     def _compose_clusters(self) -> dict[str, Any]:
-        """docker-compose clusters, in config order (empty for libvirt-only projects)."""
+        """docker-compose clusters, in config order (empty for libvirt-only
+        projects). A ``@property`` for symmetry with :attr:`_vm_clusters`."""
         return {
             name: cluster
             for name, cluster in (self.config.get('clusters') or {}).items()
@@ -507,6 +509,7 @@ class BoxmanManager:
 
         version = str(conf.get('version', '1.0')).strip()
         if version in ('1', '1.0'):
+            self._reject_v1_docker_compose(conf)
             self._warn_on_v1_boxes(conf)
             return conf
         if version in ('2', '2.0'):
@@ -516,6 +519,35 @@ class BoxmanManager:
             f"unsupported config version: '{version}' "
             f"(supported: '1.0', '2.0')"
         )
+
+    def _reject_v1_docker_compose(self, conf: dict[str, Any]) -> None:
+        """
+        Reject a v1.0 / versionless config that resolves any cluster to the
+        docker-compose provider.
+
+        The docker-compose provider consumes ``boxes:``, which v1.0 ignores
+        (see :meth:`_warn_on_v1_boxes`). Without this guard the cluster would
+        be picked up by ``_compose_clusters`` and provisioned into live
+        services *despite* the v1 nudge telling the user those boxes are
+        ignored — the warning and the behaviour would contradict. The
+        provider is new in this epic, so no legitimate v1 config uses it;
+        failing fast with a clear message is safe.
+
+        Raises:
+            ConfigError: If a cluster's effective provider (per-cluster
+                ``provider:`` or the primary provider) is ``docker-compose``.
+        """
+        for cluster_name, cluster in (conf.get('clusters') or {}).items():
+            if not isinstance(cluster, dict):
+                continue
+            provider = cluster.get('provider') or primary_provider_type(conf)
+            if provider == 'docker-compose':
+                raise ConfigError(
+                    f"cluster '{cluster_name}' uses the docker-compose "
+                    f"provider, which requires version: '2.0' (docker-compose "
+                    f"clusters consume 'boxes:', ignored under v1.0). Add "
+                    f"\"version: '2.0'\" to the config."
+                )
 
     def _warn_on_v1_boxes(self, conf: dict[str, Any]) -> None:
         """
@@ -2409,27 +2441,62 @@ class BoxmanManager:
 
     def provision_compose_clusters(self) -> None:
         """``docker compose up --wait`` every docker-compose cluster."""
-        for cluster_name, cluster in self._compose_clusters().items():
+        self._reject_compose_project_collisions()
+        for cluster_name, cluster in self._compose_clusters.items():
             self.session_for_cluster(cluster_name).up_cluster(cluster_name, cluster)
+
+    def _reject_compose_project_collisions(self) -> None:
+        """
+        Reject two docker-compose clusters whose sanitized ``docker compose``
+        project names collide (e.g. ``web.api`` and ``web_api`` both →
+        ``<base>_web_api``, or case-only differences).
+
+        Colliding clusters would share compose state; teardown runs
+        ``docker compose down --remove-orphans``, so tearing one down could
+        delete the sibling's containers. Fail fast at provision — before any
+        compose state exists — with an actionable message.
+
+        Raises:
+            ConfigError: If any two dc clusters map to the same project name.
+        """
+        seen: dict[str, str] = {}
+        for cluster_name in self._compose_clusters:
+            proj = self.session_for_cluster(cluster_name).compose_project_name(
+                cluster_name)
+            if proj in seen:
+                raise ConfigError(
+                    f"clusters '{seen[proj]}' and '{cluster_name}' both map to "
+                    f"docker compose project '{proj}' — rename one so their "
+                    f"compose state can't collide (teardown uses "
+                    f"--remove-orphans)."
+                )
+            seen[proj] = cluster_name
 
     def stop_compose_clusters(self) -> None:
         """``docker compose stop`` every docker-compose cluster (boxman down)."""
-        for cluster_name, cluster in self._compose_clusters().items():
+        for cluster_name, cluster in self._compose_clusters.items():
             self.session_for_cluster(cluster_name).stop_cluster(cluster_name, cluster)
 
     def start_compose_clusters(self) -> None:
-        """``docker compose start`` every docker-compose cluster."""
-        for cluster_name, cluster in self._compose_clusters().items():
+        """``docker compose start`` every docker-compose cluster.
+
+        Reserved API surface for the later control-verb phase (a cheaper,
+        no-recreate ``start`` after ``stop``). Not wired into a flow yet:
+        ``up``-after-``down`` currently reconciles via
+        :meth:`provision_compose_clusters` (``up -d --wait``), which also
+        starts stopped containers and re-asserts readiness.
+        """
+        for cluster_name, cluster in self._compose_clusters.items():
             self.session_for_cluster(cluster_name).start_cluster(cluster_name, cluster)
 
     def deprovision_compose_clusters(self) -> None:
         """``docker compose down`` every docker-compose cluster (keep volumes)."""
-        for cluster_name, cluster in self._compose_clusters().items():
+        for cluster_name, cluster in self._compose_clusters.items():
             self.session_for_cluster(cluster_name).down_cluster(cluster_name, cluster)
 
     def destroy_compose_clusters(self) -> None:
         """``docker compose down --volumes`` every docker-compose cluster."""
-        for cluster_name, cluster in self._compose_clusters().items():
+        for cluster_name, cluster in self._compose_clusters.items():
             self.session_for_cluster(cluster_name).destroy_cluster(cluster_name, cluster)
 
     def define_networks(self) -> None:
@@ -2487,7 +2554,7 @@ class BoxmanManager:
     ### end networks define / remove / destroy
 
     ### vms define / remove / destroy
-    def _ensure_libvirt_storage_pool(self, workdir: str) -> None:
+    def _ensure_libvirt_storage_pool(self, workdir: str, cluster_name: str) -> None:
         """
         Ensure the libvirt directory storage pool exists for the given workdir.
 
@@ -2496,11 +2563,15 @@ class BoxmanManager:
         the same directory, every process races to define the same pool and all
         but the first fail with "pool already exists". Pre-defining the pool
         here (sequentially, before parallel cloning begins) eliminates the race.
+
+        Uses *cluster_name*'s own libvirt session for the virsh connection so a
+        compose-primary mixed project (where the default ``self.provider`` is
+        the docker-compose session) still targets the configured libvirt
+        URI/runtime instead of silently falling back to local qemu:///system.
         """
         workdir = os.path.abspath(os.path.expanduser(workdir))
         pool_name = os.path.basename(workdir)
-        # Phase 1 (#49): default session — libvirt storage pools by nature.
-        virsh = VirshCommand(self.provider.provider_config)
+        virsh = VirshCommand(self.session_for_cluster(cluster_name).provider_config)
 
         result = virsh.execute("pool-info", pool_name, warn=True)
         if result.ok:
@@ -2538,7 +2609,7 @@ class BoxmanManager:
             workdir = os.path.abspath(os.path.expanduser(cluster['workdir']))
             if workdir not in seen_workdirs:
                 seen_workdirs.add(workdir)
-                self._ensure_libvirt_storage_pool(workdir)
+                self._ensure_libvirt_storage_pool(workdir, cluster_name)
 
         def _clone(cluster, vm_info, new_vm_name):
             max_retries = 5
@@ -3730,12 +3801,23 @@ class BoxmanManager:
         expected_vms = cls._get_project_vm_names()
 
         if not expected_vms:
-            # No libvirt VMs. A docker-compose-only project still has work to
-            # do: (idempotently) bring up its compose clusters. `up_cluster`
-            # is `docker compose up -d --wait`, which starts stopped containers
-            # and no-ops when everything is already running.
-            if cls._compose_clusters():
-                cls.provision_compose_clusters()
+            # No libvirt VMs. A docker-compose-only project still has work to do.
+            if cls._compose_clusters:
+                # A first run (project not yet registered) must go through full
+                # provision() — cache registration, provision_files() (cluster
+                # files: + runtime sentinels) and netlab — exactly like a libvirt
+                # project's first `up` (Case 1 below). provision() ends by calling
+                # provision_compose_clusters(), so the containers come up too. A
+                # subsequent `up` just reconciles the compose clusters (idempotent),
+                # mirroring the libvirt "all running" reconcile path (Case 3).
+                cls.cache.read_projects_cache()
+                project_name = config.get('project')
+                if project_name and project_name in (cls.cache.projects or {}):
+                    cls.provision_compose_clusters()
+                else:
+                    cls.logger.info(
+                        "no existing project state found, running full provision...")
+                    cls.provision(cls, cli_args)
                 return
             cls.logger.error("no VMs defined in configuration")
             return
@@ -3889,6 +3971,12 @@ class BoxmanManager:
         ``boxman control save``). With ``--suspend``, pauses VMs in memory
         instead (same as ``boxman control suspend``).
 
+        docker-compose clusters are always brought down with
+        ``docker compose stop`` (containers kept, reversible via ``up``);
+        ``--suspend`` does not apply to them — compose has no in-memory
+        pause analog wired in this phase, so the flag is a no-op for dc
+        clusters.
+
         Reuses ``process_vm_list()`` and the same provider methods as
         ``boxman control save`` / ``boxman control suspend``.
         """
@@ -3899,7 +3987,7 @@ class BoxmanManager:
 
         vm_list = cls.process_vm_list(cli_args)
 
-        if not vm_list and not cls._compose_clusters():
+        if not vm_list and not cls._compose_clusters:
             cls.logger.info("no VMs found in configuration")
             return
 
@@ -3955,8 +4043,15 @@ class BoxmanManager:
         cls.destroy_netlab()
 
         # Tear down docker-compose clusters (`docker compose down`: remove
-        # containers + networks, keep named volumes) before libvirt state.
-        cls.deprovision_compose_clusters()
+        # containers + networks, keep named volumes). Best-effort, like
+        # destroy's step 2b: a failure here must not abort the libvirt VM /
+        # network / files / cache teardown that follows (deprovision is also
+        # invoked from `provision --force`).
+        try:
+            cls.deprovision_compose_clusters()
+        except Exception as exc:
+            cls.logger.warning(
+                f"deprovision_compose_clusters raised: {exc} — continuing")
 
         processes = [
             Process(
@@ -4132,9 +4227,21 @@ class BoxmanManager:
         templates_present = any(
             os.path.exists(d) for d in template_dirs
         )
+        # docker-compose clusters keep a generated docker-compose.yml in their
+        # workdir until destroy_cluster removes it (only on a successful
+        # teardown). Treat its presence as state to tear down so destroy stays
+        # retryable after the cache entry was lost — the terms above are
+        # otherwise cache-/workspace-/runtime-centric and miss dc state.
+        compose_present = any(
+            os.path.isfile(os.path.join(
+                os.path.expanduser(cluster.get('workdir', '')),
+                'docker-compose.yml'))
+            for cluster in cls._compose_clusters.values()
+            if cluster.get('workdir')
+        )
 
         if not (in_cache or ws_present or boxman_dir_present
-                or container_present or templates_present):
+                or container_present or templates_present or compose_present):
             cls.logger.info(
                 f"nothing to do — project '{project_name or '?'}' "
                 f"is not registered, no workspace dir, no runtime "
@@ -4150,6 +4257,15 @@ class BoxmanManager:
         print(f"  {step}. remove generated provisioning files "
               f"(env.sh, ansible.cfg, inventory, ssh_config, SSH keys)")
         step += 1
+        # Disclose docker-compose named-volume deletion explicitly: destroy runs
+        # `docker compose down --volumes`, which permanently removes named
+        # volumes (declarable via compose_extra) — not obvious from the steps
+        # above, which only mention VMs/networks/files.
+        for _dc_name in cls._compose_clusters:
+            print(f"  {step}. tear down docker-compose cluster '{_dc_name}' "
+                  f"(docker compose down --volumes — removes its containers, "
+                  f"networks AND named volumes)")
+            step += 1
         if is_docker and runtime_plan and runtime_plan["actions"]:
             for action in runtime_plan["actions"]:
                 print(f"  {step}. {action}")
@@ -5335,7 +5451,7 @@ class BoxmanManager:
                     workdir = os.path.abspath(os.path.expanduser(cluster['workdir']))
                     if workdir not in seen_workdirs:
                         seen_workdirs.add(workdir)
-                        self._ensure_libvirt_storage_pool(workdir)
+                        self._ensure_libvirt_storage_pool(workdir, cluster_name)
 
         # clone new VMs (parallel with retry)
         def _clone(cluster, vm_info, new_vm_name):

@@ -75,14 +75,41 @@ A v1.0 config that uses `boxes:` gets a one-line warning (nothing reads
 partial migration that still has a sibling `vms:`) — provisioning behaviour
 is unchanged.
 
-### Not yet runnable: docker-compose / mixed configs
+### Running docker-compose clusters (Phase 3, #51)
 
-A v2.0 config with a docker-compose cluster **parses and normalizes**, but
-is **not runnable until Phase 3** (`DockerComposeSession`). Running
-`boxman provision` / `up` on one exits **2** at session build with the
-friendly "docker-compose provider … lands in Phase 3 (#51)" message (the
-registry has no docker-compose session yet), rather than provisioning
-anything. Pure-libvirt v2.0 configs are fully runnable.
+A v2.0 config with a docker-compose cluster is **runnable**: `boxman
+provision` / `up` generate a `docker-compose.yml` in the cluster `workdir`
+and run `docker compose up -d --wait`, and `down` / `deprovision` / `destroy`
+tear it down. Phase 3 scope is **cluster-internal bridge networks only** —
+`shared_networks` (L2 to VMs) lands in Phase 4, structured `volumes:` in
+Phase 5, ssh/exec/inventory in Phase 6, snapshots in Phase 7. Box features
+outside this scope are warned about and skipped (use `compose_extra:` as the
+escape hatch).
+
+Two hard requirements, both enforced fail-fast (exit 2):
+
+- **`version: '2.0'` is required.** A docker-compose cluster consumes
+  `boxes:`, which v1.0 ignores (see [`_warn_on_v1_boxes`](#) above) — so a
+  v1.0 / versionless config whose primary or per-cluster provider resolves to
+  `docker-compose` is **rejected** (rather than silently provisioning services
+  the v1.0 `boxes:` nudge — see above — says are ignored).
+- **`runtime: local` is required** (see next section).
+
+### Provider vs runtime — two independent axes
+
+`provider:` (per-cluster, this document) selects *what* provisions a cluster
+(`libvirt` vs `docker-compose`). `--runtime` / the app-config `runtime:` key
+selects *where boxman's commands execute*: `local` (directly on the host) or
+`docker` (a.k.a. `docker-compose` — **libvirt inside a container**, used to
+run the libvirt provider without host libvirt). These are unrelated.
+
+The **docker-compose provider requires `runtime: local`**: it shells out to
+`docker compose` on the host directly. Pairing it with the `docker` runtime
+(libvirt-in-a-container) is a configuration error and boxman exits 2 at
+session build. Note this fail-fast fires for **every** subcommand, so a
+project that adds a docker-compose cluster to an existing libvirt-in-docker
+runtime can no longer run *anything* (including `destroy`) until the runtime
+is switched to `local` — an intentional, if blunt, consequence.
 
 ### Why `boxman conf` still shows `boxes:`
 
@@ -111,8 +138,13 @@ Safe / unsafe forms inside a compose `environment:` or `command:` value:
 
 **Rule of thumb:** in docker-compose clusters, use `${VAR}` /
 `$${VAR}` for interpolation and never a bare single-word `{{ word }}`.
-(A structure-aware exemption for compose blocks is deferred to Phase 3,
-where these values are actually consumed.)
+
+**Phase 3 status:** a full structure-aware exemption is still out of scope,
+but the generator now **warns** when a compose `environment:` / `command:`
+value carries the `{word}` corruption signature (a mangled bare
+`{{ word }}`), so the silent-corruption trap surfaces at generate time
+instead of reaching the container. `${VAR}` / `$${VAR}` are unaffected and
+produce no warning.
 
 ## Examples
 

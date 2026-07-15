@@ -19,6 +19,7 @@ with ``docker compose -f <cluster_workdir>/docker-compose.yml ps`` (D5).
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Iterable
 
 import yaml
@@ -36,6 +37,21 @@ _PASSTHROUGH_KEYS = (
     "restart",
     "healthcheck",
 )
+
+#: the ``{word}`` signature left by config preprocessing when it mangles a
+#: bare Jinja ``{{ word }}`` in a compose value. Excludes ``${word}`` (a `$`
+#: before the brace), which is a safe compose interpolation, not corruption.
+_CORRUPTED_TEMPLATE_RE = re.compile(r"(?<!\$)\{[a-zA-Z_]\w*\}")
+
+#: every box key the Phase-3 generator understands. Anything else is warned
+#: about and dropped (``volumes:`` → Phase 5 is handled separately, but is a
+#: recognised key so it doesn't also trip the unknown-key warning).
+_KNOWN_BOX_KEYS = frozenset(_PASSTHROUGH_KEYS) | {
+    "build",
+    "networks",
+    "volumes",
+    "compose_extra",
+}
 
 
 class ComposeGenerator:
@@ -108,6 +124,18 @@ class ComposeGenerator:
         shared: frozenset[str],
     ) -> dict[str, Any]:
         svc: dict[str, Any] = {}
+
+        self._warn_corrupted_templating(cluster_name, box_name, box)
+
+        unknown = [k for k in box if k not in _KNOWN_BOX_KEYS]
+        if unknown:
+            self.logger.warning(
+                f"box '{cluster_name}.{box_name}': ignoring unknown key(s) "
+                f"{', '.join(repr(k) for k in unknown)} — not part of the "
+                f"Phase-3 docker-compose box schema; use 'compose_extra:' to "
+                f"pass them through to the service."
+            )
+
         for key in _PASSTHROUGH_KEYS:
             if key in box:
                 svc[key] = box[key]
@@ -139,16 +167,65 @@ class ComposeGenerator:
             )
         return svc
 
+    def _warn_corrupted_templating(
+        self, cluster_name: str, box_name: str, box: dict[str, Any]
+    ) -> None:
+        """Warn when a compose ``environment:``/``command:`` value carries the
+        ``{word}`` corruption signature.
+
+        ``load_config`` does a whole-file preprocessing pass that rewrites a
+        bare Jinja ``{{ word }}`` into ``{word}`` (a task placeholder) with no
+        YAML-structure awareness, so it also mangles docker-compose values. The
+        Phase-2 caveat deferred a structure-aware exemption to "Phase 3, where
+        these values are consumed" (config-schema.md); this is that consumer,
+        so at minimum we flag the corruption instead of shipping it silently.
+        ``${VAR}`` / ``$${VAR}`` are unaffected and remain the safe forms.
+        """
+        values: list[str] = []
+        cmd = box.get("command")
+        if isinstance(cmd, str):
+            values.append(cmd)
+        elif isinstance(cmd, (list, tuple)):
+            values.extend(str(x) for x in cmd)
+        env = box.get("environment")
+        if isinstance(env, (list, tuple)):
+            values.extend(str(x) for x in env)
+        elif isinstance(env, dict):
+            values.extend(str(v) for v in env.values())
+
+        for val in values:
+            if _CORRUPTED_TEMPLATE_RE.search(val):
+                self.logger.warning(
+                    f"box '{cluster_name}.{box_name}': value {val!r} contains a "
+                    f"'{{word}}' token — a bare Jinja '{{{{ word }}}}' in a "
+                    f"compose environment:/command: is rewritten to '{{word}}' "
+                    f"by config preprocessing. Use ${{VAR}} or $${{VAR}} for "
+                    f"compose-time interpolation (see "
+                    f"doc/docker-compose-provider/config-schema.md)."
+                )
+                break
+
     def _build(self, build: Any, conf_dir: str) -> Any:
-        """Resolve ``build.context`` to an absolute path vs *conf_dir* (D4)."""
+        """Resolve a **local** ``build.context`` to an absolute path vs
+        *conf_dir* (D4).
+
+        Compose also accepts remote contexts — Git URLs (``https://…​.git#ref``,
+        ``git@…``), scheme URLs, and host shorthands (``github.com/…``). Those
+        are passed through verbatim: joining them onto *conf_dir* would mangle
+        e.g. ``https://github.com/x/y.git#main`` into ``/proj/https:/github…``.
+        """
         if isinstance(build, str):
-            return os.path.abspath(os.path.join(conf_dir, os.path.expanduser(build)))
+            return build if _is_remote_build_context(build) \
+                else self._abs_context(build, conf_dir)
         out = dict(build)
-        ctx = out.get("context", ".")
-        out["context"] = os.path.abspath(
-            os.path.join(conf_dir, os.path.expanduser(str(ctx)))
-        )
+        ctx = str(out.get("context", "."))
+        if not _is_remote_build_context(ctx):
+            out["context"] = self._abs_context(ctx, conf_dir)
         return out
+
+    @staticmethod
+    def _abs_context(ctx: str, conf_dir: str) -> str:
+        return os.path.abspath(os.path.join(conf_dir, os.path.expanduser(ctx)))
 
     def _service_networks(
         self,
@@ -196,3 +273,24 @@ class ComposeGenerator:
             else:
                 result[key] = value
         return result
+
+
+#: git host shorthands compose accepts as a remote build context
+_REMOTE_CONTEXT_HOSTS = ("github.com/", "bitbucket.org/", "gitlab.com/")
+
+
+def _is_remote_build_context(ctx: str) -> bool:
+    """True if *ctx* is a remote build context (Git/URL) rather than a local
+    filesystem path.
+
+    Compose treats these as remote and must **not** have them resolved against
+    the conf.yml dir: scheme URLs (``https://``, ``git://``, ``ssh://``),
+    scp-like Git (``git@host:path``), and the ``github.com/…`` /
+    ``bitbucket.org/…`` / ``gitlab.com/…`` shorthands (with an optional
+    ``#ref`` fragment).
+    """
+    ctx = ctx.strip()
+    if "://" in ctx or ctx.startswith("git@"):
+        return True
+    head = ctx.split("#", 1)[0]
+    return head.startswith(_REMOTE_CONTEXT_HOSTS)

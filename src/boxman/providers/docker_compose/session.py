@@ -73,9 +73,9 @@ class DockerComposeSession:
         """boxman provision/up → generate the compose file and
         ``docker compose up -d --wait`` (idempotent)."""
         self._require_local_runtime(cluster_name)
+        timeout = self._readiness_timeout(cluster_cfg, cluster_name)
         runner, _workdir, _compose_file = self._compose_context(cluster_name, cluster_cfg)
         runner.preflight()
-        timeout = int(cluster_cfg.get("readiness_timeout", DEFAULT_READINESS_TIMEOUT))
         self.logger.info(
             f"[{cluster_name}] docker compose up (project '{runner.project}', "
             f"wait ≤{timeout}s)"
@@ -85,32 +85,39 @@ class DockerComposeSession:
 
     def stop_cluster(self, cluster_name: str, cluster_cfg: dict[str, Any]) -> bool:
         """boxman down → ``docker compose stop`` (keep containers)."""
-        runner, _wd, _cf = self._compose_context(cluster_name, cluster_cfg)
+        runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
         self.logger.info(f"[{cluster_name}] docker compose stop")
-        runner.stop()
-        return True
+        return self._check(cluster_name, "stop", runner.stop())
 
     def start_cluster(self, cluster_name: str, cluster_cfg: dict[str, Any]) -> bool:
-        """boxman up (after down) → ``docker compose start``."""
-        runner, _wd, _cf = self._compose_context(cluster_name, cluster_cfg)
+        """``docker compose start`` — reserved API surface for the later
+        control-verb phase; not driven by a flow yet (``up``-after-``down``
+        reconciles via :meth:`up_cluster`). See
+        ``BoxmanManager.start_compose_clusters``."""
+        runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
         self.logger.info(f"[{cluster_name}] docker compose start")
-        runner.start()
-        return True
+        return self._check(cluster_name, "start", runner.start())
 
     def down_cluster(self, cluster_name: str, cluster_cfg: dict[str, Any]) -> bool:
         """boxman deprovision → ``docker compose down`` (remove containers +
         networks, keep named volumes)."""
-        runner, _wd, _cf = self._compose_context(cluster_name, cluster_cfg)
+        runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
         self.logger.info(f"[{cluster_name}] docker compose down")
-        runner.down()
-        return True
+        return self._check(cluster_name, "down", runner.down())
 
     def destroy_cluster(self, cluster_name: str, cluster_cfg: dict[str, Any]) -> bool:
         """boxman destroy → ``docker compose down --volumes`` and remove the
-        generated compose file."""
-        runner, _wd, compose_file = self._compose_context(cluster_name, cluster_cfg)
+        generated compose file (only when the teardown actually succeeded)."""
+        runner, _wd, compose_file = self._teardown_runner(cluster_name, cluster_cfg)
         self.logger.info(f"[{cluster_name}] docker compose down --volumes")
-        runner.down_volumes()
+        ok = self._check(cluster_name, "down --volumes", runner.down_volumes())
+        if not ok:
+            # keep the on-disk file so a retry can still resolve the project
+            self.logger.warning(
+                f"[{cluster_name}] keeping {compose_file} for retry "
+                f"(teardown did not report success)."
+            )
+            return False
         try:
             if os.path.isfile(compose_file):
                 os.remove(compose_file)
@@ -120,6 +127,25 @@ class DockerComposeSession:
             )
         return True
 
+    def _check(self, cluster_name: str, op: str, result: Any) -> bool:
+        """Warn (don't raise) when a best-effort teardown op did not succeed.
+
+        The teardown runner methods shell out with ``warn=True`` (no raise);
+        their ``Result.ok`` is inspected here so a failed ``stop``/``down`` is
+        surfaced instead of being silently reported as success. A ``result``
+        without an ``ok`` attribute (e.g. a test double returning ``None``) is
+        treated as success.
+        """
+        if not getattr(result, "ok", True):
+            detail = (
+                getattr(result, "stderr", "") or getattr(result, "stdout", "") or ""
+            ).strip()
+            self.logger.warning(
+                f"[{cluster_name}] 'docker compose {op}' reported failure: {detail}"
+            )
+            return False
+        return True
+
     # -- internals ---------------------------------------------------------
 
     def _compose_context(
@@ -127,11 +153,10 @@ class DockerComposeSession:
     ) -> tuple[ComposeRunner, str, str]:
         """Regenerate the compose file (idempotent) and build a runner.
 
-        Regenerating on every op keeps ``-f`` valid for down/stop/start
-        even if the workdir was wiped, and keeps the on-disk file in sync
-        with the config.
+        Regeneration is for **bring-up only** (``up_cluster``); teardown uses
+        :meth:`_teardown_runner`, which never regenerates.
         """
-        workdir = os.path.expanduser(cluster_cfg["workdir"])
+        workdir = self._workdir(cluster_cfg, cluster_name)
         shared = set(self.config.get("shared_networks") or {})
         compose = self._generator.generate(
             cluster_name, cluster_cfg, self._conf_dir(), shared
@@ -142,13 +167,94 @@ class DockerComposeSession:
             compose_file=compose_file,
             workdir=workdir,
             logger=self.logger,
+            use_sudo=self.use_sudo,
         )
         return runner, workdir, compose_file
+
+    def _teardown_runner(
+        self, cluster_name: str, cluster_cfg: dict[str, Any]
+    ) -> tuple[ComposeRunner, str, str]:
+        """Build a runner for a teardown op **without regenerating** the file.
+
+        Uses the on-disk ``<workdir>/docker-compose.yml`` when present (so a
+        hand-edited file is respected and never overwritten); otherwise falls
+        back to a **label-only** runner (``docker compose -p <project> …``) so
+        containers can still be removed after the workdir/file was wiped.
+
+        This deliberately avoids :meth:`_compose_context`'s ``generate()``:
+        regenerating on teardown would make ``down``/``deprovision``/``destroy``
+        fail on a config that no longer generates cleanly (e.g. a box that lost
+        its ``image:``), and would recreate the workdir + compose file on a
+        ``down`` of a never-provisioned project.
+        """
+        workdir = self._workdir(cluster_cfg, cluster_name)
+        compose_file = os.path.join(workdir, "docker-compose.yml")
+        project = self._compose_project(cluster_name)
+        if os.path.isfile(compose_file):
+            runner = ComposeRunner(
+                project=project,
+                compose_file=compose_file,
+                workdir=workdir,
+                logger=self.logger,
+                use_sudo=self.use_sudo,
+            )
+        else:
+            # label-only: resolve the project from compose labels
+            runner = ComposeRunner(
+                project=project, logger=self.logger, use_sudo=self.use_sudo)
+        return runner, workdir, compose_file
+
+    def _readiness_timeout(self, cluster_cfg: dict[str, Any], cluster_name: str) -> int:
+        """Validate the cluster ``readiness_timeout:`` → positive int seconds.
+
+        Raises a clear :class:`ConfigError` instead of a bare ``ValueError`` /
+        ``TypeError`` traceback for non-integer or non-positive input.
+        """
+        raw = cluster_cfg.get("readiness_timeout", DEFAULT_READINESS_TIMEOUT)
+        try:
+            timeout = int(raw)
+        except (TypeError, ValueError):
+            raise ConfigError(
+                f"docker-compose cluster '{cluster_name}': readiness_timeout "
+                f"must be an integer number of seconds (got {raw!r})."
+            )
+        if timeout <= 0:
+            raise ConfigError(
+                f"docker-compose cluster '{cluster_name}': readiness_timeout "
+                f"must be a positive integer (got {timeout})."
+            )
+        return timeout
+
+    def _workdir(self, cluster_cfg: dict[str, Any], cluster_name: str) -> str:
+        """Resolve the cluster ``workdir:`` (required) to an absolute-ish path.
+
+        Raises a clear :class:`ConfigError` instead of a bare ``KeyError`` when
+        ``workdir:`` is missing — it is the first thing every lifecycle op needs
+        (the generated ``docker-compose.yml`` lives at ``<workdir>/``).
+        """
+        workdir = cluster_cfg.get("workdir")
+        if not workdir:
+            raise ConfigError(
+                f"docker-compose cluster '{cluster_name}' has no 'workdir:' — "
+                f"it is required (the generated docker-compose.yml is written "
+                f"to <workdir>/docker-compose.yml)."
+            )
+        return os.path.expanduser(workdir)
 
     def _conf_dir(self) -> str:
         """Directory of the project ``conf.yml`` (for build-context resolution)."""
         config_path = getattr(self.manager, "config_path", None)
         return os.path.dirname(os.path.abspath(config_path)) if config_path else os.getcwd()
+
+    def compose_project_name(self, cluster_name: str) -> str:
+        """Public accessor for the ``docker compose -p`` name of *cluster_name*.
+
+        The manager uses this to detect cross-cluster project-name collisions
+        (distinct cluster names that sanitize to the same project) before
+        creating any compose state — see
+        ``BoxmanManager._reject_compose_project_collisions``.
+        """
+        return self._compose_project(cluster_name)
 
     def _compose_project(self, cluster_name: str) -> str:
         """Derive the ``docker compose -p`` name — one project per cluster
@@ -160,7 +266,13 @@ class DockerComposeSession:
         """Defense-in-depth: the docker-compose provider requires
         ``runtime: local`` (the ``docker-compose`` *runtime* is
         libvirt-in-a-container, a different axis). app.py fails fast at
-        session build; this re-checks in case the session is driven directly."""
+        session build; this re-checks in case the session is driven directly.
+
+        With no manager attached (a bare direct-drive, e.g. in a unit test)
+        there is no runtime axis to enforce, so the ``getattr`` default of
+        ``"local"`` intentionally passes — the authoritative fail-fast is
+        app.py's session-build guardrail, which always has the manager.
+        """
         runtime = getattr(self.manager, "runtime", "local")
         if runtime != "local":
             raise ConfigError(
