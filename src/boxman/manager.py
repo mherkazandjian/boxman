@@ -233,6 +233,36 @@ class BoxmanManager:
             return self.provider
         return self.session_for_cluster(cluster_name)
 
+    def _is_compose_cluster(self, cluster_name: str) -> bool:
+        """True if *cluster_name* is provisioned by the docker-compose provider."""
+        return self.provider_type_for_cluster(cluster_name) == 'docker-compose'
+
+    @property
+    def _vm_clusters(self) -> dict[str, Any]:
+        """
+        Clusters handled by a **per-VM** provider (libvirt).
+
+        The manager's per-VM / per-network lifecycle helpers iterate this
+        instead of ``config['clusters']`` so docker-compose clusters (which
+        carry ``boxes:``, not ``vms:``, and are provisioned coarsely via the
+        ``*_compose_clusters`` helpers) are never fed into the per-VM loops.
+        For a libvirt-only project this is exactly ``config['clusters']``, so
+        behaviour is unchanged.
+        """
+        return {
+            name: cluster
+            for name, cluster in (self.config.get('clusters') or {}).items()
+            if not self._is_compose_cluster(name)
+        }
+
+    def _compose_clusters(self) -> dict[str, Any]:
+        """docker-compose clusters, in config order (empty for libvirt-only projects)."""
+        return {
+            name: cluster
+            for name, cluster in (self.config.get('clusters') or {}).items()
+            if self._is_compose_cluster(name)
+        }
+
     def _vm_cluster_map(self) -> dict[str, str]:
         """
         Map every full VM name of this project to its cluster name.
@@ -2370,6 +2400,38 @@ class BoxmanManager:
         netlab.render_topology(source_root=source_root)
         netlab.ensure_up()
 
+    # --- docker-compose clusters: coarse per-cluster lifecycle ------------
+    # docker-compose is cluster-scoped (one `docker compose up --wait` per
+    # cluster, ADR-001/D1). Rather than the per-VM libvirt loops, the manager
+    # dispatches a whole dc cluster to its session's coarse methods. These
+    # helpers are no-ops for libvirt-only projects (``_compose_clusters()``
+    # is empty).
+
+    def provision_compose_clusters(self) -> None:
+        """``docker compose up --wait`` every docker-compose cluster."""
+        for cluster_name, cluster in self._compose_clusters().items():
+            self.session_for_cluster(cluster_name).up_cluster(cluster_name, cluster)
+
+    def stop_compose_clusters(self) -> None:
+        """``docker compose stop`` every docker-compose cluster (boxman down)."""
+        for cluster_name, cluster in self._compose_clusters().items():
+            self.session_for_cluster(cluster_name).stop_cluster(cluster_name, cluster)
+
+    def start_compose_clusters(self) -> None:
+        """``docker compose start`` every docker-compose cluster."""
+        for cluster_name, cluster in self._compose_clusters().items():
+            self.session_for_cluster(cluster_name).start_cluster(cluster_name, cluster)
+
+    def deprovision_compose_clusters(self) -> None:
+        """``docker compose down`` every docker-compose cluster (keep volumes)."""
+        for cluster_name, cluster in self._compose_clusters().items():
+            self.session_for_cluster(cluster_name).down_cluster(cluster_name, cluster)
+
+    def destroy_compose_clusters(self) -> None:
+        """``docker compose down --volumes`` every docker-compose cluster."""
+        for cluster_name, cluster in self._compose_clusters().items():
+            self.session_for_cluster(cluster_name).destroy_cluster(cluster_name, cluster)
+
     def define_networks(self) -> None:
         """
         Define the networks specified in the cluster configuration (sequential).
@@ -2380,7 +2442,7 @@ class BoxmanManager:
         otherwise two concurrent processes can both select the same bridge index
         and the second net-define fails with "bridge name already in use".
         """
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             for network_name, network_info in cluster.get('networks', {}).items():
                 _network_name = self.full_network_name(
                     project_config=self.config,
@@ -2417,7 +2479,7 @@ class BoxmanManager:
 
         processes = [
             Process(target=_destroy, args=(cluster_name, cluster, network_name, network_info))
-            for cluster_name, cluster in self.config['clusters'].items()
+            for cluster_name, cluster in self._vm_clusters.items()
             for network_name, network_info in cluster.get('networks', {}).items()
         ]
         [p.start() for p in processes]
@@ -2461,7 +2523,7 @@ class BoxmanManager:
         """
         def vm_clone_tasks():
             prj_name = f'bprj__{self.config["project"]}__bprj'
-            for cluster_name, cluster in self.config['clusters'].items():
+            for cluster_name, cluster in self._vm_clusters.items():
                 for vm_name, vm_info in cluster['vms'].items():
                     vm_info = vm_info.copy()
                     new_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
@@ -2472,7 +2534,7 @@ class BoxmanManager:
         # directory; doing it here sequentially prevents the race condition
         # where N parallel processes all try to define the same pool at once.
         seen_workdirs: set = set()
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             workdir = os.path.abspath(os.path.expanduser(cluster['workdir']))
             if workdir not in seen_workdirs:
                 seen_workdirs.add(workdir)
@@ -2552,7 +2614,7 @@ class BoxmanManager:
         """
         prj_name = f'bprj__{self.config["project"]}__bprj'
         def vm_destroy_tasks():
-            for cluster_name, cluster in self.config['clusters'].items():
+            for cluster_name, cluster in self._vm_clusters.items():
                 for vm_name in cluster['vms'].keys():
                     full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                     yield full_vm_name, cluster_name, vm_name
@@ -2729,7 +2791,7 @@ class BoxmanManager:
                 target=self._configure_and_start_vm,
                 args=(cluster_name, cluster, vm_name, vm_info)
             )
-            for cluster_name, cluster in self.config['clusters'].items()
+            for cluster_name, cluster in self._vm_clusters.items()
             for vm_name, vm_info in cluster['vms'].items()
         ]
         [p.start() for p in processes]
@@ -2740,7 +2802,7 @@ class BoxmanManager:
     def configure_network_interfaces(self) -> None:
         """Configure network interfaces for all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 vm_info = vm_info.copy()
@@ -2765,7 +2827,7 @@ class BoxmanManager:
     def configure_disks(self) -> None:
         """Configure disks for all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             workdir = cluster.get('workdir', '.')
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
@@ -2786,7 +2848,7 @@ class BoxmanManager:
     def configure_cpu_mem(self) -> None:
         """Configure CPU and memory for all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 self.logger.info(
@@ -2808,7 +2870,7 @@ class BoxmanManager:
     def start_vms(self) -> None:
         """Start all VMs (sequential)."""
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 self.logger.info(f"starting vm {full_vm_name}")
@@ -2831,7 +2893,7 @@ class BoxmanManager:
         prj_name = f'bprj__{self.config["project"]}__bprj'
         vm_names = [
             f"{prj_name}_{cluster_name}_{vm_name}"
-            for cluster_name, cluster in self.config['clusters'].items()
+            for cluster_name, cluster in self._vm_clusters.items()
             for vm_name in cluster['vms']
         ]
 
@@ -2865,7 +2927,7 @@ class BoxmanManager:
         ws_path = self.config.get('workspace', {}).get('path', '')
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             self.logger.info(f"cluster: {cluster_name}")
             self.logger.info("-" * 60)
 
@@ -2972,7 +3034,7 @@ class BoxmanManager:
         # blocks — opening 'w' once per cluster would have the later
         # iteration truncate the earlier one's entries.
         groups: dict[str, list[tuple[str, dict, str]]] = {}
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             base_path = ws_path or cluster.get('workdir', '~')
             ssh_config = os.path.expanduser(os.path.join(
                 base_path,
@@ -3044,7 +3106,7 @@ class BoxmanManager:
         success = True
         ws_path = self.config.get('workspace', {}).get('path', '')
 
-        for _, cluster in self.config['clusters'].items():
+        for _, cluster in self._vm_clusters.items():
             base_path = os.path.expanduser(ws_path or cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
 
@@ -3155,7 +3217,7 @@ class BoxmanManager:
         ws_path = self.config.get('workspace', {}).get('path', '')
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             base_path = os.path.expanduser(ws_path or cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
             admin_pub_key = os.path.join(base_path, f"{admin_key_name}.pub")
@@ -3343,7 +3405,7 @@ class BoxmanManager:
         """
         # write global authorized keys so they can be consumed by container
         # entrypoints or cloud-init scripts
-        for _, cluster in self.config['clusters'].items():
+        for _, cluster in self._vm_clusters.items():
             workdir = os.path.expanduser(cluster['workdir'])
             global_keys_path = os.path.join(workdir, 'global_authorized_keys')
             self.write_global_authorized_keys_file(global_keys_path)
@@ -3631,7 +3693,7 @@ class BoxmanManager:
         # backing chain issues and tray-lock errors on subsequent snapshots.
         cls.logger.info("ejecting cdrom (seed.iso) from all VMs post-provisioning...")
         prj_name = f'bprj__{config["project"]}__bprj'
-        for _cluster_name, _cluster in config['clusters'].items():
+        for _cluster_name, _cluster in cls._vm_clusters.items():
             for _vm_name, _ in _cluster['vms'].items():
                 _full_vm_name = f"{prj_name}_{_cluster_name}_{_vm_name}"
                 cls.session_for_cluster(_cluster_name).eject_cdrom(_full_vm_name)
@@ -3641,6 +3703,10 @@ class BoxmanManager:
 
         # display connection information (after ssh setup so connections are ready)
         cls.connect_info()
+
+        # bring up docker-compose clusters (no-op for libvirt-only projects);
+        # after libvirt VMs, mirroring the netlab hook's "extra infra last" order
+        cls.provision_compose_clusters()
 
         # render and deploy the containerlab topology (no-op if not configured)
         cls.deploy_netlab()
@@ -3664,6 +3730,13 @@ class BoxmanManager:
         expected_vms = cls._get_project_vm_names()
 
         if not expected_vms:
+            # No libvirt VMs. A docker-compose-only project still has work to
+            # do: (idempotently) bring up its compose clusters. `up_cluster`
+            # is `docker compose up -d --wait`, which starts stopped containers
+            # and no-ops when everything is already running.
+            if cls._compose_clusters():
+                cls.provision_compose_clusters()
+                return
             cls.logger.error("no VMs defined in configuration")
             return
 
@@ -3710,6 +3783,9 @@ class BoxmanManager:
             # even though the VMs stayed up.
             cls.ensure_shared_bridges()
             cls.ensure_netlab_up()
+            # Reconcile docker-compose clusters too: a host reboot or manual
+            # `docker compose stop` may have left them down (idempotent).
+            cls.provision_compose_clusters()
             cls.connect_info()
             # Re-write SSH config in case IPs changed (DHCP renewals after
             # a host reboot, manual virsh net cycle, etc.) or in case the
@@ -3793,6 +3869,9 @@ class BoxmanManager:
         # shared bridges have live endpoints on both sides.
         cls.ensure_netlab_up()
 
+        # Bring up docker-compose clusters after the VMs are up (idempotent).
+        cls.provision_compose_clusters()
+
         # Display connection information
         cls.connect_info()
 
@@ -3820,14 +3899,15 @@ class BoxmanManager:
 
         vm_list = cls.process_vm_list(cli_args)
 
-        if not vm_list:
+        if not vm_list and not cls._compose_clusters():
             cls.logger.info("no VMs found in configuration")
             return
 
         use_suspend = getattr(cli_args, 'suspend', False)
 
         if use_suspend:
-            cls.logger.info("suspending all VMs (--suspend)...")
+            if vm_list:
+                cls.logger.info("suspending all VMs (--suspend)...")
 
             def _suspend(vm_name):
                 cls.logger.info(f"suspending VM '{vm_name}'...")
@@ -3839,7 +3919,8 @@ class BoxmanManager:
                 for vm_name, _ in vm_list
             ]
         else:
-            cls.logger.info("saving the state of all VMs to disk...")
+            if vm_list:
+                cls.logger.info("saving the state of all VMs to disk...")
 
             def _save(vm_name, workdir):
                 cls.logger.info(f"saving VM '{vm_name}' state to '{workdir}'...")
@@ -3853,6 +3934,9 @@ class BoxmanManager:
 
         [p.start() for p in processes]
         [p.join() for p in processes]
+
+        # Stop docker-compose clusters (keep containers; reversible via `up`).
+        cls.stop_compose_clusters()
 
         cls.logger.info("infrastructure is down")
 
@@ -3870,12 +3954,16 @@ class BoxmanManager:
         # shared bridges before we touch libvirt state.
         cls.destroy_netlab()
 
+        # Tear down docker-compose clusters (`docker compose down`: remove
+        # containers + networks, keep named volumes) before libvirt state.
+        cls.deprovision_compose_clusters()
+
         processes = [
             Process(
                 target=cls._destroy_vm_and_disks,
                 args=(cluster_name, cluster, vm_name, vm_info)
             )
-            for cluster_name, cluster in cls.config['clusters'].items()
+            for cluster_name, cluster in cls._vm_clusters.items()
             for vm_name, vm_info in cluster['vms'].items()
         ]
         [p.start() for p in processes]
@@ -4124,6 +4212,17 @@ class BoxmanManager:
             except Exception as exc:
                 cls.logger.warning(f"deprovision raised: {exc} — continuing")
 
+        # 2b. fully tear down docker-compose clusters — destroy goes beyond
+        #     deprovision's `docker compose down` (keeps named volumes) to
+        #     `down --volumes` and removes the generated compose file. Runs
+        #     regardless of the libvirt-in-container runtime state: the
+        #     compose provider shells out to the host docker directly.
+        try:
+            cls.destroy_compose_clusters()
+        except Exception as exc:
+            cls.logger.warning(
+                f"destroy_compose_clusters raised: {exc} — continuing")
+
         # 3. tear down the docker runtime (reuses _force_rmtree for the
         #    .boxman dir, no double prompt)
         if is_docker:
@@ -4160,7 +4259,7 @@ class BoxmanManager:
         List snapshots of the VMs in the cluster.
         """
         prj_name = f'bprj__{cls.config["project"]}__bprj'
-        for cluster_name, cluster in cls.config['clusters'].items():
+        for cluster_name, cluster in cls._vm_clusters.items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 cls.session_for_cluster(cluster_name).snapshot_list(full_vm_name)
@@ -4185,7 +4284,7 @@ class BoxmanManager:
 
         # 1. Per-VM data.
         per_vm: dict[str, dict] = {}
-        for cluster_name, cluster in cls.config['clusters'].items():
+        for cluster_name, cluster in cls._vm_clusters.items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 data = cls.session_for_cluster(cluster_name).snapshot_log_data(full_vm_name)
@@ -4608,7 +4707,7 @@ class BoxmanManager:
     def _storage_targets(cls, cli_args=None):
         """Yield ``(full_vm_name, workdir, vm_info)`` for every VM in every cluster."""
         prj_name = f'bprj__{cls.config["project"]}__bprj'
-        for cluster_name, cluster in cls.config['clusters'].items():
+        for cluster_name, cluster in cls._vm_clusters.items():
             workdir = os.path.expanduser(cluster['workdir'])
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
@@ -4832,7 +4931,7 @@ class BoxmanManager:
         """
         retval = []
         prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             workdir = os.path.expanduser(cluster['workdir'])
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
@@ -5229,7 +5328,7 @@ class BoxmanManager:
 
         # pre-define storage pools for workdirs of new VMs
         seen_workdirs: set = set()
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             for vm_name in cluster['vms']:
                 full = f"{prj_name}_{cluster_name}_{vm_name}"
                 if full in new_vm_names:
@@ -5277,7 +5376,7 @@ class BoxmanManager:
         # and the configure/start step below see the resolved values
         self._resolve_iso_config()
         clone_tasks = []
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             for vm_name, vm_info in cluster['vms'].items():
                 full = f"{prj_name}_{cluster_name}_{vm_name}"
                 if full in new_vm_names:
@@ -5306,7 +5405,7 @@ class BoxmanManager:
 
         # configure and start new VMs (parallel)
         configure_tasks = []
-        for cluster_name, cluster in self.config['clusters'].items():
+        for cluster_name, cluster in self._vm_clusters.items():
             for vm_name, vm_info in cluster['vms'].items():
                 full = f"{prj_name}_{cluster_name}_{vm_name}"
                 if full in new_vm_names:
@@ -5644,7 +5743,7 @@ class BoxmanManager:
             result_queue: Queue = Queue()
 
             update_tasks = []
-            for cluster_name, cluster_cfg in config['clusters'].items():
+            for cluster_name, cluster_cfg in cls._vm_clusters.items():
                 for vm_name, vm_info in cluster_cfg['vms'].items():
                     full = f"{prj_name}_{cluster_name}_{vm_name}"
                     if full in update_vm_names:

@@ -544,6 +544,18 @@ def _main():
                     provider_types.append(_cluster_type)
 
         for _ptype in provider_types:
+            # The docker-compose PROVIDER shells out to `docker compose` on
+            # the host; the `docker-compose` RUNTIME is libvirt-in-a-container
+            # (a different axis). Requiring runtime 'local' keeps them from
+            # being confused. Fail fast with a clean message.
+            if _ptype == 'docker-compose' and manager.runtime != 'local':
+                log.error(
+                    f"the docker-compose provider requires runtime 'local' "
+                    f"(got '{manager.runtime}'). The 'docker-compose' runtime "
+                    f"is libvirt-in-a-container — a different setting; see "
+                    f"doc/docker-compose-provider/config-schema.md."
+                )
+                sys.exit(2)
             if _ptype == 'libvirt':
                 # merge runtime metadata into the provider config from boxman.yml
                 provider_conf_with_runtime = manager.get_provider_config_with_runtime(

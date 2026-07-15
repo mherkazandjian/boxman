@@ -53,9 +53,14 @@ class TestCreateSession:
         assert isinstance(session, FakeVirtualbox)
         assert created_with == [conf]
 
-    def test_docker_compose_is_a_friendly_not_implemented(self):
-        with pytest.raises(NotImplementedError, match=r"Phase 3"):
-            create_session('docker-compose', {})
+    def test_docker_compose_builds_a_session(self):
+        """Phase 3 (#51): the docker-compose provider is now implemented, so
+        the registry constructs a real ``DockerComposeSession`` (it no longer
+        raises the Phase-1 ``NotImplementedError`` stub)."""
+        from boxman.providers.docker_compose.session import DockerComposeSession
+        session = create_session(
+            'docker-compose', {"provider": {"docker-compose": {}}})
+        assert isinstance(session, DockerComposeSession)
 
     def test_unknown_provider_lists_supported_types(self):
         with pytest.raises(ValueError) as excinfo:

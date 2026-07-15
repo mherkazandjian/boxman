@@ -29,11 +29,8 @@ def _virtualbox_session(config: dict[str, Any]) -> "ProviderSession":
 
 
 def _docker_compose_session(config: dict[str, Any]) -> "ProviderSession":
-    raise NotImplementedError(
-        "the 'docker-compose' provider is not implemented yet — its core "
-        "lifecycle lands in Phase 3 of the docker-compose provider epic "
-        "(https://github.com/mherkazandjian/boxman/issues/51)"
-    )
+    from boxman.providers.docker_compose.session import DockerComposeSession
+    return DockerComposeSession(config)
 
 
 #: provider-type name -> factory producing a live session for that provider
@@ -58,8 +55,6 @@ def create_session(provider_type: str, config: dict[str, Any]) -> "ProviderSessi
 
     Raises:
         ValueError: If *provider_type* is not a registered provider.
-        NotImplementedError: For providers that are registered but not
-            implemented yet (currently ``docker-compose``).
     """
     try:
         factory = PROVIDERS[provider_type]
