@@ -1,0 +1,58 @@
+---
+# docker-compose-standalone
+#
+# A pure docker-compose boxman project — no libvirt, no VMs. Two services on
+# one cluster-internal bridge network, brought up with `docker compose up
+# --wait` under the hood:
+#
+#   frontend (nginx, published :8080) --depends_on(healthy)--> cache (redis)
+#
+# Demonstrates the docker-compose provider on its own: `boxes:` -> compose
+# `services:`, a cluster-internal bridge network with a subnet, published
+# ports, a healthcheck, and a `depends_on: {condition: service_healthy}`
+# (passed through verbatim). The generated docker-compose.yml is written to
+# the cluster `workdir` and is inspectable / hand-runnable.
+#
+# Requires the `local` runtime (the default) — the docker-compose provider
+# shells out to `docker compose` on the host.
+#
+#   cd boxes/docker-compose-standalone
+#   boxman provision
+#   curl -sI localhost:8080          # nginx is up
+#   docker compose -f .boxman/web/docker-compose.yml ps
+#   boxman destroy
+version: '2.0'
+project: dc_standalone
+
+provider:
+  docker-compose:
+    project_name: dc_standalone
+
+clusters:
+  web:
+    provider: docker-compose
+    workdir: ./.boxman/web
+
+    networks:
+      appnet:
+        driver: bridge
+        subnet: 172.28.0.0/24
+
+    boxes:
+      cache:
+        image: redis:7-alpine
+        networks: [appnet]
+        healthcheck:
+          test: ["CMD", "redis-cli", "ping"]
+          interval: 5s
+          timeout: 3s
+          retries: 5
+
+      frontend:
+        image: nginx:1.27-alpine
+        ports:
+          - "8080:80"
+        networks: [appnet]
+        depends_on:
+          cache:
+            condition: service_healthy
