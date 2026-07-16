@@ -1,5 +1,6 @@
 """
-Unit tests for the docker-compose provider (Phase 3, epic #42 / issue #51).
+Unit tests for the docker-compose provider (epic #42 / issues #51 Phase 3,
+#52 Phase 4).
 
 Everything here is mocked — no live ``docker`` and no libvirt. Per the
 host-vs-VM testing policy, live container behaviour is exercised only inside
@@ -7,9 +8,10 @@ the staging VM (nested docker-compose e2e), never on the host. These tests
 cover four seams:
 
 - :class:`ComposeGenerator` — ``boxes:`` → compose ``services:`` translation,
-  cluster-internal bridge networks, absolute ``build.context`` (D4),
-  ``compose_extra:`` deep-merge (D7), and the warn+skip of out-of-phase box
-  features (``volumes:`` → Phase 5, shared/macvlan networks → Phase 4).
+  cluster-internal bridge networks, ``shared_networks`` → macvlan attach
+  (Phase 4: static/auto IPs, IPAM, reference-gating), absolute
+  ``build.context`` (D4), ``compose_extra:`` deep-merge (D7), and the warn+skip
+  of still-out-of-phase box features (``volumes:`` → Phase 5).
 - :class:`ComposeRunner` — the exact ``docker compose`` command strings and
   the preflight / failure error paths (``boxman.utils.shell.run`` mocked).
 - :class:`DockerComposeSession` — satisfies the ``ProviderSession`` protocol,
@@ -207,16 +209,120 @@ class TestComposeGenerator:
         assert warn.called
         assert "Phase 5" in warn.call_args[0][0]
 
-    def test_shared_network_ref_warned_and_skipped(self):
+    # -- Phase 4: shared_networks → macvlan ------------------------------
+    def _shared(self, **over):
+        base = {"bridge": "br-lab", "subnet": "10.10.0.0/24"}
+        base.update(over)
+        return {"labnet": base}
+
+    def test_shared_network_emits_macvlan_and_attaches(self):
+        """A box ref to a shared_networks bridge → a top-level macvlan network
+        (driver + parent + ipam subnet) and a plain-list service attachment."""
         gen = ComposeGenerator()
         cluster = {"boxes": {"w": {"image": "x", "networks": ["labnet"]}}}
+        compose = gen.generate(
+            "s", cluster, conf_dir="/proj", shared_networks=self._shared()
+        )
+        assert compose["networks"]["labnet"] == {
+            "driver": "macvlan",
+            "driver_opts": {"parent": "br-lab"},
+            "ipam": {"config": [{"subnet": "10.10.0.0/24"}]},
+        }
+        assert compose["services"]["w"]["networks"] == ["labnet"]
+
+    def test_shared_network_static_ipv4_address_mapping_form(self):
+        """A mapping ``{net: {ipv4_address: …}}`` pins a static address and
+        forces the service ``networks`` into mapping form."""
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x",
+                                   "networks": {"labnet": {"ipv4_address": "10.10.0.5"}}}}}
+        compose = gen.generate(
+            "s", cluster, conf_dir="/proj", shared_networks=self._shared()
+        )
+        assert compose["services"]["w"]["networks"] == {
+            "labnet": {"ipv4_address": "10.10.0.5"}
+        }
+        assert compose["networks"]["labnet"]["driver"] == "macvlan"
+
+    def test_shared_network_gateway_and_ip_range_in_ipam(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x", "networks": ["labnet"]}}}
+        shared = self._shared(gateway="10.10.0.1", ip_range="10.10.0.128/25")
+        net = gen.generate(
+            "s", cluster, conf_dir="/proj", shared_networks=shared
+        )["networks"]["labnet"]
+        assert net["ipam"]["config"][0] == {
+            "subnet": "10.10.0.0/24",
+            "gateway": "10.10.0.1",
+            "ip_range": "10.10.0.128/25",
+        }
+
+    def test_shared_network_only_emitted_when_referenced(self):
+        """A shared network declared but attached by no box is not emitted."""
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x"}}}
+        compose = gen.generate(
+            "s", cluster, conf_dir="/proj", shared_networks=self._shared()
+        )
+        assert "networks" not in compose
+
+    def test_shared_network_without_subnet_raises(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x", "networks": ["labnet"]}}}
+        shared = {"labnet": {"bridge": "br-lab"}}  # no subnet
+        with pytest.raises(ConfigError, match=r"needs a 'subnet:'"):
+            gen.generate("s", cluster, conf_dir="/proj", shared_networks=shared)
+
+    def test_shared_network_without_bridge_raises(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x", "networks": ["labnet"]}}}
+        shared = {"labnet": {"subnet": "10.10.0.0/24"}}  # no bridge
+        with pytest.raises(ConfigError, match=r"no 'bridge:'"):
+            gen.generate("s", cluster, conf_dir="/proj", shared_networks=shared)
+
+    def test_shared_and_cluster_networks_mixed_mapping_form(self):
+        """A box on both a cluster-internal net and a static-IP shared net →
+        mapping form with an empty opts dict for the internal one."""
+        gen = ComposeGenerator()
+        cluster = {
+            "networks": {"backend": {"subnet": "172.30.0.0/24"}},
+            "boxes": {"w": {"image": "x", "networks": {
+                "backend": None,
+                "labnet": {"ipv4_address": "10.10.0.9"},
+            }}},
+        }
+        compose = gen.generate(
+            "s", cluster, conf_dir="/proj", shared_networks=self._shared()
+        )
+        assert compose["services"]["w"]["networks"] == {
+            "backend": {},
+            "labnet": {"ipv4_address": "10.10.0.9"},
+        }
+        assert compose["networks"]["backend"]["driver"] == "bridge"
+        assert compose["networks"]["labnet"]["driver"] == "macvlan"
+
+    def test_ipv4_address_on_cluster_internal_net_warns_and_drops(self):
+        gen = ComposeGenerator()
+        cluster = {
+            "networks": {"backend": {"subnet": "172.30.0.0/24"}},
+            "boxes": {"w": {"image": "x",
+                            "networks": {"backend": {"ipv4_address": "172.30.0.5"}}}},
+        }
         with mock.patch.object(gen.logger, "warning") as warn:
-            svc = gen.generate(
-                "s", cluster, conf_dir="/proj", shared_network_names=["labnet"]
-            )["services"]["w"]
-        assert "networks" not in svc
-        assert warn.called
-        assert "Phase 4" in warn.call_args[0][0]
+            svc = gen.generate("s", cluster, conf_dir="/proj")["services"]["w"]
+        # dropped → plain list attach, no static IP wired
+        assert svc["networks"] == ["backend"]
+        assert any("only wired for shared_networks" in str(c.args[0])
+                   for c in warn.call_args_list)
+
+    def test_shared_network_compose_extra_merges_onto_macvlan(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x", "networks": ["labnet"]}}}
+        shared = self._shared(compose_extra={"driver_opts": {"macvlan_mode": "bridge"}})
+        net = gen.generate(
+            "s", cluster, conf_dir="/proj", shared_networks=shared
+        )["networks"]["labnet"]
+        assert net["driver_opts"] == {"parent": "br-lab", "macvlan_mode": "bridge"}
 
     def test_unknown_network_ref_warned_and_skipped(self):
         gen = ComposeGenerator()
@@ -770,7 +876,7 @@ class TestFlowWiring:
             "register_project_in_cache", "unregister_from_cache",
             "_expand_oci_base_images", "ensure_templates_exist",
             "validate_base_images", "provision_files", "deprovision_files",
-            "ensure_shared_bridges", "setup_ssh_access", "connect_info",
+            "setup_ssh_access", "connect_info",
             "write_ssh_config", "define_networks", "destroy_networks",
         ]:
             monkeypatch.setattr(m, name, lambda *a, **k: None)
@@ -779,6 +885,7 @@ class TestFlowWiring:
         monkeypatch.setattr(m, "get_connect_info", lambda *a, **k: True)
         # record the ordering-relevant hooks
         monkeypatch.setattr(m, "configure_and_start_vms", lambda: order.append("vms"))
+        monkeypatch.setattr(m, "ensure_shared_bridges", lambda: order.append("bridges"))
         monkeypatch.setattr(m, "deploy_netlab", lambda: order.append("netlab"))
         monkeypatch.setattr(m, "ensure_netlab_up", lambda: order.append("netlab_up"))
         monkeypatch.setattr(m, "destroy_netlab", lambda: order.append("netlab_down"))
@@ -794,6 +901,8 @@ class TestFlowWiring:
         BoxmanManager.provision(m, SimpleNamespace(force=False, rebuild_templates=False))
         assert "provision_compose_clusters" in order
         assert order.index("vms") < order.index("provision_compose_clusters") < order.index("netlab")
+        # shared bridges (macvlan parents) must exist before compose comes up
+        assert order.index("bridges") < order.index("provision_compose_clusters")
 
     def test_down_stops_compose_clusters(self, monkeypatch):
         m = self._mgr()
@@ -829,14 +938,16 @@ class TestFlowWiring:
         BoxmanManager.up(m, SimpleNamespace(force=False))
         assert order == ["provision"]
 
-    def test_up_dc_only_reconcile_calls_compose_up(self, monkeypatch):
+    def test_up_dc_only_reconcile_ensures_bridges_before_compose_up(self, monkeypatch):
         m = self._mgr()
         order = []
         self._neutralize(m, monkeypatch, order)
         monkeypatch.setattr(m, "_get_project_vm_names", lambda *a, **k: [])
         m.cache.projects = {"proj": {"conf": "x", "runtime": "local"}}  # already provisioned
         BoxmanManager.up(m, SimpleNamespace(force=False))
-        assert order == ["provision_compose_clusters"]
+        # a host reboot drops the non-persistent bridge; recreate it before
+        # the macvlan-attached containers reconcile.
+        assert order == ["bridges", "provision_compose_clusters"]
 
     def test_up_all_vms_running_reconciles_compose(self, monkeypatch):
         m = self._mgr()
@@ -848,3 +959,5 @@ class TestFlowWiring:
         BoxmanManager.up(m, SimpleNamespace(force=False))
         assert "provision_compose_clusters" in order
         assert order.index("netlab_up") < order.index("provision_compose_clusters")
+        # bridges reconciled before compose on the hybrid all-running path too
+        assert order.index("bridges") < order.index("provision_compose_clusters")

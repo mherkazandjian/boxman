@@ -2,15 +2,21 @@
 ComposeGenerator — translate a boxman docker-compose *cluster* into a
 ``docker-compose.yml`` dict and write it to the cluster workdir.
 
-Phase 3 scope: services (image / build / command / environment / ports /
-depends_on / restart / healthcheck), cluster-internal bridge networks, and
-the ``compose_extra:`` escape hatch (deep-merged verbatim, per-cluster and
-per-box — design decision D7). Out-of-phase box features are warned about
-and skipped:
+Scope: services (image / build / command / environment / ports /
+depends_on / restart / healthcheck), cluster-internal bridge networks,
+``shared_networks`` bridges attached as docker **macvlan** networks (Phase 4
+— L2 to libvirt VMs on the same host bridge), and the ``compose_extra:``
+escape hatch (deep-merged verbatim, per-cluster and per-box — design
+decision D7). Out-of-phase box features are warned about and skipped:
 
 - ``volumes:`` (structured named/bind/workdir mounts) → **Phase 5**.
-- a box network that resolves to a ``shared_networks`` bridge (macvlan
-  L2 to VMs) → **Phase 4**; only cluster-internal networks are emitted.
+
+A box's ``networks:`` may be a plain list (``[app_bridge, backend]`` — the
+container gets an auto-assigned address on each) or a mapping that pins a
+static address on a shared bridge
+(``{app_bridge: {ipv4_address: 10.10.0.5}}``). A shared bridge referenced by
+a box must declare a ``subnet:`` under ``shared_networks:`` so docker's
+macvlan IPAM has an address pool.
 
 The generated file is a fidelity artifact — inspectable and hand-runnable
 with ``docker compose -f <cluster_workdir>/docker-compose.yml ps`` (D5).
@@ -20,7 +26,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Iterable
+from typing import Any
 
 import yaml
 
@@ -67,7 +73,7 @@ class ComposeGenerator:
         cluster_name: str,
         cluster_cfg: dict[str, Any],
         conf_dir: str,
-        shared_network_names: Iterable[str] = (),
+        shared_networks: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Build the compose dict for *cluster_name*.
@@ -78,25 +84,34 @@ class ComposeGenerator:
                 optional ``compose_extra:``).
             conf_dir: Directory of the project ``conf.yml`` — ``build.context``
                 is resolved absolute against it (D4).
-            shared_network_names: Names declared under the top-level
-                ``shared_networks:`` — used only to phrase the Phase-4
-                skip warning precisely.
+            shared_networks: The top-level ``shared_networks:`` block (name →
+                ``{bridge, subnet, gateway?, ip_range?, ...}``). A box network
+                ref that matches a key here is emitted as a docker **macvlan**
+                network over that host bridge (Phase 4).
 
         Returns:
             The compose dict (no top-level ``version:`` — the compose spec
             treats it as obsolete).
         """
-        shared = frozenset(shared_network_names)
+        shared_networks = shared_networks or {}
         cluster_networks = cluster_cfg.get("networks") or {}
+        #: shared_networks keys actually attached by a box in this cluster —
+        #: only these become top-level macvlan networks (insertion order via
+        #: shared_networks below keeps the output deterministic).
+        referenced_shared: set[str] = set()
 
         services: dict[str, Any] = {}
         for box_name, box in (cluster_cfg.get("boxes") or {}).items():
             services[box_name] = self._service(
-                cluster_name, box_name, box or {}, conf_dir, cluster_networks, shared
+                cluster_name, box_name, box or {}, conf_dir,
+                cluster_networks, shared_networks, referenced_shared,
             )
 
         compose: dict[str, Any] = {"services": services}
         networks = self._networks(cluster_networks)
+        networks.update(
+            self._shared_macvlan_networks(referenced_shared, shared_networks)
+        )
         if networks:
             compose["networks"] = networks
 
@@ -121,7 +136,8 @@ class ComposeGenerator:
         box: dict[str, Any],
         conf_dir: str,
         cluster_networks: dict[str, Any],
-        shared: frozenset[str],
+        shared_networks: dict[str, Any],
+        referenced_shared: set[str],
     ) -> dict[str, Any]:
         svc: dict[str, Any] = {}
 
@@ -144,7 +160,8 @@ class ComposeGenerator:
             svc["build"] = self._build(box["build"], conf_dir)
 
         nets = self._service_networks(
-            cluster_name, box_name, box.get("networks") or [], cluster_networks, shared
+            cluster_name, box_name, box.get("networks"),
+            cluster_networks, shared_networks, referenced_shared,
         )
         if nets:
             svc["networks"] = nets
@@ -231,27 +248,91 @@ class ComposeGenerator:
         self,
         cluster_name: str,
         box_name: str,
-        refs: list[str],
+        networks: Any,
         cluster_networks: dict[str, Any],
-        shared: frozenset[str],
-    ) -> list[str]:
-        out: list[str] = []
-        for ref in refs:
+        shared_networks: dict[str, Any],
+        referenced_shared: set[str],
+    ) -> list[str] | dict[str, Any]:
+        """Resolve a box's ``networks:`` to the service's compose ``networks``.
+
+        *networks* is either a list of names (auto address on each) or a
+        mapping ``name -> {ipv4_address: …}`` pinning a static address (only
+        meaningful on a shared/macvlan bridge). Cluster-internal and shared
+        refs are attached; a shared ref is recorded in *referenced_shared* so
+        :meth:`_shared_macvlan_networks` emits the top-level macvlan network.
+        Unknown refs are warned about and dropped.
+
+        Returns the mapping form (``{name: {ipv4_address: …}}``) when any ref
+        carries per-network options, else the plain list form.
+        """
+        entries = self._normalize_box_networks(cluster_name, box_name, networks)
+        attached: dict[str, dict[str, Any]] = {}
+        any_opts = False
+        for ref, opts in entries:
             if ref in cluster_networks:
-                out.append(ref)
-            elif ref in shared:
-                self.logger.warning(
-                    f"box '{cluster_name}.{box_name}': network '{ref}' is a "
-                    f"shared_networks bridge — L2 attach to VMs lands in "
-                    f"Phase 4; skipping it for now."
-                )
+                if opts.get("ipv4_address"):
+                    self.logger.warning(
+                        f"box '{cluster_name}.{box_name}': ignoring "
+                        f"'ipv4_address' on cluster-internal network '{ref}' — "
+                        f"static addresses are only wired for shared_networks "
+                        f"(macvlan) bridges; use 'compose_extra:' for a static "
+                        f"IP on a cluster-internal network."
+                    )
+                    opts = {k: v for k, v in opts.items() if k != "ipv4_address"}
+            elif ref in shared_networks:
+                self._require_macvlan_ipam(cluster_name, box_name, ref,
+                                           shared_networks[ref] or {})
+                referenced_shared.add(ref)
             else:
                 self.logger.warning(
-                    f"box '{cluster_name}.{box_name}': network '{ref}' is not a "
-                    f"cluster-internal network — skipping (shared/macvlan "
-                    f"networks land in Phase 4)."
+                    f"box '{cluster_name}.{box_name}': network '{ref}' is "
+                    f"neither a cluster-internal network nor a shared_networks "
+                    f"bridge — skipping."
                 )
-        return out
+                continue
+            svc_opts = {"ipv4_address": opts["ipv4_address"]} \
+                if opts.get("ipv4_address") else {}
+            if svc_opts:
+                any_opts = True
+            attached[ref] = svc_opts
+
+        if not attached:
+            return []
+        return attached if any_opts else list(attached)
+
+    @staticmethod
+    def _normalize_box_networks(
+        cluster_name: str, box_name: str, networks: Any
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Normalise a box ``networks:`` (list or mapping) to ``[(ref, opts)]``.
+
+        List form yields empty opts per ref; mapping form carries each ref's
+        option dict (``{ipv4_address: …}``, or ``None`` → empty).
+        """
+        if not networks:
+            return []
+        if isinstance(networks, dict):
+            return [(ref, dict(opts or {})) for ref, opts in networks.items()]
+        if isinstance(networks, (list, tuple)):
+            return [(ref, {}) for ref in networks]
+        return []
+
+    def _require_macvlan_ipam(
+        self, cluster_name: str, box_name: str, ref: str, entry: dict[str, Any]
+    ) -> None:
+        """A shared bridge attached by a box needs a ``subnet`` (macvlan IPAM)
+        and an underlying ``bridge`` — raise ``ConfigError`` otherwise."""
+        if not entry.get("bridge"):
+            raise ConfigError(
+                f"box '{cluster_name}.{box_name}': shared network '{ref}' has "
+                f"no 'bridge:' — add it under shared_networks['{ref}']."
+            )
+        if not entry.get("subnet"):
+            raise ConfigError(
+                f"box '{cluster_name}.{box_name}': shared network '{ref}' needs "
+                f"a 'subnet:' for the docker macvlan IPAM pool — add it under "
+                f"shared_networks['{ref}']."
+            )
 
     def _networks(self, cluster_networks: dict[str, Any]) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -261,6 +342,38 @@ class ComposeGenerator:
             if net.get("subnet"):
                 spec["ipam"] = {"config": [{"subnet": net["subnet"]}]}
             out[name] = self._deep_merge(spec, net.get("compose_extra") or {})
+        return out
+
+    def _shared_macvlan_networks(
+        self, referenced: set[str], shared_networks: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Emit a top-level docker **macvlan** network for each referenced
+        shared bridge, so containers land on the same L2 as libvirt VMs
+        cabled into that host bridge (Phase 4, design D8).
+
+        Each becomes ``driver: macvlan`` + ``driver_opts.parent: <bridge>`` +
+        an ``ipam`` config carrying the bridge's ``subnet`` (required) and
+        optional ``gateway`` / ``ip_range``. Iterated in *shared_networks*
+        declaration order (filtered by *referenced*) for deterministic output.
+        Presence of ``bridge``/``subnet`` is already enforced upstream in
+        :meth:`_require_macvlan_ipam`.
+        """
+        out: dict[str, Any] = {}
+        for name, entry in shared_networks.items():
+            if name not in referenced:
+                continue
+            entry = entry or {}
+            ipam_cfg: dict[str, Any] = {"subnet": entry["subnet"]}
+            if entry.get("gateway"):
+                ipam_cfg["gateway"] = entry["gateway"]
+            if entry.get("ip_range"):
+                ipam_cfg["ip_range"] = entry["ip_range"]
+            spec: dict[str, Any] = {
+                "driver": "macvlan",
+                "driver_opts": {"parent": entry["bridge"]},
+                "ipam": {"config": [ipam_cfg]},
+            }
+            out[name] = self._deep_merge(spec, entry.get("compose_extra") or {})
         return out
 
     @staticmethod

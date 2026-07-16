@@ -80,11 +80,12 @@ is unchanged.
 A v2.0 config with a docker-compose cluster is **runnable**: `boxman
 provision` / `up` generate a `docker-compose.yml` in the cluster `workdir`
 and run `docker compose up -d --wait`, and `down` / `deprovision` / `destroy`
-tear it down. Phase 3 scope is **cluster-internal bridge networks only** —
-`shared_networks` (L2 to VMs) lands in Phase 4, structured `volumes:` in
-Phase 5, ssh/exec/inventory in Phase 6, snapshots in Phase 7. Box features
-outside this scope are warned about and skipped (use `compose_extra:` as the
-escape hatch).
+tear it down. Scope covers cluster-internal bridge networks and
+`shared_networks` **macvlan L2 to libvirt VMs** (Phase 4, #52 — see
+[Shared networks (macvlan L2 to VMs)](#shared-networks-macvlan-l2-to-vms)
+below). Still out of scope: structured `volumes:` (Phase 5),
+ssh/exec/inventory (Phase 6), snapshots (Phase 7). Box features outside this
+scope are warned about and skipped (use `compose_extra:` as the escape hatch).
 
 Two hard requirements, both enforced fail-fast (exit 2):
 
@@ -119,6 +120,65 @@ therefore intentionally show the **pre-normalization** shape — a fidelity
 view of what you wrote (`boxes:`), not boxman's internal `vms:` form. This
 is by design; the internal normalization is what the provisioning flows act
 on.
+
+## Shared networks (macvlan L2 to VMs)
+
+A top-level `shared_networks:` block declares host Linux bridges that both a
+docker-compose container **and** a libvirt VM can attach to, putting them on
+the same L2 domain. boxman creates each bridge on the host
+(`shared_bridges.ensure`, idempotent, never torn down — bridges can be shared
+across projects); the docker-compose generator attaches a referencing
+container via a docker **macvlan** network whose `parent` is that bridge.
+
+```yaml
+version: '2.0'
+project: hybrid_lab
+shared_networks:
+  app_bridge:
+    bridge: br-app            # required: the host Linux bridge name
+    subnet: 10.10.0.0/24      # required when a box attaches (macvlan IPAM pool)
+    gateway: 10.10.0.1        # optional
+    ip_range: 10.10.0.128/25  # optional — restrict docker's auto-assign pool
+    stp: false                # optional (default false)
+    # disable_netfilter: false  # default; see the Netfilter note below
+    # compose_extra: {...}      # optional, deep-merged onto the macvlan net
+clusters:
+  services:
+    provider: docker-compose
+    workdir: ./.boxman/services
+    boxes:
+      web:
+        image: nginx
+        networks: [app_bridge]          # list form → auto-assigned address
+      api:
+        image: myapi
+        networks:
+          app_bridge:
+            ipv4_address: 10.10.0.20     # mapping form → static address
+```
+
+A box's `networks:` accepts two forms:
+
+| Form | Example | Effect |
+|---|---|---|
+| **list** | `networks: [app_bridge, backend]` | attach to each; docker auto-assigns an address |
+| **mapping** | `networks: {app_bridge: {ipv4_address: 10.10.0.20}}` | pin a static address on that network |
+
+Notes and requirements:
+
+- A shared network a box attaches to **must** declare `bridge:` and `subnet:`
+  — otherwise `provision` fails with a `ConfigError` (docker's macvlan IPAM
+  needs an address pool). A `shared_networks` entry that no box references is
+  fine and simply isn't emitted into the compose file.
+- `ipv4_address` is **only** wired for `shared_networks` (macvlan) attachments.
+  On a cluster-internal network it is warned about and dropped — use
+  `compose_extra:` if you need a static IP on a cluster-internal network.
+- **Netfilter (decision D8):** by default (`disable_netfilter: false`) boxman
+  leaves the host-global `bridge-nf-call-iptables` untouched and installs an
+  idempotent per-bridge scoped `iptables` accept rule so bridged lab frames
+  aren't dropped by a docker `FORWARD`/`DOCKER-USER` DROP policy. Setting
+  `disable_netfilter: true` instead disables netfilter on bridges **host-wide**
+  (a discouraged opt-in, logged loudly, reverted by any reboot).
 
 ## Templating caveat for compose values (`environment:`, `command:`)
 

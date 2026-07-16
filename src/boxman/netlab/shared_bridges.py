@@ -42,6 +42,50 @@ def _set_sysfs(path: str, value: str) -> None:
     run(f"echo {value} | sudo tee {path}", hide=True)
 
 
+def _scoped_rule_body(bridge: str) -> str:
+    """The physdev accept rule body shared by ``-C`` (check) and ``-I`` (insert).
+
+    Accepts frames both entering and leaving *bridge* that are bridged
+    (``--physdev-is-bridged``) — i.e. L2 lab traffic between a bridge-attached
+    VM and a macvlan-attached container on the same bridge — so it isn't
+    dropped by a docker-style ``FORWARD``/``DOCKER-USER`` DROP policy while the
+    host keeps ``bridge-nf-call-iptables=1`` (decision D8).
+    """
+    return (f"-i {bridge} -o {bridge} "
+            f"-m physdev --physdev-is-bridged -j ACCEPT")
+
+
+def _iptables_chain_exists(chain: str) -> bool:
+    return run(f"sudo iptables -t filter -n -L {chain}",
+               warn=True, hide=True).ok
+
+
+def _ensure_iptables_rule(chain: str, body: str) -> None:
+    """Idempotently insert ``body`` at the top of filter table *chain*.
+
+    Uses ``-C`` (check) before ``-I`` (insert at position 1) so repeated
+    ``ensure()`` calls don't stack duplicate rules (spike scenario 7).
+    """
+    if run(f"sudo iptables -t filter -C {chain} {body}",
+           warn=True, hide=True).ok:
+        return  # already present
+    _run_sudo(f"iptables -t filter -I {chain} 1 {body}")
+
+
+def _ensure_scoped_accept(bridge: str) -> None:
+    """Allow bridged lab frames on *bridge* via scoped per-bridge rules (D8).
+
+    Inserts into ``FORWARD`` (works without docker) and, when the
+    ``DOCKER-USER`` chain exists (docker host), there too — that copy survives
+    a docker daemon restart (docker recreates but does not flush DOCKER-USER),
+    which the spike confirmed.
+    """
+    body = _scoped_rule_body(bridge)
+    _ensure_iptables_rule("FORWARD", body)
+    if _iptables_chain_exists("DOCKER-USER"):
+        _ensure_iptables_rule("DOCKER-USER", body)
+
+
 def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
     """Ensure every bridge declared in *shared_networks* exists and is up.
 
@@ -51,15 +95,21 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
 
     - ``bridge`` (str, required): the Linux bridge name on the host.
     - ``stp`` (bool, default False): enable STP on the bridge.
-    - ``disable_netfilter`` (bool, default True): set
-      ``/proc/sys/net/bridge/bridge-nf-call-iptables=0`` so lab frames
-      aren't dropped by host iptables rules. System-wide setting;
-      we flip it once per ``ensure()`` call if any entry asks for it.
+    - ``disable_netfilter`` (bool, default **False**): when False (the
+      default, decision D8), lab frames are allowed by an idempotent
+      per-bridge scoped ``iptables`` accept rule and the host-global
+      ``bridge-nf-call-iptables`` is left untouched. When True (an explicit,
+      discouraged opt-in), the host-global ``bridge-nf-call-iptables=0`` is
+      set instead, with a loud warning — it weakens docker/k8s bridge
+      filtering host-wide and is reverted by any reboot / kubelet.
+
+    ``subnet``/``gateway``/``ip_range`` may also be present; those are
+    consumed by the docker-compose generator (macvlan IPAM), not here.
     """
     if not shared_networks:
         return
 
-    want_nf_disabled = False
+    globally_disabled: list[str] = []
     for entry_name, entry in shared_networks.items():
         bridge = entry.get("bridge")
         if not bridge:
@@ -79,10 +129,24 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
         _run_sudo(f"ip link set dev {bridge} type bridge stp_state "
                   f"{1 if stp == 'on' else 0}")
 
-        if entry.get("disable_netfilter", True):
-            want_nf_disabled = True
+        # Decision D8: default to scoped per-bridge accept rules; the
+        # host-global sysctl disable is an explicit opt-in.
+        if entry.get("disable_netfilter", False):
+            globally_disabled.append(bridge)
+        else:
+            _ensure_scoped_accept(bridge)
 
-    if want_nf_disabled:
+    if globally_disabled:
+        log.warning(
+            f"disable_netfilter: true set for shared bridge(s) "
+            f"{', '.join(repr(b) for b in globally_disabled)} — setting the "
+            f"host-global bridge-nf-call-iptables=0. This weakens docker/k8s "
+            f"bridge filtering HOST-WIDE, is reverted by any reboot "
+            f"(br_netfilter defaults the sysctl to 1 on load) and by kubelet "
+            f"on kubernetes hosts. Prefer the default (scoped per-bridge accept "
+            f"rules) — drop 'disable_netfilter: true' unless you specifically "
+            f"need the global disable."
+        )
         nf_path = Path("/proc/sys/net/bridge/bridge-nf-call-iptables")
         if nf_path.exists():
             _set_sysfs(str(nf_path), "0")

@@ -157,9 +157,9 @@ class DockerComposeSession:
         :meth:`_teardown_runner`, which never regenerates.
         """
         workdir = self._workdir(cluster_cfg, cluster_name)
-        shared = set(self.config.get("shared_networks") or {})
+        shared_networks = self.config.get("shared_networks") or {}
         compose = self._generator.generate(
-            cluster_name, cluster_cfg, self._conf_dir(), shared
+            cluster_name, cluster_cfg, self._conf_dir(), shared_networks
         )
         compose_file = self._generator.write(compose, workdir)
         runner = ComposeRunner(
