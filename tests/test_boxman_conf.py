@@ -879,6 +879,34 @@ class TestConfigSchemaV2:
         assert self._mgr()._apply_config_version(None) is None
         assert self._mgr()._apply_config_version({}) == {}
 
+    # --- v1.0: docker-compose is rejected (needs v2.0) -------------------
+
+    def test_v1_top_level_docker_compose_is_error(self):
+        """A versionless config whose primary provider is docker-compose is
+        rejected: the provider consumes 'boxes:', which v1.0 ignores, so
+        provisioning would contradict the v1 'boxes ignored' nudge."""
+        cfg = self._cfg(top_provider='docker-compose',
+                        cluster={'boxes': {'web': {'image': 'nginx'}}})
+        with pytest.raises(ConfigError, match=r"docker-compose.*requires version: '2.0'"):
+            self._mgr()._apply_config_version(cfg)
+
+    def test_v1_per_cluster_docker_compose_is_error(self):
+        """A v1.0 config with a per-cluster docker-compose provider is also
+        rejected (the predicate reads the same per-cluster override)."""
+        cfg = self._cfg(version='1.0', top_provider='libvirt',
+                        cluster={'provider': 'docker-compose',
+                                 'boxes': {'web': {'image': 'nginx'}}})
+        with pytest.raises(ConfigError, match=r"docker-compose.*requires version: '2.0'"):
+            self._mgr()._apply_config_version(cfg)
+
+    def test_v1_libvirt_with_boxes_still_only_warns(self):
+        """The rejection is docker-compose-specific: a v1 libvirt cluster
+        using 'boxes:' still merely warns (regression guard for the nudge)."""
+        cfg = self._cfg(version='1.0', top_provider='libvirt',
+                        cluster={'boxes': {'b1': {}}})
+        out = self._mgr()._apply_config_version(cfg)  # no raise
+        assert out is cfg
+
     # --- v2.0 libvirt: boxes -> vms --------------------------------------
 
     def test_v2_libvirt_boxes_renamed_to_vms(self):
@@ -1174,3 +1202,20 @@ class TestMainConfigErrorExit:
             assert any('shown-anyway' in r.message for r in captured_logs.records)
         finally:
             boxman_logger.setLevel(previous)
+
+    def test_provision_error_also_exits_2(self, captured_logs, monkeypatch):
+        """Phase 3: the wrapper now catches the whole BoxmanError family, so an
+        operational failure on the docker-compose path (an unhealthy service →
+        ProvisionError) exits 2 cleanly instead of dumping a traceback."""
+        from boxman.scripts import app
+        from boxman.exceptions import ProvisionError
+
+        def _raise():
+            raise ProvisionError('service never became healthy')
+
+        monkeypatch.setattr(app, '_main', _raise)
+        with captured_logs.at_level(logging.ERROR, logger='boxman'):
+            with pytest.raises(SystemExit) as excinfo:
+                app.main()
+        assert excinfo.value.code == 2
+        assert any('never became healthy' in r.message for r in captured_logs.records)

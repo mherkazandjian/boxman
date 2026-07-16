@@ -14,7 +14,7 @@ import yaml
 import boxman
 from boxman import log
 from boxman.abstract.providers import ProviderSession as Session
-from boxman.exceptions import ConfigError
+from boxman.exceptions import BoxmanError
 from boxman.manager import BoxmanManager
 from boxman.providers import create_session, primary_provider_type
 from boxman.providers.libvirt.import_image import ImageImporter
@@ -286,15 +286,19 @@ def main():
     """
     CLI entry point.
 
-    Thin wrapper that translates config-schema errors
-    (:class:`~boxman.exceptions.ConfigError`, e.g. an unsupported
-    ``version:`` or an invalid v2.0 cluster) into a clean ``log.error`` +
-    exit 2, instead of surfacing a traceback. All other flow (including
-    the ``sys.exit()`` calls throughout) lives in :func:`_main`.
+    Thin wrapper that translates any :class:`~boxman.exceptions.BoxmanError`
+    into a clean ``log.error`` + exit 2 instead of surfacing a traceback.
+    This covers config-schema errors (:class:`~boxman.exceptions.ConfigError`,
+    e.g. an unsupported ``version:`` or an invalid v2.0 cluster) as well as
+    operational failures on the docker-compose path — a service that never
+    becomes healthy within ``readiness_timeout``
+    (:class:`~boxman.exceptions.ProvisionError`) or a missing docker/compose
+    plugin (:class:`~boxman.exceptions.RuntimeUnavailable`). All other flow
+    (including the ``sys.exit()`` calls throughout) lives in :func:`_main`.
     """
     try:
         _main()
-    except ConfigError as exc:
+    except BoxmanError as exc:
         # A viewer command (e.g. ``snapshot log``) raises the boxman logger
         # to CRITICAL+1 to silence INFO spam before the config is loaded; if
         # loading then fails, restore a level that lets this error through so
@@ -544,6 +548,18 @@ def _main():
                     provider_types.append(_cluster_type)
 
         for _ptype in provider_types:
+            # The docker-compose PROVIDER shells out to `docker compose` on
+            # the host; the `docker-compose` RUNTIME is libvirt-in-a-container
+            # (a different axis). Requiring runtime 'local' keeps them from
+            # being confused. Fail fast with a clean message.
+            if _ptype == 'docker-compose' and manager.runtime != 'local':
+                log.error(
+                    f"the docker-compose provider requires runtime 'local' "
+                    f"(got '{manager.runtime}'). The 'docker-compose' runtime "
+                    f"is libvirt-in-a-container — a different setting; see "
+                    f"doc/docker-compose-provider/config-schema.md."
+                )
+                sys.exit(2)
             if _ptype == 'libvirt':
                 # merge runtime metadata into the provider config from boxman.yml
                 provider_conf_with_runtime = manager.get_provider_config_with_runtime(
