@@ -63,21 +63,12 @@ templates:
       hostname: node01
       manage_etc_hosts: true
 
-      # Per-MAC netplan: adapter_1 (mgmt NAT) takes DHCP; adapter_2 gets a
-      # static address on the shared bridge, which has no DHCP — it is a
-      # plain L2 domain, so the address is assigned here by MAC match.
-      network:
-        version: 2
-        ethernets:
-          mgmt-nic:
-            match: { macaddress: "52:54:00:aa:00:01" }
-            dhcp4: true
-            dhcp6: false
-            optional: true
-          app-nic:
-            match: { macaddress: "52:54:00:aa:00:02" }
-            addresses: [10.10.0.20/24]
-
+      # node01's mgmt NIC (adapter_1) gets a DHCP address from the libvirt NAT
+      # and that is node01's routable/management IP (boxman uses it for ssh).
+      # The shared bridge (adapter_2) is a plain L2 domain with NO DHCP, so its
+      # address is assigned as an explicit step in the README before the L2
+      # test — deliberately NOT here, so boxman does not mistake the
+      # unreachable 10.10.0.x address for node01's management IP.
       users:
         - name: ubuntu
           lock_passwd: false
@@ -87,20 +78,18 @@ templates:
 
       chpasswd:
         expire: false
-        list: |
-          ubuntu:ubuntu
+        users:
+          - name: ubuntu
+            password: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+            type: text
 
       ssh_pwauth: true
       package_update: false
       packages:
         - qemu-guest-agent
-        - iputils-ping
 
       runcmd:
         - [ systemctl, enable, --now, qemu-guest-agent ]
-        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /admin -s /bin/bash -G sudo admin" ]
-        - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin && chmod 0440 /etc/sudoers.d/admin" ]
-        - [ sh, -c, "echo 'admin:{{ env('BOXMAN_ADMIN_PASS', default='boxman') }}' | chpasswd" ]
         - [ sh, -c, "echo done at $(date -Is) >> /var/log/hybrid-cloudinit.log" ]
 
 workspace:
@@ -111,7 +100,7 @@ clusters:
     provider: libvirt
     base_image: ubuntu-24.04-minimal-base-template-cloudinit
     proxy_host: localhost
-    admin_user: admin
+    admin_user: ubuntu
     admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
     admin_key_name: id_ed25519_boxman
     ssh_config: ssh_config

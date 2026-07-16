@@ -19,10 +19,15 @@ On `boxman up` boxman:
 1. creates the host bridge `bx_app` and installs a **scoped** per-bridge
    netfilter accept rule (decision D8 — `bridge-nf-call-iptables` is left
    untouched host-wide),
-2. clones/boots `node01` with its second NIC on `bx_app` (static `10.10.0.20`
-   via a per-MAC netplan match — the shared bridge has no DHCP),
+2. clones/boots `node01` with its second NIC (`adapter_2`) attached to `bx_app`,
 3. generates the docker-compose file and brings `web` up: a macvlan network on
    `bx_app` (static `10.10.0.10`) plus a cluster-internal `backend` bridge.
+
+`node01`'s management IP is the DHCP address on its mgmt NIC (that is what
+`boxman ssh` uses). The shared bridge is a plain L2 domain with **no DHCP**, so
+`node01`'s address on it (`10.10.0.20`) is assigned as an explicit step in the
+test below — deliberately not at boot, so boxman doesn't mistake that
+host-unreachable `10.10.0.x` address for node01's management IP.
 
 ## Prerequisites
 
@@ -61,32 +66,35 @@ The container is `hybrid_libvirt_dc_services-web-1` (find it with
 `docker ps --filter name=web`). It has `10.10.0.10` on the shared bridge and a
 `backend` address on `172.31.0.0/24`.
 
-**Ping both ways** (VM `10.10.0.20` ⇄ container `10.10.0.10`):
+**Step 1 — give node01 its address on the shared bridge.** It has no DHCP there,
+so assign it once (the app NIC is the second one, `enp7s0` on this box):
 
 ```bash
-# container -> VM
-docker exec hybrid_libvirt_dc_services-web-1 ping -c3 10.10.0.20
-
-# VM -> container
-boxman ssh compute_node01            # or: ssh -F <workspace>/ssh_config compute_node01
-node01$ ping -c3 10.10.0.10
+boxman ssh compute_node01 -- sudo ip addr add 10.10.0.20/24 dev enp7s0
+boxman ssh compute_node01 -- ip -4 -br addr show enp7s0     # -> 10.10.0.20/24
 ```
 
-**ARP resolves across the bridge** (each side learns the other's real MAC —
-proof this is L2, not routed):
+**Step 2 — ping both ways** (VM `10.10.0.20` ⇄ container `10.10.0.10`):
 
 ```bash
-node01$ ip neigh show 10.10.0.10                 # -> lladdr <container mac> REACHABLE
+docker exec hybrid_libvirt_dc_services-web-1 ping -c3 10.10.0.20   # container -> VM
+boxman ssh compute_node01 -- ping -c3 10.10.0.10                   # VM -> container
+```
+
+**Step 3 — ARP resolves across the bridge** (each side learns the other's real
+MAC — proof this is L2, not routed):
+
+```bash
+boxman ssh compute_node01 -- ip neigh show 10.10.0.10       # -> lladdr <container mac>
 docker exec hybrid_libvirt_dc_services-web-1 ip neigh show 10.10.0.20
 ```
 
-**Cluster-internal isolation** — the container's `backend` address is *not*
-reachable from the VM (only the shared bridge is L2-adjacent):
+**Step 4 — cluster-internal isolation.** The container's `backend` address is
+*not* reachable from the VM (only the shared bridge is L2-adjacent):
 
 ```bash
-# find the container's backend IP
-docker exec hybrid_libvirt_dc_services-web-1 ip -4 addr show eth0
-node01$ ping -c2 -W2 172.31.0.<that ip>          # -> 100% loss (isolated)
+docker exec hybrid_libvirt_dc_services-web-1 ip -4 -br addr   # note the 172.31.0.x
+boxman ssh compute_node01 -- ping -c2 -W2 172.31.0.2          # -> 100% loss (isolated)
 ```
 
 ## Tear down
@@ -110,6 +118,10 @@ sudo ip link del bx_app          # only if nothing else uses it
   as a non-root user: the agent check uses a bare `virsh` (no `-c` URI), which
   defaults to `qemu:///session`. Export `LIBVIRT_DEFAULT_URI=qemu:///system`
   before `boxman up`.
+- **`ssh-copy-id`/`boxman ssh` gets "Permission denied"** right after a
+  `destroy` + `up`: the fresh `node01` reuses the same mgmt IP but has a new
+  host key, so the client refuses password auth against the stale
+  `known_hosts` entry. Clear it: `ssh-keygen -R <node01 mgmt ip>`.
 - **`web` has no internet** (e.g. an in-container package install fails): the
   L2 test does not need it, but if you want it, keep the container's default
   route on `backend` (don't add a `gateway:` to `app_bridge`, as this box does).
