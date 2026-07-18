@@ -184,6 +184,54 @@ Notes and requirements:
   disables netfilter on bridges **host-wide** (a discouraged opt-in, logged
   loudly, reverted by any reboot).
 
+## Volumes
+
+A box's `volumes:` is a list of **structured** mounts (not raw compose
+strings — use `compose_extra:` for those). Each entry needs a `container_path`;
+whether it has a `host_path` decides its kind:
+
+```yaml
+clusters:
+  data:
+    provider: docker-compose
+    workdir: ./.boxman/data
+    boxes:
+      db:
+        image: postgres:16
+        volumes:
+          - name: pg_data                 # named volume (docker-managed)
+            container_path: /var/lib/postgresql/data
+            size: 10G                      # advisory only — see below
+          - host_path: ./initdb           # bind mount (relative → resolved vs conf.yml dir)
+            container_path: /docker-entrypoint-initdb.d
+            readonly: true
+          - host_path: .                   # "workdir" mount — a bind at the project dir
+            container_path: /workspace
+```
+
+| Kind | Trigger | Emitted | Top-level `volumes:` |
+|---|---|---|---|
+| **named** | has `name`, no `host_path` | `<name>:<container_path>[:ro]` | `{<name>: {driver: local}}` |
+| **bind** | has `host_path` | `<abs host_path>:<container_path>[:ro]` | — |
+| **workdir** | a bind with `host_path: .` | `<conf dir>:<container_path>[:ro]` | — |
+
+- `readonly: true` appends `:ro`.
+- A relative `host_path` is resolved absolute against the `conf.yml` directory
+  (same rule as `build.context`). boxman `mkdir -p`s a bind host dir before
+  `up` (so docker doesn't create it as `root`); an existing path is left as-is.
+- **`size:` is advisory** — docker's `local` volume driver does not enforce
+  quotas, so boxman emits the volume and logs a warning rather than pretending
+  to cap it. On a bind mount `size:` is meaningless and warned/ignored.
+- Malformed entries fail fast with a `ConfigError` (non-mapping entry, missing
+  `container_path`, or a named entry missing `name`) rather than silently
+  dropping a mount. `compose_extra:` on a named entry is deep-merged onto its
+  top-level `{driver: local}` spec (e.g. custom `driver_opts`).
+
+**Lifecycle:** `boxman down` keeps volumes (`docker compose down`); `boxman
+destroy` removes **named** volumes (`down --volumes`) and the generated compose
+file. Bind-mount host directories are **never** removed — they are your paths
+(`./initdb`, `.`), so cleaning them up is your call.
+
 ## Templating caveat for compose values (`environment:`, `command:`)
 
 `load_config` pre-processes bare `{{ name }}` tokens into `{name}` task

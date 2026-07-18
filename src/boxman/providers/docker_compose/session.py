@@ -75,6 +75,7 @@ class DockerComposeSession:
         self._require_local_runtime(cluster_name)
         timeout = self._readiness_timeout(cluster_cfg, cluster_name)
         runner, _workdir, _compose_file = self._compose_context(cluster_name, cluster_cfg)
+        self._ensure_bind_dirs(cluster_name, cluster_cfg)
         runner.preflight()
         self.logger.info(
             f"[{cluster_name}] docker compose up (project '{runner.project}', "
@@ -247,6 +248,44 @@ class DockerComposeSession:
         """Directory of the project ``conf.yml`` (for build-context resolution)."""
         config_path = getattr(self.manager, "config_path", None)
         return os.path.dirname(os.path.abspath(config_path)) if config_path else os.getcwd()
+
+    def _ensure_bind_dirs(
+        self, cluster_name: str, cluster_cfg: dict[str, Any]
+    ) -> None:
+        """``mkdir -p`` each bind-mount host directory before ``compose up``.
+
+        A bind mount whose host path doesn't exist yet would otherwise be
+        created by the docker daemon as ``root:root``; pre-creating it here (as
+        the boxman user, the ``_ensure_writable_dir`` intent) gives saner
+        ownership. Named volumes need no pre-creation (docker-managed), and
+        bind dirs are deliberately **never removed** on teardown — they are
+        user paths (``./configs``, ``.``). A host path that already exists (or
+        is a file) is left untouched.
+        """
+        conf_dir = self._conf_dir()
+        for box_name, box in (cluster_cfg.get("boxes") or {}).items():
+            for entry in (box or {}).get("volumes") or []:
+                if not isinstance(entry, dict):
+                    continue  # malformed — the generator raises on it
+                host_path = entry.get("host_path")
+                if not host_path:
+                    continue  # named volume — docker-managed
+                abs_host = os.path.abspath(
+                    os.path.join(conf_dir, os.path.expanduser(str(host_path)))
+                )
+                if os.path.exists(abs_host):
+                    continue
+                try:
+                    os.makedirs(abs_host, exist_ok=True)
+                    self.logger.info(
+                        f"[{cluster_name}] created bind-mount dir {abs_host} "
+                        f"(box '{box_name}')"
+                    )
+                except OSError as exc:
+                    self.logger.warning(
+                        f"[{cluster_name}] could not create bind-mount dir "
+                        f"{abs_host}: {exc} — docker will create it as root."
+                    )
 
     def compose_project_name(self, cluster_name: str) -> str:
         """Public accessor for the ``docker compose -p`` name of *cluster_name*.

@@ -5,11 +5,20 @@ ComposeGenerator — translate a boxman docker-compose *cluster* into a
 Scope: services (image / build / command / environment / ports /
 depends_on / restart / healthcheck), cluster-internal bridge networks,
 ``shared_networks`` bridges attached as docker **macvlan** networks (Phase 4
-— L2 to libvirt VMs on the same host bridge), and the ``compose_extra:``
-escape hatch (deep-merged verbatim, per-cluster and per-box — design
-decision D7). Out-of-phase box features are warned about and skipped:
+— L2 to libvirt VMs on the same host bridge), structured ``volumes:`` (Phase
+5 — named / bind / workdir mounts), and the ``compose_extra:`` escape hatch
+(deep-merged verbatim, per-cluster and per-box — design decision D7).
 
-- ``volumes:`` (structured named/bind/workdir mounts) → **Phase 5**.
+A box's ``volumes:`` is a list of structured mounts:
+
+- **named** (``{name: pg_data, container_path: /var/lib/postgresql/data}``) —
+  emitted as ``pg_data:/var/lib/postgresql/data`` plus a top-level
+  ``volumes: {pg_data: {driver: local}}``. An optional ``size:`` is
+  **advisory** (warned) — docker's local driver does not enforce quotas.
+- **bind** (``{host_path: ./configs, container_path: /etc/app,
+  readonly: true}``) — emitted as ``<abs host>:/etc/app:ro``; a relative
+  ``host_path`` is resolved against the project ``conf.yml`` dir (D4). A
+  "workdir mount" is just a bind mount with ``host_path: .``.
 
 A box's ``networks:`` may be a plain list (``[app_bridge, backend]`` — the
 container gets an auto-assigned address on each) or a mapping that pins a
@@ -49,15 +58,24 @@ _PASSTHROUGH_KEYS = (
 #: before the brace), which is a safe compose interpolation, not corruption.
 _CORRUPTED_TEMPLATE_RE = re.compile(r"(?<!\$)\{[a-zA-Z_]\w*\}")
 
-#: every box key the Phase-3 generator understands. Anything else is warned
-#: about and dropped (``volumes:`` → Phase 5 is handled separately, but is a
-#: recognised key so it doesn't also trip the unknown-key warning).
+#: every box key the generator understands. Anything else is warned about and
+#: dropped.
 _KNOWN_BOX_KEYS = frozenset(_PASSTHROUGH_KEYS) | {
     "build",
     "networks",
     "volumes",
     "compose_extra",
 }
+
+#: keys understood inside a structured ``volumes:`` entry. Others warn.
+_KNOWN_VOLUME_KEYS = frozenset({
+    "name",
+    "container_path",
+    "host_path",
+    "readonly",
+    "size",
+    "compose_extra",
+})
 
 
 class ComposeGenerator:
@@ -106,12 +124,16 @@ class ComposeGenerator:
         #: only these become top-level macvlan networks (insertion order via
         #: shared_networks below keeps the output deterministic).
         referenced_shared: set[str] = set()
+        #: named volumes defined by any box → the top-level ``volumes:`` block,
+        #: in first-seen order (a name shared by two boxes is defined once).
+        named_volumes: dict[str, Any] = {}
 
         services: dict[str, Any] = {}
         for box_name, box in (cluster_cfg.get("boxes") or {}).items():
             services[box_name] = self._service(
                 cluster_name, box_name, box or {}, conf_dir,
                 cluster_networks, shared_networks, referenced_shared,
+                named_volumes,
             )
 
         compose: dict[str, Any] = {}
@@ -124,6 +146,8 @@ class ComposeGenerator:
         )
         if networks:
             compose["networks"] = networks
+        if named_volumes:
+            compose["volumes"] = named_volumes
 
         # D7: per-cluster escape hatch, deep-merged verbatim.
         return self._deep_merge(compose, cluster_cfg.get("compose_extra") or {})
@@ -148,6 +172,7 @@ class ComposeGenerator:
         cluster_networks: dict[str, Any],
         shared_networks: dict[str, Any],
         referenced_shared: set[str],
+        named_volumes: dict[str, Any],
     ) -> dict[str, Any]:
         svc: dict[str, Any] = {}
 
@@ -176,12 +201,11 @@ class ComposeGenerator:
         if nets:
             svc["networks"] = nets
 
-        if box.get("volumes"):
-            self.logger.warning(
-                f"box '{cluster_name}.{box_name}': 'volumes:' is not supported "
-                f"yet (lands in Phase 5) — skipping {len(box['volumes'])} "
-                f"volume(s). Use 'compose_extra:' if you need them now."
-            )
+        vols = self._service_volumes(
+            cluster_name, box_name, box.get("volumes"), conf_dir, named_volumes
+        )
+        if vols:
+            svc["volumes"] = vols
 
         # D7: per-box escape hatch, deep-merged verbatim (last, so it can
         # override anything boxman generated).
@@ -253,6 +277,85 @@ class ComposeGenerator:
     @staticmethod
     def _abs_context(ctx: str, conf_dir: str) -> str:
         return os.path.abspath(os.path.join(conf_dir, os.path.expanduser(ctx)))
+
+    def _service_volumes(
+        self,
+        cluster_name: str,
+        box_name: str,
+        volumes: Any,
+        conf_dir: str,
+        named_volumes: dict[str, Any],
+    ) -> list[str]:
+        """Translate a box's structured ``volumes:`` to compose mount strings.
+
+        Each entry is a mapping. A ``host_path`` makes it a **bind** mount
+        (relative paths resolved absolute vs *conf_dir*, D4); otherwise it is a
+        **named** volume (needs ``name``) that is also recorded in
+        *named_volumes* for the top-level ``volumes:`` block. ``readonly: true``
+        appends ``:ro``. ``size:`` is advisory on a named volume (docker's
+        local driver does not enforce quotas) and meaningless on a bind mount —
+        both are warned, never enforced. Malformed input raises ``ConfigError``
+        rather than silently dropping a mount.
+        """
+        if not volumes:
+            return []
+        if not isinstance(volumes, (list, tuple)):
+            raise ConfigError(
+                f"box '{cluster_name}.{box_name}': 'volumes:' must be a list of "
+                f"mounts (got {type(volumes).__name__})."
+            )
+        mounts: list[str] = []
+        for entry in volumes:
+            if not isinstance(entry, dict):
+                raise ConfigError(
+                    f"box '{cluster_name}.{box_name}': each 'volumes:' entry must "
+                    f"be a mapping with 'container_path' (+ 'name' for a named "
+                    f"volume or 'host_path' for a bind mount) — got {entry!r}."
+                )
+            unknown = [k for k in entry if k not in _KNOWN_VOLUME_KEYS]
+            if unknown:
+                self.logger.warning(
+                    f"box '{cluster_name}.{box_name}': ignoring unknown "
+                    f"'volumes:' key(s) {', '.join(repr(k) for k in unknown)} — "
+                    f"use 'compose_extra:' to pass extra mount options."
+                )
+            container_path = entry.get("container_path")
+            if not container_path:
+                raise ConfigError(
+                    f"box '{cluster_name}.{box_name}': a 'volumes:' entry is "
+                    f"missing 'container_path' ({entry!r})."
+                )
+            ro = ":ro" if entry.get("readonly") else ""
+            host_path = entry.get("host_path")
+            if host_path:
+                if entry.get("size"):
+                    self.logger.warning(
+                        f"box '{cluster_name}.{box_name}': 'size:' is ignored on "
+                        f"the bind mount for '{container_path}' — it is only "
+                        f"meaningful on a named volume."
+                    )
+                abs_host = self._abs_context(str(host_path), conf_dir)
+                mounts.append(f"{abs_host}:{container_path}{ro}")
+            else:
+                name = entry.get("name")
+                if not name:
+                    raise ConfigError(
+                        f"box '{cluster_name}.{box_name}': a named 'volumes:' "
+                        f"entry needs a 'name' (or a 'host_path' for a bind "
+                        f"mount) — {entry!r}."
+                    )
+                if entry.get("size"):
+                    self.logger.warning(
+                        f"box '{cluster_name}.{box_name}': size: "
+                        f"{entry['size']!r} on named volume '{name}' is advisory "
+                        f"— docker's local driver does not enforce quotas."
+                    )
+                mounts.append(f"{name}:{container_path}{ro}")
+                if name not in named_volumes:
+                    named_volumes[name] = self._deep_merge(
+                        {"driver": "local"}, entry.get("compose_extra") or {}
+                    )
+        return mounts
 
     def _service_networks(
         self,

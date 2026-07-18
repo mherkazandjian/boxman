@@ -9,9 +9,9 @@ cover four seams:
 
 - :class:`ComposeGenerator` — ``boxes:`` → compose ``services:`` translation,
   cluster-internal bridge networks, ``shared_networks`` → macvlan attach
-  (Phase 4: static/auto IPs, IPAM, reference-gating), absolute
-  ``build.context`` (D4), ``compose_extra:`` deep-merge (D7), and the warn+skip
-  of still-out-of-phase box features (``volumes:`` → Phase 5).
+  (Phase 4: static/auto IPs, IPAM, reference-gating), structured ``volumes:``
+  (Phase 5: named / bind / workdir, readonly, advisory size, fail-fast),
+  absolute ``build.context`` (D4), and ``compose_extra:`` deep-merge (D7).
 - :class:`ComposeRunner` — the exact ``docker compose`` command strings and
   the preflight / failure error paths (``boxman.utils.shell.run`` mocked).
 - :class:`DockerComposeSession` — satisfies the ``ProviderSession`` protocol,
@@ -200,14 +200,104 @@ class TestComposeGenerator:
         assert net["internal"] is True
         assert net["driver"] == "bridge"
 
-    def test_volumes_warn_and_skip(self):
+    # -- Phase 5: volumes -------------------------------------------------
+    def test_named_volume_emits_mount_and_top_level(self):
         gen = ComposeGenerator()
-        cluster = {"boxes": {"db": {"image": "postgres", "volumes": ["data:/var/lib"]}}}
+        cluster = {"boxes": {"db": {"image": "postgres", "volumes": [
+            {"name": "pg_data", "container_path": "/var/lib/postgresql/data"}]}}}
+        compose = gen.generate("s", cluster, conf_dir="/proj")
+        assert compose["services"]["db"]["volumes"] == [
+            "pg_data:/var/lib/postgresql/data"]
+        assert compose["volumes"] == {"pg_data": {"driver": "local"}}
+
+    def test_bind_mount_resolves_abs_and_readonly(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "nginx", "volumes": [
+            {"host_path": "./configs", "container_path": "/etc/app",
+             "readonly": True}]}}}
+        compose = gen.generate("s", cluster, conf_dir="/proj")
+        assert compose["services"]["w"]["volumes"] == ["/proj/configs:/etc/app:ro"]
+        assert "volumes" not in compose  # bind mounts have no top-level entry
+
+    def test_workdir_is_a_bind_at_conf_dir(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x", "volumes": [
+            {"host_path": ".", "container_path": "/workspace"}]}}}
+        svc = gen.generate("s", cluster, conf_dir="/proj")["services"]["w"]
+        assert svc["volumes"] == ["/proj:/workspace"]
+
+    def test_named_volume_size_is_advisory_warn(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"db": {"image": "postgres", "volumes": [
+            {"name": "pg_data", "container_path": "/data", "size": "10G"}]}}}
         with mock.patch.object(gen.logger, "warning") as warn:
-            svc = gen.generate("s", cluster, conf_dir="/proj")["services"]["db"]
-        assert "volumes" not in svc
-        assert warn.called
-        assert "Phase 5" in warn.call_args[0][0]
+            compose = gen.generate("s", cluster, conf_dir="/proj")
+        assert compose["services"]["db"]["volumes"] == ["pg_data:/data"]  # still emitted
+        assert compose["volumes"] == {"pg_data": {"driver": "local"}}      # no size enforced
+        assert any("advisory" in str(c.args[0]) for c in warn.call_args_list)
+
+    def test_size_on_bind_warns_ignored(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x", "volumes": [
+            {"host_path": "./d", "container_path": "/d", "size": "5G"}]}}}
+        with mock.patch.object(gen.logger, "warning") as warn:
+            gen.generate("s", cluster, conf_dir="/proj")
+        assert any("ignored on the bind mount" in str(c.args[0])
+                   for c in warn.call_args_list)
+
+    def test_shared_named_volume_defined_once(self):
+        """Two boxes mounting the same named volume → one top-level entry."""
+        gen = ComposeGenerator()
+        cluster = {"boxes": {
+            "a": {"image": "x", "volumes": [{"name": "shared", "container_path": "/a"}]},
+            "b": {"image": "x", "volumes": [{"name": "shared", "container_path": "/b"}]},
+        }}
+        compose = gen.generate("s", cluster, conf_dir="/proj")
+        assert compose["volumes"] == {"shared": {"driver": "local"}}
+        assert compose["services"]["a"]["volumes"] == ["shared:/a"]
+        assert compose["services"]["b"]["volumes"] == ["shared:/b"]
+
+    def test_named_volume_compose_extra_merges(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"db": {"image": "x", "volumes": [
+            {"name": "v", "container_path": "/d",
+             "compose_extra": {"driver_opts": {"type": "none", "o": "bind"}}}]}}}
+        vol = gen.generate("s", cluster, conf_dir="/proj")["volumes"]["v"]
+        assert vol == {"driver": "local",
+                       "driver_opts": {"type": "none", "o": "bind"}}
+
+    def test_volume_missing_container_path_raises(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"db": {"image": "x", "volumes": [{"name": "v"}]}}}
+        with pytest.raises(ConfigError, match=r"missing 'container_path'"):
+            gen.generate("s", cluster, conf_dir="/proj")
+
+    def test_named_volume_missing_name_raises(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"db": {"image": "x",
+                                    "volumes": [{"container_path": "/d"}]}}}
+        with pytest.raises(ConfigError, match=r"needs a 'name'"):
+            gen.generate("s", cluster, conf_dir="/proj")
+
+    def test_non_dict_volume_entry_raises(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"db": {"image": "x", "volumes": ["data:/var/lib"]}}}
+        with pytest.raises(ConfigError, match=r"must\s+be a mapping"):
+            gen.generate("s", cluster, conf_dir="/proj")
+
+    def test_volumes_not_a_list_raises(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"db": {"image": "x", "volumes": {"name": "v"}}}}
+        with pytest.raises(ConfigError, match=r"'volumes:' must be a list"):
+            gen.generate("s", cluster, conf_dir="/proj")
+
+    def test_unknown_volume_key_warns(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"db": {"image": "x", "volumes": [
+            {"name": "v", "container_path": "/d", "typo": 1}]}}}
+        with mock.patch.object(gen.logger, "warning") as warn:
+            gen.generate("s", cluster, conf_dir="/proj")
+        assert any("unknown" in str(c.args[0]) for c in warn.call_args_list)
 
     # -- Phase 4: shared_networks → macvlan ------------------------------
     def _shared(self, **over):
@@ -617,6 +707,36 @@ class TestDockerComposeSession:
         with self._patch_context(session, runner):
             session.up_cluster("stack", {})
         assert ("up", DEFAULT_READINESS_TIMEOUT) in runner.calls
+
+    def test_up_cluster_precreates_bind_dirs(self):
+        """Bind-mount host dirs are mkdir -p'd before compose up; named volumes
+        (docker-managed) are not."""
+        session = self._session()
+        runner = _FakeRunner()
+        cluster = {"boxes": {"w": {"image": "x", "volumes": [
+            {"host_path": "./data", "container_path": "/d"},
+            {"name": "vol", "container_path": "/v"},
+        ]}}}
+        with self._patch_context(session, runner), \
+             mock.patch("boxman.providers.docker_compose.session.os.path.exists",
+                        return_value=False), \
+             mock.patch("boxman.providers.docker_compose.session.os.makedirs") as md:
+            session.up_cluster("stack", cluster)
+        made = [c.args[0] for c in md.call_args_list]
+        assert "/proj/data" in made                 # bind dir created
+        assert all("vol" not in p for p in made)     # named volume is not a dir
+
+    def test_ensure_bind_dirs_skips_existing_and_named(self):
+        session = self._session()
+        cluster = {"boxes": {"w": {"volumes": [
+            {"host_path": "./data", "container_path": "/d"},   # exists → skip
+            {"name": "vol", "container_path": "/v"},           # named → skip
+        ]}}}
+        with mock.patch("boxman.providers.docker_compose.session.os.path.exists",
+                        return_value=True), \
+             mock.patch("boxman.providers.docker_compose.session.os.makedirs") as md:
+            session._ensure_bind_dirs("stack", cluster)
+        md.assert_not_called()
 
     def test_readiness_timeout_non_integer_raises(self):
         session = self._session()

@@ -413,6 +413,16 @@ with a loud warning. Evidence: [spike/findings.md](spike/findings.md)
 
 ## Volume Management
 
+> **Implemented in Phase 5 ([#53](https://github.com/mherkazandjian/boxman/issues/53)).**
+> Structured `volumes:` (named / bind / workdir, `readonly:`) translate to
+> compose mounts + a top-level `volumes:` block for named volumes.
+> `size:` is **advisory** — docker's `local` driver can't enforce quotas, so
+> boxman emits the volume and warns rather than pretending to cap it (it stays
+> available via `compose_extra: {driver_opts: …}` for setups that can).
+> Lifecycle: `down` keeps volumes, `destroy` runs `down --volumes`; bind-mount
+> host dirs are never auto-removed. See
+> [config-schema.md](./config-schema.md#volumes).
+
 ### Volume Types
 
 ```mermaid
