@@ -74,6 +74,7 @@ class ComposeGenerator:
         cluster_cfg: dict[str, Any],
         conf_dir: str,
         shared_networks: dict[str, Any] | None = None,
+        project_name: str | None = None,
     ) -> dict[str, Any]:
         """
         Build the compose dict for *cluster_name*.
@@ -88,6 +89,12 @@ class ComposeGenerator:
                 ``{bridge, subnet, gateway?, ip_range?, ...}``). A box network
                 ref that matches a key here is emitted as a docker **macvlan**
                 network over that host bridge (Phase 4).
+            project_name: The compose project name boxman runs the stack under.
+                When given, it is emitted as a top-level ``name:`` so the file
+                is hand-runnable (``docker compose -f <file> ps``) under the
+                same project boxman uses — the D5 fidelity claim. The runner
+                still passes ``-p`` explicitly, which overrides ``name:``, so
+                its behaviour is unchanged.
 
         Returns:
             The compose dict (no top-level ``version:`` — the compose spec
@@ -107,7 +114,10 @@ class ComposeGenerator:
                 cluster_networks, shared_networks, referenced_shared,
             )
 
-        compose: dict[str, Any] = {"services": services}
+        compose: dict[str, Any] = {}
+        if project_name:
+            compose["name"] = project_name
+        compose["services"] = services
         networks = self._networks(cluster_networks)
         networks.update(
             self._shared_macvlan_networks(referenced_shared, shared_networks)
@@ -307,15 +317,34 @@ class ComposeGenerator:
         """Normalise a box ``networks:`` (list or mapping) to ``[(ref, opts)]``.
 
         List form yields empty opts per ref; mapping form carries each ref's
-        option dict (``{ipv4_address: …}``, or ``None`` → empty).
+        option dict (``{ipv4_address: …}``, or ``None`` → empty). Malformed
+        input fails fast with a ``ConfigError`` rather than silently dropping
+        the attachment — a bare string (``networks: app_bridge``, a forgotten
+        ``[…]``) would otherwise emit a service with no ``networks:`` key at
+        all, so compose attaches it to the project-default bridge and the
+        macvlan L2 attach silently never happens.
         """
         if not networks:
             return []
+        if isinstance(networks, str):
+            # A forgotten list: treat the single name as a one-element list
+            # rather than dropping it silently.
+            return [(networks, {})]
         if isinstance(networks, dict):
+            for ref, opts in networks.items():
+                if opts is not None and not isinstance(opts, dict):
+                    raise ConfigError(
+                        f"box '{cluster_name}.{box_name}': networks['{ref}'] "
+                        f"must be a mapping like {{ipv4_address: …}} or null "
+                        f"(got {opts!r})."
+                    )
             return [(ref, dict(opts or {})) for ref, opts in networks.items()]
         if isinstance(networks, (list, tuple)):
-            return [(ref, {}) for ref in networks]
-        return []
+            return [(str(ref), {}) for ref in networks]
+        raise ConfigError(
+            f"box '{cluster_name}.{box_name}': 'networks:' must be a list or "
+            f"mapping (got {type(networks).__name__})."
+        )
 
     def _require_macvlan_ipam(
         self, cluster_name: str, box_name: str, ref: str, entry: dict[str, Any]

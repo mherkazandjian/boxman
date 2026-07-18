@@ -14,9 +14,11 @@
 #
 # boxman creates bx_app (+ a scoped netfilter accept rule — decision D8),
 # attaches node01's second NIC to it, and brings the macvlan container up on
-# it. The VM's shared-bridge address is assigned by a per-MAC netplan match
-# in cloud-init (the shared bridge is a plain L2 domain with no DHCP). The
-# container's macvlan address is pinned statically at 10.10.0.10.
+# it. The VM's shared-bridge address (10.10.0.20) is assigned as an explicit
+# step in the README — the shared bridge is a plain L2 domain with no DHCP, and
+# addressing it at boot would make boxman mistake that host-unreachable address
+# for node01's management IP. The container's macvlan address is pinned
+# statically at 10.10.0.10.
 #
 #   cd boxes/hybrid-libvirt-docker-compose
 #   boxman up

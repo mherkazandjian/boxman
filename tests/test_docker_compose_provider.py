@@ -332,6 +332,51 @@ class TestComposeGenerator:
         assert "networks" not in svc
         assert warn.called
 
+    # -- malformed networks: fail fast, never silently drop -----------------
+    def test_bare_string_networks_is_attached_not_silently_dropped(self):
+        """A forgotten list (`networks: labnet`) must still attach — not vanish
+        (which would land the service on the default bridge, no macvlan)."""
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x", "networks": "labnet"}}}
+        svc = gen.generate(
+            "s", cluster, conf_dir="/proj", shared_networks=self._shared()
+        )["services"]["w"]
+        assert svc["networks"] == ["labnet"]
+
+    def test_scalar_network_opts_raises_configerror(self):
+        """`networks: {labnet: 10.10.0.5}` (a scalar where a mapping/null is
+        required) is a ConfigError, not a raw ValueError."""
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x",
+                                   "networks": {"labnet": "10.10.0.5"}}}}
+        with pytest.raises(ConfigError, match=r"must be a mapping"):
+            gen.generate("s", cluster, conf_dir="/proj",
+                         shared_networks=self._shared())
+
+    def test_non_list_non_mapping_networks_raises_configerror(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x", "networks": 123}}}
+        with pytest.raises(ConfigError, match=r"must be a list or mapping"):
+            gen.generate("s", cluster, conf_dir="/proj")
+
+    def test_generate_emits_top_level_name_when_project_given(self):
+        """With project_name, a top-level `name:` is emitted so the file is
+        hand-runnable under the same project boxman uses (D5)."""
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "nginx"}}}
+        compose = gen.generate("web", cluster, conf_dir="/proj",
+                               project_name="dc_standalone_web")
+        assert compose["name"] == "dc_standalone_web"
+        # name comes first, services still present
+        assert list(compose)[0] == "name"
+        assert "w" in compose["services"]
+
+    def test_generate_omits_name_without_project(self):
+        gen = ComposeGenerator()
+        compose = gen.generate("web", {"boxes": {"w": {"image": "x"}}},
+                               conf_dir="/proj")
+        assert "name" not in compose
+
     def test_corrupted_templating_warns(self):
         """A '{word}' token (the signature of a mangled bare '{{ word }}') in a
         compose command:/environment: value is flagged."""

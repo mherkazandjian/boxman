@@ -41,9 +41,8 @@ host-unreachable `10.10.0.x` address for node01's management IP.
   with `ssh-copy-id` over a password session (`apt install sshpass` /
   `dnf install sshpass`). Without it, key injection is skipped (non-fatal) and
   you fall back to the guest agent for the checks below.
-- The macvlan support this box relies on lands with **Phase 4** — run it from a
-  checkout that has it (the `feat/docker-compose-provider` line, once #62 is
-  merged).
+- The macvlan support this box relies on requires the
+  `feat/docker-compose-provider` line (the docker-compose provider epic).
 - First run downloads the Ubuntu 24.04 cloud image (~0.5 GB, cached under
   `~/.cache/boxman/images`).
 
@@ -109,7 +108,11 @@ shared bridges can be used by multiple projects, so removing them is an explicit
 action:
 
 ```bash
-sudo ip link del bx_app          # only if nothing else uses it
+# remove the two scoped ACCEPT rules ensure() installed for this bridge...
+sudo iptables -D FORWARD -i bx_app -o bx_app -m physdev --physdev-is-bridged -j ACCEPT
+sudo iptables -D DOCKER-USER -i bx_app -o bx_app -m physdev --physdev-is-bridged -j ACCEPT  # if the chain exists
+# ...then the bridge itself (only if nothing else uses it)
+sudo ip link del bx_app
 ```
 
 ## Troubleshooting

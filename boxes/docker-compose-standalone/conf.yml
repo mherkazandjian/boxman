@@ -19,7 +19,7 @@
 #   cd boxes/docker-compose-standalone
 #   boxman provision
 #   curl -sI localhost:8080          # nginx is up
-#   docker compose -f .boxman/web/docker-compose.yml ps
+#   docker compose -p dc_standalone_web ps
 #   boxman destroy
 version: '2.0'
 project: dc_standalone

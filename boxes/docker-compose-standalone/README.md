@@ -35,9 +35,9 @@ boxman provision
 # nginx answers on the published port
 curl -sI localhost:8080 | head -1              # HTTP/1.1 200 OK
 
-# inspect the generated, hand-runnable compose file
-docker compose -f .boxman/web/docker-compose.yml ps
-cat .boxman/web/docker-compose.yml
+# inspect the stack — boxman runs it under project 'dc_standalone_web'
+docker compose -p dc_standalone_web ps
+cat .boxman/web/docker-compose.yml     # emits a top-level 'name:', so `-f <file> ps` also works
 
 # redis is healthy behind the frontend
 docker exec dc_standalone_web-cache-1 redis-cli ping   # PONG

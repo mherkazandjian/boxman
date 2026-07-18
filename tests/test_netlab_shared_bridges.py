@@ -148,13 +148,11 @@ class TestEnsure:
     def test_disable_netfilter_opt_in_sets_global_and_warns(self, captured_logs):
         """Explicit disable_netfilter: true → host-global sysctl=0, a loud
         warning, and NO scoped FORWARD rule."""
-        import logging as _logging
         cfg = {"lab_mgmt": {"bridge": "br1", "disable_netfilter": True}}
         with patch("boxman.netlab.shared_bridges.run",
                    side_effect=self._fake_run()) as run:
             with patch("pathlib.Path.exists", return_value=True):
-                with captured_logs.at_level(_logging.WARNING, logger="boxman"):
-                    shared_bridges.ensure(cfg)
+                shared_bridges.ensure(cfg)
         all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
         assert "bridge-nf-call-iptables" in all_cmds and "echo 0" in all_cmds
         assert "-I FORWARD" not in all_cmds  # global disable, no scoped rule

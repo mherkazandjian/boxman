@@ -45,11 +45,16 @@ def _set_sysfs(path: str, value: str) -> None:
 def _scoped_rule_body(bridge: str) -> str:
     """The physdev accept rule body shared by ``-C`` (check) and ``-I`` (insert).
 
-    Accepts frames both entering and leaving *bridge* that are bridged
-    (``--physdev-is-bridged``) — i.e. L2 lab traffic between a bridge-attached
-    VM and a macvlan-attached container on the same bridge — so it isn't
-    dropped by a docker-style ``FORWARD``/``DOCKER-USER`` DROP policy while the
-    host keeps ``bridge-nf-call-iptables=1`` (decision D8).
+    ``-i <br> -o <br> -m physdev --physdev-is-bridged`` matches frames the
+    bridge **forwards between two of its ports** (br_netfilter's FORWARD
+    traversal) — e.g. VM↔VM or VM↔containerlab-veth L2 lab traffic on the
+    shared bridge — so it isn't dropped by a docker-style
+    ``FORWARD``/``DOCKER-USER`` DROP policy while the host keeps
+    ``bridge-nf-call-iptables=1`` (decision D8). It is also installed as
+    belt-and-braces for macvlan-attached containers, though a macvlan endpoint
+    is a child of the bridge *device* rather than a bridge port, so on mainline
+    kernels VM↔container frames use the bridge local pass-up / ``br_dev_xmit``
+    paths and likely do not traverse filter ``FORWARD`` at all.
     """
     return (f"-i {bridge} -o {bridge} "
             f"-m physdev --physdev-is-bridged -j ACCEPT")

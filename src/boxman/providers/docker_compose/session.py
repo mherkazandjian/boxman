@@ -158,12 +158,14 @@ class DockerComposeSession:
         """
         workdir = self._workdir(cluster_cfg, cluster_name)
         shared_networks = self.config.get("shared_networks") or {}
+        project = self._compose_project(cluster_name)
         compose = self._generator.generate(
-            cluster_name, cluster_cfg, self._conf_dir(), shared_networks
+            cluster_name, cluster_cfg, self._conf_dir(), shared_networks,
+            project_name=project,
         )
         compose_file = self._generator.write(compose, workdir)
         runner = ComposeRunner(
-            project=self._compose_project(cluster_name),
+            project=project,
             compose_file=compose_file,
             workdir=workdir,
             logger=self.logger,

@@ -175,10 +175,14 @@ Notes and requirements:
   `compose_extra:` if you need a static IP on a cluster-internal network.
 - **Netfilter (decision D8):** by default (`disable_netfilter: false`) boxman
   leaves the host-global `bridge-nf-call-iptables` untouched and installs an
-  idempotent per-bridge scoped `iptables` accept rule so bridged lab frames
-  aren't dropped by a docker `FORWARD`/`DOCKER-USER` DROP policy. Setting
-  `disable_netfilter: true` instead disables netfilter on bridges **host-wide**
-  (a discouraged opt-in, logged loudly, reverted by any reboot).
+  idempotent per-bridge scoped `iptables` accept rule (on `FORWARD`, and
+  `DOCKER-USER` when that chain exists) so bridged lab frames aren't dropped by
+  a docker `FORWARD`/`DOCKER-USER` DROP policy. Like the shared bridges
+  themselves, these rules are **never removed by boxman** (they can be shared
+  across projects) — tearing them down is an explicit user action (see the
+  hybrid box's teardown note). Setting `disable_netfilter: true` instead
+  disables netfilter on bridges **host-wide** (a discouraged opt-in, logged
+  loudly, reverted by any reboot).
 
 ## Templating caveat for compose values (`environment:`, `command:`)
 
