@@ -230,6 +230,8 @@ provider:
 shared_networks:
   app_bridge:
     bridge: br-app
+    subnet: 10.10.0.0/24       # required when a docker-compose box attaches (macvlan IPAM)
+    gateway: 10.10.0.1         # optional
     stp: false
     disable_netfilter: false   # default — scoped per-bridge rules instead (decision D8)
 
@@ -349,7 +351,7 @@ graph LR
     D --> E[Generate macvlan network]
     E --> F[docker-compose.yml]
     
-    F --> G["networks:<br/>  app_bridge:<br/>    driver: macvlan<br/>    driver_opts:<br/>      parent: br-app"]
+    F --> G["networks:<br/>  app_bridge:<br/>    driver: macvlan<br/>    driver_opts:<br/>      parent: br-app<br/>    ipam:<br/>      config:<br/>        - subnet: 10.10.0.0/24"]
     
     C --> H[Host bridge ready]
     G --> I[Containers attach via macvlan]

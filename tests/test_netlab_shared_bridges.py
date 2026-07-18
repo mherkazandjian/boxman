@@ -83,34 +83,80 @@ class TestEnsure:
 
         assert any("stp_state 1" in c.args[0] for c in run.call_args_list)
 
-    def test_disables_bridge_netfilter_when_proc_exists(self):
-        def fake_run(cmd, **kwargs):
+    @staticmethod
+    def _fake_run(rule_present=False, docker_user=False):
+        """A run() double for the netfilter path.
+
+        ``rule_present`` → the ``iptables -C`` check reports the scoped rule
+        already exists (so no ``-I`` insert). ``docker_user`` → the
+        ``DOCKER-USER`` chain exists.
+        """
+        def fake(cmd, **kwargs):
             if cmd.startswith("ip link show dev"):
                 return _result(ok=True)
+            if "-C FORWARD" in cmd or "-C DOCKER-USER" in cmd:
+                return _result(ok=rule_present)
+            if "-n -L DOCKER-USER" in cmd:
+                return _result(ok=docker_user)
             return _result(ok=True)
+        return fake
 
-        cfg = {"lab_mgmt": {"bridge": "br1"}}  # disable_netfilter defaults True
-        with patch("boxman.netlab.shared_bridges.run", side_effect=fake_run) as run:
+    def test_default_applies_scoped_forward_rule_not_global_disable(self):
+        """D8 default (disable_netfilter unset → False): a scoped physdev
+        ACCEPT rule is inserted into FORWARD, and the host-global sysctl is
+        left untouched."""
+        cfg = {"lab_mgmt": {"bridge": "br1"}}  # default disable_netfilter=False
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=self._fake_run()) as run:
             with patch("pathlib.Path.exists", return_value=True):
                 shared_bridges.ensure(cfg)
-
         all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
-        assert "bridge-nf-call-iptables" in all_cmds
-        assert "echo 0" in all_cmds
-
-    def test_skips_netfilter_when_opted_out(self):
-        def fake_run(cmd, **kwargs):
-            if cmd.startswith("ip link show dev"):
-                return _result(ok=True)
-            return _result(ok=True)
-
-        cfg = {"lab_mgmt": {"bridge": "br1", "disable_netfilter": False}}
-        with patch("boxman.netlab.shared_bridges.run", side_effect=fake_run) as run:
-            with patch("pathlib.Path.exists", return_value=True):
-                shared_bridges.ensure(cfg)
-
-        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert ("iptables -t filter -I FORWARD 1 -i br1 -o br1 "
+                "-m physdev --physdev-is-bridged -j ACCEPT") in all_cmds
         assert "bridge-nf-call-iptables" not in all_cmds
+        assert "echo 0" not in all_cmds
+
+    def test_scoped_rule_idempotent_when_already_present(self):
+        """When ``iptables -C`` reports the rule exists, no ``-I`` insert runs."""
+        cfg = {"lab_mgmt": {"bridge": "br1"}}
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=self._fake_run(rule_present=True)) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert "-C FORWARD" in all_cmds       # checked
+        assert "-I FORWARD" not in all_cmds   # but not re-inserted
+
+    def test_scoped_rule_added_to_docker_user_when_chain_exists(self):
+        cfg = {"lab_mgmt": {"bridge": "br1"}}
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=self._fake_run(docker_user=True)) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert "-I DOCKER-USER 1 -i br1 -o br1" in all_cmds
+
+    def test_scoped_rule_skips_docker_user_when_chain_absent(self):
+        cfg = {"lab_mgmt": {"bridge": "br1"}}
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=self._fake_run(docker_user=False)) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert "-I DOCKER-USER" not in all_cmds
+
+    def test_disable_netfilter_opt_in_sets_global_and_warns(self, captured_logs):
+        """Explicit disable_netfilter: true → host-global sysctl=0, a loud
+        warning, and NO scoped FORWARD rule."""
+        cfg = {"lab_mgmt": {"bridge": "br1", "disable_netfilter": True}}
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=self._fake_run()) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert "bridge-nf-call-iptables" in all_cmds and "echo 0" in all_cmds
+        assert "-I FORWARD" not in all_cmds  # global disable, no scoped rule
+        assert any("HOST-WIDE" in r.message for r in captured_logs.records)
 
     def test_missing_bridge_key_raises(self):
         cfg = {"lab_mgmt": {"stp": False}}  # no 'bridge'

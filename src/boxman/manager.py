@@ -3813,6 +3813,12 @@ class BoxmanManager:
                 cls.cache.read_projects_cache()
                 project_name = config.get('project')
                 if project_name and project_name in (cls.cache.projects or {}):
+                    # Shared bridges must exist before macvlan-attached
+                    # containers come up: a host reboot drops the
+                    # (non-persistent) Linux bridge, so recreate it on this
+                    # dc-only reconcile path too — mirroring the hybrid
+                    # "all VMs running" path (ensure_shared_bridges → up).
+                    cls.ensure_shared_bridges()
                     cls.provision_compose_clusters()
                 else:
                     cls.logger.info(
