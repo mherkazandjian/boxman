@@ -159,6 +159,14 @@ containerlab:
         kind: arista_ceos
         image: ceos:4.32.0F
         startup-config: configs/sw1.cfg.j2
+      # A `kind: bridge` node references the *existing* shared Linux
+      # bridge that boxman creates from `shared_networks.clab_mgmt` (and
+      # that host01's second NIC also joins) — it attaches, it does not
+      # create one. (`host:<name>` would create a new host interface and
+      # collide with the bridge.)
+      clab_mgmt:
+        kind: bridge
     links:
-      # sw1's Ethernet1 lands on the same host bridge as host01's second NIC.
-      - endpoints: ["sw1:eth1", "host:clab_mgmt"]
+      # sw1's Ethernet1 lands on the same host bridge as host01's second
+      # NIC; eth-sw1 is the bridge-side veth on the shared bridge.
+      - endpoints: ["sw1:eth1", "clab_mgmt:eth-sw1"]

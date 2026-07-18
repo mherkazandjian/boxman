@@ -6,8 +6,8 @@
 # IOSvL2 Catalyst-style L2 device running via vrnetlab.
 #
 # The only real differences vs. the cEOS variant are:
-#   - `kind: cisco_vios_l2`  (containerlab kind)
-#   - `image: vrnetlab/cisco_vios_l2:15.2.2020T`  (vrnetlab-built container)
+#   - `kind: cisco_vios` + `type: switch`  (containerlab kind; IOSvL2 switch)
+#   - `image: vrnetlab/cisco_vios:L2-20200929`  (vrnetlab-built container)
 #   - Interface name: `GigabitEthernet0/1` instead of `Ethernet1`
 #   - startup-config uses classic Cisco IOS CLI (Catalyst-style)
 #
@@ -19,11 +19,12 @@
 #     workflow:
 #
 #       git clone https://github.com/srl-labs/vrnetlab.git
-#       cp <your>/vios_l2-adventerprisek9-m.vmdk.SPA.<ver>.qcow2 \
-#          vrnetlab/cisco/vios_l2/
-#       cd vrnetlab/cisco/vios_l2
-#       make                                   # builds vrnetlab/cisco_vios_l2:<ver>
-#       docker images | grep cisco_vios_l2
+#       # a `vios_l2` filename auto-selects the switch build
+#       cp <your>/vios_l2-adventerprisek9-m.SSA.high_iron_20200929.qcow2 \
+#          vrnetlab/cisco/vios/
+#       cd vrnetlab/cisco/vios
+#       make                                   # builds vrnetlab/cisco_vios:L2-20200929
+#       docker images | grep cisco_vios
 #
 #     You must supply the qcow2 yourself — it's a Cisco-licensed image
 #     (CCO / EA / VIRL subscription). Vendor-image licensing is
@@ -171,11 +172,26 @@ containerlab:
   topology:
     nodes:
       sw1:
-        kind: cisco_vios_l2
-        image: vrnetlab/cisco_vios_l2:15.2.2020T
+        # containerlab's kind for Cisco vIOS is `cisco_vios`; the IOSvL2
+        # switch personality is selected with `type: switch`. There is no
+        # `cisco_vios_l2` kind. The vrnetlab image lives under the
+        # `vrnetlab/cisco_vios` repo (L2 builds get an `L2-<date>` tag).
+        kind: cisco_vios
+        type: switch
+        image: vrnetlab/cisco_vios:L2-20200929
         startup-config: configs/sw1.cfg.j2
+      # A `kind: bridge` node references the *existing* shared Linux
+      # bridge that boxman creates from `shared_networks.clab_mgmt` (and
+      # that host01's second NIC also joins) — containerlab attaches to
+      # it, it does NOT create one. This is what puts sw1 and host01 on
+      # the same L2 segment. (`host:<name>` would instead create a new
+      # host interface named clab_mgmt and collide with the bridge.)
+      clab_mgmt:
+        kind: bridge
     links:
-      # IOSvL2's first data port is GigabitEthernet0/1. containerlab
-      # normalises this to a plain ethN name on the container side; the
-      # host endpoint is just the shared bridge.
-      - endpoints: ["sw1:Gi0/1", "host:clab_mgmt"]
+      # containerlab's cisco_vios kind names data ports with a flat index
+      # (eth1, eth2, … — NOT IOS slot notation like Gi0/1). eth1 is the
+      # first data port, which the switch exposes in its own CLI as
+      # GigabitEthernet0/1 (that's what configs/sw1.cfg.j2 configures).
+      # The bridge-side veth is named eth-sw1 on the shared bridge.
+      - endpoints: ["sw1:eth1", "clab_mgmt:eth-sw1"]
