@@ -145,7 +145,7 @@ class TestEnsure:
         all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
         assert "-I DOCKER-USER" not in all_cmds
 
-    def test_disable_netfilter_opt_in_sets_global_and_warns(self, caplog):
+    def test_disable_netfilter_opt_in_sets_global_and_warns(self, captured_logs):
         """Explicit disable_netfilter: true → host-global sysctl=0, a loud
         warning, and NO scoped FORWARD rule."""
         import logging as _logging
@@ -153,12 +153,12 @@ class TestEnsure:
         with patch("boxman.netlab.shared_bridges.run",
                    side_effect=self._fake_run()) as run:
             with patch("pathlib.Path.exists", return_value=True):
-                with caplog.at_level(_logging.WARNING, logger="boxman"):
+                with captured_logs.at_level(_logging.WARNING, logger="boxman"):
                     shared_bridges.ensure(cfg)
         all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
         assert "bridge-nf-call-iptables" in all_cmds and "echo 0" in all_cmds
         assert "-I FORWARD" not in all_cmds  # global disable, no scoped rule
-        assert any("HOST-WIDE" in r.message for r in caplog.records)
+        assert any("HOST-WIDE" in r.message for r in captured_logs.records)
 
     def test_missing_bridge_key_raises(self):
         cfg = {"lab_mgmt": {"stp": False}}  # no 'bridge'
