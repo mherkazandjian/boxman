@@ -14,15 +14,38 @@ import yaml
 import boxman
 from boxman import log
 from boxman.abstract.providers import ProviderSession as Session
+from boxman.exceptions import ConfigError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.import_image import ImageImporter
 from boxman.providers.libvirt.session import LibVirtSession
+from boxman.providers.virtualbox.session import VirtualBoxSession
 from boxman.scripts.cli_parser import parse_args
 from boxman.utils.jinja_env import create_jinja_env
-from boxman.virtualbox.vboxmanage import Virtualbox
 
 now = datetime.now(timezone.utc)
 snap_name = now.strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def ensure_virtualbox_runtime_is_local(runtime: str) -> None:
+    """
+    Guard: the VirtualBox provider only supports the ``local`` runtime.
+
+    VirtualBox is a host-local hypervisor — ``VBoxManage`` must run directly on
+    the host and cannot be driven through a container runtime. Any non-``local``
+    runtime is therefore a configuration error.
+
+    Args:
+        runtime: The resolved runtime name (e.g. ``local``, ``docker``).
+
+    Raises:
+        ConfigError: If *runtime* is anything other than ``local``.
+    """
+    if runtime != 'local':
+        raise ConfigError(
+            f"the 'virtualbox' provider only supports the 'local' runtime, "
+            f"but the resolved runtime is '{runtime}'. Remove the --runtime "
+            f"flag / the 'runtime:' setting in boxman.yml, or set it to 'local'."
+        )
 
 
 def parse_vms_list(session: Session, cli_args):
@@ -507,7 +530,17 @@ def main():
             provider_type = list(manager.config['provider'].keys())[0]
 
         if provider_type == 'virtualbox':
-            session = Virtualbox(manager.config)    # .. todo:: rename to VirtualBoxSession
+            # VirtualBox is a host-local hypervisor: fail fast before building
+            # the session if the resolved runtime is not 'local'.
+            try:
+                ensure_virtualbox_runtime_is_local(manager.runtime)
+            except ConfigError as exc:
+                log.error(str(exc))
+                sys.exit(2)
+
+            session = VirtualBoxSession(manager.config)
+            session.manager = manager
+            manager.provider = session
         elif provider_type == 'libvirt':
             # merge runtime metadata into the provider config from boxman.yml
             provider_conf_with_runtime = manager.get_provider_config_with_runtime(

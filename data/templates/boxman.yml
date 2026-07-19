@@ -79,3 +79,20 @@ providers:
     virsh_cmd: virsh
     # specify the verbosity of libvirt commands
     verbose: False
+
+  # configuration for the virtualbox provider
+  #
+  # NOTE: the virtualbox provider only supports the 'local' runtime —
+  # VBoxManage runs directly on the host and cannot be driven through a
+  # container runtime. Using it with --runtime docker fails fast.
+  virtualbox:
+    # path to the VBoxManage binary (most hosts ship the CamelCase name)
+    vboxmanage_cmd: VBoxManage
+    # whether to prefix VBoxManage commands with sudo
+    use_sudo: False
+    # default medium/disk format for created disks (VDI | VMDK | VHD)
+    default_medium_format: VDI
+    # optional: base folder where VirtualBox stores VM data
+    # basefolder: ~/VirtualBox VMs
+    # specify the verbosity of virtualbox commands
+    verbose: False

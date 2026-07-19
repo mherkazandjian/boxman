@@ -28,6 +28,10 @@ from boxman.manager import BoxmanManager
 #: module-level constant in app.py).
 snap_name = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
 
+#: Providers boxman can target. Sourced in one place so the ``--provider``
+#: choices stay in sync as providers are added/removed.
+SUPPORTED_PROVIDERS = ['libvirt', 'virtualbox']
+
 
 def parse_args():
     # Lazy-imported here (not at module scope) to avoid a circular import
@@ -37,7 +41,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             f"Boxman version {boxman.metadata.version}\n"
-            "Virtualbox vboxmanage wrapper and infrastructure as code manager\n"
+            "Declarative VM provisioning manager (libvirt / virtualbox providers)\n"
             "\n"
             "usage example\n"
             "\n"
@@ -157,11 +161,14 @@ def parse_args():
     parser_import_image.add_argument(
         '--provider',
         type=str,
-        help='the provider to import the image into',
+        help=(
+            'the provider to import the image into '
+            f'(one of: {", ".join(SUPPORTED_PROVIDERS)}; '
+            'default: inferred from the image manifest)'
+        ),
         dest='provider',
         required=False,
-        choices=['virtualbox', 'libvirt'])   # figure out how to automate this with the
-                                             # supported providers list below
+        choices=SUPPORTED_PROVIDERS)
 
     #
     # sub parser for the 'image' subcommand (OCI registry image operations)
