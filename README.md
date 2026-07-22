@@ -322,6 +322,24 @@ transparently — no flag needed at revert time. See
 [Disk Reclaim and Storage](doc/storage.md) for the full reclaim
 workflow and the `boxman storage` subcommand.
 
+### Output verbosity
+
+By default boxman prints terse, docker-compose-style progress lines (the
+important milestones only). Add `-v`/`-vv`/`-vvv` — either before or after the
+sub-command — to reveal more detail, or `-q`/`--quiet` for warnings and errors
+only:
+
+```bash
+boxman up            # terse (default)
+boxman -v up         # + info-level detail
+boxman up -vv        # + full [time LEVEL file:func] debug lines
+boxman up -vvv       # also echo the underlying shell commands
+boxman up -q         # warnings and errors only
+```
+
+The default level can also be set with the `BOXMAN_VERBOSITY` environment
+variable (e.g. `BOXMAN_VERBOSITY=2`); any explicit `-v`/`-q` flag overrides it.
+
 ### SSH into VMs
 
 ```bash

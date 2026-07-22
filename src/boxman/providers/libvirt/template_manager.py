@@ -12,11 +12,13 @@ The rest of ``create_template`` needs a follow-up pass before this
 module is put into service.
 """
 
+import logging
 import os
 import shutil
 from typing import Any
 
 from boxman import log
+from boxman.loggers.logger import is_verbose
 from boxman.utils.shell import run
 from boxman.providers.libvirt.cloudinit import CloudInitTemplate
 from boxman.providers.libvirt.commands import VirshCommand, VirtInstallCommand
@@ -84,7 +86,7 @@ class TemplateManager:
             # use sparse-aware copy
             result = run(
                 f"rsync --sparse --progress '{src_path}' '{dest_path}'",
-                hide=False, warn=True
+                hide=not is_verbose(logging.DEBUG), warn=True
             )
             if not result.ok:
                 # fallback to regular copy
@@ -126,9 +128,7 @@ class TemplateManager:
         """
         vm_name = template_config.get("name", template_name)
 
-        self.logger.info("=" * 70)
-        self.logger.info(f"creating template: {vm_name}")
-        self.logger.info("=" * 70)
+        self.logger.status(f"creating template: {vm_name}")
 
         # check if template already exists
         if self.template_exists(vm_name):
@@ -167,7 +167,7 @@ class TemplateManager:
             self.logger.info(f"resizing disk image to {disk_size}")
             result = run(
                 f"qemu-img resize '{disk_path}' {disk_size}",
-                hide=False, warn=True
+                hide=not is_verbose(logging.DEBUG), warn=True
             )
             if not result.ok:
                 self.logger.error(f"failed to resize disk image: {result.stderr}")
@@ -246,7 +246,7 @@ class TemplateManager:
             cmd = f"docker exec --user root {container} bash -c '{escaped}'"
 
         self.logger.info(f"executing: {cmd}")
-        result = run(cmd, hide=False, warn=True)
+        result = run(cmd, hide=not is_verbose(logging.DEBUG), warn=True)
 
         if not result.ok:
             self.logger.error(f"virt-install failed: {result.stderr}")
@@ -261,9 +261,7 @@ class TemplateManager:
         # clean up the seed ISO nocloud directory
         ci.cleanup()
 
-        self.logger.info("=" * 70)
-        self.logger.info(f"template '{vm_name}' is ready")
-        self.logger.info("=" * 70)
+        self.logger.status(f"template '{vm_name}' is ready")
 
         return True
 

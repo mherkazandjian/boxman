@@ -17,7 +17,8 @@ from boxman.abstract.providers import ProviderSession as Session
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.import_image import ImageImporter
 from boxman.providers.libvirt.session import LibVirtSession
-from boxman.scripts.cli_parser import parse_args
+from boxman.loggers.logger import set_quiet, set_verbosity, suppressed
+from boxman.scripts.cli_parser import parse_args, resolve_verbosity
 from boxman.utils.jinja_env import create_jinja_env
 from boxman.virtualbox.vboxmanage import Virtualbox
 
@@ -306,6 +307,16 @@ def main():
 
     args.remaining_args = remaining
 
+    # Verbosity: minimal (STATUS) by default; -v/-vv/-vvv (either position)
+    # reveal more, -q/--quiet shows warnings+errors only. This overrides the
+    # import-time default in loggers/logger.py.
+    _verbosity = 0
+    if getattr(args, 'quiet', 0):
+        set_quiet()
+    else:
+        _verbosity = resolve_verbosity(args)
+        set_verbosity(_verbosity)
+
     if args.version:
         print(f'v{boxman.metadata.version}')
         sys.exit(0)
@@ -331,19 +342,15 @@ def main():
 
     # Handle 'ps' — needs config and virsh but not a full provider session
     if args.func == BoxmanManager.ps:
-        _boxman_logger = logging.getLogger('boxman')
+        import contextlib
         _ps_json = getattr(args, 'json', False)
-        if _ps_json:
-            _boxman_logger.setLevel(logging.CRITICAL + 1)
-        try:
+        _cm = suppressed() if _ps_json else contextlib.nullcontext()
+        with _cm:
             manager = BoxmanManager(config=args.conf)
             if not manager.config:
-                _boxman_logger.setLevel(logging.DEBUG)
                 log.error("no project config found (conf.yml)")
                 sys.exit(1)
             args.func(manager, args)
-        finally:
-            _boxman_logger.setLevel(logging.DEBUG)
         sys.exit(0)
 
     # 'snapshot log' is a viewer command — suppress INFO logging across the
@@ -411,6 +418,13 @@ def main():
 
         # load the boxman app configuration
         boxman_config = load_boxman_config(os.path.expanduser(args.boxman_conf))
+
+        # -vvv: echo the underlying shell commands (provider 'verbose' flag).
+        if _verbosity >= 3:
+            _providers = boxman_config.setdefault('providers', {})
+            for _pname, _pcfg in list(_providers.items()):
+                if isinstance(_pcfg, dict):
+                    _pcfg['verbose'] = True
 
         # make the app-level (boxman.yml) available to the manager
         manager.load_app_config(boxman_config)

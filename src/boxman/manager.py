@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import json
 import logging
@@ -15,6 +16,7 @@ import yaml
 from boxman.utils.shell import run
 
 from boxman import log
+from boxman.loggers.logger import suppressed
 from boxman.config_cache import BoxmanCache
 from boxman.image_cache import ImageCache
 from boxman.netlab import ContainerlabManager, shared_bridges
@@ -2048,7 +2050,7 @@ class BoxmanManager:
                     info=network_info,
                     workdir=cluster['workdir']
                 )
-                self.logger.info(f"defined network {_network_name} in {cluster['workdir']}")
+                self.logger.status(f"defined network {_network_name} in {cluster['workdir']}")
 
     def destroy_networks(self) -> None:
         """
@@ -2135,31 +2137,30 @@ class BoxmanManager:
 
         def _clone(cluster, vm_info, new_vm_name):
             max_retries = 5
-            boxman_logger = logging.getLogger('boxman')
             for attempt in range(1, max_retries + 1):
                 last_attempt = attempt == max_retries
+                # Suppress error-level logs on all retryable attempts so that
+                # transient pool-busy failures don't appear as errors; only the
+                # final attempt logs errors normally. suppressed() restores the
+                # prior level (not a hardcoded DEBUG) so -v/-vv survives retries.
+                _cm = (contextlib.nullcontext() if last_attempt
+                       else suppressed(logging.CRITICAL))
                 try:
-                    # Suppress error-level logs on all retryable attempts so
-                    # that transient pool-busy failures don't appear as errors.
-                    # Only the final attempt logs errors normally.
-                    if not last_attempt:
-                        boxman_logger.setLevel(logging.CRITICAL)
-                    src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
-                    if not src_vm_name and not self._is_diskless_boot(vm_info):
-                        raise ValueError(
-                            f"no base_image for VM '{new_vm_name}': "
-                            f"set base_image at the cluster or VM level"
+                    with _cm:
+                        src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
+                        if not src_vm_name and not self._is_diskless_boot(vm_info):
+                            raise ValueError(
+                                f"no base_image for VM '{new_vm_name}': "
+                                f"set base_image at the cluster or VM level"
+                            )
+                        self.provider.clone_vm(
+                            src_vm_name=src_vm_name,
+                            new_vm_name=new_vm_name,
+                            info=vm_info,
+                            workdir=cluster['workdir']
                         )
-                    self.provider.clone_vm(
-                        src_vm_name=src_vm_name,
-                        new_vm_name=new_vm_name,
-                        info=vm_info,
-                        workdir=cluster['workdir']
-                    )
-                    boxman_logger.setLevel(logging.DEBUG)
                     return
                 except Exception:
-                    boxman_logger.setLevel(logging.DEBUG)
                     if not last_attempt:
                         delay = attempt * 2
                         self.logger.warning(
@@ -2512,29 +2513,28 @@ class BoxmanManager:
         This method displays the VM names, hostnames, IP addresses, and
         other connection details for all configured VMs.
         """
-        self.logger.info("=== vm connection information ===")
+        self.logger.status("=== vm connection information ===")
         ws_path = self.config.get('workspace', {}).get('path', '')
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self.config['clusters'].items():
-            self.logger.info(f"cluster: {cluster_name}")
-            self.logger.info("-" * 60)
+            self.logger.status(f"cluster: {cluster_name}")
 
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 hostname = vm_info.get('hostname', vm_name)
 
-                self.logger.info(f"vm: {vm_name} (hostname: {hostname})")
+                self.logger.status(f"vm: {vm_name} (hostname: {hostname})")
 
                 # get the ip addresses for all interfaces
                 ip_addresses = self.provider.get_vm_ip_addresses(full_vm_name)
 
                 if ip_addresses:
-                    self.logger.info("  ip addresses:")
+                    self.logger.status("  ip addresses:")
                     for iface, ip in ip_addresses.items():
-                        self.logger.info(f"    {iface}: {ip}")
+                        self.logger.status(f"    {iface}: {ip}")
                 else:
-                    self.logger.info("  ip addresses: not available")
+                    self.logger.status("  ip addresses: not available")
 
                 # get ssh connection information
                 admin_user = cluster.get('admin_user', '<placeholder>')
@@ -2544,11 +2544,11 @@ class BoxmanManager:
                     cluster.get('admin_key_name', 'id_ed25519_boxman')
                 ))
 
-                self.logger.info("  connect via ssh:")
+                self.logger.status("  connect via ssh:")
                 # show direct connection if ip is available
                 if ip_addresses:
                     first_ip = next(iter(ip_addresses.values()))
-                    self.logger.info(f"    direct: ssh -i {admin_key} {admin_user}@{first_ip}")
+                    self.logger.status(f"    direct: ssh -i {admin_key} {admin_user}@{first_ip}")
 
                 # show connection using ssh_config if available
                 if 'ssh_config' in cluster:
@@ -2556,11 +2556,11 @@ class BoxmanManager:
                         base_path,
                         cluster.get('ssh_config', 'ssh_config')
                     ))
-                    self.logger.info(f"    via config: ssh -F {ssh_config} {cluster_name}_{hostname}")
+                    self.logger.status(f"    via config: ssh -F {ssh_config} {cluster_name}_{hostname}")
 
-                self.logger.info("")
+                self.logger.status("")
 
-            self.logger.info("")
+            self.logger.status("")
 
     #: Alias of the ProxyJump stanza written into ``ssh_config`` when the
     #: docker runtime is active. Kept as a class constant so tests and
@@ -4897,28 +4897,30 @@ class BoxmanManager:
         # clone new VMs (parallel with retry)
         def _clone(cluster, vm_info, new_vm_name):
             max_retries = 5
-            boxman_logger = logging.getLogger('boxman')
             for attempt in range(1, max_retries + 1):
                 last_attempt = attempt == max_retries
+                # Suppress error-level logs on all retryable attempts so that
+                # transient pool-busy failures don't appear as errors; only the
+                # final attempt logs errors normally. suppressed() restores the
+                # prior level (not a hardcoded DEBUG) so -v/-vv survives retries.
+                _cm = (contextlib.nullcontext() if last_attempt
+                       else suppressed(logging.CRITICAL))
                 try:
-                    if not last_attempt:
-                        boxman_logger.setLevel(logging.CRITICAL)
-                    src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
-                    if not src_vm_name and not self._is_diskless_boot(vm_info):
-                        raise ValueError(
-                            f"no base_image for VM '{new_vm_name}': "
-                            f"set base_image at the cluster or VM level"
+                    with _cm:
+                        src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
+                        if not src_vm_name and not self._is_diskless_boot(vm_info):
+                            raise ValueError(
+                                f"no base_image for VM '{new_vm_name}': "
+                                f"set base_image at the cluster or VM level"
+                            )
+                        self.provider.clone_vm(
+                            src_vm_name=src_vm_name,
+                            new_vm_name=new_vm_name,
+                            info=vm_info,
+                            workdir=cluster['workdir']
                         )
-                    self.provider.clone_vm(
-                        src_vm_name=src_vm_name,
-                        new_vm_name=new_vm_name,
-                        info=vm_info,
-                        workdir=cluster['workdir']
-                    )
-                    boxman_logger.setLevel(logging.DEBUG)
                     return
                 except Exception:
-                    boxman_logger.setLevel(logging.DEBUG)
                     if not last_attempt:
                         delay = attempt * 2
                         self.logger.warning(
