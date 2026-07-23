@@ -294,7 +294,8 @@ class BoxmanManager:
 
     def _select_dc_clusters(self, cli_args) -> list[tuple[str, dict]]:
         """docker-compose clusters selected by ``--cluster`` (an unset/absent
-        ``--cluster`` selects all). ``(name, cfg)`` pairs — empty for a
+        ``--cluster`` selects all; ``--vms`` is a libvirt concept and is
+        ignored for containers). ``(name, cfg)`` pairs — empty for a
         libvirt-only project."""
         wanted = getattr(cli_args, 'cluster', None)
         return [
@@ -4462,13 +4463,26 @@ class BoxmanManager:
     @staticmethod
     def snapshot_list(cls, cli_args):
         """
-        List snapshots of the VMs in the cluster.
+        List snapshots of the VMs and docker-compose clusters in the project.
         """
         prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls._vm_clusters.items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 cls.session_for_cluster(cluster_name).snapshot_list(full_vm_name)
+        # docker-compose clusters (docker commit-backed, D3)
+        for cname, cluster in cls._compose_clusters.items():
+            snaps = cls.session_for_cluster(cname).snapshot_list_cluster(cname, cluster)
+            cls.logger.info(f"cluster: {cname} (docker-compose)")
+            if not snaps:
+                cls.logger.info("  (no snapshots)")
+            for name in sorted(snaps, key=lambda k: snaps[k].get('created', '')):
+                snap = snaps[name]
+                cls.logger.info(
+                    f"  {name}  created={snap.get('created', '?')}  "
+                    f"{snap.get('description', '')}".rstrip())
+                for box, tag in (snap.get('boxes') or {}).items():
+                    cls.logger.info(f"      {box}: {tag}")
 
     @staticmethod
     def snapshot_log(cls, cli_args):
@@ -4657,17 +4671,30 @@ class BoxmanManager:
     def snapshot_take(cls, cli_args):
         """
         Take a snapshot of the selected VMs (parallel), then verify each one.
+        docker-compose clusters are snapshotted per-cluster via ``docker
+        commit`` (decision D3; named volumes are NOT captured).
 
         Honours ``--cluster`` / ``--vms`` so a single cluster (or VM) can be
         snapshotted independently in a multi-cluster project.
         """
+        # docker-compose clusters first (cluster-scoped, D3).
+        dc_done = False
+        for cname, cluster in cls._select_dc_clusters(cli_args):
+            cls.session_for_cluster(cname).snapshot_take_cluster(
+                cname, cluster, cli_args.snapshot_name,
+                getattr(cli_args, 'snapshot_descr', '') or '')
+            dc_done = True
+
         vm_targets = [
             (full_vm_name, workdir)
             for full_vm_name, _cluster_name, _vm_name, workdir
             in cls._select_vm_targets(cls, cli_args)
         ]
         if not vm_targets:
-            cls.logger.warning("no VMs matched the given --cluster/--vms selection")
+            if not dc_done:
+                cls.logger.warning(
+                    "no VMs or containers matched the given "
+                    "--cluster/--vms selection")
             return
 
         compress_memory = getattr(cli_args, 'compress_memory', False)
@@ -4724,9 +4751,28 @@ class BoxmanManager:
         3. Run parallel restores, tracking per-VM success via a Queue.
         4. Retry failed VMs in subsequent rounds until ALL succeed.
         """
+        # docker-compose clusters (cluster-scoped, D3): regenerate with the
+        # snapshot image tags + up --force-recreate. Resolve latest per cluster
+        # when no snapshot name was given.
+        dc_done = False
+        for cname, cluster in cls._select_dc_clusters(cli_args):
+            snap = cli_args.snapshot_name
+            if not snap:
+                snaps = cls.session_for_cluster(cname).snapshot_list_cluster(cname, cluster)
+                if not snaps:
+                    cls.logger.error(f"[{cname}] no snapshots to restore")
+                    continue
+                snap = max(snaps, key=lambda k: snaps[k].get('created', ''))
+                cls.logger.info(f"[{cname}] resolved latest snapshot: '{snap}'")
+            cls.session_for_cluster(cname).snapshot_restore_cluster(cname, cluster, snap)
+            dc_done = True
+
         selected = cls._select_vm_targets(cls, cli_args)
         if not selected:
-            cls.logger.warning("no VMs matched the given --cluster/--vms selection")
+            if not dc_done:
+                cls.logger.warning(
+                    "no VMs or containers matched the given "
+                    "--cluster/--vms selection")
             return
 
         # ── 1. Resolve snapshot names ────────────────────────────────────────
@@ -4816,9 +4862,19 @@ class BoxmanManager:
             cls.logger.error("error: Snapshot name is required")
             return
 
+        # docker-compose clusters (cluster-scoped, D3)
+        dc_done = False
+        for cname, cluster in cls._select_dc_clusters(cli_args):
+            cls.session_for_cluster(cname).snapshot_delete_cluster(
+                cname, cluster, cli_args.snapshot_name)
+            dc_done = True
+
         targets = cls._select_vm_targets(cls, cli_args)
         if not targets:
-            cls.logger.warning("no VMs matched the given --cluster/--vms selection")
+            if not dc_done:
+                cls.logger.warning(
+                    "no VMs or containers matched the given "
+                    "--cluster/--vms selection")
             return
 
         for full_vm_name, _cluster_name, _vm_name, _workdir in targets:

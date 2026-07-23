@@ -13,9 +13,11 @@ for a docker-compose cluster and raise a clear error if called.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 from boxman import log
@@ -209,6 +211,172 @@ class DockerComposeSession:
         runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
         self.logger.info(f"[{cluster_name}] docker compose unpause")
         return self._check(cluster_name, "unpause", runner.unpause())
+
+    # -- snapshots (Phase 7, decision D3) — docker commit-backed -----------
+
+    def _container_names(
+        self, cluster_name: str, cluster_cfg: dict[str, Any]
+    ) -> dict[str, str]:
+        """Map each running/existing box → its container name via
+        ``docker compose ps``. Boxes without a container are absent."""
+        runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
+        result = runner.ps_json()
+        names: dict[str, str] = {}
+        if not getattr(result, "ok", False):
+            return names
+        for line in (getattr(result, "stdout", "") or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            for obj in (parsed if isinstance(parsed, list) else [parsed]):
+                if obj.get("Service") and obj.get("Name"):
+                    names[obj["Service"]] = obj["Name"]
+        return names
+
+    def snapshot_take_cluster(
+        self, cluster_name: str, cluster_cfg: dict[str, Any],
+        snapshot_name: str, description: str = "",
+    ) -> bool:
+        """``docker commit`` every container in the cluster to
+        ``boxman/<project>_<box>:<snap>`` and record it in the workdir
+        metadata. **Named volumes are NOT captured** — a commit only snapshots
+        the container's writable layer (decision D3)."""
+        project = self._compose_project(cluster_name)
+        names = self._container_names(cluster_name, cluster_cfg)
+        runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
+        self.logger.warning(
+            f"[{cluster_name}] snapshot '{snapshot_name}' commits container "
+            f"filesystems only — **named volumes are NOT captured** (docker "
+            f"commit cannot include them). Back volumes up separately."
+        )
+        tags: dict[str, str] = {}
+        for box in (cluster_cfg.get("boxes") or {}):
+            container = names.get(box)
+            if not container:
+                self.logger.warning(
+                    f"[{cluster_name}] box '{box}' has no container — skipping "
+                    f"in snapshot '{snapshot_name}'."
+                )
+                continue
+            tag = _snapshot_tag(project, box, snapshot_name)
+            result = runner.commit(container, tag)
+            if not getattr(result, "ok", False):
+                raise ProvisionError(
+                    f"[{cluster_name}] docker commit failed for box '{box}': "
+                    f"{(getattr(result, 'stderr', '') or getattr(result, 'stdout', '')).strip()}"
+                )
+            self.logger.info(f"[{cluster_name}] snapshot '{snapshot_name}': {box} -> {tag}")
+            tags[box] = tag
+        if not tags:
+            raise ProvisionError(
+                f"[{cluster_name}] no containers to snapshot for "
+                f"'{snapshot_name}' — is the cluster up?"
+            )
+        meta = self._read_snapshots(cluster_name, cluster_cfg)
+        meta[snapshot_name] = {
+            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "description": description or "",
+            "boxes": tags,
+        }
+        self._save_snapshots(cluster_name, cluster_cfg, meta)
+        return True
+
+    def snapshot_list_cluster(
+        self, cluster_name: str, cluster_cfg: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Recorded snapshots for the cluster (name → metadata)."""
+        return self._read_snapshots(cluster_name, cluster_cfg)
+
+    def snapshot_delete_cluster(
+        self, cluster_name: str, cluster_cfg: dict[str, Any], snapshot_name: str
+    ) -> bool:
+        """Remove a snapshot's images (``docker image rm``) and metadata."""
+        meta = self._read_snapshots(cluster_name, cluster_cfg)
+        snap = meta.get(snapshot_name)
+        if not snap:
+            self.logger.warning(
+                f"[{cluster_name}] no snapshot '{snapshot_name}' to delete.")
+            return False
+        runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
+        for _box, tag in (snap.get("boxes") or {}).items():
+            runner.image_rm(tag)
+            self.logger.info(f"[{cluster_name}] removed snapshot image {tag}")
+        meta.pop(snapshot_name, None)
+        self._save_snapshots(cluster_name, cluster_cfg, meta)
+        return True
+
+    def snapshot_restore_cluster(
+        self, cluster_name: str, cluster_cfg: dict[str, Any], snapshot_name: str
+    ) -> bool:
+        """Regenerate the compose file with the snapshot's per-box image tags
+        and ``up --force-recreate``.
+
+        Note: a subsequent ``boxman up`` regenerates from ``conf.yml`` and
+        reverts to the declared images — restore is a point-in-time recreate,
+        not a permanent pin. **Volume data is unchanged** (not part of the
+        snapshot)."""
+        self._require_local_runtime(cluster_name)
+        meta = self._read_snapshots(cluster_name, cluster_cfg)
+        snap = meta.get(snapshot_name)
+        if not snap:
+            raise ConfigError(
+                f"[{cluster_name}] no snapshot '{snapshot_name}' "
+                f"(have: {', '.join(meta) or 'none'})."
+            )
+        restore_cfg = copy.deepcopy(cluster_cfg)
+        boxes = restore_cfg.get("boxes") or {}
+        for box, tag in (snap.get("boxes") or {}).items():
+            if box in boxes:
+                boxes[box] = {**(boxes[box] or {}), "image": tag}
+                boxes[box].pop("build", None)  # the snapshot image replaces build
+        workdir = self._workdir(restore_cfg, cluster_name)
+        project = self._compose_project(cluster_name)
+        shared = self.config.get("shared_networks") or {}
+        compose = self._generator.generate(
+            cluster_name, restore_cfg, self._conf_dir(), shared, project_name=project)
+        compose_file = self._generator.write(compose, workdir)
+        runner = ComposeRunner(
+            project=project, compose_file=compose_file, workdir=workdir,
+            logger=self.logger, use_sudo=self.use_sudo)
+        timeout = self._readiness_timeout(cluster_cfg, cluster_name)
+        self.logger.info(
+            f"[{cluster_name}] restoring snapshot '{snapshot_name}' "
+            f"(up --force-recreate)")
+        runner.up(timeout, force_recreate=True)
+        return True
+
+    def _snapshot_meta_path(
+        self, cluster_name: str, cluster_cfg: dict[str, Any]
+    ) -> str:
+        return os.path.join(
+            self._workdir(cluster_cfg, cluster_name), "snapshots.json")
+
+    def _read_snapshots(
+        self, cluster_name: str, cluster_cfg: dict[str, Any]
+    ) -> dict[str, Any]:
+        path = self._snapshot_meta_path(cluster_name, cluster_cfg)
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path) as fobj:
+                data = json.load(fobj)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError) as exc:
+            self.logger.warning(
+                f"[{cluster_name}] could not read {path}: {exc}")
+            return {}
+
+    def _save_snapshots(
+        self, cluster_name: str, cluster_cfg: dict[str, Any], meta: dict[str, Any]
+    ) -> None:
+        path = self._snapshot_meta_path(cluster_name, cluster_cfg)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fobj:
+            json.dump(meta, fobj, indent=2, sort_keys=True)
 
     def _check(self, cluster_name: str, op: str, result: Any) -> bool:
         """Warn (don't raise) when a best-effort teardown op did not succeed.
@@ -470,6 +638,18 @@ def compose_project_name(config: dict[str, Any], cluster_name: str) -> str:
     dc = (config.get("provider") or {}).get("docker-compose") or {}
     base = dc.get("project_name") or config.get("project") or "boxman"
     return _sanitize_project_name(f"{base}_{cluster_name}")
+
+def _snapshot_tag(project: str, box: str, snapshot_name: str) -> str:
+    """Docker image reference for a box snapshot:
+    ``boxman/<project>_<box>:<snap>``. The repo path must be lowercase
+    (``[a-z0-9._/-]``); the tag allows ``[A-Za-z0-9_.-]``."""
+    def _repo(part: str) -> str:
+        return re.sub(r"[^a-z0-9._-]", "-", part.lower()).strip("-._") or "x"
+
+    def _tag(part: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]", "-", part).strip("-._") or "snap"
+
+    return f"boxman/{_repo(project)}_{_repo(box)}:{_tag(snapshot_name)}"
 
 
 def _sanitize_project_name(name: str) -> str:

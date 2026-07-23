@@ -266,8 +266,36 @@ containers appear alongside VMs, and no verb tracebacks on an unsupported op.
 - **`boxman control`** for containers: `suspend` → `docker compose pause`,
   `resume` → `docker compose unpause`, `start` → `docker compose start`.
   `save` has no docker equivalent (containers have no save-to-file state) — it
-  logs an explanatory message and skips the dc clusters (use snapshots in a
-  later phase, or `destroy`).
+  logs an explanatory message and skips the dc clusters (use
+  [snapshots](#snapshots-and-container-state-decision-d3) or `destroy`).
+
+## Snapshots and container state (decision D3)
+
+`boxman snapshot` works for docker-compose clusters, backed by `docker commit`
+— with one loud caveat.
+
+- **`boxman snapshot take <name>`** commits each container in the cluster to an
+  image `boxman/<project>_<box>:<name>` and records it in `snapshots.json` in
+  the cluster workdir.
+- **`boxman snapshot restore <name>`** regenerates the compose file with those
+  snapshot image tags and runs `up --force-recreate`. A subsequent `boxman up`
+  regenerates from `conf.yml` and reverts to the declared images — restore is a
+  point-in-time recreate, not a permanent pin.
+- **`boxman snapshot list` / `delete <name>`** read the metadata and
+  `docker image rm` the tagged images.
+
+> **Named volumes are NOT part of a snapshot.** `docker commit` captures only a
+> container's writable filesystem layer, not the data in mounted volumes — so a
+> snapshot/restore does **not** roll back volume data (databases, uploads,
+> etc.). This is the key divergence from libvirt's external snapshots (which
+> capture disk + optionally memory). Back up named volumes separately if you
+> need their state. boxman warns about this on every `take`.
+
+**Container state across `down`/`up`:** `boxman down` stops containers (or
+`deprovision` removes them) but **keeps named volumes**, so volume-backed data
+survives a `down`/`up` cycle; the container filesystem itself is ephemeral and
+is rebuilt from the declared image on `up`. `destroy` removes named volumes
+too. (This is independent of snapshots.)
 
 ## Templating caveat for compose values (`environment:`, `command:`)
 
