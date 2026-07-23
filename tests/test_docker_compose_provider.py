@@ -299,6 +299,68 @@ class TestComposeGenerator:
             gen.generate("s", cluster, conf_dir="/proj")
         assert any("unknown" in str(c.args[0]) for c in warn.call_args_list)
 
+    # -- Phase 5 review: fail-fast paths + no-op warnings -----------------
+    def test_relative_container_path_raises(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"db": {"image": "x", "volumes": [
+            {"name": "v", "container_path": "data"}]}}}
+        with pytest.raises(ConfigError, match=r"must be an absolute path"):
+            gen.generate("s", cluster, conf_dir="/proj")
+
+    @pytest.mark.parametrize("entry", [
+        {"name": "v", "container_path": "/d:x"},        # colon in container_path
+        {"name": "v:x", "container_path": "/d"},        # colon in name
+        {"host_path": "./h:x", "container_path": "/d"}, # colon in host_path
+    ])
+    def test_colon_in_path_or_name_raises(self, entry):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"db": {"image": "x", "volumes": [entry]}}}
+        with pytest.raises(ConfigError, match=r"must not contain ':'"):
+            gen.generate("s", cluster, conf_dir="/proj")
+
+    def test_bind_named_only_keys_warn_ignored(self):
+        """`name:`/`compose_extra:` on a bind mount are no-ops → warned."""
+        gen = ComposeGenerator()
+        cluster = {"boxes": {"w": {"image": "x", "volumes": [
+            {"host_path": "./h", "container_path": "/d",
+             "name": "ignored", "compose_extra": {"x": 1}}]}}}
+        with mock.patch.object(gen.logger, "warning") as warn:
+            compose = gen.generate("s", cluster, conf_dir="/proj")
+        assert compose["services"]["w"]["volumes"] == ["/proj/h:/d"]
+        assert "volumes" not in compose  # no top-level entry for a bind
+        msgs = " ".join(str(c.args[0]) for c in warn.call_args_list)
+        assert "'name:' is ignored on the bind mount" in msgs
+        assert "'compose_extra:' is ignored on the bind mount" in msgs
+
+    def test_shared_named_volume_divergent_compose_extra_warns(self):
+        """First-seen spec wins; a later box's differing compose_extra warns."""
+        gen = ComposeGenerator()
+        cluster = {"boxes": {
+            "a": {"image": "x", "volumes": [
+                {"name": "v", "container_path": "/a",
+                 "compose_extra": {"driver_opts": {"o": "bind"}}}]},
+            "b": {"image": "x", "volumes": [
+                {"name": "v", "container_path": "/b",
+                 "compose_extra": {"driver_opts": {"o": "tmpfs"}}}]},
+        }}
+        with mock.patch.object(gen.logger, "warning") as warn:
+            compose = gen.generate("s", cluster, conf_dir="/proj")
+        # first-seen (box a) spec is kept
+        assert compose["volumes"]["v"]["driver_opts"] == {"o": "bind"}
+        assert any("already defined by an earlier box" in str(c.args[0])
+                   for c in warn.call_args_list)
+
+    def test_shared_named_volume_same_spec_no_warn(self):
+        gen = ComposeGenerator()
+        cluster = {"boxes": {
+            "a": {"image": "x", "volumes": [{"name": "v", "container_path": "/a"}]},
+            "b": {"image": "x", "volumes": [{"name": "v", "container_path": "/b"}]},
+        }}
+        with mock.patch.object(gen.logger, "warning") as warn:
+            gen.generate("s", cluster, conf_dir="/proj")
+        assert not any("already defined" in str(c.args[0])
+                       for c in warn.call_args_list)
+
     # -- Phase 4: shared_networks → macvlan ------------------------------
     def _shared(self, **over):
         base = {"bridge": "br-lab", "subnet": "10.10.0.0/24"}

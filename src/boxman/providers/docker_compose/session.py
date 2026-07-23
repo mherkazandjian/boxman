@@ -19,7 +19,10 @@ from typing import Any
 
 from boxman import log
 from boxman.exceptions import ConfigError, ProvisionError
-from boxman.providers.docker_compose.compose_generator import ComposeGenerator
+from boxman.providers.docker_compose.compose_generator import (
+    ComposeGenerator,
+    resolve_local_path,
+)
 from boxman.providers.docker_compose.compose_runner import (
     DEFAULT_READINESS_TIMEOUT,
     ComposeRunner,
@@ -270,9 +273,9 @@ class DockerComposeSession:
                 host_path = entry.get("host_path")
                 if not host_path:
                     continue  # named volume — docker-managed
-                abs_host = os.path.abspath(
-                    os.path.join(conf_dir, os.path.expanduser(str(host_path)))
-                )
+                # Same resolver the generator uses to emit the mount, so the dir
+                # we create is exactly the one docker will bind.
+                abs_host = resolve_local_path(str(host_path), conf_dir)
                 if os.path.exists(abs_host):
                     continue
                 try:

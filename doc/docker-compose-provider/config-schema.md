@@ -80,12 +80,13 @@ is unchanged.
 A v2.0 config with a docker-compose cluster is **runnable**: `boxman
 provision` / `up` generate a `docker-compose.yml` in the cluster `workdir`
 and run `docker compose up -d --wait`, and `down` / `deprovision` / `destroy`
-tear it down. Scope covers cluster-internal bridge networks and
+tear it down. Scope covers cluster-internal bridge networks,
 `shared_networks` **macvlan L2 to libvirt VMs** (Phase 4, #52 — see
 [Shared networks (macvlan L2 to VMs)](#shared-networks-macvlan-l2-to-vms)
-below). Still out of scope: structured `volumes:` (Phase 5),
-ssh/exec/inventory (Phase 6), snapshots (Phase 7). Box features outside this
-scope are warned about and skipped (use `compose_extra:` as the escape hatch).
+below), and structured **`volumes:`** (Phase 5, #53 — see
+[Volumes](#volumes) below). Still out of scope: ssh/exec/inventory (Phase 6),
+snapshots (Phase 7). Box features outside this scope are warned about and
+skipped (use `compose_extra:` as the escape hatch).
 
 Two hard requirements, both enforced fail-fast (exit 2):
 
@@ -215,17 +216,25 @@ clusters:
 | **bind** | has `host_path` | `<abs host_path>:<container_path>[:ro]` | — |
 | **workdir** | a bind with `host_path: .` | `<conf dir>:<container_path>[:ro]` | — |
 
-- `readonly: true` appends `:ro`.
+- `container_path` must be an **absolute** path; `readonly: true` appends `:ro`.
 - A relative `host_path` is resolved absolute against the `conf.yml` directory
   (same rule as `build.context`). boxman `mkdir -p`s a bind host dir before
   `up` (so docker doesn't create it as `root`); an existing path is left as-is.
+  A **missing bind path is always created as a directory** — a single-file bind
+  mount must already exist on the host (boxman, like docker, can't tell a file
+  from a dir from the schema).
 - **`size:` is advisory** — docker's `local` volume driver does not enforce
   quotas, so boxman emits the volume and logs a warning rather than pretending
   to cap it. On a bind mount `size:` is meaningless and warned/ignored.
+- `name:` and `compose_extra:` apply to **named volumes only** — on a bind mount
+  (`host_path:` present) they are warned and ignored. `compose_extra:` on a
+  named entry is deep-merged onto its top-level `{driver: local}` spec (e.g.
+  custom `driver_opts`); when two boxes share a `name:`, the first-seen spec
+  wins and a later box's differing options are warned + ignored.
 - Malformed entries fail fast with a `ConfigError` (non-mapping entry, missing
-  `container_path`, or a named entry missing `name`) rather than silently
-  dropping a mount. `compose_extra:` on a named entry is deep-merged onto its
-  top-level `{driver: local}` spec (e.g. custom `driver_opts`).
+  or non-absolute `container_path`, a named entry missing `name`, or a `:` in a
+  path/name that would re-split the emitted mount) rather than silently
+  dropping a mount.
 
 **Lifecycle:** `boxman down` keeps volumes (`docker compose down`); `boxman
 destroy` removes **named** volumes (`down --volumes`) and the generated compose

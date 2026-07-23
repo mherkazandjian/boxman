@@ -78,6 +78,18 @@ _KNOWN_VOLUME_KEYS = frozenset({
 })
 
 
+def resolve_local_path(path: str, base_dir: str) -> str:
+    """Resolve *path* absolute against *base_dir* (``~`` expanded); an already
+    absolute *path* ignores *base_dir*.
+
+    The single source of truth for build-context, bind-mount and bind-dir
+    resolution — the docs promise bind resolution follows "the same rule as
+    ``build.context``", so both the generator (emitting the mount) and the
+    session (``mkdir``-ing the host dir) call this, and can never drift apart.
+    """
+    return os.path.abspath(os.path.join(base_dir, os.path.expanduser(path)))
+
+
 class ComposeGenerator:
     """Render a docker-compose cluster to a ``docker-compose.yml`` dict/file."""
 
@@ -276,7 +288,7 @@ class ComposeGenerator:
 
     @staticmethod
     def _abs_context(ctx: str, conf_dir: str) -> str:
-        return os.path.abspath(os.path.join(conf_dir, os.path.expanduser(ctx)))
+        return resolve_local_path(ctx, conf_dir)
 
     def _service_volumes(
         self,
@@ -325,16 +337,39 @@ class ComposeGenerator:
                     f"box '{cluster_name}.{box_name}': a 'volumes:' entry is "
                     f"missing 'container_path' ({entry!r})."
                 )
+            container_path = str(container_path)
+            # Fail fast on paths that would only error cryptically at
+            # ``docker compose up``, or a ``:`` that would silently re-split the
+            # short-syntax mount string boxman emits.
+            if not os.path.isabs(container_path):
+                raise ConfigError(
+                    f"box '{cluster_name}.{box_name}': volume container_path "
+                    f"{container_path!r} must be an absolute path."
+                )
+            if ":" in container_path:
+                raise ConfigError(
+                    f"box '{cluster_name}.{box_name}': volume container_path "
+                    f"{container_path!r} must not contain ':'."
+                )
             ro = ":ro" if entry.get("readonly") else ""
             host_path = entry.get("host_path")
             if host_path:
-                if entry.get("size"):
-                    self.logger.warning(
-                        f"box '{cluster_name}.{box_name}': 'size:' is ignored on "
-                        f"the bind mount for '{container_path}' — it is only "
-                        f"meaningful on a named volume."
+                # host_path decides the kind; a named-volume-only key here is a
+                # no-op — warn rather than drop it silently (as `size:` does).
+                for noop_key in ("name", "size", "compose_extra"):
+                    if entry.get(noop_key):
+                        self.logger.warning(
+                            f"box '{cluster_name}.{box_name}': '{noop_key}:' is "
+                            f"ignored on the bind mount for '{container_path}' — "
+                            f"it applies only to named volumes ('host_path' makes "
+                            f"this a bind mount)."
+                        )
+                if ":" in str(host_path):
+                    raise ConfigError(
+                        f"box '{cluster_name}.{box_name}': volume host_path "
+                        f"{host_path!r} must not contain ':'."
                     )
-                abs_host = self._abs_context(str(host_path), conf_dir)
+                abs_host = resolve_local_path(str(host_path), conf_dir)
                 mounts.append(f"{abs_host}:{container_path}{ro}")
             else:
                 name = entry.get("name")
@@ -344,6 +379,11 @@ class ComposeGenerator:
                         f"entry needs a 'name' (or a 'host_path' for a bind "
                         f"mount) — {entry!r}."
                     )
+                if ":" in str(name):
+                    raise ConfigError(
+                        f"box '{cluster_name}.{box_name}': volume name {name!r} "
+                        f"must not contain ':'."
+                    )
                 if entry.get("size"):
                     self.logger.warning(
                         f"box '{cluster_name}.{box_name}': size: "
@@ -351,9 +391,16 @@ class ComposeGenerator:
                         f"— docker's local driver does not enforce quotas."
                     )
                 mounts.append(f"{name}:{container_path}{ro}")
+                spec = self._deep_merge(
+                    {"driver": "local"}, entry.get("compose_extra") or {}
+                )
                 if name not in named_volumes:
-                    named_volumes[name] = self._deep_merge(
-                        {"driver": "local"}, entry.get("compose_extra") or {}
+                    named_volumes[name] = spec
+                elif named_volumes[name] != spec:
+                    self.logger.warning(
+                        f"box '{cluster_name}.{box_name}': named volume '{name}' "
+                        f"is already defined by an earlier box (first-seen wins) "
+                        f"— this box's differing volume options are ignored."
                     )
         return mounts
 
