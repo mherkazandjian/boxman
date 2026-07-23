@@ -80,12 +80,13 @@ is unchanged.
 A v2.0 config with a docker-compose cluster is **runnable**: `boxman
 provision` / `up` generate a `docker-compose.yml` in the cluster `workdir`
 and run `docker compose up -d --wait`, and `down` / `deprovision` / `destroy`
-tear it down. Scope covers cluster-internal bridge networks and
+tear it down. Scope covers cluster-internal bridge networks,
 `shared_networks` **macvlan L2 to libvirt VMs** (Phase 4, #52 — see
 [Shared networks (macvlan L2 to VMs)](#shared-networks-macvlan-l2-to-vms)
-below). Still out of scope: structured `volumes:` (Phase 5),
-ssh/exec/inventory (Phase 6), snapshots (Phase 7). Box features outside this
-scope are warned about and skipped (use `compose_extra:` as the escape hatch).
+below), and structured **`volumes:`** (Phase 5, #53 — see
+[Volumes](#volumes) below). Still out of scope: ssh/exec/inventory (Phase 6),
+snapshots (Phase 7). Box features outside this scope are warned about and
+skipped (use `compose_extra:` as the escape hatch).
 
 Two hard requirements, both enforced fail-fast (exit 2):
 
@@ -183,6 +184,62 @@ Notes and requirements:
   hybrid box's teardown note). Setting `disable_netfilter: true` instead
   disables netfilter on bridges **host-wide** (a discouraged opt-in, logged
   loudly, reverted by any reboot).
+
+## Volumes
+
+A box's `volumes:` is a list of **structured** mounts (not raw compose
+strings — use `compose_extra:` for those). Each entry needs a `container_path`;
+whether it has a `host_path` decides its kind:
+
+```yaml
+clusters:
+  data:
+    provider: docker-compose
+    workdir: ./.boxman/data
+    boxes:
+      db:
+        image: postgres:16
+        volumes:
+          - name: pg_data                 # named volume (docker-managed)
+            container_path: /var/lib/postgresql/data
+            size: 10G                      # advisory only — see below
+          - host_path: ./initdb           # bind mount (relative → resolved vs conf.yml dir)
+            container_path: /docker-entrypoint-initdb.d
+            readonly: true
+          - host_path: .                   # "workdir" mount — a bind at the project dir
+            container_path: /workspace
+```
+
+| Kind | Trigger | Emitted | Top-level `volumes:` |
+|---|---|---|---|
+| **named** | has `name`, no `host_path` | `<name>:<container_path>[:ro]` | `{<name>: {driver: local}}` |
+| **bind** | has `host_path` | `<abs host_path>:<container_path>[:ro]` | — |
+| **workdir** | a bind with `host_path: .` | `<conf dir>:<container_path>[:ro]` | — |
+
+- `container_path` must be an **absolute** path; `readonly: true` appends `:ro`.
+- A relative `host_path` is resolved absolute against the `conf.yml` directory
+  (same rule as `build.context`). boxman `mkdir -p`s a bind host dir before
+  `up` (so docker doesn't create it as `root`); an existing path is left as-is.
+  A **missing bind path is always created as a directory** — a single-file bind
+  mount must already exist on the host (boxman, like docker, can't tell a file
+  from a dir from the schema).
+- **`size:` is advisory** — docker's `local` volume driver does not enforce
+  quotas, so boxman emits the volume and logs a warning rather than pretending
+  to cap it. On a bind mount `size:` is meaningless and warned/ignored.
+- `name:` and `compose_extra:` apply to **named volumes only** — on a bind mount
+  (`host_path:` present) they are warned and ignored. `compose_extra:` on a
+  named entry is deep-merged onto its top-level `{driver: local}` spec (e.g.
+  custom `driver_opts`); when two boxes share a `name:`, the first-seen spec
+  wins and a later box's differing options are warned + ignored.
+- Malformed entries fail fast with a `ConfigError` (non-mapping entry, missing
+  or non-absolute `container_path`, a named entry missing `name`, or a `:` in a
+  path/name that would re-split the emitted mount) rather than silently
+  dropping a mount.
+
+**Lifecycle:** `boxman down` keeps volumes (`docker compose down`); `boxman
+destroy` removes **named** volumes (`down --volumes`) and the generated compose
+file. Bind-mount host directories are **never** removed — they are your paths
+(`./initdb`, `.`), so cleaning them up is your call.
 
 ## Templating caveat for compose values (`environment:`, `command:`)
 
