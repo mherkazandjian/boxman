@@ -241,6 +241,34 @@ destroy` removes **named** volumes (`down --volumes`) and the generated compose
 file. Bind-mount host directories are **never** removed — they are your paths
 (`./initdb`, `.`), so cleaning them up is your call.
 
+## CLI/UX for docker-compose clusters
+
+Every boxman verb treats a mixed (libvirt + docker-compose) project uniformly;
+containers appear alongside VMs, and no verb tracebacks on an unsupported op.
+
+- **`boxman ps`** lists VMs and containers with a `Provider` column and each
+  container's `State` (+ health). `boxman connect_info` adds a per-container
+  section with published ports and the `boxman exec` entry point.
+- **`boxman exec <cluster>.<box>`** runs `docker compose exec` on a container —
+  an interactive shell (default `sh`; `--shell bash`), or a one-shot command
+  after `--` (`boxman exec services.cache -- redis-cli ping`). A bare
+  `<box>` works when it's unique across dc clusters. **`boxman ssh` stays
+  VM-only** — exec is the container equivalent (decision D2). There is no
+  ssh_config entry for containers.
+- **Ansible / `boxman run` / `tasks:`** reach containers through the generated
+  inventory: each container is a host with
+  `ansible_connection: community.docker.docker` and
+  `ansible_host: <project>_<cluster>-<box>-1`, grouped under its cluster. So
+  `boxman run --cmd '…'` and `tasks:` hit containers and VMs alike.
+  **Prerequisite:** the `community.docker` Ansible collection
+  (`ansible-galaxy collection install community.docker`) and the Docker SDK
+  for Python on the control host.
+- **`boxman control`** for containers: `suspend` → `docker compose pause`,
+  `resume` → `docker compose unpause`, `start` → `docker compose start`.
+  `save` has no docker equivalent (containers have no save-to-file state) — it
+  logs an explanatory message and skips the dc clusters (use snapshots in a
+  later phase, or `destroy`).
+
 ## Templating caveat for compose values (`environment:`, `command:`)
 
 `load_config` pre-processes bare `{{ name }}` tokens into `{name}` task

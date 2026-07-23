@@ -13,6 +13,7 @@ for a docker-compose cluster and raise a clear error if called.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any
@@ -24,6 +25,7 @@ from boxman.providers.docker_compose.compose_generator import (
     resolve_local_path,
 )
 from boxman.providers.docker_compose.compose_runner import (
+    DEFAULT_EXEC_SHELL,
     DEFAULT_READINESS_TIMEOUT,
     ComposeRunner,
 )
@@ -130,6 +132,86 @@ class DockerComposeSession:
                 f"[{cluster_name}] could not remove {compose_file}: {exc}"
             )
         return True
+
+    # -- control / access (Phase 6) ----------------------------------------
+
+    def container_status(
+        self, cluster_name: str, cluster_cfg: dict[str, Any]
+    ) -> list[dict[str, str]]:
+        """Per-service status rows for a dc cluster via ``docker compose ps``.
+
+        Each row: ``{service, name, state, health, ports}``. Empty list when the
+        project has no containers (never provisioned / fully removed). Never
+        raises — a missing project simply reports no rows (uniform with a
+        VM-state query on an unprovisioned VM).
+        """
+        runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
+        result = runner.ps_json()
+        rows: list[dict[str, str]] = []
+        if not getattr(result, "ok", False):
+            return rows
+        for line in (getattr(result, "stdout", "") or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            # compose v2 emits NDJSON objects; some builds emit a JSON array
+            for obj in (parsed if isinstance(parsed, list) else [parsed]):
+                rows.append({
+                    "service": obj.get("Service", ""),
+                    "name": obj.get("Name", ""),
+                    "state": obj.get("State", ""),
+                    "health": obj.get("Health", ""),
+                    "ports": _format_ports(obj.get("Publishers")),
+                })
+        return rows
+
+    def exec_command_for(
+        self, cluster_name: str, cluster_cfg: dict[str, Any], box: str,
+        cmd: list[str] | None = None, shell: str = DEFAULT_EXEC_SHELL,
+    ) -> str:
+        """Validate *box* and return the ``docker compose exec`` command string.
+
+        The caller runs it with inherited stdio (interactive shell) — so this
+        only builds and validates, it does not execute. ``ConfigError`` if
+        *box* is not a service of this cluster.
+        """
+        boxes = cluster_cfg.get("boxes") or {}
+        if box not in boxes:
+            raise ConfigError(
+                f"box '{box}' is not a service in docker-compose cluster "
+                f"'{cluster_name}' (services: {', '.join(boxes) or 'none'})."
+            )
+        runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
+        return runner.exec_command(box, cmd=cmd, shell=shell)
+
+    def pause_cluster(
+        self, cluster_name: str, cluster_cfg: dict[str, Any],
+        boxes: list[str] | None = None,
+    ) -> bool:
+        """boxman control suspend → ``docker compose pause`` (whole cluster or
+        the named boxes)."""
+        runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
+        self.logger.info(
+            f"[{cluster_name}] docker compose pause"
+            f"{''.join(' ' + b for b in (boxes or []))}"
+        )
+        return self._check(cluster_name, "pause", runner.pause(boxes))
+
+    def unpause_cluster(
+        self, cluster_name: str, cluster_cfg: dict[str, Any],
+        boxes: list[str] | None = None,
+    ) -> bool:
+        """boxman control resume → ``docker compose unpause``."""
+        runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
+        self.logger.info(
+            f"[{cluster_name}] docker compose unpause"
+            f"{''.join(' ' + b for b in (boxes or []))}"
+        )
+        return self._check(cluster_name, "unpause", runner.unpause(boxes))
 
     def _check(self, cluster_name: str, op: str, result: Any) -> bool:
         """Warn (don't raise) when a best-effort teardown op did not succeed.
@@ -365,6 +447,23 @@ class DockerComposeSession:
 
     def snapshot_list(self, vm_name: str | None = None) -> list[dict[str, str]]:
         self._cluster_scoped("snapshot_list")
+
+
+def _format_ports(publishers: Any) -> str:
+    """Compact ``hostport->targetport`` string from a compose ps ``Publishers``
+    list (or pass through a plain string / empty)."""
+    if not isinstance(publishers, list):
+        return str(publishers or "")
+    parts: list[str] = []
+    for pub in publishers:
+        if not isinstance(pub, dict):
+            continue
+        published, target = pub.get("PublishedPort"), pub.get("TargetPort")
+        if published:
+            parts.append(f"{published}->{target}")
+        elif target:
+            parts.append(str(target))
+    return ", ".join(parts)
 
 
 def _sanitize_project_name(name: str) -> str:

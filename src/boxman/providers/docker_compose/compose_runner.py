@@ -23,6 +23,10 @@ from boxman.utils.shell import run
 #: default per-cluster readiness timeout, seconds (D1)
 DEFAULT_READINESS_TIMEOUT = 120
 
+#: default interactive shell for ``boxman exec`` (POSIX-universal; override
+#: with ``--shell``)
+DEFAULT_EXEC_SHELL = "sh"
+
 
 class ComposeRunner:
     def __init__(
@@ -91,7 +95,45 @@ class ComposeRunner:
         """``docker compose ps`` (captured)."""
         return run(f"{self._base()} ps", hide=True, warn=True)
 
+    def ps_json(self):
+        """``docker compose ps --format json --all`` (captured).
+
+        Compose v2 emits one JSON object per line (newline-delimited); include
+        ``--all`` so stopped/paused services are reported too (for ``ps`` /
+        ``connect_info`` status columns)."""
+        return run(f"{self._base()} ps --all --format json", hide=True, warn=True)
+
+    def pause(self, services: list[str] | None = None):
+        """``docker compose pause`` (whole project, or the given services)."""
+        return run(f"{self._base()} pause{self._svc(services)}", warn=True)
+
+    def unpause(self, services: list[str] | None = None):
+        """``docker compose unpause`` (whole project, or the given services)."""
+        return run(f"{self._base()} unpause{self._svc(services)}", warn=True)
+
+    def exec_command(
+        self, box: str, cmd: list[str] | None = None,
+        shell: str = DEFAULT_EXEC_SHELL,
+    ) -> str:
+        """Build the ``docker compose exec`` command string for *box*.
+
+        With *cmd* → a one-shot ``exec -T <box> <cmd…>`` (``-T`` disables TTY
+        allocation so it works from a non-terminal / script). Without *cmd* →
+        an interactive ``exec <box> <shell>`` (TTY auto-allocated by compose).
+        Returned as a string for the caller to run with inherited stdio (like
+        the ssh path), so the interactive shell attaches to the real terminal.
+        """
+        base = self._base()
+        if cmd:
+            inner = " ".join(shlex.quote(c) for c in cmd)
+            return f"{base} exec -T {shlex.quote(box)} {inner}"
+        return f"{base} exec {shlex.quote(box)} {shlex.quote(shell)}"
+
     # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _svc(services: list[str] | None) -> str:
+        return "".join(f" {shlex.quote(s)}" for s in (services or []))
 
     def _base(self) -> str:
         # ``-f`` / ``--project-directory`` are included only when set. A

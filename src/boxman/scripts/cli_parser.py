@@ -1077,6 +1077,43 @@ def parse_args():
         dest='cluster'
     )
 
+    # ── exec ─────────────────────────────────────────────────────────
+    parser_exec = subparsers.add_parser(
+        'exec',
+        help='exec into a docker-compose container',
+        description=(
+            "Run a command in (or open an interactive shell on) a\n"
+            "docker-compose container, via `docker compose exec`.\n"
+            "\n"
+            "Target is <cluster>.<box>. With no command an interactive\n"
+            "shell (default: sh) is opened; a trailing command after `--`\n"
+            "runs non-interactively. Use `ssh` for libvirt VMs.\n"
+            "\n"
+            "examples:\n"
+            "    $ boxman exec services.web\n"
+            "    $ boxman exec services.web --shell bash\n"
+            "    $ boxman exec services.cache -- redis-cli ping\n"
+        ),
+        formatter_class=RawTextHelpFormatter
+    )
+    parser_exec.set_defaults(func=BoxmanManager.exec_container)
+    parser_exec.add_argument(
+        'target',
+        type=str,
+        help='container to exec into, as <cluster>.<box>'
+    )
+    parser_exec.add_argument(
+        '--shell',
+        type=str,
+        default=None,
+        help='interactive shell to open when no command is given (default: sh)'
+    )
+    parser_exec.add_argument(
+        'cmd',
+        nargs=argparse.REMAINDER,
+        help='command to run non-interactively (after `--`)'
+    )
+
     # ── pxe-boot ─────────────────────────────────────────────────────
     parser_pxe = subparsers.add_parser(
         'pxe-boot',
