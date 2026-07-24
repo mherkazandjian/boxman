@@ -284,14 +284,24 @@ class BoxmanManager:
         }
 
     def _compose_project_for(self, cluster_name: str) -> str:
-        """The ``docker compose -p`` project name for a dc cluster — mirrors
-        :meth:`DockerComposeSession._compose_project` so container names can be
-        derived (``<project>-<box>-1``) at inventory-render time without a live
-        session or a docker query."""
-        from boxman.providers.docker_compose.session import _sanitize_project_name
-        dc = (self.config.get('provider') or {}).get('docker-compose') or {}
-        base = dc.get('project_name') or self.config.get('project') or 'boxman'
-        return _sanitize_project_name(f"{base}_{cluster_name}")
+        """The ``docker compose -p`` project name for a dc cluster, so container
+        names can be derived (``<project>-<box>-1``) at inventory-render time
+        without a live session or docker query. Single-sourced with the
+        session's ``_compose_project`` so the inventory ``ansible_host`` can
+        never diverge from the real compose container name."""
+        from boxman.providers.docker_compose.session import compose_project_name
+        return compose_project_name(self.config, cluster_name)
+
+    def _select_dc_clusters(self, cli_args) -> list[tuple[str, dict]]:
+        """docker-compose clusters selected by ``--cluster`` (an unset/absent
+        ``--cluster`` selects all). ``(name, cfg)`` pairs — empty for a
+        libvirt-only project."""
+        wanted = getattr(cli_args, 'cluster', None)
+        return [
+            (name, cluster)
+            for name, cluster in self._compose_clusters.items()
+            if wanted in (None, name)
+        ]
 
     def _vm_cluster_map(self) -> dict[str, str]:
         """
@@ -5143,7 +5153,7 @@ class BoxmanManager:
         for vm_name, _ in cls.process_vm_list(cli_args):
             cls.session_for_vm(vm_name).suspend_vm(vm_name)
             cls.logger.info(f"vm {vm_name} suspended")
-        for cluster_name, cluster in cls._compose_clusters.items():
+        for cluster_name, cluster in cls._select_dc_clusters(cli_args):
             cls._dc_session(cluster_name).pause_cluster(cluster_name, cluster)
 
     @staticmethod
@@ -5155,7 +5165,7 @@ class BoxmanManager:
         for vm_name, _ in cls.process_vm_list(cli_args):
             cls.session_for_vm(vm_name).resume_vm(vm_name)
             cls.logger.info(f"VM {vm_name} resumed")
-        for cluster_name, cluster in cls._compose_clusters.items():
+        for cluster_name, cluster in cls._select_dc_clusters(cli_args):
             cls._dc_session(cluster_name).unpause_cluster(cluster_name, cluster)
 
     @staticmethod
@@ -5167,7 +5177,7 @@ class BoxmanManager:
         """
         for vm_name, workdir in cls.process_vm_list(cli_args):
             cls.session_for_vm(vm_name).save_vm(vm_name, workdir)
-        for cluster_name in cls._compose_clusters:
+        for cluster_name, _cluster in cls._select_dc_clusters(cli_args):
             cls.logger.warning(
                 f"'control save' is not supported for docker-compose cluster "
                 f"'{cluster_name}' — containers have no save-to-file state; use "
@@ -5185,7 +5195,7 @@ class BoxmanManager:
                 cls.session_for_vm(vm_name).restore_vm(vm_name, workdir)
             else:
                 cls.session_for_vm(vm_name).start_vm(vm_name)
-        for cluster_name, cluster in cls._compose_clusters.items():
+        for cluster_name, cluster in cls._select_dc_clusters(cli_args):
             if getattr(cli_args, "restore", False):
                 cls.logger.info(
                     f"[{cluster_name}] --restore has no docker-compose "
@@ -5433,7 +5443,7 @@ class BoxmanManager:
         records = []
         for idx, (cluster_name, vm_name, full_name) in enumerate(vm_list):
             virsh_id, state = vm_info.get(full_name, ("-", "not created"))
-            rec = {"id": idx, "cluster": cluster_name, "name": vm_name,
+            rec = {"id": idx, "cluster": cluster_name, "vm": vm_name,
                    "provider": cls.provider_type_for_cluster(cluster_name),
                    "state": state}
             if provider_info:
@@ -5458,7 +5468,7 @@ class BoxmanManager:
                 if row:
                     state = row["state"] + (
                         f" ({row['health']})" if row.get("health") else "")
-                rec = {"id": "-", "cluster": cluster_name, "name": box_name,
+                rec = {"id": "-", "cluster": cluster_name, "vm": box_name,
                        "provider": "docker-compose", "state": state}
                 if provider_info:
                     rec["virsh_id"] = "-"
@@ -5477,11 +5487,11 @@ class BoxmanManager:
         if provider_info:
             headers = ("Id", "Cluster", "Name", "Provider", "State",
                        "Virsh Id", "Virsh Name")
-            rows = [(str(r["id"]), r["cluster"], r["name"], r["provider"],
+            rows = [(str(r["id"]), r["cluster"], r["vm"], r["provider"],
                      r["state"], r["virsh_id"], r["virsh_name"]) for r in records]
         else:
             headers = ("Id", "Cluster", "Name", "Provider", "State")
-            rows = [(str(r["id"]), r["cluster"], r["name"], r["provider"],
+            rows = [(str(r["id"]), r["cluster"], r["vm"], r["provider"],
                      r["state"]) for r in records]
 
         col_count = len(headers)
@@ -5556,25 +5566,24 @@ class BoxmanManager:
     def exec_container(cls, cli_args):
         """Exec into a docker-compose container via ``docker compose exec``.
 
-        Interactive shell when no command is given; a trailing command (after
-        ``--``) runs non-interactively. Runs with inherited stdio so an
-        interactive shell attaches to the real terminal (mirrors ``ssh``).
+        Interactive shell when no command is given (``--shell`` picks the shell);
+        a trailing command (after ``--`` when it has flags) runs
+        non-interactively. Runs the argv list with ``shell=False`` and inherited
+        stdio, so an interactive shell attaches to the real terminal.
         """
         import subprocess
         import sys
 
         cmd = list(getattr(cli_args, 'cmd', None) or [])
-        if cmd and cmd[0] == '--':
-            cmd = cmd[1:]
         shell = getattr(cli_args, 'shell', None) or 'sh'
 
         cluster, box = cls._resolve_container_target(cli_args.target)
         cluster_cfg = cls.config['clusters'][cluster]
-        command = cls._dc_session(cluster).exec_command_for(
+        argv = cls._dc_session(cluster).exec_command_for(
             cluster, cluster_cfg, box, cmd=cmd or None, shell=shell
         )
-        cls.logger.info(f"exec: {command}")
-        result = subprocess.run(command, shell=True)
+        cls.logger.info(f"exec: {' '.join(argv)}")
+        result = subprocess.run(argv)
         if result.returncode != 0:
             sys.exit(result.returncode)
 

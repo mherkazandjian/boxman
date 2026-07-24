@@ -141,13 +141,19 @@ class DockerComposeSession:
         """Per-service status rows for a dc cluster via ``docker compose ps``.
 
         Each row: ``{service, name, state, health, ports}``. Empty list when the
-        project has no containers (never provisioned / fully removed). Never
-        raises — a missing project simply reports no rows (uniform with a
-        VM-state query on an unprovisioned VM).
+        project has no containers (never provisioned / fully removed) — or when
+        the cluster is misconfigured (e.g. no ``workdir``). Never raises, so the
+        display verbs (``ps``/``connect_info``) can't be broken by a status
+        probe (uniform with a VM-state query on an unprovisioned VM).
         """
-        runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
-        result = runner.ps_json()
         rows: list[dict[str, str]] = []
+        try:
+            runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
+        except ConfigError as exc:
+            self.logger.warning(
+                f"[{cluster_name}] cannot query container status: {exc}")
+            return rows
+        result = runner.ps_json()
         if not getattr(result, "ok", False):
             return rows
         for line in (getattr(result, "stdout", "") or "").splitlines():
@@ -189,29 +195,20 @@ class DockerComposeSession:
         return runner.exec_command(box, cmd=cmd, shell=shell)
 
     def pause_cluster(
-        self, cluster_name: str, cluster_cfg: dict[str, Any],
-        boxes: list[str] | None = None,
+        self, cluster_name: str, cluster_cfg: dict[str, Any]
     ) -> bool:
-        """boxman control suspend → ``docker compose pause`` (whole cluster or
-        the named boxes)."""
+        """boxman control suspend → ``docker compose pause`` (whole cluster)."""
         runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
-        self.logger.info(
-            f"[{cluster_name}] docker compose pause"
-            f"{''.join(' ' + b for b in (boxes or []))}"
-        )
-        return self._check(cluster_name, "pause", runner.pause(boxes))
+        self.logger.info(f"[{cluster_name}] docker compose pause")
+        return self._check(cluster_name, "pause", runner.pause())
 
     def unpause_cluster(
-        self, cluster_name: str, cluster_cfg: dict[str, Any],
-        boxes: list[str] | None = None,
+        self, cluster_name: str, cluster_cfg: dict[str, Any]
     ) -> bool:
-        """boxman control resume → ``docker compose unpause``."""
+        """boxman control resume → ``docker compose unpause`` (whole cluster)."""
         runner, _wd, _cf = self._teardown_runner(cluster_name, cluster_cfg)
-        self.logger.info(
-            f"[{cluster_name}] docker compose unpause"
-            f"{''.join(' ' + b for b in (boxes or []))}"
-        )
-        return self._check(cluster_name, "unpause", runner.unpause(boxes))
+        self.logger.info(f"[{cluster_name}] docker compose unpause")
+        return self._check(cluster_name, "unpause", runner.unpause())
 
     def _check(self, cluster_name: str, op: str, result: Any) -> bool:
         """Warn (don't raise) when a best-effort teardown op did not succeed.
@@ -385,8 +382,7 @@ class DockerComposeSession:
     def _compose_project(self, cluster_name: str) -> str:
         """Derive the ``docker compose -p`` name — one project per cluster
         (ADR-001), so clusters never share compose state."""
-        base = self._provider_config.get("project_name") or self.config.get("project") or "boxman"
-        return _sanitize_project_name(f"{base}_{cluster_name}")
+        return compose_project_name(self.config, cluster_name)
 
     def _require_local_runtime(self, cluster_name: str) -> None:
         """Defense-in-depth: the docker-compose provider requires
@@ -464,6 +460,16 @@ def _format_ports(publishers: Any) -> str:
         elif target:
             parts.append(str(target))
     return ", ".join(parts)
+
+
+def compose_project_name(config: dict[str, Any], cluster_name: str) -> str:
+    """The ``docker compose -p`` project name for a dc cluster — the single
+    source of truth shared by :meth:`DockerComposeSession._compose_project`
+    (compose ops) and ``BoxmanManager._compose_project_for`` (inventory
+    ``ansible_host`` derivation), so the two can never drift apart."""
+    dc = (config.get("provider") or {}).get("docker-compose") or {}
+    base = dc.get("project_name") or config.get("project") or "boxman"
+    return _sanitize_project_name(f"{base}_{cluster_name}")
 
 
 def _sanitize_project_name(name: str) -> str:

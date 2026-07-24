@@ -114,26 +114,37 @@ class ComposeRunner:
     def exec_command(
         self, box: str, cmd: list[str] | None = None,
         shell: str = DEFAULT_EXEC_SHELL,
-    ) -> str:
-        """Build the ``docker compose exec`` command string for *box*.
+    ) -> list[str]:
+        """Build the ``docker compose exec`` **argv list** for *box*.
 
         With *cmd* → a one-shot ``exec -T <box> <cmd…>`` (``-T`` disables TTY
         allocation so it works from a non-terminal / script). Without *cmd* →
         an interactive ``exec <box> <shell>`` (TTY auto-allocated by compose).
-        Returned as a string for the caller to run with inherited stdio (like
-        the ssh path), so the interactive shell attaches to the real terminal.
+        Returned as an argv list so the caller runs it with ``shell=False``
+        (no shell injection surface) and inherited stdio, so an interactive
+        shell attaches to the real terminal.
         """
-        base = self._base()
+        argv = self._base_argv() + ["exec"]
         if cmd:
-            inner = " ".join(shlex.quote(c) for c in cmd)
-            return f"{base} exec -T {shlex.quote(box)} {inner}"
-        return f"{base} exec {shlex.quote(box)} {shlex.quote(shell)}"
+            return argv + ["-T", box, *cmd]
+        return argv + [box, shell]
 
     # -- internals ---------------------------------------------------------
 
     @staticmethod
     def _svc(services: list[str] | None) -> str:
         return "".join(f" {shlex.quote(s)}" for s in (services or []))
+
+    def _base_argv(self) -> list[str]:
+        """The ``docker compose -p <project> …`` prefix as an argv list (for
+        commands run with ``shell=False``)."""
+        argv = (["sudo"] if self._sudo else []) + [
+            "docker", "compose", "-p", self.project]
+        if self.compose_file:
+            argv += ["-f", self.compose_file]
+        if self.workdir:
+            argv += ["--project-directory", self.workdir]
+        return argv
 
     def _base(self) -> str:
         # ``-f`` / ``--project-directory`` are included only when set. A

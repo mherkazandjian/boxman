@@ -700,10 +700,14 @@ class TestComposeRunner:
 
     # -- Phase 6: exec / pause / ps ------------------------------------
     def test_exec_command_interactive_and_cmd(self):
-        r = self._runner()
-        assert r.exec_command("web").endswith("exec web sh")
-        assert "exec -T web redis-cli ping" in r.exec_command("web", ["redis-cli", "ping"])
-        assert r.exec_command("web", shell="bash").endswith("exec web bash")
+        r = self._runner()  # project proj_stack, file /wd/docker-compose.yml, wd /wd
+        assert r.exec_command("web") == [
+            "docker", "compose", "-p", "proj_stack",
+            "-f", "/wd/docker-compose.yml", "--project-directory", "/wd",
+            "exec", "web", "sh"]
+        assert r.exec_command("web", ["redis-cli", "ping"])[-4:] == [
+            "-T", "web", "redis-cli", "ping"]
+        assert r.exec_command("web", shell="bash")[-2:] == ["web", "bash"]
 
     def test_pause_unpause_commands(self):
         r = self._runner()
@@ -772,7 +776,7 @@ class _FakeRunner:
 
     def exec_command(self, box, cmd=None, shell="sh"):
         self.calls.append(("exec_command", box, cmd, shell))
-        return f"COMPOSE exec {box} {cmd or shell}"
+        return ["compose", "exec", box, *(cmd or [shell])]
 
 
 class TestDockerComposeSession:
@@ -977,9 +981,9 @@ class TestDockerComposeSession:
         runner = _FakeRunner()
         with self._patch_teardown(session, runner):
             session.pause_cluster("services", {})
-            session.unpause_cluster("services", {}, boxes=["web"])
+            session.unpause_cluster("services", {})
         assert ("pause", None) in runner.calls
-        assert ("unpause", ["web"]) in runner.calls
+        assert ("unpause", None) in runner.calls
 
     def test_require_local_runtime_guardrail(self):
         session = self._session(runtime="docker-compose")
@@ -1209,14 +1213,16 @@ class TestPhase6CliParity:
     def test_exec_container_builds_and_runs(self):
         m = self._mgr()
         sess = mock.Mock()
-        sess.exec_command_for.return_value = "docker compose exec web sh"
-        m.session_for_cluster = lambda c: sess
+        sess.exec_command_for.return_value = ["docker", "compose", "exec", "web", "sh"]
+        m._dc_session = lambda c: sess
         args = SimpleNamespace(target="services.web", cmd=[], shell=None)
         with mock.patch("subprocess.run",
                         return_value=SimpleNamespace(returncode=0)) as sp:
             BoxmanManager.exec_container(m, args)
         assert sess.exec_command_for.call_args.args[:3] == ("services", m.config["clusters"]["services"], "web")
-        assert sp.call_args.args[0] == "docker compose exec web sh"
+        # runs the argv LIST with shell=False (no shell=True kwarg)
+        assert sp.call_args.args[0] == ["docker", "compose", "exec", "web", "sh"]
+        assert sp.call_args.kwargs.get("shell") in (None, False)
 
     # -- control -------------------------------------------------------
     def test_control_suspend_pauses_dc(self):
@@ -1241,6 +1247,38 @@ class TestPhase6CliParity:
         with mock.patch.object(m.logger, "warning") as warn:
             BoxmanManager.save_vm(m, SimpleNamespace())
         assert any("not supported" in str(c.args[0]) for c in warn.call_args_list)
+
+    def test_control_suspend_honors_cluster_scope(self):
+        """--cluster scopes the dc control op to that cluster only."""
+        m = self._mgr({"other": {"provider": "docker-compose", "boxes": {"z": {}}}})
+        paused = []
+        sess = mock.Mock()
+        sess.pause_cluster.side_effect = lambda name, cfg: paused.append(name)
+        m._dc_session = lambda c: sess
+        m.process_vm_list = lambda a: []
+        BoxmanManager.suspend_vm(m, SimpleNamespace(cluster="other"))
+        assert paused == ["other"]      # 'services' left running
+
+    def test_compose_project_for_matches_session(self):
+        """The manager's inventory derivation and the session's compose-op
+        derivation are single-sourced — they must agree."""
+        m = self._mgr()
+        session = create_session("docker-compose", m.config)
+        assert m._compose_project_for("services") == session._compose_project("services")
+
+    # -- exec parser (regression: --shell after the target) ------------
+    def test_exec_parser_shell_after_target(self):
+        from boxman.scripts.cli_parser import parse_args
+        parser = parse_args()
+        a, _ = parser.parse_known_args(["exec", "services.web", "--shell", "bash"])
+        assert a.target == "services.web" and a.shell == "bash" and a.cmd == []
+
+    def test_exec_parser_command_after_separator(self):
+        from boxman.scripts.cli_parser import parse_args
+        parser = parse_args()
+        a, _ = parser.parse_known_args(
+            ["exec", "services.web", "--", "redis-cli", "ping"])
+        assert a.target == "services.web" and a.cmd == ["redis-cli", "ping"]
 
     # -- ps ------------------------------------------------------------
     def test_ps_includes_containers(self, capsys):
