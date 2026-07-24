@@ -571,7 +571,7 @@ graph TB
     
     subgraph Phase6["Phase 6: CLI/UX"]
         AC16["✓ boxman ps shows VMs and containers"]
-        AC17["✓ boxman ssh works for containers"]
+        AC17["✓ boxman exec works for containers (ssh is VM-only, D2)"]
         AC18["✓ Inventory includes containers"]
     end
 ```
@@ -644,7 +644,7 @@ Questions" section.
 | # | Question | Decision |
 |---|---|---|
 | D1 | Container readiness | `docker compose up --wait` + per-cluster `readiness_timeout` (default 120s): waits for `healthy` when a healthcheck exists, `running` otherwise — no custom polling loop. |
-| D2 | Container access | `boxman ssh <cluster>.<box>` transparently uses `docker exec -it` — no sshd sidecars. Ansible reaches containers via the `community.docker` connection plugin. `write_ssh_config` stays VM-only. |
+| D2 | Container access | **Revised in Phase 6 ([#54](https://github.com/mherkazandjian/boxman/issues/54)):** a **distinct `boxman exec <cluster>.<box>`** verb runs `docker compose exec` (interactive shell, or a `-- <cmd>` one-shot) — `boxman ssh` stays VM-only, for a clean ssh-vs-docker split (the earlier plan overloaded `ssh`; a separate verb reads clearer). No sshd sidecars. Ansible reaches containers via the `community.docker` connection plugin. `write_ssh_config` stays VM-only. |
 | D3 | Snapshot semantics | `docker commit`-backed: `take` commits + tags `boxman/<project>_<box>:<snap>`; `restore` regenerates the compose file with snapshot tags + `up --force-recreate`; `list`/`delete` = image ls/rmi + metadata JSON in the cluster workdir. **Volumes are not snapshotted** — documented loudly. |
 | D4 | `build.context` | Resolved by boxman to an absolute path (relative to the conf.yml directory) at generation time — the generated compose file lives in the cluster workdir, so passing relative paths through would silently break. |
 | D5 | Compose file location | `<cluster_workdir>/docker-compose.yml` — inspectable and hand-runnable (`docker compose -f … ps`), same debuggability philosophy as the `.rendered.yml` dump. |

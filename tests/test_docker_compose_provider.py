@@ -698,6 +698,40 @@ class TestComposeRunner:
         ):
             runner.preflight()  # no raise
 
+    # -- Phase 6: exec / pause / ps ------------------------------------
+    def test_exec_command_interactive_and_cmd(self):
+        r = self._runner()  # project proj_stack, file /wd/docker-compose.yml, wd /wd
+        assert r.exec_command("web") == [
+            "docker", "compose", "-p", "proj_stack",
+            "-f", "/wd/docker-compose.yml", "--project-directory", "/wd",
+            "exec", "web", "sh"]
+        assert r.exec_command("web", ["redis-cli", "ping"])[-4:] == [
+            "-T", "web", "redis-cli", "ping"]
+        assert r.exec_command("web", shell="bash")[-2:] == ["web", "bash"]
+
+    def test_pause_unpause_commands(self):
+        r = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok(),
+        ) as run:
+            r.pause()
+            r.pause(["web"])
+            r.unpause()
+        cmds = [c.args[0] for c in run.call_args_list]
+        assert any(c.endswith(" pause") for c in cmds)
+        assert any(c.endswith(" pause web") for c in cmds)
+        assert any(c.endswith(" unpause") for c in cmds)
+
+    def test_ps_json_command(self):
+        r = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok("{}"),
+        ) as run:
+            r.ps_json()
+        assert "ps --all --format json" in run.call_args_list[0].args[0]
+
 
 # --------------------------------------------------------------------------
 # DockerComposeSession
@@ -708,6 +742,7 @@ class _FakeRunner:
     def __init__(self):
         self.project = "proj_stack"
         self.calls: list = []
+        self.ps_json_result = _ok("")
 
     def preflight(self):
         self.calls.append(("preflight",))
@@ -726,6 +761,22 @@ class _FakeRunner:
 
     def start(self):
         self.calls.append(("start",))
+
+    def pause(self, services=None):
+        self.calls.append(("pause", services))
+        return _ok()
+
+    def unpause(self, services=None):
+        self.calls.append(("unpause", services))
+        return _ok()
+
+    def ps_json(self):
+        self.calls.append(("ps_json",))
+        return self.ps_json_result
+
+    def exec_command(self, box, cmd=None, shell="sh"):
+        self.calls.append(("exec_command", box, cmd, shell))
+        return ["compose", "exec", box, *(cmd or [shell])]
 
 
 class TestDockerComposeSession:
@@ -889,6 +940,50 @@ class TestDockerComposeSession:
         session = self._session()
         with pytest.raises(ConfigError, match=r"no 'workdir:'"):
             session._teardown_runner("app", {})
+
+    # -- Phase 6: exec / status / pause -----------------------------------
+    def test_exec_command_for_valid_box(self):
+        session = self._session()
+        runner = _FakeRunner()
+        with self._patch_teardown(session, runner):
+            session.exec_command_for(
+                "services", {"boxes": {"web": {}}}, "web", cmd=["ls"])
+        assert ("exec_command", "web", ["ls"], "sh") in runner.calls
+
+    def test_exec_command_for_unknown_box_raises(self):
+        session = self._session()
+        with pytest.raises(ConfigError, match=r"not a service"):
+            session.exec_command_for("services", {"boxes": {"web": {}}}, "nope")
+
+    def test_container_status_parses_ps_json(self):
+        session = self._session()
+        runner = _FakeRunner()
+        runner.ps_json_result = _ok(
+            '{"Service":"web","Name":"p-web-1","State":"running",'
+            '"Health":"healthy","Publishers":[{"PublishedPort":8080,"TargetPort":80}]}\n'
+            '{"Service":"db","Name":"p-db-1","State":"exited","Health":"","Publishers":[]}'
+        )
+        with self._patch_teardown(session, runner):
+            rows = session.container_status("services", {"boxes": {}})
+        assert rows[0] == {"service": "web", "name": "p-web-1", "state": "running",
+                           "health": "healthy", "ports": "8080->80"}
+        assert rows[1]["service"] == "db" and rows[1]["ports"] == ""
+
+    def test_container_status_empty_on_failure(self):
+        session = self._session()
+        runner = _FakeRunner()
+        runner.ps_json_result = _fail()
+        with self._patch_teardown(session, runner):
+            assert session.container_status("services", {"boxes": {}}) == []
+
+    def test_pause_unpause_cluster(self):
+        session = self._session()
+        runner = _FakeRunner()
+        with self._patch_teardown(session, runner):
+            session.pause_cluster("services", {})
+            session.unpause_cluster("services", {})
+        assert ("pause", None) in runner.calls
+        assert ("unpause", None) in runner.calls
 
     def test_require_local_runtime_guardrail(self):
         session = self._session(runtime="docker-compose")
@@ -1071,6 +1166,144 @@ class TestManagerDispatch:
         assert set(manager._compose_clusters) == {"svc"}
         manager.provision_compose_clusters()
         assert dc.calls == [("up", "svc")]
+
+
+# --------------------------------------------------------------------------
+# Phase 6 — CLI/UX parity (exec, ps, control, inventory) for dc clusters
+# --------------------------------------------------------------------------
+class TestPhase6CliParity:
+
+    def _mgr(self, extra_clusters=None):
+        import logging
+        m = BoxmanManager.__new__(BoxmanManager)
+        m.logger = logging.getLogger("boxman")
+        m.app_config = {}
+        m.config = {
+            "project": "demo",
+            "provider": {"docker-compose": {}},
+            "clusters": {
+                "services": {"provider": "docker-compose",
+                             "boxes": {"web": {"image": "x"}, "cache": {"image": "y"}}},
+            },
+        }
+        if extra_clusters:
+            m.config["clusters"].update(extra_clusters)
+        return m
+
+    # -- target resolution --------------------------------------------
+    def test_resolve_target_dotted(self):
+        assert self._mgr()._resolve_container_target("services.web") == ("services", "web")
+
+    def test_resolve_target_bare_unique(self):
+        assert self._mgr()._resolve_container_target("cache") == ("services", "cache")
+
+    def test_resolve_target_libvirt_rejected(self):
+        m = self._mgr({"compute": {"provider": "libvirt", "vms": {"node01": {}}}})
+        with pytest.raises(ConfigError, match="libvirt"):
+            m._resolve_container_target("compute.node01")
+
+    def test_resolve_target_unknown_rejected(self):
+        with pytest.raises(ConfigError, match="no docker-compose container"):
+            self._mgr()._resolve_container_target("nope")
+
+    def test_compose_project_for(self):
+        assert self._mgr()._compose_project_for("services") == "demo_services"
+
+    # -- exec verb -----------------------------------------------------
+    def test_exec_container_builds_and_runs(self):
+        m = self._mgr()
+        sess = mock.Mock()
+        sess.exec_command_for.return_value = ["docker", "compose", "exec", "web", "sh"]
+        m._dc_session = lambda c: sess
+        args = SimpleNamespace(target="services.web", cmd=[], shell=None)
+        with mock.patch("subprocess.run",
+                        return_value=SimpleNamespace(returncode=0)) as sp:
+            BoxmanManager.exec_container(m, args)
+        assert sess.exec_command_for.call_args.args[:3] == ("services", m.config["clusters"]["services"], "web")
+        # runs the argv LIST with shell=False (no shell=True kwarg)
+        assert sp.call_args.args[0] == ["docker", "compose", "exec", "web", "sh"]
+        assert sp.call_args.kwargs.get("shell") in (None, False)
+
+    # -- control -------------------------------------------------------
+    def test_control_suspend_pauses_dc(self):
+        m = self._mgr()
+        sess = mock.Mock()
+        m.session_for_cluster = lambda c: sess
+        m.process_vm_list = lambda a: []
+        BoxmanManager.suspend_vm(m, SimpleNamespace())
+        sess.pause_cluster.assert_called_once()
+
+    def test_control_resume_unpauses_dc(self):
+        m = self._mgr()
+        sess = mock.Mock()
+        m.session_for_cluster = lambda c: sess
+        m.process_vm_list = lambda a: []
+        BoxmanManager.resume_vm(m, SimpleNamespace())
+        sess.unpause_cluster.assert_called_once()
+
+    def test_control_save_dc_warns_not_raises(self):
+        m = self._mgr()
+        m.process_vm_list = lambda a: []
+        with mock.patch.object(m.logger, "warning") as warn:
+            BoxmanManager.save_vm(m, SimpleNamespace())
+        assert any("not supported" in str(c.args[0]) for c in warn.call_args_list)
+
+    def test_control_suspend_honors_cluster_scope(self):
+        """--cluster scopes the dc control op to that cluster only."""
+        m = self._mgr({"other": {"provider": "docker-compose", "boxes": {"z": {}}}})
+        paused = []
+        sess = mock.Mock()
+        sess.pause_cluster.side_effect = lambda name, cfg: paused.append(name)
+        m._dc_session = lambda c: sess
+        m.process_vm_list = lambda a: []
+        BoxmanManager.suspend_vm(m, SimpleNamespace(cluster="other"))
+        assert paused == ["other"]      # 'services' left running
+
+    def test_compose_project_for_matches_session(self):
+        """The manager's inventory derivation and the session's compose-op
+        derivation are single-sourced — they must agree."""
+        m = self._mgr()
+        session = create_session("docker-compose", m.config)
+        assert m._compose_project_for("services") == session._compose_project("services")
+
+    # -- exec parser (regression: --shell after the target) ------------
+    def test_exec_parser_shell_after_target(self):
+        from boxman.scripts.cli_parser import parse_args
+        parser = parse_args()
+        a, _ = parser.parse_known_args(["exec", "services.web", "--shell", "bash"])
+        assert a.target == "services.web" and a.shell == "bash" and a.cmd == []
+
+    def test_exec_parser_command_after_separator(self):
+        from boxman.scripts.cli_parser import parse_args
+        parser = parse_args()
+        a, _ = parser.parse_known_args(
+            ["exec", "services.web", "--", "redis-cli", "ping"])
+        assert a.target == "services.web" and a.cmd == ["redis-cli", "ping"]
+
+    # -- ps ------------------------------------------------------------
+    def test_ps_includes_containers(self, capsys):
+        m = self._mgr()
+        sess = mock.Mock()
+        sess.container_status.return_value = [
+            {"service": "web", "name": "demo_services-web-1", "state": "running",
+             "health": "healthy", "ports": ""},
+        ]
+        m.session_for_cluster = lambda c: sess
+        BoxmanManager.ps(m, SimpleNamespace(provider_info=False, json=False))
+        out = capsys.readouterr().out
+        assert "docker-compose" in out and "web" in out and "running (healthy)" in out
+
+    # -- inventory -----------------------------------------------------
+    def test_inventory_includes_dc_containers(self):
+        m = self._mgr()
+        m.config["workspace"] = {"path": "/tmp/ws"}
+        m.resolve_workspace_defaults()
+        inv = yaml.safe_load(
+            m.config["workspace"]["files"]["inventory/01-hosts.yml"])
+        web = inv["all"]["hosts"]["services_web"]
+        assert web["ansible_connection"] == "community.docker.docker"
+        assert web["ansible_host"] == "demo_services-web-1"
+        assert "services" in inv["all"]["children"]
 
 
 # --------------------------------------------------------------------------

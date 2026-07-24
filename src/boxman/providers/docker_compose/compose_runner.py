@@ -23,6 +23,10 @@ from boxman.utils.shell import run
 #: default per-cluster readiness timeout, seconds (D1)
 DEFAULT_READINESS_TIMEOUT = 120
 
+#: default interactive shell for ``boxman exec`` (POSIX-universal; override
+#: with ``--shell``)
+DEFAULT_EXEC_SHELL = "sh"
+
 
 class ComposeRunner:
     def __init__(
@@ -91,7 +95,56 @@ class ComposeRunner:
         """``docker compose ps`` (captured)."""
         return run(f"{self._base()} ps", hide=True, warn=True)
 
+    def ps_json(self):
+        """``docker compose ps --format json --all`` (captured).
+
+        Compose v2 emits one JSON object per line (newline-delimited); include
+        ``--all`` so stopped/paused services are reported too (for ``ps`` /
+        ``connect_info`` status columns)."""
+        return run(f"{self._base()} ps --all --format json", hide=True, warn=True)
+
+    def pause(self, services: list[str] | None = None):
+        """``docker compose pause`` (whole project, or the given services)."""
+        return run(f"{self._base()} pause{self._svc(services)}", warn=True)
+
+    def unpause(self, services: list[str] | None = None):
+        """``docker compose unpause`` (whole project, or the given services)."""
+        return run(f"{self._base()} unpause{self._svc(services)}", warn=True)
+
+    def exec_command(
+        self, box: str, cmd: list[str] | None = None,
+        shell: str = DEFAULT_EXEC_SHELL,
+    ) -> list[str]:
+        """Build the ``docker compose exec`` **argv list** for *box*.
+
+        With *cmd* → a one-shot ``exec -T <box> <cmd…>`` (``-T`` disables TTY
+        allocation so it works from a non-terminal / script). Without *cmd* →
+        an interactive ``exec <box> <shell>`` (TTY auto-allocated by compose).
+        Returned as an argv list so the caller runs it with ``shell=False``
+        (no shell injection surface) and inherited stdio, so an interactive
+        shell attaches to the real terminal.
+        """
+        argv = self._base_argv() + ["exec"]
+        if cmd:
+            return argv + ["-T", box, *cmd]
+        return argv + [box, shell]
+
     # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _svc(services: list[str] | None) -> str:
+        return "".join(f" {shlex.quote(s)}" for s in (services or []))
+
+    def _base_argv(self) -> list[str]:
+        """The ``docker compose -p <project> …`` prefix as an argv list (for
+        commands run with ``shell=False``)."""
+        argv = (["sudo"] if self._sudo else []) + [
+            "docker", "compose", "-p", self.project]
+        if self.compose_file:
+            argv += ["-f", self.compose_file]
+        if self.workdir:
+            argv += ["--project-directory", self.workdir]
+        return argv
 
     def _base(self) -> str:
         # ``-f`` / ``--project-directory`` are included only when set. A

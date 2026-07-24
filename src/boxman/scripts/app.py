@@ -426,6 +426,16 @@ def _main():
         args.func(manager, args)
         sys.exit(0)
 
+    # Handle 'exec' — container access; needs config but not the full libvirt
+    # provider setup (the dc session is created on demand via _dc_session).
+    if args.func == BoxmanManager.exec_container:
+        manager = BoxmanManager(config=args.conf)
+        if not manager.config:
+            log.error("no project config found (conf.yml)")
+            sys.exit(1)
+        args.func(manager, args)
+        sys.exit(0)
+
     else:
         # use the config of a deployment specified on the cmd line only if
         # not importing an image
