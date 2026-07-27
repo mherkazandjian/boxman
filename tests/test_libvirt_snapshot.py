@@ -11,6 +11,7 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1161,3 +1162,128 @@ class TestFlattenCdromOverlays:
         assert not any(
             c.args and c.args[0] == "change-media" for c in execute.call_args_list
         )
+
+
+class TestWouldBeOverlayPaths:
+    """`snapshot take --force` predicts the overlay libvirt would create."""
+
+    def test_derives_from_current_source(self, sm: SnapshotManager):
+        # libvirt drops the source's final suffix and appends .<snapshot>
+        with patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", "/ws/vm01.qcow2"),
+                                        ("vdb", "/ws/vm01-data.1784942899")]):
+            paths = sm._would_be_overlay_paths("vm01", "snapX")
+        assert paths == ["/ws/vm01.snapX", "/ws/vm01-data.snapX"]
+
+    def test_skips_placeholder_source(self, sm: SnapshotManager):
+        with patch.object(sm, "_data_disk_targets", return_value=[("vda", "-")]):
+            assert sm._would_be_overlay_paths("vm01", "snapX") == []
+
+
+class TestForceClearForRetake:
+    """Clearing a name for re-take: orphan files vs. a live snapshot."""
+
+    @staticmethod
+    def _touch(p: Path) -> str:
+        p.write_bytes(b"x")
+        return str(p)
+
+    def test_orphan_files_removed_active_kept(self, sm: SnapshotManager,
+                                              tmp_path: Path):
+        # Reproduces the bug: the snapshot name is gone from libvirt but its
+        # per-disk overlay + memory files linger and collide on re-take.
+        active = self._touch(tmp_path / "vm01.qcow2")          # live source
+        orphan_overlay = self._touch(tmp_path / "vm01.snapX")  # <stem>.snapX
+        mem = self._touch(tmp_path / "vm01_snapshot_snapX.raw")
+        mem_zst = self._touch(tmp_path / "vm01_snapshot_snapX.raw.zst")
+
+        removed_cmds = []
+
+        def fake_shell(cmd, *_a, **_k):
+            removed_cmds.append(cmd)
+            return _result()
+
+        absent = _result(
+            ok=False,
+            stderr="Domain snapshot not found: no domain snapshot with "
+                   "matching name 'snapX'")
+        with patch.object(sm.virsh, "execute", return_value=absent), \
+             patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", active)]), \
+             patch.object(sm.virsh, "execute_shell", side_effect=fake_shell):
+            assert sm._force_clear_for_retake(
+                "vm01", str(tmp_path), "snapX") is True
+
+        joined = "\n".join(removed_cmds)
+        assert orphan_overlay in joined
+        assert mem in joined
+        assert mem_zst in joined
+        # the live source is never a removal target
+        assert active not in joined
+
+    def test_ambiguous_snapshot_info_failure_aborts(self, sm: SnapshotManager,
+                                                    tmp_path: Path):
+        # A transient snapshot-info failure (not "snapshot absent") must NOT
+        # lead to removing candidate files — the snapshot might really exist.
+        orphan = self._touch(tmp_path / "vm01.snapX")
+        transient = _result(
+            ok=False, stderr="error: failed to connect to the hypervisor")
+        with patch.object(sm.virsh, "execute", return_value=transient), \
+             patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", str(tmp_path / "vm01.qcow2"))]), \
+             patch.object(sm.virsh, "execute_shell") as esh:
+            assert sm._force_clear_for_retake(
+                "vm01", str(tmp_path), "snapX") is False
+        esh.assert_not_called()          # no rm attempted
+        assert os.path.isfile(orphan)    # file left intact
+
+    def test_live_snapshot_deleted_first(self, sm: SnapshotManager,
+                                         tmp_path: Path):
+        with patch.object(sm.virsh, "execute", return_value=_result(ok=True)), \
+             patch.object(sm, "delete_snapshot", return_value=True) as dele, \
+             patch.object(sm, "_data_disk_targets", return_value=[]), \
+             patch.object(sm.virsh, "execute_shell", return_value=_result()):
+            assert sm._force_clear_for_retake(
+                "vm01", str(tmp_path), "snapX") is True
+        dele.assert_called_once_with("vm01", "snapX")
+
+    def test_live_snapshot_delete_failure_aborts(self, sm: SnapshotManager,
+                                                 tmp_path: Path):
+        with patch.object(sm.virsh, "execute", return_value=_result(ok=True)), \
+             patch.object(sm, "delete_snapshot", return_value=False), \
+             patch.object(sm, "_data_disk_targets", return_value=[]):
+            assert sm._force_clear_for_retake(
+                "vm01", str(tmp_path), "snapX") is False
+
+
+class TestCreateSnapshotForce:
+    """create_snapshot(force=...) runs the clear step before create-as."""
+
+    def test_force_invokes_clear_before_create(self, sm: SnapshotManager,
+                                               tmp_path: Path):
+        with patch.object(sm, "_force_clear_for_retake",
+                          return_value=True) as clear, \
+             patch.object(sm, "_flatten_cdrom_overlays"), \
+             patch.object(sm, "_cdrom_diskspec_args", return_value=[]), \
+             patch.object(sm.virsh, "execute", return_value=_result()):
+            assert sm.create_snapshot(
+                "vm01", str(tmp_path), "snapX", "d", force=True) is True
+        clear.assert_called_once_with("vm01", str(tmp_path), "snapX")
+
+    def test_force_clear_failure_aborts_create(self, sm: SnapshotManager,
+                                              tmp_path: Path):
+        with patch.object(sm, "_force_clear_for_retake",
+                          return_value=False), \
+             patch.object(sm.virsh, "execute", return_value=_result()) as execute:
+            assert sm.create_snapshot(
+                "vm01", str(tmp_path), "snapX", "d", force=True) is False
+        # never reaches snapshot-create-as
+        execute.assert_not_called()
+
+    def test_no_force_skips_clear(self, sm: SnapshotManager, tmp_path: Path):
+        with patch.object(sm, "_force_clear_for_retake") as clear, \
+             patch.object(sm, "_flatten_cdrom_overlays"), \
+             patch.object(sm, "_cdrom_diskspec_args", return_value=[]), \
+             patch.object(sm.virsh, "execute", return_value=_result()):
+            sm.create_snapshot("vm01", str(tmp_path), "snapX", "d")
+        clear.assert_not_called()

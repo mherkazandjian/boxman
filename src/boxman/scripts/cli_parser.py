@@ -73,6 +73,10 @@ def parse_args():
             "       # snapshot and set a name for the snapshot (all vms get the same snapshot name)\n"
             "       $ boxman snapshot take --name=mystate1\n"
             "\n"
+            "       # overwrite a snapshot name that already exists (or whose\n"
+            "       # files linger from a prior deletion)\n"
+            "       $ boxman snapshot take --name=mystate1 --force\n"
+            "\n"
             "     restore\n"
             "       # restore all vms in the default config file\n"
             "       $ boxman snapshot restore --name=mystate1\n"
@@ -488,6 +492,15 @@ def parse_args():
         default=3,
         dest='memory_compress_level',
         help='zstd compression level (default 3 — sweet spot)',
+    )
+    parser_snap_take.add_argument(
+        '--force', '--overwrite', '--replace',
+        action='store_true',
+        dest='force',
+        help='if a snapshot named --name already exists (or leftover '
+             'overlay/memory files from a prior deletion remain), remove '
+             'it/them first and re-take, instead of failing with a name '
+             'collision (aliases: --overwrite, --replace)',
     )
 
     #

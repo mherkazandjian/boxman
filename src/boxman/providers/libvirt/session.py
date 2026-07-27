@@ -880,7 +880,8 @@ class LibVirtSession:
                       snapshot_name=None,
                       description=None,
                       compress_memory: bool = False,
-                      compress_level: int = 3):
+                      compress_level: int = 3,
+                      force: bool = False):
         """
         Create a snapshot of a specific VM
 
@@ -893,6 +894,9 @@ class LibVirtSession:
                 a successful snapshot. The next ``snapshot restore``
                 decompresses it transparently.
             compress_level: zstd level (default 3).
+            force: overwrite an existing snapshot of the same name (and
+                clear any leftover overlay/memory files from a prior
+                deletion) instead of failing on a name collision.
 
         Returns:
             bool: True if successful, False otherwise
@@ -906,7 +910,8 @@ class LibVirtSession:
             snapshot_name=snapshot_name,
             description=description,
             compress_memory=compress_memory,
-            compress_level=compress_level)
+            compress_level=compress_level,
+            force=force)
 
     def snapshot_log_data(self, vm_name: str) -> dict:
         """
