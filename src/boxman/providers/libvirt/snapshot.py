@@ -5,6 +5,7 @@ This module provides functionality to manage VM snapshots using command-line too
 """
 
 import os
+import shlex
 import time
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -228,6 +229,19 @@ class SnapshotManager:
             paths.append(f"{stem}.{snapshot_name}")
         return paths
 
+    @staticmethod
+    def _snapshot_info_reports_absent(stderr: str | None) -> bool:
+        """
+        Whether a failed ``snapshot-info`` clearly means the snapshot does
+        not exist (vs. a transient/connectivity error). libvirt reports a
+        missing snapshot as e.g. "Domain snapshot not found: no domain
+        snapshot with matching name 'X'".
+        """
+        text = (stderr or "").lower()
+        return any(marker in text for marker in (
+            "not found", "no domain snapshot", "no snapshot",
+            "does not exist"))
+
     def _force_clear_for_retake(self,
                                 vm_name: str,
                                 vm_dir: str,
@@ -260,6 +274,17 @@ class SnapshotManager:
                     f"--force: could not remove existing snapshot "
                     f"'{snapshot_name}' on {vm_name}; refusing to overwrite")
                 return False
+        elif not self._snapshot_info_reports_absent(info.stderr):
+            # snapshot-info failed for a reason other than "snapshot does not
+            # exist" (libvirt connectivity, auth, a transient error). We can't
+            # tell whether the snapshot is really there, so removing candidate
+            # files risks deleting a live snapshot's overlay/memory — abort.
+            self.logger.error(
+                f"--force: cannot determine whether snapshot "
+                f"'{snapshot_name}' exists on {vm_name} (snapshot-info "
+                f"failed: {(info.stderr or '').strip()}); refusing to "
+                f"remove any files")
+            return False
 
         active = {src for _t, src in self._data_disk_targets(vm_name)}
         removed = []
@@ -271,7 +296,8 @@ class SnapshotManager:
             if path in active:
                 continue  # in the live chain — never remove
             if os.path.isfile(path):
-                self.virsh.execute_shell(f"rm -f '{path}'", warn=True)
+                self.virsh.execute_shell(
+                    f"rm -f -- {shlex.quote(path)}", warn=True)
                 removed.append(path)
         if removed:
             self.logger.info(
