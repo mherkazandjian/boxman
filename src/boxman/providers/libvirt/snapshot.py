@@ -140,7 +140,8 @@ class SnapshotManager:
                         snapshot_name: str,
                         description: str,
                         compress_memory: bool = False,
-                        compress_level: int = 3) -> bool:
+                        compress_level: int = 3,
+                        force: bool = False) -> bool:
         """
         Create a snapshot of a VM.
 
@@ -156,11 +157,19 @@ class SnapshotManager:
                 decompresses transparently.
             compress_level: zstd compression level (default 3 — sweet spot
                 of ~71% reduction at sub-second/GB on commodity CPUs).
+            force: If True, first clear anything that would make
+                *snapshot_name* collide — an existing libvirt snapshot with
+                that name, or orphaned per-disk overlay / memory files a
+                prior deletion left behind — so the name can be re-used.
+                See :meth:`_force_clear_for_retake`.
 
         Returns:
             bool: True if successful, False otherwise
         """
         try:
+            if force and not self._force_clear_for_retake(
+                    vm_name, vm_dir, snapshot_name):
+                return False
             # Before saving memory state, ensure cdroms point directly at
             # their raw ISO backing files (not qcow2 overlays of them).
             # This prevents snapshot-revert from failing with
@@ -195,6 +204,80 @@ class SnapshotManager:
         except Exception as exc:
             self.logger.error(f"error creating snapshot for vm {vm_name}: {exc}")
             return False
+
+    def _would_be_overlay_paths(self,
+                                vm_name: str,
+                                snapshot_name: str) -> list[str]:
+        """
+        Predict the overlay file ``snapshot-create-as`` would create for
+        each data disk of *vm_name*.
+
+        With no explicit ``file=`` in the diskspec, libvirt derives the new
+        external-overlay path from the disk's *current* source by dropping
+        its final suffix and appending ``.<snapshot_name>`` — e.g. a live
+        source ``…_provider01.qcow2`` (or ``…_provider01.1785187648``)
+        yields ``…_provider01.<snapshot_name>``. A stale file at that exact
+        path is what triggers libvirt's "external snapshot file … already
+        exists and is not a block device" error on a re-take.
+        """
+        paths = []
+        for _target, source in self._data_disk_targets(vm_name):
+            if not source or source == '-':
+                continue
+            stem = os.path.splitext(source)[0]
+            paths.append(f"{stem}.{snapshot_name}")
+        return paths
+
+    def _force_clear_for_retake(self,
+                                vm_name: str,
+                                vm_dir: str,
+                                snapshot_name: str) -> bool:
+        """
+        Remove anything that would make a fresh snapshot named
+        *snapshot_name* collide, so ``snapshot take --force`` can re-use the
+        name. Two cases:
+
+        1. A live libvirt snapshot with that name still exists → delete it
+           properly via :meth:`delete_snapshot` (blockcommit/collapse merges
+           its overlay back into base). If that delete fails (e.g. it is a
+           buried, non-most-recent snapshot), abort rather than overwrite.
+        2. The snapshot was already deleted but its per-disk overlay files
+           and/or memory ``.raw``/``.raw.zst`` were left on disk (the orphan
+           case that produced the "file already exists" error) → remove those
+           files.
+
+        Files that are part of the VM's *current* active disk chain are never
+        removed. Returns True when the name is clear to re-use.
+        """
+        info = self.virsh.execute(
+            "snapshot-info", vm_name, snapshot_name, warn=True)
+        if info.ok:
+            self.logger.info(
+                f"--force: removing existing snapshot '{snapshot_name}' on "
+                f"{vm_name} before re-taking")
+            if not self.delete_snapshot(vm_name, snapshot_name):
+                self.logger.error(
+                    f"--force: could not remove existing snapshot "
+                    f"'{snapshot_name}' on {vm_name}; refusing to overwrite")
+                return False
+
+        active = {src for _t, src in self._data_disk_targets(vm_name)}
+        removed = []
+        candidates = list(self._would_be_overlay_paths(vm_name, snapshot_name))
+        snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
+        candidates.append(os.path.join(vm_dir, snap_fname))
+        candidates.append(os.path.join(vm_dir, f"{snap_fname}.zst"))
+        for path in candidates:
+            if path in active:
+                continue  # in the live chain — never remove
+            if os.path.isfile(path):
+                self.virsh.execute_shell(f"rm -f '{path}'", warn=True)
+                removed.append(path)
+        if removed:
+            self.logger.info(
+                f"--force: removed {len(removed)} leftover snapshot file(s) "
+                f"for '{snapshot_name}' on {vm_name}")
+        return True
 
     # ── memory file compression (zstd) ──────────────────────────────────
     #

@@ -4022,6 +4022,7 @@ class BoxmanManager:
 
         compress_memory = getattr(cli_args, 'compress_memory', False)
         compress_level = getattr(cli_args, 'memory_compress_level', 3)
+        force = getattr(cli_args, 'force', False)
 
         def _take(full_vm_name, vm_dir, snapshot_name, description):
             cls.provider.snapshot_take(
@@ -4030,7 +4031,8 @@ class BoxmanManager:
                 snapshot_name=snapshot_name,
                 description=description,
                 compress_memory=compress_memory,
-                compress_level=compress_level)
+                compress_level=compress_level,
+                force=force)
 
         processes = [
             Process(target=_take, args=(full_vm_name, vm_dir,
