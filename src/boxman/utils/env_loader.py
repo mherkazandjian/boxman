@@ -185,6 +185,11 @@ def load_workspace_env(
                 # an implicit localhost. Anchoring to the cwd at load time (the
                 # project root) makes the value immune to the later chdir; when
                 # the workdir is already absolute this is identical to before.
+                # This applies to every path override (INVENTORY, SSH_CONFIG,
+                # ANSIBLE_CONFIG) — all are consumed by those same chdir'd
+                # subprocesses. Workspace-level keys are unaffected: they come
+                # through `_apply(workspace_config, None)`, where resolve_base
+                # is falsy, so they keep their historical relative handling.
                 val = os.path.abspath(os.path.join(resolve_base, val))
             env_vars[env_key] = val
             # ansible consults ANSIBLE_INVENTORY (which env.sh seeds from

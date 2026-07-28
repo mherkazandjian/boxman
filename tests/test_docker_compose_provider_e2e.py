@@ -19,8 +19,10 @@ Two tiers:
 These are local-only, like ``make test-provision`` — they create and destroy
 real infrastructure::
 
-    make test-dc-e2e                                  # docker-only tier
-    make test-dc-e2e pytest_args="-k hybrid"          # hybrid tier too
+    make test-dc-e2e                              # both tiers; hybrid
+                                                  # auto-skips without /dev/kvm
+    make test-dc-e2e pytest_args="-k Hybrid"      # restrict to the hybrid tier
+    make test-dc-e2e pytest_args="-k Lifecycle"   # restrict to the docker-only tier
 """
 
 import json
@@ -181,21 +183,35 @@ class TestDockerComposeProviderLifecycle:
         assert "hello" in result.stdout
 
     def test_snapshot_take_restore_and_volume_divergence(self, standalone_up):
-        """D3: a restore rolls back the container filesystem but NOT volumes."""
-        _boxman("exec web.cache -- redis-cli set persisted yes", cwd=standalone_up)
+        """D3: a restore rolls back the container filesystem but NOT volumes.
+
+        Both values are changed *after* the snapshot, which is what makes the
+        two assertions discriminating: the filesystem one fails if the commit
+        is not restored, and the volume one fails if volume data *were* rolled
+        back with it. A value written before the take would read the same
+        either way and prove nothing.
+        """
+        _boxman("exec web.cache -- redis-cli set divergence before", cwd=standalone_up)
         _boxman("exec web.cache -- redis-cli save", cwd=standalone_up)
         assert _boxman("snapshot take --name e2e1 -m e2e", cwd=standalone_up, warn=True).ok
 
-        # dirty the container filesystem after the snapshot
+        # after the snapshot: dirty the container filesystem *and* the volume
         _boxman("exec web.cache -- sh -c 'echo dirt > /tmp/dirt'", cwd=standalone_up)
+        _boxman("exec web.cache -- redis-cli set divergence after", cwd=standalone_up)
+        _boxman("exec web.cache -- redis-cli save", cwd=standalone_up)
+
         assert _boxman("snapshot restore --name e2e1", cwd=standalone_up, warn=True).ok
 
+        # the container filesystem went back to the snapshot
         gone = _boxman("exec web.cache -- ls /tmp/dirt", cwd=standalone_up, warn=True)
         assert not gone.ok, "container filesystem was not rolled back"
 
-        # ...while the named volume is untouched by the snapshot
-        kept = _boxman("exec web.cache -- redis-cli get persisted", cwd=standalone_up)
-        assert "yes" in kept.stdout
+        # ...but the volume kept the *post-snapshot* write (docker commit never
+        # captured it), which is the divergence the docs warn about
+        kept = _boxman("exec web.cache -- redis-cli get divergence", cwd=standalone_up)
+        assert "after" in kept.stdout, (
+            "named volume was rolled back with the snapshot — D3 says commit "
+            f"captures the writable layer only. got: {kept.stdout!r}")
 
         assert _boxman("snapshot delete --name e2e1", cwd=standalone_up, warn=True).ok
 
@@ -206,8 +222,21 @@ class TestDockerComposeProviderLifecycle:
         _boxman("snapshot delete --name dup", cwd=standalone_up, warn=True)
 
     def test_destroy_removes_containers_and_named_volumes(self):
-        """AC15: destroy tears down containers *and* named volumes."""
-        _boxman("provision --force", cwd=STANDALONE, warn=True)
+        """AC15: destroy tears down containers *and* named volumes.
+
+        **Must stay the last test in this class.** It deliberately does not
+        take ``standalone_up`` yet tears the module deployment down, so any
+        test added below it — or any run order shuffled by a plugin such as
+        pytest-randomly — would execute against a destroyed project. (The
+        second destroy in the fixture teardown is harmless: idempotent and
+        ``warn=True``.)
+
+        The re-provision is asserted so a transient failure cannot leave both
+        emptiness checks passing vacuously against a project that was never
+        brought up.
+        """
+        assert _boxman("provision --force", cwd=STANDALONE, warn=True).ok, \
+            "re-provision failed — the emptiness assertions below would be vacuous"
         assert _boxman("destroy --auto-accept", cwd=STANDALONE, warn=True).ok
         ps = _run(f"docker compose -p {STANDALONE_PROJECT} ps -q", warn=True)
         assert not ps.stdout.strip()
@@ -221,9 +250,36 @@ class TestDockerComposeProviderLifecycle:
 # Tier 2 — hybrid: VM ↔ container on a shared L2 domain (needs KVM)
 # ---------------------------------------------------------------------------
 
+#: the VM's address on the shared bridge, and the NIC it belongs to. That L2
+#: domain has no DHCP on purpose (addressing it at boot would make boxman
+#: mistake the host-unreachable address for node01's management IP), so the
+#: fixture assigns it — see the box README, step 1.
+VM_BRIDGE_IP = "10.10.0.20"
+VM_BRIDGE_NIC = "enp7s0"
+CONTAINER_BRIDGE_IP = "10.10.0.10"
+
+
+def _vm_ssh(box_dir, command, warn=False):
+    """Run *command* on the hybrid box's VM.
+
+    ``boxman ssh`` opens an interactive session and takes no trailing command,
+    so this goes through the ssh_config boxman generates in the workspace.
+    """
+    ssh_config = os.path.join(_workspace_path(box_dir), "ssh_config")
+    return _run(
+        f"ssh -F {ssh_config} -o BatchMode=yes -o ConnectTimeout=10 "
+        f"compute_node01 {command}", warn=warn)
+
+
 @pytest.fixture(scope="module")
 def hybrid_up():
     """Provision the hybrid box for the module, destroy it after.
+
+    Also establishes the L2 precondition: the VM's address on the shared
+    bridge. Doing it here (rather than skipping later when it is absent) keeps
+    the AC10/AC11 assertions able to *fail* — a broken macvlan parent, a
+    missing bridge attachment or a firewall regression must not look like an
+    unconfigured operator.
 
     Module-scoped and defined at module level: a class-scoped fixture written
     as an instance method is deprecated by pytest.
@@ -231,6 +287,16 @@ def hybrid_up():
     _boxman("destroy --auto-accept", cwd=HYBRID, warn=True)
     result = _boxman("provision --force", cwd=HYBRID, warn=True)
     assert result.ok, f"hybrid provision failed:\n{result.stdout}\n{result.stderr}"
+
+    # idempotent: a re-run would report "File exists", so verify rather than
+    # trust the exit status
+    _vm_ssh(HYBRID, f"sudo ip addr add {VM_BRIDGE_IP}/24 dev {VM_BRIDGE_NIC}",
+            warn=True)
+    shown = _vm_ssh(HYBRID, f"ip -4 -br addr show {VM_BRIDGE_NIC}", warn=True)
+    assert VM_BRIDGE_IP in shown.stdout, (
+        f"could not put {VM_BRIDGE_IP} on {VM_BRIDGE_NIC}; the L2 assertions "
+        f"would be meaningless. got: {shown.stdout!r} {shown.stderr!r}")
+
     yield HYBRID
     _boxman("destroy --auto-accept", cwd=HYBRID, warn=True)
 
@@ -281,20 +347,42 @@ class TestHybridVmContainer:
             assert '"driver": "macvlan"' in info or '"Driver": "macvlan"' in info
             assert "bx_app" in info, "macvlan is not parented on the host bridge"
 
-    def test_container_reaches_vm_over_shared_bridge(self, hybrid_up):
-        """AC10/AC11: the macvlan container pings the VM on the shared bridge
-        and learns its MAC via ARP.
+    def test_container_and_vm_reach_each_other_over_shared_bridge(self, hybrid_up):
+        """AC10: VM and container ping each other across the shared bridge.
 
-        The VM's shared-bridge address is assigned by the README walkthrough
-        (that L2 domain has no DHCP), so skip rather than fail when it has not
-        been set up — this test asserts boxman's plumbing, not the operator's.
+        The address precondition is established by the fixture, so a failure
+        here is a real regression (macvlan parent, bridge attachment,
+        netfilter) rather than an unconfigured operator — no skipping.
         """
-        ping = _boxman(
-            "exec services.web -- ping -c2 -W2 10.10.0.20", cwd=hybrid_up, warn=True)
-        if not ping.ok:
-            pytest.skip(
-                "VM shared-bridge address 10.10.0.20 not configured — follow "
-                "the box README before running the L2 assertions")
+        out = _boxman(
+            f"exec services.web -- ping -c2 -W2 {VM_BRIDGE_IP}",
+            cwd=hybrid_up, warn=True)
+        assert out.ok, f"container could not reach the VM:\n{out.stdout}{out.stderr}"
+
+        back = _vm_ssh(hybrid_up, f"ping -c2 -W2 {CONTAINER_BRIDGE_IP}", warn=True)
+        assert back.ok, f"VM could not reach the container:\n{back.stdout}{back.stderr}"
+
+    def test_arp_resolves_across_the_shared_bridge(self, hybrid_up):
+        """AC11: each side learns the other's real MAC — proof this is L2 and
+        not routed. The VM's MAC is pinned in the box conf, so assert that
+        exact value rather than merely 'some lladdr'."""
         arp = _boxman(
-            "exec services.web -- ip neigh show 10.10.0.20", cwd=hybrid_up, warn=True)
-        assert "lladdr" in arp.stdout, "no ARP entry learned for the VM"
+            f"exec services.web -- ip neigh show {VM_BRIDGE_IP}",
+            cwd=hybrid_up, warn=True)
+        assert "lladdr" in arp.stdout, f"no ARP entry for the VM: {arp.stdout!r}"
+        # adapter_2's mac in boxes/hybrid-libvirt-docker-compose/conf.yml
+        assert "52:54:00:aa:00:02" in arp.stdout.lower(), (
+            f"container resolved the VM to an unexpected MAC: {arp.stdout!r}")
+
+        back = _vm_ssh(hybrid_up, f"ip neigh show {CONTAINER_BRIDGE_IP}", warn=True)
+        assert "lladdr" in back.stdout, (
+            f"VM learned no ARP entry for the container: {back.stdout!r}")
+
+    def test_cluster_internal_address_unreachable_from_vm(self, hybrid_up):
+        """AC12, the traffic-level half: the container's cluster-internal
+        address is not reachable from the VM — only the shared bridge is
+        L2-adjacent."""
+        out = _vm_ssh(hybrid_up, "ping -c2 -W2 172.31.0.2", warn=True)
+        assert not out.ok, (
+            "the cluster-internal network is reachable from the VM — isolation "
+            f"regression:\n{out.stdout}")
