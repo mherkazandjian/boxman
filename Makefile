@@ -95,6 +95,10 @@ test-integration:
 test-provision:
 	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_provision_boxes.py
 
+#@help: run docker-compose *provider* e2e tests (needs docker; hybrid tier also needs /dev/kvm)
+test-dc-e2e:
+	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_docker_compose_provider_e2e.py
+
 #@help: count lines of code per category (code/tests/docs/conf/templates/boxes/shell/docker/make/claude)
 loc:
 	@python3 scripts/count_loc.py

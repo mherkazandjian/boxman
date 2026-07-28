@@ -66,25 +66,33 @@ The container is `hybrid_libvirt_dc_services-web-1` (find it with
 `backend` address on `172.31.0.0/24`.
 
 **Step 1 — give node01 its address on the shared bridge.** It has no DHCP there,
-so assign it once (the app NIC is the second one, `enp7s0` on this box):
+so assign it once (the app NIC is the second one, `enp7s0` on this box).
+
+`boxman ssh` opens an *interactive* session and takes no trailing command, so
+run one-off commands over the ssh_config boxman generates in the workspace:
 
 ```bash
-boxman ssh compute_node01 -- sudo ip addr add 10.10.0.20/24 dev enp7s0
-boxman ssh compute_node01 -- ip -4 -br addr show enp7s0     # -> 10.10.0.20/24
+WS=~/workspaces/boxmandev/hybrid-libvirt-docker-compose   # workspace.path from conf.yml
+alias vmsh="ssh -F $WS/ssh_config compute_node01"
+
+vmsh sudo ip addr add 10.10.0.20/24 dev enp7s0
+vmsh ip -4 -br addr show enp7s0                            # -> 10.10.0.20/24
 ```
+
+(`boxman ssh compute_node01` still works for an interactive shell.)
 
 **Step 2 — ping both ways** (VM `10.10.0.20` ⇄ container `10.10.0.10`):
 
 ```bash
 docker exec hybrid_libvirt_dc_services-web-1 ping -c3 10.10.0.20   # container -> VM
-boxman ssh compute_node01 -- ping -c3 10.10.0.10                   # VM -> container
+vmsh ping -c3 10.10.0.10                                          # VM -> container
 ```
 
 **Step 3 — ARP resolves across the bridge** (each side learns the other's real
 MAC — proof this is L2, not routed):
 
 ```bash
-boxman ssh compute_node01 -- ip neigh show 10.10.0.10       # -> lladdr <container mac>
+vmsh ip neigh show 10.10.0.10                              # -> lladdr <container mac>
 docker exec hybrid_libvirt_dc_services-web-1 ip neigh show 10.10.0.20
 ```
 
@@ -93,7 +101,7 @@ docker exec hybrid_libvirt_dc_services-web-1 ip neigh show 10.10.0.20
 
 ```bash
 docker exec hybrid_libvirt_dc_services-web-1 ip -4 -br addr   # note the 172.31.0.x
-boxman ssh compute_node01 -- ping -c2 -W2 172.31.0.2          # -> 100% loss (isolated)
+vmsh ping -c2 -W2 172.31.0.2                                  # -> 100% loss (isolated)
 ```
 
 ## Tear down

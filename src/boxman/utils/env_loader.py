@@ -177,7 +177,15 @@ def load_workspace_env(
             # point `boxman ssh` / `run` at a file that was never created.
             resolve_base = ssh_base if (env_key == "SSH_CONFIG" and ssh_base) else base
             if resolve_base and not os.path.isabs(val):
-                val = os.path.normpath(os.path.join(resolve_base, val))
+                # abspath, not normpath: tasks run with cwd set to the workdir
+                # (or workspace.path), so a result that is still relative would
+                # be resolved a *second* time against that cwd and miss. With a
+                # relative cluster workdir like './.boxman/web' that produced
+                # '.boxman/web/.boxman/web/inventory' and ansible fell back to
+                # an implicit localhost. Anchoring to the cwd at load time (the
+                # project root) makes the value immune to the later chdir; when
+                # the workdir is already absolute this is identical to before.
+                val = os.path.abspath(os.path.join(resolve_base, val))
             env_vars[env_key] = val
             # ansible consults ANSIBLE_INVENTORY (which env.sh seeds from
             # INVENTORY); keep it in step so a repointed inventory actually

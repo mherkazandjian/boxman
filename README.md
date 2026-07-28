@@ -18,6 +18,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - **Image import**: define a libvirt VM from a pre-built `(disk + XML)` package described by a JSON manifest, served from disk or over HTTP/HTTPS — see [Image Management](doc/image-management.md)
 - **OCI registry images** (via `oras`): publish qcow2 disks + optional `vmimage.json` metadata with `boxman image push`, inspect a reference with `boxman image inspect`, and use an OCI image as a base via a template `image.uri: oci://…` or directly with `base_image: oci://…`. Both boxman's own titled-qcow2 artifacts and KubeVirt **containerDisk** images (qcow2 embedded at `/disk/`, e.g. `oci://quay.io/containerdisks/ubuntu:24.04`) are supported — see [Image Management](doc/image-management.md)
 - **Runtime environments**: execute provider commands locally or inside a Docker container
+- **Per-cluster providers**: a project can mix `libvirt` VM clusters and `docker-compose` container clusters, with every verb (`up`, `ps`, `snapshot`, `control`, ansible inventory) working across both — and VM↔container L2 adjacency over a shared bridge. See [Providers](#providers)
 - **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
 - **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow disks
 - **Disk reclaim and storage hygiene**: `boxman storage` inspects qcow2 footprint, runs guest-side fstrim, compacts qcow2 files, and compresses snapshot memory dumps with zstd — see [Disk Reclaim and Storage](doc/storage.md)
@@ -292,6 +293,70 @@ environment variable.
 files under `boxes/<name>/.boxman/` (libvirt runtime data), `make
 boxes-clean` removes them via a throwaway `alpine` container. The same
 fallback is used automatically by `destroy` and `destroy-runtime`.
+
+## Providers
+
+The **provider** controls *what* a cluster is made of. It is set per cluster,
+so one project can mix them:
+
+| Provider | Cluster contains | Declared with |
+|---|---|---|
+| `libvirt` (default) | KVM/QEMU virtual machines | `vms:` (or `boxes:`) |
+| `docker-compose` | containers, one compose project per cluster | `boxes:` |
+
+> **`docker-compose` means two different things in boxman.** As a *runtime*
+> (above) it is where libvirt commands run — inside a container. As a
+> *provider* (here) it is what a cluster is built from — containers instead of
+> VMs. They are independent axes that happen to share a name. The
+> docker-compose **provider** requires the `local` **runtime**, and says so
+> explicitly if you mix them up.
+
+```yaml
+version: '2.0'                 # required to use per-cluster providers
+project: shop
+
+provider:
+  docker-compose:
+    project_name: shop
+
+clusters:
+  web:                         # containers
+    provider: docker-compose
+    workdir: ./.boxman/web
+    boxes:
+      cache:
+        image: redis:7-alpine
+
+  compute:                     # VMs, same project
+    provider: libvirt
+    base_image: ubuntu-24.04-minimal-base-template-cloudinit
+    boxes:
+      node01: { memory: 2048 }
+```
+
+Every verb works across both: `provision`, `up`/`down`, `ps`, `destroy`,
+`snapshot`, `control`, and the ansible inventory. Two differences worth
+knowing up front:
+
+- **`boxman ssh` is VM-only.** Containers are reached with **`boxman exec
+  <cluster>.<box>`**, which runs `docker compose exec` — no sshd sidecar and no
+  keys baked into images.
+- **`--cluster` scopes either provider; `--vms` is libvirt-only** and skips
+  docker-compose clusters entirely, so `snapshot restore --vms node01` cannot
+  quietly recreate your containers.
+
+Container snapshots are `docker commit`-backed, and **named volumes are not
+captured** — see the user guide for that caveat in full.
+
+Start here:
+
+- [`boxes/docker-compose-standalone`](boxes/docker-compose-standalone) — a pure
+  container project: volumes, `exec`, inventory, snapshots. No KVM needed.
+- [`boxes/hybrid-libvirt-docker-compose`](boxes/hybrid-libvirt-docker-compose) —
+  a VM and a container sharing an L2 domain.
+- [User guide](doc/docker-compose-provider/user-guide.md) ·
+  [config schema](doc/docker-compose-provider/config-schema.md) ·
+  [v1.0 → v2.0 migration](doc/docker-compose-provider/migration-v1-to-v2.md)
 
 ## Sample configuration
 

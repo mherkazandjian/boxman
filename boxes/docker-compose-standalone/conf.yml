@@ -13,12 +13,19 @@
 # (passed through verbatim). The generated docker-compose.yml is written to
 # the cluster `workdir` and is inspectable / hand-runnable.
 #
+# It is also the feature showcase for the provider: **volumes** (a named
+# volume that survives down/up, and a read-only bind mount), plus the CLI
+# surface — `boxman exec`, the ansible inventory, and `docker commit`-backed
+# `boxman snapshot`. The README walks each one.
+#
 # Requires the `local` runtime (the default) — the docker-compose provider
-# shells out to `docker compose` on the host.
+# shells out to `docker compose` on the host. No KVM and no VM images, so it
+# runs on any machine with Docker.
 #
 #   cd boxes/docker-compose-standalone
 #   boxman provision
 #   curl -sI localhost:8080          # nginx is up
+#   boxman exec web.cache -- redis-cli ping
 #   docker compose -p dc_standalone_web ps
 #   boxman destroy
 version: '2.0'
@@ -42,6 +49,13 @@ clusters:
       cache:
         image: redis:7-alpine
         networks: [appnet]
+        # A *named* volume: docker-managed, and it survives `boxman down` /
+        # `deprovision`. Redis persists its dump.rdb here, so data written
+        # before a down/up cycle is still there afterwards. `boxman destroy`
+        # removes it (that is the difference between destroy and deprovision).
+        volumes:
+          - name: cache_data
+            container_path: /data
         healthcheck:
           test: ["CMD", "redis-cli", "ping"]
           interval: 5s
@@ -53,6 +67,15 @@ clusters:
         ports:
           - "8080:80"
         networks: [appnet]
+        # A *bind* mount: a host directory mounted into the container. The
+        # relative host_path is resolved against this conf.yml's directory
+        # (decision D4), and boxman pre-creates it as you (not root-owned by
+        # the docker daemon). `readonly: true` emits the `:ro` flag — nginx
+        # only needs to read its content.
+        volumes:
+          - host_path: ./site
+            container_path: /usr/share/nginx/html
+            readonly: true
         depends_on:
           cache:
             condition: service_healthy

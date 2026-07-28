@@ -576,6 +576,39 @@ graph TB
     end
 ```
 
+#### Coverage — where each AC is actually proven
+
+Filled in during Phase 8 ([#56](https://github.com/mherkazandjian/boxman/issues/56)).
+`e2e` = `tests/test_docker_compose_provider_e2e.py` (`make test-dc-e2e`); unit
+tests are the host suite (`make test`).
+
+| AC | Proven by |
+|----|-----------|
+| AC1 v1.0 projects unchanged | unit: `test_boxman_conf.py::test_v1_*` (a versionless/v1.0 config is returned untouched) + the full libvirt suite passing |
+| AC2 existing tests pass | the whole host suite, run green on every phase merge |
+| AC3 single-provider dispatch | unit: `test_provider_registry.py`, `test_provider_protocol.py` |
+| AC4 v2.0 libvirt-only ≡ v1.0 | unit: `test_boxman_conf.py::test_v2_libvirt_only_equals_v1_shape` |
+| AC5 `boxes:` alias for `vms:` | unit: `test_v2_libvirt_boxes_renamed_to_vms`, `test_v2_libvirt_boxes_and_vms_is_error` |
+| AC6 per-cluster `provider:` | unit: `test_boxman_conf.py` v2 normalization + `provider_type_for_cluster` |
+| AC7 dc cluster `boxman up` | e2e: `test_containers_are_running` (real `up -d --wait`) |
+| AC8 dc cluster `boxman destroy` | e2e: `test_destroy_removes_containers_and_named_volumes` |
+| AC9 readiness/health | e2e: provisioning the standalone box blocks on `--wait`; its `cache` declares a healthcheck and `frontend` a `condition: service_healthy` |
+| AC10 VM↔container ping | e2e (KVM tier): `test_container_reaches_vm_over_shared_bridge`, which **skips unless the VM's shared-bridge address was assigned first** — that L2 domain deliberately has no DHCP (box README, step 1). Verified live in Phase 8 with the precondition met: both directions 0% packet loss. |
+| AC11 ARP between them | same test asserts a learned `lladdr`, same precondition. Live: the container resolves the VM to `52:54:00:aa:00:02` — `adapter_2`'s MAC from the box conf — and the VM resolves the container's macvlan MAC, proving L2 rather than routing. |
+| AC12 internal nets isolated | e2e (KVM tier): `test_cluster_internal_network_is_isolated_from_the_bridge` — internal net is a compose-scoped `bridge`, only the shared one is a `macvlan` parented on `bx_app`. Live: the VM pinging the container's `backend` address gets 100% loss. |
+| AC13 named volumes persist | e2e: `test_named_volume_survives_down_up` |
+| AC14 bind mounts work | e2e: `test_published_port_serves_the_bind_mount`, `test_bind_mount_is_readonly` |
+| AC15 volumes cleaned on destroy | e2e: `test_destroy_removes_containers_and_named_volumes` |
+| AC16 `ps` shows both | e2e: `test_ps_reports_containers_with_provider` (+ `test_mixed_ps_shows_both_providers` on the KVM tier) |
+| AC17 `exec` for containers | e2e: `test_exec_one_shot` — and `ssh` stays VM-only per the revised D2 |
+| AC18 inventory includes containers | e2e: `test_inventory_lists_containers_with_docker_connection`, and `test_inventory_spans_both_providers` for the mixed case |
+
+Beyond the ACs, the provider's failure behaviour is unit-tested in
+`tests/test_docker_compose_provider.py` (duplicate/colliding snapshot names,
+commit rollback, `ps`-failure propagation, delete-keeps-metadata,
+missing-image validation, per-cluster failure isolation, the narrowed-`--vms`
+rule and the `runtime: local` guardrail).
+
 ---
 
 ## Breaking Changes & Versioning
