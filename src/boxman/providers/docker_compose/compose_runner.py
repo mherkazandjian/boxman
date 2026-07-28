@@ -58,15 +58,19 @@ class ComposeRunner:
                 "install it or upgrade Docker."
             )
 
-    def up(self, timeout: int = DEFAULT_READINESS_TIMEOUT):
+    def up(self, timeout: int = DEFAULT_READINESS_TIMEOUT,
+           force_recreate: bool = False):
         """``docker compose up -d --wait`` — create+start and block on
-        readiness. Raises :class:`ProvisionError` on failure/timeout."""
+        readiness. ``force_recreate`` recreates containers even if their config
+        is unchanged (used by snapshot restore, which swaps in snapshot image
+        tags). Raises :class:`ProvisionError` on failure/timeout."""
         if not self.compose_file:
             raise ProvisionError(
                 f"cannot bring up project '{self.project}' without a compose "
                 f"file (label-only runners are for teardown)."
             )
-        cmd = f"{self._base()} up -d --wait --wait-timeout {int(timeout)}"
+        recreate = " --force-recreate" if force_recreate else ""
+        cmd = f"{self._base()} up -d --wait{recreate} --wait-timeout {int(timeout)}"
         result = run(cmd, warn=True)
         if not result.ok:
             raise ProvisionError(
@@ -128,6 +132,25 @@ class ComposeRunner:
         if cmd:
             return argv + ["-T", box, *cmd]
         return argv + [box, shell]
+
+    # -- docker image ops (snapshots, D3) — plain `docker`, not compose -----
+
+    def commit(self, container: str, tag: str):
+        """``docker commit <container> <tag>`` — snapshot a container's
+        filesystem to an image (captures the writable layer only, not volumes)."""
+        return run(
+            f"{self._sudo}docker commit {shlex.quote(container)} {shlex.quote(tag)}",
+            warn=True, hide=True)
+
+    def image_rm(self, tag: str):
+        """``docker image rm -f <tag>``."""
+        return run(f"{self._sudo}docker image rm -f {shlex.quote(tag)}",
+                   warn=True, hide=True)
+
+    def image_exists(self, tag: str) -> bool:
+        """True iff *tag* resolves to a local image."""
+        return run(f"{self._sudo}docker image inspect {shlex.quote(tag)}",
+                   warn=True, hide=True).ok
 
     # -- internals ---------------------------------------------------------
 

@@ -295,13 +295,80 @@ class BoxmanManager:
     def _select_dc_clusters(self, cli_args) -> list[tuple[str, dict]]:
         """docker-compose clusters selected by ``--cluster`` (an unset/absent
         ``--cluster`` selects all). ``(name, cfg)`` pairs — empty for a
-        libvirt-only project."""
+        libvirt-only project.
+
+        A **narrowed** ``--vms`` (anything other than the default ``all``)
+        deselects every dc cluster: ``--vms`` names libvirt VMs and has no
+        container meaning, so treating it as "VMs only" keeps an explicitly
+        scoped command — ``snapshot restore --vms node01`` — from also
+        force-recreating containers the user scoped away. ``--cluster``
+        remains the way to reach containers, and wins when both are given.
+        """
+        dc_clusters = self._compose_clusters
+        if not dc_clusters:
+            return []
         wanted = getattr(cli_args, 'cluster', None)
+        vms = getattr(cli_args, 'vms', None)
+        if wanted is None and vms not in (None, '', 'all'):
+            self.logger.info(
+                f"--vms is libvirt-only, so docker-compose cluster(s) "
+                f"{', '.join(dc_clusters)} were skipped; use --cluster to "
+                f"include containers."
+            )
+            return []
         return [
             (name, cluster)
-            for name, cluster in self._compose_clusters.items()
+            for name, cluster in dc_clusters.items()
             if wanted in (None, name)
         ]
+
+    def _restore_dc_plan(self, dc_plan) -> list:
+        """Run the validated docker-compose restores, isolating per-cluster
+        failures so one bad cluster can't strand the rest. Returns the names
+        of the clusters that failed."""
+        failed = []
+        for cname, cluster, snap in dc_plan:
+            try:
+                self.session_for_cluster(cname).snapshot_restore_cluster(
+                    cname, cluster, snap)
+            except Exception as exc:
+                failed.append(cname)
+                self.logger.error(
+                    f"[{cname}] snapshot restore failed: {exc}")
+        return failed
+
+    def _for_each_dc_cluster(self, cli_args, op_label, func) -> tuple[bool, list]:
+        """Apply *func(cluster_name, cluster_cfg)* to each selected dc cluster,
+        isolating failures.
+
+        Returns ``(any_selected, failed_cluster_names)``. Without this a single
+        failing dc cluster — e.g. one that was never brought up — would raise
+        straight out of the verb and skip both the remaining dc clusters and
+        every VM in a mixed project.
+        """
+        any_selected = False
+        failed: list[str] = []
+        for cname, cluster in self._select_dc_clusters(cli_args):
+            any_selected = True
+            try:
+                func(cname, cluster)
+            except Exception as exc:
+                failed.append(cname)
+                self.logger.error(f"[{cname}] snapshot {op_label} failed: {exc}")
+        return any_selected, failed
+
+    def _exit_if_dc_failed(self, failed, op_label) -> None:
+        """Exit non-zero when any dc cluster failed, *after* the rest of the
+        verb has run — the failure is reported per cluster as it happens, but
+        the command must not report success overall."""
+        if not failed:
+            return
+        import sys
+        self.logger.error(
+            f"snapshot {op_label} failed for docker-compose cluster(s): "
+            f"{', '.join(failed)}"
+        )
+        sys.exit(1)
 
     def _vm_cluster_map(self) -> dict[str, str]:
         """
@@ -4462,13 +4529,26 @@ class BoxmanManager:
     @staticmethod
     def snapshot_list(cls, cli_args):
         """
-        List snapshots of the VMs in the cluster.
+        List snapshots of the VMs and docker-compose clusters in the project.
         """
         prj_name = f'bprj__{cls.config["project"]}__bprj'
         for cluster_name, cluster in cls._vm_clusters.items():
             for vm_name, _ in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                 cls.session_for_cluster(cluster_name).snapshot_list(full_vm_name)
+        # docker-compose clusters (docker commit-backed, D3)
+        for cname, cluster in cls._compose_clusters.items():
+            snaps = cls.session_for_cluster(cname).snapshot_list_cluster(cname, cluster)
+            cls.logger.info(f"cluster: {cname} (docker-compose)")
+            if not snaps:
+                cls.logger.info("  (no snapshots)")
+            for name in sorted(snaps, key=lambda k: snaps[k].get('created', '')):
+                snap = snaps[name]
+                cls.logger.info(
+                    f"  {name}  created={snap.get('created', '?')}  "
+                    f"{snap.get('description', '')}".rstrip())
+                for box, tag in (snap.get('boxes') or {}).items():
+                    cls.logger.info(f"      {box}: {tag}")
 
     @staticmethod
     def snapshot_log(cls, cli_args):
@@ -4657,17 +4737,32 @@ class BoxmanManager:
     def snapshot_take(cls, cli_args):
         """
         Take a snapshot of the selected VMs (parallel), then verify each one.
+        docker-compose clusters are snapshotted per-cluster via ``docker
+        commit`` (decision D3; named volumes are NOT captured).
 
         Honours ``--cluster`` / ``--vms`` so a single cluster (or VM) can be
         snapshotted independently in a multi-cluster project.
         """
+        # docker-compose clusters first (cluster-scoped, D3). Failures are
+        # isolated per cluster so a dc cluster that isn't up can't stop the
+        # VMs of a mixed project from being snapshotted.
+        dc_done, dc_failed = cls._for_each_dc_cluster(
+            cli_args, 'take',
+            lambda cname, cluster: cls.session_for_cluster(cname).snapshot_take_cluster(
+                cname, cluster, cli_args.snapshot_name,
+                getattr(cli_args, 'snapshot_descr', '') or ''))
+
         vm_targets = [
             (full_vm_name, workdir)
             for full_vm_name, _cluster_name, _vm_name, workdir
             in cls._select_vm_targets(cls, cli_args)
         ]
         if not vm_targets:
-            cls.logger.warning("no VMs matched the given --cluster/--vms selection")
+            if not dc_done:
+                cls.logger.warning(
+                    "no VMs or containers matched the given "
+                    "--cluster/--vms selection")
+            cls._exit_if_dc_failed(dc_failed, 'take')
             return
 
         compress_memory = getattr(cli_args, 'compress_memory', False)
@@ -4708,6 +4803,7 @@ class BoxmanManager:
             cls.logger.info("all snapshots verified successfully")
         else:
             cls.logger.error("one or more snapshots failed verification — check errors above")
+        cls._exit_if_dc_failed(dc_failed, 'take')
 
     @staticmethod
     def snapshot_restore(cls, cli_args):
@@ -4723,10 +4819,60 @@ class BoxmanManager:
         2. Pre-validate ALL resolved snapshots; abort if any are invalid.
         3. Run parallel restores, tracking per-VM success via a Queue.
         4. Retry failed VMs in subsequent rounds until ALL succeed.
+
+        Both provider types are resolved and validated **before either is
+        mutated**: a docker-compose restore is a destructive
+        ``up --force-recreate``, so running it ahead of the VM pre-validation
+        would let an invalid VM snapshot abort the command with the containers
+        already recreated — a partial restore, despite the pre-validation
+        contract above.
         """
+        # ── 0. Resolve + validate docker-compose clusters (cluster-scoped,
+        #      D3). Nothing is mutated here — the recreate happens in step 3
+        #      once the VM snapshots have been validated too.
+        dc_plan = []      # [(cluster_name, cluster_cfg, resolved_snapshot)]
+        dc_selected = False
+        dc_abort = False
+        for cname, cluster in cls._select_dc_clusters(cli_args):
+            dc_selected = True
+            session = cls.session_for_cluster(cname)
+            snap = session.snapshot_resolve_cluster(
+                cname, cluster, cli_args.snapshot_name)
+            if snap is None:
+                cls.logger.error(f"[{cname}] no snapshots to restore")
+                continue
+            if not cli_args.snapshot_name:
+                cls.logger.info(f"[{cname}] resolved latest snapshot: '{snap}'")
+            valid, errors = session.validate_snapshot_cluster(cname, cluster, snap)
+            if valid:
+                cls.logger.info(f"snapshot ok: [{cname}] / '{snap}'")
+                dc_plan.append((cname, cluster, snap))
+            else:
+                dc_abort = True
+                for err in errors:
+                    cls.logger.error(
+                        f"snapshot invalid: [{cname}] / '{snap}': {err}")
+
         selected = cls._select_vm_targets(cls, cli_args)
+        if not selected and not dc_plan:
+            if not dc_selected:
+                cls.logger.warning(
+                    "no VMs or containers matched the given "
+                    "--cluster/--vms selection")
+            if dc_abort:
+                cls.logger.error(
+                    "aborting restore — one or more snapshots have errors "
+                    "(see above)")
+            return
+
         if not selected:
-            cls.logger.warning("no VMs matched the given --cluster/--vms selection")
+            # containers only: nothing to pre-validate on the libvirt side
+            if dc_abort:
+                cls.logger.error(
+                    "aborting restore — one or more snapshots have errors "
+                    "(see above)")
+                return
+            cls._exit_if_dc_failed(cls._restore_dc_plan(dc_plan), 'restore')
             return
 
         # ── 1. Resolve snapshot names ────────────────────────────────────────
@@ -4745,7 +4891,7 @@ class BoxmanManager:
 
         # ── 2. Pre-validate all snapshots ────────────────────────────────────
         cls.logger.info("pre-validating snapshots before restore...")
-        abort = False
+        abort = dc_abort   # a bad container snapshot aborts the whole restore
         for full_vm_name, snap_name in vm_targets:
             valid, errors = cls.session_for_vm(full_vm_name).validate_snapshot(full_vm_name, snap_name)
             if valid:
@@ -4760,6 +4906,11 @@ class BoxmanManager:
             cls.logger.error(
                 "aborting restore — one or more snapshots have errors (see above)")
             return
+
+        # ── 3. Everything validated: mutate. Containers first (fast, coarse),
+        #      then the parallel VM restores below. A dc failure is reported
+        #      now but only exits after the VMs have had their turn.
+        dc_failed = cls._restore_dc_plan(dc_plan)
 
         # ── 3 & 4. Parallel restore with retry until all succeed ─────────────
         def _restore(full_vm_name, snapshot_name, queue):
@@ -4792,6 +4943,7 @@ class BoxmanManager:
 
             if not failed:
                 cls.logger.info("all VMs restored successfully")
+                cls._exit_if_dc_failed(dc_failed, 'restore')
                 return
 
             pending = failed
@@ -4802,6 +4954,7 @@ class BoxmanManager:
         cls.logger.error(
             f"restore gave up after {max_rounds} rounds. "
             f"still failing: {[vm for vm, _ in pending]}")
+        cls._exit_if_dc_failed(dc_failed, 'restore')
 
 
     @staticmethod
@@ -4816,14 +4969,26 @@ class BoxmanManager:
             cls.logger.error("error: Snapshot name is required")
             return
 
+        # docker-compose clusters (cluster-scoped, D3), failures isolated so
+        # one cluster can't strand the others or the VMs.
+        dc_done, dc_failed = cls._for_each_dc_cluster(
+            cli_args, 'delete',
+            lambda cname, cluster: cls.session_for_cluster(cname).snapshot_delete_cluster(
+                cname, cluster, cli_args.snapshot_name))
+
         targets = cls._select_vm_targets(cls, cli_args)
         if not targets:
-            cls.logger.warning("no VMs matched the given --cluster/--vms selection")
+            if not dc_done:
+                cls.logger.warning(
+                    "no VMs or containers matched the given "
+                    "--cluster/--vms selection")
+            cls._exit_if_dc_failed(dc_failed, 'delete')
             return
 
         for full_vm_name, _cluster_name, _vm_name, _workdir in targets:
             cls.session_for_cluster(_cluster_name).snapshot_delete(full_vm_name, cli_args.snapshot_name)
             cls.logger.info(f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
+        cls._exit_if_dc_failed(dc_failed, 'delete')
 
     @staticmethod
     def _collapse_one_vm(provider_config, full_vm_name, workdir, vm_info,

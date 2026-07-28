@@ -24,6 +24,7 @@ cover four seams:
 
 from __future__ import annotations
 
+import json
 import os
 from types import SimpleNamespace
 from unittest import mock
@@ -43,6 +44,7 @@ from boxman.providers.docker_compose.compose_runner import (
 from boxman.providers.docker_compose.session import (
     DockerComposeSession,
     _sanitize_project_name,
+    _snapshot_tag,
 )
 
 
@@ -732,6 +734,28 @@ class TestComposeRunner:
             r.ps_json()
         assert "ps --all --format json" in run.call_args_list[0].args[0]
 
+    # -- Phase 7: snapshot primitives ----------------------------------
+    def test_commit_image_rm_commands(self):
+        r = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok(),
+        ) as run:
+            r.commit("proj_stack-web-1", "boxman/proj_stack_web:v1")
+            r.image_rm("boxman/proj_stack_web:v1")
+        cmds = [c.args[0] for c in run.call_args_list]
+        assert any(c.startswith("docker commit proj_stack-web-1 boxman/proj_stack_web:v1") for c in cmds)
+        assert any("docker image rm -f boxman/proj_stack_web:v1" in c for c in cmds)
+
+    def test_up_force_recreate_flag(self):
+        r = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok(),
+        ) as run:
+            r.up(30, force_recreate=True)
+        assert "up -d --wait --force-recreate --wait-timeout 30" in run.call_args_list[0].args[0]
+
 
 # --------------------------------------------------------------------------
 # DockerComposeSession
@@ -743,12 +767,16 @@ class _FakeRunner:
         self.project = "proj_stack"
         self.calls: list = []
         self.ps_json_result = _ok("")
+        #: knobs for the failure paths (snapshot review fixes)
+        self.commit_fail_on = None      # container name whose commit fails
+        self.image_rm_result = None     # override the image_rm Result
+        self.image_exists_result = True
 
     def preflight(self):
         self.calls.append(("preflight",))
 
-    def up(self, timeout):
-        self.calls.append(("up", timeout))
+    def up(self, timeout, force_recreate=False):
+        self.calls.append(("up", timeout, force_recreate))
 
     def down(self):
         self.calls.append(("down",))
@@ -770,6 +798,7 @@ class _FakeRunner:
         self.calls.append(("unpause", services))
         return _ok()
 
+    # snapshots (Phase 7)
     def ps_json(self):
         self.calls.append(("ps_json",))
         return self.ps_json_result
@@ -777,6 +806,20 @@ class _FakeRunner:
     def exec_command(self, box, cmd=None, shell="sh"):
         self.calls.append(("exec_command", box, cmd, shell))
         return ["compose", "exec", box, *(cmd or [shell])]
+
+    def commit(self, container, tag):
+        self.calls.append(("commit", container, tag))
+        if self.commit_fail_on == container:
+            return _fail(stderr="no such container")
+        return _ok()
+
+    def image_rm(self, tag):
+        self.calls.append(("image_rm", tag))
+        return self.image_rm_result if self.image_rm_result is not None else _ok()
+
+    def image_exists(self, tag):
+        self.calls.append(("image_exists", tag))
+        return self.image_exists_result
 
 
 class TestDockerComposeSession:
@@ -812,14 +855,14 @@ class TestDockerComposeSession:
         with self._patch_context(session, runner):
             session.up_cluster("stack", {"readiness_timeout": 30})
         assert ("preflight",) in runner.calls
-        assert ("up", 30) in runner.calls
+        assert ("up", 30, False) in runner.calls
 
     def test_up_cluster_default_timeout(self):
         session = self._session()
         runner = _FakeRunner()
         with self._patch_context(session, runner):
             session.up_cluster("stack", {})
-        assert ("up", DEFAULT_READINESS_TIMEOUT) in runner.calls
+        assert ("up", DEFAULT_READINESS_TIMEOUT, False) in runner.calls
 
     def test_up_cluster_precreates_bind_dirs(self):
         """Bind-mount host dirs are mkdir -p'd before compose up; named volumes
@@ -985,6 +1028,199 @@ class TestDockerComposeSession:
         assert ("pause", None) in runner.calls
         assert ("unpause", None) in runner.calls
 
+    # -- Phase 7: snapshots (docker commit-backed, D3) -----------------
+    def _ps_two_containers(self):
+        return _ok(
+            '{"Service":"web","Name":"p-web-1","State":"running"}\n'
+            '{"Service":"cache","Name":"p-cache-1","State":"running"}'
+        )
+
+    def test_snapshot_take_commits_and_writes_metadata(self, tmp_path):
+        session = self._session()
+        runner = _FakeRunner()
+        runner.ps_json_result = self._ps_two_containers()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {}, "cache": {}}}
+        with self._patch_teardown(session, runner):
+            session.snapshot_take_cluster("services", cfg, "v1", "first")
+        # each container committed to boxman/<compose-project>_<box>:v1,
+        # where the compose project is <project>_<cluster> (boxman_services)
+        commits = [c for c in runner.calls if c[0] == "commit"]
+        assert ("commit", "p-web-1", "boxman/boxman_services_web:v1") in commits
+        assert ("commit", "p-cache-1", "boxman/boxman_services_cache:v1") in commits
+        # metadata written to <workdir>/snapshots.json
+        meta = json.loads((tmp_path / "snapshots.json").read_text())
+        assert meta["v1"]["description"] == "first"
+        assert meta["v1"]["boxes"]["web"] == "boxman/boxman_services_web:v1"
+
+    def test_snapshot_take_no_containers_raises(self, tmp_path):
+        session = self._session()
+        runner = _FakeRunner()
+        runner.ps_json_result = _ok("")  # nothing running
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {}}}
+        with self._patch_teardown(session, runner):
+            with pytest.raises(ProvisionError, match=r"no containers to snapshot"):
+                session.snapshot_take_cluster("services", cfg, "v1")
+
+    def test_snapshot_list_and_delete(self, tmp_path):
+        session = self._session()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {}}}
+        session._save_snapshots("services", cfg, {
+            "v1": {"created": "t", "boxes": {"web": "boxman/p_web:v1"}}})
+        assert "v1" in session.snapshot_list_cluster("services", cfg)
+        runner = _FakeRunner()
+        with self._patch_teardown(session, runner):
+            assert session.snapshot_delete_cluster("services", cfg, "v1") is True
+        assert ("image_rm", "boxman/p_web:v1") in runner.calls
+        assert session.snapshot_list_cluster("services", cfg) == {}
+
+    def test_snapshot_delete_missing_returns_false(self, tmp_path):
+        session = self._session()
+        cfg = {"workdir": str(tmp_path), "boxes": {}}
+        assert session.snapshot_delete_cluster("services", cfg, "nope") is False
+
+    def test_snapshot_restore_regenerates_with_snapshot_images(self, tmp_path):
+        session = self._session()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {"image": "nginx"}}}
+        session._save_snapshots("services", cfg, {
+            "v1": {"created": "t", "boxes": {"web": "boxman/p_web:v1"}}})
+        fake = _FakeRunner()
+        with mock.patch.object(session._generator, "generate",
+                               return_value={"services": {}}) as gen, \
+             mock.patch.object(session._generator, "write", return_value="/wd/dc.yml"), \
+             mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=fake):
+            session.snapshot_restore_cluster("services", cfg, "v1")
+        # the box image was overridden to the snapshot tag before regeneration
+        assert gen.call_args.args[1]["boxes"]["web"]["image"] == "boxman/p_web:v1"
+        # and up ran with force_recreate
+        assert any(c[0] == "up" and c[2] is True for c in fake.calls)
+
+    def test_snapshot_restore_unknown_raises(self, tmp_path):
+        session = self._session()
+        cfg = {"workdir": str(tmp_path), "boxes": {}}
+        with pytest.raises(ConfigError, match=r"no snapshot 'nope'"):
+            session.snapshot_restore_cluster("services", cfg, "nope")
+
+    # -- Phase 7 review fixes -----------------------------------------
+
+    def test_snapshot_take_rejects_duplicate_name(self, tmp_path):
+        """A repeat take would re-point tags one box at a time, so a failure
+        midway would leave a half-old/half-new snapshot — reject instead."""
+        session = self._session()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {}}}
+        session._save_snapshots("services", cfg, {
+            "v1": {"created": "2026-01-01", "boxes": {"web": "boxman/x:v1"}}})
+        runner = _FakeRunner()
+        with self._patch_teardown(session, runner):
+            with pytest.raises(ConfigError, match=r"already exists"):
+                session.snapshot_take_cluster("services", cfg, "v1")
+        assert not [c for c in runner.calls if c[0] == "commit"]  # nothing committed
+
+    def test_snapshot_take_rejects_tag_collision(self, tmp_path):
+        """`v:1` and `v-1` sanitize to the same tag — the second take would
+        silently overwrite the first snapshot's image."""
+        session = self._session()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {}}}
+        session._save_snapshots("services", cfg, {
+            "v-1": {"created": "t",
+                    "boxes": {"web": "boxman/boxman_services_web:v-1"}}})
+        with self._patch_teardown(session, _FakeRunner()):
+            with pytest.raises(ConfigError, match=r"same docker tag"):
+                session.snapshot_take_cluster("services", cfg, "v:1")
+
+    def test_snapshot_take_rolls_back_partial_commits(self, tmp_path):
+        """If a later box fails to commit, images already written for this
+        take are removed — otherwise they leak with no metadata to reclaim."""
+        session = self._session()
+        runner = _FakeRunner()
+        runner.ps_json_result = self._ps_two_containers()
+        runner.commit_fail_on = "p-cache-1"
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {}, "cache": {}}}
+        with self._patch_teardown(session, runner):
+            with pytest.raises(ProvisionError, match=r"docker commit failed"):
+                session.snapshot_take_cluster("services", cfg, "v1")
+        assert ("image_rm", "boxman/boxman_services_web:v1") in runner.calls
+        assert not (tmp_path / "snapshots.json").exists()   # no metadata written
+
+    def test_snapshot_take_requires_local_runtime(self, tmp_path):
+        session = self._session(runtime="docker-compose")
+        with pytest.raises(ConfigError, match=r"requires runtime 'local'"):
+            session.snapshot_take_cluster(
+                "services", {"workdir": str(tmp_path), "boxes": {}}, "v1")
+
+    def test_snapshot_take_rejects_overlong_name(self, tmp_path):
+        session = self._session()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {}}}
+        with self._patch_teardown(session, _FakeRunner()):
+            with pytest.raises(ConfigError, match=r"too long"):
+                session.snapshot_take_cluster("services", cfg, "x" * 129)
+
+    def test_container_names_raises_on_ps_failure(self, tmp_path):
+        """A failed ps must surface, not masquerade as 'no containers'."""
+        session = self._session()
+        runner = _FakeRunner()
+        runner.ps_json_result = _fail(stderr="cannot connect to docker daemon")
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {}}}
+        with self._patch_teardown(session, runner):
+            with pytest.raises(ProvisionError, match=r"cannot connect to docker daemon"):
+                session.snapshot_take_cluster("services", cfg, "v1")
+
+    def test_snapshot_delete_keeps_metadata_when_image_rm_fails(self, tmp_path):
+        """`image rm` fails while a restored container holds the image —
+        dropping the entry would leak it with nothing left to reclaim it by."""
+        session = self._session()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {}}}
+        session._save_snapshots("services", cfg, {
+            "v1": {"created": "t", "boxes": {"web": "boxman/p_web:v1"}}})
+        runner = _FakeRunner()
+        runner.image_rm_result = _fail("image is being used by running container")
+        with self._patch_teardown(session, runner):
+            assert session.snapshot_delete_cluster("services", cfg, "v1") is False
+        assert "v1" in session.snapshot_list_cluster("services", cfg)  # retryable
+
+    def test_validate_snapshot_cluster_flags_missing_image(self, tmp_path):
+        """Metadata outlives a pruned image; restore must not start."""
+        session = self._session()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {}}}
+        session._save_snapshots("services", cfg, {
+            "v1": {"created": "t", "boxes": {"web": "boxman/p_web:v1"}}})
+        runner = _FakeRunner()
+        runner.image_exists_result = False
+        with self._patch_teardown(session, runner):
+            valid, errors = session.validate_snapshot_cluster("services", cfg, "v1")
+        assert valid is False and "boxman/p_web:v1" in errors[0]
+        # and restore refuses rather than starting the destructive recreate
+        with self._patch_teardown(session, runner):
+            with pytest.raises(ConfigError, match=r"cannot restore snapshot"):
+                session.snapshot_restore_cluster("services", cfg, "v1")
+
+    def test_snapshot_resolve_cluster(self, tmp_path):
+        session = self._session()
+        cfg = {"workdir": str(tmp_path), "boxes": {}}
+        assert session.snapshot_resolve_cluster("services", cfg, None) is None
+        session._save_snapshots("services", cfg, {
+            "old": {"created": "2026-01-01"}, "new": {"created": "2026-02-01"}})
+        assert session.snapshot_resolve_cluster("services", cfg, None) == "new"
+        assert session.snapshot_resolve_cluster("services", cfg, "old") == "old"
+
+    def test_snapshot_restore_ensures_bind_dirs_and_preflight(self, tmp_path):
+        """Restore is a bring-up: same bind-dir precreation as up_cluster, so
+        a host dir removed between take and restore isn't created root-owned."""
+        session = self._session()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {"image": "nginx"}}}
+        session._save_snapshots("services", cfg, {
+            "v1": {"created": "t", "boxes": {"web": "boxman/p_web:v1"}}})
+        fake = _FakeRunner()
+        with mock.patch.object(session._generator, "generate",
+                               return_value={"services": {}}), \
+             mock.patch.object(session._generator, "write", return_value="/wd/dc.yml"), \
+             mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=fake), \
+             mock.patch.object(session, "_ensure_bind_dirs") as binds:
+            session.snapshot_restore_cluster("services", cfg, "v1")
+        binds.assert_called_once()
+        assert ("preflight",) in fake.calls
+
     def test_require_local_runtime_guardrail(self):
         session = self._session(runtime="docker-compose")
         with pytest.raises(ConfigError, match=r"requires runtime 'local'"):
@@ -1043,6 +1279,151 @@ class _RecordingSession:
 
     def destroy_cluster(self, name, cfg):
         self.calls.append(("destroy", name))
+
+
+# --------------------------------------------------------------------------
+# Phase 7 — snapshot tag helper + manager dc-branch wiring
+# --------------------------------------------------------------------------
+class TestSnapshotTag:
+
+    def test_lowercases_and_sanitizes(self):
+        assert _snapshot_tag("demo_services", "Web", "v1.0") == "boxman/demo_services_web:v1.0"
+
+    def test_replaces_invalid_chars(self):
+        tag = _snapshot_tag("demo_services", "my/box", "feat branch")
+        assert tag == "boxman/demo_services_my-box:feat-branch"
+
+
+class TestSnapshotDcWiring:
+
+    def _mgr(self, extra=None):
+        import logging
+        m = BoxmanManager.__new__(BoxmanManager)
+        m.logger = logging.getLogger("boxman")
+        m.config = {
+            "project": "demo",
+            "provider": {"docker-compose": {}},
+            "clusters": {"services": {"provider": "docker-compose",
+                                      "boxes": {"web": {"image": "x"}}}},
+        }
+        if extra:
+            m.config["clusters"].update(extra)
+        return m
+
+    def test_take_routes_to_cluster_session(self):
+        m = self._mgr()
+        sess = mock.Mock()
+        m.session_for_cluster = lambda c: sess
+        args = SimpleNamespace(snapshot_name="v1", snapshot_descr="d", cluster=None, vms="all")
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
+            BoxmanManager.snapshot_take(m, args)
+        sess.snapshot_take_cluster.assert_called_once_with("services", m.config["clusters"]["services"], "v1", "d")
+
+    def test_delete_routes_to_cluster_session(self):
+        m = self._mgr()
+        sess = mock.Mock()
+        m.session_for_cluster = lambda c: sess
+        args = SimpleNamespace(snapshot_name="v1", cluster=None, vms="all")
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
+            BoxmanManager.snapshot_delete(m, args)
+        sess.snapshot_delete_cluster.assert_called_once_with("services", m.config["clusters"]["services"], "v1")
+
+    @staticmethod
+    def _restore_session(latest="new", valid=True, errors=()):
+        sess = mock.Mock()
+        sess.snapshot_resolve_cluster.return_value = latest
+        sess.validate_snapshot_cluster.return_value = (valid, list(errors))
+        return sess
+
+    def test_restore_resolves_latest_when_unnamed(self):
+        m = self._mgr()
+        sess = self._restore_session(latest="new")
+        m.session_for_cluster = lambda c: sess
+        args = SimpleNamespace(snapshot_name=None, cluster=None, vms="all")
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
+            BoxmanManager.snapshot_restore(m, args)
+        sess.snapshot_resolve_cluster.assert_called_once_with(
+            "services", m.config["clusters"]["services"], None)
+        sess.snapshot_restore_cluster.assert_called_once_with(
+            "services", m.config["clusters"]["services"], "new")
+
+    def test_restore_validates_before_mutating(self):
+        """An invalid container snapshot must abort *before* the destructive
+        up --force-recreate (mher: partial-restore ordering)."""
+        m = self._mgr()
+        sess = self._restore_session(valid=False, errors=["image missing: x"])
+        m.session_for_cluster = lambda c: sess
+        args = SimpleNamespace(snapshot_name="v1", cluster=None, vms="all")
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
+            BoxmanManager.snapshot_restore(m, args)
+        sess.validate_snapshot_cluster.assert_called_once()
+        sess.snapshot_restore_cluster.assert_not_called()
+
+    def test_restore_defers_dc_until_vm_prevalidation_passes(self):
+        """Mixed project: a bad VM snapshot aborts with containers untouched."""
+        m = self._mgr()
+        sess = self._restore_session()
+        vm_sess = mock.Mock()
+        vm_sess.validate_snapshot.return_value = (False, ["corrupt overlay"])
+        m.session_for_cluster = lambda c: sess
+        m.session_for_vm = lambda v: vm_sess
+        args = SimpleNamespace(snapshot_name="v1", cluster=None, vms="all")
+        with mock.patch.object(
+            BoxmanManager, "_select_vm_targets",
+            staticmethod(lambda cls, a: [("node01", "vms", "node01", "/w")]),
+        ):
+            BoxmanManager.snapshot_restore(m, args)
+        # dc snapshot was validated, but never recreated
+        sess.validate_snapshot_cluster.assert_called_once()
+        sess.snapshot_restore_cluster.assert_not_called()
+
+    def test_take_isolates_per_cluster_failure(self):
+        """One failing dc cluster must not stop the other, nor the VMs."""
+        m = self._mgr({"other": {"provider": "docker-compose", "boxes": {"z": {}}}})
+        seen = []
+
+        def _take(cname, *a, **kw):
+            seen.append(cname)
+            if cname == "services":
+                raise ProvisionError("cluster is not up")
+            return True
+
+        sess = mock.Mock()
+        sess.snapshot_take_cluster.side_effect = _take
+        m.session_for_cluster = lambda c: sess
+        args = SimpleNamespace(snapshot_name="v1", snapshot_descr="", cluster=None, vms="all")
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
+            with pytest.raises(SystemExit) as exc:   # non-zero overall
+                BoxmanManager.snapshot_take(m, args)
+        assert exc.value.code == 1
+        assert seen == ["services", "other"]   # kept going after the failure
+
+    def test_restore_failure_exits_nonzero(self):
+        m = self._mgr()
+        sess = self._restore_session()
+        sess.snapshot_restore_cluster.side_effect = ProvisionError("up failed")
+        m.session_for_cluster = lambda c: sess
+        args = SimpleNamespace(snapshot_name="v1", cluster=None, vms="all")
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
+            with pytest.raises(SystemExit) as exc:
+                BoxmanManager.snapshot_restore(m, args)
+        assert exc.value.code == 1
+
+    def test_select_dc_clusters_honors_cluster_filter(self):
+        m = self._mgr({"other": {"provider": "docker-compose", "boxes": {"z": {}}}})
+        got = dict(m._select_dc_clusters(SimpleNamespace(cluster="other")))
+        assert set(got) == {"other"}
+        allc = dict(m._select_dc_clusters(SimpleNamespace(cluster=None)))
+        assert set(allc) == {"services", "other"}
+
+    def test_narrowed_vms_deselects_dc_clusters(self):
+        """`--vms node01` is libvirt-only: containers must be left alone
+        rather than force-recreated (mher's --vms scoping question)."""
+        m = self._mgr()
+        assert m._select_dc_clusters(SimpleNamespace(cluster=None, vms="node01")) == []
+        # the default, and an explicit --cluster, still select
+        assert dict(m._select_dc_clusters(SimpleNamespace(cluster=None, vms="all")))
+        assert dict(m._select_dc_clusters(SimpleNamespace(cluster="services", vms="node01")))
 
 
 class TestManagerDispatch:

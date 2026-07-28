@@ -266,8 +266,57 @@ containers appear alongside VMs, and no verb tracebacks on an unsupported op.
 - **`boxman control`** for containers: `suspend` → `docker compose pause`,
   `resume` → `docker compose unpause`, `start` → `docker compose start`.
   `save` has no docker equivalent (containers have no save-to-file state) — it
-  logs an explanatory message and skips the dc clusters (use snapshots in a
-  later phase, or `destroy`).
+  logs an explanatory message and skips the dc clusters (use
+  [snapshots](#snapshots-and-container-state-decision-d3) or `destroy`).
+
+## Snapshots and container state (decision D3)
+
+`boxman snapshot` works for docker-compose clusters, backed by `docker commit`
+— with one loud caveat.
+
+- **`boxman snapshot take --name <name> [-m <description>]`** commits each
+  container in the cluster to an image
+  `boxman/<project>_<cluster>_<box>:<name>` — the repository carries the
+  *compose project* (`<project>_<cluster>`), so same-named boxes in different
+  clusters never collide — and records it in `snapshots.json` in the cluster
+  workdir. The name must be unused: a repeat `take` would re-point the tags one
+  box at a time, so a failure midway would leave the snapshot part old and part
+  new. `boxman snapshot delete --name <name>` first (libvirt rejects a
+  duplicate snapshot name too). If a commit fails partway, the images already
+  written for that take are removed again.
+- **`boxman snapshot restore --name <name>`** regenerates the compose file with
+  those snapshot image tags and runs `up --force-recreate`. Every recorded
+  image is checked to still exist first, so a snapshot whose images were pruned
+  outside boxman fails cleanly instead of part-way through the recreate. A
+  subsequent `boxman up` regenerates from `conf.yml` and reverts to the
+  declared images — restore is a point-in-time recreate, not a permanent pin.
+- **`boxman snapshot list`** / **`boxman snapshot delete --name <name>`** read
+  the metadata and `docker image rm` the tagged images. If any image cannot be
+  removed the metadata entry is **kept**, so the delete stays retryable rather
+  than leaving an image with nothing left to reclaim it by. Note that deleting
+  a snapshot you are currently *restored onto* succeeds but only untags the
+  image — the running container still references it, so it lingers as a
+  dangling image until those containers are replaced (`docker image prune`
+  reclaims it).
+
+**Scoping in a mixed project.** `--cluster <name>` selects a single cluster, of
+either provider. `--vms` names libvirt VMs and has no container meaning, so a
+narrowed `--vms` is treated as "VMs only" and **skips docker-compose clusters
+entirely** — `boxman snapshot restore --vms node01 --name X` will not
+force-recreate your containers. Use `--cluster` (or no filter) to include them.
+
+> **Named volumes are NOT part of a snapshot.** `docker commit` captures only a
+> container's writable filesystem layer, not the data in mounted volumes — so a
+> snapshot/restore does **not** roll back volume data (databases, uploads,
+> etc.). This is the key divergence from libvirt's external snapshots (which
+> capture disk + optionally memory). Back up named volumes separately if you
+> need their state. boxman warns about this on every `take`.
+
+**Container state across `down`/`up`:** `boxman down` stops containers (or
+`deprovision` removes them) but **keeps named volumes**, so volume-backed data
+survives a `down`/`up` cycle; the container filesystem itself is ephemeral and
+is rebuilt from the declared image on `up`. `destroy` removes named volumes
+too. (This is independent of snapshots.)
 
 ## Templating caveat for compose values (`environment:`, `command:`)
 
