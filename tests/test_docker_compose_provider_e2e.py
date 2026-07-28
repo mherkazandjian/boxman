@@ -202,9 +202,15 @@ class TestDockerComposeProviderLifecycle:
 
         assert _boxman("snapshot restore --name e2e1", cwd=standalone_up, warn=True).ok
 
-        # the container filesystem went back to the snapshot
+        # the container filesystem went back to the snapshot. Assert the
+        # specific "no such file" rather than merely a non-zero exit, which a
+        # broken `exec` (or a container left down by the restore) would also
+        # produce — that would turn a failed restore into a green test.
         gone = _boxman("exec web.cache -- ls /tmp/dirt", cwd=standalone_up, warn=True)
         assert not gone.ok, "container filesystem was not rolled back"
+        assert "No such file" in (gone.stdout + gone.stderr), (
+            f"expected /tmp/dirt to be absent after restore, but the command "
+            f"failed for a different reason:\n{gone.stdout}{gone.stderr}")
 
         # ...but the volume kept the *post-snapshot* write (docker commit never
         # captured it), which is the divergence the docs warn about
@@ -381,8 +387,15 @@ class TestHybridVmContainer:
     def test_cluster_internal_address_unreachable_from_vm(self, hybrid_up):
         """AC12, the traffic-level half: the container's cluster-internal
         address is not reachable from the VM — only the shared bridge is
-        L2-adjacent."""
+        L2-adjacent.
+
+        Asserts ping actually ran and reported total loss. A bare
+        ``not out.ok`` would also be satisfied by ssh failing outright, which
+        would pass this test without ever demonstrating isolation.
+        """
         out = _vm_ssh(hybrid_up, "ping -c2 -W2 172.31.0.2", warn=True)
-        assert not out.ok, (
-            "the cluster-internal network is reachable from the VM — isolation "
-            f"regression:\n{out.stdout}")
+        assert "100% packet loss" in out.stdout, (
+            "expected total loss to the cluster-internal address; either it is "
+            f"reachable (isolation regression) or ping never ran:\n"
+            f"{out.stdout}{out.stderr}")
+        assert not out.ok
