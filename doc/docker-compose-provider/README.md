@@ -1,8 +1,28 @@
-# Docker-Compose Provider Design Documents
+# Docker-Compose Provider
 
-This directory contains the design documents for adding docker-compose as a first-class provider in boxman, enabling mixed topologies where libvirt VMs and docker containers coexist with L2 connectivity.
+Design *and* user documentation for docker-compose as a first-class provider in
+boxman, enabling mixed topologies where libvirt VMs and docker containers
+coexist with L2 connectivity.
 
-## Documents
+## Using it (start here)
+
+- **[user-guide.md](user-guide.md)** — the practical path: prerequisites, a
+  minimal project, lifecycle, volumes, networking, `exec`, ansible, snapshots,
+  scoping in mixed projects, troubleshooting.
+- **[config-schema.md](config-schema.md)** — every key and its exact semantics.
+- **[migration-v1-to-v2.md](migration-v1-to-v2.md)** — moving an existing
+  project to config v2.0 (spoiler: only needed if you want containers).
+- Example boxes:
+  [`docker-compose-standalone`](../../boxes/docker-compose-standalone)
+  (containers only — volumes, `exec`, inventory, snapshots; no KVM needed) and
+  [`hybrid-libvirt-docker-compose`](../../boxes/hybrid-libvirt-docker-compose)
+  (a VM and a container sharing an L2 domain).
+
+> `docker-compose` names two independent things in boxman: a **runtime** (where
+> libvirt commands run) and this **provider** (what a cluster is made of). See
+> [the user guide](user-guide.md#first-the-name-collision).
+
+## Design documents
 
 ### Main Design Document
 - **[design.md](design.md)** - Complete design document with Mermaid diagrams covering:
@@ -89,22 +109,28 @@ Shared bridges keep `bridge-nf-call-iptables=1`; per-bridge physdev accept rules
 
 ## Implementation Phases
 
-1. **Phase 0**: Design & Validation (this phase)
-2. **Phase 1**: Provider Registry & Multi-Provider Dispatch
-3. **Phase 2**: Config Schema v2.0 & Versioning
-4. **Phase 3**: DockerComposeSession Core Lifecycle
-5. **Phase 4**: Network Integration (macvlan, shared bridges)
-6. **Phase 5**: Volume/Storage Management
-7. **Phase 6**: CLI & User Experience Updates
-8. **Phase 7**: Snapshot & State Management
-9. **Phase 8**: Testing & Documentation
-10. **Phase 9**: Release
+| | Phase | Issue | Status |
+|---|---|---|---|
+| 0 | Design & validation (incl. netfilter spike) | [#48](https://github.com/mherkazandjian/boxman/issues/48) | done |
+| 1 | Provider registry & multi-provider dispatch | [#49](https://github.com/mherkazandjian/boxman/issues/49) | done |
+| 2 | Config schema v2.0 & versioning | [#50](https://github.com/mherkazandjian/boxman/issues/50) | done |
+| 3 | DockerComposeSession core lifecycle | [#51](https://github.com/mherkazandjian/boxman/issues/51) | done |
+| 4 | Network integration (macvlan, shared bridges) | [#52](https://github.com/mherkazandjian/boxman/issues/52) | done |
+| 5 | Volume / storage management | [#53](https://github.com/mherkazandjian/boxman/issues/53) | done |
+| 6 | CLI & user-experience updates | [#54](https://github.com/mherkazandjian/boxman/issues/54) | done |
+| 7 | Snapshot & state management | [#55](https://github.com/mherkazandjian/boxman/issues/55) | done |
+| 8 | Testing & documentation | [#56](https://github.com/mherkazandjian/boxman/issues/56) | in progress |
+| 9 | Release | [#57](https://github.com/mherkazandjian/boxman/issues/57) | pending |
+
+Each phase merged into the epic branch `feat/docker-compose-provider`, which
+merges into `main` after one final epic review. Every phase carries a drift
+retro on its tracking issue recording where the implementation diverged from
+the plan.
 
 ## Next Steps
 
-1. ~~Run the netfilter spike~~ — executed 2026-07-13 in the staging VM ([spike/findings.md](spike/findings.md))
-2. Merge the Phase 0 PR into the epic feature branch `feat/docker-compose-provider` — closes Phase 0 ([#48](https://github.com/mherkazandjian/boxman/issues/48)); the feature branch accumulates all phases and merges into `main` after one final epic review
-3. Begin Phase 1 — provider registry ([#49](https://github.com/mherkazandjian/boxman/issues/49))
+1. Finish Phase 8 — e2e tests, example coverage, user docs, migration guide ([#56](https://github.com/mherkazandjian/boxman/issues/56))
+2. Phase 9 — version bump, changelog, tag, and close the epic ([#57](https://github.com/mherkazandjian/boxman/issues/57))
 
 ## Related Issues
 

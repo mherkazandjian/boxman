@@ -54,6 +54,127 @@ boxman up         # bring them back
 boxman destroy    # docker compose down --volumes + remove the generated file
 ```
 
+## Volumes
+
+Two kinds, one of each:
+
+| Box | Kind | Mount | Survives |
+|-----|------|-------|----------|
+| `cache` | named (`cache_data`) | `/data` | `down`/`up` and `deprovision` — removed by `destroy` |
+| `frontend` | bind (`./site`, read-only) | `/usr/share/nginx/html` | it is your directory; boxman never deletes it |
+
+The bind mount is live — edit and reload, no rebuild:
+
+```bash
+curl -s localhost:8080 | grep -o '<h1>.*</h1>'   # <h1>boxman</h1>
+sed -i 's|<h1>boxman</h1>|<h1>edited</h1>|' site/index.html
+curl -s localhost:8080 | grep -o '<h1>.*</h1>'   # <h1>edited</h1>
+```
+
+It is mounted `:ro`, so the container cannot write to it:
+
+```bash
+boxman exec web.frontend -- sh -c 'echo x > /usr/share/nginx/html/x' 2>&1
+# sh: can't create /usr/share/nginx/html/x: Read-only file system
+```
+
+The named volume persists across a stop/start cycle:
+
+```bash
+boxman exec web.cache -- redis-cli set greeting hello
+boxman exec web.cache -- redis-cli save          # flush to /data (the volume)
+boxman down && boxman up
+boxman exec web.cache -- redis-cli get greeting  # "hello" — survived
+```
+
+`boxman destroy` removes named volumes (`docker compose down --volumes`); the
+bind directory `./site` is left alone.
+
+## Exec into a container
+
+`boxman ssh` is for VMs. Containers get **`boxman exec`** (decision D2) — no
+sshd sidecar, no keys baked into images:
+
+```bash
+boxman exec web.cache                     # interactive shell (default: sh)
+boxman exec web.frontend --shell bash     # pick the shell
+boxman exec web.cache -- redis-cli ping   # one-shot: PONG
+```
+
+Put a command after `--` when it has its own flags, so they reach the container
+instead of boxman.
+
+## Ansible / `boxman run`
+
+Containers land in the generated inventory as ordinary hosts, reached with the
+`community.docker` connection plugin — no SSH, no keys in the image:
+
+```bash
+cat .boxman/web/inventory/01-hosts.yml
+```
+
+```yaml
+web_cache:
+  ansible_connection: "community.docker.docker"
+  ansible_host: "dc_standalone_web-cache-1"     # the real container name
+web_frontend:
+  ansible_connection: "community.docker.docker"
+  ansible_host: "dc_standalone_web-frontend-1"
+```
+
+Prerequisites on the control host:
+
+```bash
+ansible-galaxy collection install community.docker
+pip install docker            # the Docker SDK for Python
+```
+
+> **Ansible modules need a Python interpreter *inside* the container.** The
+> images here (`nginx:alpine`, `redis:alpine`) deliberately ship without one,
+> so module-based tasks such as `-m ping` or `ansible.builtin.shell` fail with
+> *"No python interpreters found"*. That is a property of minimal images, not
+> of boxman. Two ways forward:
+>
+> ```bash
+> # 1. the raw module needs no interpreter — good for minimal images
+> ansible all -m raw -a 'nginx -v'
+>
+> # 2. or use an image that has python, and the full module set works
+> ```
+>
+> `boxman run --cmd '<cmd>'` wraps `ansible.builtin.shell`, so it needs option
+> 2. For a quick command against a minimal image, `boxman exec` is the direct
+> route.
+
+## Snapshots
+
+Backed by `docker commit` (decision D3) — with one caveat worth reading twice.
+
+```bash
+boxman exec web.cache -- redis-cli set marker before-snapshot
+boxman snapshot take --name v1 -m "known good"
+boxman snapshot list
+
+# change something, then roll back
+boxman exec web.cache -- sh -c 'echo scratch > /tmp/scratch'
+boxman snapshot restore --name v1
+boxman exec web.cache -- ls /tmp/scratch     # gone — filesystem rolled back
+
+boxman snapshot delete --name v1
+```
+
+> **Named volumes are not part of a snapshot.** `docker commit` captures a
+> container's writable layer only, never the data in a mounted volume. So the
+> redis key above lives in `/data` (the `cache_data` volume) and is **not**
+> rolled back by a restore — only the container filesystem is. This is the key
+> divergence from libvirt snapshots, which capture the disk. Back volumes up
+> separately. boxman warns about this on every `take`.
+
+Snapshot names must be unused — `boxman snapshot delete --name v1` first, or
+pick a new name. A restore is a point-in-time recreate, not a permanent pin: a
+later `boxman up` regenerates from `conf.yml` and returns to the declared
+images.
+
 ## Notes
 
 - The generated `docker-compose.yml` lives under `.boxman/` (git-ignored). It
@@ -61,3 +182,6 @@ boxman destroy    # docker compose down --volumes + remove the generated file
   directly.
 - Need a compose feature boxman does not model yet? Add it under
   `compose_extra:` (per-box or per-cluster) and it is deep-merged verbatim.
+- In a **mixed** project, `--cluster <name>` scopes a command to one cluster of
+  either provider. `--vms` names libvirt VMs only, so passing it skips
+  docker-compose clusters entirely.

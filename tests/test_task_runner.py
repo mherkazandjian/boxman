@@ -143,6 +143,23 @@ class TestLoadWorkspaceEnv:
         assert result["INVENTORY"] == str(tmp_path / "inventory")
         assert result["ANSIBLE_INVENTORY"] == result["INVENTORY"]
 
+    def test_relative_cluster_workdir_yields_absolute_inventory(self, monkeypatch, tmp_path):
+        """A *relative* cluster workdir must still produce an absolute
+        INVENTORY.
+
+        Tasks run with cwd set to the workdir, so a result that stayed relative
+        got resolved a second time against that cwd — a docker-compose cluster
+        with `workdir: ./.boxman/web` produced
+        `.boxman/web/.boxman/web/inventory`, ansible parsed nothing and silently
+        fell back to an implicit localhost.
+        """
+        monkeypatch.chdir(tmp_path)
+        cluster = {"workdir": "./.boxman/web", "inventory": "inventory"}
+        result = load_workspace_env(cluster, {})
+        assert os.path.isabs(result["INVENTORY"])
+        assert result["INVENTORY"] == str(tmp_path / ".boxman" / "web" / "inventory")
+        assert result["ANSIBLE_INVENTORY"] == result["INVENTORY"]
+
     def test_cluster_absolute_inventory_left_untouched(self, tmp_path):
         """An absolute cluster inventory is used as-is, not joined to workdir."""
         abs_inv = str(tmp_path / "elsewhere" / "inv")
