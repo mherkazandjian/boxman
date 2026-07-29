@@ -218,7 +218,11 @@ Checksum verification behaviour:
 
  - git clone
  - `pip install .` (or `pip install -e .` for development)
- - For docker-compose runtime extras: `pip install '.[docker-compose]'`
+ - `pip install '.[docker-compose]'` adds the **Docker SDK for Python**.
+   boxman never imports it — every docker call shells out to the `docker`
+   CLI — but Ansible's `community.docker` connection plugin needs it on the
+   control host to reach containers of a docker-compose cluster (`boxman
+   run` / `tasks:`). Not required just to provision containers.
  - For the libvirt provider it is necessary that the user executing boxman
    can run sudo virsh and other libvirt commands (see below).
  - The boxman application config is searched at `~/.config/boxman/boxman.yml` by default.
@@ -588,7 +592,7 @@ make ping
 
 ## License
 
-This project is licensed under the [MIT License](../LICENSE).
+This project is licensed under the [MIT License](LICENSE).
 
 ## Boxman Commands
 
