@@ -6,9 +6,15 @@
   <bridge name='{{ bridge_name }}' stp='{{ bridge_stp }}' delay='{{ bridge_delay }}'/>
   <mac address='{{ mac_address }}'/>
   <ip address='{{ ip_address }}' netmask='{{ netmask }}'>
-  {%- if dhcp_range_start and dhcp_range_end %}
+  {% if (dhcp_range_start and dhcp_range_end) or dhcp_hosts %}
     <dhcp>
+    {% if dhcp_range_start and dhcp_range_end %}
       <range start='{{ dhcp_range_start }}' end='{{ dhcp_range_end }}'/>
+    {% endif %}
+    {# libvirt's schema wants <range> before <host>, so this loop stays last #}
+    {% for host in dhcp_hosts %}
+      <host mac='{{ host.mac }}'{% if 'name' in host %} name='{{ host.name }}'{% endif %} ip='{{ host.ip }}'/>
+    {% endfor %}
     </dhcp>
   {% endif %}
   </ip>

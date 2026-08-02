@@ -92,6 +92,9 @@ class Network(VirshCommand):
         #: str: the end of dhcp range
         self.dhcp_range_end = None
 
+        #: list: static dhcp reservations, each a dict of mac, ip and name
+        self.dhcp_hosts = []
+
         # extract the ip configuration. If the 'ip' key is not present then the
         # otherwise mandatory keys will be set to default values. These are:
         #  - ip_address
@@ -103,12 +106,112 @@ class Network(VirshCommand):
         self.ip_address = ip_info.get('address', '192.168.254.1')
         self.netmask = ip_info.get('netmask', '255.255.255.0')
 
-        dhcp_info = ip_info.get('dhcp', {}).get('range', {})
+        dhcp_conf = ip_info.get('dhcp', {})
+        dhcp_info = dhcp_conf.get('range', {})
         self.dhcp_range_start = dhcp_info.get('start', None)
         self.dhcp_range_end = dhcp_info.get('end', None)
 
+        # a reservation may sit inside or outside the dynamic range: dnsmasq
+        # excludes reserved addresses from the pool either way. keeping them
+        # outside is still the clearer convention
+        self.dhcp_hosts = self._parse_dhcp_hosts(dhcp_conf.get('hosts', []))
+
         #: bool: whether the network should be enabled
         self.enable = info.get('enable', True)
+
+    def _parse_dhcp_hosts(self, hosts_info: list) -> list:
+        """
+        Validate and normalise the static dhcp reservations.
+
+        Each entry becomes a ``<host>`` element under ``<dhcp>``, which libvirt
+        turns into a dnsmasq ``dhcp-host`` line pinning an address to a mac for
+        the life of the network.
+
+        The checks are the ones whose absence produces either a network libvirt
+        refuses to define -- with an error that does not say which entry is at
+        fault -- or one that defines cleanly and then hands out the wrong
+        address.
+
+        Args:
+            hosts_info: the raw ``ip.dhcp.hosts`` list from the configuration
+
+        Returns:
+            A list of dicts with the keys ``mac``, ``ip`` and optionally
+            ``name``, or an empty list when nothing is reserved.
+
+        Raises:
+            ValueError: if an entry is incomplete, malformed, outside the
+                network, or collides with another entry
+        """
+        if not hosts_info:
+            return []
+
+        try:
+            network = ipaddress.IPv4Interface(
+                f"{self.ip_address}/{self.netmask}").network
+        except ValueError as exc:
+            raise ValueError(
+                f"network {self.name}: cannot validate the dhcp reservations "
+                f"because {self.ip_address}/{self.netmask} is not a valid "
+                f"ipv4 network: {exc}") from exc
+
+        hosts = []
+        seen_macs = {}
+        seen_ips = {}
+
+        for entry in hosts_info:
+            mac = entry.get('mac')
+            ip = entry.get('ip')
+
+            if not mac or not ip:
+                raise ValueError(
+                    f"network {self.name}: a dhcp reservation needs both a "
+                    f"'mac' and an 'ip', got {entry!r}")
+
+            try:
+                address = ipaddress.IPv4Address(ip)
+            except ValueError as exc:
+                raise ValueError(
+                    f"network {self.name}: the dhcp reservation for {mac} has "
+                    f"an invalid ip {ip!r}: {exc}") from exc
+
+            if address not in network:
+                raise ValueError(
+                    f"network {self.name}: the dhcp reservation {ip} for {mac} "
+                    f"is outside the network {network}")
+
+            # libvirt compares these case-insensitively, so normalise before
+            # looking for duplicates or the same mac twice in two cases slips
+            # through and the last one silently wins
+            mac = mac.lower()
+
+            if mac in seen_macs:
+                raise ValueError(
+                    f"network {self.name}: mac {mac} is reserved twice, for "
+                    f"{seen_macs[mac]} and {ip}")
+
+            if ip in seen_ips:
+                raise ValueError(
+                    f"network {self.name}: ip {ip} is reserved twice, for "
+                    f"{seen_ips[ip]} and {mac}")
+
+            seen_macs[mac] = ip
+            seen_ips[ip] = mac
+
+            host = {'mac': mac, 'ip': ip}
+
+            # optional, and worth setting: it becomes the dnsmasq hostname, so
+            # the guest also resolves by name for everything on this network
+            if name := entry.get('name'):
+                host['name'] = name
+
+            hosts.append(host)
+
+        self.logger.info(
+            f"network {self.name}: {len(hosts)} static dhcp reservation(s): " +
+            ', '.join(f"{host['mac']} -> {host['ip']}" for host in hosts))
+
+        return hosts
 
     def generate_xml(self) -> str:
         """
@@ -142,7 +245,8 @@ class Network(VirshCommand):
             'ip_address': self.ip_address,
             'netmask': self.netmask,
             'dhcp_range_start': self.dhcp_range_start,
-            'dhcp_range_end': self.dhcp_range_end
+            'dhcp_range_end': self.dhcp_range_end,
+            'dhcp_hosts': self.dhcp_hosts
         }
 
         conf_xml = template.render(**context)

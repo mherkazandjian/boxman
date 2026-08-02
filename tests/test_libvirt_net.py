@@ -117,6 +117,83 @@ class TestGenerateXml:
         assert dhcp_range.get("end") == "192.168.150.100"
 
 
+class TestDhcpReservations:
+    """Static ``ip.dhcp.hosts`` entries -> ``<host>`` elements under <dhcp>."""
+
+    @staticmethod
+    def _net(hosts, dhcp_range=True) -> Network:
+        dhcp = {}
+        if dhcp_range:
+            dhcp["range"] = {"start": "10.5.3.50", "end": "10.5.3.100"}
+        if hosts is not None:
+            dhcp["hosts"] = hosts
+        info = {
+            "mode": "nat",
+            "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0",
+                   "dhcp": dhcp},
+        }
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            return Network(name="demo-net", info=info, assign_new_bridge=True,
+                           provider_config={"use_sudo": False})
+
+    def test_no_hosts_key_leaves_reservations_empty(self):
+        assert self._net(None).dhcp_hosts == []
+
+    def test_reservation_renders_as_host_element(self):
+        net = self._net([{"mac": "52:54:00:0c:01:01", "ip": "10.5.3.10",
+                          "name": "ctrl-1-01"}])
+        ip = ET.fromstring(net.generate_xml()).find("ip")
+        hosts = ip.findall("dhcp/host")
+        assert len(hosts) == 1
+        assert hosts[0].get("mac") == "52:54:00:0c:01:01"
+        assert hosts[0].get("ip") == "10.5.3.10"
+        assert hosts[0].get("name") == "ctrl-1-01"
+        # the dynamic range must survive alongside the reservation
+        assert ip.find("dhcp/range").get("start") == "10.5.3.50"
+
+    def test_name_is_optional(self):
+        net = self._net([{"mac": "52:54:00:0c:01:02", "ip": "10.5.3.11"}])
+        host = ET.fromstring(net.generate_xml()).find("ip/dhcp/host")
+        assert host.get("name") is None
+        assert host.get("ip") == "10.5.3.11"
+
+    def test_reservations_without_a_range_still_emit_dhcp(self):
+        # a reservations-only network is valid libvirt: no dynamic pool, every
+        # guest pinned. it must not fall through to an empty <ip>
+        net = self._net([{"mac": "52:54:00:0c:01:03", "ip": "10.5.3.12"}],
+                        dhcp_range=False)
+        ip = ET.fromstring(net.generate_xml()).find("ip")
+        assert ip.find("dhcp") is not None
+        assert ip.find("dhcp/range") is None
+        assert ip.find("dhcp/host").get("ip") == "10.5.3.12"
+
+    def test_mac_is_normalised_to_lowercase(self):
+        net = self._net([{"mac": "52:54:00:AB:CD:EF", "ip": "10.5.3.13"}])
+        assert net.dhcp_hosts[0]["mac"] == "52:54:00:ab:cd:ef"
+
+    def test_ordering_puts_range_before_hosts(self):
+        # libvirt's schema is <range>* then <host>*; a reversed document is
+        # rejected at define time
+        net = self._net([{"mac": "52:54:00:0c:01:04", "ip": "10.5.3.14"}])
+        children = [el.tag for el in ET.fromstring(net.generate_xml()).find("ip/dhcp")]
+        assert children == ["range", "host"]
+
+    @pytest.mark.parametrize("hosts, expected", [
+        ([{"mac": "52:54:00:0c:01:01"}], "needs both"),
+        ([{"ip": "10.5.3.10"}], "needs both"),
+        ([{"mac": "52:54:00:0c:01:01", "ip": "not-an-ip"}], "invalid ip"),
+        ([{"mac": "52:54:00:0c:01:01", "ip": "10.9.9.9"}], "outside the network"),
+        ([{"mac": "52:54:00:0c:01:01", "ip": "10.5.3.10"},
+          {"mac": "52:54:00:0C:01:01", "ip": "10.5.3.11"}], "reserved twice"),
+        ([{"mac": "52:54:00:0c:01:01", "ip": "10.5.3.10"},
+          {"mac": "52:54:00:0c:01:02", "ip": "10.5.3.10"}], "reserved twice"),
+    ])
+    def test_invalid_reservations_are_rejected(self, hosts, expected):
+        with pytest.raises(ValueError, match=expected):
+            self._net(hosts)
+
+
 class TestWriteXml:
 
     def test_writes_file_and_returns_absolute_path(self, tmp_path: Path):
