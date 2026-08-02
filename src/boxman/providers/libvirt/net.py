@@ -12,6 +12,7 @@ from jinja2 import Environment, FileSystemLoader
 
 from boxman import log
 
+from . import net_reconcile
 from .commands import LibVirtCommandBase, VirshCommand
 
 
@@ -53,29 +54,44 @@ class Network(VirshCommand):
         #: the cache object to be used to store network information
         self.manager = manager
 
+        #: str | None: the bridge name the configuration pinned, if any. Kept
+        #: separate from the one actually in use so that reconciliation can
+        #: tell "the config asked for virbr42" apart from "boxman picked one"
+        self.pinned_bridge_name = bridge_info.get('name')
+
         if assign_new_bridge:
             # handle the bridge name - if not specified, find the first available virbrX
-            bridge_name = bridge_info.get('name')
+            bridge_name = self.pinned_bridge_name
             if not bridge_name:
                 bridge_name = self.find_available_bridge_name()
         else:
             if bridge_name := Network.get_bridge_from_network(name, provider_config=self.provider_config):
-                self.logger.info(f"found existing bridge {bridge_name} for network {name}")
+                self.logger.debug(f"found existing bridge {bridge_name} for network {name}")
             else:
-                self.logger.warning(f"no existing bridge found for network {name}, "
-                                    f"assigning new bridge name")
+                # not an error: an undefined network has no bridge yet, which
+                # is exactly what reconciliation asks about before creating one
+                bridge_name = self.pinned_bridge_name
+                self.logger.debug(
+                    f"no bridge in libvirt for network {name} "
+                    f"(it is not defined yet)")
 
         #: str: the name of the bridge interface
         self.bridge_name = bridge_name
 
         #: str: use stp on/off for the bridge
-        self.bridge_stp = bridge_info.get('stp', 'on')
+        self.bridge_stp = self._normalise_stp(bridge_info.get('stp', 'on'))
         #: str: the delay for the stp
-        self.bridge_delay = bridge_info.get('delay', '0')
+        self.bridge_delay = str(bridge_info.get('delay', '0'))
 
         #: str: set the mac address for the bridge
-        self.mac_address = info.get(
-            'mac', f"52:54:00:{':'.join(['%02x' % (i + 10) for i in range(3)])}")
+        #: canonicalised because libvirt zero-pads this one when it stores it
+        #: (52:54:0:a:b:c comes back as 52:54:00:0a:0b:0c). Left short, the
+        #: configuration and the live network never match, and reconciliation
+        #: would rebuild the network -- rebooting its guests -- on every run.
+        #: Reservation macs are deliberately *not* padded: libvirt stores those
+        #: verbatim, so padding them would create the mismatch instead
+        self.mac_address = self._canonical_mac(info.get(
+            'mac', f"52:54:00:{':'.join(['%02x' % (i + 10) for i in range(3)])}"))
 
         #: bool: whether the ip has been provided or dummy values are injected
         self.ip_provided = 'ip' in info
@@ -122,6 +138,49 @@ class Network(VirshCommand):
 
         #: bool: whether the network should be enabled
         self.enable = info.get('enable', True)
+
+    @staticmethod
+    def _canonical_mac(value: str) -> str:
+        """
+        Zero-pad and lowercase a mac, the way libvirt stores a network's own.
+
+        Left alone if it does not look like six hex groups, so that anything
+        unexpected still reaches libvirt and gets libvirt's own error rather
+        than being silently mangled here.
+        """
+        groups = str(value).split(':')
+        if len(groups) != 6:
+            return str(value).lower()
+        try:
+            return ':'.join(f"{int(group, 16):02x}" for group in groups)
+        except ValueError:
+            return str(value).lower()
+
+    @staticmethod
+    def _normalise_stp(value: Any) -> str:
+        """
+        Coerce a configured ``stp`` value to the ``on``/``off`` libvirt echoes.
+
+        yaml reads an unquoted ``stp: on`` as the boolean True, which would be
+        rendered as ``stp='True'``. libvirt accepts that and stores it as
+        ``stp='on'`` -- so without this the configuration and the live network
+        never agree, and every reconcile reports drift that a recreate cannot
+        fix.
+
+        Raises:
+            ValueError: on a value that is neither, rather than quietly
+                turning a typo like ``stp: enabled`` into ``off``
+        """
+        if isinstance(value, bool):
+            return 'on' if value else 'off'
+
+        text = str(value).strip().lower()
+        if text in ('on', 'true', 'yes', '1'):
+            return 'on'
+        if text in ('off', 'false', 'no', '0'):
+            return 'off'
+        raise ValueError(
+            f"bridge stp must be on or off, got {value!r}")
 
     def _parse_dhcp_hosts(self, hosts_info: list) -> list:
         """
@@ -248,10 +307,35 @@ class Network(VirshCommand):
 
             # optional, and worth setting: it becomes the dnsmasq hostname, so
             # the guest also resolves by name for everything on this network
-            if name := entry.get('name'):
+            name = entry.get('name')
+            if isinstance(name, bool):
+                # `name: false` would otherwise become the hostname 'False'
+                raise ValueError(
+                    f"network {self.name}: the dhcp reservation name for "
+                    f"{mac} must be a hostname, got the boolean {name!r}")
+
+            if name is not None and str(name) != '':
+                # stored as a string: yaml reads `name: 101` as an int, which
+                # would never compare equal to the '101' read back out of the
+                # network XML, and every reconcile would re-apply it
+                name = str(name)
+
+                # libvirt round-trips this name through its own files
+                # unescaped, so an xml metacharacter defines cleanly and then
+                # breaks `net-start` with a parse error ("EntityRef: expecting
+                # ';'", "Unescaped '<' not allowed in attributes"). Escaping on
+                # the way out does not help; the name simply cannot hold one
+                if bad := set(name) & set('&<>"\''):
+                    raise ValueError(
+                        f"network {self.name}: the dhcp reservation name "
+                        f"{name!r} contains {''.join(sorted(bad))!r}. libvirt "
+                        f"defines a network holding & < or ' and then fails to "
+                        f"start it; \" and > are refused with them because "
+                        f"none of the five belong in a hostname")
+
                 # hostnames are case-insensitive, and libvirt accepts the same
                 # one twice: dnsmasq then resolves it to whichever it likes
-                if (key := str(name).lower()) in seen_names:
+                if (key := name.lower()) in seen_names:
                     raise ValueError(
                         f"network {self.name}: name {name!r} is reserved "
                         f"twice, for {seen_names[key]} and {ip}")
@@ -260,7 +344,9 @@ class Network(VirshCommand):
 
             hosts.append(host)
 
-        self.logger.info(
+        # debug rather than info: reconciliation builds a Network per plan and
+        # per apply, so this would print several times per network per `up`
+        self.logger.debug(
             f"network {self.name}: {len(hosts)} static dhcp reservation(s): " +
             ', '.join(f"{host['mac']} -> {host['ip']}" for host in hosts))
 
@@ -327,6 +413,184 @@ class Network(VirshCommand):
         log.info(f"wrote network XML to {abs_path} ({os.path.getsize(abs_path)} bytes)")
         return abs_path
 
+    def _listed_networks(self, active_only: bool = False) -> list[str] | None:
+        """Names of the networks libvirt knows, or None if it could not be asked."""
+        args = ["net-list", "--name"] if active_only else ["net-list", "--all", "--name"]
+        result = self.execute(*args, hide=True, warn=True)
+        if not result.ok:
+            return None
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def exists(self) -> bool | None:
+        """
+        Whether the network is defined.
+
+        Returns:
+            True/False, or None when libvirt could not be reached at all --
+            which is not the same as "not defined" and must not be treated as
+            an invitation to create it.
+        """
+        listed = self._listed_networks()
+        return None if listed is None else self.name in listed
+
+    def dump_xml(self) -> str | None:
+        """
+        Return the network XML as libvirt currently has it.
+
+        Returns:
+            The XML text, or None when it could not be read (undefined, or
+            libvirt unreachable -- use :meth:`exists` to tell those apart).
+        """
+        result = self.execute("net-dumpxml", self.name, hide=True, warn=True)
+        if not result.ok:
+            return None
+        return result.stdout
+
+    def is_active(self) -> bool:
+        """Return True when the network is defined *and* running."""
+        listed = self._listed_networks(active_only=True)
+        return bool(listed) and self.name in listed
+
+    def start(self) -> bool:
+        """Start a defined network, and make it come back after a host reboot."""
+        result = self.execute("net-start", self.name, hide=True, warn=True)
+        if not result.ok:
+            self.logger.error(
+                f"network {self.name}: could not be started: "
+                f"{result.stderr.strip()}")
+            return False
+
+        autostart = self.execute(
+            "net-autostart", self.name, hide=True, warn=True)
+        if not autostart.ok:
+            # not fatal, but it means the network is gone again after a reboot
+            self.logger.warning(
+                f"network {self.name}: started, but could not be set to "
+                f"autostart: {autostart.stderr.strip()}")
+
+        self.logger.info(f"network {self.name}: started")
+        return True
+
+    def apply_net_update(self,
+                         command: str,
+                         section: str,
+                         element: str,
+                         live: bool | None = None) -> bool:
+        """
+        Run a single ``virsh net-update`` against this network.
+
+        The element is handed over in a temporary file rather than inline.
+        ``net-update`` accepts both, but the inline form is a shell argument
+        full of spaces and quotes, and under a container runtime the command is
+        re-wrapped as a string -- a quoting bug waiting to happen.
+
+        ``--live`` is only added when the network is running; applying it to a
+        defined-but-stopped network is an error, while ``--config`` alone is
+        exactly right.
+
+        Args:
+            command: ``add-last``, ``modify`` or ``delete``
+            section: the section to update, e.g. ``ip-dhcp-host``
+            element: the XML element to add, match or modify
+            live: whether the network is running. Left to be looked up when
+                not given, but the caller should pass it so that a plan of a
+                dozen operations does not run a dozen ``net-list`` calls.
+
+        Returns:
+            True on success.
+        """
+        if live is None:
+            live = self.is_active()
+
+        temp = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.xml', prefix='boxman-netupdate-', delete=False)
+        try:
+            temp.write(element)
+            temp.close()
+
+            args = ["net-update", self.name, command, section, temp.name,
+                    "--config"]
+            if live:
+                args.append("--live")
+
+            result = self.execute(*args, hide=True, warn=True)
+            if not result.ok:
+                self.logger.error(
+                    f"network {self.name}: {command} {section} failed: "
+                    f"{result.stderr.strip()}")
+                return False
+
+            self.logger.info(
+                f"network {self.name}: {command} {section} {element}")
+            return True
+        finally:
+            if os.path.exists(temp.name):
+                os.unlink(temp.name)
+
+    def apply_live_plan(self, plan: dict[str, Any]) -> bool:
+        """
+        Apply the non-disruptive half of a reconciliation plan.
+
+        Ranges are applied before reservations so that a reservation moving
+        into freshly-widened space does not transiently look out of range.
+
+        Args:
+            plan: as produced by :func:`net_reconcile.diff_network`
+
+        Returns:
+            True when every operation succeeded.
+        """
+        ok = True
+        live = self.is_active()
+
+        # a range change is a delete followed by an add. If the delete fails,
+        # adding anyway would leave the network with two ranges -- and the diff
+        # only ever reads the first, so every later run would try to add again
+        for command, entry in plan.get('range_ops', []):
+            if not self.apply_net_update(
+                    command, 'ip-dhcp-range',
+                    net_reconcile.range_element(entry), live=live):
+                self.logger.error(
+                    f"network {self.name}: stopping after a failed range "
+                    f"{command} rather than leaving the network with a "
+                    f"half-applied range; the reservations are left for the "
+                    f"next run")
+                return False
+
+        for command, entry in plan.get('host_ops', []):
+            # a delete matches on the mac alone; sending the whole element
+            # makes libvirt match every attribute, so a stale ip would miss
+            match = {'mac': entry['mac']} if command == 'delete' else entry
+            ok &= self.apply_net_update(
+                command, 'ip-dhcp-host',
+                net_reconcile.host_element(match), live=live)
+
+        return bool(ok)
+
+    def attached_domains(self) -> list[str]:
+        """
+        Return the names of domains whose interfaces use this network.
+
+        Used to tell the user which guests a recreate would disconnect.
+        """
+        result = self.execute("list", "--all", "--name", hide=True, warn=True)
+        if not result.ok:
+            return []
+
+        attached = []
+        for domain in [line.strip() for line in result.stdout.splitlines() if line.strip()]:
+            iflist = self.execute(
+                "domiflist", domain, hide=True, warn=True)
+            if not iflist.ok:
+                continue
+            for line in iflist.stdout.splitlines():
+                fields = line.split()
+                # columns: Interface Type Source Model MAC
+                if len(fields) >= 3 and fields[1] == 'network' and fields[2] == self.name:
+                    attached.append(domain)
+                    break
+        return attached
+
     def update_network_cache(self) -> bool:
         """
         Write the network information to the cache.
@@ -379,6 +643,14 @@ class Network(VirshCommand):
             if 'networks' in project_data:
                 conflicts[project_name]['networks'] = {}
                 for net_name, net_info in project_data['networks'].items():
+                    # a network is not in conflict with its own cache entry.
+                    # Redefining one -- after a recreate, or after a define that
+                    # failed and left the entry behind -- would otherwise be
+                    # refused forever, by name and by address, against itself
+                    if (project_name == self.manager.config['project']
+                            and net_name == self.name):
+                        continue
+
                     conflicts[project_name]['networks'][net_name] = {}
                     if net_name == self.name:
                         # network already exists in the cache
@@ -442,13 +714,25 @@ class Network(VirshCommand):
                 f"bridge '{self.bridge_name}' is already in use by another "
                 f"active network. Cannot define network '{self.name}'.")
             self._log_bridge_usage(self.bridge_name)
-            sys.exit(1)
-
-        self.update_network_cache()
+            # RuntimeError rather than sys.exit: reconciliation calls this per
+            # network and turns a failure into a result, and a bare exit would
+            # take the process down mid-run, after a recreate has already
+            # destroyed the old network
+            raise RuntimeError(
+                f"bridge '{self.bridge_name}' is already in use by another "
+                f"active network, cannot define network '{self.name}'")
 
         # define the network
         try:
             self.execute("net-define", written_path)
+
+            # the cache is written only once the network really exists. Written
+            # before the define, a failed define (a rejected netmask, a libvirtd
+            # blip) would leave the cache claiming a network that is not there,
+            # and check_network_exists() would then refuse to create it on every
+            # later run -- wedged until projects.json is edited by hand
+            self.update_network_cache()
+
             self.execute("net-start", self.name)
             self.execute("net-autostart", self.name)
 

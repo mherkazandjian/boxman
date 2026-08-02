@@ -184,16 +184,21 @@ class TestDhcpReservations:
         net = self._net([{"mac": "52:54:0:c:1:1", "ip": "10.5.3.15"}])
         assert net.dhcp_hosts[0]["mac"] == "52:54:0:c:1:1"
 
-    def test_name_with_xml_metacharacters_is_escaped(self):
-        # the jinja environment has no autoescape; an unescaped name would
-        # produce a document libvirt cannot parse
+    @pytest.mark.parametrize("name", ["a&b", "a<b", "a>b", "a'b", 'a"b'])
+    def test_names_with_xml_metacharacters_are_rejected(self, name):
+        # escaping is not enough: libvirt accepts the escaped form at
+        # net-define and then fails at net-start, because it writes the name
+        # back out unescaped ("EntityRef: expecting ';'"). Verified against
+        # libvirt 11.2.0, so the only safe answer is to refuse the name
+        with pytest.raises(ValueError, match="libvirt"):
+            self._net([{"mac": "52:54:00:0c:01:05", "ip": "10.5.3.16",
+                        "name": name}])
+
+    def test_an_ordinary_name_still_renders(self):
         net = self._net([{"mac": "52:54:00:0c:01:05", "ip": "10.5.3.16",
-                          "name": "a&b<c>'d\""}])
-        xml = net.generate_xml()
-        assert "&amp;" in xml
-        # round-trips back to the literal the user configured
-        host = ET.fromstring(xml).find("ip/dhcp/host")
-        assert host.get("name") == "a&b<c>'d\""
+                          "name": "node-01.lab"}])
+        host = ET.fromstring(net.generate_xml()).find("ip/dhcp/host")
+        assert host.get("name") == "node-01.lab"
 
     @pytest.mark.parametrize("dhcp", [None, {}, {"range": None, "hosts": None}])
     def test_null_dhcp_blocks_are_not_a_crash(self, dhcp):

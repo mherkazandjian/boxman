@@ -1,4 +1,5 @@
 import os
+import tempfile
 import time
 from multiprocessing import Process, Queue
 from typing import Any
@@ -14,6 +15,7 @@ from .disk import DiskManager
 from .disk_cleanup import remove_vm_disks
 from .import_image import ImageImporter
 from .iso_boot_vm import IsoBootVM
+from . import net_reconcile
 from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
@@ -175,6 +177,307 @@ class LibVirtSession:
         status = network.define_network(file_path=os.path.join(workdir, f'{name}_net_define.xml'))
 
         return status
+
+    def reattach_domain_network(self,
+                                domain: str,
+                                network_name: str) -> str:
+        """
+        Reconnect a domain's interfaces after its network was recreated.
+
+        Destroying a libvirt network deletes the bridge and libvirt does not
+        put the guests back when it returns -- the domain keeps running with a
+        tap that is attached to nothing. Two ways back:
+
+        - hot: detach and re-attach the interface. Free when it works, but it
+          needs pci hotplug support in the guest's machine type and an
+          operating system that answers the unplug request. It fails outright
+          with ``Bus 'pci.0' does not support hotplugging`` on machine types
+          without it.
+        - cold: power-cycle the domain. Always works, because the persistent
+          domain XML still names the network, so the interface is rebuilt from
+          scratch on boot.
+
+        Hot is tried first and cold is the fallback.
+
+        Args:
+            domain: the domain name
+            network_name: the fully qualified network name
+
+        Returns:
+            ``hot``, ``cold``, ``skipped`` (not running, or not attached) or
+            ``failed``.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+
+        iflist = virsh.execute("domiflist", domain, hide=True, warn=True)
+        if not iflist.ok:
+            return 'failed'
+
+        interfaces = []
+        for line in iflist.stdout.splitlines():
+            fields = line.split()
+            # columns: Interface Type Source Model MAC
+            if len(fields) >= 5 and fields[1] == 'network' and fields[2] == network_name:
+                interfaces.append({'model': fields[3], 'mac': fields[4]})
+
+        if not interfaces:
+            return 'skipped'
+
+        state = virsh.execute("domstate", domain, hide=True, warn=True)
+        if not state.ok:
+            return 'failed'
+        state_text = state.stdout.strip()
+
+        if 'shut off' in state_text:
+            # a stopped domain rebuilds its interfaces from the persistent
+            # config the next time it starts, so there is nothing to repair
+            return 'skipped'
+
+        if 'paused' in state_text or 'pmsuspended' in state_text:
+            # the qemu process outlived the bridge, so the tap is dead just as
+            # it is for a running guest -- resuming does not rebuild it. Wake
+            # the guest so it can answer the shutdown request, then cycle it
+            log.info(
+                f"{domain}: is {state_text}, waking it so it can be "
+                f"power-cycled back onto {network_name}")
+
+            # a pmsuspended domain is asleep inside the guest OS; virsh resume
+            # only lifts a libvirt-level pause and does nothing for it
+            command = 'dompmwakeup' if 'pmsuspended' in state_text else 'resume'
+            woken = virsh.execute(command, domain, hide=True, warn=True)
+            if not woken.ok:
+                log.warning(
+                    f"{domain}: {command} failed ({woken.stderr.strip()}), "
+                    f"the power cycle will have to force it off")
+
+            return 'cold' if self._power_cycle(virsh, domain) else 'failed'
+
+        if 'running' not in state_text:
+            return 'skipped'
+
+        if self._hot_replug(virsh, domain, network_name, interfaces):
+            log.info(f"{domain}: re-attached to {network_name} without a reboot")
+            return 'hot'
+
+        log.info(
+            f"{domain}: hot re-attach unavailable, power-cycling to restore "
+            f"the link to {network_name}")
+        return 'cold' if self._power_cycle(virsh, domain) else 'failed'
+
+    @staticmethod
+    def _interface_element(virsh, domain: str, mac: str) -> str | None:
+        """
+        Return the domain's own ``<interface>`` element for *mac*.
+
+        Re-attaching a hand-built element would drop the pci address, mtu,
+        driver options and boot order, so the nic would come back in a
+        different slot and the guest's predictable interface name would change
+        under it. Round-tripping libvirt's own element keeps the slot.
+        """
+        dumped = virsh.execute("dumpxml", domain, hide=True, warn=True)
+        if not dumped.ok:
+            return None
+        try:
+            root = ET.fromstring(dumped.stdout)
+        except ET.ParseError:
+            return None
+
+        for interface in root.findall('./devices/interface'):
+            element_mac = interface.find('mac')
+            if element_mac is not None and \
+                    (element_mac.get('address') or '').lower() == mac.lower():
+                return ET.tostring(interface, encoding='unicode')
+        return None
+
+    @classmethod
+    def _hot_replug(cls, virsh, domain: str, network_name: str,
+                    interfaces: list[dict]) -> bool:
+        """Detach and re-attach each interface. False if any step fails."""
+        for interface in interfaces:
+            element = cls._interface_element(virsh, domain, interface['mac'])
+            if element is None:
+                log.debug(
+                    f"{domain}: could not read the interface element for "
+                    f"{interface['mac']}")
+                return False
+
+            temp = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.xml', prefix='boxman-iface-', delete=False)
+            try:
+                temp.write(element)
+                temp.close()
+
+                detached = virsh.execute(
+                    "detach-device", domain, temp.name, "--live",
+                    hide=True, warn=True)
+                if not detached.ok:
+                    return False
+
+                # detach-device returns once the unplug has been *requested*;
+                # the guest still has to acknowledge it. Attaching the same mac
+                # before it is gone is rejected as a duplicate, which would
+                # send a guest that could have been fixed in place into a
+                # needless reboot
+                if not cls._wait_for_detach(virsh, domain, interface['mac']):
+                    log.debug(
+                        f"{domain}: interface {interface['mac']} did not go "
+                        f"away after the detach request")
+                    return False
+
+                attached = virsh.execute(
+                    "attach-device", domain, temp.name, "--live",
+                    hide=True, warn=True)
+                if not attached.ok:
+                    # the interface is gone now, so only a power cycle can
+                    # bring it back -- say so rather than reporting success
+                    log.warning(
+                        f"{domain}: interface {interface['mac']} was detached "
+                        f"but could not be re-attached")
+                    return False
+            finally:
+                if os.path.exists(temp.name):
+                    os.unlink(temp.name)
+
+        return True
+
+    @staticmethod
+    def _wait_for_detach(virsh, domain: str, mac: str,
+                         timeout: int = 10) -> bool:
+        """Poll until *mac* is no longer listed on the running domain."""
+        waited = 0
+        while waited < timeout:
+            iflist = virsh.execute("domiflist", domain, hide=True, warn=True)
+            if not iflist.ok:
+                return False
+            if mac.lower() not in iflist.stdout.lower():
+                return True
+            time.sleep(1)
+            waited += 1
+        return False
+
+    @staticmethod
+    def _power_cycle(virsh, domain: str, timeout: int = 120) -> bool:
+        """Shut the domain down gracefully (force after *timeout*) and start it."""
+        virsh.execute("shutdown", domain, hide=True, warn=True)
+
+        waited = 0
+        while waited < timeout:
+            state = virsh.execute("domstate", domain, hide=True, warn=True)
+            if state.ok and 'shut off' in state.stdout:
+                break
+            time.sleep(2)
+            waited += 2
+        else:
+            log.warning(
+                f"{domain}: did not shut down within {timeout}s, forcing it off")
+            virsh.execute("destroy", domain, hide=True, warn=True)
+
+        return virsh.execute("start", domain, hide=True, warn=True).ok
+
+    def plan_network(self,
+                     name: str = None,
+                     info: dict[str, Any] | None = None) -> dict[str, Any]:
+        """
+        Compare a configured network against its live libvirt definition.
+
+        Args:
+            name: the fully qualified network name
+            info: the network block from the configuration
+
+        Returns:
+            A plan dict as described in
+            :func:`boxman.providers.libvirt.net_reconcile.diff_network`, with
+            an extra ``create`` action when the network does not exist yet and
+            an ``attached_vms`` list when it would have to be recreated.
+        """
+        # assign_new_bridge=False so that inspecting an existing network does
+        # not consume a fresh virbrX for a network that already has one
+        network = Network(
+            name=name,
+            info=info,
+            provider_config=self.provider_config,
+            assign_new_bridge=False,
+            manager=self.manager)
+
+        empty = {'structural': [], 'host_ops': [], 'range_ops': [],
+                 'attached_vms': [], 'actual': {}, 'inactive': False}
+
+        defined = network.exists()
+        if defined is None:
+            # libvirt could not be asked at all (daemon down, socket
+            # permissions, the runtime container stopped). That is emphatically
+            # not "the network is missing", and creating it would be wrong
+            log.error(
+                f"network {name}: libvirt could not be queried, skipping it")
+            return {'action': 'error', **empty}
+
+        if not defined:
+            return {'action': 'create', **empty}
+
+        actual_xml = network.dump_xml()
+        if actual_xml is None:
+            log.error(
+                f"network {name}: is defined but its XML could not be read, "
+                f"skipping it")
+            return {'action': 'error', **empty}
+
+        actual = net_reconcile.parse_network_xml(actual_xml)
+        plan = net_reconcile.diff_network(
+            net_reconcile.desired_state(network), actual)
+
+        # the caller needs the state as it is on disk, not only the diff: a
+        # recreate has to tear down the iptables rules belonging to the network
+        # that is there now, which may be a different mode or subnet than the
+        # one being defined in its place
+        plan['actual'] = actual
+        plan['attached_vms'] = (
+            network.attached_domains() if plan['action'] == 'recreate' else [])
+
+        # a defined network that is not running is drift too, and the content
+        # diff cannot see it: a VM wired to it fails to start with "network is
+        # not active". Happens after a manual `virsh net-destroy` or a host
+        # reboot with autostart off
+        plan['inactive'] = not network.is_active()
+        if plan['inactive'] and plan['action'] == 'none':
+            plan['action'] = 'live'
+
+        return plan
+
+    def start_network(self,
+                      name: str = None,
+                      info: dict[str, Any] | None = None) -> bool:
+        """Start a defined-but-stopped network."""
+        network = Network(
+            name=name,
+            info=info,
+            provider_config=self.provider_config,
+            assign_new_bridge=False,
+            manager=self.manager)
+        return network.start()
+
+    def apply_network_live_plan(self,
+                                name: str = None,
+                                info: dict[str, Any] | None = None,
+                                plan: dict[str, Any] | None = None) -> bool:
+        """
+        Apply the live half of a plan to an existing network.
+
+        Args:
+            name: the fully qualified network name
+            info: the network block from the configuration
+            plan: the plan returned by :meth:`plan_network`
+
+        Returns:
+            True when every ``net-update`` succeeded.
+        """
+        network = Network(
+            name=name,
+            info=info,
+            provider_config=self.provider_config,
+            assign_new_bridge=False,
+            manager=self.manager)
+
+        return network.apply_live_plan(plan or {})
 
     def destroy_network(self,
                         name: str = None,
