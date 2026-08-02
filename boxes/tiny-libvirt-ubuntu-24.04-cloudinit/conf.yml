@@ -21,6 +21,15 @@ templates:
     memory: 4096
     vcpus: 2
     cloudinit_done_marker: /var/log/hello-cloudinit.log
+    # Caps on the post-virt-install verification phase, in seconds. The
+    # defaults below are what boxman uses when these are omitted; raise
+    # cloudinit_done_timeout for templates that install a lot of packages,
+    # otherwise the done marker poll gives up before cloud-init finishes and
+    # the template is reported as unusable.
+    #cloudinit_agent_timeout: 300        # wait for the qemu guest agent
+    #cloudinit_guest_exec_timeout: 120   # wait for guest-exec to be usable
+    #cloudinit_done_timeout: 120         # wait for cloudinit_done_marker
+    #cloudinit_fallback_timeout: 180     # blind wait when the guest can't be polled
     cloudinit: |
       #cloud-config
       hostname: hello-cloudinit

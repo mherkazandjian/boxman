@@ -213,3 +213,79 @@ class TestDefaultTemplates:
         rendered = DEFAULT_META_DATA.format(instance_id="abc", hostname="demo")
         assert "instance-id: abc" in rendered
         assert "local-hostname: demo" in rendered
+
+
+class TestCloudinitTimeouts:
+    """The cloud-init verification caps are per-template knobs (conf.yml)."""
+
+    SLEEP = "boxman.providers.libvirt.cloudinit.time.sleep"
+
+    def test_defaults_match_previous_hardcoded_values(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        assert t.cloudinit_agent_timeout == 300
+        assert t.cloudinit_guest_exec_timeout == 120
+        assert t.cloudinit_done_timeout == 120
+        assert t.cloudinit_fallback_timeout == 180
+
+    def test_overrides_are_stored(self, tmp_path: Path):
+        t = _make_template(
+            tmp_path,
+            cloudinit_done_timeout=900,
+            cloudinit_guest_exec_timeout=180,
+        )
+        assert t.cloudinit_done_timeout == 900
+        assert t.cloudinit_guest_exec_timeout == 180
+
+    def test_poll_done_marker_honours_configured_timeout(self, tmp_path: Path):
+        t = _make_template(tmp_path, cloudinit_done_timeout=7)
+        with patch.object(t.virsh, "execute_shell", return_value=_result(ok=False)), \
+                patch(self.SLEEP) as sleep:
+            assert t._poll_done_marker("/var/log/done") is False
+        # back-off 1 + 2 + 4 == the 7s cap
+        assert sum(c.args[0] for c in sleep.call_args_list) == 7
+
+    def test_explicit_max_wait_still_wins(self, tmp_path: Path):
+        t = _make_template(tmp_path, cloudinit_done_timeout=900)
+        with patch.object(t.virsh, "execute_shell", return_value=_result(ok=False)), \
+                patch(self.SLEEP) as sleep:
+            assert t._poll_done_marker("/var/log/done", max_wait=3) is False
+        assert sum(c.args[0] for c in sleep.call_args_list) == 3
+
+    def test_fallback_wait_honours_configured_timeout(self, tmp_path: Path):
+        t = _make_template(tmp_path, cloudinit_fallback_timeout=30)
+        with patch.object(t.virsh, "execute_shell", return_value=_result(ok=True)), \
+                patch(self.SLEEP) as sleep:
+            t._wait_cloudinit_fallback()
+        assert sleep.call_count == 3          # range(0, 30, 10)
+
+    def test_agent_wait_loop_scales_with_timeout(self, tmp_path: Path):
+        # agent never answers: 10s cap / 2s per probe == 5 guest-ping attempts,
+        # then a zero-length blind wait, then the shutdown path
+        t = _make_template(
+            tmp_path, cloudinit_agent_timeout=10, cloudinit_fallback_timeout=0)
+        with patch.object(t.virsh, "execute_shell",
+                          return_value=_result(ok=False)) as shell, \
+                patch.object(t.virsh, "execute",
+                             return_value=_result(stdout="shut off")), \
+                patch(self.SLEEP):
+            assert t.verify_and_shutdown() is True
+        assert shell.call_count == 5
+
+    def test_guest_exec_loop_scales_with_timeout(self, tmp_path: Path):
+        # agent answers guest-ping but guest-exec stays blacklisted:
+        # 1 ping + (20s / 5s) == 4 guest-exec probes
+        t = _make_template(
+            tmp_path, cloudinit_guest_exec_timeout=20,
+            cloudinit_fallback_timeout=0)
+        calls: list[str] = []
+
+        def fake_shell(cmd, **kwargs):
+            calls.append(cmd)
+            return _result(ok="guest-ping" in cmd)
+
+        with patch.object(t.virsh, "execute_shell", side_effect=fake_shell), \
+                patch.object(t.virsh, "execute",
+                             return_value=_result(stdout="shut off")), \
+                patch(self.SLEEP):
+            assert t.verify_and_shutdown() is True
+        assert sum("guest-exec" in c for c in calls) == 4

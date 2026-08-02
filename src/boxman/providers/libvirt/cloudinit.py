@@ -53,6 +53,10 @@ class CloudInitTemplate:
         cloudinit_metadata: str | None = None,
         cloudinit_network_config: str | None = None,
         cloudinit_done_marker: str | None = None,
+        cloudinit_agent_timeout: int = 300,
+        cloudinit_guest_exec_timeout: int = 120,
+        cloudinit_done_timeout: int = 120,
+        cloudinit_fallback_timeout: int = 180,
         workdir: str | None = None,
         provider_config: dict[str, Any] | None = None,
         memory: int = 2048,
@@ -71,6 +75,19 @@ class CloudInitTemplate:
         self.cloudinit_metadata = cloudinit_metadata
         self.cloudinit_network_config = cloudinit_network_config
         self.cloudinit_done_marker = cloudinit_done_marker
+
+        # Timeouts for the cloud-init verification phase, all in seconds and
+        # all overridable per template from conf.yml. Templates that install a
+        # lot of packages routinely blow past the defaults.
+        #: wait for the qemu guest agent to answer guest-ping
+        self.cloudinit_agent_timeout = cloudinit_agent_timeout
+        #: wait for guest-exec to stop being blacklisted by the agent
+        self.cloudinit_guest_exec_timeout = cloudinit_guest_exec_timeout
+        #: wait for ``cloudinit_done_marker`` to appear in the guest
+        self.cloudinit_done_timeout = cloudinit_done_timeout
+        #: blind wait used when the guest cannot be polled at all
+        self.cloudinit_fallback_timeout = cloudinit_fallback_timeout
+
         self.workdir = os.path.expanduser(workdir) if workdir else tempfile.mkdtemp(prefix="boxman-cloudinit-")
         self.provider_config = provider_config or {}
         self.memory = memory
@@ -528,15 +545,19 @@ class CloudInitTemplate:
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _wait_cloudinit_fallback(self, seconds: int = 180) -> None:
+    def _wait_cloudinit_fallback(self, seconds: int | None = None) -> None:
         """
         Time-based fallback: wait *seconds* for cloud-init to finish when
         we cannot poll via ``guest-exec`` (e.g. Rocky/RHEL where the
         guest agent blacklists ``guest-exec``).
 
+        *seconds* defaults to ``cloudinit_fallback_timeout``.
+
         While waiting, periodically ping the guest agent to confirm the VM
         is still alive.
         """
+        if seconds is None:
+            seconds = self.cloudinit_fallback_timeout
         self.logger.info(
             f"waiting {seconds}s for cloud-init to finish "
             f"(guest-exec unavailable, using time-based fallback)...")
@@ -558,13 +579,18 @@ class CloudInitTemplate:
                     f"still waiting for cloud-init... ({elapsed}s / {seconds}s)")
         self.logger.info("fallback wait complete")
 
-    def _poll_done_marker(self, marker_path: str, max_wait: int = 120) -> bool:
+    def _poll_done_marker(self, marker_path: str, max_wait: int | None = None) -> bool:
         """
         Poll for *marker_path* inside the guest via ``guest-exec`` with
         exponential back-off.
 
+        *max_wait* defaults to ``cloudinit_done_timeout``.
+
         Returns True if the marker was found, False on timeout.
         """
+        if max_wait is None:
+            max_wait = self.cloudinit_done_timeout
+
         self.logger.info(
             f"polling for done marker: {marker_path} "
             f"(exponential back-off, max {max_wait}s)...")
@@ -662,8 +688,10 @@ class CloudInitTemplate:
         self.logger.info("verifying VM health: waiting for QEMU guest agent (this may take a few minutes while cloud-init installs it)...")
         agent_up = False
 
-        # Wait up to 300 seconds (5 minutes) for the guest agent
-        for i in range(150):
+        # Wait up to cloudinit_agent_timeout seconds for the guest agent
+        agent_poll_interval = 2
+        agent_attempts = max(1, self.cloudinit_agent_timeout // agent_poll_interval)
+        for i in range(agent_attempts):
             result = self.virsh.execute_shell(
                 f"virsh qemu-agent-command {self.template_name} '{{\"execute\":\"guest-ping\"}}'",
                 hide=True, warn=True)
@@ -672,14 +700,16 @@ class CloudInitTemplate:
                 break
 
             if i > 0 and i % 15 == 0:
-                self.logger.info(f"still waiting for QEMU guest agent... ({i * 2}s elapsed)")
+                self.logger.info(
+                    f"still waiting for QEMU guest agent... "
+                    f"({i * agent_poll_interval}s / {self.cloudinit_agent_timeout}s)")
 
-            time.sleep(2)
+            time.sleep(agent_poll_interval)
 
         if not agent_up:
             self.logger.warning("QEMU guest agent did not respond in time. OS might not be healthy or agent is not installed.")
             # Even without the agent we should give cloud-init a chance
-            self._wait_cloudinit_fallback(seconds=180)
+            self._wait_cloudinit_fallback()
         else:
             self.logger.info("QEMU guest agent is responding. OS is healthy.")
 
@@ -698,7 +728,10 @@ class CloudInitTemplate:
                 "waiting for guest-exec to become available "
                 "(cloud-init must reconfigure the agent first)...")
 
-            for attempt in range(24):  # up to ~120s (24 * 5s)
+            exec_poll_interval = 5
+            exec_attempts = max(
+                1, self.cloudinit_guest_exec_timeout // exec_poll_interval)
+            for attempt in range(exec_attempts):
                 exec_cmd = (
                     '{"execute":"guest-exec","arguments":'
                     '{"path":"/bin/sh","arg":["-c","echo ok"],'
@@ -717,8 +750,9 @@ class CloudInitTemplate:
                 if attempt > 0 and attempt % 6 == 0:
                     self.logger.info(
                         f"still waiting for guest-exec... "
-                        f"({attempt * 5}s elapsed)")
-                time.sleep(5)
+                        f"({attempt * exec_poll_interval}s / "
+                        f"{self.cloudinit_guest_exec_timeout}s)")
+                time.sleep(exec_poll_interval)
 
             if guest_exec_ok:
                 # guest-exec availability means cloud-init has already
@@ -745,7 +779,7 @@ class CloudInitTemplate:
                     "like Rocky/RHEL blacklist it by default). "
                     "To fix: add BLOCK_RPCS= to /etc/sysconfig/qemu-ga "
                     "via cloud-init write_files and restart the agent.")
-                self._wait_cloudinit_fallback(seconds=120)
+                self._wait_cloudinit_fallback()
 
         self.logger.info("shutting down the template VM...")
         self.virsh.execute("shutdown", self.template_name, hide=True, warn=True)
@@ -901,7 +935,10 @@ class CloudInitTemplate:
             return False
 
         # Verify the VM is up and healthy, then shut it down
-        self.verify_and_shutdown()
+        if not self.verify_and_shutdown():
+            self.logger.error(
+                "cloud-init did not complete — template is not usable")
+            return False
 
         # Eject the seed ISO from the template's persistent config.
         # The VM is now shut off, so cloud-init has finished and the cdrom
