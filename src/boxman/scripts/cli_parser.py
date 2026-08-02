@@ -330,9 +330,10 @@ def parse_args():
         '--recreate-networks',
         action='store_true',
         default=False,
-        help=('apply network changes that libvirt cannot make in place (mode, '
-              'address, netmask, bridge) by destroying and redefining the '
-              'network; attached VMs are reconnected, by a reboot if needed'),
+        help=('apply network changes that libvirt cannot make in place '
+              '(forward mode, ip address, netmask, mac, bridge name/stp/delay) '
+              'by destroying and redefining the network; attached VMs are '
+              'reconnected, by a reboot if their machine type cannot hot-plug'),
         dest='recreate_networks'
     )
     parser_up.add_argument(
@@ -375,9 +376,10 @@ def parse_args():
         '--recreate-networks',
         action='store_true',
         default=False,
-        help=('apply network changes that libvirt cannot make in place (mode, '
-              'address, netmask, bridge) by destroying and redefining the '
-              'network; attached VMs are reconnected, by a reboot if needed'),
+        help=('apply network changes that libvirt cannot make in place '
+              '(forward mode, ip address, netmask, mac, bridge name/stp/delay) '
+              'by destroying and redefining the network; attached VMs are '
+              'reconnected, by a reboot if their machine type cannot hot-plug'),
         dest='recreate_networks'
     )
 

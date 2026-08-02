@@ -23,6 +23,7 @@ from __future__ import annotations
 import ipaddress
 import xml.etree.ElementTree as ET
 from typing import Any
+from xml.sax.saxutils import escape
 
 #: fields that force a destroy + redefine because libvirt refuses to update
 #: them in place. ``bridge_name`` is only compared when the configuration
@@ -121,7 +122,11 @@ def desired_state(network) -> dict[str, Any]:
 
     return {
         'mode': network.forward_mode,
-        'bridge_name': network.bridge_name,
+        # the *configured* name, not the one in use: when the configuration
+        # does not pin one boxman assigned it and libvirt is authoritative, so
+        # leaving this None is what keeps an auto-assigned virbrX from reading
+        # as drift
+        'bridge_name': network.pinned_bridge_name,
         'bridge_stp': str(network.bridge_stp),
         'bridge_delay': str(network.bridge_delay),
         'mac': network.mac_address.lower() if network.mac_address else None,
@@ -151,20 +156,26 @@ def diff_dhcp_hosts(desired: list, actual: list) -> list[tuple[str, dict]]:
     desired_by_mac = {_host_key(entry): entry for entry in desired}
     actual_by_mac = {_host_key(entry): entry for entry in actual}
 
-    ops: list[tuple[str, dict]] = []
+    deletes: list[tuple[str, dict]] = []
+    modifies: list[tuple[str, dict]] = []
+    adds: list[tuple[str, dict]] = []
 
-    # deletions first: frees an address that a later addition may want to reuse
     for mac in actual_by_mac:
         if mac not in desired_by_mac:
-            ops.append(('delete', actual_by_mac[mac]))
+            deletes.append(('delete', actual_by_mac[mac]))
 
     for mac, entry in desired_by_mac.items():
         if mac not in actual_by_mac:
-            ops.append(('add-last', entry))
+            adds.append(('add-last', entry))
         elif entry != actual_by_mac[mac]:
-            ops.append(('modify', entry))
+            modifies.append(('modify', entry))
 
-    return ops
+    # delete, then modify, then add. libvirt rejects an entry whose address is
+    # still held by another reservation, so every operation that frees an
+    # address has to come before the one that claims it -- otherwise handing
+    # an address from one mac to another fails on the first run and only
+    # converges on the second
+    return deletes + modifies + adds
 
 
 def diff_dhcp_range(desired: dict | None,
@@ -257,16 +268,29 @@ def describe_plan(name: str, plan: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _attr(value: Any) -> str:
+    """
+    Escape a value for use inside a single-quoted XML attribute.
+
+    The jinja template escapes with ``|e``, and these elements have to do the
+    same: a reservation name is free-form configuration text, so a name holding
+    an ``&`` or a quote would define happily through the template and then make
+    every later ``net-update`` on that network fail to parse.
+    """
+    return escape(str(value), {"'": '&apos;', '"': '&quot;'})
+
+
 def host_element(entry: dict[str, Any]) -> str:
     """Render a reservation as the ``<host>`` element ``net-update`` matches on."""
-    attrs = f"mac='{entry['mac']}'"
+    attrs = f"mac='{_attr(entry['mac'])}'"
     if entry.get('name'):
-        attrs += f" name='{entry['name']}'"
+        attrs += f" name='{_attr(entry['name'])}'"
     if entry.get('ip'):
-        attrs += f" ip='{entry['ip']}'"
+        attrs += f" ip='{_attr(entry['ip'])}'"
     return f"<host {attrs}/>"
 
 
 def range_element(entry: dict[str, Any]) -> str:
     """Render a dhcp range as the ``<range>`` element ``net-update`` matches on."""
-    return f"<range start='{entry['start']}' end='{entry['end']}'/>"
+    return (f"<range start='{_attr(entry['start'])}' "
+            f"end='{_attr(entry['end'])}'/>")

@@ -16,6 +16,7 @@ modified, only added or deleted").
 
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -223,6 +224,73 @@ class TestDiffNetwork:
         assert nr.diff_network(desired, actual)["action"] == "recreate"
 
 
+class TestPinnedBridgeAndStp:
+    """Fields whose configured form differs from what libvirt echoes back."""
+
+    def test_pinned_bridge_name_reaches_the_diff(self, ):
+        # the plan builds its Network with assign_new_bridge=False, which reads
+        # the bridge from libvirt; the *configured* name has to survive that or
+        # the pinned-name drift check can never fire
+        info = {"mode": "nat", "bridge": {"name": "virbr42"},
+                "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0"}}
+        with patch.object(Network, "get_bridge_from_network",
+                          return_value="virbr9"):
+            net = Network(name="demo", info=info, assign_new_bridge=False,
+                          provider_config={"use_sudo": False})
+        assert net.bridge_name == "virbr9"          # what is in use
+        assert nr.desired_state(net)["bridge_name"] == "virbr42"   # what was asked for
+
+    def test_unpinned_bridge_name_is_not_reported_as_desired(self):
+        info = {"mode": "nat",
+                "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0"}}
+        with patch.object(Network, "get_bridge_from_network",
+                          return_value="virbr9"):
+            net = Network(name="demo", info=info, assign_new_bridge=False,
+                          provider_config={"use_sudo": False})
+        assert nr.desired_state(net)["bridge_name"] is None
+
+    @pytest.mark.parametrize("configured, expected", [
+        (True, "on"), (False, "off"),          # yaml reads unquoted on/off as bool
+        ("on", "on"), ("off", "off"),
+        ("true", "on"), ("yes", "on"), (1, "on"), (0, "off"),
+    ])
+    def test_stp_is_normalised(self, configured, expected):
+        assert Network._normalise_stp(configured) == expected
+
+    def test_yaml_boolean_stp_does_not_read_as_drift(self):
+        # `stp: on` unquoted is True in yaml; libvirt accepts stp='True' and
+        # stores it as 'on'. Without normalising, that mismatch is permanent
+        # drift and --recreate-networks would rebuild the network on every run
+        info = {"mode": "nat", "bridge": {"stp": True, "delay": 0},
+                "mac": "52:54:00:0a:0b:0c",
+                "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0",
+                       "dhcp": {"range": {"start": "10.5.3.50",
+                                          "end": "10.5.3.100"},
+                                "hosts": [{"mac": "52:54:00:00:00:01",
+                                           "ip": "10.5.3.10",
+                                           "name": "one"}]}}}
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            net = Network(name="demo", info=info, assign_new_bridge=True,
+                          provider_config={"use_sudo": False})
+        plan = nr.diff_network(nr.desired_state(net),
+                               nr.parse_network_xml(LIVE_XML))
+        assert plan["action"] == "none", plan["structural"]
+
+    def test_numeric_reservation_name_does_not_read_as_drift(self):
+        # `name: 101` is an int in yaml and would never equal the '101' read
+        # back from the network XML
+        info = {"mode": "nat",
+                "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0",
+                       "dhcp": {"hosts": [{"mac": "52:54:00:00:00:01",
+                                           "ip": "10.5.3.10", "name": 101}]}}}
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            net = Network(name="demo", info=info, assign_new_bridge=True,
+                          provider_config={"use_sudo": False})
+        assert net.dhcp_hosts[0]["name"] == "101"
+
+
 class TestTeardownInfo:
     """A recreate must withdraw the rules of the network that is there now."""
 
@@ -256,6 +324,116 @@ class TestTeardownInfo:
         assert self._teardown({}, network_info) is network_info
 
 
+class TestRecreateSequence:
+    """
+    The destructive path, with the provider and the cache stubbed.
+
+    The ordering here is not cosmetic: ``define_network`` starts with
+    ``check_network_exists()``, which walks every cached project *including
+    this one*. A network's own leftover cache entry therefore collides with
+    itself and the redefine raises -- after the network has already been
+    destroyed, which wedges the project until the cache is edited by hand.
+    """
+
+    @staticmethod
+    def _manager(remove=True, define=True, reattach='hot'):
+        from boxman.manager import BoxmanManager
+
+        mgr = BoxmanManager.__new__(BoxmanManager)
+        mgr.config = {'project': 'p1', 'clusters': {}}
+        mgr.logger = MagicMock()
+
+        calls = []
+
+        mgr.cache = MagicMock()
+        mgr.cache.projects = {'p1': {'networks': {'full-net': {'ip_address': '10.5.3.1'}}}}
+        mgr.cache.read_projects_cache.side_effect = lambda: calls.append('cache-read')
+        mgr.cache.write_projects_cache.side_effect = lambda: calls.append('cache-write')
+
+        provider = MagicMock()
+        provider.remove_network.side_effect = lambda **kw: (
+            calls.append('remove') or remove)
+        provider.define_network.side_effect = lambda **kw: (
+            calls.append('define') or define)
+        provider.reattach_domain_network.side_effect = lambda *a: (
+            calls.append('reattach') or reattach)
+        mgr.provider = provider
+
+        return mgr, calls
+
+    def _recreate(self, mgr, plan=None):
+        return mgr._recreate_network(
+            cluster={'workdir': '/tmp/wd'},
+            network_name='cluster_1/mgmt',
+            full_name='full-net',
+            network_info={'mode': 'route'},
+            plan=plan if plan is not None else {
+                'structural': ["ip address '10.5.3.1' -> '10.9.9.1'"],
+                'attached_vms': ['vm1'],
+                'actual': {'mode': 'nat', 'ip_address': '10.5.3.1',
+                           'netmask': '255.255.255.0'}},
+            dry_run=False, allow_recreate=True, auto_accept=True)
+
+    def test_cache_entry_is_dropped_before_the_redefine(self):
+        mgr, calls = self._manager()
+        assert self._recreate(mgr) == 'recreated'
+        assert 'full-net' not in mgr.cache.projects['p1']['networks']
+        assert calls.index('cache-write') < calls.index('define')
+        assert calls.index('remove') < calls.index('define')
+
+    def test_a_failed_removal_does_not_redefine_on_top(self):
+        mgr, calls = self._manager(remove=False)
+        assert self._recreate(mgr) == 'failed'
+        assert 'define' not in calls
+
+    def test_a_conflict_on_redefine_is_a_result_not_a_traceback(self):
+        mgr, calls = self._manager()
+        mgr.provider.define_network.side_effect = RuntimeError(
+            "found 2 conflicts for network full-net")
+        assert self._recreate(mgr) == 'failed'
+
+    def test_a_vm_that_cannot_be_reconnected_is_not_reported_as_success(self):
+        mgr, _ = self._manager(reattach='failed')
+        assert self._recreate(mgr) == 'partial'
+
+    def test_teardown_uses_the_actual_mode(self):
+        mgr, _ = self._manager()
+        self._recreate(mgr)
+        info = mgr.provider.remove_network.call_args.kwargs['info']
+        assert info['mode'] == 'nat'          # what is there, not the new 'route'
+
+    def test_nothing_is_touched_without_the_flag(self):
+        mgr, calls = self._manager()
+        outcome = mgr._recreate_network(
+            cluster={'workdir': '/tmp/wd'}, network_name='cluster_1/mgmt',
+            full_name='full-net', network_info={'mode': 'route'},
+            plan={'structural': ['x'], 'attached_vms': ['vm1'], 'actual': {}},
+            dry_run=False, allow_recreate=False, auto_accept=True)
+        assert outcome == 'skipped'
+        assert calls == []
+
+    def test_dry_run_touches_nothing(self):
+        mgr, calls = self._manager()
+        outcome = mgr._recreate_network(
+            cluster={'workdir': '/tmp/wd'}, network_name='cluster_1/mgmt',
+            full_name='full-net', network_info={'mode': 'route'},
+            plan={'structural': ['x'], 'attached_vms': ['vm1'], 'actual': {}},
+            dry_run=True, allow_recreate=True, auto_accept=True)
+        assert outcome == 'skipped'
+        assert calls == []
+
+    def test_no_stdin_aborts_instead_of_raising(self):
+        mgr, calls = self._manager()
+        with patch('builtins.input', side_effect=EOFError):
+            outcome = mgr._recreate_network(
+                cluster={'workdir': '/tmp/wd'}, network_name='cluster_1/mgmt',
+                full_name='full-net', network_info={'mode': 'route'},
+                plan={'structural': ['x'], 'attached_vms': [], 'actual': {}},
+                dry_run=False, allow_recreate=True, auto_accept=False)
+        assert outcome == 'skipped'
+        assert calls == []
+
+
 class TestElementRendering:
 
     def test_host_element_includes_the_optional_name(self):
@@ -269,6 +447,18 @@ class TestElementRendering:
     def test_range_element(self):
         assert nr.range_element({"start": "1.1.1.1", "end": "1.1.1.9"}) == \
             "<range start='1.1.1.1' end='1.1.1.9'/>"
+
+    def test_name_is_escaped(self):
+        # the template escapes with |e, and this path has to match: a name
+        # holding an & defines fine and would then break every net-update
+        element = nr.host_element(
+            {"mac": "aa", "ip": "1.1.1.1", "name": "a&b'c"})
+        assert "a&amp;b&apos;c" in element
+        ET.fromstring(element)   # parses, which is the whole point
+
+    def test_a_numeric_value_is_rendered(self):
+        assert nr.host_element({"mac": "aa", "ip": "1.1.1.1", "name": 101}) == \
+            "<host mac='aa' name='101' ip='1.1.1.1'/>"
 
 
 class TestApplyLivePlan:
@@ -315,7 +505,7 @@ class TestApplyLivePlan:
         # element would fail to match an entry whose ip already moved
         net, _ = self._net_with_exec()
         seen = []
-        net.apply_net_update = lambda command, section, element: (
+        net.apply_net_update = lambda command, section, element, live=None: (
             seen.append((command, section, element)) or True)
 
         net.apply_live_plan({
@@ -326,7 +516,7 @@ class TestApplyLivePlan:
     def test_add_and_modify_send_the_whole_element(self):
         net, _ = self._net_with_exec()
         seen = []
-        net.apply_net_update = lambda command, section, element: (
+        net.apply_net_update = lambda command, section, element, live=None: (
             seen.append(element) or True)
 
         net.apply_live_plan({"host_ops": [
@@ -335,6 +525,29 @@ class TestApplyLivePlan:
 
         assert seen == ["<host mac='aa' name='n' ip='1.1.1.2'/>",
                         "<host mac='bb' ip='1.1.1.3'/>"]
+
+    def test_a_failed_range_delete_stops_the_add(self):
+        # otherwise the network ends up with two ranges, and the diff only
+        # reads the first -- so every later run tries to add the second again
+        net, _ = self._net_with_exec()
+        seen = []
+        net.apply_net_update = lambda command, section, element, live=None: (
+            seen.append(command) or command != 'delete')
+
+        ok = net.apply_live_plan({"range_ops": [
+            ("delete", {"start": "1.1.1.1", "end": "1.1.1.9"}),
+            ("add-last", {"start": "1.1.1.10", "end": "1.1.1.20"})]})
+
+        assert seen == ["delete"]
+        assert ok is False
+
+    def test_active_state_is_looked_up_once_per_plan(self):
+        net, calls = self._net_with_exec()
+        net.apply_live_plan({"host_ops": [
+            ("add-last", {"mac": "aa", "ip": "1.1.1.1"}),
+            ("add-last", {"mac": "bb", "ip": "1.1.1.2"}),
+            ("add-last", {"mac": "cc", "ip": "1.1.1.3"})]})
+        assert len([args for args in calls if args[0] == "net-list"]) == 1
 
     def test_a_failing_update_is_reported(self):
         net = _network({"mode": "nat",

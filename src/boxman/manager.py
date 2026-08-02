@@ -2110,31 +2110,52 @@ class BoxmanManager:
                 if plan['action'] == 'none':
                     continue
 
-                for line in net_reconcile.describe_plan(network_name, plan):
+                # two clusters may each hold a network called 'mgmt', so the
+                # logs carry the cluster as well
+                label = f"{cluster_name}/{network_name}"
+
+                if plan['action'] == 'error':
+                    results[full_name] = 'failed'
+                    continue
+
+                for line in net_reconcile.describe_plan(label, plan):
                     self.logger.info(line)
 
                 if plan['action'] == 'create':
-                    self.logger.info(f"network {network_name}: not defined yet")
+                    self.logger.info(f"network {label}: not defined yet")
                     if dry_run:
                         results[full_name] = 'skipped'
                         continue
-                    ok = self.provider.define_network(
-                        name=full_name, info=network_info,
-                        workdir=cluster['workdir'])
-                    results[full_name] = 'created' if ok else 'failed'
+                    results[full_name] = self._define_network(
+                        label=label, full_name=full_name,
+                        network_info=network_info, workdir=cluster['workdir'])
 
                 elif plan['action'] == 'live':
                     if dry_run:
+                        if plan.get('inactive'):
+                            self.logger.info(
+                                f"[dry-run] network {label}: is defined but "
+                                f"not running, would start it")
                         results[full_name] = 'skipped'
                         continue
-                    ok = self.provider.apply_network_live_plan(
-                        name=full_name, info=network_info, plan=plan)
+
+                    ok = True
+                    if plan.get('inactive'):
+                        self.logger.info(
+                            f"network {label}: is defined but not running, "
+                            f"starting it")
+                        ok = self.provider.start_network(
+                            name=full_name, info=network_info)
+
+                    if ok and (plan['host_ops'] or plan['range_ops']):
+                        ok = self.provider.apply_network_live_plan(
+                            name=full_name, info=network_info, plan=plan)
                     results[full_name] = 'updated' if ok else 'failed'
 
                 elif plan['action'] == 'recreate':
                     results[full_name] = self._recreate_network(
                         cluster=cluster,
-                        network_name=network_name,
+                        network_name=label,
                         full_name=full_name,
                         network_info=network_info,
                         plan=plan,
@@ -2143,6 +2164,100 @@ class BoxmanManager:
                         auto_accept=auto_accept)
 
         return results
+
+    def report_network_results(self, results: dict[str, str]) -> None:
+        """
+        Log the outcome of a reconcile, loudly for the ones that went wrong.
+
+        ``failed`` and ``partial`` would otherwise be buried: the caller
+        carries on either way, so this is the only place a user learns that a
+        network did not come back or that a guest is still disconnected.
+        """
+        if not results:
+            return
+
+        for full_name, outcome in sorted(results.items()):
+            if outcome == 'failed':
+                self.logger.error(f"network {full_name}: {outcome}")
+            elif outcome == 'partial':
+                self.logger.warning(
+                    f"network {full_name}: recreated, but at least one VM "
+                    f"could not be reconnected")
+            else:
+                self.logger.info(f"network {full_name}: {outcome}")
+
+    def wait_for_vm_ips(self, vm_names: list[str], max_wait: int = 300) -> bool:
+        """
+        Wait until every named VM reports an address, or *max_wait* passes.
+
+        Returns:
+            True if they all got one.
+        """
+        if not vm_names:
+            return True
+
+        self.logger.info("waiting for VMs to get IP addresses...")
+        wait_time = 1
+        total_waited = 0
+        while total_waited < max_wait:
+            if all(self.provider.get_vm_ip_addresses(name) for name in vm_names):
+                self.logger.info(
+                    f"all VMs have IP addresses (waited {total_waited}s)")
+                return True
+            time.sleep(wait_time)
+            total_waited += wait_time
+            wait_time = min(wait_time * 2, 60)
+
+        self.logger.warning(
+            f"not every VM had an IP address after {max_wait}s; the ssh "
+            f"config may be incomplete")
+        return False
+
+    def _define_network(self,
+                        label: str,
+                        full_name: str,
+                        network_info: dict[str, Any],
+                        workdir: str) -> str:
+        """
+        Define a network, turning a conflict into a result instead of a crash.
+
+        ``define_network`` starts with ``check_network_exists()``, which raises
+        when the cache already holds an entry with this name, bridge or
+        address. That is the right guard when two projects collide, but it
+        raises before the try inside ``define_network``, so left alone it
+        reaches the CLI as a traceback.
+        """
+        try:
+            ok = self.provider.define_network(
+                name=full_name, info=network_info, workdir=workdir)
+        except RuntimeError as exc:
+            self.logger.error(f"network {label}: could not be defined: {exc}")
+            return 'failed'
+        return 'created' if ok else 'failed'
+
+    def _forget_cached_network(self, full_name: str) -> None:
+        """
+        Drop a network's entry from the projects cache.
+
+        Needed before redefining it: ``check_network_exists()`` walks every
+        cached project *including this one*, so a network's own leftover entry
+        counts as a conflict with itself -- same name, same address -- and the
+        redefine raises instead of running. ``remove_network()`` only touches
+        libvirt and iptables, never the cache.
+        """
+        try:
+            self.cache.read_projects_cache()
+            project = (self.cache.projects or {}).get(self.config['project'])
+            if not project or full_name not in project.get('networks', {}):
+                return
+            del project['networks'][full_name]
+            self.cache.write_projects_cache()
+            self.logger.debug(f"removed {full_name} from the projects cache")
+        except (KeyError, OSError, ValueError) as exc:
+            # not fatal on its own, but the redefine that follows will fail on
+            # the stale entry, so say why
+            self.logger.warning(
+                f"could not drop {full_name} from the projects cache: {exc}")
 
     @staticmethod
     def _teardown_info(plan: dict[str, Any],
@@ -2216,15 +2331,22 @@ class BoxmanManager:
             print("\nIts bridge will be deleted and recreated. These VMs lose "
                   f"their network link and will be reconnected, by a reboot "
                   f"if their machine type cannot hot-plug: {attached_text}\n")
-            answer = input(
-                f"Type the network name '{network_name}' to proceed: ").strip()
+            try:
+                answer = input(
+                    f"Type '{network_name}' to proceed: ").strip()
+            except EOFError:
+                # nothing is attached to stdin (a cron run, a pipeline): treat
+                # that as a no rather than a traceback
+                print("No input available, aborted.")
+                return 'skipped'
             if answer != network_name:
                 print("Aborted.")
                 return 'skipped'
 
         self.logger.info(f"network {network_name}: removing")
+        removed = True
         try:
-            self.provider.remove_network(
+            removed = self.provider.remove_network(
                 name=full_name, info=self._teardown_info(plan, network_info))
         except RuntimeError as exc:
             # remove_network destroys and undefines before it touches iptables,
@@ -2234,20 +2356,41 @@ class BoxmanManager:
                 f"network {network_name}: removed, but its firewall rules "
                 f"could not be cleaned up: {exc}")
 
+        if not removed:
+            # destroy or undefine failed, so the network is still there.
+            # Redefining on top of it would fail confusingly
+            self.logger.error(
+                f"network {network_name}: could not be removed, leaving it "
+                f"as it is rather than defining on top of it")
+            return 'failed'
+
+        # the cache still lists the network we just removed, and
+        # check_network_exists() would count that as a conflict with itself
+        self._forget_cached_network(full_name)
+
         self.logger.info(f"network {network_name}: defining again")
-        if not self.provider.define_network(
-                name=full_name, info=network_info, workdir=cluster['workdir']):
+        if self._define_network(
+                label=network_name, full_name=full_name,
+                network_info=network_info,
+                workdir=cluster['workdir']) == 'failed':
             self.logger.error(
                 f"network {network_name}: could not be defined again. The "
                 f"attached VMs are left disconnected: {attached_text}")
             return 'failed'
 
+        reattach_failed = []
         for domain in attached:
             outcome = self.provider.reattach_domain_network(domain, full_name)
             if outcome == 'failed':
+                reattach_failed.append(domain)
                 self.logger.error(
                     f"{domain}: could not be reconnected to {network_name}, "
                     f"start it by hand")
+
+        if reattach_failed:
+            # the network is back but not every guest is, and saying
+            # 'recreated' would paper over a VM that is still down
+            return 'partial'
 
         return 'recreated'
 
@@ -3569,9 +3712,18 @@ class BoxmanManager:
             # manual `docker stop` may have left lab containers down
             # even though the VMs stayed up.
             cls.ensure_shared_bridges()
-            cls.reconcile_networks(
+            network_results = cls.reconcile_networks(
                 allow_recreate=getattr(cli_args, 'recreate_networks', False),
                 auto_accept=getattr(cli_args, 'yes', False))
+            cls.report_network_results(network_results)
+
+            # a recreate power-cycles the guests attached to the network, so
+            # the addresses connect_info() and the ssh config are about to be
+            # written from do not exist yet
+            if any(outcome in ('recreated', 'partial')
+                   for outcome in network_results.values()):
+                cls.wait_for_vm_ips(sorted(cls._get_project_vm_names()))
+
             cls.ensure_netlab_up()
             cls.connect_info()
             # Re-write SSH config in case IPs changed (DHCP renewals after
@@ -3596,9 +3748,9 @@ class BoxmanManager:
         # to find the network it is wired to, and any reservation added to the
         # config since the last run has to be in dnsmasq before the guest asks
         # for a lease.
-        cls.reconcile_networks(
+        cls.report_network_results(cls.reconcile_networks(
             allow_recreate=getattr(cli_args, 'recreate_networks', False),
-            auto_accept=getattr(cli_args, 'yes', False))
+            auto_accept=getattr(cli_args, 'yes', False)))
 
         # Build workdir lookup from process_vm_list for restore operations
         vm_workdir_map = {vm_name: workdir for vm_name, workdir in cls.process_vm_list(cli_args)}
@@ -5435,9 +5587,7 @@ class BoxmanManager:
             allow_recreate=getattr(cli_args, 'recreate_networks', False),
             auto_accept=auto_accept)
 
-        if network_results:
-            for network_name, outcome in sorted(network_results.items()):
-                cls.logger.info(f"network {network_name}: {outcome}")
+        cls.report_network_results(network_results)
 
         # --- categorize VMs ---
         expected_vms = set(cls._get_project_vm_names())
