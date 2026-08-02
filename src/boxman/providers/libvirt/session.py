@@ -1,4 +1,5 @@
 import os
+import tempfile
 import time
 from multiprocessing import Process, Queue
 from typing import Any
@@ -14,6 +15,7 @@ from .disk import DiskManager
 from .disk_cleanup import remove_vm_disks
 from .import_image import ImageImporter
 from .iso_boot_vm import IsoBootVM
+from . import net_reconcile
 from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
@@ -175,6 +177,193 @@ class LibVirtSession:
         status = network.define_network(file_path=os.path.join(workdir, f'{name}_net_define.xml'))
 
         return status
+
+    def reattach_domain_network(self,
+                                domain: str,
+                                network_name: str) -> str:
+        """
+        Reconnect a domain's interfaces after its network was recreated.
+
+        Destroying a libvirt network deletes the bridge and libvirt does not
+        put the guests back when it returns -- the domain keeps running with a
+        tap that is attached to nothing. Two ways back:
+
+        - hot: detach and re-attach the interface. Free when it works, but it
+          needs pci hotplug support in the guest's machine type and an
+          operating system that answers the unplug request. It fails outright
+          with ``Bus 'pci.0' does not support hotplugging`` on machine types
+          without it.
+        - cold: power-cycle the domain. Always works, because the persistent
+          domain XML still names the network, so the interface is rebuilt from
+          scratch on boot.
+
+        Hot is tried first and cold is the fallback.
+
+        Args:
+            domain: the domain name
+            network_name: the fully qualified network name
+
+        Returns:
+            ``hot``, ``cold``, ``skipped`` (not running, or not attached) or
+            ``failed``.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+
+        iflist = virsh.execute("domiflist", domain, hide=True, warn=True)
+        if not iflist.ok:
+            return 'failed'
+
+        interfaces = []
+        for line in iflist.stdout.splitlines():
+            fields = line.split()
+            # columns: Interface Type Source Model MAC
+            if len(fields) >= 5 and fields[1] == 'network' and fields[2] == network_name:
+                interfaces.append({'model': fields[3], 'mac': fields[4]})
+
+        if not interfaces:
+            return 'skipped'
+
+        state = virsh.execute("domstate", domain, hide=True, warn=True)
+        if not state.ok or 'running' not in state.stdout:
+            # a stopped domain rebuilds its interfaces from the persistent
+            # config the next time it starts, so there is nothing to repair
+            return 'skipped'
+
+        if self._hot_replug(virsh, domain, network_name, interfaces):
+            log.info(f"{domain}: re-attached to {network_name} without a reboot")
+            return 'hot'
+
+        log.info(
+            f"{domain}: hot re-attach unavailable, power-cycling to restore "
+            f"the link to {network_name}")
+        return 'cold' if self._power_cycle(virsh, domain) else 'failed'
+
+    @staticmethod
+    def _hot_replug(virsh, domain: str, network_name: str,
+                    interfaces: list[dict]) -> bool:
+        """Detach and re-attach each interface. False if any step fails."""
+        for interface in interfaces:
+            element = (
+                f"<interface type='network'>"
+                f"<source network='{network_name}'/>"
+                f"<mac address='{interface['mac']}'/>"
+                f"<model type='{interface['model']}'/>"
+                f"</interface>")
+
+            temp = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.xml', prefix='boxman-iface-', delete=False)
+            try:
+                temp.write(element)
+                temp.close()
+
+                detached = virsh.execute(
+                    "detach-device", domain, temp.name, "--live",
+                    hide=True, warn=True)
+                if not detached.ok:
+                    return False
+
+                attached = virsh.execute(
+                    "attach-device", domain, temp.name, "--live",
+                    hide=True, warn=True)
+                if not attached.ok:
+                    # the interface is gone now, so only a power cycle can
+                    # bring it back -- say so rather than reporting success
+                    log.warning(
+                        f"{domain}: interface {interface['mac']} was detached "
+                        f"but could not be re-attached")
+                    return False
+            finally:
+                if os.path.exists(temp.name):
+                    os.unlink(temp.name)
+
+        return True
+
+    @staticmethod
+    def _power_cycle(virsh, domain: str, timeout: int = 120) -> bool:
+        """Shut the domain down gracefully (force after *timeout*) and start it."""
+        virsh.execute("shutdown", domain, hide=True, warn=True)
+
+        waited = 0
+        while waited < timeout:
+            state = virsh.execute("domstate", domain, hide=True, warn=True)
+            if state.ok and 'shut off' in state.stdout:
+                break
+            time.sleep(2)
+            waited += 2
+        else:
+            log.warning(
+                f"{domain}: did not shut down within {timeout}s, forcing it off")
+            virsh.execute("destroy", domain, hide=True, warn=True)
+
+        return virsh.execute("start", domain, hide=True, warn=True).ok
+
+    def plan_network(self,
+                     name: str = None,
+                     info: dict[str, Any] | None = None) -> dict[str, Any]:
+        """
+        Compare a configured network against its live libvirt definition.
+
+        Args:
+            name: the fully qualified network name
+            info: the network block from the configuration
+
+        Returns:
+            A plan dict as described in
+            :func:`boxman.providers.libvirt.net_reconcile.diff_network`, with
+            an extra ``create`` action when the network does not exist yet and
+            an ``attached_vms`` list when it would have to be recreated.
+        """
+        # assign_new_bridge=False so that inspecting an existing network does
+        # not consume a fresh virbrX for a network that already has one
+        network = Network(
+            name=name,
+            info=info,
+            provider_config=self.provider_config,
+            assign_new_bridge=False,
+            manager=self.manager)
+
+        actual_xml = network.dump_xml()
+        if actual_xml is None:
+            return {'action': 'create', 'structural': [], 'host_ops': [],
+                    'range_ops': [], 'attached_vms': [], 'actual': {}}
+
+        actual = net_reconcile.parse_network_xml(actual_xml)
+        plan = net_reconcile.diff_network(
+            net_reconcile.desired_state(network), actual)
+
+        # the caller needs the state as it is on disk, not only the diff: a
+        # recreate has to tear down the iptables rules belonging to the network
+        # that is there now, which may be a different mode or subnet than the
+        # one being defined in its place
+        plan['actual'] = actual
+        plan['attached_vms'] = (
+            network.attached_domains() if plan['action'] == 'recreate' else [])
+
+        return plan
+
+    def apply_network_live_plan(self,
+                                name: str = None,
+                                info: dict[str, Any] | None = None,
+                                plan: dict[str, Any] | None = None) -> bool:
+        """
+        Apply the live half of a plan to an existing network.
+
+        Args:
+            name: the fully qualified network name
+            info: the network block from the configuration
+            plan: the plan returned by :meth:`plan_network`
+
+        Returns:
+            True when every ``net-update`` succeeded.
+        """
+        network = Network(
+            name=name,
+            info=info,
+            provider_config=self.provider_config,
+            assign_new_bridge=False,
+            manager=self.manager)
+
+        return network.apply_live_plan(plan or {})
 
     def destroy_network(self,
                         name: str = None,

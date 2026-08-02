@@ -326,6 +326,22 @@ def parse_args():
         help='force-rebuild all templates (destroy and recreate) before provisioning',
         dest='rebuild_templates'
     )
+    parser_up.add_argument(
+        '--recreate-networks',
+        action='store_true',
+        default=False,
+        help=('apply network changes that libvirt cannot make in place (mode, '
+              'address, netmask, bridge) by destroying and redefining the '
+              'network; attached VMs are reconnected, by a reboot if needed'),
+        dest='recreate_networks'
+    )
+    parser_up.add_argument(
+        '--yes', '-y',
+        action='store_true',
+        default=False,
+        help='skip the confirmation prompt for recreating a network',
+        dest='yes'
+    )
 
     #
     # sub parser for the 'update' subcommand
@@ -354,6 +370,15 @@ def parse_args():
         default=False,
         help='skip confirmation prompt for VM removal',
         dest='yes'
+    )
+    parser_update.add_argument(
+        '--recreate-networks',
+        action='store_true',
+        default=False,
+        help=('apply network changes that libvirt cannot make in place (mode, '
+              'address, netmask, bridge) by destroying and redefining the '
+              'network; attached VMs are reconnected, by a reboot if needed'),
+        dest='recreate_networks'
     )
 
     #

@@ -18,6 +18,7 @@ from boxman import log
 from boxman.config_cache import BoxmanCache
 from boxman.image_cache import ImageCache
 from boxman.netlab import ContainerlabManager, shared_bridges
+from boxman.providers.libvirt import net_reconcile
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.runtime import RuntimeBase, create_runtime
@@ -2050,6 +2051,206 @@ class BoxmanManager:
                 )
                 self.logger.info(f"defined network {_network_name} in {cluster['workdir']}")
 
+    def reconcile_networks(self,
+                           dry_run: bool = False,
+                           allow_recreate: bool = False,
+                           auto_accept: bool = False) -> dict[str, str]:
+        """
+        Bring the libvirt networks in line with the configuration.
+
+        Three outcomes per network, decided by comparing the configuration
+        against ``virsh net-dumpxml``:
+
+        - **create** -- the network is not defined yet. Defined and started.
+        - **live** -- only the dhcp reservations or the dhcp range differ.
+          Applied with ``virsh net-update ... --live --config``: dnsmasq is
+          reloaded, the bridge stays up, no guest is disturbed.
+        - **recreate** -- the forward mode, address, netmask, bridge or mac
+          differ. libvirt cannot change these in place, so the network has to
+          be destroyed and defined again. That deletes the bridge and leaves
+          attached guests with a dead nic, so it only happens with
+          *allow_recreate*, and the guests are re-attached afterwards.
+
+        Args:
+            dry_run: report the plan and change nothing
+            allow_recreate: permit the disruptive path
+            auto_accept: skip the confirmation prompt for a recreate
+
+        Returns:
+            A mapping of network name to the action taken: one of ``created``,
+            ``updated``, ``recreated``, ``skipped`` or ``failed``.
+        """
+        if not hasattr(self.provider, 'plan_network'):
+            self.logger.debug(
+                "provider does not support network reconciliation, skipping")
+            return {}
+
+        results: dict[str, str] = {}
+
+        for cluster_name, cluster in self.config['clusters'].items():
+            for network_name, network_info in cluster.get('networks', {}).items():
+                full_name = self.full_network_name(
+                    project_config=self.config,
+                    cluster_name=cluster_name,
+                    network_name=network_name)
+
+                try:
+                    plan = self.provider.plan_network(
+                        name=full_name, info=network_info)
+                except ValueError as exc:
+                    # the network block itself does not validate (a bad dhcp
+                    # reservation, say). Report it against the network it came
+                    # from and carry on: the other networks, and the VMs, are
+                    # not necessarily affected
+                    self.logger.error(
+                        f"network {network_name}: {exc}")
+                    results[full_name] = 'failed'
+                    continue
+
+                if plan['action'] == 'none':
+                    continue
+
+                for line in net_reconcile.describe_plan(network_name, plan):
+                    self.logger.info(line)
+
+                if plan['action'] == 'create':
+                    self.logger.info(f"network {network_name}: not defined yet")
+                    if dry_run:
+                        results[full_name] = 'skipped'
+                        continue
+                    ok = self.provider.define_network(
+                        name=full_name, info=network_info,
+                        workdir=cluster['workdir'])
+                    results[full_name] = 'created' if ok else 'failed'
+
+                elif plan['action'] == 'live':
+                    if dry_run:
+                        results[full_name] = 'skipped'
+                        continue
+                    ok = self.provider.apply_network_live_plan(
+                        name=full_name, info=network_info, plan=plan)
+                    results[full_name] = 'updated' if ok else 'failed'
+
+                elif plan['action'] == 'recreate':
+                    results[full_name] = self._recreate_network(
+                        cluster=cluster,
+                        network_name=network_name,
+                        full_name=full_name,
+                        network_info=network_info,
+                        plan=plan,
+                        dry_run=dry_run,
+                        allow_recreate=allow_recreate,
+                        auto_accept=auto_accept)
+
+        return results
+
+    @staticmethod
+    def _teardown_info(plan: dict[str, Any],
+                       network_info: dict[str, Any]) -> dict[str, Any]:
+        """
+        Describe the network **as it is now**, for the removal step.
+
+        The iptables rules to withdraw are the ones that were installed for the
+        current definition, so they follow its forward mode, bridge and subnet
+        -- not the ones being defined in its place. Handing ``remove_network``
+        the new configuration would, on a ``nat`` -> ``route`` change, try to
+        withdraw route rules that were never added and leave the nat rules
+        behind.
+
+        No dhcp block is carried over: nothing in the teardown reads it, and
+        reservations validated against the new subnet would be rejected when
+        paired with the old address.
+        """
+        actual = plan.get('actual') or {}
+        if not actual.get('mode'):
+            return network_info
+
+        info: dict[str, Any] = {'mode': actual['mode']}
+
+        if actual.get('bridge_name'):
+            info['bridge'] = {'name': actual['bridge_name']}
+        if actual.get('ip_address'):
+            info['ip'] = {'address': actual['ip_address']}
+            if actual.get('netmask'):
+                info['ip']['netmask'] = actual['netmask']
+
+        return info
+
+    def _recreate_network(self,
+                          cluster: dict[str, Any],
+                          network_name: str,
+                          full_name: str,
+                          network_info: dict[str, Any],
+                          plan: dict[str, Any],
+                          dry_run: bool,
+                          allow_recreate: bool,
+                          auto_accept: bool) -> str:
+        """
+        Destroy and redefine one network, then reconnect its guests.
+
+        Split out of :meth:`reconcile_networks` because the disruptive path is
+        where all the caveats live and it deserves to be read on its own.
+        """
+        attached = plan.get('attached_vms', [])
+        attached_text = ', '.join(attached) if attached else 'none'
+
+        if not allow_recreate:
+            self.logger.warning(
+                f"network {network_name}: the changes above need the network "
+                f"to be destroyed and defined again, which libvirt cannot do "
+                f"in place. Re-run with --recreate-networks to apply them "
+                f"(attached VMs that would be restarted: {attached_text})")
+            return 'skipped'
+
+        if dry_run:
+            self.logger.info(
+                f"[dry-run] would recreate network {network_name} and "
+                f"reconnect: {attached_text}")
+            return 'skipped'
+
+        if not auto_accept:
+            print(f"\nNetwork '{network_name}' has to be destroyed and "
+                  f"redefined to apply:")
+            for change in plan['structural']:
+                print(f"  - {change}")
+            print("\nIts bridge will be deleted and recreated. These VMs lose "
+                  f"their network link and will be reconnected, by a reboot "
+                  f"if their machine type cannot hot-plug: {attached_text}\n")
+            answer = input(
+                f"Type the network name '{network_name}' to proceed: ").strip()
+            if answer != network_name:
+                print("Aborted.")
+                return 'skipped'
+
+        self.logger.info(f"network {network_name}: removing")
+        try:
+            self.provider.remove_network(
+                name=full_name, info=self._teardown_info(plan, network_info))
+        except RuntimeError as exc:
+            # remove_network destroys and undefines before it touches iptables,
+            # so the network is already gone: say what was left behind rather
+            # than aborting half way
+            self.logger.warning(
+                f"network {network_name}: removed, but its firewall rules "
+                f"could not be cleaned up: {exc}")
+
+        self.logger.info(f"network {network_name}: defining again")
+        if not self.provider.define_network(
+                name=full_name, info=network_info, workdir=cluster['workdir']):
+            self.logger.error(
+                f"network {network_name}: could not be defined again. The "
+                f"attached VMs are left disconnected: {attached_text}")
+            return 'failed'
+
+        for domain in attached:
+            outcome = self.provider.reattach_domain_network(domain, full_name)
+            if outcome == 'failed':
+                self.logger.error(
+                    f"{domain}: could not be reconnected to {network_name}, "
+                    f"start it by hand")
+
+        return 'recreated'
+
     def destroy_networks(self) -> None:
         """
         Destroy the networks specified in the cluster configuration (parallel).
@@ -3368,6 +3569,9 @@ class BoxmanManager:
             # manual `docker stop` may have left lab containers down
             # even though the VMs stayed up.
             cls.ensure_shared_bridges()
+            cls.reconcile_networks(
+                allow_recreate=getattr(cli_args, 'recreate_networks', False),
+                auto_accept=getattr(cli_args, 'yes', False))
             cls.ensure_netlab_up()
             cls.connect_info()
             # Re-write SSH config in case IPs changed (DHCP renewals after
@@ -3387,6 +3591,14 @@ class BoxmanManager:
 
         # Shared bridges must exist before VMs attach to them on boot.
         cls.ensure_shared_bridges()
+
+        # Same for the libvirt networks: a VM that is about to be started has
+        # to find the network it is wired to, and any reservation added to the
+        # config since the last run has to be in dnsmasq before the guest asks
+        # for a lease.
+        cls.reconcile_networks(
+            allow_recreate=getattr(cli_args, 'recreate_networks', False),
+            auto_accept=getattr(cli_args, 'yes', False))
 
         # Build workdir lookup from process_vm_list for restore operations
         vm_workdir_map = {vm_name: workdir for vm_name, workdir in cls.process_vm_list(cli_args)}
@@ -5212,6 +5424,20 @@ class BoxmanManager:
         # ensure provider config reflects runtime settings
         if hasattr(cls.provider, 'update_provider_config_with_runtime'):
             cls.provider.update_provider_config_with_runtime()
+
+        # --- networks first ---
+        # a new VM further down may be wired to a network that does not exist
+        # yet, and this runs before the early return below so that a change
+        # which only touches networks is not silently a no-op
+        cls.ensure_shared_bridges()
+        network_results = cls.reconcile_networks(
+            dry_run=dry_run,
+            allow_recreate=getattr(cli_args, 'recreate_networks', False),
+            auto_accept=auto_accept)
+
+        if network_results:
+            for network_name, outcome in sorted(network_results.items()):
+                cls.logger.info(f"network {network_name}: {outcome}")
 
         # --- categorize VMs ---
         expected_vms = set(cls._get_project_vm_names())

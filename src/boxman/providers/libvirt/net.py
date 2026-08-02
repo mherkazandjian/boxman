@@ -12,6 +12,7 @@ from jinja2 import Environment, FileSystemLoader
 
 from boxman import log
 
+from . import net_reconcile
 from .commands import LibVirtCommandBase, VirshCommand
 
 
@@ -326,6 +327,124 @@ class Network(VirshCommand):
 
         log.info(f"wrote network XML to {abs_path} ({os.path.getsize(abs_path)} bytes)")
         return abs_path
+
+    def dump_xml(self) -> str | None:
+        """
+        Return the network XML as libvirt currently has it.
+
+        Returns:
+            The XML text, or None when the network is not defined.
+        """
+        result = self.execute("net-dumpxml", self.name, hide=True, warn=True)
+        if not result.ok:
+            return None
+        return result.stdout
+
+    def is_active(self) -> bool:
+        """Return True when the network is defined *and* running."""
+        result = self.execute("net-list", "--name", hide=True, warn=True)
+        if not result.ok:
+            return False
+        return self.name in [
+            line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def apply_net_update(self,
+                         command: str,
+                         section: str,
+                         element: str) -> bool:
+        """
+        Run a single ``virsh net-update`` against this network.
+
+        The element is handed over in a temporary file rather than inline.
+        ``net-update`` accepts both, but the inline form is a shell argument
+        full of spaces and quotes, and under a container runtime the command is
+        re-wrapped as a string -- a quoting bug waiting to happen.
+
+        ``--live`` is only added when the network is running; applying it to a
+        defined-but-stopped network is an error, while ``--config`` alone is
+        exactly right.
+
+        Args:
+            command: ``add-last``, ``modify`` or ``delete``
+            section: the section to update, e.g. ``ip-dhcp-host``
+            element: the XML element to add, match or modify
+
+        Returns:
+            True on success.
+        """
+        temp = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.xml', prefix='boxman-netupdate-', delete=False)
+        try:
+            temp.write(element)
+            temp.close()
+
+            args = ["net-update", self.name, command, section, temp.name,
+                    "--config"]
+            if self.is_active():
+                args.append("--live")
+
+            result = self.execute(*args, hide=True, warn=True)
+            if not result.ok:
+                self.logger.error(
+                    f"network {self.name}: {command} {section} failed: "
+                    f"{result.stderr.strip()}")
+                return False
+
+            self.logger.info(
+                f"network {self.name}: {command} {section} {element}")
+            return True
+        finally:
+            if os.path.exists(temp.name):
+                os.unlink(temp.name)
+
+    def apply_live_plan(self, plan: dict[str, Any]) -> bool:
+        """
+        Apply the non-disruptive half of a reconciliation plan.
+
+        Ranges are applied before reservations so that a reservation moving
+        into freshly-widened space does not transiently look out of range.
+
+        Args:
+            plan: as produced by :func:`net_reconcile.diff_network`
+
+        Returns:
+            True when every operation succeeded.
+        """
+        ok = True
+        for command, entry in plan.get('range_ops', []):
+            ok &= self.apply_net_update(
+                command, 'ip-dhcp-range', net_reconcile.range_element(entry))
+        for command, entry in plan.get('host_ops', []):
+            # a delete matches on the mac alone; sending the whole element
+            # makes libvirt match every attribute, so a stale ip would miss
+            match = {'mac': entry['mac']} if command == 'delete' else entry
+            ok &= self.apply_net_update(
+                command, 'ip-dhcp-host', net_reconcile.host_element(match))
+        return bool(ok)
+
+    def attached_domains(self) -> list[str]:
+        """
+        Return the names of domains whose interfaces use this network.
+
+        Used to tell the user which guests a recreate would disconnect.
+        """
+        result = self.execute("list", "--all", "--name", hide=True, warn=True)
+        if not result.ok:
+            return []
+
+        attached = []
+        for domain in [line.strip() for line in result.stdout.splitlines() if line.strip()]:
+            iflist = self.execute(
+                "domiflist", domain, hide=True, warn=True)
+            if not iflist.ok:
+                continue
+            for line in iflist.stdout.splitlines():
+                fields = line.split()
+                # columns: Interface Type Source Model MAC
+                if len(fields) >= 3 and fields[1] == 'network' and fields[2] == self.name:
+                    attached.append(domain)
+                    break
+        return attached
 
     def update_network_cache(self) -> bool:
         """
