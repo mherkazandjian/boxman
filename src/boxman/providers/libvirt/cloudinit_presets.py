@@ -25,6 +25,15 @@ from __future__ import annotations
 from passlib.hash import sha512_crypt
 
 
+#: completion marker for templates that bring no cloudinit block of their own.
+#: This is the file the LAST ``runcmd`` entry of DEFAULT_USER_DATA appends to,
+#: which is the only thing in the stock user-data that means "finished".
+#: Deliberately not /etc/boxman-template-marker: that one is written by
+#: ``write_files``, which cloud-init runs in the config stage -- long before
+#: runcmd -- so polling for it would report success while the template was
+#: still being built.
+DEFAULT_DONE_MARKER = "/var/log/boxman-cloudinit.log"
+
 DEFAULT_META_DATA = """\
 instance-id: {instance_id}
 local-hostname: {hostname}

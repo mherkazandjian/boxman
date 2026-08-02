@@ -23,6 +23,15 @@ templates:
     vcpus: 2
     cloudinit_network_config: disabled
     cloudinit_done_marker: /var/log/hello-cloudinit.log
+    # Caps on the post-virt-install verification phase, in seconds (defaults
+    # shown). Rocky/RHEL ship a guest agent that blacklists guest-exec until
+    # cloud-init reconfigures it, so this is the family where
+    # cloudinit_guest_exec_timeout matters — if guest-exec never becomes
+    # usable boxman falls back to a blind cloudinit_fallback_timeout wait.
+    #cloudinit_agent_timeout: 300        # wait for the qemu guest agent
+    #cloudinit_guest_exec_timeout: 120   # wait for guest-exec to be usable
+    #cloudinit_done_timeout: 120         # wait for cloudinit_done_marker
+    #cloudinit_fallback_timeout: 180     # blind wait when the guest can't be polled
     cloudinit: |
       #cloud-config
       hostname: hello-cloudinit

@@ -1037,11 +1037,21 @@ class BoxmanManager:
 
         force = getattr(cli_args, 'force', False) if cli_args is not None else False
 
-        cls._create_templates_impl(requested=requested, force=force)
+        failed = cls._create_templates_impl(requested=requested, force=force)
+        if failed:
+            cls.logger.error(
+                f"{len(failed)} template(s) could not be created: "
+                f"{', '.join(failed)}")
+            raise SystemExit(1)
 
-    def _create_templates_impl(self, requested=None, force=False) -> None:
+    def _create_templates_impl(self, requested=None, force=False) -> list[str]:
         """
         Internal implementation for creating template VMs.
+
+        Returns:
+            The keys of the templates that could not be built. Empty when they
+            all succeeded. A caller that ignores this will happily clone from a
+            template whose cloud-init never finished.
 
         Args:
             requested: Optional list of template keys to create (None = all).
@@ -1058,7 +1068,10 @@ class BoxmanManager:
 
         if not templates:
             self.logger.warning("no templates defined in configuration")
-            return
+            return []
+
+        #: keys of the templates whose build failed, reported to the caller
+        failed: list[str] = []
 
         # determine provider config
         provider_type = list(config.get('provider', {}).keys())[0] if 'provider' in config else 'libvirt'
@@ -1114,7 +1127,7 @@ class BoxmanManager:
                 f"the following template(s) already exist: {names}. "
                 f"Use --force to delete and recreate them."
             )
-            return
+            return list(existing_templates)
 
         # Merge both lists (existing ones will be force-recreated)
         all_keys = existing_templates + templates_to_create
@@ -1143,6 +1156,10 @@ class BoxmanManager:
             cloudinit_metadata = tpl_conf.get('cloudinit_metadata', None)
             cloudinit_network_config = tpl_conf.get('cloudinit_network_config', None)
             cloudinit_done_marker = tpl_conf.get('cloudinit_done_marker', None)
+            cloudinit_agent_timeout = tpl_conf.get('cloudinit_agent_timeout', 300)
+            cloudinit_guest_exec_timeout = tpl_conf.get('cloudinit_guest_exec_timeout', 120)
+            cloudinit_done_timeout = tpl_conf.get('cloudinit_done_timeout', 120)
+            cloudinit_fallback_timeout = tpl_conf.get('cloudinit_fallback_timeout', 180)
             tpl_memory = tpl_conf.get('memory', 2048)
             tpl_vcpus = tpl_conf.get('vcpus', 2)
             tpl_os_variant = tpl_conf.get('os_variant', 'generic')
@@ -1171,6 +1188,10 @@ class BoxmanManager:
                 cloudinit_metadata=cloudinit_metadata,
                 cloudinit_network_config=cloudinit_network_config,
                 cloudinit_done_marker=cloudinit_done_marker,
+                cloudinit_agent_timeout=cloudinit_agent_timeout,
+                cloudinit_guest_exec_timeout=cloudinit_guest_exec_timeout,
+                cloudinit_done_timeout=cloudinit_done_timeout,
+                cloudinit_fallback_timeout=cloudinit_fallback_timeout,
                 workdir=tpl_workdir,
                 provider_config=provider_config,
                 memory=tpl_memory,
@@ -1184,11 +1205,20 @@ class BoxmanManager:
                 image_cache=image_cache,
             )
 
-            success = ct.create_template(force=force)
+            try:
+                success = ct.create_template(force=force)
+            except ValueError as exc:
+                # a bad timeout or marker in the template block
+                self.logger.error(f"template '{tpl_key}': {exc}")
+                success = False
+
             if success:
                 self.logger.info(f"template '{tpl_key}' created successfully")
             else:
                 self.logger.error(f"failed to create template '{tpl_key}'")
+                failed.append(tpl_key)
+
+        return failed
 
     def _ensure_writable_dir(self, path: str) -> None:
         """
@@ -1794,14 +1824,25 @@ class BoxmanManager:
         if not missing_keys and not broken_keys:
             return True
 
+        failed: list[str] = []
         if missing_keys:
             self.logger.info(
                 f"auto-creating {len(missing_keys)} missing template(s): {missing_keys}")
-            self._create_templates_impl(requested=missing_keys, force=False)
+            failed += self._create_templates_impl(
+                requested=missing_keys, force=False)
         if broken_keys:
             self.logger.info(
                 f"auto-rebuilding {len(broken_keys)} broken template(s): {broken_keys}")
-            self._create_templates_impl(requested=broken_keys, force=True)
+            failed += self._create_templates_impl(
+                requested=broken_keys, force=True)
+
+        if failed:
+            # returning True here would let provisioning carry on and clone
+            # from a template whose cloud-init never finished
+            self.logger.error(
+                f"template(s) {', '.join(failed)} could not be built, so the "
+                f"VMs that use them cannot be cloned")
+            return False
 
         return True
 
@@ -3570,11 +3611,17 @@ class BoxmanManager:
                 "rebuilding all templates (--rebuild-templates implies --force "
                 "for create-templates)..."
             )
-            cls._create_templates_impl(requested=None, force=True)
+            if cls._create_templates_impl(requested=None, force=True):
+                cls.logger.error(
+                    "aborting: not every template could be rebuilt")
+                return
         else:
             # Auto-create any template VMs that are referenced as base_image
             # but do not yet exist.
-            cls.ensure_templates_exist()
+            if not cls.ensure_templates_exist():
+                cls.logger.error(
+                    "aborting: not every template could be created")
+                return
 
         try:
             cls.validate_base_images()
@@ -5653,8 +5700,12 @@ class BoxmanManager:
                 # expand any `base_image: oci://…` into implicit templates
                 # before resolving/cloning (the clone path needs a VM name).
                 cls._expand_oci_base_images()
-                # ensure templates exist
-                cls.ensure_templates_exist()
+                # ensure templates exist -- cloning from one that failed to
+                # build produces VMs whose cloud-init never ran
+                if not cls.ensure_templates_exist():
+                    cls.logger.error(
+                        "aborting: not every template could be created")
+                    return
                 try:
                     cls.validate_base_images()
                 except ValueError as exc:

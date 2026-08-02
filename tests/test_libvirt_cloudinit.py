@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from boxman.providers.libvirt.cloudinit import (
-    CloudInitTemplate, DEFAULT_USER_DATA, DEFAULT_META_DATA,
+    CloudInitTemplate, DEFAULT_USER_DATA, DEFAULT_META_DATA, DEFAULT_DONE_MARKER,
 )
 
 
@@ -213,3 +213,165 @@ class TestDefaultTemplates:
         rendered = DEFAULT_META_DATA.format(instance_id="abc", hostname="demo")
         assert "instance-id: abc" in rendered
         assert "local-hostname: demo" in rendered
+
+
+class TestCloudinitTimeouts:
+    """The cloud-init verification caps are per-template knobs (conf.yml)."""
+
+    SLEEP = "boxman.providers.libvirt.cloudinit.time.sleep"
+
+    def test_defaults_match_previous_hardcoded_values(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        assert t.cloudinit_agent_timeout == 300
+        assert t.cloudinit_guest_exec_timeout == 120
+        assert t.cloudinit_done_timeout == 120
+        assert t.cloudinit_fallback_timeout == 180
+
+    def test_overrides_are_stored(self, tmp_path: Path):
+        t = _make_template(
+            tmp_path,
+            cloudinit_done_timeout=900,
+            cloudinit_guest_exec_timeout=180,
+        )
+        assert t.cloudinit_done_timeout == 900
+        assert t.cloudinit_guest_exec_timeout == 180
+
+    def test_a_quoted_timeout_is_coerced(self, tmp_path: Path):
+        # yaml hands back "900" for a quoted value; left alone it reaches the
+        # // in the wait loops and raises TypeError, long after virt-install
+        # has already booted the VM
+        t = _make_template(tmp_path, cloudinit_done_timeout="900")
+        assert t.cloudinit_done_timeout == 900
+
+    @pytest.mark.parametrize("value", [None, "abc", "", -5, [300]])
+    def test_a_nonsense_timeout_is_rejected_up_front(self, tmp_path: Path, value):
+        with pytest.raises(ValueError, match="cloudinit_done_timeout"):
+            _make_template(tmp_path, cloudinit_done_timeout=value)
+
+    def test_zero_means_skip_the_wait(self, tmp_path: Path):
+        t = _make_template(tmp_path, cloudinit_fallback_timeout=0)
+        assert t.cloudinit_fallback_timeout == 0
+
+    def test_poll_done_marker_honours_configured_timeout(self, tmp_path: Path):
+        t = _make_template(tmp_path, cloudinit_done_timeout=7)
+        with patch.object(t.virsh, "execute_shell", return_value=_result(ok=False)), \
+                patch(self.SLEEP) as sleep:
+            assert t._poll_done_marker("/var/log/done") is False
+        # back-off 1 + 2 + 4 == the 7s cap
+        assert sum(c.args[0] for c in sleep.call_args_list) == 7
+
+    def test_explicit_max_wait_still_wins(self, tmp_path: Path):
+        t = _make_template(tmp_path, cloudinit_done_timeout=900)
+        with patch.object(t.virsh, "execute_shell", return_value=_result(ok=False)), \
+                patch(self.SLEEP) as sleep:
+            assert t._poll_done_marker("/var/log/done", max_wait=3) is False
+        assert sum(c.args[0] for c in sleep.call_args_list) == 3
+
+    def test_fallback_wait_honours_configured_timeout(self, tmp_path: Path):
+        t = _make_template(tmp_path, cloudinit_fallback_timeout=30)
+        with patch.object(t.virsh, "execute_shell", return_value=_result(ok=True)), \
+                patch(self.SLEEP) as sleep:
+            t._wait_cloudinit_fallback()
+        assert sleep.call_count == 3          # range(0, 30, 10)
+
+    def test_agent_wait_loop_scales_with_timeout(self, tmp_path: Path):
+        # agent never answers: 10s cap / 2s per probe == 5 guest-ping attempts,
+        # then a zero-length blind wait, then the shutdown path
+        t = _make_template(
+            tmp_path, cloudinit_agent_timeout=10, cloudinit_fallback_timeout=0)
+        with patch.object(t.virsh, "execute_shell",
+                          return_value=_result(ok=False)) as shell, \
+                patch.object(t.virsh, "execute",
+                             return_value=_result(stdout="shut off")), \
+                patch(self.SLEEP):
+            assert t.verify_and_shutdown() is True
+        assert shell.call_count == 5
+
+    def test_guest_exec_loop_scales_with_timeout(self, tmp_path: Path):
+        # agent answers guest-ping but guest-exec stays blacklisted:
+        # 1 ping + (20s / 5s) == 4 guest-exec probes
+        t = _make_template(
+            tmp_path, cloudinit_guest_exec_timeout=20,
+            cloudinit_fallback_timeout=0)
+        calls: list[str] = []
+
+        def fake_shell(cmd, **kwargs):
+            calls.append(cmd)
+            return _result(ok="guest-ping" in cmd)
+
+        with patch.object(t.virsh, "execute_shell", side_effect=fake_shell), \
+                patch.object(t.virsh, "execute",
+                             return_value=_result(stdout="shut off")), \
+                patch(self.SLEEP):
+            assert t.verify_and_shutdown() is True
+        assert sum("guest-exec" in c for c in calls) == 4
+
+
+class TestVerificationFailureLeavesCleanState:
+    """
+    What is left behind when cloud-init cannot be verified.
+
+    A template VM left *running* is worse than a failed one: the next
+    ``create-templates`` reports "already exists", and ``up`` sees the domain,
+    skips creation and virt-clones a running guest.
+    """
+
+    SLEEP = "boxman.providers.libvirt.cloudinit.time.sleep"
+
+    @staticmethod
+    def _template(tmp_path: Path, **overrides):
+        t = _make_template(tmp_path, cloudinit_userdata="#cloud-config\n",
+                           cloudinit_done_marker="/var/log/done", **overrides)
+        calls: list = []
+
+        def fake_execute(*args, **kwargs):
+            calls.append(args)
+            # domstate is asked whether the VM went down
+            if args and args[0] == "domstate":
+                return _result(stdout="shut off")
+            return _result()
+
+        def fake_shell(cmd, **kwargs):
+            calls.append(("shell", cmd))
+            # the agent answers, guest-exec works, the marker never appears
+            return _result(ok=("guest-ping" in cmd or "guest-exec" in cmd),
+                           stdout='{"return": {"pid": 1}}')
+
+        t.virsh.execute = fake_execute
+        t.virsh.execute_shell = fake_shell
+        return t, calls
+
+    def test_a_missing_marker_still_shuts_the_vm_down(self, tmp_path: Path):
+        t, calls = self._template(tmp_path, cloudinit_done_timeout=1)
+        with patch(self.SLEEP):
+            assert t.verify_and_shutdown() is False
+        assert any(args[0] == "shutdown" for args in calls if args and args[0] != "shell"), \
+            "the template VM was left running"
+
+    def test_no_marker_configured_is_not_a_hard_failure(self, tmp_path: Path):
+        # nothing to check against is not the same as a failed check: falling
+        # back to a blind wait keeps templates that predate the marker working
+        t = _make_template(tmp_path, cloudinit_userdata="#cloud-config\n",
+                           cloudinit_fallback_timeout=0)
+        assert t.cloudinit_done_marker is None
+        t.virsh.execute = lambda *a, **k: _result(stdout="shut off")
+        t.virsh.execute_shell = lambda cmd, **k: _result(
+            ok=("guest-ping" in cmd or "guest-exec" in cmd),
+            stdout='{"return": {"pid": 1}}')
+        with patch(self.SLEEP):
+            assert t.verify_and_shutdown() is True
+
+    def test_a_template_without_its_own_cloudinit_gets_the_default_marker(self, tmp_path: Path):
+        # an implicit template synthesised from `base_image: oci://…` has
+        # nowhere to declare one, but it runs DEFAULT_USER_DATA, whose last
+        # runcmd entry appends to this file
+        t = _make_template(tmp_path)
+        assert t.cloudinit_done_marker == DEFAULT_DONE_MARKER
+
+    def test_the_default_marker_is_written_last_not_early(self):
+        # write_files runs in the config stage, before runcmd: a marker from
+        # there would be found while the template was still being built
+        from boxman.providers.libvirt.cloudinit_presets import DEFAULT_USER_DATA
+        assert DEFAULT_DONE_MARKER not in DEFAULT_USER_DATA.split("runcmd:")[0]
+        last_runcmd = DEFAULT_USER_DATA.rstrip().splitlines()[-1]
+        assert DEFAULT_DONE_MARKER in last_runcmd, last_runcmd
