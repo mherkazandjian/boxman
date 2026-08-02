@@ -2038,7 +2038,7 @@ class BoxmanManager:
         and the second net-define fails with "bridge name already in use".
         """
         for cluster_name, cluster in self.config['clusters'].items():
-            for network_name, network_info in cluster.get('networks', {}).items():
+            for network_name, network_info in (cluster.get('networks') or {}).items():
                 _network_name = self.full_network_name(
                     project_config=self.config,
                     cluster_name=cluster_name,
@@ -2088,7 +2088,7 @@ class BoxmanManager:
         results: dict[str, str] = {}
 
         for cluster_name, cluster in self.config['clusters'].items():
-            for network_name, network_info in cluster.get('networks', {}).items():
+            for network_name, network_info in (cluster.get('networks') or {}).items():
                 full_name = self.full_network_name(
                     project_config=self.config,
                     cluster_name=cluster_name,
@@ -2185,6 +2185,16 @@ class BoxmanManager:
                     f"could not be reconnected")
             else:
                 self.logger.info(f"network {full_name}: {outcome}")
+
+    def _vms_worth_waiting_for(self) -> list[str]:
+        """
+        Project VMs minus the ones a recreate could not reconnect.
+
+        Waiting on a guest we already reported as unreachable only burns the
+        whole timeout before saying what we already knew.
+        """
+        unreachable = getattr(self, '_reattach_failed_vms', set())
+        return sorted(set(self._get_project_vm_names()) - unreachable)
 
     def wait_for_vm_ips(self, vm_names: list[str], max_wait: int = 300) -> bool:
         """
@@ -2383,6 +2393,11 @@ class BoxmanManager:
             outcome = self.provider.reattach_domain_network(domain, full_name)
             if outcome == 'failed':
                 reattach_failed.append(domain)
+                # remembered so the post-recreate IP wait does not sit on a
+                # guest we already know is not coming back on its own
+                if not hasattr(self, '_reattach_failed_vms'):
+                    self._reattach_failed_vms = set()
+                self._reattach_failed_vms.add(domain)
                 self.logger.error(
                     f"{domain}: could not be reconnected to {network_name}, "
                     f"start it by hand")
@@ -2418,7 +2433,7 @@ class BoxmanManager:
         processes = [
             Process(target=_destroy, args=(cluster_name, cluster, network_name, network_info))
             for cluster_name, cluster in self.config['clusters'].items()
-            for network_name, network_info in cluster.get('networks', {}).items()
+            for network_name, network_info in (cluster.get('networks') or {}).items()
         ]
         [p.start() for p in processes]
         [p.join() for p in processes]
@@ -3722,7 +3737,7 @@ class BoxmanManager:
             # written from do not exist yet
             if any(outcome in ('recreated', 'partial')
                    for outcome in network_results.values()):
-                cls.wait_for_vm_ips(sorted(cls._get_project_vm_names()))
+                cls.wait_for_vm_ips(cls._vms_worth_waiting_for())
 
             cls.ensure_netlab_up()
             cls.connect_info()
@@ -3949,7 +3964,11 @@ class BoxmanManager:
         print()
 
         if not auto_accept:
-            answer = input("Proceed? [y/N] ").strip().lower()
+            try:
+                answer = input("Proceed? [y/N] ").strip().lower()
+            except EOFError:
+                print("No input available, aborted.")
+                return
             if answer not in ("y", "yes"):
                 print("Aborted.")
                 return
@@ -5744,6 +5763,11 @@ class BoxmanManager:
 
         # regenerate SSH config and display connect info
         if not dry_run:
+            # a recreated network power-cycles the guests attached to it, so
+            # the addresses the ssh config is written from do not exist yet
+            if any(outcome in ('recreated', 'partial')
+                   for outcome in network_results.values()):
+                cls.wait_for_vm_ips(cls._vms_worth_waiting_for())
             cls.setup_ssh_access()
             cls.connect_info()
 

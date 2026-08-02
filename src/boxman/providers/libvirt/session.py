@@ -235,12 +235,21 @@ class LibVirtSession:
 
         if 'paused' in state_text or 'pmsuspended' in state_text:
             # the qemu process outlived the bridge, so the tap is dead just as
-            # it is for a running guest -- resuming does not rebuild it. Resume
-            # so the guest can answer the shutdown request, then cycle it
+            # it is for a running guest -- resuming does not rebuild it. Wake
+            # the guest so it can answer the shutdown request, then cycle it
             log.info(
-                f"{domain}: is {state_text}, resuming it so it can be "
+                f"{domain}: is {state_text}, waking it so it can be "
                 f"power-cycled back onto {network_name}")
-            virsh.execute("resume", domain, hide=True, warn=True)
+
+            # a pmsuspended domain is asleep inside the guest OS; virsh resume
+            # only lifts a libvirt-level pause and does nothing for it
+            command = 'dompmwakeup' if 'pmsuspended' in state_text else 'resume'
+            woken = virsh.execute(command, domain, hide=True, warn=True)
+            if not woken.ok:
+                log.warning(
+                    f"{domain}: {command} failed ({woken.stderr.strip()}), "
+                    f"the power cycle will have to force it off")
+
             return 'cold' if self._power_cycle(virsh, domain) else 'failed'
 
         if 'running' not in state_text:

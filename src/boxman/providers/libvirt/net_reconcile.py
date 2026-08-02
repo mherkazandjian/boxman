@@ -164,8 +164,24 @@ def diff_dhcp_hosts(desired: list, actual: list) -> list[tuple[str, dict]]:
         if mac not in desired_by_mac:
             deletes.append(('delete', actual_by_mac[mac]))
 
+    # an address moving between two reservations that both survive cannot be
+    # done with a modify: libvirt refuses to hand out an address another entry
+    # still holds, so the pair would fail on every run. Those entries are
+    # deleted first and added back in their new arrangement instead
+    surviving_ips = {
+        (entry.get('ip'), _host_key(entry)) for entry in actual
+        if _host_key(entry) in desired_by_mac}
+    contested = {
+        mac for mac, entry in desired_by_mac.items()
+        if mac in actual_by_mac
+        and any(ip == entry.get('ip') and holder != mac
+                for ip, holder in surviving_ips)}
+
     for mac, entry in desired_by_mac.items():
         if mac not in actual_by_mac:
+            adds.append(('add-last', entry))
+        elif mac in contested:
+            deletes.append(('delete', actual_by_mac[mac]))
             adds.append(('add-last', entry))
         elif entry != actual_by_mac[mac]:
             modifies.append(('modify', entry))

@@ -16,6 +16,7 @@ modified, only added or deleted").
 
 from __future__ import annotations
 
+import json
 import xml.etree.ElementTree as ET
 from unittest.mock import MagicMock, patch
 
@@ -161,6 +162,22 @@ class TestDiffDhcpHosts:
         assert [command for command, _ in ops] == ["delete", "add-last"]
 
 
+    def test_two_reservations_swapping_addresses_converge(self):
+        # a modify cannot claim an address another surviving entry still holds,
+        # so libvirt rejects it and the pair never converges; both have to be
+        # deleted before either is added back
+        ops = nr.diff_dhcp_hosts(
+            [{"mac": "aa", "ip": "1.1.1.2"}, {"mac": "bb", "ip": "1.1.1.1"}],
+            [{"mac": "aa", "ip": "1.1.1.1"}, {"mac": "bb", "ip": "1.1.1.2"}])
+        commands = [command for command, _ in ops]
+        assert commands == ["delete", "delete", "add-last", "add-last"]
+
+    def test_an_uncontested_move_is_still_a_modify(self):
+        ops = nr.diff_dhcp_hosts([{"mac": "aa", "ip": "1.1.1.9"}],
+                                 [{"mac": "aa", "ip": "1.1.1.1"}])
+        assert [command for command, _ in ops] == ["modify"]
+
+
 class TestDiffDhcpRange:
 
     def test_change_becomes_delete_then_add(self):
@@ -248,6 +265,48 @@ class TestPinnedBridgeAndStp:
             net = Network(name="demo", info=info, assign_new_bridge=False,
                           provider_config={"use_sudo": False})
         assert nr.desired_state(net)["bridge_name"] is None
+
+    def test_a_short_network_mac_does_not_read_as_drift(self):
+        # libvirt zero-pads the network's own mac when it stores it, so a
+        # short-form config would be permanent structural drift -- and with
+        # --recreate-networks that rebuilds the network, rebooting its guests,
+        # on every single run
+        info = {"mode": "nat", "mac": "52:54:0:a:b:c",
+                "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0",
+                       "dhcp": {"range": {"start": "10.5.3.50",
+                                          "end": "10.5.3.100"},
+                                "hosts": [{"mac": "52:54:00:00:00:01",
+                                           "ip": "10.5.3.10",
+                                           "name": "one"}]}}}
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            net = Network(name="demo", info=info, assign_new_bridge=True,
+                          provider_config={"use_sudo": False})
+        assert net.mac_address == "52:54:00:0a:0b:0c"
+        plan = nr.diff_network(nr.desired_state(net),
+                               nr.parse_network_xml(LIVE_XML))
+        assert plan["action"] == "none", plan["structural"]
+
+    def test_a_short_reservation_mac_is_left_alone(self):
+        # the opposite of the network mac: libvirt stores reservation macs
+        # verbatim, so padding one here would create the mismatch
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            net = Network(
+                name="demo", assign_new_bridge=True,
+                provider_config={"use_sudo": False},
+                info={"mode": "nat",
+                      "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0",
+                             "dhcp": {"hosts": [{"mac": "52:54:0:c:1:1",
+                                                 "ip": "10.5.3.10"}]}}})
+        assert net.dhcp_hosts[0]["mac"] == "52:54:0:c:1:1"
+
+    def test_an_unrecognised_stp_value_is_rejected(self):
+        # quietly turning `stp: enabled` into 'off' would disable stp silently
+        with pytest.raises(ValueError, match="stp must be on or off"):
+            Network(name="demo", info={"bridge": {"stp": "enabled"}},
+                    assign_new_bridge=False,
+                    provider_config={"use_sudo": False})
 
     @pytest.mark.parametrize("configured, expected", [
         (True, "on"), (False, "off"),          # yaml reads unquoted on/off as bool
@@ -432,6 +491,83 @@ class TestRecreateSequence:
                 dry_run=False, allow_recreate=True, auto_accept=False)
         assert outcome == 'skipped'
         assert calls == []
+
+
+class TestCacheSelfConflict:
+    """
+    The wedge: a network must not conflict with its own cache entry.
+
+    ``define_network`` used to write the cache entry *before* ``net-define``,
+    so a define that failed left the cache claiming a network that does not
+    exist; ``check_network_exists`` then refused to create it on every later
+    run, by name and by address, against itself. These drive the real
+    ``BoxmanCache`` against a temporary cache file rather than a mock, because
+    the mocked-provider tests cannot see inside ``define_network`` at all.
+    """
+
+    @staticmethod
+    def _net_with_cache(tmp_path, cached: dict | None):
+        from boxman.config_cache import BoxmanCache
+
+        cache = BoxmanCache.__new__(BoxmanCache)
+        cache.cache_dir = str(tmp_path)
+        cache.projects_cache_file = str(tmp_path / 'projects.json')
+        cache.projects = None
+        if cached is not None:
+            (tmp_path / 'projects.json').write_text(json.dumps(cached))
+
+        manager = MagicMock()
+        manager.cache = cache
+        manager.config = {'project': 'p1'}
+        manager._runtime_name = 'local'
+
+        info = {"mode": "nat", "bridge": {"name": "virbr9"},
+                "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0"}}
+        net = Network(name="bprj__p1__bprj__clstr__c1__clstr__nat", info=info,
+                      assign_new_bridge=True,
+                      provider_config={"use_sudo": False}, manager=manager)
+        return net, cache
+
+    def test_a_networks_own_entry_is_not_a_conflict(self, tmp_path):
+        # exactly the state a failed define, or a recreate, leaves behind
+        net, _ = self._net_with_cache(tmp_path, {
+            'p1': {'runtime': 'local', 'networks': {
+                'bprj__p1__bprj__clstr__c1__clstr__nat': {
+                    'ip_address': '10.5.3.1', 'bridge_name': 'virbr9'}}}})
+        net.check_network_exists()      # must not raise
+
+    def test_another_project_with_the_same_address_still_conflicts(self, tmp_path):
+        net, _ = self._net_with_cache(tmp_path, {
+            'p2': {'runtime': 'local', 'networks': {
+                'bprj__p2__bprj__clstr__c1__clstr__nat': {
+                    'ip_address': '10.5.3.1', 'bridge_name': 'virbr9'}}}})
+        with pytest.raises(RuntimeError, match="conflict"):
+            net.check_network_exists()
+
+    def test_the_cache_is_written_only_after_the_define_succeeds(self, tmp_path):
+        # a failed net-define must not leave an entry behind
+        net, cache = self._net_with_cache(tmp_path, {'p1': {'runtime': 'local'}})
+
+        def fake_execute(*args, **kwargs):
+            if args[0] == "net-define":
+                raise RuntimeError("boom")
+            return _result()
+
+        net.execute = fake_execute
+        net._get_libvirt_bridges = lambda: set()
+        assert net.define_network(str(tmp_path / 'net.xml')) is False
+
+        cache.read_projects_cache()
+        assert not cache.projects['p1'].get('networks')
+
+    def test_a_bridge_already_in_use_raises_instead_of_exiting(self, tmp_path):
+        # SystemExit would take the whole reconcile down, after a recreate has
+        # already destroyed the previous network
+        net, _ = self._net_with_cache(tmp_path, {'p1': {'runtime': 'local'}})
+        net._get_libvirt_bridges = lambda: {"virbr9"}
+        net._log_bridge_usage = lambda _: None
+        with pytest.raises(RuntimeError, match="already in use"):
+            net.define_network(str(tmp_path / 'net.xml'))
 
 
 class TestElementRendering:
