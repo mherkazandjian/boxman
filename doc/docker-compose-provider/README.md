@@ -12,6 +12,10 @@ coexist with L2 connectivity.
 - **[config-schema.md](config-schema.md)** — every key and its exact semantics.
 - **[migration-v1-to-v2.md](migration-v1-to-v2.md)** — moving an existing
   project to config v2.0 (spoiler: only needed if you want containers).
+- **[demo-runbook.md](demo-runbook.md)** — a rehearsed live walkthrough: one
+  config with a VM and a container, `up`, the unified `ps`, an ARP-level proof
+  that the shared bridge really is layer 2, and teardown. Doubles as a
+  copy-pasteable smoke test of the whole epic.
 - Example boxes:
   [`docker-compose-standalone`](../../boxes/docker-compose-standalone)
   (containers only — volumes, `exec`, inventory, snapshots; no KVM needed) and
