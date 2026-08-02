@@ -320,6 +320,7 @@ class TestCheckTemplatesForClusters:
 
         def fake_impl(*args, **kwargs):
             captured.append((args, kwargs))
+            return []          # no template failed to build
 
         with _patch.object(m, '_create_templates_impl', side_effect=fake_impl):
             ok = m.ensure_templates_exist()
@@ -347,7 +348,7 @@ class TestCheckTemplatesForClusters:
         m._provider.vm_exists.return_value = False  # not registered
         captured: list = []
         with _patch.object(m, '_create_templates_impl',
-                           side_effect=lambda *a, **kw: captured.append(kw)):
+                           side_effect=lambda *a, **kw: (captured.append(kw), [])[1]):
             ok = m.ensure_templates_exist()
         assert ok is True
         assert len(captured) == 1

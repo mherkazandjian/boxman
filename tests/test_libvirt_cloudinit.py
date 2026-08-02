@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from boxman.providers.libvirt.cloudinit import (
-    CloudInitTemplate, DEFAULT_USER_DATA, DEFAULT_META_DATA,
+    CloudInitTemplate, DEFAULT_USER_DATA, DEFAULT_META_DATA, DEFAULT_DONE_MARKER,
 )
 
 
@@ -236,6 +236,22 @@ class TestCloudinitTimeouts:
         assert t.cloudinit_done_timeout == 900
         assert t.cloudinit_guest_exec_timeout == 180
 
+    def test_a_quoted_timeout_is_coerced(self, tmp_path: Path):
+        # yaml hands back "900" for a quoted value; left alone it reaches the
+        # // in the wait loops and raises TypeError, long after virt-install
+        # has already booted the VM
+        t = _make_template(tmp_path, cloudinit_done_timeout="900")
+        assert t.cloudinit_done_timeout == 900
+
+    @pytest.mark.parametrize("value", [None, "abc", "", -5, [300]])
+    def test_a_nonsense_timeout_is_rejected_up_front(self, tmp_path: Path, value):
+        with pytest.raises(ValueError, match="cloudinit_done_timeout"):
+            _make_template(tmp_path, cloudinit_done_timeout=value)
+
+    def test_zero_means_skip_the_wait(self, tmp_path: Path):
+        t = _make_template(tmp_path, cloudinit_fallback_timeout=0)
+        assert t.cloudinit_fallback_timeout == 0
+
     def test_poll_done_marker_honours_configured_timeout(self, tmp_path: Path):
         t = _make_template(tmp_path, cloudinit_done_timeout=7)
         with patch.object(t.virsh, "execute_shell", return_value=_result(ok=False)), \
@@ -289,3 +305,65 @@ class TestCloudinitTimeouts:
                 patch(self.SLEEP):
             assert t.verify_and_shutdown() is True
         assert sum("guest-exec" in c for c in calls) == 4
+
+
+class TestVerificationFailureLeavesCleanState:
+    """
+    What is left behind when cloud-init cannot be verified.
+
+    A template VM left *running* is worse than a failed one: the next
+    ``create-templates`` reports "already exists", and ``up`` sees the domain,
+    skips creation and virt-clones a running guest.
+    """
+
+    SLEEP = "boxman.providers.libvirt.cloudinit.time.sleep"
+
+    @staticmethod
+    def _template(tmp_path: Path, **overrides):
+        t = _make_template(tmp_path, cloudinit_userdata="#cloud-config\n",
+                           cloudinit_done_marker="/var/log/done", **overrides)
+        calls: list = []
+
+        def fake_execute(*args, **kwargs):
+            calls.append(args)
+            # domstate is asked whether the VM went down
+            if args and args[0] == "domstate":
+                return _result(stdout="shut off")
+            return _result()
+
+        def fake_shell(cmd, **kwargs):
+            calls.append(("shell", cmd))
+            # the agent answers, guest-exec works, the marker never appears
+            return _result(ok=("guest-ping" in cmd or "guest-exec" in cmd),
+                           stdout='{"return": {"pid": 1}}')
+
+        t.virsh.execute = fake_execute
+        t.virsh.execute_shell = fake_shell
+        return t, calls
+
+    def test_a_missing_marker_still_shuts_the_vm_down(self, tmp_path: Path):
+        t, calls = self._template(tmp_path, cloudinit_done_timeout=1)
+        with patch(self.SLEEP):
+            assert t.verify_and_shutdown() is False
+        assert any(args[0] == "shutdown" for args in calls if args and args[0] != "shell"), \
+            "the template VM was left running"
+
+    def test_no_marker_configured_is_not_a_hard_failure(self, tmp_path: Path):
+        # nothing to check against is not the same as a failed check: falling
+        # back to a blind wait keeps templates that predate the marker working
+        t = _make_template(tmp_path, cloudinit_userdata="#cloud-config\n",
+                           cloudinit_fallback_timeout=0)
+        assert t.cloudinit_done_marker is None
+        t.virsh.execute = lambda *a, **k: _result(stdout="shut off")
+        t.virsh.execute_shell = lambda cmd, **k: _result(
+            ok=("guest-ping" in cmd or "guest-exec" in cmd),
+            stdout='{"return": {"pid": 1}}')
+        with patch(self.SLEEP):
+            assert t.verify_and_shutdown() is True
+
+    def test_a_template_without_its_own_cloudinit_gets_the_default_marker(self, tmp_path: Path):
+        # an implicit template synthesised from `base_image: oci://…` has
+        # nowhere to declare one, but it runs DEFAULT_USER_DATA, which writes
+        # this file at the end
+        t = _make_template(tmp_path)
+        assert t.cloudinit_done_marker == DEFAULT_DONE_MARKER

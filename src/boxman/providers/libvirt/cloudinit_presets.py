@@ -25,6 +25,11 @@ from __future__ import annotations
 from passlib.hash import sha512_crypt
 
 
+#: file written by DEFAULT_USER_DATA once cloud-init has run to the end.
+#: Used as the completion marker for templates that do not bring their own
+#: cloudinit block, so their build can be verified like any other.
+DEFAULT_DONE_MARKER = "/etc/boxman-template-marker"
+
 DEFAULT_META_DATA = """\
 instance-id: {instance_id}
 local-hostname: {hostname}
