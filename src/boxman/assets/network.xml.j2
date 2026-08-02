@@ -6,9 +6,18 @@
   <bridge name='{{ bridge_name }}' stp='{{ bridge_stp }}' delay='{{ bridge_delay }}'/>
   <mac address='{{ mac_address }}'/>
   <ip address='{{ ip_address }}' netmask='{{ netmask }}'>
-  {%- if dhcp_range_start and dhcp_range_end %}
+  {% if (dhcp_range_start and dhcp_range_end) or dhcp_hosts %}
     <dhcp>
+    {% if dhcp_range_start and dhcp_range_end %}
       <range start='{{ dhcp_range_start }}' end='{{ dhcp_range_end }}'/>
+    {% endif %}
+    {# <range> first, then <host>: libvirt accepts either order but emits and
+       documents this one, so a dumpxml diff stays readable. the attributes are
+       escaped because the environment has no autoescape and a reservation name
+       is free-form config text #}
+    {% for host in dhcp_hosts %}
+      <host mac='{{ host.mac|e }}'{% if 'name' in host %} name='{{ host.name|e }}'{% endif %} ip='{{ host.ip|e }}'/>
+    {% endfor %}
     </dhcp>
   {% endif %}
   </ip>

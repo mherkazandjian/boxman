@@ -117,6 +117,137 @@ class TestGenerateXml:
         assert dhcp_range.get("end") == "192.168.150.100"
 
 
+class TestDhcpReservations:
+    """Static ``ip.dhcp.hosts`` entries -> ``<host>`` elements under <dhcp>."""
+
+    @staticmethod
+    def _net(hosts, dhcp_range=True) -> Network:
+        dhcp = {}
+        if dhcp_range:
+            dhcp["range"] = {"start": "10.5.3.50", "end": "10.5.3.100"}
+        if hosts is not None:
+            dhcp["hosts"] = hosts
+        info = {
+            "mode": "nat",
+            "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0",
+                   "dhcp": dhcp},
+        }
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            return Network(name="demo-net", info=info, assign_new_bridge=True,
+                           provider_config={"use_sudo": False})
+
+    def test_no_hosts_key_leaves_reservations_empty(self):
+        assert self._net(None).dhcp_hosts == []
+
+    def test_reservation_renders_as_host_element(self):
+        net = self._net([{"mac": "52:54:00:0c:01:01", "ip": "10.5.3.10",
+                          "name": "ctrl-1-01"}])
+        ip = ET.fromstring(net.generate_xml()).find("ip")
+        hosts = ip.findall("dhcp/host")
+        assert len(hosts) == 1
+        assert hosts[0].get("mac") == "52:54:00:0c:01:01"
+        assert hosts[0].get("ip") == "10.5.3.10"
+        assert hosts[0].get("name") == "ctrl-1-01"
+        # the dynamic range must survive alongside the reservation
+        assert ip.find("dhcp/range").get("start") == "10.5.3.50"
+
+    def test_name_is_optional(self):
+        net = self._net([{"mac": "52:54:00:0c:01:02", "ip": "10.5.3.11"}])
+        host = ET.fromstring(net.generate_xml()).find("ip/dhcp/host")
+        assert host.get("name") is None
+        assert host.get("ip") == "10.5.3.11"
+
+    def test_reservations_without_a_range_still_emit_dhcp(self):
+        # a reservations-only network is valid libvirt: no dynamic pool, every
+        # guest pinned. it must not fall through to an empty <ip>
+        net = self._net([{"mac": "52:54:00:0c:01:03", "ip": "10.5.3.12"}],
+                        dhcp_range=False)
+        ip = ET.fromstring(net.generate_xml()).find("ip")
+        assert ip.find("dhcp") is not None
+        assert ip.find("dhcp/range") is None
+        assert ip.find("dhcp/host").get("ip") == "10.5.3.12"
+
+    def test_mac_is_normalised_to_lowercase(self):
+        net = self._net([{"mac": "52:54:00:AB:CD:EF", "ip": "10.5.3.13"}])
+        assert net.dhcp_hosts[0]["mac"] == "52:54:00:ab:cd:ef"
+
+    def test_ordering_puts_range_before_hosts(self):
+        # libvirt accepts either order, but it emits <range> before <host>
+        # itself, so matching it keeps a dumpxml diff readable
+        net = self._net([{"mac": "52:54:00:0c:01:04", "ip": "10.5.3.14"}])
+        children = [el.tag for el in ET.fromstring(net.generate_xml()).find("ip/dhcp")]
+        assert children == ["range", "host"]
+
+    def test_short_hex_groups_in_a_mac_are_accepted(self):
+        # libvirt parses 52:54:0:c:1:1, so the format check must not be stricter
+        net = self._net([{"mac": "52:54:0:c:1:1", "ip": "10.5.3.15"}])
+        assert net.dhcp_hosts[0]["mac"] == "52:54:0:c:1:1"
+
+    def test_name_with_xml_metacharacters_is_escaped(self):
+        # the jinja environment has no autoescape; an unescaped name would
+        # produce a document libvirt cannot parse
+        net = self._net([{"mac": "52:54:00:0c:01:05", "ip": "10.5.3.16",
+                          "name": "a&b<c>'d\""}])
+        xml = net.generate_xml()
+        assert "&amp;" in xml
+        # round-trips back to the literal the user configured
+        host = ET.fromstring(xml).find("ip/dhcp/host")
+        assert host.get("name") == "a&b<c>'d\""
+
+    @pytest.mark.parametrize("dhcp", [None, {}, {"range": None, "hosts": None}])
+    def test_null_dhcp_blocks_are_not_a_crash(self, dhcp):
+        # yaml turns `dhcp:` with nothing under it into None, not into {}
+        info = {"mode": "nat",
+                "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0",
+                       "dhcp": dhcp}}
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            net = Network(name="demo-net", info=info, assign_new_bridge=True,
+                          provider_config={"use_sudo": False})
+        assert net.dhcp_hosts == []
+        assert net.dhcp_range_start is None
+        assert ET.fromstring(net.generate_xml()).find("ip/dhcp") is None
+
+    def test_null_ip_block_is_not_a_crash(self):
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            net = Network(name="demo-net", info={"mode": "nat", "ip": None},
+                          assign_new_bridge=True,
+                          provider_config={"use_sudo": False})
+        assert net.dhcp_hosts == []
+        assert net.ip_address == "192.168.254.1"
+
+    @pytest.mark.parametrize("hosts, expected", [
+        ([{"mac": "52:54:00:0c:01:01"}], "needs both"),
+        ([{"ip": "10.5.3.10"}], "needs both"),
+        ([{"mac": "52:54:00:0c:01:01", "ip": "not-an-ip"}], "invalid ip"),
+        ([{"mac": "52:54:00:0c:01:01", "ip": "10.9.9.9"}], "outside the network"),
+        ([{"mac": "52:54:00:0c:01:01", "ip": "10.5.3.10"},
+          {"mac": "52:54:00:0C:01:01", "ip": "10.5.3.11"}], "reserved twice"),
+        ([{"mac": "52:54:00:0c:01:01", "ip": "10.5.3.10"},
+          {"mac": "52:54:00:0c:01:02", "ip": "10.5.3.10"}], "reserved twice"),
+        # the address the bridge itself answers on
+        ([{"mac": "52:54:00:0c:01:01", "ip": "10.5.3.1"}], "gateway address"),
+        ([{"mac": "52:54:00:0c:01:01", "ip": "10.5.3.0"}],
+         "network or broadcast"),
+        ([{"mac": "52:54:00:0c:01:01", "ip": "10.5.3.255"}],
+         "network or broadcast"),
+        # hostnames are case-insensitive, so these two collide
+        ([{"mac": "52:54:00:0c:01:01", "ip": "10.5.3.10", "name": "ctrl"},
+          {"mac": "52:54:00:0c:01:02", "ip": "10.5.3.11", "name": "CTRL"}],
+         "reserved twice"),
+        ([{"mac": "52-54-00-0c-01-01", "ip": "10.5.3.10"}], "malformed mac"),
+        ([{"mac": "5254000c0101", "ip": "10.5.3.10"}], "malformed mac"),
+        # a mapping instead of a list of mappings: the leading '-' was forgotten
+        ({"mac": "52:54:00:0c:01:01", "ip": "10.5.3.10"}, "must be a list"),
+        (["52:54:00:0c:01:01"], "must be a mapping"),
+    ])
+    def test_invalid_reservations_are_rejected(self, hosts, expected):
+        with pytest.raises(ValueError, match=expected):
+            self._net(hosts)
+
+
 class TestWriteXml:
 
     def test_writes_file_and_returns_absolute_path(self, tmp_path: Path):

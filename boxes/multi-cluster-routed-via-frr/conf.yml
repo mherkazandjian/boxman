@@ -181,6 +181,15 @@ clusters:
             range:
               start: '192.168.10.2'
               end: '192.168.10.254'
+            # pin a guest to a fixed address by its mac. the mac has to match
+            # the vm's network_adapters entry below, and the optional name
+            # becomes its dnsmasq hostname on this network. a reservation may
+            # sit inside the dynamic range -- dnsmasq excludes it from the pool
+            # either way -- but narrowing the range to leave room is clearer
+            #hosts:
+            #  - mac: '52:54:00:11:01:01'
+            #    name: app1
+            #    ip: '192.168.10.10'
         enable: True
         autostart: True
 
