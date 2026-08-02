@@ -11,9 +11,12 @@
     {% if dhcp_range_start and dhcp_range_end %}
       <range start='{{ dhcp_range_start }}' end='{{ dhcp_range_end }}'/>
     {% endif %}
-    {# libvirt's schema wants <range> before <host>, so this loop stays last #}
+    {# <range> first, then <host>: libvirt accepts either order but emits and
+       documents this one, so a dumpxml diff stays readable. the attributes are
+       escaped because the environment has no autoescape and a reservation name
+       is free-form config text #}
     {% for host in dhcp_hosts %}
-      <host mac='{{ host.mac }}'{% if 'name' in host %} name='{{ host.name }}'{% endif %} ip='{{ host.ip }}'/>
+      <host mac='{{ host.mac|e }}'{% if 'name' in host %} name='{{ host.name|e }}'{% endif %} ip='{{ host.ip|e }}'/>
     {% endfor %}
     </dhcp>
   {% endif %}
