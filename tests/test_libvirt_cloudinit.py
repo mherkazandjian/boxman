@@ -363,7 +363,15 @@ class TestVerificationFailureLeavesCleanState:
 
     def test_a_template_without_its_own_cloudinit_gets_the_default_marker(self, tmp_path: Path):
         # an implicit template synthesised from `base_image: oci://…` has
-        # nowhere to declare one, but it runs DEFAULT_USER_DATA, which writes
-        # this file at the end
+        # nowhere to declare one, but it runs DEFAULT_USER_DATA, whose last
+        # runcmd entry appends to this file
         t = _make_template(tmp_path)
         assert t.cloudinit_done_marker == DEFAULT_DONE_MARKER
+
+    def test_the_default_marker_is_written_last_not_early(self):
+        # write_files runs in the config stage, before runcmd: a marker from
+        # there would be found while the template was still being built
+        from boxman.providers.libvirt.cloudinit_presets import DEFAULT_USER_DATA
+        assert DEFAULT_DONE_MARKER not in DEFAULT_USER_DATA.split("runcmd:")[0]
+        last_runcmd = DEFAULT_USER_DATA.rstrip().splitlines()[-1]
+        assert DEFAULT_DONE_MARKER in last_runcmd, last_runcmd
