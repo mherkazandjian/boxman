@@ -238,10 +238,11 @@ def test_nft_forward_facts_ignores_nat_and_mangle():
         {"rule": {"family": "ip", "table": "mangle", "chain": "POSTROUTING",
                   "expr": [{"match": {"right": "virbr0"}}]}},
     )
-    rules, policy_drop, libvirt_table = checker.nft_forward_facts(doc)
+    rules, policy_drop, libvirt_table, parsed = checker.nft_forward_facts(doc)
     assert "virbr0" not in rules
     assert policy_drop is False
     assert libvirt_table is False
+    assert parsed is True
 
 
 def test_nft_forward_facts_collects_forward_chains_and_policy():
@@ -254,15 +255,27 @@ def test_nft_forward_facts_collects_forward_chains_and_policy():
         {"chain": {"family": "ip", "table": "filter", "name": "FORWARD",
                    "hook": "forward", "policy": "drop"}},
     )
-    rules, policy_drop, libvirt_table = checker.nft_forward_facts(doc)
+    rules, policy_drop, libvirt_table, parsed = checker.nft_forward_facts(doc)
+    assert parsed is True
     assert "virbr0" in rules
     assert policy_drop is True
     assert libvirt_table is True
 
 
 def test_nft_forward_facts_survives_garbage():
-    assert checker.nft_forward_facts("not json") == ("", False, False)
-    assert checker.nft_forward_facts("") == ("", False, False)
+    assert checker.nft_forward_facts("not json") == ("", False, False, False)
+    assert checker.nft_forward_facts("") == ("", False, False, False)
+
+
+def test_nft_forward_facts_reports_an_unrecognised_shape():
+    """Schema drift must read as "I did not understand", not as "no libvirt".
+
+    Silently returning empty facts would mark a healthy nftables host as
+    sharing docker's table and offer it a disruptive fix.
+    """
+    assert checker.nft_forward_facts('{"something_else": []}')[3] is False
+    assert checker.nft_forward_facts('{"nftables": []}')[3] is False
+    assert checker.nft_forward_facts("[]")[3] is False
 
 
 # --------------------------------------------------------------------------- #

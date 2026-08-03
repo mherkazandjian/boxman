@@ -194,10 +194,17 @@ def iptables_forward_facts(text):
 def nft_forward_facts(json_text):
     """Forward-hook facts from ``nft -j list ruleset`` output.
 
-    Returns ``(rules_text, policy_drop, libvirt_table)``: the serialised rules
-    of every base chain on the forward hook, whether any such chain drops by
-    default, and whether libvirt owns a table (proof that it is using the
-    nftables backend instead of sharing docker's).
+    Returns ``(rules_text, policy_drop, libvirt_table, parsed)``: the
+    serialised rules of every base chain on the forward hook, whether any such
+    chain drops by default, whether libvirt owns a table (proof that it is
+    using the nftables backend instead of sharing docker's), and whether the
+    output was understood at all.
+
+    ``parsed`` guards against schema drift.  If a future nft speaks a shape
+    this function does not recognise, every fact above comes back empty and
+    silently absent -- which would read as "libvirt is not using nftables" and
+    warn a perfectly healthy host.  Saying "I did not understand this" instead
+    keeps that failure honest.
 
     The JSON form is used rather than the human-readable listing because the
     latter cannot be scanned safely: it also contains nat and mangle, which
@@ -208,9 +215,11 @@ def nft_forward_facts(json_text):
     try:
         doc = json.loads(json_text)
     except (ValueError, TypeError):
-        return "", False, False
+        return "", False, False, False
 
     items = doc.get("nftables", []) if isinstance(doc, dict) else []
+    if not isinstance(items, list) or not items:
+        return "", False, False, False
     forward, policy_drop, libvirt_table = set(), False, False
     for item in items:
         if not isinstance(item, dict):
@@ -232,7 +241,7 @@ def nft_forward_facts(json_text):
         if isinstance(rule, dict) and (
                 rule.get("family"), rule.get("table"), rule.get("chain")) in forward:
             rules.append(json.dumps(rule, sort_keys=True))
-    return "\n".join(rules), policy_drop, libvirt_table
+    return "\n".join(rules), policy_drop, libvirt_table, True
 
 
 def forwarding_verdict(networks, evidence, docker_present, backend,
@@ -1009,11 +1018,14 @@ class Doctor(object):
 
         if have("nft"):
             rc, out = self._root_capture(["nft", "-j", "list", "ruleset"])
-            if rc == 0:
-                rules, drop, libvirt_table = nft_forward_facts(out)
+            rules, drop, libvirt_table, parsed = nft_forward_facts(out) \
+                if rc == 0 else ("", False, False, False)
+            if parsed:
                 evidence.append(rules)
                 policy_drop = policy_drop or drop
             else:
+                # ran but told us nothing we understood -- same standing as
+                # not having been allowed to look
                 complete_view = False
         else:
             complete_view = False
