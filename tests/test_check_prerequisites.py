@@ -185,7 +185,7 @@ def test_iptables_forward_facts_keeps_only_forward_rules():
         "-A FORWARD -i virbr0 -o eth0 -j ACCEPT\n"
         "-A OUTPUT -o virbr9 -j ACCEPT\n"
     )
-    rules, policy_drop = checker.iptables_forward_facts(text)
+    rules, _drop_rules, policy_drop = checker.iptables_forward_facts(text)
     assert "virbr0" in rules
     # an OUTPUT rule must never vouch for a bridge's forwarding
     assert "virbr9" not in rules
@@ -203,16 +203,16 @@ def test_iptables_forward_facts_ignores_orphaned_libvirt_chains():
         "-A FORWARD -j DOCKER-USER\n"
         "-A LIBVIRT_FWI -d 192.168.122.0/24 -o virbr0 -j ACCEPT\n"
     )
-    rules, _ = checker.iptables_forward_facts(orphaned)
+    rules, _, _ = checker.iptables_forward_facts(orphaned)
     assert "virbr0" not in rules
 
     wired = "-A FORWARD -j LIBVIRT_FWX\n" + orphaned
-    rules, _ = checker.iptables_forward_facts(wired)
+    rules, _, _ = checker.iptables_forward_facts(wired)
     assert "virbr0" in rules
 
 
 def test_iptables_forward_facts_accept_policy():
-    _, policy_drop = checker.iptables_forward_facts("-P FORWARD ACCEPT\n")
+    _, _, policy_drop = checker.iptables_forward_facts("-P FORWARD ACCEPT\n")
     assert policy_drop is False
 
 
@@ -238,33 +238,106 @@ def test_nft_forward_facts_ignores_nat_and_mangle():
         {"rule": {"family": "ip", "table": "mangle", "chain": "POSTROUTING",
                   "expr": [{"match": {"right": "virbr0"}}]}},
     )
-    rules, policy_drop, libvirt_table, parsed = checker.nft_forward_facts(doc)
+    rules, _drops, policy_drop, libvirt_table, parsed = checker.nft_forward_facts(doc)
     assert "virbr0" not in rules
     assert policy_drop is False
     assert libvirt_table is False
     assert parsed is True
 
 
-def test_nft_forward_facts_collects_forward_chains_and_policy():
-    doc = _nft(
+def _libvirt_ruleset(bridge="virbr0", filter_policy="accept"):
+    """A ruleset shaped like libvirt's actual nftables backend.
+
+    libvirt's `forward` base chain only jumps; the rules naming the bridge sit
+    in guest_cross / guest_input / guest_output one hop below it. A collector
+    that stops at base chains sees nothing and calls a healthy host wiped.
+    """
+    return _nft(
+        {"metainfo": {"version": "1.0.9"}},
         {"table": {"family": "ip", "name": "libvirt_network"}},
         {"chain": {"family": "ip", "table": "libvirt_network", "name": "forward",
-                   "hook": "forward", "policy": "accept"}},
+                   "type": "filter", "hook": "forward", "policy": "accept"}},
         {"rule": {"family": "ip", "table": "libvirt_network", "chain": "forward",
-                  "expr": [{"match": {"right": "virbr0"}}]}},
+                  "expr": [{"jump": {"target": "guest_cross"}}]}},
+        {"rule": {"family": "ip", "table": "libvirt_network", "chain": "forward",
+                  "expr": [{"jump": {"target": "guest_output"}}]}},
+        {"chain": {"family": "ip", "table": "libvirt_network", "name": "guest_cross"}},
+        {"chain": {"family": "ip", "table": "libvirt_network", "name": "guest_output"}},
+        {"rule": {"family": "ip", "table": "libvirt_network", "chain": "guest_output",
+                  "expr": [{"match": {"left": {"meta": {"key": "iifname"}},
+                                      "right": bridge}},
+                           {"accept": None}]}},
+        {"table": {"family": "ip", "name": "filter"}},
         {"chain": {"family": "ip", "table": "filter", "name": "FORWARD",
-                   "hook": "forward", "policy": "drop"}},
+                   "type": "filter", "hook": "forward", "policy": filter_policy}},
     )
-    rules, policy_drop, libvirt_table, parsed = checker.nft_forward_facts(doc)
+
+
+def test_nft_forward_facts_follows_jumps_into_libvirt_guest_chains():
+    """Regression: base chains alone find nothing on the nftables backend."""
+    rules, _drops, policy_drop, libvirt_table, parsed = checker.nft_forward_facts(
+        _libvirt_ruleset())
     assert parsed is True
-    assert "virbr0" in rules
-    assert policy_drop is True
     assert libvirt_table is True
+    assert "virbr0" in rules
+    assert policy_drop is False
+
+
+def test_nft_forward_facts_does_not_follow_jumps_across_tables():
+    """A same-named chain in another table must not be pulled in."""
+    doc = _nft(
+        {"table": {"family": "ip", "name": "filter"}},
+        {"chain": {"family": "ip", "table": "filter", "name": "FORWARD",
+                   "type": "filter", "hook": "forward", "policy": "drop"}},
+        {"rule": {"family": "ip", "table": "filter", "chain": "FORWARD",
+                  "expr": [{"jump": {"target": "shared"}}]}},
+        {"rule": {"family": "ip", "table": "filter", "chain": "shared",
+                  "expr": [{"match": {"right": "virbr0"}}]}},
+        {"table": {"family": "ip", "name": "other"}},
+        {"rule": {"family": "ip", "table": "other", "chain": "shared",
+                  "expr": [{"match": {"right": "virbr9"}}]}},
+    )
+    rules, _, _, _, _ = checker.nft_forward_facts(doc)
+    assert "virbr0" in rules
+    assert "virbr9" not in rules
+
+
+def test_nft_forward_facts_reads_a_base_chain_policy():
+    rules, _drops, policy_drop, _, parsed = checker.nft_forward_facts(
+        _libvirt_ruleset(filter_policy="drop"))
+    assert parsed is True
+    assert policy_drop is True
+
+
+# --------------------------------------------------------------------------- #
+# the two halves composed -- parser output fed to the verdict                 #
+# --------------------------------------------------------------------------- #
+def _verdict_for(ruleset, networks=None):
+    rules, drops, policy_drop, libvirt_table, _ = checker.nft_forward_facts(ruleset)
+    return checker.forwarding_verdict(
+        networks or [("default", "virbr0", True)], rules, True,
+        "nftables" if libvirt_table else "", policy_drop, drops)
+
+
+def test_healthy_nftables_host_is_not_called_wiped():
+    """The blocker, end to end: both halves done, nothing to report."""
+    status, detail, needs_fix = _verdict_for(_libvirt_ruleset())
+    assert status == checker.OK, detail
+    assert needs_fix is False
+
+
+def test_half_fixed_nftables_host_is_caught_end_to_end():
+    """Backend migrated but the DROP policy never cleared."""
+    status, detail, needs_fix = _verdict_for(_libvirt_ruleset(filter_policy="drop"))
+    assert status == checker.WARN
+    assert "cannot forward" in detail
+    assert "only the policy is left" in detail
+    assert needs_fix is True
 
 
 def test_nft_forward_facts_survives_garbage():
-    assert checker.nft_forward_facts("not json") == ("", False, False, False)
-    assert checker.nft_forward_facts("") == ("", False, False, False)
+    assert checker.nft_forward_facts("not json") == ("", "", False, False, False)
+    assert checker.nft_forward_facts("") == ("", "", False, False, False)
 
 
 def test_nft_forward_facts_reports_an_unrecognised_shape():
@@ -273,9 +346,9 @@ def test_nft_forward_facts_reports_an_unrecognised_shape():
     Silently returning empty facts would mark a healthy nftables host as
     sharing docker's table and offer it a disruptive fix.
     """
-    assert checker.nft_forward_facts('{"something_else": []}')[3] is False
-    assert checker.nft_forward_facts('{"nftables": []}')[3] is False
-    assert checker.nft_forward_facts("[]")[3] is False
+    assert checker.nft_forward_facts('{"something_else": []}')[4] is False
+    assert checker.nft_forward_facts('{"nftables": []}')[4] is False
+    assert checker.nft_forward_facts("[]")[4] is False
 
 
 # --------------------------------------------------------------------------- #
@@ -294,7 +367,7 @@ def test_forwarding_verdict_skips_when_nothing_is_forwarded():
 
 def test_forwarding_verdict_flags_wiped_rules():
     status, detail, needs_fix = checker.forwarding_verdict(
-        _NAT, _ABSENT, True, "", policy_drop=True)
+        _NAT, _ABSENT, True, "", policy_drop=True, drop_evidence=_ABSENT)
     assert status == checker.WARN
     assert needs_fix is True
     assert "default" in detail
@@ -314,7 +387,8 @@ def test_forwarding_verdict_flags_the_latent_case():
 
 def test_forwarding_verdict_notes_a_drop_policy():
     _, detail, _ = checker.forwarding_verdict(
-        _NAT, _PRESENT, True, "iptables", policy_drop=True)
+        _NAT, _PRESENT, True, "iptables", policy_drop=True,
+        drop_evidence=_PRESENT)
     assert "FORWARD policy is DROP" in detail
 
 
@@ -326,10 +400,11 @@ def test_forwarding_verdict_catches_the_half_fixed_host():
     rules are pristine and the guest is still dead.
     """
     status, detail, needs_fix = checker.forwarding_verdict(
-        _NAT, _PRESENT, True, "nftables", policy_drop=True)
+        _NAT, _PRESENT, True, "nftables", policy_drop=True, drop_evidence="")
     assert status == checker.WARN
     assert needs_fix is True
-    assert "still cannot forward" in detail
+    assert "cannot forward" in detail
+    assert "only the policy is left" in detail
 
 
 def test_forwarding_verdict_ok_once_both_halves_are_done():
@@ -432,3 +507,97 @@ def test_non_disruptive_fix_still_honours_yes(monkeypatch):
     doctor._handle_fix(result, lambda: (checker.OK, "installed", None))
 
     assert len(ran) == 1
+
+
+# --------------------------------------------------------------------------- #
+# _forwarding_fix command construction                                        #
+# --------------------------------------------------------------------------- #
+def _fix_doctor(monkeypatch, configured="", supported=True):
+    doctor = checker.Doctor.__new__(checker.Doctor)
+    monkeypatch.setattr(doctor, "_libvirt_fw_backend",
+                        lambda: (configured, supported), raising=False)
+    monkeypatch.setattr(doctor, "_libvirt_net_unit",
+                        lambda: "virtnetworkd", raising=False)
+    return doctor
+
+
+def test_fix_migrates_libvirt_before_touching_docker(monkeypatch):
+    """Ordering is a safety property, not a style choice.
+
+    The docker half ends in a docker restart -- the event that wipes the
+    shared table. Running it before libvirt has moved out means an abort at
+    any later step leaves a merely at-risk host actually broken.
+    """
+    fix = _fix_doctor(monkeypatch)._forwarding_fix("iptables", True)
+    joined = " | ".join(fix.commands)
+    assert joined.index("network.conf") < joined.index("daemon.json"), joined
+    assert joined.index("restart virtnetworkd") < joined.index("restart docker")
+    assert fix.disruptive is True
+
+
+def test_fix_reapplies_libvirt_rules_when_nothing_else_would(monkeypatch):
+    """Acute case with the backend already migrated.
+
+    Without a restart the guided fix "succeeds" and the re-probe still
+    reports the network as wiped.
+    """
+    doctor = _fix_doctor(monkeypatch, configured="nftables")
+    fix = doctor._forwarding_fix("nftables", True, wiped=True)
+    assert fix.commands[-1] == "sudo systemctl restart virtnetworkd"
+
+
+def test_fix_does_not_double_restart_when_migrating(monkeypatch):
+    fix = _fix_doctor(monkeypatch)._forwarding_fix("iptables", True, wiped=True)
+    assert fix.commands.count("sudo systemctl restart virtnetworkd") == 1
+
+
+def test_fix_offers_nothing_runnable_when_docker_is_not_the_cause(monkeypatch):
+    """A DROP policy with no docker means some other owner set it."""
+    doctor = _fix_doctor(monkeypatch, configured="nftables")
+    fix = doctor._forwarding_fix("nftables", False)
+    assert fix.commands == []
+    assert fix.disruptive is False
+    assert "find what set" in fix.description
+
+
+def test_fix_leaves_daemon_json_alone_without_a_docker_daemon(monkeypatch):
+    fix = _fix_doctor(monkeypatch)._forwarding_fix("iptables", False)
+    assert not any("daemon.json" in cmd for cmd in fix.commands)
+    assert any("network.conf" in cmd for cmd in fix.commands)
+
+
+def test_fix_appends_the_backend_with_a_leading_newline(monkeypatch):
+    """A network.conf with no trailing newline must not have lines fused."""
+    fix = _fix_doctor(monkeypatch)._forwarding_fix("iptables", False)
+    sed = next(cmd for cmd in fix.commands if "firewall_backend" in cmd)
+    assert '\\nfirewall_backend' in sed
+
+
+# --------------------------------------------------------------------------- #
+# open-mode networks                                                          #
+# --------------------------------------------------------------------------- #
+def test_open_mode_network_is_flagged_when_the_policy_drops():
+    """libvirt writes no rules for mode='open', so a DROP kills it outright."""
+    status, detail, needs_fix = checker.forwarding_verdict(
+        [("lab", "virbr7", False)], _ABSENT, False, "nftables",
+        policy_drop=True, drop_evidence=_ABSENT)
+    assert status == checker.WARN
+    assert "lab" in detail
+    assert "drops by default" in detail
+    assert needs_fix is True
+
+
+def test_open_mode_network_is_fine_when_something_accepts_it():
+    # the accept lives in the dropping chain itself, so the policy is moot --
+    # this is what boxman's own routed-network FORWARD rules look like
+    evidence = "-A FORWARD -i virbr7 -j ACCEPT"
+    status, detail, needs_fix = checker.forwarding_verdict(
+        [("lab", "virbr7", False)], evidence, False, "nftables",
+        policy_drop=True, drop_evidence=evidence)
+    assert status == checker.OK, detail
+    assert needs_fix is False
+
+
+def test_wiped_networks_ignores_networks_that_expect_no_rules():
+    nets = [("lab", "virbr7", False), ("default", "virbr0", True)]
+    assert checker.wiped_networks(nets, "") == ["default"]
