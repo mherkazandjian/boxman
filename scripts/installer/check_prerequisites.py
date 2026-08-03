@@ -164,7 +164,10 @@ def parse_firewall_backend(text):
     is a reliable signal that this build understands it.
     """
     match = re.search(r'^\s*firewall_backend\s*=\s*"?([a-z]+)"?', text, re.M)
-    return (match.group(1) if match else ""), ("firewall_backend" in text)
+    # anchored on a real declaration, set or commented out -- the bare word
+    # could appear in unrelated prose and would then claim false support
+    supported = re.search(r"^\s*#?\s*firewall_backend\s*=", text, re.M) is not None
+    return (match.group(1) if match else ""), supported
 
 
 def iptables_forward_facts(text):
@@ -932,15 +935,18 @@ class Doctor(object):
                 return True
         return False
 
-    def _forwarding_fix(self, backend):
+    def _forwarding_fix(self, backend, docker_manages):
         """Commands that take libvirt out of the table docker rebuilds.
 
         ``backend`` is the *effective* backend, so a host that already keeps
         libvirt in its own table is only offered the docker half.
+        ``docker_manages`` is the same signal the verdict used: offering to
+        edit /etc/docker/daemon.json and restart docker just because the
+        binary exists would contradict the reason we stopped trusting it.
         """
         configured, supported = self._libvirt_fw_backend()
         commands = []
-        if have("docker"):
+        if docker_manages:
             commands += [
                 "sudo cp -an /etc/docker/daemon.json "
                 "/etc/docker/daemon.json.boxman-bak 2>/dev/null || true",
@@ -1054,11 +1060,13 @@ class Doctor(object):
             # only a fallback, since libvirt >= 11 defaults to nftables with
             # the setting left unset.
             backend = "nftables" if libvirt_table else self._libvirt_fw_backend()[0]
+            docker_manages = self._docker_manages_firewall(evidence)
             status, detail, needs_fix = forwarding_verdict(
-                networks, evidence, self._docker_manages_firewall(evidence),
-                backend, policy_drop, complete_view)
-            return status, detail, (self._forwarding_fix(backend)
-                                    if needs_fix else None)
+                networks, evidence, docker_manages, backend, policy_drop,
+                complete_view)
+            return status, detail, (
+                self._forwarding_fix(backend, docker_manages)
+                if needs_fix else None)
 
         self.check("Host forwarding (docker/libvirt)", forwarding)
 

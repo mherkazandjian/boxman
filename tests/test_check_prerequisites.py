@@ -163,6 +163,18 @@ def test_parse_firewall_backend_absent_means_unsupported():
     assert checker.parse_firewall_backend("# some other option\n") == ("", False)
 
 
+def test_parse_firewall_backend_ignores_the_bare_word_in_prose():
+    """Support is inferred from a real declaration, not a mention.
+
+    The word can appear in unrelated prose (a changelog note, a comment about
+    another distro) and must not be read as "this build supports the option".
+    """
+    text = "# see the firewall_backend discussion upstream for context\n"
+    assert checker.parse_firewall_backend(text) == ("", False)
+    assert checker.parse_firewall_backend(
+        '#firewall_backend = "iptables"\n') == ("", True)
+
+
 # --------------------------------------------------------------------------- #
 # iptables_forward_facts                                                      #
 # --------------------------------------------------------------------------- #
