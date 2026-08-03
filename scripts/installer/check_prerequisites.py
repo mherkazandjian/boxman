@@ -986,9 +986,17 @@ class Doctor(object):
         description = ("give libvirt its own nftables table and stop docker "
                        "forcing FORWARD to DROP (a .boxman-bak backup is "
                        "written next to each file)")
-        if backend == "nftables":
+        if backend == "nftables" and docker_manages:
             description = ("stop docker forcing FORWARD to DROP -- libvirt "
                            "already has its own table")
+        elif backend == "nftables":
+            # nothing here to automate: docker is not the one dropping, so
+            # whatever set the policy (firewalld, a hand-rolled ruleset, an
+            # admin) has to be found before anything can be recommended
+            description = ("libvirt already has its own table; find what set "
+                           "the FORWARD policy to DROP -- `iptables -S FORWARD "
+                           "| head -1` and `nft list ruleset | grep -B5 'hook "
+                           "forward'` -- and let that owner accept the bridge")
         elif not supported:
             description += ("; this libvirt build has no firewall_backend "
                             "option, so only the docker half can be automated")
