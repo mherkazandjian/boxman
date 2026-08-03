@@ -499,6 +499,113 @@ the host before the first `compact` / `compress-snapshots`.
 Full reference, flag matrix, and troubleshooting:
 [doc/storage.md](doc/storage.md).
 
+## Advanced
+
+### Docker and libvirt fight over the same firewall table
+
+**Symptom.** Guests get an address and can reach the host, but nothing past it.
+Usually after a `systemctl restart docker`, a docker upgrade, or a reboot where
+docker happened to start last. It presents as a slow or flaky network rather
+than a firewall fault, because NAT keeps working and only forwarding is dead.
+
+**Cause.** Docker and libvirt both write the `filter` table. Docker rebuilds
+that table on every restart and leaves the FORWARD policy at `DROP`. libvirt's
+rules — and boxman's own routed-network `FORWARD` rules — are collateral
+damage, and nothing re-applies them.
+
+Every base chain on the forward hook is evaluated, and **a drop or reject in
+any one of them is final**; an accept only ends its own chain. libvirt's
+ACCEPTs therefore cannot rescue a packet that docker's policy drops:
+
+```text
+  guest ──▶ [ FORWARD HOOK ] ──▶ internet
+                   │
+                   ├─ ip filter FORWARD .............. policy DROP   ◀ docker
+                   │    -j DOCKER-USER      (empty)
+                   │    -j DOCKER-FORWARD
+                   │    LIBVIRT_FWI/FWO/FWX  ▓ empty, no jumps ▓  ◀ wiped
+                   │
+                   └─ ip6 filter FORWARD ............. policy accept
+
+                        verdict = DROP
+```
+
+The nat table usually survives, so `LIBVIRT_PRT` still MASQUERADEs happily.
+That mismatch is the tell.
+
+**Fix — stop sharing the table.** Two settings; both are required, and either
+one alone leaves the host broken in a different way.
+
+```text
+                   ├─ ip filter FORWARD .............. policy ACCEPT ◀ ip-forward-no-drop
+                   ├─ ip6 filter FORWARD ............. policy accept
+                   └─ ip libvirt_network forward ..... accept virbr* ◀ firewall_backend=nftables
+                        verdict = ACCEPT
+```
+
+```text
+  BEFORE                            AFTER
+  ┌ table ip filter ─────────┐      ┌ table ip filter ─────────┐
+  │  docker   ── rebuilds ───┼──╮   │  docker   ── rebuilds    │ harmless
+  │  libvirt  ── collateral ◀┼──╯   └──────────────────────────┘
+  └──────────────────────────┘      ┌ table ip libvirt_network ┐
+                                    │  libvirt  ── untouchable │
+                                    └──────────────────────────┘
+```
+
+```bash
+# 1. /etc/docker/daemon.json  ->  "ip-forward-no-drop": true
+sudo systemctl restart docker
+
+# 2. the flag stops docker *setting* DROP; it does not clear one it already
+#    set. This one-off reset is the step everyone misses:
+sudo iptables -P FORWARD ACCEPT
+
+# 3. /etc/libvirt/network.conf  ->  firewall_backend = "nftables"
+sudo systemctl restart virtnetworkd     # or libvirtd on monolithic builds
+```
+
+Verify:
+
+```bash
+nft list tables | grep libvirt          # libvirt now owns a private table
+sudo iptables -S FORWARD | head -1      # -P FORWARD ACCEPT
+sudo virsh net-destroy default && sudo virsh net-start default
+```
+
+Then the real test: a guest reaches the internet, and `systemctl restart
+docker` leaves it reachable.
+
+`python3 scripts/installer/check_prerequisites.py` detects both the acute case
+(rules already gone) and the latent one (still fine, but the next docker
+restart takes them), and offers these commands as a guided fix.
+
+**Three things worth internalising:**
+
+1. **This is not an iptables-vs-nftables problem.** On any modern distro
+   `iptables` is `iptables-nft` — docker's "iptables filter table" *is*
+   `table ip filter` in nftables. The fix is a **private table instead of a
+   shared one**, not a change of framework.
+2. **Rule order does not save you.** Being first in your own chain is
+   irrelevant when a different base chain at the same hook drops the packet.
+3. **firewalld is not the answer.** It does not relocate libvirt's rules and
+   does not touch docker's FORWARD policy, so it fixes neither half. libvirt
+   *does* re-apply its rules on firewalld's reload signal — but a docker
+   restart never emits one, so that recovery hook never fires. Enabling it
+   only adds a third forward-hook chain that ends in `reject`, which
+   everything then has to be zoned past.
+
+**Caveats.**
+
+- `ip-forward-no-drop` makes host-wide forwarding default-accept. On a box
+  routing guest subnets that is a deliberate posture change, not a free win.
+- Once libvirt's own rules are protected, boxman's routed-network `FORWARD`
+  rules are duplication. They are also what masks this fault — which is why
+  the breakage tends to look partial.
+- **This applies to the local runtime only.** Under `--runtime docker` the
+  libvirt container has its own network namespace, so its tables are already
+  isolated from the host's docker.
+
 ## Development
 
 ### Run boxman in development mode

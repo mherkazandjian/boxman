@@ -47,6 +47,17 @@ as usual. Fixes that add you to a group (e.g. `libvirt`, `kvm`, `docker`) are
 flagged as needing a logout/login before they take effect — re-run the checker
 afterwards to confirm.
 
+## Disruptive fixes
+
+A few fixes restart running services — the docker/libvirt forwarding fix
+restarts `docker` and `virtnetworkd`, briefly interrupting running containers
+and guest connectivity. Those are marked **disruptive**: they always ask for
+confirmation, **even under `--yes`**, so an unattended run can never bounce a
+container host. Decline one and it is reported in the summary as a manual step.
+
+Disruptive fixes write a `.boxman-bak` copy of every file they edit before
+changing it.
+
 ## What it checks
 
 - **Environment** — Python ≥ 3.10, `boxman` on PATH (+ active conda/venv), and
@@ -60,6 +71,13 @@ afterwards to confirm.
   tool, `sshpass`, `rsync`, the OpenSSH client, and your **sudo rights**
   (including the footgun where cleanup silently no-ops if `sudo qemu-img`/`rm`
   aren't passwordless).
+- **Host forwarding (docker/libvirt)** — whether docker has rebuilt the
+  iptables `filter` table out from under libvirt (and boxman's own
+  routed-network `FORWARD` rules), leaving guests that NAT but never forward.
+  Catches both the acute case (rules already gone) and the latent one (still
+  present, but the next `systemctl restart docker` takes them). The guided fix
+  gives libvirt its own nftables table and stops docker forcing `FORWARD` to
+  `DROP`. Background and diagrams: the **Advanced** section of the main README.
 - **Docker runtime** (when selected) — Docker Engine + Compose v2 reachable and
   `/dev/kvm` on the host.
 - **Optional features** — `ansible`, `zstd`, `virt-sparsify`, `oras`,
