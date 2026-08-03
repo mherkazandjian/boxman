@@ -336,8 +336,8 @@ def test_half_fixed_nftables_host_is_caught_end_to_end():
 
 
 def test_nft_forward_facts_survives_garbage():
-    assert checker.nft_forward_facts("not json") == ("", "", False, False, False)
-    assert checker.nft_forward_facts("") == ("", "", False, False, False)
+    assert checker.nft_forward_facts("not json") == ("", [], False, False, False)
+    assert checker.nft_forward_facts("") == ("", [], False, False, False)
 
 
 def test_nft_forward_facts_reports_an_unrecognised_shape():
@@ -601,3 +601,77 @@ def test_open_mode_network_is_fine_when_something_accepts_it():
 def test_wiped_networks_ignores_networks_that_expect_no_rules():
     nets = [("lab", "virbr7", False), ("default", "virbr0", True)]
     assert checker.wiped_networks(nets, "") == ["default"]
+
+
+# --------------------------------------------------------------------------- #
+# round-3 regressions                                                         #
+# --------------------------------------------------------------------------- #
+def test_each_dropping_chain_must_accept_the_bridge():
+    """An accept in one dropping chain cannot vouch past a second one.
+
+    Two independent default-drop forward chains (a hardened host plus docker):
+    the packet dies in whichever one has no accept for the bridge.
+    """
+    accepts = '-A FORWARD -i virbr0 -j ACCEPT'
+    status, detail, needs_fix = checker.forwarding_verdict(
+        _NAT, accepts, True, "nftables", policy_drop=True,
+        drop_evidence=[accepts, "-A FORWARD -j DOCKER-USER"])
+    assert status == checker.WARN, detail
+    assert needs_fix is True
+
+    # accepted in both -> genuinely safe
+    status, _, needs_fix = checker.forwarding_verdict(
+        _NAT, accepts, True, "nftables", policy_drop=True,
+        drop_evidence=[accepts, accepts])
+    assert status == checker.OK
+    assert needs_fix is False
+
+
+def test_nft_forward_facts_keeps_dropping_chains_separate():
+    doc = _nft(
+        {"table": {"family": "ip", "name": "filter"}},
+        {"chain": {"family": "ip", "table": "filter", "name": "FORWARD",
+                   "type": "filter", "hook": "forward", "policy": "drop"}},
+        {"rule": {"family": "ip", "table": "filter", "chain": "FORWARD",
+                  "expr": [{"match": {"right": "virbr0"}}]}},
+        {"table": {"family": "ip", "name": "hardened"}},
+        {"chain": {"family": "ip", "table": "hardened", "name": "fwd",
+                   "type": "filter", "hook": "forward", "policy": "drop"}},
+    )
+    _, drop_closures, policy_drop, _, _ = checker.nft_forward_facts(doc)
+    assert policy_drop is True
+    assert len(drop_closures) == 2
+    # one chain names the bridge, the other is empty -> not safe
+    assert any("virbr0" in closure for closure in drop_closures)
+    assert any("virbr0" not in closure for closure in drop_closures)
+
+
+def test_latent_host_on_old_libvirt_still_reapplies_rules(monkeypatch):
+    """A docker restart against the shared table wipes rules even when the
+    host was only *at risk* at the time the fix was built."""
+    doctor = _fix_doctor(monkeypatch, supported=False)
+    monkeypatch.setattr(doctor, "_docker_supports_no_drop", lambda: True,
+                        raising=False)
+    fix = doctor._forwarding_fix("iptables", docker_manages=True, wiped=False)
+    assert any("restart docker" in cmd for cmd in fix.commands)
+    assert fix.commands[-1] == "sudo systemctl restart virtnetworkd"
+
+
+def test_old_docker_engine_is_not_offered_the_daemon_json_edit(monkeypatch):
+    """dockerd refuses to start on an unknown directive -- writing it would
+    leave docker down, which is worse than the problem."""
+    doctor = _fix_doctor(monkeypatch, supported=False)
+    monkeypatch.setattr(doctor, "_docker_supports_no_drop", lambda: False,
+                        raising=False)
+    fix = doctor._forwarding_fix("iptables", docker_manages=True)
+    assert not any("daemon.json" in cmd for cmd in fix.commands)
+    assert not any("restart docker" in cmd for cmd in fix.commands)
+    assert "sudo iptables -P FORWARD ACCEPT" in fix.commands
+    assert "predates" in fix.description
+
+
+def test_fix_describes_no_docker_host_without_mentioning_docker(monkeypatch):
+    doctor = _fix_doctor(monkeypatch, supported=False)
+    fix = doctor._forwarding_fix("iptables", docker_manages=False, wiped=True)
+    assert fix.commands == ["sudo systemctl restart virtnetworkd"]
+    assert "docker" not in fix.description

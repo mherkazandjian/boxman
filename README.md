@@ -553,17 +553,29 @@ one alone leaves the host broken in a different way.
                                     └──────────────────────────┘
 ```
 
+Do them **in this order**. Step 2 restarts docker, which is the event that
+wipes the shared table — so move libvirt out first. Stopping halfway then
+costs you nothing you did not already have.
+
 ```bash
-# 1. /etc/docker/daemon.json  ->  "ip-forward-no-drop": true
+# 1. /etc/libvirt/network.conf  ->  firewall_backend = "nftables"
+sudo systemctl restart virtnetworkd     # or libvirtd on monolithic builds
+
+# 2. /etc/docker/daemon.json  ->  "ip-forward-no-drop": true
+#    Check the engine knows it first -- dockerd refuses to start on an
+#    unknown directive:  dockerd --help | grep ip-forward-no-drop
 sudo systemctl restart docker
 
-# 2. the flag stops docker *setting* DROP; it does not clear one it already
+# 3. the flag stops docker *setting* DROP; it does not clear one it already
 #    set. This one-off reset is the step everyone misses:
 sudo iptables -P FORWARD ACCEPT
-
-# 3. /etc/libvirt/network.conf  ->  firewall_backend = "nftables"
-sudo systemctl restart virtnetworkd     # or libvirtd on monolithic builds
+sudo ip6tables -P FORWARD ACCEPT        # docker manages v6 too
 ```
+
+If your libvirt is too old for `firewall_backend` (before 10.10), step 1 is
+unavailable: do steps 2–3 and then `sudo systemctl restart virtnetworkd` to
+put libvirt's rules back, and accept that a docker restart will keep removing
+them.
 
 Verify:
 
