@@ -26,6 +26,7 @@ Exit code: 0 when no blocking FAIL remains, 1 otherwise.
 """
 
 import argparse
+import json
 import os
 import platform
 import re
@@ -166,18 +167,82 @@ def parse_firewall_backend(text):
     return (match.group(1) if match else ""), ("firewall_backend" in text)
 
 
-def forwarding_verdict(networks, rules, docker_present, backend,
-                       complete_view=True):
+def iptables_forward_facts(text):
+    """Forward-relevant facts from ``iptables -S`` (filter table) output.
+
+    Returns ``(rules_text, policy_drop)``.  Only ``-A FORWARD`` lines count as
+    evidence, plus libvirt's own ``LIBVIRT_FW*`` chains -- and those only when
+    FORWARD still jumps into them, because a populated chain nothing jumps to
+    is inert.  Docker's rebuild removes the jumps, which is exactly the state
+    we must not mistake for a healthy one.
+    """
+    lines = [line.strip() for line in text.splitlines()]
+    jumped = any(re.match(r"-A FORWARD .*-j LIBVIRT_", line) for line in lines)
+    keep = []
+    for line in lines:
+        if re.match(r"-A FORWARD\b", line):
+            keep.append(line)
+        elif jumped and re.match(r"-A LIBVIRT_FW", line):
+            keep.append(line)
+    policy_drop = any(re.match(r"-P FORWARD DROP\b", line) for line in lines)
+    return "\n".join(keep), policy_drop
+
+
+def nft_forward_facts(json_text):
+    """Forward-hook facts from ``nft -j list ruleset`` output.
+
+    Returns ``(rules_text, policy_drop, libvirt_table)``: the serialised rules
+    of every base chain on the forward hook, whether any such chain drops by
+    default, and whether libvirt owns a table (proof that it is using the
+    nftables backend instead of sharing docker's).
+
+    The JSON form is used rather than the human-readable listing because the
+    latter cannot be scanned safely: it also contains nat and mangle, which
+    survive the very wipe we are looking for.  libvirt's mangle CHECKSUM rule
+    names the bridge, so a naive scan finds it and reports a dead network as
+    healthy.
+    """
+    try:
+        doc = json.loads(json_text)
+    except (ValueError, TypeError):
+        return "", False, False
+
+    items = doc.get("nftables", []) if isinstance(doc, dict) else []
+    forward, policy_drop, libvirt_table = set(), False, False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        table = item.get("table")
+        if isinstance(table, dict) and str(table.get("name", "")).startswith("libvirt"):
+            libvirt_table = True
+        chain = item.get("chain")
+        if isinstance(chain, dict) and chain.get("hook") == "forward":
+            forward.add((chain.get("family"), chain.get("table"), chain.get("name")))
+            if chain.get("policy") == "drop":
+                policy_drop = True
+
+    rules = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rule = item.get("rule")
+        if isinstance(rule, dict) and (
+                rule.get("family"), rule.get("table"), rule.get("chain")) in forward:
+            rules.append(json.dumps(rule, sort_keys=True))
+    return "\n".join(rules), policy_drop, libvirt_table
+
+
+def forwarding_verdict(networks, evidence, docker_present, backend,
+                       policy_drop=False, complete_view=True):
     """Grade the host forward path from facts already gathered.
 
-    ``networks`` is ``[(network_name, bridge_name), ...]`` for the active
-    NAT/routed libvirt networks; ``rules`` is the concatenated text of every
-    ruleset we managed to read (``iptables -S`` *and* ``nft list ruleset``).
-    ``complete_view`` is False when one of those could not be read -- a bridge
-    we then fail to find is reported as unconfirmed rather than wiped, because
-    libvirt's nftables backend keeps its rules in a private table and a checker
-    that could not look there must not claim they are gone.
-    Returns ``(status, detail, needs_fix)``.
+    ``networks`` is ``[(name, bridge, expects_rules), ...]`` for the active
+    libvirt networks that care about forwarding; ``expects_rules`` is False for
+    modes libvirt deliberately writes no rules for (``open``), which must not
+    be reported as wiped.  ``evidence`` is the forward-scoped rule text --
+    never a whole ruleset.  ``complete_view`` is False when part of the ruleset
+    could not be read, in which case a bridge we fail to find is reported as
+    unconfirmed rather than wiped.  Returns ``(status, detail, needs_fix)``.
 
     Docker and libvirt both write the ``filter`` table.  Docker rebuilds it on
     every restart and leaves the FORWARD policy at DROP; libvirt's rules -- and
@@ -188,12 +253,12 @@ def forwarding_verdict(networks, rules, docker_present, backend,
     forwarding is dead: it reads as a slow network, not a firewall fault.
     """
     if not networks:
-        return SKIP, "no active NAT/routed libvirt networks", False
+        return SKIP, "no active forwarding libvirt networks", False
 
     # Word-anchored, not a substring test: plain containment would let
     # virbr10's rules vouch for virbr1 and hide a genuinely wiped network.
-    wiped = [name for name, bridge in networks
-             if not re.search(r"\b%s\b" % re.escape(bridge), rules)]
+    wiped = [name for name, bridge, expects in networks
+             if expects and not re.search(r"\b%s\b" % re.escape(bridge), evidence)]
 
     if wiped and not complete_view:
         return INFO, ("part of the ruleset was unreadable, so the rules for %s "
@@ -206,16 +271,28 @@ def forwarding_verdict(networks, rules, docker_present, backend,
             detail += "\ndocker shares this table and rebuilds it on restart"
         return WARN, detail, True
 
+    # libvirt is safely in its own table, but a foreign DROP at the same hook
+    # still kills the packet. This is the half-fixed state: protecting the
+    # rules without clearing the policy changes nothing for the guest.
+    if backend == "nftables" and policy_drop:
+        return WARN, ("libvirt has its own table, but the FORWARD policy is "
+                      "DROP -- a drop in any table at the hook is final, so "
+                      "guests still cannot forward"), True
+
     if docker_present and backend != "nftables":
         detail = ("forwarding works now, but libvirt shares the filter table "
                   "with docker -- the next `systemctl restart docker` wipes "
                   "these rules")
-        if re.search(r"^-P FORWARD DROP", rules, re.M):
+        if policy_drop:
             detail += "\nFORWARD policy is DROP, so nothing survives the wipe"
         return WARN, detail, True
 
+    if not backend and not complete_view:
+        return INFO, ("rules are in place, but libvirt's firewall backend "
+                      "could not be determined from here"), False
+
     return OK, "forwarding rules present for: %s" % ", ".join(
-        name for name, _ in networks), False
+        name for name, _, _ in networks), False
 
 
 # --------------------------------------------------------------------------- #
@@ -357,8 +434,15 @@ class Doctor(object):
             self._remember_manual(result)
             return
 
-        # --yes deliberately does not cover disruptive fixes: bouncing a
-        # container host is not something an unattended run may decide.
+        # A disruptive fix needs a human at a terminal: --yes does not cover
+        # it, and neither does a piped "y" (`yes | check_prerequisites.py`).
+        # Bouncing a container host is not something an unattended run may
+        # decide for itself.
+        if fix.disruptive and not sys.stdin.isatty():
+            self._remember_manual(
+                result, note="needs a terminal to confirm; not run")
+            return
+
         auto = self.opts.yes and not fix.disruptive
         if not (auto or self._ask("       -> run the above now?")):
             self._remember_manual(result)
@@ -411,6 +495,14 @@ class Doctor(object):
             if rc != 0:
                 ok = False
                 print("       " + self.c("command exited with status %d" % rc, "yellow"))
+                if fix.disruptive:
+                    # Later commands restart services. Carrying on past a
+                    # failed edit would apply the disruption without the
+                    # change it was meant to accompany.
+                    print("       " + self.c(
+                        "stopping here; the remaining commands were not run",
+                        "yellow"))
+                    return False
         return ok
 
     # -- environment discovery --------------------------------------------- #
@@ -789,25 +881,28 @@ class Doctor(object):
     def _root_capture(self, args):
         """Run a root-only inspection command without ever prompting.
 
-        Returns ``(rc, text)``; rc 126 means "we were not allowed to look",
-        which callers surface as INFO -- a checker that cannot see must say so
-        rather than guess.
+        Returns ``(rc, text)``.  Any non-zero rc means "we did not get a
+        reliable answer" -- the caller must treat that as reduced visibility
+        rather than as evidence of absence.  No attempt is made to classify
+        sudo's refusal message: it is localised, so matching English text would
+        silently misbehave under any other locale.
         """
         if getattr(os, "geteuid", lambda: 1)() == 0:
             return run_capture(args)
         if not have("sudo"):
-            return 126, ""
-        rc, out = run_capture(["sudo", "-n"] + args)
-        if rc != 0 and re.search(r"password is required|terminal is required",
-                                 out, re.I):
-            return 126, ""
-        return rc, out
+            return 1, ""
+        return run_capture(["sudo", "-n"] + args)
 
     def _libvirt_net_unit(self):
         """The systemd unit that owns libvirt's network rules on this host."""
         for unit in ("virtnetworkd", "libvirtd"):
             if run_capture(["systemctl", "is-active", unit])[1].strip() == "active":
                 return unit
+        # a socket-activated virtnetworkd is idle, not absent; restarting
+        # libvirtd instead would fail outright on a modular install
+        if run_capture(["systemctl", "is-active",
+                        "virtnetworkd.socket"])[1].strip() == "active":
+            return "virtnetworkd"
         return "libvirtd"
 
     def _libvirt_fw_backend(self):
@@ -818,40 +913,53 @@ class Doctor(object):
         except OSError:
             return "", False
 
-    def _effective_fw_backend(self, rules):
-        """What libvirt is actually doing, not merely what is configured.
+    def _docker_manages_firewall(self, evidence):
+        """Is a docker daemon actually writing firewall rules here?
 
-        A libvirt-owned nft table is proof.  The config file is only a
-        fallback: libvirt >= 11 defaults to the nftables backend with the
-        setting left unset, so an empty ``firewall_backend`` means nothing on
-        its own.
+        The ``docker`` binary alone proves nothing -- it is also present as a
+        remote-only client and as podman's compatibility shim, neither of which
+        touches this host's tables.  Warning those hosts about "the next
+        `systemctl restart docker`" and offering to edit /etc/docker/daemon.json
+        is pure noise.
         """
-        if re.search(r"^table (?:ip|ip6|inet) libvirt", rules, re.M):
-            return "nftables"
-        return self._libvirt_fw_backend()[0]
+        if "DOCKER-USER" in evidence or "DOCKER-FORWARD" in evidence:
+            return True
+        if not have("docker"):
+            return False
+        for query in ("is-active", "is-enabled"):
+            if run_capture(["systemctl", query, "docker"])[1].strip() in (
+                    "active", "enabled"):
+                return True
+        return False
 
-    def _forwarding_fix(self):
-        """Commands that take libvirt out of the table docker rebuilds."""
-        backend, supported = self._libvirt_fw_backend()
+    def _forwarding_fix(self, backend):
+        """Commands that take libvirt out of the table docker rebuilds.
+
+        ``backend`` is the *effective* backend, so a host that already keeps
+        libvirt in its own table is only offered the docker half.
+        """
+        configured, supported = self._libvirt_fw_backend()
         commands = []
         if have("docker"):
             commands += [
-                "sudo cp -a /etc/docker/daemon.json "
+                "sudo cp -an /etc/docker/daemon.json "
                 "/etc/docker/daemon.json.boxman-bak 2>/dev/null || true",
+                # merge and restart are chained: if the merge fails, restarting
+                # docker would perform the very wipe this fix exists to prevent
                 "sudo python3 -c \"import json,pathlib;"
                 "p=pathlib.Path('/etc/docker/daemon.json');"
-                "d=json.loads(p.read_text() or '{}') if p.exists() else {};"
+                "d=json.loads(p.read_text().strip() or '{}') if p.exists() else {};"
                 "d['ip-forward-no-drop']=True;"
                 "p.parent.mkdir(parents=True,exist_ok=True);"
-                "p.write_text(json.dumps(d,indent=2))\"",
-                "sudo systemctl restart docker",
+                "p.write_text(json.dumps(d,indent=2))\""
+                " && sudo systemctl restart docker",
                 # the flag stops docker *setting* the policy; it does not clear
                 # one docker already set, so this one-off reset is required
                 "sudo iptables -P FORWARD ACCEPT",
             ]
         if supported and backend != "nftables":
             commands += [
-                "sudo cp -a /etc/libvirt/network.conf "
+                "sudo cp -an /etc/libvirt/network.conf "
                 "/etc/libvirt/network.conf.boxman-bak 2>/dev/null || true",
                 "sudo sh -c 'sed -i "
                 "\"/^[[:space:]]*firewall_backend[[:space:]]*=/d\" "
@@ -863,11 +971,48 @@ class Doctor(object):
         description = ("give libvirt its own nftables table and stop docker "
                        "forcing FORWARD to DROP (a .boxman-bak backup is "
                        "written next to each file)")
-        if not supported:
+        if backend == "nftables":
+            description = ("stop docker forcing FORWARD to DROP -- libvirt "
+                           "already has its own table")
+        elif not supported:
             description += ("; this libvirt build has no firewall_backend "
                             "option, so only the docker half can be automated")
         return Fix(description, commands, needs_sudo=True,
                    disruptive=bool(commands))
+
+    def _forward_evidence(self):
+        """Gather forward-scoped rules from both firewall views.
+
+        Returns ``(evidence, policy_drop, libvirt_table, complete_view)``.
+        Only rules on the forward hook are collected: scanning a whole ruleset
+        would let nat and mangle -- which survive a docker rebuild -- vouch for
+        filter rules that are long gone.
+        """
+        evidence, policy_drop, libvirt_table, complete_view = [], False, False, True
+
+        if have("iptables"):
+            rc, out = self._root_capture(["iptables", "-S"])
+            if rc == 0:
+                rules, drop = iptables_forward_facts(out)
+                evidence.append(rules)
+                policy_drop = policy_drop or drop
+            else:
+                complete_view = False
+        else:
+            complete_view = False
+
+        if have("nft"):
+            rc, out = self._root_capture(["nft", "-j", "list", "ruleset"])
+            if rc == 0:
+                rules, drop, libvirt_table = nft_forward_facts(out)
+                evidence.append(rules)
+                policy_drop = policy_drop or drop
+            else:
+                complete_view = False
+        else:
+            complete_view = False
+
+        return "\n".join(evidence), policy_drop, libvirt_table, complete_view
 
     def _check_host_forwarding(self):
         """Report whether libvirt's forwarding rules are intact -- see
@@ -885,38 +1030,35 @@ class Doctor(object):
             for name in [n.strip() for n in out.splitlines() if n.strip()]:
                 rc, xml = run_capture(
                     ["virsh", "-c", "qemu:///system", "net-dumpxml", name])
-                if rc != 0 or not re.search(
-                        r"<forward[^>]*mode=['\"](nat|route)", xml):
+                if rc != 0:
                     continue
+                mode = re.search(r"<forward[^>]*mode=['\"](nat|route|open)", xml)
                 bridge = re.search(r"<bridge[^>]*name=['\"]([^'\"]+)", xml)
-                if bridge:
-                    networks.append((name, bridge.group(1)))
+                if mode and bridge:
+                    # 'open' means libvirt deliberately writes no rules, so its
+                    # bridge must not be judged against the ruleset -- but the
+                    # host's forward policy still decides whether it works
+                    networks.append((name, bridge.group(1),
+                                     mode.group(1) != "open"))
             if not networks:
-                return SKIP, "no active NAT/routed libvirt networks", None
+                return SKIP, "no active forwarding libvirt networks", None
 
-            # Both must be consulted: docker and boxman write the iptables
-            # filter table, while libvirt's nftables backend keeps its rules in
-            # a private table that `iptables -S` cannot see.
-            texts, complete_view = [], True
-            for args in (["iptables", "-S"], ["nft", "list", "ruleset"]):
-                if not have(args[0]):
-                    complete_view = False
-                    continue
-                rc, out = self._root_capture(args)
-                if rc == 0:
-                    texts.append(out)
-                else:
-                    complete_view = False
-            if not texts:
+            evidence, policy_drop, libvirt_table, complete_view = \
+                self._forward_evidence()
+            if not evidence and not complete_view:
                 return INFO, ("cannot read the firewall ruleset without "
                               "passwordless sudo; re-run as root to include "
                               "this check"), None
 
-            rules = "\n".join(texts)
+            # A live libvirt table is proof of the backend; the config file is
+            # only a fallback, since libvirt >= 11 defaults to nftables with
+            # the setting left unset.
+            backend = "nftables" if libvirt_table else self._libvirt_fw_backend()[0]
             status, detail, needs_fix = forwarding_verdict(
-                networks, rules, "DOCKER-USER" in rules or have("docker"),
-                self._effective_fw_backend(rules), complete_view)
-            return status, detail, (self._forwarding_fix() if needs_fix else None)
+                networks, evidence, self._docker_manages_firewall(evidence),
+                backend, policy_drop, complete_view)
+            return status, detail, (self._forwarding_fix(backend)
+                                    if needs_fix else None)
 
         self.check("Host forwarding (docker/libvirt)", forwarding)
 

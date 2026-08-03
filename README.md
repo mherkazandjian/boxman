@@ -582,10 +582,11 @@ restart takes them), and offers these commands as a guided fix.
 
 **Three things worth internalising:**
 
-1. **This is not an iptables-vs-nftables problem.** On any modern distro
-   `iptables` is `iptables-nft` — docker's "iptables filter table" *is*
-   `table ip filter` in nftables. The fix is a **private table instead of a
-   shared one**, not a change of framework.
+1. **This is not an iptables-vs-nftables problem.** On most current distros
+   `iptables` is `iptables-nft` (check with `iptables --version`, which then
+   reports `(nf_tables)`) — docker's "iptables filter table" *is* `table ip
+   filter` in nftables. The fix is a **private table instead of a shared
+   one**, not a change of framework.
 2. **Rule order does not save you.** Being first in your own chain is
    irrelevant when a different base chain at the same hook drops the packet.
 3. **firewalld is not the answer.** It does not relocate libvirt's rules and

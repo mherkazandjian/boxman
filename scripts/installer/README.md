@@ -51,12 +51,19 @@ afterwards to confirm.
 
 A few fixes restart running services — the docker/libvirt forwarding fix
 restarts `docker` and `virtnetworkd`, briefly interrupting running containers
-and guest connectivity. Those are marked **disruptive**: they always ask for
-confirmation, **even under `--yes`**, so an unattended run can never bounce a
-container host. Decline one and it is reported in the summary as a manual step.
+and guest connectivity. Those are marked **disruptive** and require a human at
+a terminal:
 
-Disruptive fixes write a `.boxman-bak` copy of every file they edit before
-changing it.
+- `--yes` does not cover them.
+- Neither does a piped answer (`yes | check_prerequisites.py --yes`) — without
+  a tty they are declined outright, not prompted.
+- If one of their commands fails, the remaining commands are **not** run, so a
+  failed config edit is never followed by the service restart it was meant to
+  accompany.
+
+Decline one and it is reported in the summary as a manual step. Disruptive
+fixes write a `.boxman-bak` copy of every file they edit, and never overwrite
+an existing backup.
 
 ## What it checks
 

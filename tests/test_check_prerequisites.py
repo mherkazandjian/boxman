@@ -164,28 +164,112 @@ def test_parse_firewall_backend_absent_means_unsupported():
 
 
 # --------------------------------------------------------------------------- #
+# iptables_forward_facts                                                      #
+# --------------------------------------------------------------------------- #
+def test_iptables_forward_facts_keeps_only_forward_rules():
+    text = (
+        "-P FORWARD DROP\n"
+        "-A INPUT -i lo -j ACCEPT\n"
+        "-A FORWARD -i virbr0 -o eth0 -j ACCEPT\n"
+        "-A OUTPUT -o virbr9 -j ACCEPT\n"
+    )
+    rules, policy_drop = checker.iptables_forward_facts(text)
+    assert "virbr0" in rules
+    # an OUTPUT rule must never vouch for a bridge's forwarding
+    assert "virbr9" not in rules
+    assert policy_drop is True
+
+
+def test_iptables_forward_facts_ignores_orphaned_libvirt_chains():
+    """A populated chain nothing jumps to is inert.
+
+    Docker's rebuild removes the FORWARD jumps but leaves the LIBVIRT_FW*
+    chains behind, so counting their contents would call a dead host healthy.
+    """
+    orphaned = (
+        "-P FORWARD DROP\n"
+        "-A FORWARD -j DOCKER-USER\n"
+        "-A LIBVIRT_FWI -d 192.168.122.0/24 -o virbr0 -j ACCEPT\n"
+    )
+    rules, _ = checker.iptables_forward_facts(orphaned)
+    assert "virbr0" not in rules
+
+    wired = "-A FORWARD -j LIBVIRT_FWX\n" + orphaned
+    rules, _ = checker.iptables_forward_facts(wired)
+    assert "virbr0" in rules
+
+
+def test_iptables_forward_facts_accept_policy():
+    _, policy_drop = checker.iptables_forward_facts("-P FORWARD ACCEPT\n")
+    assert policy_drop is False
+
+
+# --------------------------------------------------------------------------- #
+# nft_forward_facts                                                           #
+# --------------------------------------------------------------------------- #
+def _nft(*items):
+    import json as _json
+    return _json.dumps({"nftables": list(items)})
+
+
+def test_nft_forward_facts_ignores_nat_and_mangle():
+    """The regression that made the acute case undetectable.
+
+    libvirt's mangle CHECKSUM rule names the bridge and survives a docker
+    rebuild, so scanning the whole ruleset finds the bridge on a host whose
+    forwarding is dead.
+    """
+    doc = _nft(
+        {"table": {"family": "ip", "name": "mangle"}},
+        {"chain": {"family": "ip", "table": "mangle", "name": "POSTROUTING",
+                   "hook": "postrouting", "policy": "accept"}},
+        {"rule": {"family": "ip", "table": "mangle", "chain": "POSTROUTING",
+                  "expr": [{"match": {"right": "virbr0"}}]}},
+    )
+    rules, policy_drop, libvirt_table = checker.nft_forward_facts(doc)
+    assert "virbr0" not in rules
+    assert policy_drop is False
+    assert libvirt_table is False
+
+
+def test_nft_forward_facts_collects_forward_chains_and_policy():
+    doc = _nft(
+        {"table": {"family": "ip", "name": "libvirt_network"}},
+        {"chain": {"family": "ip", "table": "libvirt_network", "name": "forward",
+                   "hook": "forward", "policy": "accept"}},
+        {"rule": {"family": "ip", "table": "libvirt_network", "chain": "forward",
+                  "expr": [{"match": {"right": "virbr0"}}]}},
+        {"chain": {"family": "ip", "table": "filter", "name": "FORWARD",
+                   "hook": "forward", "policy": "drop"}},
+    )
+    rules, policy_drop, libvirt_table = checker.nft_forward_facts(doc)
+    assert "virbr0" in rules
+    assert policy_drop is True
+    assert libvirt_table is True
+
+
+def test_nft_forward_facts_survives_garbage():
+    assert checker.nft_forward_facts("not json") == ("", False, False)
+    assert checker.nft_forward_facts("") == ("", False, False)
+
+
+# --------------------------------------------------------------------------- #
 # forwarding_verdict                                                          #
 # --------------------------------------------------------------------------- #
-_HEALTHY = (
-    "-P FORWARD ACCEPT\n"
-    "-A FORWARD -i virbr0 -o virbr0 -j ACCEPT\n"
-)
-_WIPED = (
-    "-P FORWARD DROP\n"
-    "-A FORWARD -j DOCKER-USER\n"
-    "-A FORWARD -j DOCKER-FORWARD\n"
-)
+_PRESENT = '-A FORWARD -i virbr0 -o eth0 -j ACCEPT'
+_ABSENT = '-A FORWARD -j DOCKER-USER'
+_NAT = [("default", "virbr0", True)]
 
 
 def test_forwarding_verdict_skips_when_nothing_is_forwarded():
-    status, _, needs_fix = checker.forwarding_verdict([], _WIPED, True, "")
+    status, _, needs_fix = checker.forwarding_verdict([], _ABSENT, True, "")
     assert status == checker.SKIP
     assert needs_fix is False
 
 
 def test_forwarding_verdict_flags_wiped_rules():
     status, detail, needs_fix = checker.forwarding_verdict(
-        [("default", "virbr0")], _WIPED, True, "")
+        _NAT, _ABSENT, True, "", policy_drop=True)
     assert status == checker.WARN
     assert needs_fix is True
     assert "default" in detail
@@ -196,74 +280,130 @@ def test_forwarding_verdict_flags_wiped_rules():
 def test_forwarding_verdict_flags_the_latent_case():
     """Rules are present, but they live in the table docker rebuilds."""
     status, detail, needs_fix = checker.forwarding_verdict(
-        [("default", "virbr0")], _HEALTHY, True, "iptables")
+        _NAT, _PRESENT, True, "iptables")
     assert status == checker.WARN
     assert needs_fix is True
     assert "wipes these rules" in detail
-    # policy is ACCEPT here, so the extra DROP warning must not appear
     assert "FORWARD policy is DROP" not in detail
 
 
 def test_forwarding_verdict_notes_a_drop_policy():
-    rules = _HEALTHY.replace("-P FORWARD ACCEPT", "-P FORWARD DROP")
     _, detail, _ = checker.forwarding_verdict(
-        [("default", "virbr0")], rules, True, "iptables")
+        _NAT, _PRESENT, True, "iptables", policy_drop=True)
     assert "FORWARD policy is DROP" in detail
 
 
-def test_forwarding_verdict_ok_once_libvirt_owns_its_table():
+def test_forwarding_verdict_catches_the_half_fixed_host():
+    """libvirt in its own table is not enough while a foreign chain drops.
+
+    This is the state the README calls out as "the step everyone misses":
+    firewall_backend switched, `iptables -P FORWARD ACCEPT` never run. The
+    rules are pristine and the guest is still dead.
+    """
+    status, detail, needs_fix = checker.forwarding_verdict(
+        _NAT, _PRESENT, True, "nftables", policy_drop=True)
+    assert status == checker.WARN
+    assert needs_fix is True
+    assert "still cannot forward" in detail
+
+
+def test_forwarding_verdict_ok_once_both_halves_are_done():
     status, _, needs_fix = checker.forwarding_verdict(
-        [("default", "virbr0")], _HEALTHY, True, "nftables")
+        _NAT, _PRESENT, True, "nftables", policy_drop=False)
     assert status == checker.OK
     assert needs_fix is False
 
 
 def test_forwarding_verdict_ok_without_docker():
     status, _, needs_fix = checker.forwarding_verdict(
-        [("default", "virbr0")], _HEALTHY, False, "")
+        _NAT, _PRESENT, False, "iptables")
     assert status == checker.OK
     assert needs_fix is False
 
 
 def test_forwarding_verdict_will_not_cry_wolf_on_a_partial_view():
-    """Unreadable ruleset => "unknown", never "wiped".
-
-    libvirt's nftables backend keeps its rules in a private table. If we could
-    not read it, their absence from `iptables -S` proves nothing.
-    """
+    """Unreadable ruleset => "unknown", never "wiped"."""
     status, detail, needs_fix = checker.forwarding_verdict(
-        [("default", "virbr0")], _WIPED, True, "", complete_view=False)
+        _NAT, _ABSENT, True, "", complete_view=False)
     assert status == checker.INFO
     assert needs_fix is False
     assert "could not be confirmed" in detail
 
 
-def test_forwarding_verdict_accepts_rules_from_the_nft_table():
-    """Rules found in libvirt's own nft table count as present."""
-    rules = (
-        "-P FORWARD DROP\n"
-        "-A FORWARD -j DOCKER-USER\n"
-        'table ip libvirt_network {\n'
-        '  chain forward {\n'
-        '    iifname "virbr0" accept\n'
-        "  }\n"
-        "}\n"
-    )
+def test_forwarding_verdict_reports_an_undetermined_backend():
+    status, detail, needs_fix = checker.forwarding_verdict(
+        _NAT, _PRESENT, False, "", complete_view=False)
+    assert status == checker.INFO
+    assert needs_fix is False
+    assert "backend could not be determined" in detail
+
+
+def test_forwarding_verdict_open_mode_is_never_called_wiped():
+    """libvirt writes no rules for mode='open'; absence proves nothing."""
     status, _, needs_fix = checker.forwarding_verdict(
-        [("default", "virbr0")], rules, True, "nftables")
+        [("lab", "virbr7", False)], _ABSENT, False, "nftables")
     assert status == checker.OK
     assert needs_fix is False
 
 
 def test_forwarding_verdict_bridge_match_is_not_a_substring():
-    """virbr10's rules must not vouch for virbr1.
-
-    Plain containment would report virbr1 as healthy here and hide a network
-    with no rules at all.
-    """
-    rules = "-P FORWARD DROP\n-A FORWARD -i virbr10 -o virbr10 -j ACCEPT\n"
+    """virbr10's rules must not vouch for virbr1."""
+    evidence = "-A FORWARD -i virbr10 -o virbr10 -j ACCEPT"
     status, detail, needs_fix = checker.forwarding_verdict(
-        [("lab", "virbr1")], rules, True, "")
+        [("lab", "virbr1", True)], evidence, True, "")
     assert status == checker.WARN
     assert needs_fix is True
     assert "lab" in detail
+
+
+# --------------------------------------------------------------------------- #
+# disruptive fixes are never applied unattended                               #
+# --------------------------------------------------------------------------- #
+class _Opts(object):
+    def __init__(self, yes=True, check_only=False):
+        self.yes = yes
+        self.check_only = check_only
+        self.runtime = "local"
+        self.verbose = False
+
+
+def _doctor(monkeypatch, stdin_isatty):
+    monkeypatch.setattr(checker.sys.stdin, "isatty", lambda: stdin_isatty,
+                        raising=False)
+    doctor = checker.Doctor.__new__(checker.Doctor)
+    doctor.opts = _Opts()
+    doctor.results = []
+    doctor.manual_steps = []
+    doctor.relogin_needed = False
+    doctor.use_color = False
+    doctor.interactive = True          # --yes implies this
+    return doctor
+
+
+def test_disruptive_fix_is_not_run_by_yes_without_a_terminal(monkeypatch):
+    """`yes | check_prerequisites.py --yes` must not bounce a container host."""
+    doctor = _doctor(monkeypatch, stdin_isatty=False)
+    ran = []
+    monkeypatch.setattr(doctor, "_run_fix", lambda fix: ran.append(fix) or True)
+    monkeypatch.setattr(doctor, "_ask", lambda prompt: pytest.fail(
+        "must not even ask without a terminal"))
+
+    fix = checker.Fix("restart docker", ["sudo systemctl restart docker"],
+                      disruptive=True)
+    result = checker.Result("Host forwarding", checker.WARN, "", fix)
+    doctor._handle_fix(result, lambda: (checker.WARN, "", fix))
+
+    assert ran == []
+    assert any("needs a terminal" in step for step in doctor.manual_steps)
+
+
+def test_non_disruptive_fix_still_honours_yes(monkeypatch):
+    doctor = _doctor(monkeypatch, stdin_isatty=False)
+    ran = []
+    monkeypatch.setattr(doctor, "_run_fix", lambda fix: ran.append(fix) or True)
+
+    fix = checker.Fix("install sshpass", ["sudo pacman -S sshpass"])
+    result = checker.Result("sshpass", checker.FAIL, "", fix)
+    doctor._handle_fix(result, lambda: (checker.OK, "installed", None))
+
+    assert len(ran) == 1
