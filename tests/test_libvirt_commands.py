@@ -153,3 +153,65 @@ class TestCallSiteAudit:
                           return_value=_result(stdout=blklist)):
             args = sm._cdrom_diskspec_args("vm01")
         assert args == ["--diskspec", "hdc,snapshot=no"]
+
+
+class TestSharedDockerExecWrap:
+    """One docker-exec wrap implementation shared by the runtime and the
+    libvirt command layer (#85 item 9)."""
+
+    def test_both_paths_produce_identical_output(self):
+        from boxman.runtime.docker_compose import (
+            DockerComposeRuntime,
+            docker_exec_wrap,
+        )
+        cmd = "virsh -c qemu:///system domstate 'vm 01'"
+        container = "boxman-libvirt-proj"
+
+        rt = DockerComposeRuntime(config={"runtime_container": container})
+        via_runtime = rt.wrap_command(cmd)
+
+        v = VirshCommand(provider_config={
+            "runtime": "docker-compose",
+            "runtime_container": container,
+        })
+        via_command_layer = v._wrap_for_runtime(cmd)
+
+        assert via_runtime == via_command_layer == docker_exec_wrap(cmd, container)
+        expected_escaped = cmd.replace("'", "'\\''")
+        assert via_runtime == (
+            f"docker exec --user root {container} bash -c '{expected_escaped}'"
+        )
+
+    def test_single_quotes_escaped_identically(self):
+        from boxman.runtime.docker_compose import (
+            DockerComposeRuntime,
+            docker_exec_wrap,
+        )
+        cmd = "echo 'a' && echo 'b'"
+        rt = DockerComposeRuntime(config={"runtime_container": "c"})
+        v = VirshCommand(provider_config={
+            "runtime": "docker-compose", "runtime_container": "c"})
+        assert rt.wrap_command(cmd) == v._wrap_for_runtime(cmd) \
+            == docker_exec_wrap(cmd, "c")
+
+    def test_missing_container_is_hard_error(self):
+        # used to silently fall back to 'boxman-libvirt-default', exec'ing
+        # into the wrong container
+        import pytest
+
+        from boxman.exceptions import ConfigError
+        v = VirshCommand(provider_config={"runtime": "docker-compose"})
+        with pytest.raises(ConfigError, match="runtime_container"):
+            v._wrap_for_runtime("virsh list --all")
+
+    def test_missing_container_raises_through_execute(self):
+        import pytest
+
+        from boxman.exceptions import ConfigError
+        v = VirshCommand(provider_config={"runtime": "docker-compose"})
+        with pytest.raises(ConfigError):
+            v.execute("list", "--all")
+
+    def test_local_runtime_needs_no_container(self):
+        v = VirshCommand(provider_config={"runtime": "local"})
+        assert v._wrap_for_runtime("virsh list") == "virsh list"
