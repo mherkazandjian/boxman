@@ -40,32 +40,35 @@ Cisco Modeling Labs / Enterprise Agreement are the usual paths.
 
   ```bash
   git clone https://github.com/srl-labs/vrnetlab.git
-  cd vrnetlab/cisco/vios_l2
+  cd vrnetlab/cisco/vios
   ```
 
-**3. Copy the qcow2 into the vios_l2 directory and build.**
+**3. Copy the qcow2 into the `cisco/vios` directory and build.**
 
-  vrnetlab's Makefile derives the image tag from the qcow2 filename,
-  so rename the file to encode the version cleanly first.
+  srl-labs/vrnetlab builds both the router and the L2 switch from this
+  one directory and auto-selects the switch personality from a
+  `vios_l2` filename. The Makefile derives the image tag from the
+  filename, so keep the `vios_l2-` prefix and a clean date/version.
 
   ```bash
-  # rename to make the version unambiguous
+  # keep the vios_l2 prefix so the build detects the L2 switch;
+  # the trailing date becomes the image tag (L2-<date>)
   cp /path/to/vios_l2-adventerprisek9-m.SSA.high_iron_20200929.qcow2 \
-     vios_l2-15.2.2020T.qcow2
+     vios_l2-20200929.qcow2
 
   # build the vrnetlab container (takes a few minutes; boots the qcow2
   # once to snapshot the post-init state)
   make
 
   # verify
-  docker images | grep cisco_vios_l2
-  # vrnetlab/cisco_vios_l2   15.2.2020T   <id>   <time>   ~600MB
+  docker images | grep cisco_vios
+  # vrnetlab/cisco_vios   L2-20200929   <id>   <time>   ~600MB
   ```
 
-  If your build tags the image differently (say `vrnetlab/vr-iosvl2`),
-  update `containerlab.topology.nodes.sw1.image` in `conf.yml` to
-  match. Containerlab's kind for this image is `cisco_vios_l2`
-  regardless of tag.
+  If your build tags the image differently, update
+  `containerlab.topology.nodes.sw1.image` in `conf.yml` to match.
+  Containerlab's kind for this image is `cisco_vios` with
+  `type: switch` (there is no `cisco_vios_l2` kind), regardless of tag.
 
 **4. Smoke-test the image with containerlab alone.**
 
@@ -78,8 +81,9 @@ Cisco Modeling Labs / Enterprise Agreement are the usual paths.
   topology:
     nodes:
       sw1:
-        kind: cisco_vios_l2
-        image: vrnetlab/cisco_vios_l2:15.2.2020T
+        kind: cisco_vios
+        type: switch
+        image: vrnetlab/cisco_vios:L2-20200929
   EOF
 
   sudo containerlab deploy -t /tmp/iosvl2-smoke.clab.yml

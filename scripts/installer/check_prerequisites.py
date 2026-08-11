@@ -26,6 +26,7 @@ Exit code: 0 when no blocking FAIL remains, 1 otherwise.
 """
 
 import argparse
+import json
 import os
 import platform
 import re
@@ -90,40 +91,119 @@ def classify_family(osid, id_like):
         return "debian"
     if tokens & {"rhel", "fedora", "centos", "rocky", "almalinux", "ol", "oracle"}:
         return "rhel"
+    if tokens & {"nixos"}:
+        return "nixos"
+    if tokens & {"guix"}:  # ID=guix is always Guix System
+        return "guix"
+    if tokens & {"gentoo"}:
+        return "gentoo"
     return "unknown"
 
 
 # Verbatim per-distro core stack lines (from doc/tutorial/README.md), minus the
 # systemctl/usermod steps which the checker handles as their own fixes.
+#
+# Only *imperative* package-manager distros belong here. NixOS and Guix System
+# are declarative: their libvirt/QEMU stack and the libvirtd service are enabled
+# by editing the system config and rebuilding, never by an imperative "install"
+# command -- see _NIXOS_CORE_ADVICE / _GUIX_CORE_ADVICE, which the core-tools
+# check emits as advisory (printed, never auto-run) fixes instead.
+#
+# Gentoo USE-flag caveats: app-emulation/qemu needs QEMU_SOFTMMU_TARGETS to
+# include x86_64 (e.g. QEMU_SOFTMMU_TARGETS="x86_64") to build qemu-system-x86_64;
+# app-emulation/libvirt needs USE="virt-network qemu" for the QEMU/KVM driver and
+# the default NAT network. virt-install / virt-clone ship in
+# app-emulation/virt-manager. Services are systemd or OpenRC depending on the
+# profile (OpenRC: `rc-update add libvirtd default && rc-service libvirtd start`).
 _CORE_STACK = {
     "arch": "sudo pacman -S --needed libvirt qemu-full virt-install sshpass dnsmasq",
     "debian": ("sudo apt update && sudo apt install -y libvirt-daemon-system "
                "libvirt-clients qemu-kvm virtinst sshpass bridge-utils cloud-image-utils"),
     "rhel": "sudo dnf install -y libvirt qemu-kvm virt-install sshpass genisoimage",
+    "gentoo": ("sudo emerge --ask app-emulation/libvirt app-emulation/qemu "
+               "app-emulation/virt-manager net-dns/dnsmasq app-admin/sudo"),
 }
 
-# Package name for a cloud-init seed-ISO tool, per family.
-_SEED_PKG = {"arch": "libisoburn", "debian": "cloud-image-utils", "rhel": "genisoimage"}
+# Declarative core-stack remediation for NixOS: printed as advisory text, never
+# offered to auto-run (a Fix with no runnable commands).
+_NIXOS_CORE_ADVICE = (
+    "NixOS is declarative -- enable the libvirt/QEMU stack in "
+    "/etc/nixos/configuration.nix:\n"
+    "virtualisation.libvirtd.enable = true;\n"
+    "programs.virt-manager.enable = true;\n"
+    "environment.systemPackages = with pkgs; [ virt-manager qemu cloud-utils ];\n"
+    "users.users.<you>.extraGroups = [ \"libvirtd\" \"kvm\" ];\n"
+    "then apply with: sudo nixos-rebuild switch"
+)
+
+# Declarative core-stack remediation for Guix System (advisory, never auto-run).
+_GUIX_CORE_ADVICE = (
+    "Guix System is declarative -- add libvirt to your operating-system in "
+    "/etc/config.scm:\n"
+    "(use-service-modules virtualization)  ; provides libvirt-service-type\n"
+    "in (services ...): (service libvirt-service-type)\n"
+    "in your (user-account ...): "
+    "(supplementary-groups '(\"libvirt\" \"kvm\" \"wheel\"))\n"
+    "then apply with: sudo guix system reconfigure /etc/config.scm\n"
+    "user CLI tools can also be added with: guix install qemu virt-manager"
+)
+
+# Declarative libvirtd-service remediation (advisory) for NixOS.
+_NIXOS_LIBVIRTD_ADVICE = (
+    "enable libvirtd declaratively: set virtualisation.libvirtd.enable = true; "
+    "in /etc/nixos/configuration.nix, then sudo nixos-rebuild switch"
+)
+
+# Package name for a cloud-init seed-ISO tool, per family. On NixOS/Guix these
+# are individual user CLI tools, so an imperative install is legitimate.
+_SEED_PKG = {
+    "arch": "libisoburn",
+    "debian": "cloud-image-utils",
+    "rhel": "genisoimage",
+    "gentoo": "dev-libs/libisoburn",
+    "nixos": "cloud-utils",
+    "guix": "xorriso",
+}
 
 # Single-package names for individually-missing tools, per family.
 _TOOL_PKG = {
-    "rsync": {"arch": "rsync", "debian": "rsync", "rhel": "rsync"},
-    "sshpass": {"arch": "sshpass", "debian": "sshpass", "rhel": "sshpass"},
-    "ansible": {"arch": "ansible", "debian": "ansible", "rhel": "ansible"},
-    "zstd": {"arch": "zstd", "debian": "zstd", "rhel": "zstd"},
-    "virt-sparsify": {"arch": "guestfs-tools", "debian": "libguestfs-tools", "rhel": "guestfs-tools"},
-    "openssh": {"arch": "openssh", "debian": "openssh-client", "rhel": "openssh-clients"},
+    "rsync": {"arch": "rsync", "debian": "rsync", "rhel": "rsync",
+              "gentoo": "net-misc/rsync", "nixos": "rsync", "guix": "rsync"},
+    "sshpass": {"arch": "sshpass", "debian": "sshpass", "rhel": "sshpass",
+                "gentoo": "net-misc/sshpass", "nixos": "sshpass", "guix": "sshpass"},
+    "ansible": {"arch": "ansible", "debian": "ansible", "rhel": "ansible",
+                "gentoo": "app-admin/ansible", "nixos": "ansible", "guix": "ansible"},
+    "zstd": {"arch": "zstd", "debian": "zstd", "rhel": "zstd",
+             "gentoo": "app-arch/zstd", "nixos": "zstd", "guix": "zstd"},
+    "virt-sparsify": {"arch": "guestfs-tools", "debian": "libguestfs-tools", "rhel": "guestfs-tools",
+                      "gentoo": "app-emulation/libguestfs", "nixos": "guestfs-tools", "guix": "libguestfs"},
+    "openssh": {"arch": "openssh", "debian": "openssh-client", "rhel": "openssh-clients",
+                "gentoo": "net-misc/openssh", "nixos": "openssh", "guix": "openssh"},
 }
 
 
 def install_cmd(family, pkgs):
-    """Build the package-manager install command for `pkgs` (a space string)."""
+    """Build the package-manager install command for `pkgs` (a space string).
+
+    For NixOS and Guix this is only ever used for *individual user CLI tools*
+    (rsync, sshpass, a seed-ISO tool, ...), which may legitimately be installed
+    imperatively into the user profile. The declarative-only bits (the libvirtd
+    service, the core stack, group membership) never go through here -- they are
+    emitted as advisory fixes instead.
+    """
     if family == "arch":
         return "sudo pacman -S --needed " + pkgs
     if family == "debian":
         return "sudo apt update && sudo apt install -y " + pkgs
     if family == "rhel":
         return "sudo dnf install -y " + pkgs
+    if family == "gentoo":
+        return "sudo emerge --ask " + pkgs
+    if family == "nixos":
+        atoms = " ".join("nixpkgs#" + pkg for pkg in pkgs.split())
+        return "nix profile install " + atoms
+    if family == "guix":
+        return "guix install " + pkgs
     return None
 
 
@@ -155,15 +235,251 @@ def worst_status(statuses):
     return OK
 
 
+def parse_firewall_backend(text):
+    """Return ``(configured_backend, option_supported)`` from network.conf text.
+
+    libvirt's shipped network.conf documents ``firewall_backend`` even when the
+    setting itself is commented out, so the option's mere presence in the file
+    is a reliable signal that this build understands it.
+    """
+    match = re.search(r'^\s*firewall_backend\s*=\s*"?([a-z]+)"?', text, re.M)
+    # anchored on a real declaration, set or commented out -- the bare word
+    # could appear in unrelated prose and would then claim false support
+    supported = re.search(r"^\s*#?\s*firewall_backend\s*=", text, re.M) is not None
+    return (match.group(1) if match else ""), supported
+
+
+def iptables_forward_facts(text):
+    """Forward-relevant facts from ``iptables -S`` (filter table) output.
+
+    Returns ``(rules_text, drop_closures, policy_drop)``.  Only ``-A FORWARD``
+    lines count as
+    evidence, plus libvirt's own ``LIBVIRT_FW*`` chains -- and those only when
+    FORWARD still jumps into them, because a populated chain nothing jumps to
+    is inert.  Docker's rebuild removes the jumps, which is exactly the state
+    we must not mistake for a healthy one.
+    """
+    lines = [line.strip() for line in text.splitlines()]
+    jumped = any(re.match(r"-A FORWARD .*-j LIBVIRT_", line) for line in lines)
+    keep = []
+    for line in lines:
+        if re.match(r"-A FORWARD\b", line):
+            keep.append(line)
+        elif jumped and re.match(r"-A LIBVIRT_FW", line):
+            keep.append(line)
+    policy_drop = any(re.match(r"-P FORWARD DROP\b", line) for line in lines)
+    rules = "\n".join(keep)
+    # When FORWARD drops by default, its own rules are what can still rescue a
+    # packet before the policy applies -- so they decide which bridges are
+    # actually at risk.
+    return rules, ([rules] if policy_drop else []), policy_drop
+
+
+def _jump_targets(rule):
+    """Chain names a rule hands control to (``jump`` / ``goto``)."""
+    targets = []
+    for expr in rule.get("expr") or []:
+        if not isinstance(expr, dict):
+            continue
+        for verb in ("jump", "goto"):
+            spec = expr.get(verb)
+            if isinstance(spec, dict) and spec.get("target"):
+                targets.append(spec["target"])
+    return targets
+
+
+def nft_forward_facts(json_text):
+    """Forward-hook facts from ``nft -j list ruleset`` output.
+
+    Returns ``(rules_text, drop_closures, policy_drop, libvirt_table,
+    parsed)``: the serialised rules reachable from the forward hook, one
+    closure per chain that *drops by default*, whether any such chain exists, whether libvirt owns a table (proof that it is using the
+    nftables backend instead of sharing docker's), and whether the output was
+    understood at all.
+
+    The drop subset matters because a default drop only kills what its own
+    chain did not already accept -- so it is per-bridge, not per-host.
+
+    ``parsed`` guards against schema drift.  If a future nft speaks a shape
+    this function does not recognise, every fact above comes back empty and
+    silently absent -- which would read as "libvirt is not using nftables" and
+    warn a perfectly healthy host.  Saying "I did not understand this" instead
+    keeps that failure honest.
+
+    The JSON form is used rather than the human-readable listing because the
+    latter cannot be scanned safely: it also contains nat and mangle, which
+    survive the very wipe we are looking for.  libvirt's mangle CHECKSUM rule
+    names the bridge, so a naive scan finds it and reports a dead network as
+    healthy.
+    """
+    try:
+        doc = json.loads(json_text)
+    except (ValueError, TypeError):
+        return "", [], False, False, False
+
+    items = doc.get("nftables", []) if isinstance(doc, dict) else []
+    if not isinstance(items, list) or not items:
+        return "", [], False, False, False
+
+    reachable, dropping, policy_drop, libvirt_table = set(), set(), False, False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        table = item.get("table")
+        if isinstance(table, dict) and str(table.get("name", "")).startswith("libvirt"):
+            libvirt_table = True
+        chain = item.get("chain")
+        if isinstance(chain, dict) and chain.get("hook") == "forward":
+            key = (chain.get("family"), chain.get("table"), chain.get("name"))
+            reachable.add(key)
+            if chain.get("policy") == "drop":
+                policy_drop = True
+                dropping.add(key)
+
+    by_chain = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rule = item.get("rule")
+        if isinstance(rule, dict):
+            key = (rule.get("family"), rule.get("table"), rule.get("chain"))
+            by_chain.setdefault(key, []).append(rule)
+
+    # Base chains are only the entry point. libvirt's nftables backend keeps
+    # its `forward` base chain nearly empty and jumps to guest_cross /
+    # guest_input / guest_output, which is where the bridge is actually named
+    # -- so stopping at base chains would find no rules for a perfectly
+    # healthy network. Follow jump/goto within the same table until the
+    # reachable set stops growing.
+    def close_over(seed):
+        found, pending = set(seed), list(seed)
+        while pending:
+            family, table_name, chain_name = pending.pop()
+            for rule in by_chain.get((family, table_name, chain_name), []):
+                for target in _jump_targets(rule):
+                    nxt = (family, table_name, target)
+                    if nxt not in found:
+                        found.add(nxt)
+                        pending.append(nxt)
+        return found
+
+    def serialise(keys):
+        out = []
+        for key in sorted(keys, key=lambda k: [str(part) for part in k]):
+            for rule in by_chain.get(key, []):
+                out.append(json.dumps(rule, sort_keys=True))
+        return "\n".join(out)
+
+    # one closure per dropping chain, not a merged blob: each such chain kills
+    # independently, so a bridge must be accepted in every one of them
+    drop_closures = [serialise(close_over([key])) for key in
+                     sorted(dropping, key=lambda k: [str(part) for part in k])]
+    return (serialise(close_over(reachable)), drop_closures,
+            policy_drop, libvirt_table, True)
+
+
+def wiped_networks(networks, evidence):
+    """Networks that should carry forwarding rules but have none.
+
+    Word-anchored, not a substring test: plain containment would let virbr10's
+    rules vouch for virbr1 and hide a genuinely wiped network.
+    """
+    return [name for name, bridge, expects in networks
+            if expects and not re.search(r"\b%s\b" % re.escape(bridge), evidence)]
+
+
+def forwarding_verdict(networks, evidence, docker_present, backend,
+                       policy_drop=False, drop_evidence="", complete_view=True):
+    """Grade the host forward path from facts already gathered.
+
+    ``networks`` is ``[(name, bridge, expects_rules), ...]`` for the active
+    libvirt networks that care about forwarding; ``expects_rules`` is False for
+    modes libvirt deliberately writes no rules for (``open``), which must not
+    be reported as wiped.  ``evidence`` is the forward-scoped rule text --
+    never a whole ruleset.  ``complete_view`` is False when part of the ruleset
+    could not be read, in which case a bridge we fail to find is reported as
+    unconfirmed rather than wiped.  Returns ``(status, detail, needs_fix)``.
+
+    Docker and libvirt both write the ``filter`` table.  Docker rebuilds it on
+    every restart and leaves the FORWARD policy at DROP; libvirt's rules -- and
+    boxman's own routed-network FORWARD rules -- are collateral damage, and
+    nothing re-applies them.  Every base chain on the forward hook is evaluated
+    and a drop in any of them is final, so libvirt's ACCEPTs cannot rescue the
+    packet.  The nat table usually survives, so guests keep NATing while
+    forwarding is dead: it reads as a slow network, not a firewall fault.
+    """
+    if not networks:
+        return SKIP, "no active forwarding libvirt networks", False
+
+    # Word-anchored, not a substring test: plain containment would let
+    # virbr10's rules vouch for virbr1 and hide a genuinely wiped network.
+    # One entry per chain that drops by default, holding the rules that chain
+    # can still rescue a packet with. Merging them would let an accept in one
+    # dropping chain vouch for a bridge that a second dropping chain kills.
+    if isinstance(drop_evidence, str):
+        drop_evidence = [drop_evidence] if drop_evidence else []
+    closures = list(drop_evidence) or ([""] if policy_drop else [])
+
+    wiped = wiped_networks(networks, evidence)
+    # A default drop only kills what its own chain did not already accept, so
+    # this is decided per bridge. It catches the half-fixed host (libvirt moved
+    # to its own table, policy never cleared) and 'open' networks alike -- for
+    # those libvirt writes nothing by design, which is exactly why a drop is
+    # fatal to them.
+    at_risk = [name for name, bridge, _ in networks
+               if any(not re.search(r"\b%s\b" % re.escape(bridge), closure)
+                      for closure in closures)]
+
+    if wiped and not complete_view:
+        return INFO, ("part of the ruleset was unreadable, so the rules for %s "
+                      "could not be confirmed either way" % ", ".join(wiped)), False
+
+    if wiped:
+        detail = ("no forwarding rules for active network(s): %s\n"
+                  "guests will NAT but never forward" % ", ".join(wiped))
+        if docker_present:
+            detail += "\ndocker shares this table and rebuilds it on restart"
+        return WARN, detail, True
+
+    if at_risk and complete_view:
+        detail = ("a chain at the forward hook drops by default and nothing "
+                  "in it accepts: %s\n"
+                  "a drop in any table at the hook is final, so these guests "
+                  "cannot forward" % ", ".join(at_risk))
+        if backend == "nftables":
+            # the half-fixed host: rules protected, policy never cleared
+            detail += "\nlibvirt already has its own table -- only the policy is left"
+        return WARN, detail, True
+
+    if docker_present and backend != "nftables":
+        detail = ("forwarding works now, but libvirt shares the filter table "
+                  "with docker -- the next `systemctl restart docker` wipes "
+                  "these rules")
+        if policy_drop:
+            detail += "\nFORWARD policy is DROP, so nothing survives the wipe"
+        return WARN, detail, True
+
+    if not backend and not complete_view:
+        return INFO, ("rules are in place, but libvirt's firewall backend "
+                      "could not be determined from here"), False
+
+    return OK, "forwarding rules present for: %s" % ", ".join(
+        name for name, _, _ in networks), False
+
+
 # --------------------------------------------------------------------------- #
 # Small result containers                                                      #
 # --------------------------------------------------------------------------- #
 class Fix(object):
-    def __init__(self, description, commands=None, needs_sudo=False, needs_relogin=False):
+    def __init__(self, description, commands=None, needs_sudo=False,
+                 needs_relogin=False, disruptive=False):
         self.description = description
         self.commands = list(commands or [])
         self.needs_sudo = needs_sudo
         self.needs_relogin = needs_relogin
+        # Restarts a running service. Always confirmed interactively, even
+        # under --yes, so an unattended run can never bounce a container host.
+        self.disruptive = disruptive
 
     @property
     def runnable(self):
@@ -270,7 +586,12 @@ class Doctor(object):
         return result
 
     def _show_fix(self, fix):
-        print("       " + self.c("fix: " + fix.description, "cyan"))
+        # Descriptions are usually one line; advisory (declarative-distro) fixes
+        # carry a multi-line config snippet, so indent continuation lines.
+        desc_lines = fix.description.splitlines() or [""]
+        print("       " + self.c("fix: " + desc_lines[0], "cyan"))
+        for extra in desc_lines[1:]:
+            print("       " + self.c("     " + extra, "cyan"))
         for cmd in fix.commands:
             print("         " + self.c("$ " + cmd, "dim"))
         if fix.needs_relogin:
@@ -279,6 +600,10 @@ class Doctor(object):
     def _handle_fix(self, result, probe):
         fix = result.fix
         self._show_fix(fix)
+        if fix.disruptive:
+            print("       " + self.c(
+                "(disruptive: restarts services -- running containers and guest "
+                "connectivity are interrupted)", "yellow"))
 
         # Advisory-only situations: read-only mode, no runnable commands, or a
         # non-interactive session the user hasn't pre-approved with --yes.
@@ -286,7 +611,17 @@ class Doctor(object):
             self._remember_manual(result)
             return
 
-        if not (self.opts.yes or self._ask("       -> run the above now?")):
+        # A disruptive fix needs a human at a terminal: --yes does not cover
+        # it, and neither does a piped "y" (`yes | check_prerequisites.py`).
+        # Bouncing a container host is not something an unattended run may
+        # decide for itself.
+        if fix.disruptive and not sys.stdin.isatty():
+            self._remember_manual(
+                result, note="needs a terminal to confirm; not run")
+            return
+
+        auto = self.opts.yes and not fix.disruptive
+        if not (auto or self._ask("       -> run the above now?")):
             self._remember_manual(result)
             return
 
@@ -320,7 +655,9 @@ class Doctor(object):
     def _ask(self, prompt):
         try:
             answer = input("%s [y/N] " % prompt).strip().lower()
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, OSError):
+            # OSError: the terminal went away mid-prompt (EIO on hangup).
+            # Declining is the only safe reading of "no answer".
             print()
             return False
         return answer in ("y", "yes")
@@ -337,6 +674,14 @@ class Doctor(object):
             if rc != 0:
                 ok = False
                 print("       " + self.c("command exited with status %d" % rc, "yellow"))
+                if fix.disruptive:
+                    # Later commands restart services. Carrying on past a
+                    # failed edit would apply the disruption without the
+                    # change it was meant to accompany.
+                    print("       " + self.c(
+                        "stopping here; the remaining commands were not run",
+                        "yellow"))
+                    return False
         return ok
 
     # -- environment discovery --------------------------------------------- #
@@ -391,6 +736,29 @@ class Doctor(object):
             description += (" (unrecognized distro '%s' -- install %s with your "
                             "package manager)" % (self.os["id"] or "?", pkgs))
         return Fix(description, commands, needs_sudo=True, needs_relogin=relogin)
+
+    def _core_stack_fix(self):
+        """Remediation for a missing libvirt/QEMU core stack, per distro.
+
+        Imperative (a runnable install command) on package-manager distros
+        (arch/debian/rhel/gentoo). Advisory-only (a Fix with no commands, so it
+        is printed but never offered to auto-run) on the declarative distros
+        NixOS and Guix System, whose stack + service are enabled by editing the
+        system config and rebuilding.
+        """
+        stack = _CORE_STACK.get(self.family)
+        if stack:
+            return Fix("install the libvirt/QEMU stack for your distro",
+                       [stack], needs_sudo=True)
+        if self.family == "nixos":
+            return Fix(_NIXOS_CORE_ADVICE, commands=[])
+        if self.family == "guix":
+            return Fix(_GUIX_CORE_ADVICE, commands=[])
+        fix = Fix("install the libvirt/QEMU stack for your distro", [],
+                  needs_sudo=True)
+        fix.description += (" -- unknown distro '%s'; install libvirt, "
+                            "qemu-kvm, virt-install, virt-clone" % (self.os["id"] or "?"))
+        return fix
 
     # ===================================================================== #
     # Check groups                                                          #
@@ -559,14 +927,7 @@ class Doctor(object):
                 missing.append("qemu-system-x86_64")
             if not missing:
                 return OK, "virsh, virt-install, virt-clone, qemu-img, qemu-system present", None
-            stack = _CORE_STACK.get(self.family)
-            cmds = [stack] if stack else []
-            fix = Fix("install the libvirt/QEMU stack for your distro", cmds,
-                      needs_sudo=True)
-            if not stack:
-                fix.description += (" -- unknown distro '%s'; install libvirt, "
-                                    "qemu-kvm, virt-install, virt-clone" % (self.os["id"] or "?"))
-            return FAIL, "missing: %s" % ", ".join(missing), fix
+            return FAIL, "missing: %s" % ", ".join(missing), self._core_stack_fix()
 
         tools = self.check("Core libvirt/QEMU tools", core_tools)
 
@@ -578,8 +939,17 @@ class Doctor(object):
             alt = run_capture(["systemctl", "is-active", "virtqemud"])[1].strip()
             if alt == "active":
                 return OK, "virtqemud.service is active (modular libvirt)", None
-            fix = Fix("enable and start libvirtd",
-                      commands=["sudo systemctl enable --now libvirtd"], needs_sudo=True)
+            if self.family == "nixos":
+                fix = Fix(_NIXOS_LIBVIRTD_ADVICE, commands=[])  # declarative: no auto-run
+            elif self.family == "gentoo":
+                # systemd profile: systemctl works. OpenRC profile: use rc-service.
+                fix = Fix("enable and start libvirtd (systemd profile; on an OpenRC "
+                          "profile use `sudo rc-update add libvirtd default && "
+                          "sudo rc-service libvirtd start`)",
+                          commands=["sudo systemctl enable --now libvirtd"], needs_sudo=True)
+            else:
+                fix = Fix("enable and start libvirtd",
+                          commands=["sudo systemctl enable --now libvirtd"], needs_sudo=True)
             return FAIL, "libvirtd not active (state: %s)" % (active or "unknown"), fix
 
         if have("systemctl"):
@@ -600,13 +970,27 @@ class Doctor(object):
 
         def groups():
             names, user = user_group_names()
-            want = ["libvirt", "kvm"]
+            # NixOS names the libvirt group `libvirtd`; everyone else `libvirt`.
+            libvirt_group = "libvirtd" if self.family == "nixos" else "libvirt"
+            want = [libvirt_group, "kvm"]
             missing = [g for g in want if g not in names]
             if not missing:
                 return OK, "user '%s' is in: %s" % (user, ", ".join(want)), None
-            fix = Fix("add yourself to the libvirt and kvm groups",
-                      commands=["sudo usermod -aG libvirt,kvm $USER"],
-                      needs_sudo=True, needs_relogin=True)
+            if self.family == "nixos":
+                fix = Fix("add your user to the libvirtd/kvm groups declaratively: "
+                          "users.users.<you>.extraGroups = [ \"libvirtd\" \"kvm\" ]; "
+                          "in /etc/nixos/configuration.nix, then sudo nixos-rebuild switch",
+                          commands=[], needs_relogin=True)
+            elif self.family == "guix":
+                fix = Fix("add your user to the libvirt/kvm groups declaratively: put "
+                          "(supplementary-groups '(\"libvirt\" \"kvm\")) in your "
+                          "user-account in /etc/config.scm, then sudo guix system "
+                          "reconfigure /etc/config.scm",
+                          commands=[], needs_relogin=True)
+            else:
+                fix = Fix("add yourself to the libvirt and kvm groups",
+                          commands=["sudo usermod -aG libvirt,kvm $USER"],
+                          needs_sudo=True, needs_relogin=True)
             # WARN, not FAIL: group membership is only the standard *means* to
             # reach /dev/kvm and the libvirt socket, and those ends are checked
             # directly ("/dev/kvm access", "libvirt connectivity"). If access
@@ -637,6 +1021,7 @@ class Doctor(object):
                 return WARN, "'default' network exists but is inactive", fix
 
             self.check("Default libvirt network", default_net)
+            self._check_host_forwarding()
 
         def seed_tool():
             tools = ["cloud-localds", "genisoimage", "mkisofs", "xorrisofs", "xorriso"]
@@ -709,6 +1094,274 @@ class Doctor(object):
             return WARN, "passwordless sudo present but missing: " + "; ".join(gaps), fix
 
         self.check("sudo rights", sudo_rights)
+
+    # -- host packet forwarding (docker vs libvirt) ------------------------- #
+    def _root_capture(self, args):
+        """Run a root-only inspection command without ever prompting.
+
+        Returns ``(rc, text)``.  Any non-zero rc means "we did not get a
+        reliable answer" -- the caller must treat that as reduced visibility
+        rather than as evidence of absence.  No attempt is made to classify
+        sudo's refusal message: it is localised, so matching English text would
+        silently misbehave under any other locale.
+        """
+        if getattr(os, "geteuid", lambda: 1)() == 0:
+            return run_capture(args)
+        if not have("sudo"):
+            return 1, ""
+        return run_capture(["sudo", "-n"] + args)
+
+    def _libvirt_net_unit(self):
+        """The systemd unit that owns libvirt's network rules on this host."""
+        for unit in ("virtnetworkd", "libvirtd"):
+            if run_capture(["systemctl", "is-active", unit])[1].strip() == "active":
+                return unit
+        # a socket-activated virtnetworkd is idle, not absent; restarting
+        # libvirtd instead would fail outright on a modular install
+        if run_capture(["systemctl", "is-active",
+                        "virtnetworkd.socket"])[1].strip() == "active":
+            return "virtnetworkd"
+        return "libvirtd"
+
+    def _libvirt_fw_backend(self):
+        """``(configured_backend, option_supported)`` for this libvirt."""
+        try:
+            with open("/etc/libvirt/network.conf") as handle:
+                return parse_firewall_backend(handle.read())
+        except OSError:
+            return "", False
+
+    def _docker_manages_firewall(self, evidence):
+        """Is a docker daemon actually writing firewall rules here?
+
+        The ``docker`` binary alone proves nothing -- it is also present as a
+        remote-only client and as podman's compatibility shim, neither of which
+        touches this host's tables.  Warning those hosts about "the next
+        `systemctl restart docker`" and offering to edit /etc/docker/daemon.json
+        is pure noise.
+        """
+        if "DOCKER-USER" in evidence or "DOCKER-FORWARD" in evidence:
+            return True
+        if not have("docker"):
+            return False
+        for query in ("is-active", "is-enabled"):
+            if run_capture(["systemctl", query, "docker"])[1].strip() in (
+                    "active", "enabled"):
+                return True
+        return False
+
+    def _docker_supports_no_drop(self):
+        """Does this engine understand ``ip-forward-no-drop``?
+
+        Distro engines from the 24.x/26.x era do not, and dockerd refuses to
+        start on an unknown daemon.json directive -- so writing the key and
+        restarting would leave docker down. That is the worst outcome this
+        script can produce, so anything short of proof counts as "no".
+        """
+        if not have("dockerd"):
+            return False
+        rc, out = run_capture(["dockerd", "--help"])
+        return rc == 0 and "ip-forward-no-drop" in out
+
+    def _forwarding_fix(self, backend, docker_manages, wiped=False):
+        """Commands that take libvirt out of the table docker rebuilds.
+
+        ``backend`` is the *effective* backend, so a host that already keeps
+        libvirt in its own table is only offered the docker half.
+        ``docker_manages`` is the same signal the verdict used: offering to
+        edit /etc/docker/daemon.json and restart docker just because the
+        binary exists would contradict the reason we stopped trusting it.
+        """
+        configured, supported = self._libvirt_fw_backend()
+        unit = self._libvirt_net_unit()
+
+        # Migrate libvirt FIRST. The docker half ends in a docker restart --
+        # the very event that wipes the shared table -- so running it before
+        # libvirt has moved out means an abort at any later step leaves a host
+        # that was merely at risk actually broken.
+        libvirt_cmds = []
+        if supported and backend != "nftables":
+            libvirt_cmds = [
+                "sudo sh -c '[ ! -f /etc/libvirt/network.conf ] || "
+                "cp -an /etc/libvirt/network.conf "
+                "/etc/libvirt/network.conf.boxman-bak'",
+                # the leading newline guards against a file with no trailing
+                # one, where a bare append would fuse onto the last setting
+                "sudo sh -c 'sed -i "
+                "\"/^[[:space:]]*firewall_backend[[:space:]]*=/d\" "
+                "/etc/libvirt/network.conf && printf "
+                "\"\\nfirewall_backend = \\\"nftables\\\"\\n\" "
+                ">> /etc/libvirt/network.conf'",
+                "sudo systemctl restart %s" % unit,
+            ]
+
+        # the flag stops docker *setting* the policy; it does not clear one
+        # docker already set, so this one-off reset is required. Both families:
+        # docker manages ip6tables too, and leaving the v6 policy at DROP makes
+        # the check warn forever after an otherwise successful fix.
+        policy_reset = ["sudo iptables -P FORWARD ACCEPT"]
+        if have("ip6tables"):
+            policy_reset.append("sudo ip6tables -P FORWARD ACCEPT")
+
+        docker_cmds, stale_engine = [], False
+        if docker_manages and self._docker_supports_no_drop():
+            docker_cmds = [
+                "sudo sh -c '[ ! -f /etc/docker/daemon.json ] || "
+                "cp -an /etc/docker/daemon.json "
+                "/etc/docker/daemon.json.boxman-bak'",
+                # merge and restart are chained: if the merge fails, restarting
+                # docker would perform the very wipe this fix exists to prevent
+                "sudo python3 -c \"import json,pathlib;"
+                "p=pathlib.Path('/etc/docker/daemon.json');"
+                "d=json.loads(p.read_text().strip() or '{}') if p.exists() else {};"
+                "d['ip-forward-no-drop']=True;"
+                "p.parent.mkdir(parents=True,exist_ok=True);"
+                "p.write_text(json.dumps(d,indent=2))\""
+                " && sudo systemctl restart docker",
+            ] + policy_reset
+        elif docker_manages:
+            # Engine too old for the directive: clearing the policy still
+            # restores connectivity now, but docker will set it again on its
+            # next restart. Editing daemon.json here would stop dockerd dead.
+            docker_cmds, stale_engine = list(policy_reset), True
+
+        commands = libvirt_cmds + docker_cmds
+
+        # Re-apply libvirt's rules when nothing above will and they are either
+        # already gone or about to be: a docker restart against the shared
+        # table takes them with it. Gating this on `wiped` alone left a merely
+        # at-risk host actually broken, with the fix reporting success.
+        restarts_docker = any("restart docker" in cmd for cmd in docker_cmds)
+        if not libvirt_cmds and (
+                wiped or (restarts_docker and backend != "nftables")):
+            commands.append("sudo systemctl restart %s" % unit)
+        if backend == "nftables" and docker_manages:
+            description = ("stop docker forcing FORWARD to DROP -- libvirt "
+                           "already has its own table")
+        elif backend == "nftables":
+            # nothing here to automate: docker is not the one dropping, so
+            # whatever set the policy (firewalld, a hand-rolled ruleset, an
+            # admin) has to be found before anything can be recommended
+            description = ("libvirt already has its own table; find what set "
+                           "the FORWARD policy to DROP -- `iptables -S FORWARD "
+                           "| head -1` and `nft list ruleset | grep -B5 'hook "
+                           "forward'` -- and let that owner accept the bridge")
+        elif libvirt_cmds:
+            description = ("give libvirt its own nftables table and stop "
+                           "docker forcing FORWARD to DROP (a .boxman-bak "
+                           "backup is written next to each file)")
+        elif docker_manages:
+            description = ("clear the FORWARD policy and re-apply libvirt's "
+                           "rules; this libvirt build has no firewall_backend "
+                           "option, so it cannot be moved out of docker's "
+                           "table")
+        else:
+            description = "re-apply libvirt's network rules"
+        if stale_engine:
+            description += ("; this docker engine predates "
+                            "`ip-forward-no-drop`, so daemon.json is left "
+                            "alone -- upgrade docker or the policy returns on "
+                            "its next restart")
+        return Fix(description, commands, needs_sudo=True,
+                   disruptive=bool(commands))
+
+    def _forward_evidence(self):
+        """Gather forward-scoped rules from both firewall views.
+
+        Returns ``(evidence, drop_closures, policy_drop, libvirt_table,
+        complete_view)``.  Only rules on the forward hook are collected:
+        scanning a whole ruleset would let nat and mangle -- which survive a
+        docker rebuild -- vouch for filter rules that are long gone.
+        """
+        evidence, drops = [], []
+        policy_drop, libvirt_table, complete_view = False, False, True
+
+        if have("iptables"):
+            rc, out = self._root_capture(["iptables", "-S"])
+            if rc == 0:
+                rules, drop_rules, drop = iptables_forward_facts(out)
+                evidence.append(rules)
+                drops.extend(drop_rules)
+                policy_drop = policy_drop or drop
+            else:
+                complete_view = False
+        else:
+            complete_view = False
+
+        if have("nft"):
+            rc, out = self._root_capture(["nft", "-j", "list", "ruleset"])
+            rules, drop_rules, drop, libvirt_table, parsed = \
+                nft_forward_facts(out) if rc == 0 else ("", [], False, False, False)
+            if parsed:
+                evidence.append(rules)
+                drops.extend(drop_rules)
+                policy_drop = policy_drop or drop
+            else:
+                # ran but told us nothing we understood -- same standing as
+                # not having been allowed to look
+                complete_view = False
+        else:
+            complete_view = False
+
+        return ("\n".join(evidence), drops, policy_drop,
+                libvirt_table, complete_view)
+
+    def _check_host_forwarding(self):
+        """Report whether libvirt's forwarding rules are intact -- see
+        :func:`forwarding_verdict` for why docker keeps removing them."""
+        def forwarding():
+            if not have("virsh"):
+                return SKIP, "needs virsh to inspect", None
+
+            rc, out = run_capture(
+                ["virsh", "-c", "qemu:///system", "net-list", "--name"])
+            if rc != 0:
+                return SKIP, "cannot list libvirt networks", None
+
+            networks = []
+            for name in [n.strip() for n in out.splitlines() if n.strip()]:
+                rc, xml = run_capture(
+                    ["virsh", "-c", "qemu:///system", "net-dumpxml", name])
+                if rc != 0:
+                    continue
+                forward = re.search(r"<forward\b[^>]*>", xml)
+                if not forward:
+                    continue
+                # libvirt defaults a mode-less <forward/> to nat
+                mode = re.search(r"mode=['\"]([a-z]+)", forward.group(0))
+                mode = mode.group(1) if mode else "nat"
+                if mode not in ("nat", "route", "open"):
+                    continue
+                bridge = re.search(r"<bridge[^>]*name=['\"]([^'\"]+)", xml)
+                if bridge:
+                    # 'open' means libvirt deliberately writes no rules, so its
+                    # bridge must not be judged against the ruleset -- but the
+                    # host's forward policy still decides whether it works
+                    networks.append((name, bridge.group(1), mode != "open"))
+            if not networks:
+                return SKIP, "no active forwarding libvirt networks", None
+
+            evidence, drop_evidence, policy_drop, libvirt_table, complete_view = \
+                self._forward_evidence()
+            if not evidence and not complete_view:
+                return INFO, ("cannot read the firewall ruleset without "
+                              "passwordless sudo; re-run as root to include "
+                              "this check"), None
+
+            # A live libvirt table is proof of the backend; the config file is
+            # only a fallback, since libvirt >= 11 defaults to nftables with
+            # the setting left unset.
+            backend = "nftables" if libvirt_table else self._libvirt_fw_backend()[0]
+            docker_manages = self._docker_manages_firewall(evidence)
+            status, detail, needs_fix = forwarding_verdict(
+                networks, evidence, docker_manages, backend, policy_drop,
+                drop_evidence, complete_view)
+            wiped = bool(wiped_networks(networks, evidence))
+            return status, detail, (
+                self._forwarding_fix(backend, docker_manages, wiped)
+                if needs_fix else None)
+
+        self.check("Host forwarding (docker/libvirt)", forwarding)
 
     def _check_optional_tools(self):
         self.section("Optional features (not required for basic `boxman up`)")
@@ -857,7 +1510,10 @@ class Doctor(object):
         if self.manual_steps:
             print("\n  " + self.c("Remaining / suggested steps:", "bold"))
             for step in self.manual_steps:
-                print("   - " + step)
+                lines = step.splitlines() or [step]
+                print("   - " + lines[0])
+                for extra in lines[1:]:
+                    print("     " + extra)
         if self.relogin_needed:
             print("\n  " + self.c("* Log out and back in for group changes to take effect, "
                                   "then re-run this checker.", "yellow"))

@@ -60,6 +60,66 @@ sudo systemctl enable --now libvirtd
 sudo usermod -aG libvirt,kvm $USER
 ```
 
+### Gentoo
+
+```bash
+sudo emerge --ask app-emulation/libvirt app-emulation/qemu \
+  app-emulation/virt-manager net-dns/dnsmasq app-admin/sudo
+sudo systemctl enable --now libvirtd        # systemd profile
+# OpenRC profile instead:
+#   sudo rc-update add libvirtd default && sudo rc-service libvirtd start
+sudo usermod -aG libvirt,kvm $USER
+```
+
+> **USE flags:** build `app-emulation/qemu` with `QEMU_SOFTMMU_TARGETS="x86_64"`
+> (so you get the `qemu-system-x86_64` system emulator) and
+> `app-emulation/libvirt` with `USE="virt-network qemu"` (QEMU/KVM driver + the
+> default NAT network). `virt-install` / `virt-clone` ship in
+> `app-emulation/virt-manager`.
+
+### NixOS
+
+NixOS is declarative — enable the stack in `/etc/nixos/configuration.nix`
+instead of installing packages imperatively:
+
+```nix
+virtualisation.libvirtd.enable = true;
+programs.virt-manager.enable = true;
+environment.systemPackages = with pkgs; [ virt-manager qemu cloud-utils ];
+users.users.<you>.extraGroups = [ "libvirtd" "kvm" ];
+```
+
+then apply it:
+
+```bash
+sudo nixos-rebuild switch
+```
+
+User-level CLI tools (e.g. `sshpass`, `rsync`) can still be installed
+imperatively with `nix profile install nixpkgs#<pkg>`.
+
+### Guix System
+
+Guix System is declarative — add libvirt to your `operating-system` in
+`/etc/config.scm`:
+
+```scheme
+(use-service-modules virtualization)          ; provides libvirt-service-type
+;; in (services ...):
+(service libvirt-service-type)
+;; in your (user-account ...):
+(supplementary-groups '("libvirt" "kvm" "wheel"))
+```
+
+then apply it:
+
+```bash
+sudo guix system reconfigure /etc/config.scm
+```
+
+User-level CLI tools can still be installed imperatively with
+`guix install <pkg>`.
+
 > **Important:** Log out and back in after adding yourself to the groups.
 
 ### Verify
@@ -185,6 +245,10 @@ graph TD
 cd doc/tutorial/tutorial1
 boxman provision
 ```
+
+> Boxman prints terse, docker-compose-style progress by default; add
+> `-v`/`-vv`/`-vvv` (before or after the sub-command) for more detail, `-q`
+> for warnings and errors only, or set `BOXMAN_VERBOSITY`.
 
 Behind the scenes, boxman:
 

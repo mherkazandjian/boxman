@@ -38,6 +38,18 @@ lxml = "^5.0"
 # libcrypt was rebuilt without the legacy symbol (common with conda
 # Pythons on RHEL 9 / Rocky 9).
 passlib = "^1.7"
+# Optional — pulled in by the `docker-compose` extra. boxman itself never
+# imports this: every docker call shells out to the `docker` CLI. It is here
+# for Ansible's `community.docker` connection plugin, which needs the SDK on
+# the control host to reach the containers of a docker-compose cluster
+# (`boxman run` / `tasks:` against container clusters).
+#
+# It must be declared here, not only in a dependency group: poetry resolves
+# `extras` against `[tool.poetry.dependencies]`, so a group-only entry made
+# the extra a silent no-op — `pip install 'boxman[docker-compose]'` published
+# `Provides-Extra: docker-compose` with no matching `Requires-Dist` and
+# installed nothing.
+docker = { version = ">=7.0", optional = true }
 
 [tool.poetry.extras]
 docker-compose = ["docker"]

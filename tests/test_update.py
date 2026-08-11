@@ -5,7 +5,7 @@ disk resize, and update orchestration logic.
 
 import os
 import pytest
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import patch, MagicMock, PropertyMock, call
 
 from boxman.providers.libvirt.vm_differ import VMStateDiffer
 from boxman.providers.libvirt.virsh_edit import VirshEdit
@@ -732,3 +732,114 @@ class TestVMStateDifferDiskParsing:
 
         disks = differ.get_actual_disks('test-vm')
         assert disks == []
+
+
+# ---------------------------------------------------------------------------
+# Removed-VM destruction (update() path) — regression tests for the
+# undefined-`workdir` NameError (issue #81)
+# ---------------------------------------------------------------------------
+class TestDestroyRemovedVm:
+
+    def _make_manager(self):
+        """Bare BoxmanManager instance with a mocked provider."""
+        from boxman.manager import BoxmanManager
+        mgr = BoxmanManager.__new__(BoxmanManager)
+        mgr.logger = MagicMock()
+        mgr.provider = MagicMock()
+        mgr.provider.provider_config = {'uri': 'qemu:///system'}
+        return mgr
+
+    @patch('boxman.manager.VirshCommand')
+    def test_vm_disk_dirs_from_domblklist(self, mock_virsh_cls):
+        """Disk directories come from libvirt, cdrom sources are ignored."""
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(
+            ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
+
+        dirs = mgr._vm_disk_dirs('test-vm')
+
+        assert dirs == ['/data', '/var/lib/libvirt/images']
+
+    @patch('boxman.manager.VirshCommand')
+    def test_vm_disk_dirs_fallback_when_query_fails(self, mock_virsh_cls):
+        """If domblklist fails, fall back to the configured workdirs."""
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(ok=False)
+        mgr.collect_workdirs = MagicMock(return_value=['/fallback'])
+
+        dirs = mgr._vm_disk_dirs('test-vm')
+
+        assert dirs == ['/fallback']
+
+    @patch('boxman.manager.VirshCommand')
+    def test_destroy_removed_vm_sweeps_libvirt_disk_dirs(self, mock_virsh_cls):
+        """destroy_disks runs once per libvirt-reported disk directory."""
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(
+            ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
+
+        mgr._destroy_removed_vm('test-vm')
+
+        swept = sorted(
+            c.args[0] for c in mgr.provider.destroy_disks.call_args_list)
+        assert swept == ['/data', '/var/lib/libvirt/images']
+        for c in mgr.provider.destroy_disks.call_args_list:
+            assert c.kwargs == {'vm_name': 'test-vm', 'disks': []}
+        # domain undefined both gracefully and with force
+        assert mgr.provider.destroy_vm.call_args_list == [
+            call('test-vm'),
+            call('test-vm', force=True),
+        ]
+
+    @patch('boxman.manager.VirshCommand')
+    def test_vm_disk_dirs_handles_paths_with_spaces(self, mock_virsh_cls):
+        """A disk path containing spaces must survive domblklist parsing."""
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(
+            ok=True,
+            stdout=(
+                " Type   Device   Target   Source\n"
+                "-------------------------------------------\n"
+                " file   disk     vda      /vm images/test-vm.qcow2\n"
+            )
+        )
+
+        dirs = mgr._vm_disk_dirs('test-vm')
+
+        assert dirs == ['/vm images']
+
+    @patch('boxman.manager.VirshCommand')
+    def test_vm_disk_dirs_fallback_when_no_disks(self, mock_virsh_cls):
+        """ok=True with zero disk rows (e.g. diskless VM) also falls back
+        to the configured workdirs."""
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(
+            ok=True, stdout=" Type   Device   Target   Source\n---\n")
+        mgr.collect_workdirs = MagicMock(return_value=['/fallback'])
+
+        dirs = mgr._vm_disk_dirs('test-vm')
+
+        assert dirs == ['/fallback']
+
+    @patch('boxman.manager.VirshCommand')
+    def test_destroy_removed_vm_queries_disks_before_undefining(
+            self, mock_virsh_cls):
+        """domblklist must run before destroy_vm — after the domain is
+        undefined the query returns nothing (ordering regression guard)."""
+        mgr = self._make_manager()
+        virsh = mock_virsh_cls.return_value
+        virsh.execute.return_value = MagicMock(
+            ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
+
+        parent = MagicMock()
+        parent.attach_mock(virsh.execute, 'virsh_execute')
+        parent.attach_mock(mgr.provider.destroy_vm, 'destroy_vm')
+
+        mgr._destroy_removed_vm('test-vm')
+
+        ordered = [c[0] for c in parent.mock_calls]
+        assert ordered == [
+            'virsh_execute', 'destroy_vm', 'destroy_vm']
+        # first destroy_vm is the graceful one, second is force=True
+        assert parent.mock_calls[1] == call.destroy_vm('test-vm')
+        assert parent.mock_calls[2] == call.destroy_vm('test-vm', force=True)

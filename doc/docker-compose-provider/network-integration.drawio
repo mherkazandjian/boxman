@@ -1,0 +1,90 @@
+<mxfile host="app.diagrams.net" modified="2026-01-08T00:00:00.000Z" agent="Boxman Design" version="21.0.0" type="device">
+  <diagram id="network-integration" name="Network Integration">
+    <mxGraphModel dx="1422" dy="762" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        
+        <!-- Host Machine Container -->
+        <mxCell id="host_machine" value="HOST MACHINE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=16;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="100" y="60" width="960" height="700" as="geometry" />
+        </mxCell>
+        
+        <!-- Shared Bridge -->
+        <mxCell id="shared_bridge" value="br-app (shared bridge)&#xa;10.0.0.0/24" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="300" y="120" width="560" height="60" as="geometry" />
+        </mxCell>
+        
+        <!-- Libvirt Cluster -->
+        <mxCell id="libvirt_cluster" value="Libvirt Cluster (compute)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="140" y="240" width="320" height="280" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="vm_node01" value="VM node01&#xa;eth0: virbr1 (NAT)&#xa;eth1: br-app" style="shape=mxgraph.basic.rect;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11" vertex="1" parent="1">
+          <mxGeometry x="180" y="300" width="240" height="80" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="virbr1" value="virbr1&#xa;192.168.10.0/24&#xa;NAT" style="ellipse;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=10" vertex="1" parent="1">
+          <mxGeometry x="180" y="420" width="120" height="80" as="geometry" />
+        </mxCell>
+        
+        <!-- Docker-Compose Cluster -->
+        <mxCell id="docker_cluster" value="Docker-Compose Cluster (services)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=13;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="540" y="240" width="480" height="280" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="web_container" value="web container&#xa;eth0: backend (docker)&#xa;eth1: br-app (macvlan)" style="shape=mxgraph.basic.rect;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11" vertex="1" parent="1">
+          <mxGeometry x="580" y="300" width="200" height="80" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="api_container" value="api container&#xa;eth0: backend (docker)&#xa;eth1: br-app (macvlan)" style="shape=mxgraph.basic.rect;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11" vertex="1" parent="1">
+          <mxGeometry x="800" y="300" width="200" height="80" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="backend_network" value="backend&#xa;172.20.0.0/24&#xa;docker bridge" style="ellipse;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=10" vertex="1" parent="1">
+          <mxGeometry x="680" y="420" width="140" height="80" as="geometry" />
+        </mxCell>
+        
+        <!-- iptables/sysfs -->
+        <mxCell id="iptables_box" value="iptables / sysfs&#xa;bridge-nf-call-iptables=0&#xa;(shared_bridges.py)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11" vertex="1" parent="1">
+          <mxGeometry x="300" y="580" width="560" height="60" as="geometry" />
+        </mxCell>
+        
+        <!-- Network Flow Labels -->
+        <mxCell id="label_l2" value="L2 Adjacency&#xa;(ARP, DHCP, 802.1Q)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=10;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="520" y="180" width="120" height="40" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="label_isolated" value="Isolated Networks&#xa;(per-cluster)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=10;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="420" y="440" width="120" height="40" as="geometry" />
+        </mxCell>
+        
+        <!-- Connections -->
+        <mxCell id="edge_vm_bridge" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.2;entryY=1;entryDx=0;entryDy=0;strokeColor=#6c8ebf;strokeWidth=2" edge="1" parent="1" source="vm_node01" target="shared_bridge">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge_web_bridge" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;strokeColor=#6c8ebf;strokeWidth=2" edge="1" parent="1" source="web_container" target="shared_bridge">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge_api_bridge" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.8;entryY=1;entryDx=0;entryDy=0;strokeColor=#6c8ebf;strokeWidth=2" edge="1" parent="1" source="api_container" target="shared_bridge">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge_vm_virbr" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00" edge="1" parent="1" source="vm_node01" target="virbr1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge_web_backend" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.3;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00" edge="1" parent="1" source="web_container" target="backend_network">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="edge_api_backend" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.7;entryY=0;entryDx=0;entryDy=0;strokeColor=#d79b00" edge="1" parent="1" source="api_container" target="backend_network">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -1,0 +1,158 @@
+---
+# hybrid-libvirt-docker-compose
+#
+# A libvirt VM and a docker-compose container sharing an L2 domain (Phase 4,
+# issue #52). Both attach to the same host Linux bridge `bx_app`; the
+# container attaches via a docker **macvlan** network whose parent is that
+# bridge, so VM and container are directly L2-adjacent.
+#
+#   node01 (libvirt)                          web (docker-compose)
+#     adapter_1 -- dhcp --- mgmt NAT            eth0 -- backend (172.31.0.0/24)
+#     adapter_2 -- 10.10.0.20/24 --\            eth1 -- 10.10.0.10 (macvlan) --\
+#                                   \                                          \
+#                                    `------ bx_app (shared bridge, 10.10.0.0/24) -'
+#
+# boxman creates bx_app (+ a scoped netfilter accept rule — decision D8),
+# attaches node01's second NIC to it, and brings the macvlan container up on
+# it. The VM's shared-bridge address (10.10.0.20) is assigned as an explicit
+# step in the README — the shared bridge is a plain L2 domain with no DHCP, and
+# addressing it at boot would make boxman mistake that host-unreachable address
+# for node01's management IP. The container's macvlan address is pinned
+# statically at 10.10.0.10.
+#
+#   cd boxes/hybrid-libvirt-docker-compose
+#   boxman up
+#   # then follow README.md to ping/ARP between node01 and web
+#   boxman destroy
+version: '2.0'
+project: hybrid_libvirt_dc
+
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/usr/bin/virt-install'
+    virt_clone_cmd: '/usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+    verbose: True
+  docker-compose:
+    project_name: hybrid_libvirt_dc
+
+# Host Linux bridge shared by the VM (bridge port) and the container (macvlan).
+shared_networks:
+  app_bridge:
+    bridge: bx_app
+    subnet: 10.10.0.0/24     # required: docker macvlan IPAM pool for the container
+    stp: false
+    # disable_netfilter defaults to false (decision D8): boxman installs a
+    # scoped per-bridge physdev accept rule rather than disabling netfilter
+    # host-wide. Set it to true only if you specifically need the global
+    # disable (discouraged; logged loudly).
+
+templates:
+  template1:
+    name: ubuntu-24.04-minimal-base-template-cloudinit
+    image:
+      uri: http://cloud-images-archive.ubuntu.com/releases/noble/release-20240423/ubuntu-24.04-server-cloudimg-amd64.img
+      checksum: sha256:32a9d30d18803da72f5936cf2b7b9efcb4d0bb63c67933f17e3bdfd1751de3f3
+    disk_size: 20G
+    os_variant: ubuntu24.04
+    memory: 2048
+    vcpus: 2
+    cloudinit_done_marker: /var/log/hybrid-cloudinit.log
+    cloudinit: |
+      #cloud-config
+      hostname: node01
+      manage_etc_hosts: true
+
+      # node01's mgmt NIC (adapter_1) gets a DHCP address from the libvirt NAT
+      # and that is node01's routable/management IP (boxman uses it for ssh).
+      # The shared bridge (adapter_2) is a plain L2 domain with NO DHCP, so its
+      # address is assigned as an explicit step in the README before the L2
+      # test — deliberately NOT here, so boxman does not mistake the
+      # unreachable 10.10.0.x address for node01's management IP.
+      users:
+        - name: ubuntu
+          lock_passwd: false
+          groups: [sudo]
+          sudo: "ALL=(ALL) NOPASSWD:ALL"
+          shell: /bin/bash
+
+      chpasswd:
+        expire: false
+        users:
+          - name: ubuntu
+            password: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+            type: text
+
+      ssh_pwauth: true
+      package_update: false
+      packages:
+        - qemu-guest-agent
+
+      runcmd:
+        - [ systemctl, enable, --now, qemu-guest-agent ]
+        - [ sh, -c, "echo done at $(date -Is) >> /var/log/hybrid-cloudinit.log" ]
+
+workspace:
+  path: ~/workspaces/boxmandev/hybrid-libvirt-docker-compose
+
+clusters:
+  compute:
+    provider: libvirt
+    base_image: ubuntu-24.04-minimal-base-template-cloudinit
+    proxy_host: localhost
+    admin_user: ubuntu
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+    admin_key_name: id_ed25519_boxman
+    ssh_config: ssh_config
+
+    networks:
+      mgmt:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:aa:ff:01'
+        ip:
+          address: '192.168.90.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.90.2'
+              end: '192.168.90.254'
+        enable: True
+        autostart: True
+
+    boxes:
+      node01:
+        hostname: node01
+        cpus: { sockets: 1, cores: 2 }
+        memory: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'mgmt'
+            mac: '52:54:00:aa:00:01'
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'app_bridge'
+            mac: '52:54:00:aa:00:02'
+
+  services:
+    provider: docker-compose
+    workdir: ./.boxman/services
+
+    networks:
+      backend:
+        driver: bridge
+        subnet: 172.31.0.0/24
+
+    boxes:
+      web:
+        image: nicolaka/netshoot
+        command: ["/bin/sleep", "infinity"]
+        networks:
+          backend: null                 # cluster-internal (isolated from the VM)
+          app_bridge:
+            ipv4_address: 10.10.0.10     # static macvlan address on the shared bridge

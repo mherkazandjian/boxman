@@ -1,0 +1,185 @@
+---
+# Example: Hybrid libvirt + docker-compose topology
+# This demonstrates the v2.0 config schema with mixed providers
+
+version: '2.0'
+project: hybrid_web_app
+
+# Provider configurations
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: false
+  docker-compose:
+    project_name: hybrid_web_app
+
+# Shared networks for L2 connectivity between VMs and containers.
+# Netfilter stays enabled host-wide; boxman inserts scoped per-bridge
+# accept rules instead (design.md decision D8). Setting
+# disable_netfilter: true is an explicit, discouraged opt-in.
+shared_networks:
+  app_bridge:
+    bridge: br-app
+    stp: false
+    disable_netfilter: false
+
+# Workspace configuration
+workspace:
+  path: ~/workspaces/hybrid_web_app
+
+# Cluster definitions
+clusters:
+  
+  # ─── Libvirt cluster: application servers ───
+  compute:
+    provider: libvirt
+    workdir: ~/workspaces/hybrid_web_app/compute
+    base_image: ubuntu-24.04-cloudinit
+    admin_user: admin
+    admin_pass: "{{ env_required('ADMIN_PASS') }}"
+    admin_key_name: id_ed25519_boxman
+    
+    networks:
+      mgmt:
+        mode: nat
+        network: 192.168.10.0/24
+        dhcp: 'on'
+    
+    boxes:
+      app01:
+        hostname: app01
+        cpus:
+          sockets: 1
+          cores: 2
+        memory: 4096
+        network_adapters:
+          - name: eth0
+            network_source: mgmt
+          - name: eth1
+            network_source: app_bridge  # shared bridge → L2 with containers
+      
+      app02:
+        hostname: app02
+        cpus:
+          sockets: 1
+          cores: 2
+        memory: 4096
+        network_adapters:
+          - name: eth0
+            network_source: mgmt
+          - name: eth1
+            network_source: app_bridge
+  
+  # ─── Docker-compose cluster: supporting services ───
+  services:
+    provider: docker-compose
+    workdir: ~/workspaces/hybrid_web_app/services
+    
+    networks:
+      backend:
+        driver: bridge
+        subnet: 172.20.0.0/24
+    
+    boxes:
+      # Web server (nginx)
+      web:
+        image: nginx:latest
+        ports:
+          - "8080:80"
+          - "8443:443"
+        environment:
+          - NGINX_HOST=app01
+          - NGINX_PORT=8000
+        volumes:
+          - name: nginx_config
+            host_path: ./configs/nginx
+            container_path: /etc/nginx/conf.d
+            readonly: true
+          - name: nginx_logs
+            container_path: /var/log/nginx
+        networks:
+          - backend
+          - app_bridge  # shared bridge → L2 with VMs
+        depends_on:
+          - api
+        restart: unless-stopped
+      
+      # API service
+      api:
+        image: myapp/api:latest
+        build:
+          context: ./api
+          dockerfile: Dockerfile
+        environment:
+          - DB_HOST=db
+          - DB_PORT=5432
+          - REDIS_HOST=redis
+          - APP_SERVERS=app01:8000,app02:8000
+        networks:
+          - backend
+        depends_on:
+          - db
+          - redis
+        restart: unless-stopped
+      
+      # Database (PostgreSQL)
+      db:
+        image: postgres:16
+        environment:
+          - POSTGRES_DB=myapp
+          - POSTGRES_USER=myapp
+          - POSTGRES_PASSWORD="{{ env_required('DB_PASSWORD') }}"
+        volumes:
+          - name: pg_data
+            container_path: /var/lib/postgresql/data
+            size: 20G
+          - name: pg_config
+            host_path: ./configs/postgres
+            container_path: /etc/postgresql
+            readonly: true
+        networks:
+          - backend
+        restart: unless-stopped
+      
+      # Cache (Redis)
+      redis:
+        image: redis:7-alpine
+        command: redis-server --appendonly yes
+        volumes:
+          - name: redis_data
+            container_path: /data
+        networks:
+          - backend
+        restart: unless-stopped
+      
+      # Monitoring (Prometheus)
+      prometheus:
+        image: prom/prometheus:latest
+        volumes:
+          - name: prometheus_config
+            host_path: ./configs/prometheus
+            container_path: /etc/prometheus
+          - name: prometheus_data
+            container_path: /prometheus
+        networks:
+          - backend
+        ports:
+          - "9090:9090"
+        restart: unless-stopped
+
+# Tasks for common operations
+tasks:
+  deploy:
+    description: Deploy application to app servers
+    command: |
+      ansible-playbook -i inventory deploy.yml
+  
+  logs:
+    description: View logs from all services
+    command: |
+      docker compose -p hybrid_web_app logs -f
+  
+  db-backup:
+    description: Backup PostgreSQL database
+    command: |
+      docker exec hybrid_web_app-db-1 pg_dump -U myapp myapp > backup.sql

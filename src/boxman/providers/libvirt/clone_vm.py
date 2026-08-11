@@ -63,7 +63,7 @@ class CloneVM:
                 'auto_clone': True
             }
 
-            self.logger.info(f"cloning the vm {self.src_vm_name} to {self.new_vm_name}")
+            self.logger.status(f"cloning the vm {self.src_vm_name} to {self.new_vm_name}")
             self.virt_clone.execute(*cmd_args, **cmd_kwargs)
 
             # after cloning, remove all inherited network interfaces if the machine has network

@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -232,3 +233,57 @@ class TestNetlabCliHandlers:
         args.node = None
         BoxmanManager.netlab_ssh(mgr, args)
         mgr.logger.error.assert_called_once()
+
+
+class TestNetlabStartupConfigSourceRoot:
+    """Regression: startup-config templates must resolve relative to the
+    config file's *directory*, even when ``--conf`` is the bare relative
+    default ``conf.yml`` (the documented ``cd boxes/<box> && boxman up``
+    flow). Before the abspath() fix, ``os.path.dirname("conf.yml")`` was
+    ``""``, which ``render_topology`` treated as "unset" and fell back to
+    the workspace dir — so ``configs/<node>.cfg.j2`` was looked up in the
+    wrong place and raised ``FileNotFoundError``.
+    """
+
+    @staticmethod
+    def _capture_source_root(mgr):
+        captured = {}
+        fake = MagicMock()
+        fake.render_topology.side_effect = (
+            lambda source_root=None: captured.__setitem__("root", source_root)
+        )
+        mgr._netlab = fake
+        return captured
+
+    @staticmethod
+    def _assert_resolves_to_cwd(captured, tmp_path):
+        root = captured["root"]
+        assert root, "source_root must not be empty (the bug produced '')"
+        assert os.path.isabs(root), f"source_root must be absolute, got {root!r}"
+        assert os.path.realpath(root) == os.path.realpath(str(tmp_path))
+
+    def test_deploy_netlab_relative_conf_resolves_to_box_dir(
+            self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        mgr = _make_manager({
+            "workspace": {"path": str(tmp_path / "ws")},
+            "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
+        })
+        mgr.config_path = "conf.yml"  # bare relative default
+        captured = self._capture_source_root(mgr)
+
+        mgr.deploy_netlab()
+        self._assert_resolves_to_cwd(captured, tmp_path)
+
+    def test_ensure_netlab_up_relative_conf_resolves_to_box_dir(
+            self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        mgr = _make_manager({
+            "workspace": {"path": str(tmp_path / "ws")},
+            "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
+        })
+        mgr.config_path = "conf.yml"
+        captured = self._capture_source_root(mgr)
+
+        mgr.ensure_netlab_up()
+        self._assert_resolves_to_cwd(captured, tmp_path)

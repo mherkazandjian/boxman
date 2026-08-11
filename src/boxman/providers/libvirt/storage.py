@@ -18,12 +18,14 @@ CLI subcommands (``df``, ``trim``, ``compact``, ``optimize``).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import Any
 from xml.etree import ElementTree as ET
 
 from boxman import log
+from boxman.loggers.logger import is_verbose
 
 from .commands import LibVirtCommandBase, VirshCommand
 
@@ -202,7 +204,7 @@ class StorageManager:
     def sparsify_in_place(self, disk_path: str) -> bool:
         cmd = f"virt-sparsify --in-place {disk_path}"
         self.logger.info(f"sparsifying {disk_path}")
-        result = self.cmd.execute_shell(cmd, warn=True, hide=False)
+        result = self.cmd.execute_shell(cmd, warn=True, hide=not is_verbose(logging.DEBUG))
         if not result.ok:
             self.logger.error(
                 f"virt-sparsify failed for {disk_path}: {result.stderr.strip()}")
@@ -216,7 +218,7 @@ class StorageManager:
         cmd = (f"qemu-img convert {compress_flag}-O qcow2 {disk_path} {tmp_path} "
                f"&& mv {tmp_path} {disk_path}")
         self.logger.info(f"converting {disk_path} (compress={compress})")
-        result = self.cmd.execute_shell(cmd, warn=True, hide=False)
+        result = self.cmd.execute_shell(cmd, warn=True, hide=not is_verbose(logging.DEBUG))
         if not result.ok:
             self.logger.error(
                 f"qemu-img convert failed for {disk_path}: {result.stderr.strip()}")

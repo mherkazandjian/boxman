@@ -18,6 +18,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - **Image import**: define a libvirt VM from a pre-built `(disk + XML)` package described by a JSON manifest, served from disk or over HTTP/HTTPS — see [Image Management](doc/image-management.md)
 - **OCI registry images** (via `oras`): publish qcow2 disks + optional `vmimage.json` metadata with `boxman image push`, inspect a reference with `boxman image inspect`, and use an OCI image as a base via a template `image.uri: oci://…` or directly with `base_image: oci://…`. Both boxman's own titled-qcow2 artifacts and KubeVirt **containerDisk** images (qcow2 embedded at `/disk/`, e.g. `oci://quay.io/containerdisks/ubuntu:24.04`) are supported — see [Image Management](doc/image-management.md)
 - **Runtime environments**: execute provider commands locally or inside a Docker container
+- **Per-cluster providers**: a project can mix `libvirt` VM clusters and `docker-compose` container clusters, with every verb (`up`, `ps`, `snapshot`, `control`, ansible inventory) working across both — and VM↔container L2 adjacency over a shared bridge. See [Providers](#providers)
 - **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
 - **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow disks
 - **Disk reclaim and storage hygiene**: `boxman storage` inspects qcow2 footprint, runs guest-side fstrim, compacts qcow2 files, and compresses snapshot memory dumps with zstd — see [Disk Reclaim and Storage](doc/storage.md)
@@ -223,7 +224,11 @@ Checksum verification behaviour:
 
  - git clone
  - `pip install .` (or `pip install -e .` for development)
- - For docker-compose runtime extras: `pip install '.[docker-compose]'`
+ - `pip install '.[docker-compose]'` adds the **Docker SDK for Python**.
+   boxman never imports it — every docker call shells out to the `docker`
+   CLI — but Ansible's `community.docker` connection plugin needs it on the
+   control host to reach containers of a docker-compose cluster (`boxman
+   run` / `tasks:`). Not required just to provision containers.
  - For the libvirt provider it is necessary that the user executing boxman
    can run sudo virsh and other libvirt commands (see below).
  - The boxman application config is searched at `~/.config/boxman/boxman.yml` by default.
@@ -299,6 +304,70 @@ files under `boxes/<name>/.boxman/` (libvirt runtime data), `make
 boxes-clean` removes them via a throwaway `alpine` container. The same
 fallback is used automatically by `destroy` and `destroy-runtime`.
 
+## Providers
+
+The **provider** controls *what* a cluster is made of. It is set per cluster,
+so one project can mix them:
+
+| Provider | Cluster contains | Declared with |
+|---|---|---|
+| `libvirt` (default) | KVM/QEMU virtual machines | `vms:` (or `boxes:`) |
+| `docker-compose` | containers, one compose project per cluster | `boxes:` |
+
+> **`docker-compose` means two different things in boxman.** As a *runtime*
+> (above) it is where libvirt commands run — inside a container. As a
+> *provider* (here) it is what a cluster is built from — containers instead of
+> VMs. They are independent axes that happen to share a name. The
+> docker-compose **provider** requires the `local` **runtime**, and says so
+> explicitly if you mix them up.
+
+```yaml
+version: '2.0'                 # required to use per-cluster providers
+project: shop
+
+provider:
+  docker-compose:
+    project_name: shop
+
+clusters:
+  web:                         # containers
+    provider: docker-compose
+    workdir: ./.boxman/web
+    boxes:
+      cache:
+        image: redis:7-alpine
+
+  compute:                     # VMs, same project
+    provider: libvirt
+    base_image: ubuntu-24.04-minimal-base-template-cloudinit
+    boxes:
+      node01: { memory: 2048 }
+```
+
+Every verb works across both: `provision`, `up`/`down`, `ps`, `destroy`,
+`snapshot`, `control`, and the ansible inventory. Two differences worth
+knowing up front:
+
+- **`boxman ssh` is VM-only.** Containers are reached with **`boxman exec
+  <cluster>.<box>`**, which runs `docker compose exec` — no sshd sidecar and no
+  keys baked into images.
+- **`--cluster` scopes either provider; `--vms` is libvirt-only** and skips
+  docker-compose clusters entirely, so `snapshot restore --vms node01` cannot
+  quietly recreate your containers.
+
+Container snapshots are `docker commit`-backed, and **named volumes are not
+captured** — see the user guide for that caveat in full.
+
+Start here:
+
+- [`boxes/docker-compose-standalone`](boxes/docker-compose-standalone) — a pure
+  container project: volumes, `exec`, inventory, snapshots. No KVM needed.
+- [`boxes/hybrid-libvirt-docker-compose`](boxes/hybrid-libvirt-docker-compose) —
+  a VM and a container sharing an L2 domain.
+- [User guide](doc/docker-compose-provider/user-guide.md) ·
+  [config schema](doc/docker-compose-provider/config-schema.md) ·
+  [v1.0 → v2.0 migration](doc/docker-compose-provider/migration-v1-to-v2.md)
+
 ## Sample configuration
 
   See [`data/templates/boxman.yml`](data/templates/boxman.yml) and
@@ -321,6 +390,24 @@ The `--compress-memory` flag zstd-compresses the snapshot memory dump
 transparently — no flag needed at revert time. See
 [Disk Reclaim and Storage](doc/storage.md) for the full reclaim
 workflow and the `boxman storage` subcommand.
+
+### Output verbosity
+
+By default boxman prints terse, docker-compose-style progress lines (the
+important milestones only). Add `-v`/`-vv`/`-vvv` — either before or after the
+sub-command — to reveal more detail, or `-q`/`--quiet` for warnings and errors
+only:
+
+```bash
+boxman up            # terse (default)
+boxman -v up         # + info-level detail
+boxman up -vv        # + full [time LEVEL file:func] debug lines
+boxman up -vvv       # also echo the underlying shell commands
+boxman up -q         # warnings and errors only
+```
+
+The default level can also be set with the `BOXMAN_VERBOSITY` environment
+variable (e.g. `BOXMAN_VERBOSITY=2`); any explicit `-v`/`-q` flag overrides it.
 
 ### SSH into VMs
 
@@ -499,6 +586,126 @@ the host before the first `compact` / `compress-snapshots`.
 Full reference, flag matrix, and troubleshooting:
 [doc/storage.md](doc/storage.md).
 
+## Advanced
+
+### Docker and libvirt fight over the same firewall table
+
+**Symptom.** Guests get an address and can reach the host, but nothing past it.
+Usually after a `systemctl restart docker`, a docker upgrade, or a reboot where
+docker happened to start last. It presents as a slow or flaky network rather
+than a firewall fault, because NAT keeps working and only forwarding is dead.
+
+**Cause.** Docker and libvirt both write the `filter` table. Docker rebuilds
+that table on every restart and leaves the FORWARD policy at `DROP`. libvirt's
+rules — and boxman's own routed-network `FORWARD` rules — are collateral
+damage, and nothing re-applies them.
+
+Every base chain on the forward hook is evaluated, and **a drop or reject in
+any one of them is final**; an accept only ends its own chain. libvirt's
+ACCEPTs therefore cannot rescue a packet that docker's policy drops:
+
+```text
+  guest ──▶ [ FORWARD HOOK ] ──▶ internet
+                   │
+                   ├─ ip filter FORWARD .............. policy DROP   ◀ docker
+                   │    -j DOCKER-USER      (empty)
+                   │    -j DOCKER-FORWARD
+                   │    LIBVIRT_FWI/FWO/FWX  ▓ empty, no jumps ▓  ◀ wiped
+                   │
+                   └─ ip6 filter FORWARD ............. policy accept
+
+                        verdict = DROP
+```
+
+The nat table usually survives, so `LIBVIRT_PRT` still MASQUERADEs happily.
+That mismatch is the tell.
+
+**Fix — stop sharing the table.** Two settings; both are required, and either
+one alone leaves the host broken in a different way.
+
+```text
+                   ├─ ip filter FORWARD .............. policy ACCEPT ◀ ip-forward-no-drop
+                   ├─ ip6 filter FORWARD ............. policy accept
+                   └─ ip libvirt_network forward ..... accept virbr* ◀ firewall_backend=nftables
+                        verdict = ACCEPT
+```
+
+```text
+  BEFORE                            AFTER
+  ┌ table ip filter ─────────┐      ┌ table ip filter ─────────┐
+  │  docker   ── rebuilds ───┼──╮   │  docker   ── rebuilds    │ harmless
+  │  libvirt  ── collateral ◀┼──╯   └──────────────────────────┘
+  └──────────────────────────┘      ┌ table ip libvirt_network ┐
+                                    │  libvirt  ── untouchable │
+                                    └──────────────────────────┘
+```
+
+Do them **in this order**. Step 2 restarts docker, which is the event that
+wipes the shared table — so move libvirt out first. Stopping halfway then
+costs you nothing you did not already have.
+
+```bash
+# 1. /etc/libvirt/network.conf  ->  firewall_backend = "nftables"
+sudo systemctl restart virtnetworkd     # or libvirtd on monolithic builds
+
+# 2. /etc/docker/daemon.json  ->  "ip-forward-no-drop": true
+#    Check the engine knows it first -- dockerd refuses to start on an
+#    unknown directive:  dockerd --help | grep ip-forward-no-drop
+sudo systemctl restart docker
+
+# 3. the flag stops docker *setting* DROP; it does not clear one it already
+#    set. This one-off reset is the step everyone misses:
+sudo iptables -P FORWARD ACCEPT
+sudo ip6tables -P FORWARD ACCEPT        # docker manages v6 too
+```
+
+If your libvirt is too old for `firewall_backend` (before 10.10), step 1 is
+unavailable: do steps 2–3 and then `sudo systemctl restart virtnetworkd` to
+put libvirt's rules back, and accept that a docker restart will keep removing
+them.
+
+Verify:
+
+```bash
+nft list tables | grep libvirt          # libvirt now owns a private table
+sudo iptables -S FORWARD | head -1      # -P FORWARD ACCEPT
+sudo virsh net-destroy default && sudo virsh net-start default
+```
+
+Then the real test: a guest reaches the internet, and `systemctl restart
+docker` leaves it reachable.
+
+`python3 scripts/installer/check_prerequisites.py` detects both the acute case
+(rules already gone) and the latent one (still fine, but the next docker
+restart takes them), and offers these commands as a guided fix.
+
+**Three things worth internalising:**
+
+1. **This is not an iptables-vs-nftables problem.** On most current distros
+   `iptables` is `iptables-nft` (check with `iptables --version`, which then
+   reports `(nf_tables)`) — docker's "iptables filter table" *is* `table ip
+   filter` in nftables. The fix is a **private table instead of a shared
+   one**, not a change of framework.
+2. **Rule order does not save you.** Being first in your own chain is
+   irrelevant when a different base chain at the same hook drops the packet.
+3. **firewalld is not the answer.** It does not relocate libvirt's rules and
+   does not touch docker's FORWARD policy, so it fixes neither half. libvirt
+   *does* re-apply its rules on firewalld's reload signal — but a docker
+   restart never emits one, so that recovery hook never fires. Enabling it
+   only adds a third forward-hook chain that ends in `reject`, which
+   everything then has to be zoned past.
+
+**Caveats.**
+
+- `ip-forward-no-drop` makes host-wide forwarding default-accept. On a box
+  routing guest subnets that is a deliberate posture change, not a free win.
+- Once libvirt's own rules are protected, boxman's routed-network `FORWARD`
+  rules are duplication. They are also what masks this fault — which is why
+  the breakage tends to look partial.
+- **This applies to the local runtime only.** Under `--runtime docker` the
+  libvirt container has its own network namespace, so its tables are already
+  isolated from the host's docker.
+
 ## Development
 
 ### Run boxman in development mode
@@ -529,7 +736,7 @@ make ping
 
 ## License
 
-This project is licensed under the [MIT License](../LICENSE).
+This project is licensed under the [MIT License](LICENSE).
 
 ## Boxman Commands
 

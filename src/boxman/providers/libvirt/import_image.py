@@ -377,9 +377,7 @@ class ImageImporter:
         Returns:
             True if successful, False otherwise
         """
-        self._log_info("=" * 70)
         self._log_info("vm image import utility")
-        self._log_info("=" * 70)
 
         # read the manifest
         # .. todo:: this is redundant with what is done in the session and the manager and the app
@@ -479,10 +477,8 @@ class ImageImporter:
             self._log_error("Failed to define VM")
             return False
 
-        self._log_info("=" * 70)
         self._log_info(f"Successfully imported VM '{vm_name}'")
         self._log_info(f"  Disk image: {dst_image_path}")
         self._log_info(f"  Connection URI: {self.uri}")
-        self._log_info("=" * 70)
 
         return True

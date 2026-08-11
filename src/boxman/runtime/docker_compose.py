@@ -7,6 +7,7 @@ When the bundled assets are used, they are copied to a ``.boxman/runtime/docker`
 directory next to the project's ``conf.yml``.
 """
 
+import hashlib
 import os
 import re
 import shutil
@@ -246,9 +247,9 @@ class DockerComposeRuntime(RuntimeBase):
                 "BOXMAN_PROJECT_DIR": abs_project_dir,
             }
 
-            self.logger.info("docker compose environment variables:")
+            self.logger.debug("docker compose environment variables:")
             for k, v in env_vars.items():
-                self.logger.info(f"  {k}={v}")
+                self.logger.debug(f"  {k}={v}")
 
             compose_env = os.environ.copy()
             compose_env.update(env_vars)
@@ -326,8 +327,7 @@ class DockerComposeRuntime(RuntimeBase):
             with open(compose_path) as fobj:
                 contents = fobj.read()
             self.logger.info(
-                f"docker-compose.yml ({compose_path}):\n"
-                f"{'─' * 60}\n{contents}{'─' * 60}")
+                f"docker-compose.yml ({compose_path}):\n{contents}")
         except Exception as exc:
             self.logger.warning(f"could not read compose file for logging: {exc}")
 
@@ -574,10 +574,50 @@ class DockerComposeRuntime(RuntimeBase):
         base = self.project_dir or os.getcwd()
         return os.path.join(base, ".boxman", "runtime", "docker")
 
+    #: Items in the bundled asset source dir that are never deployed:
+    #: ``data`` holds runtime state, ``.env`` holds local overrides.
+    _ASSET_DEPLOY_EXCLUDES = ("data", ".env")
+
+    #: Name of the fingerprint file written next to the deployed assets.
+    #: Used to detect when the package's bundled assets have changed
+    #: (e.g. after a boxman upgrade) so stale copies are redeployed.
+    _ASSET_FINGERPRINT_FILE = ".assets-fingerprint"
+
+    @classmethod
+    def _assets_fingerprint(cls, source_dir: str) -> str:
+        """
+        Content fingerprint (sha256) of every deployable file under
+        *source_dir*, covering relative paths and file contents.
+
+        Excludes ``_ASSET_DEPLOY_EXCLUDES`` at any depth — the same
+        semantics as ``shutil.copytree(ignore=ignore_patterns(...))``
+        used by the deploy step, so both always agree on the file set.
+        """
+        digest = hashlib.sha256()
+        for root, dirs, files in os.walk(source_dir):
+            dirs[:] = sorted(
+                d for d in dirs if d not in cls._ASSET_DEPLOY_EXCLUDES)
+            for name in sorted(files):
+                if name in cls._ASSET_DEPLOY_EXCLUDES:
+                    continue
+                path = os.path.join(root, name)
+                rel = os.path.relpath(path, source_dir)
+                # NUL separators keep (path, content) pairs unambiguous
+                digest.update(rel.encode() + b"\0")
+                with open(path, "rb") as fh:
+                    digest.update(fh.read())
+                digest.update(b"\0")
+        return digest.hexdigest()
+
     def _deploy_bundled_assets(self) -> str | None:
         """
         Copy the bundled docker assets from the package into
         ``.boxman/runtime/docker/`` next to the project's conf.yml.
+
+        Already-deployed assets are reused only while their fingerprint
+        matches the package's bundled assets; a mismatch (e.g. a boxman
+        upgrade shipping a fixed Dockerfile) triggers a redeploy so
+        fixes actually reach existing projects.
 
         Returns:
             Absolute path to the deployed docker-compose.yml, or None
@@ -586,37 +626,59 @@ class DockerComposeRuntime(RuntimeBase):
         local_dir = self._get_local_runtime_dir()
         local_compose = os.path.join(local_dir, "docker-compose.yml")
 
-        # if already deployed, reuse it
-        if os.path.isfile(local_compose):
-            self.logger.info(
-                f"using existing runtime assets in {local_dir}")
-            return local_compose
-
         # find the source assets inside the package
         source_dir = self._find_asset_source_dir()
         if source_dir is None:
+            # without a source we cannot verify staleness — fall back to
+            # reusing whatever was deployed before
+            if os.path.isfile(local_compose):
+                self.logger.info(
+                    f"using existing runtime assets in {local_dir}")
+                return local_compose
             return None
 
         source_compose = os.path.join(source_dir, "docker-compose.yml")
         if not os.path.isfile(source_compose):
             return None
 
-        # copy all files from the source to the local runtime dir
+        # reuse the deployed copy only if it matches the bundled source
+        fingerprint_path = os.path.join(
+            local_dir, self._ASSET_FINGERPRINT_FILE)
+        if os.path.isfile(local_compose) and os.path.isfile(fingerprint_path):
+            with open(fingerprint_path) as fh:
+                deployed_fingerprint = fh.read().strip()
+            if deployed_fingerprint == self._assets_fingerprint(source_dir):
+                self.logger.info(
+                    f"using existing runtime assets in {local_dir}")
+                return local_compose
+            self.logger.info(
+                f"bundled runtime assets changed; redeploying to {local_dir}")
+
+        # copy all files from the source to the local runtime dir.
+        # Deployed entries that no longer exist in the source are
+        # removed first (except runtime state) so stale files cannot
+        # linger while the fingerprint reports "in sync".
         self.logger.info(
             f"copying bundled docker assets from {source_dir} → {local_dir}")
         os.makedirs(local_dir, exist_ok=True)
 
-        for item in os.listdir(source_dir):
-            src = os.path.join(source_dir, item)
-            dst = os.path.join(local_dir, item)
-            if item == "data":
+        keep = set(self._ASSET_DEPLOY_EXCLUDES) | {self._ASSET_FINGERPRINT_FILE}
+        for item in os.listdir(local_dir):
+            if item in keep:
                 continue
-            if item == ".env":
-                continue
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
+            stale = os.path.join(local_dir, item)
+            if os.path.isdir(stale) and not os.path.islink(stale):
+                shutil.rmtree(stale)
             else:
-                shutil.copy2(src, dst)
+                os.remove(stale)
+
+        shutil.copytree(
+            source_dir, local_dir,
+            ignore=shutil.ignore_patterns(*self._ASSET_DEPLOY_EXCLUDES),
+            dirs_exist_ok=True)
+
+        with open(fingerprint_path, "w") as fh:
+            fh.write(self._assets_fingerprint(source_dir))
 
         self.logger.info(f"deployed runtime assets to {local_dir}")
         return local_compose
@@ -633,7 +695,6 @@ class DockerComposeRuntime(RuntimeBase):
         """
         if not instance_name or instance_name == "default":
             return 0
-        import hashlib
         digest = hashlib.md5(instance_name.encode()).hexdigest()
         return int(digest[:4], 16) % 1000
 

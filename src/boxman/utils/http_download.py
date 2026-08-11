@@ -1,9 +1,11 @@
 """HTTP/HTTPS download helper with wget -> curl -> urllib fallbacks."""
 
+import logging
 import os
 import urllib.request
 
 from boxman import log
+from boxman.loggers.logger import is_verbose
 from boxman.utils.shell import run as _shell_run
 
 
@@ -14,12 +16,12 @@ def download_url(url: str, dst_path: str) -> bool:
     finally a urllib fallback. A partial *dst_path* left by a failed
     attempt is removed before the next attempt.
     """
-    log.info(f"downloading {url} -> {dst_path}")
+    log.status(f"downloading {url} -> {dst_path}")
 
     # wget: handles redirects, proxies, SSL well; prints chunky progress.
     result = _shell_run(
         f'wget --progress=dot:mega -O "{dst_path}" "{url}"',
-        hide=False, warn=True,
+        hide=not is_verbose(logging.DEBUG), warn=True,
     )
     if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
         log.info("download complete (wget)")
@@ -30,7 +32,7 @@ def download_url(url: str, dst_path: str) -> bool:
     # curl fallback.
     result = _shell_run(
         f'curl -L --progress-bar -o "{dst_path}" "{url}"',
-        hide=False, warn=True,
+        hide=not is_verbose(logging.DEBUG), warn=True,
     )
     if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
         log.info("download complete (curl)")

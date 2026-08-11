@@ -152,7 +152,15 @@ containerlab:
         image: ghcr.io/nokia/srlinux:24.10.1
         type: ixrd3l                         # SR Linux platform variant
         startup-config: configs/sw1.cfg.j2
+      # A `kind: bridge` node references the *existing* shared Linux
+      # bridge that boxman creates from `shared_networks.clab_mgmt` (and
+      # that host01's second NIC also joins) — it attaches, it does not
+      # create one. (`host:<name>` would create a new host interface and
+      # collide with the bridge.)
+      clab_mgmt:
+        kind: bridge
     links:
       # SR Linux port naming is `ethernet-1/N`. Containerlab abbreviates
       # with `eN` on the topology side, but the full name works too.
-      - endpoints: ["sw1:e1-1", "host:clab_mgmt"]
+      # eth-sw1 is the bridge-side veth on the shared bridge.
+      - endpoints: ["sw1:e1-1", "clab_mgmt:eth-sw1"]
