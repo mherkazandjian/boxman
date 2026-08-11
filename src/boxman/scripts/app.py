@@ -398,6 +398,18 @@ def _main():
             if not manager.config:
                 log.error("no project config found (conf.yml)")
                 sys.exit(1)
+            # same load/merge/inject path as the other verbs so ps honors
+            # boxman.yml (uri, sudo lists) and the resolved runtime
+            boxman_config = load_boxman_config(os.path.expanduser(args.boxman_conf))
+            manager.load_app_config(boxman_config)
+            manager.runtime = args.runtime or boxman_config.get('runtime', 'local')
+            # scope the runtime container to this project (as the full
+            # session path does) so ps targets the right container
+            if manager.runtime_instance.name == 'docker-compose':
+                manager.runtime_instance.project_dir = os.path.abspath(
+                    os.path.dirname(args.conf))
+                if 'project' in manager.config:
+                    manager.runtime_instance.project_name = manager.config['project']
             args.func(manager, args)
         sys.exit(0)
 

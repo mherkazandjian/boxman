@@ -220,6 +220,31 @@ class BoxmanManager:
             for name in clusters
         )
 
+    def _libvirt_provider_config(self) -> dict[str, Any]:
+        """
+        Resolve the libvirt provider config for a one-off virsh probe:
+        the project's ``provider.libvirt`` block merged over app-level
+        (boxman.yml) ``providers.libvirt`` defaults, with runtime
+        metadata injected.
+        """
+        provider_config = (
+            (self.config or {}).get('provider', {}).get('libvirt', {}))
+        if self.app_config and 'providers' in self.app_config:
+            app_prov = self.app_config['providers'].get('libvirt', {})
+            provider_config = merge_provider_configs(app_prov, provider_config)
+        if hasattr(self, 'runtime_instance'):
+            provider_config = self.runtime_instance.inject_into_provider_config(
+                provider_config)
+        return provider_config
+
+    def _virsh(self) -> "VirshCommand":
+        """
+        Build a one-off VirshCommand for a libvirt probe, using the config
+        from :meth:`_libvirt_provider_config` so app-level settings and the
+        runtime (local host vs. container) are honored.
+        """
+        return VirshCommand(provider_config=self._libvirt_provider_config())
+
     def session_for_cluster(self, cluster_name: str) -> "ProviderSession":
         """
         Return the provider session that manages *cluster_name*.
@@ -1675,20 +1700,9 @@ class BoxmanManager:
         #: keys of the templates whose build failed, reported to the caller
         failed: list[str] = []
 
-        # determine provider config — templates are libvirt-only, so resolve
-        # the libvirt block explicitly: in a mixed project the first key of
-        # ``provider:`` may be a different provider, and probing/creating on
-        # that config would target the wrong hypervisor.
-        provider_config = config.get('provider', {}).get('libvirt', {})
-
-        # merge app-level provider config as defaults
-        if self.app_config and 'providers' in self.app_config:
-            app_provider = self.app_config['providers'].get('libvirt', {})
-            provider_config = merge_provider_configs(app_provider, provider_config)
-
-        # inject runtime settings
-        if hasattr(self, 'runtime_instance'):
-            provider_config = self.runtime_instance.inject_into_provider_config(provider_config)
+        # determine provider config — templates are libvirt-only, so the
+        # libvirt block is resolved explicitly (app-merged + runtime-injected)
+        provider_config = self._libvirt_provider_config()
 
         self.logger.info(f"resolved provider config for templates: {provider_config}")
 
@@ -1700,7 +1714,6 @@ class BoxmanManager:
 
         # --- Pre-check: detect already-existing templates ----------------
         # Build a temporary VirshCommand to query existing VMs once.
-        from boxman.providers.libvirt.commands import VirshCommand
         _virsh = VirshCommand(provider_config=provider_config)
         _existing_vms: set = set()
         result = _virsh.execute("list", "--all", "--name", hide=True, warn=True)
@@ -2382,16 +2395,7 @@ class BoxmanManager:
             elif self.provider is not None:
                 # fallback: try virsh list
                 try:
-                    from boxman.providers.libvirt.commands import VirshCommand
-                    provider_type = primary_provider_type(self.config)
-                    provider_config = self.config.get('provider', {}).get(provider_type, {})
-                    if self.app_config and 'providers' in self.app_config:
-                        app_prov = self.app_config['providers'].get(provider_type, {})
-                        provider_config = merge_provider_configs(app_prov, provider_config)
-                    if hasattr(self, 'runtime_instance'):
-                        provider_config = self.runtime_instance.inject_into_provider_config(provider_config)
-                    virsh = VirshCommand(provider_config=provider_config)
-                    result = virsh.execute("list", "--all", "--name", hide=True, warn=True)
+                    result = self._virsh().execute("list", "--all", "--name", hide=True, warn=True)
                     if result.ok:
                         vm_list = [v.strip() for v in result.stdout.strip().split("\n") if v.strip()]
                         exists = tpl_vm_name in vm_list
@@ -4185,19 +4189,7 @@ class BoxmanManager:
         if not self._has_libvirt_clusters():
             return []
 
-        # Resolve the libvirt provider config explicitly — these probes are
-        # libvirt-only, so in a mixed project the first key of ``provider:``
-        # (primary_provider_type) may point at the wrong hypervisor.
-        provider_config = self.config.get('provider', {}).get('libvirt', {})
-        if self.app_config and 'providers' in self.app_config:
-            app_prov = self.app_config['providers'].get('libvirt', {})
-            provider_config = merge_provider_configs(app_prov, provider_config)
-        if hasattr(self, 'runtime_instance'):
-            provider_config = self.runtime_instance.inject_into_provider_config(
-                provider_config)
-
-        virsh = VirshCommand(provider_config=provider_config)
-        result = virsh.execute("list", "--all", "--name", hide=True, warn=True)
+        result = self._virsh().execute("list", "--all", "--name", hide=True, warn=True)
         if not result.ok:
             self.logger.warning("could not query existing VMs via virsh")
             return []
@@ -4219,19 +4211,7 @@ class BoxmanManager:
         if not self._has_libvirt_clusters():
             return []
 
-        # Resolve the libvirt provider config explicitly — see
-        # _find_existing_project_vms for why primary_provider_type is wrong
-        # here in mixed projects.
-        provider_config = self.config.get('provider', {}).get('libvirt', {})
-        if self.app_config and 'providers' in self.app_config:
-            app_prov = self.app_config['providers'].get('libvirt', {})
-            provider_config = merge_provider_configs(app_prov, provider_config)
-        if hasattr(self, 'runtime_instance'):
-            provider_config = self.runtime_instance.inject_into_provider_config(
-                provider_config)
-
-        virsh = VirshCommand(provider_config=provider_config)
-        result = virsh.execute("list", "--all", "--name", hide=True, warn=True)
+        result = self._virsh().execute("list", "--all", "--name", hide=True, warn=True)
         if not result.ok:
             self.logger.warning("could not query existing VMs via virsh")
             return []
@@ -4258,20 +4238,8 @@ class BoxmanManager:
         if not self._has_libvirt_clusters():
             return {}
 
-        # Resolve the libvirt provider config explicitly — see
-        # _find_existing_project_vms for why primary_provider_type is wrong
-        # here in mixed projects.
-        provider_config = self.config.get('provider', {}).get('libvirt', {})
-        if self.app_config and 'providers' in self.app_config:
-            app_prov = self.app_config['providers'].get('libvirt', {})
-            provider_config = merge_provider_configs(app_prov, provider_config)
-        if hasattr(self, 'runtime_instance'):
-            provider_config = self.runtime_instance.inject_into_provider_config(
-                provider_config)
-
-        virsh = VirshCommand(provider_config=provider_config)
         # Use the table output to get both name and state
-        result = virsh.execute("list", "--all", hide=True, warn=True)
+        result = self._virsh().execute("list", "--all", hide=True, warn=True)
         if not result.ok:
             self.logger.warning("could not query VM states via virsh")
             return {}
@@ -6125,17 +6093,11 @@ class BoxmanManager:
                 print("No VMs or containers defined in configuration")
             return
 
-        # Query virsh for VM states — only when there are libvirt VMs (a
-        # dc-only project has no libvirt to talk to).
+        # Query virsh for VM states — only when the project has libvirt
+        # clusters (a dc-only project has no libvirt to talk to).
         vm_info: dict[str, tuple[str, str]] = {}
-        if vm_list:
-            provider_type = primary_provider_type(cls.config)
-            provider_config = cls.config.get("provider", {}).get(provider_type, {})
-            if cls.app_config and "providers" in cls.app_config:
-                app_prov = cls.app_config["providers"].get(provider_type, {})
-                provider_config = merge_provider_configs(app_prov, provider_config)
-            virsh = VirshCommand(provider_config=provider_config)
-            result = virsh.execute("list", "--all", hide=True, warn=True)
+        if vm_list and cls._has_libvirt_clusters():
+            result = cls._virsh().execute("list", "--all", hide=True, warn=True)
             if result.ok:
                 for line in result.stdout.strip().splitlines():
                     line = line.strip()
