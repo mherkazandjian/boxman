@@ -21,6 +21,8 @@ from collections.abc import Iterable
 
 from boxman import log
 
+from .disk import disk_path_for
+
 
 def remove_vm_disks(
     workdir: str,
@@ -60,12 +62,12 @@ def remove_vm_disks(
     """
     workdir = os.path.expanduser(workdir)
 
-    boot_disk = os.path.join(workdir, f'{vm_name}.qcow2')
+    boot_disk = disk_path_for(workdir, vm_name)
     if os.path.isfile(boot_disk):
         os.remove(boot_disk)
 
     for disk in extra_disks:
-        disk_path = os.path.join(workdir, f'{vm_name}_{disk["name"]}.qcow2')
+        disk_path = disk_path_for(workdir, disk["name"], disk_prefix=vm_name)
         if os.path.isfile(disk_path):
             os.remove(disk_path)
 

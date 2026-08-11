@@ -5,6 +5,25 @@ from typing import Any
 from .commands import LibVirtCommandBase, VirshCommand
 
 
+def disk_path_for(workdir: str,
+                  disk_name: str,
+                  driver_type: str = 'qcow2',
+                  disk_prefix: str | None = None) -> str:
+    """
+    Return the canonical path of a disk image under *workdir*.
+
+    Naming: ``<workdir>/<disk_prefix>_<disk_name>.<driver_type>`` when
+    *disk_prefix* is given, ``<workdir>/<disk_name>.<driver_type>``
+    otherwise; ``~`` is expanded.
+    """
+    if disk_prefix:
+        disk_path = os.path.join(
+            workdir, f"{disk_prefix}_{disk_name}.{driver_type}")
+    else:
+        disk_path = os.path.join(workdir, f"{disk_name}.{driver_type}")
+    return os.path.expanduser(disk_path)
+
+
 class DiskManager(VirshCommand):
     """
     Class for managing VM disk operations in libvirt.
@@ -179,13 +198,9 @@ class DiskManager(VirshCommand):
             bus = disk_config.get("bus", "virtio")
 
             # create disk path
-            if disk_prefix:
-                disk_path = os.path.join(workdir, f"{disk_prefix}_{disk_name}.{driver_type}")
-            else:
-                disk_path = os.path.join(workdir, f"{disk_name}.{driver_type}")
-
-            # ensure path is expanded
-            disk_path = os.path.expanduser(disk_path)
+            disk_path = disk_path_for(workdir, disk_name,
+                                      driver_type=driver_type,
+                                      disk_prefix=disk_prefix)
 
             # 1. create the disk — unless the caller flagged the config
             # attach_only (image file already exists, e.g. a leftover

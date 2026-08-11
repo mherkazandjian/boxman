@@ -365,7 +365,7 @@ class TestShutdownAndWait:
         with patch.object(sm, "is_shut_off",
                           side_effect=lambda _vm: next(shut_off_states)), \
              patch.object(sm.virsh, "execute", return_value=_result()) as exe, \
-             patch("boxman.providers.libvirt.storage.time.sleep"):
+             patch("boxman.providers.libvirt.destroy_vm.time.sleep"):
             assert sm.shutdown_and_wait("vm01", timeout_s=10) is True
         verbs = [c.args[0] for c in exe.call_args_list]
         assert "shutdown" in verbs
@@ -376,22 +376,14 @@ class TestShutdownAndWait:
         with patch.object(sm, "is_shut_off",
                           side_effect=lambda _vm: next(shut_off_states)), \
              patch.object(sm.virsh, "execute", return_value=_result()), \
-             patch("boxman.providers.libvirt.storage.time.sleep"):
+             patch("boxman.providers.libvirt.destroy_vm.time.sleep"):
             assert sm.shutdown_and_wait("vm01", timeout_s=10) is True
 
     def test_destroys_after_timeout(self, sm: StorageManager):
         # is_shut_off stays False forever — must fall through to destroy
-        time_values = [0]  # always before deadline=5 on entry, after on second check
-
-        def fake_time():
-            time_values[0] += 100
-            return time_values[0]
-
         with patch.object(sm, "is_shut_off", return_value=False), \
              patch.object(sm.virsh, "execute", return_value=_result()) as exe, \
-             patch("boxman.providers.libvirt.storage.time.time",
-                   side_effect=fake_time), \
-             patch("boxman.providers.libvirt.storage.time.sleep"):
+             patch("boxman.providers.libvirt.destroy_vm.time.sleep"):
             sm.shutdown_and_wait("vm01", timeout_s=5)
         verbs = [c.args[0] for c in exe.call_args_list]
         assert "shutdown" in verbs

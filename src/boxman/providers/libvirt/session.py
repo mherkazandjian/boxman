@@ -11,7 +11,7 @@ from . import net_reconcile
 from .cdrom import CDROMManager
 from .clone_vm import CloneVM
 from .commands import VirshCommand
-from .destroy_vm import DestroyVM
+from .destroy_vm import DestroyVM, shutdown_and_wait
 from .disk import DiskManager
 from .disk_cleanup import remove_vm_disks
 from .import_image import ImageImporter
@@ -332,19 +332,7 @@ class LibVirtSession:
     def _power_cycle(virsh, domain: str, timeout: int = 120) -> bool:
         """Shut the domain down gracefully (force after *timeout*) and start it."""
         virsh.execute("shutdown", domain, hide=True, warn=True)
-
-        waited = 0
-        while waited < timeout:
-            state = virsh.execute("domstate", domain, hide=True, warn=True)
-            if state.ok and 'shut off' in state.stdout:
-                break
-            time.sleep(2)
-            waited += 2
-        else:
-            log.warning(
-                f"{domain}: did not shut down within {timeout}s, forcing it off")
-            virsh.execute("destroy", domain, hide=True, warn=True)
-
+        shutdown_and_wait(virsh, domain, timeout=timeout, logger=log)
         return virsh.execute("start", domain, hide=True, warn=True).ok
 
     def plan_network(self,
@@ -1494,12 +1482,10 @@ class LibVirtSession:
                     return False
 
                 # wait for the vm to shut down
-                for _i in range(30):
-                    state_result = virsh.execute("domstate", vm_name, warn=True)
-                    if state_result.ok and "shut off" in state_result.stdout:
-                        break
-                    time.sleep(1)
-                else:
+                if not shutdown_and_wait(virsh, vm_name, timeout=30,
+                                         force_after=False,
+                                         poll_interval=1,
+                                         logger=self.logger):
                     self.logger.error(f"vm {vm_name} did not shut down within timeout")
                     return False
 
@@ -1578,29 +1564,8 @@ class LibVirtSession:
         self.logger.info(f"shutting down VM {vm_name}...")
         virsh.execute('shutdown', vm_name, warn=True)
 
-        # poll for shut off
-        waited = 0
-        poll_interval = 2
-        while waited < timeout:
-            time.sleep(poll_interval)
-            waited += poll_interval
-            result = virsh.execute('domstate', vm_name, warn=True)
-            if result.ok and 'shut off' in result.stdout:
-                self.logger.info(f"VM {vm_name} is shut off after {waited}s")
-                return True
-
-        # force stop as fallback
-        self.logger.warning(
-            f"VM {vm_name} did not shut off within {timeout}s, forcing stop")
-        virsh.execute('destroy', vm_name, warn=True)
-        time.sleep(2)
-
-        result = virsh.execute('domstate', vm_name, warn=True)
-        if result.ok and 'shut off' in result.stdout:
-            return True
-
-        self.logger.error(f"failed to shut off VM {vm_name}")
-        return False
+        return shutdown_and_wait(virsh, vm_name, timeout=timeout,
+                                 logger=self.logger)
 
     def update_vm_cpu_memory(self,
                              vm_name: str,
@@ -1650,60 +1615,28 @@ class LibVirtSession:
 
         # --- Step 1: update persistent config (inactive XML) ---
         xml_content = editor.get_domain_xml(vm_name, inactive=True)
-        modifications = []
 
         desired_total = None
         if cpus:
-            sockets = cpus.get('sockets', 1)
-            cores = cpus.get('cores', 1)
-            threads = cpus.get('threads', 1)
-            desired_total = sockets * cores * threads
+            desired_total = (cpus.get('sockets', 1)
+                             * cpus.get('cores', 1)
+                             * cpus.get('threads', 1))
 
-            effective_max_vcpus = max_vcpus or desired_total
-            if max_vcpus is not None and max_vcpus < desired_total:
-                effective_max_vcpus = desired_total
+        # memory mods only apply when the memory actually changes (or a
+        # new ceiling is requested); the clamping/scaling algorithm itself
+        # is shared with VirshEdit.configure_cpu_memory
+        memory_for_mods = (
+            memory_mb
+            if memory_mb is not None
+            and (memory_mb != actual_memory_mb or max_memory_mb is not None)
+            else None)
 
-            modifications.append(('//vcpu', 'text', str(effective_max_vcpus)))
+        modifications, remove_topology = editor.cpu_memory_modifications(
+            cpus, memory_for_mods, max_vcpus, max_memory_mb,
+            logger=self.logger)
 
-            if effective_max_vcpus > desired_total:
-                # libvirt requires topology product == max vcpu count.
-                # scale sockets so that sockets * cores * threads == max.
-                cores_x_threads = cores * threads
-                if effective_max_vcpus % cores_x_threads == 0:
-                    max_sockets = effective_max_vcpus // cores_x_threads
-                    modifications.extend([
-                        ('//cpu/topology', 'sockets', str(max_sockets)),
-                        ('//cpu/topology', 'cores', str(cores)),
-                        ('//cpu/topology', 'threads', str(threads)),
-                    ])
-                else:
-                    # can't express with given cores*threads, remove topology
-                    from lxml import etree
-                    tree = etree.fromstring(xml_content.encode('utf-8'))
-                    for topo in tree.xpath('//cpu/topology'):
-                        topo.getparent().remove(topo)
-                    xml_content = etree.tostring(
-                        tree, encoding='unicode', pretty_print=True)
-
-                modifications.append(
-                    ('//vcpu', 'current', str(desired_total)))
-            else:
-                modifications.extend([
-                    ('//cpu/topology', 'sockets', str(sockets)),
-                    ('//cpu/topology', 'cores', str(cores)),
-                    ('//cpu/topology', 'threads', str(threads)),
-                ])
-
-        if memory_mb is not None and (memory_mb != actual_memory_mb or max_memory_mb is not None):
-            effective_max_memory = max_memory_mb or memory_mb
-            if max_memory_mb is not None and max_memory_mb < memory_mb:
-                effective_max_memory = memory_mb
-            max_memory_kib = effective_max_memory * 1024
-            current_memory_kib = memory_mb * 1024
-            modifications.extend([
-                ('//memory', 'text', str(max_memory_kib)),
-                ('//currentMemory', 'text', str(current_memory_kib)),
-            ])
+        if remove_topology:
+            xml_content = editor._drop_topology(xml_content)
 
         if modifications:
             modified_xml = editor.modify_xml_xpath(xml_content, modifications)

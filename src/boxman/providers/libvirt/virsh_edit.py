@@ -144,6 +144,106 @@ class VirshEdit:
             self.logger.error(f"failed to find xpath values: {exc}")
             raise
 
+    @staticmethod
+    def cpu_memory_modifications(cpus: dict[str, int] | None,
+                                 memory_mb: int | None,
+                                 max_vcpus: int | None,
+                                 max_memory_mb: int | None,
+                                 logger=log) -> tuple[list[tuple[str, str, str]], bool]:
+        """
+        Compute the ``(xpath, attr, value)`` modification list for CPU and
+        memory configuration.
+
+        The max ceilings (``max_vcpus`` / ``max_memory_mb``) are clamped to
+        at least the current values, and the CPU topology is scaled so that
+        ``sockets * cores * threads == max_vcpus``.
+
+        Returns:
+            ``(modifications, remove_topology)`` — *remove_topology* is
+            True when the max vCPU count cannot be expressed with the
+            given cores*threads product, in which case the caller must
+            drop the ``//cpu/topology`` element from the domain XML before
+            applying the modifications.
+        """
+        modifications: list[tuple[str, str, str]] = []
+        remove_topology = False
+
+        # configure cpu if specified
+        if cpus:
+            sockets = cpus.get('sockets', 1)
+            cores = cpus.get('cores', 1)
+            threads = cpus.get('threads', 1)
+            total_vcpus = sockets * cores * threads
+
+            effective_max_vcpus = max_vcpus or total_vcpus
+            if max_vcpus is not None and max_vcpus < total_vcpus:
+                logger.warning(
+                    f"max_vcpus ({max_vcpus}) < current vcpus ({total_vcpus}), "
+                    f"clamping max_vcpus to {total_vcpus}")
+                effective_max_vcpus = total_vcpus
+
+            modifications.append(('//vcpu', 'text', str(effective_max_vcpus)))
+
+            if effective_max_vcpus > total_vcpus:
+                # libvirt requires topology product == max vcpu count.
+                # scale sockets so that sockets * cores * threads == max.
+                # if it doesn't divide evenly, remove the topology element.
+                cores_x_threads = cores * threads
+                if effective_max_vcpus % cores_x_threads == 0:
+                    max_sockets = effective_max_vcpus // cores_x_threads
+                    modifications.extend([
+                        ('//cpu/topology', 'sockets', str(max_sockets)),
+                        ('//cpu/topology', 'cores', str(cores)),
+                        ('//cpu/topology', 'threads', str(threads))
+                    ])
+                    logger.info(
+                        f"topology adjusted to sockets={max_sockets} "
+                        f"cores={cores} threads={threads} to match "
+                        f"max_vcpus={effective_max_vcpus}")
+                else:
+                    # can't express this max with the given cores*threads,
+                    # remove topology so libvirt doesn't reject it
+                    logger.info(
+                        f"removing topology element: max_vcpus "
+                        f"({effective_max_vcpus}) not divisible by "
+                        f"cores*threads ({cores_x_threads})")
+                    remove_topology = True
+
+                modifications.append(
+                    ('//vcpu', 'current', str(total_vcpus)))
+            else:
+                # max == current, set topology normally
+                modifications.extend([
+                    ('//cpu/topology', 'sockets', str(sockets)),
+                    ('//cpu/topology', 'cores', str(cores)),
+                    ('//cpu/topology', 'threads', str(threads))
+                ])
+
+        # configure memory if specified
+        if memory_mb is not None:
+            effective_max_memory = max_memory_mb or memory_mb
+            if max_memory_mb is not None and max_memory_mb < memory_mb:
+                logger.warning(
+                    f"max_memory ({max_memory_mb}M) < memory ({memory_mb}M), "
+                    f"clamping max_memory to {memory_mb}M")
+                effective_max_memory = memory_mb
+            max_memory_kb = effective_max_memory * 1024
+            current_memory_kb = memory_mb * 1024
+            modifications.extend([
+                ('//memory', 'text', str(max_memory_kb)),
+                ('//currentMemory', 'text', str(current_memory_kb))
+            ])
+
+        return modifications, remove_topology
+
+    @staticmethod
+    def _drop_topology(xml_content: str) -> str:
+        """Remove every ``//cpu/topology`` element from *xml_content*."""
+        tree = etree.fromstring(xml_content.encode('utf-8'))
+        for topo in tree.xpath('//cpu/topology'):
+            topo.getparent().remove(topo)
+        return etree.tostring(tree, encoding='unicode', pretty_print=True)
+
     def configure_cpu_memory(self,
                            domain_name: str,
                            cpus: dict[str, int] | None = None,
@@ -181,77 +281,12 @@ class VirshEdit:
             else:
                 self.logger.debug("no topology element found")
 
-            modifications = []
+            modifications, remove_topology = self.cpu_memory_modifications(
+                cpus, memory_mb, max_vcpus, max_memory_mb,
+                logger=self.logger)
 
-            # configure memory if specified
-            if memory_mb is not None:
-                effective_max_memory = max_memory_mb or memory_mb
-                if max_memory_mb is not None and max_memory_mb < memory_mb:
-                    self.logger.warning(
-                        f"max_memory ({max_memory_mb}M) < memory ({memory_mb}M) "
-                        f"for {domain_name}, clamping max_memory to {memory_mb}M")
-                    effective_max_memory = memory_mb
-                max_memory_kb = effective_max_memory * 1024
-                current_memory_kb = memory_mb * 1024
-                modifications.extend([
-                    ('//memory', 'text', str(max_memory_kb)),
-                    ('//currentMemory', 'text', str(current_memory_kb))
-                ])
-
-            # configure cpu if specified
-            if cpus:
-                sockets = cpus.get('sockets', 1)
-                cores = cpus.get('cores', 1)
-                threads = cpus.get('threads', 1)
-                total_vcpus = sockets * cores * threads
-
-                effective_max_vcpus = max_vcpus or total_vcpus
-                if max_vcpus is not None and max_vcpus < total_vcpus:
-                    self.logger.warning(
-                        f"max_vcpus ({max_vcpus}) < current vcpus ({total_vcpus}) "
-                        f"for {domain_name}, clamping max_vcpus to {total_vcpus}")
-                    effective_max_vcpus = total_vcpus
-
-                modifications.append(('//vcpu', 'text', str(effective_max_vcpus)))
-
-                if effective_max_vcpus > total_vcpus:
-                    # libvirt requires topology product == max vcpu count.
-                    # scale sockets so that sockets * cores * threads == max.
-                    # if it doesn't divide evenly, remove the topology element.
-                    cores_x_threads = cores * threads
-                    if effective_max_vcpus % cores_x_threads == 0:
-                        max_sockets = effective_max_vcpus // cores_x_threads
-                        modifications.extend([
-                            ('//cpu/topology', 'sockets', str(max_sockets)),
-                            ('//cpu/topology', 'cores', str(cores)),
-                            ('//cpu/topology', 'threads', str(threads))
-                        ])
-                        self.logger.info(
-                            f"topology adjusted to sockets={max_sockets} "
-                            f"cores={cores} threads={threads} to match "
-                            f"max_vcpus={effective_max_vcpus}")
-                    else:
-                        # can't express this max with the given cores*threads,
-                        # remove topology so libvirt doesn't reject it
-                        self.logger.info(
-                            f"removing topology element: max_vcpus "
-                            f"({effective_max_vcpus}) not divisible by "
-                            f"cores*threads ({cores_x_threads})")
-                        tree = etree.fromstring(xml_content.encode('utf-8'))
-                        for topo in tree.xpath('//cpu/topology'):
-                            topo.getparent().remove(topo)
-                        xml_content = etree.tostring(
-                            tree, encoding='unicode', pretty_print=True)
-
-                    modifications.append(
-                        ('//vcpu', 'current', str(total_vcpus)))
-                else:
-                    # max == current, set topology normally
-                    modifications.extend([
-                        ('//cpu/topology', 'sockets', str(sockets)),
-                        ('//cpu/topology', 'cores', str(cores)),
-                        ('//cpu/topology', 'threads', str(threads))
-                    ])
+            if remove_topology:
+                xml_content = self._drop_topology(xml_content)
 
             if not modifications:
                 self.logger.info(f"no cpu/memory modifications needed for {domain_name}")

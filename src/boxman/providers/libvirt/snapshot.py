@@ -535,6 +535,34 @@ class SnapshotManager:
                 pass
         return out
 
+    def _snapshot_graph(self, vm_name: str) -> dict[str, dict]:
+        """
+        Return ``{name: info}`` for every snapshot of *vm_name*.
+
+        Runs ``snapshot-list --name`` once and ``snapshot-dumpxml`` once
+        per snapshot. Each *info* carries the parsed fields from
+        :meth:`_parse_snapshot_xml` (``description`` / ``parent`` /
+        ``creation_time``, when present) plus the raw ``xml`` (``None``
+        when the dumpxml failed, so callers can skip those entries).
+        """
+        list_result = self.virsh.execute(
+            "snapshot-list", vm_name, "--name", warn=True)
+        if not list_result.ok:
+            return {}
+
+        graph: dict[str, dict] = {}
+        for name in (n.strip() for n in list_result.stdout.splitlines()):
+            if not name:
+                continue
+            xml_result = self.virsh.execute(
+                "snapshot-dumpxml", vm_name, name, warn=True)
+            xml_text = xml_result.stdout if xml_result.ok else None
+            info = (self._parse_snapshot_xml(xml_text)
+                    if xml_text is not None else {})
+            info['xml'] = xml_text
+            graph[name] = info
+        return graph
+
     def list_snapshots_detailed(self, vm_name: str) -> list[dict]:
         """
         Return per-snapshot dicts for *vm_name* in chain order
@@ -545,20 +573,10 @@ class SnapshotManager:
         snapshot — everything else is parsed out of the XML via
         :meth:`_parse_snapshot_xml`.
         """
-        list_result = self.virsh.execute(
-            "snapshot-list", vm_name, "--name", warn=True)
-        if not list_result.ok:
+        parsed = self._snapshot_graph(vm_name)
+        if not parsed:
             return []
-        names = [n.strip() for n in list_result.stdout.splitlines() if n.strip()]
-        if not names:
-            return []
-
-        parsed: dict[str, dict] = {}
-        for name in names:
-            xml_result = self.virsh.execute(
-                "snapshot-dumpxml", vm_name, name, warn=True)
-            parsed[name] = (self._parse_snapshot_xml(xml_result.stdout)
-                            if xml_result.ok else {})
+        names = list(parsed)
 
         # Topological sort by parent → child.
         children: dict[str | None, list[str]] = {}
@@ -657,28 +675,13 @@ class SnapshotManager:
             list: List of snapshot info dictionaries
         """
         try:
-            # fetch the available snapshots
-            result = self.virsh.execute("snapshot-list", vm_name, "--name")
-            if not result.ok:
-                self.logger.error(f"failed to list snapshots for vm {vm_name}: {result.stderr}")
-                return []
-
-            snapshot_names = result.stdout.strip().split('\n')
-            snapshot_names = [name for name in snapshot_names if name]
-
-            # get the snapshot details
-            snapshots = []
-            for snapshot_name in snapshot_names:
-                dumpxml_result = self.virsh.execute("snapshot-dumpxml", vm_name, snapshot_name)
-                if dumpxml_result.ok:
-                    snap_info = {'name': snapshot_name}
-                    xml_content = dumpxml_result.stdout
-
-                    root = ET.fromstring(xml_content)
-                    snap_info['description'] = root.findtext('description', default='')
-
-                    snapshots.append(snap_info)
-            return snapshots
+            # fetch the available snapshots and their descriptions
+            graph = self._snapshot_graph(vm_name)
+            return [
+                {'name': name, 'description': info.get('description', '')}
+                for name, info in graph.items()
+                if info['xml'] is not None
+            ]
         except Exception as exc:
             self.logger.error(f"error listing snapshots for vm {vm_name}: {exc}")
             return []
@@ -688,22 +691,12 @@ class SnapshotManager:
         Return a mapping of snapshot_name -> set of overlay file paths
         for every external snapshot on *vm_name*.
         """
-        result = self.virsh.execute(
-            "snapshot-list", vm_name, "--name", warn=True)
-        if not result.ok:
-            return {}
-
         overlays: dict[str, list[str]] = {}
-        for snap in result.stdout.strip().splitlines():
-            snap = snap.strip()
-            if not snap:
-                continue
-            xml_result = self.virsh.execute(
-                "snapshot-dumpxml", vm_name, snap, warn=True)
-            if not xml_result.ok:
+        for snap, info in self._snapshot_graph(vm_name).items():
+            if info['xml'] is None:
                 continue
             try:
-                root = ET.fromstring(xml_result.stdout)
+                root = ET.fromstring(info['xml'])
                 files = []
                 for disk in root.findall(".//disks/disk"):
                     if disk.get("snapshot") != "external":
@@ -1052,23 +1045,22 @@ class SnapshotManager:
         first. Built from each snapshot's ``<parent>`` element so it
         works for any tree topology, but boxman only takes linear chains.
         """
-        snaps = self.list_snapshots(vm_name)
-        if not snaps:
+        graph = self._snapshot_graph(vm_name)
+        if not graph:
             return []
 
         parents: dict[str, str | None] = {}
-        for snap in snaps:
-            xml_result = self.virsh.execute(
-                "snapshot-dumpxml", vm_name, snap['name'], warn=True)
-            if not xml_result.ok:
+        for name, info in graph.items():
+            xml_text = info['xml']
+            if xml_text is None:
                 continue
             try:
-                root = ET.fromstring(xml_result.stdout)
+                # keep the historical behavior of excluding snapshots
+                # whose dumpxml does not parse at all
+                ET.fromstring(xml_text)
             except ET.ParseError:
                 continue
-            parent_name_elem = root.find("parent/name")
-            parents[snap['name']] = (
-                parent_name_elem.text if parent_name_elem is not None else None)
+            parents[name] = info.get('parent')
 
         children: dict[str | None, list[str]] = {}
         for name, parent in parents.items():
