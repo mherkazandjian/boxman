@@ -1,15 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <network>
-  <name>{{ name }}</name>
+  {# the environment has no autoescape, so every config-derived value is
+     escaped explicitly -- a name holding an & or a quote would otherwise
+     produce XML that libvirt rejects at net-define #}
+  <name>{{ name|e }}</name>
   <uuid>{{ uuid_val }}</uuid>
   <forward mode='{{ forward_mode }}'/>
-  <bridge name='{{ bridge_name }}' stp='{{ bridge_stp }}' delay='{{ bridge_delay }}'/>
+  <bridge name='{{ bridge_name|e }}' stp='{{ bridge_stp }}' delay='{{ bridge_delay }}'/>
   <mac address='{{ mac_address }}'/>
-  <ip address='{{ ip_address }}' netmask='{{ netmask }}'>
+  <ip address='{{ ip_address|e }}' netmask='{{ netmask|e }}'>
   {% if (dhcp_range_start and dhcp_range_end) or dhcp_hosts %}
     <dhcp>
     {% if dhcp_range_start and dhcp_range_end %}
-      <range start='{{ dhcp_range_start }}' end='{{ dhcp_range_end }}'/>
+      <range start='{{ dhcp_range_start|e }}' end='{{ dhcp_range_end|e }}'/>
     {% endif %}
     {# <range> first, then <host>: libvirt accepts either order but emits and
        documents this one, so a dumpxml diff stays readable. the attributes are

@@ -583,3 +583,86 @@ class TestRouteIsolationRules:
                    return_value=_result()) as run:
             net.execute_shell("iptables -C INPUT -i virbr9 -j DROP", warn=True)
         assert run.call_args.args[0].startswith(expected_prefix)
+
+
+class TestShellQuoting:
+    """Config-derived values interpolated into shell strings are quoted.
+
+    Regression tests for issue #85 item 6 (net.py part): the bridge name
+    comes from the configuration and used to land in the iptables command
+    strings verbatim.
+    """
+
+    @staticmethod
+    def _net(bridge_name: str) -> Network:
+        return Network(name="routed-net",
+                       info={"mode": "route", "bridge": {"name": bridge_name}},
+                       assign_new_bridge=True,
+                       provider_config={"use_sudo": False})
+
+    def test_apply_quotes_a_bridge_name_with_metacharacters(self):
+        net = self._net("virbr 9;touch /tmp/x")
+        seen = []
+        with patch.object(
+                net, "_ensure_rule",
+                side_effect=lambda cls, chk, act, present=True:
+                    seen.append((chk, act)) or True):
+            assert net.apply_route_iptables_rule() is True
+        assert seen
+        for check_cmd, action_cmd in seen:
+            assert "'virbr 9;touch /tmp/x'" in check_cmd
+            assert "'virbr 9;touch /tmp/x'" in action_cmd
+
+    def test_remove_quotes_a_bridge_name_with_metacharacters(self):
+        net = self._net("virbr 9;touch /tmp/x")
+        seen = []
+        with patch.object(
+                net, "_ensure_rule",
+                side_effect=lambda cls, chk, act, present=True:
+                    seen.append((chk, act)) or True):
+            assert net.remove_route_iptables_rule() is True
+        assert seen
+        for check_cmd, action_cmd in seen:
+            assert "'virbr 9;touch /tmp/x'" in check_cmd
+            assert "'virbr 9;touch /tmp/x'" in action_cmd
+
+    def test_a_plain_bridge_name_is_left_unquoted(self):
+        net = self._net("virbr9")
+        seen = []
+        with patch.object(
+                net, "_ensure_rule",
+                side_effect=lambda cls, chk, act, present=True:
+                    seen.append(chk) or True):
+            assert net.apply_route_iptables_rule() is True
+        assert seen
+        for check_cmd in seen:
+            # shlex.quote leaves a shell-safe name untouched
+            assert "virbr9" in check_cmd
+            assert "'" not in check_cmd
+
+
+class TestXmlEscaping:
+    """The network template has no autoescape; config values need |e.
+
+    Regression tests for issue #85 item 6 (network.xml.j2 part).
+    """
+
+    @staticmethod
+    def _net(name: str, bridge_name: str = "virbr9") -> Network:
+        return Network(name=name,
+                       info={"mode": "nat", "bridge": {"name": bridge_name},
+                             "ip": {"address": "10.5.3.1",
+                                    "netmask": "255.255.255.0"}},
+                       assign_new_bridge=True,
+                       provider_config={"use_sudo": False})
+
+    def test_name_with_xml_metacharacters_stays_well_formed(self):
+        net = self._net("net&<x>")
+        root = ET.fromstring(net.generate_xml())   # must parse
+        assert root.findtext("name") == "net&<x>"
+
+    def test_bridge_name_with_a_quote_cannot_break_out_of_the_attribute(self):
+        net = self._net("demo-net", bridge_name="virbr0' onload='x")
+        root = ET.fromstring(net.generate_xml())   # must parse
+        assert root.find("bridge").get("name") == "virbr0' onload='x"
+        assert "onload" not in root.find("bridge").attrib

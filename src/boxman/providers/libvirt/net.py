@@ -1,6 +1,7 @@
 import ipaddress
 import os
 import re
+import shlex
 import sys
 import tempfile
 import uuid
@@ -1003,8 +1004,10 @@ class Network(VirshCommand):
             return True
 
         try:
-            br_name = self.bridge_name
-            self.logger.info(f"removing route isolation rules for bridge {br_name}")
+            # shlex.quote: the bridge name comes from the config and is
+            # interpolated into a shell string below
+            br_name = shlex.quote(self.bridge_name)
+            self.logger.info(f"removing route isolation rules for bridge {self.bridge_name}")
 
             # no embedded 'sudo': execute_shell routes that decision through
             # _should_use_sudo_for_command, so use_sudo: false is honoured
@@ -1049,9 +1052,11 @@ class Network(VirshCommand):
             return True  # Nothing to do for non-route networks
 
         try:
-            bridge_name = self.bridge_name
+            # shlex.quote: the bridge name comes from the config and is
+            # interpolated into a shell string below
+            bridge_name = shlex.quote(self.bridge_name)
             self.logger.info(
-                f"configuring complete isolation for routed network with bridge {bridge_name}")
+                f"configuring complete isolation for routed network with bridge {self.bridge_name}")
 
             # 1. allow vm-to-vm communication on the same bridge. No embedded
             # 'sudo' here or below: execute_shell routes that decision through
