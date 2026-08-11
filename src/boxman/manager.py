@@ -4992,7 +4992,11 @@ class BoxmanManager:
 
         print()
         if not auto_accept:
-            answer = input("Proceed? [y/N] ").strip().lower()
+            try:
+                answer = input("Proceed? [y/N] ").strip().lower()
+            except EOFError:
+                print("No input available, aborted.")
+                return
             if answer not in ("y", "yes"):
                 print("Aborted.")
                 return

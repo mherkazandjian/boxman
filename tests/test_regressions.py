@@ -366,7 +366,7 @@ class TestDestroyReadsProjectCache:
     even when it was properly registered.
     """
 
-    def test_destroy_loads_cache_before_in_cache_check(self, tmp_path: Path):
+    def test_destroy_loads_cache_before_in_cache_check(self, tmp_path: Path, capsys):
         import json as _json
         import os as _os
 
@@ -388,11 +388,12 @@ class TestDestroyReadsProjectCache:
             args = MagicMock(auto_accept=False, templates=False)
 
             # Force EOF on the prompt so the test doesn't hang waiting
-            # for stdin; reaching the prompt proves the short-circuit
-            # did NOT fire.
-            with patch("builtins.input", side_effect=EOFError), \
-                 pytest.raises(EOFError):
+            # for stdin; the clean abort (instead of an EOFError
+            # traceback, #85 item 16) proves the short-circuit did NOT
+            # fire.
+            with patch("builtins.input", side_effect=EOFError):
                 BoxmanManager.destroy(mgr, args)
+            assert "No input available, aborted." in capsys.readouterr().out
 
         # The cache must have been loaded — .projects populated from disk
         assert mgr.cache.projects is not None
