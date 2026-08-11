@@ -186,6 +186,10 @@ cd doc/tutorial/tutorial1
 boxman provision
 ```
 
+> Boxman prints terse, docker-compose-style progress by default; add
+> `-v`/`-vv`/`-vvv` (before or after the sub-command) for more detail, `-q`
+> for warnings and errors only, or set `BOXMAN_VERBOSITY`.
+
 Behind the scenes, boxman:
 
 1. Renders Jinja2 templates in the YAML

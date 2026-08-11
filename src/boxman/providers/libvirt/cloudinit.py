@@ -16,6 +16,7 @@ compatibility.
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,6 +29,7 @@ from typing import Any
 import invoke
 
 from boxman import log
+from boxman.loggers.logger import is_verbose
 from boxman.image_cache import ImageCache
 from boxman.utils.shell import run as _shell_run
 
@@ -187,7 +189,7 @@ class CloudInitTemplate:
 
         result = self.virsh.execute_shell(
             f'cloud-localds{network_flag} "{seed_iso_path}" "{nocloud_dir}/user-data" "{nocloud_dir}/meta-data"',
-            hide=False, warn=True,
+            hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok:
             self.logger.info("seed ISO created with cloud-localds")
@@ -202,7 +204,7 @@ class CloudInitTemplate:
             result = self.virsh.execute_shell(
                 f'{tool} -output "{seed_iso_path}" -volid cidata -joliet -rock '
                 f'"{nocloud_dir}/user-data" "{nocloud_dir}/meta-data"{extra_files}',
-                hide=False, warn=True,
+                hide=not is_verbose(logging.DEBUG), warn=True,
             )
             if result.ok:
                 self.logger.info(f"seed ISO created with {tool}")
@@ -464,7 +466,7 @@ class CloudInitTemplate:
         self.logger.info(f"copying image {src} -> {dst}")
         result = self.virsh.execute_shell(
             f'rsync --sparse --progress "{src}" "{dst}"',
-            hide=False, warn=True,
+            hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok:
             self.logger.info("image copied (sparse via rsync)")
@@ -493,7 +495,7 @@ class CloudInitTemplate:
         self.logger.info(f"resizing disk image {image_path} to {size}")
         result = self.virsh.execute_shell(
             f'qemu-img resize "{image_path}" {size}',
-            hide=False, warn=True,
+            hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok:
             self.logger.info(f"disk image resized to {size}")
@@ -504,12 +506,12 @@ class CloudInitTemplate:
 
     def _download_image(self, url: str, dst_path: str) -> bool:
         """Download a cloud image from a URL with progress and fallbacks."""
-        self.logger.info(f"downloading base image {url} -> {dst_path}")
+        self.logger.status(f"downloading base image {url} -> {dst_path}")
 
         # Try wget first (handles redirects, proxies, SSL better)
         result = _shell_run(
             f'wget --progress=dot:mega -O "{dst_path}" "{url}"',
-            hide=False, warn=True,
+            hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
             self.logger.info("download complete (wget)")
@@ -518,7 +520,7 @@ class CloudInitTemplate:
         # Try curl as second fallback
         result = _shell_run(
             f'curl -L --progress-bar -o "{dst_path}" "{url}"',
-            hide=False, warn=True,
+            hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
             self.logger.info("download complete (curl)")
@@ -716,10 +718,9 @@ class CloudInitTemplate:
             return
         output = self._guest_exec_output(res.stdout)
         if output:
-            self.logger.info("=== Cloud-Init Output Log ===")
+            self.logger.debug("cloud-init output log:")
             for line in output.splitlines():
-                self.logger.info(f"  {line}")
-            self.logger.info("=============================")
+                self.logger.debug(f"  {line}")
 
     def verify_and_shutdown(self) -> bool:
         self.logger.info("verifying VM health: waiting for QEMU guest agent (this may take a few minutes while cloud-init installs it)...")
@@ -737,7 +738,7 @@ class CloudInitTemplate:
                 break
 
             if i > 0 and i % 15 == 0:
-                self.logger.info(
+                self.logger.debug(
                     f"still waiting for QEMU guest agent... "
                     f"({i * agent_poll_interval}s / {self.cloudinit_agent_timeout}s)")
 
@@ -891,9 +892,7 @@ class CloudInitTemplate:
             return False
 
     def create_template(self, force: bool = False) -> bool:
-        self.logger.info("=" * 70)
-        self.logger.info(f"creating cloud-init template: {self.template_name}")
-        self.logger.info("=" * 70)
+        self.logger.status(f"creating cloud-init template: {self.template_name}")
 
         if self._check_vm_exists():
             if not force:
@@ -1017,10 +1016,8 @@ class CloudInitTemplate:
                             "--eject", "--config",
                             warn=True)
 
-        self.logger.info("=" * 70)
-        self.logger.info(f"template VM '{self.template_name}' created successfully")
+        self.logger.status(f"template VM '{self.template_name}' created successfully")
         self.logger.info(f"  disk image: {dst_image_path}")
-        self.logger.info("=" * 70)
         return True
 
     @staticmethod

@@ -794,7 +794,7 @@ class LibVirtSession:
             verify_result = virsh.execute("domstate", vm_name)
 
             if "running" in verify_result.stdout:
-                self.logger.info(f"vm {vm_name} started successfully")
+                self.logger.status(f"vm {vm_name} started successfully")
                 return True
             else:
                 self.logger.error(

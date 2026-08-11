@@ -246,9 +246,9 @@ class DockerComposeRuntime(RuntimeBase):
                 "BOXMAN_PROJECT_DIR": abs_project_dir,
             }
 
-            self.logger.info("docker compose environment variables:")
+            self.logger.debug("docker compose environment variables:")
             for k, v in env_vars.items():
-                self.logger.info(f"  {k}={v}")
+                self.logger.debug(f"  {k}={v}")
 
             compose_env = os.environ.copy()
             compose_env.update(env_vars)
@@ -326,8 +326,7 @@ class DockerComposeRuntime(RuntimeBase):
             with open(compose_path) as fobj:
                 contents = fobj.read()
             self.logger.info(
-                f"docker-compose.yml ({compose_path}):\n"
-                f"{'─' * 60}\n{contents}{'─' * 60}")
+                f"docker-compose.yml ({compose_path}):\n{contents}")
         except Exception as exc:
             self.logger.warning(f"could not read compose file for logging: {exc}")
 
