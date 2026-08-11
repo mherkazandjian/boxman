@@ -20,7 +20,7 @@ Defaulting ``in_stream=False`` disables the stdin pump. Interactive
 callers (there are none today, but keep the override path open) can
 still pass a non-False stream explicitly.
 
-Added in Phase 2.8 follow-up (see /home/mher/.claude/plans/).
+Added in a Phase 2.8 follow-up of the engineering review plan.
 """
 
 from __future__ import annotations
