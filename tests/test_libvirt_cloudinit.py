@@ -443,3 +443,102 @@ class TestAgentCommand:
                 patch("boxman.providers.libvirt.cloudinit.time.sleep"):
             assert t.verify_and_shutdown() is True
         assert ex.call_args_list[0].args[0] == "qemu-agent-command"
+
+
+class TestCreateTemplateSafeguards:
+    """
+    Safeguards in create_template (#85 item 26):
+
+    - ``--force`` must wait for the old domain to shut off before undefine,
+      and must abort when undefine fails (otherwise the virt-install below
+      dies with "domain already exists").
+    - A libvirt network without DHCP must abort before virt-install instead
+      of burning the full guest-agent timeout.
+    """
+
+    SLEEP = "boxman.providers.libvirt.cloudinit.time.sleep"
+    SHELL_RUN = "boxman.providers.libvirt.cloudinit._shell_run"
+
+    @staticmethod
+    def _stub_success_path(t: CloudInitTemplate) -> None:
+        """Stub out everything past the VM-exists / DHCP gates."""
+        t._resolve_bridge = MagicMock(return_value="virbr0")
+        t._verify_dhcp_on_network = MagicMock(return_value=True)
+        t.copy_base_image = MagicMock(return_value=True)
+        t.prepare_nocloud_dir = MagicMock(return_value="/nocloud")
+        t.build_seed_iso = MagicMock(return_value=True)
+        t.verify_and_shutdown = MagicMock(return_value=True)
+
+    def test_force_recreate_waits_for_shut_off_before_undefine(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        self._stub_success_path(t)
+        t._check_vm_exists = MagicMock(return_value=True)
+        calls: list[str] = []
+        states = iter(["running", "running", "shut off"])
+
+        def fake_execute(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd == "domstate":
+                return _result(stdout=next(states, "shut off"))
+            return _result()
+
+        with patch.object(t.virsh, "execute", side_effect=fake_execute), \
+                patch(self.SLEEP), \
+                patch(self.SHELL_RUN, return_value=_result()):
+            assert t.create_template(force=True) is True
+        assert calls.index("destroy") < calls.index("domstate") < calls.index("undefine")
+        # two "running" polls + one "shut off" before undefine
+        assert calls[:calls.index("undefine")].count("domstate") == 3
+
+    def test_force_recreate_aborts_when_undefine_fails(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        self._stub_success_path(t)
+        t._check_vm_exists = MagicMock(return_value=True)
+
+        def fake_execute(cmd, *args, **kwargs):
+            if cmd == "domstate":
+                return _result(stdout="shut off")
+            if cmd == "undefine":
+                return _result(ok=False, stderr="domain is still active")
+            return _result()
+
+        with patch.object(t.virsh, "execute", side_effect=fake_execute), \
+                patch(self.SLEEP):
+            assert t.create_template(force=True) is False
+        t.copy_base_image.assert_not_called()
+
+    def test_force_recreate_aborts_when_vm_stays_running(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        self._stub_success_path(t)
+        t._check_vm_exists = MagicMock(return_value=True)
+        calls: list[str] = []
+
+        def fake_execute(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd == "domstate":
+                return _result(stdout="running")
+            return _result()
+
+        with patch.object(t.virsh, "execute", side_effect=fake_execute), \
+                patch(self.SLEEP):
+            assert t.create_template(force=True) is False
+        assert calls.count("domstate") == 30  # polled until the cap, then gave up
+        assert "undefine" not in calls
+
+    def test_create_template_aborts_when_dhcp_missing(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        self._stub_success_path(t)
+        t._check_vm_exists = MagicMock(return_value=False)
+        t._verify_dhcp_on_network = MagicMock(return_value=False)
+        with patch.object(t.virsh, "execute", return_value=_result()):
+            assert t.create_template() is False
+        t.copy_base_image.assert_not_called()
+
+    def test_explicit_bridge_skips_the_dhcp_check(self, tmp_path: Path):
+        t = _make_template(tmp_path, bridge="virbr0")
+        self._stub_success_path(t)
+        t._check_vm_exists = MagicMock(return_value=False)
+        with patch.object(t.virsh, "execute", return_value=_result()), \
+                patch(self.SHELL_RUN, return_value=_result()):
+            assert t.create_template() is True
+        t._verify_dhcp_on_network.assert_not_called()

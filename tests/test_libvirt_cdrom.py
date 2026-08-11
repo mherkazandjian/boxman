@@ -44,6 +44,33 @@ class TestGenerateXml:
         assert "<readonly/>" in xml
 
 
+class TestBusForTarget:
+    # _find_next_available_target falls back to sd* once the IDE slots are
+    # taken; the device XML bus must match the target prefix (#85 item 26)
+
+    def test_hd_targets_are_ide(self, cd: CDROMManager):
+        assert cd._bus_for_target("hdc") == "ide"
+
+    def test_sd_targets_are_sata(self, cd: CDROMManager):
+        assert cd._bus_for_target("sda") == "sata"
+
+    def test_generated_xml_matches_sata_target(self, cd: CDROMManager):
+        xml = cd._generate_cdrom_xml("/tmp/foo.iso", "sda")
+        assert "dev='sda' bus='sata'" in xml
+
+    def test_detach_xml_matches_sata_target(self, cd: CDROMManager):
+        written = {}
+
+        def capture(*args, **kwargs):
+            # the temp XML still exists while detach-device runs
+            written["xml"] = Path(args[2]).read_text()
+            return _result()
+
+        with patch.object(cd, "execute", side_effect=capture):
+            assert cd.detach_cdrom("sda") is True
+        assert "dev='sda' bus='sata'" in written["xml"]
+
+
 class TestFindNextAvailableTarget:
     # domblklist --details has 4 columns: Type Device Target Source
     DOMBLKLIST = (
