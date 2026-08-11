@@ -99,6 +99,43 @@ test-provision:
 test-dc-e2e:
 	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_docker_compose_provider_e2e.py
 
+# --- disposable test-runner VM ---------------------------------------------
+# All test tiers (unit, smoke, integration) run inside a dedicated disposable
+# VM (data/dev/test-runner, 2 vCPU / 16 GB) so test side effects — docker
+# networks, libvirt domains, image downloads — never touch the host.
+# Requires: nested KVM enabled on the host, libvirt + docker in the VM.
+TEST_VM_CONF    := data/dev/test-runner/conf.yml
+TEST_VM_WS      := $(HOME)/workspaces/boxmandev/test-runner
+TEST_VM_DOMAIN  := bprj__boxman_dev_test_runner__bprj_cluster_1_runner01
+TEST_VM_SSH     := ssh -F $(TEST_VM_WS)/ssh_config cluster_1_runner01
+
+#@help: provision the disposable test-runner VM (2 vCPU / 16 GB, docker + nested kvm)
+test-vm-up:
+	PYTHONPATH=src:$(PYTHONPATH) python src/boxman/scripts/app.py --conf $(TEST_VM_CONF) provision
+	# nested virtualization: boxman already emits cpu mode='host-passthrough',
+	# so /dev/kvm is available inside the VM (verify: make test-vm-check)
+	$(TEST_VM_SSH) 'ls /dev/kvm && docker --version'
+
+#@help: rsync the repo into the test-runner VM and create its venv
+test-vm-sync:
+	$(TEST_VM_SSH) 'mkdir -p ~/boxman && python3 -m venv ~/boxman/.venv'
+	rsync -a --delete -e "ssh -F $(TEST_VM_WS)/ssh_config" \
+		--exclude .git --exclude .venv --exclude .boxman --exclude __pycache__ \
+		--exclude containers/docker/data --exclude dist --exclude .pytest_cache \
+		./ cluster_1_runner01:~/boxman/
+	$(TEST_VM_SSH) 'cd ~/boxman && .venv/bin/pip install -q -e ".[docker-compose]" pytest'
+
+#@help: run tests inside the test-runner VM (tier=integration for the Docker/KVM tier)
+# NOTE: the venv must be on PATH — e2e tests shell out to bare `python3`/`boxman`.
+test-vm-test:
+	$(TEST_VM_SSH) 'cd ~/boxman && PATH=$$HOME/boxman/.venv/bin:$$PATH PYTHONPATH=src \
+		.venv/bin/python -m pytest tests/ -q \
+		$(if $(filter integration,$(tier)),-m integration -o addopts=,) $(pytest_args)'
+
+#@help: destroy the disposable test-runner VM and its workspace
+test-vm-destroy:
+	PYTHONPATH=src:$(PYTHONPATH) python src/boxman/scripts/app.py --conf $(TEST_VM_CONF) destroy -y
+
 #@help: count lines of code per category (code/tests/docs/conf/templates/boxes/shell/docker/make/claude)
 loc:
 	@if ! command -v docker >/dev/null 2>&1; then \

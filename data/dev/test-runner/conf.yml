@@ -1,0 +1,196 @@
+---
+# Disposable boxman test-runner VM.
+#
+# All boxman testing (unit, smoke, integration) runs inside this VM so the
+# host is never touched by test side effects (docker networks, libvirt
+# domains, downloaded images). Nested virtualization is required for the
+# integration tier; boxman already emits cpu mode='host-passthrough', so
+# /dev/kvm is available inside the VM out of the box (the host still needs
+# nested KVM enabled: /sys/module/kvm_{intel,amd}/parameters/nested).
+version: '1.0'
+project: boxman_dev_test_runner
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+    verbose: True
+
+templates:
+  template1:
+    name: test-runner-ubuntu-24.04-base-template
+    image:
+      uri: http://cloud-images-archive.ubuntu.com/releases/noble/release-20240423/ubuntu-24.04-server-cloudimg-amd64.img
+      checksum: sha256:32a9d30d18803da72f5936cf2b7b9efcb4d0bb63c67933f17e3bdfd1751de3f3
+    disk_size: 60G
+    os_variant: ubuntu24.04
+    memory: 4096
+    vcpus: 2
+    cloudinit_done_marker: /var/log/test-runner-cloudinit.log
+    # Docker + the apt transaction that installs it are slow; give the
+    # verification phase generous caps.
+    cloudinit_agent_timeout: 300        # wait for the qemu guest agent
+    cloudinit_guest_exec_timeout: 180   # wait for guest-exec to be usable
+    cloudinit_done_timeout: 600         # wait for cloudinit_done_marker
+    cloudinit_fallback_timeout: 300     # blind wait when the guest can't be polled
+    cloudinit: |
+      #cloud-config
+      hostname: test-runner
+      manage_etc_hosts: true
+
+      network:
+        version: 2
+        ethernets:
+          default:
+            match:
+              name: "en*"
+            dhcp4: true
+            dhcp6: false
+
+      users:
+        - name: ubuntu
+          lock_passwd: false
+          groups: [sudo, docker, kvm, libvirt]
+          sudo: "ALL=(ALL) NOPASSWD:ALL"
+          shell: /bin/bash
+        - name: admin
+          # the Ubuntu cloud image already ships an 'admin' group; without
+          # primary_group, useradd fails with "group admin exists"
+          primary_group: admin
+          lock_passwd: false
+          groups: [sudo, docker, kvm, libvirt]
+          sudo: "ALL=(ALL) NOPASSWD:ALL"
+          shell: /bin/bash
+
+      chpasswd:
+        expire: false
+        users:
+          - name: admin
+            password: '{{ env("BOXMAN_ADMIN_PASS", default="boxman") }}'
+            type: text
+
+      ssh_pwauth: true
+      package_update: true
+      packages:
+        - qemu-guest-agent
+        - openssh-server
+        - python3-venv
+        - git
+        - rsync
+        - make
+        - sshpass
+        - docker.io
+        - docker-compose-v2
+        # local-runtime integration tests drive libvirt inside the guest
+        - libvirt-daemon-system
+        - qemu-kvm
+        - virtinst
+        - genisoimage
+
+      write_files:
+        - path: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+          permissions: "0644"
+          content: |
+            [Service]
+            ExecStart=
+            ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any
+        # Ubuntu 24.04 ships an enforcing AppArmor profile for unix_chkpwd
+        # which strips capabilities from the helper. The libvirt test
+        # container (Rocky 9) ships /etc/shadow mode 0000, so the confined
+        # helper cannot read it and sshd rejects every login with
+        # "Access denied by PAM account configuration". Grant the two DAC
+        # capabilities back via the profile's local include.
+        - path: /etc/apparmor.d/local/unix-chkpwd
+          permissions: "0644"
+          content: |
+            capability dac_override,
+            capability dac_read_search,
+        # The host's enforcing libvirtd AppArmor profile only whitelists
+        # the Debian path /usr/lib/libvirt/libvirt_iohelper; the Rocky test
+        # container uses /usr/libexec/..., so snapshot-create-as fails with
+        # "cannot execute binary /usr/libexec/libvirt_iohelper: Permission
+        # denied". Whitelist the Rocky path too.
+        - path: /etc/apparmor.d/local/usr.sbin.libvirtd
+          permissions: "0644"
+          content: |
+            /usr/libexec/libvirt_iohelper ix,
+        # Boxes with max_memory ceilings (e.g. the docker-runtime box sets
+        # max_memory: 16384) make libvirt pre-size the qemu memory backend
+        # at the *maximum*. With the default overcommit heuristic a 16 GB
+        # backend fails to mmap inside this 16 GB VM ("cannot set up guest
+        # memory 'pc.ram': Cannot allocate memory"). Always-overcommit is
+        # safe here: the guest only touches currentMemory (2 GB).
+        - path: /etc/sysctl.d/99-test-runner-overcommit.conf
+          permissions: "0644"
+          content: |
+            vm.overcommit_memory=1
+
+      runcmd:
+        - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - rm -f /etc/cloud/cloud.cfg.d/subiquity-disable-cloudinit-networking.cfg
+        - systemctl daemon-reload
+        - systemctl enable --now qemu-guest-agent
+        - netplan generate || true
+        - netplan apply || true
+        - dhclient -v || true
+        - systemctl enable --now docker
+        # apply the AppArmor overrides (see write_files above)
+        - apparmor_parser -r /etc/apparmor.d/unix-chkpwd
+        - apparmor_parser -r /etc/apparmor.d/usr.sbin.libvirtd
+        # apply the overcommit sysctl (see write_files above)
+        - sysctl --system
+        # libvirt-qemu (uid 64055) must be able to reach boxman-templates
+        # under /home/admin — Ubuntu 24.04 homes are 0750 by default
+        - chmod 755 /home/admin
+        - echo ran at $(date -Is) >> /var/log/test-runner-cloudinit.log
+
+workspace:
+  path: ~/workspaces/boxmandev/test-runner
+
+clusters:
+  cluster_1:
+    base_image: test-runner-ubuntu-24.04-base-template
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+    admin_key_name: id_ed25519_boxman    # generated automatically at provisioning time
+    ssh_config: ssh_config               # generated automatically at provisioning time
+
+    networks:
+      nat1:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:00:03'
+        ip:
+          address: '192.168.15.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.15.2'
+              end: '192.168.15.254'
+        enable: True
+        autostart: True
+
+    vms:
+      runner01:
+        hostname: runner01
+        cpus:
+          sockets: 1
+          cores: 2
+          threads: 1
+        memory: 16384
+        disks:
+          - name: disk01
+            driver:
+              name: qemu
+              type: qcow2
+            target: vdb
+            size: 20480
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
