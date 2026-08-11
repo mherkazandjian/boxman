@@ -14,6 +14,7 @@ Part of Phase 1.2 of the review plan
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -542,3 +543,102 @@ class TestCreateTemplateSafeguards:
                 patch(self.SHELL_RUN, return_value=_result()):
             assert t.create_template() is True
         t._verify_dhcp_on_network.assert_not_called()
+
+
+class TestShellQuoting:
+    """
+    Paths and names interpolated into shell command strings must be
+    shlex-quoted (#85 item 6): a space or quote in a workdir, ISO path or
+    template name must not split or break the command.
+    """
+
+    SHELL_RUN = "boxman.providers.libvirt.cloudinit._shell_run"
+
+    def test_seed_iso_paths_are_quoted(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        nocloud = tmp_path / "no cloud"
+        nocloud.mkdir()
+        seed = str(tmp_path / "se'ed.iso")
+        with patch.object(t.virsh, "execute_shell",
+                          return_value=_result(ok=True)) as shell:
+            assert t.build_seed_iso(str(nocloud), seed) is True
+        cmd = shell.call_args.args[0]
+        assert shlex.quote(seed) in cmd
+        assert shlex.quote(str(nocloud / "user-data")) in cmd
+        assert shlex.quote(str(nocloud / "meta-data")) in cmd
+
+    def test_seed_iso_fallback_paths_are_quoted(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        nocloud = tmp_path / "no cloud"
+        nocloud.mkdir()
+        calls: list[str] = []
+
+        def fake(cmd, *_a, **_kw):
+            calls.append(cmd)
+            return _result(ok="genisoimage" in cmd)  # cloud-localds fails
+
+        with patch.object(t.virsh, "execute_shell", side_effect=fake):
+            assert t.build_seed_iso(str(nocloud), str(tmp_path / "s.iso")) is True
+        genisoimage = next(c for c in calls if "genisoimage" in c)
+        assert shlex.quote(str(nocloud / "user-data")) in genisoimage
+
+    def test_rsync_paths_are_quoted(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        with patch.object(t.virsh, "execute_shell",
+                          return_value=_result(ok=True)) as shell:
+            assert t._copy_local("/tmp/a b.qcow2", "/tmp/c d.qcow2") is True
+        cmd = shell.call_args.args[0]
+        assert shlex.quote("/tmp/a b.qcow2") in cmd
+        assert shlex.quote("/tmp/c d.qcow2") in cmd
+
+    def test_wget_command_quotes_dst_and_url(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        with patch(self.SHELL_RUN, return_value=_result(ok=True)) as run, \
+                patch("boxman.providers.libvirt.cloudinit.os.path.isfile",
+                      return_value=True), \
+                patch("boxman.providers.libvirt.cloudinit.os.path.getsize",
+                      return_value=10):
+            assert t._download_image(
+                "http://x/y iso.qcow2", "/tmp/d st.img") is True
+        cmd = run.call_args.args[0]
+        assert cmd.startswith("wget ")
+        assert f"-O {shlex.quote('/tmp/d st.img')}" in cmd
+        assert shlex.quote("http://x/y iso.qcow2") in cmd
+
+    def test_curl_command_quotes_dst_and_url(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        calls: list[str] = []
+
+        def fake_run(cmd, **_kw):
+            calls.append(cmd)
+            return _result(ok="curl" in cmd)
+
+        with patch(self.SHELL_RUN, side_effect=fake_run), \
+                patch("boxman.providers.libvirt.cloudinit.os.path.isfile",
+                      return_value=True), \
+                patch("boxman.providers.libvirt.cloudinit.os.path.getsize",
+                      return_value=10):
+            assert t._download_image(
+                "http://x/y iso.qcow2", "/tmp/d st.img") is True
+        curl = next(c for c in calls if c.startswith("curl "))
+        assert f"-o {shlex.quote('/tmp/d st.img')}" in curl
+        assert shlex.quote("http://x/y iso.qcow2") in curl
+
+    def test_virt_install_command_quotes_name_and_paths(self, tmp_path: Path):
+        t = _make_template(tmp_path, template_name="my tmpl")
+        t._check_vm_exists = MagicMock(return_value=False)
+        t._resolve_bridge = MagicMock(return_value="virbr0")
+        t._verify_dhcp_on_network = MagicMock(return_value=True)
+        t.copy_base_image = MagicMock(return_value=True)
+        t.prepare_nocloud_dir = MagicMock(return_value="/nocloud")
+        t.build_seed_iso = MagicMock(return_value=True)
+        t.verify_and_shutdown = MagicMock(return_value=True)
+        with patch.object(t.virsh, "execute", return_value=_result()), \
+                patch(self.SHELL_RUN, return_value=_result()) as run:
+            assert t.create_template() is True
+        cmd = run.call_args.args[0]
+        assert "--name='my tmpl'" in cmd
+        dst_image = os.path.join(t.workdir, "my tmpl", "my tmpl.qcow2")
+        assert f"path={shlex.quote(dst_image)}" in cmd
+        seed = os.path.join(t.workdir, "my tmpl", "seed.iso")
+        assert f"path={shlex.quote(seed)}" in cmd

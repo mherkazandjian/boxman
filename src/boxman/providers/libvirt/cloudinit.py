@@ -186,10 +186,12 @@ class CloudInitTemplate:
         network_config_path = os.path.join(nocloud_dir, "network-config")
         network_flag = ""
         if os.path.exists(network_config_path):
-            network_flag = f' --network-config="{network_config_path}"'
+            network_flag = f" --network-config={shlex.quote(network_config_path)}"
 
         result = self.virsh.execute_shell(
-            f'cloud-localds{network_flag} "{seed_iso_path}" "{nocloud_dir}/user-data" "{nocloud_dir}/meta-data"',
+            f"cloud-localds{network_flag} {shlex.quote(seed_iso_path)} "
+            f"{shlex.quote(os.path.join(nocloud_dir, 'user-data'))} "
+            f"{shlex.quote(os.path.join(nocloud_dir, 'meta-data'))}",
             hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok:
@@ -199,12 +201,13 @@ class CloudInitTemplate:
         # Fallback: include network-config in the ISO if present
         extra_files = ""
         if os.path.exists(network_config_path):
-            extra_files = f' "{network_config_path}"'
+            extra_files = f" {shlex.quote(network_config_path)}"
 
         for tool in ("genisoimage", "mkisofs", "xorrisofs"):
             result = self.virsh.execute_shell(
-                f'{tool} -output "{seed_iso_path}" -volid cidata -joliet -rock '
-                f'"{nocloud_dir}/user-data" "{nocloud_dir}/meta-data"{extra_files}',
+                f"{tool} -output {shlex.quote(seed_iso_path)} -volid cidata -joliet -rock "
+                f"{shlex.quote(os.path.join(nocloud_dir, 'user-data'))} "
+                f"{shlex.quote(os.path.join(nocloud_dir, 'meta-data'))}{extra_files}",
                 hide=not is_verbose(logging.DEBUG), warn=True,
             )
             if result.ok:
@@ -466,7 +469,7 @@ class CloudInitTemplate:
         """Sparse-copy a local file; falls back to shutil.copy2."""
         self.logger.info(f"copying image {src} -> {dst}")
         result = self.virsh.execute_shell(
-            f'rsync --sparse --progress "{src}" "{dst}"',
+            f'rsync --sparse --progress {shlex.quote(src)} {shlex.quote(dst)}',
             hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok:
@@ -511,7 +514,7 @@ class CloudInitTemplate:
 
         # Try wget first (handles redirects, proxies, SSL better)
         result = _shell_run(
-            f'wget --progress=dot:mega -O "{dst_path}" "{url}"',
+            f'wget --progress=dot:mega -O {shlex.quote(dst_path)} {shlex.quote(url)}',
             hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
@@ -520,7 +523,7 @@ class CloudInitTemplate:
 
         # Try curl as second fallback
         result = _shell_run(
-            f'curl -L --progress-bar -o "{dst_path}" "{url}"',
+            f'curl -L --progress-bar -o {shlex.quote(dst_path)} {shlex.quote(url)}',
             hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
@@ -987,20 +990,20 @@ class CloudInitTemplate:
             if self.virt_install.use_sudo:
                 parts.append("sudo")
             parts.append(self.virt_install.command_path)
-            parts.append(f"--connect={self.virt_install.uri}")
-            parts.append(f"--name={self.template_name}")
+            parts.append(f"--connect={shlex.quote(self.virt_install.uri)}")
+            parts.append(f"--name={shlex.quote(self.template_name)}")
             parts.append(f"--memory={self.memory}")
             parts.append(f"--vcpus={self.vcpus}")
-            parts.append(f"--os-variant={self.os_variant}")
+            parts.append(f"--os-variant={shlex.quote(self.os_variant)}")
             parts.append("--import")
-            parts.append(f"--disk=path={dst_image_path},format={self.disk_format},bus=virtio,discard=unmap")
-            parts.append(f"--disk=path={seed_iso_path},device=cdrom")
+            parts.append(f"--disk=path={shlex.quote(dst_image_path)},format={self.disk_format},bus=virtio,discard=unmap")
+            parts.append(f"--disk=path={shlex.quote(seed_iso_path)},device=cdrom")
 
             # Use bridge device directly if resolved, otherwise fall back to network name
             if bridge_device:
-                parts.append(f"--network=bridge={bridge_device},model=virtio")
+                parts.append(f"--network=bridge={shlex.quote(bridge_device)},model=virtio")
             else:
-                parts.append(f"--network=network={self.network},model=virtio")
+                parts.append(f"--network=network={shlex.quote(self.network)},model=virtio")
 
             parts.append("--graphics=vnc")
             parts.append("--video=virtio")

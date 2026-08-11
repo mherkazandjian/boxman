@@ -1,8 +1,19 @@
 import os
 import tempfile
 from typing import Any
+from xml.sax.saxutils import escape
 
 from .commands import VirshCommand
+
+
+def _xml_attr(value: str) -> str:
+    """
+    Escape a value for use inside a single-quoted XML attribute.
+
+    Mirrors ``net_reconcile._attr``: a source path or target name holding an
+    ``&`` or a quote would otherwise produce XML that libvirt cannot parse.
+    """
+    return escape(str(value), {"'": '&apos;', '"': '&quot;'})
 
 
 class CDROMManager(VirshCommand):
@@ -84,7 +95,7 @@ class CDROMManager(VirshCommand):
             # Generate XML for the device to detach (source not needed for detach)
             bus = self._bus_for_target(target_dev)
             xml_content = f"""<disk type='file' device='cdrom'>
-  <target dev='{target_dev}' bus='{bus}'/>
+  <target dev='{_xml_attr(target_dev)}' bus='{bus}'/>
   <readonly/>
 </disk>"""
 
@@ -213,8 +224,8 @@ class CDROMManager(VirshCommand):
         bus = self._bus_for_target(target_dev)
         return f"""<disk type='file' device='cdrom'>
   <driver name='qemu' type='raw'/>
-  <source file='{source_path}'/>
-  <target dev='{target_dev}' bus='{bus}'/>
+  <source file='{_xml_attr(source_path)}'/>
+  <target dev='{_xml_attr(target_dev)}' bus='{bus}'/>
   <readonly/>
 </disk>"""
 
