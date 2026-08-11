@@ -322,7 +322,7 @@ class VirshEdit:
         try:
             result = self.virsh.execute(
                 'setvcpus', domain_name, str(vcpu_count),
-                '--live', '--config')
+                '--live', '--config', warn=True)
             if not result.ok:
                 self.logger.error(
                     f"failed to hot-set vCPUs for {domain_name}: {result.stderr}")
@@ -355,7 +355,7 @@ class VirshEdit:
             memory_kib = memory_mb * 1024
             result = self.virsh.execute(
                 'setmem', domain_name, str(memory_kib),
-                '--live', '--config')
+                '--live', '--config', warn=True)
             if not result.ok:
                 self.logger.error(
                     f"failed to hot-set memory for {domain_name}: {result.stderr}")
@@ -385,7 +385,7 @@ class VirshEdit:
         try:
             result = self.virsh.execute(
                 'setvcpus', domain_name, str(max_vcpus),
-                '--maximum', '--config')
+                '--maximum', '--config', warn=True)
             if not result.ok:
                 self.logger.error(
                     f"failed to update max vCPUs for {domain_name}: "
@@ -418,7 +418,7 @@ class VirshEdit:
             memory_kib = max_memory_mb * 1024
             result = self.virsh.execute(
                 'setmaxmem', domain_name, str(memory_kib),
-                '--config')
+                '--config', warn=True)
             if not result.ok:
                 self.logger.error(
                     f"failed to update max memory for {domain_name}: "
