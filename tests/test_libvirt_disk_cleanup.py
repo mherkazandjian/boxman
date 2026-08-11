@@ -57,6 +57,43 @@ class TestRemoveVmDisks:
         assert (tmp_path / "vm02.qcow2").exists()
         assert (tmp_path / "other-vm.qcow2").exists()
 
+    def test_prefix_collision_leaves_longer_named_vm_untouched(
+        self, tmp_path: Path
+    ):
+        """Regression for issue #85 item 1: destroying ``web`` in a
+        shared workdir must not delete files of a VM named ``web2``."""
+        # web's own files
+        (tmp_path / "web.qcow2").write_bytes(b"x")
+        (tmp_path / "web_data.qcow2").write_bytes(b"x")
+        (tmp_path / "web.1772465824").write_bytes(b"x")
+        (tmp_path / "web_snapshot_baseline.raw").write_bytes(b"x")
+        # web2's files — same workdir, name starts with "web"
+        (tmp_path / "web2.qcow2").write_bytes(b"x")
+        (tmp_path / "web2_data.qcow2").write_bytes(b"x")
+        (tmp_path / "web2.1772465824").write_bytes(b"x")
+        (tmp_path / "web2_snapshot_baseline.raw").write_bytes(b"x")
+
+        remove_vm_disks(str(tmp_path), "web", [{"name": "data"}])
+
+        for leftover in tmp_path.glob("web.*"):
+            assert not leftover.exists()
+        assert not (tmp_path / "web.qcow2").exists()
+        assert not (tmp_path / "web_data.qcow2").exists()
+        assert not (tmp_path / "web_snapshot_baseline.raw").exists()
+        # every web2 file survives
+        assert (tmp_path / "web2.qcow2").exists()
+        assert (tmp_path / "web2_data.qcow2").exists()
+        assert (tmp_path / "web2.1772465824").exists()
+        assert (tmp_path / "web2_snapshot_baseline.raw").exists()
+
+    def test_unrelated_named_extra_disk_survives(self, tmp_path: Path):
+        """Extra disks are only removed when named in extra_disks."""
+        (tmp_path / "vm01.qcow2").write_bytes(b"x")
+        (tmp_path / "vm01_orphan.qcow2").write_bytes(b"x")
+        remove_vm_disks(str(tmp_path), "vm01", [])
+        assert not (tmp_path / "vm01.qcow2").exists()
+        assert (tmp_path / "vm01_orphan.qcow2").exists()
+
     def test_tolerates_missing_files(self, tmp_path: Path):
         # Nothing in tmp_path — must not raise
         assert remove_vm_disks(str(tmp_path), "ghost-vm", []) is True
