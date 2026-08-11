@@ -570,6 +570,64 @@ class TestCacheSelfConflict:
             net.define_network(str(tmp_path / 'net.xml'))
 
 
+class TestRuntimeScopeFiltering:
+    """
+    Conflicts are only meaningful within one runtime scope.
+
+    Regression tests for issue #85 item 15: each runtime has its own
+    isolated libvirt instance, but the filter used to be
+    ``current != 'local' and project_runtime != current`` -- so a local run
+    still conflict-checked projects living in a docker-compose runtime and
+    reported false name/bridge/IP conflicts against a libvirt it does not
+    even talk to.
+    """
+
+    @staticmethod
+    def _net(tmp_path, cached: dict, runtime: str):
+        from boxman.config_cache import BoxmanCache
+
+        cache = BoxmanCache.__new__(BoxmanCache)
+        cache.cache_dir = str(tmp_path)
+        cache.projects_cache_file = str(tmp_path / 'projects.json')
+        cache.projects = None
+        (tmp_path / 'projects.json').write_text(json.dumps(cached))
+
+        manager = MagicMock()
+        manager.cache = cache
+        manager.config = {'project': 'p1'}
+        manager._runtime_name = runtime
+
+        info = {"mode": "nat", "bridge": {"name": "virbr9"},
+                "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0"}}
+        return Network(name="net-a", info=info, assign_new_bridge=True,
+                       provider_config={"use_sudo": False}, manager=manager)
+
+    # the other project collides on name, bridge AND address -- if it is
+    # checked at all, every conflict type fires
+    _OTHER = {'p2': {'runtime': None, 'networks': {
+        'net-a': {'ip_address': '10.5.3.1', 'bridge_name': 'virbr9'}}}}
+
+    def test_local_run_ignores_docker_compose_projects(self, tmp_path):
+        cached = {**self._OTHER, 'p2': {**self._OTHER['p2'],
+                                        'runtime': 'docker-compose'}}
+        net = self._net(tmp_path, cached, runtime='local')
+        net.check_network_exists()      # must not raise
+
+    def test_docker_compose_run_ignores_local_projects(self, tmp_path):
+        cached = {**self._OTHER, 'p2': {**self._OTHER['p2'],
+                                        'runtime': 'local'}}
+        net = self._net(tmp_path, cached, runtime='docker-compose')
+        net.check_network_exists()      # must not raise
+
+    def test_same_scope_still_conflicts(self, tmp_path):
+        for runtime in ('local', 'docker-compose'):
+            cached = {**self._OTHER, 'p2': {**self._OTHER['p2'],
+                                            'runtime': runtime}}
+            net = self._net(tmp_path, cached, runtime=runtime)
+            with pytest.raises(RuntimeError, match="conflict"):
+                net.check_network_exists()
+
+
 class TestElementRendering:
 
     def test_host_element_includes_the_optional_name(self):

@@ -615,9 +615,10 @@ class Network(VirshCommand):
         """
         Check if there are any issues or conflicts with existing networks in the cache.
 
-        When running under a non-local runtime (e.g. docker-compose), only
-        projects registered under the **same** runtime are checked, because
-        each runtime has its own isolated libvirt instance.
+        Only projects registered under the **same** runtime are checked:
+        each runtime has its own isolated libvirt instance, so a network
+        living in a docker-compose runtime can never conflict with one on
+        the local host's libvirt (and vice versa).
 
         Returns:
             True if the network exists, False otherwise
@@ -631,9 +632,11 @@ class Network(VirshCommand):
         conflicts = {}
         n_conflicts = 0
         for project_name, project_data in projects_in_cache.items():
-            # Skip projects from a different runtime scope
+            # Skip projects from a different runtime scope -- including when
+            # the current runtime is 'local': a docker-compose runtime is a
+            # different libvirt instance, not the same one
             project_runtime = project_data.get('runtime', 'local')
-            if current_runtime != 'local' and project_runtime != current_runtime:
+            if project_runtime != current_runtime:
                 self.logger.debug(
                     f"skipping project {project_name} (runtime={project_runtime}) "
                     f"— current runtime is {current_runtime}")
