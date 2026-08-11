@@ -303,7 +303,7 @@ class TestVirshEditHotMethods:
         result = editor.hot_set_vcpus('test-vm', 8)
         assert result is True
         editor.virsh.execute.assert_called_once_with(
-            'setvcpus', 'test-vm', '8', '--live', '--config')
+            'setvcpus', 'test-vm', '8', '--live', '--config', warn=True)
 
     @patch.object(VirshEdit, '__init__', lambda self, **kwargs: setattr(self, 'virsh', MagicMock()) or setattr(self, 'logger', MagicMock()))
     def test_hot_set_vcpus_failure(self):
@@ -325,7 +325,7 @@ class TestVirshEditHotMethods:
         result = editor.hot_set_memory('test-vm', 4096)
         assert result is True
         editor.virsh.execute.assert_called_once_with(
-            'setmem', 'test-vm', str(4096 * 1024), '--live', '--config')
+            'setmem', 'test-vm', str(4096 * 1024), '--live', '--config', warn=True)
 
     @patch.object(VirshEdit, '__init__', lambda self, **kwargs: setattr(self, 'virsh', MagicMock()) or setattr(self, 'logger', MagicMock()))
     def test_hot_set_memory_failure(self):
@@ -653,7 +653,7 @@ class TestDiskManagerResize:
         result = dm.resize_disk_offline('/data/disk.qcow2', 4096)
         assert result is True
         mock_instance.execute_shell.assert_called_once_with(
-            'qemu-img resize /data/disk.qcow2 4096M')
+            'qemu-img resize /data/disk.qcow2 4096M', warn=True)
 
     @patch('boxman.providers.libvirt.disk.LibVirtCommandBase')
     def test_resize_disk_offline_failure(self, mock_cmd_cls):
@@ -672,7 +672,7 @@ class TestDiskManagerResize:
         result = dm.resize_disk_online('vdb', 4096)
         assert result is True
         dm.execute.assert_called_once_with(
-            'blockresize', 'test-vm', 'vdb', '--size=4096M')
+            'blockresize', 'test-vm', 'vdb', '--size=4096M', warn=True)
 
     def test_resize_disk_routes_to_online_when_running(self):
         dm = self._make_manager()
