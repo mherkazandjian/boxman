@@ -28,8 +28,14 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 ### Native (Host) Installation
 
 ```bash
-pip install -r requirements.txt
 pip install .
+```
+
+For docker-compose clusters, also install the optional extra (provides the
+Docker SDK needed by Ansible's `community.docker` connection plugin):
+
+```bash
+pip install '.[docker-compose]'
 ```
 
 ### Docker-based Libvirt Environment
