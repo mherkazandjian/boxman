@@ -2,6 +2,8 @@
 
 A guided "doctor" that verifies a host is ready to run boxman and, for anything
 that's missing, prints the exact fix for your distro and offers to run it.
+Distro families covered: Arch, Debian/Ubuntu, Fedora/RHEL/Rocky, Gentoo, and the
+declarative NixOS and Guix System (see the note on declarative distros below).
 
 Boxman drives libvirt/KVM through the `virsh` / `virt-install` / `virt-clone` /
 `qemu-img` command-line tools and needs a handful of host-level things in place
@@ -38,7 +40,7 @@ For each problem it can fix, the checker:
 
 1. explains what's wrong,
 2. prints the exact command(s) for your detected distro (Arch / Debian-Ubuntu /
-   Fedora-RHEL-Rocky), and
+   Fedora-RHEL-Rocky / Gentoo), and
 3. asks `Run this now? [y/N]`.
 
 **Nothing on your system is changed unless you answer yes** (or pass `--yes`).
@@ -47,6 +49,7 @@ as usual. Fixes that add you to a group (e.g. `libvirt`, `kvm`, `docker`) are
 flagged as needing a logout/login before they take effect — re-run the checker
 afterwards to confirm.
 
+<<<<<<< HEAD
 ## Disruptive fixes
 
 A few fixes restart running services — the docker/libvirt forwarding fix
@@ -64,6 +67,16 @@ a terminal:
 Decline one and it is reported in the summary as a manual step. Disruptive
 fixes write a `.boxman-bak` copy of every file they edit, and never overwrite
 an existing backup.
+=======
+**Declarative distros (NixOS, Guix System).** For the libvirt/QEMU stack, the
+`libvirtd` service and group membership, the checker prints an *advisory*
+snippet for your system config (`/etc/nixos/configuration.nix` +
+`sudo nixos-rebuild switch`, or `/etc/config.scm` +
+`sudo guix system reconfigure`) and never offers to auto-run it — those changes
+belong in your declarative config, not an imperative `install`. Individual user
+CLI tools (rsync, sshpass, a cloud-init seed-ISO tool, …) are still offered
+imperatively via `nix profile install nixpkgs#<pkg>` / `guix install <pkg>`.
+>>>>>>> origin/feat/installer-nixos-guix-gentoo
 
 ## What it checks
 

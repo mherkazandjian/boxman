@@ -91,40 +91,119 @@ def classify_family(osid, id_like):
         return "debian"
     if tokens & {"rhel", "fedora", "centos", "rocky", "almalinux", "ol", "oracle"}:
         return "rhel"
+    if tokens & {"nixos"}:
+        return "nixos"
+    if tokens & {"guix"}:  # ID=guix is always Guix System
+        return "guix"
+    if tokens & {"gentoo"}:
+        return "gentoo"
     return "unknown"
 
 
 # Verbatim per-distro core stack lines (from doc/tutorial/README.md), minus the
 # systemctl/usermod steps which the checker handles as their own fixes.
+#
+# Only *imperative* package-manager distros belong here. NixOS and Guix System
+# are declarative: their libvirt/QEMU stack and the libvirtd service are enabled
+# by editing the system config and rebuilding, never by an imperative "install"
+# command -- see _NIXOS_CORE_ADVICE / _GUIX_CORE_ADVICE, which the core-tools
+# check emits as advisory (printed, never auto-run) fixes instead.
+#
+# Gentoo USE-flag caveats: app-emulation/qemu needs QEMU_SOFTMMU_TARGETS to
+# include x86_64 (e.g. QEMU_SOFTMMU_TARGETS="x86_64") to build qemu-system-x86_64;
+# app-emulation/libvirt needs USE="virt-network qemu" for the QEMU/KVM driver and
+# the default NAT network. virt-install / virt-clone ship in
+# app-emulation/virt-manager. Services are systemd or OpenRC depending on the
+# profile (OpenRC: `rc-update add libvirtd default && rc-service libvirtd start`).
 _CORE_STACK = {
     "arch": "sudo pacman -S --needed libvirt qemu-full virt-install sshpass dnsmasq",
     "debian": ("sudo apt update && sudo apt install -y libvirt-daemon-system "
                "libvirt-clients qemu-kvm virtinst sshpass bridge-utils cloud-image-utils"),
     "rhel": "sudo dnf install -y libvirt qemu-kvm virt-install sshpass genisoimage",
+    "gentoo": ("sudo emerge --ask app-emulation/libvirt app-emulation/qemu "
+               "app-emulation/virt-manager net-dns/dnsmasq app-admin/sudo"),
 }
 
-# Package name for a cloud-init seed-ISO tool, per family.
-_SEED_PKG = {"arch": "libisoburn", "debian": "cloud-image-utils", "rhel": "genisoimage"}
+# Declarative core-stack remediation for NixOS: printed as advisory text, never
+# offered to auto-run (a Fix with no runnable commands).
+_NIXOS_CORE_ADVICE = (
+    "NixOS is declarative -- enable the libvirt/QEMU stack in "
+    "/etc/nixos/configuration.nix:\n"
+    "virtualisation.libvirtd.enable = true;\n"
+    "programs.virt-manager.enable = true;\n"
+    "environment.systemPackages = with pkgs; [ virt-manager qemu cloud-utils ];\n"
+    "users.users.<you>.extraGroups = [ \"libvirtd\" \"kvm\" ];\n"
+    "then apply with: sudo nixos-rebuild switch"
+)
+
+# Declarative core-stack remediation for Guix System (advisory, never auto-run).
+_GUIX_CORE_ADVICE = (
+    "Guix System is declarative -- add libvirt to your operating-system in "
+    "/etc/config.scm:\n"
+    "(use-service-modules virtualization)  ; provides libvirt-service-type\n"
+    "in (services ...): (service libvirt-service-type)\n"
+    "in your (user-account ...): "
+    "(supplementary-groups '(\"libvirt\" \"kvm\" \"wheel\"))\n"
+    "then apply with: sudo guix system reconfigure /etc/config.scm\n"
+    "user CLI tools can also be added with: guix install qemu virt-manager"
+)
+
+# Declarative libvirtd-service remediation (advisory) for NixOS.
+_NIXOS_LIBVIRTD_ADVICE = (
+    "enable libvirtd declaratively: set virtualisation.libvirtd.enable = true; "
+    "in /etc/nixos/configuration.nix, then sudo nixos-rebuild switch"
+)
+
+# Package name for a cloud-init seed-ISO tool, per family. On NixOS/Guix these
+# are individual user CLI tools, so an imperative install is legitimate.
+_SEED_PKG = {
+    "arch": "libisoburn",
+    "debian": "cloud-image-utils",
+    "rhel": "genisoimage",
+    "gentoo": "dev-libs/libisoburn",
+    "nixos": "cloud-utils",
+    "guix": "xorriso",
+}
 
 # Single-package names for individually-missing tools, per family.
 _TOOL_PKG = {
-    "rsync": {"arch": "rsync", "debian": "rsync", "rhel": "rsync"},
-    "sshpass": {"arch": "sshpass", "debian": "sshpass", "rhel": "sshpass"},
-    "ansible": {"arch": "ansible", "debian": "ansible", "rhel": "ansible"},
-    "zstd": {"arch": "zstd", "debian": "zstd", "rhel": "zstd"},
-    "virt-sparsify": {"arch": "guestfs-tools", "debian": "libguestfs-tools", "rhel": "guestfs-tools"},
-    "openssh": {"arch": "openssh", "debian": "openssh-client", "rhel": "openssh-clients"},
+    "rsync": {"arch": "rsync", "debian": "rsync", "rhel": "rsync",
+              "gentoo": "net-misc/rsync", "nixos": "rsync", "guix": "rsync"},
+    "sshpass": {"arch": "sshpass", "debian": "sshpass", "rhel": "sshpass",
+                "gentoo": "net-misc/sshpass", "nixos": "sshpass", "guix": "sshpass"},
+    "ansible": {"arch": "ansible", "debian": "ansible", "rhel": "ansible",
+                "gentoo": "app-admin/ansible", "nixos": "ansible", "guix": "ansible"},
+    "zstd": {"arch": "zstd", "debian": "zstd", "rhel": "zstd",
+             "gentoo": "app-arch/zstd", "nixos": "zstd", "guix": "zstd"},
+    "virt-sparsify": {"arch": "guestfs-tools", "debian": "libguestfs-tools", "rhel": "guestfs-tools",
+                      "gentoo": "app-emulation/libguestfs", "nixos": "guestfs-tools", "guix": "libguestfs"},
+    "openssh": {"arch": "openssh", "debian": "openssh-client", "rhel": "openssh-clients",
+                "gentoo": "net-misc/openssh", "nixos": "openssh", "guix": "openssh"},
 }
 
 
 def install_cmd(family, pkgs):
-    """Build the package-manager install command for `pkgs` (a space string)."""
+    """Build the package-manager install command for `pkgs` (a space string).
+
+    For NixOS and Guix this is only ever used for *individual user CLI tools*
+    (rsync, sshpass, a seed-ISO tool, ...), which may legitimately be installed
+    imperatively into the user profile. The declarative-only bits (the libvirtd
+    service, the core stack, group membership) never go through here -- they are
+    emitted as advisory fixes instead.
+    """
     if family == "arch":
         return "sudo pacman -S --needed " + pkgs
     if family == "debian":
         return "sudo apt update && sudo apt install -y " + pkgs
     if family == "rhel":
         return "sudo dnf install -y " + pkgs
+    if family == "gentoo":
+        return "sudo emerge --ask " + pkgs
+    if family == "nixos":
+        atoms = " ".join("nixpkgs#" + pkg for pkg in pkgs.split())
+        return "nix profile install " + atoms
+    if family == "guix":
+        return "guix install " + pkgs
     return None
 
 
@@ -507,7 +586,12 @@ class Doctor(object):
         return result
 
     def _show_fix(self, fix):
-        print("       " + self.c("fix: " + fix.description, "cyan"))
+        # Descriptions are usually one line; advisory (declarative-distro) fixes
+        # carry a multi-line config snippet, so indent continuation lines.
+        desc_lines = fix.description.splitlines() or [""]
+        print("       " + self.c("fix: " + desc_lines[0], "cyan"))
+        for extra in desc_lines[1:]:
+            print("       " + self.c("     " + extra, "cyan"))
         for cmd in fix.commands:
             print("         " + self.c("$ " + cmd, "dim"))
         if fix.needs_relogin:
@@ -652,6 +736,29 @@ class Doctor(object):
             description += (" (unrecognized distro '%s' -- install %s with your "
                             "package manager)" % (self.os["id"] or "?", pkgs))
         return Fix(description, commands, needs_sudo=True, needs_relogin=relogin)
+
+    def _core_stack_fix(self):
+        """Remediation for a missing libvirt/QEMU core stack, per distro.
+
+        Imperative (a runnable install command) on package-manager distros
+        (arch/debian/rhel/gentoo). Advisory-only (a Fix with no commands, so it
+        is printed but never offered to auto-run) on the declarative distros
+        NixOS and Guix System, whose stack + service are enabled by editing the
+        system config and rebuilding.
+        """
+        stack = _CORE_STACK.get(self.family)
+        if stack:
+            return Fix("install the libvirt/QEMU stack for your distro",
+                       [stack], needs_sudo=True)
+        if self.family == "nixos":
+            return Fix(_NIXOS_CORE_ADVICE, commands=[])
+        if self.family == "guix":
+            return Fix(_GUIX_CORE_ADVICE, commands=[])
+        fix = Fix("install the libvirt/QEMU stack for your distro", [],
+                  needs_sudo=True)
+        fix.description += (" -- unknown distro '%s'; install libvirt, "
+                            "qemu-kvm, virt-install, virt-clone" % (self.os["id"] or "?"))
+        return fix
 
     # ===================================================================== #
     # Check groups                                                          #
@@ -820,14 +927,7 @@ class Doctor(object):
                 missing.append("qemu-system-x86_64")
             if not missing:
                 return OK, "virsh, virt-install, virt-clone, qemu-img, qemu-system present", None
-            stack = _CORE_STACK.get(self.family)
-            cmds = [stack] if stack else []
-            fix = Fix("install the libvirt/QEMU stack for your distro", cmds,
-                      needs_sudo=True)
-            if not stack:
-                fix.description += (" -- unknown distro '%s'; install libvirt, "
-                                    "qemu-kvm, virt-install, virt-clone" % (self.os["id"] or "?"))
-            return FAIL, "missing: %s" % ", ".join(missing), fix
+            return FAIL, "missing: %s" % ", ".join(missing), self._core_stack_fix()
 
         tools = self.check("Core libvirt/QEMU tools", core_tools)
 
@@ -839,8 +939,17 @@ class Doctor(object):
             alt = run_capture(["systemctl", "is-active", "virtqemud"])[1].strip()
             if alt == "active":
                 return OK, "virtqemud.service is active (modular libvirt)", None
-            fix = Fix("enable and start libvirtd",
-                      commands=["sudo systemctl enable --now libvirtd"], needs_sudo=True)
+            if self.family == "nixos":
+                fix = Fix(_NIXOS_LIBVIRTD_ADVICE, commands=[])  # declarative: no auto-run
+            elif self.family == "gentoo":
+                # systemd profile: systemctl works. OpenRC profile: use rc-service.
+                fix = Fix("enable and start libvirtd (systemd profile; on an OpenRC "
+                          "profile use `sudo rc-update add libvirtd default && "
+                          "sudo rc-service libvirtd start`)",
+                          commands=["sudo systemctl enable --now libvirtd"], needs_sudo=True)
+            else:
+                fix = Fix("enable and start libvirtd",
+                          commands=["sudo systemctl enable --now libvirtd"], needs_sudo=True)
             return FAIL, "libvirtd not active (state: %s)" % (active or "unknown"), fix
 
         if have("systemctl"):
@@ -861,13 +970,27 @@ class Doctor(object):
 
         def groups():
             names, user = user_group_names()
-            want = ["libvirt", "kvm"]
+            # NixOS names the libvirt group `libvirtd`; everyone else `libvirt`.
+            libvirt_group = "libvirtd" if self.family == "nixos" else "libvirt"
+            want = [libvirt_group, "kvm"]
             missing = [g for g in want if g not in names]
             if not missing:
                 return OK, "user '%s' is in: %s" % (user, ", ".join(want)), None
-            fix = Fix("add yourself to the libvirt and kvm groups",
-                      commands=["sudo usermod -aG libvirt,kvm $USER"],
-                      needs_sudo=True, needs_relogin=True)
+            if self.family == "nixos":
+                fix = Fix("add your user to the libvirtd/kvm groups declaratively: "
+                          "users.users.<you>.extraGroups = [ \"libvirtd\" \"kvm\" ]; "
+                          "in /etc/nixos/configuration.nix, then sudo nixos-rebuild switch",
+                          commands=[], needs_relogin=True)
+            elif self.family == "guix":
+                fix = Fix("add your user to the libvirt/kvm groups declaratively: put "
+                          "(supplementary-groups '(\"libvirt\" \"kvm\")) in your "
+                          "user-account in /etc/config.scm, then sudo guix system "
+                          "reconfigure /etc/config.scm",
+                          commands=[], needs_relogin=True)
+            else:
+                fix = Fix("add yourself to the libvirt and kvm groups",
+                          commands=["sudo usermod -aG libvirt,kvm $USER"],
+                          needs_sudo=True, needs_relogin=True)
             # WARN, not FAIL: group membership is only the standard *means* to
             # reach /dev/kvm and the libvirt socket, and those ends are checked
             # directly ("/dev/kvm access", "libvirt connectivity"). If access
@@ -1387,7 +1510,10 @@ class Doctor(object):
         if self.manual_steps:
             print("\n  " + self.c("Remaining / suggested steps:", "bold"))
             for step in self.manual_steps:
-                print("   - " + step)
+                lines = step.splitlines() or [step]
+                print("   - " + lines[0])
+                for extra in lines[1:]:
+                    print("     " + extra)
         if self.relogin_needed:
             print("\n  " + self.c("* Log out and back in for group changes to take effect, "
                                   "then re-run this checker.", "yellow"))
