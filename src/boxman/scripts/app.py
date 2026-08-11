@@ -178,51 +178,6 @@ def machine_start(session, cli_args):
     [p.join() for p in processes]
 
 
-def export_config(session: Session, cli_args):
-    """
-    Take the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-
-    .. todo:: add option to specify exporting a certain snapshot
-    """
-    vms = parse_vms_list(session, cli_args)
-    assert cli_args.path
-    os.makedirs(cli_args.path, exist_ok=False)
-    def _export_vm(vm, dirpath):
-        session.savestate(vm)
-        session.export_vm(
-            vm,
-            path=os.path.expanduser(os.path.join(dirpath, f'{vm}.ovf'))
-        )
-        session.startvm(vm)
-    processes = [Process(target=_export_vm, args=(vm, cli_args.path)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-    #_ = [_export_vm(vm, cli_args.export_path) for vm in vms]
-
-
-def import_config(session: Session, cli_args):
-    """
-    Take a snapshot of the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    # .. todo:: add option to start/resume the vms once imported
-    """
-    raise NotImplementedError('importing is not implemented yet')
-    #vms = parse_vms_list(session, cli_args)
-    #def _take(vm):
-    #    session.snapshot.take(
-    #        vm,
-    #        snap_name=cli_args.snapshot_name,
-    #        live=cli_args.live)
-    #processes = [Process(target=_take, args=(vm,)) for vm in vms]
-    #[p.start() for p in processes]
-    #[p.join() for p in processes]
-    ##_ = [_take(vm) for vm in vms]
-
 def _default_boxman_config() -> dict:
     """
     Return the default boxman application configuration.
