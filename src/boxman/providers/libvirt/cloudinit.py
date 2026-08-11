@@ -597,8 +597,11 @@ class CloudInitTemplate:
         override, sudo, and runtime wrapping all apply — a raw string would
         silently hit the default local libvirt daemon.
         """
+        # the payload is passed raw: VirshCommand.build_command quotes
+        # every value centrally (shlex.quote), so a pre-quoted payload
+        # would end up double-quoted
         return self.virsh.execute(
-            "qemu-agent-command", self.template_name, shlex.quote(payload),
+            "qemu-agent-command", self.template_name, payload,
             hide=True, warn=True)
 
     def _wait_cloudinit_fallback(self, seconds: int | None = None) -> None:
