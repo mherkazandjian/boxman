@@ -63,7 +63,10 @@ class CDROMManager(VirshCommand):
                 temp_path = temp.name
 
             attachment_args = ["--persistent"] if persistent else []
-            result = self.execute("attach-device", self.vm_name, temp_path, *attachment_args)
+            # warn=True so a failed attach reaches the error branch below
+            # instead of raising out of execute (matches change_media)
+            result = self.execute("attach-device", self.vm_name, temp_path,
+                                  *attachment_args, warn=True)
 
             os.unlink(temp_path)
 
@@ -104,7 +107,10 @@ class CDROMManager(VirshCommand):
                 temp_path = temp.name
 
             detach_args = ["--persistent"] if persistent else []
-            result = self.execute("detach-device", self.vm_name, temp_path, *detach_args)
+            # warn=True so a failed detach reaches the error branch below
+            # instead of raising out of execute (matches change_media)
+            result = self.execute("detach-device", self.vm_name, temp_path,
+                                  *detach_args, warn=True)
 
             os.unlink(temp_path)
 

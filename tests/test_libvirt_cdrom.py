@@ -143,8 +143,11 @@ class TestAttachCDROM:
         iso = tmp_path / "u.iso"
         iso.write_bytes(b"x")
         with patch.object(cd, "_find_next_available_target", return_value="hdc"), \
-             patch.object(cd, "execute", return_value=_result(ok=False, stderr="nope")):
+             patch.object(cd, "execute", return_value=_result(ok=False, stderr="nope")) as execute:
             assert cd.attach_cdrom(str(iso)) is False
+        # warn=True keeps the error branch live — without it execute raises
+        # and the `if not result.ok` check is dead code (#85 item 38)
+        assert execute.call_args.kwargs.get("warn") is True
 
     def test_cleans_up_temp_xml_on_exception(self, cd: CDROMManager, tmp_path: Path):
         """If execute raises, the temp XML file must still be removed."""
@@ -178,8 +181,11 @@ class TestDetachCDROM:
         assert args[0] == "detach-device"
 
     def test_failure_returns_false(self, cd: CDROMManager):
-        with patch.object(cd, "execute", return_value=_result(ok=False, stderr="x")):
+        with patch.object(cd, "execute", return_value=_result(ok=False, stderr="x")) as execute:
             assert cd.detach_cdrom("hdc") is False
+        # warn=True keeps the error branch live — without it execute raises
+        # and the `if not result.ok` check is dead code (#85 item 38)
+        assert execute.call_args.kwargs.get("warn") is True
 
 
 class TestChangeMedia:
