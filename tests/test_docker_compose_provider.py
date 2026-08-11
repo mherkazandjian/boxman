@@ -1352,6 +1352,29 @@ class TestSnapshotDcWiring:
         sess.snapshot_restore_cluster.assert_called_once_with(
             "services", m.config["clusters"]["services"], "new")
 
+    def test_restore_plan_ensures_shared_bridges_before_compose_up(self):
+        """Regression (#85 item 27): after a host reboot the macvlan parent
+        bridges are gone; the dc restore plan must recreate them before the
+        compose recreate, or it fails with a cryptic "parent interface does
+        not exist"."""
+        m = self._mgr()
+        sess = self._restore_session(latest="new")
+        m.session_for_cluster = lambda c: sess
+        order = []
+        m.ensure_shared_bridges = lambda: order.append("bridges")
+        sess.snapshot_restore_cluster.side_effect = (
+            lambda *a: order.append("restore"))
+        args = SimpleNamespace(snapshot_name=None, cluster=None, vms="all")
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
+            BoxmanManager.snapshot_restore(m, args)
+        assert order == ["bridges", "restore"]
+
+    def test_restore_dc_plan_empty_skips_bridges(self):
+        m = self._mgr()
+        m.ensure_shared_bridges = mock.Mock()
+        assert m._restore_dc_plan([]) == []
+        m.ensure_shared_bridges.assert_not_called()
+
     def test_restore_validates_before_mutating(self):
         """An invalid container snapshot must abort *before* the destructive
         up --force-recreate (mher: partial-restore ordering)."""
