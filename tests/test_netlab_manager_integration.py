@@ -13,9 +13,11 @@ Covers:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+import yaml
 
 from boxman.manager import BoxmanManager
 
@@ -287,3 +289,68 @@ class TestNetlabStartupConfigSourceRoot:
 
         mgr.ensure_netlab_up()
         self._assert_resolves_to_cwd(captured, tmp_path)
+
+
+class TestNetlabWorkdirAbsolute:
+    """Regression: the netlab workdir must be absolute.
+
+    Containerlab resolves relative ``startup-config`` paths in the
+    topology against the topology file's own directory, so a relative
+    workdir would emit paths like ``netlab/configs/sw1.cfg`` inside
+    ``netlab/<lab>.clab.yml`` — containerlab then looks for
+    ``netlab/netlab/configs/sw1.cfg`` and the deploy fails.
+    """
+
+    def test_workdir_absolute_when_config_path_relative(
+            self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        mgr = _make_manager({
+            "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
+        })
+        mgr.config_path = "conf.yml"  # bare relative default, no workspace.path
+
+        netlab = mgr.netlab
+        assert netlab is not None
+        assert netlab.workdir.is_absolute()
+        assert netlab.workdir == tmp_path
+
+    def test_workdir_absolute_when_workspace_path_relative(
+            self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        mgr = _make_manager({
+            "workspace": {"path": "ws"},
+            "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
+        })
+
+        netlab = mgr.netlab
+        assert netlab is not None
+        assert netlab.workdir.is_absolute()
+        assert netlab.workdir == tmp_path / "ws"
+
+    def test_rendered_topology_startup_config_paths_absolute(
+            self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "configs").mkdir()
+        (tmp_path / "configs" / "sw1.cfg.j2").write_text("hostname sw1\n")
+        mgr = _make_manager({
+            "containerlab": {
+                "lab_name": "netlab",
+                "topology": {
+                    "nodes": {
+                        "sw1": {
+                            "kind": "arista_ceos",
+                            "startup-config": "configs/sw1.cfg.j2",
+                        },
+                    },
+                },
+            },
+        })
+        mgr.config_path = "conf.yml"
+
+        topology_path = mgr.netlab.render_topology()
+
+        rendered = yaml.safe_load(topology_path.read_text())
+        startup = rendered["topology"]["nodes"]["sw1"]["startup-config"]
+        assert os.path.isabs(startup), (
+            f"startup-config path must be absolute, got {startup!r}")
+        assert Path(startup).exists()
