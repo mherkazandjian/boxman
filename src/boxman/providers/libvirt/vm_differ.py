@@ -5,6 +5,7 @@ from boxman import log
 
 from .commands import VirshCommand
 from .virsh_edit import VirshEdit
+from .virsh_parse import parse_domblklist
 
 
 class VMStateDiffer:
@@ -131,23 +132,16 @@ class VMStateDiffer:
             return []
 
         disks = []
-        lines = result.stdout.strip().split('\n')
-        # skip header lines (Type Device Target Source)
-        for line in lines[2:]:
-            parts = line.split()
-            if len(parts) < 4:
+        for row in parse_domblklist(result.stdout):
+            if row.device != 'disk' or row.type != 'file':
                 continue
-            disk_type = parts[0]   # file, block, etc.
-            device = parts[1]      # disk, cdrom
-            target = parts[2]      # vda, vdb, hda, sda
-            source = parts[3]      # /path/to/file or -
-
-            if device != 'disk' or disk_type != 'file' or source == '-':
+            source = row.source
+            if source is None or source == '-':
                 continue
 
-            size_mb = self._get_disk_size_mb(domain_name, target)
+            size_mb = self._get_disk_size_mb(domain_name, row.target)
             disks.append({
-                'target': target,
+                'target': row.target,
                 'source': source,
                 'size_mb': size_mb
             })
@@ -213,24 +207,17 @@ class VMStateDiffer:
             return []
 
         cdroms = []
-        lines = result.stdout.strip().split('\n')
-        for line in lines[2:]:
-            parts = line.split()
-            if len(parts) < 3:
+        for row in parse_domblklist(result.stdout):
+            if row.device != 'cdrom':
                 continue
-            device = parts[1]
-            target = parts[2]
-            source = parts[3] if len(parts) >= 4 else '-'
-
-            if device != 'cdrom':
-                continue
-            if source == '-':
+            source = row.source
+            if source is None or source == '-':
                 continue
             if os.path.basename(source).startswith('seed'):
                 continue
 
             cdroms.append({
-                'target': target,
+                'target': row.target,
                 'source': source,
             })
 

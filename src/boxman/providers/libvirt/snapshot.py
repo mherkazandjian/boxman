@@ -13,6 +13,7 @@ from xml.etree import ElementTree as ET
 from boxman import log
 
 from .commands import VirshCommand
+from .virsh_parse import parse_domblklist
 
 
 class SnapshotManager:
@@ -133,11 +134,9 @@ class SnapshotManager:
         if not result.ok:
             return []
         args = []
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            # domblklist --details columns: Type  Device  Target  Source
-            if len(parts) >= 3 and parts[1] == 'cdrom':
-                args.extend(["--diskspec", f"{parts[2]},snapshot=no"])
+        for row in parse_domblklist(result.stdout):
+            if row.device == 'cdrom':
+                args.extend(["--diskspec", f"{row.target},snapshot=no"])
         return args
 
     def create_snapshot(self,
@@ -1094,14 +1093,10 @@ class SnapshotManager:
         if not result.ok:
             return []
         disks: list[tuple[str, str]] = []
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 4:
+        for row in parse_domblklist(result.stdout):
+            if row.device != 'disk' or row.source is None:
                 continue
-            # columns: Type Device Target Source
-            if parts[1] != 'disk':
-                continue
-            disks.append((parts[2], parts[3]))
+            disks.append((row.target, row.source))
         return disks
 
     def _overlay_path_for_snapshot(self,

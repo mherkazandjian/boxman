@@ -44,6 +44,7 @@ from .cloudinit_presets import (
     hash_password as _hash_password,
 )
 from .commands import VirshCommand, VirtInstallCommand
+from .virsh_parse import parse_domblklist
 
 
 class CloudInitTemplate:
@@ -1041,11 +1042,9 @@ class CloudInitTemplate:
         blklist = self.virsh.execute(
             "domblklist", self.template_name, "--details", warn=True)
         if blklist.ok:
-            for line in blklist.stdout.splitlines():
-                parts = line.split()
-                # columns: Type  Device  Target  Source
-                if len(parts) >= 4 and parts[1] == 'cdrom':
-                    target, source = parts[2], parts[3]
+            for row in parse_domblklist(blklist.stdout):
+                if row.device == 'cdrom' and row.source is not None:
+                    target, source = row.target, row.source
                     if os.path.basename(source).startswith('seed'):
                         self.logger.info(
                             f"ejecting seed cdrom '{target}' from template "

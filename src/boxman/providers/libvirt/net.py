@@ -14,6 +14,7 @@ from boxman import log
 
 from . import net_reconcile
 from .commands import VirshCommand
+from .virsh_parse import parse_domiflist
 
 
 class Network(VirshCommand):
@@ -583,10 +584,8 @@ class Network(VirshCommand):
                 "domiflist", domain, hide=True, warn=True)
             if not iflist.ok:
                 continue
-            for line in iflist.stdout.splitlines():
-                fields = line.split()
-                # columns: Interface Type Source Model MAC
-                if len(fields) >= 3 and fields[1] == 'network' and fields[2] == self.name:
+            for row in parse_domiflist(iflist.stdout):
+                if row.type == 'network' and row.source == self.name:
                     attached.append(domain)
                     break
         return attached
