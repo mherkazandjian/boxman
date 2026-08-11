@@ -406,8 +406,13 @@ class TestRecreateSequence:
 
         mgr.cache = MagicMock()
         mgr.cache.projects = {'p1': {'networks': {'full-net': {'ip_address': '10.5.3.1'}}}}
-        mgr.cache.read_projects_cache.side_effect = lambda: calls.append('cache-read')
-        mgr.cache.write_projects_cache.side_effect = lambda: calls.append('cache-write')
+
+        def _unregister_network(project, name):
+            calls.append('cache-write')
+            mgr.cache.projects[project]['networks'].pop(name, None)
+            return True
+
+        mgr.cache.unregister_network.side_effect = _unregister_network
 
         provider = MagicMock()
         provider.remove_network.side_effect = lambda **kw: (

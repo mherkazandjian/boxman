@@ -164,3 +164,121 @@ class TestWriteProjectsCache:
         cache.write_projects_cache()
         on_disk = json.loads(Path(cache.projects_cache_file).read_text())
         assert on_disk == cache.projects
+
+
+class TestCorruptCache:
+    """Regression: a corrupt projects.json (e.g. truncated by a crashed
+    writer) must not raise JSONDecodeError through every boxman command —
+    it is moved aside and treated as empty."""
+
+    def test_read_treats_corrupt_as_empty_and_backs_up(self, cache: BoxmanCache):
+        Path(cache.projects_cache_file).write_text("{not json")
+        assert cache.read_projects_cache() == {}
+        backup = Path(cache.projects_cache_file + ".corrupt")
+        assert backup.read_text() == "{not json"
+        assert not Path(cache.projects_cache_file).exists()
+
+    def test_register_project_survives_corrupt_cache(
+            self, cache: BoxmanCache, tmp_path: Path):
+        Path(cache.projects_cache_file).write_text("garbage")
+        conf = tmp_path / "p.yml"
+        conf.write_text("x")
+        assert cache.register_project("p", str(conf)) is True
+        on_disk = json.loads(Path(cache.projects_cache_file).read_text())
+        assert "p" in on_disk
+
+    def test_list_projects_survives_corrupt_cache(self, cache: BoxmanCache):
+        Path(cache.projects_cache_file).write_text("]")
+        assert cache.list_projects() == {}
+
+
+class TestAtomicWrite:
+    """Regression: cache writes must go through tmp-file + os.replace so a
+    crashed or concurrent writer can never truncate projects.json."""
+
+    def test_failed_dump_leaves_existing_file_intact(
+            self, cache: BoxmanCache, monkeypatch):
+        original = {"p": {"conf": "/tmp/p.yml", "runtime": "local"}}
+        Path(cache.projects_cache_file).write_text(json.dumps(original))
+        cache.projects = {"q": {}}
+
+        def _crash(*_a, **_k):
+            raise RuntimeError("crash mid-write")
+
+        monkeypatch.setattr(json, "dump", _crash)
+        with pytest.raises(RuntimeError, match="crash mid-write"):
+            cache.write_projects_cache()
+        assert json.loads(Path(cache.projects_cache_file).read_text()) == original
+
+    def test_no_tmp_files_left_behind(self, cache: BoxmanCache):
+        cache.projects = {"x": {}}
+        cache.write_projects_cache()
+        leftovers = [p.name for p in Path(cache.cache_dir).iterdir()]
+        assert leftovers == ["projects.json"]
+
+    def test_concurrent_writers_keep_file_valid(
+            self, cache: BoxmanCache, tmp_path: Path):
+        import threading
+        conf = tmp_path / "c.yml"
+        conf.write_text("x")
+        errors = []
+
+        def worker(i):
+            try:
+                for n in range(25):
+                    name = f"p{i}-{n}"
+                    cache.register_project(name, str(conf))
+                    cache.unregister_project(name)
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        # whatever the interleaving, the file must still be valid JSON
+        json.loads(Path(cache.projects_cache_file).read_text())
+
+
+class TestRegisterProjectReturn:
+
+    def test_returns_true_on_success(self, cache: BoxmanCache, tmp_path: Path):
+        conf = tmp_path / "p.yml"
+        conf.write_text("x")
+        assert cache.register_project("p", str(conf)) is True
+
+
+class TestUnregisterNetwork:
+
+    def _seed(self, cache: BoxmanCache, tmp_path: Path):
+        conf = tmp_path / "p.yml"
+        conf.write_text("x")
+        cache.register_project("proj", str(conf))
+        cache.projects["proj"]["networks"] = {
+            "net_a": {"ip_address": "10.0.0.1"},
+            "net_b": {"ip_address": "10.0.1.1"},
+        }
+        cache.write_projects_cache()
+
+    def test_removes_entry_and_keeps_others(
+            self, cache: BoxmanCache, tmp_path: Path):
+        self._seed(cache, tmp_path)
+        assert cache.unregister_network("proj", "net_a") is True
+        on_disk = json.loads(Path(cache.projects_cache_file).read_text())
+        assert on_disk["proj"]["networks"] == {
+            "net_b": {"ip_address": "10.0.1.1"}}
+        # the rest of the project record is untouched
+        assert on_disk["proj"]["runtime"] == "local"
+
+    def test_false_when_network_not_cached(
+            self, cache: BoxmanCache, tmp_path: Path):
+        self._seed(cache, tmp_path)
+        before = Path(cache.projects_cache_file).read_text()
+        assert cache.unregister_network("proj", "net_x") is False
+        assert Path(cache.projects_cache_file).read_text() == before
+
+    def test_false_when_project_not_cached(self, cache: BoxmanCache):
+        assert cache.unregister_network("nope", "net_a") is False

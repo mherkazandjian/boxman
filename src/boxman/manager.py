@@ -3002,17 +3002,11 @@ class BoxmanManager:
         Needed before redefining it: ``check_network_exists()`` walks every
         cached project *including this one*, so a network's own leftover entry
         counts as a conflict with itself -- same name, same address -- and the
-        redefine raises instead of running. ``remove_network()`` only touches
-        libvirt and iptables, never the cache.
+        redefine raises instead of running.
         """
         try:
-            self.cache.read_projects_cache()
-            project = (self.cache.projects or {}).get(self.config['project'])
-            if not project or full_name not in project.get('networks', {}):
-                return
-            del project['networks'][full_name]
-            self.cache.write_projects_cache()
-            self.logger.debug(f"removed {full_name} from the projects cache")
+            if self.cache.unregister_network(self.config['project'], full_name):
+                self.logger.debug(f"removed {full_name} from the projects cache")
         except (KeyError, OSError, ValueError) as exc:
             # not fatal on its own, but the redefine that follows will fail on
             # the stale entry, so say why
@@ -3159,9 +3153,13 @@ class BoxmanManager:
 
         return 'recreated'
 
-    def destroy_networks(self) -> None:
+    def destroy_networks(self) -> dict:
         """
         Destroy the networks specified in the cluster configuration (parallel).
+
+        Returns:
+            The ``failures`` dict from :meth:`_run_parallel`, empty when
+            every network was removed.
         """
         def _destroy(cluster_name, cluster, network_name, network_info):
             _network_name = self.full_network_name(
@@ -3186,7 +3184,9 @@ class BoxmanManager:
             for cluster_name, cluster in self._vm_clusters.items()
             for network_name, network_info in (cluster.get('networks') or {}).items()
         ]
-        self._run_parallel(processes, op_label='destroy network')
+        _results, failures = self._run_parallel(
+            processes, op_label='destroy network')
+        return failures
     ### end networks define / remove / destroy
 
     ### vms define / remove / destroy
@@ -4740,14 +4740,24 @@ class BoxmanManager:
             for cluster_name, cluster in cls._vm_clusters.items()
             for vm_name, vm_info in cluster['vms'].items()
         ]
-        cls._run_parallel(processes, op_label='deprovision vm')
+        _results, vm_failures = cls._run_parallel(
+            processes, op_label='deprovision vm')
 
-        cls.destroy_networks()
+        net_failures = cls.destroy_networks()
 
         if getattr(cli_args, 'cleanup', False):
             cls.deprovision_files()
 
-        cls.unregister_from_cache()
+        if vm_failures or net_failures:
+            # Resources survived the teardown: keep the project registered
+            # so it stays visible to `boxman list` and a later deprovision
+            # can finish the job instead of the leftovers becoming
+            # cache-invisible.
+            cls.logger.warning(
+                "deprovision left resources behind; keeping project "
+                f"'{cls.config['project']}' registered in the cache")
+        else:
+            cls.unregister_from_cache()
 
         return
 
