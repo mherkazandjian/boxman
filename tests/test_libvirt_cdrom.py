@@ -229,3 +229,32 @@ class TestGetAttachedCDROMs:
     def test_empty_on_execute_failure(self, cd: CDROMManager):
         with patch.object(cd, "execute", return_value=_result(ok=False)):
             assert cd.get_attached_cdroms() == []
+
+
+class TestXmlEscaping:
+    # device XML interpolates paths/names into attributes — a value holding
+    # & or a quote must be escaped or libvirt cannot parse it (#85 item 6)
+
+    def test_source_path_is_escaped(self, cd: CDROMManager):
+        xml = cd._generate_cdrom_xml("/tmp/a&b's.iso", "hdc")
+        assert "file='/tmp/a&amp;b&apos;s.iso'" in xml
+
+    def test_target_is_escaped(self, cd: CDROMManager):
+        xml = cd._generate_cdrom_xml("/tmp/foo.iso", 'hd"c')
+        assert "dev='hd&quot;c'" in xml
+
+    def test_detach_target_is_escaped(self, cd: CDROMManager):
+        written = {}
+
+        def capture(*args, **kwargs):
+            written["xml"] = Path(args[2]).read_text()
+            return _result()
+
+        with patch.object(cd, "execute", side_effect=capture):
+            assert cd.detach_cdrom("hd&c") is True
+        assert "dev='hd&amp;c'" in written["xml"]
+
+    def test_plain_values_are_left_untouched(self, cd: CDROMManager):
+        xml = cd._generate_cdrom_xml("/tmp/foo.iso", "hdc")
+        assert "file='/tmp/foo.iso'" in xml
+        assert "dev='hdc'" in xml
