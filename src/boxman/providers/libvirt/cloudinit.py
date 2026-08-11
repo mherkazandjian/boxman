@@ -830,6 +830,21 @@ class CloudInitTemplate:
         self._shutdown_template()
         return True
 
+    def _wait_until_shut_off(self, attempts: int = 30, interval: int = 2) -> bool:
+        """
+        Poll ``domstate`` until the template VM is shut off.
+
+        Returns:
+            True once the domain reports "shut off", False when *attempts*
+            run out.
+        """
+        for _ in range(attempts):
+            result = self.virsh.execute("domstate", self.template_name, hide=True, warn=True)
+            if result.ok and "shut off" in result.stdout.strip():
+                return True
+            time.sleep(interval)
+        return False
+
     def _shutdown_template(self) -> None:
         """
         Shut the template VM down, forcing it off if it will not go quietly.
@@ -842,12 +857,9 @@ class CloudInitTemplate:
         self.virsh.execute("shutdown", self.template_name, hide=True, warn=True)
 
         self.logger.info("waiting for VM to shut off...")
-        for _ in range(30):
-            result = self.virsh.execute("domstate", self.template_name, hide=True, warn=True)
-            if result.ok and "shut off" in result.stdout.strip():
-                self.logger.info("VM is successfully shut off.")
-                return
-            time.sleep(2)
+        if self._wait_until_shut_off():
+            self.logger.info("VM is successfully shut off.")
+            return
 
         self.logger.warning("VM did not shut off gracefully. Forcing destroy...")
         self.virsh.execute("destroy", self.template_name, hide=True, warn=True)
@@ -907,19 +919,38 @@ class CloudInitTemplate:
                     f"destroying first (--force was specified)")
                 self.virsh.execute(
                     "destroy", self.template_name, hide=True, warn=True)
-                self.virsh.execute(
+                # undefine fails while QEMU is still tearing the domain down,
+                # and the virt-install below would then die with "domain
+                # already exists" — wait for shut-off before removing it
+                if not self._wait_until_shut_off():
+                    self.logger.error(
+                        f"template VM '{self.template_name}' did not shut off "
+                        f"after destroy — refusing to recreate it")
+                    return False
+                undefine = self.virsh.execute(
                     "undefine", self.template_name,
                     "--remove-all-storage", hide=True, warn=True)
+                if not undefine.ok:
+                    self.logger.error(
+                        f"failed to undefine template VM "
+                        f"'{self.template_name}': {undefine.stderr}")
+                    return False
                 self.logger.info(
                     f"template VM '{self.template_name}' has been removed")
 
         # Resolve bridge device (auto-starts the network if needed)
         bridge_device = self._resolve_bridge()
 
-        # Verify DHCP is available (warn early rather than debug a silent failure)
+        # Verify DHCP is available (fail fast rather than debug a silent
+        # failure — without it the guest never gets an IP and the cloud-init
+        # verification below would burn the full agent timeout for nothing)
         if not self.bridge:
             # only check when using a libvirt-managed network
-            self._verify_dhcp_on_network()
+            if not self._verify_dhcp_on_network():
+                self.logger.error(
+                    f"cannot create template '{self.template_name}': "
+                    f"no DHCP on network '{self.network}' — see above")
+                return False
 
         template_dir = os.path.join(self.workdir, self.template_name)
         os.makedirs(template_dir, exist_ok=True)

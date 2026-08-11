@@ -82,8 +82,9 @@ class CDROMManager(VirshCommand):
         """
         try:
             # Generate XML for the device to detach (source not needed for detach)
+            bus = self._bus_for_target(target_dev)
             xml_content = f"""<disk type='file' device='cdrom'>
-  <target dev='{target_dev}' bus='ide'/>
+  <target dev='{target_dev}' bus='{bus}'/>
   <readonly/>
 </disk>"""
 
@@ -209,12 +210,26 @@ class CDROMManager(VirshCommand):
         Returns:
             XML string for CDROM attachment
         """
+        bus = self._bus_for_target(target_dev)
         return f"""<disk type='file' device='cdrom'>
   <driver name='qemu' type='raw'/>
   <source file='{source_path}'/>
-  <target dev='{target_dev}' bus='ide'/>
+  <target dev='{target_dev}' bus='{bus}'/>
   <readonly/>
 </disk>"""
+
+    @staticmethod
+    def _bus_for_target(target_dev: str) -> str:
+        """
+        Derive the libvirt bus from a target device name.
+
+        ``_find_next_available_target`` falls back to sd* names once the
+        four IDE slots are taken, so the bus cannot be hardcoded to ide.
+
+        Returns:
+            'sata' for sd* targets, 'ide' otherwise (hd*)
+        """
+        return 'sata' if target_dev.startswith('sd') else 'ide'
 
     def _find_next_available_target(self) -> str | None:
         """
