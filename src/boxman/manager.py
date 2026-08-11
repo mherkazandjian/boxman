@@ -3320,30 +3320,6 @@ class BoxmanManager:
                 f"underlying cause (typically a missing template disk or a "
                 f"libvirt storage pool issue).")
 
-    def destroy_vms(self) -> None:
-        """
-        Destroy the VMs specified in the cluster configuration.
-        """
-        prj_name = f'bprj__{self.config["project"]}__bprj'
-        def vm_destroy_tasks():
-            for cluster_name, cluster in self._vm_clusters.items():
-                for vm_name in cluster['vms'].keys():
-                    full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                    yield full_vm_name, cluster_name, vm_name
-
-        def _destroy(full_vm_name, cluster_name, vm_name):
-            self.logger.info(f"Destroying VM {vm_name} in cluster {cluster_name}")
-            self.session_for_cluster(cluster_name).destroy_vm(
-                name=full_vm_name,
-                remove_storage=True
-            )
-
-        processes = [
-            Process(target=_destroy, args=(full_vm_name, cluster_name, vm_name))
-            for full_vm_name, cluster_name, vm_name in vm_destroy_tasks()
-        ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
     ### end vms define / remove / destroy
 
     def _configure_and_start_vm(
@@ -3540,89 +3516,6 @@ class BoxmanManager:
             for vm_name, vm_info in cluster['vms'].items()
         ]
         self._run_parallel(processes, op_label='configure and start vm')
-
-    # Keep individual methods available for direct use / testing
-
-    def configure_network_interfaces(self) -> None:
-        """Configure network interfaces for all VMs (sequential)."""
-        prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self._vm_clusters.items():
-            for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                vm_info = vm_info.copy()
-                self.logger.info(
-                    f"configuring network interfaces for VM {vm_name} in cluster {cluster_name}")
-                if 'network_adapters' not in vm_info:
-                    self.logger.warning(f"no network adapters defined for vm {vm_name}, skipping")
-                    continue
-                for adapter in vm_info['network_adapters']:
-                    self.resolve_adapter_network(adapter, cluster_name)
-                success = self.session_for_cluster(cluster_name).configure_vm_network_interfaces(
-                    vm_name=full_vm_name,
-                    network_adapters=vm_info['network_adapters']
-                )
-                if success:
-                    self.logger.info(
-                        f"All network interfaces configured successfully for vm {vm_name}")
-                else:
-                    self.logger.warning(
-                        f"Some network interfaces could not be configured for vm {vm_name}")
-
-    def configure_disks(self) -> None:
-        """Configure disks for all VMs (sequential)."""
-        prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self._vm_clusters.items():
-            workdir = cluster.get('workdir', '.')
-            for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                self.logger.info(f"configuring disks for vm {vm_name} in cluster {cluster_name}")
-                if 'disks' not in vm_info or not vm_info['disks']:
-                    self.logger.warning(f"no disks defined for vm {vm_name}, skipping")
-                    continue
-                success = self.session_for_cluster(cluster_name).configure_vm_disks(
-                    vm_name=full_vm_name,
-                    disks=vm_info['disks'],
-                    workdir=workdir,
-                    disk_prefix=full_vm_name)
-                if success:
-                    self.logger.info(f"all disks configured successfully for vm {vm_name}")
-                else:
-                    self.logger.warning(f"some disks could not be configured for vm {vm_name}")
-
-    def configure_cpu_mem(self) -> None:
-        """Configure CPU and memory for all VMs (sequential)."""
-        prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self._vm_clusters.items():
-            for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                self.logger.info(
-                    f"configuring cpu and memory for vm {vm_name} in cluster {cluster_name}")
-                cpus = vm_info.get('cpus')
-                memory = vm_info.get('memory')
-                if not cpus and not memory:
-                    self.logger.warning(
-                        f"no cpu or memory configuration for vm {vm_name}, skipping")
-                    continue
-                success = self.session_for_cluster(cluster_name).configure_vm_cpu_memory(
-                    vm_name=full_vm_name, cpus=cpus, memory_mb=memory
-                )
-                if success:
-                    self.logger.info(f"successfully configured cpu and memory for vm {vm_name}")
-                else:
-                    self.logger.warning(f"failed to configure cpu and memory for vm {vm_name}")
-
-    def start_vms(self) -> None:
-        """Start all VMs (sequential)."""
-        prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self._vm_clusters.items():
-            for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                self.logger.info(f"starting vm {full_vm_name}")
-                success = self.session_for_cluster(cluster_name).start_vm(full_vm_name)
-                if success:
-                    self.logger.info(f"successfully started the vm {full_vm_name}")
-                else:
-                    self.logger.warning(f"failed to start the vm {full_vm_name}")
 
     def get_connect_info(self) -> bool:
         """

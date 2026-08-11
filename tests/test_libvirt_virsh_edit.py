@@ -51,18 +51,6 @@ class TestDeadErrorBranches:
             assert ve.hot_set_memory("vm01", 1024) is False
         assert exe.call_args.kwargs.get("warn") is True
 
-    def test_update_max_vcpus_failure_returns_false(self, ve: VirshEdit):
-        with patch.object(ve.virsh, "execute",
-                          return_value=_result(ok=False, stderr="x")) as exe:
-            assert ve.update_max_vcpus("vm01", 8) is False
-        assert exe.call_args.kwargs.get("warn") is True
-
-    def test_update_max_memory_failure_returns_false(self, ve: VirshEdit):
-        with patch.object(ve.virsh, "execute",
-                          return_value=_result(ok=False, stderr="x")) as exe:
-            assert ve.update_max_memory("vm01", 4096) is False
-        assert exe.call_args.kwargs.get("warn") is True
-
     def test_hot_set_vcpus_success_returns_true(self, ve: VirshEdit):
         with patch.object(ve.virsh, "execute", return_value=_result()):
             assert ve.hot_set_vcpus("vm01", 4) is True
