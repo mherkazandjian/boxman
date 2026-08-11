@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import tempfile
 import time
@@ -584,6 +585,19 @@ class CloudInitTemplate:
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def _agent_command(self, payload: str) -> invoke.runners.Result:
+        """
+        Run a QEMU guest-agent command against the template VM.
+
+        Routes through :class:`VirshCommand` instead of a raw ``virsh …``
+        shell string so the configured libvirt ``uri``, a ``virsh_cmd``
+        override, sudo, and runtime wrapping all apply — a raw string would
+        silently hit the default local libvirt daemon.
+        """
+        return self.virsh.execute(
+            "qemu-agent-command", self.template_name, shlex.quote(payload),
+            hide=True, warn=True)
+
     def _wait_cloudinit_fallback(self, seconds: int | None = None) -> None:
         """
         Time-based fallback: wait *seconds* for cloud-init to finish when
@@ -603,10 +617,7 @@ class CloudInitTemplate:
         for i in range(0, seconds, 10):
             time.sleep(10)
             # Confirm the VM is still responsive
-            ping = self.virsh.execute_shell(
-                f"virsh qemu-agent-command {self.template_name} "
-                f"'{{\"execute\":\"guest-ping\"}}'",
-                hide=True, warn=True)
+            ping = self._agent_command('{"execute":"guest-ping"}')
             if not ping.ok:
                 self.logger.warning(
                     f"guest agent stopped responding after {i + 10}s — "
@@ -644,9 +655,7 @@ class CloudInitTemplate:
                 '"test -f ' + marker_path + ' && echo MARKER_FOUND || echo MARKER_MISSING"],'
                 '"capture-output":true}}'
             )
-            res = self.virsh.execute_shell(
-                f"virsh qemu-agent-command {self.template_name} '{check_cmd}'",
-                hide=True, warn=True)
+            res = self._agent_command(check_cmd)
 
             if res.ok:
                 found = self._guest_exec_output(res.stdout)
@@ -683,10 +692,7 @@ class CloudInitTemplate:
                 f'"arguments":{{"pid":{pid}}}}}'
             )
             for _ in range(10):
-                status_res = self.virsh.execute_shell(
-                    f"virsh qemu-agent-command {self.template_name} "
-                    f"'{status_cmd}'",
-                    hide=True, warn=True)
+                status_res = self._agent_command(status_cmd)
                 if not status_res.ok:
                     return None
                 ret = json.loads(
@@ -711,9 +717,7 @@ class CloudInitTemplate:
             + log_script
             + '"],"capture-output":true}}'
         )
-        res = self.virsh.execute_shell(
-            f"virsh qemu-agent-command {self.template_name} '{exec_cmd}'",
-            hide=True, warn=True)
+        res = self._agent_command(exec_cmd)
         if not res.ok:
             return
         output = self._guest_exec_output(res.stdout)
@@ -730,9 +734,7 @@ class CloudInitTemplate:
         agent_poll_interval = 2
         agent_attempts = max(1, self.cloudinit_agent_timeout // agent_poll_interval)
         for i in range(agent_attempts):
-            result = self.virsh.execute_shell(
-                f"virsh qemu-agent-command {self.template_name} '{{\"execute\":\"guest-ping\"}}'",
-                hide=True, warn=True)
+            result = self._agent_command('{"execute":"guest-ping"}')
             if result.ok:
                 agent_up = True
                 break
@@ -775,9 +777,7 @@ class CloudInitTemplate:
                     '{"path":"/bin/sh","arg":["-c","echo ok"],'
                     '"capture-output":true}}'
                 )
-                res = self.virsh.execute_shell(
-                    f"virsh qemu-agent-command {self.template_name} '{exec_cmd}'",
-                    hide=True, warn=True)
+                res = self._agent_command(exec_cmd)
                 if res.ok:
                     guest_exec_ok = True
                     self.logger.info("guest-exec is available")
