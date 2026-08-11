@@ -2,12 +2,14 @@
 Unit tests for selected BoxmanManager core methods.
 
 Targets the pure / easily isolated methods of the 4122-LOC manager.py:
-  - ``_merge_provider_configs`` (static, sudo-lists merging)
   - ``_canonical_runtime_name`` (static)
   - ``collect_workdirs`` (config-only, no I/O beyond path resolution)
   - ``fetch_value`` (classmethod — env/file/literal resolution)
   - ``get_global_authorized_keys`` (uses fetch_value)
   - ``runtime`` / ``runtime_instance`` / ``get_provider_config_with_runtime``
+
+Also covers ``boxman.providers.merge_provider_configs`` (sudo-lists
+merging), the single provider-config merge used by the CLI and manager.
 
 The orchestration surface (provision, up, down, snapshot_*, etc.) is
 left to integration tests.
@@ -25,6 +27,7 @@ from unittest.mock import patch
 import pytest
 
 from boxman.manager import BoxmanManager
+from boxman.providers import merge_provider_configs
 
 
 pytestmark = pytest.mark.unit
@@ -45,7 +48,7 @@ class TestMergeProviderConfigs:
     """
 
     def test_scalars_local_overrides_global(self):
-        merged = BoxmanManager._merge_provider_configs(
+        merged = merge_provider_configs(
             {"uri": "qemu:///system", "use_sudo": True},
             {"use_sudo": False},
         )
@@ -53,12 +56,12 @@ class TestMergeProviderConfigs:
         assert merged["use_sudo"] is False
 
     def test_empty_configs_yield_empty_sudo_lists(self):
-        merged = BoxmanManager._merge_provider_configs({}, {})
+        merged = merge_provider_configs({}, {})
         assert merged["sudo_skip_commands"] == []
         assert merged["force_sudo_commands"] == []
 
     def test_sudo_lists_union(self):
-        merged = BoxmanManager._merge_provider_configs(
+        merged = merge_provider_configs(
             {"sudo_skip_commands": ["ls"], "force_sudo_commands": ["virsh"]},
             {"sudo_skip_commands": ["cat"], "force_sudo_commands": ["virt-install"]},
         )
@@ -66,7 +69,7 @@ class TestMergeProviderConfigs:
         assert merged["force_sudo_commands"] == ["virsh", "virt-install"]
 
     def test_local_skip_wins_over_global_force(self):
-        merged = BoxmanManager._merge_provider_configs(
+        merged = merge_provider_configs(
             {"force_sudo_commands": ["virsh"]},
             {"sudo_skip_commands": ["virsh"]},
         )
@@ -74,7 +77,7 @@ class TestMergeProviderConfigs:
         assert "virsh" not in merged["force_sudo_commands"]
 
     def test_local_force_wins_over_global_skip(self):
-        merged = BoxmanManager._merge_provider_configs(
+        merged = merge_provider_configs(
             {"sudo_skip_commands": ["virsh"]},
             {"force_sudo_commands": ["virsh"]},
         )
@@ -84,7 +87,7 @@ class TestMergeProviderConfigs:
     def test_does_not_mutate_inputs(self):
         g = {"sudo_skip_commands": ["ls"]}
         l = {"sudo_skip_commands": ["cat"]}
-        BoxmanManager._merge_provider_configs(g, l)
+        merge_provider_configs(g, l)
         assert g == {"sudo_skip_commands": ["ls"]}
         assert l == {"sudo_skip_commands": ["cat"]}
 

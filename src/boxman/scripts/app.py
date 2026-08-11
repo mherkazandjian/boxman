@@ -16,7 +16,7 @@ from boxman import log
 from boxman.abstract.providers import ProviderSession as Session
 from boxman.exceptions import BoxmanError, ConfigError
 from boxman.manager import BoxmanManager
-from boxman.providers import create_session, primary_provider_type
+from boxman.providers import create_session, merge_provider_configs, primary_provider_type
 from boxman.providers.libvirt.import_image import ImageImporter
 from boxman.loggers.logger import set_quiet, set_verbosity, suppressed
 from boxman.scripts.cli_parser import parse_args, resolve_verbosity
@@ -425,8 +425,8 @@ def _main():
             boxman_config.get('providers', {}).get(provider_type, {})
         )
         project_provider = manager.config.get('provider', {}).get(provider_type, {})
-        merged_provider = provider_conf_with_runtime.copy()
-        merged_provider.update(project_provider)
+        merged_provider = merge_provider_configs(
+            provider_conf_with_runtime, project_provider)
         args.func(manager, args, merged_provider=merged_provider)
         sys.exit(0)
 
@@ -630,9 +630,10 @@ def _main():
                 enriched_config = manager.config.copy()
                 existing_provider = enriched_config.get('provider') or {}
                 project_provider = (existing_provider.get(_ptype) or {}).copy()
-                # Start from app-level defaults, then overlay project-level on top
-                merged_provider = provider_conf_with_runtime.copy()
-                merged_provider.update(project_provider)
+                # Start from app-level defaults, then overlay project-level on
+                # top via the shared sudo-list-aware merge
+                merged_provider = merge_provider_configs(
+                    provider_conf_with_runtime, project_provider)
                 enriched_config['provider'] = {
                     **existing_provider,
                     _ptype: merged_provider,
