@@ -614,33 +614,31 @@ def _main():
                 except ConfigError as exc:
                     log.error(str(exc))
                     sys.exit(2)
-            if _ptype == 'libvirt':
-                # merge runtime metadata into the provider config from boxman.yml
-                provider_conf_with_runtime = manager.get_provider_config_with_runtime(
-                    boxman_config.get('providers', {}).get(_ptype, {})
-                )
-                # Enrich the project config with runtime-aware provider
-                # settings. App-level (boxman.yml) settings serve as
-                # DEFAULTS; project-level (conf.yml) settings always take
-                # precedence. The libvirt block is built unconditionally so
-                # a project without a ``provider:`` section (now defaulted
-                # to libvirt by primary_provider_type) still inherits the
-                # runtime URI/sudo defaults instead of silently falling back
-                # to a local qemu:///system.
-                enriched_config = manager.config.copy()
-                existing_provider = enriched_config.get('provider') or {}
-                project_provider = (existing_provider.get(_ptype) or {}).copy()
-                # Start from app-level defaults, then overlay project-level on
-                # top via the shared sudo-list-aware merge
-                merged_provider = merge_provider_configs(
-                    provider_conf_with_runtime, project_provider)
-                enriched_config['provider'] = {
-                    **existing_provider,
-                    _ptype: merged_provider,
-                }
-                session_config = enriched_config
-            else:
-                session_config = manager.config
+            # merge runtime metadata into the provider config from boxman.yml
+            provider_conf_with_runtime = manager.get_provider_config_with_runtime(
+                boxman_config.get('providers', {}).get(_ptype, {})
+            )
+            # Enrich the project config with runtime-aware provider
+            # settings — for EVERY provider type, so app-level
+            # (boxman.yml) settings serve as DEFAULTS and project-level
+            # (conf.yml) settings always take precedence. The provider
+            # block is built unconditionally so a project without a
+            # ``provider:`` section (defaulted to libvirt by
+            # primary_provider_type) still inherits the runtime URI/sudo
+            # defaults instead of silently falling back to a local
+            # qemu:///system.
+            enriched_config = manager.config.copy()
+            existing_provider = enriched_config.get('provider') or {}
+            project_provider = (existing_provider.get(_ptype) or {}).copy()
+            # Start from app-level defaults, then overlay project-level on
+            # top via the shared sudo-list-aware merge
+            merged_provider = merge_provider_configs(
+                provider_conf_with_runtime, project_provider)
+            enriched_config['provider'] = {
+                **existing_provider,
+                _ptype: merged_provider,
+            }
+            session_config = enriched_config
 
             try:
                 session = create_session(_ptype, session_config)
