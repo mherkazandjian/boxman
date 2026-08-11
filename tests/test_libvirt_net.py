@@ -491,3 +491,95 @@ class TestDestroyUndefineExactName:
     def test_undefine_fails_when_libvirt_cannot_be_asked(self, net):
         with patch.object(net, "_listed_networks", return_value=None):
             assert net.undefine_network() is False
+
+
+class TestNatIsLibvirtdsJob:
+    """Boxman must not install its own NAT iptables rules.
+
+    Regression tests for issue #85 item 14: a ``<forward mode='nat'/>``
+    network already makes libvirtd install the masquerade and FORWARD
+    rules. Boxman's hand-rolled duplicates (keyed off
+    ``ip route get 8.8.8.8``) fought libvirtd's and leaked stale rules on
+    removal, so apply/remove of a nat network must not touch iptables.
+    """
+
+    @staticmethod
+    def _net(mode: str = "nat", use_sudo: bool = False) -> Network:
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            return Network(name="nat-net", info={"mode": mode},
+                           assign_new_bridge=True,
+                           provider_config={"use_sudo": use_sudo})
+
+    def test_define_nat_network_runs_no_iptables(self, tmp_path):
+        net = self._net("nat")
+        with patch.object(net, "check_network_exists"), \
+             patch.object(net, "_get_libvirt_bridges", return_value=set()), \
+             patch.object(net, "update_network_cache"), \
+             patch.object(net, "execute", return_value=_result()), \
+             patch.object(net, "execute_shell") as shell:
+            assert net.define_network(str(tmp_path / "net.xml")) is True
+        for call in shell.call_args_list:
+            assert "iptables" not in call.args[0]
+            assert "ip route get" not in call.args[0]
+
+    def test_remove_nat_network_runs_no_iptables(self):
+        net = self._net("nat")
+        with patch.object(net, "destroy_network", return_value=True), \
+             patch.object(net, "undefine_network", return_value=True), \
+             patch.object(net, "execute_shell") as shell:
+            assert net.remove_network() is True
+        shell.assert_not_called()
+
+
+class TestRouteIsolationRules:
+    """The routed-network isolation rules stay; sudo is execute_shell's call."""
+
+    @staticmethod
+    def _net(use_sudo: bool = False) -> Network:
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            return Network(name="routed-net", info={"mode": "route"},
+                           assign_new_bridge=True,
+                           provider_config={"use_sudo": use_sudo})
+
+    def test_apply_commands_embed_no_sudo(self):
+        net = self._net()
+        seen = []
+        with patch.object(
+                net, "_ensure_rule",
+                side_effect=lambda cls, chk, act, present=True:
+                    seen.append((chk, act)) or True):
+            assert net.apply_route_iptables_rule() is True
+        # the three isolation rules (vm-to-vm, vm->host, host->vm) survive
+        assert len(seen) == 3
+        for check_cmd, action_cmd in seen:
+            assert not check_cmd.startswith("sudo")
+            assert not action_cmd.startswith("sudo")
+            assert "virbr9" in check_cmd
+
+    def test_remove_commands_embed_no_sudo(self):
+        net = self._net()
+        seen = []
+        with patch.object(
+                net, "_ensure_rule",
+                side_effect=lambda cls, chk, act, present=True:
+                    seen.append((chk, act, present)) or True):
+            assert net.remove_route_iptables_rule() is True
+        assert len(seen) == 3
+        for check_cmd, action_cmd, present in seen:
+            assert present is False
+            assert not check_cmd.startswith("sudo")
+            assert not action_cmd.startswith("sudo")
+
+    @pytest.mark.parametrize("use_sudo, expected_prefix", [
+        (False, "iptables"),
+        (True, "sudo iptables"),
+    ])
+    def test_sudo_comes_from_use_sudo_via_execute_shell(
+            self, use_sudo, expected_prefix):
+        net = self._net(use_sudo=use_sudo)
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   return_value=_result()) as run:
+            net.execute_shell("iptables -C INPUT -i virbr9 -j DROP", warn=True)
+        assert run.call_args.args[0].startswith(expected_prefix)

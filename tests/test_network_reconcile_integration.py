@@ -30,8 +30,9 @@ Environment:
     the power cycle has to wait out the graceful-shutdown timeout, which adds
     about two minutes.
 
-The host also needs passwordless sudo for ``iptables``: boxman's NAT setup
-shells out to it when a network is defined.
+NAT is libvirtd's job (it installs the masquerade/FORWARD rules for
+``<forward mode='nat'/>`` itself), so boxman no longer shells out to
+``iptables`` for these networks.
 """
 
 from __future__ import annotations
