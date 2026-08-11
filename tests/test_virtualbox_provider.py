@@ -267,6 +267,36 @@ class TestStubbedOperations:
             _ = self._session().storage
 
 
+# --- CLI dispatch -------------------------------------------------------------
+
+class TestCliDispatch:
+    """#85 item 28: a virtualbox stub dying mid-flow must surface as a clean
+    exit 2 with a Phase 1 message, not a raw traceback."""
+
+    def test_virtualbox_stub_exits_2_with_message(self):
+        from boxman.scripts import app
+        with patch("boxman.scripts.app._main",
+                   side_effect=NotImplementedError(
+                       "VirtualBox provider: start_vm lands in Phase 2")), \
+                patch("boxman.scripts.app.log") as mock_log:
+            with pytest.raises(SystemExit) as exc:
+                app.main()
+        assert exc.value.code == 2
+        msg = mock_log.error.call_args.args[0]
+        assert "start_vm lands in Phase 2" in msg
+        assert "Phase 1" in msg
+        assert "non-functional" in msg
+
+    def test_unrelated_not_implemented_still_raises(self):
+        """Only the virtualbox stubs are translated; an unrelated
+        NotImplementedError keeps its traceback."""
+        from boxman.scripts import app
+        with patch("boxman.scripts.app._main",
+                   side_effect=NotImplementedError("something else broke")):
+            with pytest.raises(NotImplementedError, match="something else"):
+                app.main()
+
+
 # --- salvaged command builders ----------------------------------------------
 
 class TestCommandBuilders:
