@@ -29,6 +29,14 @@ RUN dnf install -y epel-release && \
         zstd \
     && dnf clean all
 
+# Rocky 9.6's qemu-kvm only ships /usr/libexec/qemu-kvm — the
+# qemu-system-x86_64 name libvirt probes for is gone. Install a real copy
+# (NOT a symlink: libvirt's QMP probe runs the emulator in a private mount
+# namespace where a dangling symlink target shows up as EACCES, which
+# silently yields empty <guest> capabilities and 'virsh version' fails with
+# "could not find capabilities for arch=x86_64").
+RUN cp /usr/libexec/qemu-kvm /usr/bin/qemu-system-x86_64
+
 COPY supervisord.conf /etc/supervisord.conf
 
 RUN mkdir -p /var/run/libvirt /var/lib/libvirt/images /var/log/supervisor /etc/dnsmasq.d
