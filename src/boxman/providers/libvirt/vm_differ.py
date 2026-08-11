@@ -184,16 +184,13 @@ class VMStateDiffer:
         """
         Compute the expected disk file path, matching DiskManager.configure_from_disk_config logic.
         """
+        from .disk import disk_path_for
         disk_name = disk_config.get("name", "disk")
         driver = disk_config.get("driver", {})
         driver_type = driver.get("type", "qcow2")
-
-        if disk_prefix:
-            disk_path = os.path.join(workdir, f"{disk_prefix}_{disk_name}.{driver_type}")
-        else:
-            disk_path = os.path.join(workdir, f"{disk_name}.{driver_type}")
-
-        return os.path.expanduser(disk_path)
+        return disk_path_for(workdir, disk_name,
+                             driver_type=driver_type,
+                             disk_prefix=disk_prefix)
 
     def get_actual_cdroms(self, domain_name: str) -> list[dict[str, Any]]:
         """
@@ -202,26 +199,9 @@ class VMStateDiffer:
         Returns:
             List of dicts with 'target' and 'source' keys.
         """
-        result = self.virsh.execute('domblklist', domain_name, '--details', warn=True)
-        if not result.ok:
-            return []
-
-        cdroms = []
-        for row in parse_domblklist(result.stdout):
-            if row.device != 'cdrom':
-                continue
-            source = row.source
-            if source is None or source == '-':
-                continue
-            if os.path.basename(source).startswith('seed'):
-                continue
-
-            cdroms.append({
-                'target': row.target,
-                'source': source,
-            })
-
-        return cdroms
+        from .cdrom import CDROMManager
+        return CDROMManager(
+            domain_name, provider_config=self.provider_config).get_attached_cdroms()
 
     def get_actual_shared_folders(self, domain_name: str) -> list[dict[str, Any]]:
         """
@@ -230,30 +210,10 @@ class VMStateDiffer:
         Returns:
             List of dicts with 'name', 'host_path', and 'readonly' keys.
         """
-        from lxml import etree
-
-        xml_content = self.virsh_edit.get_domain_xml(domain_name)
-        tree = etree.fromstring(xml_content.encode('utf-8'))
-
-        folders = []
-        for fs_elem in tree.xpath('//devices/filesystem'):
-            source_elem = fs_elem.find('source')
-            target_elem = fs_elem.find('target')
-            if source_elem is None or target_elem is None:
-                continue
-
-            host_path = source_elem.get('dir', '')
-            name = target_elem.get('dir', '')
-            readonly = fs_elem.find('readonly') is not None
-
-            if name and host_path:
-                folders.append({
-                    'name': name,
-                    'host_path': host_path,
-                    'readonly': readonly,
-                })
-
-        return folders
+        from .shared_folder import SharedFolderManager
+        return SharedFolderManager(
+            domain_name,
+            provider_config=self.provider_config).get_attached_shared_folders()
 
     def diff_vm(self,
                 domain_name: str,

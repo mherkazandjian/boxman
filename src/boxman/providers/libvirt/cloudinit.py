@@ -32,6 +32,7 @@ import invoke
 from boxman import log
 from boxman.image_cache import ImageCache
 from boxman.loggers.logger import is_verbose
+from boxman.utils.jinja_env import substitute_env
 from boxman.utils.shell import run as _shell_run
 
 from .cloudinit_presets import (  # noqa: F401 — re-exported for back-compat
@@ -44,6 +45,8 @@ from .cloudinit_presets import (
     hash_password as _hash_password,
 )
 from .commands import VirshCommand, VirtInstallCommand
+from .destroy_vm import shutdown_and_wait as _shutdown_and_wait
+from .destroy_vm import wait_until_shut_off as _wait_until_shut_off
 from .virsh_parse import parse_domblklist
 
 
@@ -321,11 +324,7 @@ class CloudInitTemplate:
 
         # Replace ${env:VAR} placeholders with actual environment variables
         # (run first so ${hash:${env:VAR}} resolves the env var before hashing)
-        userdata = re.sub(
-            r'\$\{env:([A-Za-z0-9_]+)\}',
-            lambda m: os.environ.get(m.group(1), ''),
-            userdata
-        )
+        userdata = substitute_env(userdata)
 
         # Replace ${hash:plaintext} placeholders with SHA-512 hashed passwords
         def _hash_repl(m):
@@ -847,12 +846,9 @@ class CloudInitTemplate:
             True once the domain reports "shut off", False when *attempts*
             run out.
         """
-        for _ in range(attempts):
-            result = self.virsh.execute("domstate", self.template_name, hide=True, warn=True)
-            if result.ok and "shut off" in result.stdout.strip():
-                return True
-            time.sleep(interval)
-        return False
+        return _wait_until_shut_off(
+            self.virsh, self.template_name,
+            timeout=attempts * interval, poll_interval=interval)
 
     def _shutdown_template(self) -> None:
         """
@@ -866,12 +862,13 @@ class CloudInitTemplate:
         self.virsh.execute("shutdown", self.template_name, hide=True, warn=True)
 
         self.logger.info("waiting for VM to shut off...")
-        if self._wait_until_shut_off():
+        if _shutdown_and_wait(self.virsh, self.template_name,
+                              timeout=60, logger=self.logger):
             self.logger.info("VM is successfully shut off.")
-            return
-
-        self.logger.warning("VM did not shut off gracefully. Forcing destroy...")
-        self.virsh.execute("destroy", self.template_name, hide=True, warn=True)
+        else:
+            self.logger.warning(
+                "VM did not shut off gracefully and the forced destroy "
+                "did not settle either.")
 
     def _verify_dhcp_on_network(self) -> bool:
         """
