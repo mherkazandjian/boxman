@@ -53,7 +53,7 @@ class DiskManager(VirshCommand):
             cmd_executor = LibVirtCommandBase(
                 provider_config=self.provider_config,
                 override_config_use_sudo=False)
-            result = cmd_executor.execute_shell(cmd)
+            result = cmd_executor.execute_shell(cmd, warn=True)
 
             if not result.ok:
                 self.logger.error(f"failed to create disk image: {result.stderr}")
@@ -103,7 +103,8 @@ class DiskManager(VirshCommand):
 
             # Attach the disk
             attachment_args = ["--persistent"] if persistent else []
-            result = self.execute("attach-device", self.vm_name, temp_path, *attachment_args)
+            result = self.execute("attach-device", self.vm_name, temp_path,
+                                  *attachment_args, warn=True)
 
             # Clean up the temporary file
             os.unlink(temp_path)
@@ -231,7 +232,7 @@ class DiskManager(VirshCommand):
             cmd_executor = LibVirtCommandBase(
                 provider_config=self.provider_config,
                 override_config_use_sudo=False)
-            result = cmd_executor.execute_shell(cmd)
+            result = cmd_executor.execute_shell(cmd, warn=True)
 
             if not result.ok:
                 self.logger.error(f"failed to resize disk image: {result.stderr}")
@@ -257,7 +258,7 @@ class DiskManager(VirshCommand):
         try:
             result = self.execute(
                 'blockresize', self.vm_name,
-                target_dev, f"--size={new_size_mb}M")
+                target_dev, f"--size={new_size_mb}M", warn=True)
 
             if not result.ok:
                 self.logger.error(

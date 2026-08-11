@@ -149,6 +149,14 @@ class TestRemoveNetworkInterfaces:
         with patch.object(clone.virsh, "execute", return_value=_result(ok=False)):
             assert clone.remove_network_interfaces() is False
 
+    def test_domiflist_called_with_warn_true(self, clone: CloneVM):
+        """Issue #85 item 38: without warn=True a failed domiflist raises
+        and the graceful 'return False' branch is dead code."""
+        with patch.object(clone.virsh, "execute",
+                          return_value=_result(ok=False)) as execute:
+            assert clone.remove_network_interfaces() is False
+        assert execute.call_args.kwargs.get("warn") is True
+
     def test_detach_failure_is_logged_but_loop_continues(
         self, clone: CloneVM, captured_logs
     ):

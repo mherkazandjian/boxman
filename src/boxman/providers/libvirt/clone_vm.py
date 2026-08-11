@@ -103,7 +103,7 @@ class CloneVM:
         try:
             vm_name = self.new_vm_name
             # use virsh domiflist to get the network interfaces
-            result = self.virsh.execute("domiflist", vm_name)
+            result = self.virsh.execute("domiflist", vm_name, warn=True)
             if not result.ok:
                 self.logger.error(f"Failed to get interface list for VM {vm_name}")
                 return False
