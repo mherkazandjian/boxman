@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import ConfigError
 from boxman.netlab import shared_bridges
 
 
@@ -160,8 +161,71 @@ class TestEnsure:
 
     def test_missing_bridge_key_raises(self):
         cfg = {"lab_mgmt": {"stp": False}}  # no 'bridge'
-        with pytest.raises(ValueError, match="missing required 'bridge' key"):
+        with pytest.raises(ConfigError, match="missing required 'bridge' key"):
             shared_bridges.ensure(cfg)
+
+    @pytest.mark.parametrize("name", [
+        "a" * 16,               # over the IFNAMSIZ 15-char limit
+        "br;rm -rf /",          # shell metacharacters
+        "br name",              # whitespace
+        "br$(id)",              # command substitution
+    ])
+    def test_invalid_bridge_names_rejected(self, name):
+        cfg = {"lab_mgmt": {"bridge": name}}
+        with patch("boxman.netlab.shared_bridges.run") as run:
+            with pytest.raises(ConfigError, match="invalid bridge name"):
+                shared_bridges.ensure(cfg)
+            run.assert_not_called()  # rejected before any shell-out
+
+    @pytest.mark.parametrize("name", [
+        "a" * 15,               # exactly at the IFNAMSIZ limit
+        "br_0",
+        "br-0",
+        "br.100",               # vlan-style dotted name
+    ])
+    def test_valid_bridge_names_accepted(self, name):
+        def fake_run(cmd, **kwargs):
+            if cmd.startswith("ip link show dev"):
+                return _result(ok=True)
+            return _result(ok=True)
+
+        cfg = {"lab_mgmt": {"bridge": name}}
+        with patch("boxman.netlab.shared_bridges.run", side_effect=fake_run):
+            with patch("pathlib.Path.exists", return_value=False):
+                shared_bridges.ensure(cfg)  # must not raise
+
+    def test_mtu_applied_when_configured(self):
+        """`mtu:` emits `ip link set dev <br> mtu <n>` at ensure time —
+        bridges default to 1500 while containerlab veth links use 9500."""
+        def fake_run(cmd, **kwargs):
+            if cmd.startswith("ip link show dev"):
+                return _result(ok=True)
+            return _result(ok=True)
+
+        cfg = {"lab_mgmt": {"bridge": "br1", "mtu": 9500}}
+        with patch("boxman.netlab.shared_bridges.run", side_effect=fake_run) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert "sudo ip link set dev br1 mtu 9500" in all_cmds
+
+    def test_mtu_not_touched_when_absent(self):
+        cfg = {"lab_mgmt": {"bridge": "br1"}}
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=self._fake_run()) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert " mtu " not in all_cmds
+
+    @pytest.mark.parametrize("mtu", ["9500", 0, -1, True, 1.5])
+    def test_invalid_mtu_rejected(self, mtu):
+        cfg = {"lab_mgmt": {"bridge": "br1", "mtu": mtu}}
+        with patch("boxman.netlab.shared_bridges.run") as run:
+            with pytest.raises(ConfigError, match="'mtu' must be a positive"):
+                shared_bridges.ensure(cfg)
+            run.assert_not_called()
 
 
 class TestHelpers:
