@@ -6,11 +6,6 @@ Extracted from ``scripts/app.py`` in Phase 2.5 of the review plan
 from the orchestration in ``main()``. The public surface is just
 :func:`parse_args`, which returns the top-level
 :class:`argparse.ArgumentParser` ready for ``.parse_known_args()``.
-
-Two local helpers (``export_config`` / ``import_config``) are still
-imported lazily inside :func:`parse_args` to avoid a circular import
-— they'll migrate here once the remaining app.py split lands in a
-follow-up pass.
 """
 
 from __future__ import annotations
@@ -34,10 +29,6 @@ SUPPORTED_PROVIDERS = ['libvirt', 'virtualbox']
 
 
 def parse_args():
-    # Lazy-imported here (not at module scope) to avoid a circular import
-    # with boxman.scripts.app, which imports parse_args from this module.
-    from boxman.scripts.app import export_config, import_config  # noqa: F401
-
     parser = argparse.ArgumentParser(
         description=(
             f"Boxman version {boxman.metadata.version}\n"
@@ -983,45 +974,6 @@ def parse_args():
         default=False,
         help='restore the saved state of the vm before starting',
         dest='restore'
-    )
-
-    #
-    # sub parser for the 'export' subcommand
-    #
-    parser_export = subparsers.add_parser('export', parents=[common], help='export the vms')
-    parser_export.set_defaults(func=export_config)
-    parser_export.add_argument(
-        '--vms',
-        type=str,
-        help='the names of the vms as a csv list',
-        dest='vms',
-        default='all'
-    )
-    parser_export.add_argument(
-        '--path',
-        type=str,
-        help='the names of the vms as a csv list',
-        dest='path',
-        default=None
-    )
-
-    #
-    # sub parser for the 'import' subcommand
-    #
-    parser_import_image = subparsers.add_parser('import', parents=[common], help='import the vms')
-    parser_import_image.set_defaults(func=import_config)
-    parser_import_image.add_argument(
-        '--vms',
-        type=str,
-        help='the names of the vms as a csv list',
-        dest='vms',
-        default='all'
-    )
-    parser_import_image.add_argument(
-        '--path',
-        type=str,
-        help='the names of the vms as a csv list',
-        dest='path',
     )
 
     #
