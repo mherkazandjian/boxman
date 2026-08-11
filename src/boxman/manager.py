@@ -200,6 +200,26 @@ class BoxmanManager:
         cluster = ((self.config or {}).get('clusters') or {}).get(cluster_name) or {}
         return cluster.get('provider') or primary_provider_type(self.config)
 
+    def _has_libvirt_clusters(self) -> bool:
+        """
+        Whether this project has any clusters that resolve to the libvirt
+        provider. Projects without a ``provider:`` section default to
+        libvirt (see :func:`primary_provider_type`).
+
+        Used to skip libvirt-only virsh probes in projects that have no
+        libvirt clusters at all (e.g. a pure docker-compose project).
+        """
+        config = self.config or {}
+        clusters = config.get('clusters') or {}
+        if not clusters:
+            return False
+        if not (config.get('provider') or {}):
+            return True
+        return any(
+            self.provider_type_for_cluster(name) == 'libvirt'
+            for name in clusters
+        )
+
     def session_for_cluster(self, cluster_name: str) -> "ProviderSession":
         """
         Return the provider session that manages *cluster_name*.
@@ -1655,13 +1675,15 @@ class BoxmanManager:
         #: keys of the templates whose build failed, reported to the caller
         failed: list[str] = []
 
-        # determine provider config
-        provider_type = list(config.get('provider', {}).keys())[0] if 'provider' in config else 'libvirt'
-        provider_config = config.get('provider', {}).get(provider_type, {})
+        # determine provider config — templates are libvirt-only, so resolve
+        # the libvirt block explicitly: in a mixed project the first key of
+        # ``provider:`` may be a different provider, and probing/creating on
+        # that config would target the wrong hypervisor.
+        provider_config = config.get('provider', {}).get('libvirt', {})
 
         # merge app-level provider config as defaults
         if self.app_config and 'providers' in self.app_config:
-            app_provider = self.app_config['providers'].get(provider_type, {})
+            app_provider = self.app_config['providers'].get('libvirt', {})
             provider_config = merge_provider_configs(app_provider, provider_config)
 
         # inject runtime settings
@@ -4160,13 +4182,15 @@ class BoxmanManager:
         expected = self._get_project_vm_names()
         if not expected:
             return []
+        if not self._has_libvirt_clusters():
+            return []
 
-        # Resolve provider config so VirshCommand uses the right
-        # runtime / URI / sudo settings.
-        provider_type = primary_provider_type(self.config)
-        provider_config = self.config.get('provider', {}).get(provider_type, {})
+        # Resolve the libvirt provider config explicitly — these probes are
+        # libvirt-only, so in a mixed project the first key of ``provider:``
+        # (primary_provider_type) may point at the wrong hypervisor.
+        provider_config = self.config.get('provider', {}).get('libvirt', {})
         if self.app_config and 'providers' in self.app_config:
-            app_prov = self.app_config['providers'].get(provider_type, {})
+            app_prov = self.app_config['providers'].get('libvirt', {})
             provider_config = merge_provider_configs(app_prov, provider_config)
         if hasattr(self, 'runtime_instance'):
             provider_config = self.runtime_instance.inject_into_provider_config(
@@ -4192,10 +4216,15 @@ class BoxmanManager:
         project = self.config.get("project", "")
         prj_prefix = f"bprj__{project}__bprj_"
 
-        provider_type = primary_provider_type(self.config)
-        provider_config = self.config.get('provider', {}).get(provider_type, {})
+        if not self._has_libvirt_clusters():
+            return []
+
+        # Resolve the libvirt provider config explicitly — see
+        # _find_existing_project_vms for why primary_provider_type is wrong
+        # here in mixed projects.
+        provider_config = self.config.get('provider', {}).get('libvirt', {})
         if self.app_config and 'providers' in self.app_config:
-            app_prov = self.app_config['providers'].get(provider_type, {})
+            app_prov = self.app_config['providers'].get('libvirt', {})
             provider_config = merge_provider_configs(app_prov, provider_config)
         if hasattr(self, 'runtime_instance'):
             provider_config = self.runtime_instance.inject_into_provider_config(
@@ -4226,11 +4255,15 @@ class BoxmanManager:
         expected = set(self._get_project_vm_names())
         if not expected:
             return {}
+        if not self._has_libvirt_clusters():
+            return {}
 
-        provider_type = primary_provider_type(self.config)
-        provider_config = self.config.get('provider', {}).get(provider_type, {})
+        # Resolve the libvirt provider config explicitly — see
+        # _find_existing_project_vms for why primary_provider_type is wrong
+        # here in mixed projects.
+        provider_config = self.config.get('provider', {}).get('libvirt', {})
         if self.app_config and 'providers' in self.app_config:
-            app_prov = self.app_config['providers'].get(provider_type, {})
+            app_prov = self.app_config['providers'].get('libvirt', {})
             provider_config = merge_provider_configs(app_prov, provider_config)
         if hasattr(self, 'runtime_instance'):
             provider_config = self.runtime_instance.inject_into_provider_config(
