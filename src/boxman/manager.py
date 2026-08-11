@@ -32,6 +32,26 @@ from boxman.utils.jinja_env import create_jinja_env
 from boxman.utils.references import resolve_reference
 
 
+#: Seconds to wait for a finished child's queue message before declaring its
+#: result missing (the child has already joined, so any wait here is just
+#: feeder-thread flush latency — or a child that died before queue.put).
+_PARALLEL_RESULT_TIMEOUT = 5
+
+
+def _parallel_worker(result_queue, label, target, args):
+    """
+    Child-process wrapper for :meth:`BoxmanManager._run_parallel`.
+
+    Always reports the outcome on *result_queue* — even when *target*
+    raises — so the parent can never mistake a crashed worker for a
+    success (or block forever waiting for a message that never comes).
+    """
+    try:
+        result_queue.put((label, True, target(*args)))
+    except Exception as exc:
+        result_queue.put((label, False, f"{type(exc).__name__}: {exc}"))
+
+
 class BoxmanManager:
     def __init__(self,
                  config: dict[str, Any] | None = None):
@@ -373,6 +393,69 @@ class BoxmanManager:
             f"{', '.join(failed)}"
         )
         sys.exit(1)
+
+    def _run_parallel(self, tasks, op_label='parallel task'):
+        """
+        Run picklable workers in child processes and report per-task failures.
+
+        Args:
+            tasks: iterable of ``(label, target, args)`` tuples; ``target`` is
+                called as ``target(*args)`` in a child process. Labels must be
+                unique within the batch.
+            op_label: verb phrase used in the per-failure error messages.
+
+        Returns:
+            ``(results, failures)`` dicts keyed by task label. A task lands in
+            ``failures`` when its child raised, exited non-zero, or reported
+            no result at all (e.g. it was killed); otherwise the worker's
+            return value lands in ``results``. Every failure is logged here —
+            callers only need the return value when they react to failures
+            (e.g. snapshot restore's retry rounds).
+        """
+        from queue import Empty
+
+        tasks = list(tasks)
+        if not tasks:
+            return {}, {}
+
+        result_queue: Queue = Queue()
+        processes = [
+            Process(
+                target=_parallel_worker,
+                args=(result_queue, label, target, args))
+            for label, target, args in tasks
+        ]
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+        reported = {}
+        for _ in processes:
+            try:
+                label, ok, payload = result_queue.get(
+                    timeout=_PARALLEL_RESULT_TIMEOUT)
+                reported[label] = (ok, payload)
+            except Empty:
+                # A child exited without reporting (killed, or the queue
+                # broke) — the per-process loop below marks it as failed.
+                break
+
+        results: dict[str, Any] = {}
+        failures: dict[str, str] = {}
+        for i, (label, _target, _args) in enumerate(tasks):
+            if processes[i].exitcode != 0:
+                failures[label] = f"worker exited with code {processes[i].exitcode}"
+            elif label not in reported:
+                failures[label] = "worker exited without reporting a result"
+            else:
+                ok, payload = reported[label]
+                if ok:
+                    results[label] = payload
+                else:
+                    failures[label] = str(payload)
+
+        for label, reason in failures.items():
+            self.logger.error(f"{op_label} failed for {label}: {reason}")
+        return results, failures
 
     def _vm_cluster_map(self) -> dict[str, str]:
         """
@@ -3085,12 +3168,12 @@ class BoxmanManager:
                 self.logger.info(f"removed network XML {xml_path}")
 
         processes = [
-            Process(target=_destroy, args=(cluster_name, cluster, network_name, network_info))
+            (f"{cluster_name}/{network_name}", _destroy,
+             (cluster_name, cluster, network_name, network_info))
             for cluster_name, cluster in self._vm_clusters.items()
             for network_name, network_info in (cluster.get('networks') or {}).items()
         ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        self._run_parallel(processes, op_label='destroy network')
     ### end networks define / remove / destroy
 
     ### vms define / remove / destroy
@@ -3432,15 +3515,12 @@ class BoxmanManager:
         started concurrently.
         """
         processes = [
-            Process(
-                target=self._configure_and_start_vm,
-                args=(cluster_name, cluster, vm_name, vm_info)
-            )
+            (f"{cluster_name}/{vm_name}", self._configure_and_start_vm,
+             (cluster_name, cluster, vm_name, vm_info))
             for cluster_name, cluster in self._vm_clusters.items()
             for vm_name, vm_info in cluster['vms'].items()
         ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        self._run_parallel(processes, op_label='configure and start vm')
 
     # Keep individual methods available for direct use / testing
 
@@ -3542,19 +3622,18 @@ class BoxmanManager:
             for vm_name in cluster['vms']
         ]
 
-        result_queue: Queue = Queue()
-
         def _check(full_vm_name):
-            ips = self.session_for_vm(full_vm_name).get_vm_ip_addresses(full_vm_name)
-            result_queue.put((full_vm_name, ips))
+            return self.session_for_vm(full_vm_name).get_vm_ip_addresses(full_vm_name)
 
-        processes = [Process(target=_check, args=(n,)) for n in vm_names]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        # Routed through _run_parallel: a crashed child can no longer
+        # deadlock the parent on a blocking result_queue.get().
+        results, _failures = self._run_parallel(
+            [(n, _check, (n,)) for n in vm_names],
+            op_label='ip address check')
 
         all_vms_have_ip = True
-        for _ in range(len(vm_names)):
-            full_vm_name, ips = result_queue.get()
+        for full_vm_name in vm_names:
+            ips = results.get(full_vm_name)
             if not ips:
                 all_vms_have_ip = False
                 self.logger.warning(f"vm {full_vm_name} does not have an ip address yet")
@@ -4626,7 +4705,7 @@ class BoxmanManager:
                 cls.logger.info(f"VM '{vm_name}' suspended")
 
             processes = [
-                Process(target=_suspend, args=(vm_name,))
+                (vm_name, _suspend, (vm_name,))
                 for vm_name, _ in vm_list
             ]
         else:
@@ -4639,12 +4718,11 @@ class BoxmanManager:
                 cls.logger.info(f"VM '{vm_name}' state saved")
 
             processes = [
-                Process(target=_save, args=(vm_name, workdir))
+                (vm_name, _save, (vm_name, workdir))
                 for vm_name, workdir in vm_list
             ]
 
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        cls._run_parallel(processes, op_label='down')
 
         # Stop docker-compose clusters (keep containers; reversible via `up`).
         cls.stop_compose_clusters()
@@ -4677,15 +4755,12 @@ class BoxmanManager:
                 f"deprovision_compose_clusters raised: {exc} — continuing")
 
         processes = [
-            Process(
-                target=cls._destroy_vm_and_disks,
-                args=(cluster_name, cluster, vm_name, vm_info)
-            )
+            (f"{cluster_name}/{vm_name}", cls._destroy_vm_and_disks,
+             (cluster_name, cluster, vm_name, vm_info))
             for cluster_name, cluster in cls._vm_clusters.items()
             for vm_name, vm_info in cluster['vms'].items()
         ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        cls._run_parallel(processes, op_label='deprovision vm')
 
         cls.destroy_networks()
 
@@ -5251,12 +5326,12 @@ class BoxmanManager:
                 force=force)
 
         processes = [
-            Process(target=_take, args=(full_vm_name, vm_dir,
-                                        cli_args.snapshot_name, cli_args.snapshot_descr))
+            (full_vm_name, _take,
+             (full_vm_name, vm_dir,
+              cli_args.snapshot_name, cli_args.snapshot_descr))
             for full_vm_name, vm_dir in vm_targets
         ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        cls._run_parallel(processes, op_label='snapshot take')
 
         # Verify every snapshot in the main process after all takes complete.
         cls.logger.info("verifying snapshots after take...")
@@ -5385,9 +5460,9 @@ class BoxmanManager:
         dc_failed = cls._restore_dc_plan(dc_plan)
 
         # ── 3 & 4. Parallel restore with retry until all succeed ─────────────
-        def _restore(full_vm_name, snapshot_name, queue):
-            ok = cls.session_for_vm(full_vm_name).snapshot_restore(full_vm_name, snapshot_name)
-            queue.put((full_vm_name, snapshot_name, ok))
+        def _restore(full_vm_name, snapshot_name):
+            return bool(cls.session_for_vm(full_vm_name).snapshot_restore(
+                full_vm_name, snapshot_name))
 
         pending = list(vm_targets)
         max_rounds = 20
@@ -5396,18 +5471,15 @@ class BoxmanManager:
             cls.logger.info(
                 f"restore round {round_num}: {len(pending)} VM(s) to restore")
 
-            q = Queue()
-            processes = [
-                Process(target=_restore, args=(vm, snap, q))
-                for vm, snap in pending
-            ]
-            [p.start() for p in processes]
-            [p.join() for p in processes]
+            # _run_parallel reports raised/killed workers as failures too, so
+            # a dying child can no longer look like a successful restore.
+            results, failures = cls._run_parallel(
+                [(vm, _restore, (vm, snap)) for vm, snap in pending],
+                op_label='snapshot restore')
 
             failed = []
-            while not q.empty():
-                vm, snap, ok = q.get()
-                if ok:
+            for vm, snap in pending:
+                if vm not in failures and results.get(vm):
                     cls.logger.info(f"restored: {vm} to '{snap}'")
                 else:
                     cls.logger.warning(f"failed: {vm} to '{snap}', will retry")
@@ -5539,14 +5611,12 @@ class BoxmanManager:
         # it manipulates qcow2 chains via libvirt-specific managers.
         provider_config = cls.provider.provider_config
         processes = [
-            Process(
-                target=BoxmanManager._collapse_one_vm,
-                args=(provider_config, full_vm_name, workdir, vm_info,
-                      target, no_shutdown, dry_run))
+            (full_vm_name, BoxmanManager._collapse_one_vm,
+             (provider_config, full_vm_name, workdir, vm_info,
+              target, no_shutdown, dry_run))
             for full_vm_name, workdir, vm_info in targets
         ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        cls._run_parallel(processes, op_label='snapshot collapse')
     ### end snapshot functions ####
 
     ### start storage functions ####
@@ -5721,14 +5791,12 @@ class BoxmanManager:
 
         provider_config = cls.provider.provider_config  # Phase 1 (#49): storage_compact stays on the default session until Phase 3
         processes = [
-            Process(
-                target=BoxmanManager._compact_one_vm,
-                args=(provider_config, full_vm_name, workdir, vm_info,
-                      method, drop_snapshots, no_shutdown, dry_run))
+            (full_vm_name, BoxmanManager._compact_one_vm,
+             (provider_config, full_vm_name, workdir, vm_info,
+              method, drop_snapshots, no_shutdown, dry_run))
             for full_vm_name, workdir, vm_info in targets
         ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        cls._run_parallel(processes, op_label='storage compact')
 
     @staticmethod
     def storage_optimize(cls, cli_args):
@@ -6771,14 +6839,10 @@ class BoxmanManager:
                     cls.logger.info(f"  {vm_name}")
             else:
                 processes = [
-                    Process(
-                        target=cls._destroy_removed_vm,
-                        args=(vm_name,)
-                    )
+                    (vm_name, cls._destroy_removed_vm, (vm_name,))
                     for vm_name in removed_vm_names
                 ]
-                [p.start() for p in processes]
-                [p.join() for p in processes]
+                cls._run_parallel(processes, op_label='destroy removed vm')
 
                 short = [n.split('_')[-1] for n in sorted(removed_vm_names)]
                 cls.logger.info(

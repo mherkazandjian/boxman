@@ -9,7 +9,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import boxman.manager
 from boxman.manager import BoxmanManager
 
 pytestmark = pytest.mark.unit
@@ -39,28 +38,19 @@ def _full(cluster, vm):
     return f"bprj__demo__bprj_{cluster}_{vm}"
 
 
-class _FakeProcess:
-    """Stand-in for multiprocessing.Process that only records its args."""
-
-    instances = []
-
-    def __init__(self, target=None, args=()):
-        self.target = target
-        self.args = args
-        _FakeProcess.instances.append(self)
-
-    def start(self):
-        pass
-
-    def join(self):
-        pass
-
-
 @pytest.fixture
-def fake_process(monkeypatch):
-    _FakeProcess.instances = []
-    monkeypatch.setattr(boxman.manager, "Process", _FakeProcess)
-    return _FakeProcess.instances
+def recorded_tasks(monkeypatch):
+    """Record the task batches dispatched through _run_parallel (and report
+    every task as successful) without spawning real child processes."""
+    batches = []
+
+    def _record(self, tasks, op_label='parallel task'):
+        tasks = list(tasks)
+        batches.append(tasks)
+        return ({label: True for label, _target, _args in tasks}, {})
+
+    monkeypatch.setattr(BoxmanManager, "_run_parallel", _record)
+    return batches
 
 
 class TestControlScoping:
@@ -142,10 +132,10 @@ class TestStorageScoping:
         trimmed = {c.args[0] for c in mgr.provider.storage.is_running.call_args_list}
         assert trimmed == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}
 
-    def test_storage_compact_scoped_by_vms(self, fake_process):
+    def test_storage_compact_scoped_by_vms(self, recorded_tasks):
         mgr = _manager()
         BoxmanManager.storage_compact(mgr, types.SimpleNamespace(vms="node01"))
-        compacted = {p.args[1] for p in fake_process}
+        compacted = {label for batch in recorded_tasks for label, _t, _a in batch}
         assert compacted == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}
 
     def test_storage_compress_snapshots_scoped_by_vms(self):
@@ -157,10 +147,10 @@ class TestStorageScoping:
             c.args[0] for c in mgr.provider.compress_snapshots_memory.call_args_list}
         assert compressed == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}
 
-    def test_snapshot_collapse_scoped_by_vms(self, fake_process):
+    def test_snapshot_collapse_scoped_by_vms(self, recorded_tasks):
         mgr = _manager()
         ns = types.SimpleNamespace(
             vms="node01", target="snap1", dry_run=False, no_shutdown=False, yes=True)
         BoxmanManager.snapshot_collapse(mgr, ns)
-        collapsed = {p.args[1] for p in fake_process}
+        collapsed = {label for batch in recorded_tasks for label, _t, _a in batch}
         assert collapsed == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}

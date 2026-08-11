@@ -10,7 +10,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import boxman.manager
 from boxman.exceptions import ConfigError, ProvisionError, SnapshotError
 from boxman.manager import BoxmanManager
 
@@ -42,20 +41,6 @@ def no_existing_state(monkeypatch):
         BoxmanManager, "_find_existing_project_vms", lambda cls: [])
     monkeypatch.setattr(
         BoxmanManager, "register_project_in_cache", lambda cls: None)
-
-
-class _FakeProcess:
-    """Stand-in for multiprocessing.Process — runs nothing, joins cleanly."""
-
-    def __init__(self, target=None, args=()):
-        self.target = target
-        self.args = args
-
-    def start(self):
-        pass
-
-    def join(self):
-        pass
 
 
 class TestProvisionFailuresRaise:
@@ -130,7 +115,9 @@ class TestSnapshotFailuresRaise:
 
     def test_take_failed_verification(self, monkeypatch):
         mgr = _manager()
-        monkeypatch.setattr(boxman.manager, "Process", _FakeProcess)
+        monkeypatch.setattr(
+            BoxmanManager, "_run_parallel",
+            lambda self, tasks, op_label='parallel task': ({}, {}))
         mgr.provider.validate_snapshot.return_value = (False, ["corrupt"])
         ns = types.SimpleNamespace(
             snapshot_name="s1", snapshot_descr="", vms="all", cluster=None)
