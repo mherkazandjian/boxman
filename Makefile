@@ -95,7 +95,11 @@ test-integration:
 test-provision:
 	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_provision_boxes.py
 
-#@help: count lines of code with cloc via docker (git-tracked files only)
+#@help: run docker-compose *provider* e2e tests (needs docker; hybrid tier also needs /dev/kvm)
+test-dc-e2e:
+	PYTHONPATH=src:$(PYTHONPATH) python -m pytest $(PYTEST_FLAGS) $(pytest_args) -m integration tests/test_docker_compose_provider_e2e.py
+
+#@help: count lines of code per category (code/tests/docs/conf/templates/boxes/shell/docker/make/claude)
 loc:
 	@if ! command -v docker >/dev/null 2>&1; then \
 		echo "docker is required for 'make loc' (cloc runs via the aldanial/cloc image)."; \

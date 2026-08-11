@@ -1,0 +1,168 @@
+---
+# dc-provider-staging
+#
+# The staging/testing VM for the docker-compose provider epic (#42).
+# One Ubuntu 24.04 VM pre-baked with everything the epic's phases need:
+#
+#   - docker + compose v2            (phases 3-7, netfilter spike #48)
+#   - libvirt/qemu-kvm + virtinst    (phase 4/8 nested hybrid e2e)
+#   - git/make/python3/pip/venv      (running boxman + its test suite inside)
+#   - br_netfilter loaded at boot    (spike scenarios need it)
+#
+# Nested KVM: verified working (vmx exposed in the guest) via virt-install's
+# default host-model CPU. Note: virt_install_extra_args is currently silently
+# ignored on the cloud-init template path (boxman hard-codes its virt-install
+# args there — see the #48 drift log); the key is kept for when boxman honors
+# it. Verify inside with: egrep -c 'vmx|svm' /proc/cpuinfo.
+#
+# Workflow: `boxman up`, bootstrap per README.md, snapshot the pristine
+# state, then restore between destructive test runs.
+version: '1.0'
+project: dc_provider_staging
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: False
+    virt_install_cmd: '/usr/bin/virt-install'
+    virt_clone_cmd: '/usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+    verbose: True
+
+templates:
+  template1:
+    name: dc-staging-ubuntu-24.04-base-template
+    image:
+      uri: http://cloud-images-archive.ubuntu.com/releases/noble/release-20240423/ubuntu-24.04-server-cloudimg-amd64.img
+      checksum: sha256:32a9d30d18803da72f5936cf2b7b9efcb4d0bb63c67933f17e3bdfd1751de3f3
+    disk_size: 40G
+    os_variant: ubuntu24.04
+    memory: 4096
+    vcpus: 4
+    # currently a no-op on the cloud-init template path (see #48 drift log);
+    # kept so the intent applies automatically once boxman supports it
+    virt_install_extra_args:
+      - '--cpu host-passthrough'
+    cloudinit_done_marker: /var/log/dc-staging-cloudinit.log
+    cloudinit: |
+      #cloud-config
+      hostname: dc-staging
+      manage_etc_hosts: true
+
+      network:
+        version: 2
+        ethernets:
+          default:
+            match:
+              name: "en*"
+            dhcp4: true
+            dhcp6: false
+
+      users:
+        - name: ubuntu
+          lock_passwd: false
+          groups: [sudo]
+          sudo: "ALL=(ALL) NOPASSWD:ALL"
+          shell: /bin/bash
+
+      chpasswd:
+        expire: false
+        list: |
+          ubuntu:ubuntu
+
+      ssh_pwauth: true
+      package_update: true
+      packages:
+        - qemu-guest-agent
+        - openssh-server
+        - git
+        - make
+        - curl
+        - python3-pip
+        - python3-venv
+        - iptables
+        - docker.io
+        - docker-compose-v2
+        - qemu-kvm
+        - libvirt-daemon-system
+        - virtinst
+        - genisoimage
+
+      write_files:
+        - path: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+          permissions: "0644"
+          content: |
+            [Service]
+            ExecStart=
+            ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any
+        - path: /etc/modules-load.d/br_netfilter.conf
+          permissions: "0644"
+          content: |
+            br_netfilter
+
+      runcmd:
+        - rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        - rm -f /etc/cloud/cloud.cfg.d/subiquity-disable-cloudinit-networking.cfg
+        - systemctl daemon-reload
+        - systemctl enable --now qemu-guest-agent
+        - netplan generate || true
+        - netplan apply || true
+        - dhclient -v || true
+        - [ systemctl, enable, --now, qemu-guest-agent ]
+        # create admin user via shell commands (same recipe as the tiny box)
+        - [ sh, -c, "groupadd -f admin" ]
+        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /admin -s /bin/bash -g admin -G sudo admin" ]
+        - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin" ]
+        - [ sh, -c, "chmod 0440 /etc/sudoers.d/admin" ]
+        - [ sh, -c, "echo 'admin:{{ env("BOXMAN_ADMIN_PASS", default="boxman") }}' | chpasswd" ]
+        - [ sh, -c, "mkdir -p /admin/.ssh && chmod 700 /admin/.ssh && chown -R admin:admin /admin /admin/.ssh" ]
+        # epic-specific: docker + libvirt ready for both users, br_netfilter live
+        - [ sh, -c, "usermod -aG docker,libvirt,kvm admin" ]
+        - [ sh, -c, "usermod -aG docker,libvirt,kvm ubuntu" ]
+        - [ systemctl, enable, --now, docker ]
+        - [ sh, -c, "systemctl enable --now libvirtd || true" ]
+        - [ sh, -c, "modprobe br_netfilter || true" ]
+        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/dc-staging-cloudinit.log" ]
+
+workspace:
+  path: ~/workspaces/boxmandev/dc-provider-staging
+
+clusters:
+  staging:
+    base_image: dc-staging-ubuntu-24.04-base-template
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+    admin_key_name: id_ed25519_boxman    # generated automatically at provisioning time
+    ssh_config: ssh_config               # generated automatically at provisioning time
+
+    networks:
+      mgmt:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:77:01'
+        ip:
+          address: '192.168.77.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.77.2'
+              end: '192.168.77.254'
+        enable: True
+        autostart: True
+
+    vms:
+      stage01:
+        hostname: stage01
+        cpus:
+          sockets: 1
+          cores: 4
+          threads: 2
+        memory: 12288
+        max_vcpus: 16
+        max_memory: 32768
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'mgmt'

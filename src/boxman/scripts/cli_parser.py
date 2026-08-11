@@ -910,6 +910,13 @@ def parse_args():
         dest='vms',
         default='all'
     )
+    parser_ctrl_suspend.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        dest='cluster',
+        help='restrict to a single cluster (honoured for docker-compose clusters)'
+    )
 
     #
     # sub parser for the 'control resume' subsubcommand
@@ -922,6 +929,13 @@ def parse_args():
         help='the names of the vms as a csv list',
         dest='vms',
         default='all'
+    )
+    parser_ctrl_resume.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        dest='cluster',
+        help='restrict to a single cluster (honoured for docker-compose clusters)'
     )
 
     #
@@ -936,6 +950,13 @@ def parse_args():
         dest='vms',
         default='all'
     )
+    parser_ctrl_save.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        dest='cluster',
+        help='restrict to a single cluster (honoured for docker-compose clusters)'
+    )
 
     #
     # sub parser for the 'control start' subsubcommand
@@ -948,6 +969,13 @@ def parse_args():
         help='the names of the vms as a csv list',
         dest='vms',
         default='all'
+    )
+    parser_ctrl_start.add_argument(
+        '--cluster',
+        type=str,
+        default=None,
+        dest='cluster',
+        help='restrict to a single cluster (honoured for docker-compose clusters)'
     )
     parser_ctrl_start.add_argument(
         '--restore',
@@ -1151,6 +1179,44 @@ def parse_args():
         default=None,
         help='cluster name to scope the workspace environment to',
         dest='cluster'
+    )
+
+    # ── exec ─────────────────────────────────────────────────────────
+    parser_exec = subparsers.add_parser(
+        'exec',
+        help='exec into a docker-compose container',
+        description=(
+            "Run a command in (or open an interactive shell on) a\n"
+            "docker-compose container, via `docker compose exec`.\n"
+            "\n"
+            "Target is <cluster>.<box>. With no command an interactive\n"
+            "shell (default: sh) is opened; a trailing command after `--`\n"
+            "runs non-interactively. Use `ssh` for libvirt VMs.\n"
+            "\n"
+            "examples:\n"
+            "    $ boxman exec services.web\n"
+            "    $ boxman exec services.web --shell bash\n"
+            "    $ boxman exec services.cache -- redis-cli ping\n"
+        ),
+        formatter_class=RawTextHelpFormatter
+    )
+    parser_exec.set_defaults(func=BoxmanManager.exec_container)
+    parser_exec.add_argument(
+        'target',
+        type=str,
+        help='container to exec into, as <cluster>.<box>'
+    )
+    parser_exec.add_argument(
+        '--shell',
+        type=str,
+        default=None,
+        help='interactive shell to open when no command is given (default: sh)'
+    )
+    parser_exec.add_argument(
+        'cmd',
+        nargs='*',
+        help='command to run non-interactively (put it after `--` if it has '
+             'its own flags, e.g. `-- ls -la`)'
     )
 
     # ── pxe-boot ─────────────────────────────────────────────────────

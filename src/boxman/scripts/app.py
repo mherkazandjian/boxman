@@ -14,13 +14,12 @@ import yaml
 import boxman
 from boxman import log
 from boxman.abstract.providers import ProviderSession as Session
-from boxman.exceptions import ConfigError
+from boxman.exceptions import BoxmanError, ConfigError
 from boxman.manager import BoxmanManager
+from boxman.providers import create_session, primary_provider_type
 from boxman.providers.libvirt.import_image import ImageImporter
-from boxman.providers.libvirt.session import LibVirtSession
 from boxman.loggers.logger import set_quiet, set_verbosity, suppressed
 from boxman.scripts.cli_parser import parse_args, resolve_verbosity
-from boxman.providers.virtualbox.session import VirtualBoxSession
 from boxman.utils.jinja_env import create_jinja_env
 
 now = datetime.now(timezone.utc)
@@ -307,6 +306,32 @@ def load_boxman_config(path: str) -> dict:
 
 
 def main():
+    """
+    CLI entry point.
+
+    Thin wrapper that translates any :class:`~boxman.exceptions.BoxmanError`
+    into a clean ``log.error`` + exit 2 instead of surfacing a traceback.
+    This covers config-schema errors (:class:`~boxman.exceptions.ConfigError`,
+    e.g. an unsupported ``version:`` or an invalid v2.0 cluster) as well as
+    operational failures on the docker-compose path — a service that never
+    becomes healthy within ``readiness_timeout``
+    (:class:`~boxman.exceptions.ProvisionError`) or a missing docker/compose
+    plugin (:class:`~boxman.exceptions.RuntimeUnavailable`). All other flow
+    (including the ``sys.exit()`` calls throughout) lives in :func:`_main`.
+    """
+    try:
+        _main()
+    except BoxmanError as exc:
+        # A viewer command (e.g. ``snapshot log``) raises the boxman logger
+        # to CRITICAL+1 to silence INFO spam before the config is loaded; if
+        # loading then fails, restore a level that lets this error through so
+        # it is not swallowed (exit 2 with empty output).
+        logging.getLogger('boxman').setLevel(logging.ERROR)
+        log.error(str(exc))
+        sys.exit(2)
+
+
+def _main():
 
     arg_parser = parse_args()
     args, remaining = arg_parser.parse_known_args()
@@ -395,10 +420,7 @@ def main():
         runtime = args.runtime or boxman_config.get('runtime', 'local')
         manager.runtime = runtime
         # Compute merged provider config (same logic as provision path)
-        provider_type = (
-            list(manager.config.get('provider', {}).keys())[0]
-            if 'provider' in manager.config else 'libvirt'
-        )
+        provider_type = primary_provider_type(manager.config)
         provider_conf_with_runtime = manager.get_provider_config_with_runtime(
             boxman_config.get('providers', {}).get(provider_type, {})
         )
@@ -426,6 +448,16 @@ def main():
 
     # Handle 'ssh' — needs config but not a provider session or runtime
     if args.func == BoxmanManager.ssh_session:
+        manager = BoxmanManager(config=args.conf)
+        if not manager.config:
+            log.error("no project config found (conf.yml)")
+            sys.exit(1)
+        args.func(manager, args)
+        sys.exit(0)
+
+    # Handle 'exec' — container access; needs config but not the full libvirt
+    # provider setup (the dc session is created on demand via _dc_session).
+    if args.func == BoxmanManager.exec_container:
         manager = BoxmanManager(config=args.conf)
         if not manager.config:
             log.error("no project config found (conf.yml)")
@@ -541,41 +573,81 @@ def main():
             # fetch the provider configuration from the boxman config
             manager.config = boxman_config['providers'][provider_type]
         else:
-            provider_type = list(manager.config['provider'].keys())[0]
+            provider_type = primary_provider_type(manager.config)
 
-        if provider_type == 'virtualbox':
-            # VirtualBox is a host-local hypervisor: fail fast before building
-            # the session if the resolved runtime is not 'local'.
-            try:
-                ensure_virtualbox_runtime_is_local(manager.runtime)
-            except ConfigError as exc:
-                log.error(str(exc))
-                sys.exit(2)
-
-            session = VirtualBoxSession(manager.config)
-            session.manager = manager
-            manager.provider = session
-        elif provider_type == 'libvirt':
-            # merge runtime metadata into the provider config from boxman.yml
-            provider_conf_with_runtime = manager.get_provider_config_with_runtime(
-                boxman_config.get('providers', {}).get(provider_type, {})
+        # Build a session for every provider declared in the project config
+        # via the registry (import-image keeps its single-provider flow —
+        # the provider type comes from the manifest / CLI flag above).
+        if args.func == BoxmanManager.import_image:
+            provider_types = [provider_type]
+        else:
+            provider_types = (
+                list(manager.config.get('provider', {}).keys()) or [provider_type]
             )
-            # enrich the project config with runtime-aware provider settings
-            # App-level (boxman.yml) settings serve as DEFAULTS;
-            # project-level (conf.yml) settings always take precedence.
-            enriched_config = manager.config.copy()
-            if 'provider' in enriched_config and provider_type in enriched_config['provider']:
-                project_provider = enriched_config['provider'][provider_type].copy()
+            # Also cover any cluster-level ``provider:`` override so a mixed
+            # config fails fast with the friendly registry error (exit 2)
+            # instead of a mid-provision traceback when a cluster resolves
+            # to a provider no session was built for.
+            for _cluster_name in (manager.config.get('clusters') or {}):
+                _cluster_type = manager.provider_type_for_cluster(_cluster_name)
+                if _cluster_type not in provider_types:
+                    provider_types.append(_cluster_type)
+
+        for _ptype in provider_types:
+            # The docker-compose PROVIDER shells out to `docker compose` on
+            # the host; the `docker-compose` RUNTIME is libvirt-in-a-container
+            # (a different axis). Requiring runtime 'local' keeps them from
+            # being confused. Fail fast with a clean message.
+            if _ptype == 'docker-compose' and manager.runtime != 'local':
+                log.error(
+                    f"the docker-compose provider requires runtime 'local' "
+                    f"(got '{manager.runtime}'). The 'docker-compose' runtime "
+                    f"is libvirt-in-a-container — a different setting; see "
+                    f"doc/docker-compose-provider/config-schema.md."
+                )
+                sys.exit(2)
+            if _ptype == 'virtualbox':
+                # VirtualBox is a host-local hypervisor: fail fast before
+                # building the session if the resolved runtime is not 'local'.
+                try:
+                    ensure_virtualbox_runtime_is_local(manager.runtime)
+                except ConfigError as exc:
+                    log.error(str(exc))
+                    sys.exit(2)
+            if _ptype == 'libvirt':
+                # merge runtime metadata into the provider config from boxman.yml
+                provider_conf_with_runtime = manager.get_provider_config_with_runtime(
+                    boxman_config.get('providers', {}).get(_ptype, {})
+                )
+                # Enrich the project config with runtime-aware provider
+                # settings. App-level (boxman.yml) settings serve as
+                # DEFAULTS; project-level (conf.yml) settings always take
+                # precedence. The libvirt block is built unconditionally so
+                # a project without a ``provider:`` section (now defaulted
+                # to libvirt by primary_provider_type) still inherits the
+                # runtime URI/sudo defaults instead of silently falling back
+                # to a local qemu:///system.
+                enriched_config = manager.config.copy()
+                existing_provider = enriched_config.get('provider') or {}
+                project_provider = (existing_provider.get(_ptype) or {}).copy()
                 # Start from app-level defaults, then overlay project-level on top
                 merged_provider = provider_conf_with_runtime.copy()
                 merged_provider.update(project_provider)
-                enriched_config['provider'][provider_type] = merged_provider
+                enriched_config['provider'] = {
+                    **existing_provider,
+                    _ptype: merged_provider,
+                }
+                session_config = enriched_config
+            else:
+                session_config = manager.config
 
-            session = LibVirtSession(enriched_config)
+            try:
+                session = create_session(_ptype, session_config)
+            except (NotImplementedError, ValueError) as exc:
+                log.error(str(exc))
+                sys.exit(2)
             session.manager = manager
-            manager.provider = session
-        elif provider_type == 'docker-compose':
-            raise NotImplementedError('docker-compose is not implemented yet')
+            manager.register_session(_ptype, session)
 
         args.func(manager, args)
 
