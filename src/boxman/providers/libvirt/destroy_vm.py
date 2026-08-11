@@ -230,7 +230,22 @@ class DestroyVM(VirshCommand):
         try:
             self.logger.info(f"**force** un-defining vm {self.name}")
 
-            self.execute("undefine --remove-all-storage --wipe-storage --delete-storage-volume-snapshots --snapshots-metadata", self.name)
+            # Try the full storage-removal form first. It is not
+            # idempotent (--remove-all-storage errors when the files are
+            # already gone) and --delete-storage-volume-snapshots
+            # requires a recent libvirt, so on failure fall back to a
+            # plain undefine that only drops snapshot metadata — the
+            # domain must always be removable.
+            result = self.execute(
+                "undefine", self.name,
+                "--remove-all-storage", "--wipe-storage",
+                "--delete-storage-volume-snapshots", "--snapshots-metadata",
+                warn=True)
+            if not result.ok:
+                self.logger.warning(
+                    f"undefine with storage removal failed for {self.name} "
+                    f"({result.stderr.strip()}) — retrying plain undefine")
+                self.execute("undefine", self.name, "--snapshots-metadata")
 
             # verify that the vm is no longer defined
             if not self.is_vm_defined():

@@ -177,7 +177,9 @@ class TestForceUndefine:
             assert dv.force_undefine_vm() is True
         calls = [c.args[0] for c in execute.call_args_list]
         assert "destroy" in calls  # force-kill first
-        assert any("undefine --remove-all-storage" in c for c in calls)
+        rich = [c for c in execute.call_args_list
+                if c.args[0] == "undefine" and "--remove-all-storage" in c.args]
+        assert rich, "expected the full storage-removal undefine"
 
     def test_skips_kill_when_already_shut_off(self, dv: DestroyVM):
         with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
@@ -186,6 +188,55 @@ class TestForceUndefine:
             dv.force_undefine_vm()
         calls = [c.args[0] for c in execute.call_args_list]
         assert "destroy" not in calls
+
+    def test_flags_passed_as_separate_args(self, dv: DestroyVM):
+        """Regression for issue #85 item 25: flags must be separate
+        args, not one re-split string."""
+        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
+             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "execute", return_value=_result()) as execute:
+            assert dv.force_undefine_vm() is True
+        undefine = [c for c in execute.call_args_list
+                    if c.args[0] == "undefine"][0]
+        assert undefine.args[1] == "vm01"
+        for flag in ("--remove-all-storage", "--wipe-storage",
+                     "--delete-storage-volume-snapshots",
+                     "--snapshots-metadata"):
+            assert flag in undefine.args
+
+    def test_falls_back_to_plain_undefine_on_failure(self, dv: DestroyVM):
+        """Regression for issue #85 item 25: when the rich undefine
+        fails (old libvirt, storage already gone), retry with plain
+        undefine --snapshots-metadata so the domain stays removable."""
+        calls = []
+
+        def fake_execute(*args, **kwargs):
+            calls.append((args, kwargs))
+            if args[0] == "undefine" and "--remove-all-storage" in args:
+                return _result(ok=False, stderr="unsupported flag")
+            return _result()
+
+        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
+             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "execute", side_effect=fake_execute):
+            assert dv.force_undefine_vm() is True
+        undefines = [args for args, _ in calls if args[0] == "undefine"]
+        assert len(undefines) == 2
+        assert undefines[1] == ("undefine", "vm01", "--snapshots-metadata")
+        # rich form ran with warn=True so its failure could be handled
+        rich_kwargs = [kw for args, kw in calls
+                       if args[0] == "undefine"
+                       and "--remove-all-storage" in args][0]
+        assert rich_kwargs.get("warn") is True
+
+    def test_no_fallback_when_rich_undefine_succeeds(self, dv: DestroyVM):
+        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
+             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "execute", return_value=_result()) as execute:
+            assert dv.force_undefine_vm() is True
+        undefines = [c for c in execute.call_args_list
+                     if c.args[0] == "undefine"]
+        assert len(undefines) == 1
 
 
 class TestRemove:
@@ -228,7 +279,8 @@ class TestRemove:
             assert dv.remove() is True
         calls = [c.args[0] for c in execute.call_args_list]
         assert "destroy" in calls  # force-killed the paused domain
-        assert any("undefine" in c and "--snapshots-metadata" in c for c in calls)
+        assert any(c.args[0] == "undefine" and "--snapshots-metadata" in c.args
+                   for c in execute.call_args_list)
 
     def test_never_issues_per_snapshot_snapshot_delete(self, dv: DestroyVM):
         with patch.object(dv, "is_vm_running", return_value=False), \
@@ -238,4 +290,5 @@ class TestRemove:
             assert dv.remove() is True
         commands = [c.args[0] for c in execute.call_args_list]
         assert not any(c.startswith("snapshot-delete") for c in commands)
-        assert any("--snapshots-metadata" in c for c in commands)
+        assert any("--snapshots-metadata" in c.args
+                   for c in execute.call_args_list)
