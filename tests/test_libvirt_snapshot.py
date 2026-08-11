@@ -117,6 +117,15 @@ class TestGetLatestSnapshot:
         with patch.object(sm.virsh, "execute", return_value=_result(ok=False)):
             assert sm.get_latest_snapshot("vm01") is None
 
+    def test_passes_warn_true(self, sm: SnapshotManager):
+        """Regression for issue #85 item 12: without warn=True a VM with
+        no current snapshot makes virsh exit non-zero and execute raise
+        RuntimeError instead of returning None."""
+        with patch.object(sm.virsh, "execute",
+                          return_value=_result(stdout="snap1\n")) as execute:
+            sm.get_latest_snapshot("vm01")
+        assert execute.call_args.kwargs.get("warn") is True
+
 
 class TestValidateSnapshot:
 

@@ -447,7 +447,8 @@ class SnapshotManager:
         Returns:
             str: Name of the current snapshot, or None if none exists
         """
-        result = self.virsh.execute("snapshot-current", vm_name, "--name")
+        result = self.virsh.execute(
+            "snapshot-current", vm_name, "--name", warn=True)
         if result.ok:
             name = result.stdout.strip()
             return name if name else None
