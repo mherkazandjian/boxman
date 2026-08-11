@@ -1,6 +1,9 @@
 include common.mk
 
-nothing:
+.PHONY: clean dev-clean uninstall build install cleaninstall full-reinstall \
+	devipython devshell test test-integration test-provision test-dc-e2e \
+	test-vm-up test-vm-sync test-vm-test test-vm-destroy loc loc-detailed \
+	boxes-deprovision boxes-clean help
 
 ################
 #@group: \033[0;32mbuild\033[0m
@@ -64,14 +67,6 @@ devipython:
 #@help: launch a shell in data/dev
 devshell:
 	@cd data/dev && poetry run bash
-
-# .. todo:: this does not work as expected, since the bash env vars are not preserved. We need to source the env vars in the Makefile or use a wrapper script.
-# .. todo:: just a placeholder to be fixed later
-#@help: build the documentation (placeholder)
-docs:
-	@docker run -it --rm --user $(id -u):$(id -g) --workdir="/home/${USER}" \
-		--volume="/etc/group:/etc/group:ro" --volume="/etc/passwd:/etc/passwd:ro" \
-		--volume="/etc/shadow:/etc/shadow:ro" -v $PWD:/work texlive/texlive:latest -c "cd /work/docs/tutorial && pdflatex boxman_beamer.tex"
 
 ################
 #@group: \033[0;32mtesting\033[0m

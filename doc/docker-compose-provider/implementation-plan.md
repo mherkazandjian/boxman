@@ -1,6 +1,6 @@
 # Docker-Compose Provider — Phased Implementation Plan
 
-Epic: [#42](https://github.com/mherkazandjian/boxman/issues/42) · Design docs: this directory · Status: Phase 0 in progress
+Epic: [#42](https://github.com/mherkazandjian/boxman/issues/42) · Design docs: this directory · Status: completed (the docker-compose provider is fully implemented; this plan is kept for historical reference)
 
 ## Context
 

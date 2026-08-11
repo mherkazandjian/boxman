@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# HISTORICAL: Phase 0 spike of the docker-compose provider epic (completed).
+# The per-bridge scoped rules this script validated are implemented in
+# src/boxman/netlab/shared_bridges.py. Kept as the decision record.
+#
 # Netfilter/iptables spike for the docker-compose provider.
 # Phase 0 deliverable — issue #48 (epic #42).
 #

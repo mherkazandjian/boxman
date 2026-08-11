@@ -1,5 +1,11 @@
 # PXE Boot Support for boxman — Implementation Plan
 
+> **Status: completed — historical document.** PXE support is implemented:
+> see the `pxe-boot` CLI subcommand (`src/boxman/scripts/cli_parser.py`),
+> `src/boxman/providers/libvirt/bare_vm.py`,
+> `src/boxman/providers/libvirt/iso_boot_vm.py`, and the example in
+> `boxes/talos-iso-boot/`. The plan below is kept for reference.
+
 ## Background
 
 The `hpccluster` project uses a `cobbler_pxe` Ansible role to set up PXE
