@@ -15,6 +15,7 @@ the currently-loaded config, no long-lived client.
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 from pathlib import Path
 from typing import Any
@@ -220,22 +221,25 @@ class ContainerlabManager:
                 f"(did you call render_topology()?)"
             )
         self.logger.info(f"deploying containerlab lab {self.lab_name!r}")
-        run(f"containerlab deploy -t {topology}")
+        run(f"containerlab deploy -t {shlex.quote(str(topology))}")
 
     def ensure_up(self) -> None:
         """Idempotent: deploy the lab if absent, else start any stopped nodes.
 
         Safe to call repeatedly from ``boxman up``. Lists existing Docker
-        containers matching the lab's ``clab-<lab>-*`` naming prefix:
+        containers carrying the ``containerlab=<lab_name>`` label that
+        containerlab sets on every node it deploys. (A ``name=clab-<lab>-``
+        filter would be a *substring* match, so sibling labs like ``foo``
+        and ``foo-bar`` on one host would see each other's containers.)
 
         - No matches → render + deploy fresh.
         - All matches running → no-op.
         - Some matches stopped (e.g. after host reboot) → ``docker start``
           each one. No need to re-render or re-deploy.
         """
-        prefix = f"clab-{self.lab_name}-"
         result = run(
-            f"docker ps -a --filter name={prefix} "
+            f"docker ps -a "
+            f"--filter label=containerlab={shlex.quote(self.lab_name)} "
             f"--format '{{{{.Names}}}} {{{{.State}}}}'",
             hide=True, warn=True,
         )
@@ -263,23 +267,25 @@ class ContainerlabManager:
 
         for name in stopped:
             self.logger.info(f"starting stopped lab container {name!r}")
-            run(f"docker start {name}", warn=True)
+            run(f"docker start {shlex.quote(name)}", warn=True)
 
     def destroy(self) -> None:
         """Run ``containerlab destroy --name <lab_name>`` (graceful if absent)."""
         self.logger.info(f"destroying containerlab lab {self.lab_name!r}")
         topology = self.topology_path
         if topology.exists():
-            run(f"containerlab destroy -t {topology} --cleanup", warn=True)
+            run(f"containerlab destroy -t {shlex.quote(str(topology))} "
+                f"--cleanup", warn=True)
         else:
             # Fall back to name-based destroy if the rendered topology is gone.
-            run(f"containerlab destroy --name {self.lab_name} --cleanup",
-                warn=True)
+            run(f"containerlab destroy --name {shlex.quote(self.lab_name)} "
+                f"--cleanup", warn=True)
 
     def inspect(self) -> dict[str, Any]:
         """Return ``containerlab inspect --format json`` output for the lab."""
         result = run(
-            f"containerlab inspect --name {self.lab_name} --format json",
+            f"containerlab inspect --name {shlex.quote(self.lab_name)} "
+            f"--format json",
             hide=True, warn=True,
         )
         if not result.ok:
