@@ -6,6 +6,7 @@ import os
 import pytest
 import yaml
 
+from boxman.exceptions import BoxmanError, ConfigError
 from boxman.utils.jinja_env import env, env_required, env_is_set, create_jinja_env
 from boxman.manager import BoxmanManager
 
@@ -41,17 +42,23 @@ class TestEnvRequiredFunction:
 
     def test_raises_when_unset(self, monkeypatch):
         monkeypatch.delenv("BOXMAN_TEST_VAR", raising=False)
-        with pytest.raises(ValueError, match="not set"):
+        with pytest.raises(ConfigError, match="not set"):
             env_required("BOXMAN_TEST_VAR")
 
     def test_raises_with_custom_message(self, monkeypatch):
         monkeypatch.delenv("BOXMAN_TEST_VAR", raising=False)
-        with pytest.raises(ValueError, match="provide BOXMAN_TEST_VAR"):
+        with pytest.raises(ConfigError, match="provide BOXMAN_TEST_VAR"):
             env_required("BOXMAN_TEST_VAR", "provide BOXMAN_TEST_VAR")
 
     def test_raises_when_empty(self, monkeypatch):
         monkeypatch.setenv("BOXMAN_TEST_VAR", "")
-        with pytest.raises(ValueError):
+        with pytest.raises(ConfigError):
+            env_required("BOXMAN_TEST_VAR")
+
+    def test_config_error_is_a_boxman_error(self, monkeypatch):
+        """app.py maps BoxmanError → log.error + exit 2 (no traceback)."""
+        monkeypatch.delenv("BOXMAN_TEST_VAR", raising=False)
+        with pytest.raises(BoxmanError):
             env_required("BOXMAN_TEST_VAR")
 
 
@@ -125,7 +132,7 @@ class TestJinjaTemplateRendering:
 
         jinja_env = create_jinja_env(str(tmp_path))
         template = jinja_env.get_template("test.yml")
-        with pytest.raises(ValueError, match="set MY_PASSWORD!"):
+        with pytest.raises(ConfigError, match="set MY_PASSWORD!"):
             template.render()
 
     def test_env_is_set_in_template(self, tmp_path, monkeypatch):
@@ -205,7 +212,7 @@ class TestBoxmanManagerLoadConfigWithJinja:
         )
 
         mgr = BoxmanManager()
-        with pytest.raises(ValueError, match="not set"):
+        with pytest.raises(ConfigError, match="not set"):
             mgr.load_config(str(conf))
 
     def test_load_config_conditional_with_env_is_set(self, tmp_path, monkeypatch):

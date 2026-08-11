@@ -78,10 +78,12 @@ Usage::
 
 import os
 import re
+import shlex
 import subprocess
 from typing import Any
 
 from boxman import log
+from boxman.exceptions import ConfigError
 from boxman.utils.env_loader import load_workspace_env
 
 
@@ -130,7 +132,7 @@ class TaskRunner:
         clusters = config.get("clusters", {})
         if cluster_name:
             if cluster_name not in clusters:
-                raise ValueError(f"cluster '{cluster_name}' not found in config")
+                raise ConfigError(f"cluster '{cluster_name}' not found in config")
             self.cluster_name = cluster_name
         else:
             self.cluster_name = next(iter(clusters)) if clusters else None
@@ -212,26 +214,28 @@ class TaskRunner:
             The exit code of the task process.
 
         Raises:
-            KeyError: If the task is not defined.
+            ConfigError: If the task is not defined.
         """
         if task_name not in self.tasks:
             available = ", ".join(self.tasks.keys()) if self.tasks else "(none)"
-            raise KeyError(
+            raise ConfigError(
                 f"task '{task_name}' not found. Available tasks: {available}"
             )
 
         task = self.tasks[task_name]
         command = task["command"].strip()
 
-        # Substitute {placeholder} markers with values from task_flags
+        # Substitute {placeholder} markers with values from task_flags.
+        # Whitespace adjacent to a removed placeholder collapses to a single
+        # space; spacing anywhere else — e.g. inside quoted arguments of a
+        # flag value — is preserved as written.
         def _replace(match):
-            name = match.group(1)
-            if task_flags and name in task_flags:
-                return task_flags[name]
-            return ""
+            lead, name, trail = match.groups()
+            if task_flags and task_flags.get(name):
+                return f"{lead}{task_flags[name]}{trail}"
+            return " " if lead and trail else ""
 
-        command = re.sub(r"\{(\w+)\}", _replace, command)
-        command = re.sub(r" {2,}", " ", command).strip()
+        command = re.sub(r"( ?)\{(\w+)\}( ?)", _replace, command).strip()
 
         # Append extra arguments (everything after -- on the CLI).
         # "quoted" mode joins them into a single shell-quoted argument
@@ -239,7 +243,6 @@ class TaskRunner:
         if extra_args:
             mode = task.get("extra_args_mode", "append")
             if mode == "quoted":
-                import shlex
                 command = command + " " + shlex.quote(" ".join(extra_args))
             else:
                 command = command + " " + " ".join(extra_args)
@@ -296,7 +299,9 @@ class TaskRunner:
         if extra_args:
             command = command + " " + " ".join(extra_args)
 
-        ansible_cmd = f'ansible all -m ansible.builtin.shell -a "{command}"'
+        ansible_cmd = (
+            "ansible all -m ansible.builtin.shell -a " + shlex.quote(command)
+        )
         if ansible_flags:
             ansible_cmd = ansible_cmd + " " + ansible_flags
 
