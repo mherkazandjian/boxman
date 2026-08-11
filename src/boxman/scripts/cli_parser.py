@@ -1,8 +1,8 @@
 """
 Argparse parser construction for the boxman CLI.
 
-Extracted from ``scripts/app.py`` in Phase 2.5 of the review plan
-(see /home/mher/.claude/plans/) to keep the argparse wiring separate
+Extracted from ``scripts/app.py`` in Phase 2.5 of the engineering
+review plan to keep the argparse wiring separate
 from the orchestration in ``main()``. The public surface is just
 :func:`parse_args`, which returns the top-level
 :class:`argparse.ArgumentParser` ready for ``.parse_known_args()``.

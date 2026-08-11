@@ -2,7 +2,7 @@
 Filesystem-only helpers for removing a VM's disks and leftover artifacts.
 
 Extracted from :meth:`LibVirtSession.destroy_disks` in Phase 2.6 of the
-review plan (see /home/mher/.claude/plans/) so that the pure filesystem
+engineering review plan so that the pure filesystem
 logic lives outside the libvirt session class — both for clarity and so
 it can be exercised without constructing a session.
 

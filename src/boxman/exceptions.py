@@ -4,7 +4,7 @@ Exception hierarchy for boxman.
 A small, purpose-built hierarchy that lets callers distinguish between
 config errors, provisioning failures, and transient runtime issues
 without matching on exception messages. Added in Phase 2.2 of the
-review plan (see /home/mher/.claude/plans/).
+engineering review plan.
 
 Callers should prefer these over bare ``Exception`` so failure classes
 can be handled differently (e.g. retry transient runtime failures but

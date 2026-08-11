@@ -6,7 +6,7 @@ Currently just :func:`safe_execute`, which collapses the
 ``providers/libvirt/snapshot.py``, ``cloudinit.py``, and a handful of
 other helper methods.
 
-Added in Phase 2.2 of the review plan (see /home/mher/.claude/plans/).
+Added in Phase 2.2 of the engineering review plan.
 """
 
 from __future__ import annotations
