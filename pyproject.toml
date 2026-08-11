@@ -5,7 +5,7 @@ description = "Boxman (box manager) – declarative VM/container provisioning vi
 authors = ["Mher Kazandjian <mherkazandjian@gmail.com>"]
 license = "MIT"
 readme = "README.md"
-homepage = "https://boxman.example.com"
+homepage = "https://github.com/mherkazandjian/boxman"
 packages = [
     { include = "boxman", from = "src" },
 ]
@@ -15,13 +15,16 @@ include = [
     { path = "containers/docker/Makefile", format = ["sdist", "wheel"] },
     { path = "containers/docker/supervisord.conf", format = ["sdist", "wheel"] },
     { path = "containers/docker/entrypoint.sh", format = ["sdist", "wheel"] },
-    { path = "containers/docker/.env", format = ["sdist", "wheel"] },
     { path = "containers/docker/README.md", format = ["sdist", "wheel"] },
-    { path = "boxes/**/*", format = ["sdist", "wheel"] },
-]
-exclude = [
-    "containers/docker/data/**",
-    "**/.boxman/**",
+    # Enumerate the file types boxes actually ship instead of `boxes/**/*`:
+    # a blanket include would sweep in gitignored, generated `*.rendered.yml`
+    # files (which can hold local secrets), and poetry's `exclude` does not
+    # override an explicit `include`.
+    { path = "boxes/**/conf.yml", format = ["sdist", "wheel"] },
+    { path = "boxes/**/site.yml", format = ["sdist", "wheel"] },
+    { path = "boxes/**/*.md", format = ["sdist", "wheel"] },
+    { path = "boxes/**/*.j2", format = ["sdist", "wheel"] },
+    { path = "boxes/**/*.html", format = ["sdist", "wheel"] },
 ]
 
 [tool.poetry.scripts]
