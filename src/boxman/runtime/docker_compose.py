@@ -23,6 +23,19 @@ from boxman.runtime.base import RuntimeBase
 from boxman.utils.shell import run as _shell_run
 
 
+def docker_exec_wrap(command: str, container: str) -> str:
+    """
+    Wrap *command* in a ``docker exec --user root <container> bash -c '…'``
+    invocation, escaping single quotes for the shell round-trip.
+
+    This is the single shared implementation of the docker-exec wrapping —
+    used by both :meth:`DockerComposeRuntime.wrap_command` and
+    ``LibVirtCommandBase._wrap_for_runtime`` so the two paths cannot drift.
+    """
+    escaped = command.replace("'", "'\\''")
+    return f"docker exec --user root {container} bash -c '{escaped}'"
+
+
 class DockerComposeRuntime(RuntimeBase):
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -105,8 +118,7 @@ class DockerComposeRuntime(RuntimeBase):
 
     def wrap_command(self, command: str) -> str:
         """Wrap *command* in a ``docker exec`` invocation."""
-        escaped = command.replace("'", "'\\''")
-        return f"docker exec --user root {self.container_name} bash -c '{escaped}'"
+        return docker_exec_wrap(command, self.container_name)
 
     def inject_into_provider_config(
         self, provider_config: dict[str, Any]

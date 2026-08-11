@@ -5,6 +5,8 @@ from typing import Any
 import invoke
 
 from boxman import log
+from boxman.exceptions import ConfigError
+from boxman.runtime.docker_compose import docker_exec_wrap
 from boxman.utils.shell import run as _shell_run
 
 
@@ -53,9 +55,11 @@ class LibVirtCommandBase:
         #: str: The runtime environment ('local', 'docker-compose', etc.)
         self.runtime = self.provider_config.get('runtime', 'local')
 
-        #: str: The docker-compose container name for remote execution
-        self.runtime_container = self.provider_config.get(
-            'runtime_container', 'boxman-libvirt-default')
+        #: str | None: The docker-compose container name for remote
+        #: execution. No default: under a docker-compose runtime a missing
+        #: container name is a hard error (see _wrap_for_runtime), not a
+        #: silent fall-back that would exec into the wrong container.
+        self.runtime_container = self.provider_config.get('runtime_container')
 
         #: List[str]: Commands that should never get sudo prepended
         self.sudo_skip_commands: list[str] = self.provider_config.get(
@@ -267,9 +271,17 @@ class LibVirtCommandBase:
         if self.runtime == 'local':
             return command
         elif self.runtime == 'docker-compose':
-            # escape single quotes in the command for safe shell wrapping
-            escaped = command.replace("'", "'\\''")
-            return f"docker exec --user root {self.runtime_container} bash -c '{escaped}'"
+            if not self.runtime_container:
+                # No silent fall-back to a guessed container name: exec'ing
+                # into the wrong container is worse than failing loudly. The
+                # manager is responsible for injecting 'runtime_container'
+                # (via the runtime's inject_into_provider_config) before
+                # provider commands run.
+                raise ConfigError(
+                    "runtime is 'docker-compose' but no 'runtime_container' "
+                    "was injected into the provider config — cannot wrap "
+                    f"command for execution: {command}")
+            return docker_exec_wrap(command, self.runtime_container)
         else:
             raise ValueError(f"unsupported runtime: {self.runtime}")
 
