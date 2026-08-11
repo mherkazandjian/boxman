@@ -14,44 +14,35 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
 
 from boxman.manager import BoxmanManager
-
+from conftest import make_bare_manager
 
 pytestmark = pytest.mark.unit
-
-
-def _make_manager(config: dict | None) -> BoxmanManager:
-    mgr = BoxmanManager.__new__(BoxmanManager)
-    mgr.config = config
-    mgr.config_path = None
-    mgr.logger = MagicMock()
-    mgr._netlab = None
-    return mgr
 
 
 class TestNetlabProperty:
 
     def test_none_when_no_config(self):
-        mgr = _make_manager(None)
+        mgr = make_bare_manager(None)
         assert mgr.netlab is None
 
     def test_none_when_containerlab_absent(self):
-        mgr = _make_manager({"clusters": {}})
+        mgr = make_bare_manager({"clusters": {}})
         assert mgr.netlab is None
 
     def test_none_when_explicitly_disabled(self):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "containerlab": {"enabled": False, "lab_name": "netlab"},
         })
         assert mgr.netlab is None
 
     def test_instance_when_enabled(self, tmp_path):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path)},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -60,7 +51,7 @@ class TestNetlabProperty:
         assert netlab.lab_name == "netlab"
 
     def test_cached(self, tmp_path):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path)},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -72,12 +63,12 @@ class TestNetlabProperty:
 class TestDeployNetlab:
 
     def test_noop_when_not_configured(self):
-        mgr = _make_manager({"clusters": {}})
+        mgr = make_bare_manager({"clusters": {}})
         # Should not raise or call anything.
         mgr.deploy_netlab()
 
     def test_calls_preflight_render_deploy_in_order(self, tmp_path):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path)},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -94,7 +85,7 @@ class TestDeployNetlab:
         assert call_order == ["preflight", "render", "deploy"]
 
     def test_propagates_preflight_error(self, tmp_path):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path)},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -112,11 +103,11 @@ class TestDeployNetlab:
 class TestDestroyNetlab:
 
     def test_noop_when_not_configured(self):
-        mgr = _make_manager({"clusters": {}})
+        mgr = make_bare_manager({"clusters": {}})
         mgr.destroy_netlab()  # no raise
 
     def test_calls_destroy(self, tmp_path):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path)},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -128,7 +119,7 @@ class TestDestroyNetlab:
         fake_netlab.destroy.assert_called_once()
 
     def test_survives_missing_binary(self, tmp_path):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path)},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -146,11 +137,11 @@ class TestEnsureNetlabUp:
     """`boxman up` path: reconcile the lab without tearing it down."""
 
     def test_noop_when_not_configured(self):
-        mgr = _make_manager({"clusters": {}})
+        mgr = make_bare_manager({"clusters": {}})
         mgr.ensure_netlab_up()  # no raise
 
     def test_calls_preflight_render_ensure_up_in_order(self, tmp_path):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path)},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -171,17 +162,17 @@ class TestNetlabCliHandlers:
     """Unit-test the four static CLI handlers without argparse plumbing."""
 
     def test_netlab_deploy_logs_error_when_absent(self):
-        mgr = _make_manager({"clusters": {}})
+        mgr = make_bare_manager({"clusters": {}})
         BoxmanManager.netlab_deploy(mgr, MagicMock())
         mgr.logger.error.assert_called_once()
 
     def test_netlab_destroy_logs_error_when_absent(self):
-        mgr = _make_manager({"clusters": {}})
+        mgr = make_bare_manager({"clusters": {}})
         BoxmanManager.netlab_destroy(mgr, MagicMock())
         mgr.logger.error.assert_called_once()
 
     def test_netlab_inspect_prints_json(self, tmp_path, capsys):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path)},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -196,7 +187,7 @@ class TestNetlabCliHandlers:
         fake_netlab.preflight.assert_called_once()
 
     def test_netlab_ssh_prints_command(self, tmp_path, capsys):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path)},
             "containerlab": {
                 "lab_name": "netlab",
@@ -212,7 +203,7 @@ class TestNetlabCliHandlers:
         assert out == "ssh admin@clab-netlab-sw1"
 
     def test_netlab_ssh_with_custom_user(self, tmp_path, capsys):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path)},
             "containerlab": {
                 "lab_name": "netlab",
@@ -227,7 +218,7 @@ class TestNetlabCliHandlers:
         assert "ssh root@clab-netlab-sw1" in capsys.readouterr().out
 
     def test_netlab_ssh_missing_node_logs_error(self, tmp_path):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path)},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -267,7 +258,7 @@ class TestNetlabStartupConfigSourceRoot:
     def test_deploy_netlab_relative_conf_resolves_to_box_dir(
             self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path / "ws")},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -280,7 +271,7 @@ class TestNetlabStartupConfigSourceRoot:
     def test_ensure_netlab_up_relative_conf_resolves_to_box_dir(
             self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": str(tmp_path / "ws")},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -304,7 +295,7 @@ class TestNetlabWorkdirAbsolute:
     def test_workdir_absolute_when_config_path_relative(
             self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
         mgr.config_path = "conf.yml"  # bare relative default, no workspace.path
@@ -317,7 +308,7 @@ class TestNetlabWorkdirAbsolute:
     def test_workdir_absolute_when_workspace_path_relative(
             self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "workspace": {"path": "ws"},
             "containerlab": {"lab_name": "netlab", "topology": {"nodes": {}}},
         })
@@ -332,7 +323,7 @@ class TestNetlabWorkdirAbsolute:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "configs").mkdir()
         (tmp_path / "configs" / "sw1.cfg.j2").write_text("hostname sw1\n")
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "containerlab": {
                 "lab_name": "netlab",
                 "topology": {

@@ -3,17 +3,16 @@ Tests for BoxmanManager.resolve_workspace_defaults().
 """
 
 import os
-import yaml
-import pytest
 
-from boxman.manager import BoxmanManager
+import yaml
+
 from boxman.utils.env_loader import load_workspace_env
+from conftest import make_bare_manager
 
 
 def _make_manager(config):
     """Create a BoxmanManager with an in-memory config dict (no file loading)."""
-    mgr = BoxmanManager()
-    mgr.config = config
+    mgr = make_bare_manager(config)
     mgr.resolve_workspace_defaults()
     return mgr
 
@@ -28,7 +27,7 @@ class TestWorkdirResolution:
                 'web': {'vms': {'web01': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         assert config['clusters']['web']['workdir'] == os.path.join(
             '~/workspaces/myproject', 'web'
         )
@@ -44,7 +43,7 @@ class TestWorkdirResolution:
                 },
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         assert config['clusters']['db']['workdir'] == '~/custom/db-workdir'
 
     def test_multiple_clusters_get_own_workdir(self):
@@ -56,7 +55,7 @@ class TestWorkdirResolution:
                 'beta': {'vms': {'b01': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         assert config['clusters']['alpha']['workdir'] == '/opt/boxman/alpha'
         assert config['clusters']['beta']['workdir'] == '/opt/boxman/beta'
 
@@ -67,7 +66,7 @@ class TestWorkdirResolution:
                 'orphan': {'vms': {'vm01': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         # no workdir should be set, no files generated
         assert 'workdir' not in config['clusters']['orphan']
         assert 'files' not in config['clusters']['orphan']
@@ -93,7 +92,7 @@ class TestPerClusterInventoryGeneration:
                 },
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         cfiles = config['clusters']['c1']['files']
         assert 'inventory/01-hosts.yml' in cfiles
         parsed = yaml.safe_load(cfiles['inventory/01-hosts.yml'])
@@ -109,7 +108,7 @@ class TestPerClusterInventoryGeneration:
                 'cluster_2': {'vms': {'service01': {}, 'node01': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         inv1 = yaml.safe_load(
             config['clusters']['cluster_1']['files']['inventory/01-hosts.yml'])
         inv2 = yaml.safe_load(
@@ -135,7 +134,7 @@ class TestPerClusterInventoryGeneration:
                 'cluster_2': {'vms': {'service01': {}, 'node01': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         combined = yaml.safe_load(
             config['workspace']['files']['inventory/01-hosts.yml'])
         inv2 = yaml.safe_load(
@@ -156,7 +155,7 @@ class TestPerClusterInventoryGeneration:
                 },
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         cfiles = config['clusters']['cluster_2']['files']
         assert 'inventory_cluster_2/01-hosts.yml' in cfiles
         assert 'inventory/01-hosts.yml' not in cfiles
@@ -173,7 +172,7 @@ class TestPerClusterInventoryGeneration:
                 },
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         assert config['clusters']['c1']['files']['inventory/01-hosts.yml'] == custom
 
     def test_no_per_cluster_inventory_without_workdir(self):
@@ -183,7 +182,7 @@ class TestPerClusterInventoryGeneration:
                 'orphan': {'vms': {'vm01': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         assert 'files' not in config['clusters']['orphan']
 
 
@@ -269,7 +268,7 @@ class TestAnsibleCfgGeneration:
                 'c1': {'vms': {'vm01': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         cfg = config['workspace']['files']['ansible.cfg']
         assert '[defaults]' in cfg
         assert 'host_key_checking = False' in cfg
@@ -293,7 +292,7 @@ class TestAnsibleCfgGeneration:
                 'c1': {'vms': {'vm01': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         assert config['workspace']['files']['ansible.cfg'] == custom_cfg
 
 
@@ -307,7 +306,7 @@ class TestEnvShGeneration:
                 'c1': {'vms': {'node01': {}, 'node02': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         env_sh = config['workspace']['files']['env.sh']
         assert 'export INVENTORY=inventory' in env_sh
         assert 'export SSH_CONFIG=ssh_config' in env_sh
@@ -326,7 +325,7 @@ class TestEnvShGeneration:
                 'c1': {'vms': {'alpha': {}, 'beta': {}, 'gamma': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         env_sh = config['workspace']['files']['env.sh']
         assert 'export GATEWAYHOST=c1_alpha' in env_sh
 
@@ -338,7 +337,7 @@ class TestEnvShGeneration:
                 'c1': {'vms': {'vm01': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         env_sh = config['workspace']['files']['env.sh']
         assert 'export SSH_CONFIG=ssh_config' in env_sh
         assert 'export ANSIBLE_CONFIG=ansible.cfg' in env_sh
@@ -357,7 +356,7 @@ class TestEnvShGeneration:
                 },
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         assert config['workspace']['files']['env.sh'] == custom_env
 
 
@@ -371,7 +370,7 @@ class TestWorkspaceInventoryGeneration:
                 'c1': {'vms': {'node01': {}, 'node02': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         inv = config['workspace']['files']['inventory/01-hosts.yml']
         parsed = yaml.safe_load(inv)
         assert set(parsed['all']['hosts'].keys()) == {'c1_node01', 'c1_node02'}
@@ -390,7 +389,7 @@ class TestWorkspaceInventoryGeneration:
                 'db': {'vms': {'db01': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         inv = config['workspace']['files']['inventory/01-hosts.yml']
         parsed = yaml.safe_load(inv)
         assert set(parsed['all']['hosts'].keys()) == {'web_web01', 'web_web02', 'db_db01'}
@@ -414,7 +413,7 @@ class TestWorkspaceInventoryGeneration:
                 'c1': {'vms': {'vm01': {}}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         assert config['workspace']['files']['inventory/01-hosts.yml'] == custom_inv
 
 
@@ -428,7 +427,7 @@ class TestEdgeCases:
                 'empty': {'vms': {}},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         assert 'files' not in config['clusters']['empty']
 
     def test_cluster_without_vms_key_skipped(self):
@@ -439,13 +438,13 @@ class TestEdgeCases:
                 'novms': {},
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         assert 'files' not in config['clusters']['novms']
 
     def test_no_clusters_key(self):
         """Config with no clusters key does not raise."""
         config = {'workspace': {'path': '/tmp/ws'}}
-        mgr = _make_manager(config)  # should not raise
+        _make_manager(config)  # should not raise
 
     def test_partial_explicit_files_are_preserved(self):
         """Only missing workspace files are auto-generated; explicit ones are kept."""
@@ -461,7 +460,7 @@ class TestEdgeCases:
                 },
             },
         }
-        mgr = _make_manager(config)
+        _make_manager(config)
         ws_files = config['workspace']['files']
         # ansible.cfg kept as-is
         assert ws_files['ansible.cfg'] == custom_cfg

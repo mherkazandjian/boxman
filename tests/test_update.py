@@ -3,13 +3,16 @@ Tests for the boxman update feature: VMStateDiffer, hot/cold CPU/memory,
 disk resize, and update orchestration logic.
 """
 
-import os
-import pytest
-from unittest.mock import patch, MagicMock, PropertyMock, call
+from unittest.mock import MagicMock, call, patch
 
-from boxman.providers.libvirt.vm_differ import VMStateDiffer
-from boxman.providers.libvirt.virsh_edit import VirshEdit
+import pytest
+
 from boxman.providers.libvirt.disk import DiskManager
+from boxman.providers.libvirt.virsh_edit import VirshEdit
+from boxman.providers.libvirt.vm_differ import VMStateDiffer
+from conftest import make_bare_manager
+
+pytestmark = pytest.mark.unit
 
 
 # ---------------------------------------------------------------------------
@@ -600,17 +603,19 @@ class TestVMStateDifferMaxDiff:
 # ---------------------------------------------------------------------------
 # DiskManager XML generation tests
 # ---------------------------------------------------------------------------
+def _make_disk_manager():
+    """Bare DiskManager instance (constructor bypassed) for unit tests."""
+    dm = DiskManager.__new__(DiskManager)
+    dm.vm_name = 'test-vm'
+    dm.logger = MagicMock()
+    dm.provider_config = {'uri': 'qemu:///system'}
+    return dm
+
+
 class TestDiskManagerXml:
 
-    def _make_manager(self):
-        dm = DiskManager.__new__(DiskManager)
-        dm.vm_name = 'test-vm'
-        dm.logger = MagicMock()
-        dm.provider_config = {'uri': 'qemu:///system'}
-        return dm
-
     def test_generate_disk_xml_includes_bus_virtio(self):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         xml = dm._generate_disk_xml(
             disk_path='/data/disk.qcow2',
             target_dev='vdb',
@@ -620,7 +625,7 @@ class TestDiskManagerXml:
         assert "bus='virtio'" in xml
 
     def test_generate_disk_xml_custom_bus(self):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         xml = dm._generate_disk_xml(
             disk_path='/data/disk.qcow2',
             target_dev='sdb',
@@ -636,16 +641,9 @@ class TestDiskManagerXml:
 # ---------------------------------------------------------------------------
 class TestDiskManagerResize:
 
-    def _make_manager(self):
-        dm = DiskManager.__new__(DiskManager)
-        dm.vm_name = 'test-vm'
-        dm.logger = MagicMock()
-        dm.provider_config = {'uri': 'qemu:///system'}
-        return dm
-
     @patch('boxman.providers.libvirt.disk.LibVirtCommandBase')
     def test_resize_disk_offline_success(self, mock_cmd_cls):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         mock_instance = MagicMock()
         mock_cmd_cls.return_value = mock_instance
         mock_instance.execute_shell.return_value = MagicMock(ok=True)
@@ -657,7 +655,7 @@ class TestDiskManagerResize:
 
     @patch('boxman.providers.libvirt.disk.LibVirtCommandBase')
     def test_resize_disk_offline_failure(self, mock_cmd_cls):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         mock_instance = MagicMock()
         mock_cmd_cls.return_value = mock_instance
         mock_instance.execute_shell.return_value = MagicMock(ok=False, stderr='err')
@@ -666,7 +664,7 @@ class TestDiskManagerResize:
         assert result is False
 
     def test_resize_disk_online_success(self):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         dm.execute = MagicMock(return_value=MagicMock(ok=True))
 
         result = dm.resize_disk_online('vdb', 4096)
@@ -675,7 +673,7 @@ class TestDiskManagerResize:
             'blockresize', 'test-vm', 'vdb', '--size=4096M', warn=True)
 
     def test_resize_disk_routes_to_online_when_running(self):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         dm.resize_disk_online = MagicMock(return_value=True)
         dm.resize_disk_offline = MagicMock(return_value=True)
 
@@ -685,7 +683,7 @@ class TestDiskManagerResize:
         dm.resize_disk_offline.assert_not_called()
 
     def test_resize_disk_routes_to_offline_when_stopped(self):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         dm.resize_disk_online = MagicMock(return_value=True)
         dm.resize_disk_offline = MagicMock(return_value=True)
 
@@ -742,9 +740,7 @@ class TestDestroyRemovedVm:
 
     def _make_manager(self):
         """Bare BoxmanManager instance with a mocked provider."""
-        from boxman.manager import BoxmanManager
-        mgr = BoxmanManager.__new__(BoxmanManager)
-        mgr.logger = MagicMock()
+        mgr = make_bare_manager()
         mgr.provider = MagicMock()
         mgr.provider.provider_config = {'uri': 'qemu:///system'}
         return mgr
