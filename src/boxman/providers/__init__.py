@@ -73,9 +73,9 @@ def primary_provider_type(config: dict[str, Any] | None) -> str:
 
     The primary provider is the first key under the top-level
     ``provider:`` mapping of the project config; projects without a
-    ``provider:`` section default to ``libvirt``. Until config schema
-    v2.0 introduces per-cluster providers (Phase 2 of the docker-compose
-    provider epic), this is the type every cluster resolves to.
+    ``provider:`` section default to ``libvirt``. With config schema
+    v2.0, clusters may override this with their own provider — this
+    function returns the project-wide default.
     """
     providers = list(((config or {}).get('provider') or {}).keys())
     return providers[0] if providers else 'libvirt'

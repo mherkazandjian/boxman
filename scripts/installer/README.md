@@ -49,7 +49,6 @@ as usual. Fixes that add you to a group (e.g. `libvirt`, `kvm`, `docker`) are
 flagged as needing a logout/login before they take effect — re-run the checker
 afterwards to confirm.
 
-<<<<<<< HEAD
 ## Disruptive fixes
 
 A few fixes restart running services — the docker/libvirt forwarding fix
@@ -67,7 +66,7 @@ a terminal:
 Decline one and it is reported in the summary as a manual step. Disruptive
 fixes write a `.boxman-bak` copy of every file they edit, and never overwrite
 an existing backup.
-=======
+
 **Declarative distros (NixOS, Guix System).** For the libvirt/QEMU stack, the
 `libvirtd` service and group membership, the checker prints an *advisory*
 snippet for your system config (`/etc/nixos/configuration.nix` +
@@ -76,7 +75,6 @@ snippet for your system config (`/etc/nixos/configuration.nix` +
 belong in your declarative config, not an imperative `install`. Individual user
 CLI tools (rsync, sshpass, a cloud-init seed-ISO tool, …) are still offered
 imperatively via `nix profile install nixpkgs#<pkg>` / `guix install <pkg>`.
->>>>>>> origin/feat/installer-nixos-guix-gentoo
 
 ## What it checks
 
