@@ -20,15 +20,37 @@ explicit user action, not a side effect of ``boxman destroy``.
 
 from __future__ import annotations
 
+import re
+import shlex
 from pathlib import Path
 from typing import Any
 
 from boxman import log
+from boxman.exceptions import ConfigError
 from boxman.utils.shell import run
+
+#: Valid Linux bridge names: shell-safe characters only, and at most 15
+#: chars — the kernel's IFNAMSIZ is 16 bytes *including* the trailing NUL.
+BRIDGE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,15}$")
+
+
+def _validate_bridge_name(name: str, entry_name: str) -> None:
+    """Raise :class:`ConfigError` unless *name* is a usable bridge name.
+
+    Bridge names are interpolated into sudo'd shell commands and must
+    fit the kernel's IFNAMSIZ 15-character limit, so reject anything
+    outside ``^[a-zA-Z0-9_.-]{1,15}$`` up front.
+    """
+    if not BRIDGE_NAME_RE.fullmatch(name):
+        raise ConfigError(
+            f"shared_networks[{entry_name!r}]: invalid bridge name {name!r}: "
+            f"must match {BRIDGE_NAME_RE.pattern} "
+            f"(kernel IFNAMSIZ 15-char limit)"
+        )
 
 
 def _bridge_exists(name: str) -> bool:
-    result = run(f"ip link show dev {name}", warn=True, hide=True)
+    result = run(f"ip link show dev {shlex.quote(name)}", warn=True, hide=True)
     return result.ok
 
 
@@ -56,7 +78,7 @@ def _scoped_rule_body(bridge: str) -> str:
     kernels VM↔container frames use the bridge local pass-up / ``br_dev_xmit``
     paths and likely do not traverse filter ``FORWARD`` at all.
     """
-    return (f"-i {bridge} -o {bridge} "
+    return (f"-i {shlex.quote(bridge)} -o {shlex.quote(bridge)} "
             f"-m physdev --physdev-is-bridged -j ACCEPT")
 
 
@@ -84,6 +106,11 @@ def _ensure_scoped_accept(bridge: str) -> None:
     ``DOCKER-USER`` chain exists (docker host), there too — that copy survives
     a docker daemon restart (docker recreates but does not flush DOCKER-USER),
     which the spike confirmed.
+
+    Known gap: only the IPv4 ``iptables`` filter table is covered. Hosts
+    with a restrictive *IPv6* FORWARD policy need the analogous
+    ``ip6tables`` accept rule, which is not installed yet — IPv6 lab frames
+    forwarded between bridge ports may be dropped on such hosts.
     """
     body = _scoped_rule_body(bridge)
     _ensure_iptables_rule("FORWARD", body)
@@ -98,7 +125,13 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
 
     Each entry is a dict with:
 
-    - ``bridge`` (str, required): the Linux bridge name on the host.
+    - ``bridge`` (str, required): the Linux bridge name on the host. Must
+      match ``^[a-zA-Z0-9_.-]{1,15}$`` (kernel IFNAMSIZ limit);
+      :class:`ConfigError` is raised otherwise.
+    - ``mtu`` (int, optional): MTU applied to the bridge at ensure time
+      (``ip link set dev <br> mtu <n>``). Bridges default to 1500 while
+      containerlab veth links default to 9500, so set this (e.g. 9500) on
+      bridges that carry jumbo lab traffic to avoid a silent blackhole.
     - ``stp`` (bool, default False): enable STP on the bridge.
     - ``disable_netfilter`` (bool, default **False**): when False (the
       default, decision D8), lab frames are allowed by an idempotent
@@ -118,20 +151,34 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
     for entry_name, entry in shared_networks.items():
         bridge = entry.get("bridge")
         if not bridge:
-            raise ValueError(
+            raise ConfigError(
                 f"shared_networks[{entry_name!r}] missing required 'bridge' key"
             )
+        _validate_bridge_name(bridge, entry_name)
+
+        mtu = entry.get("mtu")
+        if mtu is not None and (
+                not isinstance(mtu, int) or isinstance(mtu, bool) or mtu <= 0):
+            raise ConfigError(
+                f"shared_networks[{entry_name!r}]: 'mtu' must be a positive "
+                f"integer, got {mtu!r}"
+            )
+
+        qbridge = shlex.quote(bridge)
 
         if _bridge_exists(bridge):
             log.info(f"shared bridge {bridge!r} already present")
         else:
             log.info(f"creating shared bridge {bridge!r}")
-            _run_sudo(f"ip link add name {bridge} type bridge")
+            _run_sudo(f"ip link add name {qbridge} type bridge")
 
-        _run_sudo(f"ip link set dev {bridge} up")
+        _run_sudo(f"ip link set dev {qbridge} up")
+
+        if mtu is not None:
+            _run_sudo(f"ip link set dev {qbridge} mtu {mtu}")
 
         stp = "on" if entry.get("stp", False) else "off"
-        _run_sudo(f"ip link set dev {bridge} type bridge stp_state "
+        _run_sudo(f"ip link set dev {qbridge} type bridge stp_state "
                   f"{1 if stp == 'on' else 0}")
 
         # Decision D8: default to scoped per-bridge accept rules; the
