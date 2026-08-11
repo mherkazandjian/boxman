@@ -24,6 +24,7 @@ from boxman.netlab import ContainerlabManager, shared_bridges
 from boxman.providers import PROVIDERS, merge_provider_configs, primary_provider_type
 from boxman.providers.libvirt import net_reconcile
 from boxman.providers.libvirt.commands import VirshCommand
+from boxman.providers.libvirt.virsh_parse import parse_domblklist
 from boxman.runtime import RuntimeBase, create_runtime
 from boxman.task_runner import TaskRunner
 from boxman.utils.io import write_files
@@ -3464,12 +3465,9 @@ class BoxmanManager:
             "domblklist", full_vm_name, "--details", warn=True)
         dirs = set()
         if result.ok:
-            for line in result.stdout.splitlines():
-                # domblklist --details columns: Type  Device  Target  Source
-                # maxsplit=3 so disk paths containing spaces survive
-                parts = line.split(None, 3)
-                if len(parts) >= 4 and parts[1] == 'disk' and parts[3] != '-':
-                    dirs.add(os.path.dirname(parts[3]))
+            for row in parse_domblklist(result.stdout):
+                if row.device == 'disk' and row.source not in (None, '-'):
+                    dirs.add(os.path.dirname(row.source))
         if not dirs:
             self.logger.warning(
                 f"could not query disk paths for {full_vm_name} from "

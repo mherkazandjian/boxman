@@ -4,6 +4,7 @@ from typing import Any
 from boxman import log
 
 from .commands import VirshCommand, VirtCloneCommand
+from .virsh_parse import parse_domiflist
 
 
 class CloneVM:
@@ -109,21 +110,10 @@ class CloneVM:
                 return False
 
             # parse the output to extract interface information
-            # output format is like:
-            # Interface  Type       Source     Model       MAC
-            # -------------------------------------------------------
-            # vnet0      network    default    virtio      52:54:00:xx:xx:xx
-
-            interfaces = []
-            lines = result.stdout.strip().split('\n')
-            if len(lines) > 2:  # Skip header and separator lines
-                for line in lines[2:]:
-                    parts = line.split()
-                    if len(parts) >= 5:  # Interface Type Source Model MAC
-                        iface_type = parts[1]
-                        source = parts[2]
-                        mac = parts[4]
-                        interfaces.append((iface_type, source, mac))
+            interfaces = [
+                (row.type, row.source, row.mac)
+                for row in parse_domiflist(result.stdout)
+            ]
 
             self.logger.info(
                 f"found {len(interfaces)} network interfaces to remove from the vm {vm_name}")

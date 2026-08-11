@@ -21,6 +21,7 @@ from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
 from .storage import StorageManager
 from .virsh_edit import VirshEdit
+from .virsh_parse import parse_domblklist, parse_domiflist
 
 
 class LibVirtSession:
@@ -188,11 +189,9 @@ class LibVirtSession:
             return 'failed'
 
         interfaces = []
-        for line in iflist.stdout.splitlines():
-            fields = line.split()
-            # columns: Interface Type Source Model MAC
-            if len(fields) >= 5 and fields[1] == 'network' and fields[2] == network_name:
-                interfaces.append({'model': fields[3], 'mac': fields[4]})
+        for row in parse_domiflist(iflist.stdout):
+            if row.type == 'network' and row.source == network_name:
+                interfaces.append({'model': row.model, 'mac': row.mac})
 
         if not interfaces:
             return 'skipped'
@@ -1270,12 +1269,10 @@ class LibVirtSession:
         result = virsh.execute("domblklist", vm_name, "--details", warn=True)
         if not result.ok:
             return
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            # domblklist --details columns: Type  Device  Target  Source
-            if len(parts) >= 3 and parts[1] == 'cdrom':
-                target = parts[2]
-                source = parts[3] if len(parts) >= 4 else '-'
+        for row in parse_domblklist(result.stdout):
+            if row.device == 'cdrom':
+                target = row.target
+                source = row.source if row.source is not None else '-'
                 if source == '-':
                     self.logger.debug(f"cdrom {target} on {vm_name} is already empty")
                     continue

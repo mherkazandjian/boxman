@@ -4,6 +4,7 @@ from typing import Any
 from xml.sax.saxutils import escape
 
 from .commands import VirshCommand
+from .virsh_parse import parse_domblklist
 
 
 def _xml_attr(value: str) -> str:
@@ -192,17 +193,10 @@ class CDROMManager(VirshCommand):
             return []
 
         cdroms = []
-        lines = result.stdout.strip().split('\n')
-        for line in lines[2:]:
-            parts = line.split()
-            if len(parts) < 3:
+        for row in parse_domblklist(result.stdout):
+            if row.device != 'cdrom':
                 continue
-            device = parts[1]
-            target = parts[2]
-            source = parts[3] if len(parts) >= 4 else '-'
-
-            if device != 'cdrom':
-                continue
+            source = row.source or '-'
             if source == '-':
                 continue
             # exclude seed ISOs (cloud-init)
@@ -210,7 +204,7 @@ class CDROMManager(VirshCommand):
                 continue
 
             cdroms.append({
-                'target': target,
+                'target': row.target,
                 'source': source,
             })
 
@@ -262,11 +256,7 @@ class CDROMManager(VirshCommand):
 
         used_targets = set()
         if result.ok:
-            lines = result.stdout.strip().split('\n')
-            for line in lines[2:]:
-                parts = line.split()
-                if len(parts) >= 3:
-                    used_targets.add(parts[2])
+            used_targets = {row.target for row in parse_domblklist(result.stdout)}
 
         # IDE supports hda-hdd (4 devices)
         for suffix in ('a', 'b', 'c', 'd'):
