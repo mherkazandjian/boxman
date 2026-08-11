@@ -410,6 +410,12 @@ class BoxmanManager:
         """Run the validated docker-compose restores, isolating per-cluster
         failures so one bad cluster can't strand the rest. Returns the names
         of the clusters that failed."""
+        if not dc_plan:
+            return []
+        # The macvlan parent bridges must exist before compose recreates the
+        # containers — after a host reboot they are gone and the recreate
+        # would fail with a cryptic "parent interface does not exist".
+        self.ensure_shared_bridges()
         failed = []
         for cname, cluster, snap in dc_plan:
             try:
