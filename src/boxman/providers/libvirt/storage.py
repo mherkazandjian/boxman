@@ -28,6 +28,7 @@ from boxman import log
 from boxman.loggers.logger import is_verbose
 
 from .commands import LibVirtCommandBase, VirshCommand
+from .destroy_vm import DestroyVM
 
 
 def vm_disk_paths(
@@ -132,6 +133,18 @@ class StorageManager:
             return False
         return "running" in result.stdout
 
+    def is_shut_off(self, vm_name: str) -> bool:
+        """
+        True only when the domain is fully "shut off" (or gone).
+
+        Stricter than ``not is_running()``: a *paused* or *in shutdown*
+        domain no longer reads as "running" but its QEMU process is still
+        alive and holding the disk — compacting the image then corrupts
+        it. Reuses :meth:`DestroyVM.is_vm_shut_off` for the check.
+        """
+        return DestroyVM(
+            vm_name, provider_config=self.provider_config).is_vm_shut_off()
+
     def is_libguestfs_available(self) -> bool:
         """Whether ``virt-sparsify`` is reachable in the configured runtime."""
         result = self.cmd.execute_shell(
@@ -173,7 +186,7 @@ class StorageManager:
     # ── vm state transitions ────────────────────────────────────────────
 
     def shutdown_and_wait(self, vm_name: str, timeout_s: int = 120) -> bool:
-        if not self.is_running(vm_name):
+        if self.is_shut_off(vm_name):
             return True
         self.logger.info(f"shutting down vm {vm_name} (timeout {timeout_s}s)")
         result = self.virsh.execute("shutdown", vm_name, warn=True)
@@ -183,7 +196,7 @@ class StorageManager:
             return False
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            if not self.is_running(vm_name):
+            if self.is_shut_off(vm_name):
                 return True
             time.sleep(2)
         self.logger.warning(
