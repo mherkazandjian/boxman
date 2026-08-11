@@ -26,7 +26,6 @@ from boxman.providers.libvirt.shared_folder import SharedFolderManager
 from boxman.providers.libvirt.snapshot import SnapshotManager
 from boxman.runtime.docker_compose import DockerComposeRuntime
 
-
 pytestmark = pytest.mark.regression
 
 
@@ -45,7 +44,7 @@ def _result(stdout: str = "", ok: bool = True, stderr: str = "", return_code: in
 #           batched sudo rsync before revert
 # ---------------------------------------------------------------------------
 
-class TestSnapshotOverlayPreservation_057eb7d:
+class TestSnapshotOverlayPreservation057eb7d:
 
     def test_revert_order_is_preserve_then_revert_then_restore(self):
         """Regression: libvirt deletes the *current* snapshot's overlay
@@ -108,7 +107,7 @@ class TestSnapshotOverlayPreservation_057eb7d:
 # 5e96515 — ssh proxyjump for docker runtime
 # ---------------------------------------------------------------------------
 
-class TestDockerRuntimeSshProxyJump_5e96515:
+class TestDockerRuntimeSshProxyJump5e96515:
 
     def test_no_jump_stanza_for_local_runtime(self, tmp_path: Path):
         mgr = BoxmanManager()
@@ -166,7 +165,7 @@ class TestDockerRuntimeSshProxyJump_5e96515:
 # eca430e — multi-project port isolation for docker runtime
 # ---------------------------------------------------------------------------
 
-class TestMultiProjectPortIsolation_eca430e:
+class TestMultiProjectPortIsolationEca430e:
 
     def test_default_project_maps_to_offset_zero(self):
         """Legacy single-project setups must keep 2222/16509/16514."""
@@ -197,7 +196,7 @@ class TestMultiProjectPortIsolation_eca430e:
 # 380b776 — allow excluding some commands from sudo
 # ---------------------------------------------------------------------------
 
-class TestSudoSkipCommands_380b776:
+class TestSudoSkipCommands380b776:
 
     def test_skip_list_wins_over_use_sudo_true(self):
         cmd = LibVirtCommandBase(provider_config={
@@ -261,7 +260,7 @@ class TestRmNeverSudo:
 # 36a8a6b — shared folder + cdrom hotplug
 # ---------------------------------------------------------------------------
 
-class TestCdromHotplug_36a8a6b:
+class TestCdromHotplug36a8a6b:
 
     def test_attach_uses_persistent_flag_not_config_only(self, tmp_path: Path):
         """Live+persistent hotplug means `--persistent` (defaults to runtime
@@ -281,7 +280,7 @@ class TestCdromHotplug_36a8a6b:
         assert "--config" not in args
 
 
-class TestSharedFolderHotplug_36a8a6b:
+class TestSharedFolderHotplug36a8a6b:
 
     def test_tries_live_persistent_before_config_fallback(self, tmp_path: Path):
         """Live attach first; only fall back to --config when live fails.
@@ -327,7 +326,7 @@ class TestSharedFolderHotplug_36a8a6b:
 # ece550a — per-VM base image override
 # ---------------------------------------------------------------------------
 
-class TestPerVmBaseImage_ece550a:
+class TestPerVmBaseImageEce550a:
     """
     Regression: base images can be specified at the VM level to override
     the cluster-wide template.base_image. The override must work when both
@@ -368,7 +367,6 @@ class TestDestroyReadsProjectCache:
 
     def test_destroy_loads_cache_before_in_cache_check(self, tmp_path: Path, capsys):
         import json as _json
-        import os as _os
 
         # Build a cache that already contains our project
         cache_dir = tmp_path / "cache"

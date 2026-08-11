@@ -19,7 +19,6 @@ import pytest
 
 from boxman.providers.libvirt.snapshot import SnapshotManager
 
-
 pytestmark = pytest.mark.unit
 
 

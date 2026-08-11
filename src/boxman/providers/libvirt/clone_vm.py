@@ -129,7 +129,7 @@ class CloneVM:
                 f"found {len(interfaces)} network interfaces to remove from the vm {vm_name}")
 
             # Remove each interface
-            for iface_type, source, mac in interfaces:
+            for iface_type, _source, mac in interfaces:
                 self.logger.info(f"removing interface with MAC {mac} from the vm {vm_name}")
 
                 # Use the detach-interface command with the correct type and MAC

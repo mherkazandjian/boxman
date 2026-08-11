@@ -21,7 +21,6 @@ import re
 import sys
 import zipfile
 from base64 import urlsafe_b64encode
-from pathlib import Path
 
 # Directories to relocate and their target under share/boxman/
 RELOCATIONS = {

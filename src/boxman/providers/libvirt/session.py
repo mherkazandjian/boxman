@@ -7,6 +7,7 @@ from xml.etree import ElementTree as ET
 
 from boxman import log
 
+from . import net_reconcile
 from .cdrom import CDROMManager
 from .clone_vm import CloneVM
 from .commands import VirshCommand
@@ -15,11 +16,10 @@ from .disk import DiskManager
 from .disk_cleanup import remove_vm_disks
 from .import_image import ImageImporter
 from .iso_boot_vm import IsoBootVM
-from . import net_reconcile
 from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
-from .storage import StorageManager, vm_disk_paths
+from .storage import StorageManager
 from .virsh_edit import VirshEdit
 
 
@@ -1497,7 +1497,7 @@ class LibVirtSession:
                     return False
 
                 # wait for the vm to shut down
-                for i in range(30):
+                for _i in range(30):
                     state_result = virsh.execute("domstate", vm_name, warn=True)
                     if state_result.ok and "shut off" in state_result.stdout:
                         break

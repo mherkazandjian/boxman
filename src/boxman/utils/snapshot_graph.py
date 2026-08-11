@@ -84,10 +84,10 @@ def _row_prefix(lanes: list[str | None], this_lane_idx: int) -> str:
     caller can append the row content directly.
     """
     chars: list[str] = []
-    for i, l in enumerate(lanes):
+    for i, lane in enumerate(lanes):
         if i == this_lane_idx:
             chars.append('*')
-        elif l is None:
+        elif lane is None:
             chars.append(' ')
         else:
             chars.append('|')

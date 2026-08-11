@@ -21,7 +21,6 @@ from boxman.providers.libvirt.cloudinit_presets import (
     hash_password,
 )
 
-
 pytestmark = pytest.mark.unit
 
 

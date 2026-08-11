@@ -16,7 +16,6 @@ import pytest
 
 from boxman.utils.shell import run as shell_run
 
-
 pytestmark = pytest.mark.unit
 
 

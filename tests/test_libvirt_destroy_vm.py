@@ -13,7 +13,6 @@ import pytest
 
 from boxman.providers.libvirt.destroy_vm import DestroyVM
 
-
 pytestmark = pytest.mark.unit
 
 

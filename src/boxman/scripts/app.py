@@ -1,21 +1,19 @@
 #!/usr/bin/env python
 
-import argparse
 import logging
 import os
 import shutil
 import sys
-from argparse import RawTextHelpFormatter
 
 import yaml
 
 import boxman
 from boxman import log
 from boxman.exceptions import BoxmanError, ConfigError
+from boxman.loggers.logger import set_quiet, set_verbosity, suppressed
 from boxman.manager import BoxmanManager
 from boxman.providers import create_session, merge_provider_configs, primary_provider_type
 from boxman.providers.libvirt.import_image import ImageImporter
-from boxman.loggers.logger import set_quiet, set_verbosity, suppressed
 from boxman.scripts.cli_parser import parse_args, resolve_verbosity
 from boxman.utils.jinja_env import create_jinja_env
 

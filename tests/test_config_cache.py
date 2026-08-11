@@ -19,7 +19,6 @@ import pytest
 
 from boxman.config_cache import BoxmanCache
 
-
 pytestmark = pytest.mark.unit
 
 

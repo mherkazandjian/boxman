@@ -2,13 +2,12 @@
 Tests for boxman.utils.jinja_env – Jinja2 template helpers for env vars.
 """
 
-import os
 import pytest
 import yaml
 
 from boxman.exceptions import BoxmanError, ConfigError
-from boxman.utils.jinja_env import env, env_required, env_is_set, create_jinja_env
 from boxman.manager import BoxmanManager
+from boxman.utils.jinja_env import create_jinja_env, env, env_is_set, env_required
 
 
 class TestEnvFunction:

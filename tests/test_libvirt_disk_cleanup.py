@@ -17,7 +17,6 @@ import pytest
 
 from boxman.providers.libvirt.disk_cleanup import remove_vm_disks
 
-
 pytestmark = pytest.mark.unit
 
 

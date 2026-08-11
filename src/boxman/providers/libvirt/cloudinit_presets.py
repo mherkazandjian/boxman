@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from passlib.hash import sha512_crypt
 
-
 #: completion marker for templates that bring no cloudinit block of their own.
 #: This is the file the LAST ``runcmd`` entry of DEFAULT_USER_DATA appends to,
 #: which is the only thing in the stock user-data that means "finished".

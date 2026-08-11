@@ -166,7 +166,7 @@ class LibVirtCommandBase:
                     f"Stderr: {exc.result.stderr}"
                 )
                 self.logger.error(error_message)
-                raise RuntimeError(error_message)
+                raise RuntimeError(error_message) from exc
             return exc.result
 
     def _should_use_sudo_for_command(self, command: str) -> bool:
@@ -251,7 +251,7 @@ class LibVirtCommandBase:
                     f"Stderr: {exc.result.stderr}"
                 )
                 self.logger.error(error_message)
-                raise RuntimeError(error_message)
+                raise RuntimeError(error_message) from exc
             return exc.result
 
     def _wrap_for_runtime(self, command: str) -> str:

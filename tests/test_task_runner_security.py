@@ -18,7 +18,6 @@ import pytest
 
 from boxman.task_runner import SAFE_NAME_RE, TaskRunner, _validate_safe_name
 
-
 pytestmark = pytest.mark.unit
 
 

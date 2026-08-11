@@ -20,7 +20,6 @@ from boxman.exceptions import (
 )
 from boxman.utils.decorators import safe_execute
 
-
 pytestmark = pytest.mark.unit
 
 
@@ -172,7 +171,8 @@ class TestVirshEditRaisesProvisionError:
     not bare RuntimeError, on failure."""
 
     def test_runtime_error_is_wrapped_in_provision_error(self):
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
+
         from boxman.providers.libvirt.virsh_edit import VirshEdit
 
         editor = VirshEdit(provider_config={"use_sudo": False})

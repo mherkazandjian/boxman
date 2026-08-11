@@ -21,10 +21,8 @@ import subprocess
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from boxman import log
-
 
 # ── metadata sidecar (vmimage.json) ──────────────────────────────────────────
 
@@ -39,14 +37,14 @@ class VmImageMetadata:
     """
 
     firmware: str = "uefi"  # "uefi" or "bios"
-    machine: Optional[str] = None
+    machine: str | None = None
     disk_bus: str = "virtio"
     net_model: str = "virtio"
 
     # display / informational
-    name: Optional[str] = None
-    version: Optional[str] = None
-    arch: Optional[str] = None
+    name: str | None = None
+    version: str | None = None
+    arch: str | None = None
 
 
 def _metadata_from_dict(raw: dict) -> VmImageMetadata:
@@ -95,7 +93,7 @@ def _repo_without_tag(ref: str) -> str:
     return ref
 
 
-def _find_qcow2(out_dir: Path) -> Optional[Path]:
+def _find_qcow2(out_dir: Path) -> Path | None:
     """Locate the qcow2 in a pulled oras output directory.
 
     Prefers ``disk.qcow2``; otherwise the first ``*.qcow2`` (sorted).
@@ -122,8 +120,7 @@ def _run_oras(cmd: list, action: str, ref: str) -> subprocess.CompletedProcess:
         result = subprocess.run(
             cmd,
             check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
         )
     except FileNotFoundError as exc:
@@ -230,7 +227,7 @@ def _manifest_kind(manifest: dict) -> str:
     return "unknown"
 
 
-def _select_index_digest(manifest: dict) -> Optional[str]:
+def _select_index_digest(manifest: dict) -> str | None:
     """Pick the ``linux/<host-arch>`` manifest digest from an image index.
 
     Matches strictly on the host OS/architecture — selecting a different
@@ -311,7 +308,7 @@ def _blob_fetch_to_file(repo: str, digest: str, dest: Path) -> None:
         action="blob fetch", ref=f"{repo}@{digest}")
 
 
-def _extract_disk_from_layer(blob_path: Path, out_dir: Path) -> Optional[Path]:
+def _extract_disk_from_layer(blob_path: Path, out_dir: Path) -> Path | None:
     """Extract the embedded VM disk image from a single (compressed) layer tarball.
 
     Streams the tar (``r|*`` auto-detects gzip/bzip2/xz; zstd is unsupported and
@@ -325,9 +322,9 @@ def _extract_disk_from_layer(blob_path: Path, out_dir: Path) -> Optional[Path]:
 
     Returns the path to the extracted disk image, or ``None`` if the layer has none.
     """
-    chosen: Optional[Path] = None
+    chosen: Path | None = None
     chosen_size = -1
-    writing: Optional[Path] = None
+    writing: Path | None = None
     try:
         with open(blob_path, "rb") as raw, tarfile.open(fileobj=raw, mode="r|*") as tar:
             for member in tar:
@@ -363,7 +360,7 @@ def _extract_disk_from_layer(blob_path: Path, out_dir: Path) -> Optional[Path]:
     return chosen
 
 
-def _extract_embedded_disk(ref: str, manifest: dict, out_dir: Path) -> Optional[Path]:
+def _extract_embedded_disk(ref: str, manifest: dict, out_dir: Path) -> Path | None:
     """Extract the VM disk image embedded in a container image's layers.
 
     Layers are scanned from topmost to bottom (so an upper layer's disk wins);
@@ -463,7 +460,7 @@ def pull_oci_image(image_ref: str, out_dir: str) -> str:
     return str(disk)
 
 
-def _fetch_vmimage_metadata(ref: str, layers: list) -> Optional[VmImageMetadata]:
+def _fetch_vmimage_metadata(ref: str, layers: list) -> VmImageMetadata | None:
     """Best-effort fetch of the ``vmimage.json`` blob for inspection.
 
     Returns ``None`` if there is no such layer or the small blob cannot be
@@ -482,8 +479,7 @@ def _fetch_vmimage_metadata(ref: str, layers: list) -> Optional[VmImageMetadata]
         result = subprocess.run(
             ["oras", "blob", "fetch", f"{repo}@{digest}", "--output", "-"],
             check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
         )
     except FileNotFoundError:

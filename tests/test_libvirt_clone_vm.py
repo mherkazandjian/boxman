@@ -15,7 +15,6 @@ import pytest
 from boxman.providers.libvirt.clone_vm import CloneVM
 from boxman.providers.libvirt.session import LibVirtSession
 
-
 pytestmark = pytest.mark.unit
 
 

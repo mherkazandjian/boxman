@@ -13,7 +13,6 @@ Covers:
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -21,7 +20,6 @@ import pytest
 
 from boxman.providers.libvirt.destroy_vm import DestroyVM
 from boxman.providers.libvirt.storage import StorageManager, vm_disk_paths
-
 
 pytestmark = pytest.mark.unit
 

@@ -612,7 +612,7 @@ class DockerComposeSession:
             raise ConfigError(
                 f"docker-compose cluster '{cluster_name}': readiness_timeout "
                 f"must be an integer number of seconds (got {raw!r})."
-            )
+            ) from None
         if timeout <= 0:
             raise ConfigError(
                 f"docker-compose cluster '{cluster_name}': readiness_timeout "

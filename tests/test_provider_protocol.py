@@ -17,7 +17,6 @@ from boxman.abstract.providers import Provider, ProviderSession
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.providers.virtualbox.session import VirtualBoxSession
 
-
 pytestmark = pytest.mark.unit
 
 

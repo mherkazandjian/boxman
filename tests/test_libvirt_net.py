@@ -19,7 +19,6 @@ import pytest
 
 from boxman.providers.libvirt.net import Network, NetworkInterface
 
-
 pytestmark = pytest.mark.unit
 
 

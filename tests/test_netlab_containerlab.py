@@ -20,7 +20,6 @@ from boxman.netlab.containerlab import (
 )
 from boxman.utils.jinja_env import create_jinja_env
 
-
 pytestmark = pytest.mark.unit
 
 

@@ -30,8 +30,8 @@ from typing import Any
 import invoke
 
 from boxman import log
-from boxman.loggers.logger import is_verbose
 from boxman.image_cache import ImageCache
+from boxman.loggers.logger import is_verbose
 from boxman.utils.shell import run as _shell_run
 
 from .cloudinit_presets import (  # noqa: F401 — re-exported for back-compat
@@ -39,6 +39,8 @@ from .cloudinit_presets import (  # noqa: F401 — re-exported for back-compat
     DEFAULT_META_DATA,
     DEFAULT_NETWORK_CONFIG,
     DEFAULT_USER_DATA,
+)
+from .cloudinit_presets import (
     hash_password as _hash_password,
 )
 from .commands import VirshCommand, VirtInstallCommand

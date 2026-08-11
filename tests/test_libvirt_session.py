@@ -26,7 +26,6 @@ import pytest
 
 from boxman.providers.libvirt.session import LibVirtSession
 
-
 pytestmark = pytest.mark.unit
 
 

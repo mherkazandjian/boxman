@@ -19,7 +19,7 @@ All external calls are mocked — no VBoxManage is invoked on any host.
 from __future__ import annotations
 
 import subprocess
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -28,7 +28,6 @@ from boxman.exceptions import ConfigError
 from boxman.providers.virtualbox import VirtualBoxSession as VirtualBoxSessionExport
 from boxman.providers.virtualbox.commands import VBoxManageCommand
 from boxman.providers.virtualbox.session import VirtualBoxSession
-
 
 pytestmark = pytest.mark.unit
 

@@ -25,7 +25,6 @@ import pytest
 from boxman.providers.libvirt import net_reconcile as nr
 from boxman.providers.libvirt.net import Network
 
-
 pytestmark = pytest.mark.unit
 
 

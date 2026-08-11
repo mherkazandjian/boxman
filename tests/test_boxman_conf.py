@@ -4,14 +4,14 @@ Test that --boxman-conf overrides the default ~/.config/boxman/boxman.yml.
 
 import logging
 import os
-import tempfile
-import yaml
-import pytest
 import shutil as _shutil
 
-from boxman.scripts.app import load_boxman_config
-from boxman.manager import BoxmanManager
+import pytest
+import yaml
+
 from boxman.exceptions import ConfigError
+from boxman.manager import BoxmanManager
+from boxman.scripts.app import load_boxman_config
 
 
 class TestBoxmanConfOverride:
@@ -610,6 +610,7 @@ class TestWriteSshConfig:
 
     def test_docker_runtime_emits_jump_stanza_and_proxyjump(self, tmp_path):
         from unittest.mock import PropertyMock, patch
+
         from boxman.runtime.docker_compose import DockerComposeRuntime
 
         mgr = self._make_manager(tmp_path, runtime_name="docker-compose")
@@ -694,7 +695,6 @@ class TestNormalizeOwnership:
 
     def test_clean_user_owned_tree_is_a_noop(self, tmp_path, monkeypatch):
         """No foreign entries → no unlink, no sudo, nothing logged."""
-        from unittest.mock import patch
         (tmp_path / "a.txt").write_text("hi")
         (tmp_path / "sub").mkdir()
         (tmp_path / "sub" / "b.txt").write_text("hi")
@@ -722,7 +722,6 @@ class TestNormalizeOwnership:
     ):
         """Stale root-owned file inside user-writable dir → unlinked
         directly, no sudo escalation."""
-        from unittest.mock import patch
         stale = tmp_path / "seed.iso"
         stale.write_bytes(b"stale")
 
@@ -748,7 +747,7 @@ class TestNormalizeOwnership:
                 self.name = real.name
                 self._fake_uid = fake_uid
             def stat(self, follow_symlinks=False):
-                real_stat = self._real.stat(follow_symlinks=follow_symlinks)
+                self._real.stat(follow_symlinks=follow_symlinks)
                 # st_uid is read-only; build a tuple-like proxy.
                 class _Stat:
                     pass
@@ -1207,8 +1206,8 @@ class TestMainConfigErrorExit:
         """Phase 3: the wrapper now catches the whole BoxmanError family, so an
         operational failure on the docker-compose path (an unhealthy service →
         ProvisionError) exits 2 cleanly instead of dumping a traceback."""
-        from boxman.scripts import app
         from boxman.exceptions import ProvisionError
+        from boxman.scripts import app
 
         def _raise():
             raise ProvisionError('service never became healthy')
