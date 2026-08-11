@@ -35,23 +35,17 @@ class TestCreateSession:
         assert isinstance(session, LibVirtSession)
         assert isinstance(session, ProviderSession)
 
-    def test_virtualbox_factory_wiring(self, monkeypatch):
-        """The Virtualbox constructor shells out to ``vboxmanage`` at
-        init, so wiring is verified against a stand-in class instead of
-        requiring the binary on the test host."""
-        created_with: list = []
-
-        class FakeVirtualbox:
-            def __init__(self, conf):
-                created_with.append(conf)
-
-        import boxman.virtualbox.vboxmanage as vboxmanage
-        monkeypatch.setattr(vboxmanage, 'Virtualbox', FakeVirtualbox)
+    def test_virtualbox_factory_wiring(self):
+        """The registry wires ``virtualbox`` to the first-class
+        ``VirtualBoxSession`` (successor to the legacy
+        ``boxman.virtualbox.vboxmanage.Virtualbox``). Its constructor is
+        deliberately side-effect free, so no stand-in is needed."""
+        from boxman.providers.virtualbox.session import VirtualBoxSession
 
         conf = {"provider": {"virtualbox": {}}}
         session = create_session('virtualbox', conf)
-        assert isinstance(session, FakeVirtualbox)
-        assert created_with == [conf]
+        assert isinstance(session, VirtualBoxSession)
+        assert session.config == conf
 
     def test_docker_compose_builds_a_session(self):
         """Phase 3 (#51): the docker-compose provider is now implemented, so

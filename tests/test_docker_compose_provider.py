@@ -1715,12 +1715,14 @@ class TestFlowWiring:
         # no-op the libvirt/cache/ssh/files collaborators
         for name in [
             "register_project_in_cache", "unregister_from_cache",
-            "_expand_oci_base_images", "ensure_templates_exist",
+            "_expand_oci_base_images",
             "validate_base_images", "provision_files", "deprovision_files",
             "setup_ssh_access", "connect_info",
             "write_ssh_config", "define_networks", "destroy_networks",
         ]:
             monkeypatch.setattr(m, name, lambda *a, **k: None)
+        # provision() aborts early when this returns falsy
+        monkeypatch.setattr(m, "ensure_templates_exist", lambda *a, **k: True)
         monkeypatch.setattr(m, "_find_existing_project_vms", lambda *a, **k: [])
         monkeypatch.setattr(m, "_get_vm_states", lambda *a, **k: {})
         monkeypatch.setattr(m, "get_connect_info", lambda *a, **k: True)
