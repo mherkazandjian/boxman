@@ -354,22 +354,19 @@ class TestConfigDryRun:
     """
 
     def test_template_config_renders_and_parses(self):
-        from pathlib import Path as P
         import yaml
+
         from boxman.utils.jinja_env import create_jinja_env
 
-        tpl_dir = P(__file__).resolve().parent.parent / "data" / "templates"
-        candidates = list(tpl_dir.glob("conf*.yml"))
-        if not candidates:
-            pytest.skip("no example template config found in data/templates/")
-
+        tpl_dir = Path(__file__).resolve().parent.parent / "data" / "templates"
         env = create_jinja_env(str(tpl_dir))
-        template = env.get_template(candidates[0].name)
+        template = env.get_template("conf.libvirt.yml")
         rendered = template.render()
-        # must be parseable YAML
+        # must be parseable YAML with the expected top-level structure
         data = yaml.safe_load(rendered)
-        # bare minimum: has a project key or something structurally similar
-        assert isinstance(data, (dict, type(None)))
+        assert isinstance(data, dict)
+        assert "project" in data
+        assert "clusters" in data
 
 
 class TestImageDispatch:

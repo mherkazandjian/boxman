@@ -52,6 +52,8 @@ from boxman.providers.docker_compose.session import (
     _snapshot_tag,
 )
 
+pytestmark = pytest.mark.unit
+
 
 # --------------------------------------------------------------------------
 # ComposeGenerator
