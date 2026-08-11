@@ -29,13 +29,11 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 import invoke
 import pytest
 
 from boxman.manager import BoxmanManager
-
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
@@ -111,7 +109,7 @@ def _ssh(host: str, cmd: str, ssh_config: Path, warn: bool = False) -> invoke.ru
 def _wait_for_ssh(host: str, ssh_config: Path, max_attempts: int = 20) -> None:
     """Wait until *host* accepts SSH. Raises on timeout."""
     last_err = ""
-    for attempt in range(1, max_attempts + 1):
+    for _attempt in range(1, max_attempts + 1):
         result = _ssh(host, "hostname", ssh_config, warn=True)
         if result.ok and result.stdout.strip():
             return

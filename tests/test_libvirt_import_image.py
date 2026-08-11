@@ -15,7 +15,6 @@ import pytest
 
 from boxman.providers.libvirt.import_image import ImageImporter
 
-
 pytestmark = pytest.mark.unit
 
 

@@ -14,7 +14,6 @@ import pytest
 
 from boxman.image_cache import ImageCache
 
-
 pytestmark = pytest.mark.unit
 
 

@@ -220,7 +220,7 @@ def sudo_nopasswd_covers(sudo_l_output, binary):
         rhs = line.split("NOPASSWD", 1)[1]
         if re.search(r":\s*ALL\b", rhs):
             return True
-        if re.search(r"[/\s]%s(\b|,|$)" % re.escape(base), rhs):
+        if re.search(rf"[/\s]{re.escape(base)}(\b|,|$)", rhs):
             return True
     return False
 
@@ -385,7 +385,7 @@ def wiped_networks(networks, evidence):
     rules vouch for virbr1 and hide a genuinely wiped network.
     """
     return [name for name, bridge, expects in networks
-            if expects and not re.search(r"\b%s\b" % re.escape(bridge), evidence)]
+            if expects and not re.search(rf"\b{re.escape(bridge)}\b", evidence)]
 
 
 def forwarding_verdict(networks, evidence, docker_present, backend,
@@ -427,25 +427,25 @@ def forwarding_verdict(networks, evidence, docker_present, backend,
     # those libvirt writes nothing by design, which is exactly why a drop is
     # fatal to them.
     at_risk = [name for name, bridge, _ in networks
-               if any(not re.search(r"\b%s\b" % re.escape(bridge), closure)
+               if any(not re.search(rf"\b{re.escape(bridge)}\b", closure)
                       for closure in closures)]
 
     if wiped and not complete_view:
-        return INFO, ("part of the ruleset was unreadable, so the rules for %s "
-                      "could not be confirmed either way" % ", ".join(wiped)), False
+        return INFO, ("part of the ruleset was unreadable, so the rules for "
+                      f"{', '.join(wiped)} could not be confirmed either way"), False
 
     if wiped:
-        detail = ("no forwarding rules for active network(s): %s\n"
-                  "guests will NAT but never forward" % ", ".join(wiped))
+        detail = (f"no forwarding rules for active network(s): {', '.join(wiped)}\n"
+                  "guests will NAT but never forward")
         if docker_present:
             detail += "\ndocker shares this table and rebuilds it on restart"
         return WARN, detail, True
 
     if at_risk and complete_view:
         detail = ("a chain at the forward hook drops by default and nothing "
-                  "in it accepts: %s\n"
+                  f"in it accepts: {', '.join(at_risk)}\n"
                   "a drop in any table at the hook is final, so these guests "
-                  "cannot forward" % ", ".join(at_risk))
+                  "cannot forward")
         if backend == "nftables":
             # the half-fixed host: rules protected, policy never cleared
             detail += "\nlibvirt already has its own table -- only the policy is left"
@@ -463,14 +463,14 @@ def forwarding_verdict(networks, evidence, docker_present, backend,
         return INFO, ("rules are in place, but libvirt's firewall backend "
                       "could not be determined from here"), False
 
-    return OK, "forwarding rules present for: %s" % ", ".join(
-        name for name, _, _ in networks), False
+    return OK, "forwarding rules present for: {}".format(
+        ", ".join(name for name, _, _ in networks)), False
 
 
 # --------------------------------------------------------------------------- #
 # Small result containers                                                      #
 # --------------------------------------------------------------------------- #
-class Fix(object):
+class Fix:
     def __init__(self, description, commands=None, needs_sudo=False,
                  needs_relogin=False, disruptive=False):
         self.description = description
@@ -486,7 +486,7 @@ class Fix(object):
         return bool(self.commands)
 
 
-class Result(object):
+class Result:
     def __init__(self, name, status, detail="", fix=None):
         self.name = name
         self.status = status
@@ -511,7 +511,7 @@ def run_capture(args, timeout=20):
             args,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            universal_newlines=True,
+            text=True,
             timeout=timeout,
         )
         return proc.returncode, proc.stdout or ""
@@ -543,7 +543,7 @@ def user_group_names():
 # --------------------------------------------------------------------------- #
 # The doctor                                                                  #
 # --------------------------------------------------------------------------- #
-class Doctor(object):
+class Doctor:
     def __init__(self, opts):
         self.opts = opts
         self.os = self._detect_os()
@@ -561,15 +561,15 @@ class Doctor(object):
     def c(self, text, name):
         if not self.use_color:
             return text
-        return "\033[%sm%s\033[0m" % (_ANSI.get(name, "0"), text)
+        return "\033[{}m{}\033[0m".format(_ANSI.get(name, "0"), text)
 
     def section(self, title):
-        print("\n" + self.c("== %s ==" % title, "bold"))
+        print("\n" + self.c(f"== {title} ==", "bold"))
 
     def _print_result(self, result, prefix=""):
         tag, color = _STATUS_TAG[result.status]
-        label = self.c("[%s]" % tag, color)
-        print("%s%s %s" % (prefix, label, result.name))
+        label = self.c(f"[{tag}]", color)
+        print(f"{prefix}{label} {result.name}")
         if result.detail:
             for line in result.detail.splitlines():
                 print("       " + line)
@@ -644,7 +644,7 @@ class Doctor(object):
     def _remember_manual(self, result, note=None):
         entry = result.name
         if note:
-            entry += " (%s)" % note
+            entry += f" ({note})"
         elif result.fix and result.fix.commands:
             entry += ": " + " ; ".join(result.fix.commands)
         elif result.fix:
@@ -654,7 +654,7 @@ class Doctor(object):
 
     def _ask(self, prompt):
         try:
-            answer = input("%s [y/N] " % prompt).strip().lower()
+            answer = input(f"{prompt} [y/N] ").strip().lower()
         except (EOFError, KeyboardInterrupt, OSError):
             # OSError: the terminal went away mid-prompt (EIO on hangup).
             # Declining is the only safe reading of "no answer".
@@ -673,7 +673,7 @@ class Doctor(object):
                 return False
             if rc != 0:
                 ok = False
-                print("       " + self.c("command exited with status %d" % rc, "yellow"))
+                print("       " + self.c(f"command exited with status {rc}", "yellow"))
                 if fix.disruptive:
                     # Later commands restart services. Carrying on past a
                     # failed edit would apply the disruption without the
@@ -733,8 +733,8 @@ class Doctor(object):
             commands.append(cmd)
         commands.extend(extra_cmds or [])
         if not commands:
-            description += (" (unrecognized distro '%s' -- install %s with your "
-                            "package manager)" % (self.os["id"] or "?", pkgs))
+            description += (" (unrecognized distro '{}' -- install {} with your "
+                            "package manager)".format(self.os["id"] or "?", pkgs))
         return Fix(description, commands, needs_sudo=True, needs_relogin=relogin)
 
     def _core_stack_fix(self):
@@ -776,11 +776,11 @@ class Doctor(object):
 
     def _header(self):
         print(self.c("Boxman prerequisites checker", "bold"))
-        print("  host    : %s" % self.os["pretty"])
-        print("  family  : %s   runtime: %s" % (self.family, self.runtime))
+        print(f"  host    : {self.os['pretty']}")
+        print(f"  family  : {self.family}   runtime: {self.runtime}")
         mode = "check-only (read-only)" if self.opts.check_only else (
             "auto-fix (--yes)" if self.opts.yes else "guided (asks before any change)")
-        print("  mode    : %s" % mode)
+        print(f"  mode    : {mode}")
         if not self.opts.check_only:
             print(self.c("  Nothing is changed unless you confirm each fix.", "dim"))
 
@@ -789,28 +789,28 @@ class Doctor(object):
         self.section("Environment")
 
         def python_version():
-            ver = "%d.%d.%d" % sys.version_info[:3]
+            ver = ".".join(str(p) for p in sys.version_info[:3])
             if sys.version_info[:2] >= (3, 10):
-                return OK, "Python %s (boxman needs >= 3.10)" % ver, None
+                return OK, f"Python {ver} (boxman needs >= 3.10)", None
             fix = Fix(
                 "install Python >= 3.10 (e.g. `conda create -n boxman python=3.12` "
                 "or a system python3.10+), then reinstall boxman into it",
                 commands=[],
             )
-            return FAIL, "Python %s is too old; boxman needs >= 3.10" % ver, fix
+            return FAIL, f"Python {ver} is too old; boxman needs >= 3.10", fix
 
         self.check("Python version", python_version)
 
         def boxman_installed():
             env = os.environ.get("CONDA_DEFAULT_ENV") or os.environ.get("VIRTUAL_ENV")
-            env_note = ("active env: %s" % env) if env else "no conda/venv detected"
+            env_note = (f"active env: {env}") if env else "no conda/venv detected"
             if have("boxman"):
                 rc, out = run_capture(["boxman", "--version"])
                 ver = out.strip().splitlines()[0] if (rc == 0 and out.strip()) else "installed"
-                return OK, "%s (%s); %s" % (ver, shutil.which("boxman"), env_note), None
+                return OK, f"{ver} ({shutil.which('boxman')}); {env_note}", None
             fix = Fix("install boxman into your active environment",
                       commands=["pip install boxman"])
-            return WARN, "`boxman` not on PATH; %s" % env_note, fix
+            return WARN, f"`boxman` not on PATH; {env_note}", fix
 
         self.check("boxman on PATH", boxman_installed)
 
@@ -818,7 +818,7 @@ class Doctor(object):
             mods = ["yaml", "invoke", "jinja2", "lxml", "passlib"]
             missing = []
             for mod in mods:
-                rc, _ = run_capture([sys.executable, "-c", "import %s" % mod])
+                rc, _ = run_capture([sys.executable, "-c", f"import {mod}"])
                 if rc != 0:
                     missing.append(mod)
             if not missing:
@@ -826,9 +826,9 @@ class Doctor(object):
             hint = ("lxml needs system libxml2/libxslt; the rest come with "
                     "`pip install boxman`") if "lxml" in missing else \
                    "reinstall boxman to pull these"
-            fix = Fix("install boxman's Python deps into %s (%s)" % (sys.executable, hint),
-                      commands=["%s -m pip install %s" % (sys.executable, " ".join(missing))])
-            return WARN, "missing: %s" % ", ".join(missing), fix
+            fix = Fix(f"install boxman's Python deps into {sys.executable} ({hint})",
+                      commands=[f"{sys.executable} -m pip install {' '.join(missing)}"])
+            return WARN, f"missing: {', '.join(missing)}", fix
 
         self.check("boxman Python deps", python_deps)
 
@@ -865,7 +865,7 @@ class Doctor(object):
             except OSError:
                 pass
             fix = Fix("load the KVM kernel module (needs VT-x/AMD-V enabled in BIOS)",
-                      commands=["sudo modprobe kvm %s" % vendor_mod], needs_sudo=True)
+                      commands=[f"sudo modprobe kvm {vendor_mod}"], needs_sudo=True)
             return FAIL, "/dev/kvm missing -- KVM module not loaded", fix
 
         kvm = self.check("/dev/kvm device", dev_kvm)
@@ -896,7 +896,7 @@ class Doctor(object):
 
         def nested():
             for mod in ("kvm_intel", "kvm_amd"):
-                path = "/sys/module/%s/parameters/nested" % mod
+                path = f"/sys/module/{mod}/parameters/nested"
                 if os.path.exists(path):
                     try:
                         with open(path) as handle:
@@ -904,13 +904,13 @@ class Doctor(object):
                     except OSError:
                         continue
                     if val in ("Y", "1"):
-                        return OK, "nested virtualization enabled (%s)" % mod, None
+                        return OK, f"nested virtualization enabled ({mod})", None
                     fix = Fix(
                         "enable nested virt on the *host*, e.g. "
-                        "`echo 'options %s nested=1' | sudo tee /etc/modprobe.d/kvm.conf` "
-                        "then reload the module" % mod,
+                        f"`echo 'options {mod} nested=1' | sudo tee /etc/modprobe.d/kvm.conf` "
+                        "then reload the module",
                         commands=[])
-                    return WARN, "running in a VM and nested virt is disabled (%s=%s)" % (mod, val), fix
+                    return WARN, f"running in a VM and nested virt is disabled ({mod}={val})", fix
             return SKIP, "no kvm_intel/kvm_amd module parameter found", None
 
         self.check("Nested virtualization", nested)
@@ -927,7 +927,7 @@ class Doctor(object):
                 missing.append("qemu-system-x86_64")
             if not missing:
                 return OK, "virsh, virt-install, virt-clone, qemu-img, qemu-system present", None
-            return FAIL, "missing: %s" % ", ".join(missing), self._core_stack_fix()
+            return FAIL, f"missing: {', '.join(missing)}", self._core_stack_fix()
 
         tools = self.check("Core libvirt/QEMU tools", core_tools)
 
@@ -961,7 +961,7 @@ class Doctor(object):
                 if rc == 0:
                     return OK, "virsh can reach qemu:///system", None
                 reason = out.strip().splitlines()[-1] if out.strip() else "connection failed"
-                detail = "cannot reach qemu:///system: %s" % reason
+                detail = f"cannot reach qemu:///system: {reason}"
                 if "permission" in out.lower() or "authentication" in out.lower():
                     detail += "\n(usually a group-membership issue -- see the groups check below)"
                 return FAIL, detail, None  # fix handled by service/groups checks
@@ -975,7 +975,7 @@ class Doctor(object):
             want = [libvirt_group, "kvm"]
             missing = [g for g in want if g not in names]
             if not missing:
-                return OK, "user '%s' is in: %s" % (user, ", ".join(want)), None
+                return OK, f"user '{user}' is in: {', '.join(want)}", None
             if self.family == "nixos":
                 fix = Fix("add your user to the libvirtd/kvm groups declaratively: "
                           "users.users.<you>.extraGroups = [ \"libvirtd\" \"kvm\" ]; "
@@ -996,7 +996,7 @@ class Doctor(object):
             # directly ("/dev/kvm access", "libvirt connectivity"). If access
             # already works (world-readable device, polkit, sudo), missing group
             # membership isn't blocking -- the functional checks decide that.
-            return WARN, "user '%s' not in group(s): %s" % (user, ", ".join(missing)), fix
+            return WARN, f"user '{user}' not in group(s): {', '.join(missing)}", fix
 
         if _HAVE_UNIX_IDS:
             self.check("User groups (libvirt, kvm)", groups)
@@ -1027,10 +1027,10 @@ class Doctor(object):
             tools = ["cloud-localds", "genisoimage", "mkisofs", "xorrisofs", "xorriso"]
             found = [t for t in tools if have(t)]
             if found:
-                return OK, "cloud-init seed tool available (%s)" % found[0], None
+                return OK, f"cloud-init seed tool available ({found[0]})", None
             fix = self._install_fix(
                 "install a cloud-init seed-ISO tool", _SEED_PKG.get(self.family, "genisoimage"))
-            return FAIL, "none of: %s (needed to build cloud-init seed ISOs)" % ", ".join(tools), fix
+            return FAIL, f"none of: {', '.join(tools)} (needed to build cloud-init seed ISOs)", fix
 
         self.check("cloud-init seed tool", seed_tool)
 
@@ -1043,7 +1043,7 @@ class Doctor(object):
                 return OK, "ssh and ssh-keygen present", None
             fix = self._install_fix("install the OpenSSH client",
                                     _TOOL_PKG["openssh"].get(self.family, "openssh-client"))
-            return WARN, "missing: %s" % ", ".join(missing), fix
+            return WARN, f"missing: {', '.join(missing)}", fix
 
         self.check("SSH client tools", ssh_client)
 
@@ -1053,10 +1053,10 @@ class Doctor(object):
     def _check_simple_bin(self, label, binary, severity, feature):
         def probe():
             if have(binary):
-                return OK, "%s present" % binary, None
+                return OK, f"{binary} present", None
             pkg = _TOOL_PKG.get(binary, {}).get(self.family, binary)
-            fix = self._install_fix("install %s" % binary, pkg)
-            return severity, "%s not found (needed for %s)" % (binary, feature), fix
+            fix = self._install_fix(f"install {binary}", pkg)
+            return severity, f"{binary} not found (needed for {feature})", fix
 
         self.check(label, probe)
 
@@ -1072,7 +1072,7 @@ class Doctor(object):
                     "/etc/sudoers.d/boxman line: "
                     "`%s ALL=(root) NOPASSWD: /usr/bin/virsh, /usr/bin/qemu-img, "
                     "/usr/sbin/iptables, /usr/sbin/ip, /usr/bin/rsync, /bin/rm`" % (
-                        (user_group_names()[1] or "$USER")),
+                        user_group_names()[1] or "$USER"),
                     commands=[])
                 return WARN, ("passwordless sudo not available; boxman's automatic "
                               "iptables/NAT and cleanup steps fail when run "
@@ -1192,7 +1192,7 @@ class Doctor(object):
                 "/etc/libvirt/network.conf && printf "
                 "\"\\nfirewall_backend = \\\"nftables\\\"\\n\" "
                 ">> /etc/libvirt/network.conf'",
-                "sudo systemctl restart %s" % unit,
+                f"sudo systemctl restart {unit}",
             ]
 
         # the flag stops docker *setting* the policy; it does not clear one
@@ -1234,7 +1234,7 @@ class Doctor(object):
         restarts_docker = any("restart docker" in cmd for cmd in docker_cmds)
         if not libvirt_cmds and (
                 wiped or (restarts_docker and backend != "nftables")):
-            commands.append("sudo systemctl restart %s" % unit)
+            commands.append(f"sudo systemctl restart {unit}")
         if backend == "nftables" and docker_manages:
             description = ("stop docker forcing FORWARD to DROP -- libvirt "
                            "already has its own table")
@@ -1378,15 +1378,15 @@ class Doctor(object):
     def _optional_line(self, binary, pkgkey, feature):
         def probe():
             if have(binary):
-                return OK, "%s present" % binary, None
+                return OK, f"{binary} present", None
             if pkgkey:
                 pkg = _TOOL_PKG.get(pkgkey, {}).get(self.family, pkgkey)
-                fix = self._install_fix("install %s" % binary, pkg)
+                fix = self._install_fix(f"install {binary}", pkg)
             else:
                 url = {"oras": "https://oras.land/docs/installation",
                        "containerlab": "https://containerlab.dev/install/"}.get(binary, "")
-                fix = Fix("install %s -- see %s" % (binary, url), commands=[])
-            return WARN, "%s not installed (only needed for %s)" % (binary, feature), fix
+                fix = Fix(f"install {binary} -- see {url}", commands=[])
+            return WARN, f"{binary} not installed (only needed for {feature})", fix
 
         self.check(binary, probe)
 
@@ -1455,8 +1455,8 @@ class Doctor(object):
             try:
                 free_gb = shutil.disk_usage(probe_dir).free / (1024.0 ** 3)
             except OSError:
-                return SKIP, "cannot stat %s" % probe_dir, None
-            detail = "%.0f GB free on %s" % (free_gb, probe_dir)
+                return SKIP, f"cannot stat {probe_dir}", None
+            detail = f"{free_gb:.0f} GB free on {probe_dir}"
             if free_gb < 20:
                 return WARN, detail + " (VM images are large; ~20-50 GB recommended)", None
             return OK, detail, None
@@ -1473,7 +1473,7 @@ class Doctor(object):
             if not match:
                 return SKIP, "cannot parse MemTotal", None
             total_gb = int(match.group(1)) / (1024.0 ** 2)
-            detail = "%.1f GB RAM" % total_gb
+            detail = f"{total_gb:.1f} GB RAM"
             if total_gb < 8:
                 return WARN, detail + " (8+ GB recommended for comfortable VM clusters)", None
             return OK, detail, None
@@ -1487,9 +1487,9 @@ class Doctor(object):
             while existing and not os.path.exists(existing):
                 existing = os.path.dirname(existing)
             if existing and os.access(existing, os.W_OK):
-                return OK, "%s is writable" % full, None
-            fix = Fix("create the directory", commands=["mkdir -p %s" % full])
-            return WARN, "%s not writable (boxman auto-creates it; check permissions)" % full, fix
+                return OK, f"{full} is writable", None
+            fix = Fix("create the directory", commands=[f"mkdir -p {full}"])
+            return WARN, f"{full} not writable (boxman auto-creates it; check permissions)", fix
 
         self.check(label, probe)
 
@@ -1499,12 +1499,12 @@ class Doctor(object):
         for result in self.results:
             counts[result.status] = counts.get(result.status, 0) + 1
         self.section("Summary")
-        print("  %s   %s   %s   %s   %s" % (
-            self.c("OK: %d" % counts[OK], "green"),
-            self.c("WARN: %d" % counts[WARN], "yellow"),
-            self.c("FAIL: %d" % counts[FAIL], "red"),
-            self.c("SKIP: %d" % counts[SKIP], "dim"),
-            self.c("INFO: %d" % counts[INFO], "cyan"),
+        print("  {}   {}   {}   {}   {}".format(
+            self.c(f"OK: {counts[OK]}", "green"),
+            self.c(f"WARN: {counts[WARN]}", "yellow"),
+            self.c(f"FAIL: {counts[FAIL]}", "red"),
+            self.c(f"SKIP: {counts[SKIP]}", "dim"),
+            self.c(f"INFO: {counts[INFO]}", "cyan"),
         ))
 
         if self.manual_steps:

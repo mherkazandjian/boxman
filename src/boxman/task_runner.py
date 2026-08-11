@@ -86,7 +86,6 @@ from boxman import log
 from boxman.exceptions import ConfigError
 from boxman.utils.env_loader import load_workspace_env
 
-
 #: Names (VMs, clusters, hosts) that will be interpolated into a shell
 #: command must match this pattern. Alphanumerics, underscore, hyphen,
 #: dot — nothing that a shell treats specially. Rejects backticks,
@@ -184,7 +183,7 @@ class TaskRunner:
     def _log_env(self) -> None:
         """Log workspace environment variables at info level."""
         # Access self.env to ensure _workspace_vars is populated
-        self.env
+        _ = self.env
         for key in sorted(self._workspace_vars):
             log.info(f"  {key}={self._workspace_vars[key]}")
 

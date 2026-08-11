@@ -11,7 +11,6 @@ import pytest
 
 from boxman.providers.libvirt.bare_vm import BareVM
 
-
 pytestmark = pytest.mark.unit
 
 

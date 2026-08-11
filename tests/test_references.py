@@ -18,7 +18,6 @@ import pytest
 
 from boxman.utils.references import resolve_reference
 
-
 pytestmark = pytest.mark.unit
 
 

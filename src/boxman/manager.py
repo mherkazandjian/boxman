@@ -13,24 +13,23 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 import yaml
-from boxman.utils.shell import run
 
 from boxman import log
-from boxman.loggers.logger import suppressed
+from boxman.abstract.providers import ProviderSession
 from boxman.config_cache import BoxmanCache
 from boxman.exceptions import ConfigError, ProvisionError, SnapshotError
 from boxman.image_cache import ImageCache
+from boxman.loggers.logger import suppressed
 from boxman.netlab import ContainerlabManager, shared_bridges
 from boxman.providers import PROVIDERS, merge_provider_configs, primary_provider_type
 from boxman.providers.libvirt import net_reconcile
-from boxman.abstract.providers import ProviderSession
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.runtime import RuntimeBase, create_runtime
 from boxman.task_runner import TaskRunner
 from boxman.utils.io import write_files
 from boxman.utils.jinja_env import create_jinja_env
 from boxman.utils.references import resolve_reference
-
+from boxman.utils.shell import run
 
 #: Seconds to wait for a finished child's queue message before declaring its
 #: result missing (the child has already joined, so any wait here is just
@@ -1405,7 +1404,7 @@ class BoxmanManager:
 
         # cluster-level files → written to cluster workdir
         clusters = self.config['clusters']
-        for cluster_name, cluster in clusters.items():
+        for _cluster_name, cluster in clusters.items():
             if files := cluster.get('files'):
                 write_files(files, rootdir=cluster['workdir'])
             wd = cluster.get('workdir')
@@ -1433,7 +1432,7 @@ class BoxmanManager:
                 self._remove_files(ws_files, rootdir=workspace_path)
 
         clusters = self.config['clusters']
-        for cluster_name, cluster in clusters.items():
+        for _cluster_name, cluster in clusters.items():
             base_path = workspace_path or cluster.get('workdir', '')
             base_path = os.path.expanduser(base_path)
 
@@ -1894,7 +1893,7 @@ class BoxmanManager:
                 if not result.ok:
                     raise PermissionError(
                         f"failed to create directory '{path}' even with sudo"
-                    )
+                    ) from None
                 # fall through to chown below
 
         # Two failure modes to repair here:
@@ -2394,11 +2393,11 @@ class BoxmanManager:
 
         # collect which templates are referenced by clusters or individual VMs
         needed_template_keys: set = set()
-        for cluster_name, cluster in self.config.get('clusters', {}).items():
+        for _cluster_name, cluster in self.config.get('clusters', {}).items():
             base_image = cluster.get('base_image', '')
             if base_image in tpl_name_to_key:
                 needed_template_keys.add(tpl_name_to_key[base_image])
-            for vm_name, vm_info in cluster.get('vms', {}).items():
+            for _vm_name, vm_info in cluster.get('vms', {}).items():
                 vm_base = vm_info.get('base_image', '')
                 if vm_base and vm_base in tpl_name_to_key:
                     needed_template_keys.add(tpl_name_to_key[vm_base])
@@ -2530,18 +2529,18 @@ class BoxmanManager:
 
         # ANSI helpers
         if use_color and pretty:
-            BOLD = "\033[1m"
-            CYAN = "\033[1;36m"
-            GREEN = "\033[1;32m"
-            YELLOW = "\033[1;33m"
-            DIM = "\033[2m"
-            RESET = "\033[0m"
+            bold = "\033[1m"
+            cyan = "\033[1;36m"
+            green = "\033[1;32m"
+            yellow = "\033[1;33m"
+            dim = "\033[2m"
+            reset = "\033[0m"
         else:
-            BOLD = CYAN = GREEN = YELLOW = DIM = RESET = ""
+            bold = cyan = green = yellow = dim = reset = ""
 
         if not projects:
             if pretty:
-                print(f"{YELLOW}No projects registered.{RESET}")
+                print(f"{yellow}No projects registered.{reset}")
             else:
                 cls.logger.info("No projects registered.")
             return
@@ -2582,7 +2581,7 @@ class BoxmanManager:
                     parts.append(cell.ljust(col_widths[i]))
                 line = "  ".join(parts)
                 if bold:
-                    return f"{BOLD}{line}{RESET}"
+                    return f"{bold}{line}{reset}"
                 return line
 
             print()
@@ -2594,24 +2593,24 @@ class BoxmanManager:
 
         elif pretty == 'plain':
             print()
-            print(f"{BOLD}Registered projects:{RESET}")
+            print(f"{bold}Registered projects:{reset}")
             print()
             for proj_name, proj_info in projects.items():
-                print(f"  {CYAN}{proj_name}{RESET}")
+                print(f"  {cyan}{proj_name}{reset}")
                 if isinstance(proj_info, dict):
                     conf = proj_info.get('conf', 'n/a')
                     runtime = proj_info.get('runtime', 'n/a')
-                    print(f"    {DIM}config:{RESET}  {conf}")
-                    print(f"    {DIM}runtime:{RESET} {runtime}")
+                    print(f"    {dim}config:{reset}  {conf}")
+                    print(f"    {dim}runtime:{reset} {runtime}")
 
                     networks = proj_info.get('networks', {})
                     if networks:
-                        print(f"    {DIM}networks:{RESET}")
+                        print(f"    {dim}networks:{reset}")
                         for net_name, net_info in networks.items():
                             ip = net_info.get('ip_address', 'n/a') if isinstance(net_info, dict) else 'n/a'
                             bridge = net_info.get('bridge_name', 'n/a') if isinstance(net_info, dict) else 'n/a'
-                            print(f"      {GREEN}-{RESET} {net_name}")
-                            print(f"          {DIM}ip:{RESET} {ip}  {DIM}bridge:{RESET} {bridge}")
+                            print(f"      {green}-{reset} {net_name}")
+                            print(f"          {dim}ip:{reset} {ip}  {dim}bridge:{reset} {bridge}")
                 else:
                     print(f"    {proj_info}")
                 print()
@@ -3783,7 +3782,7 @@ class BoxmanManager:
 
                 try:
                     cmd = f'ssh-keygen -t ed25519 -a 100 -f {admin_priv_key} -q -N ""'
-                    result = run(cmd, hide=True, warn=True)
+                    run(cmd, hide=True, warn=True)
 
                     # verify keys were created
                     if os.path.isfile(admin_priv_key) and os.path.isfile(admin_pub_key):

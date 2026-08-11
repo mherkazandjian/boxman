@@ -14,7 +14,6 @@ import pytest
 from boxman.manager import BoxmanManager
 from boxman.scripts.app import main, parse_args
 
-
 pytestmark = pytest.mark.smoke
 
 

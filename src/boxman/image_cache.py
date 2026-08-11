@@ -114,7 +114,7 @@ class ImageCache:
         try:
             h = hashlib.new(algorithm)
         except ValueError:
-            raise ValueError(f"unknown checksum algorithm: '{algorithm}'")
+            raise ValueError(f"unknown checksum algorithm: '{algorithm}'") from None
 
         log.info(f"computing {algorithm} checksum of {file_path} ...")
         with open(file_path, "rb") as fobj:

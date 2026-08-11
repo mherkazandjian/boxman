@@ -12,7 +12,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 CATEGORIES = [
     "code", "tests", "docs", "conf", "templates",
     "boxes", "shell", "docker", "make", "claude", "other",

@@ -18,7 +18,6 @@ import boxman
 from boxman.manager import BoxmanManager
 from boxman.providers import PROVIDERS
 
-
 #: Default snapshot name — current UTC timestamp formatted for display.
 #: Evaluated at module-import time (same semantics as the original
 #: module-level constant in app.py).

@@ -3,19 +3,15 @@ Tests for boxman.utils.env_loader and boxman.task_runner.
 """
 
 import os
-import stat
-import subprocess
-import textwrap
 import types
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from boxman.exceptions import BoxmanError, ConfigError
-from boxman.utils.env_loader import source_env_file, load_workspace_env
-from boxman.task_runner import TaskRunner
 from boxman.manager import BoxmanManager
-
+from boxman.task_runner import TaskRunner
+from boxman.utils.env_loader import load_workspace_env, source_env_file
 
 # ---------------------------------------------------------------------------
 # env_loader tests
@@ -291,10 +287,9 @@ class TestTaskRunner:
         assert out_file.read_text().strip() == "test_inventory"
 
     def test_run_task_with_extra_args(self, basic_config, tmp_path):
-        out_file = tmp_path / "args_out.txt"
         basic_config["tasks"]["echo_args"] = {
             "description": "echo args",
-            "command": f"echo",
+            "command": "echo",
         }
         runner = TaskRunner(basic_config)
         exit_code = runner.run("echo_args", extra_args=["hello", "world"])

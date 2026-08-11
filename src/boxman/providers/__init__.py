@@ -13,35 +13,36 @@ dependencies of every other provider.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from boxman.abstract.providers import ProviderSession
 
 
-def _libvirt_session(config: dict[str, Any]) -> "ProviderSession":
+def _libvirt_session(config: dict[str, Any]) -> ProviderSession:
     from boxman.providers.libvirt.session import LibVirtSession
     return LibVirtSession(config)
 
 
-def _virtualbox_session(config: dict[str, Any]) -> "ProviderSession":
+def _virtualbox_session(config: dict[str, Any]) -> ProviderSession:
     from boxman.providers.virtualbox.session import VirtualBoxSession
     return VirtualBoxSession(config)
 
 
-def _docker_compose_session(config: dict[str, Any]) -> "ProviderSession":
+def _docker_compose_session(config: dict[str, Any]) -> ProviderSession:
     from boxman.providers.docker_compose.session import DockerComposeSession
     return DockerComposeSession(config)
 
 
 #: provider-type name -> factory producing a live session for that provider
-PROVIDERS: dict[str, Callable[[dict[str, Any]], "ProviderSession"]] = {
+PROVIDERS: dict[str, Callable[[dict[str, Any]], ProviderSession]] = {
     'libvirt': _libvirt_session,
     'virtualbox': _virtualbox_session,
     'docker-compose': _docker_compose_session,
 }
 
 
-def create_session(provider_type: str, config: dict[str, Any]) -> "ProviderSession":
+def create_session(provider_type: str, config: dict[str, Any]) -> ProviderSession:
     """
     Create a live session for *provider_type* from *config*.
 

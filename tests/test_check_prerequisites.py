@@ -477,7 +477,7 @@ def test_forwarding_verdict_bridge_match_is_not_a_substring():
 # --------------------------------------------------------------------------- #
 # disruptive fixes are never applied unattended                               #
 # --------------------------------------------------------------------------- #
-class _Opts(object):
+class _Opts:
     def __init__(self, yes=True, check_only=False):
         self.yes = yes
         self.check_only = check_only
@@ -710,17 +710,17 @@ def test_core_stack_covers_exactly_the_imperative_families():
 
 @pytest.mark.parametrize("family", ALL_FAMILIES)
 def test_seed_pkg_has_a_column_for_every_family(family):
-    assert family in checker._SEED_PKG, "missing _SEED_PKG column: %s" % family
-    assert checker._SEED_PKG[family], "empty _SEED_PKG entry: %s" % family
+    assert family in checker._SEED_PKG, f"missing _SEED_PKG column: {family}"
+    assert checker._SEED_PKG[family], f"empty _SEED_PKG entry: {family}"
 
 
 @pytest.mark.parametrize("tool", sorted(checker._TOOL_PKG))
 @pytest.mark.parametrize("family", ALL_FAMILIES)
 def test_tool_pkg_has_a_column_for_every_family(tool, family):
     assert family in checker._TOOL_PKG[tool], \
-        "missing _TOOL_PKG[%r] column: %s" % (tool, family)
+        f"missing _TOOL_PKG[{tool!r}] column: {family}"
     assert checker._TOOL_PKG[tool][family], \
-        "empty _TOOL_PKG[%r] entry: %s" % (tool, family)
+        f"empty _TOOL_PKG[{tool!r}] entry: {family}"
 
 
 # --------------------------------------------------------------------------- #

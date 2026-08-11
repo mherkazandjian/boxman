@@ -6,6 +6,7 @@ Requires Docker with compose v2 and /dev/kvm on the host.
 
 import os
 import time
+
 import invoke
 import pytest
 
@@ -44,7 +45,7 @@ class TestDockerCompose:
         """SSH into the container and run a simple command."""
         max_attempts = 5
         last_err = None
-        for attempt in range(1, max_attempts + 1):
+        for _attempt in range(1, max_attempts + 1):
             result = _run('make ssh cmd="echo ok"', warn=True)
             if result.ok and "ok" in result.stdout:
                 return  # success

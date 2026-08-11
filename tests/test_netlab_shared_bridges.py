@@ -15,7 +15,6 @@ import pytest
 from boxman.exceptions import ConfigError
 from boxman.netlab import shared_bridges
 
-
 pytestmark = pytest.mark.unit
 
 

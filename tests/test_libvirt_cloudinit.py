@@ -21,9 +21,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from boxman.providers.libvirt.cloudinit import (
-    CloudInitTemplate, DEFAULT_USER_DATA, DEFAULT_META_DATA, DEFAULT_DONE_MARKER,
+    DEFAULT_DONE_MARKER,
+    DEFAULT_META_DATA,
+    DEFAULT_USER_DATA,
+    CloudInitTemplate,
 )
-
 
 pytestmark = pytest.mark.unit
 

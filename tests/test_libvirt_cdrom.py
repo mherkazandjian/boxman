@@ -14,7 +14,6 @@ import pytest
 
 from boxman.providers.libvirt.cdrom import CDROMManager
 
-
 pytestmark = pytest.mark.unit
 
 

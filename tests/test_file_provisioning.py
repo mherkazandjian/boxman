@@ -3,15 +3,13 @@ Tests for file provisioning, deprovision (removal), env.sh skip behaviour,
 and extra_args_mode in TaskRunner.
 """
 
-import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.utils.io import write_files
 from boxman.manager import BoxmanManager
 from boxman.task_runner import TaskRunner
-
+from boxman.utils.io import write_files
 
 # ---------------------------------------------------------------------------
 # write_files: env.sh skip behaviour

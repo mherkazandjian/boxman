@@ -25,7 +25,6 @@ from boxman.providers.libvirt.oci_pull import (
     pull_oci_image,
 )
 
-
 pytestmark = pytest.mark.unit
 
 # Embedded containerDisk disks are validated as qcow2 by content, so fake disks
@@ -685,6 +684,7 @@ class TestOciCacheUrl:
     def test_distinct_registries_same_tail_do_not_collide(self):
         import os
         from urllib.parse import urlparse
+
         from boxman.providers.libvirt.cloudinit import CloudInitTemplate
 
         a = CloudInitTemplate._oci_cache_url("oci://regA/team1/ubuntu:latest")

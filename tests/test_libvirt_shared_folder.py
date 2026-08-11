@@ -14,7 +14,6 @@ import pytest
 
 from boxman.providers.libvirt.shared_folder import SharedFolderManager
 
-
 pytestmark = pytest.mark.unit
 
 

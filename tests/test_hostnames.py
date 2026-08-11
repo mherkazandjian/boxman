@@ -11,7 +11,6 @@ import pytest
 
 from boxman.utils.hostnames import expand_name_range
 
-
 pytestmark = pytest.mark.unit
 
 

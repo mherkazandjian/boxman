@@ -10,7 +10,6 @@ unittest.TestCase → pytest style.
 from __future__ import annotations
 
 import os
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,7 +18,6 @@ import pytest
 
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.oci_push import push_oci_image
-
 
 pytestmark = pytest.mark.unit
 

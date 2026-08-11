@@ -20,7 +20,6 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,7 +27,6 @@ import pytest
 
 from boxman.manager import BoxmanManager
 from boxman.providers import merge_provider_configs
-
 
 pytestmark = pytest.mark.unit
 
@@ -86,10 +84,10 @@ class TestMergeProviderConfigs:
 
     def test_does_not_mutate_inputs(self):
         g = {"sudo_skip_commands": ["ls"]}
-        l = {"sudo_skip_commands": ["cat"]}
-        merge_provider_configs(g, l)
+        local = {"sudo_skip_commands": ["cat"]}
+        merge_provider_configs(g, local)
         assert g == {"sudo_skip_commands": ["ls"]}
-        assert l == {"sudo_skip_commands": ["cat"]}
+        assert local == {"sudo_skip_commands": ["cat"]}
 
 
 class TestCanonicalRuntimeName:
@@ -289,7 +287,8 @@ class TestCheckTemplatesForClusters:
 
     @staticmethod
     def _mgr_with_template(tmp_path: Path):
-        from unittest.mock import MagicMock, patch as _patch
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
         with _patch("boxman.manager.BoxmanCache"):
             m = BoxmanManager()
         m.config = {
@@ -433,7 +432,8 @@ class TestCloneAndConfigureNewVmsExitCodeGuard:
         return proc
 
     def _mgr_with_one_vm(self, tmp_path: Path):
-        from unittest.mock import MagicMock, patch as _patch
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
         with _patch("boxman.manager.BoxmanCache"):
             m = BoxmanManager()
         m.config = {

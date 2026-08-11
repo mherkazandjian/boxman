@@ -3,13 +3,14 @@ Tests for boxman.runtime – runtime factory, wrapping, and config injection.
 """
 
 import shlex
+from unittest.mock import MagicMock, patch
 
 import pytest
-from unittest.mock import patch, MagicMock
+
 from boxman.exceptions import BoxmanError, ConfigError
 from boxman.runtime import create_runtime
-from boxman.runtime.local import LocalRuntime
 from boxman.runtime.docker_compose import DockerComposeRuntime
+from boxman.runtime.local import LocalRuntime
 
 
 class TestCreateRuntime:
@@ -1084,9 +1085,10 @@ class TestDockerComposeRuntimeBridgeConflict:
     def test_cache_filtering_by_runtime(self):
         """Projects registered under a different runtime should be ignored
         during conflict checks."""
+        from unittest.mock import MagicMock, patch
+
         from boxman.manager import BoxmanManager
         from boxman.providers.libvirt.net import Network
-        from unittest.mock import MagicMock, patch
 
         mgr = BoxmanManager()
         mgr._runtime_name = 'docker-compose'
@@ -1123,9 +1125,10 @@ class TestDockerComposeRuntimeBridgeConflict:
 
     def test_cache_conflict_same_runtime(self):
         """Projects in the same runtime SHOULD trigger conflicts."""
+        from unittest.mock import MagicMock, patch
+
         from boxman.manager import BoxmanManager
         from boxman.providers.libvirt.net import Network
-        from unittest.mock import MagicMock, patch
 
         mgr = BoxmanManager()
         mgr._runtime_name = 'docker-compose'

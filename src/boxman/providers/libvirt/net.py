@@ -2,7 +2,6 @@ import ipaddress
 import os
 import re
 import shlex
-import sys
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
@@ -676,7 +675,7 @@ class Network(VirshCommand):
             for project, project_conflicts in conflicts.items():
                 if 'networks' in project_conflicts:
                     for net_name, net_conflicts in project_conflicts['networks'].items():
-                        for conflict_type, conflict_msg in net_conflicts.items():
+                        for _conflict_type, conflict_msg in net_conflicts.items():
                             self.logger.error(f"{conflict_msg} (project: {project}, network: {net_name})")
 
             msg = f"found {n_conflicts} conflicts for network {self.name} in project {self.manager.config['project']}"

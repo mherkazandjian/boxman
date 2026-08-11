@@ -23,7 +23,6 @@ import pytest
 import boxman.metadata
 from boxman.scripts.app import main, parse_args
 
-
 pytestmark = pytest.mark.smoke
 
 
@@ -153,6 +152,7 @@ class TestStorageDispatch:
 
     def test_storage_compact_rejects_bad_method(self):
         import pytest as _pytest
+
         from boxman.scripts.app import parse_args
         parser = parse_args()
         with _pytest.raises(SystemExit):
@@ -228,6 +228,7 @@ class TestStorageDispatch:
 
     def test_snapshot_collapse_requires_to(self):
         import pytest as _pytest
+
         from boxman.scripts.app import parse_args
         parser = parse_args()
         with _pytest.raises(SystemExit):
