@@ -15,6 +15,8 @@ import os
 
 from jinja2 import Environment, FileSystemLoader
 
+from boxman.exceptions import ConfigError
+
 
 def env(var_name: str, default: str = "") -> str:
     """
@@ -29,12 +31,13 @@ def env_required(var_name: str, message: str = None) -> str:
     """
     Return the value of environment variable *var_name*.
 
-    Raises ``ValueError`` if the variable is not set or is empty.
+    Raises :class:`~boxman.exceptions.ConfigError` if the variable is not
+    set or is empty.
     """
     value = os.environ.get(var_name)
     if not value:
         msg = message or f"required environment variable '{var_name}' is not set"
-        raise ValueError(msg)
+        raise ConfigError(msg)
     return value
 
 

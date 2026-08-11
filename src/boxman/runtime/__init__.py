@@ -6,6 +6,7 @@ A *runtime* controls **where** provider commands are executed:
   - ``docker``         – inside a boxman docker-compose container
 """
 
+from boxman.exceptions import ConfigError
 from boxman.runtime.base import RuntimeBase
 from boxman.runtime.docker_compose import DockerComposeRuntime
 from boxman.runtime.local import LocalRuntime
@@ -23,7 +24,7 @@ def create_runtime(name: str, **kwargs) -> RuntimeBase:
         A RuntimeBase subclass instance.
 
     Raises:
-        ValueError: If the runtime name is unknown.
+        ConfigError: If the runtime name is unknown.
     """
     runtimes = {
         "local": LocalRuntime,
@@ -31,7 +32,7 @@ def create_runtime(name: str, **kwargs) -> RuntimeBase:
         "docker-compose": DockerComposeRuntime,
     }
     if name not in runtimes:
-        raise ValueError(
+        raise ConfigError(
             f"unknown runtime '{name}', supported: {', '.join(runtimes)}"
         )
     return runtimes[name](**kwargs)

@@ -4,6 +4,7 @@ Tests for boxman.runtime – runtime factory, wrapping, and config injection.
 
 import pytest
 from unittest.mock import patch, MagicMock
+from boxman.exceptions import BoxmanError, ConfigError
 from boxman.runtime import create_runtime
 from boxman.runtime.local import LocalRuntime
 from boxman.runtime.docker_compose import DockerComposeRuntime
@@ -22,7 +23,12 @@ class TestCreateRuntime:
         assert rt.name == "docker-compose"
 
     def test_unknown_raises(self):
-        with pytest.raises(ValueError, match="unknown runtime"):
+        with pytest.raises(ConfigError, match="unknown runtime"):
+            create_runtime("aws-magic")
+
+    def test_unknown_raises_boxman_error(self):
+        """app.py maps BoxmanError → log.error + exit 2 (no traceback)."""
+        with pytest.raises(BoxmanError):
             create_runtime("aws-magic")
 
 
