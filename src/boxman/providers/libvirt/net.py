@@ -754,30 +754,6 @@ class Network(VirshCommand):
             self.logger.error(f"Error defining network: {exc}")
             return False
 
-    def define_and_start(self,
-                        file_path: str | None = None,
-                        autostart: bool = True) -> bool:
-        """
-        Define and start the network in one operation.
-
-        Args:
-            file_path: Path to write the XML file
-            autostart: Whether to set the network to autostart
-
-        Returns:
-            True if all operations were successful, False otherwise
-        """
-        if not self.define_network(file_path):
-            return False
-
-        if not self.start_network():
-            return False
-
-        if autostart and not self.autostart_network():
-            return False
-
-        return True
-
     def destroy_network(self) -> bool:
         """
         Destroy (stop) the network.

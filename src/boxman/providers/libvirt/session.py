@@ -460,31 +460,14 @@ class LibVirtSession:
         Destroy a network.
 
         Args:
-            cluster_name: Name of the cluster
-            network_name: Name of the network
+            name: Name of the network
+            info: the network block from the configuration
 
         Returns:
             True if successful, False otherwise
         """
         network = Network(name=name, info=info)
         status = network.destroy_network()
-        return status
-
-    def undefine_network(self,
-                         name: str = None,
-                         info: dict[str, Any] | None = None) -> bool:
-        """
-        Undefine a network.
-
-        Args:
-            cluster_name: Name of the cluster
-            network_name: Name of the network
-
-        Returns:
-            True if successful, False otherwise
-        """
-        network = Network(name=name, info=info)
-        status = network.undefine_network()
         return status
 
     def remove_network(self,

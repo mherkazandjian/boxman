@@ -6,14 +6,11 @@ import os
 import shutil
 import sys
 from argparse import RawTextHelpFormatter
-from datetime import datetime, timezone
-from multiprocessing import Process
 
 import yaml
 
 import boxman
 from boxman import log
-from boxman.abstract.providers import ProviderSession as Session
 from boxman.exceptions import BoxmanError, ConfigError
 from boxman.manager import BoxmanManager
 from boxman.providers import create_session, merge_provider_configs, primary_provider_type
@@ -21,9 +18,6 @@ from boxman.providers.libvirt.import_image import ImageImporter
 from boxman.loggers.logger import set_quiet, set_verbosity, suppressed
 from boxman.scripts.cli_parser import parse_args, resolve_verbosity
 from boxman.utils.jinja_env import create_jinja_env
-
-now = datetime.now(timezone.utc)
-snap_name = now.strftime('%Y-%m-%dT%H:%M:%S')
 
 
 def ensure_virtualbox_runtime_is_local(runtime: str) -> None:
@@ -46,136 +40,6 @@ def ensure_virtualbox_runtime_is_local(runtime: str) -> None:
             f"but the resolved runtime is '{runtime}'. Remove the --runtime "
             f"flag / the 'runtime:' setting in boxman.yml, or set it to 'local'."
         )
-
-
-def parse_vms_list(session: Session, cli_args):
-    """
-    Parse the list of vms, either "all" vms or a comma-separated list
-
-    When 'all' is specified, all the vms from the session configurations
-    are used.
-
-    :param session: The instance of a session
-    """
-    vms = []
-    if cli_args.vms == 'all':
-        for cluster in session.conf['clusters']:
-            for vm in session.conf['clusters'][cluster]['vms']:
-                vms.append(vm)
-    else:
-        vms.extend(cli_args.vms.split(','))
-
-    return vms
-
-
-def snapshot_take(session, cli_args):
-    """
-    Take a snapshot of the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _take(vm):
-        session.snapshot.take(
-            vm,
-            snap_name=cli_args.snapshot_name,
-            live=cli_args.live)
-    processes = [Process(target=_take, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-    #_ = [_take(vm) for vm in vms]
-
-
-def snapshot_list(session, cli_args):
-    vms = parse_vms_list(session, cli_args)
-    for vm in vms:
-        session.snapshot.list(vm)
-
-
-def snapshot_delete(session, cli_args):
-    vms = parse_vms_list(session, cli_args)
-    for vm in vms:
-        session.snapshot.delete(
-            vm,
-            snap_name=cli_args.snapshot_name)
-
-
-def snapshot_restore(session, cli_args):
-    """
-    Restore a snapshot of the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _restore(vm):
-        session.snapshot.restore(
-            vm,
-            snap_name=cli_args.snapshot_name)
-    processes = [Process(target=_restore, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-
-
-def machine_suspend(session, cli_args):
-    """
-    Suspend the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _suspend(vm):
-        session.suspend(vm)
-    processes = [Process(target=_suspend, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-
-
-def machine_resume(session, cli_args):
-    """
-    Resume the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _resume(vm):
-        session.resume(vm)
-    processes = [Process(target=_resume, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-
-
-def machine_save(session, cli_args):
-    """
-    Save the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _save(vm):
-        session.savestate(vm)
-    processes = [Process(target=_save, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-
-
-def machine_start(session, cli_args):
-    """
-    Start the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _start(vm):
-        session.startvm(vm)
-    processes = [Process(target=_start, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
 
 
 def _default_boxman_config() -> dict:

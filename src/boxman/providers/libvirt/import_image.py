@@ -26,17 +26,6 @@ SUPPORTED_PROVIDERS = ("libvirt",)
 REQUIRED_MANIFEST_KEYS = ("xml_path", "image_path", "provider")
 
 
-class ImageDownloaderUtils:
-    """
-    Class that provides utility functions for the ImageImporter such as downloading
-    the package from various sources. move this to a separate module.
-    For the time being just put the .zip on google drive, and add instructions on how to
-    download and extract it using one liners and then point to the extracted location.
-    for the command line to import it.
-    """
-    pass
-
-
 class ImageImporter:
     """
     A class to import and initialize VM images from URLs or local files.
