@@ -318,6 +318,11 @@ def main():
     (:class:`~boxman.exceptions.ProvisionError`) or a missing docker/compose
     plugin (:class:`~boxman.exceptions.RuntimeUnavailable`). All other flow
     (including the ``sys.exit()`` calls throughout) lives in :func:`_main`.
+
+    Also translates the virtualbox provider's ``NotImplementedError`` stubs
+    into a clean exit 2: the provider is registered but Phase 1 (config
+    surface only, non-functional), so without this every operation would die
+    with a raw traceback mid-flow.
     """
     try:
         _main()
@@ -328,6 +333,18 @@ def main():
         # it is not swallowed (exit 2 with empty output).
         logging.getLogger('boxman').setLevel(logging.ERROR)
         log.error(str(exc))
+        sys.exit(2)
+    except NotImplementedError as exc:
+        if not str(exc).startswith("VirtualBox provider:"):
+            raise
+        # The virtualbox provider is registered but Phase 1 (config surface
+        # only, non-functional): every operation stub raises
+        # NotImplementedError. Translate it into a clear message instead of
+        # a raw traceback mid-flow.
+        logging.getLogger('boxman').setLevel(logging.ERROR)
+        log.error(
+            f"{exc} — the virtualbox provider is Phase 1 "
+            "(config surface only, non-functional)")
         sys.exit(2)
 
 
