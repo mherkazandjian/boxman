@@ -2563,7 +2563,15 @@ class BoxmanManager:
         if netlab is None:
             return
         netlab.preflight()
-        source_root = os.path.dirname(self.config_path) if self.config_path else None
+        # Resolve startup-config templates relative to the *config file's*
+        # directory. abspath() is required: run the documented way
+        # (`cd boxes/<box> && boxman up`), config_path is the bare relative
+        # default "conf.yml", so os.path.dirname() would return "" — which
+        # render_topology treats as "unset" and falls back to the workspace
+        # dir, where configs/ does not exist (FileNotFoundError on sw1's
+        # startup-config).
+        source_root = (os.path.dirname(os.path.abspath(self.config_path))
+                       if self.config_path else None)
         netlab.render_topology(source_root=source_root)
         netlab.deploy()
 
@@ -2598,8 +2606,11 @@ class BoxmanManager:
             return
         netlab.preflight()
         # Render the topology so ensure_up has a .clab.yml to deploy from
-        # if the lab is missing entirely.
-        source_root = os.path.dirname(self.config_path) if self.config_path else None
+        # if the lab is missing entirely. abspath() so a bare relative
+        # --conf (the default "conf.yml") resolves to the box directory
+        # rather than "" — see deploy_netlab() for the full rationale.
+        source_root = (os.path.dirname(os.path.abspath(self.config_path))
+                       if self.config_path else None)
         netlab.render_topology(source_root=source_root)
         netlab.ensure_up()
 
