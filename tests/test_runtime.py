@@ -356,6 +356,61 @@ class TestDockerComposeRuntime:
             assert (local_dir / "Dockerfile").read_text() == "FROM scratch\n"
             assert marker.is_file()
 
+    def test_redeploy_removes_files_dropped_from_source(self, tmp_path):
+        """A file removed from the package's bundled assets must not
+        linger in the deployed copy after a redeploy."""
+        rt, asset_dir, project_dir = self._make_bundled_project(tmp_path)
+        (asset_dir / "entrypoint.sh").write_text("#!/bin/bash\n")
+        with patch.object(
+            rt, "_find_asset_source_dir", return_value=str(asset_dir)
+        ):
+            rt._deploy_bundled_assets()
+            local_dir = project_dir / ".boxman" / "runtime" / "docker"
+            assert (local_dir / "entrypoint.sh").is_file()
+
+            # package drops entrypoint.sh and changes the Dockerfile
+            (asset_dir / "entrypoint.sh").unlink()
+            (asset_dir / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+            rt._deploy_bundled_assets()
+
+            assert not (local_dir / "entrypoint.sh").exists()
+            assert (local_dir / "Dockerfile").read_text() == "FROM ubuntu:24.04\n"
+
+    def test_redeploy_preserves_runtime_state(self, tmp_path):
+        """data/ and .env in the deployed dir are runtime state and must
+        survive a redeploy."""
+        rt, asset_dir, project_dir = self._make_bundled_project(tmp_path)
+        with patch.object(
+            rt, "_find_asset_source_dir", return_value=str(asset_dir)
+        ):
+            rt._deploy_bundled_assets()
+            local_dir = project_dir / ".boxman" / "runtime" / "docker"
+            (local_dir / "data").mkdir()
+            (local_dir / "data" / "state.txt").write_text("keep me\n")
+            (local_dir / ".env").write_text("BOXMAN_FOO=bar\n")
+
+            (asset_dir / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+            rt._deploy_bundled_assets()
+
+            assert (local_dir / "data" / "state.txt").read_text() == "keep me\n"
+            assert (local_dir / ".env").read_text() == "BOXMAN_FOO=bar\n"
+
+    def test_fingerprint_ignores_excludes_at_any_depth(self, tmp_path):
+        """data/ and .env are excluded from the fingerprint everywhere,
+        matching the copytree ignore semantics."""
+        rt, asset_dir, _ = self._make_bundled_project(tmp_path)
+        nested = asset_dir / "conf"
+        nested.mkdir()
+        (nested / "settings.yml").write_text("a: 1\n")
+
+        before = rt._assets_fingerprint(str(asset_dir))
+        (nested / ".env").write_text("SECRET=1\n")
+        (nested / "data").mkdir()
+        (nested / "data" / "state.bin").write_text("x\n")
+        after = rt._assets_fingerprint(str(asset_dir))
+
+        assert before == after
+
     def test_bundled_assets_not_found_falls_through(self, tmp_path, monkeypatch):
         """When bundled assets don't exist and no other source is configured,
         FileNotFoundError is raised."""

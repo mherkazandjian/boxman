@@ -7,6 +7,7 @@ When the bundled assets are used, they are copied to a ``.boxman/runtime/docker`
 directory next to the project's ``conf.yml``.
 """
 
+import hashlib
 import os
 import re
 import shutil
@@ -587,8 +588,11 @@ class DockerComposeRuntime(RuntimeBase):
         """
         Content fingerprint (sha256) of every deployable file under
         *source_dir*, covering relative paths and file contents.
+
+        Excludes ``_ASSET_DEPLOY_EXCLUDES`` at any depth — the same
+        semantics as ``shutil.copytree(ignore=ignore_patterns(...))``
+        used by the deploy step, so both always agree on the file set.
         """
-        import hashlib
         digest = hashlib.sha256()
         for root, dirs, files in os.walk(source_dir):
             dirs[:] = sorted(
@@ -598,9 +602,11 @@ class DockerComposeRuntime(RuntimeBase):
                     continue
                 path = os.path.join(root, name)
                 rel = os.path.relpath(path, source_dir)
-                digest.update(rel.encode())
+                # NUL separators keep (path, content) pairs unambiguous
+                digest.update(rel.encode() + b"\0")
                 with open(path, "rb") as fh:
                     digest.update(fh.read())
+                digest.update(b"\0")
         return digest.hexdigest()
 
     def _deploy_bundled_assets(self) -> str | None:
@@ -648,20 +654,28 @@ class DockerComposeRuntime(RuntimeBase):
             self.logger.info(
                 f"bundled runtime assets changed; redeploying to {local_dir}")
 
-        # copy all files from the source to the local runtime dir
+        # copy all files from the source to the local runtime dir.
+        # Deployed entries that no longer exist in the source are
+        # removed first (except runtime state) so stale files cannot
+        # linger while the fingerprint reports "in sync".
         self.logger.info(
             f"copying bundled docker assets from {source_dir} → {local_dir}")
         os.makedirs(local_dir, exist_ok=True)
 
-        for item in os.listdir(source_dir):
-            src = os.path.join(source_dir, item)
-            dst = os.path.join(local_dir, item)
-            if item in self._ASSET_DEPLOY_EXCLUDES:
+        keep = set(self._ASSET_DEPLOY_EXCLUDES) | {self._ASSET_FINGERPRINT_FILE}
+        for item in os.listdir(local_dir):
+            if item in keep:
                 continue
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
+            stale = os.path.join(local_dir, item)
+            if os.path.isdir(stale) and not os.path.islink(stale):
+                shutil.rmtree(stale)
             else:
-                shutil.copy2(src, dst)
+                os.remove(stale)
+
+        shutil.copytree(
+            source_dir, local_dir,
+            ignore=shutil.ignore_patterns(*self._ASSET_DEPLOY_EXCLUDES),
+            dirs_exist_ok=True)
 
         with open(fingerprint_path, "w") as fh:
             fh.write(self._assets_fingerprint(source_dir))
@@ -681,7 +695,6 @@ class DockerComposeRuntime(RuntimeBase):
         """
         if not instance_name or instance_name == "default":
             return 0
-        import hashlib
         digest = hashlib.md5(instance_name.encode()).hexdigest()
         return int(digest[:4], 16) % 1000
 

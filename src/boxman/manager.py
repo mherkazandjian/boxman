@@ -3388,8 +3388,9 @@ class BoxmanManager:
         dirs = set()
         if result.ok:
             for line in result.stdout.splitlines():
-                parts = line.split()
                 # domblklist --details columns: Type  Device  Target  Source
+                # maxsplit=3 so disk paths containing spaces survive
+                parts = line.split(None, 3)
                 if len(parts) >= 4 and parts[1] == 'disk' and parts[3] != '-':
                     dirs.add(os.path.dirname(parts[3]))
         if not dirs:

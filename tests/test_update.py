@@ -790,3 +790,56 @@ class TestDestroyRemovedVm:
             call('test-vm'),
             call('test-vm', force=True),
         ]
+
+    @patch('boxman.manager.VirshCommand')
+    def test_vm_disk_dirs_handles_paths_with_spaces(self, mock_virsh_cls):
+        """A disk path containing spaces must survive domblklist parsing."""
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(
+            ok=True,
+            stdout=(
+                " Type   Device   Target   Source\n"
+                "-------------------------------------------\n"
+                " file   disk     vda      /vm images/test-vm.qcow2\n"
+            )
+        )
+
+        dirs = mgr._vm_disk_dirs('test-vm')
+
+        assert dirs == ['/vm images']
+
+    @patch('boxman.manager.VirshCommand')
+    def test_vm_disk_dirs_fallback_when_no_disks(self, mock_virsh_cls):
+        """ok=True with zero disk rows (e.g. diskless VM) also falls back
+        to the configured workdirs."""
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(
+            ok=True, stdout=" Type   Device   Target   Source\n---\n")
+        mgr.collect_workdirs = MagicMock(return_value=['/fallback'])
+
+        dirs = mgr._vm_disk_dirs('test-vm')
+
+        assert dirs == ['/fallback']
+
+    @patch('boxman.manager.VirshCommand')
+    def test_destroy_removed_vm_queries_disks_before_undefining(
+            self, mock_virsh_cls):
+        """domblklist must run before destroy_vm — after the domain is
+        undefined the query returns nothing (ordering regression guard)."""
+        mgr = self._make_manager()
+        virsh = mock_virsh_cls.return_value
+        virsh.execute.return_value = MagicMock(
+            ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
+
+        parent = MagicMock()
+        parent.attach_mock(virsh.execute, 'virsh_execute')
+        parent.attach_mock(mgr.provider.destroy_vm, 'destroy_vm')
+
+        mgr._destroy_removed_vm('test-vm')
+
+        ordered = [c[0] for c in parent.mock_calls]
+        assert ordered == [
+            'virsh_execute', 'destroy_vm', 'destroy_vm']
+        # first destroy_vm is the graceful one, second is force=True
+        assert parent.mock_calls[1] == call.destroy_vm('test-vm')
+        assert parent.mock_calls[2] == call.destroy_vm('test-vm', force=True)
