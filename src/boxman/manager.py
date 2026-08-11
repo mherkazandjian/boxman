@@ -167,6 +167,21 @@ class BoxmanManager:
             self._sessions = {}
         return self._sessions
 
+    def _update_sessions_with_runtime(self) -> None:
+        """
+        Ensure every registered session's provider config carries the
+        runtime metadata (``runtime``, ``runtime_container``) so provider
+        commands are wrapped for the active runtime.
+
+        Call this at the start of every verb flow that drives provider
+        commands; without it a session built before the runtime was
+        resolved would run virsh on the local host instead of inside the
+        runtime container.
+        """
+        for _session in self._get_sessions().values():
+            if hasattr(_session, 'update_provider_config_with_runtime'):
+                _session.update_provider_config_with_runtime()
+
     def register_session(self, provider_type: str, session: "ProviderSession") -> None:
         """
         Register a live *session* for *provider_type*.
@@ -4270,9 +4285,7 @@ class BoxmanManager:
         # Ensure provider configs reflect runtime settings.
         # Project-level provider settings (from conf.yml) always take
         # precedence over app-level defaults (from boxman.yml).
-        for _session in cls._get_sessions().values():
-            if hasattr(_session, 'update_provider_config_with_runtime'):
-                _session.update_provider_config_with_runtime()
+        cls._update_sessions_with_runtime()
 
         # --- Pre-check: detect state that would block a clean provision ---
         # Block on either (a) live VMs from this project, or (b) a stale
@@ -4542,9 +4555,7 @@ class BoxmanManager:
         )
 
         # Ensure provider configs reflect runtime settings
-        for _session in cls._get_sessions().values():
-            if hasattr(_session, 'update_provider_config_with_runtime'):
-                _session.update_provider_config_with_runtime()
+        cls._update_sessions_with_runtime()
 
         # Shared bridges must exist before VMs attach to them on boot.
         cls.ensure_shared_bridges()
@@ -4650,9 +4661,7 @@ class BoxmanManager:
         ``boxman control save`` / ``boxman control suspend``.
         """
         # Ensure provider configs reflect runtime settings
-        for _session in cls._get_sessions().values():
-            if hasattr(_session, 'update_provider_config_with_runtime'):
-                _session.update_provider_config_with_runtime()
+        cls._update_sessions_with_runtime()
 
         vm_list = cls._control_vm_targets(cls, cli_args)
 
@@ -4702,9 +4711,7 @@ class BoxmanManager:
         # Ensure provider configs reflect runtime settings.
         # Project-level provider settings (from conf.yml) always take
         # precedence over app-level defaults (from boxman.yml).
-        for _session in cls._get_sessions().values():
-            if hasattr(_session, 'update_provider_config_with_runtime'):
-                _session.update_provider_config_with_runtime()
+        cls._update_sessions_with_runtime()
 
         # Tear down the containerlab lab first so its veths release any
         # shared bridges before we touch libvirt state.
@@ -5047,6 +5054,9 @@ class BoxmanManager:
         """
         List snapshots of the VMs and docker-compose clusters in the project.
         """
+        # Ensure provider configs reflect runtime settings
+        cls._update_sessions_with_runtime()
+
         for full_vm_name, cluster_name, _vm_name, _workdir in (
                 cls._select_vm_targets(cls, cli_args)):
             cls.session_for_cluster(cluster_name).snapshot_list(full_vm_name)
@@ -5260,6 +5270,9 @@ class BoxmanManager:
         Honours ``--cluster`` / ``--vms`` so a single cluster (or VM) can be
         snapshotted independently in a multi-cluster project.
         """
+        # Ensure provider configs reflect runtime settings
+        cls._update_sessions_with_runtime()
+
         # docker-compose clusters first (cluster-scoped, D3). Failures are
         # isolated per cluster so a dc cluster that isn't up can't stop the
         # VMs of a mixed project from being snapshotted.
@@ -5347,6 +5360,9 @@ class BoxmanManager:
         already recreated — a partial restore, despite the pre-validation
         contract above.
         """
+        # Ensure provider configs reflect runtime settings
+        cls._update_sessions_with_runtime()
+
         # ── 0. Resolve + validate docker-compose clusters (cluster-scoped,
         #      D3). Nothing is mutated here — the recreate happens in step 3
         #      once the VM snapshots have been validated too.
@@ -5480,6 +5496,9 @@ class BoxmanManager:
         Honours ``--cluster`` / ``--vms`` so a snapshot can be removed from a
         single cluster (or VM) in a multi-cluster project.
         """
+        # Ensure provider configs reflect runtime settings
+        cls._update_sessions_with_runtime()
+
         if not cli_args.snapshot_name:
             cls.logger.error("error: Snapshot name is required")
             return
@@ -5825,6 +5844,9 @@ class BoxmanManager:
         Suspend the machines: libvirt VMs → virsh suspend; docker-compose
         containers → ``docker compose pause``.
         """
+        # Ensure provider configs reflect runtime settings
+        cls._update_sessions_with_runtime()
+
         for vm_name, _ in cls._control_vm_targets(cls, cli_args):
             cls.session_for_vm(vm_name).suspend_vm(vm_name)
             cls.logger.info(f"vm {vm_name} suspended")
@@ -5837,6 +5859,9 @@ class BoxmanManager:
         Resume the machines: libvirt VMs → virsh resume; docker-compose
         containers → ``docker compose unpause``.
         """
+        # Ensure provider configs reflect runtime settings
+        cls._update_sessions_with_runtime()
+
         for vm_name, _ in cls._control_vm_targets(cls, cli_args):
             cls.session_for_vm(vm_name).resume_vm(vm_name)
             cls.logger.info(f"VM {vm_name} resumed")
@@ -5850,6 +5875,9 @@ class BoxmanManager:
         docker-compose containers (no save-to-file state) — an explanatory
         message is logged, no traceback.
         """
+        # Ensure provider configs reflect runtime settings
+        cls._update_sessions_with_runtime()
+
         for vm_name, workdir in cls._control_vm_targets(cls, cli_args):
             cls.session_for_vm(vm_name).save_vm(vm_name, workdir)
         for cluster_name, _cluster in cls._select_dc_clusters(cli_args):
@@ -5865,6 +5893,9 @@ class BoxmanManager:
         Start the machines: libvirt VMs (optionally --restore); docker-compose
         containers → ``docker compose start``.
         """
+        # Ensure provider configs reflect runtime settings
+        cls._update_sessions_with_runtime()
+
         for vm_name, workdir in cls._control_vm_targets(cls, cli_args):
             if cli_args.restore:
                 cls.session_for_vm(vm_name).restore_vm(vm_name, workdir)
@@ -6645,9 +6676,7 @@ class BoxmanManager:
         # Phase 1 (#49): the update/diff flow below stays on the default
         # session — it is deeply libvirt-shaped (VMStateDiffer, virsh
         # edits) and only libvirt clusters can exist until Phase 3 (#51).
-        for _session in cls._get_sessions().values():
-            if hasattr(_session, 'update_provider_config_with_runtime'):
-                _session.update_provider_config_with_runtime()
+        cls._update_sessions_with_runtime()
 
         # --- networks first ---
         # a new VM further down may be wired to a network that does not exist
