@@ -13,7 +13,7 @@ from jinja2 import Environment, FileSystemLoader
 from boxman import log
 
 from . import net_reconcile
-from .commands import LibVirtCommandBase, VirshCommand
+from .commands import VirshCommand
 
 
 class Network(VirshCommand):
@@ -736,12 +736,13 @@ class Network(VirshCommand):
             self.execute("net-start", self.name)
             self.execute("net-autostart", self.name)
 
-            # apply appropriate network configuration based on type
+            # apply appropriate network configuration based on type. NAT
+            # needs nothing from boxman: libvirtd installs the masquerade
+            # and FORWARD rules for <forward mode='nat'/> itself when the
+            # network starts (and removes them when it stops)
             if self.forward_mode == 'route':
                 self.apply_route_iptables_rule()
-            elif self.forward_mode == 'nat':
-                self.apply_nat_config()
-            else:
+            elif self.forward_mode != 'nat':
                 raise RuntimeError(f"Unsupported forward mode: {self.forward_mode}")
 
             return True
@@ -844,11 +845,12 @@ class Network(VirshCommand):
         if not self.undefine_network():
             return False
 
-        # remove iptables rules if any
+        # remove iptables rules if any. NAT needs no cleanup: the rules are
+        # libvirtd's own and go away with the network
         if self.forward_mode == 'route':
             return self.remove_route_iptables_rule()
         elif self.forward_mode == 'nat':
-            return self.remove_nat_config()
+            return True
         else:
             raise RuntimeError(f"Unsupported forward mode: {self.forward_mode}")
 
@@ -1001,22 +1003,24 @@ class Network(VirshCommand):
             br_name = self.bridge_name
             self.logger.info(f"removing route isolation rules for bridge {br_name}")
 
+            # no embedded 'sudo': execute_shell routes that decision through
+            # _should_use_sudo_for_command, so use_sudo: false is honoured
             if not self._ensure_rule(
                     self,
-                    f"sudo iptables -C FORWARD -i {br_name} -o {br_name} -j ACCEPT",
-                    f"sudo iptables -D FORWARD -i {br_name} -o {br_name} -j ACCEPT",
+                    f"iptables -C FORWARD -i {br_name} -o {br_name} -j ACCEPT",
+                    f"iptables -D FORWARD -i {br_name} -o {br_name} -j ACCEPT",
                     present=False):
                 return False
             if not self._ensure_rule(
                     self,
-                    f"sudo iptables -C INPUT  -i {br_name} -j DROP",
-                    f"sudo iptables -D INPUT  -i {br_name} -j DROP",
+                    f"iptables -C INPUT  -i {br_name} -j DROP",
+                    f"iptables -D INPUT  -i {br_name} -j DROP",
                     present=False):
                 return False
             if not self._ensure_rule(
                     self,
-                    f"sudo iptables -C OUTPUT -o {br_name} -j DROP",
-                    f"sudo iptables -D OUTPUT -o {br_name} -j DROP",
+                    f"iptables -C OUTPUT -o {br_name} -j DROP",
+                    f"iptables -D OUTPUT -o {br_name} -j DROP",
                     present=False):
                 return False
 
@@ -1025,79 +1029,6 @@ class Network(VirshCommand):
         except Exception as exc:
             self.logger.error(f"error removing route isolation rules: {exc}")
             return False
-
-    def remove_nat_config(self) -> bool:
-        """
-        Remove the forwarding and masquerade rules inserted by apply_nat_config.
-        """
-        if self.forward_mode != 'nat':
-            return True
-
-        status = True
-
-        def remove_ip_tables_rules():
-
-            if not self.bridge_name:
-                self.logger.warning("no bridge name found, cannot remove isolation rules")
-                return True
-
-            try:
-                # discover outgoing iface (same logic as insertion)
-                cmd_exec = LibVirtCommandBase(
-                    provider_config=self.provider_config,
-                    override_config_use_sudo=False)
-
-                cmd = "ip route get 8.8.8.8 | awk '{print $5}'"
-                res = cmd_exec.execute_shell(cmd, hide=True, warn=True)
-                out_iface = res.stdout.strip() if res.ok else ""
-                bridge_name = self.bridge_name
-
-                if out_iface:
-                    self._ensure_rule(
-                        self,
-                        f"sudo iptables -C FORWARD -i {out_iface} -o {bridge_name} -j ACCEPT",
-                        f"sudo iptables -D FORWARD -i {out_iface} -o {bridge_name} -j ACCEPT",
-                        present=False)
-                    self._ensure_rule(
-                        self,
-                        f"sudo iptables -C FORWARD -i {bridge_name} -o {out_iface} -j ACCEPT",
-                        f"sudo iptables -D FORWARD -i {bridge_name} -o {out_iface} -j ACCEPT",
-                        present=False)
-                else:
-                    self.logger.warning(
-                        "could not determine outgoing iface while cleaning nat rules")
-
-                return True
-            except Exception as exc:
-                self.logger.error(f"error removing NAT configuration for {self.name}: {exc}")
-                return False
-
-        status &= remove_ip_tables_rules()
-
-        def remove_iptables_nat_rules():
-            try:
-                # remove masquerade
-                import ipaddress
-                try:
-                    net_cidr = str(ipaddress.IPv4Interface(
-                        f"{self.ip_address}/{self.netmask}").network)
-                    self._ensure_rule(
-                        self,
-                        f"sudo iptables -t nat -C POSTROUTING -s {net_cidr} -j MASQUERADE",
-                        f"sudo iptables -t nat -D POSTROUTING -s {net_cidr} -j MASQUERADE",
-                        present=False)
-                except ValueError:
-                    self.logger.warning(
-                        "could not compute network cidr while cleaning masquerade rule")
-
-                return True
-            except Exception as exc:
-                self.logger.error(f"error removing NAT configuration for {self.name}: {exc}")
-                return False
-
-        status &= remove_iptables_nat_rules()
-
-        return status
 
     def apply_route_iptables_rule(self) -> bool:
         """
@@ -1119,21 +1050,23 @@ class Network(VirshCommand):
             self.logger.info(
                 f"configuring complete isolation for routed network with bridge {bridge_name}")
 
-            # 1. allow vm-to-vm communication on the same bridge
-            vm2vm_check = f"sudo iptables -C FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
-            vm2vm_cmd   = f"sudo iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
+            # 1. allow vm-to-vm communication on the same bridge. No embedded
+            # 'sudo' here or below: execute_shell routes that decision through
+            # _should_use_sudo_for_command, so use_sudo: false is honoured
+            vm2vm_check = f"iptables -C FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
+            vm2vm_cmd   = f"iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
             if not self._ensure_rule(self, vm2vm_check, vm2vm_cmd):
                 return False
 
             # 2. block all traffic from the VMs to the host
-            host2vm_check = f"sudo iptables -C INPUT -i {bridge_name} -j DROP"
-            host2vm_cmd   = f"sudo iptables -I INPUT -i {bridge_name} -j DROP"
+            host2vm_check = f"iptables -C INPUT -i {bridge_name} -j DROP"
+            host2vm_cmd   = f"iptables -I INPUT -i {bridge_name} -j DROP"
             if not self._ensure_rule(self, host2vm_check, host2vm_cmd):
                 return False
 
             # 3. block all traffic from host to the VMs
-            vm2host_check = f"sudo iptables -C OUTPUT -o {bridge_name} -j DROP"
-            vm2host_cmd   = f"sudo iptables -I OUTPUT -o {bridge_name} -j DROP"
+            vm2host_check = f"iptables -C OUTPUT -o {bridge_name} -j DROP"
+            vm2host_cmd   = f"iptables -I OUTPUT -o {bridge_name} -j DROP"
             if not self._ensure_rule(self, vm2host_check, vm2host_cmd):
                 return False
 
@@ -1142,82 +1075,6 @@ class Network(VirshCommand):
 
         except Exception as exc:
             self.logger.error(f"error applying route isolation rules: {exc}")
-            return False
-
-    def apply_nat_config(self) -> bool:
-        """
-        Apply nat configuration for networks with forward mode 'nat'.
-
-        This method:
-
-          - finds the outgoing interface (eth0, wlan0, etc.)
-          - gets the bridge name for this network
-          - allows forwarding between the bridge and outgoing interface
-          - enables ip masquerading for the network
-
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            # find the outgoing interface
-            cmd_executor = LibVirtCommandBase(
-                provider_config=self.provider_config,
-                override_config_use_sudo=False)
-
-            # get the outgoing interface using 'ip route'
-            # .. todo:: figure out how to get the default route interface in case the host
-            #           is not connected to the internet. This should work even if the host is not
-            #           connected to the internet.
-            cmd = "ip route get 8.8.8.8 | awk '{print $5}'"
-            result = cmd_executor.execute_shell(cmd, hide=True)
-            if not result.ok:
-                self.logger.error(f"failed to find outgoing interface: {result.stderr}")
-                return False
-
-            bridge = self.bridge_name
-
-            out_iface = result.stdout.strip()
-            if not out_iface:
-                self.logger.error("could not determine outgoing interface")
-                return False
-
-            self.logger.info(f"found outgoing interface: {out_iface}")
-
-            # bridge interface is already known (self.bridge_name)
-            self.logger.info(f"using bridge interface: {bridge}")
-
-            # allow forwarding between interfaces
-            fwd1_check = f"sudo iptables -C FORWARD -i {out_iface} -o {bridge} -j ACCEPT"
-            fwd1_cmd   = f"sudo iptables -I FORWARD -i {out_iface} -o {bridge} -j ACCEPT"
-            if not self._ensure_rule(self, fwd1_check, fwd1_cmd):
-                return False
-
-            fwd2_check = f"sudo iptables -C FORWARD -i {bridge} -o {out_iface} -j ACCEPT"
-            fwd2_cmd   = f"sudo iptables -I FORWARD -i {bridge} -o {out_iface} -j ACCEPT"
-            if not self._ensure_rule(self, fwd2_check, fwd2_cmd):
-                return False
-
-            # enable nat for the virtual network
-            if self.ip_address:
-                try:
-                    ip_interface = ipaddress.IPv4Interface(f"{self.ip_address}/{self.netmask}")
-                    network_cidr = str(ip_interface.network)
-
-                    masq_check = f"sudo iptables -t nat -C POSTROUTING -s {network_cidr} -j MASQUERADE"
-                    masq_cmd   = f"sudo iptables -t nat -A POSTROUTING -s {network_cidr} -j MASQUERADE"
-                    if not self._ensure_rule(self, masq_check, masq_cmd):
-                        return False
-
-                    self.logger.info(
-                        f"successfully configured nat for network {self.name} ({network_cidr})")
-                    return True
-
-                except ValueError as exc:
-                    self.logger.error(f"error calculating network cidr: {exc}")
-                    return False
-
-        except Exception as exc:
-            self.logger.error(f"error configuring NAT for network {self.name}: {exc}")
             return False
 
     @staticmethod
