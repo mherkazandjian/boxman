@@ -584,10 +584,16 @@ class BoxmanManager:
 
         workspace_path = (self.config.get("workspace", {}) or {}).get("path")
         workdir = workspace_path or os.path.dirname(self.config_path or ".") or "."
-        jinja_env = create_jinja_env(os.path.expanduser(workdir))
+        # The workdir must be absolute: containerlab resolves relative
+        # startup-config paths in the topology against the topology file's
+        # own directory, so a relative workdir would emit paths like
+        # ``netlab/configs/x.cfg`` that containerlab then looks up as
+        # ``netlab/netlab/configs/x.cfg``.
+        workdir = os.path.abspath(os.path.expanduser(workdir))
+        jinja_env = create_jinja_env(workdir)
         self._netlab = ContainerlabManager(
             lab_config=lab_config,
-            workdir=os.path.expanduser(workdir),
+            workdir=workdir,
             jinja_env=jinja_env,
         )
         return self._netlab
