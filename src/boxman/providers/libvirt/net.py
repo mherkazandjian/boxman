@@ -781,16 +781,19 @@ class Network(VirshCommand):
             True if successful, False otherwise
         """
         try:
-            # check if network exists first
-            result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
-            if result.return_code != 0:
+            # check if network exists first -- by exact name, not a grep
+            # substring ('prod' must not match 'prod-backup')
+            listed = self._listed_networks()
+            if listed is None:
+                self.logger.error(
+                    f"could not ask libvirt whether network {self.name} exists")
+                return False
+            if self.name not in listed:
                 self.logger.info(f"network {self.name} does not exist, nothing to destroy")
                 return True
 
-            # check if network is active
-            result = self.execute("net-list", "| grep -q " + self.name, warn=True)
-            if result.return_code == 0:
-                # the network is active, stop it
+            # destroy only when the network itself is active
+            if self.is_active():
                 self.execute("net-destroy", self.name)
                 self.logger.info(f"network {self.name} destroyed successfully")
 
@@ -807,9 +810,13 @@ class Network(VirshCommand):
             True if successful, False otherwise
         """
         try:
-            # check if network exists
-            result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
-            if result.return_code != 0:
+            # check if network exists (exact name match, as in destroy_network)
+            listed = self._listed_networks()
+            if listed is None:
+                self.logger.error(
+                    f"could not ask libvirt whether network {self.name} exists")
+                return False
+            if self.name not in listed:
                 self.logger.info(f"Network {self.name} does not exist, nothing to undefine")
                 return True
 
