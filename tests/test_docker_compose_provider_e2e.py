@@ -291,6 +291,15 @@ def hybrid_up():
     as an instance method is deprecated by pytest.
     """
     _boxman("destroy --auto-accept", cwd=HYBRID, warn=True)
+    # The template name is shared with other boxes (e.g.
+    # tiny-libvirt-ubuntu-24.04-cloudinit) via the default
+    # ~/boxman-templates workdir, and a full-suite run may have last built
+    # it with a different box's cloud-init (different admin password, no
+    # key injection path). Rebuild it from THIS box's config so the clone
+    # gets the right users — same pattern as test_provision_boxes.
+    result = _boxman("create-templates --force", cwd=HYBRID, warn=True)
+    assert result.ok, (
+        f"hybrid create-templates failed:\n{result.stdout}\n{result.stderr}")
     result = _boxman("provision --force", cwd=HYBRID, warn=True)
     assert result.ok, f"hybrid provision failed:\n{result.stdout}\n{result.stderr}"
 
