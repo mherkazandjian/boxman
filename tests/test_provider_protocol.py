@@ -15,6 +15,7 @@ import pytest
 
 from boxman.abstract.providers import Provider, ProviderSession
 from boxman.providers.libvirt.session import LibVirtSession
+from boxman.providers.virtualbox.session import VirtualBoxSession
 
 
 pytestmark = pytest.mark.unit
@@ -25,6 +26,12 @@ class TestProviderSessionProtocol:
     def test_libvirt_session_satisfies_protocol(self):
         session = LibVirtSession(config={"provider": {"libvirt": {}}})
         # Protocol instance check for attributes + methods defined in the shape
+        assert isinstance(session, ProviderSession)
+
+    def test_virtualbox_session_satisfies_protocol(self):
+        session = VirtualBoxSession(config={"provider": {"virtualbox": {}}})
+        # VirtualBoxSession structurally satisfies the same protocol as
+        # LibVirtSession even though its per-VM methods are Phase-1 stubs.
         assert isinstance(session, ProviderSession)
 
     def test_arbitrary_object_does_not_satisfy_protocol(self):

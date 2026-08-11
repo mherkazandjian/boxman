@@ -21,8 +21,8 @@ from boxman.config_cache import BoxmanCache
 from boxman.image_cache import ImageCache
 from boxman.netlab import ContainerlabManager, shared_bridges
 from boxman.providers.libvirt import net_reconcile
+from boxman.abstract.providers import ProviderSession
 from boxman.providers.libvirt.commands import VirshCommand
-from boxman.providers.libvirt.session import LibVirtSession
 from boxman.runtime import RuntimeBase, create_runtime
 from boxman.task_runner import TaskRunner
 from boxman.utils.io import write_files
@@ -81,17 +81,19 @@ class BoxmanManager:
         self.app_config = config
 
     @property
-    def provider(self) -> Optional["LibVirtSession"]:
+    def provider(self) -> Optional["ProviderSession"]:
         """
         Get the current provider session.
 
         Returns:
-            The provider session instance or None if not initialized
+            The provider session instance or None if not initialized.
+            Any provider that satisfies the ``ProviderSession`` protocol
+            (``LibVirtSession``, ``VirtualBoxSession``, ...) is accepted.
         """
         return self._provider
 
     @provider.setter
-    def provider(self, value: "LibVirtSession") -> None:
+    def provider(self, value: "ProviderSession") -> None:
         """
         Set the provider session.
 
