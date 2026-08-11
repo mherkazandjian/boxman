@@ -52,9 +52,20 @@ def _run(cmd, warn=False):
 
 
 def discover_boxes():
-    """Return sorted list of box directories that contain a conf.yml."""
+    """Return sorted list of box directories that contain a conf.yml.
+
+    Boxes meant for the docker runtime (``*-docker-runtime``) are
+    excluded: driven with the local runtime their ``use_sudo: False``
+    provider config collides with sudo-owned templates on the host, so
+    ``create-templates`` fails and every parametrized test skips
+    (issue #81). They are covered under the docker runtime by
+    ``tests/test_lifecycle_e2e.py`` instead.
+    """
     pattern = os.path.join(BOXES_DIR, "*/conf.yml")
-    return sorted(os.path.dirname(p) for p in glob.glob(pattern))
+    return sorted(
+        os.path.dirname(p) for p in glob.glob(pattern)
+        if not os.path.basename(os.path.dirname(p)).endswith("-docker-runtime")
+    )
 
 
 def parse_box_config(box_dir):

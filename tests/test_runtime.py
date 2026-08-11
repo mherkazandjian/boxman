@@ -290,6 +290,72 @@ class TestDockerComposeRuntime:
             expected = str(project_dir / ".boxman" / "runtime" / "docker" / "docker-compose.yml")
             assert result == expected
 
+    def _make_bundled_project(self, tmp_path):
+        """Fake bundled asset source + empty project dir."""
+        asset_dir = tmp_path / "assets" / "docker"
+        asset_dir.mkdir(parents=True)
+        (asset_dir / "docker-compose.yml").write_text("version: '3'\n")
+        (asset_dir / "Dockerfile").write_text("FROM scratch\n")
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        rt = DockerComposeRuntime()
+        rt.project_dir = str(project_dir)
+        return rt, asset_dir, project_dir
+
+    def test_bundled_assets_redeployed_when_source_changes(self, tmp_path):
+        """A stale .boxman/runtime/docker copy must be refreshed when the
+        package's bundled assets change (issue #81)."""
+        rt, asset_dir, project_dir = self._make_bundled_project(tmp_path)
+        with patch.object(
+            rt, "_find_asset_source_dir", return_value=str(asset_dir)
+        ):
+            rt._deploy_bundled_assets()
+            deployed = (
+                project_dir / ".boxman" / "runtime" / "docker" / "Dockerfile")
+            assert deployed.read_text() == "FROM scratch\n"
+
+            # package ships a fixed Dockerfile
+            (asset_dir / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+            rt._deploy_bundled_assets()
+            assert deployed.read_text() == "FROM ubuntu:24.04\n"
+
+    def test_bundled_assets_reused_when_unchanged(self, tmp_path):
+        """When the deployed fingerprint matches the bundled source the
+        existing copy is reused as-is (no redeploy)."""
+        rt, asset_dir, project_dir = self._make_bundled_project(tmp_path)
+        with patch.object(
+            rt, "_find_asset_source_dir", return_value=str(asset_dir)
+        ):
+            rt._deploy_bundled_assets()
+            marker = (
+                project_dir / ".boxman" / "runtime" / "docker"
+                / ".assets-fingerprint")
+            assert marker.is_file()
+
+            # a local tweak with a still-valid fingerprint is left alone
+            deployed = (
+                project_dir / ".boxman" / "runtime" / "docker" / "Dockerfile")
+            deployed.write_text("FROM local-tweak\n")
+            rt._deploy_bundled_assets()
+            assert deployed.read_text() == "FROM local-tweak\n"
+
+    def test_bundled_assets_legacy_deploy_without_fingerprint(self, tmp_path):
+        """Assets deployed before fingerprinting existed (no marker file)
+        are redeployed once so staleness can be tracked going forward."""
+        rt, asset_dir, project_dir = self._make_bundled_project(tmp_path)
+        with patch.object(
+            rt, "_find_asset_source_dir", return_value=str(asset_dir)
+        ):
+            rt._deploy_bundled_assets()
+            local_dir = project_dir / ".boxman" / "runtime" / "docker"
+            marker = local_dir / ".assets-fingerprint"
+            marker.unlink()
+            (local_dir / "Dockerfile").write_text("FROM ancient\n")
+
+            rt._deploy_bundled_assets()
+            assert (local_dir / "Dockerfile").read_text() == "FROM scratch\n"
+            assert marker.is_file()
+
     def test_bundled_assets_not_found_falls_through(self, tmp_path, monkeypatch):
         """When bundled assets don't exist and no other source is configured,
         FileNotFoundError is raised."""

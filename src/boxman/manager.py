@@ -3369,24 +3369,58 @@ class BoxmanManager:
         )
         session.destroy_vm(full_vm_name, force=True)
 
-    def _destroy_removed_vm(self, full_vm_name: str, workdir: str) -> None:
+    def _vm_disk_dirs(self, full_vm_name: str) -> list[str]:
+        """
+        Return the directories that hold *full_vm_name*'s disk files,
+        discovered from libvirt itself (``virsh domblklist``).
+
+        Used for VMs that no longer appear in conf.yml, whose workdir
+        can therefore not be resolved from the config. Falls back to
+        every workdir known to the project config when the domain
+        cannot be queried (e.g. already undefined) — the destroy_disks
+        glob is anchored at the VM name, so sweeping extra directories
+        is harmless.
+        """
+        virsh = VirshCommand(
+            provider_config=self.provider.provider_config)
+        result = virsh.execute(
+            "domblklist", full_vm_name, "--details", warn=True)
+        dirs = set()
+        if result.ok:
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                # domblklist --details columns: Type  Device  Target  Source
+                if len(parts) >= 4 and parts[1] == 'disk' and parts[3] != '-':
+                    dirs.add(os.path.dirname(parts[3]))
+        if not dirs:
+            self.logger.warning(
+                f"could not query disk paths for {full_vm_name} from "
+                f"libvirt; falling back to all configured workdirs")
+            dirs.update(self.collect_workdirs())
+        return sorted(dirs)
+
+    def _destroy_removed_vm(self, full_vm_name: str) -> None:
         """
         Destroy a VM that has been removed from the config.
 
         Uses destroy_vm + destroy_disks with an empty disk list since we
-        no longer have the disk config for this VM. The glob-based cleanup
-        in destroy_disks catches all {vm_name}* artifacts.
+        no longer have the disk config for this VM. The disk directories
+        are read from libvirt before the domain is undefined (see
+        ``_vm_disk_dirs``); the glob-based cleanup in destroy_disks
+        catches all {vm_name}* artifacts.
         """
         self.logger.info(f"removing VM {full_vm_name} (no longer in config)")
         # Phase 1 (#49): stays on the default session — the VM is gone
         # from the config, so its cluster (and provider) can no longer be
         # resolved. Revisited in Phase 3 (#51).
+        disk_dirs = self._vm_disk_dirs(full_vm_name)
         self.provider.destroy_vm(full_vm_name)
-        self.provider.destroy_disks(
-            workdir,
-            vm_name=full_vm_name,
-            disks=[]
-        )
+        for workdir in disk_dirs:
+            self.provider.destroy_disks(
+                workdir,
+                vm_name=full_vm_name,
+                disks=[]
+            )
         self.provider.destroy_vm(full_vm_name, force=True)
 
     def configure_and_start_vms(self) -> None:
@@ -6746,7 +6780,7 @@ class BoxmanManager:
                 processes = [
                     Process(
                         target=cls._destroy_removed_vm,
-                        args=(vm_name, workdir)
+                        args=(vm_name,)
                     )
                     for vm_name in removed_vm_names
                 ]
