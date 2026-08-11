@@ -33,7 +33,12 @@ import pytest
 import yaml
 
 from boxman.abstract.providers import ProviderSession
-from boxman.exceptions import ConfigError, ProvisionError, RuntimeUnavailable
+from boxman.exceptions import (
+    ConfigError,
+    ProvisionError,
+    RuntimeUnavailable,
+    SnapshotError,
+)
 from boxman.manager import BoxmanManager
 from boxman.providers import create_session
 from boxman.providers.docker_compose.compose_generator import ComposeGenerator
@@ -1372,7 +1377,8 @@ class TestSnapshotDcWiring:
             BoxmanManager, "_select_vm_targets",
             staticmethod(lambda cls, a: [("node01", "vms", "node01", "/w")]),
         ):
-            BoxmanManager.snapshot_restore(m, args)
+            with pytest.raises(SnapshotError, match="aborting restore"):
+                BoxmanManager.snapshot_restore(m, args)
         # dc snapshot was validated, but never recreated
         sess.validate_snapshot_cluster.assert_called_once()
         sess.snapshot_restore_cluster.assert_not_called()

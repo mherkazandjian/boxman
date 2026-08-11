@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.cdrom import CDROMManager
 from boxman.providers.libvirt.commands import LibVirtCommandBase
@@ -488,7 +489,8 @@ class TestProvisionForceClearsStaleCacheEntry:
              patch.object(mgr, "deprovision") as deprov, \
              patch.object(mgr, "register_project_in_cache") as register, \
              patch.object(mgr.__class__, "provider", MagicMock()):
-            BoxmanManager.provision(mgr, args)
+            with pytest.raises(ProvisionError, match="cannot provision"):
+                BoxmanManager.provision(mgr, args)
 
         # Must not proceed to deprovision or register
         deprov.assert_not_called()

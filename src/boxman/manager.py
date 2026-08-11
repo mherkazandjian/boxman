@@ -18,7 +18,7 @@ from boxman.utils.shell import run
 from boxman import log
 from boxman.loggers.logger import suppressed
 from boxman.config_cache import BoxmanCache
-from boxman.exceptions import ConfigError
+from boxman.exceptions import ConfigError, ProvisionError, SnapshotError
 from boxman.image_cache import ImageCache
 from boxman.netlab import ContainerlabManager, shared_bridges
 from boxman.providers import PROVIDERS, primary_provider_type
@@ -4254,11 +4254,10 @@ class BoxmanManager:
             summary = "; ".join(reasons)
 
             if not force:
-                cls.logger.error(
+                raise ProvisionError(
                     f"cannot provision — {summary}. "
                     f"Use --force to deprovision first and re-provision."
                 )
-                return
 
             cls.logger.warning(
                 f"state will be deprovisioned first (--force): {summary}"
@@ -4269,8 +4268,7 @@ class BoxmanManager:
         try:
             cls.register_project_in_cache()
         except RuntimeError as exc:
-            cls.logger.error(str(exc))
-            return
+            raise ProvisionError(str(exc)) from exc
 
         # Expand any `base_image: oci://…` references into implicit templates
         # before template build / cloning (the clone path needs a VM name).
@@ -4284,22 +4282,19 @@ class BoxmanManager:
                 "for create-templates)..."
             )
             if cls._create_templates_impl(requested=None, force=True):
-                cls.logger.error(
+                raise ProvisionError(
                     "aborting: not every template could be rebuilt")
-                return
         else:
             # Auto-create any template VMs that are referenced as base_image
             # but do not yet exist.
             if not cls.ensure_templates_exist():
-                cls.logger.error(
+                raise ProvisionError(
                     "aborting: not every template could be created")
-                return
 
         try:
             cls.validate_base_images()
         except ValueError as exc:
-            cls.logger.error(str(exc))
-            return
+            raise ConfigError(str(exc)) from exc
 
         cls.provision_files()
 
@@ -4429,8 +4424,7 @@ class BoxmanManager:
                         "no existing project state found, running full provision...")
                     cls.provision(cls, cli_args)
                 return
-            cls.logger.error("no VMs defined in configuration")
-            return
+            raise ConfigError("no VMs defined in configuration")
 
         vm_states = cls._get_vm_states()
         existing_names = set(vm_states.keys())
@@ -4448,12 +4442,11 @@ class BoxmanManager:
             force = getattr(cli_args, 'force', False)
             names_str = ", ".join(f"'{v}'" for v in sorted(missing))
             if not force:
-                cls.logger.error(
+                raise ProvisionError(
                     f"partial infrastructure state: the following VM(s) are "
                     f"missing: {names_str}. Use --force to deprovision and "
                     f"re-provision everything."
                 )
-                return
             else:
                 cls.logger.warning(
                     f"partial state detected (missing: {names_str}). "
@@ -5282,7 +5275,8 @@ class BoxmanManager:
         if all_ok:
             cls.logger.info("all snapshots verified successfully")
         else:
-            cls.logger.error("one or more snapshots failed verification — check errors above")
+            raise SnapshotError(
+                "one or more snapshots failed verification — check errors above")
         cls._exit_if_dc_failed(dc_failed, 'take')
 
     @staticmethod
@@ -5362,9 +5356,8 @@ class BoxmanManager:
             if not snap_name:
                 snap_name = cls.session_for_vm(full_vm_name).get_latest_snapshot(full_vm_name)
                 if snap_name is None:
-                    cls.logger.error(
+                    raise SnapshotError(
                         f"no snapshot found for {full_vm_name}, aborting restore")
-                    return
                 cls.logger.info(
                     f"resolved latest snapshot for {full_vm_name}: '{snap_name}'")
             vm_targets.append((full_vm_name, snap_name))
@@ -5383,9 +5376,8 @@ class BoxmanManager:
                         f"snapshot invalid: {full_vm_name} / '{snap_name}': {err}")
 
         if abort:
-            cls.logger.error(
+            raise SnapshotError(
                 "aborting restore — one or more snapshots have errors (see above)")
-            return
 
         # ── 3. Everything validated: mutate. Containers first (fast, coarse),
         #      then the parallel VM restores below. A dc failure is reported
