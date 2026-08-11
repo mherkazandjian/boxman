@@ -4518,8 +4518,8 @@ class BoxmanManager:
             allow_recreate=getattr(cli_args, 'recreate_networks', False),
             auto_accept=getattr(cli_args, 'yes', False)))
 
-        # Build workdir lookup from process_vm_list for restore operations
-        vm_workdir_map = {vm_name: workdir for vm_name, workdir in cls.process_vm_list(cli_args)}
+        # Build workdir lookup for restore operations
+        vm_workdir_map = dict(cls._control_vm_targets(cls, cli_args))
 
         def _bring_up(vm_name, state, workdir):
             session = cls.session_for_vm(vm_name)
@@ -4607,7 +4607,7 @@ class BoxmanManager:
         pause analog wired in this phase, so the flag is a no-op for dc
         clusters.
 
-        Reuses ``process_vm_list()`` and the same provider methods as
+        Reuses ``_control_vm_targets()`` and the same provider methods as
         ``boxman control save`` / ``boxman control suspend``.
         """
         # Ensure provider configs reflect runtime settings
@@ -4615,7 +4615,7 @@ class BoxmanManager:
             if hasattr(_session, 'update_provider_config_with_runtime'):
                 _session.update_provider_config_with_runtime()
 
-        vm_list = cls.process_vm_list(cli_args)
+        vm_list = cls._control_vm_targets(cls, cli_args)
 
         if not vm_list and not cls._compose_clusters:
             cls.logger.info("no VMs found in configuration")
@@ -5008,13 +5008,11 @@ class BoxmanManager:
         """
         List snapshots of the VMs and docker-compose clusters in the project.
         """
-        prj_name = f'bprj__{cls.config["project"]}__bprj'
-        for cluster_name, cluster in cls._vm_clusters.items():
-            for vm_name, _ in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                cls.session_for_cluster(cluster_name).snapshot_list(full_vm_name)
+        for full_vm_name, cluster_name, _vm_name, _workdir in (
+                cls._select_vm_targets(cls, cli_args)):
+            cls.session_for_cluster(cluster_name).snapshot_list(full_vm_name)
         # docker-compose clusters (docker commit-backed, D3)
-        for cname, cluster in cls._compose_clusters.items():
+        for cname, cluster in cls._select_dc_clusters(cli_args):
             snaps = cls.session_for_cluster(cname).snapshot_list_cluster(cname, cluster)
             cls.logger.info(f"cluster: {cname} (docker-compose)")
             if not snaps:
@@ -5047,11 +5045,10 @@ class BoxmanManager:
 
         # 1. Per-VM data.
         per_vm: dict[str, dict] = {}
-        for cluster_name, cluster in cls._vm_clusters.items():
-            for vm_name, _ in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                data = cls.session_for_cluster(cluster_name).snapshot_log_data(full_vm_name)
-                per_vm[full_vm_name] = data
+        for full_vm_name, cluster_name, _vm_name, _workdir in (
+                cls._select_vm_targets(cls, cli_args)):
+            data = cls.session_for_cluster(cluster_name).snapshot_log_data(full_vm_name)
+            per_vm[full_vm_name] = data
 
         if not any(d.get('chain') for d in per_vm.values()):
             cls.logger.info("no snapshots found")
@@ -5198,6 +5195,10 @@ class BoxmanManager:
         targets = []
         for cluster_name, cluster in clusters.items():
             if cluster_filter is not None and cluster_name != cluster_filter:
+                continue
+            if cls._is_compose_cluster(cluster_name):
+                # docker-compose clusters carry ``boxes:``, not ``vms:`` —
+                # they are selected via ``_select_dc_clusters`` instead.
                 continue
             workdir = os.path.expanduser(cluster['workdir'])
             for vm_name in cluster.get('vms', {}):
@@ -5522,7 +5523,11 @@ class BoxmanManager:
         no_shutdown = getattr(cli_args, 'no_shutdown', False)
         yes = getattr(cli_args, 'yes', False)
 
-        targets = list(cls._storage_targets(cls, cli_args))
+        targets = []
+        for full_vm_name, cluster_name, vm_name, workdir in (
+                cls._select_vm_targets(cls, cli_args)):
+            vm_info = cls.config['clusters'][cluster_name]['vms'][vm_name] or {}
+            targets.append((full_vm_name, workdir, vm_info))
 
         if not yes and not dry_run:
             cls.logger.warning(
@@ -5554,16 +5559,6 @@ class BoxmanManager:
 
     ### start storage functions ####
     @staticmethod
-    def _storage_targets(cls, cli_args=None):
-        """Yield ``(full_vm_name, workdir, vm_info)`` for every VM in every cluster."""
-        prj_name = f'bprj__{cls.config["project"]}__bprj'
-        for cluster_name, cluster in cls._vm_clusters.items():
-            workdir = os.path.expanduser(cluster['workdir'])
-            for vm_name, vm_info in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                yield full_vm_name, workdir, vm_info or {}
-
-    @staticmethod
     def _format_bytes(num: int | None) -> str:
         if num is None:
             return "-"
@@ -5584,7 +5579,9 @@ class BoxmanManager:
         storage = cls.provider.storage  # Phase 1 (#49): storage_df stays on the default session until Phase 3
         rows = []
         snap_mem_total_per_vm: dict[str, int] = {}
-        for full_vm_name, workdir, vm_info in cls._storage_targets(cls, cli_args):
+        for full_vm_name, cluster_name, vm_name, workdir in (
+                cls._select_vm_targets(cls, cli_args)):
+            vm_info = cls.config['clusters'][cluster_name]['vms'][vm_name] or {}
             disks = vm_disk_paths(workdir, full_vm_name, vm_info)
             snap_count = storage.count_snapshots(full_vm_name)
             mem_files = storage.snapshot_memory_files(workdir, full_vm_name)
@@ -5641,7 +5638,7 @@ class BoxmanManager:
         but nothing will be returned to the host.
         """
         storage = cls.provider.storage  # Phase 1 (#49): storage_trim stays on the default session until Phase 3
-        for full_vm_name, _workdir, _vm_info in cls._storage_targets(cls, cli_args):
+        for full_vm_name, _c, _v, _workdir in cls._select_vm_targets(cls, cli_args):
             if not storage.is_running(full_vm_name):
                 cls.logger.warning(
                     f"skip trim: vm {full_vm_name} is not running")
@@ -5720,7 +5717,11 @@ class BoxmanManager:
         chain-flattening methods when snapshots exist unless
         ``--drop-snapshots`` is passed.
         """
-        targets = list(cls._storage_targets(cls, cli_args))
+        targets = []
+        for full_vm_name, cluster_name, vm_name, workdir in (
+                cls._select_vm_targets(cls, cli_args)):
+            vm_info = cls.config['clusters'][cluster_name]['vms'][vm_name] or {}
+            targets.append((full_vm_name, workdir, vm_info))
         method = getattr(cli_args, 'method', 'auto')
         drop_snapshots = getattr(cli_args, 'drop_snapshots', False)
         no_shutdown = getattr(cli_args, 'no_shutdown', False)
@@ -5765,7 +5766,7 @@ class BoxmanManager:
         decompress = getattr(cli_args, 'decompress', False)
         level = getattr(cli_args, 'level', 3)
         action = "decompress" if decompress else "compress"
-        for full_vm_name, _workdir, _vm_info in cls._storage_targets(cls, cli_args):
+        for full_vm_name, _c, _v, _workdir in cls._select_vm_targets(cls, cli_args):
             cls.logger.info(f"storage {action}-snapshots: {full_vm_name}")
             processed, total = cls.session_for_vm(full_vm_name).compress_snapshots_memory(
                 full_vm_name, level=level, decompress=decompress)
@@ -5775,18 +5776,17 @@ class BoxmanManager:
     ### end storage functions ####
 
     ### start control vm functions ####
-    def process_vm_list(self, cli_args):
+    @staticmethod
+    def _control_vm_targets(cls, cli_args):
         """
-        Process the list of VMs to control.
+        ``(full_vm_name, workdir)`` pairs for the VMs selected by
+        ``--cluster`` / ``--vms`` (every VM when neither flag is given).
         """
-        retval = []
-        prj_name = f'bprj__{self.config["project"]}__bprj'
-        for cluster_name, cluster in self._vm_clusters.items():
-            workdir = os.path.expanduser(cluster['workdir'])
-            for vm_name, _ in cluster['vms'].items():
-                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                retval.append((full_vm_name, workdir))
-        return retval
+        return [
+            (full_vm_name, workdir)
+            for full_vm_name, _c, _v, workdir
+            in cls._select_vm_targets(cls, cli_args)
+        ]
 
     @staticmethod
     def suspend_vm(cls, cli_args):
@@ -5794,7 +5794,7 @@ class BoxmanManager:
         Suspend the machines: libvirt VMs → virsh suspend; docker-compose
         containers → ``docker compose pause``.
         """
-        for vm_name, _ in cls.process_vm_list(cli_args):
+        for vm_name, _ in cls._control_vm_targets(cls, cli_args):
             cls.session_for_vm(vm_name).suspend_vm(vm_name)
             cls.logger.info(f"vm {vm_name} suspended")
         for cluster_name, cluster in cls._select_dc_clusters(cli_args):
@@ -5806,7 +5806,7 @@ class BoxmanManager:
         Resume the machines: libvirt VMs → virsh resume; docker-compose
         containers → ``docker compose unpause``.
         """
-        for vm_name, _ in cls.process_vm_list(cli_args):
+        for vm_name, _ in cls._control_vm_targets(cls, cli_args):
             cls.session_for_vm(vm_name).resume_vm(vm_name)
             cls.logger.info(f"VM {vm_name} resumed")
         for cluster_name, cluster in cls._select_dc_clusters(cli_args):
@@ -5819,7 +5819,7 @@ class BoxmanManager:
         docker-compose containers (no save-to-file state) — an explanatory
         message is logged, no traceback.
         """
-        for vm_name, workdir in cls.process_vm_list(cli_args):
+        for vm_name, workdir in cls._control_vm_targets(cls, cli_args):
             cls.session_for_vm(vm_name).save_vm(vm_name, workdir)
         for cluster_name, _cluster in cls._select_dc_clusters(cli_args):
             cls.logger.warning(
@@ -5834,7 +5834,7 @@ class BoxmanManager:
         Start the machines: libvirt VMs (optionally --restore); docker-compose
         containers → ``docker compose start``.
         """
-        for vm_name, workdir in cls.process_vm_list(cli_args):
+        for vm_name, workdir in cls._control_vm_targets(cls, cli_args):
             if cli_args.restore:
                 cls.session_for_vm(vm_name).restore_vm(vm_name, workdir)
             else:
