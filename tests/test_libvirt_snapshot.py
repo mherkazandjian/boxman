@@ -82,19 +82,22 @@ class TestCreateSnapshot:
             assert sm.create_snapshot("vm01", str(tmp_path), "snap1", "desc") is True
         args = execute.call_args.args
         assert args[0] == "snapshot-create-as"
-        assert any("--domain vm01" in a for a in args)
-        assert any("--name snap1" in a for a in args)
-        assert any("--atomic" in a for a in args)
-        assert any("--memspec=" in a and "snap1.raw" in a for a in args)
+        # flags and values are passed as separate tokens — build_command
+        # quotes each token centrally, so "--domain vm01" as a single token
+        # would reach virsh as one literal argument
+        assert "--domain" in args and "vm01" in args
+        assert "--name" in args and "snap1" in args
+        assert "--atomic" in args
+        assert any(a.startswith("--memspec=") and "snap1.raw" in a for a in args)
 
     def test_includes_cdrom_diskspec_args(self, sm: SnapshotManager, tmp_path: Path):
         with patch.object(sm, "_flatten_cdrom_overlays"), \
              patch.object(sm, "_cdrom_diskspec_args",
-                          return_value=["--diskspec hdc,snapshot=no"]), \
+                          return_value=["--diskspec", "hdc,snapshot=no"]), \
              patch.object(sm.virsh, "execute", return_value=_result()) as execute:
             sm.create_snapshot("vm01", str(tmp_path), "s", "d")
         args = execute.call_args.args
-        assert "--diskspec hdc,snapshot=no" in args
+        assert "--diskspec" in args and "hdc,snapshot=no" in args
 
     def test_command_failure_returns_false(self, sm: SnapshotManager, tmp_path: Path):
         with patch.object(sm, "_flatten_cdrom_overlays"), \

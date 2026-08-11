@@ -1,4 +1,5 @@
 import os
+import shlex
 from typing import Any
 
 import invoke
@@ -72,6 +73,14 @@ class LibVirtCommandBase:
         """
         Build a complete command string with options.
 
+        Every positional argument and every keyword VALUE is passed through
+        :func:`shlex.quote`, so callers must pass raw values — pre-quoted
+        values would end up quoted twice. (``shlex.quote`` is a no-op for
+        values that need no quoting, e.g. ``--size=50M``.) Callers that need
+        actual shell constructs (pipes, redirects, ``&&``) must use
+        :meth:`execute_shell` instead — that path is intentionally NOT
+        quoted.
+
         Args:
             *args: Positional arguments for the command
             **kwargs: Keyword arguments that will be converted to command options
@@ -89,7 +98,7 @@ class LibVirtCommandBase:
             command_parts.append(self.command_path)
 
         # Add positional arguments
-        command_parts.extend([str(arg) for arg in args])
+        command_parts.extend([shlex.quote(str(arg)) for arg in args])
 
         # Add keyword arguments as options
         for key, value in kwargs.items():
@@ -99,14 +108,14 @@ class LibVirtCommandBase:
                 # Skip False or None values
                 continue
             else:
-                command_parts.append(f"--{key.replace('_', '-')}={value}")
+                command_parts.append(
+                    f"--{key.replace('_', '-')}={shlex.quote(str(value))}")
 
         return " ".join(command_parts)
 
     def execute(self, *args,
                 hide: bool = True,
                 warn: bool = False,
-                capture: bool = True,
                 **kwargs) -> invoke.runners.Result:
         """
         Execute a command.
@@ -115,7 +124,6 @@ class LibVirtCommandBase:
             *args: Positional arguments for the command
             hide: Whether to hide command output
             warn: Whether to warn instead of raising exceptions
-            capture: Whether to capture command output
             **kwargs: Keyword arguments to be passed as command options
 
         Returns:
@@ -290,6 +298,11 @@ class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
         """
         Build a complete virsh command string with options.
 
+        Positional arguments, keyword values, and the connection URI are
+        quoted centrally via :func:`shlex.quote` (see
+        :meth:`LibVirtCommandBase.build_command`) — callers must pass raw
+        values, never pre-quoted ones.
+
         Args:
             cmd: The virsh subcommand to execute (like list, start, define, etc.)
             *args: Positional arguments for the command
@@ -304,13 +317,13 @@ class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
             command_parts.append("sudo")
 
         # add the virsh command with connection URI
-        command_parts.append(f"{self.command_path} -c {self.uri}")
+        command_parts.append(f"{self.command_path} -c {shlex.quote(self.uri)}")
 
         # add the actual virsh subcommand
         command_parts.append(cmd)
 
         # add positional arguments
-        command_parts.extend([str(arg) for arg in args])
+        command_parts.extend([shlex.quote(str(arg)) for arg in args])
 
         # add keyword arguments as options
         for key, value in kwargs.items():
@@ -320,7 +333,8 @@ class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
                 # skip False or None values
                 continue
             else:
-                command_parts.append(f"--{key.replace('_', '-')}={value}")
+                command_parts.append(
+                    f"--{key.replace('_', '-')}={shlex.quote(str(value))}")
 
         return " ".join(command_parts)
 

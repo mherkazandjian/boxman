@@ -123,6 +123,11 @@ class SnapshotManager:
         reintroducing the problem for the next revert.  Passing
         --diskspec <target>,snapshot=no prevents that overlay from being
         created so the cdrom stays at the raw ISO permanently.
+
+        Each flag is returned as two separate tokens (``--diskspec`` and the
+        spec) — a single ``"--diskspec <spec>"`` token only worked because
+        command building used to join parts without quoting; with central
+        quoting it would reach virsh as one literal argument.
         """
         result = self.virsh.execute("domblklist", vm_name, "--details", warn=True)
         if not result.ok:
@@ -132,7 +137,7 @@ class SnapshotManager:
             parts = line.split()
             # domblklist --details columns: Type  Device  Target  Source
             if len(parts) >= 3 and parts[1] == 'cdrom':
-                args.append(f"--diskspec {parts[2]},snapshot=no")
+                args.extend(["--diskspec", f"{parts[2]},snapshot=no"])
         return args
 
     def create_snapshot(self,
@@ -182,11 +187,15 @@ class SnapshotManager:
             # Exclude cdroms from the snapshot so no new qcow2 overlay is
             # created for them (they stay at the raw ISO after this call).
             cdrom_args = self._cdrom_diskspec_args(vm_name)
+            # separate tokens for every flag and value: build_command quotes
+            # each token centrally, so "--domain vm01" as one token would
+            # reach virsh as a single literal argument, and a pre-quoted
+            # description would be quoted twice
             result = self.virsh.execute(
                 "snapshot-create-as",
-                f"--domain {vm_name}",
-                f"--name {snapshot_name}",
-                f"--description '{description}'",
+                "--domain", vm_name,
+                "--name", snapshot_name,
+                "--description", description,
                 "--atomic",
                 f"--memspec={mem_path}",
                 *cdrom_args)
