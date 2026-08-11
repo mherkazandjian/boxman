@@ -414,3 +414,80 @@ class TestNetworkInterfaceConfigureFromConfig:
             })
         _args, kwargs = add.call_args
         assert kwargs["model"] == "virtio"
+
+
+class TestDestroyUndefineExactName:
+    """Existence checks must match the network name exactly.
+
+    Regression tests for issue #85 item 13: the checks used to be
+    ``net-list | grep -q <name>``, so destroying ``prod`` while
+    ``prod-backup`` existed matched the grep and spuriously ran
+    ``net-destroy prod`` against an undefined network, failing the remove.
+    """
+
+    @pytest.fixture
+    def net(self) -> Network:
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            return Network(name="prod", info={}, assign_new_bridge=True,
+                           provider_config={"use_sudo": False})
+
+    def test_destroy_skips_net_destroy_when_only_superstring_exists(self, net):
+        calls = []
+
+        def listed(active_only: bool = False):
+            return ["prod-backup"]
+
+        with patch.object(net, "_listed_networks", side_effect=listed), \
+             patch.object(net, "execute",
+                          side_effect=lambda *a, **k: calls.append(a) or _result()):
+            assert net.destroy_network() is True
+        assert not any(args[0] == "net-destroy" for args in calls)
+
+    def test_destroy_runs_net_destroy_when_name_matches_exactly(self, net):
+        calls = []
+
+        def listed(active_only: bool = False):
+            return ["prod", "prod-backup"]
+
+        with patch.object(net, "_listed_networks", side_effect=listed), \
+             patch.object(net, "execute",
+                          side_effect=lambda *a, **k: calls.append(a) or _result()):
+            assert net.destroy_network() is True
+        assert ("net-destroy", "prod") in calls
+
+    def test_destroy_defined_but_inactive_is_left_alone(self, net):
+        calls = []
+
+        def listed(active_only: bool = False):
+            return [] if active_only else ["prod"]
+
+        with patch.object(net, "_listed_networks", side_effect=listed), \
+             patch.object(net, "execute",
+                          side_effect=lambda *a, **k: calls.append(a) or _result()):
+            assert net.destroy_network() is True
+        assert not any(args[0] == "net-destroy" for args in calls)
+
+    def test_destroy_fails_when_libvirt_cannot_be_asked(self, net):
+        with patch.object(net, "_listed_networks", return_value=None):
+            assert net.destroy_network() is False
+
+    def test_undefine_skips_net_undefine_when_only_superstring_exists(self, net):
+        calls = []
+        with patch.object(net, "_listed_networks", return_value=["prod-backup"]), \
+             patch.object(net, "execute",
+                          side_effect=lambda *a, **k: calls.append(a) or _result()):
+            assert net.undefine_network() is True
+        assert not any(args[0] == "net-undefine" for args in calls)
+
+    def test_undefine_runs_net_undefine_when_name_matches_exactly(self, net):
+        calls = []
+        with patch.object(net, "_listed_networks", return_value=["prod"]), \
+             patch.object(net, "execute",
+                          side_effect=lambda *a, **k: calls.append(a) or _result()):
+            assert net.undefine_network() is True
+        assert ("net-undefine", "prod") in calls
+
+    def test_undefine_fails_when_libvirt_cannot_be_asked(self, net):
+        with patch.object(net, "_listed_networks", return_value=None):
+            assert net.undefine_network() is False
