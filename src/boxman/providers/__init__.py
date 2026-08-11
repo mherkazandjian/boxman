@@ -67,6 +67,45 @@ def create_session(provider_type: str, config: dict[str, Any]) -> "ProviderSessi
     return factory(config)
 
 
+def merge_provider_configs(global_config: dict[str, Any],
+                           local_config: dict[str, Any]) -> dict[str, Any]:
+    """
+    Merge global (app-level) and local (project-level) provider configs.
+
+    This is the single merge implementation used by every code path that
+    combines boxman.yml ``providers:`` settings with a project's
+    ``provider:`` block (CLI session creation, ``show_conf``, and the
+    manager's one-off virsh probes).
+
+    Scalar keys: local overrides global (standard dict.update behaviour).
+
+    ``sudo_skip_commands`` / ``force_sudo_commands``: per-command merging.
+    If a command appears in a local list it is removed from the opposite
+    global list so that the local setting wins.  Commands that only appear
+    in the global lists are preserved.
+    """
+    merged = global_config.copy()
+    # pull out the sudo command lists before the scalar update clobbers them
+    g_skip = set(global_config.get('sudo_skip_commands', []))
+    g_force = set(global_config.get('force_sudo_commands', []))
+    l_skip = set(local_config.get('sudo_skip_commands', []))
+    l_force = set(local_config.get('force_sudo_commands', []))
+
+    # scalar overrides
+    merged.update(local_config)
+
+    # per-command merge: local wins over global for any given command
+    all_local = l_skip | l_force
+    final_skip = (g_skip - all_local) | l_skip
+    final_force = (g_force - all_local) | l_force
+    # if a command ended up in both after merge, force wins
+    final_skip -= final_force
+
+    merged['sudo_skip_commands'] = sorted(final_skip)
+    merged['force_sudo_commands'] = sorted(final_force)
+    return merged
+
+
 def primary_provider_type(config: dict[str, Any] | None) -> str:
     """
     Return the project's primary provider type.

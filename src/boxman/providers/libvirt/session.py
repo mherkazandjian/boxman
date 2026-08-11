@@ -38,39 +38,16 @@ class LibVirtSession:
         #: logging.Logger: the logger instance
         self.logger = log
 
-        # get provider config from the project configuration — these are
-        # authoritative and must never be overridden by app-level defaults.
-        self._project_provider_config = config.get('provider', {}).get('libvirt', {})
-
-        #: Dict[str, Any]: the base provider config (may be enriched with
-        #: app-level or runtime settings, but project-level keys always win
-        #: via the property).
-        self._provider_config_base = self._project_provider_config.copy()
+        #: Dict[str, Any]: the effective provider config. The CLI hands the
+        #: session an already-merged dict (app-level defaults + runtime
+        #: injection, overlaid by project-level settings via
+        #: :func:`boxman.providers.merge_provider_configs`), so no further
+        #: precedence handling happens here.
+        self.provider_config = dict(
+            (config.get('provider', {}) or {}).get('libvirt', {}) or {})
 
         #: the boxman manager instance (mainly to get access to the cache)
         self.manager = None
-
-    @property
-    def provider_config(self) -> dict[str, Any]:
-        """
-        Return the effective provider config.
-
-        Project-level settings (from conf.yml) always take precedence
-        over app-level (boxman.yml) or runtime-injected values.
-        """
-        merged = self._provider_config_base.copy()
-        merged.update(self._project_provider_config)
-        return merged
-
-    @provider_config.setter
-    def provider_config(self, value: dict[str, Any]) -> None:
-        """
-        Set the base provider config.
-
-        The getter will overlay project-level settings on top, so
-        project-level keys like ``use_sudo`` can never be overridden.
-        """
-        self._provider_config_base = value
 
     @property
     def uri(self) -> str:
@@ -78,7 +55,7 @@ class LibVirtSession:
 
     @uri.setter
     def uri(self, value: str) -> None:
-        self._provider_config_base['uri'] = value
+        self.provider_config['uri'] = value
 
     @property
     def use_sudo(self) -> bool:
@@ -86,27 +63,25 @@ class LibVirtSession:
 
     @use_sudo.setter
     def use_sudo(self, value: bool) -> None:
-        self._provider_config_base['use_sudo'] = value
+        self.provider_config['use_sudo'] = value
 
     def update_provider_config(self, new_config: dict[str, Any]) -> None:
         """
-        Update provider_config with *new_config*, but project-level settings
-        always win (enforced by the property getter).
+        Update provider_config with *new_config* (plain last-write-wins).
+
+        Precedence between app-level and project-level settings is resolved
+        upstream by :func:`boxman.providers.merge_provider_configs` before
+        the session is built; this is only used for runtime metadata
+        injection, which never carries project keys.
 
         Args:
-            new_config: Additional config keys (e.g. from boxman.yml providers
-                        section or runtime injection).
+            new_config: Additional config keys (e.g. runtime injection).
         """
-        merged = self._provider_config_base.copy()
-        merged.update(new_config)
-        self._provider_config_base = merged
+        self.provider_config.update(new_config)
 
     def update_provider_config_with_runtime(self) -> None:
         """
         Enrich provider_config with runtime metadata from the manager.
-
-        Project-level provider settings always take precedence over
-        app-level (boxman.yml) settings and runtime defaults.
         """
         if self.manager is None:
             return
@@ -115,7 +90,6 @@ class LibVirtSession:
         enriched = self.manager.get_provider_config_with_runtime(
             self.provider_config
         )
-        # Merge, ensuring project-level keys win
         self.update_provider_config(enriched)
 
     def import_image(self,

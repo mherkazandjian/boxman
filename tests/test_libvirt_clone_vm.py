@@ -194,8 +194,7 @@ class TestCloneVmIsoBootDispatch:
 
     def _make_session(self):
         session = LibVirtSession.__new__(LibVirtSession)
-        session._provider_config_base = {"uri": "qemu:///system", "use_sudo": False}
-        session._project_provider_config = {}
+        session.provider_config = {"uri": "qemu:///system", "use_sudo": False}
         return session
 
     @patch("boxman.providers.libvirt.session.IsoBootVM")
