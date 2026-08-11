@@ -289,6 +289,9 @@ class VMStateDiffer:
               - max_vcpus_changed, desired_max_vcpus, actual_max_vcpus
               - max_memory_changed, desired_max_memory_mb, actual_max_memory_mb
               - new_disks: list of disk configs to create and attach
+                (a config carries ``attach_only: True`` when its image
+                file already exists on disk — attach it as-is instead of
+                recreating it)
               - resize_disks: list of dicts with target, source, current_size_mb, desired_size_mb
               - new_cdroms, removed_cdroms, changed_cdroms
               - new_shared_folders, removed_shared_folders, changed_shared_folders
@@ -345,9 +348,20 @@ class VMStateDiffer:
             desired_size = disk_config.get('size', 1024)
             expected_path = self._expected_disk_path(disk_config, workdir, disk_prefix)
 
-            if target not in actual_targets and not os.path.exists(expected_path):
-                # new disk — not attached and file doesn't exist
-                new_disks.append(disk_config)
+            if target not in actual_targets:
+                if os.path.exists(expected_path):
+                    # Leftover image from a failed earlier run — the disk
+                    # is neither new nor a resize. Attach the existing
+                    # file as-is (skip create) rather than silently
+                    # dropping the desired disk.
+                    self.logger.warning(
+                        f"disk {target} on {domain_name}: image "
+                        f"{expected_path} exists but is not attached — "
+                        f"attaching existing file (skipping create)")
+                    new_disks.append({**disk_config, 'attach_only': True})
+                else:
+                    # new disk — not attached and file doesn't exist
+                    new_disks.append(disk_config)
             elif target in actual_targets:
                 # disk exists — check if resize needed
                 actual_disk = actual_by_target[target]

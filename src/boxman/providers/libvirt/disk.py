@@ -154,7 +154,9 @@ class DiskManager(VirshCommand):
         Configure a disk from configuration.
 
         Args:
-            disk_config: Dictionary with disk configuration
+            disk_config: Dictionary with disk configuration. When it
+                contains ``attach_only: True`` the image file is expected
+                to already exist and creation is skipped (attach only).
             workdir: Working directory for disk images
             disk_prefix: Prefix to add to disk image filename
 
@@ -184,8 +186,13 @@ class DiskManager(VirshCommand):
             # ensure path is expanded
             disk_path = os.path.expanduser(disk_path)
 
-            # 1. create the disk
-            if not self.create_disk(disk_path, disk_size, format=driver_type):
+            # 1. create the disk — unless the caller flagged the config
+            # attach_only (image file already exists, e.g. a leftover
+            # from a failed earlier run): recreating it would wipe data.
+            if disk_config.get("attach_only"):
+                self.logger.info(
+                    f"using existing disk image {disk_path} (attach only)")
+            elif not self.create_disk(disk_path, disk_size, format=driver_type):
                 self.logger.error(f"failed to create disk {disk_path}")
                 return False
 
