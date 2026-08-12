@@ -853,9 +853,9 @@ class TestManagerDestroyRuntimeCleanup:
         args.auto_accept = auto_accept
         return args
 
-    @patch("boxman.manager.subprocess.run")
-    @patch("boxman.manager.shutil.rmtree")
-    @patch("boxman.manager.os.path.isdir")
+    @patch("boxman.manager_parts.flows.subprocess.run")
+    @patch("boxman.manager_parts.flows.shutil.rmtree")
+    @patch("boxman.manager_parts.flows.os.path.isdir")
     def test_docker_fallback_when_boxman_dir_survives_rmtree(
         self, mock_isdir, mock_rmtree, mock_subprocess_run
     ):
@@ -894,9 +894,9 @@ class TestManagerDestroyRuntimeCleanup:
         assert "alpine" in docker_cmd
         assert "/cleanup/*" in docker_cmd[-1]
 
-    @patch("boxman.manager.subprocess.run")
-    @patch("boxman.manager.shutil.rmtree")
-    @patch("boxman.manager.os.path.isdir")
+    @patch("boxman.manager_parts.flows.subprocess.run")
+    @patch("boxman.manager_parts.flows.shutil.rmtree")
+    @patch("boxman.manager_parts.flows.os.path.isdir")
     def test_no_docker_fallback_when_rmtree_succeeds(
         self, mock_isdir, mock_rmtree, mock_subprocess_run
     ):
@@ -949,8 +949,8 @@ class TestManagerDestroyRuntimeCleanup:
         mock_input.assert_called_once()
         mock_runtime.destroy_runtime.assert_not_called()
 
-    @patch("boxman.manager.shutil.rmtree")
-    @patch("boxman.manager.os.path.isdir", return_value=False)
+    @patch("boxman.manager_parts.flows.shutil.rmtree")
+    @patch("boxman.manager_parts.flows.os.path.isdir", return_value=False)
     @patch("builtins.input", return_value="y")
     def test_prompt_proceeds_on_yes(self, mock_input, mock_isdir, mock_rmtree):
         """When the user answers 'y', destroy_runtime should proceed."""
@@ -974,8 +974,8 @@ class TestManagerDestroyRuntimeCleanup:
         mock_input.assert_called_once()
         mock_runtime.destroy_runtime.assert_called_once()
 
-    @patch("boxman.manager.shutil.rmtree")
-    @patch("boxman.manager.os.path.isdir", return_value=False)
+    @patch("boxman.manager_parts.flows.shutil.rmtree")
+    @patch("boxman.manager_parts.flows.os.path.isdir", return_value=False)
     def test_auto_accept_skips_prompt(self, mock_isdir, mock_rmtree):
         """With --auto-accept, no input prompt should be shown."""
         from boxman.manager import BoxmanManager

@@ -78,7 +78,7 @@ class TestRestoreRetryLoop:
     def test_raising_restore_worker_never_reports_success(self, monkeypatch):
         """The old queue-drain loop printed 'all VMs restored successfully'
         when a worker died before queue.put — it must retry/fail instead."""
-        monkeypatch.setattr("boxman.manager.time.sleep", lambda _s: None)
+        monkeypatch.setattr("boxman.manager_parts.snapshots.time.sleep", lambda _s: None)
         mgr = _manager()
         mgr.provider.snapshot_restore.side_effect = RuntimeError("libvirt gone")
         mgr.provider.validate_snapshot.return_value = (True, [])
