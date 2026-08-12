@@ -3,6 +3,8 @@ import tempfile
 from typing import Any
 from xml.sax.saxutils import escape
 
+from boxman import log
+
 from .commands import VirshCommand
 from .virsh_parse import parse_domblklist
 
@@ -17,7 +19,7 @@ def _xml_attr(value: str) -> str:
     return escape(str(value), {"'": '&apos;', '"': '&quot;'})
 
 
-class CDROMManager(VirshCommand):
+class CDROMManager:
     """
     Class for managing CDROM/ISO device operations in libvirt.
 
@@ -26,7 +28,15 @@ class CDROMManager(VirshCommand):
     """
 
     def __init__(self, vm_name: str, provider_config: dict[str, Any] | None = None):
-        super().__init__(provider_config)
+        #: VirshCommand: Command executor for virsh
+        self.virsh = VirshCommand(provider_config=provider_config)
+
+        #: Dict[str, Any]: Configuration for the libvirt provider
+        self.provider_config = provider_config or {}
+
+        #: logging.Logger: Logger instance
+        self.logger = log
+
         self.vm_name = vm_name
 
     def attach_cdrom(self,
@@ -66,7 +76,7 @@ class CDROMManager(VirshCommand):
             attachment_args = ["--persistent"] if persistent else []
             # warn=True so a failed attach reaches the error branch below
             # instead of raising out of execute (matches change_media)
-            result = self.execute("attach-device", self.vm_name, temp_path,
+            result = self.virsh.execute("attach-device", self.vm_name, temp_path,
                                   *attachment_args, warn=True)
 
             os.unlink(temp_path)
@@ -110,7 +120,7 @@ class CDROMManager(VirshCommand):
             detach_args = ["--persistent"] if persistent else []
             # warn=True so a failed detach reaches the error branch below
             # instead of raising out of execute (matches change_media)
-            result = self.execute("detach-device", self.vm_name, temp_path,
+            result = self.virsh.execute("detach-device", self.vm_name, temp_path,
                                   *detach_args, warn=True)
 
             os.unlink(temp_path)
@@ -145,7 +155,7 @@ class CDROMManager(VirshCommand):
                 self.logger.error(f"ISO file does not exist: {source_path}")
                 return False
 
-            result = self.execute(
+            result = self.virsh.execute(
                 "change-media", self.vm_name, target_dev,
                 source_path, "--live", "--config",
                 warn=True)
@@ -188,7 +198,7 @@ class CDROMManager(VirshCommand):
         Returns a list of dicts with 'target' and 'source' keys.
         Excludes seed ISOs (used for cloud-init).
         """
-        result = self.execute("domblklist", self.vm_name, "--details", warn=True)
+        result = self.virsh.execute("domblklist", self.vm_name, "--details", warn=True)
         if not result.ok:
             return []
 
@@ -252,7 +262,7 @@ class CDROMManager(VirshCommand):
         Returns:
             Device name (e.g., 'hdc') or None if no slot available
         """
-        result = self.execute("domblklist", self.vm_name, "--details", warn=True)
+        result = self.virsh.execute("domblklist", self.vm_name, "--details", warn=True)
 
         used_targets = set()
         if result.ok:

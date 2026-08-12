@@ -85,7 +85,7 @@ class TestDeadErrorBranches:
             "warn") is True
 
     def test_attach_disk_failure_returns_false(self, dm: DiskManager):
-        with patch.object(dm, "execute",
+        with patch.object(dm.virsh, "execute",
                           return_value=_result(ok=False, stderr="x")) as exe:
             assert dm.attach_disk("/tmp/d.qcow2", "vdb") is False
         assert exe.call_args.kwargs.get("warn") is True
@@ -102,7 +102,7 @@ class TestDeadErrorBranches:
             "warn") is True
 
     def test_resize_disk_online_failure_returns_false(self, dm: DiskManager):
-        with patch.object(dm, "execute",
+        with patch.object(dm.virsh, "execute",
                           return_value=_result(ok=False, stderr="x")) as exe:
             assert dm.resize_disk_online("vdb", 2048) is False
         assert exe.call_args.kwargs.get("warn") is True

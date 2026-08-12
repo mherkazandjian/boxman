@@ -557,7 +557,7 @@ class TestCacheSelfConflict:
                 raise RuntimeError("boom")
             return _result()
 
-        net.execute = fake_execute
+        net.virsh.execute = fake_execute
         net._get_libvirt_bridges = lambda: set()
         assert net.define_network(str(tmp_path / 'net.xml')) is False
 
@@ -674,7 +674,7 @@ class TestApplyLivePlan:
                 return _result(stdout="demo\n" if active else "")
             return _result()
 
-        net.execute = fake_execute
+        net.virsh.execute = fake_execute
         return net, calls
 
     def test_range_is_applied_before_the_reservations(self):
@@ -750,7 +750,7 @@ class TestApplyLivePlan:
     def test_a_failing_update_is_reported(self):
         net = _network({"mode": "nat",
                         "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0"}})
-        net.execute = lambda *a, **k: (
+        net.virsh.execute = lambda *a, **k: (
             _result(stdout="demo\n") if a[0] == "net-list"
             else _result(ok=False, stderr="boom"))
         assert net.apply_live_plan(

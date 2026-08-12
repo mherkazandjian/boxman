@@ -2,6 +2,8 @@ import os
 import tempfile
 from typing import Any
 
+from boxman import log
+
 from .commands import LibVirtCommandBase, VirshCommand
 
 
@@ -24,7 +26,7 @@ def disk_path_for(workdir: str,
     return os.path.expanduser(disk_path)
 
 
-class DiskManager(VirshCommand):
+class DiskManager:
     """
     Class for managing VM disk operations in libvirt.
 
@@ -39,7 +41,14 @@ class DiskManager(VirshCommand):
             vm_name: Name of the VM to manage disks for
             provider_config: Configuration for the libvirt provider
         """
-        super().__init__(provider_config)
+        #: VirshCommand: Command executor for virsh
+        self.virsh = VirshCommand(provider_config=provider_config)
+
+        #: Dict[str, Any]: Configuration for the libvirt provider
+        self.provider_config = provider_config or {}
+
+        #: logging.Logger: Logger instance
+        self.logger = log
 
         #: str: the name of the VM
         self.vm_name = vm_name
@@ -122,7 +131,7 @@ class DiskManager(VirshCommand):
 
             # Attach the disk
             attachment_args = ["--persistent"] if persistent else []
-            result = self.execute("attach-device", self.vm_name, temp_path,
+            result = self.virsh.execute("attach-device", self.vm_name, temp_path,
                                   *attachment_args, warn=True)
 
             # Clean up the temporary file
@@ -271,7 +280,7 @@ class DiskManager(VirshCommand):
             True if successful, False otherwise
         """
         try:
-            result = self.execute(
+            result = self.virsh.execute(
                 'blockresize', self.vm_name,
                 target_dev, f"--size={new_size_mb}M", warn=True)
 

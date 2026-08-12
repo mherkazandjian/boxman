@@ -17,7 +17,7 @@ from .commands import VirshCommand
 from .virsh_parse import parse_domiflist
 
 
-class Network(VirshCommand):
+class Network:
     """
     Class to define libvirt networks by creating XML definitions and using virsh commands.
     """
@@ -38,7 +38,14 @@ class Network(VirshCommand):
             provider_config: Configuration for the libvirt provider
             cache: Optional cache object for storing network definitions
         """
-        super().__init__(provider_config=provider_config)
+        #: VirshCommand: Command executor for virsh
+        self.virsh = VirshCommand(provider_config=provider_config)
+
+        #: Dict[str, Any]: Configuration for the libvirt provider
+        self.provider_config = provider_config or {}
+
+        #: logging.Logger: Logger instance
+        self.logger = log
 
         #: str: the name of the network
         self.name = name
@@ -417,7 +424,7 @@ class Network(VirshCommand):
     def _listed_networks(self, active_only: bool = False) -> list[str] | None:
         """Names of the networks libvirt knows, or None if it could not be asked."""
         args = ["net-list", "--name"] if active_only else ["net-list", "--all", "--name"]
-        result = self.execute(*args, hide=True, warn=True)
+        result = self.virsh.execute(*args, hide=True, warn=True)
         if not result.ok:
             return None
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -442,7 +449,7 @@ class Network(VirshCommand):
             The XML text, or None when it could not be read (undefined, or
             libvirt unreachable -- use :meth:`exists` to tell those apart).
         """
-        result = self.execute("net-dumpxml", self.name, hide=True, warn=True)
+        result = self.virsh.execute("net-dumpxml", self.name, hide=True, warn=True)
         if not result.ok:
             return None
         return result.stdout
@@ -454,14 +461,14 @@ class Network(VirshCommand):
 
     def start(self) -> bool:
         """Start a defined network, and make it come back after a host reboot."""
-        result = self.execute("net-start", self.name, hide=True, warn=True)
+        result = self.virsh.execute("net-start", self.name, hide=True, warn=True)
         if not result.ok:
             self.logger.error(
                 f"network {self.name}: could not be started: "
                 f"{result.stderr.strip()}")
             return False
 
-        autostart = self.execute(
+        autostart = self.virsh.execute(
             "net-autostart", self.name, hide=True, warn=True)
         if not autostart.ok:
             # not fatal, but it means the network is gone again after a reboot
@@ -514,7 +521,7 @@ class Network(VirshCommand):
             if live:
                 args.append("--live")
 
-            result = self.execute(*args, hide=True, warn=True)
+            result = self.virsh.execute(*args, hide=True, warn=True)
             if not result.ok:
                 self.logger.error(
                     f"network {self.name}: {command} {section} failed: "
@@ -574,13 +581,13 @@ class Network(VirshCommand):
 
         Used to tell the user which guests a recreate would disconnect.
         """
-        result = self.execute("list", "--all", "--name", hide=True, warn=True)
+        result = self.virsh.execute("list", "--all", "--name", hide=True, warn=True)
         if not result.ok:
             return []
 
         attached = []
         for domain in [line.strip() for line in result.stdout.splitlines() if line.strip()]:
-            iflist = self.execute(
+            iflist = self.virsh.execute(
                 "domiflist", domain, hide=True, warn=True)
             if not iflist.ok:
                 continue
@@ -726,7 +733,7 @@ class Network(VirshCommand):
 
         # define the network
         try:
-            self.execute("net-define", written_path)
+            self.virsh.execute("net-define", written_path)
 
             # the cache is written only once the network really exists. Written
             # before the define, a failed define (a rejected netmask, a libvirtd
@@ -735,8 +742,8 @@ class Network(VirshCommand):
             # later run -- wedged until projects.json is edited by hand
             self.update_network_cache()
 
-            self.execute("net-start", self.name)
-            self.execute("net-autostart", self.name)
+            self.virsh.execute("net-start", self.name)
+            self.virsh.execute("net-autostart", self.name)
 
             # apply appropriate network configuration based on type. NAT
             # needs nothing from boxman: libvirtd installs the masquerade
@@ -773,7 +780,7 @@ class Network(VirshCommand):
 
             # destroy only when the network itself is active
             if self.is_active():
-                self.execute("net-destroy", self.name)
+                self.virsh.execute("net-destroy", self.name)
                 self.logger.info(f"network {self.name} destroyed successfully")
 
             return True
@@ -800,10 +807,10 @@ class Network(VirshCommand):
                 return True
 
             # disable autostart first if it's enabled
-            self.execute("net-autostart", self.name, "--disable", warn=True)
+            self.virsh.execute("net-autostart", self.name, "--disable", warn=True)
 
             # undefine the network
-            self.execute("net-undefine", self.name)
+            self.virsh.execute("net-undefine", self.name)
             self.logger.info(f"network {self.name} undefined successfully")
             return True
         except RuntimeError as e:
@@ -945,12 +952,12 @@ class Network(VirshCommand):
         Make sure a rule is either present (present=True) or absent (present=False).
 
         Args:
-            instance   : object exposing execute_shell & logger
+            cls        : object with a ``virsh`` executor and a ``logger``
             check_cmd  : iptables -C ... command used to probe rule existence
             action_cmd : command that adds the rule (present) or deletes the rule (absent)
             present    : True -> ensure rule exists, False -> ensure rule is removed
         """
-        chk_res = cls.execute_shell(check_cmd, warn=True)
+        chk_res = cls.virsh.execute_shell(check_cmd, warn=True)
 
         # desired state already reached
         if (present and chk_res.return_code == 0) or (not present and chk_res.return_code != 0):
@@ -958,7 +965,7 @@ class Network(VirshCommand):
             return True
 
         # need an action to reach desired state
-        apply_res = cls.execute_shell(action_cmd, warn=True)
+        apply_res = cls.virsh.execute_shell(action_cmd, warn=True)
         if not apply_res.ok:
             cls.logger.error(f"failed to execute '{action_cmd}': {apply_res.stderr}")
             return False
@@ -1143,7 +1150,7 @@ class Network(VirshCommand):
             return []
 
 
-class NetworkInterface(VirshCommand):
+class NetworkInterface:
     """
     Class to manage network interfaces for libvirt VMs.
     """
@@ -1157,7 +1164,8 @@ class NetworkInterface(VirshCommand):
             vm_name: Name of the VM to manage interfaces for
             provider_config: Configuration for the libvirt provider
         """
-        super().__init__(provider_config=provider_config)
+        #: VirshCommand: Command executor for virsh
+        self.virsh = VirshCommand(provider_config=provider_config)
 
         #: str: Name of the VM
         self.vm_name = vm_name
@@ -1218,7 +1226,7 @@ class NetworkInterface(VirshCommand):
                 temp_path = temp.name
 
             # use virsh to attach the interface
-            self.execute("attach-device", self.vm_name, temp_path, "--persistent")
+            self.virsh.execute("attach-device", self.vm_name, temp_path, "--persistent")
 
             # remove temporary file
             os.unlink(temp_path)

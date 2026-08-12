@@ -16,8 +16,8 @@ def wait_until_shut_off(virsh,
     Poll until *vm_name* reports "shut off", giving up after *timeout* seconds.
 
     Args:
-        virsh: Command executor with an ``execute`` method (e.g.
-            :class:`VirshCommand` or any subclass).
+        virsh: Command executor with an ``execute`` method (a
+            :class:`VirshCommand` instance).
         vm_name: Name of the VM.
         timeout: Maximum seconds to wait.
         poll_interval: Seconds between ``domstate`` polls.
@@ -92,7 +92,7 @@ def shutdown_and_wait(virsh,
     return is_shut_off()
 
 
-class DestroyVM(VirshCommand):
+class DestroyVM:
     """
     Class to destroy (remove) VMs in libvirt using virsh commands.
 
@@ -109,7 +109,11 @@ class DestroyVM(VirshCommand):
             name: Name of the VM to destroy
             provider_config: Configuration for the libvirt provider
         """
-        super().__init__(provider_config=provider_config)
+        #: VirshCommand: Command executor for virsh
+        self.virsh = VirshCommand(provider_config=provider_config)
+
+        #: logging.Logger: Logger instance
+        self.logger = log
 
         #: str: the name of the VM to destroy
         self.name = name
@@ -125,7 +129,7 @@ class DestroyVM(VirshCommand):
             True if VM is running, False otherwise
         """
         try:
-            result = self.execute("domstate", self.name, warn=True)
+            result = self.virsh.execute("domstate", self.name, warn=True)
             return result.ok and "running" in result.stdout
         except RuntimeError:
             return False
@@ -142,7 +146,7 @@ class DestroyVM(VirshCommand):
             True when the domain is "shut off" or no longer exists.
         """
         try:
-            result = self.execute("domstate", self.name, warn=True)
+            result = self.virsh.execute("domstate", self.name, warn=True)
             if not result.ok:
                 return True   # domain gone → effectively stopped
             return "shut off" in result.stdout
@@ -157,7 +161,7 @@ class DestroyVM(VirshCommand):
             True if VM exists, False otherwise
         """
         try:
-            result = self.execute("dominfo", self.name, warn=True)
+            result = self.virsh.execute("dominfo", self.name, warn=True)
             return result.ok
         except RuntimeError:
             return False
@@ -188,12 +192,12 @@ class DestroyVM(VirshCommand):
         try:
             # try graceful shutdown first
             self.logger.info(f"shutting down vm {self.name} gracefully")
-            self.execute("shutdown", self.name)
+            self.virsh.execute("shutdown", self.name)
 
             # wait for vm to reach "shut off" — not just "not running", because
             # a VM in the "in shutdown" state is no longer "running" but the
             # QEMU process is still alive (and storage cannot be removed yet).
-            if shutdown_and_wait(self, self.name, timeout=timeout,
+            if shutdown_and_wait(self.virsh, self.name, timeout=timeout,
                                  force_after=False, poll_interval=1,
                                  logger=self.logger,
                                  is_shut_off=self.is_vm_shut_off):
@@ -232,7 +236,7 @@ class DestroyVM(VirshCommand):
 
         try:
             self.logger.info(f"force shutting down the vm {self.name}")
-            self.execute("destroy", self.name)
+            self.virsh.execute("destroy", self.name)
 
             # verify that the vm is no longer running
             if not self.is_vm_running():
@@ -284,7 +288,7 @@ class DestroyVM(VirshCommand):
         try:
             self.logger.info(f"un-defining vm {self.name}")
 
-            self.execute("undefine", self.name)
+            self.virsh.execute("undefine", self.name)
 
             # verify that the vm is no longer defined
             if not self.is_vm_defined():
@@ -314,7 +318,7 @@ class DestroyVM(VirshCommand):
         if not self.is_vm_shut_off():
             self.logger.warning(
                 f"vm {self.name} is not shut off, force-killing before undefine")
-            self.execute("destroy", self.name, warn=True)
+            self.virsh.execute("destroy", self.name, warn=True)
 
         try:
             self.logger.info(f"**force** un-defining vm {self.name}")
@@ -325,7 +329,7 @@ class DestroyVM(VirshCommand):
             # requires a recent libvirt, so on failure fall back to a
             # plain undefine that only drops snapshot metadata — the
             # domain must always be removable.
-            result = self.execute(
+            result = self.virsh.execute(
                 "undefine", self.name,
                 "--remove-all-storage", "--wipe-storage",
                 "--delete-storage-volume-snapshots", "--snapshots-metadata",
@@ -334,7 +338,7 @@ class DestroyVM(VirshCommand):
                 self.logger.warning(
                     f"undefine with storage removal failed for {self.name} "
                     f"({result.stderr.strip()}) — retrying plain undefine")
-                self.execute("undefine", self.name, "--snapshots-metadata")
+                self.virsh.execute("undefine", self.name, "--snapshots-metadata")
 
             # verify that the vm is no longer defined
             if not self.is_vm_defined():

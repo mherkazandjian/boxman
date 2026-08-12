@@ -370,7 +370,7 @@ class TestNetworkInterfaceAddInterface:
         return NetworkInterface("vm01", provider_config={"use_sudo": False})
 
     def test_success_calls_attach_device(self, ni: NetworkInterface):
-        with patch.object(ni, "execute", return_value=_result()) as execute:
+        with patch.object(ni.virsh, "execute", return_value=_result()) as execute:
             ok = ni.add_interface(
                 network_source="default", mac_address="52:54:00:aa:bb:cc",
             )
@@ -381,7 +381,7 @@ class TestNetworkInterfaceAddInterface:
         assert "--persistent" in args
 
     def test_exception_returns_false(self, ni: NetworkInterface):
-        with patch.object(ni, "execute", side_effect=RuntimeError("boom")):
+        with patch.object(ni.virsh, "execute", side_effect=RuntimeError("boom")):
             assert ni.add_interface(network_source="default") is False
 
 
@@ -438,7 +438,7 @@ class TestDestroyUndefineExactName:
             return ["prod-backup"]
 
         with patch.object(net, "_listed_networks", side_effect=listed), \
-             patch.object(net, "execute",
+             patch.object(net.virsh, "execute",
                           side_effect=lambda *a, **k: calls.append(a) or _result()):
             assert net.destroy_network() is True
         assert not any(args[0] == "net-destroy" for args in calls)
@@ -450,7 +450,7 @@ class TestDestroyUndefineExactName:
             return ["prod", "prod-backup"]
 
         with patch.object(net, "_listed_networks", side_effect=listed), \
-             patch.object(net, "execute",
+             patch.object(net.virsh, "execute",
                           side_effect=lambda *a, **k: calls.append(a) or _result()):
             assert net.destroy_network() is True
         assert ("net-destroy", "prod") in calls
@@ -462,7 +462,7 @@ class TestDestroyUndefineExactName:
             return [] if active_only else ["prod"]
 
         with patch.object(net, "_listed_networks", side_effect=listed), \
-             patch.object(net, "execute",
+             patch.object(net.virsh, "execute",
                           side_effect=lambda *a, **k: calls.append(a) or _result()):
             assert net.destroy_network() is True
         assert not any(args[0] == "net-destroy" for args in calls)
@@ -474,7 +474,7 @@ class TestDestroyUndefineExactName:
     def test_undefine_skips_net_undefine_when_only_superstring_exists(self, net):
         calls = []
         with patch.object(net, "_listed_networks", return_value=["prod-backup"]), \
-             patch.object(net, "execute",
+             patch.object(net.virsh, "execute",
                           side_effect=lambda *a, **k: calls.append(a) or _result()):
             assert net.undefine_network() is True
         assert not any(args[0] == "net-undefine" for args in calls)
@@ -482,7 +482,7 @@ class TestDestroyUndefineExactName:
     def test_undefine_runs_net_undefine_when_name_matches_exactly(self, net):
         calls = []
         with patch.object(net, "_listed_networks", return_value=["prod"]), \
-             patch.object(net, "execute",
+             patch.object(net.virsh, "execute",
                           side_effect=lambda *a, **k: calls.append(a) or _result()):
             assert net.undefine_network() is True
         assert ("net-undefine", "prod") in calls
@@ -515,8 +515,8 @@ class TestNatIsLibvirtdsJob:
         with patch.object(net, "check_network_exists"), \
              patch.object(net, "_get_libvirt_bridges", return_value=set()), \
              patch.object(net, "update_network_cache"), \
-             patch.object(net, "execute", return_value=_result()), \
-             patch.object(net, "execute_shell") as shell:
+             patch.object(net.virsh, "execute", return_value=_result()), \
+             patch.object(net.virsh, "execute_shell") as shell:
             assert net.define_network(str(tmp_path / "net.xml")) is True
         for call in shell.call_args_list:
             assert "iptables" not in call.args[0]
@@ -526,7 +526,7 @@ class TestNatIsLibvirtdsJob:
         net = self._net("nat")
         with patch.object(net, "destroy_network", return_value=True), \
              patch.object(net, "undefine_network", return_value=True), \
-             patch.object(net, "execute_shell") as shell:
+             patch.object(net.virsh, "execute_shell") as shell:
             assert net.remove_network() is True
         shell.assert_not_called()
 
@@ -580,7 +580,7 @@ class TestRouteIsolationRules:
         net = self._net(use_sudo=use_sudo)
         with patch("boxman.providers.libvirt.commands._shell_run",
                    return_value=_result()) as run:
-            net.execute_shell("iptables -C INPUT -i virbr9 -j DROP", warn=True)
+            net.virsh.execute_shell("iptables -C INPUT -i virbr9 -j DROP", warn=True)
         assert run.call_args.args[0].startswith(expected_prefix)
 
 

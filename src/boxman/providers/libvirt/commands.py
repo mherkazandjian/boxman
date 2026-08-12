@@ -286,7 +286,7 @@ class LibVirtCommandBase:
             raise ValueError(f"unsupported runtime: {self.runtime}")
 
 
-class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
+class VirshCommand(LibVirtCommandBase):
     """
     Class for executing virsh commands for managing libvirt domains,
     networks, storage, etc.
