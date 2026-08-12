@@ -83,7 +83,7 @@ class TestRestoreRetryLoop:
         mgr.provider.snapshot_restore.side_effect = RuntimeError("libvirt gone")
         mgr.provider.validate_snapshot.return_value = (True, [])
         ns = types.SimpleNamespace(snapshot_name="s1", vms="all", cluster=None)
-        BoxmanManager.snapshot_restore(mgr, ns)
+        mgr.snapshot_restore(ns)
         infos = [c.args[0] for c in mgr.logger.info.call_args_list if c.args]
         assert not any("all VMs restored successfully" in m for m in infos)
         errors = [c.args[0] for c in mgr.logger.error.call_args_list if c.args]

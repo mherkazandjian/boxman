@@ -58,33 +58,33 @@ class TestControlScoping:
     def test_save_scoped_by_vms(self):
         mgr = _manager()
         ns = types.SimpleNamespace(vms="node01", cluster=None)
-        BoxmanManager.save_vm(mgr, ns)
+        mgr.save_vm(ns)
         saved = {c.args[0] for c in mgr.provider.save_vm.call_args_list}
         assert saved == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}
 
     def test_save_defaults_to_all_vms(self):
         mgr = _manager()
-        BoxmanManager.save_vm(mgr, types.SimpleNamespace())
+        mgr.save_vm(types.SimpleNamespace())
         assert mgr.provider.save_vm.call_count == 4
 
     def test_suspend_scoped_by_vms(self):
         mgr = _manager()
         ns = types.SimpleNamespace(vms="cluster_2_service01", cluster=None)
-        BoxmanManager.suspend_vm(mgr, ns)
+        mgr.suspend_vm(ns)
         suspended = {c.args[0] for c in mgr.provider.suspend_vm.call_args_list}
         assert suspended == {_full("cluster_2", "service01")}
 
     def test_resume_scoped_by_cluster(self):
         mgr = _manager()
         ns = types.SimpleNamespace(vms="all", cluster="cluster_1")
-        BoxmanManager.resume_vm(mgr, ns)
+        mgr.resume_vm(ns)
         resumed = {c.args[0] for c in mgr.provider.resume_vm.call_args_list}
         assert resumed == {_full("cluster_1", "service01"), _full("cluster_1", "node01")}
 
     def test_start_scoped_by_vms(self):
         mgr = _manager()
         ns = types.SimpleNamespace(vms="node01", cluster=None, restore=False)
-        BoxmanManager.start_vm(mgr, ns)
+        mgr.start_vm(ns)
         started = {c.args[0] for c in mgr.provider.start_vm.call_args_list}
         assert started == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}
 
@@ -94,20 +94,20 @@ class TestSnapshotListLogScoping:
     def test_snapshot_list_scoped_by_vms(self):
         mgr = _manager()
         ns = types.SimpleNamespace(vms="node01", cluster=None)
-        BoxmanManager.snapshot_list(mgr, ns)
+        mgr.snapshot_list(ns)
         listed = {c.args[0] for c in mgr.provider.snapshot_list.call_args_list}
         assert listed == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}
 
     def test_snapshot_list_defaults_to_all_vms(self):
         mgr = _manager()
-        BoxmanManager.snapshot_list(mgr, types.SimpleNamespace())
+        mgr.snapshot_list(types.SimpleNamespace())
         assert mgr.provider.snapshot_list.call_count == 4
 
     def test_snapshot_log_scoped_by_vms(self):
         mgr = _manager()
         mgr.provider.snapshot_log_data.return_value = {"chain": [], "current": None}
         ns = types.SimpleNamespace(vms="node01", cluster=None)
-        BoxmanManager.snapshot_log(mgr, ns)
+        mgr.snapshot_log(ns)
         logged = {c.args[0] for c in mgr.provider.snapshot_log_data.call_args_list}
         assert logged == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}
 
@@ -122,27 +122,27 @@ class TestStorageScoping:
         monkeypatch.setattr(
             "boxman.providers.libvirt.storage.vm_disk_paths",
             lambda workdir, full_vm_name, vm_info: seen.append(full_vm_name) or [])
-        BoxmanManager.storage_df(mgr, types.SimpleNamespace(vms="node01"))
+        mgr.storage_df(types.SimpleNamespace(vms="node01"))
         assert set(seen) == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}
 
     def test_storage_trim_scoped_by_vms(self):
         mgr = _manager()
         mgr.provider.storage.is_running.return_value = False
-        BoxmanManager.storage_trim(mgr, types.SimpleNamespace(vms="node01"))
+        mgr.storage_trim(types.SimpleNamespace(vms="node01"))
         trimmed = {c.args[0] for c in mgr.provider.storage.is_running.call_args_list}
         assert trimmed == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}
 
     def test_storage_compact_scoped_by_vms(self, recorded_tasks):
         mgr = _manager()
-        BoxmanManager.storage_compact(mgr, types.SimpleNamespace(vms="node01"))
+        mgr.storage_compact(types.SimpleNamespace(vms="node01"))
         compacted = {label for batch in recorded_tasks for label, _t, _a in batch}
         assert compacted == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}
 
     def test_storage_compress_snapshots_scoped_by_vms(self):
         mgr = _manager()
         mgr.provider.compress_snapshots_memory.return_value = (1, 1)
-        BoxmanManager.storage_compress_snapshots(
-            mgr, types.SimpleNamespace(vms="node01"))
+        mgr.storage_compress_snapshots(
+            types.SimpleNamespace(vms="node01"))
         compressed = {
             c.args[0] for c in mgr.provider.compress_snapshots_memory.call_args_list}
         assert compressed == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}
@@ -151,6 +151,6 @@ class TestStorageScoping:
         mgr = _manager()
         ns = types.SimpleNamespace(
             vms="node01", target="snap1", dry_run=False, no_shutdown=False, yes=True)
-        BoxmanManager.snapshot_collapse(mgr, ns)
+        mgr.snapshot_collapse(ns)
         collapsed = {label for batch in recorded_tasks for label, _t, _a in batch}
         assert collapsed == {_full("cluster_1", "node01"), _full("cluster_2", "node01")}

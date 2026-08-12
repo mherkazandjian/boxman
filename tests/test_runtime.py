@@ -883,7 +883,7 @@ class TestManagerDestroyRuntimeCleanup:
         # 4. _force_rmtree final check → False (docker cleaned it)
         mock_isdir.side_effect = [True, True, True, False]
 
-        BoxmanManager.destroy_runtime(mgr, self._make_cli_args())
+        mgr.destroy_runtime(self._make_cli_args())
 
         # shutil.rmtree called twice: initial attempt + after docker cleanup
         assert mock_rmtree.call_count == 2
@@ -922,7 +922,7 @@ class TestManagerDestroyRuntimeCleanup:
         # 3. _force_rmtree post-shutil.rmtree check → False (rmtree worked)
         mock_isdir.side_effect = [True, True, False]
 
-        BoxmanManager.destroy_runtime(mgr, self._make_cli_args())
+        mgr.destroy_runtime(self._make_cli_args())
 
         assert mock_rmtree.call_count == 1
         mock_subprocess_run.assert_not_called()
@@ -944,7 +944,7 @@ class TestManagerDestroyRuntimeCleanup:
         }
         mgr._runtime_instance = mock_runtime
 
-        BoxmanManager.destroy_runtime(mgr, self._make_cli_args(auto_accept=False))
+        mgr.destroy_runtime(self._make_cli_args(auto_accept=False))
 
         mock_input.assert_called_once()
         mock_runtime.destroy_runtime.assert_not_called()
@@ -969,7 +969,7 @@ class TestManagerDestroyRuntimeCleanup:
         }
         mgr._runtime_instance = mock_runtime
 
-        BoxmanManager.destroy_runtime(mgr, self._make_cli_args(auto_accept=False))
+        mgr.destroy_runtime(self._make_cli_args(auto_accept=False))
 
         mock_input.assert_called_once()
         mock_runtime.destroy_runtime.assert_called_once()
@@ -994,7 +994,7 @@ class TestManagerDestroyRuntimeCleanup:
         mgr._runtime_instance = mock_runtime
 
         with patch("builtins.input") as mock_input:
-            BoxmanManager.destroy_runtime(mgr, self._make_cli_args(auto_accept=True))
+            mgr.destroy_runtime(self._make_cli_args(auto_accept=True))
             mock_input.assert_not_called()
 
         mock_runtime.destroy_runtime.assert_called_once()

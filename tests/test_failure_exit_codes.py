@@ -50,7 +50,7 @@ class TestProvisionFailuresRaise:
         monkeypatch.setattr(
             BoxmanManager, "_find_existing_project_vms", lambda cls: ["vm1"])
         with pytest.raises(ProvisionError, match="cannot provision"):
-            BoxmanManager.provision(mgr, types.SimpleNamespace(force=False))
+            mgr.provision(types.SimpleNamespace(force=False))
 
     def test_cache_registration_conflict(self, monkeypatch, no_existing_state):
         mgr = _manager()
@@ -61,7 +61,7 @@ class TestProvisionFailuresRaise:
         monkeypatch.setattr(
             BoxmanManager, "register_project_in_cache", _conflict)
         with pytest.raises(ProvisionError, match="already registered"):
-            BoxmanManager.provision(mgr, types.SimpleNamespace(force=False))
+            mgr.provision(types.SimpleNamespace(force=False))
 
     def test_template_rebuild_failure(self, monkeypatch, no_existing_state):
         mgr = _manager()
@@ -70,7 +70,7 @@ class TestProvisionFailuresRaise:
             lambda cls, requested=None, force=False: ["failed-template"])
         ns = types.SimpleNamespace(force=False, rebuild_templates=True)
         with pytest.raises(ProvisionError, match="could be rebuilt"):
-            BoxmanManager.provision(mgr, ns)
+            mgr.provision(ns)
 
     def test_ensure_templates_failure(self, monkeypatch, no_existing_state):
         mgr = _manager()
@@ -78,7 +78,7 @@ class TestProvisionFailuresRaise:
             BoxmanManager, "ensure_templates_exist", lambda cls: False)
         ns = types.SimpleNamespace(force=False, rebuild_templates=False)
         with pytest.raises(ProvisionError, match="could be created"):
-            BoxmanManager.provision(mgr, ns)
+            mgr.provision(ns)
 
     def test_validate_base_images_failure(self, monkeypatch, no_existing_state):
         mgr = _manager()
@@ -91,7 +91,7 @@ class TestProvisionFailuresRaise:
         monkeypatch.setattr(BoxmanManager, "validate_base_images", _invalid)
         ns = types.SimpleNamespace(force=False, rebuild_templates=False)
         with pytest.raises(ConfigError, match="base image 'x' not found"):
-            BoxmanManager.provision(mgr, ns)
+            mgr.provision(ns)
 
 
 class TestUpFailuresRaise:
@@ -100,7 +100,7 @@ class TestUpFailuresRaise:
         mgr = _manager()
         mgr.config = {"project": "demo", "clusters": {}}
         with pytest.raises(ConfigError, match="no VMs defined"):
-            BoxmanManager.up(mgr, types.SimpleNamespace())
+            mgr.up(types.SimpleNamespace())
 
     def test_partial_state_without_force(self, monkeypatch):
         mgr = _manager()
@@ -108,7 +108,7 @@ class TestUpFailuresRaise:
             BoxmanManager, "_get_vm_states",
             lambda cls: {"bprj__demo__bprj_cluster_1_service01": "running"})
         with pytest.raises(ProvisionError, match="partial infrastructure state"):
-            BoxmanManager.up(mgr, types.SimpleNamespace(force=False))
+            mgr.up(types.SimpleNamespace(force=False))
 
 
 class TestSnapshotFailuresRaise:
@@ -122,18 +122,18 @@ class TestSnapshotFailuresRaise:
         ns = types.SimpleNamespace(
             snapshot_name="s1", snapshot_descr="", vms="all", cluster=None)
         with pytest.raises(SnapshotError, match="failed verification"):
-            BoxmanManager.snapshot_take(mgr, ns)
+            mgr.snapshot_take(ns)
 
     def test_restore_no_snapshot_found(self):
         mgr = _manager()
         mgr.provider.get_latest_snapshot.return_value = None
         ns = types.SimpleNamespace(snapshot_name=None, vms="all", cluster=None)
         with pytest.raises(SnapshotError, match="no snapshot found"):
-            BoxmanManager.snapshot_restore(mgr, ns)
+            mgr.snapshot_restore(ns)
 
     def test_restore_validation_abort(self):
         mgr = _manager()
         mgr.provider.validate_snapshot.return_value = (False, ["bad chain"])
         ns = types.SimpleNamespace(snapshot_name="s1", vms="all", cluster=None)
         with pytest.raises(SnapshotError, match="aborting restore"):
-            BoxmanManager.snapshot_restore(mgr, ns)
+            mgr.snapshot_restore(ns)
