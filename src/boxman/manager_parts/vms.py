@@ -141,7 +141,7 @@ class VMsMixin:
         # wait-for-IP loop in particular looks like a hang.
         failed = [
             (task[2], p.exitcode)
-            for task, p in zip(clone_tasks, processes)
+            for task, p in zip(clone_tasks, processes, strict=False)
             if p.exitcode != 0
         ]
         if failed:

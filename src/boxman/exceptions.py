@@ -46,7 +46,7 @@ class SnapshotError(BoxmanError):
     callers can decide whether to retry."""
 
 
-class RuntimeUnavailable(BoxmanError):
+class RuntimeUnavailable(BoxmanError):  # noqa: N818 - public API name, renaming is a breaking change
     """Raised when the selected runtime (docker-compose, local libvirt)
     is not reachable — docker daemon down, libvirtd not responding, or
     the runtime container refused to start. Typically retriable."""

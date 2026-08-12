@@ -790,7 +790,7 @@ class Doctor:
 
         def python_version():
             ver = ".".join(str(p) for p in sys.version_info[:3])
-            if sys.version_info[:2] >= (3, 10):
+            if sys.version_info[:2] >= (3, 10):  # noqa: UP036 - standalone installer must parse on end-user Python < 3.10
                 return OK, f"Python {ver} (boxman needs >= 3.10)", None
             fix = Fix(
                 "install Python >= 3.10 (e.g. `conda create -n boxman python=3.12` "
