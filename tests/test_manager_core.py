@@ -400,7 +400,7 @@ class TestCloneVmsExitCodeGuard:
         m = self._mgr_with_one_vm(tmp_path)
         fake = self._fake_process(exitcode=1)
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
-             _patch("boxman.manager.Process", return_value=fake):
+             _patch("boxman.manager_parts.vms.Process", return_value=fake):
             with pytest.raises(RuntimeError, match="clone failed for 1 VM"):
                 m.clone_vms()
 
@@ -409,7 +409,7 @@ class TestCloneVmsExitCodeGuard:
         m = self._mgr_with_one_vm(tmp_path)
         fake = self._fake_process(exitcode=0)
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
-             _patch("boxman.manager.Process", return_value=fake):
+             _patch("boxman.manager_parts.vms.Process", return_value=fake):
             # No exception, no return value either.
             m.clone_vms()
 
@@ -456,7 +456,7 @@ class TestCloneAndConfigureNewVmsExitCodeGuard:
         fake = self._fake_process(exitcode=1)
         new_vm_names = {'bprj__demo__bprj_cluster_1_node01'}
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
-             _patch("boxman.manager.Process", return_value=fake):
+             _patch("boxman.manager_parts.vms.Process", return_value=fake):
             with pytest.raises(RuntimeError, match="clone failed for 1 new VM"):
                 m._clone_and_configure_new_vms(new_vm_names)
 
@@ -470,5 +470,5 @@ class TestCloneAndConfigureNewVmsExitCodeGuard:
         new_vm_names = {'bprj__demo__bprj_cluster_1_node01'}
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
              _patch.object(m, '_configure_and_start_vm'), \
-             _patch("boxman.manager.Process", return_value=fake):
+             _patch("boxman.manager_parts.vms.Process", return_value=fake):
             m._clone_and_configure_new_vms(new_vm_names)

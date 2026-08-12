@@ -745,7 +745,7 @@ class TestDestroyRemovedVm:
         mgr.provider.provider_config = {'uri': 'qemu:///system'}
         return mgr
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_vm_disk_dirs_from_domblklist(self, mock_virsh_cls):
         """Disk directories come from libvirt, cdrom sources are ignored."""
         mgr = self._make_manager()
@@ -756,7 +756,7 @@ class TestDestroyRemovedVm:
 
         assert dirs == ['/data', '/var/lib/libvirt/images']
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_vm_disk_dirs_fallback_when_query_fails(self, mock_virsh_cls):
         """If domblklist fails, fall back to the configured workdirs."""
         mgr = self._make_manager()
@@ -767,7 +767,7 @@ class TestDestroyRemovedVm:
 
         assert dirs == ['/fallback']
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_destroy_removed_vm_sweeps_libvirt_disk_dirs(self, mock_virsh_cls):
         """destroy_disks runs once per libvirt-reported disk directory."""
         mgr = self._make_manager()
@@ -787,7 +787,7 @@ class TestDestroyRemovedVm:
             call('test-vm', force=True),
         ]
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_vm_disk_dirs_handles_paths_with_spaces(self, mock_virsh_cls):
         """A disk path containing spaces must survive domblklist parsing."""
         mgr = self._make_manager()
@@ -804,7 +804,7 @@ class TestDestroyRemovedVm:
 
         assert dirs == ['/vm images']
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_vm_disk_dirs_fallback_when_no_disks(self, mock_virsh_cls):
         """ok=True with zero disk rows (e.g. diskless VM) also falls back
         to the configured workdirs."""
@@ -817,7 +817,7 @@ class TestDestroyRemovedVm:
 
         assert dirs == ['/fallback']
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_destroy_removed_vm_queries_disks_before_undefining(
             self, mock_virsh_cls):
         """domblklist must run before destroy_vm — after the domain is

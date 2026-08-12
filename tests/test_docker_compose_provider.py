@@ -1535,7 +1535,7 @@ class TestManagerDispatch:
         """Finding 2: in a compose-primary mixed project, self.provider is the
         dc session; _ensure_libvirt_storage_pool must build VirshCommand from
         the libvirt cluster's own session config (its URI), not the dc default."""
-        from boxman import manager as mgr_mod
+        from boxman.manager_parts import vms as vms_mod
 
         m = BoxmanManager()
         m.config = {
@@ -1561,7 +1561,7 @@ class TestManagerDispatch:
             def execute(self, *a, **k):
                 return SimpleNamespace(ok=True, stdout="", stderr="")
 
-        monkeypatch.setattr(mgr_mod, "VirshCommand", _FakeVirsh)
+        monkeypatch.setattr(vms_mod, "VirshCommand", _FakeVirsh)
         m._ensure_libvirt_storage_pool("/tmp/vm", "vms")
         assert captured["cfg"] == {"uri": "qemu+ssh://remote/system"}
 

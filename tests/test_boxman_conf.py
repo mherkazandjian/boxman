@@ -708,7 +708,7 @@ class TestNormalizeOwnership:
             from unittest.mock import MagicMock
             return MagicMock(ok=True, stderr="", stdout="")
 
-        monkeypatch.setattr("boxman.manager.run", _capture_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run", _capture_run)
         mgr._normalize_ownership(str(tmp_path))
 
         # No sudo invoked.
@@ -734,7 +734,7 @@ class TestNormalizeOwnership:
             from unittest.mock import MagicMock
             return MagicMock(ok=True, stderr="", stdout="")
 
-        monkeypatch.setattr("boxman.manager.run", _capture_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run", _capture_run)
 
         # Pretend the file is owned by uid=0 (root) by patching scandir
         # to return an entry whose stat reports st_uid=0.
@@ -761,7 +761,7 @@ class TestNormalizeOwnership:
             for e in real_scandir(p):
                 yield _FakeEntry(e, fake_uid=0)
 
-        monkeypatch.setattr("boxman.manager.os.scandir", _fake_scandir)
+        monkeypatch.setattr("boxman.manager_parts.images.os.scandir", _fake_scandir)
         mgr._normalize_ownership(str(tmp_path))
 
         # File got removed without sudo.
@@ -782,10 +782,10 @@ class TestNormalizeOwnership:
             run_calls.append(cmd)
             return MagicMock(ok=True, stderr="", stdout="")
 
-        monkeypatch.setattr("boxman.manager.run", _capture_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run", _capture_run)
         # Pretend the dir is not writable.
         monkeypatch.setattr(
-            "boxman.manager.os.access",
+            "boxman.manager_parts.images.os.access",
             lambda p, mode: False if p == str(tmp_path) else True,
         )
 
@@ -810,9 +810,9 @@ class TestNormalizeOwnership:
                 stdout="",
             )
 
-        monkeypatch.setattr("boxman.manager.run", _failing_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run", _failing_run)
         monkeypatch.setattr(
-            "boxman.manager.os.access",
+            "boxman.manager_parts.images.os.access",
             lambda p, mode: False,
         )
 
