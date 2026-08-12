@@ -418,18 +418,11 @@ class TestCloneAndConfigureNewVmsExitCodeGuard:
     """
     Mirror of TestCloneVmsExitCodeGuard but for the `update` path
     (_clone_and_configure_new_vms). Same silent-failure bug if any
-    clone subprocess exits non-zero — the configure/start steps would
-    otherwise run against VMs that were never defined.
+    clone worker fails — the configure/start steps would otherwise run
+    against VMs that were never defined. The clone batch runs through
+    ``_run_parallel`` (#85 item 4), which reports raised/killed workers
+    as failures.
     """
-
-    @staticmethod
-    def _fake_process(exitcode: int):
-        from unittest.mock import MagicMock
-        proc = MagicMock()
-        proc.exitcode = exitcode
-        proc.start = MagicMock()
-        proc.join = MagicMock()
-        return proc
 
     def _mgr_with_one_vm(self, tmp_path: Path):
         from unittest.mock import MagicMock
@@ -453,22 +446,22 @@ class TestCloneAndConfigureNewVmsExitCodeGuard:
     def test_raises_when_clone_subprocess_fails(self, tmp_path: Path):
         from unittest.mock import patch as _patch
         m = self._mgr_with_one_vm(tmp_path)
-        fake = self._fake_process(exitcode=1)
         new_vm_names = {'bprj__demo__bprj_cluster_1_node01'}
+        failures = {
+            'bprj__demo__bprj_cluster_1_node01': 'worker exited with code 1'}
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
-             _patch("boxman.manager_parts.vms.Process", return_value=fake):
+             _patch.object(m, '_run_parallel', return_value=({}, failures)):
             with pytest.raises(RuntimeError, match="clone failed for 1 new VM"):
                 m._clone_and_configure_new_vms(new_vm_names)
 
     def test_no_raise_when_all_clones_succeed(self, tmp_path: Path):
         """When clones succeed, control should move into the configure
-        phase — patch _configure_and_start_vm so we don't depend on the
-        rest of the orchestration."""
+        phase — _run_parallel is patched out, so no real workers run."""
         from unittest.mock import patch as _patch
         m = self._mgr_with_one_vm(tmp_path)
-        fake = self._fake_process(exitcode=0)
         new_vm_names = {'bprj__demo__bprj_cluster_1_node01'}
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
-             _patch.object(m, '_configure_and_start_vm'), \
-             _patch("boxman.manager_parts.vms.Process", return_value=fake):
+             _patch.object(m, '_run_parallel', return_value=({}, {})) as par:
             m._clone_and_configure_new_vms(new_vm_names)
+        # clone batch + configure batch
+        assert par.call_count == 2

@@ -44,6 +44,11 @@ def _dying_worker():
     os._exit(1)
 
 
+def _dying_update_worker(*_args):
+    # Same hard crash, but tolerant of the update-worker's arg list.
+    os._exit(1)
+
+
 class TestRunParallel:
 
     def test_success_collects_results(self):
@@ -91,6 +96,38 @@ class TestRestoreRetryLoop:
         assert not any("all VMs restored successfully" in m for m in infos)
         errors = [c.args[0] for c in mgr.logger.error.call_args_list if c.args]
         assert any("libvirt gone" in m for m in errors)
+
+
+class TestUpdateParallelFailures:
+
+    def test_dying_update_worker_lands_in_failed_summary(self, monkeypatch):
+        """update()'s per-VM diff/apply batch runs through _run_parallel:
+        a worker killed before queue.put must land in the failed summary,
+        not vanish silently (#85 items 4/16)."""
+        mgr = _manager()
+        full = "bprj__demo__bprj_cluster_1_node01"
+        monkeypatch.setattr(
+            BoxmanManager, "_update_sessions_with_runtime", lambda self: None)
+        monkeypatch.setattr(
+            BoxmanManager, "ensure_shared_bridges", lambda self: None)
+        monkeypatch.setattr(
+            BoxmanManager, "reconcile_networks", lambda self, **kw: {})
+        monkeypatch.setattr(
+            BoxmanManager, "report_network_results", lambda self, r: None)
+        monkeypatch.setattr(
+            BoxmanManager, "_find_all_existing_project_vms",
+            lambda self: [full])
+        monkeypatch.setattr(
+            BoxmanManager, "setup_ssh_access", lambda self: None)
+        monkeypatch.setattr(
+            BoxmanManager, "connect_info", lambda self: None)
+        monkeypatch.setattr(
+            BoxmanManager, "_update_single_vm", _dying_update_worker)
+        ns = types.SimpleNamespace(
+            dry_run=False, yes=True, recreate_networks=False)
+        mgr.update(ns)
+        errors = [c.args[0] for c in mgr.logger.error.call_args_list if c.args]
+        assert any("failed" in msg and "node01" in msg for msg in errors)
 
 
 class TestGetConnectInfo:

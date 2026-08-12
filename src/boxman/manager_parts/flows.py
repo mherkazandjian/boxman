@@ -5,7 +5,6 @@ import os
 import shutil
 import subprocess
 import time
-from multiprocessing import Process
 
 from boxman import log
 from boxman.exceptions import ConfigError, ProvisionError
@@ -309,15 +308,11 @@ class FlowsMixin:
                     f"attempting to start...")
                 session.start_vm(vm_name)
 
-        processes = [
-            Process(
-                target=_bring_up,
-                args=(vm_name, state, vm_workdir_map.get(vm_name, ''))
-            )
-            for vm_name, state in non_running.items()
-        ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        self._run_parallel(
+            [(vm_name, _bring_up,
+              (vm_name, state, vm_workdir_map.get(vm_name, '')))
+             for vm_name, state in non_running.items()],
+            op_label='bring up vm')
 
         # Wait for IP addresses
         self.wait_for_vm_ips(self._get_project_vm_names(), max_wait=300)
