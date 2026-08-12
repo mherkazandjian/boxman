@@ -353,7 +353,7 @@ class SnapshotsMixin:
                     "no VMs or containers matched the given "
                     "--cluster/--vms selection")
             if dc_abort:
-                self.logger.error(
+                raise SnapshotError(
                     "aborting restore — one or more snapshots have errors "
                     "(see above)")
             return
@@ -361,10 +361,9 @@ class SnapshotsMixin:
         if not selected:
             # containers only: nothing to pre-validate on the libvirt side
             if dc_abort:
-                self.logger.error(
+                raise SnapshotError(
                     "aborting restore — one or more snapshots have errors "
                     "(see above)")
-                return
             self._exit_if_dc_failed(self._restore_dc_plan(dc_plan), 'restore')
             return
 
@@ -439,10 +438,10 @@ class SnapshotsMixin:
                 self.logger.info(f"{len(failed)} VM(s) failed, retrying in 3s...")
                 time.sleep(3)
 
-        self.logger.error(
+        self._exit_if_dc_failed(dc_failed, 'restore')
+        raise SnapshotError(
             f"restore gave up after {max_rounds} rounds. "
             f"still failing: {[vm for vm, _ in pending]}")
-        self._exit_if_dc_failed(dc_failed, 'restore')
 
     def snapshot_delete(self, cli_args):
         """
@@ -455,8 +454,7 @@ class SnapshotsMixin:
         self._update_sessions_with_runtime()
 
         if not cli_args.snapshot_name:
-            self.logger.error("error: Snapshot name is required")
-            return
+            raise SnapshotError("snapshot name is required for delete")
 
         # docker-compose clusters (cluster-scoped, D3), failures isolated so
         # one cluster can't strand the others or the VMs.

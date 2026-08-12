@@ -1379,13 +1379,15 @@ class TestSnapshotDcWiring:
 
     def test_restore_validates_before_mutating(self):
         """An invalid container snapshot must abort *before* the destructive
-        up --force-recreate (mher: partial-restore ordering)."""
+        up --force-recreate (mher: partial-restore ordering), and must raise
+        so the CLI exits non-zero (#85 item 3)."""
         m = self._mgr()
         sess = self._restore_session(valid=False, errors=["image missing: x"])
         m.session_for_cluster = lambda c: sess
         args = SimpleNamespace(snapshot_name="v1", cluster=None, vms="all")
         with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
-            m.snapshot_restore(args)
+            with pytest.raises(SnapshotError, match="aborting restore"):
+                m.snapshot_restore(args)
         sess.validate_snapshot_cluster.assert_called_once()
         sess.snapshot_restore_cluster.assert_not_called()
 

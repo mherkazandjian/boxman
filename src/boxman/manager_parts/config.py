@@ -38,6 +38,9 @@ class ConfigMixin:
 
         Returns:
             Dict containing the configuration
+
+        Raises:
+            ConfigError: If the configuration file does not exist.
         """
         # get the directory and filename for jinja template loading
         config_dir = os.path.dirname(os.path.abspath(config_path))
@@ -64,8 +67,12 @@ class ConfigMixin:
         # would have {{ suffix }} converted to {suffix} before Jinja2 runs,
         # leaving the literal string "disk{suffix}" in the output.
         raw_path = os.path.join(config_dir, config_filename)
-        with open(raw_path) as fobj:
-            raw_content = fobj.read()
+        try:
+            with open(raw_path) as fobj:
+                raw_content = fobj.read()
+        except FileNotFoundError as exc:
+            raise ConfigError(
+                f"project config not found: {raw_path}") from exc
 
         # collect all variable names introduced by jinja2 control flow
         jinja_ctrl_vars: set = set()
