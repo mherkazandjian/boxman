@@ -28,7 +28,7 @@ class RuntimeBase(ABC):
     def name(self) -> str:
         """Short identifier, e.g. 'local' or 'docker-compose'."""
 
-    def ensure_ready(self) -> None:
+    def ensure_ready(self) -> None:  # noqa: B027 - intentional no-op default; local runtime needs no setup
         """
         Ensure the runtime environment is up and ready to accept commands.
 

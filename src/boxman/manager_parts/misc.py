@@ -426,10 +426,10 @@ class MiscMixin:
             max(len(headers[i]), *(len(row[i]) for row in rows))
             for i in range(col_count)
         ]
-        print("  ".join(h.ljust(w) for h, w in zip(headers, widths)))
+        print("  ".join(h.ljust(w) for h, w in zip(headers, widths, strict=False)))
         print("  ".join("-" * w for w in widths))
         for row in rows:
-            print("  ".join(val.ljust(w) for val, w in zip(row, widths)))
+            print("  ".join(val.ljust(w) for val, w in zip(row, widths, strict=False)))
 
     def ssh_session(self, cli_args):
         """

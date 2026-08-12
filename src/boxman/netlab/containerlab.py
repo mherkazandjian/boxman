@@ -27,7 +27,7 @@ from boxman import log
 from boxman.utils.shell import run
 
 
-class ContainerlabNotInstalled(RuntimeError):
+class ContainerlabNotInstalled(RuntimeError):  # noqa: N818 - public API name, renaming is a breaking change
     """Raised when the ``containerlab`` binary or Docker isn't available."""
 
 
