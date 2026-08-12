@@ -113,7 +113,7 @@ class TestShowConfMerge:
     def test_show_conf_uses_unified_merge(self, conf_yml: Path):
         captured: dict = {}
 
-        def fake_show_conf(manager, args, merged_provider=None):
+        def fake_show_conf(args, merged_provider=None):
             captured["merged_provider"] = merged_provider
 
         with patch("boxman.manager.BoxmanCache"), \

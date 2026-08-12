@@ -97,30 +97,27 @@ class TestSubcommandHelps:
 
 
 class TestStorageDispatch:
-    """Storage subverbs must wire to the correct BoxmanManager methods."""
+    """Storage subverbs must name the correct BoxmanManager handler."""
 
     def test_storage_df_dispatch(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(["storage", "df"])
-        assert args.func is BoxmanManager.storage_df
+        assert args.handler == 'storage_df'
         assert args.vms == "all"
 
     def test_storage_trim_dispatch(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(["storage", "trim"])
-        assert args.func is BoxmanManager.storage_trim
+        assert args.handler == 'storage_trim'
         assert args.dry_run is False
 
     def test_storage_compact_defaults(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(["storage", "compact"])
-        assert args.func is BoxmanManager.storage_compact
+        assert args.handler == 'storage_compact'
         assert args.method == "auto"
         assert args.no_shutdown is False
         assert args.drop_snapshots is False
@@ -142,11 +139,10 @@ class TestStorageDispatch:
         assert args.dry_run is True
 
     def test_storage_optimize_dispatch(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(["storage", "optimize", "--skip-trim"])
-        assert args.func is BoxmanManager.storage_optimize
+        assert args.handler == 'storage_optimize'
         assert args.skip_trim is True
         assert args.skip_compact is False
 
@@ -159,11 +155,10 @@ class TestStorageDispatch:
             parser.parse_args(["storage", "compact", "--method", "nuke-from-orbit"])
 
     def test_storage_compress_snapshots_dispatch(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(["storage", "compress-snapshots"])
-        assert args.func is BoxmanManager.storage_compress_snapshots
+        assert args.handler == 'storage_compress_snapshots'
         assert args.level == 3
         assert args.decompress is False
 
@@ -191,12 +186,11 @@ class TestStorageDispatch:
         assert args.memory_compress_level == 3
 
     def test_snapshot_take_cluster_scope(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(
             ["snapshot", "take", "--cluster", "cluster_2", "--vms", "node01"])
-        assert args.func is BoxmanManager.snapshot_take
+        assert args.handler == 'snapshot_take'
         assert args.cluster == "cluster_2"
         assert args.vms == "node01"
 
@@ -208,22 +202,20 @@ class TestStorageDispatch:
         assert args.vms == "all"
 
     def test_snapshot_restore_cluster_scope(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(
             ["snapshot", "restore", "--cluster", "cluster_1", "--name", "s1"])
-        assert args.func is BoxmanManager.snapshot_restore
+        assert args.handler == 'snapshot_restore'
         assert args.cluster == "cluster_1"
         assert args.snapshot_name == "s1"
 
     def test_snapshot_delete_cluster_scope(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(
             ["snapshot", "delete", "--cluster", "cluster_2", "--name", "s1"])
-        assert args.func is BoxmanManager.snapshot_delete
+        assert args.handler == 'snapshot_delete'
         assert args.cluster == "cluster_2"
 
     def test_snapshot_collapse_requires_to(self):
@@ -235,23 +227,21 @@ class TestStorageDispatch:
             parser.parse_args(["snapshot", "collapse"])
 
     def test_snapshot_collapse_dispatch(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(
             ["snapshot", "collapse", "--to", "before-slurm"])
-        assert args.func is BoxmanManager.snapshot_collapse
+        assert args.handler == 'snapshot_collapse'
         assert args.target == "before-slurm"
         assert args.dry_run is False
         assert args.no_shutdown is False
         assert args.yes is False
 
     def test_snapshot_log_dispatch(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(["snapshot", "log"])
-        assert args.func is BoxmanManager.snapshot_log
+        assert args.handler == 'snapshot_log'
         assert args.vms == "all"
         assert args.max_count is None
         assert args.as_json is False
@@ -371,23 +361,21 @@ class TestConfigDryRun:
 
 
 class TestImageDispatch:
-    """`image` subverbs must wire to the correct BoxmanManager methods."""
+    """`image` subverbs must name the correct BoxmanManager handler."""
 
     def test_image_inspect_dispatch(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(["image", "inspect", "oci://reg/repo:tag"])
-        assert args.func is BoxmanManager.inspect_image
+        assert args.handler == 'inspect_image'
         assert args.image_ref == "oci://reg/repo:tag"
 
     def test_image_push_dispatch(self):
-        from boxman.manager import BoxmanManager
         from boxman.scripts.app import parse_args
         parser = parse_args()
         args = parser.parse_args(
             ["image", "push", "reg/repo:tag", "--qcow2", "/tmp/disk.qcow2"])
-        assert args.func is BoxmanManager.push_image
+        assert args.handler == 'push_image'
         assert args.image_ref == "reg/repo:tag"
         assert args.qcow2 == "/tmp/disk.qcow2"
         assert args.metadata is None
