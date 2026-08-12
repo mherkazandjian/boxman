@@ -1,39 +1,29 @@
 """
-Protocols that describe the provider surface (libvirt / VirtualBox).
+Protocol that describes the shared provider-session surface.
 
-``LibVirtSession`` and the legacy VirtualBox session both implement the
-same high-level contract: a constructor that takes a config dict, a
-mutable ``provider_config`` + ``uri`` + ``use_sudo`` surface, and a
-small set of orchestration methods (``start_vm``, ``destroy_vm``,
-``clone_vm``, ``define_network``, snapshot APIs, etc.).
+``LibVirtSession``, ``VirtualBoxSession`` and ``DockerComposeSession``
+all implement the same core contract: a constructor that takes a config
+dict, a mutable ``provider_config`` + ``uri`` + ``use_sudo`` surface
+(see :class:`boxman.providers.session_base.SessionConfigMixin`), and a
+common set of lifecycle/network/snapshot methods.
 
-These used to be empty sentinel classes (``class Provider: pass``).
-Phase 2.3 of the review plan turns them into
-:class:`typing.Protocol`\\s so that code annotated with the protocol
-type-checks against any concrete implementation — the protocols are
-structural (duck-typed), not an inheritance contract.
+This used to be an empty sentinel class (``class Provider: pass``).
+Phase 2.3 of the review plan turned it into a :class:`typing.Protocol`
+so that code annotated with the protocol type-checks against any
+concrete implementation — the protocol is structural (duck-typed), not
+an inheritance contract.
 
-Only the methods that are actually consumed by ``BoxmanManager`` and the
-CLI are listed here. Provider-internal helpers stay off the protocol so
-that implementations can keep internal refactoring flexibility.
+The protocol deliberately lists only the surface that is **uniform
+across all three providers** — the subset ``BoxmanManager`` and the CLI
+drive provider-agnostically. The manager calls many more
+provider-specific methods (per-cluster lifecycle on docker-compose,
+plan/update/storage ops on libvirt); those stay off the protocol so
+implementations keep their internal refactoring flexibility.
 """
 
 from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
-
-
-@runtime_checkable
-class Provider(Protocol):
-    """A provider represents the static side of an infrastructure backend.
-
-    At the moment this is thin — the bulk of the contract is on
-    :class:`ProviderSession`. Kept as its own protocol so future
-    provider-level metadata (display name, available regions, etc.)
-    can be added without churning session-level callers.
-    """
-
-    name: str
 
 
 @runtime_checkable

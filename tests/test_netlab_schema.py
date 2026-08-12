@@ -17,24 +17,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.net import NetworkInterface
-
+from conftest import make_bare_manager
 
 pytestmark = pytest.mark.unit
-
-
-def _make_manager(config: dict) -> BoxmanManager:
-    mgr = BoxmanManager.__new__(BoxmanManager)
-    mgr.config = config
-    mgr.logger = MagicMock()
-    return mgr
 
 
 class TestAdapterResolution:
 
     def test_shared_network_rewrites_to_bridge(self):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "project": "p1",
             "shared_networks": {
                 "lab_mgmt": {"bridge": "shared_lab_mgmt"},
@@ -48,7 +40,7 @@ class TestAdapterResolution:
         assert adapter["source_type"] == "bridge"
 
     def test_global_adapter_unchanged(self):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "project": "p1",
             "shared_networks": {"lab_mgmt": {"bridge": "br1"}},
             "clusters": {},
@@ -60,7 +52,7 @@ class TestAdapterResolution:
         assert "source_type" not in adapter
 
     def test_cluster_scoped_network_prefixed(self):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "project": "p1",
             "shared_networks": {},
             "clusters": {},
@@ -77,7 +69,7 @@ class TestAdapterResolution:
         # A name that matches shared_networks should resolve as a bridge
         # even if is_global is also set. Shared bridges are already the
         # "global" concept for hybrid L2 glue.
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "project": "p1",
             "shared_networks": {"lab_mgmt": {"bridge": "br_lab"}},
             "clusters": {},
@@ -89,7 +81,7 @@ class TestAdapterResolution:
         assert adapter["source_type"] == "bridge"
 
     def test_no_shared_networks_key_falls_back(self):
-        mgr = _make_manager({
+        mgr = make_bare_manager({
             "project": "p1",
             "clusters": {},
         })
@@ -106,6 +98,7 @@ class TestInterfaceXmlRendering:
         iface.vm_name = "vm1"
         iface.logger = MagicMock()
         iface.provider_config = {"use_sudo": False}
+        iface.virsh = MagicMock()
 
         captured: dict[str, str] = {}
 
@@ -118,7 +111,7 @@ class TestInterfaceXmlRendering:
             result.ok = True
             return result
 
-        iface.execute = fake_execute
+        iface.virsh.execute = fake_execute
         ok = iface.add_interface(**kwargs)
         assert ok
         return captured["xml"]

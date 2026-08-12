@@ -19,7 +19,7 @@ All external calls are mocked — no VBoxManage is invoked on any host.
 from __future__ import annotations
 
 import subprocess
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -28,7 +28,6 @@ from boxman.exceptions import ConfigError
 from boxman.providers.virtualbox import VirtualBoxSession as VirtualBoxSessionExport
 from boxman.providers.virtualbox.commands import VBoxManageCommand
 from boxman.providers.virtualbox.session import VirtualBoxSession
-
 
 pytestmark = pytest.mark.unit
 
@@ -97,12 +96,14 @@ class TestConstructionSideEffectFree:
 
 class TestConfigSurface:
 
-    def test_project_provider_config_wins(self):
+    def test_update_provider_config_is_last_write_wins(self):
+        """Same post-#110 semantics as the libvirt session: the constructor
+        receives an already-merged config, and ``update_provider_config`` is
+        a plain last-write-wins update (runtime metadata injection only)."""
         session = VirtualBoxSession(
             config={"provider": {"virtualbox": {"use_sudo": True}}})
-        # app-level default should not override the project-level value
         session.update_provider_config({"use_sudo": False, "vboxmanage_cmd": "vbm"})
-        assert session.use_sudo is True
+        assert session.use_sudo is False
         assert session.provider_config["vboxmanage_cmd"] == "vbm"
 
     def test_uri_defaults_to_empty_string(self):
@@ -265,6 +266,36 @@ class TestStubbedOperations:
     def test_storage_property_raises(self):
         with pytest.raises(NotImplementedError):
             _ = self._session().storage
+
+
+# --- CLI dispatch -------------------------------------------------------------
+
+class TestCliDispatch:
+    """#85 item 28: a virtualbox stub dying mid-flow must surface as a clean
+    exit 2 with a Phase 1 message, not a raw traceback."""
+
+    def test_virtualbox_stub_exits_2_with_message(self):
+        from boxman.scripts import app
+        with patch("boxman.scripts.app._main",
+                   side_effect=NotImplementedError(
+                       "VirtualBox provider: start_vm lands in Phase 2")), \
+                patch("boxman.scripts.app.log") as mock_log:
+            with pytest.raises(SystemExit) as exc:
+                app.main()
+        assert exc.value.code == 2
+        msg = mock_log.error.call_args.args[0]
+        assert "start_vm lands in Phase 2" in msg
+        assert "Phase 1" in msg
+        assert "non-functional" in msg
+
+    def test_unrelated_not_implemented_still_raises(self):
+        """Only the virtualbox stubs are translated; an unrelated
+        NotImplementedError keeps its traceback."""
+        from boxman.scripts import app
+        with patch("boxman.scripts.app._main",
+                   side_effect=NotImplementedError("something else broke")):
+            with pytest.raises(NotImplementedError, match="something else"):
+                app.main()
 
 
 # --- salvaged command builders ----------------------------------------------

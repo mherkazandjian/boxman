@@ -29,9 +29,10 @@ def download_url(url: str, dst_path: str) -> bool:
     if os.path.exists(dst_path):
         os.remove(dst_path)
 
-    # curl fallback.
+    # curl fallback. --fail so an HTTP 4xx/5xx error page is not written
+    # and accepted as a valid download (wget already fails on HTTP errors).
     result = _shell_run(
-        f'curl -L --progress-bar -o "{dst_path}" "{url}"',
+        f'curl -fL --progress-bar -o "{dst_path}" "{url}"',
         hide=not is_verbose(logging.DEBUG), warn=True,
     )
     if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:

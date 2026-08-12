@@ -1,29 +1,39 @@
 #!/usr/bin/env python
 
-import argparse
 import logging
 import os
 import shutil
 import sys
-from argparse import RawTextHelpFormatter
-from datetime import datetime, timezone
-from multiprocessing import Process
 
 import yaml
 
 import boxman
 from boxman import log
-from boxman.abstract.providers import ProviderSession as Session
 from boxman.exceptions import BoxmanError, ConfigError
-from boxman.manager import BoxmanManager
-from boxman.providers import create_session, primary_provider_type
-from boxman.providers.libvirt.import_image import ImageImporter
 from boxman.loggers.logger import set_quiet, set_verbosity, suppressed
+from boxman.manager import BoxmanManager
+from boxman.providers import create_session, merge_provider_configs, primary_provider_type
+from boxman.providers.libvirt.import_image import ImageImporter
 from boxman.scripts.cli_parser import parse_args, resolve_verbosity
 from boxman.utils.jinja_env import create_jinja_env
 
-now = datetime.now(timezone.utc)
-snap_name = now.strftime('%Y-%m-%dT%H:%M:%S')
+#: Names of the :class:`BoxmanManager` methods the CLI may dispatch to.
+#: The parser declares them via ``set_defaults(handler='<name>')`` and
+#: :func:`_main` resolves the bound method with ``getattr`` at dispatch
+#: time, so decorating or aliasing a handler method can never silently
+#: break dispatch (the old ``args.func is BoxmanManager.x`` identity
+#: comparisons did).
+_CLI_HANDLERS = frozenset({
+    'import_image', 'push_image', 'inspect_image', 'create_templates',
+    'list_projects', 'provision', 'up', 'update', 'down',
+    'destroy_runtime', 'destroy', 'deprovision', 'snapshot_take',
+    'snapshot_list', 'snapshot_log', 'snapshot_restore', 'snapshot_delete',
+    'snapshot_collapse', 'storage_df', 'storage_trim', 'storage_compact',
+    'storage_optimize', 'storage_compress_snapshots', 'suspend_vm',
+    'resume_vm', 'save_vm', 'start_vm', 'run_task', 'ps', 'show_conf',
+    'ssh_session', 'exec_container', 'pxe_boot', 'netlab_deploy',
+    'netlab_destroy', 'netlab_inspect', 'netlab_ssh',
+})
 
 
 def ensure_virtualbox_runtime_is_local(runtime: str) -> None:
@@ -47,181 +57,6 @@ def ensure_virtualbox_runtime_is_local(runtime: str) -> None:
             f"flag / the 'runtime:' setting in boxman.yml, or set it to 'local'."
         )
 
-
-def parse_vms_list(session: Session, cli_args):
-    """
-    Parse the list of vms, either "all" vms or a comma-separated list
-
-    When 'all' is specified, all the vms from the session configurations
-    are used.
-
-    :param session: The instance of a session
-    """
-    vms = []
-    if cli_args.vms == 'all':
-        for cluster in session.conf['clusters']:
-            for vm in session.conf['clusters'][cluster]['vms']:
-                vms.append(vm)
-    else:
-        vms.extend(cli_args.vms.split(','))
-
-    return vms
-
-
-def snapshot_take(session, cli_args):
-    """
-    Take a snapshot of the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _take(vm):
-        session.snapshot.take(
-            vm,
-            snap_name=cli_args.snapshot_name,
-            live=cli_args.live)
-    processes = [Process(target=_take, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-    #_ = [_take(vm) for vm in vms]
-
-
-def snapshot_list(session, cli_args):
-    vms = parse_vms_list(session, cli_args)
-    for vm in vms:
-        session.snapshot.list(vm)
-
-
-def snapshot_delete(session, cli_args):
-    vms = parse_vms_list(session, cli_args)
-    for vm in vms:
-        session.snapshot.delete(
-            vm,
-            snap_name=cli_args.snapshot_name)
-
-
-def snapshot_restore(session, cli_args):
-    """
-    Restore a snapshot of the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _restore(vm):
-        session.snapshot.restore(
-            vm,
-            snap_name=cli_args.snapshot_name)
-    processes = [Process(target=_restore, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-
-
-def machine_suspend(session, cli_args):
-    """
-    Suspend the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _suspend(vm):
-        session.suspend(vm)
-    processes = [Process(target=_suspend, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-
-
-def machine_resume(session, cli_args):
-    """
-    Resume the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _resume(vm):
-        session.resume(vm)
-    processes = [Process(target=_resume, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-
-
-def machine_save(session, cli_args):
-    """
-    Save the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _save(vm):
-        session.savestate(vm)
-    processes = [Process(target=_save, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-
-
-def machine_start(session, cli_args):
-    """
-    Start the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    """
-    vms = parse_vms_list(session, cli_args)
-    def _start(vm):
-        session.startvm(vm)
-    processes = [Process(target=_start, args=(vm,)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-
-
-def export_config(session: Session, cli_args):
-    """
-    Take the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-
-    .. todo:: add option to specify exporting a certain snapshot
-    """
-    vms = parse_vms_list(session, cli_args)
-    assert cli_args.path
-    os.makedirs(cli_args.path, exist_ok=False)
-    def _export_vm(vm, dirpath):
-        session.savestate(vm)
-        session.export_vm(
-            vm,
-            path=os.path.expanduser(os.path.join(dirpath, f'{vm}.ovf'))
-        )
-        session.startvm(vm)
-    processes = [Process(target=_export_vm, args=(vm, cli_args.path)) for vm in vms]
-    [p.start() for p in processes]
-    [p.join() for p in processes]
-    #_ = [_export_vm(vm, cli_args.export_path) for vm in vms]
-
-
-def import_config(session: Session, cli_args):
-    """
-    Take a snapshot of the vms
-
-    :param session: The instance of a session
-    :param cli_args: The parsed arguments from the cli
-    # .. todo:: add option to start/resume the vms once imported
-    """
-    raise NotImplementedError('importing is not implemented yet')
-    #vms = parse_vms_list(session, cli_args)
-    #def _take(vm):
-    #    session.snapshot.take(
-    #        vm,
-    #        snap_name=cli_args.snapshot_name,
-    #        live=cli_args.live)
-    #processes = [Process(target=_take, args=(vm,)) for vm in vms]
-    #[p.start() for p in processes]
-    #[p.join() for p in processes]
-    ##_ = [_take(vm) for vm in vms]
 
 def _default_boxman_config() -> dict:
     """
@@ -318,6 +153,11 @@ def main():
     (:class:`~boxman.exceptions.ProvisionError`) or a missing docker/compose
     plugin (:class:`~boxman.exceptions.RuntimeUnavailable`). All other flow
     (including the ``sys.exit()`` calls throughout) lives in :func:`_main`.
+
+    Also translates the virtualbox provider's ``NotImplementedError`` stubs
+    into a clean exit 2: the provider is registered but Phase 1 (config
+    surface only, non-functional), so without this every operation would die
+    with a raw traceback mid-flow.
     """
     try:
         _main()
@@ -328,6 +168,18 @@ def main():
         # it is not swallowed (exit 2 with empty output).
         logging.getLogger('boxman').setLevel(logging.ERROR)
         log.error(str(exc))
+        sys.exit(2)
+    except NotImplementedError as exc:
+        if not str(exc).startswith("VirtualBox provider:"):
+            raise
+        # The virtualbox provider is registered but Phase 1 (config surface
+        # only, non-functional): every operation stub raises
+        # NotImplementedError. Translate it into a clear message instead of
+        # a raw traceback mid-flow.
+        logging.getLogger('boxman').setLevel(logging.ERROR)
+        log.error(
+            f"{exc} — the virtualbox provider is Phase 1 "
+            "(config surface only, non-functional)")
         sys.exit(2)
 
 
@@ -349,7 +201,7 @@ def _main():
     # Only the 'run' subcommand accepts dynamic task flags;
     # all other subcommands should reject unknown arguments.
     if remaining and (
-        not hasattr(args, "func") or args.func != BoxmanManager.run_task
+        getattr(args, 'handler', None) != 'run_task'
     ):
         arg_parser.error(f"unrecognized arguments: {' '.join(remaining)}")
 
@@ -369,27 +221,35 @@ def _main():
         print(f'v{boxman.metadata.version}')
         sys.exit(0)
 
-    if not hasattr(args, 'func'):
+    if not hasattr(args, 'handler'):
         arg_parser.print_help()
         sys.exit(1)
 
-    if args.func == BoxmanManager.list_projects:
+    # Defensive allowlist: the parser only ever sets these names, but
+    # dispatch resolves them with getattr — reject anything unexpected
+    # instead of risking an attribute lookup on the manager.
+    if args.handler not in _CLI_HANDLERS:
+        arg_parser.error(f"unknown command handler: {args.handler}")
+
+    if args.handler == 'list_projects':
         manager = BoxmanManager(config=None)
-        args.func(manager, args)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # Handle 'image push' — provider-agnostic; no project config needed.
-    if args.func == BoxmanManager.push_image:
-        args.func(None, args)
+    if args.handler == 'push_image':
+        manager = BoxmanManager(config=None)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # Handle 'image inspect' — provider-agnostic; no project config needed.
-    if args.func == BoxmanManager.inspect_image:
-        args.func(None, args)
+    if args.handler == 'inspect_image':
+        manager = BoxmanManager(config=None)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # Handle 'ps' — needs config and virsh but not a full provider session
-    if args.func == BoxmanManager.ps:
+    if args.handler == 'ps':
         import contextlib
         _ps_json = getattr(args, 'json', False)
         _cm = suppressed() if _ps_json else contextlib.nullcontext()
@@ -398,7 +258,19 @@ def _main():
             if not manager.config:
                 log.error("no project config found (conf.yml)")
                 sys.exit(1)
-            args.func(manager, args)
+            # same load/merge/inject path as the other verbs so ps honors
+            # boxman.yml (uri, sudo lists) and the resolved runtime
+            boxman_config = load_boxman_config(os.path.expanduser(args.boxman_conf))
+            manager.load_app_config(boxman_config)
+            manager.runtime = args.runtime or boxman_config.get('runtime', 'local')
+            # scope the runtime container to this project (as the full
+            # session path does) so ps targets the right container
+            if manager.runtime_instance.name == 'docker-compose':
+                manager.runtime_instance.project_dir = os.path.abspath(
+                    os.path.dirname(args.conf))
+                if 'project' in manager.config:
+                    manager.runtime_instance.project_name = manager.config['project']
+            getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # 'snapshot log' is a viewer command — suppress INFO logging across the
@@ -406,11 +278,11 @@ def _main():
     # execute spam from per-VM snapshot-dumpxml/info/current calls would
     # otherwise drown the few lines of actual output. The dispatch then
     # falls through to the regular provider-setup path below.
-    if args.func == BoxmanManager.snapshot_log:
+    if args.handler == 'snapshot_log':
         logging.getLogger('boxman').setLevel(logging.CRITICAL + 1)
 
     # Handle 'conf' — show effective merged configuration
-    if args.func == BoxmanManager.show_conf:
+    if args.handler == 'show_conf':
         manager = BoxmanManager(config=args.conf)
         if not manager.config:
             log.error("no project config found (conf.yml)")
@@ -425,13 +297,13 @@ def _main():
             boxman_config.get('providers', {}).get(provider_type, {})
         )
         project_provider = manager.config.get('provider', {}).get(provider_type, {})
-        merged_provider = provider_conf_with_runtime.copy()
-        merged_provider.update(project_provider)
-        args.func(manager, args, merged_provider=merged_provider)
+        merged_provider = merge_provider_configs(
+            provider_conf_with_runtime, project_provider)
+        getattr(manager, args.handler)(args, merged_provider=merged_provider)
         sys.exit(0)
 
     # Handle 'run' — needs config but not a provider session or runtime
-    if args.func == BoxmanManager.run_task:
+    if args.handler == 'run_task':
         manager = BoxmanManager(config=args.conf)
         if not manager.config:
             log.error("no project config found (conf.yml)")
@@ -443,32 +315,32 @@ def _main():
                     "Define tasks or use --cmd for ad-hoc commands."
                 )
                 sys.exit(1)
-        args.func(manager, args)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # Handle 'ssh' — needs config but not a provider session or runtime
-    if args.func == BoxmanManager.ssh_session:
+    if args.handler == 'ssh_session':
         manager = BoxmanManager(config=args.conf)
         if not manager.config:
             log.error("no project config found (conf.yml)")
             sys.exit(1)
-        args.func(manager, args)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # Handle 'exec' — container access; needs config but not the full libvirt
     # provider setup (the dc session is created on demand via _dc_session).
-    if args.func == BoxmanManager.exec_container:
+    if args.handler == 'exec_container':
         manager = BoxmanManager(config=args.conf)
         if not manager.config:
             log.error("no project config found (conf.yml)")
             sys.exit(1)
-        args.func(manager, args)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     else:
         # use the config of a deployment specified on the cmd line only if
         # not importing an image
-        config = None if args.func == BoxmanManager.import_image else args.conf
+        config = None if args.handler == 'import_image' else args.conf
         manager = BoxmanManager(config=config)
 
         # load the boxman app configuration
@@ -493,7 +365,7 @@ def _main():
         # before we lock it into the bind-mount list. Skip for destroy
         # (we're about to nuke the workdir anyway — prompting would be
         # absurd, especially with -y).
-        if args.func != BoxmanManager.destroy:
+        if args.handler != 'destroy':
             manager.reconcile_workdirs_with_runtime(
                 manager.runtime_instance.name)
 
@@ -533,25 +405,25 @@ def _main():
 
         # Handle destroy-runtime — tear down Docker resources without
         # starting the container first
-        if args.func == BoxmanManager.destroy_runtime:
-            args.func(manager, args)
+        if args.handler == 'destroy_runtime':
+            getattr(manager, args.handler)(args)
             sys.exit(0)
 
         # Commands that manage the runtime themselves (they start it
         # best-effort rather than hard-requiring it, so they still work
         # when the runtime is broken or unreachable).
-        manages_own_runtime = args.func == BoxmanManager.destroy
+        manages_own_runtime = args.handler == 'destroy'
 
         if not manages_own_runtime:
             # ensure the runtime environment is up and ready before proceeding
             manager.runtime_instance.ensure_ready()
 
         # Handle create-templates — it doesn't need a full provider session
-        if args.func == BoxmanManager.create_templates:
-            args.func(manager, args)
+        if args.handler == 'create_templates':
+            getattr(manager, args.handler)(args)
             sys.exit(0)
 
-        if args.func == BoxmanManager.import_image:
+        if args.handler == 'import_image':
 
             # if the provider is specified in the cmd line, use it
             if args.provider:
@@ -578,7 +450,7 @@ def _main():
         # Build a session for every provider declared in the project config
         # via the registry (import-image keeps its single-provider flow —
         # the provider type comes from the manifest / CLI flag above).
-        if args.func == BoxmanManager.import_image:
+        if args.handler == 'import_image':
             provider_types = [provider_type]
         else:
             provider_types = (
@@ -614,32 +486,31 @@ def _main():
                 except ConfigError as exc:
                     log.error(str(exc))
                     sys.exit(2)
-            if _ptype == 'libvirt':
-                # merge runtime metadata into the provider config from boxman.yml
-                provider_conf_with_runtime = manager.get_provider_config_with_runtime(
-                    boxman_config.get('providers', {}).get(_ptype, {})
-                )
-                # Enrich the project config with runtime-aware provider
-                # settings. App-level (boxman.yml) settings serve as
-                # DEFAULTS; project-level (conf.yml) settings always take
-                # precedence. The libvirt block is built unconditionally so
-                # a project without a ``provider:`` section (now defaulted
-                # to libvirt by primary_provider_type) still inherits the
-                # runtime URI/sudo defaults instead of silently falling back
-                # to a local qemu:///system.
-                enriched_config = manager.config.copy()
-                existing_provider = enriched_config.get('provider') or {}
-                project_provider = (existing_provider.get(_ptype) or {}).copy()
-                # Start from app-level defaults, then overlay project-level on top
-                merged_provider = provider_conf_with_runtime.copy()
-                merged_provider.update(project_provider)
-                enriched_config['provider'] = {
-                    **existing_provider,
-                    _ptype: merged_provider,
-                }
-                session_config = enriched_config
-            else:
-                session_config = manager.config
+            # merge runtime metadata into the provider config from boxman.yml
+            provider_conf_with_runtime = manager.get_provider_config_with_runtime(
+                boxman_config.get('providers', {}).get(_ptype, {})
+            )
+            # Enrich the project config with runtime-aware provider
+            # settings — for EVERY provider type, so app-level
+            # (boxman.yml) settings serve as DEFAULTS and project-level
+            # (conf.yml) settings always take precedence. The provider
+            # block is built unconditionally so a project without a
+            # ``provider:`` section (defaulted to libvirt by
+            # primary_provider_type) still inherits the runtime URI/sudo
+            # defaults instead of silently falling back to a local
+            # qemu:///system.
+            enriched_config = manager.config.copy()
+            existing_provider = enriched_config.get('provider') or {}
+            project_provider = (existing_provider.get(_ptype) or {}).copy()
+            # Start from app-level defaults, then overlay project-level on
+            # top via the shared sudo-list-aware merge
+            merged_provider = merge_provider_configs(
+                provider_conf_with_runtime, project_provider)
+            enriched_config['provider'] = {
+                **existing_provider,
+                _ptype: merged_provider,
+            }
+            session_config = enriched_config
 
             try:
                 session = create_session(_ptype, session_config)
@@ -649,7 +520,7 @@ def _main():
             session.manager = manager
             manager.register_session(_ptype, session)
 
-        args.func(manager, args)
+        getattr(manager, args.handler)(args)
 
 
 if __name__ == '__main__':

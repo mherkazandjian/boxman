@@ -2,7 +2,8 @@
 Unit tests for boxman.providers.libvirt.session.LibVirtSession.
 
 Focus on the high-value surface:
-  - Project-level config precedence (provider_config property)
+  - Effective provider config (plain attribute; precedence is resolved
+    upstream by boxman.providers.merge_provider_configs)
   - uri / use_sudo property delegation + setters
   - update_provider_config_with_runtime
   - destroy_disks filesystem cleanup including snapshot leftovers
@@ -25,7 +26,6 @@ import pytest
 
 from boxman.providers.libvirt.session import LibVirtSession
 
-
 pytestmark = pytest.mark.unit
 
 
@@ -45,8 +45,9 @@ def _session(provider: dict | None = None) -> LibVirtSession:
 
 
 class TestConfigPrecedence:
-    """Project-level config must always win over base config — this guards
-    the explicit design in LibVirtSession.provider_config."""
+    """The session holds an already-merged provider config (precedence is
+    resolved upstream by boxman.providers.merge_provider_configs); updates
+    here are plain last-write-wins."""
 
     def test_defaults_on_empty_provider(self):
         s = _session({})
@@ -57,13 +58,12 @@ class TestConfigPrecedence:
         assert s.provider_config["uri"] == "qemu:///system"
         assert s.provider_config["use_sudo"] is True
 
-    def test_project_wins_over_base_via_update(self):
-        s = _session({"use_sudo": True})   # project says True
-        s.update_provider_config({"use_sudo": False})   # app tries to override
-        # Project wins
-        assert s.provider_config["use_sudo"] is True
+    def test_update_is_last_write_wins(self):
+        s = _session({"use_sudo": True})
+        s.update_provider_config({"use_sudo": False})
+        assert s.provider_config["use_sudo"] is False
 
-    def test_base_fills_in_for_missing_project_keys(self):
+    def test_update_fills_in_missing_keys(self):
         s = _session({"use_sudo": True})
         s.update_provider_config({"uri": "qemu:///custom"})
         assert s.provider_config["uri"] == "qemu:///custom"
@@ -89,12 +89,11 @@ class TestUriAndUseSudoProperties:
         s.use_sudo = True
         assert s.use_sudo is True
 
-    def test_project_use_sudo_wins_over_setter(self):
-        """If project said False, we cannot flip it to True via the setter."""
+    def test_use_sudo_setter_overrides_project_value(self):
+        """The setter writes straight into the effective config."""
         s = _session({"use_sudo": False})
-        s.use_sudo = True    # sets base only
-        # Project still wins
-        assert s.use_sudo is False
+        s.use_sudo = True
+        assert s.use_sudo is True
 
 
 class TestUpdateProviderConfigWithRuntime:
@@ -104,18 +103,19 @@ class TestUpdateProviderConfigWithRuntime:
         s.update_provider_config_with_runtime()
         assert s.provider_config["uri"] == "qemu:///system"
 
-    def test_delegates_to_manager_and_preserves_project_keys(self):
+    def test_delegates_to_manager_and_applies_runtime_keys(self):
         s = _session({"use_sudo": True})
         manager = MagicMock()
+        # get_provider_config_with_runtime derives from the session's own
+        # config and adds runtime metadata on top
         manager.get_provider_config_with_runtime.return_value = {
-            "use_sudo": False, "runtime": "docker-compose",
+            "use_sudo": True, "runtime": "docker-compose",
         }
         s.manager = manager
 
         s.update_provider_config_with_runtime()
         # Runtime was applied
         assert s.provider_config["runtime"] == "docker-compose"
-        # Project-level use_sudo still wins
         assert s.provider_config["use_sudo"] is True
 
 

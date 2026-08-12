@@ -5,6 +5,7 @@ from boxman import log
 
 from .commands import VirshCommand
 from .virsh_edit import VirshEdit
+from .virsh_parse import parse_domblklist
 
 
 class VMStateDiffer:
@@ -131,23 +132,16 @@ class VMStateDiffer:
             return []
 
         disks = []
-        lines = result.stdout.strip().split('\n')
-        # skip header lines (Type Device Target Source)
-        for line in lines[2:]:
-            parts = line.split()
-            if len(parts) < 4:
+        for row in parse_domblklist(result.stdout):
+            if row.device != 'disk' or row.type != 'file':
                 continue
-            disk_type = parts[0]   # file, block, etc.
-            device = parts[1]      # disk, cdrom
-            target = parts[2]      # vda, vdb, hda, sda
-            source = parts[3]      # /path/to/file or -
-
-            if device != 'disk' or disk_type != 'file' or source == '-':
+            source = row.source
+            if source is None or source == '-':
                 continue
 
-            size_mb = self._get_disk_size_mb(domain_name, target)
+            size_mb = self._get_disk_size_mb(domain_name, row.target)
             disks.append({
-                'target': target,
+                'target': row.target,
                 'source': source,
                 'size_mb': size_mb
             })
@@ -190,16 +184,13 @@ class VMStateDiffer:
         """
         Compute the expected disk file path, matching DiskManager.configure_from_disk_config logic.
         """
+        from .disk import disk_path_for
         disk_name = disk_config.get("name", "disk")
         driver = disk_config.get("driver", {})
         driver_type = driver.get("type", "qcow2")
-
-        if disk_prefix:
-            disk_path = os.path.join(workdir, f"{disk_prefix}_{disk_name}.{driver_type}")
-        else:
-            disk_path = os.path.join(workdir, f"{disk_name}.{driver_type}")
-
-        return os.path.expanduser(disk_path)
+        return disk_path_for(workdir, disk_name,
+                             driver_type=driver_type,
+                             disk_prefix=disk_prefix)
 
     def get_actual_cdroms(self, domain_name: str) -> list[dict[str, Any]]:
         """
@@ -208,33 +199,9 @@ class VMStateDiffer:
         Returns:
             List of dicts with 'target' and 'source' keys.
         """
-        result = self.virsh.execute('domblklist', domain_name, '--details', warn=True)
-        if not result.ok:
-            return []
-
-        cdroms = []
-        lines = result.stdout.strip().split('\n')
-        for line in lines[2:]:
-            parts = line.split()
-            if len(parts) < 3:
-                continue
-            device = parts[1]
-            target = parts[2]
-            source = parts[3] if len(parts) >= 4 else '-'
-
-            if device != 'cdrom':
-                continue
-            if source == '-':
-                continue
-            if os.path.basename(source).startswith('seed'):
-                continue
-
-            cdroms.append({
-                'target': target,
-                'source': source,
-            })
-
-        return cdroms
+        from .cdrom import CDROMManager
+        return CDROMManager(
+            domain_name, provider_config=self.provider_config).get_attached_cdroms()
 
     def get_actual_shared_folders(self, domain_name: str) -> list[dict[str, Any]]:
         """
@@ -243,30 +210,10 @@ class VMStateDiffer:
         Returns:
             List of dicts with 'name', 'host_path', and 'readonly' keys.
         """
-        from lxml import etree
-
-        xml_content = self.virsh_edit.get_domain_xml(domain_name)
-        tree = etree.fromstring(xml_content.encode('utf-8'))
-
-        folders = []
-        for fs_elem in tree.xpath('//devices/filesystem'):
-            source_elem = fs_elem.find('source')
-            target_elem = fs_elem.find('target')
-            if source_elem is None or target_elem is None:
-                continue
-
-            host_path = source_elem.get('dir', '')
-            name = target_elem.get('dir', '')
-            readonly = fs_elem.find('readonly') is not None
-
-            if name and host_path:
-                folders.append({
-                    'name': name,
-                    'host_path': host_path,
-                    'readonly': readonly,
-                })
-
-        return folders
+        from .shared_folder import SharedFolderManager
+        return SharedFolderManager(
+            domain_name,
+            provider_config=self.provider_config).get_attached_shared_folders()
 
     def diff_vm(self,
                 domain_name: str,
@@ -289,6 +236,9 @@ class VMStateDiffer:
               - max_vcpus_changed, desired_max_vcpus, actual_max_vcpus
               - max_memory_changed, desired_max_memory_mb, actual_max_memory_mb
               - new_disks: list of disk configs to create and attach
+                (a config carries ``attach_only: True`` when its image
+                file already exists on disk — attach it as-is instead of
+                recreating it)
               - resize_disks: list of dicts with target, source, current_size_mb, desired_size_mb
               - new_cdroms, removed_cdroms, changed_cdroms
               - new_shared_folders, removed_shared_folders, changed_shared_folders
@@ -345,9 +295,20 @@ class VMStateDiffer:
             desired_size = disk_config.get('size', 1024)
             expected_path = self._expected_disk_path(disk_config, workdir, disk_prefix)
 
-            if target not in actual_targets and not os.path.exists(expected_path):
-                # new disk — not attached and file doesn't exist
-                new_disks.append(disk_config)
+            if target not in actual_targets:
+                if os.path.exists(expected_path):
+                    # Leftover image from a failed earlier run — the disk
+                    # is neither new nor a resize. Attach the existing
+                    # file as-is (skip create) rather than silently
+                    # dropping the desired disk.
+                    self.logger.warning(
+                        f"disk {target} on {domain_name}: image "
+                        f"{expected_path} exists but is not attached — "
+                        f"attaching existing file (skipping create)")
+                    new_disks.append({**disk_config, 'attach_only': True})
+                else:
+                    # new disk — not attached and file doesn't exist
+                    new_disks.append(disk_config)
             elif target in actual_targets:
                 # disk exists — check if resize needed
                 actual_disk = actual_by_target[target]

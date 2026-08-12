@@ -11,9 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from boxman.manager import BoxmanManager
 from boxman.scripts.app import main, parse_args
-
 
 pytestmark = pytest.mark.smoke
 
@@ -52,17 +50,17 @@ class TestNetlabParserWiring:
     def test_deploy_dispatches_to_handler(self):
         parser = parse_args()
         args = parser.parse_args(["netlab", "deploy"])
-        assert args.func is BoxmanManager.netlab_deploy
+        assert args.handler == 'netlab_deploy'
 
     def test_destroy_dispatches_to_handler(self):
         parser = parse_args()
         args = parser.parse_args(["netlab", "destroy"])
-        assert args.func is BoxmanManager.netlab_destroy
+        assert args.handler == 'netlab_destroy'
 
     def test_inspect_dispatches_to_handler(self):
         parser = parse_args()
         args = parser.parse_args(["netlab", "inspect"])
-        assert args.func is BoxmanManager.netlab_inspect
+        assert args.handler == 'netlab_inspect'
 
     def test_ssh_requires_node_arg(self):
         parser = parse_args()
@@ -72,7 +70,7 @@ class TestNetlabParserWiring:
     def test_ssh_dispatches_and_captures_node(self):
         parser = parse_args()
         args = parser.parse_args(["netlab", "ssh", "sw1"])
-        assert args.func is BoxmanManager.netlab_ssh
+        assert args.handler == 'netlab_ssh'
         assert args.node == "sw1"
         assert args.user is None
 

@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import tempfile
 import time
@@ -29,8 +30,9 @@ from typing import Any
 import invoke
 
 from boxman import log
-from boxman.loggers.logger import is_verbose
 from boxman.image_cache import ImageCache
+from boxman.loggers.logger import is_verbose
+from boxman.utils.jinja_env import substitute_env
 from boxman.utils.shell import run as _shell_run
 
 from .cloudinit_presets import (  # noqa: F401 — re-exported for back-compat
@@ -38,9 +40,14 @@ from .cloudinit_presets import (  # noqa: F401 — re-exported for back-compat
     DEFAULT_META_DATA,
     DEFAULT_NETWORK_CONFIG,
     DEFAULT_USER_DATA,
+)
+from .cloudinit_presets import (
     hash_password as _hash_password,
 )
 from .commands import VirshCommand, VirtInstallCommand
+from .destroy_vm import shutdown_and_wait as _shutdown_and_wait
+from .destroy_vm import wait_until_shut_off as _wait_until_shut_off
+from .virsh_parse import parse_domblklist
 
 
 class CloudInitTemplate:
@@ -185,10 +192,12 @@ class CloudInitTemplate:
         network_config_path = os.path.join(nocloud_dir, "network-config")
         network_flag = ""
         if os.path.exists(network_config_path):
-            network_flag = f' --network-config="{network_config_path}"'
+            network_flag = f" --network-config={shlex.quote(network_config_path)}"
 
         result = self.virsh.execute_shell(
-            f'cloud-localds{network_flag} "{seed_iso_path}" "{nocloud_dir}/user-data" "{nocloud_dir}/meta-data"',
+            f"cloud-localds{network_flag} {shlex.quote(seed_iso_path)} "
+            f"{shlex.quote(os.path.join(nocloud_dir, 'user-data'))} "
+            f"{shlex.quote(os.path.join(nocloud_dir, 'meta-data'))}",
             hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok:
@@ -198,12 +207,13 @@ class CloudInitTemplate:
         # Fallback: include network-config in the ISO if present
         extra_files = ""
         if os.path.exists(network_config_path):
-            extra_files = f' "{network_config_path}"'
+            extra_files = f" {shlex.quote(network_config_path)}"
 
         for tool in ("genisoimage", "mkisofs", "xorrisofs"):
             result = self.virsh.execute_shell(
-                f'{tool} -output "{seed_iso_path}" -volid cidata -joliet -rock '
-                f'"{nocloud_dir}/user-data" "{nocloud_dir}/meta-data"{extra_files}',
+                f"{tool} -output {shlex.quote(seed_iso_path)} -volid cidata -joliet -rock "
+                f"{shlex.quote(os.path.join(nocloud_dir, 'user-data'))} "
+                f"{shlex.quote(os.path.join(nocloud_dir, 'meta-data'))}{extra_files}",
                 hide=not is_verbose(logging.DEBUG), warn=True,
             )
             if result.ok:
@@ -314,11 +324,7 @@ class CloudInitTemplate:
 
         # Replace ${env:VAR} placeholders with actual environment variables
         # (run first so ${hash:${env:VAR}} resolves the env var before hashing)
-        userdata = re.sub(
-            r'\$\{env:([A-Za-z0-9_]+)\}',
-            lambda m: os.environ.get(m.group(1), ''),
-            userdata
-        )
+        userdata = substitute_env(userdata)
 
         # Replace ${hash:plaintext} placeholders with SHA-512 hashed passwords
         def _hash_repl(m):
@@ -465,7 +471,7 @@ class CloudInitTemplate:
         """Sparse-copy a local file; falls back to shutil.copy2."""
         self.logger.info(f"copying image {src} -> {dst}")
         result = self.virsh.execute_shell(
-            f'rsync --sparse --progress "{src}" "{dst}"',
+            f'rsync --sparse --progress {shlex.quote(src)} {shlex.quote(dst)}',
             hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok:
@@ -510,7 +516,7 @@ class CloudInitTemplate:
 
         # Try wget first (handles redirects, proxies, SSL better)
         result = _shell_run(
-            f'wget --progress=dot:mega -O "{dst_path}" "{url}"',
+            f'wget --progress=dot:mega -O {shlex.quote(dst_path)} {shlex.quote(url)}',
             hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
@@ -519,7 +525,7 @@ class CloudInitTemplate:
 
         # Try curl as second fallback
         result = _shell_run(
-            f'curl -L --progress-bar -o "{dst_path}" "{url}"',
+            f'curl -L --progress-bar -o {shlex.quote(dst_path)} {shlex.quote(url)}',
             hide=not is_verbose(logging.DEBUG), warn=True,
         )
         if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
@@ -584,6 +590,22 @@ class CloudInitTemplate:
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def _agent_command(self, payload: str) -> invoke.runners.Result:
+        """
+        Run a QEMU guest-agent command against the template VM.
+
+        Routes through :class:`VirshCommand` instead of a raw ``virsh …``
+        shell string so the configured libvirt ``uri``, a ``virsh_cmd``
+        override, sudo, and runtime wrapping all apply — a raw string would
+        silently hit the default local libvirt daemon.
+        """
+        # the payload is passed raw: VirshCommand.build_command quotes
+        # every value centrally (shlex.quote), so a pre-quoted payload
+        # would end up double-quoted
+        return self.virsh.execute(
+            "qemu-agent-command", self.template_name, payload,
+            hide=True, warn=True)
+
     def _wait_cloudinit_fallback(self, seconds: int | None = None) -> None:
         """
         Time-based fallback: wait *seconds* for cloud-init to finish when
@@ -603,10 +625,7 @@ class CloudInitTemplate:
         for i in range(0, seconds, 10):
             time.sleep(10)
             # Confirm the VM is still responsive
-            ping = self.virsh.execute_shell(
-                f"virsh qemu-agent-command {self.template_name} "
-                f"'{{\"execute\":\"guest-ping\"}}'",
-                hide=True, warn=True)
+            ping = self._agent_command('{"execute":"guest-ping"}')
             if not ping.ok:
                 self.logger.warning(
                     f"guest agent stopped responding after {i + 10}s — "
@@ -644,9 +663,7 @@ class CloudInitTemplate:
                 '"test -f ' + marker_path + ' && echo MARKER_FOUND || echo MARKER_MISSING"],'
                 '"capture-output":true}}'
             )
-            res = self.virsh.execute_shell(
-                f"virsh qemu-agent-command {self.template_name} '{check_cmd}'",
-                hide=True, warn=True)
+            res = self._agent_command(check_cmd)
 
             if res.ok:
                 found = self._guest_exec_output(res.stdout)
@@ -683,10 +700,7 @@ class CloudInitTemplate:
                 f'"arguments":{{"pid":{pid}}}}}'
             )
             for _ in range(10):
-                status_res = self.virsh.execute_shell(
-                    f"virsh qemu-agent-command {self.template_name} "
-                    f"'{status_cmd}'",
-                    hide=True, warn=True)
+                status_res = self._agent_command(status_cmd)
                 if not status_res.ok:
                     return None
                 ret = json.loads(
@@ -711,9 +725,7 @@ class CloudInitTemplate:
             + log_script
             + '"],"capture-output":true}}'
         )
-        res = self.virsh.execute_shell(
-            f"virsh qemu-agent-command {self.template_name} '{exec_cmd}'",
-            hide=True, warn=True)
+        res = self._agent_command(exec_cmd)
         if not res.ok:
             return
         output = self._guest_exec_output(res.stdout)
@@ -730,9 +742,7 @@ class CloudInitTemplate:
         agent_poll_interval = 2
         agent_attempts = max(1, self.cloudinit_agent_timeout // agent_poll_interval)
         for i in range(agent_attempts):
-            result = self.virsh.execute_shell(
-                f"virsh qemu-agent-command {self.template_name} '{{\"execute\":\"guest-ping\"}}'",
-                hide=True, warn=True)
+            result = self._agent_command('{"execute":"guest-ping"}')
             if result.ok:
                 agent_up = True
                 break
@@ -775,9 +785,7 @@ class CloudInitTemplate:
                     '{"path":"/bin/sh","arg":["-c","echo ok"],'
                     '"capture-output":true}}'
                 )
-                res = self.virsh.execute_shell(
-                    f"virsh qemu-agent-command {self.template_name} '{exec_cmd}'",
-                    hide=True, warn=True)
+                res = self._agent_command(exec_cmd)
                 if res.ok:
                     guest_exec_ok = True
                     self.logger.info("guest-exec is available")
@@ -830,6 +838,18 @@ class CloudInitTemplate:
         self._shutdown_template()
         return True
 
+    def _wait_until_shut_off(self, attempts: int = 30, interval: int = 2) -> bool:
+        """
+        Poll ``domstate`` until the template VM is shut off.
+
+        Returns:
+            True once the domain reports "shut off", False when *attempts*
+            run out.
+        """
+        return _wait_until_shut_off(
+            self.virsh, self.template_name,
+            timeout=attempts * interval, poll_interval=interval)
+
     def _shutdown_template(self) -> None:
         """
         Shut the template VM down, forcing it off if it will not go quietly.
@@ -842,15 +862,13 @@ class CloudInitTemplate:
         self.virsh.execute("shutdown", self.template_name, hide=True, warn=True)
 
         self.logger.info("waiting for VM to shut off...")
-        for _ in range(30):
-            result = self.virsh.execute("domstate", self.template_name, hide=True, warn=True)
-            if result.ok and "shut off" in result.stdout.strip():
-                self.logger.info("VM is successfully shut off.")
-                return
-            time.sleep(2)
-
-        self.logger.warning("VM did not shut off gracefully. Forcing destroy...")
-        self.virsh.execute("destroy", self.template_name, hide=True, warn=True)
+        if _shutdown_and_wait(self.virsh, self.template_name,
+                              timeout=60, logger=self.logger):
+            self.logger.info("VM is successfully shut off.")
+        else:
+            self.logger.warning(
+                "VM did not shut off gracefully and the forced destroy "
+                "did not settle either.")
 
     def _verify_dhcp_on_network(self) -> bool:
         """
@@ -907,19 +925,38 @@ class CloudInitTemplate:
                     f"destroying first (--force was specified)")
                 self.virsh.execute(
                     "destroy", self.template_name, hide=True, warn=True)
-                self.virsh.execute(
+                # undefine fails while QEMU is still tearing the domain down,
+                # and the virt-install below would then die with "domain
+                # already exists" — wait for shut-off before removing it
+                if not self._wait_until_shut_off():
+                    self.logger.error(
+                        f"template VM '{self.template_name}' did not shut off "
+                        f"after destroy — refusing to recreate it")
+                    return False
+                undefine = self.virsh.execute(
                     "undefine", self.template_name,
                     "--remove-all-storage", hide=True, warn=True)
+                if not undefine.ok:
+                    self.logger.error(
+                        f"failed to undefine template VM "
+                        f"'{self.template_name}': {undefine.stderr}")
+                    return False
                 self.logger.info(
                     f"template VM '{self.template_name}' has been removed")
 
         # Resolve bridge device (auto-starts the network if needed)
         bridge_device = self._resolve_bridge()
 
-        # Verify DHCP is available (warn early rather than debug a silent failure)
+        # Verify DHCP is available (fail fast rather than debug a silent
+        # failure — without it the guest never gets an IP and the cloud-init
+        # verification below would burn the full agent timeout for nothing)
         if not self.bridge:
             # only check when using a libvirt-managed network
-            self._verify_dhcp_on_network()
+            if not self._verify_dhcp_on_network():
+                self.logger.error(
+                    f"cannot create template '{self.template_name}': "
+                    f"no DHCP on network '{self.network}' — see above")
+                return False
 
         template_dir = os.path.join(self.workdir, self.template_name)
         os.makedirs(template_dir, exist_ok=True)
@@ -956,20 +993,20 @@ class CloudInitTemplate:
             if self.virt_install.use_sudo:
                 parts.append("sudo")
             parts.append(self.virt_install.command_path)
-            parts.append(f"--connect={self.virt_install.uri}")
-            parts.append(f"--name={self.template_name}")
+            parts.append(f"--connect={shlex.quote(self.virt_install.uri)}")
+            parts.append(f"--name={shlex.quote(self.template_name)}")
             parts.append(f"--memory={self.memory}")
             parts.append(f"--vcpus={self.vcpus}")
-            parts.append(f"--os-variant={self.os_variant}")
+            parts.append(f"--os-variant={shlex.quote(self.os_variant)}")
             parts.append("--import")
-            parts.append(f"--disk=path={dst_image_path},format={self.disk_format},bus=virtio,discard=unmap")
-            parts.append(f"--disk=path={seed_iso_path},device=cdrom")
+            parts.append(f"--disk=path={shlex.quote(dst_image_path)},format={self.disk_format},bus=virtio,discard=unmap")
+            parts.append(f"--disk=path={shlex.quote(seed_iso_path)},device=cdrom")
 
             # Use bridge device directly if resolved, otherwise fall back to network name
             if bridge_device:
-                parts.append(f"--network=bridge={bridge_device},model=virtio")
+                parts.append(f"--network=bridge={shlex.quote(bridge_device)},model=virtio")
             else:
-                parts.append(f"--network=network={self.network},model=virtio")
+                parts.append(f"--network=network={shlex.quote(self.network)},model=virtio")
 
             parts.append("--graphics=vnc")
             parts.append("--video=virtio")
@@ -1002,11 +1039,9 @@ class CloudInitTemplate:
         blklist = self.virsh.execute(
             "domblklist", self.template_name, "--details", warn=True)
         if blklist.ok:
-            for line in blklist.stdout.splitlines():
-                parts = line.split()
-                # columns: Type  Device  Target  Source
-                if len(parts) >= 4 and parts[1] == 'cdrom':
-                    target, source = parts[2], parts[3]
+            for row in parse_domblklist(blklist.stdout):
+                if row.device == 'cdrom' and row.source is not None:
+                    target, source = row.target, row.source
                     if os.path.basename(source).startswith('seed'):
                         self.logger.info(
                             f"ejecting seed cdrom '{target}' from template "

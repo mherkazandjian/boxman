@@ -2,7 +2,7 @@
 Filesystem-only helpers for removing a VM's disks and leftover artifacts.
 
 Extracted from :meth:`LibVirtSession.destroy_disks` in Phase 2.6 of the
-review plan (see /home/mher/.claude/plans/) so that the pure filesystem
+engineering review plan so that the pure filesystem
 logic lives outside the libvirt session class — both for clarity and so
 it can be exercised without constructing a session.
 
@@ -21,6 +21,8 @@ from collections.abc import Iterable
 
 from boxman import log
 
+from .disk import disk_path_for
+
 
 def remove_vm_disks(
     workdir: str,
@@ -35,13 +37,16 @@ def remove_vm_disks(
     - ``<workdir>/<vm_name>.qcow2`` — the boot disk.
     - ``<workdir>/<vm_name>_<d['name']>.qcow2`` for each entry in
       *extra_disks*.
-    - Every remaining path matching ``<workdir>/<vm_name>*`` that is a
-      regular file — this sweeps up snapshot overlay files
-      (``<vm>.2026-04-21T08:00:00``, ``<vm>.1772465824``) and memory
-      snapshot files (``<vm>_snapshot_<name>.raw``).
+    - Snapshot artifacts matching ``<workdir>/<vm_name>.<suffix>``
+      (overlay files such as ``<vm>.2026-04-21T08:00:00`` or
+      ``<vm>.1772465824`` — note the literal dot separator) and
+      ``<workdir>/<vm_name>_snapshot_*`` (memory snapshot ``.raw``
+      files).
 
-    Other VMs' disks in the same workdir are untouched because the glob
-    is anchored at the VM name prefix.
+    Other VMs' disks in the same workdir are untouched because every
+    pattern requires the VM name to be followed by a literal ``.`` or
+    ``_snapshot_`` separator — a VM named ``web`` never matches files
+    belonging to a VM named ``web2``.
 
     Args:
         workdir: Directory the VM's files live in. ``~`` is expanded.
@@ -57,21 +62,29 @@ def remove_vm_disks(
     """
     workdir = os.path.expanduser(workdir)
 
-    boot_disk = os.path.join(workdir, f'{vm_name}.qcow2')
+    boot_disk = disk_path_for(workdir, vm_name)
     if os.path.isfile(boot_disk):
         os.remove(boot_disk)
 
     for disk in extra_disks:
-        disk_path = os.path.join(workdir, f'{vm_name}_{disk["name"]}.qcow2')
+        disk_path = disk_path_for(workdir, disk["name"], disk_prefix=vm_name)
         if os.path.isfile(disk_path):
             os.remove(disk_path)
 
-    # Snapshot artifacts: overlay files with timestamp/hash suffixes and
-    # memory snapshot .raw files — anything prefixed with vm_name that is
-    # still on disk after the named qcow2 files were removed above.
-    for leftover in _glob.glob(os.path.join(workdir, f'{vm_name}*')):
-        if os.path.isfile(leftover):
-            log.info(f"removing snapshot artifact: {leftover}")
-            os.remove(leftover)
+    # Snapshot artifacts: overlay files named ``<vm>.<suffix>`` (the
+    # literal dot separates the VM name from the timestamp/hash suffix)
+    # and memory snapshot files ``<vm>_snapshot_*``. A plain
+    # ``<vm>*`` prefix glob would also match disks of other VMs whose
+    # name starts with this VM's name (e.g. destroying ``web`` would
+    # delete ``web2.qcow2``), so both patterns require a separator.
+    patterns = (
+        os.path.join(workdir, f'{vm_name}.*'),
+        os.path.join(workdir, f'{vm_name}_snapshot_*'),
+    )
+    for pattern in patterns:
+        for leftover in _glob.glob(pattern):
+            if os.path.isfile(leftover):
+                log.info(f"removing snapshot artifact: {leftover}")
+                os.remove(leftover)
 
     return True

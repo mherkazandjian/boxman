@@ -17,7 +17,6 @@ from boxman.utils.snapshot_graph import (
     render_graph,
 )
 
-
 pytestmark = pytest.mark.unit
 
 

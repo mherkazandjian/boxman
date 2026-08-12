@@ -13,7 +13,6 @@ import pytest
 
 from boxman.manager import BoxmanManager
 
-
 pytestmark = pytest.mark.unit
 
 

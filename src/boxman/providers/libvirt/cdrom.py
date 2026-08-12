@@ -1,11 +1,25 @@
 import os
 import tempfile
 from typing import Any
+from xml.sax.saxutils import escape
+
+from boxman import log
 
 from .commands import VirshCommand
+from .virsh_parse import parse_domblklist
 
 
-class CDROMManager(VirshCommand):
+def _xml_attr(value: str) -> str:
+    """
+    Escape a value for use inside a single-quoted XML attribute.
+
+    Mirrors ``net_reconcile._attr``: a source path or target name holding an
+    ``&`` or a quote would otherwise produce XML that libvirt cannot parse.
+    """
+    return escape(str(value), {"'": '&apos;', '"': '&quot;'})
+
+
+class CDROMManager:
     """
     Class for managing CDROM/ISO device operations in libvirt.
 
@@ -14,7 +28,15 @@ class CDROMManager(VirshCommand):
     """
 
     def __init__(self, vm_name: str, provider_config: dict[str, Any] | None = None):
-        super().__init__(provider_config)
+        #: VirshCommand: Command executor for virsh
+        self.virsh = VirshCommand(provider_config=provider_config)
+
+        #: Dict[str, Any]: Configuration for the libvirt provider
+        self.provider_config = provider_config or {}
+
+        #: logging.Logger: Logger instance
+        self.logger = log
+
         self.vm_name = vm_name
 
     def attach_cdrom(self,
@@ -52,7 +74,10 @@ class CDROMManager(VirshCommand):
                 temp_path = temp.name
 
             attachment_args = ["--persistent"] if persistent else []
-            result = self.execute("attach-device", self.vm_name, temp_path, *attachment_args)
+            # warn=True so a failed attach reaches the error branch below
+            # instead of raising out of execute (matches change_media)
+            result = self.virsh.execute("attach-device", self.vm_name, temp_path,
+                                  *attachment_args, warn=True)
 
             os.unlink(temp_path)
 
@@ -82,8 +107,9 @@ class CDROMManager(VirshCommand):
         """
         try:
             # Generate XML for the device to detach (source not needed for detach)
+            bus = self._bus_for_target(target_dev)
             xml_content = f"""<disk type='file' device='cdrom'>
-  <target dev='{target_dev}' bus='ide'/>
+  <target dev='{_xml_attr(target_dev)}' bus='{bus}'/>
   <readonly/>
 </disk>"""
 
@@ -92,7 +118,10 @@ class CDROMManager(VirshCommand):
                 temp_path = temp.name
 
             detach_args = ["--persistent"] if persistent else []
-            result = self.execute("detach-device", self.vm_name, temp_path, *detach_args)
+            # warn=True so a failed detach reaches the error branch below
+            # instead of raising out of execute (matches change_media)
+            result = self.virsh.execute("detach-device", self.vm_name, temp_path,
+                                  *detach_args, warn=True)
 
             os.unlink(temp_path)
 
@@ -126,7 +155,7 @@ class CDROMManager(VirshCommand):
                 self.logger.error(f"ISO file does not exist: {source_path}")
                 return False
 
-            result = self.execute(
+            result = self.virsh.execute(
                 "change-media", self.vm_name, target_dev,
                 source_path, "--live", "--config",
                 warn=True)
@@ -169,22 +198,15 @@ class CDROMManager(VirshCommand):
         Returns a list of dicts with 'target' and 'source' keys.
         Excludes seed ISOs (used for cloud-init).
         """
-        result = self.execute("domblklist", self.vm_name, "--details", warn=True)
+        result = self.virsh.execute("domblklist", self.vm_name, "--details", warn=True)
         if not result.ok:
             return []
 
         cdroms = []
-        lines = result.stdout.strip().split('\n')
-        for line in lines[2:]:
-            parts = line.split()
-            if len(parts) < 3:
+        for row in parse_domblklist(result.stdout):
+            if row.device != 'cdrom':
                 continue
-            device = parts[1]
-            target = parts[2]
-            source = parts[3] if len(parts) >= 4 else '-'
-
-            if device != 'cdrom':
-                continue
+            source = row.source or '-'
             if source == '-':
                 continue
             # exclude seed ISOs (cloud-init)
@@ -192,7 +214,7 @@ class CDROMManager(VirshCommand):
                 continue
 
             cdroms.append({
-                'target': target,
+                'target': row.target,
                 'source': source,
             })
 
@@ -209,12 +231,26 @@ class CDROMManager(VirshCommand):
         Returns:
             XML string for CDROM attachment
         """
+        bus = self._bus_for_target(target_dev)
         return f"""<disk type='file' device='cdrom'>
   <driver name='qemu' type='raw'/>
-  <source file='{source_path}'/>
-  <target dev='{target_dev}' bus='ide'/>
+  <source file='{_xml_attr(source_path)}'/>
+  <target dev='{_xml_attr(target_dev)}' bus='{bus}'/>
   <readonly/>
 </disk>"""
+
+    @staticmethod
+    def _bus_for_target(target_dev: str) -> str:
+        """
+        Derive the libvirt bus from a target device name.
+
+        ``_find_next_available_target`` falls back to sd* names once the
+        four IDE slots are taken, so the bus cannot be hardcoded to ide.
+
+        Returns:
+            'sata' for sd* targets, 'ide' otherwise (hd*)
+        """
+        return 'sata' if target_dev.startswith('sd') else 'ide'
 
     def _find_next_available_target(self) -> str | None:
         """
@@ -226,15 +262,11 @@ class CDROMManager(VirshCommand):
         Returns:
             Device name (e.g., 'hdc') or None if no slot available
         """
-        result = self.execute("domblklist", self.vm_name, "--details", warn=True)
+        result = self.virsh.execute("domblklist", self.vm_name, "--details", warn=True)
 
         used_targets = set()
         if result.ok:
-            lines = result.stdout.strip().split('\n')
-            for line in lines[2:]:
-                parts = line.split()
-                if len(parts) >= 3:
-                    used_targets.add(parts[2])
+            used_targets = {row.target for row in parse_domblklist(result.stdout)}
 
         # IDE supports hda-hdd (4 devices)
         for suffix in ('a', 'b', 'c', 'd'):

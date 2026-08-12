@@ -18,13 +18,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.cdrom import CDROMManager
 from boxman.providers.libvirt.commands import LibVirtCommandBase
 from boxman.providers.libvirt.shared_folder import SharedFolderManager
 from boxman.providers.libvirt.snapshot import SnapshotManager
 from boxman.runtime.docker_compose import DockerComposeRuntime
-
 
 pytestmark = pytest.mark.regression
 
@@ -44,7 +44,7 @@ def _result(stdout: str = "", ok: bool = True, stderr: str = "", return_code: in
 #           batched sudo rsync before revert
 # ---------------------------------------------------------------------------
 
-class TestSnapshotOverlayPreservation_057eb7d:
+class TestSnapshotOverlayPreservation057eb7d:
 
     def test_revert_order_is_preserve_then_revert_then_restore(self):
         """Regression: libvirt deletes the *current* snapshot's overlay
@@ -107,7 +107,7 @@ class TestSnapshotOverlayPreservation_057eb7d:
 # 5e96515 — ssh proxyjump for docker runtime
 # ---------------------------------------------------------------------------
 
-class TestDockerRuntimeSshProxyJump_5e96515:
+class TestDockerRuntimeSshProxyJump5e96515:
 
     def test_no_jump_stanza_for_local_runtime(self, tmp_path: Path):
         mgr = BoxmanManager()
@@ -165,7 +165,7 @@ class TestDockerRuntimeSshProxyJump_5e96515:
 # eca430e — multi-project port isolation for docker runtime
 # ---------------------------------------------------------------------------
 
-class TestMultiProjectPortIsolation_eca430e:
+class TestMultiProjectPortIsolationEca430e:
 
     def test_default_project_maps_to_offset_zero(self):
         """Legacy single-project setups must keep 2222/16509/16514."""
@@ -196,7 +196,7 @@ class TestMultiProjectPortIsolation_eca430e:
 # 380b776 — allow excluding some commands from sudo
 # ---------------------------------------------------------------------------
 
-class TestSudoSkipCommands_380b776:
+class TestSudoSkipCommands380b776:
 
     def test_skip_list_wins_over_use_sudo_true(self):
         cmd = LibVirtCommandBase(provider_config={
@@ -260,7 +260,7 @@ class TestRmNeverSudo:
 # 36a8a6b — shared folder + cdrom hotplug
 # ---------------------------------------------------------------------------
 
-class TestCdromHotplug_36a8a6b:
+class TestCdromHotplug36a8a6b:
 
     def test_attach_uses_persistent_flag_not_config_only(self, tmp_path: Path):
         """Live+persistent hotplug means `--persistent` (defaults to runtime
@@ -271,7 +271,7 @@ class TestCdromHotplug_36a8a6b:
         cd = CDROMManager("vm01", provider_config={"use_sudo": False})
 
         with patch.object(cd, "_find_next_available_target", return_value="hdc"), \
-             patch.object(cd, "execute", return_value=_result()) as execute:
+             patch.object(cd.virsh, "execute", return_value=_result()) as execute:
             assert cd.attach_cdrom(str(iso)) is True
 
         args = execute.call_args.args
@@ -280,7 +280,7 @@ class TestCdromHotplug_36a8a6b:
         assert "--config" not in args
 
 
-class TestSharedFolderHotplug_36a8a6b:
+class TestSharedFolderHotplug36a8a6b:
 
     def test_tries_live_persistent_before_config_fallback(self, tmp_path: Path):
         """Live attach first; only fall back to --config when live fails.
@@ -294,7 +294,7 @@ class TestSharedFolderHotplug_36a8a6b:
             # succeed first time
             return _result(ok=True)
 
-        with patch.object(sf, "execute", side_effect=fake):
+        with patch.object(sf.virsh, "execute", side_effect=fake):
             out = sf.attach_shared_folder("tag", str(tmp_path))
 
         assert out["success"] is True
@@ -315,7 +315,7 @@ class TestSharedFolderHotplug_36a8a6b:
             # first (live) fails, second (config) succeeds
             return _result(ok=False, stderr="no hotplug") if len(calls) == 1 else _result(ok=True)
 
-        with patch.object(sf, "execute", side_effect=fake):
+        with patch.object(sf.virsh, "execute", side_effect=fake):
             out = sf.attach_shared_folder("tag", str(tmp_path))
 
         assert out == {"success": True, "restart_needed": True}
@@ -326,7 +326,7 @@ class TestSharedFolderHotplug_36a8a6b:
 # ece550a — per-VM base image override
 # ---------------------------------------------------------------------------
 
-class TestPerVmBaseImage_ece550a:
+class TestPerVmBaseImageEce550a:
     """
     Regression: base images can be specified at the VM level to override
     the cluster-wide template.base_image. The override must work when both
@@ -365,9 +365,8 @@ class TestDestroyReadsProjectCache:
     even when it was properly registered.
     """
 
-    def test_destroy_loads_cache_before_in_cache_check(self, tmp_path: Path):
+    def test_destroy_loads_cache_before_in_cache_check(self, tmp_path: Path, capsys):
         import json as _json
-        import os as _os
 
         # Build a cache that already contains our project
         cache_dir = tmp_path / "cache"
@@ -387,11 +386,12 @@ class TestDestroyReadsProjectCache:
             args = MagicMock(auto_accept=False, templates=False)
 
             # Force EOF on the prompt so the test doesn't hang waiting
-            # for stdin; reaching the prompt proves the short-circuit
-            # did NOT fire.
-            with patch("builtins.input", side_effect=EOFError), \
-                 pytest.raises(EOFError):
-                BoxmanManager.destroy(mgr, args)
+            # for stdin; the clean abort (instead of an EOFError
+            # traceback, #85 item 16) proves the short-circuit did NOT
+            # fire.
+            with patch("builtins.input", side_effect=EOFError):
+                mgr.destroy(args)
+            assert "No input available, aborted." in capsys.readouterr().out
 
         # The cache must have been loaded — .projects populated from disk
         assert mgr.cache.projects is not None
@@ -413,7 +413,7 @@ class TestDestroyReadsProjectCache:
 
             with patch("builtins.input") as inp:
                 # Returns None → destroy() early-exits before prompting.
-                BoxmanManager.destroy(mgr, args)
+                mgr.destroy(args)
                 inp.assert_not_called()
 
 
@@ -472,7 +472,7 @@ class TestProvisionForceClearsStaleCacheEntry:
              patch.object(mgr, "register_project_in_cache"), \
              patch.object(mgr.__class__, "provider", MagicMock()):
             try:
-                BoxmanManager.provision(mgr, args)
+                mgr.provision(args)
             except Exception:
                 # We only care about the force/deprovision dispatch here;
                 # the rest of provision() needs a live libvirt.
@@ -488,7 +488,8 @@ class TestProvisionForceClearsStaleCacheEntry:
              patch.object(mgr, "deprovision") as deprov, \
              patch.object(mgr, "register_project_in_cache") as register, \
              patch.object(mgr.__class__, "provider", MagicMock()):
-            BoxmanManager.provision(mgr, args)
+            with pytest.raises(ProvisionError, match="cannot provision"):
+                mgr.provision(args)
 
         # Must not proceed to deprovision or register
         deprov.assert_not_called()
@@ -505,7 +506,7 @@ class TestProvisionForceClearsStaleCacheEntry:
              patch.object(mgr, "register_project_in_cache"), \
              patch.object(mgr.__class__, "provider", MagicMock()):
             try:
-                BoxmanManager.provision(mgr, args)
+                mgr.provision(args)
             except Exception:
                 pass
 

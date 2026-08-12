@@ -2,11 +2,13 @@ import os
 import tempfile
 from typing import Any
 
+from boxman import log
+
 from .commands import VirshCommand
 from .virsh_edit import VirshEdit
 
 
-class SharedFolderManager(VirshCommand):
+class SharedFolderManager:
     """
     Class for managing shared folder (filesystem passthrough) operations in libvirt.
 
@@ -16,7 +18,15 @@ class SharedFolderManager(VirshCommand):
     """
 
     def __init__(self, vm_name: str, provider_config: dict[str, Any] | None = None):
-        super().__init__(provider_config)
+        #: VirshCommand: Command executor for virsh
+        self.virsh = VirshCommand(provider_config=provider_config)
+
+        #: Dict[str, Any]: Configuration for the libvirt provider
+        self.provider_config = provider_config or {}
+
+        #: logging.Logger: Logger instance
+        self.logger = log
+
         self.vm_name = vm_name
 
     def attach_shared_folder(self,
@@ -54,7 +64,7 @@ class SharedFolderManager(VirshCommand):
 
             # Try live + persistent first
             attachment_args = ["--persistent"] if persistent else []
-            result = self.execute(
+            result = self.virsh.execute(
                 "attach-device", self.vm_name, temp_path, *attachment_args,
                 warn=True)
 
@@ -75,7 +85,7 @@ class SharedFolderManager(VirshCommand):
                 temp.write(xml_content)
                 temp_path = temp.name
 
-            result = self.execute(
+            result = self.virsh.execute(
                 "attach-device", self.vm_name, temp_path, "--config",
                 warn=True)
 
@@ -118,7 +128,7 @@ class SharedFolderManager(VirshCommand):
                 temp_path = temp.name
 
             # Try live + persistent
-            result = self.execute(
+            result = self.virsh.execute(
                 "detach-device", self.vm_name, temp_path, "--persistent",
                 warn=True)
 
@@ -138,7 +148,7 @@ class SharedFolderManager(VirshCommand):
                 temp.write(xml_content)
                 temp_path = temp.name
 
-            result = self.execute(
+            result = self.virsh.execute(
                 "detach-device", self.vm_name, temp_path, "--config",
                 warn=True)
 
@@ -203,7 +213,7 @@ class SharedFolderManager(VirshCommand):
                 return {'success': False, 'restart_needed': False}
 
             # Check if VM is running — if so, the memfd change needs a restart
-            result = self.execute("domstate", self.vm_name, warn=True)
+            result = self.virsh.execute("domstate", self.vm_name, warn=True)
             is_running = result.ok and 'running' in result.stdout
 
             if is_running:

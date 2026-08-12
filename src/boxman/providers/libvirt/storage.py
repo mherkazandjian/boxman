@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -28,6 +27,9 @@ from boxman import log
 from boxman.loggers.logger import is_verbose
 
 from .commands import LibVirtCommandBase, VirshCommand
+from .destroy_vm import DestroyVM
+from .destroy_vm import shutdown_and_wait as _shutdown_and_wait
+from .disk import disk_path_for
 
 
 def vm_disk_paths(
@@ -43,13 +45,12 @@ def vm_disk_paths(
     boot disk at ``<workdir>/<vm_name>.qcow2`` and one extra per entry in
     ``vm_info['disks']`` named ``<workdir>/<vm_name>_<disk['name']>.qcow2``.
     """
-    workdir = os.path.expanduser(workdir)
-    paths = [os.path.join(workdir, f'{vm_name}.qcow2')]
+    paths = [disk_path_for(workdir, vm_name)]
     if vm_info:
         for disk in vm_info.get('disks', []) or []:
             name = disk.get('name') if isinstance(disk, dict) else None
             if name:
-                paths.append(os.path.join(workdir, f'{vm_name}_{name}.qcow2'))
+                paths.append(disk_path_for(workdir, name, disk_prefix=vm_name))
     return paths
 
 
@@ -132,6 +133,18 @@ class StorageManager:
             return False
         return "running" in result.stdout
 
+    def is_shut_off(self, vm_name: str) -> bool:
+        """
+        True only when the domain is fully "shut off" (or gone).
+
+        Stricter than ``not is_running()``: a *paused* or *in shutdown*
+        domain no longer reads as "running" but its QEMU process is still
+        alive and holding the disk — compacting the image then corrupts
+        it. Reuses :meth:`DestroyVM.is_vm_shut_off` for the check.
+        """
+        return DestroyVM(
+            vm_name, provider_config=self.provider_config).is_vm_shut_off()
+
     def is_libguestfs_available(self) -> bool:
         """Whether ``virt-sparsify`` is reachable in the configured runtime."""
         result = self.cmd.execute_shell(
@@ -173,7 +186,7 @@ class StorageManager:
     # ── vm state transitions ────────────────────────────────────────────
 
     def shutdown_and_wait(self, vm_name: str, timeout_s: int = 120) -> bool:
-        if not self.is_running(vm_name):
+        if self.is_shut_off(vm_name):
             return True
         self.logger.info(f"shutting down vm {vm_name} (timeout {timeout_s}s)")
         result = self.virsh.execute("shutdown", vm_name, warn=True)
@@ -181,15 +194,9 @@ class StorageManager:
             self.logger.error(
                 f"virsh shutdown failed for {vm_name}: {result.stderr.strip()}")
             return False
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            if not self.is_running(vm_name):
-                return True
-            time.sleep(2)
-        self.logger.warning(
-            f"vm {vm_name} did not shutdown within {timeout_s}s — issuing destroy")
-        destroy = self.virsh.execute("destroy", vm_name, warn=True)
-        return destroy.ok
+        return _shutdown_and_wait(
+            self.virsh, vm_name, timeout=timeout_s, logger=self.logger,
+            is_shut_off=lambda: self.is_shut_off(vm_name))
 
     def start(self, vm_name: str) -> bool:
         result = self.virsh.execute("start", vm_name, warn=True)

@@ -3,13 +3,16 @@ Tests for the boxman update feature: VMStateDiffer, hot/cold CPU/memory,
 disk resize, and update orchestration logic.
 """
 
-import os
-import pytest
-from unittest.mock import patch, MagicMock, PropertyMock, call
+from unittest.mock import MagicMock, call, patch
 
-from boxman.providers.libvirt.vm_differ import VMStateDiffer
-from boxman.providers.libvirt.virsh_edit import VirshEdit
+import pytest
+
 from boxman.providers.libvirt.disk import DiskManager
+from boxman.providers.libvirt.virsh_edit import VirshEdit
+from boxman.providers.libvirt.vm_differ import VMStateDiffer
+from conftest import make_bare_manager
+
+pytestmark = pytest.mark.unit
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +306,7 @@ class TestVirshEditHotMethods:
         result = editor.hot_set_vcpus('test-vm', 8)
         assert result is True
         editor.virsh.execute.assert_called_once_with(
-            'setvcpus', 'test-vm', '8', '--live', '--config')
+            'setvcpus', 'test-vm', '8', '--live', '--config', warn=True)
 
     @patch.object(VirshEdit, '__init__', lambda self, **kwargs: setattr(self, 'virsh', MagicMock()) or setattr(self, 'logger', MagicMock()))
     def test_hot_set_vcpus_failure(self):
@@ -325,7 +328,7 @@ class TestVirshEditHotMethods:
         result = editor.hot_set_memory('test-vm', 4096)
         assert result is True
         editor.virsh.execute.assert_called_once_with(
-            'setmem', 'test-vm', str(4096 * 1024), '--live', '--config')
+            'setmem', 'test-vm', str(4096 * 1024), '--live', '--config', warn=True)
 
     @patch.object(VirshEdit, '__init__', lambda self, **kwargs: setattr(self, 'virsh', MagicMock()) or setattr(self, 'logger', MagicMock()))
     def test_hot_set_memory_failure(self):
@@ -600,17 +603,20 @@ class TestVMStateDifferMaxDiff:
 # ---------------------------------------------------------------------------
 # DiskManager XML generation tests
 # ---------------------------------------------------------------------------
+def _make_disk_manager():
+    """Bare DiskManager instance (constructor bypassed) for unit tests."""
+    dm = DiskManager.__new__(DiskManager)
+    dm.vm_name = 'test-vm'
+    dm.logger = MagicMock()
+    dm.provider_config = {'uri': 'qemu:///system'}
+    dm.virsh = MagicMock()
+    return dm
+
+
 class TestDiskManagerXml:
 
-    def _make_manager(self):
-        dm = DiskManager.__new__(DiskManager)
-        dm.vm_name = 'test-vm'
-        dm.logger = MagicMock()
-        dm.provider_config = {'uri': 'qemu:///system'}
-        return dm
-
     def test_generate_disk_xml_includes_bus_virtio(self):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         xml = dm._generate_disk_xml(
             disk_path='/data/disk.qcow2',
             target_dev='vdb',
@@ -620,7 +626,7 @@ class TestDiskManagerXml:
         assert "bus='virtio'" in xml
 
     def test_generate_disk_xml_custom_bus(self):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         xml = dm._generate_disk_xml(
             disk_path='/data/disk.qcow2',
             target_dev='sdb',
@@ -636,16 +642,9 @@ class TestDiskManagerXml:
 # ---------------------------------------------------------------------------
 class TestDiskManagerResize:
 
-    def _make_manager(self):
-        dm = DiskManager.__new__(DiskManager)
-        dm.vm_name = 'test-vm'
-        dm.logger = MagicMock()
-        dm.provider_config = {'uri': 'qemu:///system'}
-        return dm
-
     @patch('boxman.providers.libvirt.disk.LibVirtCommandBase')
     def test_resize_disk_offline_success(self, mock_cmd_cls):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         mock_instance = MagicMock()
         mock_cmd_cls.return_value = mock_instance
         mock_instance.execute_shell.return_value = MagicMock(ok=True)
@@ -653,11 +652,11 @@ class TestDiskManagerResize:
         result = dm.resize_disk_offline('/data/disk.qcow2', 4096)
         assert result is True
         mock_instance.execute_shell.assert_called_once_with(
-            'qemu-img resize /data/disk.qcow2 4096M')
+            'qemu-img resize /data/disk.qcow2 4096M', warn=True)
 
     @patch('boxman.providers.libvirt.disk.LibVirtCommandBase')
     def test_resize_disk_offline_failure(self, mock_cmd_cls):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         mock_instance = MagicMock()
         mock_cmd_cls.return_value = mock_instance
         mock_instance.execute_shell.return_value = MagicMock(ok=False, stderr='err')
@@ -666,16 +665,16 @@ class TestDiskManagerResize:
         assert result is False
 
     def test_resize_disk_online_success(self):
-        dm = self._make_manager()
-        dm.execute = MagicMock(return_value=MagicMock(ok=True))
+        dm = _make_disk_manager()
+        dm.virsh.execute.return_value = MagicMock(ok=True)
 
         result = dm.resize_disk_online('vdb', 4096)
         assert result is True
-        dm.execute.assert_called_once_with(
-            'blockresize', 'test-vm', 'vdb', '--size=4096M')
+        dm.virsh.execute.assert_called_once_with(
+            'blockresize', 'test-vm', 'vdb', '--size=4096M', warn=True)
 
     def test_resize_disk_routes_to_online_when_running(self):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         dm.resize_disk_online = MagicMock(return_value=True)
         dm.resize_disk_offline = MagicMock(return_value=True)
 
@@ -685,7 +684,7 @@ class TestDiskManagerResize:
         dm.resize_disk_offline.assert_not_called()
 
     def test_resize_disk_routes_to_offline_when_stopped(self):
-        dm = self._make_manager()
+        dm = _make_disk_manager()
         dm.resize_disk_online = MagicMock(return_value=True)
         dm.resize_disk_offline = MagicMock(return_value=True)
 
@@ -742,14 +741,12 @@ class TestDestroyRemovedVm:
 
     def _make_manager(self):
         """Bare BoxmanManager instance with a mocked provider."""
-        from boxman.manager import BoxmanManager
-        mgr = BoxmanManager.__new__(BoxmanManager)
-        mgr.logger = MagicMock()
+        mgr = make_bare_manager()
         mgr.provider = MagicMock()
         mgr.provider.provider_config = {'uri': 'qemu:///system'}
         return mgr
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_vm_disk_dirs_from_domblklist(self, mock_virsh_cls):
         """Disk directories come from libvirt, cdrom sources are ignored."""
         mgr = self._make_manager()
@@ -760,7 +757,7 @@ class TestDestroyRemovedVm:
 
         assert dirs == ['/data', '/var/lib/libvirt/images']
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_vm_disk_dirs_fallback_when_query_fails(self, mock_virsh_cls):
         """If domblklist fails, fall back to the configured workdirs."""
         mgr = self._make_manager()
@@ -771,7 +768,7 @@ class TestDestroyRemovedVm:
 
         assert dirs == ['/fallback']
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_destroy_removed_vm_sweeps_libvirt_disk_dirs(self, mock_virsh_cls):
         """destroy_disks runs once per libvirt-reported disk directory."""
         mgr = self._make_manager()
@@ -791,7 +788,7 @@ class TestDestroyRemovedVm:
             call('test-vm', force=True),
         ]
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_vm_disk_dirs_handles_paths_with_spaces(self, mock_virsh_cls):
         """A disk path containing spaces must survive domblklist parsing."""
         mgr = self._make_manager()
@@ -808,7 +805,7 @@ class TestDestroyRemovedVm:
 
         assert dirs == ['/vm images']
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_vm_disk_dirs_fallback_when_no_disks(self, mock_virsh_cls):
         """ok=True with zero disk rows (e.g. diskless VM) also falls back
         to the configured workdirs."""
@@ -821,7 +818,7 @@ class TestDestroyRemovedVm:
 
         assert dirs == ['/fallback']
 
-    @patch('boxman.manager.VirshCommand')
+    @patch("boxman.manager_parts.vms.VirshCommand")
     def test_destroy_removed_vm_queries_disks_before_undefining(
             self, mock_virsh_cls):
         """domblklist must run before destroy_vm — after the domain is

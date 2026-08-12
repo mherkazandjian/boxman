@@ -2,11 +2,15 @@
 Tests for boxman.runtime – runtime factory, wrapping, and config injection.
 """
 
+import shlex
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
+
+from boxman.exceptions import BoxmanError, ConfigError
 from boxman.runtime import create_runtime
-from boxman.runtime.local import LocalRuntime
 from boxman.runtime.docker_compose import DockerComposeRuntime
+from boxman.runtime.local import LocalRuntime
 
 
 class TestCreateRuntime:
@@ -22,7 +26,12 @@ class TestCreateRuntime:
         assert rt.name == "docker-compose"
 
     def test_unknown_raises(self):
-        with pytest.raises(ValueError, match="unknown runtime"):
+        with pytest.raises(ConfigError, match="unknown runtime"):
+            create_runtime("aws-magic")
+
+    def test_unknown_raises_boxman_error(self):
+        """app.py maps BoxmanError → log.error + exit 2 (no traceback)."""
+        with pytest.raises(BoxmanError):
             create_runtime("aws-magic")
 
 
@@ -152,7 +161,143 @@ class TestDockerComposeRuntime:
         # should still be only 1 entry
         assert vols.count("/home/user/project:/home/user/project") == 1
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    # ------------------------------------------------------------------
+    # #85 item 21 — a user-supplied compose file must never be rewritten
+    # in place; bind mounts go into an override file under .boxman
+    # ------------------------------------------------------------------
+    USER_COMPOSE = (
+        "# my own runtime — do not touch\n"
+        "services:\n"
+        "  libvirt:   # the one and only service\n"
+        "    image: qemu-libvirt:local\n"
+        "    volumes:\n"
+        "      - /sys/fs/cgroup:/sys/fs/cgroup:rw\n"
+    )
+
+    def _user_compose_setup(self, tmp_path):
+        """A runtime configured with a user-owned compose file."""
+        user_dir = tmp_path / "userstuff"
+        user_dir.mkdir()
+        compose_path = user_dir / "docker-compose.yml"
+        compose_path.write_text(self.USER_COMPOSE)
+        rt = DockerComposeRuntime(config={
+            "compose_file": str(compose_path),
+            "project_dir": str(tmp_path / "proj"),
+        })
+        return rt, compose_path
+
+    def test_user_compose_file_is_never_rewritten(self, tmp_path):
+        """ensure_ready leaves a user-supplied compose file byte-identical
+        and drops no .env next to it."""
+        rt, compose_path = self._user_compose_setup(tmp_path)
+
+        with patch.object(rt, "_container_is_running", return_value=True), \
+             patch.object(rt, "_project_dir_accessible", return_value=True), \
+             patch.object(rt, "_wait_for_libvirtd"), \
+             patch.object(rt, "_log_compose_file"):
+            rt.ensure_ready()
+
+        assert compose_path.read_text() == self.USER_COMPOSE
+        assert not (compose_path.parent / ".env").exists()
+
+    def test_user_compose_gets_override_file_in_boxman_dir(self, tmp_path):
+        """The bind mounts land in an override file under
+        .boxman/runtime/docker, named for compose override merging."""
+        rt, compose_path = self._user_compose_setup(tmp_path)
+
+        with patch.object(rt, "_container_is_running", return_value=True), \
+             patch.object(rt, "_project_dir_accessible", return_value=True), \
+             patch.object(rt, "_wait_for_libvirtd"), \
+             patch.object(rt, "_log_compose_file"):
+            rt.ensure_ready()
+
+        import yaml
+        override = tmp_path / "proj" / ".boxman" / "runtime" / "docker" / \
+            "docker-compose.boxman.override.yml"
+        assert override.is_file()
+        data = yaml.safe_load(override.read_text())
+        vols = data["services"]["libvirt"]["volumes"]
+        assert f"{tmp_path}/proj:{tmp_path}/proj" in vols
+        assert "/tmp:/tmp" in vols
+        # .env went into .boxman, not next to the user's file
+        assert (override.parent / ".env").is_file()
+
+    def test_override_merged_via_second_f_and_env_file(self, tmp_path):
+        """_compose_base_cmd merges the override with a second -f and
+        passes the .boxman .env via --env-file for user files."""
+        rt, compose_path = self._user_compose_setup(tmp_path)
+
+        with patch.object(rt, "_container_is_running", return_value=True), \
+             patch.object(rt, "_project_dir_accessible", return_value=True), \
+             patch.object(rt, "_wait_for_libvirtd"), \
+             patch.object(rt, "_log_compose_file"):
+            rt.ensure_ready()
+
+        cmd = rt._compose_base_cmd(str(compose_path), str(compose_path.parent))
+        override = rt._bind_mount_override_path()
+        assert f"-f {compose_path}" in cmd
+        assert f"-f {override}" in cmd
+        assert "--env-file" in cmd
+        # user's file is the first -f so its relative paths keep resolving
+        # against its own directory
+        assert cmd.index(f"-f {compose_path}") < cmd.index(f"-f {override}")
+
+    def test_boxman_owned_compose_still_mutated_in_place(self, tmp_path):
+        """The deployed copy under .boxman keeps the old in-place
+        injection + neighbouring .env behaviour."""
+        runtime_dir = tmp_path / "proj" / ".boxman" / "runtime" / "docker"
+        runtime_dir.mkdir(parents=True)
+        compose_path = runtime_dir / "docker-compose.yml"
+        compose_path.write_text(
+            "services:\n  boxman-libvirt:\n    image: test\n")
+
+        rt = DockerComposeRuntime(config={"project_dir": str(tmp_path / "proj")})
+        assert rt._is_boxman_owned_compose(str(compose_path))
+
+        with patch.object(rt, "get_compose_file_path",
+                          return_value=str(compose_path)), \
+             patch.object(rt, "_write_bind_mount_override") as override_mock, \
+             patch.object(rt, "_container_is_running", return_value=True), \
+             patch.object(rt, "_project_dir_accessible", return_value=True), \
+             patch.object(rt, "_wait_for_libvirtd"), \
+             patch.object(rt, "_log_compose_file"):
+            rt.ensure_ready()
+
+        override_mock.assert_not_called()
+        import yaml
+        data = yaml.safe_load(compose_path.read_text())
+        vols = data["services"]["boxman-libvirt"]["volumes"]
+        assert "/tmp:/tmp" in vols
+        assert (runtime_dir / ".env").is_file()
+
+    def test_compose_base_cmd_quotes_paths_with_spaces(self, tmp_path):
+        rt = DockerComposeRuntime(config={"project_dir": str(tmp_path)})
+        compose_dir = tmp_path / "my dir"
+        compose_dir.mkdir()
+        compose_path = compose_dir / "docker-compose.yml"
+        compose_path.write_text("services: {}\n")
+        cmd = rt._compose_base_cmd(str(compose_path), str(compose_dir))
+        tokens = shlex.split(cmd)
+        assert str(compose_path) in tokens
+        assert str(compose_dir) in tokens
+
+    def test_override_dedups_volumes_already_in_user_file(self, tmp_path):
+        rt, compose_path = self._user_compose_setup(tmp_path)
+        override_path = rt._write_bind_mount_override(
+            str(compose_path), ["/sys/fs/cgroup", "/data"])
+        import yaml
+        data = yaml.safe_load(open(override_path))
+        vols = data["services"]["libvirt"]["volumes"]
+        assert vols == ["/data:/data"]
+        assert compose_path.read_text() == self.USER_COMPOSE
+
+    def test_write_bind_mount_override_no_services(self, tmp_path):
+        compose_path = tmp_path / "docker-compose.yml"
+        compose_path.write_text("{}\n")
+        rt = DockerComposeRuntime(config={"project_dir": str(tmp_path)})
+        assert rt._write_bind_mount_override(str(compose_path), ["/x"]) is None
+
+    @patch("invoke.run")
     def test_ensure_ready_skips_compose_up_when_already_running(self, mock_run):
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
 
@@ -164,7 +309,7 @@ class TestDockerComposeRuntime:
         mock_run.side_effect = [mock_result_running, mock_result_running, mock_result_running, mock_result_virsh]
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
-             patch.object(rt, "_inject_bind_mounts_into_compose"), \
+             patch.object(rt, "_write_bind_mount_override"), \
              patch.object(rt, "_write_env_file"), \
              patch.object(rt, "_log_compose_file"):
             rt.ensure_ready()
@@ -172,7 +317,7 @@ class TestDockerComposeRuntime:
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert not any("compose" in c and "up" in c for c in calls)
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_ensure_ready_starts_compose_when_not_running(self, mock_run):
         rt = DockerComposeRuntime(config={
             "runtime_container": "ctr1",
@@ -181,7 +326,8 @@ class TestDockerComposeRuntime:
         })
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
-             patch.object(rt, "_inject_bind_mounts_into_compose"), \
+             patch.object(rt, "_write_bind_mount_override"), \
+             patch.object(rt, "_write_env_file"), \
              patch.object(rt, "_log_compose_file"), \
              patch.object(rt, "verify_workdirs_accessible"):
             mock_not_running = MagicMock(ok=True, stdout="false\n")
@@ -198,7 +344,7 @@ class TestDockerComposeRuntime:
             calls = [c.args[0] for c in mock_run.call_args_list]
             assert any("compose" in c and "up" in c for c in calls)
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     @patch("boxman.runtime.docker_compose.time.sleep")
     def test_ensure_ready_raises_on_timeout(self, mock_sleep, mock_run):
         rt = DockerComposeRuntime(config={
@@ -207,7 +353,8 @@ class TestDockerComposeRuntime:
         })
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
-             patch.object(rt, "_inject_bind_mounts_into_compose"), \
+             patch.object(rt, "_write_bind_mount_override"), \
+             patch.object(rt, "_write_env_file"), \
              patch.object(rt, "_log_compose_file"):
             mock_not_running = MagicMock(ok=True, stdout="false\n")
             mock_compose_up = MagicMock(ok=True)
@@ -216,7 +363,7 @@ class TestDockerComposeRuntime:
             with pytest.raises(RuntimeError, match="did not start"):
                 rt.ensure_ready()
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_ensure_ready_checks_libvirtd_after_container_is_running(self, mock_run):
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
 
@@ -226,7 +373,7 @@ class TestDockerComposeRuntime:
         mock_run.side_effect = [mock_running, mock_dir_ok, mock_dir_ok, mock_virsh]
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
-             patch.object(rt, "_inject_bind_mounts_into_compose"), \
+             patch.object(rt, "_write_bind_mount_override"), \
              patch.object(rt, "_write_env_file"), \
              patch.object(rt, "_log_compose_file"):
             rt.ensure_ready()
@@ -426,7 +573,7 @@ class TestDockerComposeRuntime:
             with pytest.raises(FileNotFoundError, match="cannot locate"):
                 rt.get_compose_file_path()
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_ensure_ready_passes_project_dir_to_compose(self, mock_run):
         """ensure_ready must pass BOXMAN_PROJECT_DIR so the container
         bind-mounts the project directory."""
@@ -438,7 +585,8 @@ class TestDockerComposeRuntime:
         rt.project_dir = "/home/user/my-project"
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
-             patch.object(rt, "_inject_bind_mounts_into_compose"), \
+             patch.object(rt, "_write_bind_mount_override"), \
+             patch.object(rt, "_write_env_file"), \
              patch.object(rt, "_log_compose_file"), \
              patch.object(rt, "verify_workdirs_accessible"):
             mock_not_running = MagicMock(ok=True, stdout="false\n")
@@ -459,9 +607,10 @@ class TestDockerComposeRuntime:
             assert "HOST_UID" in env_kwarg
             assert "HOST_GID" in env_kwarg
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_ensure_ready_injects_workdirs_into_compose(self, mock_run):
-        """ensure_ready must inject workdirs as bind-mount volumes."""
+        """ensure_ready must pass workdirs as bind-mount volumes (to the
+        override file for a user-supplied compose file)."""
         rt = DockerComposeRuntime(config={
             "runtime_container": "ctr1",
             "compose_file": "/dev/null",
@@ -476,7 +625,8 @@ class TestDockerComposeRuntime:
             inject_calls.append(bind_dirs)
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
-             patch.object(rt, "_inject_bind_mounts_into_compose", side_effect=mock_inject), \
+             patch.object(rt, "_write_bind_mount_override", side_effect=mock_inject), \
+             patch.object(rt, "_write_env_file"), \
              patch.object(rt, "_log_compose_file"), \
              patch.object(rt, "verify_workdirs_accessible"):
             mock_not_running = MagicMock(ok=True, stdout="false\n")
@@ -497,7 +647,7 @@ class TestDockerComposeRuntime:
 
 class TestVerifyWorkdirsAccessible:
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_passes_when_all_dirs_accessible(self, mock_run):
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
         mock_run.return_value = MagicMock(ok=True)
@@ -511,7 +661,7 @@ class TestVerifyWorkdirsAccessible:
         assert all("docker exec --user root ctr1" in c for c in calls)
         assert all("test -d" in c and "-w" in c for c in calls)
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_raises_listing_missing_dirs(self, mock_run):
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
         mock_run.side_effect = [
@@ -535,7 +685,7 @@ class TestVerifyWorkdirsAccessible:
         assert "/home/user/ok" not in msg
         assert "ctr1" in msg
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_defaults_to_collected_bind_mount_dirs(self, mock_run):
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
         rt.project_dir = "/home/user/my-project"
@@ -553,7 +703,7 @@ class TestVerifyWorkdirsAccessible:
 
 class TestDockerComposeDestroyRuntime:
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_destroy_runtime_cleans_data_dirs_inside_container(self, mock_run):
         """When the container is running, destroy_runtime should exec rm -rf
         inside it before running docker compose down."""
@@ -580,7 +730,7 @@ class TestDockerComposeDestroyRuntime:
         assert "down --volumes --remove-orphans" in calls[2]
         assert result == "/tmp/test-project/.boxman"
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_destroy_runtime_skips_cleanup_when_container_not_running(self, mock_run):
         """When the container is not running, destroy_runtime should skip
         the in-container cleanup and go straight to docker compose down."""
@@ -602,7 +752,7 @@ class TestDockerComposeDestroyRuntime:
         assert "down --volumes --remove-orphans" in calls[1]
         assert result == "/tmp/test-project/.boxman"
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_destroy_runtime_continues_if_cleanup_fails(self, mock_run):
         """If the in-container cleanup fails, destroy_runtime should still
         proceed with docker compose down."""
@@ -632,7 +782,7 @@ class TestDockerComposeDestroyRuntime:
         result = rt.destroy_runtime()
         assert result is None
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_plan_destroy_runtime_with_running_container(self, mock_run, tmp_path):
         """plan_destroy_runtime should list cleanup, compose down, and dir removal."""
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
@@ -659,7 +809,7 @@ class TestDockerComposeDestroyRuntime:
         assert str(boxman_dir) in plan["paths_to_delete"]
         assert plan["container_running"] is True
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_plan_destroy_runtime_container_not_running(self, mock_run, tmp_path):
         """When container is not running, plan should omit the exec cleanup."""
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
@@ -703,9 +853,9 @@ class TestManagerDestroyRuntimeCleanup:
         args.auto_accept = auto_accept
         return args
 
-    @patch("boxman.manager.subprocess.run")
-    @patch("boxman.manager.shutil.rmtree")
-    @patch("boxman.manager.os.path.isdir")
+    @patch("boxman.manager_parts.flows.subprocess.run")
+    @patch("boxman.manager_parts.flows.shutil.rmtree")
+    @patch("boxman.manager_parts.flows.os.path.isdir")
     def test_docker_fallback_when_boxman_dir_survives_rmtree(
         self, mock_isdir, mock_rmtree, mock_subprocess_run
     ):
@@ -733,7 +883,7 @@ class TestManagerDestroyRuntimeCleanup:
         # 4. _force_rmtree final check → False (docker cleaned it)
         mock_isdir.side_effect = [True, True, True, False]
 
-        BoxmanManager.destroy_runtime(mgr, self._make_cli_args())
+        mgr.destroy_runtime(self._make_cli_args())
 
         # shutil.rmtree called twice: initial attempt + after docker cleanup
         assert mock_rmtree.call_count == 2
@@ -744,9 +894,9 @@ class TestManagerDestroyRuntimeCleanup:
         assert "alpine" in docker_cmd
         assert "/cleanup/*" in docker_cmd[-1]
 
-    @patch("boxman.manager.subprocess.run")
-    @patch("boxman.manager.shutil.rmtree")
-    @patch("boxman.manager.os.path.isdir")
+    @patch("boxman.manager_parts.flows.subprocess.run")
+    @patch("boxman.manager_parts.flows.shutil.rmtree")
+    @patch("boxman.manager_parts.flows.os.path.isdir")
     def test_no_docker_fallback_when_rmtree_succeeds(
         self, mock_isdir, mock_rmtree, mock_subprocess_run
     ):
@@ -772,7 +922,7 @@ class TestManagerDestroyRuntimeCleanup:
         # 3. _force_rmtree post-shutil.rmtree check → False (rmtree worked)
         mock_isdir.side_effect = [True, True, False]
 
-        BoxmanManager.destroy_runtime(mgr, self._make_cli_args())
+        mgr.destroy_runtime(self._make_cli_args())
 
         assert mock_rmtree.call_count == 1
         mock_subprocess_run.assert_not_called()
@@ -794,13 +944,13 @@ class TestManagerDestroyRuntimeCleanup:
         }
         mgr._runtime_instance = mock_runtime
 
-        BoxmanManager.destroy_runtime(mgr, self._make_cli_args(auto_accept=False))
+        mgr.destroy_runtime(self._make_cli_args(auto_accept=False))
 
         mock_input.assert_called_once()
         mock_runtime.destroy_runtime.assert_not_called()
 
-    @patch("boxman.manager.shutil.rmtree")
-    @patch("boxman.manager.os.path.isdir", return_value=False)
+    @patch("boxman.manager_parts.flows.shutil.rmtree")
+    @patch("boxman.manager_parts.flows.os.path.isdir", return_value=False)
     @patch("builtins.input", return_value="y")
     def test_prompt_proceeds_on_yes(self, mock_input, mock_isdir, mock_rmtree):
         """When the user answers 'y', destroy_runtime should proceed."""
@@ -819,13 +969,13 @@ class TestManagerDestroyRuntimeCleanup:
         }
         mgr._runtime_instance = mock_runtime
 
-        BoxmanManager.destroy_runtime(mgr, self._make_cli_args(auto_accept=False))
+        mgr.destroy_runtime(self._make_cli_args(auto_accept=False))
 
         mock_input.assert_called_once()
         mock_runtime.destroy_runtime.assert_called_once()
 
-    @patch("boxman.manager.shutil.rmtree")
-    @patch("boxman.manager.os.path.isdir", return_value=False)
+    @patch("boxman.manager_parts.flows.shutil.rmtree")
+    @patch("boxman.manager_parts.flows.os.path.isdir", return_value=False)
     def test_auto_accept_skips_prompt(self, mock_isdir, mock_rmtree):
         """With --auto-accept, no input prompt should be shown."""
         from boxman.manager import BoxmanManager
@@ -844,7 +994,7 @@ class TestManagerDestroyRuntimeCleanup:
         mgr._runtime_instance = mock_runtime
 
         with patch("builtins.input") as mock_input:
-            BoxmanManager.destroy_runtime(mgr, self._make_cli_args(auto_accept=True))
+            mgr.destroy_runtime(self._make_cli_args(auto_accept=True))
             mock_input.assert_not_called()
 
         mock_runtime.destroy_runtime.assert_called_once()
@@ -908,7 +1058,7 @@ class TestDockerComposeRuntimeBridgeConflict:
     used for bridge allocation.
     """
 
-    @patch("boxman.runtime.docker_compose.invoke.run")
+    @patch("invoke.run")
     def test_brctl_show_sees_host_bridges_inside_container(self, mock_run):
         """Demonstrates that brctl show inside the container returns host bridges,
         which is why virsh net-list is used instead."""
@@ -935,9 +1085,10 @@ class TestDockerComposeRuntimeBridgeConflict:
     def test_cache_filtering_by_runtime(self):
         """Projects registered under a different runtime should be ignored
         during conflict checks."""
+        from unittest.mock import MagicMock, patch
+
         from boxman.manager import BoxmanManager
         from boxman.providers.libvirt.net import Network
-        from unittest.mock import MagicMock, patch
 
         mgr = BoxmanManager()
         mgr._runtime_name = 'docker-compose'
@@ -974,9 +1125,10 @@ class TestDockerComposeRuntimeBridgeConflict:
 
     def test_cache_conflict_same_runtime(self):
         """Projects in the same runtime SHOULD trigger conflicts."""
+        from unittest.mock import MagicMock, patch
+
         from boxman.manager import BoxmanManager
         from boxman.providers.libvirt.net import Network
-        from unittest.mock import MagicMock, patch
 
         mgr = BoxmanManager()
         mgr._runtime_name = 'docker-compose'

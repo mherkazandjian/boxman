@@ -13,10 +13,9 @@ from __future__ import annotations
 
 import pytest
 
-from boxman.abstract.providers import Provider, ProviderSession
+from boxman.abstract.providers import ProviderSession
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.providers.virtualbox.session import VirtualBoxSession
-
 
 pytestmark = pytest.mark.unit
 
@@ -77,18 +76,3 @@ class TestProviderSessionProtocol:
             def clone_vm(self, new_vm_name, src_vm_name, info, workdir): return True
 
         assert not isinstance(NearlyASession(), ProviderSession)
-
-
-class TestProviderProtocol:
-
-    def test_object_with_name_satisfies_provider(self):
-        class P:
-            name = "libvirt"
-
-        assert isinstance(P(), Provider)
-
-    def test_object_without_name_does_not_satisfy_provider(self):
-        class P:
-            pass
-
-        assert not isinstance(P(), Provider)

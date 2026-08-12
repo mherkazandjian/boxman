@@ -25,7 +25,6 @@ import pytest
 from boxman.providers.libvirt import net_reconcile as nr
 from boxman.providers.libvirt.net import Network
 
-
 pytestmark = pytest.mark.unit
 
 
@@ -406,8 +405,13 @@ class TestRecreateSequence:
 
         mgr.cache = MagicMock()
         mgr.cache.projects = {'p1': {'networks': {'full-net': {'ip_address': '10.5.3.1'}}}}
-        mgr.cache.read_projects_cache.side_effect = lambda: calls.append('cache-read')
-        mgr.cache.write_projects_cache.side_effect = lambda: calls.append('cache-write')
+
+        def _unregister_network(project, name):
+            calls.append('cache-write')
+            mgr.cache.projects[project]['networks'].pop(name, None)
+            return True
+
+        mgr.cache.unregister_network.side_effect = _unregister_network
 
         provider = MagicMock()
         provider.remove_network.side_effect = lambda **kw: (
@@ -553,7 +557,7 @@ class TestCacheSelfConflict:
                 raise RuntimeError("boom")
             return _result()
 
-        net.execute = fake_execute
+        net.virsh.execute = fake_execute
         net._get_libvirt_bridges = lambda: set()
         assert net.define_network(str(tmp_path / 'net.xml')) is False
 
@@ -568,6 +572,64 @@ class TestCacheSelfConflict:
         net._log_bridge_usage = lambda _: None
         with pytest.raises(RuntimeError, match="already in use"):
             net.define_network(str(tmp_path / 'net.xml'))
+
+
+class TestRuntimeScopeFiltering:
+    """
+    Conflicts are only meaningful within one runtime scope.
+
+    Regression tests for issue #85 item 15: each runtime has its own
+    isolated libvirt instance, but the filter used to be
+    ``current != 'local' and project_runtime != current`` -- so a local run
+    still conflict-checked projects living in a docker-compose runtime and
+    reported false name/bridge/IP conflicts against a libvirt it does not
+    even talk to.
+    """
+
+    @staticmethod
+    def _net(tmp_path, cached: dict, runtime: str):
+        from boxman.config_cache import BoxmanCache
+
+        cache = BoxmanCache.__new__(BoxmanCache)
+        cache.cache_dir = str(tmp_path)
+        cache.projects_cache_file = str(tmp_path / 'projects.json')
+        cache.projects = None
+        (tmp_path / 'projects.json').write_text(json.dumps(cached))
+
+        manager = MagicMock()
+        manager.cache = cache
+        manager.config = {'project': 'p1'}
+        manager._runtime_name = runtime
+
+        info = {"mode": "nat", "bridge": {"name": "virbr9"},
+                "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0"}}
+        return Network(name="net-a", info=info, assign_new_bridge=True,
+                       provider_config={"use_sudo": False}, manager=manager)
+
+    # the other project collides on name, bridge AND address -- if it is
+    # checked at all, every conflict type fires
+    _OTHER = {'p2': {'runtime': None, 'networks': {
+        'net-a': {'ip_address': '10.5.3.1', 'bridge_name': 'virbr9'}}}}
+
+    def test_local_run_ignores_docker_compose_projects(self, tmp_path):
+        cached = {**self._OTHER, 'p2': {**self._OTHER['p2'],
+                                        'runtime': 'docker-compose'}}
+        net = self._net(tmp_path, cached, runtime='local')
+        net.check_network_exists()      # must not raise
+
+    def test_docker_compose_run_ignores_local_projects(self, tmp_path):
+        cached = {**self._OTHER, 'p2': {**self._OTHER['p2'],
+                                        'runtime': 'local'}}
+        net = self._net(tmp_path, cached, runtime='docker-compose')
+        net.check_network_exists()      # must not raise
+
+    def test_same_scope_still_conflicts(self, tmp_path):
+        for runtime in ('local', 'docker-compose'):
+            cached = {**self._OTHER, 'p2': {**self._OTHER['p2'],
+                                            'runtime': runtime}}
+            net = self._net(tmp_path, cached, runtime=runtime)
+            with pytest.raises(RuntimeError, match="conflict"):
+                net.check_network_exists()
 
 
 class TestElementRendering:
@@ -612,7 +674,7 @@ class TestApplyLivePlan:
                 return _result(stdout="demo\n" if active else "")
             return _result()
 
-        net.execute = fake_execute
+        net.virsh.execute = fake_execute
         return net, calls
 
     def test_range_is_applied_before_the_reservations(self):
@@ -688,7 +750,7 @@ class TestApplyLivePlan:
     def test_a_failing_update_is_reported(self):
         net = _network({"mode": "nat",
                         "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0"}})
-        net.execute = lambda *a, **k: (
+        net.virsh.execute = lambda *a, **k: (
             _result(stdout="demo\n") if a[0] == "net-list"
             else _result(ok=False, stderr="boom"))
         assert net.apply_live_plan(

@@ -7,106 +7,40 @@ from xml.etree import ElementTree as ET
 
 from boxman import log
 
+from ..session_base import SessionConfigMixin
+from . import net_reconcile
 from .cdrom import CDROMManager
 from .clone_vm import CloneVM
 from .commands import VirshCommand
-from .destroy_vm import DestroyVM
+from .destroy_vm import DestroyVM, shutdown_and_wait
 from .disk import DiskManager
 from .disk_cleanup import remove_vm_disks
 from .import_image import ImageImporter
 from .iso_boot_vm import IsoBootVM
-from . import net_reconcile
 from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
-from .storage import StorageManager, vm_disk_paths
+from .storage import StorageManager
 from .virsh_edit import VirshEdit
+from .virsh_parse import parse_domblklist, parse_domiflist
 
 
-class LibVirtSession:
-    def __init__(self,
-                 config: dict[str, Any] | None = None):
-        """
-        Initialize the LibVirtSession.
+class LibVirtSession(SessionConfigMixin):
+    """
+    Live session against the libvirt (KVM/QEMU) backend.
 
-        Args:
-            config: Optional configuration dictionary
-        """
-        #: Optional[Dict[str, Any]]: The configuration for this session
-        self.config = config
+    The config surface (``provider_config`` / ``uri`` / ``use_sudo`` /
+    ``update_provider_config``) comes from
+    :class:`~boxman.providers.session_base.SessionConfigMixin`; only the
+    libvirt-specific defaults and the runtime enrichment are set here.
+    """
 
-        #: logging.Logger: the logger instance
-        self.logger = log
-
-        # get provider config from the project configuration — these are
-        # authoritative and must never be overridden by app-level defaults.
-        self._project_provider_config = config.get('provider', {}).get('libvirt', {})
-
-        #: Dict[str, Any]: the base provider config (may be enriched with
-        #: app-level or runtime settings, but project-level keys always win
-        #: via the property).
-        self._provider_config_base = self._project_provider_config.copy()
-
-        #: the boxman manager instance (mainly to get access to the cache)
-        self.manager = None
-
-    @property
-    def provider_config(self) -> dict[str, Any]:
-        """
-        Return the effective provider config.
-
-        Project-level settings (from conf.yml) always take precedence
-        over app-level (boxman.yml) or runtime-injected values.
-        """
-        merged = self._provider_config_base.copy()
-        merged.update(self._project_provider_config)
-        return merged
-
-    @provider_config.setter
-    def provider_config(self, value: dict[str, Any]) -> None:
-        """
-        Set the base provider config.
-
-        The getter will overlay project-level settings on top, so
-        project-level keys like ``use_sudo`` can never be overridden.
-        """
-        self._provider_config_base = value
-
-    @property
-    def uri(self) -> str:
-        return self.provider_config.get('uri', 'qemu:///system')
-
-    @uri.setter
-    def uri(self, value: str) -> None:
-        self._provider_config_base['uri'] = value
-
-    @property
-    def use_sudo(self) -> bool:
-        return self.provider_config.get('use_sudo', False)
-
-    @use_sudo.setter
-    def use_sudo(self, value: bool) -> None:
-        self._provider_config_base['use_sudo'] = value
-
-    def update_provider_config(self, new_config: dict[str, Any]) -> None:
-        """
-        Update provider_config with *new_config*, but project-level settings
-        always win (enforced by the property getter).
-
-        Args:
-            new_config: Additional config keys (e.g. from boxman.yml providers
-                        section or runtime injection).
-        """
-        merged = self._provider_config_base.copy()
-        merged.update(new_config)
-        self._provider_config_base = merged
+    provider_key = 'libvirt'
+    default_uri = 'qemu:///system'
 
     def update_provider_config_with_runtime(self) -> None:
         """
         Enrich provider_config with runtime metadata from the manager.
-
-        Project-level provider settings always take precedence over
-        app-level (boxman.yml) settings and runtime defaults.
         """
         if self.manager is None:
             return
@@ -115,7 +49,6 @@ class LibVirtSession:
         enriched = self.manager.get_provider_config_with_runtime(
             self.provider_config
         )
-        # Merge, ensuring project-level keys win
         self.update_provider_config(enriched)
 
     def import_image(self,
@@ -214,11 +147,9 @@ class LibVirtSession:
             return 'failed'
 
         interfaces = []
-        for line in iflist.stdout.splitlines():
-            fields = line.split()
-            # columns: Interface Type Source Model MAC
-            if len(fields) >= 5 and fields[1] == 'network' and fields[2] == network_name:
-                interfaces.append({'model': fields[3], 'mac': fields[4]})
+        for row in parse_domiflist(iflist.stdout):
+            if row.type == 'network' and row.source == network_name:
+                interfaces.append({'model': row.model, 'mac': row.mac})
 
         if not interfaces:
             return 'skipped'
@@ -359,19 +290,7 @@ class LibVirtSession:
     def _power_cycle(virsh, domain: str, timeout: int = 120) -> bool:
         """Shut the domain down gracefully (force after *timeout*) and start it."""
         virsh.execute("shutdown", domain, hide=True, warn=True)
-
-        waited = 0
-        while waited < timeout:
-            state = virsh.execute("domstate", domain, hide=True, warn=True)
-            if state.ok and 'shut off' in state.stdout:
-                break
-            time.sleep(2)
-            waited += 2
-        else:
-            log.warning(
-                f"{domain}: did not shut down within {timeout}s, forcing it off")
-            virsh.execute("destroy", domain, hide=True, warn=True)
-
+        shutdown_and_wait(virsh, domain, timeout=timeout, logger=log)
         return virsh.execute("start", domain, hide=True, warn=True).ok
 
     def plan_network(self,
@@ -486,31 +405,14 @@ class LibVirtSession:
         Destroy a network.
 
         Args:
-            cluster_name: Name of the cluster
-            network_name: Name of the network
+            name: Name of the network
+            info: the network block from the configuration
 
         Returns:
             True if successful, False otherwise
         """
         network = Network(name=name, info=info)
         status = network.destroy_network()
-        return status
-
-    def undefine_network(self,
-                         name: str = None,
-                         info: dict[str, Any] | None = None) -> bool:
-        """
-        Undefine a network.
-
-        Args:
-            cluster_name: Name of the cluster
-            network_name: Name of the network
-
-        Returns:
-            True if successful, False otherwise
-        """
-        network = Network(name=name, info=info)
-        status = network.undefine_network()
         return status
 
     def remove_network(self,
@@ -1313,12 +1215,10 @@ class LibVirtSession:
         result = virsh.execute("domblklist", vm_name, "--details", warn=True)
         if not result.ok:
             return
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            # domblklist --details columns: Type  Device  Target  Source
-            if len(parts) >= 3 and parts[1] == 'cdrom':
-                target = parts[2]
-                source = parts[3] if len(parts) >= 4 else '-'
+        for row in parse_domblklist(result.stdout):
+            if row.device == 'cdrom':
+                target = row.target
+                source = row.source if row.source is not None else '-'
                 if source == '-':
                     self.logger.debug(f"cdrom {target} on {vm_name} is already empty")
                     continue
@@ -1540,12 +1440,10 @@ class LibVirtSession:
                     return False
 
                 # wait for the vm to shut down
-                for i in range(30):
-                    state_result = virsh.execute("domstate", vm_name, warn=True)
-                    if state_result.ok and "shut off" in state_result.stdout:
-                        break
-                    time.sleep(1)
-                else:
+                if not shutdown_and_wait(virsh, vm_name, timeout=30,
+                                         force_after=False,
+                                         poll_interval=1,
+                                         logger=self.logger):
                     self.logger.error(f"vm {vm_name} did not shut down within timeout")
                     return False
 
@@ -1624,29 +1522,8 @@ class LibVirtSession:
         self.logger.info(f"shutting down VM {vm_name}...")
         virsh.execute('shutdown', vm_name, warn=True)
 
-        # poll for shut off
-        waited = 0
-        poll_interval = 2
-        while waited < timeout:
-            time.sleep(poll_interval)
-            waited += poll_interval
-            result = virsh.execute('domstate', vm_name, warn=True)
-            if result.ok and 'shut off' in result.stdout:
-                self.logger.info(f"VM {vm_name} is shut off after {waited}s")
-                return True
-
-        # force stop as fallback
-        self.logger.warning(
-            f"VM {vm_name} did not shut off within {timeout}s, forcing stop")
-        virsh.execute('destroy', vm_name, warn=True)
-        time.sleep(2)
-
-        result = virsh.execute('domstate', vm_name, warn=True)
-        if result.ok and 'shut off' in result.stdout:
-            return True
-
-        self.logger.error(f"failed to shut off VM {vm_name}")
-        return False
+        return shutdown_and_wait(virsh, vm_name, timeout=timeout,
+                                 logger=self.logger)
 
     def update_vm_cpu_memory(self,
                              vm_name: str,
@@ -1696,60 +1573,28 @@ class LibVirtSession:
 
         # --- Step 1: update persistent config (inactive XML) ---
         xml_content = editor.get_domain_xml(vm_name, inactive=True)
-        modifications = []
 
         desired_total = None
         if cpus:
-            sockets = cpus.get('sockets', 1)
-            cores = cpus.get('cores', 1)
-            threads = cpus.get('threads', 1)
-            desired_total = sockets * cores * threads
+            desired_total = (cpus.get('sockets', 1)
+                             * cpus.get('cores', 1)
+                             * cpus.get('threads', 1))
 
-            effective_max_vcpus = max_vcpus or desired_total
-            if max_vcpus is not None and max_vcpus < desired_total:
-                effective_max_vcpus = desired_total
+        # memory mods only apply when the memory actually changes (or a
+        # new ceiling is requested); the clamping/scaling algorithm itself
+        # is shared with VirshEdit.configure_cpu_memory
+        memory_for_mods = (
+            memory_mb
+            if memory_mb is not None
+            and (memory_mb != actual_memory_mb or max_memory_mb is not None)
+            else None)
 
-            modifications.append(('//vcpu', 'text', str(effective_max_vcpus)))
+        modifications, remove_topology = editor.cpu_memory_modifications(
+            cpus, memory_for_mods, max_vcpus, max_memory_mb,
+            logger=self.logger)
 
-            if effective_max_vcpus > desired_total:
-                # libvirt requires topology product == max vcpu count.
-                # scale sockets so that sockets * cores * threads == max.
-                cores_x_threads = cores * threads
-                if effective_max_vcpus % cores_x_threads == 0:
-                    max_sockets = effective_max_vcpus // cores_x_threads
-                    modifications.extend([
-                        ('//cpu/topology', 'sockets', str(max_sockets)),
-                        ('//cpu/topology', 'cores', str(cores)),
-                        ('//cpu/topology', 'threads', str(threads)),
-                    ])
-                else:
-                    # can't express with given cores*threads, remove topology
-                    from lxml import etree
-                    tree = etree.fromstring(xml_content.encode('utf-8'))
-                    for topo in tree.xpath('//cpu/topology'):
-                        topo.getparent().remove(topo)
-                    xml_content = etree.tostring(
-                        tree, encoding='unicode', pretty_print=True)
-
-                modifications.append(
-                    ('//vcpu', 'current', str(desired_total)))
-            else:
-                modifications.extend([
-                    ('//cpu/topology', 'sockets', str(sockets)),
-                    ('//cpu/topology', 'cores', str(cores)),
-                    ('//cpu/topology', 'threads', str(threads)),
-                ])
-
-        if memory_mb is not None and (memory_mb != actual_memory_mb or max_memory_mb is not None):
-            effective_max_memory = max_memory_mb or memory_mb
-            if max_memory_mb is not None and max_memory_mb < memory_mb:
-                effective_max_memory = memory_mb
-            max_memory_kib = effective_max_memory * 1024
-            current_memory_kib = memory_mb * 1024
-            modifications.extend([
-                ('//memory', 'text', str(max_memory_kib)),
-                ('//currentMemory', 'text', str(current_memory_kib)),
-            ])
+        if remove_topology:
+            xml_content = editor._drop_topology(xml_content)
 
         if modifications:
             modified_xml = editor.modify_xml_xpath(xml_content, modifications)

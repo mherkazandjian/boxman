@@ -3,18 +3,15 @@ Tests for boxman.utils.env_loader and boxman.task_runner.
 """
 
 import os
-import stat
-import subprocess
-import textwrap
 import types
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.utils.env_loader import source_env_file, load_workspace_env
-from boxman.task_runner import TaskRunner
+from boxman.exceptions import BoxmanError, ConfigError
 from boxman.manager import BoxmanManager
-
+from boxman.task_runner import TaskRunner
+from boxman.utils.env_loader import load_workspace_env, source_env_file
 
 # ---------------------------------------------------------------------------
 # env_loader tests
@@ -264,7 +261,13 @@ class TestTaskRunner:
 
     def test_run_nonexistent_task_raises(self, basic_config):
         runner = TaskRunner(basic_config)
-        with pytest.raises(KeyError, match="not found"):
+        with pytest.raises(ConfigError, match="not found"):
+            runner.run("nonexistent")
+
+    def test_run_nonexistent_task_is_boxman_error(self, basic_config):
+        """app.py maps BoxmanError → log.error + exit 2 (no traceback)."""
+        runner = TaskRunner(basic_config)
+        with pytest.raises(BoxmanError):
             runner.run("nonexistent")
 
     def test_run_task_executes_command(self, basic_config, tmp_path):
@@ -284,10 +287,9 @@ class TestTaskRunner:
         assert out_file.read_text().strip() == "test_inventory"
 
     def test_run_task_with_extra_args(self, basic_config, tmp_path):
-        out_file = tmp_path / "args_out.txt"
         basic_config["tasks"]["echo_args"] = {
             "description": "echo args",
-            "command": f"echo",
+            "command": "echo",
         }
         runner = TaskRunner(basic_config)
         exit_code = runner.run("echo_args", extra_args=["hello", "world"])
@@ -300,7 +302,7 @@ class TestTaskRunner:
         exit_code = runner.run_command("whoami")
         assert exit_code == 0
         called_cmd = mock_run.call_args[0][0]
-        assert called_cmd == 'ansible all -m ansible.builtin.shell -a "whoami"'
+        assert called_cmd == 'ansible all -m ansible.builtin.shell -a whoami'
 
     @patch("boxman.task_runner.subprocess.run")
     def test_run_command_adhoc_with_ansible_flags(self, mock_run, basic_config, tmp_path):
@@ -309,7 +311,19 @@ class TestTaskRunner:
         exit_code = runner.run_command("whoami", ansible_flags="--limit node01")
         assert exit_code == 0
         called_cmd = mock_run.call_args[0][0]
-        assert called_cmd == 'ansible all -m ansible.builtin.shell -a "whoami" --limit node01'
+        assert called_cmd == 'ansible all -m ansible.builtin.shell -a whoami --limit node01'
+
+    @patch("boxman.task_runner.subprocess.run")
+    def test_run_command_adhoc_quotes_command(self, mock_run, basic_config):
+        """The user command is shlex-quoted so embedded quotes/spaces
+        can't break out of the ansible -a argument."""
+        mock_run.return_value = MagicMock(returncode=0)
+        runner = TaskRunner(basic_config)
+        runner.run_command('echo "hi"; rm -rf /')
+        called_cmd = mock_run.call_args[0][0]
+        assert called_cmd == (
+            "ansible all -m ansible.builtin.shell -a 'echo \"hi\"; rm -rf /'"
+        )
 
     def test_sets_infra_from_project(self, basic_config):
         runner = TaskRunner(basic_config)
@@ -320,7 +334,7 @@ class TestTaskRunner:
         assert runner.cluster_name == "cluster_1"
 
     def test_invalid_cluster_raises(self, basic_config):
-        with pytest.raises(ValueError, match="not found"):
+        with pytest.raises(ConfigError, match="not found"):
             TaskRunner(basic_config, cluster_name="nonexistent")
 
     def test_no_tasks_section(self, tmp_path):
@@ -655,6 +669,24 @@ class TestTaskRunnerFlagsPassing:
         assert cmd == "mycommand -v 'arg1 arg2 arg3'"
 
 
+    # ------------------------------------------------------------------
+    # 13. Intentional spacing inside quoted args is preserved
+    # ------------------------------------------------------------------
+
+    def test_double_space_inside_quoted_flag_value_preserved(self, config):
+        """Regression: the old collapse-all-double-spaces pass corrupted
+        intentional spacing inside quoted arguments."""
+        self._add_task(config, "cmd", "echo {message} done")
+        cmd = self._run(config, "cmd", task_flags={"message": "'hello  world'"})
+        assert cmd == "echo 'hello  world' done"
+
+    def test_double_space_in_command_template_preserved(self, config):
+        """Spacing written into the command itself is left untouched."""
+        self._add_task(config, "cmd", 'echo "a  b" {flags}')
+        cmd = self._run(config, "cmd")
+        assert cmd == 'echo "a  b"'
+
+
 # ---------------------------------------------------------------------------
 # Manager-level flag parsing: argparse positional mis-classification fix
 #
@@ -719,7 +751,7 @@ class TestRunTaskArgparseMisclassification:
         """Invoke run_task and return the command string passed to subprocess."""
         with patch("boxman.task_runner.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
-            BoxmanManager.run_task(manager, cli_args)
+            manager.run_task(cli_args)
             return mock_run.call_args[0][0]
 
     # ------------------------------------------------------------------

@@ -5,13 +5,12 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 
 def push_oci_image(
     image_ref: str,
     qcow2_path: str,
-    metadata_path: Optional[str] = None,
+    metadata_path: str | None = None,
 ) -> None:
     """Push a local qcow2 image and optional metadata to an OCI registry.
 
@@ -40,7 +39,7 @@ def push_oci_image(
 def _oras_push(
     image_ref: str,
     qcow2_path: str,
-    metadata_path: Optional[str] = None,
+    metadata_path: str | None = None,
 ) -> None:
     """Push an OCI artifact to a registry using the oras CLI.
 
@@ -96,8 +95,7 @@ def _oras_push(
             cmd,
             cwd=str(work_dir),
             check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
         )
     except FileNotFoundError as exc:

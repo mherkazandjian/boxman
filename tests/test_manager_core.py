@@ -2,12 +2,14 @@
 Unit tests for selected BoxmanManager core methods.
 
 Targets the pure / easily isolated methods of the 4122-LOC manager.py:
-  - ``_merge_provider_configs`` (static, sudo-lists merging)
   - ``_canonical_runtime_name`` (static)
   - ``collect_workdirs`` (config-only, no I/O beyond path resolution)
   - ``fetch_value`` (classmethod — env/file/literal resolution)
   - ``get_global_authorized_keys`` (uses fetch_value)
   - ``runtime`` / ``runtime_instance`` / ``get_provider_config_with_runtime``
+
+Also covers ``boxman.providers.merge_provider_configs`` (sudo-lists
+merging), the single provider-config merge used by the CLI and manager.
 
 The orchestration surface (provision, up, down, snapshot_*, etc.) is
 left to integration tests.
@@ -18,14 +20,13 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from boxman.manager import BoxmanManager
-
+from boxman.providers import merge_provider_configs
 
 pytestmark = pytest.mark.unit
 
@@ -45,7 +46,7 @@ class TestMergeProviderConfigs:
     """
 
     def test_scalars_local_overrides_global(self):
-        merged = BoxmanManager._merge_provider_configs(
+        merged = merge_provider_configs(
             {"uri": "qemu:///system", "use_sudo": True},
             {"use_sudo": False},
         )
@@ -53,12 +54,12 @@ class TestMergeProviderConfigs:
         assert merged["use_sudo"] is False
 
     def test_empty_configs_yield_empty_sudo_lists(self):
-        merged = BoxmanManager._merge_provider_configs({}, {})
+        merged = merge_provider_configs({}, {})
         assert merged["sudo_skip_commands"] == []
         assert merged["force_sudo_commands"] == []
 
     def test_sudo_lists_union(self):
-        merged = BoxmanManager._merge_provider_configs(
+        merged = merge_provider_configs(
             {"sudo_skip_commands": ["ls"], "force_sudo_commands": ["virsh"]},
             {"sudo_skip_commands": ["cat"], "force_sudo_commands": ["virt-install"]},
         )
@@ -66,7 +67,7 @@ class TestMergeProviderConfigs:
         assert merged["force_sudo_commands"] == ["virsh", "virt-install"]
 
     def test_local_skip_wins_over_global_force(self):
-        merged = BoxmanManager._merge_provider_configs(
+        merged = merge_provider_configs(
             {"force_sudo_commands": ["virsh"]},
             {"sudo_skip_commands": ["virsh"]},
         )
@@ -74,7 +75,7 @@ class TestMergeProviderConfigs:
         assert "virsh" not in merged["force_sudo_commands"]
 
     def test_local_force_wins_over_global_skip(self):
-        merged = BoxmanManager._merge_provider_configs(
+        merged = merge_provider_configs(
             {"sudo_skip_commands": ["virsh"]},
             {"force_sudo_commands": ["virsh"]},
         )
@@ -83,10 +84,10 @@ class TestMergeProviderConfigs:
 
     def test_does_not_mutate_inputs(self):
         g = {"sudo_skip_commands": ["ls"]}
-        l = {"sudo_skip_commands": ["cat"]}
-        BoxmanManager._merge_provider_configs(g, l)
+        local = {"sudo_skip_commands": ["cat"]}
+        merge_provider_configs(g, local)
         assert g == {"sudo_skip_commands": ["ls"]}
-        assert l == {"sudo_skip_commands": ["cat"]}
+        assert local == {"sudo_skip_commands": ["cat"]}
 
 
 class TestCanonicalRuntimeName:
@@ -286,7 +287,8 @@ class TestCheckTemplatesForClusters:
 
     @staticmethod
     def _mgr_with_template(tmp_path: Path):
-        from unittest.mock import MagicMock, patch as _patch
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
         with _patch("boxman.manager.BoxmanCache"):
             m = BoxmanManager()
         m.config = {
@@ -398,7 +400,7 @@ class TestCloneVmsExitCodeGuard:
         m = self._mgr_with_one_vm(tmp_path)
         fake = self._fake_process(exitcode=1)
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
-             _patch("boxman.manager.Process", return_value=fake):
+             _patch("boxman.manager_parts.vms.Process", return_value=fake):
             with pytest.raises(RuntimeError, match="clone failed for 1 VM"):
                 m.clone_vms()
 
@@ -407,7 +409,7 @@ class TestCloneVmsExitCodeGuard:
         m = self._mgr_with_one_vm(tmp_path)
         fake = self._fake_process(exitcode=0)
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
-             _patch("boxman.manager.Process", return_value=fake):
+             _patch("boxman.manager_parts.vms.Process", return_value=fake):
             # No exception, no return value either.
             m.clone_vms()
 
@@ -416,21 +418,15 @@ class TestCloneAndConfigureNewVmsExitCodeGuard:
     """
     Mirror of TestCloneVmsExitCodeGuard but for the `update` path
     (_clone_and_configure_new_vms). Same silent-failure bug if any
-    clone subprocess exits non-zero — the configure/start steps would
-    otherwise run against VMs that were never defined.
+    clone worker fails — the configure/start steps would otherwise run
+    against VMs that were never defined. The clone batch runs through
+    ``_run_parallel`` (#85 item 4), which reports raised/killed workers
+    as failures.
     """
 
-    @staticmethod
-    def _fake_process(exitcode: int):
-        from unittest.mock import MagicMock
-        proc = MagicMock()
-        proc.exitcode = exitcode
-        proc.start = MagicMock()
-        proc.join = MagicMock()
-        return proc
-
     def _mgr_with_one_vm(self, tmp_path: Path):
-        from unittest.mock import MagicMock, patch as _patch
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
         with _patch("boxman.manager.BoxmanCache"):
             m = BoxmanManager()
         m.config = {
@@ -450,22 +446,22 @@ class TestCloneAndConfigureNewVmsExitCodeGuard:
     def test_raises_when_clone_subprocess_fails(self, tmp_path: Path):
         from unittest.mock import patch as _patch
         m = self._mgr_with_one_vm(tmp_path)
-        fake = self._fake_process(exitcode=1)
         new_vm_names = {'bprj__demo__bprj_cluster_1_node01'}
+        failures = {
+            'bprj__demo__bprj_cluster_1_node01': 'worker exited with code 1'}
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
-             _patch("boxman.manager.Process", return_value=fake):
+             _patch.object(m, '_run_parallel', return_value=({}, failures)):
             with pytest.raises(RuntimeError, match="clone failed for 1 new VM"):
                 m._clone_and_configure_new_vms(new_vm_names)
 
     def test_no_raise_when_all_clones_succeed(self, tmp_path: Path):
         """When clones succeed, control should move into the configure
-        phase — patch _configure_and_start_vm so we don't depend on the
-        rest of the orchestration."""
+        phase — _run_parallel is patched out, so no real workers run."""
         from unittest.mock import patch as _patch
         m = self._mgr_with_one_vm(tmp_path)
-        fake = self._fake_process(exitcode=0)
         new_vm_names = {'bprj__demo__bprj_cluster_1_node01'}
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
-             _patch.object(m, '_configure_and_start_vm'), \
-             _patch("boxman.manager.Process", return_value=fake):
+             _patch.object(m, '_run_parallel', return_value=({}, {})) as par:
             m._clone_and_configure_new_vms(new_vm_names)
+        # clone batch + configure batch
+        assert par.call_count == 2

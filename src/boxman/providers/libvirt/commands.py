@@ -1,9 +1,12 @@
 import os
+import shlex
 from typing import Any
 
 import invoke
 
 from boxman import log
+from boxman.exceptions import ConfigError
+from boxman.runtime.docker_compose import docker_exec_wrap
 from boxman.utils.shell import run as _shell_run
 
 
@@ -52,9 +55,11 @@ class LibVirtCommandBase:
         #: str: The runtime environment ('local', 'docker-compose', etc.)
         self.runtime = self.provider_config.get('runtime', 'local')
 
-        #: str: The docker-compose container name for remote execution
-        self.runtime_container = self.provider_config.get(
-            'runtime_container', 'boxman-libvirt-default')
+        #: str | None: The docker-compose container name for remote
+        #: execution. No default: under a docker-compose runtime a missing
+        #: container name is a hard error (see _wrap_for_runtime), not a
+        #: silent fall-back that would exec into the wrong container.
+        self.runtime_container = self.provider_config.get('runtime_container')
 
         #: List[str]: Commands that should never get sudo prepended
         self.sudo_skip_commands: list[str] = self.provider_config.get(
@@ -71,6 +76,14 @@ class LibVirtCommandBase:
     def build_command(self, *args, **kwargs) -> str:
         """
         Build a complete command string with options.
+
+        Every positional argument and every keyword VALUE is passed through
+        :func:`shlex.quote`, so callers must pass raw values — pre-quoted
+        values would end up quoted twice. (``shlex.quote`` is a no-op for
+        values that need no quoting, e.g. ``--size=50M``.) Callers that need
+        actual shell constructs (pipes, redirects, ``&&``) must use
+        :meth:`execute_shell` instead — that path is intentionally NOT
+        quoted.
 
         Args:
             *args: Positional arguments for the command
@@ -89,7 +102,7 @@ class LibVirtCommandBase:
             command_parts.append(self.command_path)
 
         # Add positional arguments
-        command_parts.extend([str(arg) for arg in args])
+        command_parts.extend([shlex.quote(str(arg)) for arg in args])
 
         # Add keyword arguments as options
         for key, value in kwargs.items():
@@ -99,14 +112,14 @@ class LibVirtCommandBase:
                 # Skip False or None values
                 continue
             else:
-                command_parts.append(f"--{key.replace('_', '-')}={value}")
+                command_parts.append(
+                    f"--{key.replace('_', '-')}={shlex.quote(str(value))}")
 
         return " ".join(command_parts)
 
     def execute(self, *args,
                 hide: bool = True,
                 warn: bool = False,
-                capture: bool = True,
                 **kwargs) -> invoke.runners.Result:
         """
         Execute a command.
@@ -115,7 +128,6 @@ class LibVirtCommandBase:
             *args: Positional arguments for the command
             hide: Whether to hide command output
             warn: Whether to warn instead of raising exceptions
-            capture: Whether to capture command output
             **kwargs: Keyword arguments to be passed as command options
 
         Returns:
@@ -154,7 +166,7 @@ class LibVirtCommandBase:
                     f"Stderr: {exc.result.stderr}"
                 )
                 self.logger.error(error_message)
-                raise RuntimeError(error_message)
+                raise RuntimeError(error_message) from exc
             return exc.result
 
     def _should_use_sudo_for_command(self, command: str) -> bool:
@@ -239,7 +251,7 @@ class LibVirtCommandBase:
                     f"Stderr: {exc.result.stderr}"
                 )
                 self.logger.error(error_message)
-                raise RuntimeError(error_message)
+                raise RuntimeError(error_message) from exc
             return exc.result
 
     def _wrap_for_runtime(self, command: str) -> str:
@@ -259,14 +271,22 @@ class LibVirtCommandBase:
         if self.runtime == 'local':
             return command
         elif self.runtime == 'docker-compose':
-            # escape single quotes in the command for safe shell wrapping
-            escaped = command.replace("'", "'\\''")
-            return f"docker exec --user root {self.runtime_container} bash -c '{escaped}'"
+            if not self.runtime_container:
+                # No silent fall-back to a guessed container name: exec'ing
+                # into the wrong container is worse than failing loudly. The
+                # manager is responsible for injecting 'runtime_container'
+                # (via the runtime's inject_into_provider_config) before
+                # provider commands run.
+                raise ConfigError(
+                    "runtime is 'docker-compose' but no 'runtime_container' "
+                    "was injected into the provider config — cannot wrap "
+                    f"command for execution: {command}")
+            return docker_exec_wrap(command, self.runtime_container)
         else:
             raise ValueError(f"unsupported runtime: {self.runtime}")
 
 
-class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
+class VirshCommand(LibVirtCommandBase):
     """
     Class for executing virsh commands for managing libvirt domains,
     networks, storage, etc.
@@ -290,6 +310,11 @@ class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
         """
         Build a complete virsh command string with options.
 
+        Positional arguments, keyword values, and the connection URI are
+        quoted centrally via :func:`shlex.quote` (see
+        :meth:`LibVirtCommandBase.build_command`) — callers must pass raw
+        values, never pre-quoted ones.
+
         Args:
             cmd: The virsh subcommand to execute (like list, start, define, etc.)
             *args: Positional arguments for the command
@@ -304,13 +329,13 @@ class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
             command_parts.append("sudo")
 
         # add the virsh command with connection URI
-        command_parts.append(f"{self.command_path} -c {self.uri}")
+        command_parts.append(f"{self.command_path} -c {shlex.quote(self.uri)}")
 
         # add the actual virsh subcommand
         command_parts.append(cmd)
 
         # add positional arguments
-        command_parts.extend([str(arg) for arg in args])
+        command_parts.extend([shlex.quote(str(arg)) for arg in args])
 
         # add keyword arguments as options
         for key, value in kwargs.items():
@@ -320,7 +345,8 @@ class VirshCommand(LibVirtCommandBase):  # Fixed missing closing parenthesis:
                 # skip False or None values
                 continue
             else:
-                command_parts.append(f"--{key.replace('_', '-')}={value}")
+                command_parts.append(
+                    f"--{key.replace('_', '-')}={shlex.quote(str(value))}")
 
         return " ".join(command_parts)
 

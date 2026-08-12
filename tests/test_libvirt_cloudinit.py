@@ -14,15 +14,18 @@ Part of Phase 1.2 of the review plan
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from boxman.providers.libvirt.cloudinit import (
-    CloudInitTemplate, DEFAULT_USER_DATA, DEFAULT_META_DATA, DEFAULT_DONE_MARKER,
+    DEFAULT_DONE_MARKER,
+    DEFAULT_META_DATA,
+    DEFAULT_USER_DATA,
+    CloudInitTemplate,
 )
-
 
 pytestmark = pytest.mark.unit
 
@@ -254,7 +257,7 @@ class TestCloudinitTimeouts:
 
     def test_poll_done_marker_honours_configured_timeout(self, tmp_path: Path):
         t = _make_template(tmp_path, cloudinit_done_timeout=7)
-        with patch.object(t.virsh, "execute_shell", return_value=_result(ok=False)), \
+        with patch.object(t.virsh, "execute", return_value=_result(ok=False)), \
                 patch(self.SLEEP) as sleep:
             assert t._poll_done_marker("/var/log/done") is False
         # back-off 1 + 2 + 4 == the 7s cap
@@ -262,14 +265,14 @@ class TestCloudinitTimeouts:
 
     def test_explicit_max_wait_still_wins(self, tmp_path: Path):
         t = _make_template(tmp_path, cloudinit_done_timeout=900)
-        with patch.object(t.virsh, "execute_shell", return_value=_result(ok=False)), \
+        with patch.object(t.virsh, "execute", return_value=_result(ok=False)), \
                 patch(self.SLEEP) as sleep:
             assert t._poll_done_marker("/var/log/done", max_wait=3) is False
         assert sum(c.args[0] for c in sleep.call_args_list) == 3
 
     def test_fallback_wait_honours_configured_timeout(self, tmp_path: Path):
         t = _make_template(tmp_path, cloudinit_fallback_timeout=30)
-        with patch.object(t.virsh, "execute_shell", return_value=_result(ok=True)), \
+        with patch.object(t.virsh, "execute", return_value=_result(ok=True)), \
                 patch(self.SLEEP) as sleep:
             t._wait_cloudinit_fallback()
         assert sleep.call_count == 3          # range(0, 30, 10)
@@ -279,13 +282,19 @@ class TestCloudinitTimeouts:
         # then a zero-length blind wait, then the shutdown path
         t = _make_template(
             tmp_path, cloudinit_agent_timeout=10, cloudinit_fallback_timeout=0)
-        with patch.object(t.virsh, "execute_shell",
-                          return_value=_result(ok=False)) as shell, \
-                patch.object(t.virsh, "execute",
-                             return_value=_result(stdout="shut off")), \
+        pings = 0
+
+        def fake_execute(*args, **kwargs):
+            nonlocal pings
+            if args and args[0] == "qemu-agent-command":
+                pings += 1
+                return _result(ok=False)
+            return _result(stdout="shut off")
+
+        with patch.object(t.virsh, "execute", side_effect=fake_execute), \
                 patch(self.SLEEP):
             assert t.verify_and_shutdown() is True
-        assert shell.call_count == 5
+        assert pings == 5
 
     def test_guest_exec_loop_scales_with_timeout(self, tmp_path: Path):
         # agent answers guest-ping but guest-exec stays blacklisted:
@@ -293,18 +302,22 @@ class TestCloudinitTimeouts:
         t = _make_template(
             tmp_path, cloudinit_guest_exec_timeout=20,
             cloudinit_fallback_timeout=0)
-        calls: list[str] = []
+        exec_probes = 0
 
-        def fake_shell(cmd, **kwargs):
-            calls.append(cmd)
-            return _result(ok="guest-ping" in cmd)
+        def fake_execute(*args, **kwargs):
+            nonlocal exec_probes
+            if args and args[0] == "qemu-agent-command":
+                payload = args[2]
+                if "guest-exec" in payload:
+                    exec_probes += 1
+                    return _result(ok=False)
+                return _result(ok=True)  # guest-ping
+            return _result(stdout="shut off")
 
-        with patch.object(t.virsh, "execute_shell", side_effect=fake_shell), \
-                patch.object(t.virsh, "execute",
-                             return_value=_result(stdout="shut off")), \
+        with patch.object(t.virsh, "execute", side_effect=fake_execute), \
                 patch(self.SLEEP):
             assert t.verify_and_shutdown() is True
-        assert sum("guest-exec" in c for c in calls) == 4
+        assert exec_probes == 4
 
 
 class TestVerificationFailureLeavesCleanState:
@@ -329,23 +342,21 @@ class TestVerificationFailureLeavesCleanState:
             # domstate is asked whether the VM went down
             if args and args[0] == "domstate":
                 return _result(stdout="shut off")
+            if args and args[0] == "qemu-agent-command":
+                payload = args[2]
+                # the agent answers, guest-exec works, the marker never appears
+                return _result(ok=("guest-ping" in payload or "guest-exec" in payload),
+                               stdout='{"return": {"pid": 1}}')
             return _result()
 
-        def fake_shell(cmd, **kwargs):
-            calls.append(("shell", cmd))
-            # the agent answers, guest-exec works, the marker never appears
-            return _result(ok=("guest-ping" in cmd or "guest-exec" in cmd),
-                           stdout='{"return": {"pid": 1}}')
-
         t.virsh.execute = fake_execute
-        t.virsh.execute_shell = fake_shell
         return t, calls
 
     def test_a_missing_marker_still_shuts_the_vm_down(self, tmp_path: Path):
         t, calls = self._template(tmp_path, cloudinit_done_timeout=1)
         with patch(self.SLEEP):
             assert t.verify_and_shutdown() is False
-        assert any(args[0] == "shutdown" for args in calls if args and args[0] != "shell"), \
+        assert any(args[0] == "shutdown" for args in calls), \
             "the template VM was left running"
 
     def test_no_marker_configured_is_not_a_hard_failure(self, tmp_path: Path):
@@ -354,10 +365,13 @@ class TestVerificationFailureLeavesCleanState:
         t = _make_template(tmp_path, cloudinit_userdata="#cloud-config\n",
                            cloudinit_fallback_timeout=0)
         assert t.cloudinit_done_marker is None
-        t.virsh.execute = lambda *a, **k: _result(stdout="shut off")
-        t.virsh.execute_shell = lambda cmd, **k: _result(
-            ok=("guest-ping" in cmd or "guest-exec" in cmd),
-            stdout='{"return": {"pid": 1}}')
+
+        def fake_execute(*args, **kwargs):
+            if args and args[0] == "qemu-agent-command":
+                return _result(ok=True)
+            return _result(stdout="shut off")
+
+        t.virsh.execute = fake_execute
         with patch(self.SLEEP):
             assert t.verify_and_shutdown() is True
 
@@ -375,3 +389,258 @@ class TestVerificationFailureLeavesCleanState:
         assert DEFAULT_DONE_MARKER not in DEFAULT_USER_DATA.split("runcmd:")[0]
         last_runcmd = DEFAULT_USER_DATA.rstrip().splitlines()[-1]
         assert DEFAULT_DONE_MARKER in last_runcmd, last_runcmd
+
+
+class TestAgentCommand:
+    """
+    Guest-agent calls must go through VirshCommand (#85 item 5).
+
+    A raw ``virsh qemu-agent-command …`` shell string ignores the configured
+    ``uri`` (e.g. qemu+ssh://…) and the ``virsh_cmd`` override, so template
+    creation with a non-default URI polled the wrong libvirt daemon.
+    """
+
+    SHELL_RUN = "boxman.providers.libvirt.commands._shell_run"
+
+    def _run_capture(self, t: CloudInitTemplate, payload: str) -> str:
+        with patch(self.SHELL_RUN, return_value=_result()) as run:
+            t._agent_command(payload)
+        return run.call_args.args[0]
+
+    def test_custom_uri_is_used(self, tmp_path: Path):
+        t = _make_template(tmp_path, provider_config={
+            "use_sudo": False,
+            "uri": "qemu+ssh://root@example.com/system",
+        })
+        cmd = self._run_capture(t, '{"execute":"guest-ping"}')
+        assert "-c qemu+ssh://root@example.com/system" in cmd
+
+    def test_virsh_cmd_override_is_used(self, tmp_path: Path):
+        t = _make_template(tmp_path, provider_config={
+            "use_sudo": False,
+            "virsh_cmd": "/usr/local/bin/virsh",
+        })
+        cmd = self._run_capture(t, '{"execute":"guest-ping"}')
+        assert cmd.startswith("/usr/local/bin/virsh ")
+
+    def test_sudo_is_applied(self, tmp_path: Path):
+        t = _make_template(tmp_path, provider_config={"use_sudo": True})
+        cmd = self._run_capture(t, '{"execute":"guest-ping"}')
+        assert cmd.startswith("sudo virsh -c qemu:///system ")
+
+    def test_payload_is_a_single_quoted_token(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        cmd = self._run_capture(t, '{"execute":"guest-ping"}')
+        assert "qemu-agent-command ubuntu-template " in cmd
+        assert cmd.endswith('\'{"execute":"guest-ping"}\'')
+
+    def test_verify_and_shutdown_routes_pings_through_virsh(self, tmp_path: Path):
+        # the polling loop must call virsh.execute("qemu-agent-command", …),
+        # not a raw shell string
+        t = _make_template(
+            tmp_path, cloudinit_agent_timeout=2, cloudinit_fallback_timeout=0,
+            cloudinit_userdata="#cloud-config\n",  # no implicit done marker
+        )
+        with patch.object(t.virsh, "execute",
+                          return_value=_result(stdout="shut off")) as ex, \
+                patch("boxman.providers.libvirt.cloudinit.time.sleep"):
+            assert t.verify_and_shutdown() is True
+        assert ex.call_args_list[0].args[0] == "qemu-agent-command"
+
+
+class TestCreateTemplateSafeguards:
+    """
+    Safeguards in create_template (#85 item 26):
+
+    - ``--force`` must wait for the old domain to shut off before undefine,
+      and must abort when undefine fails (otherwise the virt-install below
+      dies with "domain already exists").
+    - A libvirt network without DHCP must abort before virt-install instead
+      of burning the full guest-agent timeout.
+    """
+
+    SLEEP = "boxman.providers.libvirt.cloudinit.time.sleep"
+    SHELL_RUN = "boxman.providers.libvirt.cloudinit._shell_run"
+
+    @staticmethod
+    def _stub_success_path(t: CloudInitTemplate) -> None:
+        """Stub out everything past the VM-exists / DHCP gates."""
+        t._resolve_bridge = MagicMock(return_value="virbr0")
+        t._verify_dhcp_on_network = MagicMock(return_value=True)
+        t.copy_base_image = MagicMock(return_value=True)
+        t.prepare_nocloud_dir = MagicMock(return_value="/nocloud")
+        t.build_seed_iso = MagicMock(return_value=True)
+        t.verify_and_shutdown = MagicMock(return_value=True)
+
+    def test_force_recreate_waits_for_shut_off_before_undefine(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        self._stub_success_path(t)
+        t._check_vm_exists = MagicMock(return_value=True)
+        calls: list[str] = []
+        states = iter(["running", "running", "shut off"])
+
+        def fake_execute(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd == "domstate":
+                return _result(stdout=next(states, "shut off"))
+            return _result()
+
+        with patch.object(t.virsh, "execute", side_effect=fake_execute), \
+                patch(self.SLEEP), \
+                patch(self.SHELL_RUN, return_value=_result()):
+            assert t.create_template(force=True) is True
+        assert calls.index("destroy") < calls.index("domstate") < calls.index("undefine")
+        # two "running" polls + one "shut off" before undefine
+        assert calls[:calls.index("undefine")].count("domstate") == 3
+
+    def test_force_recreate_aborts_when_undefine_fails(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        self._stub_success_path(t)
+        t._check_vm_exists = MagicMock(return_value=True)
+
+        def fake_execute(cmd, *args, **kwargs):
+            if cmd == "domstate":
+                return _result(stdout="shut off")
+            if cmd == "undefine":
+                return _result(ok=False, stderr="domain is still active")
+            return _result()
+
+        with patch.object(t.virsh, "execute", side_effect=fake_execute), \
+                patch(self.SLEEP):
+            assert t.create_template(force=True) is False
+        t.copy_base_image.assert_not_called()
+
+    def test_force_recreate_aborts_when_vm_stays_running(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        self._stub_success_path(t)
+        t._check_vm_exists = MagicMock(return_value=True)
+        calls: list[str] = []
+
+        def fake_execute(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd == "domstate":
+                return _result(stdout="running")
+            return _result()
+
+        with patch.object(t.virsh, "execute", side_effect=fake_execute), \
+                patch(self.SLEEP):
+            assert t.create_template(force=True) is False
+        assert calls.count("domstate") == 30  # polled until the cap, then gave up
+        assert "undefine" not in calls
+
+    def test_create_template_aborts_when_dhcp_missing(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        self._stub_success_path(t)
+        t._check_vm_exists = MagicMock(return_value=False)
+        t._verify_dhcp_on_network = MagicMock(return_value=False)
+        with patch.object(t.virsh, "execute", return_value=_result()):
+            assert t.create_template() is False
+        t.copy_base_image.assert_not_called()
+
+    def test_explicit_bridge_skips_the_dhcp_check(self, tmp_path: Path):
+        t = _make_template(tmp_path, bridge="virbr0")
+        self._stub_success_path(t)
+        t._check_vm_exists = MagicMock(return_value=False)
+        with patch.object(t.virsh, "execute", return_value=_result()), \
+                patch(self.SHELL_RUN, return_value=_result()):
+            assert t.create_template() is True
+        t._verify_dhcp_on_network.assert_not_called()
+
+
+class TestShellQuoting:
+    """
+    Paths and names interpolated into shell command strings must be
+    shlex-quoted (#85 item 6): a space or quote in a workdir, ISO path or
+    template name must not split or break the command.
+    """
+
+    SHELL_RUN = "boxman.providers.libvirt.cloudinit._shell_run"
+
+    def test_seed_iso_paths_are_quoted(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        nocloud = tmp_path / "no cloud"
+        nocloud.mkdir()
+        seed = str(tmp_path / "se'ed.iso")
+        with patch.object(t.virsh, "execute_shell",
+                          return_value=_result(ok=True)) as shell:
+            assert t.build_seed_iso(str(nocloud), seed) is True
+        cmd = shell.call_args.args[0]
+        assert shlex.quote(seed) in cmd
+        assert shlex.quote(str(nocloud / "user-data")) in cmd
+        assert shlex.quote(str(nocloud / "meta-data")) in cmd
+
+    def test_seed_iso_fallback_paths_are_quoted(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        nocloud = tmp_path / "no cloud"
+        nocloud.mkdir()
+        calls: list[str] = []
+
+        def fake(cmd, *_a, **_kw):
+            calls.append(cmd)
+            return _result(ok="genisoimage" in cmd)  # cloud-localds fails
+
+        with patch.object(t.virsh, "execute_shell", side_effect=fake):
+            assert t.build_seed_iso(str(nocloud), str(tmp_path / "s.iso")) is True
+        genisoimage = next(c for c in calls if "genisoimage" in c)
+        assert shlex.quote(str(nocloud / "user-data")) in genisoimage
+
+    def test_rsync_paths_are_quoted(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        with patch.object(t.virsh, "execute_shell",
+                          return_value=_result(ok=True)) as shell:
+            assert t._copy_local("/tmp/a b.qcow2", "/tmp/c d.qcow2") is True
+        cmd = shell.call_args.args[0]
+        assert shlex.quote("/tmp/a b.qcow2") in cmd
+        assert shlex.quote("/tmp/c d.qcow2") in cmd
+
+    def test_wget_command_quotes_dst_and_url(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        with patch(self.SHELL_RUN, return_value=_result(ok=True)) as run, \
+                patch("boxman.providers.libvirt.cloudinit.os.path.isfile",
+                      return_value=True), \
+                patch("boxman.providers.libvirt.cloudinit.os.path.getsize",
+                      return_value=10):
+            assert t._download_image(
+                "http://x/y iso.qcow2", "/tmp/d st.img") is True
+        cmd = run.call_args.args[0]
+        assert cmd.startswith("wget ")
+        assert f"-O {shlex.quote('/tmp/d st.img')}" in cmd
+        assert shlex.quote("http://x/y iso.qcow2") in cmd
+
+    def test_curl_command_quotes_dst_and_url(self, tmp_path: Path):
+        t = _make_template(tmp_path)
+        calls: list[str] = []
+
+        def fake_run(cmd, **_kw):
+            calls.append(cmd)
+            return _result(ok="curl" in cmd)
+
+        with patch(self.SHELL_RUN, side_effect=fake_run), \
+                patch("boxman.providers.libvirt.cloudinit.os.path.isfile",
+                      return_value=True), \
+                patch("boxman.providers.libvirt.cloudinit.os.path.getsize",
+                      return_value=10):
+            assert t._download_image(
+                "http://x/y iso.qcow2", "/tmp/d st.img") is True
+        curl = next(c for c in calls if c.startswith("curl "))
+        assert f"-o {shlex.quote('/tmp/d st.img')}" in curl
+        assert shlex.quote("http://x/y iso.qcow2") in curl
+
+    def test_virt_install_command_quotes_name_and_paths(self, tmp_path: Path):
+        t = _make_template(tmp_path, template_name="my tmpl")
+        t._check_vm_exists = MagicMock(return_value=False)
+        t._resolve_bridge = MagicMock(return_value="virbr0")
+        t._verify_dhcp_on_network = MagicMock(return_value=True)
+        t.copy_base_image = MagicMock(return_value=True)
+        t.prepare_nocloud_dir = MagicMock(return_value="/nocloud")
+        t.build_seed_iso = MagicMock(return_value=True)
+        t.verify_and_shutdown = MagicMock(return_value=True)
+        with patch.object(t.virsh, "execute", return_value=_result()), \
+                patch(self.SHELL_RUN, return_value=_result()) as run:
+            assert t.create_template() is True
+        cmd = run.call_args.args[0]
+        assert "--name='my tmpl'" in cmd
+        dst_image = os.path.join(t.workdir, "my tmpl", "my tmpl.qcow2")
+        assert f"path={shlex.quote(dst_image)}" in cmd
+        seed = os.path.join(t.workdir, "my tmpl", "seed.iso")
+        assert f"path={shlex.quote(seed)}" in cmd

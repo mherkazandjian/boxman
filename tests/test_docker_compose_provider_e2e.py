@@ -68,6 +68,7 @@ def _workspace_path(box_dir):
     inventory / ssh_config / env.sh are written (a cluster ``workdir`` only
     holds that cluster's own files)."""
     import yaml
+
     from boxman.utils.jinja_env import create_jinja_env
 
     raw = open(os.path.join(box_dir, "conf.yml")).read()
@@ -350,11 +351,11 @@ class TestHybridVmContainer:
         bridge, while only the *shared* network is a macvlan onto the host
         bridge — so internal traffic never reaches the VM's L2 domain."""
         nets = _run("docker network ls --format '{{.Name}} {{.Driver}}'", warn=True).stdout
-        internal = [l for l in nets.splitlines() if "backend" in l]
+        internal = [line for line in nets.splitlines() if "backend" in line]
         assert internal, f"cluster-internal network not found in:\n{nets}"
         assert all(line.split()[1] == "bridge" for line in internal)
 
-        shared = [l for l in nets.splitlines() if "app_bridge" in l]
+        shared = [line for line in nets.splitlines() if "app_bridge" in line]
         assert shared, f"shared macvlan network not found in:\n{nets}"
         for line in shared:
             name = line.split()[0]

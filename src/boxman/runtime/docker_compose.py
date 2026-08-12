@@ -9,18 +9,31 @@ directory next to the project's ``conf.yml``.
 
 import hashlib
 import os
-import re
+import shlex
 import shutil
 import sys
 import time
 from typing import Any
 
-import invoke
 import yaml as pyyaml
 
 from boxman import log
 from boxman.runtime.base import RuntimeBase
+from boxman.utils.compose_names import sanitize_project_name
 from boxman.utils.shell import run as _shell_run
+
+
+def docker_exec_wrap(command: str, container: str) -> str:
+    """
+    Wrap *command* in a ``docker exec --user root <container> bash -c '…'``
+    invocation, escaping single quotes for the shell round-trip.
+
+    This is the single shared implementation of the docker-exec wrapping —
+    used by both :meth:`DockerComposeRuntime.wrap_command` and
+    ``LibVirtCommandBase._wrap_for_runtime`` so the two paths cannot drift.
+    """
+    escaped = command.replace("'", "'\\''")
+    return f"docker exec --user root {container} bash -c '{escaped}'"
 
 
 class DockerComposeRuntime(RuntimeBase):
@@ -63,10 +76,10 @@ class DockerComposeRuntime(RuntimeBase):
         """
         Sanitize a project name for use as a Docker Compose project name.
 
-        Docker Compose project names must be lowercase alphanumeric
-        characters and hyphens only.
+        Thin wrapper over :func:`boxman.utils.compose_names.sanitize_project_name`
+        keeping this call site's rule set (no underscores, no fallback).
         """
-        return re.sub(r'[^a-z0-9-]', '-', name.lower()).strip('-')
+        return sanitize_project_name(name)
 
     @property
     def container_name(self) -> str:
@@ -91,13 +104,45 @@ class DockerComposeRuntime(RuntimeBase):
     def _compose_base_cmd(self, compose_path: str, compose_dir: str) -> str:
         """
         Return the base ``docker compose`` command with project scoping.
+
+        For a user-supplied compose file (anything outside the boxman-owned
+        ``.boxman/runtime/docker`` directory), the bind-mount override and
+        the ``.env`` file that :meth:`ensure_ready` wrote into ``.boxman``
+        are merged in via a second ``-f`` and ``--env-file`` — the user's
+        file and directory are never modified.
         """
-        return (
+        cmd = (
             f"docker compose "
             f"-p {self._compose_project_name} "
-            f"-f {compose_path} "
-            f"--project-directory {compose_dir}"
+            f"-f {shlex.quote(compose_path)}"
         )
+        if not self._is_boxman_owned_compose(compose_path):
+            override = self._bind_mount_override_path()
+            if os.path.isfile(override):
+                cmd += f" -f {shlex.quote(override)}"
+            env_file = os.path.join(self._get_local_runtime_dir(), ".env")
+            if os.path.isfile(env_file):
+                cmd += f" --env-file {shlex.quote(env_file)}"
+        cmd += f" --project-directory {shlex.quote(compose_dir)}"
+        return cmd
+
+    def _is_boxman_owned_compose(self, compose_path: str) -> bool:
+        """
+        Whether *compose_path* is the boxman-deployed copy (inside
+        ``.boxman/runtime/docker``) rather than a user-supplied file.
+        Only the boxman-owned copy may be mutated in place.
+        """
+        runtime_dir = os.path.abspath(self._get_local_runtime_dir())
+        return os.path.abspath(compose_path).startswith(runtime_dir + os.sep)
+
+    def _bind_mount_override_path(self) -> str:
+        """
+        Path of the compose override file that carries the injected
+        bind-mount volumes for user-supplied compose files. Lives in
+        ``.boxman`` — never next to the user's compose file.
+        """
+        return os.path.join(
+            self._get_local_runtime_dir(), "docker-compose.boxman.override.yml")
 
     @property
     def name(self) -> str:
@@ -105,8 +150,7 @@ class DockerComposeRuntime(RuntimeBase):
 
     def wrap_command(self, command: str) -> str:
         """Wrap *command* in a ``docker exec`` invocation."""
-        escaped = command.replace("'", "'\\''")
-        return f"docker exec --user root {self.container_name} bash -c '{escaped}'"
+        return docker_exec_wrap(command, self.container_name)
 
     def inject_into_provider_config(
         self, provider_config: dict[str, Any]
@@ -178,6 +222,52 @@ class DockerComposeRuntime(RuntimeBase):
         with open(compose_path, "w") as fobj:
             pyyaml.dump(compose, fobj, default_flow_style=False, sort_keys=False)
 
+    def _write_bind_mount_override(
+        self, compose_path: str, bind_dirs: list[str]
+    ) -> str | None:
+        """
+        Write a compose override file carrying the bind-mount volumes for
+        a user-supplied compose file, and return its path.
+
+        The user's compose file is only READ (to find the first service
+        name and to dedup volumes already present) — boxman never rewrites
+        a user-owned file in place (the previous in-place injection
+        destroyed comments/formatting via the pyyaml round-trip). The
+        override is merged with a second ``-f`` (see
+        :meth:`_compose_base_cmd`); compose appends the volumes of the
+        same-named service.
+        """
+        with open(compose_path) as fobj:
+            compose = pyyaml.safe_load(fobj)
+
+        services = (compose or {}).get("services", {})
+        if not services:
+            self.logger.warning("no services found in docker-compose.yml")
+            return None
+
+        service_name = next(iter(services))
+
+        # collect existing host-side mount sources for dedup
+        existing_sources = set()
+        for vol in services[service_name].get("volumes", []) or []:
+            if isinstance(vol, str) and ":" in vol:
+                existing_sources.add(vol.split(":")[0])
+
+        added = [f"{d}:{d}" for d in bind_dirs if d not in existing_sources]
+
+        override_path = self._bind_mount_override_path()
+        os.makedirs(os.path.dirname(override_path), exist_ok=True)
+        with open(override_path, "w") as fobj:
+            pyyaml.dump(
+                {"services": {service_name: {"volumes": added}}},
+                fobj, default_flow_style=False, sort_keys=False)
+
+        self.logger.info(
+            f"wrote {len(added)} bind-mount(s) for service "
+            f"'{service_name}' to override file {override_path} "
+            f"(user compose file {compose_path} left untouched)")
+        return override_path
+
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
@@ -189,13 +279,21 @@ class DockerComposeRuntime(RuntimeBase):
         compose_dir = os.path.dirname(compose_path)
         abs_project_dir = os.path.abspath(self.project_dir or os.getcwd())
 
-        # Collect directories to bind-mount and inject them into the
-        # docker-compose.yml before starting.
+        # Collect directories to bind-mount and make them visible inside
+        # the container before starting.
         bind_dirs = self._collect_bind_mount_dirs(abs_project_dir)
-        self._inject_bind_mounts_into_compose(compose_path, bind_dirs)
-
-        # Always rewrite .env with the current paths
-        self._write_env_file(compose_dir, abs_project_dir)
+        if self._is_boxman_owned_compose(compose_path):
+            # boxman owns this copy — mutate it in place and drop the
+            # .env next to it
+            self._inject_bind_mounts_into_compose(compose_path, bind_dirs)
+            self._write_env_file(compose_dir, abs_project_dir)
+        else:
+            # user-supplied compose file — never rewrite it (or drop a
+            # .env) in the user's directory; merge via override + env
+            # files kept in .boxman
+            self._write_bind_mount_override(compose_path, bind_dirs)
+            self._write_env_file(
+                self._get_local_runtime_dir(), abs_project_dir)
 
         # Log the compose file so the user can see what will be started
         self._log_compose_file(compose_path)
@@ -723,10 +821,12 @@ class DockerComposeRuntime(RuntimeBase):
         )
 
     def _write_env_file(self, runtime_dir: str,
-                        abs_project_dir: str = None) -> None:
+                        abs_project_dir: str = None) -> str:
         """
-        Write a ``.env`` file in *runtime_dir* with absolute paths.
+        Write a ``.env`` file in *runtime_dir* with absolute paths and
+        return its path.
         """
+        os.makedirs(runtime_dir, exist_ok=True)
         abs_data_dir = os.path.abspath(os.path.join(runtime_dir, "data"))
         if abs_project_dir is None:
             abs_project_dir = os.path.abspath(self.project_dir or os.getcwd())
@@ -754,6 +854,7 @@ class DockerComposeRuntime(RuntimeBase):
             f"wrote .env: BOXMAN_PROJECT_DIR={abs_project_dir}, "
             f"BOXMAN_DATA_DIR={abs_data_dir}, "
             f"ports={ssh_port}/{tcp_port}/{tls_port}")
+        return env_path
 
     @staticmethod
     def _find_asset_source_dir() -> str | None:

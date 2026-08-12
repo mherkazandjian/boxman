@@ -22,7 +22,6 @@ import os
 import re
 from typing import Any
 
-
 _ENV_PATTERN = re.compile(r"\$\{env:(.+)\}")
 
 

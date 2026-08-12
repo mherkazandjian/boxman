@@ -24,7 +24,7 @@ from boxman.providers.libvirt.oci_pull import (
     inspect_oci_image,
     pull_oci_image,
 )
-
+from conftest import make_bare_manager
 
 pytestmark = pytest.mark.unit
 
@@ -660,7 +660,7 @@ class TestInspectImageCli:
 
         fake.handler = handler
         with patch("boxman.providers.libvirt.oci_pull.subprocess.run", side_effect=fake):
-            BoxmanManager.inspect_image(None, cli_args)
+            BoxmanManager.inspect_image(make_bare_manager(), cli_args)
         out = capsys.readouterr().out
         assert "image_ref: reg/repo:tag" in out
         assert "disk.qcow2" in out
@@ -670,7 +670,7 @@ class TestInspectImageCli:
         fake = _FakeRun(returncode=1, stdout="", stderr="manifest unknown")
         with patch("boxman.providers.libvirt.oci_pull.subprocess.run", side_effect=fake):
             with pytest.raises(SystemExit) as excinfo:
-                BoxmanManager.inspect_image(None, cli_args)
+                BoxmanManager.inspect_image(make_bare_manager(), cli_args)
         assert excinfo.value.code == 1
         out = capsys.readouterr().out
         assert "error inspecting image" in out
@@ -685,6 +685,7 @@ class TestOciCacheUrl:
     def test_distinct_registries_same_tail_do_not_collide(self):
         import os
         from urllib.parse import urlparse
+
         from boxman.providers.libvirt.cloudinit import CloudInitTemplate
 
         a = CloudInitTemplate._oci_cache_url("oci://regA/team1/ubuntu:latest")

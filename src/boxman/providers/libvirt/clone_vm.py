@@ -4,6 +4,7 @@ from typing import Any
 from boxman import log
 
 from .commands import VirshCommand, VirtCloneCommand
+from .virsh_parse import parse_domiflist
 
 
 class CloneVM:
@@ -103,33 +104,22 @@ class CloneVM:
         try:
             vm_name = self.new_vm_name
             # use virsh domiflist to get the network interfaces
-            result = self.virsh.execute("domiflist", vm_name)
+            result = self.virsh.execute("domiflist", vm_name, warn=True)
             if not result.ok:
                 self.logger.error(f"Failed to get interface list for VM {vm_name}")
                 return False
 
             # parse the output to extract interface information
-            # output format is like:
-            # Interface  Type       Source     Model       MAC
-            # -------------------------------------------------------
-            # vnet0      network    default    virtio      52:54:00:xx:xx:xx
-
-            interfaces = []
-            lines = result.stdout.strip().split('\n')
-            if len(lines) > 2:  # Skip header and separator lines
-                for line in lines[2:]:
-                    parts = line.split()
-                    if len(parts) >= 5:  # Interface Type Source Model MAC
-                        iface_type = parts[1]
-                        source = parts[2]
-                        mac = parts[4]
-                        interfaces.append((iface_type, source, mac))
+            interfaces = [
+                (row.type, row.source, row.mac)
+                for row in parse_domiflist(result.stdout)
+            ]
 
             self.logger.info(
                 f"found {len(interfaces)} network interfaces to remove from the vm {vm_name}")
 
             # Remove each interface
-            for iface_type, source, mac in interfaces:
+            for iface_type, _source, mac in interfaces:
                 self.logger.info(f"removing interface with MAC {mac} from the vm {vm_name}")
 
                 # Use the detach-interface command with the correct type and MAC

@@ -20,7 +20,6 @@ from boxman.netlab.containerlab import (
 )
 from boxman.utils.jinja_env import create_jinja_env
 
-
 pytestmark = pytest.mark.unit
 
 
@@ -333,6 +332,69 @@ class TestEnsureUp:
         assert any("docker start clab-netlab-r1" in c for c in cmds)
         assert not any("docker start clab-netlab-sw1" in c for c in cmds)
         assert not any("containerlab deploy" in c for c in cmds)
+
+    def test_filter_uses_exact_containerlab_label(self, simple_lab_config, tmp_path):
+        """Regression (#85 item 19): docker's ``name=`` filter is a SUBSTRING
+        match, so labs ``netlab`` and ``netlab-b2`` on one host both match
+        ``clab-netlab-`` and interfere. ensure_up must filter on the exact
+        ``containerlab=<lab>`` label containerlab sets on every node."""
+        mgr = ContainerlabManager(simple_lab_config, tmp_path)
+
+        def fake_run(cmd, **kwargs):
+            if "docker ps" in cmd:
+                return _result(stdout="clab-netlab-sw1 running\n", ok=True)
+            return _result(ok=True)
+
+        with patch("boxman.netlab.containerlab.run", side_effect=fake_run) as run:
+            mgr.ensure_up()
+
+        ps_cmd = next(c.args[0] for c in run.call_args_list
+                      if "docker ps" in c.args[0])
+        assert "--filter label=containerlab=netlab" in ps_cmd
+        assert "--filter name=" not in ps_cmd
+
+    def test_sibling_lab_containers_not_matched(self, simple_lab_config, tmp_path):
+        """With the label filter applied by docker, a *stopped* sibling-lab
+        container (clab-netlab-b2-sw1) is never listed, so it is never
+        passed to ``docker start`` and the running sibling doesn't make
+        ensure_up no-op while our own lab is down."""
+        mgr = ContainerlabManager(simple_lab_config, tmp_path)
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "docker ps" in cmd:
+                # docker honours label=containerlab=netlab: our lab has no
+                # containers, the sibling lab's are not returned.
+                assert "label=containerlab=netlab" in cmd
+                return _result(stdout="", ok=True)
+            return _result(ok=True)
+
+        with patch("boxman.netlab.containerlab.run", side_effect=fake_run):
+            mgr.ensure_up()
+
+        assert not any("docker start" in c for c in calls)
+        assert any("containerlab deploy" in c for c in calls)
+
+    def test_lab_name_is_shell_quoted(self, simple_lab_config, tmp_path):
+        """A lab name with shell metacharacters is quoted in shell-outs."""
+        simple_lab_config["lab_name"] = "net;lab"
+        mgr = ContainerlabManager(simple_lab_config, tmp_path)
+
+        def fake_run(cmd, **kwargs):
+            if "docker ps" in cmd:
+                return _result(stdout="", ok=True)
+            return _result(ok=True)
+
+        with patch("boxman.netlab.containerlab.run", side_effect=fake_run) as run:
+            mgr.ensure_up()
+
+        cmds = [c.args[0] for c in run.call_args_list]
+        ps_cmd = next(c for c in cmds if "docker ps" in c)
+        assert "label=containerlab='net;lab'" in ps_cmd
+        deploy_cmd = next(c for c in cmds if "containerlab deploy" in c)
+        # the rendered topology path contains the metachar lab name → quoted
+        assert f"-t '{mgr.topology_path}'" in deploy_cmd
 
 
 class TestSshCommand:

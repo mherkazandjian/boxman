@@ -10,10 +10,6 @@ BEGIN {
         help = $$0;
     }
 }
-/^#@help:/ {
-    sub(/^#@help:[[:space:]]*/, "", $$0);
-    help = help $$0;
-}
 /^#@group:/ {
     # print group line immediately (no target lookup) and preserve color escapes
     sub(/^#@group:[[:space:]]*/, "", $$0);
@@ -23,7 +19,7 @@ BEGIN {
     printf "%s\n", grp;
     next;
 }
-/^[a-zA-Z0-9_.@%\/\-]+:/ {
+/^[a-z][a-zA-Z0-9_.@%\/\-]*:/ {
     target = $$0;
     sub(/:.*$$/, "", target);
     # convert common escape sequences (\033 and \e) into a real ESC char so terminal renders colors

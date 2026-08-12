@@ -1,8 +1,8 @@
 """
 Preset cloud-init user-data, meta-data, and network-config templates.
 
-Extracted from ``cloudinit.py`` in Phase 2.7 of the review plan
-(see /home/mher/.claude/plans/) so the bulk of the orchestration class
+Extracted from ``cloudinit.py`` in Phase 2.7 of the engineering
+review plan so the bulk of the orchestration class
 stays smaller and these presets can be imported directly (e.g. by tests)
 without pulling in the whole ``CloudInitTemplate`` class.
 
@@ -23,7 +23,6 @@ rather than stdlib :mod:`crypt` because:
 from __future__ import annotations
 
 from passlib.hash import sha512_crypt
-
 
 #: completion marker for templates that bring no cloudinit block of their own.
 #: This is the file the LAST ``runcmd`` entry of DEFAULT_USER_DATA appends to,

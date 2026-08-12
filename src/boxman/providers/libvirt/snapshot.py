@@ -13,6 +13,7 @@ from xml.etree import ElementTree as ET
 from boxman import log
 
 from .commands import VirshCommand
+from .virsh_parse import parse_domblklist
 
 
 class SnapshotManager:
@@ -123,16 +124,19 @@ class SnapshotManager:
         reintroducing the problem for the next revert.  Passing
         --diskspec <target>,snapshot=no prevents that overlay from being
         created so the cdrom stays at the raw ISO permanently.
+
+        Each flag is returned as two separate tokens (``--diskspec`` and the
+        spec) — a single ``"--diskspec <spec>"`` token only worked because
+        command building used to join parts without quoting; with central
+        quoting it would reach virsh as one literal argument.
         """
         result = self.virsh.execute("domblklist", vm_name, "--details", warn=True)
         if not result.ok:
             return []
         args = []
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            # domblklist --details columns: Type  Device  Target  Source
-            if len(parts) >= 3 and parts[1] == 'cdrom':
-                args.append(f"--diskspec {parts[2]},snapshot=no")
+        for row in parse_domblklist(result.stdout):
+            if row.device == 'cdrom':
+                args.extend(["--diskspec", f"{row.target},snapshot=no"])
         return args
 
     def create_snapshot(self,
@@ -182,11 +186,15 @@ class SnapshotManager:
             # Exclude cdroms from the snapshot so no new qcow2 overlay is
             # created for them (they stay at the raw ISO after this call).
             cdrom_args = self._cdrom_diskspec_args(vm_name)
+            # separate tokens for every flag and value: build_command quotes
+            # each token centrally, so "--domain vm01" as one token would
+            # reach virsh as a single literal argument, and a pre-quoted
+            # description would be quoted twice
             result = self.virsh.execute(
                 "snapshot-create-as",
-                f"--domain {vm_name}",
-                f"--name {snapshot_name}",
-                f"--description '{description}'",
+                "--domain", vm_name,
+                "--name", snapshot_name,
+                "--description", description,
                 "--atomic",
                 f"--memspec={mem_path}",
                 *cdrom_args)
@@ -447,7 +455,8 @@ class SnapshotManager:
         Returns:
             str: Name of the current snapshot, or None if none exists
         """
-        result = self.virsh.execute("snapshot-current", vm_name, "--name")
+        result = self.virsh.execute(
+            "snapshot-current", vm_name, "--name", warn=True)
         if result.ok:
             name = result.stdout.strip()
             return name if name else None
@@ -526,6 +535,34 @@ class SnapshotManager:
                 pass
         return out
 
+    def _snapshot_graph(self, vm_name: str) -> dict[str, dict]:
+        """
+        Return ``{name: info}`` for every snapshot of *vm_name*.
+
+        Runs ``snapshot-list --name`` once and ``snapshot-dumpxml`` once
+        per snapshot. Each *info* carries the parsed fields from
+        :meth:`_parse_snapshot_xml` (``description`` / ``parent`` /
+        ``creation_time``, when present) plus the raw ``xml`` (``None``
+        when the dumpxml failed, so callers can skip those entries).
+        """
+        list_result = self.virsh.execute(
+            "snapshot-list", vm_name, "--name", warn=True)
+        if not list_result.ok:
+            return {}
+
+        graph: dict[str, dict] = {}
+        for name in (n.strip() for n in list_result.stdout.splitlines()):
+            if not name:
+                continue
+            xml_result = self.virsh.execute(
+                "snapshot-dumpxml", vm_name, name, warn=True)
+            xml_text = xml_result.stdout if xml_result.ok else None
+            info = (self._parse_snapshot_xml(xml_text)
+                    if xml_text is not None else {})
+            info['xml'] = xml_text
+            graph[name] = info
+        return graph
+
     def list_snapshots_detailed(self, vm_name: str) -> list[dict]:
         """
         Return per-snapshot dicts for *vm_name* in chain order
@@ -536,20 +573,10 @@ class SnapshotManager:
         snapshot — everything else is parsed out of the XML via
         :meth:`_parse_snapshot_xml`.
         """
-        list_result = self.virsh.execute(
-            "snapshot-list", vm_name, "--name", warn=True)
-        if not list_result.ok:
+        parsed = self._snapshot_graph(vm_name)
+        if not parsed:
             return []
-        names = [n.strip() for n in list_result.stdout.splitlines() if n.strip()]
-        if not names:
-            return []
-
-        parsed: dict[str, dict] = {}
-        for name in names:
-            xml_result = self.virsh.execute(
-                "snapshot-dumpxml", vm_name, name, warn=True)
-            parsed[name] = (self._parse_snapshot_xml(xml_result.stdout)
-                            if xml_result.ok else {})
+        names = list(parsed)
 
         # Topological sort by parent → child.
         children: dict[str | None, list[str]] = {}
@@ -648,28 +675,13 @@ class SnapshotManager:
             list: List of snapshot info dictionaries
         """
         try:
-            # fetch the available snapshots
-            result = self.virsh.execute("snapshot-list", vm_name, "--name")
-            if not result.ok:
-                self.logger.error(f"failed to list snapshots for vm {vm_name}: {result.stderr}")
-                return []
-
-            snapshot_names = result.stdout.strip().split('\n')
-            snapshot_names = [name for name in snapshot_names if name]
-
-            # get the snapshot details
-            snapshots = []
-            for snapshot_name in snapshot_names:
-                dumpxml_result = self.virsh.execute("snapshot-dumpxml", vm_name, snapshot_name)
-                if dumpxml_result.ok:
-                    snap_info = {'name': snapshot_name}
-                    xml_content = dumpxml_result.stdout
-
-                    root = ET.fromstring(xml_content)
-                    snap_info['description'] = root.findtext('description', default='')
-
-                    snapshots.append(snap_info)
-            return snapshots
+            # fetch the available snapshots and their descriptions
+            graph = self._snapshot_graph(vm_name)
+            return [
+                {'name': name, 'description': info.get('description', '')}
+                for name, info in graph.items()
+                if info['xml'] is not None
+            ]
         except Exception as exc:
             self.logger.error(f"error listing snapshots for vm {vm_name}: {exc}")
             return []
@@ -679,22 +691,12 @@ class SnapshotManager:
         Return a mapping of snapshot_name -> set of overlay file paths
         for every external snapshot on *vm_name*.
         """
-        result = self.virsh.execute(
-            "snapshot-list", vm_name, "--name", warn=True)
-        if not result.ok:
-            return {}
-
         overlays: dict[str, list[str]] = {}
-        for snap in result.stdout.strip().splitlines():
-            snap = snap.strip()
-            if not snap:
-                continue
-            xml_result = self.virsh.execute(
-                "snapshot-dumpxml", vm_name, snap, warn=True)
-            if not xml_result.ok:
+        for snap, info in self._snapshot_graph(vm_name).items():
+            if info['xml'] is None:
                 continue
             try:
-                root = ET.fromstring(xml_result.stdout)
+                root = ET.fromstring(info['xml'])
                 files = []
                 for disk in root.findall(".//disks/disk"):
                     if disk.get("snapshot") != "external":
@@ -1043,23 +1045,22 @@ class SnapshotManager:
         first. Built from each snapshot's ``<parent>`` element so it
         works for any tree topology, but boxman only takes linear chains.
         """
-        snaps = self.list_snapshots(vm_name)
-        if not snaps:
+        graph = self._snapshot_graph(vm_name)
+        if not graph:
             return []
 
         parents: dict[str, str | None] = {}
-        for snap in snaps:
-            xml_result = self.virsh.execute(
-                "snapshot-dumpxml", vm_name, snap['name'], warn=True)
-            if not xml_result.ok:
+        for name, info in graph.items():
+            xml_text = info['xml']
+            if xml_text is None:
                 continue
             try:
-                root = ET.fromstring(xml_result.stdout)
+                # keep the historical behavior of excluding snapshots
+                # whose dumpxml does not parse at all
+                ET.fromstring(xml_text)
             except ET.ParseError:
                 continue
-            parent_name_elem = root.find("parent/name")
-            parents[snap['name']] = (
-                parent_name_elem.text if parent_name_elem is not None else None)
+            parents[name] = info.get('parent')
 
         children: dict[str | None, list[str]] = {}
         for name, parent in parents.items():
@@ -1084,14 +1085,10 @@ class SnapshotManager:
         if not result.ok:
             return []
         disks: list[tuple[str, str]] = []
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 4:
+        for row in parse_domblklist(result.stdout):
+            if row.device != 'disk' or row.source is None:
                 continue
-            # columns: Type Device Target Source
-            if parts[1] != 'disk':
-                continue
-            disks.append((parts[2], parts[3]))
+            disks.append((row.target, row.source))
         return disks
 
     def _overlay_path_for_snapshot(self,

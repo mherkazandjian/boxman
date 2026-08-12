@@ -2,10 +2,31 @@ import os
 import tempfile
 from typing import Any
 
+from boxman import log
+
 from .commands import LibVirtCommandBase, VirshCommand
 
 
-class DiskManager(VirshCommand):
+def disk_path_for(workdir: str,
+                  disk_name: str,
+                  driver_type: str = 'qcow2',
+                  disk_prefix: str | None = None) -> str:
+    """
+    Return the canonical path of a disk image under *workdir*.
+
+    Naming: ``<workdir>/<disk_prefix>_<disk_name>.<driver_type>`` when
+    *disk_prefix* is given, ``<workdir>/<disk_name>.<driver_type>``
+    otherwise; ``~`` is expanded.
+    """
+    if disk_prefix:
+        disk_path = os.path.join(
+            workdir, f"{disk_prefix}_{disk_name}.{driver_type}")
+    else:
+        disk_path = os.path.join(workdir, f"{disk_name}.{driver_type}")
+    return os.path.expanduser(disk_path)
+
+
+class DiskManager:
     """
     Class for managing VM disk operations in libvirt.
 
@@ -20,7 +41,14 @@ class DiskManager(VirshCommand):
             vm_name: Name of the VM to manage disks for
             provider_config: Configuration for the libvirt provider
         """
-        super().__init__(provider_config)
+        #: VirshCommand: Command executor for virsh
+        self.virsh = VirshCommand(provider_config=provider_config)
+
+        #: Dict[str, Any]: Configuration for the libvirt provider
+        self.provider_config = provider_config or {}
+
+        #: logging.Logger: Logger instance
+        self.logger = log
 
         #: str: the name of the VM
         self.vm_name = vm_name
@@ -53,7 +81,7 @@ class DiskManager(VirshCommand):
             cmd_executor = LibVirtCommandBase(
                 provider_config=self.provider_config,
                 override_config_use_sudo=False)
-            result = cmd_executor.execute_shell(cmd)
+            result = cmd_executor.execute_shell(cmd, warn=True)
 
             if not result.ok:
                 self.logger.error(f"failed to create disk image: {result.stderr}")
@@ -103,7 +131,8 @@ class DiskManager(VirshCommand):
 
             # Attach the disk
             attachment_args = ["--persistent"] if persistent else []
-            result = self.execute("attach-device", self.vm_name, temp_path, *attachment_args)
+            result = self.virsh.execute("attach-device", self.vm_name, temp_path,
+                                  *attachment_args, warn=True)
 
             # Clean up the temporary file
             os.unlink(temp_path)
@@ -154,7 +183,9 @@ class DiskManager(VirshCommand):
         Configure a disk from configuration.
 
         Args:
-            disk_config: Dictionary with disk configuration
+            disk_config: Dictionary with disk configuration. When it
+                contains ``attach_only: True`` the image file is expected
+                to already exist and creation is skipped (attach only).
             workdir: Working directory for disk images
             disk_prefix: Prefix to add to disk image filename
 
@@ -176,16 +207,17 @@ class DiskManager(VirshCommand):
             bus = disk_config.get("bus", "virtio")
 
             # create disk path
-            if disk_prefix:
-                disk_path = os.path.join(workdir, f"{disk_prefix}_{disk_name}.{driver_type}")
-            else:
-                disk_path = os.path.join(workdir, f"{disk_name}.{driver_type}")
+            disk_path = disk_path_for(workdir, disk_name,
+                                      driver_type=driver_type,
+                                      disk_prefix=disk_prefix)
 
-            # ensure path is expanded
-            disk_path = os.path.expanduser(disk_path)
-
-            # 1. create the disk
-            if not self.create_disk(disk_path, disk_size, format=driver_type):
+            # 1. create the disk — unless the caller flagged the config
+            # attach_only (image file already exists, e.g. a leftover
+            # from a failed earlier run): recreating it would wipe data.
+            if disk_config.get("attach_only"):
+                self.logger.info(
+                    f"using existing disk image {disk_path} (attach only)")
+            elif not self.create_disk(disk_path, disk_size, format=driver_type):
                 self.logger.error(f"failed to create disk {disk_path}")
                 return False
 
@@ -224,7 +256,7 @@ class DiskManager(VirshCommand):
             cmd_executor = LibVirtCommandBase(
                 provider_config=self.provider_config,
                 override_config_use_sudo=False)
-            result = cmd_executor.execute_shell(cmd)
+            result = cmd_executor.execute_shell(cmd, warn=True)
 
             if not result.ok:
                 self.logger.error(f"failed to resize disk image: {result.stderr}")
@@ -248,9 +280,9 @@ class DiskManager(VirshCommand):
             True if successful, False otherwise
         """
         try:
-            result = self.execute(
+            result = self.virsh.execute(
                 'blockresize', self.vm_name,
-                target_dev, f"--size={new_size_mb}M")
+                target_dev, f"--size={new_size_mb}M", warn=True)
 
             if not result.ok:
                 self.logger.error(

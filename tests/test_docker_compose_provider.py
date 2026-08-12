@@ -33,7 +33,12 @@ import pytest
 import yaml
 
 from boxman.abstract.providers import ProviderSession
-from boxman.exceptions import ConfigError, ProvisionError, RuntimeUnavailable
+from boxman.exceptions import (
+    ConfigError,
+    ProvisionError,
+    RuntimeUnavailable,
+    SnapshotError,
+)
 from boxman.manager import BoxmanManager
 from boxman.providers import create_session
 from boxman.providers.docker_compose.compose_generator import ComposeGenerator
@@ -46,6 +51,8 @@ from boxman.providers.docker_compose.session import (
     _sanitize_project_name,
     _snapshot_tag,
 )
+
+pytestmark = pytest.mark.unit
 
 
 # --------------------------------------------------------------------------
@@ -1315,8 +1322,8 @@ class TestSnapshotDcWiring:
         sess = mock.Mock()
         m.session_for_cluster = lambda c: sess
         args = SimpleNamespace(snapshot_name="v1", snapshot_descr="d", cluster=None, vms="all")
-        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
-            BoxmanManager.snapshot_take(m, args)
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
+            m.snapshot_take(args)
         sess.snapshot_take_cluster.assert_called_once_with("services", m.config["clusters"]["services"], "v1", "d")
 
     def test_delete_routes_to_cluster_session(self):
@@ -1324,8 +1331,8 @@ class TestSnapshotDcWiring:
         sess = mock.Mock()
         m.session_for_cluster = lambda c: sess
         args = SimpleNamespace(snapshot_name="v1", cluster=None, vms="all")
-        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
-            BoxmanManager.snapshot_delete(m, args)
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
+            m.snapshot_delete(args)
         sess.snapshot_delete_cluster.assert_called_once_with("services", m.config["clusters"]["services"], "v1")
 
     @staticmethod
@@ -1340,22 +1347,47 @@ class TestSnapshotDcWiring:
         sess = self._restore_session(latest="new")
         m.session_for_cluster = lambda c: sess
         args = SimpleNamespace(snapshot_name=None, cluster=None, vms="all")
-        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
-            BoxmanManager.snapshot_restore(m, args)
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
+            m.snapshot_restore(args)
         sess.snapshot_resolve_cluster.assert_called_once_with(
             "services", m.config["clusters"]["services"], None)
         sess.snapshot_restore_cluster.assert_called_once_with(
             "services", m.config["clusters"]["services"], "new")
 
+    def test_restore_plan_ensures_shared_bridges_before_compose_up(self):
+        """Regression (#85 item 27): after a host reboot the macvlan parent
+        bridges are gone; the dc restore plan must recreate them before the
+        compose recreate, or it fails with a cryptic "parent interface does
+        not exist"."""
+        m = self._mgr()
+        sess = self._restore_session(latest="new")
+        m.session_for_cluster = lambda c: sess
+        order = []
+        m.ensure_shared_bridges = lambda: order.append("bridges")
+        sess.snapshot_restore_cluster.side_effect = (
+            lambda *a: order.append("restore"))
+        args = SimpleNamespace(snapshot_name=None, cluster=None, vms="all")
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
+            m.snapshot_restore(args)
+        assert order == ["bridges", "restore"]
+
+    def test_restore_dc_plan_empty_skips_bridges(self):
+        m = self._mgr()
+        m.ensure_shared_bridges = mock.Mock()
+        assert m._restore_dc_plan([]) == []
+        m.ensure_shared_bridges.assert_not_called()
+
     def test_restore_validates_before_mutating(self):
         """An invalid container snapshot must abort *before* the destructive
-        up --force-recreate (mher: partial-restore ordering)."""
+        up --force-recreate (mher: partial-restore ordering), and must raise
+        so the CLI exits non-zero (#85 item 3)."""
         m = self._mgr()
         sess = self._restore_session(valid=False, errors=["image missing: x"])
         m.session_for_cluster = lambda c: sess
         args = SimpleNamespace(snapshot_name="v1", cluster=None, vms="all")
-        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
-            BoxmanManager.snapshot_restore(m, args)
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
+            with pytest.raises(SnapshotError, match="aborting restore"):
+                m.snapshot_restore(args)
         sess.validate_snapshot_cluster.assert_called_once()
         sess.snapshot_restore_cluster.assert_not_called()
 
@@ -1370,9 +1402,10 @@ class TestSnapshotDcWiring:
         args = SimpleNamespace(snapshot_name="v1", cluster=None, vms="all")
         with mock.patch.object(
             BoxmanManager, "_select_vm_targets",
-            staticmethod(lambda cls, a: [("node01", "vms", "node01", "/w")]),
+            lambda self, a: [("node01", "vms", "node01", "/w")],
         ):
-            BoxmanManager.snapshot_restore(m, args)
+            with pytest.raises(SnapshotError, match="aborting restore"):
+                m.snapshot_restore(args)
         # dc snapshot was validated, but never recreated
         sess.validate_snapshot_cluster.assert_called_once()
         sess.snapshot_restore_cluster.assert_not_called()
@@ -1392,9 +1425,9 @@ class TestSnapshotDcWiring:
         sess.snapshot_take_cluster.side_effect = _take
         m.session_for_cluster = lambda c: sess
         args = SimpleNamespace(snapshot_name="v1", snapshot_descr="", cluster=None, vms="all")
-        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
             with pytest.raises(SystemExit) as exc:   # non-zero overall
-                BoxmanManager.snapshot_take(m, args)
+                m.snapshot_take(args)
         assert exc.value.code == 1
         assert seen == ["services", "other"]   # kept going after the failure
 
@@ -1404,9 +1437,9 @@ class TestSnapshotDcWiring:
         sess.snapshot_restore_cluster.side_effect = ProvisionError("up failed")
         m.session_for_cluster = lambda c: sess
         args = SimpleNamespace(snapshot_name="v1", cluster=None, vms="all")
-        with mock.patch.object(BoxmanManager, "_select_vm_targets", staticmethod(lambda cls, a: [])):
+        with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
             with pytest.raises(SystemExit) as exc:
-                BoxmanManager.snapshot_restore(m, args)
+                m.snapshot_restore(args)
         assert exc.value.code == 1
 
     def test_select_dc_clusters_honors_cluster_filter(self):
@@ -1504,7 +1537,7 @@ class TestManagerDispatch:
         """Finding 2: in a compose-primary mixed project, self.provider is the
         dc session; _ensure_libvirt_storage_pool must build VirshCommand from
         the libvirt cluster's own session config (its URI), not the dc default."""
-        from boxman import manager as mgr_mod
+        from boxman.manager_parts import vms as vms_mod
 
         m = BoxmanManager()
         m.config = {
@@ -1530,7 +1563,7 @@ class TestManagerDispatch:
             def execute(self, *a, **k):
                 return SimpleNamespace(ok=True, stdout="", stderr="")
 
-        monkeypatch.setattr(mgr_mod, "VirshCommand", _FakeVirsh)
+        monkeypatch.setattr(vms_mod, "VirshCommand", _FakeVirsh)
         m._ensure_libvirt_storage_pool("/tmp/vm", "vms")
         assert captured["cfg"] == {"uri": "qemu+ssh://remote/system"}
 
@@ -1599,7 +1632,7 @@ class TestPhase6CliParity:
         args = SimpleNamespace(target="services.web", cmd=[], shell=None)
         with mock.patch("subprocess.run",
                         return_value=SimpleNamespace(returncode=0)) as sp:
-            BoxmanManager.exec_container(m, args)
+            m.exec_container(args)
         assert sess.exec_command_for.call_args.args[:3] == ("services", m.config["clusters"]["services"], "web")
         # runs the argv LIST with shell=False (no shell=True kwarg)
         assert sp.call_args.args[0] == ["docker", "compose", "exec", "web", "sh"]
@@ -1611,7 +1644,7 @@ class TestPhase6CliParity:
         sess = mock.Mock()
         m.session_for_cluster = lambda c: sess
         m.process_vm_list = lambda a: []
-        BoxmanManager.suspend_vm(m, SimpleNamespace())
+        m.suspend_vm(SimpleNamespace())
         sess.pause_cluster.assert_called_once()
 
     def test_control_resume_unpauses_dc(self):
@@ -1619,14 +1652,14 @@ class TestPhase6CliParity:
         sess = mock.Mock()
         m.session_for_cluster = lambda c: sess
         m.process_vm_list = lambda a: []
-        BoxmanManager.resume_vm(m, SimpleNamespace())
+        m.resume_vm(SimpleNamespace())
         sess.unpause_cluster.assert_called_once()
 
     def test_control_save_dc_warns_not_raises(self):
         m = self._mgr()
         m.process_vm_list = lambda a: []
         with mock.patch.object(m.logger, "warning") as warn:
-            BoxmanManager.save_vm(m, SimpleNamespace())
+            m.save_vm(SimpleNamespace())
         assert any("not supported" in str(c.args[0]) for c in warn.call_args_list)
 
     def test_control_suspend_honors_cluster_scope(self):
@@ -1637,7 +1670,7 @@ class TestPhase6CliParity:
         sess.pause_cluster.side_effect = lambda name, cfg: paused.append(name)
         m._dc_session = lambda c: sess
         m.process_vm_list = lambda a: []
-        BoxmanManager.suspend_vm(m, SimpleNamespace(cluster="other"))
+        m.suspend_vm(SimpleNamespace(cluster="other"))
         assert paused == ["other"]      # 'services' left running
 
     def test_compose_project_for_matches_session(self):
@@ -1670,7 +1703,7 @@ class TestPhase6CliParity:
              "health": "healthy", "ports": ""},
         ]
         m.session_for_cluster = lambda c: sess
-        BoxmanManager.ps(m, SimpleNamespace(provider_info=False, json=False))
+        m.ps(SimpleNamespace(provider_info=False, json=False))
         out = capsys.readouterr().out
         assert "docker-compose" in out and "web" in out and "running (healthy)" in out
 
@@ -1741,7 +1774,7 @@ class TestFlowWiring:
         m = self._mgr()
         order = []
         self._neutralize(m, monkeypatch, order)
-        BoxmanManager.provision(m, SimpleNamespace(force=False, rebuild_templates=False))
+        m.provision(SimpleNamespace(force=False, rebuild_templates=False))
         assert "provision_compose_clusters" in order
         assert order.index("vms") < order.index("provision_compose_clusters") < order.index("netlab")
         # shared bridges (macvlan parents) must exist before compose comes up
@@ -1751,14 +1784,14 @@ class TestFlowWiring:
         m = self._mgr()
         order = []
         self._neutralize(m, monkeypatch, order)
-        BoxmanManager.down(m, SimpleNamespace(suspend=False))
+        m.down(SimpleNamespace(suspend=False))
         assert "stop_compose_clusters" in order
 
     def test_deprovision_tears_down_compose_after_netlab(self, monkeypatch):
         m = self._mgr()
         order = []
         self._neutralize(m, monkeypatch, order)
-        BoxmanManager.deprovision(m, SimpleNamespace(cleanup=False))
+        m.deprovision(SimpleNamespace(cleanup=False))
         assert "deprovision_compose_clusters" in order
         assert order.index("netlab_down") < order.index("deprovision_compose_clusters")
 
@@ -1768,7 +1801,7 @@ class TestFlowWiring:
         self._neutralize(m, monkeypatch, order)
         m.cache.projects = {"proj": {"conf": "x", "runtime": "local"}}
         monkeypatch.setattr(m, "_force_rmtree", lambda *a, **k: None)
-        BoxmanManager.destroy(m, SimpleNamespace(auto_accept=True, templates=False))
+        m.destroy(SimpleNamespace(auto_accept=True, templates=False))
         assert "destroy_compose_clusters" in order
 
     def test_up_dc_only_first_run_routes_through_provision(self, monkeypatch):
@@ -1778,7 +1811,7 @@ class TestFlowWiring:
         monkeypatch.setattr(m, "_get_project_vm_names", lambda *a, **k: [])
         # project not in cache → first run → full provision()
         monkeypatch.setattr(m, "provision", lambda *a, **k: order.append("provision"))
-        BoxmanManager.up(m, SimpleNamespace(force=False))
+        m.up(SimpleNamespace(force=False))
         assert order == ["provision"]
 
     def test_up_dc_only_reconcile_ensures_bridges_before_compose_up(self, monkeypatch):
@@ -1787,7 +1820,7 @@ class TestFlowWiring:
         self._neutralize(m, monkeypatch, order)
         monkeypatch.setattr(m, "_get_project_vm_names", lambda *a, **k: [])
         m.cache.projects = {"proj": {"conf": "x", "runtime": "local"}}  # already provisioned
-        BoxmanManager.up(m, SimpleNamespace(force=False))
+        m.up(SimpleNamespace(force=False))
         # a host reboot drops the non-persistent bridge; recreate it before
         # the macvlan-attached containers reconcile.
         assert order == ["bridges", "provision_compose_clusters"]
@@ -1799,7 +1832,7 @@ class TestFlowWiring:
         # simulate a mixed project whose libvirt VMs are all already running
         monkeypatch.setattr(m, "_get_project_vm_names", lambda *a, **k: ["vm1"])
         monkeypatch.setattr(m, "_get_vm_states", lambda *a, **k: {"vm1": "running"})
-        BoxmanManager.up(m, SimpleNamespace(force=False))
+        m.up(SimpleNamespace(force=False))
         assert "provision_compose_clusters" in order
         assert order.index("netlab_up") < order.index("provision_compose_clusters")
         # bridges reconciled before compose on the hybrid all-running path too

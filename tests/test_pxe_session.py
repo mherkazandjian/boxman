@@ -7,14 +7,12 @@ Unit tests for PXE-related methods added to LibVirtSession:
 
 from __future__ import annotations
 
-import socket
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from lxml import etree
 
 from boxman.providers.libvirt.session import LibVirtSession
-
 
 pytestmark = pytest.mark.unit
 

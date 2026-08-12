@@ -1,7 +1,7 @@
 import ipaddress
 import os
 import re
-import sys
+import shlex
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
@@ -13,10 +13,11 @@ from jinja2 import Environment, FileSystemLoader
 from boxman import log
 
 from . import net_reconcile
-from .commands import LibVirtCommandBase, VirshCommand
+from .commands import VirshCommand
+from .virsh_parse import parse_domiflist
 
 
-class Network(VirshCommand):
+class Network:
     """
     Class to define libvirt networks by creating XML definitions and using virsh commands.
     """
@@ -37,7 +38,14 @@ class Network(VirshCommand):
             provider_config: Configuration for the libvirt provider
             cache: Optional cache object for storing network definitions
         """
-        super().__init__(provider_config=provider_config)
+        #: VirshCommand: Command executor for virsh
+        self.virsh = VirshCommand(provider_config=provider_config)
+
+        #: Dict[str, Any]: Configuration for the libvirt provider
+        self.provider_config = provider_config or {}
+
+        #: logging.Logger: Logger instance
+        self.logger = log
 
         #: str: the name of the network
         self.name = name
@@ -416,7 +424,7 @@ class Network(VirshCommand):
     def _listed_networks(self, active_only: bool = False) -> list[str] | None:
         """Names of the networks libvirt knows, or None if it could not be asked."""
         args = ["net-list", "--name"] if active_only else ["net-list", "--all", "--name"]
-        result = self.execute(*args, hide=True, warn=True)
+        result = self.virsh.execute(*args, hide=True, warn=True)
         if not result.ok:
             return None
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -441,7 +449,7 @@ class Network(VirshCommand):
             The XML text, or None when it could not be read (undefined, or
             libvirt unreachable -- use :meth:`exists` to tell those apart).
         """
-        result = self.execute("net-dumpxml", self.name, hide=True, warn=True)
+        result = self.virsh.execute("net-dumpxml", self.name, hide=True, warn=True)
         if not result.ok:
             return None
         return result.stdout
@@ -453,14 +461,14 @@ class Network(VirshCommand):
 
     def start(self) -> bool:
         """Start a defined network, and make it come back after a host reboot."""
-        result = self.execute("net-start", self.name, hide=True, warn=True)
+        result = self.virsh.execute("net-start", self.name, hide=True, warn=True)
         if not result.ok:
             self.logger.error(
                 f"network {self.name}: could not be started: "
                 f"{result.stderr.strip()}")
             return False
 
-        autostart = self.execute(
+        autostart = self.virsh.execute(
             "net-autostart", self.name, hide=True, warn=True)
         if not autostart.ok:
             # not fatal, but it means the network is gone again after a reboot
@@ -513,7 +521,7 @@ class Network(VirshCommand):
             if live:
                 args.append("--live")
 
-            result = self.execute(*args, hide=True, warn=True)
+            result = self.virsh.execute(*args, hide=True, warn=True)
             if not result.ok:
                 self.logger.error(
                     f"network {self.name}: {command} {section} failed: "
@@ -573,20 +581,18 @@ class Network(VirshCommand):
 
         Used to tell the user which guests a recreate would disconnect.
         """
-        result = self.execute("list", "--all", "--name", hide=True, warn=True)
+        result = self.virsh.execute("list", "--all", "--name", hide=True, warn=True)
         if not result.ok:
             return []
 
         attached = []
         for domain in [line.strip() for line in result.stdout.splitlines() if line.strip()]:
-            iflist = self.execute(
+            iflist = self.virsh.execute(
                 "domiflist", domain, hide=True, warn=True)
             if not iflist.ok:
                 continue
-            for line in iflist.stdout.splitlines():
-                fields = line.split()
-                # columns: Interface Type Source Model MAC
-                if len(fields) >= 3 and fields[1] == 'network' and fields[2] == self.name:
+            for row in parse_domiflist(iflist.stdout):
+                if row.type == 'network' and row.source == self.name:
                     attached.append(domain)
                     break
         return attached
@@ -615,9 +621,10 @@ class Network(VirshCommand):
         """
         Check if there are any issues or conflicts with existing networks in the cache.
 
-        When running under a non-local runtime (e.g. docker-compose), only
-        projects registered under the **same** runtime are checked, because
-        each runtime has its own isolated libvirt instance.
+        Only projects registered under the **same** runtime are checked:
+        each runtime has its own isolated libvirt instance, so a network
+        living in a docker-compose runtime can never conflict with one on
+        the local host's libvirt (and vice versa).
 
         Returns:
             True if the network exists, False otherwise
@@ -631,9 +638,11 @@ class Network(VirshCommand):
         conflicts = {}
         n_conflicts = 0
         for project_name, project_data in projects_in_cache.items():
-            # Skip projects from a different runtime scope
+            # Skip projects from a different runtime scope -- including when
+            # the current runtime is 'local': a docker-compose runtime is a
+            # different libvirt instance, not the same one
             project_runtime = project_data.get('runtime', 'local')
-            if current_runtime != 'local' and project_runtime != current_runtime:
+            if project_runtime != current_runtime:
                 self.logger.debug(
                     f"skipping project {project_name} (runtime={project_runtime}) "
                     f"— current runtime is {current_runtime}")
@@ -672,7 +681,7 @@ class Network(VirshCommand):
             for project, project_conflicts in conflicts.items():
                 if 'networks' in project_conflicts:
                     for net_name, net_conflicts in project_conflicts['networks'].items():
-                        for conflict_type, conflict_msg in net_conflicts.items():
+                        for _conflict_type, conflict_msg in net_conflicts.items():
                             self.logger.error(f"{conflict_msg} (project: {project}, network: {net_name})")
 
             msg = f"found {n_conflicts} conflicts for network {self.name} in project {self.manager.config['project']}"
@@ -724,7 +733,7 @@ class Network(VirshCommand):
 
         # define the network
         try:
-            self.execute("net-define", written_path)
+            self.virsh.execute("net-define", written_path)
 
             # the cache is written only once the network really exists. Written
             # before the define, a failed define (a rejected netmask, a libvirtd
@@ -733,45 +742,22 @@ class Network(VirshCommand):
             # later run -- wedged until projects.json is edited by hand
             self.update_network_cache()
 
-            self.execute("net-start", self.name)
-            self.execute("net-autostart", self.name)
+            self.virsh.execute("net-start", self.name)
+            self.virsh.execute("net-autostart", self.name)
 
-            # apply appropriate network configuration based on type
+            # apply appropriate network configuration based on type. NAT
+            # needs nothing from boxman: libvirtd installs the masquerade
+            # and FORWARD rules for <forward mode='nat'/> itself when the
+            # network starts (and removes them when it stops)
             if self.forward_mode == 'route':
                 self.apply_route_iptables_rule()
-            elif self.forward_mode == 'nat':
-                self.apply_nat_config()
-            else:
+            elif self.forward_mode != 'nat':
                 raise RuntimeError(f"Unsupported forward mode: {self.forward_mode}")
 
             return True
         except RuntimeError as exc:
             self.logger.error(f"Error defining network: {exc}")
             return False
-
-    def define_and_start(self,
-                        file_path: str | None = None,
-                        autostart: bool = True) -> bool:
-        """
-        Define and start the network in one operation.
-
-        Args:
-            file_path: Path to write the XML file
-            autostart: Whether to set the network to autostart
-
-        Returns:
-            True if all operations were successful, False otherwise
-        """
-        if not self.define_network(file_path):
-            return False
-
-        if not self.start_network():
-            return False
-
-        if autostart and not self.autostart_network():
-            return False
-
-        return True
 
     def destroy_network(self) -> bool:
         """
@@ -781,17 +767,20 @@ class Network(VirshCommand):
             True if successful, False otherwise
         """
         try:
-            # check if network exists first
-            result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
-            if result.return_code != 0:
+            # check if network exists first -- by exact name, not a grep
+            # substring ('prod' must not match 'prod-backup')
+            listed = self._listed_networks()
+            if listed is None:
+                self.logger.error(
+                    f"could not ask libvirt whether network {self.name} exists")
+                return False
+            if self.name not in listed:
                 self.logger.info(f"network {self.name} does not exist, nothing to destroy")
                 return True
 
-            # check if network is active
-            result = self.execute("net-list", "| grep -q " + self.name, warn=True)
-            if result.return_code == 0:
-                # the network is active, stop it
-                self.execute("net-destroy", self.name)
+            # destroy only when the network itself is active
+            if self.is_active():
+                self.virsh.execute("net-destroy", self.name)
                 self.logger.info(f"network {self.name} destroyed successfully")
 
             return True
@@ -807,17 +796,21 @@ class Network(VirshCommand):
             True if successful, False otherwise
         """
         try:
-            # check if network exists
-            result = self.execute("net-list", "--all", "| grep -q " + self.name, warn=True)
-            if result.return_code != 0:
+            # check if network exists (exact name match, as in destroy_network)
+            listed = self._listed_networks()
+            if listed is None:
+                self.logger.error(
+                    f"could not ask libvirt whether network {self.name} exists")
+                return False
+            if self.name not in listed:
                 self.logger.info(f"Network {self.name} does not exist, nothing to undefine")
                 return True
 
             # disable autostart first if it's enabled
-            self.execute("net-autostart", self.name, "--disable", warn=True)
+            self.virsh.execute("net-autostart", self.name, "--disable", warn=True)
 
             # undefine the network
-            self.execute("net-undefine", self.name)
+            self.virsh.execute("net-undefine", self.name)
             self.logger.info(f"network {self.name} undefined successfully")
             return True
         except RuntimeError as e:
@@ -837,11 +830,12 @@ class Network(VirshCommand):
         if not self.undefine_network():
             return False
 
-        # remove iptables rules if any
+        # remove iptables rules if any. NAT needs no cleanup: the rules are
+        # libvirtd's own and go away with the network
         if self.forward_mode == 'route':
             return self.remove_route_iptables_rule()
         elif self.forward_mode == 'nat':
-            return self.remove_nat_config()
+            return True
         else:
             raise RuntimeError(f"Unsupported forward mode: {self.forward_mode}")
 
@@ -958,12 +952,12 @@ class Network(VirshCommand):
         Make sure a rule is either present (present=True) or absent (present=False).
 
         Args:
-            instance   : object exposing execute_shell & logger
+            cls        : object with a ``virsh`` executor and a ``logger``
             check_cmd  : iptables -C ... command used to probe rule existence
             action_cmd : command that adds the rule (present) or deletes the rule (absent)
             present    : True -> ensure rule exists, False -> ensure rule is removed
         """
-        chk_res = cls.execute_shell(check_cmd, warn=True)
+        chk_res = cls.virsh.execute_shell(check_cmd, warn=True)
 
         # desired state already reached
         if (present and chk_res.return_code == 0) or (not present and chk_res.return_code != 0):
@@ -971,7 +965,7 @@ class Network(VirshCommand):
             return True
 
         # need an action to reach desired state
-        apply_res = cls.execute_shell(action_cmd, warn=True)
+        apply_res = cls.virsh.execute_shell(action_cmd, warn=True)
         if not apply_res.ok:
             cls.logger.error(f"failed to execute '{action_cmd}': {apply_res.stderr}")
             return False
@@ -991,25 +985,29 @@ class Network(VirshCommand):
             return True
 
         try:
-            br_name = self.bridge_name
-            self.logger.info(f"removing route isolation rules for bridge {br_name}")
+            # shlex.quote: the bridge name comes from the config and is
+            # interpolated into a shell string below
+            br_name = shlex.quote(self.bridge_name)
+            self.logger.info(f"removing route isolation rules for bridge {self.bridge_name}")
 
+            # no embedded 'sudo': execute_shell routes that decision through
+            # _should_use_sudo_for_command, so use_sudo: false is honoured
             if not self._ensure_rule(
                     self,
-                    f"sudo iptables -C FORWARD -i {br_name} -o {br_name} -j ACCEPT",
-                    f"sudo iptables -D FORWARD -i {br_name} -o {br_name} -j ACCEPT",
+                    f"iptables -C FORWARD -i {br_name} -o {br_name} -j ACCEPT",
+                    f"iptables -D FORWARD -i {br_name} -o {br_name} -j ACCEPT",
                     present=False):
                 return False
             if not self._ensure_rule(
                     self,
-                    f"sudo iptables -C INPUT  -i {br_name} -j DROP",
-                    f"sudo iptables -D INPUT  -i {br_name} -j DROP",
+                    f"iptables -C INPUT  -i {br_name} -j DROP",
+                    f"iptables -D INPUT  -i {br_name} -j DROP",
                     present=False):
                 return False
             if not self._ensure_rule(
                     self,
-                    f"sudo iptables -C OUTPUT -o {br_name} -j DROP",
-                    f"sudo iptables -D OUTPUT -o {br_name} -j DROP",
+                    f"iptables -C OUTPUT -o {br_name} -j DROP",
+                    f"iptables -D OUTPUT -o {br_name} -j DROP",
                     present=False):
                 return False
 
@@ -1018,79 +1016,6 @@ class Network(VirshCommand):
         except Exception as exc:
             self.logger.error(f"error removing route isolation rules: {exc}")
             return False
-
-    def remove_nat_config(self) -> bool:
-        """
-        Remove the forwarding and masquerade rules inserted by apply_nat_config.
-        """
-        if self.forward_mode != 'nat':
-            return True
-
-        status = True
-
-        def remove_ip_tables_rules():
-
-            if not self.bridge_name:
-                self.logger.warning("no bridge name found, cannot remove isolation rules")
-                return True
-
-            try:
-                # discover outgoing iface (same logic as insertion)
-                cmd_exec = LibVirtCommandBase(
-                    provider_config=self.provider_config,
-                    override_config_use_sudo=False)
-
-                cmd = "ip route get 8.8.8.8 | awk '{print $5}'"
-                res = cmd_exec.execute_shell(cmd, hide=True, warn=True)
-                out_iface = res.stdout.strip() if res.ok else ""
-                bridge_name = self.bridge_name
-
-                if out_iface:
-                    self._ensure_rule(
-                        self,
-                        f"sudo iptables -C FORWARD -i {out_iface} -o {bridge_name} -j ACCEPT",
-                        f"sudo iptables -D FORWARD -i {out_iface} -o {bridge_name} -j ACCEPT",
-                        present=False)
-                    self._ensure_rule(
-                        self,
-                        f"sudo iptables -C FORWARD -i {bridge_name} -o {out_iface} -j ACCEPT",
-                        f"sudo iptables -D FORWARD -i {bridge_name} -o {out_iface} -j ACCEPT",
-                        present=False)
-                else:
-                    self.logger.warning(
-                        "could not determine outgoing iface while cleaning nat rules")
-
-                return True
-            except Exception as exc:
-                self.logger.error(f"error removing NAT configuration for {self.name}: {exc}")
-                return False
-
-        status &= remove_ip_tables_rules()
-
-        def remove_iptables_nat_rules():
-            try:
-                # remove masquerade
-                import ipaddress
-                try:
-                    net_cidr = str(ipaddress.IPv4Interface(
-                        f"{self.ip_address}/{self.netmask}").network)
-                    self._ensure_rule(
-                        self,
-                        f"sudo iptables -t nat -C POSTROUTING -s {net_cidr} -j MASQUERADE",
-                        f"sudo iptables -t nat -D POSTROUTING -s {net_cidr} -j MASQUERADE",
-                        present=False)
-                except ValueError:
-                    self.logger.warning(
-                        "could not compute network cidr while cleaning masquerade rule")
-
-                return True
-            except Exception as exc:
-                self.logger.error(f"error removing NAT configuration for {self.name}: {exc}")
-                return False
-
-        status &= remove_iptables_nat_rules()
-
-        return status
 
     def apply_route_iptables_rule(self) -> bool:
         """
@@ -1108,25 +1033,29 @@ class Network(VirshCommand):
             return True  # Nothing to do for non-route networks
 
         try:
-            bridge_name = self.bridge_name
+            # shlex.quote: the bridge name comes from the config and is
+            # interpolated into a shell string below
+            bridge_name = shlex.quote(self.bridge_name)
             self.logger.info(
-                f"configuring complete isolation for routed network with bridge {bridge_name}")
+                f"configuring complete isolation for routed network with bridge {self.bridge_name}")
 
-            # 1. allow vm-to-vm communication on the same bridge
-            vm2vm_check = f"sudo iptables -C FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
-            vm2vm_cmd   = f"sudo iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
+            # 1. allow vm-to-vm communication on the same bridge. No embedded
+            # 'sudo' here or below: execute_shell routes that decision through
+            # _should_use_sudo_for_command, so use_sudo: false is honoured
+            vm2vm_check = f"iptables -C FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
+            vm2vm_cmd   = f"iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
             if not self._ensure_rule(self, vm2vm_check, vm2vm_cmd):
                 return False
 
             # 2. block all traffic from the VMs to the host
-            host2vm_check = f"sudo iptables -C INPUT -i {bridge_name} -j DROP"
-            host2vm_cmd   = f"sudo iptables -I INPUT -i {bridge_name} -j DROP"
+            host2vm_check = f"iptables -C INPUT -i {bridge_name} -j DROP"
+            host2vm_cmd   = f"iptables -I INPUT -i {bridge_name} -j DROP"
             if not self._ensure_rule(self, host2vm_check, host2vm_cmd):
                 return False
 
             # 3. block all traffic from host to the VMs
-            vm2host_check = f"sudo iptables -C OUTPUT -o {bridge_name} -j DROP"
-            vm2host_cmd   = f"sudo iptables -I OUTPUT -o {bridge_name} -j DROP"
+            vm2host_check = f"iptables -C OUTPUT -o {bridge_name} -j DROP"
+            vm2host_cmd   = f"iptables -I OUTPUT -o {bridge_name} -j DROP"
             if not self._ensure_rule(self, vm2host_check, vm2host_cmd):
                 return False
 
@@ -1135,82 +1064,6 @@ class Network(VirshCommand):
 
         except Exception as exc:
             self.logger.error(f"error applying route isolation rules: {exc}")
-            return False
-
-    def apply_nat_config(self) -> bool:
-        """
-        Apply nat configuration for networks with forward mode 'nat'.
-
-        This method:
-
-          - finds the outgoing interface (eth0, wlan0, etc.)
-          - gets the bridge name for this network
-          - allows forwarding between the bridge and outgoing interface
-          - enables ip masquerading for the network
-
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            # find the outgoing interface
-            cmd_executor = LibVirtCommandBase(
-                provider_config=self.provider_config,
-                override_config_use_sudo=False)
-
-            # get the outgoing interface using 'ip route'
-            # .. todo:: figure out how to get the default route interface in case the host
-            #           is not connected to the internet. This should work even if the host is not
-            #           connected to the internet.
-            cmd = "ip route get 8.8.8.8 | awk '{print $5}'"
-            result = cmd_executor.execute_shell(cmd, hide=True)
-            if not result.ok:
-                self.logger.error(f"failed to find outgoing interface: {result.stderr}")
-                return False
-
-            bridge = self.bridge_name
-
-            out_iface = result.stdout.strip()
-            if not out_iface:
-                self.logger.error("could not determine outgoing interface")
-                return False
-
-            self.logger.info(f"found outgoing interface: {out_iface}")
-
-            # bridge interface is already known (self.bridge_name)
-            self.logger.info(f"using bridge interface: {bridge}")
-
-            # allow forwarding between interfaces
-            fwd1_check = f"sudo iptables -C FORWARD -i {out_iface} -o {bridge} -j ACCEPT"
-            fwd1_cmd   = f"sudo iptables -I FORWARD -i {out_iface} -o {bridge} -j ACCEPT"
-            if not self._ensure_rule(self, fwd1_check, fwd1_cmd):
-                return False
-
-            fwd2_check = f"sudo iptables -C FORWARD -i {bridge} -o {out_iface} -j ACCEPT"
-            fwd2_cmd   = f"sudo iptables -I FORWARD -i {bridge} -o {out_iface} -j ACCEPT"
-            if not self._ensure_rule(self, fwd2_check, fwd2_cmd):
-                return False
-
-            # enable nat for the virtual network
-            if self.ip_address:
-                try:
-                    ip_interface = ipaddress.IPv4Interface(f"{self.ip_address}/{self.netmask}")
-                    network_cidr = str(ip_interface.network)
-
-                    masq_check = f"sudo iptables -t nat -C POSTROUTING -s {network_cidr} -j MASQUERADE"
-                    masq_cmd   = f"sudo iptables -t nat -A POSTROUTING -s {network_cidr} -j MASQUERADE"
-                    if not self._ensure_rule(self, masq_check, masq_cmd):
-                        return False
-
-                    self.logger.info(
-                        f"successfully configured nat for network {self.name} ({network_cidr})")
-                    return True
-
-                except ValueError as exc:
-                    self.logger.error(f"error calculating network cidr: {exc}")
-                    return False
-
-        except Exception as exc:
-            self.logger.error(f"error configuring NAT for network {self.name}: {exc}")
             return False
 
     @staticmethod
@@ -1297,7 +1150,7 @@ class Network(VirshCommand):
             return []
 
 
-class NetworkInterface(VirshCommand):
+class NetworkInterface:
     """
     Class to manage network interfaces for libvirt VMs.
     """
@@ -1311,7 +1164,8 @@ class NetworkInterface(VirshCommand):
             vm_name: Name of the VM to manage interfaces for
             provider_config: Configuration for the libvirt provider
         """
-        super().__init__(provider_config=provider_config)
+        #: VirshCommand: Command executor for virsh
+        self.virsh = VirshCommand(provider_config=provider_config)
 
         #: str: Name of the VM
         self.vm_name = vm_name
@@ -1372,7 +1226,7 @@ class NetworkInterface(VirshCommand):
                 temp_path = temp.name
 
             # use virsh to attach the interface
-            self.execute("attach-device", self.vm_name, temp_path, "--persistent")
+            self.virsh.execute("attach-device", self.vm_name, temp_path, "--persistent")
 
             # remove temporary file
             os.unlink(temp_path)

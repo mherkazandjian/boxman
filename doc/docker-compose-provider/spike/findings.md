@@ -1,5 +1,10 @@
 # Netfilter spike — findings
 
+> **Status: historical.** Phase 0 spike of the docker-compose provider epic.
+> The question below is settled and the per-bridge scoped accept rules it
+> validated are implemented in `src/boxman/netlab/shared_bridges.py`. Kept as
+> the decision record; not runnable instructions.
+
 Phase 0 deliverable — issue [#48](https://github.com/mherkazandjian/boxman/issues/48) (epic #42).
 Produced by [`poc.sh`](poc.sh), executed 2026-07-13 inside the epic's staging VM
 ([`boxes/dc-provider-staging`](../../../boxes/dc-provider-staging/) — itself provisioned by boxman).

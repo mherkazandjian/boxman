@@ -13,14 +13,13 @@ Covers:
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.providers.libvirt.commands import VirshCommand
 from boxman.providers.libvirt.storage import StorageManager, vm_disk_paths
-
 
 pytestmark = pytest.mark.unit
 
@@ -322,36 +321,69 @@ class TestConvert:
         assert "rm -f" in shell.call_args_list[1].args[0]
 
 
+class TestIsShutOff:
+
+    def test_true_when_shut_off(self, sm: StorageManager):
+        with patch.object(VirshCommand, "execute",
+                          return_value=_result(stdout="shut off\n")):
+            assert sm.is_shut_off("vm01") is True
+
+    def test_true_when_domain_gone(self, sm: StorageManager):
+        with patch.object(VirshCommand, "execute",
+                          return_value=_result(ok=False, stderr="not found")):
+            assert sm.is_shut_off("vm01") is True
+
+    def test_false_when_paused(self, sm: StorageManager):
+        """Regression for issue #85 item 18: a paused VM reads as 'not
+        running' but QEMU still holds the disk — compacting it would
+        corrupt the image."""
+        with patch.object(VirshCommand, "execute",
+                          return_value=_result(stdout="paused\n")):
+            assert sm.is_shut_off("vm01") is False
+
+    def test_false_when_in_shutdown(self, sm: StorageManager):
+        """Regression for issue #85 item 18: 'in shutdown' is not
+        'shut off' — QEMU is still alive."""
+        with patch.object(VirshCommand, "execute",
+                          return_value=_result(stdout="in shutdown\n")):
+            assert sm.is_shut_off("vm01") is False
+
+
 class TestShutdownAndWait:
 
-    def test_noop_when_not_running(self, sm: StorageManager):
-        with patch.object(sm, "is_running", return_value=False), \
+    def test_noop_when_shut_off(self, sm: StorageManager):
+        with patch.object(sm, "is_shut_off", return_value=True), \
              patch.object(sm.virsh, "execute") as exe:
             assert sm.shutdown_and_wait("vm01") is True
         exe.assert_not_called()
 
+    def test_paused_vm_is_shut_down_not_skipped(self, sm: StorageManager):
+        """Regression for issue #85 item 18: a paused VM must not take
+        the 'already stopped' shortcut — shutdown must be issued and the
+        wait must hold until 'shut off'."""
+        shut_off_states = iter([False, True])  # paused, then shut off
+        with patch.object(sm, "is_shut_off",
+                          side_effect=lambda _vm: next(shut_off_states)), \
+             patch.object(sm.virsh, "execute", return_value=_result()) as exe, \
+             patch("boxman.providers.libvirt.destroy_vm.time.sleep"):
+            assert sm.shutdown_and_wait("vm01", timeout_s=10) is True
+        verbs = [c.args[0] for c in exe.call_args_list]
+        assert "shutdown" in verbs
+
     def test_success_when_vm_stops_in_time(self, sm: StorageManager):
-        # First is_running True (initial check), then False after shutdown
-        running_states = iter([True, False])
-        with patch.object(sm, "is_running",
-                          side_effect=lambda _vm: next(running_states)), \
+        # First is_shut_off False (initial check), then True after shutdown
+        shut_off_states = iter([False, True])
+        with patch.object(sm, "is_shut_off",
+                          side_effect=lambda _vm: next(shut_off_states)), \
              patch.object(sm.virsh, "execute", return_value=_result()), \
-             patch("boxman.providers.libvirt.storage.time.sleep"):
+             patch("boxman.providers.libvirt.destroy_vm.time.sleep"):
             assert sm.shutdown_and_wait("vm01", timeout_s=10) is True
 
     def test_destroys_after_timeout(self, sm: StorageManager):
-        # is_running stays True forever — must fall through to destroy
-        time_values = [0]  # always before deadline=5 on entry, after on second check
-
-        def fake_time():
-            time_values[0] += 100
-            return time_values[0]
-
-        with patch.object(sm, "is_running", return_value=True), \
+        # is_shut_off stays False forever — must fall through to destroy
+        with patch.object(sm, "is_shut_off", return_value=False), \
              patch.object(sm.virsh, "execute", return_value=_result()) as exe, \
-             patch("boxman.providers.libvirt.storage.time.time",
-                   side_effect=fake_time), \
-             patch("boxman.providers.libvirt.storage.time.sleep"):
+             patch("boxman.providers.libvirt.destroy_vm.time.sleep"):
             sm.shutdown_and_wait("vm01", timeout_s=5)
         verbs = [c.args[0] for c in exe.call_args_list]
         assert "shutdown" in verbs
