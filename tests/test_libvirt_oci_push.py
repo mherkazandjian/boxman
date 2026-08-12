@@ -18,6 +18,7 @@ import pytest
 
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.oci_push import push_oci_image
+from conftest import make_bare_manager
 
 pytestmark = pytest.mark.unit
 
@@ -274,7 +275,7 @@ class TestPushImageCli:
         with patch(
             "boxman.providers.libvirt.oci_push.subprocess.run", side_effect=fake
         ):
-            BoxmanManager.push_image(None, cli_args)
+            BoxmanManager.push_image(make_bare_manager(), cli_args)
         out = capsys.readouterr().out
         assert "successfully pushed" in out
         assert "registry.com/repo:tag" in out
@@ -286,7 +287,7 @@ class TestPushImageCli:
             metadata=None,
         )
         with pytest.raises(SystemExit) as excinfo:
-            BoxmanManager.push_image(None, cli_args)
+            BoxmanManager.push_image(make_bare_manager(), cli_args)
         assert excinfo.value.code == 1
         out = capsys.readouterr().out
         assert "error pushing image" in out

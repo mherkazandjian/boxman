@@ -390,7 +390,7 @@ class TestDestroyReadsProjectCache:
             # traceback, #85 item 16) proves the short-circuit did NOT
             # fire.
             with patch("builtins.input", side_effect=EOFError):
-                BoxmanManager.destroy(mgr, args)
+                mgr.destroy(args)
             assert "No input available, aborted." in capsys.readouterr().out
 
         # The cache must have been loaded — .projects populated from disk
@@ -413,7 +413,7 @@ class TestDestroyReadsProjectCache:
 
             with patch("builtins.input") as inp:
                 # Returns None → destroy() early-exits before prompting.
-                BoxmanManager.destroy(mgr, args)
+                mgr.destroy(args)
                 inp.assert_not_called()
 
 
@@ -472,7 +472,7 @@ class TestProvisionForceClearsStaleCacheEntry:
              patch.object(mgr, "register_project_in_cache"), \
              patch.object(mgr.__class__, "provider", MagicMock()):
             try:
-                BoxmanManager.provision(mgr, args)
+                mgr.provision(args)
             except Exception:
                 # We only care about the force/deprovision dispatch here;
                 # the rest of provision() needs a live libvirt.
@@ -489,7 +489,7 @@ class TestProvisionForceClearsStaleCacheEntry:
              patch.object(mgr, "register_project_in_cache") as register, \
              patch.object(mgr.__class__, "provider", MagicMock()):
             with pytest.raises(ProvisionError, match="cannot provision"):
-                BoxmanManager.provision(mgr, args)
+                mgr.provision(args)
 
         # Must not proceed to deprovision or register
         deprov.assert_not_called()
@@ -506,7 +506,7 @@ class TestProvisionForceClearsStaleCacheEntry:
              patch.object(mgr, "register_project_in_cache"), \
              patch.object(mgr.__class__, "provider", MagicMock()):
             try:
-                BoxmanManager.provision(mgr, args)
+                mgr.provision(args)
             except Exception:
                 pass
 

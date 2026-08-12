@@ -19,7 +19,6 @@ from unittest.mock import MagicMock
 import pytest
 import yaml
 
-from boxman.manager import BoxmanManager
 from conftest import make_bare_manager
 
 pytestmark = pytest.mark.unit
@@ -163,12 +162,12 @@ class TestNetlabCliHandlers:
 
     def test_netlab_deploy_logs_error_when_absent(self):
         mgr = make_bare_manager({"clusters": {}})
-        BoxmanManager.netlab_deploy(mgr, MagicMock())
+        mgr.netlab_deploy(MagicMock())
         mgr.logger.error.assert_called_once()
 
     def test_netlab_destroy_logs_error_when_absent(self):
         mgr = make_bare_manager({"clusters": {}})
-        BoxmanManager.netlab_destroy(mgr, MagicMock())
+        mgr.netlab_destroy(MagicMock())
         mgr.logger.error.assert_called_once()
 
     def test_netlab_inspect_prints_json(self, tmp_path, capsys):
@@ -180,7 +179,7 @@ class TestNetlabCliHandlers:
         fake_netlab.inspect.return_value = {"nodes": ["r1", "sw1"]}
         mgr._netlab = fake_netlab
 
-        BoxmanManager.netlab_inspect(mgr, MagicMock())
+        mgr.netlab_inspect(MagicMock())
         out = capsys.readouterr().out
         assert '"nodes"' in out
         assert "r1" in out and "sw1" in out
@@ -197,7 +196,7 @@ class TestNetlabCliHandlers:
         args = MagicMock()
         args.node = "sw1"
         args.user = None
-        BoxmanManager.netlab_ssh(mgr, args)
+        mgr.netlab_ssh(args)
 
         out = capsys.readouterr().out.strip()
         assert out == "ssh admin@clab-netlab-sw1"
@@ -213,7 +212,7 @@ class TestNetlabCliHandlers:
         args = MagicMock()
         args.node = "sw1"
         args.user = "root"
-        BoxmanManager.netlab_ssh(mgr, args)
+        mgr.netlab_ssh(args)
 
         assert "ssh root@clab-netlab-sw1" in capsys.readouterr().out
 
@@ -224,7 +223,7 @@ class TestNetlabCliHandlers:
         })
         args = MagicMock()
         args.node = None
-        BoxmanManager.netlab_ssh(mgr, args)
+        mgr.netlab_ssh(args)
         mgr.logger.error.assert_called_once()
 
 

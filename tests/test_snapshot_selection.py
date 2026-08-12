@@ -32,7 +32,7 @@ def _manager():
 
 def _select(mgr, **kwargs):
     ns = types.SimpleNamespace(**kwargs)
-    return [(c, v) for _full, c, v, _wd in BoxmanManager._select_vm_targets(mgr, ns)]
+    return [(c, v) for _full, c, v, _wd in mgr._select_vm_targets(ns)]
 
 
 class TestSelectVmTargets:
@@ -50,7 +50,7 @@ class TestSelectVmTargets:
         """No --cluster/--vms on the namespace → whole project (back-compat)."""
         mgr = _manager()
         ns = types.SimpleNamespace()
-        targets = BoxmanManager._select_vm_targets(mgr, ns)
+        targets = mgr._select_vm_targets(ns)
         assert len(targets) == 4
 
     def test_cluster_filter(self):
@@ -87,7 +87,7 @@ class TestSelectVmTargets:
     def test_full_vm_name_is_project_and_cluster_scoped(self):
         mgr = _manager()
         ns = types.SimpleNamespace(cluster="cluster_2", vms="node01")
-        targets = BoxmanManager._select_vm_targets(mgr, ns)
+        targets = mgr._select_vm_targets(ns)
         full, cname, vname, workdir = targets[0]
         assert full == "bprj__demo__bprj_cluster_2_node01"
         assert (cname, vname) == ("cluster_2", "node01")
@@ -120,7 +120,7 @@ class TestSnapshotDeleteScoping:
         mgr = self._manager_with_provider()
         ns = types.SimpleNamespace(
             snapshot_name="s1", cluster="cluster_2", vms="all")
-        BoxmanManager.snapshot_delete(mgr, ns)
+        mgr.snapshot_delete(ns)
         deleted = {c.args[0] for c in mgr.provider.snapshot_delete.call_args_list}
         assert deleted == {
             "bprj__demo__bprj_cluster_2_service01",
@@ -130,12 +130,12 @@ class TestSnapshotDeleteScoping:
     def test_delete_whole_project_by_default(self):
         mgr = self._manager_with_provider()
         ns = types.SimpleNamespace(snapshot_name="s1")
-        BoxmanManager.snapshot_delete(mgr, ns)
+        mgr.snapshot_delete(ns)
         assert mgr.provider.snapshot_delete.call_count == 4
 
     def test_delete_no_match_is_noop(self):
         mgr = self._manager_with_provider()
         ns = types.SimpleNamespace(
             snapshot_name="s1", cluster=None, vms="ghost")
-        BoxmanManager.snapshot_delete(mgr, ns)
+        mgr.snapshot_delete(ns)
         mgr.provider.snapshot_delete.assert_not_called()

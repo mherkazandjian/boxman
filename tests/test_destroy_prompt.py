@@ -46,7 +46,7 @@ def test_destroy_prompt_aborts_cleanly_on_eof(monkeypatch, capsys):
     ns = types.SimpleNamespace(auto_accept=False, templates=False)
 
     # Must return cleanly, not raise EOFError.
-    BoxmanManager.destroy(mgr, ns)
+    mgr.destroy(ns)
 
     assert "No input available, aborted." in capsys.readouterr().out
     # Nothing destructive ran: the runtime was never started.

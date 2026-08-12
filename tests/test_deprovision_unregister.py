@@ -43,7 +43,7 @@ class TestDeprovisionUnregister:
     def _run(self, mgr, vm_failures, net_failures):
         mgr._run_parallel = MagicMock(return_value=({}, vm_failures))
         mgr.destroy_networks = MagicMock(return_value=net_failures)
-        BoxmanManager.deprovision(mgr, types.SimpleNamespace(cleanup=False))
+        mgr.deprovision(types.SimpleNamespace(cleanup=False))
 
     def test_unregisters_when_teardown_succeeds(self):
         mgr = _manager()

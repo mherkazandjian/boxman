@@ -131,11 +131,6 @@ def provisioned_box(tmp_path_factory):
     the end regardless of how the individual assertions went.
 
     Yields a tuple ``(manager, ssh_config, vm_host_alias)``.
-
-    Note: ``BoxmanManager.provision`` / ``destroy`` etc are ``@staticmethod``
-    with ``cls`` as the first positional, so they're invoked as
-    ``BoxmanManager.provision(manager, cli_args)`` — not via the bound
-    method on the instance.
     """
     # Build a manager instance from the box config.
     manager = BoxmanManager(config=str(BOX_CONF))
@@ -175,7 +170,7 @@ def provisioned_box(tmp_path_factory):
         rebuild_templates=False,
         docker_compose=False,
     )
-    BoxmanManager.provision(manager, provision_args)
+    manager.provision(provision_args)
 
     ws_path = Path(os.path.expanduser(
         manager.config["workspace"]["path"]))
@@ -195,7 +190,7 @@ def provisioned_box(tmp_path_factory):
             auto_accept=True, templates=False,
         )
         try:
-            BoxmanManager.destroy(manager, destroy_args)
+            manager.destroy(destroy_args)
         except Exception as exc:
             print(f"[teardown] destroy raised: {exc}")
 
@@ -234,9 +229,8 @@ class TestLifecycleSnapshot:
         """
         manager, ssh_config, vm_host = provisioned_box
 
-        # Take snap0 at clean state (static-call pattern, same as provision).
-        BoxmanManager.snapshot_take(
-            manager, argparse_namespace(snapshot_name="e2e_snap0"))
+        # Take snap0 at clean state.
+        manager.snapshot_take(argparse_namespace(snapshot_name="e2e_snap0"))
 
         # Write a marker that must NOT survive the revert. /tmp is world-
         # writable, so no sudo (which would need a TTY) is needed.
@@ -245,8 +239,7 @@ class TestLifecycleSnapshot:
         assert probe.ok, "marker should exist after creation"
 
         # Revert to snap0 — VM will reboot; wait for SSH again
-        BoxmanManager.snapshot_restore(
-            manager, argparse_namespace(snapshot_name="e2e_snap0"))
+        manager.snapshot_restore(argparse_namespace(snapshot_name="e2e_snap0"))
         _wait_for_ssh(vm_host, ssh_config)
 
         probe_after = _ssh(

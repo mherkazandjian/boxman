@@ -751,7 +751,7 @@ class TestRunTaskArgparseMisclassification:
         """Invoke run_task and return the command string passed to subprocess."""
         with patch("boxman.task_runner.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
-            BoxmanManager.run_task(manager, cli_args)
+            manager.run_task(cli_args)
             return mock_run.call_args[0][0]
 
     # ------------------------------------------------------------------
