@@ -10,12 +10,14 @@ exactly like :class:`~boxman.providers.libvirt.session.LibVirtSession`).
 Phase 1 status (skeleton / consolidation):
 
 * **Real now** — the config surface (``provider_config`` / ``uri`` /
-  ``use_sudo`` + setters, ``update_provider_config``) and a
+  ``use_sudo`` + setters, ``update_provider_config``), inherited from the
+  shared :class:`~boxman.providers.session_base.SessionConfigMixin`, and a
   side-effect-free constructor. The legacy ``__init__`` eagerly shelled out
   (``vboxmanage natnetwork list``) and raised ``FileNotFoundError`` on any host
   without VirtualBox installed; this one touches nothing external.
 * **No-op now** — ``update_provider_config_with_runtime`` (VirtualBox only
-  supports the ``local`` runtime, so there is no runtime metadata to inject).
+  supports the ``local`` runtime, so there is no runtime metadata to inject;
+  the mixin default is a no-op).
 * **Stubbed now** — every per-VM / network / snapshot / storage operation the
   manager calls raises ``NotImplementedError`` with a "lands in Phase N"
   message, giving later phases a red-to-green target. Real provisioning is
@@ -27,7 +29,7 @@ from __future__ import annotations
 
 from typing import Any, NoReturn
 
-from boxman import log
+from boxman.providers.session_base import SessionConfigMixin
 
 
 def _phase(method: str, phase: int) -> NotImplementedError:
@@ -36,103 +38,13 @@ def _phase(method: str, phase: int) -> NotImplementedError:
         f"VirtualBox provider: {method} lands in Phase {phase}")
 
 
-class VirtualBoxSession:
+class VirtualBoxSession(SessionConfigMixin):
     """A live session against the VirtualBox (VBoxManage) backend."""
 
-    def __init__(self, config: dict[str, Any] | None = None):
-        """
-        Initialize the session.
-
-        NOTE: construction is deliberately side-effect free — it must not shell
-        out to ``VBoxManage`` (that was the core defect in the legacy session,
-        and it is also required so the ``isinstance(x, ProviderSession)``
-        protocol check works on any host).
-
-        Args:
-            config: Optional project configuration dictionary.
-        """
-        #: Optional[Dict[str, Any]]: the configuration for this session
-        self.config = config or {}
-
-        #: logging.Logger: the logger instance
-        self.logger = log
-
-        # provider config from the project configuration — these are
-        # authoritative and must never be overridden by app-level defaults.
-        self._project_provider_config = self.config.get('provider', {}).get('virtualbox', {})
-
-        #: Dict[str, Any]: the base provider config (may be enriched with
-        #: app-level settings, but project-level keys always win via the
-        #: property getter).
-        self._provider_config_base = self._project_provider_config.copy()
-
-        #: the boxman manager instance (set by the CLI after construction)
-        self.manager = None
-
-    # --- config surface -----------------------------------------------------
-
-    @property
-    def provider_config(self) -> dict[str, Any]:
-        """
-        Return the effective provider config.
-
-        Project-level settings (from conf.yml) always take precedence over
-        app-level (boxman.yml) values.
-        """
-        merged = self._provider_config_base.copy()
-        merged.update(self._project_provider_config)
-        return merged
-
-    @provider_config.setter
-    def provider_config(self, value: dict[str, Any]) -> None:
-        """Set the base provider config (project-level keys still win)."""
-        self._provider_config_base = value
-
-    @property
-    def uri(self) -> str:
-        """
-        Connection URI.
-
-        VirtualBox has no libvirt-style connection URI; this exists to satisfy
-        the provider protocol and defaults to an empty string.
-        """
-        return self.provider_config.get('uri', '')
-
-    @uri.setter
-    def uri(self, value: str) -> None:
-        self._provider_config_base['uri'] = value
-
-    @property
-    def use_sudo(self) -> bool:
-        return self.provider_config.get('use_sudo', False)
-
-    @use_sudo.setter
-    def use_sudo(self, value: bool) -> None:
-        self._provider_config_base['use_sudo'] = value
-
-    def update_provider_config(self, new_config: dict[str, Any]) -> None:
-        """
-        Merge *new_config* into the base provider config; project-level
-        settings always win (enforced by the property getter).
-
-        Args:
-            new_config: Additional config keys (e.g. from the boxman.yml
-                ``providers`` section).
-        """
-        merged = self._provider_config_base.copy()
-        merged.update(new_config)
-        self._provider_config_base = merged
-
-    def update_provider_config_with_runtime(self) -> None:
-        """
-        No-op for VirtualBox.
-
-        VirtualBox only supports the ``local`` runtime (VBoxManage runs
-        directly on the host), so there is no runtime metadata to inject into
-        the provider config. Present so the manager can call it uniformly
-        across providers.
-        """
-        return None
+    provider_key = 'virtualbox'
+    #: VirtualBox has no libvirt-style connection URI; the property exists
+    #: to satisfy the provider protocol and defaults to an empty string.
+    default_uri = ''
 
     # --- image import -------------------------------------------------------
 

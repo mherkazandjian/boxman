@@ -9,7 +9,6 @@ directory next to the project's ``conf.yml``.
 
 import hashlib
 import os
-import re
 import shlex
 import shutil
 import sys
@@ -20,6 +19,7 @@ import yaml as pyyaml
 
 from boxman import log
 from boxman.runtime.base import RuntimeBase
+from boxman.utils.compose_names import sanitize_project_name
 from boxman.utils.shell import run as _shell_run
 
 
@@ -76,10 +76,10 @@ class DockerComposeRuntime(RuntimeBase):
         """
         Sanitize a project name for use as a Docker Compose project name.
 
-        Docker Compose project names must be lowercase alphanumeric
-        characters and hyphens only.
+        Thin wrapper over :func:`boxman.utils.compose_names.sanitize_project_name`
+        keeping this call site's rule set (no underscores, no fallback).
         """
-        return re.sub(r'[^a-z0-9-]', '-', name.lower()).strip('-')
+        return sanitize_project_name(name)
 
     @property
     def container_name(self) -> str:

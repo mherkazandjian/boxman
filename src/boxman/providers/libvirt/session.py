@@ -7,6 +7,7 @@ from xml.etree import ElementTree as ET
 
 from boxman import log
 
+from ..session_base import SessionConfigMixin
 from . import net_reconcile
 from .cdrom import CDROMManager
 from .clone_vm import CloneVM
@@ -24,61 +25,18 @@ from .virsh_edit import VirshEdit
 from .virsh_parse import parse_domblklist, parse_domiflist
 
 
-class LibVirtSession:
-    def __init__(self,
-                 config: dict[str, Any] | None = None):
-        """
-        Initialize the LibVirtSession.
+class LibVirtSession(SessionConfigMixin):
+    """
+    Live session against the libvirt (KVM/QEMU) backend.
 
-        Args:
-            config: Optional configuration dictionary
-        """
-        #: Optional[Dict[str, Any]]: The configuration for this session
-        self.config = config
+    The config surface (``provider_config`` / ``uri`` / ``use_sudo`` /
+    ``update_provider_config``) comes from
+    :class:`~boxman.providers.session_base.SessionConfigMixin`; only the
+    libvirt-specific defaults and the runtime enrichment are set here.
+    """
 
-        #: logging.Logger: the logger instance
-        self.logger = log
-
-        #: Dict[str, Any]: the effective provider config. The CLI hands the
-        #: session an already-merged dict (app-level defaults + runtime
-        #: injection, overlaid by project-level settings via
-        #: :func:`boxman.providers.merge_provider_configs`), so no further
-        #: precedence handling happens here.
-        self.provider_config = dict(
-            (config.get('provider', {}) or {}).get('libvirt', {}) or {})
-
-        #: the boxman manager instance (mainly to get access to the cache)
-        self.manager = None
-
-    @property
-    def uri(self) -> str:
-        return self.provider_config.get('uri', 'qemu:///system')
-
-    @uri.setter
-    def uri(self, value: str) -> None:
-        self.provider_config['uri'] = value
-
-    @property
-    def use_sudo(self) -> bool:
-        return self.provider_config.get('use_sudo', False)
-
-    @use_sudo.setter
-    def use_sudo(self, value: bool) -> None:
-        self.provider_config['use_sudo'] = value
-
-    def update_provider_config(self, new_config: dict[str, Any]) -> None:
-        """
-        Update provider_config with *new_config* (plain last-write-wins).
-
-        Precedence between app-level and project-level settings is resolved
-        upstream by :func:`boxman.providers.merge_provider_configs` before
-        the session is built; this is only used for runtime metadata
-        injection, which never carries project keys.
-
-        Args:
-            new_config: Additional config keys (e.g. runtime injection).
-        """
-        self.provider_config.update(new_config)
+    provider_key = 'libvirt'
+    default_uri = 'qemu:///system'
 
     def update_provider_config_with_runtime(self) -> None:
         """

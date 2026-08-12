@@ -20,7 +20,6 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from boxman import log
 from boxman.exceptions import ConfigError, ProvisionError
 from boxman.providers.docker_compose.compose_generator import (
     ComposeGenerator,
@@ -31,48 +30,20 @@ from boxman.providers.docker_compose.compose_runner import (
     DEFAULT_READINESS_TIMEOUT,
     ComposeRunner,
 )
+from boxman.providers.session_base import SessionConfigMixin
+from boxman.utils.compose_names import sanitize_project_name
 
 
-class DockerComposeSession:
+class DockerComposeSession(SessionConfigMixin):
     """Per-cluster docker-compose provider session."""
 
+    provider_key = "docker-compose"
+    #: docker-compose has no libvirt-style URI; the docker host is implicit.
+    default_uri = ""
+
     def __init__(self, config: dict[str, Any] | None = None) -> None:
-        self.config = config or {}
-        self.logger = log
-        #: set externally by scripts/app.py right after construction
-        self.manager = None
-        self._provider_config = (
-            (self.config.get("provider") or {}).get("docker-compose") or {}
-        )
+        super().__init__(config)
         self._generator = ComposeGenerator(logger=self.logger)
-
-    # -- ProviderSession protocol: config surface --------------------------
-
-    @property
-    def provider_config(self) -> dict[str, Any]:
-        return self._provider_config
-
-    @provider_config.setter
-    def provider_config(self, value: dict[str, Any]) -> None:
-        self._provider_config = value or {}
-
-    @property
-    def uri(self) -> str:
-        # docker-compose has no libvirt-style URI; the docker host is implicit.
-        return self._provider_config.get("uri", "")
-
-    @property
-    def use_sudo(self) -> bool:
-        return bool(self._provider_config.get("use_sudo", False))
-
-    def update_provider_config(self, new_config: dict[str, Any]) -> None:
-        self._provider_config = {**self._provider_config, **(new_config or {})}
-
-    def update_provider_config_with_runtime(self) -> None:
-        """No-op: the docker-compose provider requires ``runtime: local``,
-        so there is no runtime enrichment to apply. Present because the
-        manager calls it over every registered session."""
-        return None
 
     # -- coarse per-cluster lifecycle (the real work) ----------------------
 
@@ -816,7 +787,9 @@ def _snapshot_tag(project: str, box: str, snapshot_name: str) -> str:
 
 
 def _sanitize_project_name(name: str) -> str:
-    """Coerce *name* to a valid compose project name (``[a-z0-9][a-z0-9_-]*``)."""
-    slug = re.sub(r"[^a-z0-9_-]", "_", name.lower())
-    slug = slug.lstrip("_-") or "boxman"
-    return slug
+    """Coerce *name* to a valid compose project name (``[a-z0-9][a-z0-9_-]*``).
+
+    Thin wrapper over :func:`boxman.utils.compose_names.sanitize_project_name`
+    keeping this call site's rule set (underscores kept, ``boxman`` fallback).
+    """
+    return sanitize_project_name(name, allow_underscore=True)

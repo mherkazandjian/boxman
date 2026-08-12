@@ -96,12 +96,14 @@ class TestConstructionSideEffectFree:
 
 class TestConfigSurface:
 
-    def test_project_provider_config_wins(self):
+    def test_update_provider_config_is_last_write_wins(self):
+        """Same post-#110 semantics as the libvirt session: the constructor
+        receives an already-merged config, and ``update_provider_config`` is
+        a plain last-write-wins update (runtime metadata injection only)."""
         session = VirtualBoxSession(
             config={"provider": {"virtualbox": {"use_sudo": True}}})
-        # app-level default should not override the project-level value
         session.update_provider_config({"use_sudo": False, "vboxmanage_cmd": "vbm"})
-        assert session.use_sudo is True
+        assert session.use_sudo is False
         assert session.provider_config["vboxmanage_cmd"] == "vbm"
 
     def test_uri_defaults_to_empty_string(self):
