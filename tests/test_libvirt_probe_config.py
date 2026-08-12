@@ -119,9 +119,9 @@ class TestMixedProjectUsesLibvirtBlock:
         # the template already exists -> early return before any build
         virsh.execute.return_value = _virsh_result("rocky-template\n")
 
-        # the pre-check probe builds its VirshCommand from boxman.manager's
-        # top-level import (via _libvirt_provider_config)
-        with patch("boxman.manager.VirshCommand",
+        # the pre-check probe builds its VirshCommand from the images
+        # mixin's top-level import (via _libvirt_provider_config)
+        with patch("boxman.manager_parts.images.VirshCommand",
                    return_value=virsh) as ctor, \
              patch("boxman.providers.libvirt.cloudinit.CloudInitTemplate") as tpl:
             failed = mgr._create_templates_impl()

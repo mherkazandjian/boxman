@@ -49,7 +49,7 @@ class TestResolveIsos:
         mgr = _manager_with_config({
             "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}
         })
-        with patch("boxman.manager.ImageCache") as mock_cache_cls:
+        with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
             mock_cache = MagicMock()
             mock_cache.ensure.return_value = "/cache/talos.iso"
             mock_cache_cls.from_config.return_value = mock_cache
@@ -77,7 +77,7 @@ class TestResolveIsos:
                 "checksum": "sha256:abc123",
             }}
         })
-        with patch("boxman.manager.ImageCache") as mock_cache_cls:
+        with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
             mock_cache = MagicMock()
             mock_cache.enabled = True
             mock_cache.ensure.return_value = str(bad)
@@ -100,7 +100,7 @@ class TestResolveIsos:
         mgr = _manager_with_config({
             "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}
         })
-        with patch("boxman.manager.ImageCache") as mock_cache_cls:
+        with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
             mock_cache = MagicMock()
             mock_cache.ensure.return_value = None
             mock_cache_cls.from_config.return_value = mock_cache
@@ -114,7 +114,7 @@ class TestResolveIsos:
                 "checksum": "sha256:abc123",
             }}
         })
-        with patch("boxman.manager.ImageCache") as mock_cache_cls:
+        with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
             mock_cache = MagicMock()
             mock_cache.ensure.return_value = "/cache/talos.iso"
             mock_cache.verify_checksum.return_value = True
@@ -131,7 +131,7 @@ class TestResolveIsos:
                 "checksum": "sha256:abc123",
             }}
         })
-        with patch("boxman.manager.ImageCache") as mock_cache_cls:
+        with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
             mock_cache = MagicMock()
             mock_cache.ensure.return_value = "/cache/talos.iso"
             mock_cache_cls.from_config.return_value = mock_cache
