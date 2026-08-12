@@ -15,7 +15,6 @@ from argparse import RawTextHelpFormatter
 from datetime import datetime, timezone
 
 import boxman
-from boxman.manager import BoxmanManager
 from boxman.providers import PROVIDERS
 
 #: Default snapshot name — current UTC timestamp formatted for display.
@@ -216,7 +215,7 @@ def parse_args():
     # sub parser for importing images
     #
     parser_import_image = subparsers.add_parser('import-image', parents=[common], help='import an image')
-    parser_import_image.set_defaults(func=BoxmanManager.import_image)
+    parser_import_image.set_defaults(handler='import_image')
 
     parser_import_image.add_argument(
         '--uri',
@@ -268,7 +267,7 @@ def parse_args():
     parser_image_push = subparsers_image.add_parser(
         'push', parents=[common],
         help='push a qcow2 image (and optional metadata) to an OCI registry')
-    parser_image_push.set_defaults(func=BoxmanManager.push_image)
+    parser_image_push.set_defaults(handler='push_image')
     parser_image_push.add_argument(
         'image_ref',
         type=str,
@@ -295,7 +294,7 @@ def parse_args():
     parser_image_inspect = subparsers_image.add_parser(
         'inspect', parents=[common],
         help='inspect an OCI image reference (manifest + vmimage.json metadata)')
-    parser_image_inspect.set_defaults(func=BoxmanManager.inspect_image)
+    parser_image_inspect.set_defaults(handler='inspect_image')
     parser_image_inspect.add_argument(
         'image_ref',
         type=str,
@@ -308,7 +307,7 @@ def parse_args():
     parser_create_templates = subparsers.add_parser(
         'create-templates', parents=[common],
         help='create template VMs from cloud images using cloud-init')
-    parser_create_templates.set_defaults(func=BoxmanManager.create_templates)
+    parser_create_templates.set_defaults(handler='create_templates')
     parser_create_templates.add_argument(
         '--templates',
         type=str,
@@ -328,7 +327,7 @@ def parse_args():
     # sub parser for listing the registered projects
     #
     parser_list = subparsers.add_parser('list', parents=[common], help='list all registered projects')
-    parser_list.set_defaults(func=BoxmanManager.list_projects)
+    parser_list.set_defaults(handler='list_projects')
 
     list_format_group = parser_list.add_mutually_exclusive_group()
     list_format_group.add_argument(
@@ -362,7 +361,7 @@ def parse_args():
     # sub parser for provisioning a configuration
     #
     parser_prov = subparsers.add_parser('provision', parents=[common, force_parent, rebuild_templates_parent], help='provision a configuration')
-    parser_prov.set_defaults(func=BoxmanManager.provision)
+    parser_prov.set_defaults(handler='provision')
     parser_prov.add_argument(
         '--docker-compose',
         action='store_true',
@@ -377,7 +376,7 @@ def parse_args():
     parser_up = subparsers.add_parser(
         'up', parents=[common, force_parent, rebuild_templates_parent, recreate_networks_parent],
         help='bring up the infrastructure: provision if not created, start if powered off')
-    parser_up.set_defaults(func=BoxmanManager.up)
+    parser_up.set_defaults(handler='up')
     parser_up.add_argument(
         '--docker-compose',
         action='store_true',
@@ -399,7 +398,7 @@ def parse_args():
     parser_update = subparsers.add_parser(
         'update', parents=[common, recreate_networks_parent],
         help='apply config changes to already-provisioned VMs (CPU, memory, disks, add/remove VMs)')
-    parser_update.set_defaults(func=BoxmanManager.update)
+    parser_update.set_defaults(handler='update')
     parser_update.add_argument(
         '--dry-run',
         action='store_true',
@@ -428,7 +427,7 @@ def parse_args():
     parser_down = subparsers.add_parser(
         'down', parents=[common],
         help='bring down the infrastructure: save or suspend the state of all VMs')
-    parser_down.set_defaults(func=BoxmanManager.down)
+    parser_down.set_defaults(handler='down')
     parser_down.add_argument(
         '--suspend',
         action='store_true',
@@ -446,7 +445,7 @@ def parse_args():
     parser_destroy_rt.add_argument(
         '--auto-accept', '-y', action='store_true', default=False,
         help='skip the confirmation prompt and proceed immediately')
-    parser_destroy_rt.set_defaults(func=BoxmanManager.destroy_runtime)
+    parser_destroy_rt.set_defaults(handler='destroy_runtime')
 
     #
     # sub parser for the full-teardown 'destroy' command
@@ -464,13 +463,13 @@ def parse_args():
         help=('also remove template workdirs (~/boxman-templates by '
               'default, or a per-template workdir override). Off by '
               'default because templates are often shared across projects.'))
-    parser_destroy.set_defaults(func=BoxmanManager.destroy)
+    parser_destroy.set_defaults(handler='destroy')
 
     #
     # sub parser for deprovisioning a configuration
     #
     parser_deprov = subparsers.add_parser('deprovision', parents=[common], help='deprovision a configuration')
-    parser_deprov.set_defaults(func=BoxmanManager.deprovision)
+    parser_deprov.set_defaults(handler='deprovision')
     parser_deprov.add_argument(
         '--docker-compose',
         action='store_true',
@@ -498,7 +497,7 @@ def parse_args():
     # sub parser for the 'snapshot take' subsubcommand
     #
     parser_snap_take = subparsers_snap.add_parser('take', parents=[common, vms_parent], help='take a snapshot')
-    parser_snap_take.set_defaults(func=BoxmanManager.snapshot_take)
+    parser_snap_take.set_defaults(handler='snapshot_take')
     parser_snap_take.add_argument(
         '--cluster',
         type=str,
@@ -549,7 +548,7 @@ def parse_args():
     # sub parser for the 'snapshot list' subsubcommand
     #
     parser_snap_list = subparsers_snap.add_parser('list', parents=[common, vms_parent], help='list snapshots')
-    parser_snap_list.set_defaults(func=BoxmanManager.snapshot_list)
+    parser_snap_list.set_defaults(handler='snapshot_list')
 
     #
     # sub parser for the 'snapshot log' subsubcommand
@@ -557,7 +556,7 @@ def parse_args():
     parser_snap_log = subparsers_snap.add_parser(
         'log', parents=[common, vms_parent],
         help='git-log-style aggregated snapshot view across all vms')
-    parser_snap_log.set_defaults(func=BoxmanManager.snapshot_log)
+    parser_snap_log.set_defaults(handler='snapshot_log')
     parser_snap_log.add_argument(
         '-n', '--max',
         type=int,
@@ -589,7 +588,7 @@ def parse_args():
     # sub parser for the 'snapshot restore' subsubcommand
     #
     parser_snap_restore = subparsers_snap.add_parser('restore', parents=[common, vms_parent], help='restore the state of vms from snapshot')
-    parser_snap_restore.set_defaults(func=BoxmanManager.snapshot_restore)
+    parser_snap_restore.set_defaults(handler='snapshot_restore')
     parser_snap_restore.add_argument(
         '--cluster',
         type=str,
@@ -609,7 +608,7 @@ def parse_args():
     # sub parser for the 'snapshot delete' subsubcommand
     #
     parser_snap_delete = subparsers_snap.add_parser('delete', parents=[common, vms_parent], help='delete a snapshot')
-    parser_snap_delete.set_defaults(func=BoxmanManager.snapshot_delete)
+    parser_snap_delete.set_defaults(handler='snapshot_delete')
     parser_snap_delete.add_argument(
         '--cluster',
         type=str,
@@ -632,7 +631,7 @@ def parse_args():
         'collapse', parents=[common, vms_parent],
         help='merge snapshots newer than --to into the live head '
              '(target snapshot remains revertable)')
-    parser_snap_collapse.set_defaults(func=BoxmanManager.snapshot_collapse)
+    parser_snap_collapse.set_defaults(handler='snapshot_collapse')
     parser_snap_collapse.add_argument(
         '--to',
         type=str,
@@ -668,7 +667,7 @@ def parse_args():
     parser_restore = subparsers.add_parser(
         'restore', parents=[common],
         help='restore all VMs to their latest snapshot')
-    parser_restore.set_defaults(func=BoxmanManager.snapshot_restore, snapshot_name=None)
+    parser_restore.set_defaults(handler='snapshot_restore', snapshot_name=None)
 
     #
     # sub parser for the 'storage' subcommand
@@ -684,7 +683,7 @@ def parse_args():
     #
     parser_storage_df = subparsers_storage.add_parser(
         'df', parents=[common, vms_parent], help='show per-vm disk usage and reclaim estimate')
-    parser_storage_df.set_defaults(func=BoxmanManager.storage_df)
+    parser_storage_df.set_defaults(handler='storage_df')
 
     #
     # sub parser for the 'storage trim' subsubcommand
@@ -692,7 +691,7 @@ def parse_args():
     parser_storage_trim = subparsers_storage.add_parser(
         'trim', parents=[common, vms_parent],
         help='run fstrim inside running guests via qemu-guest-agent')
-    parser_storage_trim.set_defaults(func=BoxmanManager.storage_trim)
+    parser_storage_trim.set_defaults(handler='storage_trim')
     parser_storage_trim.add_argument(
         '--dry-run',
         action='store_true',
@@ -706,7 +705,7 @@ def parse_args():
     parser_storage_compact = subparsers_storage.add_parser(
         'compact', parents=[common, vms_parent],
         help='reclaim qcow2 space (sparsify or qemu-img convert)')
-    parser_storage_compact.set_defaults(func=BoxmanManager.storage_compact)
+    parser_storage_compact.set_defaults(handler='storage_compact')
     parser_storage_compact.add_argument(
         '--method',
         choices=['auto', 'sparsify', 'convert', 'convert-compressed'],
@@ -741,7 +740,7 @@ def parse_args():
     parser_storage_optimize = subparsers_storage.add_parser(
         'optimize', parents=[common, vms_parent],
         help='trim guests then compact qcow2 files (orchestrator)')
-    parser_storage_optimize.set_defaults(func=BoxmanManager.storage_optimize)
+    parser_storage_optimize.set_defaults(handler='storage_optimize')
     parser_storage_optimize.add_argument(
         '--method',
         choices=['auto', 'sparsify', 'convert', 'convert-compressed'],
@@ -784,7 +783,7 @@ def parse_args():
         'compress-snapshots', parents=[common, vms_parent],
         help='zstd-compress (or decompress) snapshot memory .raw files')
     parser_storage_compress.set_defaults(
-        func=BoxmanManager.storage_compress_snapshots)
+        handler='storage_compress_snapshots')
     parser_storage_compress.add_argument(
         '--level',
         type=int,
@@ -811,25 +810,25 @@ def parse_args():
     # sub parser for the 'control suspend' subsubcommand
     #
     parser_ctrl_suspend = subparsers_ctrl.add_parser('suspend', parents=[common, vms_parent, cluster_parent], help='suspend vms')
-    parser_ctrl_suspend.set_defaults(func=BoxmanManager.suspend_vm)
+    parser_ctrl_suspend.set_defaults(handler='suspend_vm')
 
     #
     # sub parser for the 'control resume' subsubcommand
     #
     parser_ctrl_resume = subparsers_ctrl.add_parser('resume', parents=[common, vms_parent, cluster_parent], help='resume vms')
-    parser_ctrl_resume.set_defaults(func=BoxmanManager.resume_vm)
+    parser_ctrl_resume.set_defaults(handler='resume_vm')
 
     #
     # sub parser for the 'control save' subsubcommand
     #
     parser_ctrl_save = subparsers_ctrl.add_parser('save', parents=[common, vms_parent, cluster_parent], help='save the state of vms')
-    parser_ctrl_save.set_defaults(func=BoxmanManager.save_vm)
+    parser_ctrl_save.set_defaults(handler='save_vm')
 
     #
     # sub parser for the 'control start' subsubcommand
     #
     parser_ctrl_start = subparsers_ctrl.add_parser('start', parents=[common, vms_parent, cluster_parent], help='start the vms')
-    parser_ctrl_start.set_defaults(func=BoxmanManager.start_vm)
+    parser_ctrl_start.set_defaults(handler='start_vm')
     parser_ctrl_start.add_argument(
         '--restore',
         action='store_true',
@@ -863,7 +862,7 @@ def parse_args():
         ),
         formatter_class=RawTextHelpFormatter
     )
-    parser_run.set_defaults(func=BoxmanManager.run_task)
+    parser_run.set_defaults(handler='run_task')
 
     parser_run.add_argument(
         'task_name',
@@ -914,7 +913,7 @@ def parse_args():
         ),
         formatter_class=RawTextHelpFormatter
     )
-    parser_ps.set_defaults(func=BoxmanManager.ps)
+    parser_ps.set_defaults(handler='ps')
     parser_ps.add_argument(
         '-p',
         action='store_true',
@@ -946,7 +945,7 @@ def parse_args():
         ),
         formatter_class=RawTextHelpFormatter
     )
-    parser_conf.set_defaults(func=BoxmanManager.show_conf)
+    parser_conf.set_defaults(handler='show_conf')
     parser_conf.add_argument(
         '--json',
         action='store_true',
@@ -971,7 +970,7 @@ def parse_args():
         ),
         formatter_class=RawTextHelpFormatter
     )
-    parser_ssh.set_defaults(func=BoxmanManager.ssh_session)
+    parser_ssh.set_defaults(handler='ssh_session')
 
     parser_ssh.add_argument(
         'vm_name',
@@ -1000,7 +999,7 @@ def parse_args():
         ),
         formatter_class=RawTextHelpFormatter
     )
-    parser_exec.set_defaults(func=BoxmanManager.exec_container)
+    parser_exec.set_defaults(handler='exec_container')
     parser_exec.add_argument(
         'target',
         type=str,
@@ -1040,7 +1039,7 @@ def parse_args():
         ),
         formatter_class=RawTextHelpFormatter
     )
-    parser_pxe.set_defaults(func=BoxmanManager.pxe_boot)
+    parser_pxe.set_defaults(handler='pxe_boot')
     parser_pxe.add_argument(
         '--vm',
         type=str,
@@ -1093,21 +1092,21 @@ def parse_args():
 
     parser_netlab_deploy = subparsers_netlab.add_parser(
         'deploy', parents=[common], help='render topology and deploy the containerlab lab')
-    parser_netlab_deploy.set_defaults(func=BoxmanManager.netlab_deploy)
+    parser_netlab_deploy.set_defaults(handler='netlab_deploy')
 
     parser_netlab_destroy = subparsers_netlab.add_parser(
         'destroy', parents=[common], help='tear down the containerlab lab (leaves VMs alone)')
-    parser_netlab_destroy.set_defaults(func=BoxmanManager.netlab_destroy)
+    parser_netlab_destroy.set_defaults(handler='netlab_destroy')
 
     parser_netlab_inspect = subparsers_netlab.add_parser(
         'inspect', parents=[common], help='print containerlab inspect --format json')
-    parser_netlab_inspect.set_defaults(func=BoxmanManager.netlab_inspect)
+    parser_netlab_inspect.set_defaults(handler='netlab_inspect')
 
     parser_netlab_ssh = subparsers_netlab.add_parser(
         'ssh', parents=[common],
         help='print the ssh command for a lab node (e.g. $(boxman netlab ssh sw1))'
     )
-    parser_netlab_ssh.set_defaults(func=BoxmanManager.netlab_ssh)
+    parser_netlab_ssh.set_defaults(handler='netlab_ssh')
     parser_netlab_ssh.add_argument(
         'node',
         type=str,

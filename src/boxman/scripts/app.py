@@ -17,6 +17,24 @@ from boxman.providers.libvirt.import_image import ImageImporter
 from boxman.scripts.cli_parser import parse_args, resolve_verbosity
 from boxman.utils.jinja_env import create_jinja_env
 
+#: Names of the :class:`BoxmanManager` methods the CLI may dispatch to.
+#: The parser declares them via ``set_defaults(handler='<name>')`` and
+#: :func:`_main` resolves the bound method with ``getattr`` at dispatch
+#: time, so decorating or aliasing a handler method can never silently
+#: break dispatch (the old ``args.func is BoxmanManager.x`` identity
+#: comparisons did).
+_CLI_HANDLERS = frozenset({
+    'import_image', 'push_image', 'inspect_image', 'create_templates',
+    'list_projects', 'provision', 'up', 'update', 'down',
+    'destroy_runtime', 'destroy', 'deprovision', 'snapshot_take',
+    'snapshot_list', 'snapshot_log', 'snapshot_restore', 'snapshot_delete',
+    'snapshot_collapse', 'storage_df', 'storage_trim', 'storage_compact',
+    'storage_optimize', 'storage_compress_snapshots', 'suspend_vm',
+    'resume_vm', 'save_vm', 'start_vm', 'run_task', 'ps', 'show_conf',
+    'ssh_session', 'exec_container', 'pxe_boot', 'netlab_deploy',
+    'netlab_destroy', 'netlab_inspect', 'netlab_ssh',
+})
+
 
 def ensure_virtualbox_runtime_is_local(runtime: str) -> None:
     """
@@ -183,7 +201,7 @@ def _main():
     # Only the 'run' subcommand accepts dynamic task flags;
     # all other subcommands should reject unknown arguments.
     if remaining and (
-        not hasattr(args, "func") or args.func != BoxmanManager.run_task
+        getattr(args, 'handler', None) != 'run_task'
     ):
         arg_parser.error(f"unrecognized arguments: {' '.join(remaining)}")
 
@@ -203,27 +221,35 @@ def _main():
         print(f'v{boxman.metadata.version}')
         sys.exit(0)
 
-    if not hasattr(args, 'func'):
+    if not hasattr(args, 'handler'):
         arg_parser.print_help()
         sys.exit(1)
 
-    if args.func == BoxmanManager.list_projects:
+    # Defensive allowlist: the parser only ever sets these names, but
+    # dispatch resolves them with getattr — reject anything unexpected
+    # instead of risking an attribute lookup on the manager.
+    if args.handler not in _CLI_HANDLERS:
+        arg_parser.error(f"unknown command handler: {args.handler}")
+
+    if args.handler == 'list_projects':
         manager = BoxmanManager(config=None)
-        args.func(manager, args)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # Handle 'image push' — provider-agnostic; no project config needed.
-    if args.func == BoxmanManager.push_image:
-        args.func(None, args)
+    if args.handler == 'push_image':
+        manager = BoxmanManager(config=None)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # Handle 'image inspect' — provider-agnostic; no project config needed.
-    if args.func == BoxmanManager.inspect_image:
-        args.func(None, args)
+    if args.handler == 'inspect_image':
+        manager = BoxmanManager(config=None)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # Handle 'ps' — needs config and virsh but not a full provider session
-    if args.func == BoxmanManager.ps:
+    if args.handler == 'ps':
         import contextlib
         _ps_json = getattr(args, 'json', False)
         _cm = suppressed() if _ps_json else contextlib.nullcontext()
@@ -244,7 +270,7 @@ def _main():
                     os.path.dirname(args.conf))
                 if 'project' in manager.config:
                     manager.runtime_instance.project_name = manager.config['project']
-            args.func(manager, args)
+            getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # 'snapshot log' is a viewer command — suppress INFO logging across the
@@ -252,11 +278,11 @@ def _main():
     # execute spam from per-VM snapshot-dumpxml/info/current calls would
     # otherwise drown the few lines of actual output. The dispatch then
     # falls through to the regular provider-setup path below.
-    if args.func == BoxmanManager.snapshot_log:
+    if args.handler == 'snapshot_log':
         logging.getLogger('boxman').setLevel(logging.CRITICAL + 1)
 
     # Handle 'conf' — show effective merged configuration
-    if args.func == BoxmanManager.show_conf:
+    if args.handler == 'show_conf':
         manager = BoxmanManager(config=args.conf)
         if not manager.config:
             log.error("no project config found (conf.yml)")
@@ -273,11 +299,11 @@ def _main():
         project_provider = manager.config.get('provider', {}).get(provider_type, {})
         merged_provider = merge_provider_configs(
             provider_conf_with_runtime, project_provider)
-        args.func(manager, args, merged_provider=merged_provider)
+        getattr(manager, args.handler)(args, merged_provider=merged_provider)
         sys.exit(0)
 
     # Handle 'run' — needs config but not a provider session or runtime
-    if args.func == BoxmanManager.run_task:
+    if args.handler == 'run_task':
         manager = BoxmanManager(config=args.conf)
         if not manager.config:
             log.error("no project config found (conf.yml)")
@@ -289,32 +315,32 @@ def _main():
                     "Define tasks or use --cmd for ad-hoc commands."
                 )
                 sys.exit(1)
-        args.func(manager, args)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # Handle 'ssh' — needs config but not a provider session or runtime
-    if args.func == BoxmanManager.ssh_session:
+    if args.handler == 'ssh_session':
         manager = BoxmanManager(config=args.conf)
         if not manager.config:
             log.error("no project config found (conf.yml)")
             sys.exit(1)
-        args.func(manager, args)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     # Handle 'exec' — container access; needs config but not the full libvirt
     # provider setup (the dc session is created on demand via _dc_session).
-    if args.func == BoxmanManager.exec_container:
+    if args.handler == 'exec_container':
         manager = BoxmanManager(config=args.conf)
         if not manager.config:
             log.error("no project config found (conf.yml)")
             sys.exit(1)
-        args.func(manager, args)
+        getattr(manager, args.handler)(args)
         sys.exit(0)
 
     else:
         # use the config of a deployment specified on the cmd line only if
         # not importing an image
-        config = None if args.func == BoxmanManager.import_image else args.conf
+        config = None if args.handler == 'import_image' else args.conf
         manager = BoxmanManager(config=config)
 
         # load the boxman app configuration
@@ -339,7 +365,7 @@ def _main():
         # before we lock it into the bind-mount list. Skip for destroy
         # (we're about to nuke the workdir anyway — prompting would be
         # absurd, especially with -y).
-        if args.func != BoxmanManager.destroy:
+        if args.handler != 'destroy':
             manager.reconcile_workdirs_with_runtime(
                 manager.runtime_instance.name)
 
@@ -379,25 +405,25 @@ def _main():
 
         # Handle destroy-runtime — tear down Docker resources without
         # starting the container first
-        if args.func == BoxmanManager.destroy_runtime:
-            args.func(manager, args)
+        if args.handler == 'destroy_runtime':
+            getattr(manager, args.handler)(args)
             sys.exit(0)
 
         # Commands that manage the runtime themselves (they start it
         # best-effort rather than hard-requiring it, so they still work
         # when the runtime is broken or unreachable).
-        manages_own_runtime = args.func == BoxmanManager.destroy
+        manages_own_runtime = args.handler == 'destroy'
 
         if not manages_own_runtime:
             # ensure the runtime environment is up and ready before proceeding
             manager.runtime_instance.ensure_ready()
 
         # Handle create-templates — it doesn't need a full provider session
-        if args.func == BoxmanManager.create_templates:
-            args.func(manager, args)
+        if args.handler == 'create_templates':
+            getattr(manager, args.handler)(args)
             sys.exit(0)
 
-        if args.func == BoxmanManager.import_image:
+        if args.handler == 'import_image':
 
             # if the provider is specified in the cmd line, use it
             if args.provider:
@@ -424,7 +450,7 @@ def _main():
         # Build a session for every provider declared in the project config
         # via the registry (import-image keeps its single-provider flow —
         # the provider type comes from the manifest / CLI flag above).
-        if args.func == BoxmanManager.import_image:
+        if args.handler == 'import_image':
             provider_types = [provider_type]
         else:
             provider_types = (
@@ -494,7 +520,7 @@ def _main():
             session.manager = manager
             manager.register_session(_ptype, session)
 
-        args.func(manager, args)
+        getattr(manager, args.handler)(args)
 
 
 if __name__ == '__main__':
