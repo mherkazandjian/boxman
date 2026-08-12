@@ -8,6 +8,7 @@ from multiprocessing import Process, Queue
 from typing import Any
 
 from boxman import log
+from boxman.exceptions import ConfigError, ProvisionError
 from boxman.loggers.logger import suppressed
 from boxman.manager_parts.images import ImagesMixin
 from boxman.providers.libvirt.commands import VirshCommand
@@ -807,14 +808,12 @@ class VMsMixin:
                 # ensure templates exist -- cloning from one that failed to
                 # build produces VMs whose cloud-init never ran
                 if not self.ensure_templates_exist():
-                    self.logger.error(
+                    raise ProvisionError(
                         "aborting: not every template could be created")
-                    return
                 try:
                     self.validate_base_images()
                 except ValueError as exc:
-                    self.logger.error(str(exc))
-                    return
+                    raise ConfigError(str(exc)) from exc
 
                 self._clone_and_configure_new_vms(new_vm_names)
 

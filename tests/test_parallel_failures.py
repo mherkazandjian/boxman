@@ -77,13 +77,16 @@ class TestRestoreRetryLoop:
 
     def test_raising_restore_worker_never_reports_success(self, monkeypatch):
         """The old queue-drain loop printed 'all VMs restored successfully'
-        when a worker died before queue.put — it must retry/fail instead."""
+        when a worker died before queue.put — it must retry, then raise
+        SnapshotError after the final round (#85 item 3)."""
+        from boxman.exceptions import SnapshotError
         monkeypatch.setattr("boxman.manager_parts.snapshots.time.sleep", lambda _s: None)
         mgr = _manager()
         mgr.provider.snapshot_restore.side_effect = RuntimeError("libvirt gone")
         mgr.provider.validate_snapshot.return_value = (True, [])
         ns = types.SimpleNamespace(snapshot_name="s1", vms="all", cluster=None)
-        mgr.snapshot_restore(ns)
+        with pytest.raises(SnapshotError, match="gave up after 20 rounds"):
+            mgr.snapshot_restore(ns)
         infos = [c.args[0] for c in mgr.logger.info.call_args_list if c.args]
         assert not any("all VMs restored successfully" in m for m in infos)
         errors = [c.args[0] for c in mgr.logger.error.call_args_list if c.args]
