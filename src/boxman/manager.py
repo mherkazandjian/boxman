@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import time
@@ -27,6 +26,7 @@ from boxman.providers.libvirt.commands import VirshCommand
 from boxman.providers.libvirt.virsh_parse import parse_domblklist
 from boxman.runtime import RuntimeBase, create_runtime
 from boxman.task_runner import TaskRunner
+from boxman.utils.http_download import download_url
 from boxman.utils.io import write_files
 from boxman.utils.jinja_env import create_jinja_env
 from boxman.utils.references import resolve_reference
@@ -50,6 +50,51 @@ def _parallel_worker(result_queue, label, target, args):
         result_queue.put((label, True, target(*args)))
     except Exception as exc:
         result_queue.put((label, False, f"{type(exc).__name__}: {exc}"))
+
+
+def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
+                      max_retries: int = 5) -> None:
+    """
+    Clone one VM, retrying transient (e.g. storage-pool-busy) failures.
+
+    Module-level — not a method or closure — so it stays picklable as a
+    ``multiprocessing.Process`` target. Shared by
+    :meth:`BoxmanManager.clone_vms` and
+    :meth:`BoxmanManager._clone_and_configure_new_vms`.
+    """
+    for attempt in range(1, max_retries + 1):
+        last_attempt = attempt == max_retries
+        # Suppress error-level logs on all retryable attempts so that
+        # transient pool-busy failures don't appear as errors; only the
+        # final attempt logs errors normally. suppressed() restores the
+        # prior level (not a hardcoded DEBUG) so -v/-vv survives retries.
+        _cm = (contextlib.nullcontext() if last_attempt
+               else suppressed(logging.CRITICAL))
+        try:
+            with _cm:
+                src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
+                if not src_vm_name and not BoxmanManager._is_diskless_boot(vm_info):
+                    raise ValueError(
+                        f"no base_image for VM '{new_vm_name}': "
+                        f"set base_image at the cluster or VM level"
+                    )
+                provider.clone_vm(
+                    src_vm_name=src_vm_name,
+                    new_vm_name=new_vm_name,
+                    info=vm_info,
+                    workdir=cluster['workdir']
+                )
+            return
+        except Exception:
+            if not last_attempt:
+                delay = attempt * 2
+                log.warning(
+                    f"clone {new_vm_name} failed (attempt {attempt}/{max_retries}), "
+                    f"retrying in {delay}s"
+                )
+                time.sleep(delay)
+            else:
+                raise
 
 
 class BoxmanManager:
@@ -2171,29 +2216,14 @@ class BoxmanManager:
                     vm_info['base_image'] = _resolve(vm_info.get('base_image'))
 
     def _download_iso(self, url: str, dst_path: str) -> bool:
-        """Download an ISO from a URL, trying wget then curl.
+        """Download an ISO from a URL, trying wget then curl then urllib.
 
-        The URL and destination are shell-quoted (a config-supplied URL may
-        contain ``$``/backticks). curl uses ``--fail`` so an HTTP 4xx/5xx error
-        page is not written and accepted as a valid ISO (wget already fails on
-        HTTP errors).
+        Thin wrapper over :func:`boxman.utils.http_download.download_url`
+        (which shell-quotes URL/destination and uses ``curl --fail`` so an
+        HTTP 4xx/5xx error page is not accepted as a valid ISO).
         """
         self.logger.info(f"downloading ISO {url} -> {dst_path}")
-        q_url = shlex.quote(url)
-        q_dst = shlex.quote(dst_path)
-        result = run(
-            f'wget --progress=dot:mega -O {q_dst} {q_url}',
-            hide=False, warn=True,
-        )
-        if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
-            self.logger.info("ISO download complete (wget)")
-            return True
-        result = run(
-            f'curl -fL --progress-bar -o {q_dst} {q_url}',
-            hide=False, warn=True,
-        )
-        if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
-            self.logger.info("ISO download complete (curl)")
+        if download_url(url, dst_path):
             return True
         self.logger.error(f"failed to download ISO from {url}")
         return False
@@ -3253,42 +3283,6 @@ class BoxmanManager:
                 seen_workdirs.add(workdir)
                 self._ensure_libvirt_storage_pool(workdir, cluster_name)
 
-        def _clone(cluster, vm_info, new_vm_name):
-            max_retries = 5
-            for attempt in range(1, max_retries + 1):
-                last_attempt = attempt == max_retries
-                # Suppress error-level logs on all retryable attempts so that
-                # transient pool-busy failures don't appear as errors; only the
-                # final attempt logs errors normally. suppressed() restores the
-                # prior level (not a hardcoded DEBUG) so -v/-vv survives retries.
-                _cm = (contextlib.nullcontext() if last_attempt
-                       else suppressed(logging.CRITICAL))
-                try:
-                    with _cm:
-                        src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
-                        if not src_vm_name and not self._is_diskless_boot(vm_info):
-                            raise ValueError(
-                                f"no base_image for VM '{new_vm_name}': "
-                                f"set base_image at the cluster or VM level"
-                            )
-                        self.provider.clone_vm(
-                            src_vm_name=src_vm_name,
-                            new_vm_name=new_vm_name,
-                            info=vm_info,
-                            workdir=cluster['workdir']
-                        )
-                    return
-                except Exception:
-                    if not last_attempt:
-                        delay = attempt * 2
-                        self.logger.warning(
-                            f"clone {new_vm_name} failed (attempt {attempt}/{max_retries}), "
-                            f"retrying in {delay}s"
-                        )
-                        time.sleep(delay)
-                    else:
-                        raise
-
         # resolve isos/cdroms/networks in place so both the clone subprocesses
         # and the later configure/start step see the resolved values
         self._resolve_iso_config()
@@ -3297,7 +3291,8 @@ class BoxmanManager:
             for cluster, vm_info, new_vm_name in vm_clone_tasks()
         ]
         processes = [
-            Process(target=_clone, args=(cluster, vm_info, new_vm_name))
+            Process(target=_clone_with_retry,
+                    args=(self.provider, cluster, vm_info, new_vm_name))
             for cluster, vm_info, new_vm_name in clone_tasks
         ]
         [p.start() for p in processes]
@@ -4297,27 +4292,7 @@ class BoxmanManager:
                 )
 
         # use adaptive wait for ip address assignment
-        cls.logger.info("waiting for vms to initialize and get the ip addresses...")
-        wait_time = 1  # Start with 1 second
-        max_wait = 600  # Maximum total wait time (10 minutes)
-        total_waited = 0
-
-        while total_waited < max_wait:
-            # check if all vms have ip addresses
-            if cls.get_connect_info():
-                cls.logger.info(f"All vms have ip addresses (waited {total_waited}s)")
-                break
-
-            # if we get here, at least one vm doesn't have an ip yet
-            cls.logger.info(f"wait {wait_time}s for ip assignment (total waited: {total_waited}s)")
-            time.sleep(wait_time)
-            total_waited += wait_time
-            # double the wait time up to 1 minute max per iteration
-            wait_time = min(wait_time * 2, 60)
-
-        if total_waited >= max_wait:
-            cls.logger.warning(
-                "Reached maximum wait time. Some vms may not have ip addresses.")
+        cls.wait_for_vm_ips(cls._get_project_vm_names(), max_wait=600)
 
         # Eject cdrom (seed.iso) from every VM now that cloud-init has run.
         # This prevents snapshot-related failures caused by qcow2-over-raw
@@ -4508,26 +4483,7 @@ class BoxmanManager:
         [p.join() for p in processes]
 
         # Wait for IP addresses
-        cls.logger.info("waiting for VMs to get IP addresses...")
-        wait_time = 1
-        max_wait = 300
-        total_waited = 0
-
-        while total_waited < max_wait:
-            if cls.get_connect_info():
-                cls.logger.info(
-                    f"all VMs have IP addresses (waited {total_waited}s)")
-                break
-            cls.logger.info(
-                f"waiting {wait_time}s for IP assignment "
-                f"(total waited: {total_waited}s)")
-            time.sleep(wait_time)
-            total_waited += wait_time
-            wait_time = min(wait_time * 2, 60)
-
-        if total_waited >= max_wait:
-            cls.logger.warning(
-                "reached maximum wait time. Some VMs may not have IP addresses.")
+        cls.wait_for_vm_ips(cls._get_project_vm_names(), max_wait=300)
 
         # Reconcile the containerlab lab after the VMs are up so the
         # shared bridges have live endpoints on both sides.
@@ -6270,42 +6226,6 @@ class BoxmanManager:
                         self._ensure_libvirt_storage_pool(workdir, cluster_name)
 
         # clone new VMs (parallel with retry)
-        def _clone(cluster, vm_info, new_vm_name):
-            max_retries = 5
-            for attempt in range(1, max_retries + 1):
-                last_attempt = attempt == max_retries
-                # Suppress error-level logs on all retryable attempts so that
-                # transient pool-busy failures don't appear as errors; only the
-                # final attempt logs errors normally. suppressed() restores the
-                # prior level (not a hardcoded DEBUG) so -v/-vv survives retries.
-                _cm = (contextlib.nullcontext() if last_attempt
-                       else suppressed(logging.CRITICAL))
-                try:
-                    with _cm:
-                        src_vm_name = vm_info.get('base_image') or cluster.get('base_image')
-                        if not src_vm_name and not self._is_diskless_boot(vm_info):
-                            raise ValueError(
-                                f"no base_image for VM '{new_vm_name}': "
-                                f"set base_image at the cluster or VM level"
-                            )
-                        self.provider.clone_vm(
-                            src_vm_name=src_vm_name,
-                            new_vm_name=new_vm_name,
-                            info=vm_info,
-                            workdir=cluster['workdir']
-                        )
-                    return
-                except Exception:
-                    if not last_attempt:
-                        delay = attempt * 2
-                        self.logger.warning(
-                            f"clone {new_vm_name} failed (attempt {attempt}/{max_retries}), "
-                            f"retrying in {delay}s"
-                        )
-                        time.sleep(delay)
-                    else:
-                        raise
-
         # resolve isos/cdroms/networks in place so both the clone subprocesses
         # and the configure/start step below see the resolved values
         self._resolve_iso_config()
@@ -6317,7 +6237,8 @@ class BoxmanManager:
                     clone_tasks.append((cluster, vm_info, full))
 
         processes = [
-            Process(target=_clone, args=(cluster, vm_info, new_vm_name))
+            Process(target=_clone_with_retry,
+                    args=(self.provider, cluster, vm_info, new_vm_name))
             for cluster, vm_info, new_vm_name in clone_tasks
         ]
         [p.start() for p in processes]
@@ -6663,23 +6584,7 @@ class BoxmanManager:
 
                 # wait for IPs on new VMs
                 cls.logger.info("waiting for new VMs to get IP addresses...")
-                wait_time = 1
-                max_wait = 300
-                total_waited = 0
-                while total_waited < max_wait:
-                    all_have_ips = True
-                    for vm_name in new_vm_names:
-                        ips = cls.provider.get_vm_ip_addresses(vm_name)
-                        if not ips:
-                            all_have_ips = False
-                            break
-                    if all_have_ips:
-                        cls.logger.info(
-                            f"all new VMs have IP addresses (waited {total_waited}s)")
-                        break
-                    time.sleep(wait_time)
-                    total_waited += wait_time
-                    wait_time = min(wait_time * 2, 60)
+                cls.wait_for_vm_ips(new_vm_names, max_wait=300)
 
                 # eject cdrom on new VMs
                 for vm_name in new_vm_names:
