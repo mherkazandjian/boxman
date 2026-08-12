@@ -65,7 +65,7 @@ class TestBusForTarget:
             written["xml"] = Path(args[2]).read_text()
             return _result()
 
-        with patch.object(cd, "execute", side_effect=capture):
+        with patch.object(cd.virsh, "execute", side_effect=capture):
             assert cd.detach_cdrom("sda") is True
         assert "dev='sda' bus='sata'" in written["xml"]
 
@@ -79,7 +79,7 @@ class TestFindNextAvailableTarget:
     )
 
     def test_returns_hda_when_slots_free(self, cd: CDROMManager):
-        with patch.object(cd, "execute", return_value=_result(stdout=self.DOMBLKLIST)):
+        with patch.object(cd.virsh, "execute", return_value=_result(stdout=self.DOMBLKLIST)):
             # vda is used, so hda is free
             assert cd._find_next_available_target() == "hda"
 
@@ -90,7 +90,7 @@ class TestFindNextAvailableTarget:
             "file  disk    hda     /tmp/x\n"
             "file  disk    hdb     /tmp/y\n"
         )
-        with patch.object(cd, "execute", return_value=_result(stdout=blk)):
+        with patch.object(cd.virsh, "execute", return_value=_result(stdout=blk)):
             assert cd._find_next_available_target() == "hdc"
 
     def test_falls_back_to_sd_when_all_ide_used(self, cd: CDROMManager):
@@ -102,7 +102,7 @@ class TestFindNextAvailableTarget:
             "file  disk    hdc     /tmp/c\n"
             "file  disk    hdd     /tmp/d\n"
         )
-        with patch.object(cd, "execute", return_value=_result(stdout=blk)):
+        with patch.object(cd.virsh, "execute", return_value=_result(stdout=blk)):
             assert cd._find_next_available_target() == "sda"
 
 
@@ -116,7 +116,7 @@ class TestAttachCDROM:
         iso = tmp_path / "ubuntu.iso"
         iso.write_bytes(b"fake iso")
         with patch.object(cd, "_find_next_available_target", return_value="hdc"), \
-             patch.object(cd, "execute", return_value=_result()) as execute:
+             patch.object(cd.virsh, "execute", return_value=_result()) as execute:
             assert cd.attach_cdrom(str(iso)) is True
         args, _kwargs = execute.call_args
         assert args[0] == "attach-device"
@@ -127,7 +127,7 @@ class TestAttachCDROM:
         iso = tmp_path / "ubuntu.iso"
         iso.write_bytes(b"fake iso")
         with patch.object(cd, "_find_next_available_target", return_value="hdc"), \
-             patch.object(cd, "execute", return_value=_result()) as execute:
+             patch.object(cd.virsh, "execute", return_value=_result()) as execute:
             cd.attach_cdrom(str(iso), persistent=False)
         args, _kwargs = execute.call_args
         assert "--persistent" not in args
@@ -142,7 +142,7 @@ class TestAttachCDROM:
         iso = tmp_path / "u.iso"
         iso.write_bytes(b"x")
         with patch.object(cd, "_find_next_available_target", return_value="hdc"), \
-             patch.object(cd, "execute", return_value=_result(ok=False, stderr="nope")) as execute:
+             patch.object(cd.virsh, "execute", return_value=_result(ok=False, stderr="nope")) as execute:
             assert cd.attach_cdrom(str(iso)) is False
         # warn=True keeps the error branch live — without it execute raises
         # and the `if not result.ok` check is dead code (#85 item 38)
@@ -163,7 +163,7 @@ class TestAttachCDROM:
 
         with patch.object(cd, "_find_next_available_target", return_value="hdc"), \
              patch("boxman.providers.libvirt.cdrom.tempfile.NamedTemporaryFile", side_effect=tracker), \
-             patch.object(cd, "execute", side_effect=ValueError("boom")):
+             patch.object(cd.virsh, "execute", side_effect=ValueError("boom")):
             assert cd.attach_cdrom(str(iso)) is False
         # temp file should have been unlinked
         assert recorded_path["path"] is not None
@@ -173,14 +173,14 @@ class TestAttachCDROM:
 class TestDetachCDROM:
 
     def test_success_includes_readonly_xml(self, cd: CDROMManager):
-        with patch.object(cd, "execute", return_value=_result()) as execute:
+        with patch.object(cd.virsh, "execute", return_value=_result()) as execute:
             assert cd.detach_cdrom("hdc") is True
         # first call is detach-device
         args, _kwargs = execute.call_args
         assert args[0] == "detach-device"
 
     def test_failure_returns_false(self, cd: CDROMManager):
-        with patch.object(cd, "execute", return_value=_result(ok=False, stderr="x")) as execute:
+        with patch.object(cd.virsh, "execute", return_value=_result(ok=False, stderr="x")) as execute:
             assert cd.detach_cdrom("hdc") is False
         # warn=True keeps the error branch live — without it execute raises
         # and the `if not result.ok` check is dead code (#85 item 38)
@@ -195,7 +195,7 @@ class TestChangeMedia:
     def test_change_media_happy_path(self, cd: CDROMManager, tmp_path: Path):
         iso = tmp_path / "new.iso"
         iso.write_bytes(b"x")
-        with patch.object(cd, "execute", return_value=_result()) as execute:
+        with patch.object(cd.virsh, "execute", return_value=_result()) as execute:
             assert cd.change_media("hdc", str(iso)) is True
         args, _kwargs = execute.call_args
         assert args[0] == "change-media"
@@ -227,12 +227,12 @@ class TestGetAttachedCDROMs:
             "file  cdrom   hdd     /isos/seed.iso\n"  # seed ISO filtered out
             "file  cdrom   hde     -\n"                # empty source filtered out
         )
-        with patch.object(cd, "execute", return_value=_result(stdout=out)):
+        with patch.object(cd.virsh, "execute", return_value=_result(stdout=out)):
             found = cd.get_attached_cdroms()
         assert found == [{"target": "hdc", "source": "/isos/ubuntu.iso"}]
 
     def test_empty_on_execute_failure(self, cd: CDROMManager):
-        with patch.object(cd, "execute", return_value=_result(ok=False)):
+        with patch.object(cd.virsh, "execute", return_value=_result(ok=False)):
             assert cd.get_attached_cdroms() == []
 
 
@@ -255,7 +255,7 @@ class TestXmlEscaping:
             written["xml"] = Path(args[2]).read_text()
             return _result()
 
-        with patch.object(cd, "execute", side_effect=capture):
+        with patch.object(cd.virsh, "execute", side_effect=capture):
             assert cd.detach_cdrom("hd&c") is True
         assert "dev='hd&amp;c'" in written["xml"]
 

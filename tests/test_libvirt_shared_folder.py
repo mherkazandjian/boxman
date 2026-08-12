@@ -77,7 +77,7 @@ class TestAttachSharedFolder:
         assert out == {"success": False, "restart_needed": False}
 
     def test_live_attach_success(self, sf: SharedFolderManager, tmp_path: Path):
-        with patch.object(sf, "execute", return_value=_result()) as execute:
+        with patch.object(sf.virsh, "execute", return_value=_result()) as execute:
             out = sf.attach_shared_folder("tag", str(tmp_path))
         assert out == {"success": True, "restart_needed": False}
         execute.assert_called_once()
@@ -92,7 +92,7 @@ class TestAttachSharedFolder:
             # first call (live) fails, second (config-only) succeeds
             return _result(ok=False, stderr="hotplug unsupported") if len(calls) == 1 else _result()
 
-        with patch.object(sf, "execute", side_effect=fake):
+        with patch.object(sf.virsh, "execute", side_effect=fake):
             out = sf.attach_shared_folder("tag", str(tmp_path))
         assert out == {"success": True, "restart_needed": True}
         assert any("--config" in c for c in calls)
@@ -100,7 +100,7 @@ class TestAttachSharedFolder:
     def test_both_attempts_fail_returns_failure(
         self, sf: SharedFolderManager, tmp_path: Path
     ):
-        with patch.object(sf, "execute", return_value=_result(ok=False, stderr="nope")):
+        with patch.object(sf.virsh, "execute", return_value=_result(ok=False, stderr="nope")):
             out = sf.attach_shared_folder("tag", str(tmp_path))
         assert out == {"success": False, "restart_needed": False}
 
@@ -108,7 +108,7 @@ class TestAttachSharedFolder:
 class TestDetachSharedFolder:
 
     def test_live_detach_success(self, sf: SharedFolderManager):
-        with patch.object(sf, "execute", return_value=_result()):
+        with patch.object(sf.virsh, "execute", return_value=_result()):
             out = sf.detach_shared_folder("tag", "/host")
         assert out == {"success": True, "restart_needed": False}
 
@@ -119,7 +119,7 @@ class TestDetachSharedFolder:
             calls.append(args)
             return _result(ok=False, stderr="x") if len(calls) == 1 else _result()
 
-        with patch.object(sf, "execute", side_effect=fake):
+        with patch.object(sf.virsh, "execute", side_effect=fake):
             out = sf.detach_shared_folder("tag", "/host")
         assert out == {"success": True, "restart_needed": True}
 
@@ -141,7 +141,7 @@ class TestEnsureMemfdBacking:
         mock_editor.redefine_domain.return_value = True
         with patch("boxman.providers.libvirt.shared_folder.VirshEdit",
                    return_value=mock_editor), \
-             patch.object(sf, "execute", return_value=_result(stdout="shut off\n")):
+             patch.object(sf.virsh, "execute", return_value=_result(stdout="shut off\n")):
             out = sf.ensure_memfd_backing()
         assert out == {"success": True, "restart_needed": False}
         mock_editor.redefine_domain.assert_called_once()
@@ -158,7 +158,7 @@ class TestEnsureMemfdBacking:
         mock_editor.redefine_domain.return_value = True
         with patch("boxman.providers.libvirt.shared_folder.VirshEdit",
                    return_value=mock_editor), \
-             patch.object(sf, "execute", return_value=_result(stdout="running\n")):
+             patch.object(sf.virsh, "execute", return_value=_result(stdout="running\n")):
             out = sf.ensure_memfd_backing()
         assert out == {"success": True, "restart_needed": True}
 

@@ -271,7 +271,7 @@ class TestCdromHotplug36a8a6b:
         cd = CDROMManager("vm01", provider_config={"use_sudo": False})
 
         with patch.object(cd, "_find_next_available_target", return_value="hdc"), \
-             patch.object(cd, "execute", return_value=_result()) as execute:
+             patch.object(cd.virsh, "execute", return_value=_result()) as execute:
             assert cd.attach_cdrom(str(iso)) is True
 
         args = execute.call_args.args
@@ -294,7 +294,7 @@ class TestSharedFolderHotplug36a8a6b:
             # succeed first time
             return _result(ok=True)
 
-        with patch.object(sf, "execute", side_effect=fake):
+        with patch.object(sf.virsh, "execute", side_effect=fake):
             out = sf.attach_shared_folder("tag", str(tmp_path))
 
         assert out["success"] is True
@@ -315,7 +315,7 @@ class TestSharedFolderHotplug36a8a6b:
             # first (live) fails, second (config) succeeds
             return _result(ok=False, stderr="no hotplug") if len(calls) == 1 else _result(ok=True)
 
-        with patch.object(sf, "execute", side_effect=fake):
+        with patch.object(sf.virsh, "execute", side_effect=fake):
             out = sf.attach_shared_folder("tag", str(tmp_path))
 
         assert out == {"success": True, "restart_needed": True}

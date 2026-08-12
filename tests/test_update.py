@@ -609,6 +609,7 @@ def _make_disk_manager():
     dm.vm_name = 'test-vm'
     dm.logger = MagicMock()
     dm.provider_config = {'uri': 'qemu:///system'}
+    dm.virsh = MagicMock()
     return dm
 
 
@@ -665,11 +666,11 @@ class TestDiskManagerResize:
 
     def test_resize_disk_online_success(self):
         dm = _make_disk_manager()
-        dm.execute = MagicMock(return_value=MagicMock(ok=True))
+        dm.virsh.execute.return_value = MagicMock(ok=True)
 
         result = dm.resize_disk_online('vdb', 4096)
         assert result is True
-        dm.execute.assert_called_once_with(
+        dm.virsh.execute.assert_called_once_with(
             'blockresize', 'test-vm', 'vdb', '--size=4096M', warn=True)
 
     def test_resize_disk_routes_to_online_when_running(self):

@@ -98,6 +98,7 @@ class TestInterfaceXmlRendering:
         iface.vm_name = "vm1"
         iface.logger = MagicMock()
         iface.provider_config = {"use_sudo": False}
+        iface.virsh = MagicMock()
 
         captured: dict[str, str] = {}
 
@@ -110,7 +111,7 @@ class TestInterfaceXmlRendering:
             result.ok = True
             return result
 
-        iface.execute = fake_execute
+        iface.virsh.execute = fake_execute
         ok = iface.add_interface(**kwargs)
         assert ok
         return captured["xml"]

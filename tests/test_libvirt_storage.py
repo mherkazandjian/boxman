@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.providers.libvirt.destroy_vm import DestroyVM
+from boxman.providers.libvirt.commands import VirshCommand
 from boxman.providers.libvirt.storage import StorageManager, vm_disk_paths
 
 pytestmark = pytest.mark.unit
@@ -324,12 +324,12 @@ class TestConvert:
 class TestIsShutOff:
 
     def test_true_when_shut_off(self, sm: StorageManager):
-        with patch.object(DestroyVM, "execute",
+        with patch.object(VirshCommand, "execute",
                           return_value=_result(stdout="shut off\n")):
             assert sm.is_shut_off("vm01") is True
 
     def test_true_when_domain_gone(self, sm: StorageManager):
-        with patch.object(DestroyVM, "execute",
+        with patch.object(VirshCommand, "execute",
                           return_value=_result(ok=False, stderr="not found")):
             assert sm.is_shut_off("vm01") is True
 
@@ -337,14 +337,14 @@ class TestIsShutOff:
         """Regression for issue #85 item 18: a paused VM reads as 'not
         running' but QEMU still holds the disk — compacting it would
         corrupt the image."""
-        with patch.object(DestroyVM, "execute",
+        with patch.object(VirshCommand, "execute",
                           return_value=_result(stdout="paused\n")):
             assert sm.is_shut_off("vm01") is False
 
     def test_false_when_in_shutdown(self, sm: StorageManager):
         """Regression for issue #85 item 18: 'in shutdown' is not
         'shut off' — QEMU is still alive."""
-        with patch.object(DestroyVM, "execute",
+        with patch.object(VirshCommand, "execute",
                           return_value=_result(stdout="in shutdown\n")):
             assert sm.is_shut_off("vm01") is False
 
