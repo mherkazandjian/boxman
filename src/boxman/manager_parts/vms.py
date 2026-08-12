@@ -474,26 +474,20 @@ class VMsMixin:
                 if full in new_vm_names:
                     clone_tasks.append((cluster, vm_info, full))
 
-        processes = [
-            Process(target=_clone_with_retry,
-                    args=(self.provider, cluster, vm_info, new_vm_name))
-            for cluster, vm_info, new_vm_name in clone_tasks
-        ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
-
-        # Abort the update if any clone subprocess exited non-zero — same
-        # guard as :meth:`clone_vms` to prevent downstream configure/start
-        # steps from running against VMs that were never defined.
-        failed = [
-            (task[2], p.exitcode)
-            for task, p in zip(clone_tasks, processes)
-            if p.exitcode != 0
-        ]
-        if failed:
-            names = ', '.join(name for name, _ in failed)
+        # Abort the update if any clone worker fails — same guard as
+        # :meth:`clone_vms` to prevent downstream configure/start steps
+        # from running against VMs that were never defined. _run_parallel
+        # reports raised/killed workers as failures, not just non-zero
+        # exitcodes.
+        _results, failures = self._run_parallel(
+            [(new_vm_name, _clone_with_retry,
+              (self.provider, cluster, vm_info, new_vm_name))
+             for cluster, vm_info, new_vm_name in clone_tasks],
+            op_label='clone vm')
+        if failures:
+            names = ', '.join(sorted(failures))
             raise RuntimeError(
-                f"clone failed for {len(failed)} new VM(s) ({names}); "
+                f"clone failed for {len(failures)} new VM(s) ({names}); "
                 f"aborting update. See the virt-clone error logged above.")
 
         # configure and start new VMs (parallel)
@@ -504,15 +498,11 @@ class VMsMixin:
                 if full in new_vm_names:
                     configure_tasks.append((cluster_name, cluster, vm_name, vm_info))
 
-        processes = [
-            Process(
-                target=self._configure_and_start_vm,
-                args=(cluster_name, cluster, vm_name, vm_info)
-            )
-            for cluster_name, cluster, vm_name, vm_info in configure_tasks
-        ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        self._run_parallel(
+            [(f"{cluster_name}/{vm_name}", self._configure_and_start_vm,
+              (cluster_name, cluster, vm_name, vm_info))
+             for cluster_name, cluster, vm_name, vm_info in configure_tasks],
+            op_label='configure and start vm')
 
     def _update_single_vm(
         self,
@@ -792,7 +782,14 @@ class VMsMixin:
             print(
                 "This will stop the VM(s), remove their disks, and "
                 "clean up all associated resources.\n")
-            answer = input("Proceed? [y/N] ").strip().lower()
+            try:
+                answer = input("Proceed? [y/N] ").strip().lower()
+            except EOFError:
+                # nothing is attached to stdin (a cron run, a pipeline):
+                # treat that as a no rather than a traceback — same guard
+                # as destroy/destroy_runtime (#85 item 16)
+                print("No input available, aborted.")
+                return
             if answer not in ("y", "yes"):
                 print("Aborted.")
                 return
@@ -838,22 +835,26 @@ class VMsMixin:
                         update_tasks.append(
                             (cluster_name, cluster_cfg, vm_name, vm_info))
 
-            processes = [
-                Process(
-                    target=self._update_single_vm,
-                    args=(cluster_name, cluster_cfg, vm_name, vm_info,
-                          result_queue, dry_run)
-                )
-                for cluster_name, cluster_cfg, vm_name, vm_info in update_tasks
-            ]
-            [p.start() for p in processes]
-            [p.join() for p in processes]
+            # _run_parallel reports raised/killed workers as failures;
+            # merge those into the collected results below so a dying
+            # worker lands in the failed summary instead of vanishing.
+            _res, parallel_failures = self._run_parallel(
+                [(f"{cluster_name}/{vm_name}", self._update_single_vm,
+                  (cluster_name, cluster_cfg, vm_name, vm_info,
+                   result_queue, dry_run))
+                 for cluster_name, cluster_cfg, vm_name, vm_info in update_tasks],
+                op_label='update vm')
 
             # collect and print results
             results = {}
             while not result_queue.empty():
                 vm_name, result = result_queue.get()
                 results[vm_name] = result
+            for label, reason in parallel_failures.items():
+                results.setdefault(label.split('/')[-1], {
+                    'status': 'failed',
+                    'details': reason,
+                })
 
             # print summary
             no_change = [n for n, r in results.items() if r['status'] == 'no_change']
