@@ -59,6 +59,19 @@ RUN useradd -m -s /bin/bash qemu_user && \
     chown -R qemu_user:qemu_user /home/qemu_user/.ssh && \
     usermod -aG qemu qemu_user
 
+# Ubuntu 24.04 confines unix_chkpwd with AppArmor and deliberately omits
+# dac_override/dac_read_search. Rocky's mode 0000 /etc/shadow therefore blocks
+# even the setuid-root helper. Give the root owner a read bit so normal DAC is
+# sufficient, while retaining root-only ordinary DAC access and keeping
+# qemu_user out of any shadow-readable group. qemu_user intentionally has
+# passwordless sudo elsewhere in this development image. The final checks make
+# the direct-access invariant fail at image-build time if a base-image or
+# user-creation change breaks it.
+RUN chown root:root /etc/shadow && \
+    chmod 0400 /etc/shadow && \
+    test "$(stat -c '%U:%G:%a' /etc/shadow)" = "root:root:400" && \
+    ! id -Gn qemu_user | grep -qw shadow
+
 # SSH key pair is generated at runtime in entrypoint.sh
 
 # Configure libvirtd: disable unix socket auth for local dev access

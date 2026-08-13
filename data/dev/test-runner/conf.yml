@@ -97,17 +97,6 @@ templates:
             [Service]
             ExecStart=
             ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any
-        # Ubuntu 24.04 ships an enforcing AppArmor profile for unix_chkpwd
-        # which strips capabilities from the helper. The libvirt test
-        # container (Rocky 9) ships /etc/shadow mode 0000, so the confined
-        # helper cannot read it and sshd rejects every login with
-        # "Access denied by PAM account configuration". Grant the two DAC
-        # capabilities back via the profile's local include.
-        - path: /etc/apparmor.d/local/unix-chkpwd
-          permissions: "0644"
-          content: |
-            capability dac_override,
-            capability dac_read_search,
         # The host's enforcing libvirtd AppArmor profile only whitelists
         # the Debian path /usr/lib/libvirt/libvirt_iohelper; the Rocky test
         # container uses /usr/libexec/..., so snapshot-create-as fails with
@@ -137,8 +126,7 @@ templates:
         - netplan apply || true
         - dhclient -v || true
         - systemctl enable --now docker
-        # apply the AppArmor overrides (see write_files above)
-        - apparmor_parser -r /etc/apparmor.d/unix-chkpwd
+        # apply the libvirtd AppArmor override (see write_files above)
         - apparmor_parser -r /etc/apparmor.d/usr.sbin.libvirtd
         # apply the overcommit sysctl (see write_files above)
         - sysctl --system
