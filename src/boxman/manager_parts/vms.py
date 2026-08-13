@@ -191,7 +191,7 @@ class VMsMixin:
         else:
             self.logger.warning(f"no cpu or memory configuration for vm {vm_name}, skipping")
 
-        # memballoon (virtio-balloon: free-page reporting, stats)
+        # memballoon (virtio-balloon: free-page reporting, autodeflate, stats)
         memballoon = vm_info.get('memballoon')
         if memballoon:
             self.logger.info(f"configuring memballoon for vm {vm_name}")
@@ -576,7 +576,8 @@ class VMsMixin:
                 diff['new_shared_folders'] or
                 diff['removed_shared_folders'] or
                 diff['changed_shared_folders'] or
-                diff['memballoon_changed']
+                diff['memballoon_changed'] or
+                diff['memballoon_restart_pending']
             )
 
             if not has_changes:
@@ -629,6 +630,10 @@ class VMsMixin:
                 changes.append(
                     f"memballoon: {diff['actual_memballoon']} -> "
                     f"{diff['desired_memballoon']}")
+            elif diff['memballoon_restart_pending']:
+                changes.append(
+                    f"memballoon live state: {diff['live_memballoon']} -> "
+                    f"{diff['desired_memballoon']}")
             self.logger.info(f"VM {vm_name}: changes detected: {'; '.join(changes)}")
 
             if dry_run:
@@ -641,6 +646,7 @@ class VMsMixin:
             # apply changes
             vm_running = diff['vm_state'] == 'running'
             restart_needed = False
+            pending_restart = diff['memballoon_restart_pending']
 
             # CPU / memory / max ceilings
             if (diff['cpu_changed'] or diff['memory_changed'] or
@@ -675,9 +681,9 @@ class VMsMixin:
                         'details': 'memballoon update failed'
                     }))
                     return
-                if vm_running:
-                    self.logger.info(
-                        f"VM {vm_name}: memballoon changes apply from the next boot")
+                if pending_restart:
+                    self.logger.warning(
+                        f"VM {vm_name}: restart required to apply memballoon changes")
 
             # disks
             if diff['new_disks'] or diff['resize_disks']:
@@ -741,6 +747,13 @@ class VMsMixin:
                 result_queue.put((vm_name, {
                     'status': 'updated',
                     'details': '; '.join(changes) + ' (restarted)'
+                }))
+            elif pending_restart:
+                result_queue.put((vm_name, {
+                    'status': 'needs_restart',
+                    'details': (
+                        '; '.join(changes) +
+                        ' (restart required to apply memballoon changes)')
                 }))
             else:
                 result_queue.put((vm_name, {
@@ -901,6 +914,9 @@ class VMsMixin:
             # print summary
             no_change = [n for n, r in results.items() if r['status'] == 'no_change']
             updated = [n for n, r in results.items() if r['status'] == 'updated']
+            needs_restart = [
+                n for n, r in results.items()
+                if r['status'] == 'needs_restart']
             failed = [n for n, r in results.items() if r['status'] == 'failed']
             dry_run_items = [n for n, r in results.items() if r['status'] == 'dry_run']
 
@@ -915,6 +931,12 @@ class VMsMixin:
                 self.logger.info(f"updated: {', '.join(updated)}")
                 for vm_name in updated:
                     self.logger.info(f"  {vm_name}: {results[vm_name]['details']}")
+            if needs_restart:
+                self.logger.warning(
+                    f"restart required: {', '.join(needs_restart)}")
+                for vm_name in needs_restart:
+                    self.logger.warning(
+                        f"  {vm_name}: {results[vm_name]['details']}")
             if failed:
                 self.logger.error(f"failed: {', '.join(failed)}")
                 for vm_name in failed:

@@ -1505,7 +1505,8 @@ class LibVirtSession(SessionConfigMixin):
         Args:
             vm_name: Name of the vm
             memballoon: memballoon configuration dict
-                (``free_page_reporting``, ``stats_period``) or None to skip
+                (``free_page_reporting``, ``autodeflate``, ``stats_period``)
+                or None to skip
 
         Returns:
             True if successful (or nothing to do), False otherwise

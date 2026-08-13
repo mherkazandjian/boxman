@@ -103,6 +103,30 @@ class TestApplyMemballoonToXml:
             {"free_page_reporting": False})
         assert self._memballoon(xml).get("freePageReporting") == "off"
 
+    def test_autodeflate_true(self):
+        xml = VirshEdit.apply_memballoon_to_xml(
+            _domain_xml(), {"autodeflate": True})
+        mb = self._memballoon(xml)
+        assert mb.get("model") == "virtio"
+        assert mb.get("autodeflate") == "on"
+
+    def test_autodeflate_false(self):
+        xml = VirshEdit.apply_memballoon_to_xml(
+            _domain_xml("<memballoon model='virtio' autodeflate='on'/>"),
+            {"autodeflate": False})
+        assert self._memballoon(xml).get("autodeflate") == "off"
+
+    def test_autodeflate_preserves_other_balloon_settings(self):
+        xml = VirshEdit.apply_memballoon_to_xml(
+            _domain_xml(
+                "<memballoon model='virtio' freePageReporting='on'>"
+                "<stats period='5'/></memballoon>"),
+            {"autodeflate": True})
+        mb = self._memballoon(xml)
+        assert mb.get("freePageReporting") == "on"
+        assert mb.get("autodeflate") == "on"
+        assert mb.find("stats").get("period") == "5"
+
     def test_stats_period(self):
         xml = VirshEdit.apply_memballoon_to_xml(
             _domain_xml(), {"stats_period": 10})
@@ -115,6 +139,13 @@ class TestApplyMemballoonToXml:
         assert mb.get("model") == "virtio"
         assert mb.get("freePageReporting") is None
         assert mb.find("stats") is None
+
+    def test_absent_autodeflate_key_preserves_existing_attribute(self):
+        xml = VirshEdit.apply_memballoon_to_xml(
+            _domain_xml(
+                "<memballoon model='virtio' autodeflate='on'/>"),
+            {"free_page_reporting": True})
+        assert self._memballoon(xml).get("autodeflate") == "on"
 
 
 class TestConfigureMemballoon:
@@ -156,6 +187,12 @@ class TestMemballoonValidation:
         with pytest.raises(ConfigError):
             VirshEdit.apply_memballoon_to_xml(
                 _domain_xml(), {"free_page_reporting": "false"})
+
+    @pytest.mark.parametrize("value", ["false", 0, 1, None])
+    def test_autodeflate_non_bool_rejected(self, value):
+        with pytest.raises(ConfigError, match="memballoon.autodeflate"):
+            VirshEdit.apply_memballoon_to_xml(
+                _domain_xml(), {"autodeflate": value})
 
     def test_stats_period_bool_rejected(self):
         with pytest.raises(ConfigError):

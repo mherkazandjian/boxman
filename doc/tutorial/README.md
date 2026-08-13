@@ -554,33 +554,40 @@ creation time -- the QEMU process was started with headroom for scaling.
 ### Returning unused memory to the host
 
 KVM only allocates host RAM for pages a guest has actually touched, but once touched,
-a page stays allocated until the VM stops -- even after the guest frees it. The
-`memballoon` option enables virtio-balloon **free-page reporting**, which lets the
-guest continuously hand unused pages back to the host:
+a page stays allocated until the VM stops -- even after the guest frees it.
+`memballoon` configures two complementary virtio-balloon memory-reclaim features:
+
+- **free-page reporting** continuously hands unused guest pages back to the host;
+- **autodeflate** releases ballooned memory as a last-resort safeguard before
+  guest memory pressure triggers the OOM killer.
 
 ```yaml
       node01:
         memory: 2048
         memballoon:
           free_page_reporting: true   # guest returns freed pages to the host
+          autodeflate: true            # release ballooned RAM under guest OOM pressure
           stats_period: 5             # optional; balloon stats sample interval (s)
 ```
 
-No guest-side setup is needed beyond a Linux kernel >= 5.7 (all supported cloud
-images qualify). The host needs **libvirt >= 6.9.0** and **QEMU >= 5.1** — on older
-versions `virsh define` may reject or silently drop the setting. The resulting
-libvirt domain gets a balloon device with
-`<memballoon model='virtio' freePageReporting='on'>`; verify with:
+Free-page reporting needs a Linux guest kernel >= 5.7 (all supported cloud images
+qualify), **libvirt >= 6.9.0**, and **QEMU >= 5.1**. Autodeflate is supported by
+QEMU/KVM with **libvirt >= 1.3.1**. On older or incompatible hosts, `virsh define`
+may reject or silently drop an unsupported setting. The resulting libvirt domain
+gets both settings as attributes on the same balloon device; verify with:
 
 ```bash
 virsh dumpxml --inactive <vm> | grep -A2 memballoon
-#   <memballoon model='virtio' freePageReporting='on'>
+#   <memballoon model='virtio' freePageReporting='on' autodeflate='on'>
 #     <stats period='5'/>
 ```
 
 Changes to a running VM are written to the persistent config and
-take effect from the next boot; `boxman update` applies them idempotently
-(and removing the `memballoon` block reconciles the VM back to the defaults).
+take effect from the next boot; `boxman update` reports `restart required`
+without restarting the guest automatically. It keeps reporting that live-state
+drift until the guest boots with the new persistent XML, and applies that XML
+idempotently (and removing the `memballoon` block reconciles the VM back to the
+defaults).
 
 > For many similar VMs, also consider enabling KSM on the host
 > (`systemctl enable --now ksmd` / `ksmtuned`) to deduplicate identical pages

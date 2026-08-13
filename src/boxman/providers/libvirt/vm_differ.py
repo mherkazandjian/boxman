@@ -114,22 +114,34 @@ class VMStateDiffer:
             return 0
         return int(memory_values[0]) // 1024
 
-    def get_actual_memballoon(self, domain_name: str) -> dict[str, Any]:
+    def get_actual_memballoon(
+            self, domain_name: str, inactive: bool = True) -> dict[str, Any]:
         """
-        Get the actual memballoon state from the persistent (inactive) XML.
+        Get the actual memballoon state from persistent or live XML.
+
+        Args:
+            domain_name: libvirt domain name.
+            inactive: read persistent XML when True; read the running guest's
+                live XML when False.
 
         Returns:
-            Dict with 'free_page_reporting' (bool; a missing attribute or a
-            missing memballoon element counts as False) and 'stats_period'
-            (int seconds, or None when no <stats> element is present).
+            Dict with 'free_page_reporting' and 'autodeflate' (bools; a
+            missing attribute or memballoon element counts as False), plus
+            'stats_period' (int seconds, or None when no <stats> element is
+            present).
         """
         from lxml import etree
 
-        xml_content = self.virsh_edit.get_domain_xml(domain_name, inactive=True)
+        xml_content = self.virsh_edit.get_domain_xml(
+            domain_name, inactive=inactive)
         tree = etree.fromstring(xml_content.encode('utf-8'))
         matches = tree.xpath('//devices/memballoon')
         if not matches:
-            return {'free_page_reporting': False, 'stats_period': None}
+            return {
+                'free_page_reporting': False,
+                'autodeflate': False,
+                'stats_period': None,
+            }
         memballoon = matches[0]
         stats = memballoon.find('stats')
         stats_period = None
@@ -137,6 +149,7 @@ class VMStateDiffer:
             stats_period = int(stats.get('period'))
         return {
             'free_page_reporting': memballoon.get('freePageReporting') == 'on',
+            'autodeflate': memballoon.get('autodeflate') == 'on',
             'stats_period': stats_period,
         }
 
@@ -147,11 +160,16 @@ class VMStateDiffer:
         Normalize a memballoon config block into a fully-explicit desired
         state. A missing block (None) maps to the libvirt defaults, so
         removing the block from conf.yml reconciles back to
-        ``freePageReporting`` off and no ``<stats>`` element.
+        ``freePageReporting`` and ``autodeflate`` off and no ``<stats>``
+        element. Validate before normalizing so YAML strings and other
+        malformed values cannot be truthiness-coerced during ``update``.
         """
-        config = config or {}
+        if config is None:
+            config = {}
+        VirshEdit.validate_memballoon_config(config)
         return {
-            'free_page_reporting': bool(config.get('free_page_reporting', False)),
+            'free_page_reporting': config.get('free_page_reporting', False),
+            'autodeflate': config.get('autodeflate', False),
             'stats_period': config.get('stats_period'),
         }
 
@@ -284,8 +302,9 @@ class VMStateDiffer:
               - resize_disks: list of dicts with target, source, current_size_mb, desired_size_mb
               - new_cdroms, removed_cdroms, changed_cdroms
               - new_shared_folders, removed_shared_folders, changed_shared_folders
-              - memballoon_changed, desired_memballoon (normalized),
-                actual_memballoon
+              - memballoon_changed, memballoon_restart_pending,
+                desired_memballoon (normalized), actual_memballoon, and
+                live_memballoon
               - vm_state: current VM state string
         """
         vm_state = self.get_vm_state(domain_name)
@@ -330,6 +349,13 @@ class VMStateDiffer:
         actual_memballoon = self.get_actual_memballoon(domain_name)
         normalized_memballoon = self.normalize_memballoon_config(desired_memballoon)
         memballoon_changed = normalized_memballoon != actual_memballoon
+        live_memballoon = actual_memballoon
+        if vm_state == 'running':
+            live_memballoon = self.get_actual_memballoon(
+                domain_name, inactive=False)
+        memballoon_restart_pending = (
+            vm_state == 'running'
+            and normalized_memballoon != live_memballoon)
 
         # --- Disk diff ---
         actual_disks = self.get_actual_disks(domain_name)
@@ -462,7 +488,9 @@ class VMStateDiffer:
             'removed_shared_folders': removed_shared_folders,
             'changed_shared_folders': changed_shared_folders,
             'memballoon_changed': memballoon_changed,
+            'memballoon_restart_pending': memballoon_restart_pending,
             'desired_memballoon': normalized_memballoon,
             'actual_memballoon': actual_memballoon,
+            'live_memballoon': live_memballoon,
             'vm_state': vm_state
         }

@@ -249,10 +249,10 @@ class VirshEdit:
         """
         Validate a memballoon config dict, raising ConfigError on bad values.
 
-        ``free_page_reporting`` must be a real bool (a YAML string like
-        ``"false"`` would silently enable it otherwise) and ``stats_period``
-        must be a positive integer (bools excluded) or None to remove the
-        stats element.
+        ``free_page_reporting`` and ``autodeflate`` must be real bools (a
+        YAML string like ``"false"`` would silently enable either setting
+        otherwise). ``stats_period`` must be a positive integer (bools
+        excluded) or None to remove the stats element.
         """
         if not isinstance(config, dict):
             raise ConfigError(
@@ -262,6 +262,11 @@ class VirshEdit:
             raise ConfigError(
                 f"memballoon.free_page_reporting must be a boolean, got "
                 f"{config['free_page_reporting']!r}")
+        if 'autodeflate' in config and not isinstance(
+                config['autodeflate'], bool):
+            raise ConfigError(
+                f"memballoon.autodeflate must be a boolean, got "
+                f"{config['autodeflate']!r}")
         stats_period = config.get('stats_period')
         if stats_period is not None and (
                 isinstance(stats_period, bool)
@@ -282,6 +287,7 @@ class VirshEdit:
 
         - ``free_page_reporting`` (bool): sets the ``freePageReporting='on|off'``
           attribute
+        - ``autodeflate`` (bool): sets the ``autodeflate='on|off'`` attribute
         - ``stats_period`` (int): sets ``<stats period='N'/>``; an explicit
           None removes the ``<stats>`` element
 
@@ -316,6 +322,10 @@ class VirshEdit:
             memballoon.set('freePageReporting',
                            'on' if config['free_page_reporting'] else 'off')
 
+        if 'autodeflate' in config:
+            memballoon.set('autodeflate',
+                           'on' if config['autodeflate'] else 'off')
+
         if 'stats_period' in config:
             stats = memballoon.find('stats')
             if config['stats_period'] is None:
@@ -334,8 +344,8 @@ class VirshEdit:
         """
         Configure the virtio-balloon device for a domain.
 
-        Edits the persistent (inactive) config; ``free_page_reporting``
-        takes effect from the next boot of the VM.
+        Edits the persistent (inactive) config; ``free_page_reporting`` and
+        ``autodeflate`` take effect from the next boot of the VM.
 
         Args:
             domain_name: name of the domain
@@ -518,4 +528,3 @@ class VirshEdit:
         except Exception as exc:
             self.logger.error(f"failed to hot-set memory for {domain_name}: {exc}")
             return False
-
