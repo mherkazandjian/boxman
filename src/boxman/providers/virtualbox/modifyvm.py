@@ -53,5 +53,5 @@ class ModifyVm:
                             rule_name: str = 'guestssh',
                             nic_num: int = 1) -> str:
         """Build ``VBoxManage modifyvm <vm> --natpf<n> "name,tcp,,host,,guest"``."""
-        rule = f'"{rule_name},tcp,,{host_port},,{guest_port}"'
+        rule = f'{rule_name},tcp,,{host_port},,{guest_port}'
         return self.cmd.build_command('modifyvm', vm, f'--natpf{nic_num}', rule)
