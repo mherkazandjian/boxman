@@ -115,6 +115,19 @@ def desired_state(network) -> dict[str, Any]:
     Returns:
         A dict shaped like :func:`parse_network_xml`.
     """
+    if network.forward_mode == 'bridge':
+        return {
+            'mode': 'bridge',
+            'bridge_name': network.pinned_bridge_name,
+            'bridge_stp': None,
+            'bridge_delay': None,
+            'mac': None,
+            'ip_address': None,
+            'netmask': None,
+            'dhcp_range': None,
+            'dhcp_hosts': [],
+        }
+
     dhcp_range = None
     if network.dhcp_range_start and network.dhcp_range_end:
         dhcp_range = {'start': network.dhcp_range_start,
@@ -263,6 +276,40 @@ def diff_network(desired: dict[str, Any],
         'host_ops': host_ops,
         'range_ops': range_ops,
     }
+
+
+def bridge_ownership_conflict(desired: dict[str, Any],
+                              actual: dict[str, Any]) -> str | None:
+    """Explain an unsafe same-name managed/external bridge transition.
+
+    In nat/route mode libvirt owns the Linux bridge and deletes it with the
+    network. In bridge mode the host owns it and libvirt deliberately leaves it
+    alone. Reusing one bridge name while crossing that ownership boundary
+    therefore cannot be reconciled by destroy/redefine: one direction deletes
+    the desired prerequisite, the other leaves an interface the new managed
+    network cannot claim.
+    """
+    old_mode = actual.get('mode')
+    new_mode = desired.get('mode')
+    old_bridge = actual.get('bridge_name')
+    new_bridge = desired.get('bridge_name')
+    managed = {'nat', 'route'}
+
+    if not old_bridge or not new_bridge or old_bridge != new_bridge:
+        return None
+    if old_mode in managed and new_mode == 'bridge':
+        return (
+            f"cannot change forward mode {old_mode!r} -> 'bridge' while "
+            f"reusing {old_bridge!r}: removing the current libvirt network "
+            "would delete that managed bridge; create a distinct host bridge "
+            "and set bridge.name to it")
+    if old_mode == 'bridge' and new_mode in managed:
+        return (
+            f"cannot change forward mode 'bridge' -> {new_mode!r} while "
+            f"reusing {old_bridge!r}: bridge mode preserves that host-owned "
+            "interface, so the new managed network cannot claim its name; "
+            "choose a different bridge.name or omit it for auto-allocation")
+    return None
 
 
 def describe_plan(name: str, plan: dict[str, Any]) -> list[str]:

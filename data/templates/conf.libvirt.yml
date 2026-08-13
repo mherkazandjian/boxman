@@ -53,6 +53,15 @@ clusters:
               end: '10.0.10.254'  #   mandatory (if block is specified)
         enable: True
         autostart: True
+      # migration:
+      #   # Name indirection for an existing host Linux bridge. Libvirt does
+      #   # not create or configure br-migration; create it in the libvirt
+      #   # daemon's namespace and omit ip/mac/stp/delay here.
+      #   mode: bridge
+      #   bridge:
+      #     name: br-migration
+      #   enable: True
+      #   autostart: True
 
     vms:
       boxman01:

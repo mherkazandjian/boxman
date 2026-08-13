@@ -259,6 +259,54 @@ graph TD
 | `vms` | Each VM is cloned from the template. `max_vcpus` and `max_memory` set the hot-scaling ceiling (we'll use this in Chapter 2). |
 | `workspace` | Directory where boxman generates SSH configs, ansible inventory, and keys. |
 
+### Libvirt network modes
+
+Per-cluster libvirt networks support `nat`, `route`, and `bridge` modes. `nat`
+and `route` let libvirt create the Linux bridge; they take the `ip`, `mac`,
+`bridge.stp`, and `bridge.delay` settings shown in the examples. Bridge mode is
+different: it creates a named libvirt network that points at an **existing**
+host Linux bridge.
+
+```yaml
+networks:
+  migration:
+    mode: bridge
+    bridge:
+      name: br-migration
+    enable: true
+    autostart: true
+
+vms:
+  node01:
+    network_adapters:
+      - name: migration
+        network_source: migration
+```
+
+Create and bring up `br-migration` in the libvirt daemon's network namespace
+before running Boxman. With a local libvirt URI Boxman checks that namespace
+before defining anything. With a remote URI such as `qemu+ssh://hv/system`,
+the client's `/sys` describes the wrong host, so the remote libvirt daemon is
+the authority and validates the bridge when the network starts. Do not set
+`ip`, `mac`, `bridge.stp`, or `bridge.delay` in this block: addressing and link
+policy belong to the host bridge. Boxman removes only the libvirt network
+definition during teardown; it never deletes the underlying bridge.
+
+Use bridge mode when VMs should reference a stable libvirt network name while
+different hypervisors map that name to their own bridge—for example, live
+migration. Use top-level `shared_networks` when Boxman should create/manage a
+shared Linux bridge on the **Boxman host** for direct VM, containerlab, or
+Docker attachment instead. That can supply a bridge-mode network only with the
+local runtime. A docker-compose libvirt runtime has a separate network
+namespace: create its bridge inside that runtime (for example in a custom
+runtime image/startup), not with host-level `shared_networks`.
+
+Changing between `nat`/`route` and `bridge` also crosses bridge ownership:
+libvirt deletes a managed `nat`/`route` bridge, while it preserves a host-owned
+bridge. Use different bridge names for that transition (or omit the managed
+side's `bridge.name` so Boxman reserves a safe automatic name before recreating
+the network).
+
 ## 1.4 Provision
 
 ```bash

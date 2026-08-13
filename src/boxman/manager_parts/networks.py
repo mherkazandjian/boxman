@@ -8,6 +8,7 @@ import os
 import time
 from typing import Any
 
+from boxman.exceptions import ConfigError
 from boxman.providers.libvirt import net_reconcile
 
 
@@ -83,7 +84,7 @@ class NetworksMixin:
                 try:
                     plan = self.provider.plan_network(
                         name=full_name, info=network_info)
-                except ValueError as exc:
+                except (ConfigError, ValueError) as exc:
                     # the network block itself does not validate (a bad dhcp
                     # reservation, say). Report it against the network it came
                     # from and carry on: the other networks, and the VMs, are
@@ -226,7 +227,7 @@ class NetworksMixin:
         try:
             ok = self.provider.define_network(
                 name=full_name, info=network_info, workdir=workdir)
-        except RuntimeError as exc:
+        except (ConfigError, RuntimeError) as exc:
             self.logger.error(f"network {label}: could not be defined: {exc}")
             return 'failed'
         return 'created' if ok else 'failed'
@@ -318,9 +319,10 @@ class NetworksMixin:
                   f"redefined to apply:")
             for change in plan['structural']:
                 print(f"  - {change}")
-            print("\nIts bridge will be deleted and recreated. These VMs lose "
-                  f"their network link and will be reconnected, by a reboot "
-                  f"if their machine type cannot hot-plug: {attached_text}\n")
+            print("\nThe libvirt network will be deleted and recreated. These "
+                  f"VMs lose their network link and will be reconnected, by "
+                  f"a reboot if their machine type cannot hot-plug: "
+                  f"{attached_text}\n")
             try:
                 answer = input(
                     f"Type '{network_name}' to proceed: ").strip()
@@ -359,9 +361,22 @@ class NetworksMixin:
         self._forget_cached_network(full_name)
 
         self.logger.info(f"network {network_name}: defining again")
+        definition_info = network_info
+        replacement_bridge = plan.get('replacement_bridge_name')
+        if replacement_bridge:
+            # This is an execution-time reservation, not a config pin. The
+            # next reconcile still treats the bridge as auto-assigned and reads
+            # its actual name from libvirt.
+            definition_info = dict(network_info)
+            configured_bridge = network_info.get('bridge')
+            definition_info['bridge'] = {
+                **(configured_bridge if isinstance(configured_bridge, dict)
+                   else {}),
+                'name': replacement_bridge,
+            }
         if self._define_network(
                 label=network_name, full_name=full_name,
-                network_info=network_info,
+                network_info=definition_info,
                 workdir=cluster['workdir']) == 'failed':
             self.logger.error(
                 f"network {network_name}: could not be defined again. The "

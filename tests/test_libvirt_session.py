@@ -24,6 +24,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import ConfigError
+from boxman.providers.libvirt.net import Network
 from boxman.providers.libvirt.session import LibVirtSession
 
 pytestmark = pytest.mark.unit
@@ -117,6 +119,77 @@ class TestUpdateProviderConfigWithRuntime:
         # Runtime was applied
         assert s.provider_config["runtime"] == "docker-compose"
         assert s.provider_config["use_sudo"] is True
+
+
+class TestBridgeTransitionPlanning:
+
+    NAT_XML = (
+        "<network><name>demo</name><forward mode='nat'/>"
+        "<bridge name='virbr0' stp='on' delay='0'/>"
+        "<mac address='52:54:00:0a:0b:0c'/>"
+        "<ip address='10.5.3.1' netmask='255.255.255.0'/></network>"
+    )
+    BRIDGE_XML = (
+        "<network><name>demo</name><forward mode='bridge'/>"
+        "<bridge name='virbr0'/></network>"
+    )
+
+    @staticmethod
+    def _session() -> LibVirtSession:
+        session = _session({
+            "uri": "qemu+ssh://hypervisor.example/system",
+            "use_sudo": False,
+        })
+        session.manager = MagicMock()
+        return session
+
+    @staticmethod
+    def _network_state(xml: str):
+        return (
+            patch.object(Network, "exists", return_value=True),
+            patch.object(Network, "dump_xml", return_value=xml),
+            patch.object(Network, "attached_domains", return_value=[]),
+            patch.object(Network, "is_active", return_value=True),
+        )
+
+    def test_nat_to_bridge_same_name_is_rejected_during_planning(self):
+        session = self._session()
+        patches = self._network_state(self.NAT_XML)
+        with patches[0], patches[1], patches[2], patches[3]:
+            with pytest.raises(ConfigError, match="would delete.*managed bridge"):
+                session.plan_network(
+                    name="demo",
+                    info={"mode": "bridge", "bridge": {"name": "virbr0"}},
+                )
+
+    def test_bridge_to_nat_same_pinned_name_is_rejected_during_planning(self):
+        session = self._session()
+        patches = self._network_state(self.BRIDGE_XML)
+        with (
+            patches[0], patches[1], patches[2], patches[3],
+            patch.object(Network, "get_bridge_from_network",
+                         return_value="virbr0"),
+        ):
+            with pytest.raises(ConfigError, match="cannot claim its name"):
+                session.plan_network(
+                    name="demo",
+                    info={"mode": "nat", "bridge": {"name": "virbr0"}},
+                )
+
+    def test_bridge_to_auto_nat_reserves_name_before_removal(self):
+        session = self._session()
+        patches = self._network_state(self.BRIDGE_XML)
+        with (
+            patches[0], patches[1], patches[2], patches[3],
+            patch.object(Network, "get_bridge_from_network",
+                         return_value="virbr0"),
+            patch.object(Network, "find_available_bridge_name",
+                         return_value="virbr1"),
+        ):
+            plan = session.plan_network(name="demo", info={"mode": "nat"})
+
+        assert plan["action"] == "recreate"
+        assert plan["replacement_bridge_name"] == "virbr1"
 
 
 class TestDestroyDisks:

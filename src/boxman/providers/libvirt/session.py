@@ -6,6 +6,7 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from boxman import log
+from boxman.exceptions import ConfigError
 
 from ..session_base import SessionConfigMixin
 from . import net_reconcile
@@ -317,6 +318,8 @@ class LibVirtSession(SessionConfigMixin):
             provider_config=self.provider_config,
             assign_new_bridge=False,
             manager=self.manager)
+        network.validate_definition()
+        network.validate_runtime_prerequisites()
 
         empty = {'structural': [], 'host_ops': [], 'range_ops': [],
                  'attached_vms': [], 'actual': {}, 'inactive': False}
@@ -341,8 +344,29 @@ class LibVirtSession(SessionConfigMixin):
             return {'action': 'error', **empty}
 
         actual = net_reconcile.parse_network_xml(actual_xml)
-        plan = net_reconcile.diff_network(
-            net_reconcile.desired_state(network), actual)
+        desired = net_reconcile.desired_state(network)
+        plan = net_reconcile.diff_network(desired, actual)
+
+        ownership_conflict = net_reconcile.bridge_ownership_conflict(
+            desired, actual)
+        if ownership_conflict:
+            raise ConfigError(f"network {name}: {ownership_conflict}")
+
+        # When moving from an external bridge to an auto-named managed
+        # nat/route network, reserve the replacement name while the old network
+        # is still visible. Otherwise removal may make an external ``virbr0``
+        # look available and the new managed network will try to claim it.
+        if (plan['action'] == 'recreate'
+                and actual.get('mode') == 'bridge'
+                and desired.get('mode') in {'nat', 'route'}
+                and network.pinned_bridge_name is None):
+            replacement = Network(
+                name=name,
+                info=info,
+                provider_config=self.provider_config,
+                assign_new_bridge=True,
+                manager=self.manager)
+            plan['replacement_bridge_name'] = replacement.bridge_name
 
         # the caller needs the state as it is on disk, not only the diff: a
         # recreate has to tear down the iptables rules belonging to the network
