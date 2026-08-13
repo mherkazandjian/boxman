@@ -637,9 +637,11 @@ drift until the guest boots with the new persistent XML, and applies that XML
 idempotently (and removing the `memballoon` block reconciles the VM back to the
 defaults).
 
-> For many similar VMs, also consider enabling KSM on the host
-> (`systemctl enable --now ksmd` / `ksmtuned`) to deduplicate identical pages
-> across guests -- it is a host-level setting, complementary to free-page reporting.
+> For many similar VMs, KSM can also deduplicate identical live pages
+> across guests. KSM is a host-wide, operator-owned policy with CPU,
+> capacity, NUMA, and trust-boundary trade-offs; Boxman does not enable it.
+> See [Host Memory Deduplication with KSM](../ksm.md) for a bounded
+> evaluation and measurement workflow.
 
 ## 2.4 Snapshot the Whole Cluster
 
