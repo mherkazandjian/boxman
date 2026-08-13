@@ -114,6 +114,47 @@ class VMStateDiffer:
             return 0
         return int(memory_values[0]) // 1024
 
+    def get_actual_memballoon(self, domain_name: str) -> dict[str, Any]:
+        """
+        Get the actual memballoon state from the persistent (inactive) XML.
+
+        Returns:
+            Dict with 'free_page_reporting' (bool; a missing attribute or a
+            missing memballoon element counts as False) and 'stats_period'
+            (int seconds, or None when no <stats> element is present).
+        """
+        from lxml import etree
+
+        xml_content = self.virsh_edit.get_domain_xml(domain_name, inactive=True)
+        tree = etree.fromstring(xml_content.encode('utf-8'))
+        matches = tree.xpath('//devices/memballoon')
+        if not matches:
+            return {'free_page_reporting': False, 'stats_period': None}
+        memballoon = matches[0]
+        stats = memballoon.find('stats')
+        stats_period = None
+        if stats is not None and stats.get('period'):
+            stats_period = int(stats.get('period'))
+        return {
+            'free_page_reporting': memballoon.get('freePageReporting') == 'on',
+            'stats_period': stats_period,
+        }
+
+    @staticmethod
+    def normalize_memballoon_config(
+            config: dict[str, Any] | None) -> dict[str, Any]:
+        """
+        Normalize a memballoon config block into a fully-explicit desired
+        state. A missing block (None) maps to the libvirt defaults, so
+        removing the block from conf.yml reconciles back to
+        ``freePageReporting`` off and no ``<stats>`` element.
+        """
+        config = config or {}
+        return {
+            'free_page_reporting': bool(config.get('free_page_reporting', False)),
+            'stats_period': config.get('stats_period'),
+        }
+
     def get_actual_disks(self, domain_name: str) -> list[dict[str, Any]]:
         """
         Get actual disk info from virsh domblklist + virsh domblkinfo.
@@ -225,7 +266,8 @@ class VMStateDiffer:
                 desired_max_vcpus: int | None = None,
                 desired_max_memory_mb: int | None = None,
                 desired_shared_folders: list[dict[str, Any]] | None = None,
-                desired_cdroms: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                desired_cdroms: list[dict[str, Any]] | None = None,
+                desired_memballoon: dict[str, Any] | None = None) -> dict[str, Any]:
         """
         Compute the diff between desired config and actual VM state.
 
@@ -242,6 +284,8 @@ class VMStateDiffer:
               - resize_disks: list of dicts with target, source, current_size_mb, desired_size_mb
               - new_cdroms, removed_cdroms, changed_cdroms
               - new_shared_folders, removed_shared_folders, changed_shared_folders
+              - memballoon_changed, desired_memballoon (normalized),
+                actual_memballoon
               - vm_state: current VM state string
         """
         vm_state = self.get_vm_state(domain_name)
@@ -281,6 +325,11 @@ class VMStateDiffer:
         max_memory_changed = False
         if desired_max_memory_mb is not None:
             max_memory_changed = desired_max_memory_mb != actual_max_memory_mb
+
+        # --- Memballoon diff ---
+        actual_memballoon = self.get_actual_memballoon(domain_name)
+        normalized_memballoon = self.normalize_memballoon_config(desired_memballoon)
+        memballoon_changed = normalized_memballoon != actual_memballoon
 
         # --- Disk diff ---
         actual_disks = self.get_actual_disks(domain_name)
@@ -412,5 +461,8 @@ class VMStateDiffer:
             'new_shared_folders': new_shared_folders,
             'removed_shared_folders': removed_shared_folders,
             'changed_shared_folders': changed_shared_folders,
+            'memballoon_changed': memballoon_changed,
+            'desired_memballoon': normalized_memballoon,
+            'actual_memballoon': actual_memballoon,
             'vm_state': vm_state
         }

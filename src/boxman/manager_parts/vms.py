@@ -550,6 +550,7 @@ class VMsMixin:
                 desired_max_memory_mb=vm_info.get('max_memory'),
                 desired_shared_folders=vm_info.get('shared_folders'),
                 desired_cdroms=vm_info.get('cdroms'),
+                desired_memballoon=vm_info.get('memballoon'),
             )
 
             has_changes = (
@@ -564,12 +565,11 @@ class VMsMixin:
                 diff['changed_cdroms'] or
                 diff['new_shared_folders'] or
                 diff['removed_shared_folders'] or
-                diff['changed_shared_folders']
+                diff['changed_shared_folders'] or
+                diff['memballoon_changed']
             )
 
-            memballoon_config = vm_info.get('memballoon')
-
-            if not has_changes and not memballoon_config:
+            if not has_changes:
                 self.logger.info(f"VM {vm_name}: no changes detected")
                 result_queue.put((vm_name, {'status': 'no_change', 'details': ''}))
                 return
@@ -615,11 +615,10 @@ class VMsMixin:
             if diff['changed_shared_folders']:
                 names = [f.get('name', '?') for f in diff['changed_shared_folders']]
                 changes.append(f"change shared folders: {', '.join(names)}")
-            if memballoon_config:
-                # no state diffing for the balloon device; the config is
-                # (re)applied idempotently below
-                changes.append("memballoon: apply config")
-
+            if diff['memballoon_changed']:
+                changes.append(
+                    f"memballoon: {diff['actual_memballoon']} -> "
+                    f"{diff['desired_memballoon']}")
             self.logger.info(f"VM {vm_name}: changes detected: {'; '.join(changes)}")
 
             if dry_run:
@@ -655,10 +654,11 @@ class VMsMixin:
                 if cpu_mem_result['restart_needed']:
                     restart_needed = True
 
-            # memballoon (persistent config, applied idempotently)
-            if memballoon_config:
+            # memballoon (persistent config; the normalized desired state
+            # covers both enabling and reconciling back to defaults)
+            if diff['memballoon_changed']:
                 balloon_ok = self.provider.configure_vm_memballoon(
-                    vm_name=full_vm_name, memballoon=memballoon_config)
+                    vm_name=full_vm_name, memballoon=diff['desired_memballoon'])
                 if not balloon_ok:
                     result_queue.put((vm_name, {
                         'status': 'failed',

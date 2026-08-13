@@ -3,7 +3,7 @@ from typing import Any
 from lxml import etree
 
 from boxman import log
-from boxman.exceptions import ProvisionError
+from boxman.exceptions import ConfigError, ProvisionError
 
 from .commands import VirshCommand
 
@@ -245,6 +245,33 @@ class VirshEdit:
         return etree.tostring(tree, encoding='unicode', pretty_print=True)
 
     @staticmethod
+    def validate_memballoon_config(config: dict[str, Any]) -> None:
+        """
+        Validate a memballoon config dict, raising ConfigError on bad values.
+
+        ``free_page_reporting`` must be a real bool (a YAML string like
+        ``"false"`` would silently enable it otherwise) and ``stats_period``
+        must be a positive integer (bools excluded) or None to remove the
+        stats element.
+        """
+        if not isinstance(config, dict):
+            raise ConfigError(
+                f"memballoon config must be a mapping, got {type(config).__name__}")
+        if 'free_page_reporting' in config and not isinstance(
+                config['free_page_reporting'], bool):
+            raise ConfigError(
+                f"memballoon.free_page_reporting must be a boolean, got "
+                f"{config['free_page_reporting']!r}")
+        stats_period = config.get('stats_period')
+        if stats_period is not None and (
+                isinstance(stats_period, bool)
+                or not isinstance(stats_period, int)
+                or stats_period < 1):
+            raise ConfigError(
+                f"memballoon.stats_period must be a positive integer (seconds), "
+                f"got {stats_period!r}")
+
+    @staticmethod
     def apply_memballoon_to_xml(xml_content: str, config: dict[str, Any]) -> str:
         """
         Apply the memballoon (virtio-balloon) configuration to domain xml.
@@ -255,7 +282,8 @@ class VirshEdit:
 
         - ``free_page_reporting`` (bool): sets the ``freePageReporting='on|off'``
           attribute
-        - ``stats_period`` (int): sets ``<stats period='N'/>``
+        - ``stats_period`` (int): sets ``<stats period='N'/>``; an explicit
+          None removes the ``<stats>`` element
 
         Keys absent from *config* are left untouched.
 
@@ -265,7 +293,11 @@ class VirshEdit:
 
         Returns:
             modified xml content as string
+
+        Raises:
+            ConfigError: on invalid config values
         """
+        VirshEdit.validate_memballoon_config(config)
         tree = etree.fromstring(xml_content.encode('utf-8'))
 
         memballoons = tree.xpath('//devices/memballoon')
@@ -284,12 +316,15 @@ class VirshEdit:
             memballoon.set('freePageReporting',
                            'on' if config['free_page_reporting'] else 'off')
 
-        stats_period = config.get('stats_period')
-        if stats_period is not None:
+        if 'stats_period' in config:
             stats = memballoon.find('stats')
-            if stats is None:
-                stats = etree.SubElement(memballoon, 'stats')
-            stats.set('period', str(int(stats_period)))
+            if config['stats_period'] is None:
+                if stats is not None:
+                    memballoon.remove(stats)
+            else:
+                if stats is None:
+                    stats = etree.SubElement(memballoon, 'stats')
+                stats.set('period', str(config['stats_period']))
 
         return etree.tostring(tree, encoding='unicode', pretty_print=True)
 
@@ -308,6 +343,10 @@ class VirshEdit:
 
         Returns:
             True if successful (or nothing to do), False otherwise
+
+        Raises:
+            ConfigError: on invalid config values (not swallowed, so a
+                         malformed conf.yml fails loudly)
         """
         if not config:
             self.logger.info(f"no memballoon configuration for {domain_name}, skipping")
@@ -316,6 +355,8 @@ class VirshEdit:
             xml_content = self.get_domain_xml(domain_name, inactive=True)
             modified_xml = self.apply_memballoon_to_xml(xml_content, config)
             return self.redefine_domain(domain_name, modified_xml)
+        except ConfigError:
+            raise
         except Exception as exc:
             self.logger.error(f"failed to configure memballoon for {domain_name}: {exc}")
             return False

@@ -547,10 +547,20 @@ guest continuously hand unused pages back to the host:
 ```
 
 No guest-side setup is needed beyond a Linux kernel >= 5.7 (all supported cloud
-images qualify). The resulting libvirt domain gets a balloon device with
-`<memballoon model='virtio' freePageReporting='on'>`. Changes to a running VM are
-written to the persistent config and take effect from the next boot;
-`boxman update` applies them idempotently.
+images qualify). The host needs **libvirt >= 6.9.0** and **QEMU >= 5.1** — on older
+versions `virsh define` may reject or silently drop the setting. The resulting
+libvirt domain gets a balloon device with
+`<memballoon model='virtio' freePageReporting='on'>`; verify with:
+
+```bash
+virsh dumpxml --inactive <vm> | grep -A2 memballoon
+#   <memballoon model='virtio' freePageReporting='on'>
+#     <stats period='5'/>
+```
+
+Changes to a running VM are written to the persistent config and
+take effect from the next boot; `boxman update` applies them idempotently
+(and removing the `memballoon` block reconciles the VM back to the defaults).
 
 > For many similar VMs, also consider enabling KSM on the host
 > (`systemctl enable --now ksmd` / `ksmtuned`) to deduplicate identical pages

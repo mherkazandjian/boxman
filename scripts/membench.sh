@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # membench.sh — measure how much host RAM boxman VMs actually hold onto
-# after a guest allocates and frees memory (virtio-balloon free-page-reporting
-# A/B test helper).
+# after a guest allocates and frees memory. A/B helper for virtio-balloon
+# free-page-reporting.
 #
 # Run on the libvirt host. The script:
 #   t0: record QEMU RSS per VM + host memory
@@ -81,13 +81,16 @@ domain_name() {
 }
 
 vm_rss_mib() {
-    # QEMU process RSS in MiB. Prefer virsh dommemstat (host-side counter),
-    # fall back to ps on the qemu process.
-    local dom="$1" rss
+    # QEMU process RSS in MiB. Prefer virsh dommemstat (host-side counter);
+    # fall back to ps on the qemu process of THIS domain (matched via the
+    # -name guest=<dom> argument so other VMs' processes never leak in).
+    local dom="$1" rss pid
     rss=$($VIRSH_CMD dommemstat "$dom" 2>/dev/null | awk '/^rss / {print int($2/1024)}' || true)
     if [[ -z $rss ]]; then
-        rss=$(ps -o rss= -C qemu-system-x86 -C qemu-system-x86_64 -C qemu-kvm \
-              --no-headers 2>/dev/null | head -1 | awk '{print int($1/1024)}' || true)
+        pid=$(pgrep -f "guest=${dom}," 2>/dev/null | head -1 || true)
+        if [[ -n $pid ]]; then
+            rss=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{print int($1/1024)}' || true)
+        fi
     fi
     echo "${rss:-NaN}"
 }

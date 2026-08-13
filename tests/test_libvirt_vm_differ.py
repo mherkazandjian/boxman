@@ -20,6 +20,17 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
+def _default_memballoon_state():
+    """diff_vm probes the balloon device via virsh; default it to the
+    libvirt defaults (no freePageReporting, no stats) so the disk-diff
+    helper doesn't need another patch in every test."""
+    with patch.object(VMStateDiffer, 'get_actual_memballoon',
+                      return_value={'free_page_reporting': False,
+                                    'stats_period': None}):
+        yield
+
+
+@pytest.fixture
 def differ() -> VMStateDiffer:
     return VMStateDiffer(provider_config={"use_sudo": False,
                                           "uri": "qemu:///system"})
@@ -50,6 +61,7 @@ def _diff_disks(differ: VMStateDiffer,
         )
 
 
+@pytest.mark.usefixtures("_default_memballoon_state")
 class TestDiskDiff:
 
     def test_new_disk_when_file_missing(self, differ: VMStateDiffer,
@@ -88,3 +100,103 @@ class TestDiskDiff:
         diff = _diff_disks(differ, desired, actual, str(tmp_path))
         assert diff["new_disks"] == []
         assert diff["resize_disks"] == []
+
+
+_BALLOON_XML = """<domain type='kvm'>
+  <name>vm01</name>
+  <devices>
+    {memballoon}
+  </devices>
+</domain>"""
+
+
+def _balloon_xml(memballoon: str = "") -> str:
+    return _BALLOON_XML.format(memballoon=memballoon)
+
+
+class TestMemballoonState:
+    """get_actual_memballoon / normalize_memballoon_config."""
+
+    def test_absent_element_is_defaults(self, differ: VMStateDiffer):
+        with patch.object(differ.virsh_edit, "get_domain_xml",
+                          return_value=_balloon_xml()):
+            assert differ.get_actual_memballoon("vm01") == {
+                "free_page_reporting": False, "stats_period": None}
+
+    def test_fpr_on_and_stats(self, differ: VMStateDiffer):
+        xml = _balloon_xml(
+            "<memballoon model='virtio' freePageReporting='on'>"
+            "<stats period='5'/></memballoon>")
+        with patch.object(differ.virsh_edit, "get_domain_xml",
+                          return_value=xml):
+            assert differ.get_actual_memballoon("vm01") == {
+                "free_page_reporting": True, "stats_period": 5}
+
+    def test_normalize_none_is_defaults(self):
+        assert VMStateDiffer.normalize_memballoon_config(None) == {
+            "free_page_reporting": False, "stats_period": None}
+
+    def test_normalize_partial_block(self):
+        assert VMStateDiffer.normalize_memballoon_config(
+            {"free_page_reporting": True}) == {
+            "free_page_reporting": True, "stats_period": None}
+
+
+class TestMemballoonDiff:
+    """diff_vm must flag balloon changes only when the actual inactive
+    state differs from the desired one, in both directions."""
+
+    def _diff(self, differ: VMStateDiffer, desired, actual) -> dict:
+        with patch.object(differ, "get_vm_state", return_value="running"), \
+             patch.object(differ, "get_actual_cpu",
+                          return_value={"sockets": 1, "cores": 1, "threads": 1,
+                                        "total_vcpus": 1, "current_vcpus": 1}), \
+             patch.object(differ, "get_max_vcpus", return_value=1), \
+             patch.object(differ, "get_actual_memory_mb", return_value=1024), \
+             patch.object(differ, "get_max_memory_mb", return_value=1024), \
+             patch.object(differ, "get_actual_disks", return_value=[]), \
+             patch.object(differ, "get_actual_cdroms", return_value=[]), \
+             patch.object(differ, "get_actual_shared_folders", return_value=[]), \
+             patch.object(differ, "get_actual_memballoon", return_value=actual):
+            return differ.diff_vm(
+                domain_name="vm01",
+                desired_cpus=None,
+                desired_memory_mb=None,
+                desired_disks=[],
+                workdir="/tmp",
+                disk_prefix="vm01",
+                desired_memballoon=desired,
+            )
+
+    def test_no_block_and_default_actual_is_no_change(self, differ):
+        diff = self._diff(differ, None,
+                          {"free_page_reporting": False, "stats_period": None})
+        assert diff["memballoon_changed"] is False
+
+    def test_new_block_is_a_change(self, differ):
+        diff = self._diff(differ, {"free_page_reporting": True},
+                          {"free_page_reporting": False, "stats_period": None})
+        assert diff["memballoon_changed"] is True
+        assert diff["desired_memballoon"] == {
+            "free_page_reporting": True, "stats_period": None}
+
+    def test_removed_block_reconciles_to_defaults(self, differ):
+        """Removing the memballoon block after enabling it must show up as
+        a change back to the libvirt defaults (review P2)."""
+        diff = self._diff(differ, None,
+                          {"free_page_reporting": True, "stats_period": 5})
+        assert diff["memballoon_changed"] is True
+        assert diff["desired_memballoon"] == {
+            "free_page_reporting": False, "stats_period": None}
+
+    def test_matching_state_is_no_change(self, differ):
+        diff = self._diff(differ,
+                          {"free_page_reporting": True, "stats_period": 5},
+                          {"free_page_reporting": True, "stats_period": 5})
+        assert diff["memballoon_changed"] is False
+
+    def test_stats_period_mismatch_is_a_change(self, differ):
+        diff = self._diff(differ,
+                          {"free_page_reporting": True, "stats_period": 10},
+                          {"free_page_reporting": True, "stats_period": 5})
+        assert diff["memballoon_changed"] is True

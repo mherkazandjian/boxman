@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from lxml import etree
 
+from boxman.exceptions import ConfigError
 from boxman.providers.libvirt.virsh_edit import VirshEdit
 
 pytestmark = pytest.mark.unit
@@ -145,3 +146,46 @@ class TestConfigureMemballoon:
         with patch.object(ve.virsh, "execute", side_effect=_execute):
             assert ve.configure_memballoon(
                 "vm01", {"free_page_reporting": True}) is False
+
+
+class TestMemballoonValidation:
+    """Review P3: malformed config values must raise ConfigError instead
+    of silently producing the opposite setting."""
+
+    def test_free_page_reporting_string_rejected(self):
+        with pytest.raises(ConfigError):
+            VirshEdit.apply_memballoon_to_xml(
+                _domain_xml(), {"free_page_reporting": "false"})
+
+    def test_stats_period_bool_rejected(self):
+        with pytest.raises(ConfigError):
+            VirshEdit.apply_memballoon_to_xml(
+                _domain_xml(), {"stats_period": True})
+
+    def test_stats_period_float_rejected(self):
+        with pytest.raises(ConfigError):
+            VirshEdit.apply_memballoon_to_xml(
+                _domain_xml(), {"stats_period": 2.5})
+
+    def test_stats_period_zero_rejected(self):
+        with pytest.raises(ConfigError):
+            VirshEdit.apply_memballoon_to_xml(
+                _domain_xml(), {"stats_period": 0})
+
+    def test_non_dict_config_rejected(self):
+        with pytest.raises(ConfigError):
+            VirshEdit.apply_memballoon_to_xml(_domain_xml(), "true")
+
+    def test_stats_period_none_removes_stats(self):
+        xml = VirshEdit.apply_memballoon_to_xml(
+            _domain_xml("<memballoon model='virtio'>"
+                        "<stats period='5'/></memballoon>"),
+            {"stats_period": None})
+        tree = etree.fromstring(xml.encode("utf-8"))
+        assert tree.xpath("//devices/memballoon/stats") == []
+
+    def test_configure_memballoon_reraises_config_error(self, ve: VirshEdit):
+        with patch.object(ve.virsh, "execute",
+                          return_value=_result(stdout=_domain_xml())):
+            with pytest.raises(ConfigError):
+                ve.configure_memballoon("vm01", {"stats_period": True})
