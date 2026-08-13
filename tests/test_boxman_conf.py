@@ -104,6 +104,9 @@ class TestBoxmanConfOverride:
         # paths should be the system paths (or bare command names)
         virsh_cmd = loaded["providers"]["libvirt"]["virsh_cmd"]
         assert virsh_cmd == (_shutil.which("virsh") or "virsh")
+        sysprep_cmd = loaded["providers"]["libvirt"]["virt_sysprep_cmd"]
+        assert sysprep_cmd == (_shutil.which("virt-sysprep") or "virt-sysprep")
+        assert loaded["providers"]["libvirt"]["virt_sysprep_timeout"] == 300
 
     def test_global_authorized_keys_resolves_literal(self):
         """Literal SSH keys are returned as-is."""

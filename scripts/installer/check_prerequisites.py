@@ -113,15 +113,20 @@ def classify_family(osid, id_like):
 # include x86_64 (e.g. QEMU_SOFTMMU_TARGETS="x86_64") to build qemu-system-x86_64;
 # app-emulation/libvirt needs USE="virt-network qemu" for the QEMU/KVM driver and
 # the default NAT network. virt-install / virt-clone ship in
-# app-emulation/virt-manager. Services are systemd or OpenRC depending on the
-# profile (OpenRC: `rc-update add libvirtd default && rc-service libvirtd start`).
+# app-emulation/virt-manager; virt-sysprep ships in app-emulation/guestfs-tools.
+# Services are systemd or OpenRC depending on the profile (OpenRC:
+# `rc-update add libvirtd default && rc-service libvirtd start`).
 _CORE_STACK = {
-    "arch": "sudo pacman -S --needed libvirt qemu-full virt-install sshpass dnsmasq",
+    "arch": ("sudo pacman -S --needed libvirt qemu-full virt-install "
+             "guestfs-tools sshpass dnsmasq"),
     "debian": ("sudo apt update && sudo apt install -y libvirt-daemon-system "
-               "libvirt-clients qemu-kvm virtinst sshpass bridge-utils cloud-image-utils"),
-    "rhel": "sudo dnf install -y libvirt qemu-kvm virt-install sshpass genisoimage",
+               "libvirt-clients qemu-kvm virtinst guestfs-tools sshpass "
+               "bridge-utils cloud-image-utils"),
+    "rhel": ("sudo dnf install -y libvirt qemu-kvm virt-install "
+             "guestfs-tools sshpass genisoimage"),
     "gentoo": ("sudo emerge --ask app-emulation/libvirt app-emulation/qemu "
-               "app-emulation/virt-manager net-dns/dnsmasq app-admin/sudo"),
+               "app-emulation/virt-manager app-emulation/guestfs-tools "
+               "net-dns/dnsmasq app-admin/sudo"),
 }
 
 # Declarative core-stack remediation for NixOS: printed as advisory text, never
@@ -131,7 +136,7 @@ _NIXOS_CORE_ADVICE = (
     "/etc/nixos/configuration.nix:\n"
     "virtualisation.libvirtd.enable = true;\n"
     "programs.virt-manager.enable = true;\n"
-    "environment.systemPackages = with pkgs; [ virt-manager qemu cloud-utils ];\n"
+    "environment.systemPackages = with pkgs; [ virt-manager qemu guestfs-tools cloud-utils ];\n"
     "users.users.<you>.extraGroups = [ \"libvirtd\" \"kvm\" ];\n"
     "then apply with: sudo nixos-rebuild switch"
 )
@@ -145,7 +150,7 @@ _GUIX_CORE_ADVICE = (
     "in your (user-account ...): "
     "(supplementary-groups '(\"libvirt\" \"kvm\" \"wheel\"))\n"
     "then apply with: sudo guix system reconfigure /etc/config.scm\n"
-    "user CLI tools can also be added with: guix install qemu virt-manager"
+    "user CLI tools can also be added with: guix install qemu virt-manager libguestfs"
 )
 
 # Declarative libvirtd-service remediation (advisory) for NixOS.
@@ -177,6 +182,8 @@ _TOOL_PKG = {
              "gentoo": "app-arch/zstd", "nixos": "zstd", "guix": "zstd"},
     "virt-sparsify": {"arch": "guestfs-tools", "debian": "libguestfs-tools", "rhel": "guestfs-tools",
                       "gentoo": "app-emulation/libguestfs", "nixos": "guestfs-tools", "guix": "libguestfs"},
+    "virt-sysprep": {"arch": "guestfs-tools", "debian": "guestfs-tools", "rhel": "guestfs-tools",
+                     "gentoo": "app-emulation/guestfs-tools", "nixos": "guestfs-tools", "guix": "libguestfs"},
     "openssh": {"arch": "openssh", "debian": "openssh-client", "rhel": "openssh-clients",
                 "gentoo": "net-misc/openssh", "nixos": "openssh", "guix": "openssh"},
 }
@@ -915,6 +922,22 @@ class Doctor:
 
         self.check("Nested virtualization", nested)
 
+    def _check_clone_sanitizer(self):
+        """Report virt-sysprep as recommended, not a core runtime gate."""
+        def clone_sanitizer():
+            if have("virt-sysprep"):
+                return OK, "virt-sysprep present for clone machine-ID reset", None
+            package = _TOOL_PKG["virt-sysprep"].get(
+                self.family, "guestfs-tools")
+            return WARN, (
+                "virt-sysprep missing; clone_machine_id=auto will warn and "
+                "continue, while clone_machine_id=required will fail closed"
+            ), self._install_fix(
+                "install virt-sysprep for automatic clone machine-ID resets",
+                package)
+
+        return self.check("Clone machine-ID sanitizer", clone_sanitizer)
+
     # -- LOCAL runtime ----------------------------------------------------- #
     def check_local_runtime(self):
         self.section("libvirt / QEMU (local runtime)")
@@ -926,10 +949,13 @@ class Doctor:
             if not qemu_sys:
                 missing.append("qemu-system-x86_64")
             if not missing:
-                return OK, "virsh, virt-install, virt-clone, qemu-img, qemu-system present", None
+                return OK, ("virsh, virt-install, virt-clone, qemu-img, "
+                            "qemu-system present"), None
             return FAIL, f"missing: {', '.join(missing)}", self._core_stack_fix()
 
         tools = self.check("Core libvirt/QEMU tools", core_tools)
+
+        self._check_clone_sanitizer()
 
         def libvirtd_service():
             active = run_capture(["systemctl", "is-active", "libvirtd"])[1].strip()
@@ -1070,8 +1096,9 @@ class Doctor:
                 fix = Fix(
                     "grant passwordless sudo for the commands boxman runs, e.g. a "
                     "/etc/sudoers.d/boxman line: "
-                    "`%s ALL=(root) NOPASSWD: /usr/bin/virsh, /usr/bin/qemu-img, "
-                    "/usr/sbin/iptables, /usr/sbin/ip, /usr/bin/rsync, /bin/rm`" % (
+                    "`%s ALL=(root) NOPASSWD: /usr/bin/virsh, "
+                    "/usr/bin/virt-sysprep, /usr/bin/qemu-img, /usr/sbin/iptables, "
+                    "/usr/sbin/ip, /usr/bin/rsync, /bin/rm`" % (
                         user_group_names()[1] or "$USER"),
                     commands=[])
                 return WARN, ("passwordless sudo not available; boxman's automatic "
@@ -1079,18 +1106,24 @@ class Doctor:
                               "non-interactively"), fix
             # passwordless sudo exists -- check the scope that bites people.
             iptables_ok = sudo_nopasswd_covers(out, "iptables")
+            sysprep_ok = sudo_nopasswd_covers(out, "virt-sysprep")
             qemu_ok = sudo_nopasswd_covers(out, "qemu-img")
             rm_ok = sudo_nopasswd_covers(out, "rm")
             gaps = []
             if not iptables_ok:
                 gaps.append("iptables/ip (NAT & isolated networks, netlab bridges)")
+            if not sysprep_ok:
+                gaps.append(
+                    "virt-sysprep (clone_machine_id=required needs NOPASSWD)")
             if not (qemu_ok and rm_ok):
                 gaps.append("qemu-img/rm (destroy/cleanup silently no-ops without these)")
             if not gaps:
-                return OK, "passwordless sudo covers virsh/qemu-img/iptables/rm", None
+                return OK, ("passwordless sudo covers "
+                            "virsh/virt-sysprep/qemu-img/iptables/rm"), None
             fix = Fix(
                 "widen NOPASSWD sudo scope in /etc/sudoers.d/boxman to include: "
-                "virsh, qemu-img, iptables, ip, rsync, rm", commands=[])
+                "virsh, virt-sysprep, qemu-img, iptables, ip, rsync, rm",
+                commands=[])
             return WARN, "passwordless sudo present but missing: " + "; ".join(gaps), fix
 
         self.check("sudo rights", sudo_rights)

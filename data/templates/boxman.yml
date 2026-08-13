@@ -75,6 +75,10 @@ providers:
     virt_install_cmd: virt-install
     # path to virt-clone command
     virt_clone_cmd: virt-clone
+    # path to virt-sysprep (used by clone_machine_id: auto|required)
+    virt_sysprep_cmd: virt-sysprep
+    # maximum offline guest inspection time in seconds
+    virt_sysprep_timeout: 300
     # path to virsh command
     virsh_cmd: virsh
     # specify the verbosity of libvirt commands

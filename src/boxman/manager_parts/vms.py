@@ -8,7 +8,11 @@ from multiprocessing import Process, Queue
 from typing import Any
 
 from boxman import log
-from boxman.exceptions import ConfigError, ProvisionError
+from boxman.exceptions import (
+    CloneSanitizerError,
+    ConfigError,
+    ProvisionError,
+)
 from boxman.loggers.logger import suppressed
 from boxman.manager_parts.images import ImagesMixin
 from boxman.providers.libvirt.commands import VirshCommand
@@ -48,6 +52,11 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
                     workdir=cluster['workdir']
                 )
             return
+        except (CloneSanitizerError, ConfigError):
+            # Required sanitizer and invalid-policy failures are permanent.
+            # Retrying would either repeat the same inspection or run into an
+            # unsafe clone whose cleanup already failed.
+            raise
         except Exception:
             if not last_attempt:
                 delay = attempt * 2
@@ -148,9 +157,8 @@ class VMsMixin:
             names = ', '.join(name for name, _ in failed)
             raise RuntimeError(
                 f"clone failed for {len(failed)} VM(s) ({names}); aborting "
-                f"provision. See the virt-clone error logged above for the "
-                f"underlying cause (typically a missing template disk or a "
-                f"libvirt storage pool issue).")
+                f"provision. See the preceding clone or guest-sanitizer log "
+                f"for the underlying cause and remediation.")
 
     ### end vms define / remove / destroy
     def _configure_and_start_vm(
@@ -500,7 +508,9 @@ class VMsMixin:
             names = ', '.join(sorted(failures))
             raise RuntimeError(
                 f"clone failed for {len(failures)} new VM(s) ({names}); "
-                f"aborting update. See the virt-clone error logged above.")
+                f"aborting update. See the preceding clone or "
+                f"guest-sanitizer log for the underlying cause and "
+                f"remediation.")
 
         # configure and start new VMs (parallel)
         configure_tasks = []

@@ -413,6 +413,80 @@ class TestCloneVmsExitCodeGuard:
             # No exception, no return value either.
             m.clone_vms()
 
+    def test_required_clone_sanitizer_failure_is_not_retried(
+        self, tmp_path: Path
+    ):
+        from unittest.mock import MagicMock, patch as _patch
+
+        from boxman.exceptions import CloneSanitizerError
+        from boxman.manager_parts.vms import _clone_with_retry
+
+        provider = MagicMock()
+        provider.clone_vm.side_effect = CloneSanitizerError(
+            "virt-sysprep is not installed"
+        )
+        cluster = {"base_image": "tpl", "workdir": str(tmp_path)}
+
+        with _patch("boxman.manager_parts.vms.time.sleep") as sleep:
+            with pytest.raises(CloneSanitizerError, match="virt-sysprep"):
+                _clone_with_retry(provider, cluster, {}, "vm01")
+
+        provider.clone_vm.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_failed_unsafe_clone_cleanup_is_not_retried(self, tmp_path: Path):
+        from unittest.mock import MagicMock, patch as _patch
+
+        from boxman.exceptions import CloneCleanupError
+        from boxman.manager_parts.vms import _clone_with_retry
+
+        provider = MagicMock()
+        provider.clone_vm.side_effect = CloneCleanupError(
+            "inspection failed; cleanup also failed; manual cleanup required"
+        )
+        cluster = {"base_image": "tpl", "workdir": str(tmp_path)}
+
+        with _patch("boxman.manager_parts.vms.time.sleep") as sleep:
+            with pytest.raises(CloneCleanupError, match="cleanup also failed"):
+                _clone_with_retry(provider, cluster, {}, "vm01")
+
+        provider.clone_vm.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_provision_never_configures_or_starts_after_clone_failure(
+        self, tmp_path: Path
+    ):
+        """A failed offline sanitizer exits through clone_vms before the
+        configure/start phase, so the cloned guest can never boot with the
+        inherited identity."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch as _patch
+
+        m = self._mgr_with_one_vm(tmp_path)
+        m.cache.projects = {}
+        cli_args = SimpleNamespace(force=False, rebuild_templates=False)
+
+        with _patch.object(m, '_update_sessions_with_runtime'), \
+             _patch.object(m, '_find_existing_project_vms', return_value=[]), \
+             _patch.object(m.cache, 'read_projects_cache'), \
+             _patch.object(m, 'register_project_in_cache'), \
+             _patch.object(m, '_expand_oci_base_images'), \
+             _patch.object(m, 'ensure_templates_exist', return_value=True), \
+             _patch.object(m, 'validate_base_images'), \
+             _patch.object(m, 'provision_files'), \
+             _patch.object(m, 'ensure_shared_bridges'), \
+             _patch.object(m, 'define_networks'), \
+             _patch.object(
+                 m, 'clone_vms', side_effect=RuntimeError('sysprep failed')
+             ), \
+             _patch.object(
+                 m, 'configure_and_start_vms', new=MagicMock()
+             ) as configure_and_start:
+            with pytest.raises(RuntimeError, match='sysprep failed'):
+                m.provision(cli_args)
+
+        configure_and_start.assert_not_called()
+
 
 class TestCloneAndConfigureNewVmsExitCodeGuard:
     """

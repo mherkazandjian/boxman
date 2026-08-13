@@ -30,6 +30,35 @@ class ProvisionError(BoxmanError):
     definition, SSH injection). Subclass further for granular handling."""
 
 
+class CloneSanitizerError(ProvisionError):
+    """Raised when an offline clone identity reset cannot be completed.
+
+    These failures are terminal when a VM opts into the ``required`` policy,
+    so repeating the complete clone operation cannot turn them into a safe
+    guest.  The default ``auto`` policy handles them as compatibility warnings.
+    """
+
+
+class CloneSanitizerUnavailable(CloneSanitizerError):
+    """Raised when a clone cannot be made safe because its offline guest
+    sanitizer is unavailable. This is a host/runtime prerequisite failure,
+    not a transient libvirt failure, so clone retries should fail fast."""
+
+
+class CloneCleanupError(CloneSanitizerError):
+    """Raised when a required identity reset fails and the unsafe clone
+    cannot be removed.  The message preserves both the sanitizer failure and
+    the cleanup failure so callers do not retry into a misleading
+    ``domain already exists`` error."""
+
+    def __init__(self, message: str,
+                 sanitizer_error: Exception | None = None,
+                 cleanup_error: object | None = None):
+        super().__init__(message)
+        self.sanitizer_error = sanitizer_error
+        self.cleanup_error = cleanup_error
+
+
 class NetworkError(ProvisionError):
     """Raised when a libvirt network cannot be created, destroyed, or
     inspected. Includes bridge collisions and missing NAT config."""

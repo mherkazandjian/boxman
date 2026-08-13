@@ -36,7 +36,7 @@ Boxman uses libvirt/QEMU under the hood. Install the virtualization stack for yo
 ### Arch Linux
 
 ```bash
-sudo pacman -S libvirt qemu-full virt-install sshpass dnsmasq
+sudo pacman -S libvirt qemu-full virt-install guestfs-tools sshpass dnsmasq
 sudo systemctl enable --now libvirtd
 sudo usermod -aG libvirt,kvm $USER
 ```
@@ -47,7 +47,7 @@ sudo usermod -aG libvirt,kvm $USER
 sudo apt update
 sudo apt install -y \
   libvirt-daemon-system libvirt-clients qemu-kvm \
-  virtinst sshpass bridge-utils cloud-image-utils
+  virtinst guestfs-tools sshpass bridge-utils cloud-image-utils
 sudo systemctl enable --now libvirtd
 sudo usermod -aG libvirt,kvm $USER
 ```
@@ -55,7 +55,7 @@ sudo usermod -aG libvirt,kvm $USER
 ### Fedora / RHEL / Rocky
 
 ```bash
-sudo dnf install -y libvirt qemu-kvm virt-install sshpass genisoimage
+sudo dnf install -y libvirt qemu-kvm virt-install guestfs-tools sshpass genisoimage
 sudo systemctl enable --now libvirtd
 sudo usermod -aG libvirt,kvm $USER
 ```
@@ -64,7 +64,8 @@ sudo usermod -aG libvirt,kvm $USER
 
 ```bash
 sudo emerge --ask app-emulation/libvirt app-emulation/qemu \
-  app-emulation/virt-manager net-dns/dnsmasq app-admin/sudo
+  app-emulation/virt-manager app-emulation/guestfs-tools \
+  net-dns/dnsmasq app-admin/sudo
 sudo systemctl enable --now libvirtd        # systemd profile
 # OpenRC profile instead:
 #   sudo rc-update add libvirtd default && sudo rc-service libvirtd start
@@ -85,7 +86,7 @@ instead of installing packages imperatively:
 ```nix
 virtualisation.libvirtd.enable = true;
 programs.virt-manager.enable = true;
-environment.systemPackages = with pkgs; [ virt-manager qemu cloud-utils ];
+environment.systemPackages = with pkgs; [ virt-manager qemu guestfs-tools cloud-utils ];
 users.users.<you>.extraGroups = [ "libvirtd" "kvm" ];
 ```
 
@@ -196,6 +197,7 @@ clusters:
     vms:
       node01:
         hostname: node01
+        clone_machine_id: auto  # auto (default), required, or off; see below
         cpus: { sockets: 1, cores: 2, threads: 2 }
         memory: 2048
         max_vcpus: 16       # ceiling for live hot-scaling later
@@ -208,6 +210,24 @@ clusters:
           - name: adapter_1
             network_source: 'nat1'
 ```
+
+`virt-clone` assigns a new libvirt UUID and NIC MAC but copies the guest
+filesystem, including Linux's machine ID. Boxman therefore runs the offline
+`virt-sysprep --operations machine-id` reset before changing interfaces or
+starting a normal disk clone. `clone_machine_id` controls failure handling:
+
+- `auto` (default) attempts the reset, but warns and continues if libguestfs
+  cannot inspect an opaque, encrypted, or unsupported appliance;
+- `required` fails closed and removes the new clone if the reset cannot be
+  completed; use this for supported Linux templates that must never boot with
+  the source identity;
+- `off` skips the reset and retains the legacy clone behavior.
+
+The inspection is non-interactive and limited to 300 seconds by default. Set
+`provider.libvirt.virt_sysprep_timeout` in `boxman.yml` to another positive
+number for unusually slow hosts. Guests that do not regenerate empty machine-ID
+files during boot should use `off` unless the template supplies its own
+first-boot identity mechanism.
 
 ### How the pieces fit together
 

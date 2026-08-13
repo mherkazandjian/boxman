@@ -19,6 +19,7 @@ from boxman.providers.libvirt.commands import (
     VirshCommand,
     VirtCloneCommand,
     VirtInstallCommand,
+    VirtSysprepCommand,
 )
 
 SHELL_RUN = "boxman.providers.libvirt.commands._shell_run"
@@ -89,6 +90,32 @@ class TestBuildCommandQuoting:
         assert "--original=src vm" in tokens
         assert "--name=new vm" in tokens
 
+    def test_virt_sysprep_uses_configured_uri_and_only_machine_id(self):
+        v = VirtSysprepCommand(provider_config={
+            "uri": "qemu+ssh://user@host/system",
+            "virt_sysprep_cmd": "/usr/local/bin/virt-sysprep",
+        })
+        cmd = v.build_command(domain="clone vm", operations="machine-id")
+        assert shlex.split(cmd) == [
+            "/usr/local/bin/virt-sysprep",
+            "--domain=clone vm",
+            "--operations=machine-id",
+            "--connect=qemu+ssh://user@host/system",
+        ]
+
+    def test_virt_sysprep_follows_sudo_convention(self):
+        v = VirtSysprepCommand(provider_config={"use_sudo": True})
+        assert v.build_command(domain="vm01").startswith("sudo virt-sysprep ")
+
+    def test_virt_sysprep_timeout_runs_inside_runtime_and_under_sudo(self):
+        v = VirtSysprepCommand(provider_config={"use_sudo": True})
+        tokens = shlex.split(v.build_command(
+            domain="vm01", execution_timeout=300))
+        assert tokens[:7] == [
+            "timeout", "--signal=TERM", "--kill-after=10s", "300s",
+            "sudo", "-n", "virt-sysprep",
+        ]
+
 
 class TestExecutePassesQuotedCommandToShell:
 
@@ -102,6 +129,21 @@ class TestExecutePassesQuotedCommandToShell:
         assert "vm01" in tokens
         assert "hd c" in tokens
         assert "/iso/a b.iso" in tokens
+
+    def test_timeout_is_runner_control_not_command_option(self):
+        v = VirtSysprepCommand()
+        with patch(SHELL_RUN, return_value=_result()) as run:
+            v.execute(
+                domain="vm01", operations="machine-id",
+                execution_timeout=300, timeout=315)
+        command = run.call_args.args[0]
+        tokens = shlex.split(command)
+        assert tokens[:5] == [
+            "timeout", "--signal=TERM", "--kill-after=10s", "300s",
+            "virt-sysprep",
+        ]
+        assert "--execution-timeout=300" not in tokens
+        assert run.call_args.kwargs["timeout"] == 315
 
 
 class TestCallSiteAudit:
@@ -215,3 +257,15 @@ class TestSharedDockerExecWrap:
     def test_local_runtime_needs_no_container(self):
         v = VirshCommand(provider_config={"runtime": "local"})
         assert v._wrap_for_runtime("virsh list") == "virsh list"
+
+    def test_virt_sysprep_uses_the_shared_docker_wrapper(self):
+        v = VirtSysprepCommand(provider_config={
+            "runtime": "docker-compose",
+            "runtime_container": "boxman-libvirt-demo",
+        })
+        wrapped = v._wrap_for_runtime(
+            v.build_command(domain="vm01", operations="machine-id"))
+        assert wrapped.startswith(
+            "docker exec --user root boxman-libvirt-demo bash -c '")
+        assert "virt-sysprep" in wrapped
+        assert "--operations=machine-id" in wrapped

@@ -7,6 +7,7 @@ side-effect-free helpers are exercised here -- no libvirt/subprocess/host calls.
 
 import importlib.util
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -129,6 +130,64 @@ def test_sudo_nopasswd_covers_specific_binary():
 def test_sudo_nopasswd_covers_ignores_password_required_lines():
     out = "    (ALL : ALL) ALL\n"  # sudo allowed but with a password
     assert checker.sudo_nopasswd_covers(out, "qemu-img") is False
+
+
+def test_doctor_sudo_rights_requires_virt_sysprep(monkeypatch):
+    doctor = checker.Doctor.__new__(checker.Doctor)
+    doctor.opts = SimpleNamespace(check_only=True)
+    doctor.results = []
+    doctor.manual_steps = []
+    doctor.use_color = False
+    doctor.interactive = False
+
+    policy = (
+        "(root) NOPASSWD: /usr/bin/virsh, /usr/bin/qemu-img, "
+        "/usr/sbin/iptables, /bin/rm\n"
+    )
+    monkeypatch.setattr(checker, "have", lambda command: command == "sudo")
+    monkeypatch.setattr(checker, "run_capture", lambda args: (0, policy))
+
+    doctor._check_sudo_rights()
+
+    result = doctor.results[-1]
+    assert result.status == checker.WARN
+    assert "virt-sysprep" in result.detail
+    assert "virt-sysprep" in result.fix.description
+
+
+def _minimal_doctor_for_check():
+    doctor = checker.Doctor.__new__(checker.Doctor)
+    doctor.opts = SimpleNamespace(check_only=True)
+    doctor.results = []
+    doctor.manual_steps = []
+    doctor.use_color = False
+    doctor.interactive = False
+    doctor.family = "debian"
+    doctor.os = {"id": "ubuntu"}
+    return doctor
+
+
+def test_missing_clone_sanitizer_is_optional_warning(monkeypatch):
+    doctor = _minimal_doctor_for_check()
+    monkeypatch.setattr(checker, "have", lambda command: False)
+
+    result = doctor._check_clone_sanitizer()
+
+    assert result.status == checker.WARN
+    assert "clone_machine_id=auto" in result.detail
+    assert "clone_machine_id=required" in result.detail
+    assert "guestfs-tools" in result.fix.commands[0]
+
+
+def test_present_clone_sanitizer_is_ok(monkeypatch):
+    doctor = _minimal_doctor_for_check()
+    monkeypatch.setattr(
+        checker, "have", lambda command: command == "virt-sysprep")
+
+    result = doctor._check_clone_sanitizer()
+
+    assert result.status == checker.OK
+    assert result.fix is None
 
 
 # --------------------------------------------------------------------------- #
@@ -770,6 +829,22 @@ def test_core_stack_fix_gentoo_uses_emerge():
     fix = _doctor_with_family("gentoo")._core_stack_fix()
     assert "emerge" in fix.commands[0]
     assert "app-emulation/libvirt" in fix.commands[0]
+    assert "app-emulation/guestfs-tools" in fix.commands[0]
+
+
+@pytest.mark.parametrize("family,package", [
+    ("arch", "guestfs-tools"),
+    ("debian", "guestfs-tools"),
+    ("rhel", "guestfs-tools"),
+    ("gentoo", "app-emulation/guestfs-tools"),
+])
+def test_core_stack_installs_virt_sysprep_package(family, package):
+    assert package in checker._CORE_STACK[family]
+
+
+def test_declarative_core_advice_includes_virt_sysprep_package():
+    assert "guestfs-tools" in checker._NIXOS_CORE_ADVICE
+    assert "libguestfs" in checker._GUIX_CORE_ADVICE
 
 
 def test_core_stack_fix_unknown_family_falls_back_to_manual_advice():

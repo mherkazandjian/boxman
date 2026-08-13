@@ -10,8 +10,15 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import invoke
 import pytest
 
+from boxman.exceptions import (
+    CloneCleanupError,
+    CloneSanitizerError,
+    CloneSanitizerUnavailable,
+    ConfigError,
+)
 from boxman.providers.libvirt.clone_vm import CloneVM
 from boxman.providers.libvirt.session import LibVirtSession
 
@@ -62,11 +69,40 @@ class TestConstruction:
         assert "~" not in c.new_image_path
         assert c.new_image_path.endswith("/vm-new.qcow2")
 
+    def test_bundled_docker_runtime_contains_virt_sysprep_package(self):
+        dockerfile = (
+            Path(__file__).resolve().parents[1] / "containers/docker/Dockerfile"
+        ).read_text()
+        assert "guestfs-tools" in dockerfile
+
+    @pytest.mark.parametrize("policy", ["auto", "required", "off"])
+    def test_accepts_machine_id_policies(self, tmp_path: Path, policy: str):
+        c = CloneVM(
+            src_vm_name="base", new_vm_name="vm-new",
+            info={"clone_machine_id": policy}, workdir=str(tmp_path))
+        assert c.machine_id_policy == policy
+
+    @pytest.mark.parametrize("policy", ["strict", True, None, ["auto"]])
+    def test_rejects_invalid_machine_id_policy(self, tmp_path: Path, policy):
+        with pytest.raises(ConfigError, match="clone_machine_id"):
+            CloneVM(
+                src_vm_name="base", new_vm_name="vm-new",
+                info={"clone_machine_id": policy}, workdir=str(tmp_path))
+
+    @pytest.mark.parametrize("timeout", [0, -1, True, "300"])
+    def test_rejects_invalid_sysprep_timeout(self, tmp_path: Path, timeout):
+        with pytest.raises(ConfigError, match="virt_sysprep_timeout"):
+            CloneVM(
+                src_vm_name="base", new_vm_name="vm-new", info={},
+                workdir=str(tmp_path),
+                provider_config={"virt_sysprep_timeout": timeout})
+
 
 class TestCreateClone:
 
     def test_success_path_calls_virt_clone_with_correct_args(self, clone: CloneVM):
         with patch.object(clone.virt_clone, "execute") as virt_clone_exec, \
+             patch.object(clone, "reset_machine_identity", return_value=True), \
              patch.object(clone, "remove_network_interfaces", return_value=True):
             virt_clone_exec.return_value = _result()
             assert clone.create_clone() is True
@@ -86,6 +122,7 @@ class TestCreateClone:
             provider_config=None,
         )
         with patch.object(c.virt_clone, "execute", return_value=_result()) as virt_clone, \
+             patch.object(c, "reset_machine_identity", return_value=True), \
              patch.object(c, "remove_network_interfaces") as remove_ifaces:
             assert c.create_clone() is True
             virt_clone.assert_called_once()
@@ -99,12 +136,246 @@ class TestCreateClone:
         self, clone: CloneVM, captured_logs
     ):
         with patch.object(clone.virt_clone, "execute", return_value=_result()), \
+             patch.object(clone, "reset_machine_identity", return_value=True), \
              patch.object(clone, "remove_network_interfaces", return_value=False):
             assert clone.create_clone() is True
         assert any(
             "failed to remove network interfaces" in rec.message
             for rec in captured_logs.records
         )
+
+    def test_machine_identity_is_reset_before_interface_changes(self, clone: CloneVM):
+        order = []
+        with patch.object(
+            clone.virt_clone, "execute",
+            side_effect=lambda *args, **kwargs: order.append("clone"),
+        ), patch.object(
+            clone, "reset_machine_identity",
+            side_effect=lambda: (order.append("sysprep"), True)[1],
+        ), patch.object(
+            clone, "remove_network_interfaces",
+            side_effect=lambda: (order.append("interfaces"), True)[1],
+        ):
+            assert clone.create_clone() is True
+        assert order == ["clone", "sysprep", "interfaces"]
+
+    def test_auto_sanitizer_failure_warns_and_continues(
+        self, clone: CloneVM, captured_logs
+    ):
+        error = CloneSanitizerError("unsupported guest")
+        with patch.object(clone.virt_clone, "execute", return_value=_result()), \
+             patch.object(clone, "reset_machine_identity", side_effect=error), \
+             patch.object(clone, "discard_unsafe_clone") as discard, \
+             patch.object(
+                 clone, "remove_network_interfaces", return_value=True
+             ) as remove_ifaces:
+            assert clone.create_clone() is True
+        discard.assert_not_called()
+        remove_ifaces.assert_called_once_with()
+        assert any(
+            "clone_machine_id=auto" in rec.message
+            and "unsupported guest" in rec.message
+            for rec in captured_logs.records)
+
+    def test_required_sanitizer_failure_discards_and_propagates(
+        self, clone: CloneVM
+    ):
+        clone.machine_id_policy = "required"
+        error = CloneSanitizerError("inspection failed")
+        with patch.object(clone.virt_clone, "execute", return_value=_result()), \
+             patch.object(
+                 clone,
+                 "reset_machine_identity",
+                 side_effect=error,
+             ), \
+             patch.object(clone, "discard_unsafe_clone") as discard, \
+             patch.object(clone, "remove_network_interfaces") as remove_ifaces:
+            with pytest.raises(CloneSanitizerError, match="inspection failed"):
+                clone.create_clone()
+        discard.assert_called_once_with(error)
+        remove_ifaces.assert_not_called()
+
+    def test_required_cleanup_failure_is_terminal_with_both_causes(
+        self, clone: CloneVM
+    ):
+        clone.machine_id_policy = "required"
+        sanitizer = CloneSanitizerError("unsupported encrypted guest")
+        with patch.object(clone.virt_clone, "execute", return_value=_result()), \
+             patch.object(
+                 clone, "reset_machine_identity", side_effect=sanitizer
+             ), \
+             patch.object(
+                 clone.virsh, "execute",
+                 return_value=_result(
+                     ok=False, stderr="storage pool is busy", return_code=1)
+             ), \
+             patch.object(clone, "remove_network_interfaces") as remove_ifaces:
+            with pytest.raises(CloneCleanupError) as caught:
+                clone.create_clone()
+        assert "unsupported encrypted guest" in str(caught.value)
+        assert "storage pool is busy" in str(caught.value)
+        assert caught.value.__cause__ is sanitizer
+        remove_ifaces.assert_not_called()
+
+    def test_off_skips_sanitizer(self, clone: CloneVM):
+        clone.machine_id_policy = "off"
+        with patch.object(clone.virt_clone, "execute", return_value=_result()), \
+             patch.object(clone, "reset_machine_identity") as reset, \
+             patch.object(clone, "remove_network_interfaces", return_value=True):
+            assert clone.create_clone() is True
+        reset.assert_not_called()
+
+
+class TestResetMachineIdentity:
+
+    def test_runs_only_machine_id_operation_on_the_clone(self, clone: CloneVM):
+        with patch.object(
+            clone.virt_sysprep, "execute", return_value=_result()
+        ) as execute:
+            assert clone.reset_machine_identity() is None
+        execute.assert_called_once_with(
+            domain="vm01", operations="machine-id", keys_from_stdin=True,
+            warn=True, execution_timeout=300, timeout=315)
+
+    def test_nonzero_exit_is_a_typed_failure(self, clone: CloneVM):
+        with patch.object(
+            clone.virt_sysprep,
+            "execute",
+            return_value=_result(
+                ok=False, stderr="inspection failed", return_code=1),
+        ):
+            with pytest.raises(CloneSanitizerError, match="inspection failed"):
+                clone.reset_machine_identity()
+
+    def test_missing_tool_has_actionable_package_guidance(self, clone: CloneVM):
+        with patch.object(
+            clone.virt_sysprep,
+            "execute",
+            return_value=_result(
+                ok=False,
+                stderr="virt-sysprep: not found",
+                return_code=127,
+            ),
+        ):
+            with pytest.raises(CloneSanitizerUnavailable) as caught:
+                clone.reset_machine_identity()
+        assert "virt-sysprep" in str(caught.value)
+        assert "guestfs-tools" in str(caught.value)
+
+    def test_domain_not_found_is_not_misclassified_as_missing_tool(
+        self, clone: CloneVM
+    ):
+        with patch.object(
+            clone.virt_sysprep,
+            "execute",
+            return_value=_result(
+                ok=False,
+                stderr="virt-sysprep: domain 'vm01' not found",
+                return_code=127,
+            ),
+        ):
+            with pytest.raises(CloneSanitizerError) as caught:
+                clone.reset_machine_identity()
+        assert not isinstance(caught.value, CloneSanitizerUnavailable)
+        assert "domain 'vm01' not found" in str(caught.value)
+
+    def test_sudo_missing_tool_signature_is_classified_exactly(
+        self, clone: CloneVM
+    ):
+        with patch.object(
+            clone.virt_sysprep,
+            "execute",
+            return_value=_result(
+                ok=False,
+                stderr="sudo: virt-sysprep: command not found",
+                return_code=1,
+            ),
+        ):
+            with pytest.raises(CloneSanitizerUnavailable, match="not installed"):
+                clone.reset_machine_identity()
+
+    def test_noninteractive_sudo_denial_is_a_permanent_prerequisite_failure(
+        self, clone: CloneVM
+    ):
+        with patch.object(
+            clone.virt_sysprep,
+            "execute",
+            return_value=_result(
+                ok=False,
+                stderr=(
+                    "sudo: a terminal is required to read the password\n"
+                    "sudo: a password is required"
+                ),
+                return_code=1,
+            ),
+        ):
+            with pytest.raises(CloneSanitizerUnavailable) as caught:
+                clone.reset_machine_identity()
+        assert "passwordless sudo" in str(caught.value)
+        assert "use_sudo" in str(caught.value)
+
+    def test_timeout_is_typed_and_bounded(self, clone: CloneVM):
+        timed_out = invoke.exceptions.CommandTimedOut(
+            invoke.runners.Result(command="virt-sysprep", exited=-1),
+            timeout=300,
+        )
+        with patch.object(
+            clone.virt_sysprep, "execute", side_effect=timed_out
+        ) as execute:
+            with pytest.raises(CloneSanitizerError, match="timed out after 300s"):
+                clone.reset_machine_identity()
+        assert execute.call_args.kwargs["execution_timeout"] == 300
+        assert execute.call_args.kwargs["timeout"] == 315
+
+    def test_inner_timeout_exit_is_typed(self, clone: CloneVM):
+        with patch.object(
+            clone.virt_sysprep,
+            "execute",
+            return_value=_result(ok=False, return_code=124),
+        ):
+            with pytest.raises(CloneSanitizerError, match="timed out after 300s"):
+                clone.reset_machine_identity()
+
+
+class TestDiscardUnsafeClone:
+
+    def test_undefines_only_the_failed_clone_and_its_storage(self, clone: CloneVM):
+        with patch.object(clone.virsh, "execute", return_value=_result()) as execute:
+            clone.discard_unsafe_clone()
+        execute.assert_called_once_with(
+            "undefine", "vm01", "--remove-all-storage", warn=True)
+
+    def test_cleanup_failure_is_terminal_and_preserves_sanitizer_cause(
+        self, clone: CloneVM
+    ):
+        sanitizer = CloneSanitizerError("inspection failed")
+        with patch.object(
+            clone.virsh,
+            "execute",
+            return_value=_result(ok=False, stderr="domain is busy"),
+        ):
+            with pytest.raises(CloneCleanupError) as caught:
+                clone.discard_unsafe_clone(sanitizer)
+        assert "inspection failed" in str(caught.value)
+        assert "domain is busy" in str(caught.value)
+        assert "manual cleanup" in str(caught.value)
+        assert caught.value.__cause__ is sanitizer
+        assert caught.value.sanitizer_error is sanitizer
+        assert caught.value.cleanup_error == "domain is busy"
+
+    def test_cleanup_executor_exception_preserves_both_failures(
+        self, clone: CloneVM
+    ):
+        sanitizer = CloneSanitizerError("inspection failed")
+        cleanup = ConfigError("runtime container missing")
+        with patch.object(clone.virsh, "execute", side_effect=cleanup):
+            with pytest.raises(CloneCleanupError) as caught:
+                clone.discard_unsafe_clone(sanitizer)
+        assert "inspection failed" in str(caught.value)
+        assert "runtime container missing" in str(caught.value)
+        assert caught.value.sanitizer_error is sanitizer
+        assert caught.value.cleanup_error is cleanup
+        assert caught.value.__cause__ is cleanup
 
 
 class TestRemoveNetworkInterfaces:
@@ -244,3 +515,42 @@ class TestCloneVmIsoBootDispatch:
                 info=info,
                 workdir=str(tmp_path),
             )
+
+
+class TestCloneVmMachineIdentityFailureChain:
+
+    def test_session_propagates_real_clone_sanitizer_failure(self, tmp_path):
+        session = LibVirtSession.__new__(LibVirtSession)
+        session.provider_config = {
+            "uri": "qemu:///system",
+            "use_sudo": False,
+        }
+
+        with patch(
+            "boxman.providers.libvirt.clone_vm.VirtCloneCommand.execute",
+            return_value=_result(),
+        ) as virt_clone, patch(
+            "boxman.providers.libvirt.clone_vm.VirtSysprepCommand.execute",
+            return_value=_result(
+                ok=False,
+                stderr="inspection failed",
+                return_code=1,
+            ),
+        ) as virt_sysprep, patch(
+            "boxman.providers.libvirt.clone_vm.VirshCommand.execute",
+            return_value=_result(),
+        ) as virsh:
+            with pytest.raises(CloneSanitizerError, match="inspection failed"):
+                session.clone_vm(
+                    new_vm_name="vm01",
+                    src_vm_name="template-base",
+                    info={"clone_machine_id": "required"},
+                    workdir=str(tmp_path),
+                )
+
+        virt_clone.assert_called_once()
+        virt_sysprep.assert_called_once_with(
+            domain="vm01", operations="machine-id", keys_from_stdin=True,
+            warn=True, execution_timeout=300, timeout=315)
+        virsh.assert_called_once_with(
+            "undefine", "vm01", "--remove-all-storage", warn=True)

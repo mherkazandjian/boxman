@@ -87,6 +87,7 @@ templates:
         - libvirt-daemon-system
         - qemu-kvm
         - virtinst
+        - guestfs-tools
         - genisoimage
 
       write_files:

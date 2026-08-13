@@ -57,6 +57,10 @@ clusters:
     vms:
       boxman01:
         hostname: boxman01
+        # Reset inherited Linux machine IDs: auto (default), required, or off.
+        # Use required for supported Linux templates that must never boot with
+        # their source identity; auto preserves opaque-appliance compatibility.
+        # clone_machine_id: auto
         # boot_order: [network, hd]   # PXE boot: boot from network first, then disk
         disks:
           - name: disk01
