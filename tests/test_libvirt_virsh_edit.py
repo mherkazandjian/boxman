@@ -12,7 +12,9 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
+from lxml import etree
 
+from boxman.exceptions import ConfigError
 from boxman.providers.libvirt.virsh_edit import VirshEdit
 
 pytestmark = pytest.mark.unit
@@ -58,3 +60,132 @@ class TestDeadErrorBranches:
     def test_hot_set_memory_success_returns_true(self, ve: VirshEdit):
         with patch.object(ve.virsh, "execute", return_value=_result()):
             assert ve.hot_set_memory("vm01", 1024) is True
+
+
+_DOMAIN_XML = """<domain type='kvm'>
+  <name>vm01</name>
+  <devices>
+    {memballoon}
+  </devices>
+</domain>"""
+
+
+def _domain_xml(memballoon: str = "") -> str:
+    return _DOMAIN_XML.format(memballoon=memballoon)
+
+
+class TestApplyMemballoonToXml:
+
+    def _memballoon(self, xml: str):
+        tree = etree.fromstring(xml.encode("utf-8"))
+        matches = tree.xpath("//devices/memballoon")
+        assert len(matches) == 1
+        return matches[0]
+
+    def test_creates_memballoon_with_free_page_reporting(self):
+        xml = VirshEdit.apply_memballoon_to_xml(
+            _domain_xml(), {"free_page_reporting": True})
+        mb = self._memballoon(xml)
+        assert mb.get("model") == "virtio"
+        assert mb.get("freePageReporting") == "on"
+
+    def test_upgrades_model_none_to_virtio(self):
+        xml = VirshEdit.apply_memballoon_to_xml(
+            _domain_xml("<memballoon model='none'/>"),
+            {"free_page_reporting": True})
+        mb = self._memballoon(xml)
+        assert mb.get("model") == "virtio"
+        assert mb.get("freePageReporting") == "on"
+
+    def test_free_page_reporting_false(self):
+        xml = VirshEdit.apply_memballoon_to_xml(
+            _domain_xml("<memballoon model='virtio'/>"),
+            {"free_page_reporting": False})
+        assert self._memballoon(xml).get("freePageReporting") == "off"
+
+    def test_stats_period(self):
+        xml = VirshEdit.apply_memballoon_to_xml(
+            _domain_xml(), {"stats_period": 10})
+        assert self._memballoon(xml).find("stats").get("period") == "10"
+
+    def test_absent_keys_leave_memballoon_untouched(self):
+        xml = VirshEdit.apply_memballoon_to_xml(
+            _domain_xml("<memballoon model='virtio'/>"), {})
+        mb = self._memballoon(xml)
+        assert mb.get("model") == "virtio"
+        assert mb.get("freePageReporting") is None
+        assert mb.find("stats") is None
+
+
+class TestConfigureMemballoon:
+
+    def test_none_config_is_noop(self, ve: VirshEdit):
+        with patch.object(ve.virsh, "execute") as exe:
+            assert ve.configure_memballoon("vm01", None) is True
+        exe.assert_not_called()
+
+    def test_empty_config_is_noop(self, ve: VirshEdit):
+        with patch.object(ve.virsh, "execute") as exe:
+            assert ve.configure_memballoon("vm01", {}) is True
+        exe.assert_not_called()
+
+    def test_success_returns_true(self, ve: VirshEdit):
+        with patch.object(ve.virsh, "execute",
+                          return_value=_result(stdout=_domain_xml())):
+            assert ve.configure_memballoon(
+                "vm01", {"free_page_reporting": True}) is True
+
+    def test_define_failure_returns_false(self, ve: VirshEdit):
+        def _execute(*args, **kwargs):
+            if args[0] == "define":
+                # redefine_domain calls execute without warn=True, so a
+                # failed define raises instead of returning a non-ok result
+                raise RuntimeError("invalid xml")
+            return _result(stdout=_domain_xml())
+
+        with patch.object(ve.virsh, "execute", side_effect=_execute):
+            assert ve.configure_memballoon(
+                "vm01", {"free_page_reporting": True}) is False
+
+
+class TestMemballoonValidation:
+    """Review P3: malformed config values must raise ConfigError instead
+    of silently producing the opposite setting."""
+
+    def test_free_page_reporting_string_rejected(self):
+        with pytest.raises(ConfigError):
+            VirshEdit.apply_memballoon_to_xml(
+                _domain_xml(), {"free_page_reporting": "false"})
+
+    def test_stats_period_bool_rejected(self):
+        with pytest.raises(ConfigError):
+            VirshEdit.apply_memballoon_to_xml(
+                _domain_xml(), {"stats_period": True})
+
+    def test_stats_period_float_rejected(self):
+        with pytest.raises(ConfigError):
+            VirshEdit.apply_memballoon_to_xml(
+                _domain_xml(), {"stats_period": 2.5})
+
+    def test_stats_period_zero_rejected(self):
+        with pytest.raises(ConfigError):
+            VirshEdit.apply_memballoon_to_xml(
+                _domain_xml(), {"stats_period": 0})
+
+    def test_non_dict_config_rejected(self):
+        with pytest.raises(ConfigError):
+            VirshEdit.apply_memballoon_to_xml(_domain_xml(), "true")
+
+    def test_stats_period_none_removes_stats(self):
+        xml = VirshEdit.apply_memballoon_to_xml(
+            _domain_xml("<memballoon model='virtio'>"
+                        "<stats period='5'/></memballoon>"),
+            {"stats_period": None})
+        tree = etree.fromstring(xml.encode("utf-8"))
+        assert tree.xpath("//devices/memballoon/stats") == []
+
+    def test_configure_memballoon_reraises_config_error(self, ve: VirshEdit):
+        with patch.object(ve.virsh, "execute",
+                          return_value=_result(stdout=_domain_xml())):
+            with pytest.raises(ConfigError):
+                ve.configure_memballoon("vm01", {"stats_period": True})

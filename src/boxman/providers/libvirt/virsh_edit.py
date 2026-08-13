@@ -3,7 +3,7 @@ from typing import Any
 from lxml import etree
 
 from boxman import log
-from boxman.exceptions import ProvisionError
+from boxman.exceptions import ConfigError, ProvisionError
 
 from .commands import VirshCommand
 
@@ -243,6 +243,123 @@ class VirshEdit:
         for topo in tree.xpath('//cpu/topology'):
             topo.getparent().remove(topo)
         return etree.tostring(tree, encoding='unicode', pretty_print=True)
+
+    @staticmethod
+    def validate_memballoon_config(config: dict[str, Any]) -> None:
+        """
+        Validate a memballoon config dict, raising ConfigError on bad values.
+
+        ``free_page_reporting`` must be a real bool (a YAML string like
+        ``"false"`` would silently enable it otherwise) and ``stats_period``
+        must be a positive integer (bools excluded) or None to remove the
+        stats element.
+        """
+        if not isinstance(config, dict):
+            raise ConfigError(
+                f"memballoon config must be a mapping, got {type(config).__name__}")
+        if 'free_page_reporting' in config and not isinstance(
+                config['free_page_reporting'], bool):
+            raise ConfigError(
+                f"memballoon.free_page_reporting must be a boolean, got "
+                f"{config['free_page_reporting']!r}")
+        stats_period = config.get('stats_period')
+        if stats_period is not None and (
+                isinstance(stats_period, bool)
+                or not isinstance(stats_period, int)
+                or stats_period < 1):
+            raise ConfigError(
+                f"memballoon.stats_period must be a positive integer (seconds), "
+                f"got {stats_period!r}")
+
+    @staticmethod
+    def apply_memballoon_to_xml(xml_content: str, config: dict[str, Any]) -> str:
+        """
+        Apply the memballoon (virtio-balloon) configuration to domain xml.
+
+        Ensures a ``//devices/memballoon`` element exists with
+        ``model='virtio'`` (creating it when absent, upgrading ``none``),
+        then applies the supported config keys:
+
+        - ``free_page_reporting`` (bool): sets the ``freePageReporting='on|off'``
+          attribute
+        - ``stats_period`` (int): sets ``<stats period='N'/>``; an explicit
+          None removes the ``<stats>`` element
+
+        Keys absent from *config* are left untouched.
+
+        Args:
+            xml_content: the domain xml to modify
+            config: memballoon configuration dict
+
+        Returns:
+            modified xml content as string
+
+        Raises:
+            ConfigError: on invalid config values
+        """
+        VirshEdit.validate_memballoon_config(config)
+        tree = etree.fromstring(xml_content.encode('utf-8'))
+
+        memballoons = tree.xpath('//devices/memballoon')
+        if memballoons:
+            memballoon = memballoons[0]
+            if memballoon.get('model') in (None, 'none'):
+                memballoon.set('model', 'virtio')
+        else:
+            devices = tree.xpath('//devices')
+            if not devices:
+                raise ProvisionError("domain xml has no <devices> element")
+            memballoon = etree.SubElement(devices[0], 'memballoon')
+            memballoon.set('model', 'virtio')
+
+        if 'free_page_reporting' in config:
+            memballoon.set('freePageReporting',
+                           'on' if config['free_page_reporting'] else 'off')
+
+        if 'stats_period' in config:
+            stats = memballoon.find('stats')
+            if config['stats_period'] is None:
+                if stats is not None:
+                    memballoon.remove(stats)
+            else:
+                if stats is None:
+                    stats = etree.SubElement(memballoon, 'stats')
+                stats.set('period', str(config['stats_period']))
+
+        return etree.tostring(tree, encoding='unicode', pretty_print=True)
+
+    def configure_memballoon(self,
+                             domain_name: str,
+                             config: dict[str, Any] | None) -> bool:
+        """
+        Configure the virtio-balloon device for a domain.
+
+        Edits the persistent (inactive) config; ``free_page_reporting``
+        takes effect from the next boot of the VM.
+
+        Args:
+            domain_name: name of the domain
+            config: memballoon configuration dict, or None to skip
+
+        Returns:
+            True if successful (or nothing to do), False otherwise
+
+        Raises:
+            ConfigError: on invalid config values (not swallowed, so a
+                         malformed conf.yml fails loudly)
+        """
+        if not config:
+            self.logger.info(f"no memballoon configuration for {domain_name}, skipping")
+            return True
+        try:
+            xml_content = self.get_domain_xml(domain_name, inactive=True)
+            modified_xml = self.apply_memballoon_to_xml(xml_content, config)
+            return self.redefine_domain(domain_name, modified_xml)
+        except ConfigError:
+            raise
+        except Exception as exc:
+            self.logger.error(f"failed to configure memballoon for {domain_name}: {exc}")
+            return False
 
     def configure_cpu_memory(self,
                            domain_name: str,

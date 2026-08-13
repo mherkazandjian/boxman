@@ -15,6 +15,17 @@ from conftest import make_bare_manager
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _default_memballoon_state():
+    """diff_vm probes the balloon device via virsh; default it to the
+    libvirt defaults (no freePageReporting, no stats) for every test so
+    the existing decorator stacks don't each need another patch."""
+    with patch.object(VMStateDiffer, 'get_actual_memballoon',
+                      return_value={'free_page_reporting': False,
+                                    'stats_period': None}):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Sample XML for testing
 # ---------------------------------------------------------------------------

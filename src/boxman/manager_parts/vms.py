@@ -183,6 +183,18 @@ class VMsMixin:
         else:
             self.logger.warning(f"no cpu or memory configuration for vm {vm_name}, skipping")
 
+        # memballoon (virtio-balloon: free-page reporting, stats)
+        memballoon = vm_info.get('memballoon')
+        if memballoon:
+            self.logger.info(f"configuring memballoon for vm {vm_name}")
+            success = self.session_for_cluster(cluster_name).configure_vm_memballoon(
+                vm_name=full_vm_name, memballoon=memballoon
+            )
+            if success:
+                self.logger.info(f"successfully configured memballoon for vm {vm_name}")
+            else:
+                self.logger.warning(f"failed to configure memballoon for vm {vm_name}")
+
         # network interfaces
         if 'network_adapters' not in vm_info:
             self.logger.warning(f"no network adapters defined for vm {vm_name}, skipping")
@@ -538,6 +550,7 @@ class VMsMixin:
                 desired_max_memory_mb=vm_info.get('max_memory'),
                 desired_shared_folders=vm_info.get('shared_folders'),
                 desired_cdroms=vm_info.get('cdroms'),
+                desired_memballoon=vm_info.get('memballoon'),
             )
 
             has_changes = (
@@ -552,7 +565,8 @@ class VMsMixin:
                 diff['changed_cdroms'] or
                 diff['new_shared_folders'] or
                 diff['removed_shared_folders'] or
-                diff['changed_shared_folders']
+                diff['changed_shared_folders'] or
+                diff['memballoon_changed']
             )
 
             if not has_changes:
@@ -601,7 +615,10 @@ class VMsMixin:
             if diff['changed_shared_folders']:
                 names = [f.get('name', '?') for f in diff['changed_shared_folders']]
                 changes.append(f"change shared folders: {', '.join(names)}")
-
+            if diff['memballoon_changed']:
+                changes.append(
+                    f"memballoon: {diff['actual_memballoon']} -> "
+                    f"{diff['desired_memballoon']}")
             self.logger.info(f"VM {vm_name}: changes detected: {'; '.join(changes)}")
 
             if dry_run:
@@ -636,6 +653,21 @@ class VMsMixin:
                     return
                 if cpu_mem_result['restart_needed']:
                     restart_needed = True
+
+            # memballoon (persistent config; the normalized desired state
+            # covers both enabling and reconciling back to defaults)
+            if diff['memballoon_changed']:
+                balloon_ok = self.provider.configure_vm_memballoon(
+                    vm_name=full_vm_name, memballoon=diff['desired_memballoon'])
+                if not balloon_ok:
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': 'memballoon update failed'
+                    }))
+                    return
+                if vm_running:
+                    self.logger.info(
+                        f"VM {vm_name}: memballoon changes apply from the next boot")
 
             # disks
             if diff['new_disks'] or diff['resize_disks']:
