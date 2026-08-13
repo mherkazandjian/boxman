@@ -1496,6 +1496,23 @@ class LibVirtSession(SessionConfigMixin):
             vm_name, cpus, memory_mb,
             max_vcpus=max_vcpus, max_memory_mb=max_memory_mb)
 
+    def configure_vm_memballoon(self,
+                                vm_name: str,
+                                memballoon: dict[str, Any] | None) -> bool:
+        """
+        Configure the virtio-balloon device for a vm.
+
+        Args:
+            vm_name: Name of the vm
+            memballoon: memballoon configuration dict
+                (``free_page_reporting``, ``stats_period``) or None to skip
+
+        Returns:
+            True if successful (or nothing to do), False otherwise
+        """
+        editor = VirshEdit(provider_config=self.provider_config)
+        return editor.configure_memballoon(vm_name, memballoon)
+
     ### update operations (for `boxman update`)
 
     def shutdown_and_wait(self, vm_name: str, timeout: int = 60) -> bool:

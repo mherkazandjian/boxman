@@ -183,6 +183,18 @@ class VMsMixin:
         else:
             self.logger.warning(f"no cpu or memory configuration for vm {vm_name}, skipping")
 
+        # memballoon (virtio-balloon: free-page reporting, stats)
+        memballoon = vm_info.get('memballoon')
+        if memballoon:
+            self.logger.info(f"configuring memballoon for vm {vm_name}")
+            success = self.session_for_cluster(cluster_name).configure_vm_memballoon(
+                vm_name=full_vm_name, memballoon=memballoon
+            )
+            if success:
+                self.logger.info(f"successfully configured memballoon for vm {vm_name}")
+            else:
+                self.logger.warning(f"failed to configure memballoon for vm {vm_name}")
+
         # network interfaces
         if 'network_adapters' not in vm_info:
             self.logger.warning(f"no network adapters defined for vm {vm_name}, skipping")
@@ -555,7 +567,9 @@ class VMsMixin:
                 diff['changed_shared_folders']
             )
 
-            if not has_changes:
+            memballoon_config = vm_info.get('memballoon')
+
+            if not has_changes and not memballoon_config:
                 self.logger.info(f"VM {vm_name}: no changes detected")
                 result_queue.put((vm_name, {'status': 'no_change', 'details': ''}))
                 return
@@ -601,6 +615,10 @@ class VMsMixin:
             if diff['changed_shared_folders']:
                 names = [f.get('name', '?') for f in diff['changed_shared_folders']]
                 changes.append(f"change shared folders: {', '.join(names)}")
+            if memballoon_config:
+                # no state diffing for the balloon device; the config is
+                # (re)applied idempotently below
+                changes.append("memballoon: apply config")
 
             self.logger.info(f"VM {vm_name}: changes detected: {'; '.join(changes)}")
 
@@ -636,6 +654,20 @@ class VMsMixin:
                     return
                 if cpu_mem_result['restart_needed']:
                     restart_needed = True
+
+            # memballoon (persistent config, applied idempotently)
+            if memballoon_config:
+                balloon_ok = self.provider.configure_vm_memballoon(
+                    vm_name=full_vm_name, memballoon=memballoon_config)
+                if not balloon_ok:
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': 'memballoon update failed'
+                    }))
+                    return
+                if vm_running:
+                    self.logger.info(
+                        f"VM {vm_name}: memballoon changes apply from the next boot")
 
             # disks
             if diff['new_disks'] or diff['resize_disks']:

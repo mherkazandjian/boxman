@@ -531,6 +531,31 @@ exit
 for live hot-plug. This works because we set `max_vcpus: 16` and `max_memory: 16384` at
 creation time -- the QEMU process was started with headroom for scaling.
 
+### Returning unused memory to the host
+
+KVM only allocates host RAM for pages a guest has actually touched, but once touched,
+a page stays allocated until the VM stops -- even after the guest frees it. The
+`memballoon` option enables virtio-balloon **free-page reporting**, which lets the
+guest continuously hand unused pages back to the host:
+
+```yaml
+      node01:
+        memory: 2048
+        memballoon:
+          free_page_reporting: true   # guest returns freed pages to the host
+          stats_period: 5             # optional; balloon stats sample interval (s)
+```
+
+No guest-side setup is needed beyond a Linux kernel >= 5.7 (all supported cloud
+images qualify). The resulting libvirt domain gets a balloon device with
+`<memballoon model='virtio' freePageReporting='on'>`. Changes to a running VM are
+written to the persistent config and take effect from the next boot;
+`boxman update` applies them idempotently.
+
+> For many similar VMs, also consider enabling KSM on the host
+> (`systemctl enable --now ksmd` / `ksmtuned`) to deduplicate identical pages
+> across guests -- it is a host-level setting, complementary to free-page reporting.
+
 ## 2.4 Snapshot the Whole Cluster
 
 ```bash

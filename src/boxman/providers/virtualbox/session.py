@@ -131,6 +131,11 @@ class VirtualBoxSession(SessionConfigMixin):
                                 max_memory_mb: int | None = None) -> bool:
         raise _phase('configure_vm_cpu_memory', 2)
 
+    def configure_vm_memballoon(self,
+                                vm_name: str,
+                                memballoon: dict[str, Any] | None = None) -> bool:
+        raise _phase('configure_vm_memballoon', 2)
+
     def configure_vm_network_interfaces(self,
                                         vm_name: str,
                                         network_adapters: list[dict[str, Any]]) -> bool:
