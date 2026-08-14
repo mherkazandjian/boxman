@@ -100,6 +100,39 @@ def classify_family(osid, id_like):
     return "unknown"
 
 
+def strip_yaml_comment(line):
+    """Strip a YAML comment without truncating quoted or embedded ``#``.
+
+    YAML starts a plain-scalar comment only when ``#`` is outside quotes and
+    separated from the preceding content. Single-quoted YAML escapes a quote
+    by doubling it; double-quoted strings use backslash escapes.
+    """
+    quote = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quote = None
+        elif quote == "'":
+            if char == "'":
+                if index + 1 < len(line) and line[index + 1] == "'":
+                    index += 1
+                else:
+                    quote = None
+        elif char in ('"', "'"):
+            quote = char
+        elif char == '#' and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+        index += 1
+    return line
+
+
 def configured_libvirt_use_sudo(text, default=False):
     """Read ``providers.libvirt.use_sudo`` from simple YAML without PyYAML.
 
@@ -110,7 +143,7 @@ def configured_libvirt_use_sudo(text, default=False):
     """
     parents = []
     for raw_line in text.splitlines():
-        code = raw_line.split("#", 1)[0].rstrip()
+        code = strip_yaml_comment(raw_line).rstrip()
         if not code.strip():
             continue
         indent = len(code) - len(code.lstrip(" "))
@@ -1136,18 +1169,28 @@ class Doctor:
     def _check_sudo_rights(self):
         def sudo_rights():
             sysprep_uses_sudo = getattr(self, "use_sudo", False)
+            sudo_command_names = ["virsh"]
+            sudo_command_paths = ["/usr/bin/virsh"]
+            if sysprep_uses_sudo:
+                sudo_command_names.append("virt-sysprep")
+                sudo_command_paths.append("/usr/bin/virt-sysprep")
+            sudo_command_names.extend(
+                ["qemu-img", "iptables", "ip", "rsync", "rm"])
+            sudo_command_paths.extend([
+                "/usr/bin/qemu-img", "/usr/sbin/iptables", "/usr/sbin/ip",
+                "/usr/bin/rsync", "/bin/rm",
+            ])
             if not have("sudo"):
                 fix = self._install_fix("install sudo", "sudo")
                 return WARN, "sudo not found; libvirt network/cleanup steps need it", fix
             rc, out = run_capture(["sudo", "-n", "-l"])
             if rc != 0:
+                sudoers_user = user_group_names()[1] or "$USER"
+                sudoers_commands = ", ".join(sudo_command_paths)
                 fix = Fix(
                     "grant passwordless sudo for the commands boxman runs, e.g. a "
                     "/etc/sudoers.d/boxman line: "
-                    "`%s ALL=(root) NOPASSWD: /usr/bin/virsh, "
-                    "/usr/bin/virt-sysprep, /usr/bin/qemu-img, /usr/sbin/iptables, "
-                    "/usr/sbin/ip, /usr/bin/rsync, /bin/rm`" % (
-                        user_group_names()[1] or "$USER"),
+                    f"`{sudoers_user} ALL=(root) NOPASSWD: {sudoers_commands}`",
                     commands=[])
                 return WARN, ("passwordless sudo not available; boxman's automatic "
                               "iptables/NAT and cleanup steps fail when run "
@@ -1175,7 +1218,7 @@ class Doctor:
                 return OK, "passwordless sudo covers " + covered, None
             fix = Fix(
                 "widen NOPASSWD sudo scope in /etc/sudoers.d/boxman to include: "
-                "virsh, virt-sysprep, qemu-img, iptables, ip, rsync, rm",
+                + ", ".join(sudo_command_names),
                 commands=[])
             return WARN, "passwordless sudo present but missing: " + "; ".join(gaps), fix
 

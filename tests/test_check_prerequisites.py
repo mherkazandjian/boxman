@@ -110,6 +110,20 @@ def test_configured_libvirt_use_sudo_falls_back_for_invalid_value():
     assert checker.configured_libvirt_use_sudo(text, default=False) is False
 
 
+def test_configured_libvirt_use_sudo_does_not_truncate_quoted_hash():
+    text = 'providers:\n  libvirt:\n    use_sudo: "false#not-a-comment"\n'
+    assert checker.configured_libvirt_use_sudo(text, default=True) is True
+
+
+def test_strip_yaml_comment_preserves_hashes_inside_scalars():
+    assert checker.strip_yaml_comment('key: "a # value" # comment') == (
+        'key: "a # value" ')
+    assert checker.strip_yaml_comment("key: 'a # value' # comment") == (
+        "key: 'a # value' ")
+    assert checker.strip_yaml_comment("key: a#value # comment") == (
+        "key: a#value ")
+
+
 # --------------------------------------------------------------------------- #
 # install_cmd                                                                 #
 # --------------------------------------------------------------------------- #
@@ -201,6 +215,23 @@ def test_doctor_omits_sysprep_nopasswd_gap_when_use_sudo_is_false(monkeypatch):
     assert result.status == checker.OK
     assert "virt-sysprep" not in result.detail
     assert result.fix is None
+
+
+def test_doctor_omits_sysprep_from_fix_when_use_sudo_is_false(monkeypatch):
+    doctor = _minimal_doctor_for_check()
+    doctor.use_sudo = False
+    policy = "(root) NOPASSWD: /usr/sbin/iptables\n"
+    monkeypatch.setattr(checker, "have", lambda command: command == "sudo")
+    monkeypatch.setattr(checker, "run_capture", lambda args: (0, policy))
+
+    doctor._check_sudo_rights()
+
+    result = doctor.results[-1]
+    assert result.status == checker.WARN
+    assert "qemu-img/rm" in result.detail
+    assert "virt-sysprep" not in result.detail
+    assert "virt-sysprep" not in result.fix.description
+    assert "qemu-img" in result.fix.description
 
 
 def _minimal_doctor_for_check():
