@@ -249,8 +249,9 @@ def diff_network(desired: dict[str, Any],
         want = desired.get(field)
         have = actual.get(field)
 
-        # boxman picks the bridge name unless the configuration pinned one, so
-        # only a pinned name can be said to have drifted
+        # A missing desired bridge means effective-name discovery failed. Do
+        # not recreate a network based on an unresolved comparison; callers
+        # surface the discovery failure separately.
         if field == 'bridge_name' and not want:
             continue
 

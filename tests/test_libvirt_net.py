@@ -387,6 +387,35 @@ class TestBridgeModeDefinition:
         net.remove_route_iptables_rule.assert_called_once_with()
         assert manager.cache.projects == {"p1": {"runtime": "local"}}
 
+    def test_route_rule_failure_rolls_back_without_cache_entry(self, tmp_path):
+        manager = MagicMock()
+        manager.config = {"project": "p1"}
+        manager._runtime_name = "local"
+        manager.cache.projects = {"p1": {"runtime": "local"}}
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            net = Network(
+                "managed-net", {"mode": "route"},
+                provider_config={"use_sudo": False}, manager=manager)
+        calls = []
+        net.virsh.execute = MagicMock(
+            side_effect=lambda command, *a, **k: calls.append(command) or _result())
+        net._get_libvirt_bridges = MagicMock(return_value=set())
+        net.check_network_exists = MagicMock()
+        net.apply_route_iptables_rule = MagicMock(return_value=False)
+        net.remove_route_iptables_rule = MagicMock(return_value=True)
+        net.update_network_cache = MagicMock()
+
+        assert net.define_network(str(tmp_path / "managed.xml")) is False
+        assert calls == [
+            "net-define", "net-start", "net-autostart",
+            "net-destroy", "net-undefine",
+        ]
+        net.apply_route_iptables_rule.assert_called_once_with()
+        net.remove_route_iptables_rule.assert_called_once_with()
+        net.update_network_cache.assert_not_called()
+        assert manager.cache.projects == {"p1": {"runtime": "local"}}
+
     def test_baseexception_is_not_swallowed(self, tmp_path):
         manager = MagicMock()
         manager.config = {"project": "p1"}
