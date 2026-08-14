@@ -1,4 +1,6 @@
+import copy
 import ipaddress
+import logging
 import os
 import re
 import shlex
@@ -81,11 +83,14 @@ class Network:
             # A bridge-mode libvirt network is only a named indirection to an
             # existing host bridge. Libvirt neither creates nor configures it.
             bridge_name = self.pinned_bridge_name
-        elif assign_new_bridge:
-            # handle the bridge name - if not specified, find the first available virbrX
+        elif self.pinned_bridge_name:
+            # A configured name is the effective desired name even while
+            # inspecting an existing definition. The live name is parsed from
+            # net-dumpxml separately during reconciliation.
             bridge_name = self.pinned_bridge_name
-            if not bridge_name:
-                bridge_name = self.find_available_bridge_name()
+        elif assign_new_bridge:
+            # No configured name: allocate the first available virbrX.
+            bridge_name = self.find_available_bridge_name()
         else:
             if bridge_name := Network.get_bridge_from_network(name, provider_config=self.provider_config):
                 self.logger.debug(f"found existing bridge {bridge_name} for network {name}")
@@ -225,10 +230,15 @@ class Network:
 
         A raw sysfs probe is authoritative only when the libvirt URI has no
         network authority (``qemu:///system``, ``test:///default``, or a local
-        unix socket).  For ``qemu+ssh://host/system`` and other remote URIs the
-        command would inspect the Boxman client's namespace, not *host*; skip
-        it and let the remote libvirt daemon validate the bridge at
-        ``net-start`` instead.
+        unix socket). Any authority-bearing URI -- even
+        ``qemu://localhost/system`` -- may resolve through a transport or
+        daemon namespace different from the Boxman process. In that case skip
+        client-side sysfs and let the endpoint's libvirt daemon validate the
+        bridge at ``net-start`` instead.
+
+        For a directly-addressed daemon, validate the administrative ``IFF_UP``
+        flag. ``operstate`` is deliberately not used: a perfectly usable bridge
+        with no attached ports commonly reports ``unknown``.
         """
         if self.forward_mode != 'bridge':
             return
@@ -236,7 +246,7 @@ class Network:
         if urlsplit(self.virsh.uri).netloc:
             self.logger.debug(
                 f"network {self.name}: deferring bridge {self.bridge_name!r} "
-                f"validation to remote libvirt endpoint {self.virsh.uri}")
+                "validation to the authority-bearing libvirt endpoint")
             return
 
         bridge_path = shlex.quote(
@@ -248,6 +258,23 @@ class Network:
                 f"network {self.name}: Linux bridge "
                 f"{self.bridge_name!r} does not exist in the active "
                 "runtime; create it and bring it up before running Boxman")
+
+        flags_path = shlex.quote(f"/sys/class/net/{self.bridge_name}/flags")
+        flags_result = self.virsh.execute_shell(
+            f"cat {flags_path}", hide=True, warn=True)
+        try:
+            flags = int(flags_result.stdout.strip(), 0) if flags_result.ok else None
+        except (AttributeError, ValueError):
+            flags = None
+        if flags is None:
+            raise ConfigError(
+                f"network {self.name}: could not read administrative state "
+                f"for Linux bridge {self.bridge_name!r} in the active runtime")
+        if not flags & 0x1:  # Linux IFF_UP
+            raise ConfigError(
+                f"network {self.name}: Linux bridge {self.bridge_name!r} "
+                "exists but is administratively down in the active runtime; "
+                f"run: sudo ip link set dev {self.bridge_name} up")
 
     @staticmethod
     def _canonical_mac(value: str) -> str:
@@ -704,6 +731,7 @@ class Network:
         Write the network information to the cache.
         """
         self.manager.cache.read_projects_cache()
+        previous_projects = copy.deepcopy(self.manager.cache.projects)
         projects_in_cache = self.manager.cache.projects
         project_name = self.manager.config['project']
         project_cache = projects_in_cache[project_name]
@@ -717,7 +745,13 @@ class Network:
             project_cache['networks'][self.name]['ip_address'] = self.ip_address
         project_cache['networks'][self.name]['bridge_name'] = self.bridge_name
 
-        self.manager.cache.write_projects_cache()
+        try:
+            self.manager.cache.write_projects_cache()
+        except Exception:
+            # Cache writes are atomic on disk. Restore the in-memory view too,
+            # while preserving any previous record for this network.
+            self.manager.cache.projects = previous_projects
+            raise
 
     def check_network_exists(self) -> None:
         """
@@ -840,6 +874,9 @@ class Network:
             raise RuntimeError(
                 f"bridge '{self.bridge_name}' is already in use by another "
                 f"active network, cannot define network '{self.name}'")
+        if (self.forward_mode == 'bridge'
+                and self.bridge_name in active_bridges):
+            self._log_bridge_mode_managed_owner()
 
         # Define transactionally. In particular, a remote bridge cannot be
         # checked through the client's /sys, so ``net-start`` is the
@@ -847,6 +884,7 @@ class Network:
         # definition/autostart/cache debris the caller was told had failed.
         defined = False
         started = False
+        route_rules_attempted = False
         try:
             self.virsh.execute("net-define", written_path)
             defined = True
@@ -860,7 +898,11 @@ class Network:
             # and FORWARD rules for <forward mode='nat'/> itself when the
             # network starts (and removes them when it stops)
             if self.forward_mode == 'route':
-                self.apply_route_iptables_rule()
+                route_rules_attempted = True
+                if not self.apply_route_iptables_rule():
+                    raise RuntimeError(
+                        f"network {self.name}: could not apply route "
+                        "isolation rules")
             # NAT is configured by libvirt. Bridge mode only points at the
             # pre-existing host bridge, so it needs no firewall setup here.
 
@@ -870,21 +912,48 @@ class Network:
             self.update_network_cache()
 
             return True
-        except RuntimeError as exc:
+        except Exception as exc:
+            # Catch operational/programming exceptions, including cache
+            # OSError, but deliberately leave BaseException subclasses such as
+            # KeyboardInterrupt and SystemExit alone.
+            if route_rules_attempted:
+                try:
+                    rules_removed = self.remove_route_iptables_rule()
+                except Exception as rollback_exc:
+                    self.logger.warning(
+                        f"network {self.name}: rollback could not remove "
+                        f"route isolation rules: {rollback_exc}")
+                else:
+                    if not rules_removed:
+                        self.logger.warning(
+                            f"network {self.name}: rollback could not remove "
+                            "route isolation rules")
             if started:
-                stopped = self.virsh.execute(
-                    "net-destroy", self.name, hide=True, warn=True)
-                if not stopped.ok:
+                try:
+                    stopped = self.virsh.execute(
+                        "net-destroy", self.name, hide=True, warn=True)
+                except Exception as rollback_exc:
                     self.logger.warning(
                         f"network {self.name}: rollback could not stop the "
-                        "partially defined network")
+                        f"partially defined network: {rollback_exc}")
+                else:
+                    if not stopped.ok:
+                        self.logger.warning(
+                            f"network {self.name}: rollback could not stop the "
+                            "partially defined network")
             if defined:
-                undefined = self.virsh.execute(
-                    "net-undefine", self.name, hide=True, warn=True)
-                if not undefined.ok:
+                try:
+                    undefined = self.virsh.execute(
+                        "net-undefine", self.name, hide=True, warn=True)
+                except Exception as rollback_exc:
                     self.logger.warning(
                         f"network {self.name}: rollback could not undefine the "
-                        "partially defined network")
+                        f"partially defined network: {rollback_exc}")
+                else:
+                    if not undefined.ok:
+                        self.logger.warning(
+                            f"network {self.name}: rollback could not undefine "
+                            "the partially defined network")
             self.logger.error(f"Error defining network: {exc}")
             return False
 
@@ -1073,6 +1142,45 @@ class Network:
                         f"  bridge '{bridge_name}' is used by network '{net_name}'")
         except Exception as exc:
             self.logger.warning(f"failed to enumerate bridge usage: {exc}")
+
+    def _log_bridge_mode_managed_owner(self) -> None:
+        """Diagnose bridge-mode reuse of a libvirt-managed Linux bridge.
+
+        Sharing is legal and can be intentional, so this is not a conflict.
+        It does couple lifecycles, though: destroying a nat/route owner removes
+        its Linux bridge underneath this bridge-mode network. Keep the probe
+        debug-gated because it needs one ``net-dumpxml`` per network.
+        """
+        if not self.logger.isEnabledFor(logging.DEBUG):
+            return
+
+        network_names = self._listed_networks()
+        if network_names is None:
+            self.logger.debug(
+                f"network {self.name}: could not inspect ownership of bridge "
+                f"{self.bridge_name!r}")
+            return
+
+        owners = []
+        for network_name in network_names:
+            result = self.virsh.execute(
+                "net-dumpxml", network_name, hide=True, warn=True)
+            if not result.ok:
+                continue
+            try:
+                state = net_reconcile.parse_network_xml(result.stdout)
+            except (ET.ParseError, ValueError):
+                continue
+            if (state.get('bridge_name') == self.bridge_name
+                    and state.get('mode') in {'nat', 'route'}):
+                owners.append(f"{network_name} ({state['mode']})")
+
+        if owners:
+            self.logger.debug(
+                f"network {self.name}: bridge mode references "
+                f"{self.bridge_name!r}, which is managed by libvirt network(s) "
+                f"{', '.join(owners)}; destroying an owner removes the Linux "
+                "bridge underneath this network")
 
     @staticmethod
     def _ensure_rule(cls,

@@ -283,14 +283,20 @@ vms:
         network_source: migration
 ```
 
-Create and bring up `br-migration` in the libvirt daemon's network namespace
-before running Boxman. With a local libvirt URI Boxman checks that namespace
-before defining anything. With a remote URI such as `qemu+ssh://hv/system`,
-the client's `/sys` describes the wrong host, so the remote libvirt daemon is
-the authority and validates the bridge when the network starts. Do not set
-`ip`, `mac`, `bridge.stp`, or `bridge.delay` in this block: addressing and link
-policy belong to the host bridge. Boxman removes only the libvirt network
-definition during teardown; it never deletes the underlying bridge.
+Create and administratively bring up `br-migration` in the libvirt daemon's
+network namespace before running Boxman. For an authority-less URI such as
+`qemu:///system`, Boxman verifies both that it is a Linux bridge and that its
+`IFF_UP` flag is set before defining anything. It deliberately does not use
+`operstate`: an up bridge with no attached ports commonly reports `unknown`.
+
+Any authority-bearing URI, including `qemu+ssh://hv/system` and even
+`qemu://localhost/system`, may reach a transport or daemon namespace different
+from the Boxman process. Client-side `/sys` is therefore not authoritative;
+the endpoint's libvirt daemon validates the bridge when the network starts.
+Do not set `ip`, `mac`, `bridge.stp`, or `bridge.delay` in this block:
+addressing and link policy belong to the host bridge. Boxman removes only the
+libvirt network definition during teardown; it never deletes the underlying
+bridge.
 
 Use bridge mode when VMs should reference a stable libvirt network name while
 different hypervisors map that name to their own bridge—for example, live

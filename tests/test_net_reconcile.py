@@ -173,8 +173,9 @@ class TestBridgeOwnershipTransitions:
 
     def test_auto_managed_bridge_has_no_premature_name_conflict(self):
         assert nr.bridge_ownership_conflict(
-            {"mode": "nat", "bridge_name": None},
+            {"mode": "nat", "bridge_name": "virbr0"},
             {"mode": "bridge", "bridge_name": "virbr0"},
+            desired_bridge_is_pinned=False,
         ) is None
 
 
@@ -294,26 +295,27 @@ class TestPinnedBridgeAndStp:
     """Fields whose configured form differs from what libvirt echoes back."""
 
     def test_pinned_bridge_name_reaches_the_diff(self, ):
-        # the plan builds its Network with assign_new_bridge=False, which reads
-        # the bridge from libvirt; the *configured* name has to survive that or
-        # the pinned-name drift check can never fire
+        # A configured bridge is the effective desired name. Live state is
+        # parsed separately from net-dumpxml, so construction must not replace
+        # the pin with the bridge currently in use.
         info = {"mode": "nat", "bridge": {"name": "virbr42"},
                 "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0"}}
-        with patch.object(Network, "get_bridge_from_network",
-                          return_value="virbr9"):
+        with patch.object(Network, "get_bridge_from_network") as lookup:
             net = Network(name="demo", info=info, assign_new_bridge=False,
                           provider_config={"use_sudo": False})
-        assert net.bridge_name == "virbr9"          # what is in use
-        assert nr.desired_state(net)["bridge_name"] == "virbr42"   # what was asked for
+        assert net.bridge_name == "virbr42"
+        assert nr.desired_state(net)["bridge_name"] == "virbr42"
+        lookup.assert_not_called()
 
-    def test_unpinned_bridge_name_is_not_reported_as_desired(self):
+    def test_unpinned_existing_bridge_is_the_effective_desired_name(self):
         info = {"mode": "nat",
                 "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0"}}
         with patch.object(Network, "get_bridge_from_network",
                           return_value="virbr9"):
             net = Network(name="demo", info=info, assign_new_bridge=False,
                           provider_config={"use_sudo": False})
-        assert nr.desired_state(net)["bridge_name"] is None
+        assert net.pinned_bridge_name is None
+        assert nr.desired_state(net)["bridge_name"] == "virbr9"
 
     def test_a_short_network_mac_does_not_read_as_drift(self):
         # libvirt zero-pads the network's own mac when it stores it, so a

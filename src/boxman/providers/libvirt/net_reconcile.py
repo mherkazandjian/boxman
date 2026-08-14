@@ -118,7 +118,7 @@ def desired_state(network) -> dict[str, Any]:
     if network.forward_mode == 'bridge':
         return {
             'mode': 'bridge',
-            'bridge_name': network.pinned_bridge_name,
+            'bridge_name': network.bridge_name,
             'bridge_stp': None,
             'bridge_delay': None,
             'mac': None,
@@ -135,11 +135,10 @@ def desired_state(network) -> dict[str, Any]:
 
     return {
         'mode': network.forward_mode,
-        # the *configured* name, not the one in use: when the configuration
-        # does not pin one boxman assigned it and libvirt is authoritative, so
-        # leaving this None is what keeps an auto-assigned virbrX from reading
-        # as drift
-        'bridge_name': network.pinned_bridge_name,
+        # ``bridge_name`` is the effective desired name: a configured pin, a
+        # newly allocated virbrX, or the current libvirt name when reconciling
+        # an unpinned existing network.
+        'bridge_name': network.bridge_name,
         'bridge_stp': str(network.bridge_stp),
         'bridge_delay': str(network.bridge_delay),
         'mac': network.mac_address.lower() if network.mac_address else None,
@@ -279,7 +278,9 @@ def diff_network(desired: dict[str, Any],
 
 
 def bridge_ownership_conflict(desired: dict[str, Any],
-                              actual: dict[str, Any]) -> str | None:
+                              actual: dict[str, Any],
+                              *,
+                              desired_bridge_is_pinned: bool = True) -> str | None:
     """Explain an unsafe same-name managed/external bridge transition.
 
     In nat/route mode libvirt owns the Linux bridge and deletes it with the
@@ -287,7 +288,10 @@ def bridge_ownership_conflict(desired: dict[str, Any],
     alone. Reusing one bridge name while crossing that ownership boundary
     therefore cannot be reconciled by destroy/redefine: one direction deletes
     the desired prerequisite, the other leaves an interface the new managed
-    network cannot claim.
+    network cannot claim. ``desired_bridge_is_pinned`` distinguishes that
+    second case from an unpinned managed network: during planning its resolved
+    name is still the current bridge, but the recreate path reserves a new
+    automatic name before removing anything.
     """
     old_mode = actual.get('mode')
     new_mode = desired.get('mode')
@@ -303,7 +307,8 @@ def bridge_ownership_conflict(desired: dict[str, Any],
             f"reusing {old_bridge!r}: removing the current libvirt network "
             "would delete that managed bridge; create a distinct host bridge "
             "and set bridge.name to it")
-    if old_mode == 'bridge' and new_mode in managed:
+    if (old_mode == 'bridge' and new_mode in managed
+            and desired_bridge_is_pinned):
         return (
             f"cannot change forward mode 'bridge' -> {new_mode!r} while "
             f"reusing {old_bridge!r}: bridge mode preserves that host-owned "

@@ -348,7 +348,8 @@ class LibVirtSession(SessionConfigMixin):
         plan = net_reconcile.diff_network(desired, actual)
 
         ownership_conflict = net_reconcile.bridge_ownership_conflict(
-            desired, actual)
+            desired, actual,
+            desired_bridge_is_pinned=network.pinned_bridge_name is not None)
         if ownership_conflict:
             raise ConfigError(f"network {name}: {ownership_conflict}")
 
