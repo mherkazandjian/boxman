@@ -170,7 +170,7 @@ class TestMemballoonDiff:
     def _diff(self, differ: VMStateDiffer, desired, actual, *, live=None,
               vm_state="running") -> dict:
         states = [actual]
-        if vm_state == "running":
+        if vm_state in VMStateDiffer._LIVE_DOMAIN_STATES:
             states.append(actual if live is None else live)
         with patch.object(differ, "get_vm_state", return_value=vm_state), \
              patch.object(differ, "get_actual_cpu",
@@ -210,6 +210,23 @@ class TestMemballoonDiff:
                   "stats_period": None})
 
         assert diff["memballoon_changed"] is False
+        assert diff["memballoon_restart_pending"] is True
+        assert diff["live_memballoon"]["autodeflate"] is False
+
+    @pytest.mark.parametrize(
+        "vm_state",
+        ["paused", "blocked", "in shutdown", "pmsuspended"],
+    )
+    def test_other_active_states_with_live_mismatch_need_restart(
+            self, differ, vm_state):
+        desired = {"free_page_reporting": False, "autodeflate": True,
+                   "stats_period": None}
+
+        diff = self._diff(
+            differ, desired, desired, vm_state=vm_state,
+            live={"free_page_reporting": False, "autodeflate": False,
+                  "stats_period": None})
+
         assert diff["memballoon_restart_pending"] is True
         assert diff["live_memballoon"]["autodeflate"] is False
 

@@ -18,9 +18,8 @@ pytestmark = pytest.mark.unit
 @pytest.fixture(autouse=True)
 def _default_memballoon_state():
     """diff_vm probes the balloon device via virsh; default it to the
-    libvirt defaults (no freePageReporting, no autodeflate, no stats) for
-    every test so
-    the existing decorator stacks don't each need another patch."""
+    libvirt defaults (no freePageReporting, no autodeflate, no stats) for every
+    test so the existing decorator stacks don't each need another patch."""
     with patch.object(VMStateDiffer, 'get_actual_memballoon',
                       return_value={'free_page_reporting': False,
                                     'autodeflate': False,
@@ -876,7 +875,8 @@ class TestMemballoonUpdateResult:
             'removed_shared_folders': [],
             'changed_shared_folders': [],
             'memballoon_changed': True,
-            'memballoon_restart_pending': vm_state == 'running',
+            'memballoon_restart_pending': (
+                vm_state in VMStateDiffer._LIVE_DOMAIN_STATES),
             'actual_memballoon': {
                 'free_page_reporting': False,
                 'autodeflate': False,
@@ -917,6 +917,16 @@ class TestMemballoonUpdateResult:
 
         assert result['status'] == 'needs_restart'
         assert 'restart required to apply memballoon changes' in result['details']
+        mgr.provider.shutdown_and_wait.assert_not_called()
+        mgr.provider.start_vm.assert_not_called()
+
+    def test_paused_vm_reports_restart_required(self):
+        mgr, result = self._run_update('paused')
+
+        assert result['status'] == 'needs_restart'
+        assert (
+            'restart required to apply memballoon changes'
+            in result['details'])
         mgr.provider.shutdown_and_wait.assert_not_called()
         mgr.provider.start_vm.assert_not_called()
 

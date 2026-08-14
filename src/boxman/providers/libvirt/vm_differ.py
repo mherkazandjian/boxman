@@ -14,6 +14,13 @@ class VMStateDiffer:
     and produces a structured diff describing what needs to change.
     """
 
+    # States with an active domain and therefore distinct live XML.  A paused,
+    # blocked, shutting-down, or power-managed guest still needs a later boot
+    # before persistent-only device edits become live.
+    _LIVE_DOMAIN_STATES = frozenset({
+        'running', 'blocked', 'paused', 'in shutdown', 'pmsuspended',
+    })
+
     def __init__(self, provider_config: dict[str, Any] | None = None):
         self.virsh = VirshCommand(provider_config)
         self.virsh_edit = VirshEdit(provider_config)
@@ -350,11 +357,11 @@ class VMStateDiffer:
         normalized_memballoon = self.normalize_memballoon_config(desired_memballoon)
         memballoon_changed = normalized_memballoon != actual_memballoon
         live_memballoon = actual_memballoon
-        if vm_state == 'running':
+        if vm_state in self._LIVE_DOMAIN_STATES:
             live_memballoon = self.get_actual_memballoon(
                 domain_name, inactive=False)
         memballoon_restart_pending = (
-            vm_state == 'running'
+            vm_state in self._LIVE_DOMAIN_STATES
             and normalized_memballoon != live_memballoon)
 
         # --- Disk diff ---

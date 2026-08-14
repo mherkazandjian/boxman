@@ -620,9 +620,10 @@ a page stays allocated until the VM stops -- even after the guest frees it.
 
 Free-page reporting needs a Linux guest kernel >= 5.7 (all supported cloud images
 qualify), **libvirt >= 6.9.0**, and **QEMU >= 5.1**. Autodeflate is supported by
-QEMU/KVM with **libvirt >= 1.3.1**. On older or incompatible hosts, `virsh define`
-may reject or silently drop an unsupported setting. The resulting libvirt domain
-gets both settings as attributes on the same balloon device; verify with:
+QEMU/KVM with **libvirt >= 1.3.1** and **QEMU >= 2.9**. On older or incompatible
+hosts, `virsh define` may reject or silently drop an unsupported setting. The
+resulting libvirt domain gets both settings as attributes on the same balloon
+device; verify with:
 
 ```bash
 virsh dumpxml --inactive <vm> | grep -A2 memballoon
@@ -630,12 +631,12 @@ virsh dumpxml --inactive <vm> | grep -A2 memballoon
 #     <stats period='5'/>
 ```
 
-Changes to a running VM are written to the persistent config and
-take effect from the next boot; `boxman update` reports `restart required`
-without restarting the guest automatically. It keeps reporting that live-state
-drift until the guest boots with the new persistent XML, and applies that XML
-idempotently (and removing the `memballoon` block reconciles the VM back to the
-defaults).
+Changes to an active VM (including a paused VM) are written to the persistent
+config and take effect from the next boot; `boxman update` reports
+`restart required` without restarting the guest automatically. It keeps
+reporting that live-state drift until the guest boots with the new persistent
+XML, and applies that XML idempotently (and removing the `memballoon` block
+reconciles the VM back to the defaults).
 
 > For many similar VMs, KSM can also deduplicate identical live pages
 > across guests. KSM is a host-wide, operator-owned policy with CPU,
