@@ -100,6 +100,40 @@ def classify_family(osid, id_like):
     return "unknown"
 
 
+def configured_libvirt_use_sudo(text, default=False):
+    """Read ``providers.libvirt.use_sudo`` from simple YAML without PyYAML.
+
+    The prerequisite checker deliberately has no third-party dependencies.
+    This small indentation-aware scalar reader ignores same-named keys in
+    project/provider blocks and falls back safely when the app config is
+    absent, templated, or malformed.
+    """
+    parents = []
+    for raw_line in text.splitlines():
+        code = raw_line.split("#", 1)[0].rstrip()
+        if not code.strip():
+            continue
+        indent = len(code) - len(code.lstrip(" "))
+        match = re.match(
+            r"^([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$", code.lstrip(" "))
+        if not match:
+            continue
+        while parents and parents[-1][0] >= indent:
+            parents.pop()
+        key, value = match.groups()
+        path = [parent_key for _, parent_key in parents]
+        if path == ["providers", "libvirt"] and key == "use_sudo":
+            value = value.strip().strip("\"'").lower()
+            if value in ("true", "yes", "on", "1"):
+                return True
+            if value in ("false", "no", "off", "0"):
+                return False
+            return default
+        if not value:
+            parents.append((indent, key))
+    return default
+
+
 # Verbatim per-distro core stack lines (from doc/tutorial/README.md), minus the
 # systemctl/usermod steps which the checker handles as their own fixes.
 #
@@ -180,7 +214,11 @@ _TOOL_PKG = {
                 "gentoo": "app-admin/ansible", "nixos": "ansible", "guix": "ansible"},
     "zstd": {"arch": "zstd", "debian": "zstd", "rhel": "zstd",
              "gentoo": "app-arch/zstd", "nixos": "zstd", "guix": "zstd"},
-    "virt-sparsify": {"arch": "guestfs-tools", "debian": "libguestfs-tools", "rhel": "guestfs-tools",
+    # Debian-family releases supported by Boxman, including Ubuntu 22.04 and
+    # Debian 12, ship the standalone virt-* applications in guestfs-tools.
+    # libguestfs-tools is a compatibility/meta package there; keep sysprep and
+    # sparsify guidance aligned on the package that owns both executables.
+    "virt-sparsify": {"arch": "guestfs-tools", "debian": "guestfs-tools", "rhel": "guestfs-tools",
                       "gentoo": "app-emulation/libguestfs", "nixos": "guestfs-tools", "guix": "libguestfs"},
     "virt-sysprep": {"arch": "guestfs-tools", "debian": "guestfs-tools", "rhel": "guestfs-tools",
                      "gentoo": "app-emulation/guestfs-tools", "nixos": "guestfs-tools", "guix": "libguestfs"},
@@ -556,6 +594,7 @@ class Doctor:
         self.os = self._detect_os()
         self.family = self.os["family"]
         self.runtime = self._detect_runtime(opts.runtime)
+        self.use_sudo = self._detect_libvirt_use_sudo()
         self.results = []
         self.manual_steps = []
         self.relogin_needed = False
@@ -726,6 +765,14 @@ class Doctor:
             except OSError:
                 pass
         return "local"
+
+    def _detect_libvirt_use_sudo(self):
+        path = os.path.expanduser("~/.config/boxman/boxman.yml")
+        try:
+            with open(path) as handle:
+                return configured_libvirt_use_sudo(handle.read(), default=False)
+        except OSError:
+            return False
 
     def is_virtualized(self):
         rc, out = run_capture(["systemd-detect-virt"])
@@ -1088,6 +1135,7 @@ class Doctor:
 
     def _check_sudo_rights(self):
         def sudo_rights():
+            sysprep_uses_sudo = getattr(self, "use_sudo", False)
             if not have("sudo"):
                 fix = self._install_fix("install sudo", "sudo")
                 return WARN, "sudo not found; libvirt network/cleanup steps need it", fix
@@ -1106,7 +1154,10 @@ class Doctor:
                               "non-interactively"), fix
             # passwordless sudo exists -- check the scope that bites people.
             iptables_ok = sudo_nopasswd_covers(out, "iptables")
-            sysprep_ok = sudo_nopasswd_covers(out, "virt-sysprep")
+            sysprep_ok = (
+                not sysprep_uses_sudo
+                or sudo_nopasswd_covers(out, "virt-sysprep")
+            )
             qemu_ok = sudo_nopasswd_covers(out, "qemu-img")
             rm_ok = sudo_nopasswd_covers(out, "rm")
             gaps = []
@@ -1118,8 +1169,10 @@ class Doctor:
             if not (qemu_ok and rm_ok):
                 gaps.append("qemu-img/rm (destroy/cleanup silently no-ops without these)")
             if not gaps:
-                return OK, ("passwordless sudo covers "
-                            "virsh/virt-sysprep/qemu-img/iptables/rm"), None
+                covered = "virsh/qemu-img/iptables/rm"
+                if sysprep_uses_sudo:
+                    covered = "virsh/virt-sysprep/qemu-img/iptables/rm"
+                return OK, "passwordless sudo covers " + covered, None
             fix = Fix(
                 "widen NOPASSWD sudo scope in /etc/sudoers.d/boxman to include: "
                 "virsh, virt-sysprep, qemu-img, iptables, ip, rsync, rm",

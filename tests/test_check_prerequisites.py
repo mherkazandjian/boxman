@@ -82,6 +82,35 @@ def test_classify_family_uses_id_like_when_id_unknown():
 
 
 # --------------------------------------------------------------------------- #
+# minimal app-config scalar parsing                                           #
+# --------------------------------------------------------------------------- #
+def test_configured_libvirt_use_sudo_reads_only_provider_block():
+    text = """
+runtime: local
+clusters:
+  lab:
+    use_sudo: true
+providers:
+  virtualbox:
+    use_sudo: true
+  libvirt:
+    uri: qemu:///system
+    use_sudo: false  # direct group access
+"""
+    assert checker.configured_libvirt_use_sudo(text, default=True) is False
+
+
+def test_configured_libvirt_use_sudo_supports_yaml_boolean_spellings():
+    text = "providers:\n  libvirt:\n    use_sudo: YES\n"
+    assert checker.configured_libvirt_use_sudo(text) is True
+
+
+def test_configured_libvirt_use_sudo_falls_back_for_invalid_value():
+    text = "providers:\n  libvirt:\n    use_sudo: {{ env('SUDO') }}\n"
+    assert checker.configured_libvirt_use_sudo(text, default=False) is False
+
+
+# --------------------------------------------------------------------------- #
 # install_cmd                                                                 #
 # --------------------------------------------------------------------------- #
 def test_install_cmd_per_family():
@@ -139,6 +168,7 @@ def test_doctor_sudo_rights_requires_virt_sysprep(monkeypatch):
     doctor.manual_steps = []
     doctor.use_color = False
     doctor.interactive = False
+    doctor.use_sudo = True
 
     policy = (
         "(root) NOPASSWD: /usr/bin/virsh, /usr/bin/qemu-img, "
@@ -153,6 +183,24 @@ def test_doctor_sudo_rights_requires_virt_sysprep(monkeypatch):
     assert result.status == checker.WARN
     assert "virt-sysprep" in result.detail
     assert "virt-sysprep" in result.fix.description
+
+
+def test_doctor_omits_sysprep_nopasswd_gap_when_use_sudo_is_false(monkeypatch):
+    doctor = _minimal_doctor_for_check()
+    doctor.use_sudo = False
+    policy = (
+        "(root) NOPASSWD: /usr/bin/virsh, /usr/bin/qemu-img, "
+        "/usr/sbin/iptables, /usr/bin/rm\n"
+    )
+    monkeypatch.setattr(checker, "have", lambda command: command == "sudo")
+    monkeypatch.setattr(checker, "run_capture", lambda args: (0, policy))
+
+    doctor._check_sudo_rights()
+
+    result = doctor.results[-1]
+    assert result.status == checker.OK
+    assert "virt-sysprep" not in result.detail
+    assert result.fix is None
 
 
 def _minimal_doctor_for_check():
@@ -840,6 +888,11 @@ def test_core_stack_fix_gentoo_uses_emerge():
 ])
 def test_core_stack_installs_virt_sysprep_package(family, package):
     assert package in checker._CORE_STACK[family]
+
+
+def test_debian_guestfs_tool_remediation_uses_executable_owner_package():
+    assert checker._TOOL_PKG["virt-sysprep"]["debian"] == "guestfs-tools"
+    assert checker._TOOL_PKG["virt-sparsify"]["debian"] == "guestfs-tools"
 
 
 def test_declarative_core_advice_includes_virt_sysprep_package():

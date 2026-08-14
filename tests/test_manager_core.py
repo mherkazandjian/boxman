@@ -434,6 +434,37 @@ class TestCloneVmsExitCodeGuard:
         provider.clone_vm.assert_called_once()
         sleep.assert_not_called()
 
+    def test_auto_sanitizer_warning_survives_real_retry_wrapper(
+        self, tmp_path: Path, captured_logs
+    ):
+        """The successful first attempt is suppressed, then its one safety
+        notice is re-emitted outside that context instead of disappearing."""
+        from unittest.mock import patch as _patch
+
+        from boxman.manager_parts.vms import _clone_with_retry
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        provider = LibVirtSession(config={
+            "provider": {"libvirt": {"use_sudo": False}},
+        })
+        cluster = {"base_image": "tpl", "workdir": str(tmp_path)}
+
+        with _patch(
+            "boxman.providers.libvirt.clone_vm.VirtCloneCommand.execute",
+            return_value=object(),
+        ), _patch(
+            "boxman.providers.libvirt.clone_vm.VirtSysprepCommand.execute",
+            side_effect=OSError("virt-sysprep unavailable"),
+        ):
+            _clone_with_retry(provider, cluster, {}, "vm01")
+
+        notices = [
+            record.message for record in captured_logs.records
+            if "clone_machine_id=auto" in record.message
+        ]
+        assert len(notices) == 1
+        assert "virt-sysprep unavailable" in notices[0]
+
     def test_failed_unsafe_clone_cleanup_is_not_retried(self, tmp_path: Path):
         from unittest.mock import MagicMock, patch as _patch
 

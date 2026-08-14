@@ -475,6 +475,11 @@ class VirtSysprepCommand(LibVirtCommandBase):
             kwargs['connect'] = self.uri
         command = super().build_command(*args, **kwargs)
 
+        if command.startswith("sudo "):
+            # Sysprep is always non-interactive, even for direct callers that
+            # do not request an execution timeout.
+            command = f"sudo -n {command[len('sudo '):]}"
+
         if execution_timeout is None:
             return command
         if (isinstance(execution_timeout, bool)
@@ -488,11 +493,7 @@ class VirtSysprepCommand(LibVirtCommandBase):
             "timeout --signal=TERM "
             f"--kill-after={self.TIMEOUT_KILL_GRACE}s "
             f"{execution_timeout}s")
-        if command.startswith("sudo "):
-            # Keep timeout outside sudo: allowing ``sudo timeout`` in a
-            # command-specific NOPASSWD rule would permit arbitrary root
-            # commands. GNU timeout's default process-group mode includes
-            # descendants, while ``sudo -n`` rejects credential prompts
-            # immediately for non-interactive clone workers.
-            command = f"sudo -n {command[len('sudo '):]}"
+        # Keep timeout outside sudo: allowing ``sudo timeout`` in a
+        # command-specific NOPASSWD rule would permit arbitrary root commands.
+        # GNU timeout's default process-group mode includes descendants.
         return f"{timeout_prefix} {command}"

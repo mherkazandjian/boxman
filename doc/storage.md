@@ -332,7 +332,7 @@ runtime has `zstd` available.
 
 | Tool | Used by | Soft-require behaviour |
 |---|---|---|
-| `virt-sparsify` (from `guestfs-tools` / `libguestfs-tools`) | `compact --method sparsify` and `auto` when snapshots exist | Pre-flight check; clear error before any destructive op: `virt-sparsify not found in the runtime — install guestfs-tools / libguestfs-tools, or pass --method convert` |
+| `virt-sparsify` (from `guestfs-tools`) | `compact --method sparsify` and `auto` when snapshots exist | Pre-flight check; clear error before any destructive op: `virt-sparsify not found in the runtime — install guestfs-tools, or pass --method convert` |
 | `zstd` | Memory compression / decompression | Same — error if missing on first compress; restore-side decompress also surfaces a clear error |
 | `qemu-guest-agent` | `trim` (`virsh domfstrim`) | If unresponsive, `trim` errors with `qemu-guest-agent not responsive. install it in the guest (apt/dnf install qemu-guest-agent) and reboot.` |
 
@@ -381,7 +381,7 @@ boxman storage optimize --dry-run
 | `fstrim failed: … qemu-guest-agent not responsive` | The guest agent isn't installed or the agent channel is missing | In the guest: `sudo apt install qemu-guest-agent && sudo systemctl enable --now qemu-guest-agent` (or `dnf` equivalent). Reboot if the agent channel was added by `boxman update`. |
 | `compact` refuses with "snapshots present and --drop-snapshots not given" | Method `convert`/`convert-compressed` would flatten the chain | Either pass `--drop-snapshots`, or use `--method sparsify` (or default `auto`) which preserves the chain |
 | `compact` refuses with "vm … is running and --no-shutdown was passed" | You opted out of auto-shutdown but the VM is up | Drop `--no-shutdown`, or shut the VM down manually first |
-| `virt-sparsify not found in the runtime` | `guestfs-tools` not installed in the active runtime | `dnf install guestfs-tools` (RHEL/Rocky) or `apt install libguestfs-tools` (Debian/Ubuntu); or use `--method convert`; or switch to the docker runtime which already includes it |
+| `virt-sparsify not found in the runtime` | `guestfs-tools` not installed in the active runtime | Install `guestfs-tools` with `dnf` (RHEL/Rocky) or `apt` (Debian/Ubuntu); or use `--method convert`; or switch to the docker runtime which already includes it |
 | `zstd not found in runtime` (during compress / decompress) | `zstd` missing on the host or in the runtime | Install zstd; the docker runtime image already includes it |
 | `df` shows huge `SNAPMEM` | Snapshot memory dumps not compressed | `boxman storage compress-snapshots` |
 | `df` shows huge `ALLOC` and `CHAIN > 1` | Sparse holes in overlays | `boxman storage compact` (auto picks sparsify) |

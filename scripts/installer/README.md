@@ -13,6 +13,12 @@ seed-ISO tool, `sshpass`, sudo rights, …). Installing the Python package — e
 `pip install boxman` inside a conda env — does **not** set any of that up. This
 script checks all of it in one pass.
 
+On supported Debian and Ubuntu releases, the `guestfs-tools` package owns the
+user-facing `virt-sysprep` and `virt-sparsify` executables. The similarly named
+`libguestfs-tools` is a compatibility/meta package; checker remediation names
+`guestfs-tools` directly so installing one optional tool also supplies the
+other.
+
 ## Usage
 
 ```bash

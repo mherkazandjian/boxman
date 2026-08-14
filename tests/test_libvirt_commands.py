@@ -103,9 +103,10 @@ class TestBuildCommandQuoting:
             "--connect=qemu+ssh://user@host/system",
         ]
 
-    def test_virt_sysprep_follows_sudo_convention(self):
+    def test_virt_sysprep_is_noninteractive_without_timeout(self):
         v = VirtSysprepCommand(provider_config={"use_sudo": True})
-        assert v.build_command(domain="vm01").startswith("sudo virt-sysprep ")
+        assert v.build_command(domain="vm01").startswith(
+            "sudo -n virt-sysprep ")
 
     def test_virt_sysprep_timeout_runs_inside_runtime_and_under_sudo(self):
         v = VirtSysprepCommand(provider_config={"use_sudo": True})

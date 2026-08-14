@@ -327,11 +327,14 @@ class TestResetMachineIdentity:
         assert execute.call_args.kwargs["execution_timeout"] == 300
         assert execute.call_args.kwargs["timeout"] == 315
 
-    def test_inner_timeout_exit_is_typed(self, clone: CloneVM):
+    @pytest.mark.parametrize("return_code", [124, 137])
+    def test_inner_timeout_exit_is_typed(
+        self, clone: CloneVM, return_code: int
+    ):
         with patch.object(
             clone.virt_sysprep,
             "execute",
-            return_value=_result(ok=False, return_code=124),
+            return_value=_result(ok=False, return_code=return_code),
         ):
             with pytest.raises(CloneSanitizerError, match="timed out after 300s"):
                 clone.reset_machine_identity()

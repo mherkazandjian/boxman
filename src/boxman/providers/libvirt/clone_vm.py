@@ -15,6 +15,12 @@ from .commands import VirshCommand, VirtCloneCommand, VirtSysprepCommand
 from .virsh_parse import parse_domiflist
 
 
+# Internal hand-off used by the retry wrapper. Clone attempts run under log
+# suppression so transient errors stay quiet; successful ``auto`` degradation
+# notices are collected here and re-emitted after that suppression ends.
+CLONE_DEGRADATION_NOTICES_KEY = '_boxman_clone_degradation_notices'
+
+
 class CloneVM:
     """
     Class to clone VMs in libvirt using virt-clone and virsh commands.
@@ -135,12 +141,19 @@ class CloneVM:
             self.reset_machine_identity()
         except CloneSanitizerError as sanitizer_error:
             if self.machine_id_policy == 'auto':
-                self.logger.warning(
+                message = (
                     f"could not reset inherited machine identity for vm "
                     f"{self.new_vm_name}; continuing because "
                     f"clone_machine_id=auto. The guest may retain its "
                     f"template identity. Set clone_machine_id=required to "
                     f"fail closed. Cause: {sanitizer_error}")
+                notices = self.info.get(CLONE_DEGRADATION_NOTICES_KEY)
+                if isinstance(notices, list):
+                    notices.append(message)
+                else:
+                    # Direct provider callers do not have a retry wrapper to
+                    # re-emit the notice, so retain the normal warning path.
+                    self.logger.warning(message)
                 return
 
             # ``required`` is fail-closed. A cleanup failure is itself
@@ -185,7 +198,7 @@ class CloneVM:
                 f"reset inherited machine identity for vm {self.new_vm_name}")
             return
 
-        if result.return_code == 124:
+        if result.return_code in (124, 137):
             raise CloneSanitizerError(
                 f"virt-sysprep timed out after {self.sysprep_timeout}s while "
                 f"resetting vm {self.new_vm_name}")
