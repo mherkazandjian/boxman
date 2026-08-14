@@ -14,11 +14,11 @@ class VMStateDiffer:
     and produces a structured diff describing what needs to change.
     """
 
-    # States with an active domain and therefore distinct live XML.  A paused,
-    # blocked, shutting-down, or power-managed guest still needs a later boot
-    # before persistent-only device edits become live.
+    # States with an active domain and therefore distinct live XML. A paused,
+    # blocked, shutting-down, power-managed, or crash-preserved guest still
+    # needs a later boot before persistent-only device edits become live.
     _LIVE_DOMAIN_STATES = frozenset({
-        'running', 'blocked', 'paused', 'in shutdown', 'pmsuspended',
+        'running', 'blocked', 'paused', 'in shutdown', 'pmsuspended', 'crashed',
     })
 
     def __init__(self, provider_config: dict[str, Any] | None = None):

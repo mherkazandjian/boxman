@@ -637,12 +637,12 @@ virsh dumpxml --inactive <vm> | grep -A2 memballoon
 #     <stats period='5'/>
 ```
 
-Changes to an active VM (including a paused VM) are written to the persistent
-config and take effect from the next boot; `boxman update` reports
-`restart required` without restarting the guest automatically. It keeps
-reporting that live-state drift until the guest boots with the new persistent
-XML, and applies that XML idempotently (and removing the `memballoon` block
-reconciles the VM back to the defaults).
+Changes to an active VM (including a paused or crash-preserved VM) are written
+to the persistent config and take effect from the next boot; `boxman update`
+reports `restart required` without restarting the guest automatically. It
+keeps reporting that live-state drift until the guest boots with the new
+persistent XML, and applies that XML idempotently (and removing the
+`memballoon` block reconciles the VM back to the defaults).
 
 > For many similar VMs, KSM can also deduplicate identical live pages
 > across guests. KSM is a host-wide, operator-owned policy with CPU,

@@ -215,7 +215,7 @@ class TestMemballoonDiff:
 
     @pytest.mark.parametrize(
         "vm_state",
-        ["paused", "blocked", "in shutdown", "pmsuspended"],
+        ["paused", "blocked", "in shutdown", "pmsuspended", "crashed"],
     )
     def test_other_active_states_with_live_mismatch_need_restart(
             self, differ, vm_state):

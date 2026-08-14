@@ -875,8 +875,10 @@ class TestMemballoonUpdateResult:
             'removed_shared_folders': [],
             'changed_shared_folders': [],
             'memballoon_changed': True,
+            # Keep this manager fixture independent of VMStateDiffer's state
+            # classification; differ-level tests own that contract.
             'memballoon_restart_pending': (
-                vm_state in VMStateDiffer._LIVE_DOMAIN_STATES),
+                vm_state in ('running', 'paused', 'crashed')),
             'actual_memballoon': {
                 'free_page_reporting': False,
                 'autodeflate': False,
@@ -922,6 +924,16 @@ class TestMemballoonUpdateResult:
 
     def test_paused_vm_reports_restart_required(self):
         mgr, result = self._run_update('paused')
+
+        assert result['status'] == 'needs_restart'
+        assert (
+            'restart required to apply memballoon changes'
+            in result['details'])
+        mgr.provider.shutdown_and_wait.assert_not_called()
+        mgr.provider.start_vm.assert_not_called()
+
+    def test_crash_preserved_vm_reports_restart_required(self):
+        mgr, result = self._run_update('crashed')
 
         assert result['status'] == 'needs_restart'
         assert (
