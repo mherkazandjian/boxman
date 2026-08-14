@@ -7,13 +7,12 @@ from boxman import log
 from boxman.exceptions import (
     CloneCleanupError,
     CloneSanitizerError,
-    CloneSanitizerUnavailable,
+    CloneSanitizerUnavailableError,
     ConfigError,
 )
 
 from .commands import VirshCommand, VirtCloneCommand, VirtSysprepCommand
 from .virsh_parse import parse_domiflist
-
 
 # Internal hand-off used by the retry wrapper. Clone attempts run under log
 # suppression so transient errors stay quiet; successful ``auto`` degradation
@@ -229,7 +228,7 @@ class CloneVM:
                 "nixpkgs#guestfs-tools (NixOS), or libguestfs (Guix), then "
                 "retry."
             )
-            raise CloneSanitizerUnavailable(message)
+            raise CloneSanitizerUnavailableError(message)
         sudo_denied = (
             "sudo:" in detail_lower
             and (
@@ -246,7 +245,7 @@ class CloneVM:
                 "provider.libvirt.use_sudo to false when the active user "
                 "already has libvirt access, then retry."
             )
-            raise CloneSanitizerUnavailable(message)
+            raise CloneSanitizerUnavailableError(message)
 
         raise CloneSanitizerError(
             "virt-sysprep machine-id reset failed for vm "

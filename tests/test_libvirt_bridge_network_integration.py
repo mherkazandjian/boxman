@@ -19,7 +19,6 @@ import yaml
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.session import LibVirtSession
 
-
 pytestmark = pytest.mark.integration
 
 URI = os.environ.get("BOXMAN_IT_URI", "qemu:///system")

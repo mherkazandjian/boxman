@@ -39,7 +39,7 @@ class CloneSanitizerError(ProvisionError):
     """
 
 
-class CloneSanitizerUnavailable(CloneSanitizerError):
+class CloneSanitizerUnavailableError(CloneSanitizerError):
     """Raised when a clone cannot be made safe because its offline guest
     sanitizer is unavailable. This is a host/runtime prerequisite failure,
     not a transient libvirt failure, so clone retries should fail fast."""

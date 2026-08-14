@@ -416,7 +416,8 @@ class TestCloneVmsExitCodeGuard:
     def test_required_clone_sanitizer_failure_is_not_retried(
         self, tmp_path: Path
     ):
-        from unittest.mock import MagicMock, patch as _patch
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
 
         from boxman.exceptions import CloneSanitizerError
         from boxman.manager_parts.vms import _clone_with_retry
@@ -466,7 +467,8 @@ class TestCloneVmsExitCodeGuard:
         assert "virt-sysprep unavailable" in notices[0]
 
     def test_failed_unsafe_clone_cleanup_is_not_retried(self, tmp_path: Path):
-        from unittest.mock import MagicMock, patch as _patch
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
 
         from boxman.exceptions import CloneCleanupError
         from boxman.manager_parts.vms import _clone_with_retry
@@ -491,7 +493,8 @@ class TestCloneVmsExitCodeGuard:
         configure/start phase, so the cloned guest can never boot with the
         inherited identity."""
         from types import SimpleNamespace
-        from unittest.mock import MagicMock, patch as _patch
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
 
         m = self._mgr_with_one_vm(tmp_path)
         m.cache.projects = {}

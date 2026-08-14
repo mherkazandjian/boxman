@@ -16,7 +16,7 @@ import pytest
 from boxman.exceptions import (
     CloneCleanupError,
     CloneSanitizerError,
-    CloneSanitizerUnavailable,
+    CloneSanitizerUnavailableError,
     ConfigError,
 )
 from boxman.providers.libvirt.clone_vm import CloneVM
@@ -257,7 +257,7 @@ class TestResetMachineIdentity:
                 return_code=127,
             ),
         ):
-            with pytest.raises(CloneSanitizerUnavailable) as caught:
+            with pytest.raises(CloneSanitizerUnavailableError) as caught:
                 clone.reset_machine_identity()
         assert "virt-sysprep" in str(caught.value)
         assert "guestfs-tools" in str(caught.value)
@@ -276,7 +276,7 @@ class TestResetMachineIdentity:
         ):
             with pytest.raises(CloneSanitizerError) as caught:
                 clone.reset_machine_identity()
-        assert not isinstance(caught.value, CloneSanitizerUnavailable)
+        assert not isinstance(caught.value, CloneSanitizerUnavailableError)
         assert "domain 'vm01' not found" in str(caught.value)
 
     def test_sudo_missing_tool_signature_is_classified_exactly(
@@ -291,7 +291,10 @@ class TestResetMachineIdentity:
                 return_code=1,
             ),
         ):
-            with pytest.raises(CloneSanitizerUnavailable, match="not installed"):
+            with pytest.raises(
+                CloneSanitizerUnavailableError,
+                match="not installed",
+            ):
                 clone.reset_machine_identity()
 
     def test_noninteractive_sudo_denial_is_a_permanent_prerequisite_failure(
@@ -309,7 +312,7 @@ class TestResetMachineIdentity:
                 return_code=1,
             ),
         ):
-            with pytest.raises(CloneSanitizerUnavailable) as caught:
+            with pytest.raises(CloneSanitizerUnavailableError) as caught:
                 clone.reset_machine_identity()
         assert "passwordless sudo" in str(caught.value)
         assert "use_sudo" in str(caught.value)
