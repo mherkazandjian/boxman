@@ -76,9 +76,15 @@ class VBoxManageCommand:
         """
         Build a complete ``VBoxManage`` command string.
 
-        Positional ``args`` are appended verbatim; keyword ``kwargs`` become
-        ``--flag value`` pairs (``True`` -> bare ``--flag``; ``False``/``None``
-        -> skipped). Underscores in keys are converted to dashes.
+        The binary, subcommand, positional ``args``, and keyword values are
+        quoted exactly once with :func:`shlex.quote`. Keyword ``kwargs`` become
+        separate ``--flag value`` tokens, matching VBoxManage's native syntax
+        rather than libvirt's provider-specific ``--flag=value`` form
+        (``True`` -> bare ``--flag``; ``False``/``None`` -> skipped).
+        Underscores in keys are converted to dashes. Keyword names are
+        code-controlled option identifiers; all caller-provided data belongs in
+        values and is quoted. Callers must pass raw values rather than values
+        with pre-baked shell quotes.
 
         Args:
             subcommand: The VBoxManage subcommand (e.g. ``list``, ``clonevm``).
@@ -93,9 +99,9 @@ class VBoxManageCommand:
         if self.use_sudo:
             parts.append('sudo')
 
-        parts.append(self.command_path)
-        parts.append(str(subcommand))
-        parts.extend(str(arg) for arg in args)
+        parts.append(shlex.quote(str(self.command_path)))
+        parts.append(shlex.quote(str(subcommand)))
+        parts.extend(shlex.quote(str(arg)) for arg in args)
 
         for key, value in kwargs.items():
             flag = f"--{key.replace('_', '-')}"
@@ -105,7 +111,7 @@ class VBoxManageCommand:
                 continue
             else:
                 parts.append(flag)
-                parts.append(str(value))
+                parts.append(shlex.quote(str(value)))
 
         return ' '.join(parts)
 

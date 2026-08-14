@@ -306,7 +306,8 @@ Rocky Linux 9.6
 - `supervisor` — process manager (libvirtd, virtlogd, sshd, dnsmasq)
 - `openssh-server` — SSH access
 - `dnsmasq`, `bridge-utils`, `iptables`, `nftables` — networking
-- `guestfs-tools` — `virt-sparsify` for `boxman storage compact`
+- `guestfs-tools` — `virt-sysprep` for safe clone machine identities and
+  `virt-sparsify` for `boxman storage compact`
 - `zstd` — snapshot memory compression for
   `boxman snapshot take --compress-memory` and `boxman storage compress-snapshots`
 
@@ -356,6 +357,21 @@ docker exec boxman-libvirt-default getent passwd $(id -u)
 make status
 docker exec boxman-libvirt-default cat /var/log/supervisor/sshd.stderr.log
 ```
+
+### Public key accepted, then PAM closes the SSH connection
+
+Older Boxman images inherited Rocky Linux's mode `0000 root:root` for
+`/etc/shadow`. On Ubuntu 24.04 hosts, the enforcing `unix_chkpwd` AppArmor
+profile permits reads of that file but does not grant `dac_override` or
+`dac_read_search`, so PAM account checks failed even after public-key
+authentication succeeded.
+
+Current images use mode `0400 root:root`: the setuid-root helper can use the
+owner read bit while ordinary, unprivileged reads remain unavailable to
+`qemu_user` and other non-root users. (`qemu_user` intentionally has
+passwordless `sudo` in this development image.) No host AppArmor capability
+override is required. If a runtime was created with an older Boxman version,
+redeploy the bundled assets and rebuild its image before retrying SSH.
 
 ### libvirtd socket not appearing
 

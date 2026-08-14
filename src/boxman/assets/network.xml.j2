@@ -6,6 +6,9 @@
   <name>{{ name|e }}</name>
   <uuid>{{ uuid_val }}</uuid>
   <forward mode='{{ forward_mode }}'/>
+{% if forward_mode == 'bridge' %}
+  <bridge name='{{ bridge_name|e }}'/>
+{% else %}
   <bridge name='{{ bridge_name|e }}' stp='{{ bridge_stp }}' delay='{{ bridge_delay }}'/>
   <mac address='{{ mac_address }}'/>
   <ip address='{{ ip_address|e }}' netmask='{{ netmask|e }}'>
@@ -24,4 +27,5 @@
     </dhcp>
   {% endif %}
   </ip>
+{% endif %}
 </network>

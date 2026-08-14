@@ -13,14 +13,7 @@ never touch the host.
   → `Y`). boxman already emits `cpu mode='host-passthrough'` in the domain
   XML, so no post-provisioning CPU change is needed; `make test-vm-up`
   verifies `/dev/kvm` is visible inside the guest.
-- Ubuntu 24.04's enforcing AppArmor profile for `unix_chkpwd` breaks sshd
-  inside the privileged libvirt test container (the Rocky image ships
-  `/etc/shadow` mode 0000, and the profile drops the DAC capabilities the
-  helper needs to read it). cloud-init installs an override in
-  `/etc/apparmor.d/local/unix-chkpwd` granting `dac_override` +
-  `dac_read_search`; without it every SSH login into the container fails
-  with "Access denied by PAM account configuration". See issue #84.
-- Two more host-kernel quirks are handled via cloud-init (see `conf.yml`
+- Two host-kernel quirks are handled via cloud-init (see `conf.yml`
   comments): the libvirtd AppArmor profile only allows the Debian
   `libvirt_iohelper` path (Rocky uses `/usr/libexec/...`), which breaks
   `snapshot-create-as`; and `vm.overcommit_memory=1` is needed because a
@@ -41,3 +34,32 @@ make test-vm-destroy   # full teardown (VM, network, workspace)
 
 After changing code on the host, re-run `make test-vm-sync` before
 `make test-vm-test` — the VM has its own copy of the tree.
+
+## Validate Docker SSH without the legacy AppArmor override
+
+A runner provisioned before issue #84 was fixed may still have the old
+`unix_chkpwd` local include from cloud-init. Temporarily empty it and reload
+the enforcing profile before rebuilding the image, otherwise the stale
+capability grants can hide a regression:
+
+```bash
+# Save and disable the old local include in the existing disposable runner.
+ssh -F ~/workspaces/boxmandev/test-runner/ssh_config cluster_1_runner01 \
+  'sudo cp -a /etc/apparmor.d/local/unix-chkpwd /tmp/unix-chkpwd.boxman-84 && \
+   sudo truncate -s 0 /etc/apparmor.d/local/unix-chkpwd && \
+   sudo apparmor_parser -r /etc/apparmor.d/unix-chkpwd'
+
+make test-vm-sync
+ssh -F ~/workspaces/boxmandev/test-runner/ssh_config cluster_1_runner01 \
+  'cd ~/boxman/containers/docker && docker compose down && \
+   docker compose build --no-cache'
+make test-vm-test tier=integration pytest_args="-k test_ssh_into_container"
+
+# Restore the runner's previous local include after the validation.
+ssh -F ~/workspaces/boxmandev/test-runner/ssh_config cluster_1_runner01 \
+  'sudo cp -a /tmp/unix-chkpwd.boxman-84 /etc/apparmor.d/local/unix-chkpwd && \
+   sudo apparmor_parser -r /etc/apparmor.d/unix-chkpwd'
+```
+
+Freshly provisioned runners do not install that include and need no special
+handling.

@@ -6,11 +6,18 @@ Distro families covered: Arch, Debian/Ubuntu, Fedora/RHEL/Rocky, Gentoo, and the
 declarative NixOS and Guix System (see the note on declarative distros below).
 
 Boxman drives libvirt/KVM through the `virsh` / `virt-install` / `virt-clone` /
-`qemu-img` command-line tools and needs a handful of host-level things in place
+`qemu-img` command-line tools and uses `virt-sysprep` when available to reset
+cloned Linux machine IDs. It also needs host-level dependencies
 (a running `libvirtd`, group membership, a `default` NAT network, a cloud-init
 seed-ISO tool, `sshpass`, sudo rights, …). Installing the Python package — e.g.
 `pip install boxman` inside a conda env — does **not** set any of that up. This
 script checks all of it in one pass.
+
+On supported Debian and Ubuntu releases, the `guestfs-tools` package owns the
+user-facing `virt-sysprep` and `virt-sparsify` executables. The similarly named
+`libguestfs-tools` is a compatibility/meta package; checker remediation names
+`guestfs-tools` directly so installing one optional tool also supplies the
+other.
 
 ## Usage
 
@@ -84,7 +91,8 @@ imperatively via `nix profile install nixpkgs#<pkg>` / `guix install <pkg>`.
 - **Virtualization hardware** — CPU VT-x/AMD-V, `/dev/kvm` presence and access,
   and nested virt when running inside a VM.
 - **Local runtime** — the `virsh`/`virt-install`/`virt-clone`/`qemu-img`/QEMU
-  tools, `libvirtd` running, `virsh -c qemu:///system` connectivity, `libvirt`
+  tools, optional `virt-sysprep` (`clone_machine_id: required` needs it),
+  `libvirtd` running, `virsh -c qemu:///system` connectivity, `libvirt`
   and `kvm` group membership, the `default` NAT network, a cloud-init seed-ISO
   tool, `sshpass`, `rsync`, the OpenSSH client, and your **sudo rights**
   (including the footgun where cleanup silently no-ops if `sudo qemu-img`/`rm`

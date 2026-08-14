@@ -36,7 +36,7 @@ Boxman uses libvirt/QEMU under the hood. Install the virtualization stack for yo
 ### Arch Linux
 
 ```bash
-sudo pacman -S libvirt qemu-full virt-install sshpass dnsmasq
+sudo pacman -S libvirt qemu-full virt-install guestfs-tools sshpass dnsmasq
 sudo systemctl enable --now libvirtd
 sudo usermod -aG libvirt,kvm $USER
 ```
@@ -47,7 +47,7 @@ sudo usermod -aG libvirt,kvm $USER
 sudo apt update
 sudo apt install -y \
   libvirt-daemon-system libvirt-clients qemu-kvm \
-  virtinst sshpass bridge-utils cloud-image-utils
+  virtinst guestfs-tools sshpass bridge-utils cloud-image-utils
 sudo systemctl enable --now libvirtd
 sudo usermod -aG libvirt,kvm $USER
 ```
@@ -55,7 +55,7 @@ sudo usermod -aG libvirt,kvm $USER
 ### Fedora / RHEL / Rocky
 
 ```bash
-sudo dnf install -y libvirt qemu-kvm virt-install sshpass genisoimage
+sudo dnf install -y libvirt qemu-kvm virt-install guestfs-tools sshpass genisoimage
 sudo systemctl enable --now libvirtd
 sudo usermod -aG libvirt,kvm $USER
 ```
@@ -64,7 +64,8 @@ sudo usermod -aG libvirt,kvm $USER
 
 ```bash
 sudo emerge --ask app-emulation/libvirt app-emulation/qemu \
-  app-emulation/virt-manager net-dns/dnsmasq app-admin/sudo
+  app-emulation/virt-manager app-emulation/guestfs-tools \
+  net-dns/dnsmasq app-admin/sudo
 sudo systemctl enable --now libvirtd        # systemd profile
 # OpenRC profile instead:
 #   sudo rc-update add libvirtd default && sudo rc-service libvirtd start
@@ -85,7 +86,7 @@ instead of installing packages imperatively:
 ```nix
 virtualisation.libvirtd.enable = true;
 programs.virt-manager.enable = true;
-environment.systemPackages = with pkgs; [ virt-manager qemu cloud-utils ];
+environment.systemPackages = with pkgs; [ virt-manager qemu guestfs-tools cloud-utils ];
 users.users.<you>.extraGroups = [ "libvirtd" "kvm" ];
 ```
 
@@ -196,6 +197,7 @@ clusters:
     vms:
       node01:
         hostname: node01
+        clone_machine_id: auto  # auto (default), required, or off; see below
         cpus: { sockets: 1, cores: 2, threads: 2 }
         memory: 2048
         max_vcpus: 16       # ceiling for live hot-scaling later
@@ -208,6 +210,24 @@ clusters:
           - name: adapter_1
             network_source: 'nat1'
 ```
+
+`virt-clone` assigns a new libvirt UUID and NIC MAC but copies the guest
+filesystem, including Linux's machine ID. Boxman therefore runs the offline
+`virt-sysprep --operations machine-id` reset before changing interfaces or
+starting a normal disk clone. `clone_machine_id` controls failure handling:
+
+- `auto` (default) attempts the reset, but warns and continues if libguestfs
+  cannot inspect an opaque, encrypted, or unsupported appliance;
+- `required` fails closed and removes the new clone if the reset cannot be
+  completed; use this for supported Linux templates that must never boot with
+  the source identity;
+- `off` skips the reset and retains the legacy clone behavior.
+
+The inspection is non-interactive and limited to 300 seconds by default. Set
+`provider.libvirt.virt_sysprep_timeout` in `boxman.yml` to another positive
+number for unusually slow hosts. Guests that do not regenerate empty machine-ID
+files during boot should use `off` unless the template supplies its own
+first-boot identity mechanism.
 
 ### How the pieces fit together
 
@@ -238,6 +258,60 @@ graph TD
 | `networks` | Libvirt virtual networks. `nat` mode gives VMs internet access via the host. |
 | `vms` | Each VM is cloned from the template. `max_vcpus` and `max_memory` set the hot-scaling ceiling (we'll use this in Chapter 2). |
 | `workspace` | Directory where boxman generates SSH configs, ansible inventory, and keys. |
+
+### Libvirt network modes
+
+Per-cluster libvirt networks support `nat`, `route`, and `bridge` modes. `nat`
+and `route` let libvirt create the Linux bridge; they take the `ip`, `mac`,
+`bridge.stp`, and `bridge.delay` settings shown in the examples. Bridge mode is
+different: it creates a named libvirt network that points at an **existing**
+host Linux bridge.
+
+```yaml
+networks:
+  migration:
+    mode: bridge
+    bridge:
+      name: br-migration
+    enable: true
+    autostart: true
+
+vms:
+  node01:
+    network_adapters:
+      - name: migration
+        network_source: migration
+```
+
+Create and administratively bring up `br-migration` in the libvirt daemon's
+network namespace before running Boxman. For an authority-less URI such as
+`qemu:///system`, Boxman verifies both that it is a Linux bridge and that its
+`IFF_UP` flag is set before defining anything. It deliberately does not use
+`operstate`: an up bridge with no attached ports commonly reports `unknown`.
+
+Any authority-bearing URI, including `qemu+ssh://hv/system` and even
+`qemu://localhost/system`, may reach a transport or daemon namespace different
+from the Boxman process. Client-side `/sys` is therefore not authoritative;
+the endpoint's libvirt daemon validates the bridge when the network starts.
+Do not set `ip`, `mac`, `bridge.stp`, or `bridge.delay` in this block:
+addressing and link policy belong to the host bridge. Boxman removes only the
+libvirt network definition during teardown; it never deletes the underlying
+bridge.
+
+Use bridge mode when VMs should reference a stable libvirt network name while
+different hypervisors map that name to their own bridge—for example, live
+migration. Use top-level `shared_networks` when Boxman should create/manage a
+shared Linux bridge on the **Boxman host** for direct VM, containerlab, or
+Docker attachment instead. That can supply a bridge-mode network only with the
+local runtime. A docker-compose libvirt runtime has a separate network
+namespace: create its bridge inside that runtime (for example in a custom
+runtime image/startup), not with host-level `shared_networks`.
+
+Changing between `nat`/`route` and `bridge` also crosses bridge ownership:
+libvirt deletes a managed `nat`/`route` bridge, while it preserves a host-owned
+bridge. Use different bridge names for that transition (or omit the managed
+side's `bridge.name` so Boxman reserves a safe automatic name before recreating
+the network).
 
 ## 1.4 Provision
 
@@ -534,37 +608,47 @@ creation time -- the QEMU process was started with headroom for scaling.
 ### Returning unused memory to the host
 
 KVM only allocates host RAM for pages a guest has actually touched, but once touched,
-a page stays allocated until the VM stops -- even after the guest frees it. The
-`memballoon` option enables virtio-balloon **free-page reporting**, which lets the
-guest continuously hand unused pages back to the host:
+a page stays allocated until the VM stops -- even after the guest frees it.
+`memballoon` configures two complementary virtio-balloon memory-reclaim features:
+
+- **free-page reporting** continuously hands unused guest pages back to the host;
+- **autodeflate** releases ballooned memory as a last-resort safeguard before
+  guest memory pressure triggers the OOM killer.
 
 ```yaml
       node01:
         memory: 2048
         memballoon:
           free_page_reporting: true   # guest returns freed pages to the host
+          autodeflate: true            # release ballooned RAM under guest OOM pressure
           stats_period: 5             # optional; balloon stats sample interval (s)
 ```
 
-No guest-side setup is needed beyond a Linux kernel >= 5.7 (all supported cloud
-images qualify). The host needs **libvirt >= 6.9.0** and **QEMU >= 5.1** — on older
-versions `virsh define` may reject or silently drop the setting. The resulting
-libvirt domain gets a balloon device with
-`<memballoon model='virtio' freePageReporting='on'>`; verify with:
+Free-page reporting needs a Linux guest kernel >= 5.7 (all supported cloud images
+qualify), **libvirt >= 6.9.0**, and **QEMU >= 5.1**. Autodeflate is supported by
+QEMU/KVM with **libvirt >= 1.3.1** and **QEMU >= 2.9**. On older or incompatible
+hosts, `virsh define` may reject or silently drop an unsupported setting. The
+resulting libvirt domain gets both settings as attributes on the same balloon
+device; verify with:
 
 ```bash
 virsh dumpxml --inactive <vm> | grep -A2 memballoon
-#   <memballoon model='virtio' freePageReporting='on'>
+#   <memballoon model='virtio' freePageReporting='on' autodeflate='on'>
 #     <stats period='5'/>
 ```
 
-Changes to a running VM are written to the persistent config and
-take effect from the next boot; `boxman update` applies them idempotently
-(and removing the `memballoon` block reconciles the VM back to the defaults).
+Changes to an active VM (including a paused or crash-preserved VM) are written
+to the persistent config and take effect from the next boot; `boxman update`
+reports `restart required` without restarting the guest automatically. It
+keeps reporting that live-state drift until the guest boots with the new
+persistent XML, and applies that XML idempotently (and removing the
+`memballoon` block reconciles the VM back to the defaults).
 
-> For many similar VMs, also consider enabling KSM on the host
-> (`systemctl enable --now ksmd` / `ksmtuned`) to deduplicate identical pages
-> across guests -- it is a host-level setting, complementary to free-page reporting.
+> For many similar VMs, KSM can also deduplicate identical live pages
+> across guests. KSM is a host-wide, operator-owned policy with CPU,
+> capacity, NUMA, and trust-boundary trade-offs; Boxman does not enable it.
+> See [Host Memory Deduplication with KSM](../ksm.md) for a bounded
+> evaluation and measurement workflow.
 
 ## 2.4 Snapshot the Whole Cluster
 

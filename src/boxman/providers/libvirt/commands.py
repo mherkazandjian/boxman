@@ -120,6 +120,7 @@ class LibVirtCommandBase:
     def execute(self, *args,
                 hide: bool = True,
                 warn: bool = False,
+                timeout: int | None = None,
                 **kwargs) -> invoke.runners.Result:
         """
         Execute a command.
@@ -128,6 +129,8 @@ class LibVirtCommandBase:
             *args: Positional arguments for the command
             hide: Whether to hide command output
             warn: Whether to warn instead of raising exceptions
+            timeout: Optional wall-clock limit passed to the command runner;
+                     this controls execution and is not rendered as a CLI flag
             **kwargs: Keyword arguments to be passed as command options
 
         Returns:
@@ -143,7 +146,10 @@ class LibVirtCommandBase:
             self.logger.info(f"executing: {command}")
 
         try:
-            result = _shell_run(command, hide=hide, warn=warn)
+            run_kwargs: dict[str, Any] = {'hide': hide, 'warn': warn}
+            if timeout is not None:
+                run_kwargs['timeout'] = timeout
+            result = _shell_run(command, **run_kwargs)
 
             if not result.ok and not warn:
                 error_message = (
@@ -441,3 +447,53 @@ class VirtCloneCommand(LibVirtCommandBase):
             kwargs['connect'] = self.uri
 
         return super().build_command(*args, **kwargs)
+
+
+class VirtSysprepCommand(LibVirtCommandBase):
+    """Execute ``virt-sysprep`` against a domain on the configured URI."""
+
+    TIMEOUT_KILL_GRACE = 10
+
+    def __init__(self, provider_config: dict[str, Any] | None = None):
+        super().__init__(provider_config=provider_config)
+        self.command_path = self.provider_config.get(
+            'virt_sysprep_cmd', 'virt-sysprep')
+        self.uri = self.provider_config.get('uri', 'qemu:///system')
+
+    def build_command(self, *args,
+                      execution_timeout: int | None = None,
+                      **kwargs) -> str:
+        """Build an optionally bounded command inside the active runtime.
+
+        The generic runner timeout can only terminate the outer
+        ``docker exec`` client. GNU ``timeout`` is therefore placed inside
+        the runtime so a timed-out sanitizer cannot keep modifying the guest
+        disk after Boxman continues. The outer runner deadline remains a
+        final guard for a wedged runtime wrapper.
+        """
+        if 'connect' not in kwargs:
+            kwargs['connect'] = self.uri
+        command = super().build_command(*args, **kwargs)
+
+        if command.startswith("sudo "):
+            # Sysprep is always non-interactive, even for direct callers that
+            # do not request an execution timeout.
+            command = f"sudo -n {command[len('sudo '):]}"
+
+        if execution_timeout is None:
+            return command
+        if (isinstance(execution_timeout, bool)
+                or not isinstance(execution_timeout, int)
+                or execution_timeout < 1):
+            raise ConfigError(
+                "virt-sysprep execution_timeout must be a positive integer, "
+                f"got {execution_timeout!r}")
+
+        timeout_prefix = (
+            "timeout --signal=TERM "
+            f"--kill-after={self.TIMEOUT_KILL_GRACE}s "
+            f"{execution_timeout}s")
+        # Keep timeout outside sudo: allowing ``sudo timeout`` in a
+        # command-specific NOPASSWD rule would permit arbitrary root commands.
+        # GNU timeout's default process-group mode includes descendants.
+        return f"{timeout_prefix} {command}"

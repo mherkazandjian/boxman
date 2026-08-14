@@ -62,8 +62,9 @@ def _default_boxman_config() -> dict:
     """
     Return the default boxman application configuration.
 
-    Uses system paths for virt-install, virt-clone, and virsh (resolved
-    via ``shutil.which``), with verbose and use_sudo both set to False.
+    Uses system paths for virt-install, virt-clone, virt-sysprep, and virsh
+    (resolved via ``shutil.which``), with verbose and use_sudo both set to
+    False.
     """
     return {
         "runtime": "local",
@@ -84,6 +85,8 @@ def _default_boxman_config() -> dict:
                 "verbose": False,
                 "virt_install_cmd": shutil.which("virt-install") or "virt-install",
                 "virt_clone_cmd": shutil.which("virt-clone") or "virt-clone",
+                "virt_sysprep_cmd": shutil.which("virt-sysprep") or "virt-sysprep",
+                "virt_sysprep_timeout": 300,
                 "virsh_cmd": shutil.which("virsh") or "virsh",
             },
         },

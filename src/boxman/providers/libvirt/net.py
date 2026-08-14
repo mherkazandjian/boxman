@@ -1,4 +1,6 @@
+import copy
 import ipaddress
+import logging
 import os
 import re
 import shlex
@@ -7,10 +9,13 @@ import uuid
 import xml.etree.ElementTree as ET
 from importlib import resources as importlib_resources
 from typing import Any
+from urllib.parse import urlsplit
 
 from jinja2 import Environment, FileSystemLoader
 
 from boxman import log
+from boxman.exceptions import ConfigError
+from boxman.netlab.shared_bridges import BRIDGE_NAME_RE
 
 from . import net_reconcile
 from .commands import VirshCommand
@@ -21,6 +26,8 @@ class Network:
     """
     Class to define libvirt networks by creating XML definitions and using virsh commands.
     """
+    SUPPORTED_FORWARD_MODES = frozenset({'nat', 'route', 'bridge'})
+
     def __init__(self,
                 name: str,
                 info: dict[str, Any],
@@ -50,6 +57,9 @@ class Network:
         #: str: the name of the network
         self.name = name
 
+        #: dict: original network block, retained for presence validation
+        self.info = info
+
         #: str: the uuid of the network, generated if not provided
         self.uuid_val = str(uuid.uuid4())
 
@@ -57,7 +67,9 @@ class Network:
         self.forward_mode = info.get('mode', 'nat')
 
         # extract bridge configuration
-        bridge_info = info.get('bridge', {})
+        self._raw_bridge_info = info.get('bridge')
+        bridge_info = (self._raw_bridge_info
+                       if isinstance(self._raw_bridge_info, dict) else {})
 
         #: the cache object to be used to store network information
         self.manager = manager
@@ -67,11 +79,18 @@ class Network:
         #: tell "the config asked for virbr42" apart from "boxman picked one"
         self.pinned_bridge_name = bridge_info.get('name')
 
-        if assign_new_bridge:
-            # handle the bridge name - if not specified, find the first available virbrX
+        if self.forward_mode == 'bridge':
+            # A bridge-mode libvirt network is only a named indirection to an
+            # existing host bridge. Libvirt neither creates nor configures it.
             bridge_name = self.pinned_bridge_name
-            if not bridge_name:
-                bridge_name = self.find_available_bridge_name()
+        elif self.pinned_bridge_name:
+            # A configured name is the effective desired name even while
+            # inspecting an existing definition. The live name is parsed from
+            # net-dumpxml separately during reconciliation.
+            bridge_name = self.pinned_bridge_name
+        elif assign_new_bridge:
+            # No configured name: allocate the first available virbrX.
+            bridge_name = self.find_available_bridge_name()
         else:
             if bridge_name := Network.get_bridge_from_network(name, provider_config=self.provider_config):
                 self.logger.debug(f"found existing bridge {bridge_name} for network {name}")
@@ -87,9 +106,11 @@ class Network:
         self.bridge_name = bridge_name
 
         #: str: use stp on/off for the bridge
-        self.bridge_stp = self._normalise_stp(bridge_info.get('stp', 'on'))
+        self.bridge_stp = (None if self.forward_mode == 'bridge' else
+                           self._normalise_stp(bridge_info.get('stp', 'on')))
         #: str: the delay for the stp
-        self.bridge_delay = str(bridge_info.get('delay', '0'))
+        self.bridge_delay = (None if self.forward_mode == 'bridge' else
+                             str(bridge_info.get('delay', '0')))
 
         #: str: set the mac address for the bridge
         #: canonicalised because libvirt zero-pads this one when it stores it
@@ -98,8 +119,9 @@ class Network:
         #: would rebuild the network -- rebooting its guests -- on every run.
         #: Reservation macs are deliberately *not* padded: libvirt stores those
         #: verbatim, so padding them would create the mismatch instead
-        self.mac_address = self._canonical_mac(info.get(
-            'mac', f"52:54:00:{':'.join(['%02x' % (i + 10) for i in range(3)])}"))
+        self.mac_address = None if self.forward_mode == 'bridge' else \
+            self._canonical_mac(info.get(
+                'mac', f"52:54:00:{':'.join(['%02x' % (i + 10) for i in range(3)])}"))
 
         #: bool: whether the ip has been provided or dummy values are injected
         self.ip_provided = 'ip' in info
@@ -129,10 +151,16 @@ class Network:
         # `or {}` throughout: yaml turns an empty or explicitly null block
         # (`ip:`, `dhcp: null`) into None rather than into a missing key, and a
         # bare .get() default does not cover that
-        ip_info = info.get('ip') or {}
+        # Every ``ip`` field is forbidden in bridge mode, so do not descend
+        # into a malformed nested value before validation can report the
+        # useful bridge-mode error.
+        ip_info = ({} if self.forward_mode == 'bridge'
+                   else info.get('ip') or {})
 
-        self.ip_address = ip_info.get('address', '192.168.254.1')
-        self.netmask = ip_info.get('netmask', '255.255.255.0')
+        self.ip_address = (None if self.forward_mode == 'bridge' else
+                           ip_info.get('address', '192.168.254.1'))
+        self.netmask = (None if self.forward_mode == 'bridge' else
+                        ip_info.get('netmask', '255.255.255.0'))
 
         dhcp_conf = ip_info.get('dhcp') or {}
         dhcp_info = dhcp_conf.get('range') or {}
@@ -142,10 +170,111 @@ class Network:
         # a reservation may sit inside or outside the dynamic range: dnsmasq
         # excludes reserved addresses from the pool either way. keeping them
         # outside is still the clearer convention
-        self.dhcp_hosts = self._parse_dhcp_hosts(dhcp_conf.get('hosts') or [])
+        self.dhcp_hosts = ([] if self.forward_mode == 'bridge' else
+                           self._parse_dhcp_hosts(dhcp_conf.get('hosts') or []))
 
         #: bool: whether the network should be enabled
         self.enable = info.get('enable', True)
+
+    def validate_definition(self) -> None:
+        """Validate fields needed to define or reconcile this network.
+
+        Kept out of ``__init__`` deliberately: removal needs only the libvirt
+        network name and its old forward mode. Older Boxman versions could
+        leave an otherwise unsupported ``open``/``isolated`` network defined
+        before reporting failure; ``boxman destroy`` must still be able to
+        construct that network and clean it up.
+        """
+        if self.forward_mode not in self.SUPPORTED_FORWARD_MODES:
+            supported = ', '.join(sorted(self.SUPPORTED_FORWARD_MODES))
+            raise ConfigError(
+                f"network {self.name}: unsupported forward mode "
+                f"{self.forward_mode!r}; supported modes: {supported}")
+
+        if (self._raw_bridge_info is not None
+                and not isinstance(self._raw_bridge_info, dict)):
+            raise ConfigError(
+                f"network {self.name}: bridge must be a mapping")
+
+        if self.forward_mode != 'bridge':
+            return
+
+        bridge_info = self._raw_bridge_info or {}
+        bridge_name = bridge_info.get('name')
+        if not bridge_name:
+            raise ConfigError(
+                f"network {self.name}: mode 'bridge' requires an existing "
+                "Linux bridge name at bridge.name")
+        if (not isinstance(bridge_name, str)
+                or not BRIDGE_NAME_RE.fullmatch(bridge_name)):
+            raise ConfigError(
+                f"network {self.name}: invalid bridge name {bridge_name!r}: "
+                f"must match {BRIDGE_NAME_RE.pattern}")
+
+        forbidden = []
+        if 'ip' in self.info:
+            forbidden.append('ip')
+        if 'mac' in self.info:
+            forbidden.append('mac')
+        forbidden.extend(
+            f"bridge.{key}" for key in ('stp', 'delay')
+            if key in bridge_info)
+        if forbidden:
+            raise ConfigError(
+                f"network {self.name}: mode 'bridge' uses addressing and "
+                "link settings from the existing host bridge; remove: "
+                + ', '.join(forbidden))
+
+    def validate_runtime_prerequisites(self) -> None:
+        """Verify runtime-owned resources needed by this definition exist.
+
+        A raw sysfs probe is authoritative only when the libvirt URI has no
+        network authority (``qemu:///system``, ``test:///default``, or a local
+        unix socket). Any authority-bearing URI -- even
+        ``qemu://localhost/system`` -- may resolve through a transport or
+        daemon namespace different from the Boxman process. In that case skip
+        client-side sysfs and let the endpoint's libvirt daemon validate the
+        bridge at ``net-start`` instead.
+
+        For a directly-addressed daemon, validate the administrative ``IFF_UP``
+        flag. ``operstate`` is deliberately not used: a perfectly usable bridge
+        with no attached ports commonly reports ``unknown``.
+        """
+        if self.forward_mode != 'bridge':
+            return
+
+        if urlsplit(self.virsh.uri).netloc:
+            self.logger.debug(
+                f"network {self.name}: deferring bridge {self.bridge_name!r} "
+                "validation to the authority-bearing libvirt endpoint")
+            return
+
+        bridge_path = shlex.quote(
+            f"/sys/class/net/{self.bridge_name}/bridge")
+        result = self.virsh.execute_shell(
+            f"test -d {bridge_path}", hide=True, warn=True)
+        if not result.ok:
+            raise ConfigError(
+                f"network {self.name}: Linux bridge "
+                f"{self.bridge_name!r} does not exist in the active "
+                "runtime; create it and bring it up before running Boxman")
+
+        flags_path = shlex.quote(f"/sys/class/net/{self.bridge_name}/flags")
+        flags_result = self.virsh.execute_shell(
+            f"cat {flags_path}", hide=True, warn=True)
+        try:
+            flags = int(flags_result.stdout.strip(), 0) if flags_result.ok else None
+        except (AttributeError, ValueError):
+            flags = None
+        if flags is None:
+            raise ConfigError(
+                f"network {self.name}: could not read administrative state "
+                f"for Linux bridge {self.bridge_name!r} in the active runtime")
+        if not flags & 0x1:  # Linux IFF_UP
+            raise ConfigError(
+                f"network {self.name}: Linux bridge {self.bridge_name!r} "
+                "exists but is administratively down in the active runtime; "
+                f"run: sudo ip link set dev {self.bridge_name} up")
 
     @staticmethod
     def _canonical_mac(value: str) -> str:
@@ -602,6 +731,7 @@ class Network:
         Write the network information to the cache.
         """
         self.manager.cache.read_projects_cache()
+        previous_projects = copy.deepcopy(self.manager.cache.projects)
         projects_in_cache = self.manager.cache.projects
         project_name = self.manager.config['project']
         project_cache = projects_in_cache[project_name]
@@ -615,7 +745,13 @@ class Network:
             project_cache['networks'][self.name]['ip_address'] = self.ip_address
         project_cache['networks'][self.name]['bridge_name'] = self.bridge_name
 
-        self.manager.cache.write_projects_cache()
+        try:
+            self.manager.cache.write_projects_cache()
+        except Exception:
+            # Cache writes are atomic on disk. Restore the in-memory view too,
+            # while preserving any previous record for this network.
+            self.manager.cache.projects = previous_projects
+            raise
 
     def check_network_exists(self) -> None:
         """
@@ -666,12 +802,14 @@ class Network:
                         msg = f"network {self.name} already exists in project {project_name}"
                         conflicts[project_name]['networks'][net_name]['name'] = msg
                         n_conflicts += 1
-                    if net_info.get('bridge_name') == self.bridge_name:
+                    if (self.forward_mode != 'bridge'
+                            and net_info.get('bridge_name') == self.bridge_name):
                         # bridge name conflict
                         msg = f"bridge {self.bridge_name} is already used by network {net_name} in project {project_name}"
                         conflicts[project_name]['networks'][net_name]['bridge'] = msg
                         n_conflicts += 1
-                    if net_info.get('ip_address') == self.ip_address:
+                    if (self.ip_address is not None
+                            and net_info.get('ip_address') == self.ip_address):
                         # ip address conflict
                         msg = f"ip address {self.ip_address} is already used by network {net_name} in project {project_name}"
                         conflicts[project_name]['networks'][net_name]['ip'] = msg
@@ -700,6 +838,11 @@ class Network:
         Returns:
             True if successful, False otherwise
         """
+        # Reject unsupported modes and invalid bridge-mode fields before an
+        # XML file, cache entry or libvirt network can be created.
+        self.validate_definition()
+        self.validate_runtime_prerequisites()
+
         if not file_path:
             file_path = f"/tmp/{self.name}-network.xml"
 
@@ -718,7 +861,8 @@ class Network:
 
         # Verify the bridge is not already in use before defining
         active_bridges = self._get_libvirt_bridges()
-        if self.bridge_name in active_bridges:
+        if (self.forward_mode != 'bridge'
+                and self.bridge_name in active_bridges):
             self.logger.error(
                 f"bridge '{self.bridge_name}' is already in use by another "
                 f"active network. Cannot define network '{self.name}'.")
@@ -730,19 +874,23 @@ class Network:
             raise RuntimeError(
                 f"bridge '{self.bridge_name}' is already in use by another "
                 f"active network, cannot define network '{self.name}'")
+        if (self.forward_mode == 'bridge'
+                and self.bridge_name in active_bridges):
+            self._log_bridge_mode_managed_owner()
 
-        # define the network
+        # Define transactionally. In particular, a remote bridge cannot be
+        # checked through the client's /sys, so ``net-start`` is the
+        # authoritative prerequisite check. If it fails, do not leave the
+        # definition/autostart/cache debris the caller was told had failed.
+        defined = False
+        started = False
+        route_rules_attempted = False
         try:
             self.virsh.execute("net-define", written_path)
-
-            # the cache is written only once the network really exists. Written
-            # before the define, a failed define (a rejected netmask, a libvirtd
-            # blip) would leave the cache claiming a network that is not there,
-            # and check_network_exists() would then refuse to create it on every
-            # later run -- wedged until projects.json is edited by hand
-            self.update_network_cache()
+            defined = True
 
             self.virsh.execute("net-start", self.name)
+            started = True
             self.virsh.execute("net-autostart", self.name)
 
             # apply appropriate network configuration based on type. NAT
@@ -750,12 +898,62 @@ class Network:
             # and FORWARD rules for <forward mode='nat'/> itself when the
             # network starts (and removes them when it stops)
             if self.forward_mode == 'route':
-                self.apply_route_iptables_rule()
-            elif self.forward_mode != 'nat':
-                raise RuntimeError(f"Unsupported forward mode: {self.forward_mode}")
+                route_rules_attempted = True
+                if not self.apply_route_iptables_rule():
+                    raise RuntimeError(
+                        f"network {self.name}: could not apply route "
+                        "isolation rules")
+            # NAT is configured by libvirt. Bridge mode only points at the
+            # pre-existing host bridge, so it needs no firewall setup here.
+
+            # Cache only a definition that completed its whole bring-up. A
+            # failed start (notably a missing bridge on a remote endpoint) is
+            # rolled back below and must never be advertised as provisioned.
+            self.update_network_cache()
 
             return True
-        except RuntimeError as exc:
+        except Exception as exc:
+            # Catch operational/programming exceptions, including cache
+            # OSError, but deliberately leave BaseException subclasses such as
+            # KeyboardInterrupt and SystemExit alone.
+            if route_rules_attempted:
+                try:
+                    rules_removed = self.remove_route_iptables_rule()
+                except Exception as rollback_exc:
+                    self.logger.warning(
+                        f"network {self.name}: rollback could not remove "
+                        f"route isolation rules: {rollback_exc}")
+                else:
+                    if not rules_removed:
+                        self.logger.warning(
+                            f"network {self.name}: rollback could not remove "
+                            "route isolation rules")
+            if started:
+                try:
+                    stopped = self.virsh.execute(
+                        "net-destroy", self.name, hide=True, warn=True)
+                except Exception as rollback_exc:
+                    self.logger.warning(
+                        f"network {self.name}: rollback could not stop the "
+                        f"partially defined network: {rollback_exc}")
+                else:
+                    if not stopped.ok:
+                        self.logger.warning(
+                            f"network {self.name}: rollback could not stop the "
+                            "partially defined network")
+            if defined:
+                try:
+                    undefined = self.virsh.execute(
+                        "net-undefine", self.name, hide=True, warn=True)
+                except Exception as rollback_exc:
+                    self.logger.warning(
+                        f"network {self.name}: rollback could not undefine the "
+                        f"partially defined network: {rollback_exc}")
+                else:
+                    if not undefined.ok:
+                        self.logger.warning(
+                            f"network {self.name}: rollback could not undefine "
+                            "the partially defined network")
             self.logger.error(f"Error defining network: {exc}")
             return False
 
@@ -830,14 +1028,16 @@ class Network:
         if not self.undefine_network():
             return False
 
-        # remove iptables rules if any. NAT needs no cleanup: the rules are
-        # libvirtd's own and go away with the network
+        # Remove Boxman-owned iptables rules, if any.
         if self.forward_mode == 'route':
             return self.remove_route_iptables_rule()
-        elif self.forward_mode == 'nat':
-            return True
-        else:
-            raise RuntimeError(f"Unsupported forward mode: {self.forward_mode}")
+
+        # NAT and bridge mode need no Boxman-owned host-rule cleanup. The same
+        # is true for an unsupported network orphaned by an older release:
+        # libvirt owned any rules, and destroy/undefine above already removed
+        # it. Do not make legacy cleanup impossible just because new
+        # definitions reject its mode.
+        return True
 
     def find_available_bridge_name(self) -> str:
         """
@@ -942,6 +1142,45 @@ class Network:
                         f"  bridge '{bridge_name}' is used by network '{net_name}'")
         except Exception as exc:
             self.logger.warning(f"failed to enumerate bridge usage: {exc}")
+
+    def _log_bridge_mode_managed_owner(self) -> None:
+        """Diagnose bridge-mode reuse of a libvirt-managed Linux bridge.
+
+        Sharing is legal and can be intentional, so this is not a conflict.
+        It does couple lifecycles, though: destroying a nat/route owner removes
+        its Linux bridge underneath this bridge-mode network. Keep the probe
+        debug-gated because it needs one ``net-dumpxml`` per network.
+        """
+        if not self.logger.isEnabledFor(logging.DEBUG):
+            return
+
+        network_names = self._listed_networks()
+        if network_names is None:
+            self.logger.debug(
+                f"network {self.name}: could not inspect ownership of bridge "
+                f"{self.bridge_name!r}")
+            return
+
+        owners = []
+        for network_name in network_names:
+            result = self.virsh.execute(
+                "net-dumpxml", network_name, hide=True, warn=True)
+            if not result.ok:
+                continue
+            try:
+                state = net_reconcile.parse_network_xml(result.stdout)
+            except (ET.ParseError, ValueError):
+                continue
+            if (state.get('bridge_name') == self.bridge_name
+                    and state.get('mode') in {'nat', 'route'}):
+                owners.append(f"{network_name} ({state['mode']})")
+
+        if owners:
+            self.logger.debug(
+                f"network {self.name}: bridge mode references "
+                f"{self.bridge_name!r}, which is managed by libvirt network(s) "
+                f"{', '.join(owners)}; destroying an owner removes the Linux "
+                "bridge underneath this network")
 
     @staticmethod
     def _ensure_rule(cls,

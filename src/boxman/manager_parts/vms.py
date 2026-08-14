@@ -8,9 +8,14 @@ from multiprocessing import Process, Queue
 from typing import Any
 
 from boxman import log
-from boxman.exceptions import ConfigError, ProvisionError
+from boxman.exceptions import (
+    CloneSanitizerError,
+    ConfigError,
+    ProvisionError,
+)
 from boxman.loggers.logger import suppressed
 from boxman.manager_parts.images import ImagesMixin
+from boxman.providers.libvirt.clone_vm import CLONE_DEGRADATION_NOTICES_KEY
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.providers.libvirt.virsh_parse import parse_domblklist
 
@@ -27,6 +32,9 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
     """
     for attempt in range(1, max_retries + 1):
         last_attempt = attempt == max_retries
+        degradation_notices: list[str] = []
+        attempt_info = vm_info.copy()
+        attempt_info[CLONE_DEGRADATION_NOTICES_KEY] = degradation_notices
         # Suppress error-level logs on all retryable attempts so that
         # transient pool-busy failures don't appear as errors; only the
         # final attempt logs errors normally. suppressed() restores the
@@ -44,10 +52,21 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
                 provider.clone_vm(
                     src_vm_name=src_vm_name,
                     new_vm_name=new_vm_name,
-                    info=vm_info,
+                    info=attempt_info,
                     workdir=cluster['workdir']
                 )
+            # A successful auto-policy clone never reaches a later,
+            # unsuppressed retry. Re-emit only its degradation notice after
+            # leaving the suppression context so duplicate identity is never
+            # silent while transient attempt noise remains hidden.
+            for notice in degradation_notices:
+                log.warning(notice)
             return
+        except (CloneSanitizerError, ConfigError):
+            # Required sanitizer and invalid-policy failures are permanent.
+            # Retrying would either repeat the same inspection or run into an
+            # unsafe clone whose cleanup already failed.
+            raise
         except Exception:
             if not last_attempt:
                 delay = attempt * 2
@@ -148,9 +167,8 @@ class VMsMixin:
             names = ', '.join(name for name, _ in failed)
             raise RuntimeError(
                 f"clone failed for {len(failed)} VM(s) ({names}); aborting "
-                f"provision. See the virt-clone error logged above for the "
-                f"underlying cause (typically a missing template disk or a "
-                f"libvirt storage pool issue).")
+                f"provision. See the preceding clone or guest-sanitizer log "
+                f"for the underlying cause and remediation.")
 
     ### end vms define / remove / destroy
     def _configure_and_start_vm(
@@ -183,7 +201,7 @@ class VMsMixin:
         else:
             self.logger.warning(f"no cpu or memory configuration for vm {vm_name}, skipping")
 
-        # memballoon (virtio-balloon: free-page reporting, stats)
+        # memballoon (virtio-balloon: free-page reporting, autodeflate, stats)
         memballoon = vm_info.get('memballoon')
         if memballoon:
             self.logger.info(f"configuring memballoon for vm {vm_name}")
@@ -500,7 +518,9 @@ class VMsMixin:
             names = ', '.join(sorted(failures))
             raise RuntimeError(
                 f"clone failed for {len(failures)} new VM(s) ({names}); "
-                f"aborting update. See the virt-clone error logged above.")
+                f"aborting update. See the preceding clone or "
+                f"guest-sanitizer log for the underlying cause and "
+                f"remediation.")
 
         # configure and start new VMs (parallel)
         configure_tasks = []
@@ -566,7 +586,8 @@ class VMsMixin:
                 diff['new_shared_folders'] or
                 diff['removed_shared_folders'] or
                 diff['changed_shared_folders'] or
-                diff['memballoon_changed']
+                diff['memballoon_changed'] or
+                diff['memballoon_restart_pending']
             )
 
             if not has_changes:
@@ -619,6 +640,10 @@ class VMsMixin:
                 changes.append(
                     f"memballoon: {diff['actual_memballoon']} -> "
                     f"{diff['desired_memballoon']}")
+            elif diff['memballoon_restart_pending']:
+                changes.append(
+                    f"memballoon live state: {diff['live_memballoon']} -> "
+                    f"{diff['desired_memballoon']}")
             self.logger.info(f"VM {vm_name}: changes detected: {'; '.join(changes)}")
 
             if dry_run:
@@ -631,6 +656,7 @@ class VMsMixin:
             # apply changes
             vm_running = diff['vm_state'] == 'running'
             restart_needed = False
+            pending_restart = diff['memballoon_restart_pending']
 
             # CPU / memory / max ceilings
             if (diff['cpu_changed'] or diff['memory_changed'] or
@@ -665,9 +691,9 @@ class VMsMixin:
                         'details': 'memballoon update failed'
                     }))
                     return
-                if vm_running:
-                    self.logger.info(
-                        f"VM {vm_name}: memballoon changes apply from the next boot")
+                if pending_restart:
+                    self.logger.warning(
+                        f"VM {vm_name}: restart required to apply memballoon changes")
 
             # disks
             if diff['new_disks'] or diff['resize_disks']:
@@ -731,6 +757,13 @@ class VMsMixin:
                 result_queue.put((vm_name, {
                     'status': 'updated',
                     'details': '; '.join(changes) + ' (restarted)'
+                }))
+            elif pending_restart:
+                result_queue.put((vm_name, {
+                    'status': 'needs_restart',
+                    'details': (
+                        '; '.join(changes) +
+                        ' (restart required to apply memballoon changes)')
                 }))
             else:
                 result_queue.put((vm_name, {
@@ -891,6 +924,9 @@ class VMsMixin:
             # print summary
             no_change = [n for n, r in results.items() if r['status'] == 'no_change']
             updated = [n for n, r in results.items() if r['status'] == 'updated']
+            needs_restart = [
+                n for n, r in results.items()
+                if r['status'] == 'needs_restart']
             failed = [n for n, r in results.items() if r['status'] == 'failed']
             dry_run_items = [n for n, r in results.items() if r['status'] == 'dry_run']
 
@@ -905,6 +941,12 @@ class VMsMixin:
                 self.logger.info(f"updated: {', '.join(updated)}")
                 for vm_name in updated:
                     self.logger.info(f"  {vm_name}: {results[vm_name]['details']}")
+            if needs_restart:
+                self.logger.warning(
+                    f"restart required: {', '.join(needs_restart)}")
+                for vm_name in needs_restart:
+                    self.logger.warning(
+                        f"  {vm_name}: {results[vm_name]['details']}")
             if failed:
                 self.logger.error(f"failed: {', '.join(failed)}")
                 for vm_name in failed:

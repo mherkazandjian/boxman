@@ -53,10 +53,23 @@ clusters:
               end: '10.0.10.254'  #   mandatory (if block is specified)
         enable: True
         autostart: True
+      # migration:
+      #   # Name indirection for an existing host Linux bridge. Libvirt does
+      #   # not create or configure br-migration; create it and set it UP in
+      #   # the libvirt daemon's namespace, and omit ip/mac/stp/delay here.
+      #   mode: bridge
+      #   bridge:
+      #     name: br-migration
+      #   enable: True
+      #   autostart: True
 
     vms:
       boxman01:
         hostname: boxman01
+        # Reset inherited Linux machine IDs: auto (default), required, or off.
+        # Use required for supported Linux templates that must never boot with
+        # their source identity; auto preserves opaque-appliance compatibility.
+        # clone_machine_id: auto
         # boot_order: [network, hd]   # PXE boot: boot from network first, then disk
         disks:
           - name: disk01

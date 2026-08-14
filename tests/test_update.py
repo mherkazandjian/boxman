@@ -18,10 +18,11 @@ pytestmark = pytest.mark.unit
 @pytest.fixture(autouse=True)
 def _default_memballoon_state():
     """diff_vm probes the balloon device via virsh; default it to the
-    libvirt defaults (no freePageReporting, no stats) for every test so
-    the existing decorator stacks don't each need another patch."""
+    libvirt defaults (no freePageReporting, no autodeflate, no stats) for every
+    test so the existing decorator stacks don't each need another patch."""
     with patch.object(VMStateDiffer, 'get_actual_memballoon',
                       return_value={'free_page_reporting': False,
+                                    'autodeflate': False,
                                     'stats_period': None}):
         yield
 
@@ -851,3 +852,115 @@ class TestDestroyRemovedVm:
         # first destroy_vm is the graceful one, second is force=True
         assert parent.mock_calls[1] == call.destroy_vm('test-vm')
         assert parent.mock_calls[2] == call.destroy_vm('test-vm', force=True)
+
+
+# ---------------------------------------------------------------------------
+# Persistent memballoon updates
+# ---------------------------------------------------------------------------
+class TestMemballoonUpdateResult:
+
+    @staticmethod
+    def _balloon_only_diff(vm_state):
+        return {
+            'cpu_changed': False,
+            'memory_changed': False,
+            'max_vcpus_changed': False,
+            'max_memory_changed': False,
+            'new_disks': [],
+            'resize_disks': [],
+            'new_cdroms': [],
+            'removed_cdroms': [],
+            'changed_cdroms': [],
+            'new_shared_folders': [],
+            'removed_shared_folders': [],
+            'changed_shared_folders': [],
+            'memballoon_changed': True,
+            # Keep this manager fixture independent of VMStateDiffer's state
+            # classification; differ-level tests own that contract.
+            'memballoon_restart_pending': (
+                vm_state in ('running', 'paused', 'crashed')),
+            'actual_memballoon': {
+                'free_page_reporting': False,
+                'autodeflate': False,
+                'stats_period': None,
+            },
+            'desired_memballoon': {
+                'free_page_reporting': False,
+                'autodeflate': True,
+                'stats_period': None,
+            },
+            'live_memballoon': {
+                'free_page_reporting': False,
+                'autodeflate': False,
+                'stats_period': None,
+            },
+            'vm_state': vm_state,
+        }
+
+    def _run_update(self, vm_state):
+        mgr = make_bare_manager({'project': 'demo'})
+        mgr.provider = MagicMock()
+        mgr.provider.provider_config = {'uri': 'qemu:///system'}
+        mgr.provider.configure_vm_memballoon.return_value = True
+        result_queue = MagicMock()
+
+        with patch.object(
+                VMStateDiffer, 'diff_vm',
+                return_value=self._balloon_only_diff(vm_state)):
+            mgr._update_single_vm(
+                'cluster1', {'workdir': '/tmp'}, 'node01',
+                {'memballoon': {'autodeflate': True}}, result_queue)
+
+        result_queue.put.assert_called_once()
+        return mgr, result_queue.put.call_args.args[0][1]
+
+    def test_running_vm_reports_restart_required(self):
+        mgr, result = self._run_update('running')
+
+        assert result['status'] == 'needs_restart'
+        assert 'restart required to apply memballoon changes' in result['details']
+        mgr.provider.shutdown_and_wait.assert_not_called()
+        mgr.provider.start_vm.assert_not_called()
+
+    def test_paused_vm_reports_restart_required(self):
+        mgr, result = self._run_update('paused')
+
+        assert result['status'] == 'needs_restart'
+        assert (
+            'restart required to apply memballoon changes'
+            in result['details'])
+        mgr.provider.shutdown_and_wait.assert_not_called()
+        mgr.provider.start_vm.assert_not_called()
+
+    def test_crash_preserved_vm_reports_restart_required(self):
+        mgr, result = self._run_update('crashed')
+
+        assert result['status'] == 'needs_restart'
+        assert (
+            'restart required to apply memballoon changes'
+            in result['details'])
+        mgr.provider.shutdown_and_wait.assert_not_called()
+        mgr.provider.start_vm.assert_not_called()
+
+    def test_stopped_vm_reports_updated(self):
+        _mgr, result = self._run_update('shut off')
+
+        assert result['status'] == 'updated'
+        assert 'restart required' not in result['details']
+
+    def test_persistent_match_still_reports_live_restart_pending(self):
+        diff = self._balloon_only_diff('running')
+        diff['memballoon_changed'] = False
+        mgr = make_bare_manager({'project': 'demo'})
+        mgr.provider = MagicMock()
+        mgr.provider.provider_config = {'uri': 'qemu:///system'}
+        result_queue = MagicMock()
+
+        with patch.object(VMStateDiffer, 'diff_vm', return_value=diff):
+            mgr._update_single_vm(
+                'cluster1', {'workdir': '/tmp'}, 'node01',
+                {'memballoon': {'autodeflate': True}}, result_queue)
+
+        result = result_queue.put.call_args.args[0][1]
+        assert result['status'] == 'needs_restart'
+        mgr.provider.configure_vm_memballoon.assert_not_called()

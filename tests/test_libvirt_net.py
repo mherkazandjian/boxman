@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import ConfigError
 from boxman.providers.libvirt.net import Network, NetworkInterface
 
 pytestmark = pytest.mark.unit
@@ -114,6 +115,374 @@ class TestGenerateXml:
         assert dhcp_range is not None
         assert dhcp_range.get("start") == "192.168.150.10"
         assert dhcp_range.get("end") == "192.168.150.100"
+
+    def test_bridge_mode_renders_only_forward_and_existing_bridge(self):
+        net = Network(
+            name="migration-net",
+            info={"mode": "bridge", "bridge": {"name": "br-migrate"}},
+            assign_new_bridge=True,
+            provider_config={"use_sudo": False},
+        )
+        root = ET.fromstring(net.generate_xml())
+        assert root.find("forward").get("mode") == "bridge"
+        assert root.find("bridge").attrib == {"name": "br-migrate"}
+        assert root.find("mac") is None
+        assert root.find("ip") is None
+
+
+class TestBridgeModeValidation:
+
+    @staticmethod
+    def _assert_rejected_before_define(tmp_path, info, message):
+        net = Network(
+            "migration-net", info, assign_new_bridge=True,
+            provider_config={"use_sudo": False})
+        net.virsh.execute = MagicMock()
+        xml_path = tmp_path / "invalid.xml"
+        with pytest.raises(ConfigError, match=message):
+            net.define_network(str(xml_path))
+        net.virsh.execute.assert_not_called()
+        assert not xml_path.exists()
+
+    def test_requires_an_explicit_bridge_name(self, tmp_path):
+        self._assert_rejected_before_define(
+            tmp_path, {"mode": "bridge"}, "requires.*bridge.name")
+
+    def test_bridge_block_must_be_a_mapping(self, tmp_path):
+        self._assert_rejected_before_define(
+            tmp_path, {"mode": "bridge", "bridge": ["br0"]},
+            "bridge must be a mapping")
+
+    def test_rejects_unsafe_or_overlong_bridge_name(self, tmp_path):
+        self._assert_rejected_before_define(
+            tmp_path,
+            {"mode": "bridge", "bridge": {"name": "br0;touch /tmp/x"}},
+            "invalid bridge name")
+
+    def test_rejects_non_string_bridge_name(self, tmp_path):
+        self._assert_rejected_before_define(
+            tmp_path,
+            {"mode": "bridge", "bridge": {"name": 123}},
+            "invalid bridge name")
+
+    @pytest.mark.parametrize("extra,field", [
+        ({"ip": {"address": "10.0.0.1"}}, "ip"),
+        ({"mac": "52:54:00:00:00:01"}, "mac"),
+        ({"bridge": {"name": "br0", "stp": "on"}}, "bridge.stp"),
+        ({"bridge": {"name": "br0", "delay": 0}}, "bridge.delay"),
+    ])
+    def test_rejects_fields_owned_by_the_host_bridge(
+        self, tmp_path, extra, field
+    ):
+        info = {"mode": "bridge", "bridge": {"name": "br0"}}
+        info.update(extra)
+        self._assert_rejected_before_define(
+            tmp_path, info, field.replace('.', r'\.'))
+
+    def test_rejects_unknown_modes_before_libvirt(self, tmp_path):
+        self._assert_rejected_before_define(
+            tmp_path,
+            {"mode": "hostdev", "bridge": {"name": "br-old"}},
+            "unsupported forward mode")
+
+    def test_legacy_unsupported_network_can_still_be_removed(self):
+        net = Network(
+            "old-open-net",
+            {"mode": "open", "bridge": {"name": "br-old"}},
+            assign_new_bridge=True,
+            provider_config={"use_sudo": False})
+        net.destroy_network = MagicMock(return_value=True)
+        net.undefine_network = MagicMock(return_value=True)
+        net.remove_route_iptables_rule = MagicMock()
+
+        assert net.remove_network() is True
+        net.destroy_network.assert_called_once_with()
+        net.undefine_network.assert_called_once_with()
+        net.remove_route_iptables_rule.assert_not_called()
+
+    def test_bridge_mode_may_reuse_an_existing_bridge_from_cache(self):
+        net = Network(
+            "migration-net",
+            {"mode": "bridge", "bridge": {"name": "br-migrate"}},
+            provider_config={"use_sudo": False},
+            manager=MagicMock(),
+        )
+        net.manager.config = {"project": "current"}
+        net.manager._runtime_name = "local"
+        net.manager.cache.projects = {
+            "other": {
+                "runtime": "local",
+                "networks": {
+                    "other-name": {"bridge_name": "br-migrate"}
+                },
+            }
+        }
+
+        net.check_network_exists()
+
+
+class TestBridgeModeDefinition:
+
+    @staticmethod
+    def _net(tmp_path):
+        manager = MagicMock()
+        manager.config = {"project": "p1"}
+        manager._runtime_name = "local"
+        manager.cache.projects = {"p1": {"runtime": "local"}}
+        return Network(
+            "migration-net",
+            {"mode": "bridge", "bridge": {"name": "br-migrate"}},
+            provider_config={"use_sudo": False}, manager=manager,
+        )
+
+    def test_missing_host_bridge_fails_before_net_define(self, tmp_path):
+        net = self._net(tmp_path)
+        net.virsh.execute_shell = MagicMock(return_value=_result(ok=False))
+        net.virsh.execute = MagicMock()
+
+        with pytest.raises(ConfigError, match="does not exist"):
+            net.define_network(str(tmp_path / "bridge.xml"))
+
+        net.virsh.execute.assert_not_called()
+        assert not (tmp_path / "bridge.xml").exists()
+
+    def test_existing_bridge_defines_without_firewall_setup(self, tmp_path):
+        net = self._net(tmp_path)
+        net.virsh.execute_shell = MagicMock(side_effect=[
+            _result(),
+            _result(stdout="0x1003\n"),  # IFF_UP; operstate may still be unknown
+        ])
+        net.virsh.execute = MagicMock(return_value=_result())
+        net._get_libvirt_bridges = MagicMock(return_value={"br-migrate"})
+        net._log_bridge_mode_managed_owner = MagicMock()
+        net.check_network_exists = MagicMock()
+        net.update_network_cache = MagicMock()
+        net.apply_route_iptables_rule = MagicMock()
+
+        assert net.define_network(str(tmp_path / "bridge.xml")) is True
+        commands = [call.args[0] for call in net.virsh.execute.call_args_list]
+        assert commands == ["net-define", "net-start", "net-autostart"]
+        net._log_bridge_mode_managed_owner.assert_called_once_with()
+        net.apply_route_iptables_rule.assert_not_called()
+
+    def test_administratively_down_bridge_is_rejected(self, tmp_path):
+        net = self._net(tmp_path)
+        net.virsh.execute_shell = MagicMock(side_effect=[
+            _result(),
+            _result(stdout="0x1002\n"),  # IFF_UP is clear
+        ])
+        net.virsh.execute = MagicMock()
+
+        with pytest.raises(ConfigError, match="administratively down"):
+            net.define_network(str(tmp_path / "down-bridge.xml"))
+
+        net.virsh.execute.assert_not_called()
+        commands = [call.args[0] for call in net.virsh.execute_shell.call_args_list]
+        assert commands == [
+            "test -d /sys/class/net/br-migrate/bridge",
+            "cat /sys/class/net/br-migrate/flags",
+        ]
+
+    def test_unreadable_bridge_admin_state_is_rejected(self, tmp_path):
+        net = self._net(tmp_path)
+        net.virsh.execute_shell = MagicMock(side_effect=[
+            _result(),
+            _result(ok=False, stderr="permission denied"),
+        ])
+
+        with pytest.raises(ConfigError, match="could not read administrative state"):
+            net.define_network(str(tmp_path / "unknown-bridge.xml"))
+
+    @pytest.mark.parametrize("uri", [
+        "qemu+ssh://hypervisor.example/system",
+        "qemu://localhost/system",
+    ])
+    def test_authority_uri_does_not_probe_the_client_namespace(
+        self, tmp_path, uri
+    ):
+        manager = MagicMock()
+        manager.config = {"project": "p1"}
+        manager._runtime_name = "local"
+        manager.cache.projects = {"p1": {"runtime": "local"}}
+        net = Network(
+            "migration-net",
+            {"mode": "bridge", "bridge": {"name": "br-migrate"}},
+            provider_config={
+                "use_sudo": False,
+                "uri": uri,
+            },
+            manager=manager,
+        )
+        net.virsh.execute_shell = MagicMock()
+        net.virsh.execute = MagicMock(return_value=_result())
+        net._get_libvirt_bridges = MagicMock(return_value=set())
+        net.check_network_exists = MagicMock()
+        net.update_network_cache = MagicMock()
+
+        assert net.define_network(str(tmp_path / "remote-bridge.xml")) is True
+        net.virsh.execute_shell.assert_not_called()
+        assert [call.args[0] for call in net.virsh.execute.call_args_list] == [
+            "net-define", "net-start", "net-autostart",
+        ]
+
+    def test_remote_start_failure_rolls_back_without_cache_entry(self, tmp_path):
+        manager = MagicMock()
+        manager.config = {"project": "p1"}
+        manager._runtime_name = "local"
+        manager.cache.projects = {"p1": {"runtime": "local"}}
+        net = Network(
+            "migration-net",
+            {"mode": "bridge", "bridge": {"name": "br-migrate"}},
+            provider_config={
+                "use_sudo": False,
+                "uri": "qemu+ssh://hypervisor.example/system",
+            },
+            manager=manager,
+        )
+        net.virsh.execute_shell = MagicMock()
+        calls = []
+
+        def execute(command, *args, **kwargs):
+            calls.append(command)
+            if command == "net-start":
+                raise RuntimeError("remote bridge is missing")
+            return _result()
+
+        net.virsh.execute = MagicMock(side_effect=execute)
+        net._get_libvirt_bridges = MagicMock(return_value=set())
+        net.check_network_exists = MagicMock()
+        net.update_network_cache = MagicMock()
+
+        assert net.define_network(str(tmp_path / "remote-bridge.xml")) is False
+        assert calls == ["net-define", "net-start", "net-undefine"]
+        net.virsh.execute_shell.assert_not_called()
+        net.update_network_cache.assert_not_called()
+
+    def test_cache_oserror_rolls_back_network_and_cache(self, tmp_path):
+        manager = MagicMock()
+        manager.config = {"project": "p1"}
+        manager._runtime_name = "local"
+        manager.cache.projects = {"p1": {"runtime": "local"}}
+        manager.cache.write_projects_cache.side_effect = OSError(
+            "projects.json is read-only")
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            net = Network(
+                "managed-net", {"mode": "route"},
+                provider_config={"use_sudo": False}, manager=manager)
+        calls = []
+        net.virsh.execute = MagicMock(
+            side_effect=lambda command, *a, **k: calls.append(command) or _result())
+        net._get_libvirt_bridges = MagicMock(return_value=set())
+        net.check_network_exists = MagicMock()
+        net.apply_route_iptables_rule = MagicMock(return_value=True)
+        net.remove_route_iptables_rule = MagicMock(return_value=True)
+
+        assert net.define_network(str(tmp_path / "managed.xml")) is False
+        assert calls == [
+            "net-define", "net-start", "net-autostart",
+            "net-destroy", "net-undefine",
+        ]
+        net.apply_route_iptables_rule.assert_called_once_with()
+        net.remove_route_iptables_rule.assert_called_once_with()
+        assert manager.cache.projects == {"p1": {"runtime": "local"}}
+
+    def test_route_rule_failure_rolls_back_without_cache_entry(self, tmp_path):
+        manager = MagicMock()
+        manager.config = {"project": "p1"}
+        manager._runtime_name = "local"
+        manager.cache.projects = {"p1": {"runtime": "local"}}
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            net = Network(
+                "managed-net", {"mode": "route"},
+                provider_config={"use_sudo": False}, manager=manager)
+        calls = []
+        net.virsh.execute = MagicMock(
+            side_effect=lambda command, *a, **k: calls.append(command) or _result())
+        net._get_libvirt_bridges = MagicMock(return_value=set())
+        net.check_network_exists = MagicMock()
+        net.apply_route_iptables_rule = MagicMock(return_value=False)
+        net.remove_route_iptables_rule = MagicMock(return_value=True)
+        net.update_network_cache = MagicMock()
+
+        assert net.define_network(str(tmp_path / "managed.xml")) is False
+        assert calls == [
+            "net-define", "net-start", "net-autostart",
+            "net-destroy", "net-undefine",
+        ]
+        net.apply_route_iptables_rule.assert_called_once_with()
+        net.remove_route_iptables_rule.assert_called_once_with()
+        net.update_network_cache.assert_not_called()
+        assert manager.cache.projects == {"p1": {"runtime": "local"}}
+
+    def test_baseexception_is_not_swallowed(self, tmp_path):
+        manager = MagicMock()
+        manager.config = {"project": "p1"}
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            net = Network(
+                "managed-net", {"mode": "nat"},
+                provider_config={"use_sudo": False}, manager=manager)
+        net.virsh.execute = MagicMock(return_value=_result())
+        net._get_libvirt_bridges = MagicMock(return_value=set())
+        net.check_network_exists = MagicMock()
+        net.update_network_cache = MagicMock(side_effect=KeyboardInterrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            net.define_network(str(tmp_path / "managed.xml"))
+
+    def test_removal_needs_no_firewall_cleanup(self, tmp_path):
+        net = self._net(tmp_path)
+        net.destroy_network = MagicMock(return_value=True)
+        net.undefine_network = MagicMock(return_value=True)
+        net.remove_route_iptables_rule = MagicMock()
+        assert net.remove_network() is True
+        net.remove_route_iptables_rule.assert_not_called()
+
+
+class TestBridgeModeManagedOwnerDiagnostic:
+
+    @staticmethod
+    def _net() -> Network:
+        return Network(
+            "migration-net",
+            {"mode": "bridge", "bridge": {"name": "br-migrate"}},
+            provider_config={"use_sudo": False},
+        )
+
+    def test_logs_managed_owner_and_lifecycle_risk_at_debug(self):
+        net = self._net()
+        net.logger = MagicMock()
+        net.logger.isEnabledFor.return_value = True
+        net._listed_networks = MagicMock(return_value=["nat-owner", "peer"])
+        xml = {
+            "nat-owner": (
+                "<network><forward mode='nat'/>"
+                "<bridge name='br-migrate'/></network>"),
+            "peer": (
+                "<network><forward mode='bridge'/>"
+                "<bridge name='br-migrate'/></network>"),
+        }
+        net.virsh.execute = MagicMock(
+            side_effect=lambda _cmd, name, **_kwargs: _result(stdout=xml[name]))
+
+        net._log_bridge_mode_managed_owner()
+
+        message = net.logger.debug.call_args.args[0]
+        assert "nat-owner (nat)" in message
+        assert "destroying an owner removes" in message
+        assert "peer" not in message
+
+    def test_diagnostic_does_no_virsh_work_when_debug_is_disabled(self):
+        net = self._net()
+        net.logger = MagicMock()
+        net.logger.isEnabledFor.return_value = False
+        net._listed_networks = MagicMock()
+
+        net._log_bridge_mode_managed_owner()
+
+        net._listed_networks.assert_not_called()
 
 
 class TestDhcpReservations:

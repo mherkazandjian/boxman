@@ -7,6 +7,7 @@ side-effect-free helpers are exercised here -- no libvirt/subprocess/host calls.
 
 import importlib.util
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -81,6 +82,49 @@ def test_classify_family_uses_id_like_when_id_unknown():
 
 
 # --------------------------------------------------------------------------- #
+# minimal app-config scalar parsing                                           #
+# --------------------------------------------------------------------------- #
+def test_configured_libvirt_use_sudo_reads_only_provider_block():
+    text = """
+runtime: local
+clusters:
+  lab:
+    use_sudo: true
+providers:
+  virtualbox:
+    use_sudo: true
+  libvirt:
+    uri: qemu:///system
+    use_sudo: false  # direct group access
+"""
+    assert checker.configured_libvirt_use_sudo(text, default=True) is False
+
+
+def test_configured_libvirt_use_sudo_supports_yaml_boolean_spellings():
+    text = "providers:\n  libvirt:\n    use_sudo: YES\n"
+    assert checker.configured_libvirt_use_sudo(text) is True
+
+
+def test_configured_libvirt_use_sudo_falls_back_for_invalid_value():
+    text = "providers:\n  libvirt:\n    use_sudo: {{ env('SUDO') }}\n"
+    assert checker.configured_libvirt_use_sudo(text, default=False) is False
+
+
+def test_configured_libvirt_use_sudo_does_not_truncate_quoted_hash():
+    text = 'providers:\n  libvirt:\n    use_sudo: "false#not-a-comment"\n'
+    assert checker.configured_libvirt_use_sudo(text, default=True) is True
+
+
+def test_strip_yaml_comment_preserves_hashes_inside_scalars():
+    assert checker.strip_yaml_comment('key: "a # value" # comment') == (
+        'key: "a # value" ')
+    assert checker.strip_yaml_comment("key: 'a # value' # comment") == (
+        "key: 'a # value' ")
+    assert checker.strip_yaml_comment("key: a#value # comment") == (
+        "key: a#value ")
+
+
+# --------------------------------------------------------------------------- #
 # install_cmd                                                                 #
 # --------------------------------------------------------------------------- #
 def test_install_cmd_per_family():
@@ -129,6 +173,100 @@ def test_sudo_nopasswd_covers_specific_binary():
 def test_sudo_nopasswd_covers_ignores_password_required_lines():
     out = "    (ALL : ALL) ALL\n"  # sudo allowed but with a password
     assert checker.sudo_nopasswd_covers(out, "qemu-img") is False
+
+
+def test_doctor_sudo_rights_requires_virt_sysprep(monkeypatch):
+    doctor = checker.Doctor.__new__(checker.Doctor)
+    doctor.opts = SimpleNamespace(check_only=True)
+    doctor.results = []
+    doctor.manual_steps = []
+    doctor.use_color = False
+    doctor.interactive = False
+    doctor.use_sudo = True
+
+    policy = (
+        "(root) NOPASSWD: /usr/bin/virsh, /usr/bin/qemu-img, "
+        "/usr/sbin/iptables, /bin/rm\n"
+    )
+    monkeypatch.setattr(checker, "have", lambda command: command == "sudo")
+    monkeypatch.setattr(checker, "run_capture", lambda args: (0, policy))
+
+    doctor._check_sudo_rights()
+
+    result = doctor.results[-1]
+    assert result.status == checker.WARN
+    assert "virt-sysprep" in result.detail
+    assert "virt-sysprep" in result.fix.description
+
+
+def test_doctor_omits_sysprep_nopasswd_gap_when_use_sudo_is_false(monkeypatch):
+    doctor = _minimal_doctor_for_check()
+    doctor.use_sudo = False
+    policy = (
+        "(root) NOPASSWD: /usr/bin/virsh, /usr/bin/qemu-img, "
+        "/usr/sbin/iptables, /usr/bin/rm\n"
+    )
+    monkeypatch.setattr(checker, "have", lambda command: command == "sudo")
+    monkeypatch.setattr(checker, "run_capture", lambda args: (0, policy))
+
+    doctor._check_sudo_rights()
+
+    result = doctor.results[-1]
+    assert result.status == checker.OK
+    assert "virt-sysprep" not in result.detail
+    assert result.fix is None
+
+
+def test_doctor_omits_sysprep_from_fix_when_use_sudo_is_false(monkeypatch):
+    doctor = _minimal_doctor_for_check()
+    doctor.use_sudo = False
+    policy = "(root) NOPASSWD: /usr/sbin/iptables\n"
+    monkeypatch.setattr(checker, "have", lambda command: command == "sudo")
+    monkeypatch.setattr(checker, "run_capture", lambda args: (0, policy))
+
+    doctor._check_sudo_rights()
+
+    result = doctor.results[-1]
+    assert result.status == checker.WARN
+    assert "qemu-img/rm" in result.detail
+    assert "virt-sysprep" not in result.detail
+    assert "virt-sysprep" not in result.fix.description
+    assert "qemu-img" in result.fix.description
+
+
+def _minimal_doctor_for_check():
+    doctor = checker.Doctor.__new__(checker.Doctor)
+    doctor.opts = SimpleNamespace(check_only=True)
+    doctor.results = []
+    doctor.manual_steps = []
+    doctor.use_color = False
+    doctor.interactive = False
+    doctor.family = "debian"
+    doctor.os = {"id": "ubuntu"}
+    return doctor
+
+
+def test_missing_clone_sanitizer_is_optional_warning(monkeypatch):
+    doctor = _minimal_doctor_for_check()
+    monkeypatch.setattr(checker, "have", lambda command: False)
+
+    result = doctor._check_clone_sanitizer()
+
+    assert result.status == checker.WARN
+    assert "clone_machine_id=auto" in result.detail
+    assert "clone_machine_id=required" in result.detail
+    assert "guestfs-tools" in result.fix.commands[0]
+
+
+def test_present_clone_sanitizer_is_ok(monkeypatch):
+    doctor = _minimal_doctor_for_check()
+    monkeypatch.setattr(
+        checker, "have", lambda command: command == "virt-sysprep")
+
+    result = doctor._check_clone_sanitizer()
+
+    assert result.status == checker.OK
+    assert result.fix is None
 
 
 # --------------------------------------------------------------------------- #
@@ -770,6 +908,27 @@ def test_core_stack_fix_gentoo_uses_emerge():
     fix = _doctor_with_family("gentoo")._core_stack_fix()
     assert "emerge" in fix.commands[0]
     assert "app-emulation/libvirt" in fix.commands[0]
+    assert "app-emulation/guestfs-tools" in fix.commands[0]
+
+
+@pytest.mark.parametrize("family,package", [
+    ("arch", "guestfs-tools"),
+    ("debian", "guestfs-tools"),
+    ("rhel", "guestfs-tools"),
+    ("gentoo", "app-emulation/guestfs-tools"),
+])
+def test_core_stack_installs_virt_sysprep_package(family, package):
+    assert package in checker._CORE_STACK[family]
+
+
+def test_debian_guestfs_tool_remediation_uses_executable_owner_package():
+    assert checker._TOOL_PKG["virt-sysprep"]["debian"] == "guestfs-tools"
+    assert checker._TOOL_PKG["virt-sparsify"]["debian"] == "guestfs-tools"
+
+
+def test_declarative_core_advice_includes_virt_sysprep_package():
+    assert "guestfs-tools" in checker._NIXOS_CORE_ADVICE
+    assert "libguestfs" in checker._GUIX_CORE_ADVICE
 
 
 def test_core_stack_fix_unknown_family_falls_back_to_manual_advice():

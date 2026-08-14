@@ -18,6 +18,7 @@ All external calls are mocked — no VBoxManage is invoked on any host.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 from unittest.mock import patch
 
@@ -149,6 +150,27 @@ class TestVBoxManageCommand:
         # --name dst present, --register bare, uuid/live skipped
         assert built == "VBoxManage clonevm src --name dst --register"
 
+    def test_build_command_quotes_all_data_tokens_once(self):
+        binary = "/opt/VirtualBox Tools/VBoxManage"
+        subcommand = "clone vm"
+        source = 'src "blue"; $(touch /tmp/nope) | true'
+        destination = "/tmp/VirtualBox VMs/node 'one'"
+        cmd = VBoxManageCommand(provider_config={"vboxmanage_cmd": binary})
+
+        built = cmd.build_command(
+            subcommand, source, name=destination, register=True)
+
+        assert shlex.split(built) == [
+            binary,
+            subcommand,
+            source,
+            "--name",
+            destination,
+            "--register",
+        ]
+        assert shlex.quote(source) in built
+        assert shlex.quote(shlex.quote(source)) not in built
+
     def test_override_use_sudo(self):
         cmd = VBoxManageCommand(provider_config={"use_sudo": True}, override_use_sudo=False)
         assert cmd.build_command("list", "vms") == "VBoxManage list vms"
@@ -171,6 +193,22 @@ class TestVBoxManageCommand:
         # command was split into argv
         args, _ = mock_run.call_args
         assert args[0] == ["VBoxManage", "list", "vms"]
+
+    def test_run_preserves_quoted_command_path_and_values_as_argv(self):
+        binary = "/opt/VirtualBox Tools/VBoxManage"
+        cmd = VBoxManageCommand(provider_config={"vboxmanage_cmd": binary})
+        with patch(
+                "boxman.providers.virtualbox.commands.subprocess.run",
+                return_value=_completed()) as mock_run:
+            cmd.run("showvminfo", "node 01; echo nope", machinereadable=True)
+
+        args, _ = mock_run.call_args
+        assert args[0] == [
+            binary,
+            "showvminfo",
+            "node 01; echo nope",
+            "--machinereadable",
+        ]
 
     def test_run_check_raises_on_nonzero(self):
         cmd = VBoxManageCommand(provider_config={})
@@ -356,6 +394,12 @@ class TestCommandBuilders:
     def test_modifyvm_natpf_builder(self):
         from boxman.providers.virtualbox.modifyvm import ModifyVm
         built = ModifyVm(provider_config={}).build_natpf_command(
-            "node01", host_port=2222, guest_port=22)
-        assert '--natpf1' in built
-        assert '"guestssh,tcp,,2222,,22"' in built
+            "node 01", host_port=2222, guest_port=22,
+            rule_name="guest ssh; echo nope")
+        assert shlex.split(built) == [
+            "VBoxManage",
+            "modifyvm",
+            "node 01",
+            "--natpf1",
+            "guest ssh; echo nope,tcp,,2222,,22",
+        ]

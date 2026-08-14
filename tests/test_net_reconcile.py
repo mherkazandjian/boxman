@@ -127,6 +127,57 @@ class TestDesiredState:
         assert plan["action"] == "none"
         assert plan["structural"] == []
 
+    def test_bridge_mode_round_trip_has_no_phantom_ip_mac_or_stp_drift(self):
+        net = Network(
+            name="demo",
+            info={"mode": "bridge", "bridge": {"name": "br-migrate"}},
+            assign_new_bridge=True,
+            provider_config={"use_sudo": False},
+        )
+        xml = ("<network><name>demo</name><forward mode='bridge'/>"
+               "<bridge name='br-migrate'/></network>")
+        state = nr.desired_state(net)
+        assert state == {
+            "mode": "bridge", "bridge_name": "br-migrate",
+            "bridge_stp": None, "bridge_delay": None, "mac": None,
+            "ip_address": None, "netmask": None, "dhcp_range": None,
+            "dhcp_hosts": [],
+        }
+        assert nr.diff_network(
+            state, nr.parse_network_xml(xml))["action"] == "none"
+
+
+class TestBridgeOwnershipTransitions:
+
+    @pytest.mark.parametrize("old_mode", ["nat", "route"])
+    def test_managed_to_bridge_rejects_the_managed_bridge_name(self, old_mode):
+        message = nr.bridge_ownership_conflict(
+            {"mode": "bridge", "bridge_name": "virbr9"},
+            {"mode": old_mode, "bridge_name": "virbr9"},
+        )
+        assert "would delete that managed bridge" in message
+
+    @pytest.mark.parametrize("new_mode", ["nat", "route"])
+    def test_bridge_to_managed_rejects_the_host_bridge_name(self, new_mode):
+        message = nr.bridge_ownership_conflict(
+            {"mode": new_mode, "bridge_name": "br-migrate"},
+            {"mode": "bridge", "bridge_name": "br-migrate"},
+        )
+        assert "cannot claim its name" in message
+
+    def test_different_bridge_names_are_safe_to_recreate(self):
+        assert nr.bridge_ownership_conflict(
+            {"mode": "bridge", "bridge_name": "br-external"},
+            {"mode": "nat", "bridge_name": "virbr9"},
+        ) is None
+
+    def test_auto_managed_bridge_has_no_premature_name_conflict(self):
+        assert nr.bridge_ownership_conflict(
+            {"mode": "nat", "bridge_name": "virbr0"},
+            {"mode": "bridge", "bridge_name": "virbr0"},
+            desired_bridge_is_pinned=False,
+        ) is None
+
 
 class TestDiffDhcpHosts:
 
@@ -244,26 +295,27 @@ class TestPinnedBridgeAndStp:
     """Fields whose configured form differs from what libvirt echoes back."""
 
     def test_pinned_bridge_name_reaches_the_diff(self, ):
-        # the plan builds its Network with assign_new_bridge=False, which reads
-        # the bridge from libvirt; the *configured* name has to survive that or
-        # the pinned-name drift check can never fire
+        # A configured bridge is the effective desired name. Live state is
+        # parsed separately from net-dumpxml, so construction must not replace
+        # the pin with the bridge currently in use.
         info = {"mode": "nat", "bridge": {"name": "virbr42"},
                 "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0"}}
-        with patch.object(Network, "get_bridge_from_network",
-                          return_value="virbr9"):
+        with patch.object(Network, "get_bridge_from_network") as lookup:
             net = Network(name="demo", info=info, assign_new_bridge=False,
                           provider_config={"use_sudo": False})
-        assert net.bridge_name == "virbr9"          # what is in use
-        assert nr.desired_state(net)["bridge_name"] == "virbr42"   # what was asked for
+        assert net.bridge_name == "virbr42"
+        assert nr.desired_state(net)["bridge_name"] == "virbr42"
+        lookup.assert_not_called()
 
-    def test_unpinned_bridge_name_is_not_reported_as_desired(self):
+    def test_unpinned_existing_bridge_is_the_effective_desired_name(self):
         info = {"mode": "nat",
                 "ip": {"address": "10.5.3.1", "netmask": "255.255.255.0"}}
         with patch.object(Network, "get_bridge_from_network",
                           return_value="virbr9"):
             net = Network(name="demo", info=info, assign_new_bridge=False,
                           provider_config={"use_sudo": False})
-        assert nr.desired_state(net)["bridge_name"] is None
+        assert net.pinned_bridge_name is None
+        assert nr.desired_state(net)["bridge_name"] == "virbr9"
 
     def test_a_short_network_mac_does_not_read_as_drift(self):
         # libvirt zero-pads the network's own mac when it stores it, so a
@@ -381,6 +433,14 @@ class TestTeardownInfo:
         network_info = {'mode': 'nat'}
         assert self._teardown({}, network_info) is network_info
 
+    def test_bridge_mode_teardown_has_no_synthetic_ip_block(self):
+        info = self._teardown(
+            {'mode': 'bridge', 'bridge_name': 'br-migrate',
+             'ip_address': None, 'netmask': None},
+            {'mode': 'nat', 'ip': {'address': '10.9.9.1'}})
+        assert info == {
+            'mode': 'bridge', 'bridge': {'name': 'br-migrate'}}
+
 
 class TestRecreateSequence:
     """
@@ -464,6 +524,26 @@ class TestRecreateSequence:
         self._recreate(mgr)
         info = mgr.provider.remove_network.call_args.kwargs['info']
         assert info['mode'] == 'nat'          # what is there, not the new 'route'
+
+    def test_reserved_replacement_bridge_is_used_for_the_redefine(self):
+        mgr, _ = self._manager()
+        plan = {
+            'structural': ["forward mode 'bridge' -> 'nat'"],
+            'attached_vms': [],
+            'actual': {'mode': 'bridge', 'bridge_name': 'virbr0'},
+            'replacement_bridge_name': 'virbr1',
+        }
+        outcome = mgr._recreate_network(
+            cluster={'workdir': '/tmp/wd'},
+            network_name='cluster_1/mgmt',
+            full_name='full-net',
+            network_info={'mode': 'nat'},
+            plan=plan,
+            dry_run=False, allow_recreate=True, auto_accept=True)
+
+        assert outcome == 'recreated'
+        assert mgr.provider.define_network.call_args.kwargs['info'] == {
+            'mode': 'nat', 'bridge': {'name': 'virbr1'}}
 
     def test_nothing_is_touched_without_the_flag(self):
         mgr, calls = self._manager()
