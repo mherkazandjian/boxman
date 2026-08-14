@@ -1,9 +1,25 @@
 """Static security guards for the packaged Docker runtime image."""
 
+import shlex
 from pathlib import Path
 
+import pytest
 
-DOCKERFILE = Path(__file__).resolve().parent.parent / "containers" / "docker" / "Dockerfile"
+
+DOCKERFILE = (
+    Path(__file__).resolve().parent.parent
+    / "containers" / "docker" / "Dockerfile"
+)
+pytestmark = pytest.mark.regression
+
+
+def _logical_instructions(dockerfile: str) -> list[str]:
+    """Return Dockerfile instructions with line continuations normalized."""
+    return [
+        " ".join(instruction.split())
+        for instruction in dockerfile.replace("\\\n", " ").splitlines()
+        if instruction.strip() and not instruction.lstrip().startswith("#")
+    ]
 
 
 def test_shadow_layout_supports_apparmor_confined_unix_chkpwd():
@@ -15,17 +31,25 @@ def test_shadow_layout_supports_apparmor_confined_unix_chkpwd():
     granting the SSH login user direct DAC access or using a readable group.
     The development image separately grants that user passwordless sudo.
     """
-    dockerfile = DOCKERFILE.read_text()
-    expected = (
-        "chown root:root /etc/shadow",
-        "chmod 0400 /etc/shadow",
-        "test \"$(stat -c '%U:%G:%a' /etc/shadow)\" = \"root:root:400\"",
-        "! id -Gn qemu_user | grep -qw shadow",
-    )
+    instructions = _logical_instructions(DOCKERFILE.read_text())
+    useradd_index, useradd = next(
+        (index, instruction)
+        for index, instruction in enumerate(instructions)
+        if "useradd" in instruction and "qemu_user" in instruction)
+    shadow_index, shadow = next(
+        (index, instruction)
+        for index, instruction in enumerate(instructions)
+        if "/etc/shadow" in instruction)
 
-    for command in expected:
-        assert command in dockerfile
-
-    assert dockerfile.index("useradd -m -s /bin/bash qemu_user") < dockerfile.index(
-        "chown root:root /etc/shadow"
-    )
+    assert useradd_index < shadow_index
+    assert shlex.split(useradd.removeprefix("RUN ").split(" && ")[0]) == [
+        "useradd", "-m", "-s", "/bin/bash", "qemu_user"]
+    assert [
+        shlex.split(command)
+        for command in shadow.removeprefix("RUN ").split(" && ")
+    ] == [
+        ["chown", "root:root", "/etc/shadow"],
+        ["chmod", "0400", "/etc/shadow"],
+        ["test", "$(stat -c '%U:%G:%a' /etc/shadow)", "=", "root:root:400"],
+        ["!", "id", "-Gn", "qemu_user", "|", "grep", "-qw", "shadow"],
+    ]

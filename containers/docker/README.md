@@ -370,9 +370,8 @@ Current images use mode `0400 root:root`: the setuid-root helper can use the
 owner read bit while ordinary, unprivileged reads remain unavailable to
 `qemu_user` and other non-root users. (`qemu_user` intentionally has
 passwordless `sudo` in this development image.) No host AppArmor capability
-override is required. If a
-runtime was created with an older Boxman version, redeploy the bundled assets
-and rebuild its image before retrying SSH.
+override is required. If a runtime was created with an older Boxman version,
+redeploy the bundled assets and rebuild its image before retrying SSH.
 
 ### libvirtd socket not appearing
 
