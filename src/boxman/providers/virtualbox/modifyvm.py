@@ -52,6 +52,12 @@ class ModifyVm:
                             guest_port: int,
                             rule_name: str = 'guestssh',
                             nic_num: int = 1) -> str:
-        """Build ``VBoxManage modifyvm <vm> --natpf<n> "name,tcp,,host,,guest"``."""
+        """Build a ``VBoxManage modifyvm <vm> --natpf<n> <rule>`` command.
+
+        ``<rule>`` is passed to the central command builder as an unquoted raw
+        value. The rendered shell string contains quotes only when the rule's
+        contents require them; :meth:`VBoxManageCommand.run` splits it back
+        into one exact argv token before execution.
+        """
         rule = f'{rule_name},tcp,,{host_port},,{guest_port}'
         return self.cmd.build_command('modifyvm', vm, f'--natpf{nic_num}', rule)
