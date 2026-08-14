@@ -76,7 +76,8 @@ memory controls fixed between the KSM-off and KSM-on measurements.
    pages processed before `ksmd` sleeps for `sleep_millisecs`; their
    combination determines the upper scan rate. There is no universally
    safe value. Start low and monitor CPU, `MemAvailable`, and
-   `general_profit`.
+   `general_profit`. On kernels with the scan-time advisor, first choose
+   whether the advisor or the manual batch size will own the scan rate.
 3. Start KSM and wait for a scan-count target rather than an arbitrary
    delay. At least two increments of `full_scans` let pages initially
    classified as changing be examined again.
@@ -87,20 +88,72 @@ memory controls fixed between the KSM-off and KSM-on measurements.
 The manual control surface is:
 
 ```bash
+KSM=/sys/kernel/mm/ksm
+
+# The scan-time advisor owns pages_to_scan while active. Do not mix modes.
+if test -r "$KSM/advisor_mode" && \
+        test "$(cat "$KSM/advisor_mode")" = scan-time; then
+    echo 'scan-time advisor is active; pages_to_scan is advisor-owned' >&2
+    exit 1
+fi
+
 # Optional: explicitly set this to the bounded batch size selected for this host.
-printf '%s\n' "$PAGES_PER_BATCH" | sudo tee /sys/kernel/mm/ksm/pages_to_scan
+printf '%s\n' "$PAGES_PER_BATCH" | sudo tee "$KSM/pages_to_scan"
 
 # Start scanning.
-echo 1 | sudo tee /sys/kernel/mm/ksm/run
+echo 1 | sudo tee "$KSM/run"
 
 # Stop scanning but retain merged pages for measurement.
-echo 0 | sudo tee /sys/kernel/mm/ksm/run
+echo 0 | sudo tee "$KSM/run"
 ```
+
+The kernel rejects writes to `pages_to_scan` while
+`advisor_mode=scan-time`. Do not retry the write or assume the requested
+value took effect. Either leave the advisor active and tune its controls,
+or explicitly switch to `advisor_mode=none` during an operator-approved
+manual experiment. Record and restore the original mode and controls.
+If `ksmtuned` is managing KSM, change its distribution policy instead of
+writing either interface underneath it.
 
 Monitor at a fixed interval and set a wall-time limit. Stop early if
 `MemAvailable` approaches the host's safety reserve, `ksmd` CPU is too
 high, or profit remains negative. Do not copy a scan rate from another
 machine without measuring it locally.
+
+### Built-in scan-time advisor, when available
+
+The upstream scan-time advisor first appears in the
+[Linux 6.8 KSM documentation][kernel-ksm-6.8]. Distribution kernels may
+omit it or backport it to an older version, so the kernel release string
+is not an authoritative availability check. Feature-detect
+`/sys/kernel/mm/ksm/advisor_mode` and the related controls on the running
+host:
+
+```bash
+KSM=/sys/kernel/mm/ksm
+for control in advisor_mode advisor_max_cpu advisor_target_scan_time \
+        advisor_min_pages_to_scan advisor_max_pages_to_scan; do
+    if test -r "$KSM/$control"; then
+        printf '%s=' "$control"
+        cat "$KSM/$control"
+    else
+        printf '%s=N/A\n' "$control"
+    fi
+done
+```
+
+In `scan-time` mode, the kernel recalculates `pages_to_scan` after each
+full scan. `advisor_target_scan_time` sets the target duration,
+`advisor_max_cpu` limits the advisor's CPU budget, and the min/max
+`pages_to_scan` controls bound its batch-size decisions. This is often a
+better starting point for a dynamic fleet than a fixed batch copied from
+another host.
+
+Enabling or retuning the advisor is still an operator-owned policy
+change. Set its limits from a measured host capacity budget, record the
+original values, and monitor the same counters and workload latency as
+with manual scanning. Do not enable it merely because the sysfs files
+exist.
 
 ## Measure savings and cost
 
@@ -178,10 +231,72 @@ Use aggregate PSS as the project-level measurement when it is absent.
 ## Controlled Boxman fleet result
 
 A controlled evaluation used six powered-on, same-template 1 GiB Linux
-VMs. Every guest ran the same transient memory workload, free-page
-reporting remained enabled in both arms, and KSM was the only intended
-independent variable. Measurements were taken after at least two full
-scans and repeated with scanning frozen.
+VMs. Each guest faulted 600 MiB once, the allocation process exited, and
+the fleet then idled for 90 seconds. Free-page reporting remained
+enabled with a five-second statistics period in both arms, and KSM was
+the only intended independent variable. Measurements were taken after
+at least two full scans and repeated with scanning frozen.
+
+This result is **illustrative, not an independently reproducible Boxman
+benchmark**. The repository does not contain a versioned harness or raw
+result artifact for this run. The sanitized raw values below make the
+arithmetic auditable, but operators must repeat the documented workflow
+on their own fleet before choosing a policy.
+
+The host used 4096-byte pages. The fixed KSM controls were:
+
+| Control | Before | Evaluation | Frozen sample |
+|---|---:|---:|---:|
+| `run` | 0 | 1 | 0 |
+| `pages_to_scan` | 100 | 10,000 | 10,000 |
+| `sleep_millisecs` | 20 | 20 | 20 |
+| `merge_across_nodes` | 1 | 1 | 1 |
+| `use_zero_pages` | 0 | 0 | 0 |
+| `max_page_sharing` | 256 | 256 | 256 |
+| `smart_scan` | not exposed | not exposed | not exposed |
+| `advisor_mode` | not exposed | not exposed | not exposed |
+
+The benchmark intentionally accelerated the fixed-batch scan to at most
+500,000 pages per second (`pages_to_scan / sleep interval`). This is a
+record of the experiment, not a recommended setting.
+
+Before scanning, `full_scans`, `pages_scanned`, `pages_shared`,
+`pages_sharing`, `pages_unshared`, `pages_volatile`, `ksm_zero_pages`,
+`general_profit`, and accumulated `ksmd` CPU time were all 0.
+
+Raw host-global sysfs and CPU samples:
+
+| Metric | 30 s | Two scans, 170 s | Frozen, 189 s |
+|---|---:|---:|---:|
+| `full_scans` | 0 | 2 | 2 |
+| `pages_scanned` | 11,290,000 | 26,712,292 | 30,081,102 |
+| `pages_shared` | 0 | 1,000,688 | 1,000,785 |
+| `pages_sharing` | 0 | 6,293,849 | 6,296,298 |
+| `pages_unshared` | 0 | 5,781,709 | 5,778,126 |
+| `pages_volatile` | 11,290,000 | 99,306 | 100,342 |
+| `ksm_zero_pages` | 0 | 0 | 0 |
+| `general_profit` (bytes) | -722,580,864 | 24,936,374,336 | 24,946,401,344 |
+| `ksmd` CPU time (seconds) | 6.63 | 114.76 | 126.80 |
+
+The scanner entered part of a third pass during the 19 seconds between
+the two-scan criterion and the frozen measurement; that is why
+`pages_scanned` increased while `full_scans` remained 2. At the frozen
+point, `6,296,298 * 4096 / 1048576 = 24,594.9 MiB` saved according to
+`pages_sharing`, but that is a **host-global** figure which includes
+mergeable workloads outside the six-VM fleet.
+
+Project attribution used medians of three samples over the same six QEMU
+PIDs:
+
+| Aggregate process metric | KSM off | KSM frozen |
+|---|---:|---:|
+| RSS from `smaps_rollup` (KiB) | 3,578,496 | 3,533,280 |
+| PSS from `smaps_rollup` (KiB) | 3,450,057 | 1,369,932 |
+| `ksm_merging_pages` | 0 | 548,549 |
+| `ksm_zero_pages` | 0 | 0 |
+| `ksm_process_profit` (bytes) | 0 | 2,194,132,864 |
+
+Those raw project values yield the following observations:
 
 - Aggregate QEMU PSS fell from about 3.29 GiB to 1.31 GiB: a **60.3%**
   reduction, or about **1.98 GiB**.
@@ -211,11 +326,16 @@ grep '^MemAvailable:' /proc/meminfo
 # Stop ksmd and unmerge all currently merged pages.
 echo 2 | sudo tee /sys/kernel/mm/ksm/run
 
-# Set these variables from the values recorded before the evaluation.
+# For a manual policy, set these from the values recorded before evaluation.
 printf '%s\n' "$ORIGINAL_PAGES_TO_SCAN" | \
     sudo tee /sys/kernel/mm/ksm/pages_to_scan
 printf '%s\n' "$ORIGINAL_RUN_VALUE" | sudo tee /sys/kernel/mm/ksm/run
 ```
+
+If the original policy used `advisor_mode=scan-time`, restore its
+`advisor_*` limits and mode instead. Do not try to force an old
+`pages_to_scan` value after re-enabling the advisor: it is an advisor-
+managed value and will be recalculated after a full scan.
 
 Also restore the original enabled/active state of any KSM service. After
 an unmerge, verify `pages_shared`, `pages_sharing`, `pages_unshared`,
@@ -238,3 +358,4 @@ operator-owned until results cover more kernels, hosts, and long-running
 workloads.
 
 [kernel-ksm]: https://docs.kernel.org/admin-guide/mm/ksm.html
+[kernel-ksm-6.8]: https://docs.kernel.org/6.8/admin-guide/mm/ksm.html
