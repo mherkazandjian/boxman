@@ -54,17 +54,16 @@ templates:
     # cloudinit_done_timeout. Keys here are therefore the real interface names;
     # the Arch cloud image boots with net.ifnames=0, so they are eth0/eth1.
     #
-    # eth1 is static on purpose. The second adapter of this box lands on the
-    # `isolated1` network, which is `mode: route` -- and boxman answers a routed
-    # network by installing "complete isolation" iptables rules for its bridge
-    # (Network.apply_route_iptables_rule): `INPUT -i <br> -j DROP` plus
-    # `OUTPUT -o <br> -j DROP`. libvirt's dnsmasq for that network runs *on the
-    # host*, so those two rules drop the DHCPDISCOVER on the way in and the
-    # DHCPOFFER on the way out: DHCP on an isolated network can never complete,
-    # no matter which distro is in the guest. Left on dhcp4, eth1 sits at
-    # "degraded (configuring)" forever with only a link-local address. The
-    # address below is inside isolated1's subnet and outside its (inert) DHCP
-    # range, so it also survives if the network is ever switched to nat.
+    # eth1 is static on purpose. The second adapter lands on `isolated1`,
+    # which is `mode: route`, and boxman answers a routed network by
+    # installing "complete isolation" iptables rules for its bridge. libvirt's
+    # dnsmasq for that network runs *on the host*, so those rules drop the
+    # DHCPDISCOVER on the way in and the DHCPOFFER on the way out -- DHCP on a
+    # routed network cannot complete for any guest OS. That is tracked as #152;
+    # a static address keeps this box working on any boxman version, before or
+    # after that fix. It sits inside isolated1's subnet and outside its DHCP
+    # pool, so nothing can lease it out from under the guest, and it survives
+    # if the network is ever switched to nat.
     cloudinit_network_config: |
       version: 2
       ethernets:
@@ -192,9 +191,13 @@ clusters:
           address: '10.0.14.1'
           netmask: '255.255.255.0'
           dhcp:
+            # deliberately stops well short of .101, the address the second
+            # adapter takes statically below. Once routed networks can lease
+            # addresses (see #152) an overlapping pool would let dnsmasq hand
+            # .101 to another guest and collide.
             range:
-              start: '10.0.14.2'
-              end: '10.0.14.254'
+              start: '10.0.14.10'
+              end: '10.0.14.99'
         enable: True
         autostart: True
 

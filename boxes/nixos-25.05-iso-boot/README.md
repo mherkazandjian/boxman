@@ -22,18 +22,34 @@ correct outcome here, not a fault.)
 
 That is not an oversight, it is the current limit of the tooling:
 
-- NixOS publishes **no generic cloud qcow2**, and no official NixOS image ships
-  with cloud-init enabled. The only pinned, public artifact is the installer
-  ISO used here.
+- This box boots the **minimal installer ISO**, which is a live installer: it
+  does not consume boxman's NoCloud seed and creates no user for boxman to
+  inject a key into. That, not any limitation of NixOS, is why it is not
+  SSH-able.
+- NixOS itself supports cloud-init perfectly well
+  ([`services.cloud-init.enable`](https://github.com/NixOS/nixpkgs/blob/nixos-25.05/nixos/modules/services/system/cloud-init.nix)),
+  and the official
+  [`proxmoxImage`](https://github.com/NixOS/nixpkgs/blob/nixos-25.05/nixos/release.nix)
+  job builds a disk image with cloud-init, sshd and the qemu guest agent
+  enabled. What is missing is a *generic* published cloud qcow2 that boxman
+  could point `templates:` at — the installer ISO is the only artifact this
+  box can pin without building one.
 - boxman's `templates:` path **always** builds a NoCloud seed and then waits on
   cloud-init plus the qemu guest agent (`providers/libvirt/cloudinit.py`). A
   NixOS image pushed through it would time out and never receive a key, so
   using `templates:` here would produce a box that looks supported and isn't.
 
-Getting from "boots" to "usable, SSH-able NixOS guest" needs a declarative
-provisioning hook in boxman — push a `configuration.nix` and run
-`nixos-rebuild switch` — which does not exist yet. Until then, the two honest
-ways to finish the job are both **outside** boxman:
+Getting from "boots" to "usable, SSH-able NixOS guest" does **not** require a
+`nixos-rebuild` hook in boxman. The straightforward route is a
+cloud-init-enabled NixOS disk image — built with
+[`nixos-generators`](https://github.com/nix-community/nixos-generators) or
+modelled on the upstream `proxmoxImage` job — used as an ordinary
+`templates:` image. The boxman gap is therefore about **obtaining, building
+or importing** such an image (and the guest-agent assumptions in the
+verification phase), not about NixOS lacking the mechanism. See #149.
+
+Until this box ships such an image, the two ways to finish the job by hand
+are both **outside** boxman:
 
 - interactively, in the guest console (`nixos-generate-config`, edit
   `/etc/nixos/configuration.nix`, `nixos-install`), or

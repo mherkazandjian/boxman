@@ -13,9 +13,12 @@
 # boots you into Guix's guided installer. It does NOT install Guix, create a
 # user, or configure SSH — see README.md.
 #
-# Turning this into a box that yields a usable, SSH-able Guix guest needs a
-# declarative provisioning hook in boxman (push an operating-system
-# declaration, run `guix system reconfigure`). That is tracked separately.
+# Turning this into a box that yields a usable, SSH-able Guix guest does not
+# strictly need an in-guest reconfigure hook: `guix system image
+# --image-type=qcow2` can build a qcow2 from an operating-system declaration
+# that already includes openssh-service-type and authorized keys. The boxman
+# gaps are dynamic key injection, image build/import, and the guest-agent
+# assumptions in template verification. Tracked separately.
 #
 version: '1.0'
 project: boxman_dev_guix-1.5.0-iso-boot

@@ -1,20 +1,25 @@
 # Example: boot a VM directly from the NixOS 25.05 minimal installer ISO
 #
-# Why this is an ISO-boot box and not a cloud-init template box: NixOS
-# publishes no generic cloud qcow2, and no official NixOS image ships with
-# cloud-init enabled. boxman's `templates:` path always builds a NoCloud seed
-# and then waits for cloud-init plus the qemu guest agent, so a NixOS image put
-# through it would simply time out and never receive an SSH key. The honest
-# shape for NixOS today is therefore the same one talos-iso-boot and
-# ubuntu-24.04-live-iso-boot use: a bare VM with the ISO attached.
+# Why this is an ISO-boot box and not a cloud-init template box: the artifact
+# pinned here is the minimal *installer* ISO, a live installer that does not
+# consume boxman's NoCloud seed and creates no user to inject a key into.
+#
+# That is a property of this artifact, not of NixOS. NixOS supports cloud-init
+# (services.cloud-init.enable) and its official proxmoxImage job builds a disk
+# image with cloud-init, sshd and the qemu guest agent enabled. What NixOS does
+# not publish is a *generic* cloud qcow2 that `templates:` could point at, so a
+# template box would first have to build or import one -- see #149. Until then
+# this takes the same shape as talos-iso-boot and ubuntu-24.04-live-iso-boot:
+# a bare VM with the ISO attached.
 #
 # What this box does NOT do: install NixOS, create a user, or configure SSH.
 # It boots you to the installer's console shell. Finishing the install is
 # manual (or driven from outside by nixos-anywhere) — see README.md.
 #
 # Turning this into a box that yields a usable, SSH-able NixOS guest needs a
-# declarative provisioning hook in boxman (push a configuration.nix, run
-# nixos-rebuild switch). That is tracked separately, not worked around here.
+# cloud-init-enabled NixOS image for `templates:` to clone -- built with
+# nixos-generators or modelled on upstream's proxmoxImage -- not necessarily
+# an in-guest rebuild hook. Tracked separately, not worked around here.
 #
 version: '1.0'
 project: boxman_dev_nixos-25.05-iso-boot

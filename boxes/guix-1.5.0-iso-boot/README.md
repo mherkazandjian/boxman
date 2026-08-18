@@ -25,19 +25,31 @@ correct outcome here, not a fault.)
 As with the NixOS box, that is the current limit of the tooling rather than an
 oversight:
 
-- Guix System has **no cloud image and no cloud-init**. GNU does publish a
-  bootable `guix-system-vm-image-1.5.0.x86_64-linux.qcow2`, but it is a GNOME
-  desktop *demo* image with a fixed user — there is nothing in it that consumes
-  an injected SSH key.
+- Guix System has **no native cloud-init**, so boxman's NoCloud seed — the
+  mechanism it uses to inject a key at provision time — has nothing to
+  consume it. GNU does publish a bootable
+  `guix-system-vm-image-1.5.0.x86_64-linux.qcow2`, but it is a GNOME desktop
+  *demo* image with a fixed user.
+- That does **not** mean an SSH-able Guix image is impossible. `guix system
+  image --image-type=qcow2` builds one from an `operating-system`
+  declaration, and that declaration can include `openssh-service-type` with
+  authorized keys baked in ahead of time.
 - boxman's `templates:` path **always** builds a NoCloud seed and then waits on
   cloud-init plus the qemu guest agent
   (`providers/libvirt/cloudinit.py`). Either Guix artifact pushed through it
   would time out and never receive a key.
 
-Getting to a usable, SSH-able Guix guest needs a declarative provisioning hook
-in boxman — push an `operating-system` declaration and run
-`guix system reconfigure` — which does not exist yet. Until then, finishing the
-install is done in the guest console.
+So the real boxman gaps for Guix are narrower than "no cloud-init": **dynamic
+key injection** (boxman generates a keypair at provision time, which a
+prebuilt image cannot know in advance), **image build/import** (boxman has no
+way to build a `guix system image` or consume one as a template), and the
+**guest-agent assumptions** in the template verification phase. A
+declaratively prebuilt image with your own key already in it sidesteps the
+first of those, at the cost of the image no longer being a signed upstream
+artifact. See #149.
+
+Until this box ships such an image, finishing the install is done in the guest
+console.
 
 ## About the checksum
 
