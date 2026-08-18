@@ -124,6 +124,38 @@ def test_strip_yaml_comment_preserves_hashes_inside_scalars():
         "key: a#value ")
 
 
+def test_strip_yaml_comment_honours_double_quoted_backslash_escapes():
+    # the escaped quote does not close the scalar, so the '#' after it is
+    # still inside the string and must survive
+    assert checker.strip_yaml_comment('key: "a \\" # b" # comment') == (
+        'key: "a \\" # b" ')
+
+
+def test_strip_yaml_comment_honours_single_quoted_doubled_quotes():
+    # YAML escapes a single quote by doubling it; '' must not read as a
+    # close followed by a re-open
+    assert checker.strip_yaml_comment("key: 'it''s # fine' # comment") == (
+        "key: 'it''s # fine' ")
+
+
+def test_configured_libvirt_use_sudo_skips_lines_that_are_not_keys():
+    # a sequence item under the block must not be mistaken for a mapping
+    # key, and must not derail the scan for the key that follows it
+    text = (
+        "providers:\n"
+        "  libvirt:\n"
+        "    - not-a-key\n"
+        "    use_sudo: true\n"
+    )
+    assert checker.configured_libvirt_use_sudo(text, default=False) is True
+
+
+def test_configured_libvirt_use_sudo_falls_back_when_key_is_absent():
+    text = "providers:\n  libvirt:\n    uri: qemu:///system\n"
+    assert checker.configured_libvirt_use_sudo(text, default=True) is True
+    assert checker.configured_libvirt_use_sudo(text, default=False) is False
+
+
 # --------------------------------------------------------------------------- #
 # install_cmd                                                                 #
 # --------------------------------------------------------------------------- #
@@ -232,6 +264,67 @@ def test_doctor_omits_sysprep_from_fix_when_use_sudo_is_false(monkeypatch):
     assert "virt-sysprep" not in result.detail
     assert "virt-sysprep" not in result.fix.description
     assert "qemu-img" in result.fix.description
+
+
+def test_doctor_reports_virt_sysprep_among_the_covered_commands(monkeypatch):
+    doctor = _minimal_doctor_for_check()
+    doctor.use_sudo = True
+    policy = (
+        "(root) NOPASSWD: /usr/bin/virsh, /usr/bin/virt-sysprep, "
+        "/usr/bin/qemu-img, /usr/sbin/iptables, /usr/bin/rm\n"
+    )
+    monkeypatch.setattr(checker, "have", lambda command: command == "sudo")
+    monkeypatch.setattr(checker, "run_capture", lambda args: (0, policy))
+
+    doctor._check_sudo_rights()
+
+    result = doctor.results[-1]
+    assert result.status == checker.OK
+    assert "virt-sysprep" in result.detail
+    assert result.fix is None
+
+
+@pytest.mark.parametrize("use_sudo, expected", [(True, True), (False, False)])
+def test_doctor_sudoers_template_tracks_the_configured_sudo_mode(
+    monkeypatch, use_sudo, expected
+):
+    # with no passwordless sudo at all the checker prints a ready-made
+    # sudoers line; it must list virt-sysprep only when libvirt actually
+    # runs through sudo, or the advice grants a right boxman never uses
+    doctor = _minimal_doctor_for_check()
+    doctor.use_sudo = use_sudo
+    monkeypatch.setattr(checker, "have", lambda command: command == "sudo")
+    monkeypatch.setattr(checker, "run_capture", lambda args: (1, ""))
+    monkeypatch.setattr(checker, "user_group_names", lambda: (set(), "tester"))
+
+    doctor._check_sudo_rights()
+
+    result = doctor.results[-1]
+    assert result.status == checker.WARN
+    assert "passwordless sudo not available" in result.detail
+    assert "tester ALL=(root) NOPASSWD:" in result.fix.description
+    assert "/usr/bin/virsh" in result.fix.description
+    assert ("/usr/bin/virt-sysprep" in result.fix.description) is expected
+
+
+def test_doctor_reads_libvirt_use_sudo_from_the_app_config(monkeypatch, tmp_path):
+    config_dir = tmp_path / ".config" / "boxman"
+    config_dir.mkdir(parents=True)
+    (config_dir / "boxman.yml").write_text(
+        "providers:\n  libvirt:\n    use_sudo: true\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    doctor = checker.Doctor.__new__(checker.Doctor)
+    assert doctor._detect_libvirt_use_sudo() is True
+
+
+def test_doctor_assumes_no_libvirt_sudo_without_an_app_config(monkeypatch, tmp_path):
+    # a first run has no ~/.config/boxman/boxman.yml at all; that must read
+    # as "not using sudo" rather than raising out of the checker
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    doctor = checker.Doctor.__new__(checker.Doctor)
+    assert doctor._detect_libvirt_use_sudo() is False
 
 
 def _minimal_doctor_for_check():
