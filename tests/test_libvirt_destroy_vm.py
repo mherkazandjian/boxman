@@ -221,7 +221,11 @@ class TestForceUndefine:
             assert dv.force_undefine_vm() is True
         undefines = [args for args, _ in calls if args[0] == "undefine"]
         assert len(undefines) == 2
-        assert undefines[1] == ("undefine", "vm01", "--snapshots-metadata")
+        # --managed-save rides along on the fallback too: libvirt refuses to
+        # undefine a domain that has a managed save image, which is exactly
+        # the state a suspended or memory-snapshotted VM is left in
+        assert undefines[1] == ("undefine", "vm01", "--snapshots-metadata",
+                                "--managed-save")
         # rich form ran with warn=True so its failure could be handled
         rich_kwargs = [kw for args, kw in calls
                        if args[0] == "undefine"
@@ -291,3 +295,51 @@ class TestRemove:
         assert not any(c.startswith("snapshot-delete") for c in commands)
         assert any("--snapshots-metadata" in c.args
                    for c in execute.call_args_list)
+
+
+class TestManagedSaveBlocksUndefine:
+    """A managed save image makes libvirt refuse to undefine.
+
+    boxman creates managed save images itself (suspend, and snapshots taken
+    with memory state), so any VM that was ever suspended or snapshotted
+    survived `destroy` -- while destroy still reported success. Observed as:
+    `error: Refusing to undefine while domain managed save image exists`.
+    """
+
+    def test_force_undefine_passes_managed_save(self, dv: DestroyVM):
+        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
+             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv.virsh, "execute",
+                          return_value=_result()) as execute:
+            assert dv.force_undefine_vm() is True
+        args = execute.call_args_list[0].args
+        assert "--managed-save" in args
+
+    def test_plain_undefine_passes_managed_save(self, dv: DestroyVM):
+        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
+             patch.object(dv.virsh, "execute", return_value=_result()) as execute:
+            assert dv.undefine_vm() is True
+        assert "--managed-save" in execute.call_args_list[0].args
+
+    def test_fallback_also_clears_the_managed_save(self, dv: DestroyVM):
+        # the storage-removal form is not idempotent, so the fallback is the
+        # path a real destroy usually takes -- it needs the flag too
+        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
+             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(
+                 dv.virsh, "execute",
+                 side_effect=[_result(ok=False, stderr="not managed by libvirt"),
+                              _result()]) as execute:
+            assert dv.force_undefine_vm() is True
+        assert "--managed-save" in execute.call_args_list[1].args
+
+    def test_a_failing_fallback_is_reported_not_swallowed(self, dv: DestroyVM):
+        # destroy used to exit 0 while leaving the domain defined; the whole
+        # point is that this surfaces
+        with patch.object(dv, "is_vm_defined", return_value=True), \
+             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(
+                 dv.virsh, "execute",
+                 side_effect=[_result(ok=False, stderr="storage gone"),
+                              _result(ok=False, stderr="still refusing")]):
+            assert dv.force_undefine_vm() is False
