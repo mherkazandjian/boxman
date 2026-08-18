@@ -293,6 +293,28 @@ class TestBridgeModeDefinition:
         with pytest.raises(ConfigError, match="could not read administrative state"):
             net.define_network(str(tmp_path / "unknown-bridge.xml"))
 
+    @pytest.mark.parametrize("stdout", [
+        "not-a-number",   # a runtime that answers, but not with the flags
+        "",               # an empty read
+        None,             # no stdout at all on the result object
+    ])
+    def test_unparseable_bridge_flags_are_rejected(self, tmp_path, stdout):
+        # a successful `cat` whose payload is not an integer must fail the
+        # same way an unreadable one does. Guessing "probably up" here would
+        # hand libvirt a bridge that cannot carry traffic
+        net = self._net(tmp_path)
+        net.virsh.execute_shell = MagicMock(side_effect=[
+            _result(),
+            _result(stdout=stdout),
+        ])
+        net.virsh.execute = MagicMock()
+
+        with pytest.raises(ConfigError,
+                           match="could not read administrative state"):
+            net.define_network(str(tmp_path / "bad-flags.xml"))
+
+        net.virsh.execute.assert_not_called()
+
     @pytest.mark.parametrize("uri", [
         "qemu+ssh://hypervisor.example/system",
         "qemu://localhost/system",
@@ -441,6 +463,82 @@ class TestBridgeModeDefinition:
         net.remove_route_iptables_rule.assert_not_called()
 
 
+class TestDefineNetworkRollbackDiagnostics:
+    """A rollback that cannot finish must say so, step by step.
+
+    ``define_network`` unwinds route rules, ``net-destroy`` and
+    ``net-undefine`` when bring-up fails. Each of those can fail in turn,
+    and the warnings are the only place an operator learns which pieces of
+    the half-built network were left on the host — the return value is a
+    bare ``False`` either way.
+    """
+
+    @staticmethod
+    def _routed_net():
+        manager = MagicMock()
+        manager.config = {"project": "p1"}
+        manager._runtime_name = "local"
+        manager.cache.projects = {"p1": {"runtime": "local"}}
+        with patch.object(Network, "find_available_bridge_name",
+                          return_value="virbr9"):
+            net = Network("managed-net", {"mode": "route"},
+                          provider_config={"use_sudo": False}, manager=manager)
+        net._get_libvirt_bridges = MagicMock(return_value=set())
+        net.check_network_exists = MagicMock()
+        net.apply_route_iptables_rule = MagicMock(return_value=True)
+        # bring-up itself succeeds; the cache write is what fails, so the
+        # rollback runs with all three steps armed
+        net.update_network_cache = MagicMock(
+            side_effect=OSError("projects.json is read-only"))
+        net.logger = MagicMock()
+        return net
+
+    def test_failed_rollback_steps_are_each_warned_about(self, tmp_path):
+        net = self._routed_net()
+        net.remove_route_iptables_rule = MagicMock(return_value=False)
+        net.virsh.execute = MagicMock(
+            side_effect=lambda command, *a, **k: _result(
+                ok=command not in ("net-destroy", "net-undefine")))
+
+        assert net.define_network(str(tmp_path / "managed.xml")) is False
+
+        warnings = [c.args[0] for c in net.logger.warning.call_args_list]
+        assert any("could not remove route isolation rules" in w
+                   for w in warnings)
+        assert any("could not stop the partially defined network" in w
+                   for w in warnings)
+        assert any("could not undefine the partially defined network" in w
+                   for w in warnings)
+
+    def test_raising_rollback_steps_report_their_cause(self, tmp_path):
+        # a rollback step that raises must not abort the remaining steps:
+        # failing to drop the iptables rules is no reason to leave the
+        # network defined as well
+        net = self._routed_net()
+        net.remove_route_iptables_rule = MagicMock(
+            side_effect=RuntimeError("iptables lock held"))
+
+        def execute(command, *_args, **_kwargs):
+            if command in ("net-destroy", "net-undefine"):
+                raise RuntimeError(f"{command} refused")
+            return _result()
+
+        net.virsh.execute = MagicMock(side_effect=execute)
+
+        assert net.define_network(str(tmp_path / "managed.xml")) is False
+
+        warnings = [c.args[0] for c in net.logger.warning.call_args_list]
+        assert any("iptables lock held" in w for w in warnings)
+        assert any("net-destroy refused" in w for w in warnings)
+        assert any("net-undefine refused" in w for w in warnings)
+        # every step was still attempted
+        attempted = [c.args[0] for c in net.virsh.execute.call_args_list]
+        assert attempted == [
+            "net-define", "net-start", "net-autostart",
+            "net-destroy", "net-undefine",
+        ]
+
+
 class TestBridgeModeManagedOwnerDiagnostic:
 
     @staticmethod
@@ -483,6 +581,47 @@ class TestBridgeModeManagedOwnerDiagnostic:
         net._log_bridge_mode_managed_owner()
 
         net._listed_networks.assert_not_called()
+
+    def test_unlistable_networks_are_reported_instead_of_dumped(self):
+        # this is a diagnostic, so libvirt being unreachable is a note, not
+        # a failure — but it must not silently read as "no owners found"
+        net = self._net()
+        net.logger = MagicMock()
+        net.logger.isEnabledFor.return_value = True
+        net._listed_networks = MagicMock(return_value=None)
+        net.virsh.execute = MagicMock()
+
+        net._log_bridge_mode_managed_owner()
+
+        net.virsh.execute.assert_not_called()
+        assert "could not inspect ownership" in net.logger.debug.call_args.args[0]
+
+    def test_unreadable_and_malformed_definitions_are_skipped(self):
+        # one bad definition among many must not hide the owner that the
+        # operator actually needs to know about
+        net = self._net()
+        net.logger = MagicMock()
+        net.logger.isEnabledFor.return_value = True
+        net._listed_networks = MagicMock(
+            return_value=["vanished", "truncated", "nat-owner"])
+        responses = {
+            # disappeared between net-list and net-dumpxml
+            "vanished": _result(ok=False, stderr="no such network"),
+            # well-formed enough to reach the parser, not enough to parse
+            "truncated": _result(stdout="<network><forward mode='nat'"),
+            "nat-owner": _result(stdout=(
+                "<network><forward mode='nat'/>"
+                "<bridge name='br-migrate'/></network>")),
+        }
+        net.virsh.execute = MagicMock(
+            side_effect=lambda _cmd, name, **_kwargs: responses[name])
+
+        net._log_bridge_mode_managed_owner()
+
+        message = net.logger.debug.call_args.args[0]
+        assert "nat-owner (nat)" in message
+        assert "vanished" not in message
+        assert "truncated" not in message
 
 
 class TestDhcpReservations:
@@ -900,45 +1039,267 @@ class TestNatIsLibvirtdsJob:
         shell.assert_not_called()
 
 
-class TestRouteIsolationRules:
-    """The routed-network isolation rules stay; sudo is execute_shell's call."""
+class TestCacheSurvivesADestroyedProject:
+    """`destroy` unregisters the project; a later define must still work.
+
+    Redefining through the reconcile path used to raise a bare KeyError on
+    the project name. It surfaced as the opaque "Error defining network:
+    '<project>'", the network was never created, and the VMs then failed to
+    start with "Network not found".
+    """
 
     @staticmethod
-    def _net(use_sudo: bool = False) -> Network:
+    def _net(projects: dict) -> Network:
+        manager = MagicMock()
+        manager.config = {"project": "gone"}
+        manager.config_path = "/tmp/some/conf.yml"
+        manager._runtime_name = "local"
+        manager.cache.projects = projects
         with patch.object(Network, "find_available_bridge_name",
                           return_value="virbr9"):
-            return Network(name="routed-net", info={"mode": "route"},
-                           assign_new_bridge=True,
-                           provider_config={"use_sudo": use_sudo})
+            return Network("net1", {"mode": "nat"},
+                           provider_config={"use_sudo": False},
+                           manager=manager)
 
-    def test_apply_commands_embed_no_sudo(self):
-        net = self._net()
-        seen = []
-        with patch.object(
-                net, "_ensure_rule",
-                side_effect=lambda cls, chk, act, present=True:
-                    seen.append((chk, act)) or True):
-            assert net.apply_route_iptables_rule() is True
-        # the three isolation rules (vm-to-vm, vm->host, host->vm) survive
-        assert len(seen) == 3
-        for check_cmd, action_cmd in seen:
-            assert not check_cmd.startswith("sudo")
-            assert not action_cmd.startswith("sudo")
-            assert "virbr9" in check_cmd
+    def test_missing_project_is_re_registered_instead_of_raising(self):
+        projects: dict = {}
+        net = self._net(projects)
+        net.update_network_cache()
+        assert "gone" in projects
+        assert projects["gone"]["networks"]["net1"]["bridge_name"] == "virbr9"
 
-    def test_remove_commands_embed_no_sudo(self):
+    def test_re_registered_entry_is_well_formed(self):
+        # other code reads conf/runtime off the entry, so a bare {} would be
+        # a different kind of landmine
+        projects: dict = {}
+        self._net(projects).update_network_cache()
+        assert projects["gone"]["conf"] == "/tmp/some/conf.yml"
+        assert projects["gone"]["runtime"] == "local"
+
+    def test_an_existing_project_entry_is_preserved(self):
+        projects = {"gone": {"conf": "/orig.yml", "runtime": "local",
+                             "networks": {"other": {"bridge_name": "virbr1"}}}}
+        self._net(projects).update_network_cache()
+        assert projects["gone"]["conf"] == "/orig.yml"
+        assert "other" in projects["gone"]["networks"]
+        assert "net1" in projects["gone"]["networks"]
+
+
+class TestIsolationOfAnUndefinedNetwork:
+    """A network that does not exist is not an isolation failure.
+
+    Reporting one adds a misleading second error on top of whatever actually
+    failed to define the network.
+    """
+
+    @staticmethod
+    def _net() -> Network:
+        with patch.object(Network, "get_bridge_from_network", return_value=None):
+            return Network("ghost-net", {"mode": "route"},
+                           assign_new_bridge=False,
+                           provider_config={"use_sudo": False})
+
+    def test_undefined_network_reports_absent(self):
         net = self._net()
-        seen = []
-        with patch.object(
-                net, "_ensure_rule",
-                side_effect=lambda cls, chk, act, present=True:
-                    seen.append((chk, act, present)) or True):
-            assert net.remove_route_iptables_rule() is True
-        assert len(seen) == 3
-        for check_cmd, action_cmd, present in seen:
-            assert present is False
-            assert not check_cmd.startswith("sudo")
-            assert not action_cmd.startswith("sudo")
+        with patch.object(Network, "list_networks", return_value=["other-net"]):
+            assert net.reconcile_isolation() == 'absent'
+
+    def test_defined_but_bridgeless_network_is_still_a_failure(self):
+        net = self._net()
+        with patch.object(Network, "list_networks", return_value=["ghost-net"]):
+            assert net.reconcile_isolation() == 'failed'
+
+
+class TestRoutedDhcpOptionTrimming:
+    """A routed network must not advertise what it then blocks.
+
+    dnsmasq offers the bridge address as both gateway (option 3) and resolver
+    (option 6), but the isolation rules drop traffic to it. The router option
+    is the damaging one: it installs a default route at metric 0, outranking
+    the guest's real NIC and black-holing all of its traffic. An empty
+    ``dhcp-option=N`` makes dnsmasq omit the option entirely.
+    """
+
+    DNSMASQ_NS = {'dnsmasq': 'http://libvirt.org/schemas/network/dnsmasq/1.0'}
+
+    @staticmethod
+    def _xml(mode: str, with_dhcp: bool = True) -> str:
+        info: dict = {"mode": mode, "bridge": {"name": "virbr9"}}
+        if mode != 'bridge':
+            info["ip"] = {"address": "10.0.14.1", "netmask": "255.255.255.0"}
+            if with_dhcp:
+                info["ip"]["dhcp"] = {"range": {"start": "10.0.14.2",
+                                                "end": "10.0.14.254"}}
+        return Network("t", info, assign_new_bridge=True,
+                       provider_config={"use_sudo": False}).generate_xml()
+
+    def _options(self, xml: str) -> list[str]:
+        root = ET.fromstring(xml)  # must stay well-formed with the namespace
+        block = root.find('dnsmasq:options', self.DNSMASQ_NS)
+        if block is None:
+            return []
+        return [o.get('value')
+                for o in block.findall('dnsmasq:option', self.DNSMASQ_NS)]
+
+    def test_routed_dhcp_network_suppresses_router_and_dns(self):
+        assert sorted(self._options(self._xml('route'))) == [
+            'dhcp-option=3', 'dhcp-option=6']
+
+    def test_routed_network_without_dhcp_declares_nothing(self):
+        # nothing is handed out, so there is no offer to trim
+        assert self._options(self._xml('route', with_dhcp=False)) == []
+
+    @pytest.mark.parametrize("mode", ["nat", "bridge"])
+    def test_other_modes_are_untouched(self, mode):
+        # only route mode installs the host<->guest block, so only route mode
+        # advertises a gateway the guest cannot reach
+        xml = self._xml(mode)
+        assert self._options(xml) == []
+        assert 'dnsmasq' not in xml
+
+    def test_namespace_is_only_declared_when_used(self):
+        assert 'xmlns:dnsmasq' in self._xml('route')
+        assert 'xmlns:dnsmasq' not in self._xml('route', with_dhcp=False)
+
+    def test_reservations_alone_also_trim_the_offer(self):
+        info = {"mode": "route", "bridge": {"name": "virbr9"},
+                "ip": {"address": "10.0.14.1", "netmask": "255.255.255.0",
+                       "dhcp": {"hosts": [{"mac": "52:54:00:0c:01:01",
+                                           "ip": "10.0.14.10"}]}}}
+        xml = Network("t", info, assign_new_bridge=True,
+                      provider_config={"use_sudo": False}).generate_xml()
+        assert sorted(self._options(xml)) == ['dhcp-option=3', 'dhcp-option=6']
+
+
+class TestRouteIsolationChains:
+    """Routed-network isolation lives in a chain per direction.
+
+    Loose rules in INPUT/OUTPUT could not be reconciled safely: ``iptables
+    -I`` pushes to the top, so a DROP re-inserted after an ACCEPT ends up
+    above it and silently re-breaks DHCP. A chain is declarative -- flush and
+    refill -- so ordering is owned rather than inherited from insertion
+    history.
+    """
+
+    @staticmethod
+    def _net(with_dhcp: bool = True, bridge_name: str = "virbr9",
+             use_sudo: bool = False) -> Network:
+        info: dict = {"mode": "route", "bridge": {"name": bridge_name}}
+        if with_dhcp:
+            info["ip"] = {
+                "address": "10.0.14.1", "netmask": "255.255.255.0",
+                "dhcp": {"range": {"start": "10.0.14.2",
+                                   "end": "10.0.14.254"}},
+            }
+        return Network(name="routed-net", info=info, assign_new_bridge=True,
+                       provider_config={"use_sudo": use_sudo})
+
+    @staticmethod
+    def _record(net: Network, rules_present: bool = False):
+        """Stub execute_shell: `-C` probes report absent unless told otherwise."""
+        calls: list[str] = []
+
+        def run(command, *_args, **_kwargs):
+            calls.append(command)
+            if " -C " in f" {command} ":
+                return _result(ok=rules_present,
+                               return_code=0 if rules_present else 1)
+            return _result(ok=True, return_code=0)
+
+        net.virsh.execute_shell = MagicMock(side_effect=run)
+        return calls
+
+    def _apply(self, net: Network, rules_present: bool = False) -> list[str]:
+        calls = self._record(net, rules_present)
+        assert net.apply_route_iptables_rule() is True
+        return calls
+
+    def test_chain_is_created_flushed_and_hooked(self):
+        calls = self._apply(self._net())
+        for chain, hook, flag in (("BXM_ISO_I_virbr9", "INPUT", "-i"),
+                                  ("BXM_ISO_O_virbr9", "OUTPUT", "-o")):
+            assert f"iptables -N {chain}" in calls
+            assert f"iptables -F {chain}" in calls
+            assert f"iptables -I {hook} {flag} virbr9 -j {chain}" in calls
+
+    def test_accept_is_filled_before_drop(self):
+        # inside a chain the rules are appended, so this ordering is the whole
+        # point: an ACCEPT after the DROP would never be reached
+        calls = self._apply(self._net())
+        accept = calls.index("iptables -A BXM_ISO_I_virbr9 -p udp --dport 67 -j ACCEPT")
+        drop = calls.index("iptables -A BXM_ISO_I_virbr9 -j DROP")
+        assert accept < drop
+
+    def test_dhcp_ports_are_direction_specific(self):
+        calls = self._apply(self._net())
+        assert "iptables -A BXM_ISO_I_virbr9 -p udp --dport 67 -j ACCEPT" in calls
+        assert "iptables -A BXM_ISO_O_virbr9 -p udp --dport 68 -j ACCEPT" in calls
+
+    def test_no_dhcp_hole_without_a_dhcp_block(self):
+        # a routed network that hands out nothing keeps the unconditional
+        # host<->guest block it has always had, so this stays additive
+        calls = self._apply(self._net(with_dhcp=False))
+        # the chain is filled with the DROP alone. (Legacy `-D ... --dport`
+        # cleanup commands may still appear -- those remove an exception, they
+        # do not add one.)
+        assert not any(c.startswith("iptables -A") and "--dport" in c
+                       for c in calls)
+        assert "iptables -A BXM_ISO_I_virbr9 -j DROP" in calls
+
+    def test_reservations_alone_also_open_the_hole(self):
+        # `dhcp: hosts` with no range is valid libvirt -- every guest pinned
+        info = {
+            "mode": "route", "bridge": {"name": "virbr9"},
+            "ip": {"address": "10.0.14.1", "netmask": "255.255.255.0",
+                   "dhcp": {"hosts": [{"mac": "52:54:00:0c:01:01",
+                                       "ip": "10.0.14.10"}]}},
+        }
+        net = Network("routed-net", info, assign_new_bridge=True,
+                      provider_config={"use_sudo": False})
+        assert any("--dport 67" in c for c in self._apply(net))
+
+    def test_vm_to_vm_forward_rule_survives(self):
+        calls = self._apply(self._net())
+        assert ("iptables -I FORWARD -i virbr9 -o virbr9 -j ACCEPT") in calls
+
+    def test_legacy_loose_rules_are_migrated_away(self):
+        # hosts provisioned by an older boxman still carry the pre-chain
+        # rules; left in place they are dead weight at best
+        calls = self._apply(self._net(), rules_present=True)
+        assert "iptables -D INPUT -i virbr9 -j DROP" in calls
+        assert "iptables -D OUTPUT -o virbr9 -j DROP" in calls
+
+    def test_removal_unhooks_flushes_and_deletes(self):
+        net = self._net()
+        calls = self._record(net, rules_present=True)
+        assert net.remove_route_iptables_rule() is True
+        for chain, hook, flag in (("BXM_ISO_I_virbr9", "INPUT", "-i"),
+                                  ("BXM_ISO_O_virbr9", "OUTPUT", "-o")):
+            assert f"iptables -D {hook} {flag} virbr9 -j {chain}" in calls
+            assert f"iptables -F {chain}" in calls
+            assert f"iptables -X {chain}" in calls
+
+    def test_chain_name_is_sanitised_not_quoted(self):
+        # the chain name is an iptables identifier, not an argument, so it is
+        # sanitised; the bridge name in the match IS quoted
+        net = self._net(bridge_name="br-a.b")
+        calls = self._apply(net)
+        assert any("BXM_ISO_I_br_a_b" in c for c in calls)
+        assert not any("BXM_ISO_I_br-a.b" in c for c in calls)
+
+    def test_bridge_name_with_metacharacters_is_quoted(self):
+        net = self._net(bridge_name="virbr 9;touch /tmp/x")
+        calls = self._apply(net)
+        matches = [c for c in calls if "-i " in c or "-o " in c]
+        assert matches
+        for cmd in matches:
+            assert "'virbr 9;touch /tmp/x'" in cmd
+
+    def test_a_plain_bridge_name_is_left_unquoted(self):
+        # shlex.quote leaves a shell-safe name untouched, so existing command
+        # strings stay byte-identical
+        calls = self._apply(self._net())
+        assert not any("'" in c for c in calls)
 
     @pytest.mark.parametrize("use_sudo, expected_prefix", [
         (False, "iptables"),
@@ -953,60 +1314,63 @@ class TestRouteIsolationRules:
         assert run.call_args.args[0].startswith(expected_prefix)
 
 
-class TestShellQuoting:
-    """Config-derived values interpolated into shell strings are quoted.
+class TestRouteIsolationDrift:
+    """Isolation is host iptables state, so it does not survive a reboot.
 
-    Regression tests for issue #85 item 6 (net.py part): the bridge name
-    comes from the configuration and used to land in the iptables command
-    strings verbatim.
+    libvirt autostarts the network again regardless, so without a reconcile
+    the network comes back up unprotected and stays that way. Detecting that
+    is what separates "already fine" from "was open, now repaired".
     """
 
     @staticmethod
-    def _net(bridge_name: str) -> Network:
+    def _net(mode: str = "route") -> Network:
         return Network(name="routed-net",
-                       info={"mode": "route", "bridge": {"name": bridge_name}},
+                       info={"mode": mode, "bridge": {"name": "virbr9"}},
                        assign_new_bridge=True,
                        provider_config={"use_sudo": False})
 
-    def test_apply_quotes_a_bridge_name_with_metacharacters(self):
-        net = self._net("virbr 9;touch /tmp/x")
-        seen = []
-        with patch.object(
-                net, "_ensure_rule",
-                side_effect=lambda cls, chk, act, present=True:
-                    seen.append((chk, act)) or True):
-            assert net.apply_route_iptables_rule() is True
-        assert seen
-        for check_cmd, action_cmd in seen:
-            assert "'virbr 9;touch /tmp/x'" in check_cmd
-            assert "'virbr 9;touch /tmp/x'" in action_cmd
+    def test_intact_when_both_jumps_are_present(self):
+        net = self._net()
+        net.virsh.execute_shell = MagicMock(return_value=_result(return_code=0))
+        assert net._isolation_is_intact() is True
 
-    def test_remove_quotes_a_bridge_name_with_metacharacters(self):
-        net = self._net("virbr 9;touch /tmp/x")
-        seen = []
-        with patch.object(
-                net, "_ensure_rule",
-                side_effect=lambda cls, chk, act, present=True:
-                    seen.append((chk, act)) or True):
-            assert net.remove_route_iptables_rule() is True
-        assert seen
-        for check_cmd, action_cmd in seen:
-            assert "'virbr 9;touch /tmp/x'" in check_cmd
-            assert "'virbr 9;touch /tmp/x'" in action_cmd
+    def test_not_intact_when_a_jump_is_missing(self):
+        net = self._net()
+        net.virsh.execute_shell = MagicMock(
+            return_value=_result(ok=False, return_code=1))
+        assert net._isolation_is_intact() is False
 
-    def test_a_plain_bridge_name_is_left_unquoted(self):
-        net = self._net("virbr9")
-        seen = []
-        with patch.object(
-                net, "_ensure_rule",
-                side_effect=lambda cls, chk, act, present=True:
-                    seen.append(chk) or True):
-            assert net.apply_route_iptables_rule() is True
-        assert seen
-        for check_cmd in seen:
-            # shlex.quote leaves a shell-safe name untouched
-            assert "virbr9" in check_cmd
-            assert "'" not in check_cmd
+    def test_reconcile_reports_repaired_when_rules_had_vanished(self):
+        net = self._net()
+        net._isolation_is_intact = MagicMock(return_value=False)
+        net.apply_route_iptables_rule = MagicMock(return_value=True)
+        assert net.reconcile_isolation() == 'repaired'
+        net.apply_route_iptables_rule.assert_called_once_with()
+
+    def test_reconcile_reports_ok_when_nothing_had_drifted(self):
+        net = self._net()
+        net._isolation_is_intact = MagicMock(return_value=True)
+        net.apply_route_iptables_rule = MagicMock(return_value=True)
+        assert net.reconcile_isolation() == 'ok'
+
+    def test_check_only_reports_drift_without_touching_anything(self):
+        net = self._net()
+        net._isolation_is_intact = MagicMock(return_value=False)
+        net.apply_route_iptables_rule = MagicMock()
+        assert net.reconcile_isolation(check_only=True) == 'drifted'
+        net.apply_route_iptables_rule.assert_not_called()
+
+    def test_failure_to_apply_is_reported(self):
+        net = self._net()
+        net._isolation_is_intact = MagicMock(return_value=False)
+        net.apply_route_iptables_rule = MagicMock(return_value=False)
+        assert net.reconcile_isolation() == 'failed'
+
+    def test_non_routed_networks_are_skipped(self):
+        net = self._net(mode="nat")
+        net.virsh.execute_shell = MagicMock()
+        assert net.reconcile_isolation() == 'skipped'
+        net.virsh.execute_shell.assert_not_called()
 
 
 class TestXmlEscaping:

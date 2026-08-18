@@ -1,5 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<network>
+{%- set has_dhcp = (dhcp_range_start and dhcp_range_end) or dhcp_hosts %}
+{#- A routed network is isolated from the host by firewall rules, so the
+    gateway and resolver dnsmasq would advertise (DHCP options 3 and 6, both
+    the bridge address) are unreachable by construction. Handing them out is
+    actively harmful: the router option installs a default route at metric 0,
+    which outranks the guest's real NIC and black-holes all of its traffic.
+    An empty `dhcp-option=N` tells dnsmasq to omit that option entirely, so
+    the guest gets an address and a netmask and nothing it cannot use. #}
+{%- set trim_dhcp_options = (forward_mode == 'route') and has_dhcp %}
+<network{% if trim_dhcp_options %} xmlns:dnsmasq='http://libvirt.org/schemas/network/dnsmasq/1.0'{% endif %}>
   {# the environment has no autoescape, so every config-derived value is
      escaped explicitly -- a name holding an & or a quote would otherwise
      produce XML that libvirt rejects at net-define #}
@@ -28,4 +37,10 @@
   {% endif %}
   </ip>
 {% endif %}
+{%- if trim_dhcp_options %}
+  <dnsmasq:options>
+    <dnsmasq:option value='dhcp-option=3'/>
+    <dnsmasq:option value='dhcp-option=6'/>
+  </dnsmasq:options>
+{%- endif %}
 </network>

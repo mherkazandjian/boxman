@@ -150,7 +150,62 @@ class NetworksMixin:
                         allow_recreate=allow_recreate,
                         auto_accept=auto_accept)
 
+        # Isolation rules are host iptables state, not libvirt state, so they
+        # do not survive a reboot or a manual flush while the network itself
+        # autostarts happily without them. Re-assert them on every reconcile
+        # rather than only at define time.
+        self._reconcile_network_isolation(dry_run=dry_run)
+
         return results
+
+    def _reconcile_network_isolation(self, dry_run: bool = False) -> None:
+        """
+        Re-apply the host isolation of every routed network in the config.
+
+        Reported rather than done silently: a routed network that lost its
+        rules has been reachable from the host, and from the guests' point of
+        view unisolated, for however long it was up. That is worth a warning
+        even though it is being fixed here and now.
+        """
+        if not hasattr(self.provider, 'reconcile_network_isolation'):
+            return
+
+        for cluster_name, cluster in self.config['clusters'].items():
+            for network_name, network_info in (cluster.get('networks') or {}).items():
+                if (network_info or {}).get('mode') != 'route':
+                    continue
+                label = f"{cluster_name}/{network_name}"
+                full_name = self.full_network_name(
+                    project_config=self.config,
+                    cluster_name=cluster_name,
+                    network_name=network_name)
+                try:
+                    outcome = self.provider.reconcile_network_isolation(
+                        name=full_name, info=network_info,
+                        check_only=dry_run)
+                except Exception as exc:
+                    self.logger.error(
+                        f"network {label}: could not check isolation rules: {exc}")
+                    continue
+
+                if outcome == 'absent':
+                    # the network is not defined; its own failure was already
+                    # reported by the define path
+                    self.logger.debug(
+                        f"network {label}: not defined, isolation not applicable")
+                elif outcome == 'repaired':
+                    self.logger.warning(
+                        f"network {label}: isolation rules were missing and "
+                        f"have been re-applied. A routed network is left "
+                        f"unprotected between a host reboot and the next "
+                        f"boxman run.")
+                elif outcome == 'drifted':
+                    self.logger.warning(
+                        f"[dry-run] network {label}: isolation rules are "
+                        f"missing; they would be re-applied.")
+                elif outcome == 'failed':
+                    self.logger.error(
+                        f"network {label}: could not apply isolation rules")
 
     def report_network_results(self, results: dict[str, str]) -> None:
         """

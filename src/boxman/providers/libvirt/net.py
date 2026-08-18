@@ -734,6 +734,25 @@ class Network:
         previous_projects = copy.deepcopy(self.manager.cache.projects)
         projects_in_cache = self.manager.cache.projects
         project_name = self.manager.config['project']
+
+        # `destroy` unregisters the project, so a later define that arrives
+        # through the reconcile path rather than a full provision used to
+        # KeyError here. The exception was swallowed as "Error defining
+        # network: '<project>'", the network was never created, and the VMs
+        # then failed to start with "Network not found". Re-register instead.
+        if project_name not in projects_in_cache:
+            self.logger.debug(
+                f"project {project_name} is not in the cache, re-registering "
+                f"it while defining network {self.name}")
+            entry: dict[str, Any] = {}
+            conf_path = getattr(self.manager, 'config_path', None)
+            if conf_path:
+                entry['conf'] = os.path.abspath(os.path.expanduser(conf_path))
+            runtime_name = getattr(self.manager, '_runtime_name', None)
+            if runtime_name:
+                entry['runtime'] = runtime_name
+            projects_in_cache[project_name] = entry
+
         project_cache = projects_in_cache[project_name]
 
         if 'networks' not in project_cache:
@@ -1213,8 +1232,11 @@ class Network:
     def remove_route_iptables_rule(self) -> bool:
         """
         Remove the isolation rules inserted by apply_route_iptables_rule.
-        Executed during `remove_network`.  Follows the same check-then-execute
-        pattern used in apply_route_iptables_rule.
+
+        Executed during ``remove_network``. Tearing down a chain is
+        unhook-flush-delete, so there is no rule-by-rule bookkeeping to fall
+        out of step with the apply path. Legacy loose rules from older
+        versions are cleaned up too, so a host does not accumulate them.
         """
         if self.forward_mode != 'route':
             return True
@@ -1237,18 +1259,20 @@ class Network:
                     f"iptables -D FORWARD -i {br_name} -o {br_name} -j ACCEPT",
                     present=False):
                 return False
-            if not self._ensure_rule(
-                    self,
-                    f"iptables -C INPUT  -i {br_name} -j DROP",
-                    f"iptables -D INPUT  -i {br_name} -j DROP",
-                    present=False):
-                return False
-            if not self._ensure_rule(
-                    self,
-                    f"iptables -C OUTPUT -o {br_name} -j DROP",
-                    f"iptables -D OUTPUT -o {br_name} -j DROP",
-                    present=False):
-                return False
+
+            for chain, hook, iface_flag, _port in self._isolation_chain_specs():
+                if not self._ensure_rule(
+                        self,
+                        f"iptables -C {hook} {iface_flag} {br_name} -j {chain}",
+                        f"iptables -D {hook} {iface_flag} {br_name} -j {chain}",
+                        present=False):
+                    return False
+                # a chain must be empty before it can be deleted; both fail
+                # harmlessly when the chain was never created
+                self.virsh.execute_shell(f"iptables -F {chain}", warn=True)
+                self.virsh.execute_shell(f"iptables -X {chain}", warn=True)
+
+            self._remove_legacy_isolation_rules(br_name)
 
             self.logger.info(f"successfully removed isolation rules for routed network {self.name}")
             return True
@@ -1256,20 +1280,113 @@ class Network:
             self.logger.error(f"error removing route isolation rules: {exc}")
             return False
 
+    def _dhcp_is_declared(self) -> bool:
+        """
+        Whether this network hands out addresses itself.
+
+        Only a network that actually declares ``dhcp:`` needs the exception
+        below. One without it keeps the unconditional host<->guest block that
+        ``mode: route`` has always had, so this stays additive: nobody relying
+        on "routed means the guest cannot reach the host at all" is affected.
+        """
+        return bool((self.dhcp_range_start and self.dhcp_range_end)
+                    or self.dhcp_hosts)
+
+    def _isolation_chain_specs(self) -> list[tuple[str, str, str, int]]:
+        """
+        ``(chain, hook, iface_flag, dhcp_port)`` for this network's isolation.
+
+        The rules live in a chain of their own rather than loose in
+        INPUT/OUTPUT so that reconciling is "flush and refill in order"
+        instead of "insert and hope the ordering survived". That matters:
+        ``iptables -I`` pushes to the top, so a DROP re-inserted after an
+        ACCEPT silently ends up above it and re-breaks DHCP.
+
+        The chain name is sanitised rather than shell-quoted -- it is an
+        iptables identifier, not an argument -- and the prefix is kept short
+        because iptables caps chain names at 28 characters while an interface
+        name may be up to 15.
+        """
+        safe_bridge = re.sub(r'[^A-Za-z0-9_]', '_', self.bridge_name or '')
+        return [
+            (f"BXM_ISO_I_{safe_bridge}", 'INPUT', '-i', 67),
+            (f"BXM_ISO_O_{safe_bridge}", 'OUTPUT', '-o', 68),
+        ]
+
+    def _isolation_is_intact(self) -> bool:
+        """
+        Whether both isolation chains are still hooked into INPUT/OUTPUT.
+
+        These rules are in-memory host state, so a reboot or a manual flush
+        drops them while libvirt happily autostarts the network again. Used
+        to tell "already fine" from "was unprotected and has been repaired",
+        because the second case is worth telling the operator about.
+        """
+        bridge_name = shlex.quote(self.bridge_name)
+        for chain, hook, iface_flag, _port in self._isolation_chain_specs():
+            probe = self.virsh.execute_shell(
+                f"iptables -C {hook} {iface_flag} {bridge_name} -j {chain}",
+                warn=True)
+            if probe.return_code != 0:
+                return False
+        return True
+
+    def reconcile_isolation(self, check_only: bool = False) -> str:
+        """
+        Re-assert this network's isolation, reporting whether it had drifted.
+
+        Returns one of ``skipped`` (not a routed network), ``ok`` (rules were
+        already in place), ``drifted`` (missing, and *check_only* asked us not
+        to touch them), ``repaired`` or ``failed``.
+        """
+        if self.forward_mode != 'route':
+            return 'skipped'
+        if not self.bridge_name:
+            # No bridge usually means the network is not defined at all -- a
+            # define that failed earlier, say. That is already reported by
+            # whatever failed; calling it an isolation failure here only adds
+            # a misleading second error to an existing one.
+            if self.name not in (self.list_networks(
+                    provider_config=self.provider_config) or []):
+                self.logger.debug(
+                    f"network {self.name}: not defined, nothing to isolate")
+                return 'absent'
+            self.logger.warning(
+                f"network {self.name}: no bridge name, cannot check isolation")
+            return 'failed'
+
+        intact = self._isolation_is_intact()
+        if check_only:
+            return 'ok' if intact else 'drifted'
+        if not self.apply_route_iptables_rule():
+            return 'failed'
+        return 'ok' if intact else 'repaired'
+
     def apply_route_iptables_rule(self) -> bool:
         """
         Apply iptables rules for truly isolated routed networks.
 
-        This method configures iptables to:
+        Guests on the bridge may talk to each other; host and guests may not
+        talk at all -- except for DHCP, when the network declares a ``dhcp:``
+        block of its own. That exception is required rather than optional:
+        DHCP terminates *on the host* (libvirt runs dnsmasq bound to the
+        bridge address), so it travels INPUT and OUTPUT, exactly the chains
+        this isolates. Without the hole a routed network can never hand out
+        the addresses it advertises.
 
-            - allow vm-to-vm communication on the same bridge
-            - block all traffic between host and guests in both directions
+        Idempotent, and safe to run repeatedly -- it is the reconcile path as
+        well as the create path.
 
         Returns:
             True if successful, False otherwise
         """
         if self.forward_mode != 'route':
             return True  # Nothing to do for non-route networks
+
+        if not self.bridge_name:
+            self.logger.error(
+                f"network {self.name}: no bridge name, cannot isolate")
+            return False
 
         try:
             # shlex.quote: the bridge name comes from the config and is
@@ -1286,17 +1403,42 @@ class Network:
             if not self._ensure_rule(self, vm2vm_check, vm2vm_cmd):
                 return False
 
-            # 2. block all traffic from the VMs to the host
-            host2vm_check = f"iptables -C INPUT -i {bridge_name} -j DROP"
-            host2vm_cmd   = f"iptables -I INPUT -i {bridge_name} -j DROP"
-            if not self._ensure_rule(self, host2vm_check, host2vm_cmd):
-                return False
+            # 2. host<->guest block, held in a chain per direction
+            for chain, hook, iface_flag, dhcp_port in self._isolation_chain_specs():
+                # -N fails harmlessly when the chain is already there
+                self.virsh.execute_shell(f"iptables -N {chain}", warn=True)
 
-            # 3. block all traffic from host to the VMs
-            vm2host_check = f"iptables -C OUTPUT -o {bridge_name} -j DROP"
-            vm2host_cmd   = f"iptables -I OUTPUT -o {bridge_name} -j DROP"
-            if not self._ensure_rule(self, vm2host_check, vm2host_cmd):
-                return False
+                # flush and refill: the contents are declarative, so drift in
+                # ordering or leftovers from an older boxman cannot survive
+                if not self.virsh.execute_shell(
+                        f"iptables -F {chain}", warn=True).ok:
+                    self.logger.error(f"could not flush {chain}")
+                    return False
+
+                if self._dhcp_is_declared():
+                    accept = self.virsh.execute_shell(
+                        f"iptables -A {chain} -p udp --dport {dhcp_port} "
+                        f"-j ACCEPT", warn=True)
+                    if not accept.ok:
+                        self.logger.error(
+                            f"could not add the dhcp exception to {chain}")
+                        return False
+
+                if not self.virsh.execute_shell(
+                        f"iptables -A {chain} -j DROP", warn=True).ok:
+                    self.logger.error(f"could not add the drop rule to {chain}")
+                    return False
+
+                if not self._ensure_rule(
+                        self,
+                        f"iptables -C {hook} {iface_flag} {bridge_name} -j {chain}",
+                        f"iptables -I {hook} {iface_flag} {bridge_name} -j {chain}"):
+                    return False
+
+            # 3. drop the loose rules older boxman versions inserted straight
+            # into INPUT/OUTPUT. Left behind they are dead weight at best and,
+            # if one ever lands above the jump, an unreachable-DHCP bug again
+            self._remove_legacy_isolation_rules(bridge_name)
 
             self.logger.info(f"successfully applied complete isolation for routed network {self.name}")
             return True
@@ -1304,6 +1446,25 @@ class Network:
         except Exception as exc:
             self.logger.error(f"error applying route isolation rules: {exc}")
             return False
+
+    def _remove_legacy_isolation_rules(self, bridge_name: str) -> None:
+        """
+        Delete the pre-chain isolation rules, if this host still carries them.
+
+        Best-effort: a host that never ran an older boxman simply has nothing
+        to delete, and ``-C`` failing is the normal case rather than an error.
+        """
+        legacy = [
+            f"INPUT -i {bridge_name} -j DROP",
+            f"OUTPUT -o {bridge_name} -j DROP",
+            f"INPUT -i {bridge_name} -p udp --dport 67 -j ACCEPT",
+            f"OUTPUT -o {bridge_name} -p udp --dport 68 -j ACCEPT",
+        ]
+        for spec in legacy:
+            self._ensure_rule(self,
+                              f"iptables -C {spec}",
+                              f"iptables -D {spec}",
+                              present=False)
 
     @staticmethod
     def get_bridge_from_network(network_name: str,
