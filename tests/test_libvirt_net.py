@@ -1171,6 +1171,15 @@ class TestRoutedDhcpOptionTrimming:
         assert sorted(self._options(xml)) == ['dhcp-option=3', 'dhcp-option=6']
 
 
+TRIMMED_XML = (
+    "<network><dnsmasq:options>"
+    "<dnsmasq:option value='dhcp-option=3'/>"
+    "<dnsmasq:option value='dhcp-option=6'/>"
+    "</dnsmasq:options></network>"
+)
+UNTRIMMED_XML = "<network><forward mode='route'/></network>"
+
+
 class TestRouteIsolationChains:
     """Routed-network isolation lives in a chain per direction.
 
@@ -1195,22 +1204,34 @@ class TestRouteIsolationChains:
                        provider_config={"use_sudo": use_sudo})
 
     @staticmethod
-    def _record(net: Network, rules_present: bool = False):
-        """Stub execute_shell: `-C` probes report absent unless told otherwise."""
+    def _record(net: Network, rules_present: bool = False,
+                trimmed: bool = True, chain_rules: list | None = None):
+        """Stub both executors and record every iptables command."""
         calls: list[str] = []
 
-        def run(command, *_args, **_kwargs):
+        def shell(command, *_args, **_kwargs):
             calls.append(command)
+            if command.startswith("iptables -S "):
+                if chain_rules is None:
+                    return _result(ok=False, return_code=1)
+                return _result(stdout="\n".join(chain_rules))
             if " -C " in f" {command} ":
                 return _result(ok=rules_present,
                                return_code=0 if rules_present else 1)
             return _result(ok=True, return_code=0)
 
-        net.virsh.execute_shell = MagicMock(side_effect=run)
+        def execute(cmd, *_args, **_kwargs):
+            if cmd == "net-dumpxml":
+                return _result(
+                    stdout=TRIMMED_XML if trimmed else UNTRIMMED_XML)
+            return _result()
+
+        net.virsh.execute_shell = MagicMock(side_effect=shell)
+        net.virsh.execute = MagicMock(side_effect=execute)
         return calls
 
-    def _apply(self, net: Network, rules_present: bool = False) -> list[str]:
-        calls = self._record(net, rules_present)
+    def _apply(self, net: Network, **kwargs) -> list[str]:
+        calls = self._record(net, **kwargs)
         assert net.apply_route_iptables_rule() is True
         return calls
 
@@ -1223,8 +1244,6 @@ class TestRouteIsolationChains:
             assert f"iptables -I {hook} {flag} virbr9 -j {chain}" in calls
 
     def test_accept_is_filled_before_drop(self):
-        # inside a chain the rules are appended, so this ordering is the whole
-        # point: an ACCEPT after the DROP would never be reached
         calls = self._apply(self._net())
         accept = calls.index("iptables -A BXM_ISO_I_virbr9 -p udp --dport 67 -j ACCEPT")
         drop = calls.index("iptables -A BXM_ISO_I_virbr9 -j DROP")
@@ -1236,18 +1255,23 @@ class TestRouteIsolationChains:
         assert "iptables -A BXM_ISO_O_virbr9 -p udp --dport 68 -j ACCEPT" in calls
 
     def test_no_dhcp_hole_without_a_dhcp_block(self):
-        # a routed network that hands out nothing keeps the unconditional
-        # host<->guest block it has always had, so this stays additive
         calls = self._apply(self._net(with_dhcp=False))
-        # the chain is filled with the DROP alone. (Legacy `-D ... --dport`
-        # cleanup commands may still appear -- those remove an exception, they
-        # do not add one.)
+        assert not any(c.startswith("iptables -A") and "--dport" in c
+                       for c in calls)
+        assert "iptables -A BXM_ISO_I_virbr9 -j DROP" in calls
+
+    def test_hole_stays_shut_until_the_live_offer_is_trimmed(self):
+        # an upgrade must not open DHCP on a network whose dnsmasq still
+        # advertises the bridge as router and DNS: the resulting lease
+        # installs a metric-0 default route to an unreachable gateway and
+        # black-holes the guest. Such a network plans as `action: none`, so
+        # nothing else would stop this.
+        calls = self._apply(self._net(), trimmed=False)
         assert not any(c.startswith("iptables -A") and "--dport" in c
                        for c in calls)
         assert "iptables -A BXM_ISO_I_virbr9 -j DROP" in calls
 
     def test_reservations_alone_also_open_the_hole(self):
-        # `dhcp: hosts` with no range is valid libvirt -- every guest pinned
         info = {
             "mode": "route", "bridge": {"name": "virbr9"},
             "ip": {"address": "10.0.14.1", "netmask": "255.255.255.0",
@@ -1263,25 +1287,64 @@ class TestRouteIsolationChains:
         assert ("iptables -I FORWARD -i virbr9 -o virbr9 -j ACCEPT") in calls
 
     def test_legacy_loose_rules_are_migrated_away(self):
-        # hosts provisioned by an older boxman still carry the pre-chain
-        # rules; left in place they are dead weight at best
         calls = self._apply(self._net(), rules_present=True)
         assert "iptables -D INPUT -i virbr9 -j DROP" in calls
         assert "iptables -D OUTPUT -o virbr9 -j DROP" in calls
 
     def test_removal_unhooks_flushes_and_deletes(self):
         net = self._net()
-        calls = self._record(net, rules_present=True)
+        calls = self._record(net, rules_present=False,
+                             chain_rules=["-A BXM_ISO_I_virbr9 -j DROP"])
         assert net.remove_route_iptables_rule() is True
-        for chain, hook, flag in (("BXM_ISO_I_virbr9", "INPUT", "-i"),
-                                  ("BXM_ISO_O_virbr9", "OUTPUT", "-o")):
-            assert f"iptables -D {hook} {flag} virbr9 -j {chain}" in calls
+        for chain in ("BXM_ISO_I_virbr9", "BXM_ISO_O_virbr9"):
             assert f"iptables -F {chain}" in calls
             assert f"iptables -X {chain}" in calls
 
+    def test_removal_deletes_every_duplicate_hook(self):
+        # -D removes ONE match; a duplicated jump would keep the chain
+        # referenced and make -X fail, while teardown still reported success
+        net = self._net()
+        seen: list[str] = []
+        remaining = {"INPUT": 3, "OUTPUT": 1}
+
+        def shell(command, *_a, **_k):
+            seen.append(command)
+            if command.startswith("iptables -S "):
+                return _result(stdout="-A chain -j DROP")
+            for hook in remaining:
+                if f" -C {hook} " in command and "BXM_ISO" in command:
+                    return _result(ok=remaining[hook] > 0,
+                                   return_code=0 if remaining[hook] > 0 else 1)
+                if f" -D {hook} " in command and "BXM_ISO" in command:
+                    remaining[hook] -= 1
+                    return _result(ok=True, return_code=0)
+            if " -C " in f" {command} ":
+                return _result(ok=False, return_code=1)
+            return _result(ok=True, return_code=0)
+
+        net.virsh.execute_shell = MagicMock(side_effect=shell)
+        net.virsh.execute = MagicMock(return_value=_result(stdout=TRIMMED_XML))
+        assert net.remove_route_iptables_rule() is True
+        assert remaining == {"INPUT": 0, "OUTPUT": 0}
+
+    def test_removal_fails_loudly_when_the_chain_cannot_be_deleted(self):
+        net = self._net()
+
+        def shell(command, *_a, **_k):
+            if command.startswith("iptables -S "):
+                return _result(stdout="-A BXM_ISO_I_virbr9 -j DROP")
+            if command.startswith("iptables -X "):
+                return _result(ok=False, return_code=1,
+                               stderr="chain is still referenced")
+            if " -C " in f" {command} ":
+                return _result(ok=False, return_code=1)
+            return _result(ok=True, return_code=0)
+
+        net.virsh.execute_shell = MagicMock(side_effect=shell)
+        net.virsh.execute = MagicMock(return_value=_result(stdout=TRIMMED_XML))
+        assert net.remove_route_iptables_rule() is False
+
     def test_chain_name_is_sanitised_not_quoted(self):
-        # the chain name is an iptables identifier, not an argument, so it is
-        # sanitised; the bridge name in the match IS quoted
         net = self._net(bridge_name="br-a.b")
         calls = self._apply(net)
         assert any("BXM_ISO_I_br_a_b" in c for c in calls)
@@ -1296,8 +1359,6 @@ class TestRouteIsolationChains:
             assert "'virbr 9;touch /tmp/x'" in cmd
 
     def test_a_plain_bridge_name_is_left_unquoted(self):
-        # shlex.quote leaves a shell-safe name untouched, so existing command
-        # strings stay byte-identical
         calls = self._apply(self._net())
         assert not any("'" in c for c in calls)
 
@@ -1312,6 +1373,72 @@ class TestRouteIsolationChains:
                    return_value=_result()) as run:
             net.virsh.execute_shell("iptables -C INPUT -i virbr9 -j DROP", warn=True)
         assert run.call_args.args[0].startswith(expected_prefix)
+
+
+class TestIsolationContentsAreChecked:
+    """A hooked chain is not necessarily an isolating one.
+
+    A chain that is still jumped to but empty, or that lost its terminal
+    DROP, returns from the user chain and stops isolating anything -- while a
+    jump-only probe reports everything fine and a reconcile returns 'ok'
+    instead of 'repaired', hiding the exposure.
+    """
+
+    @staticmethod
+    def _net(with_dhcp: bool = True) -> Network:
+        info: dict = {"mode": "route", "bridge": {"name": "virbr9"}}
+        if with_dhcp:
+            info["ip"] = {"address": "10.0.14.1", "netmask": "255.255.255.0",
+                          "dhcp": {"range": {"start": "10.0.14.2",
+                                             "end": "10.0.14.254"}}}
+        return Network("routed-net", info, assign_new_bridge=True,
+                       provider_config={"use_sudo": False})
+
+    @staticmethod
+    def _probe(net: Network, chain_rules: list, trimmed: bool = True):
+        def shell(command, *_a, **_k):
+            if command.startswith("iptables -S "):
+                chain = command.split()[-1]
+                port = 67 if chain.startswith("BXM_ISO_I_") else 68
+                rules = [r.replace("CHAIN", chain).replace("PORT", str(port))
+                         for r in chain_rules]
+                return _result(stdout="\n".join(rules))
+            if " -C " in f" {command} ":
+                return _result(ok=True, return_code=0)   # jump present
+            return _result(ok=True, return_code=0)
+        net.virsh.execute_shell = MagicMock(side_effect=shell)
+        net.virsh.execute = MagicMock(return_value=_result(
+            stdout=TRIMMED_XML if trimmed else UNTRIMMED_XML))
+        return net._isolation_is_intact()
+
+    def test_correct_contents_are_intact(self):
+        assert self._probe(self._net(), [
+            "-A CHAIN -p udp -m udp --dport PORT -j ACCEPT",
+            "-A CHAIN -j DROP"]) is True
+
+    def test_empty_chain_is_not_intact(self):
+        # hooked but empty: traffic returns from the user chain unfiltered
+        assert self._probe(self._net(), []) is False
+
+    def test_missing_terminal_drop_is_not_intact(self):
+        assert self._probe(self._net(), [
+            "-A CHAIN -p udp -m udp --dport PORT -j ACCEPT"]) is False
+
+    def test_unexpected_dhcp_hole_is_not_intact(self):
+        # no dhcp declared, so an ACCEPT here is drift, not correctness
+        assert self._probe(self._net(with_dhcp=False), [
+            "-A CHAIN -p udp -m udp --dport PORT -j ACCEPT",
+            "-A CHAIN -j DROP"]) is False
+
+    def test_missing_expected_hole_is_not_intact(self):
+        assert self._probe(self._net(), [
+            "-A CHAIN -j DROP"]) is False
+
+    def test_untrimmed_offer_expects_no_hole(self):
+        # while the live offer is untrimmed the hole must NOT be present,
+        # so a drop-only chain is the correct state
+        assert self._probe(self._net(), [
+            "-A CHAIN -j DROP"], trimmed=False) is True
 
 
 class TestRouteIsolationDrift:
@@ -1329,10 +1456,13 @@ class TestRouteIsolationDrift:
                        assign_new_bridge=True,
                        provider_config={"use_sudo": False})
 
-    def test_intact_when_both_jumps_are_present(self):
+    def test_a_present_jump_alone_is_not_enough(self):
+        # the jump can be there while the chain is empty, which isolates
+        # nothing; contents are checked in TestIsolationContentsAreChecked
         net = self._net()
         net.virsh.execute_shell = MagicMock(return_value=_result(return_code=0))
-        assert net._isolation_is_intact() is True
+        net.virsh.execute = MagicMock(return_value=_result(stdout=""))
+        assert net._isolation_is_intact() is False
 
     def test_not_intact_when_a_jump_is_missing(self):
         net = self._net()

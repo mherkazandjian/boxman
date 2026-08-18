@@ -154,11 +154,17 @@ class NetworksMixin:
         # do not survive a reboot or a manual flush while the network itself
         # autostarts happily without them. Re-assert them on every reconcile
         # rather than only at define time.
-        self._reconcile_network_isolation(dry_run=dry_run)
+        for full_name, outcome in self._reconcile_network_isolation(
+                dry_run=dry_run).items():
+            # an unisolated routed network is a failed network: without this
+            # `up` exits 0 while the guests can reach the host
+            if outcome == 'failed':
+                results[full_name] = 'failed'
 
         return results
 
-    def _reconcile_network_isolation(self, dry_run: bool = False) -> None:
+    def _reconcile_network_isolation(
+            self, dry_run: bool = False) -> dict[str, str]:
         """
         Re-apply the host isolation of every routed network in the config.
 
@@ -167,8 +173,9 @@ class NetworksMixin:
         view unisolated, for however long it was up. That is worth a warning
         even though it is being fixed here and now.
         """
+        outcomes: dict[str, str] = {}
         if not hasattr(self.provider, 'reconcile_network_isolation'):
-            return
+            return outcomes
 
         for cluster_name, cluster in self.config['clusters'].items():
             for network_name, network_info in (cluster.get('networks') or {}).items():
@@ -186,7 +193,9 @@ class NetworksMixin:
                 except Exception as exc:
                     self.logger.error(
                         f"network {label}: could not check isolation rules: {exc}")
+                    outcomes[full_name] = 'failed'
                     continue
+                outcomes[full_name] = outcome
 
                 if outcome == 'absent':
                     # the network is not defined; its own failure was already
@@ -206,6 +215,8 @@ class NetworksMixin:
                 elif outcome == 'failed':
                     self.logger.error(
                         f"network {label}: could not apply isolation rules")
+
+        return outcomes
 
     def report_network_results(self, results: dict[str, str]) -> None:
         """

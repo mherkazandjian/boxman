@@ -1261,16 +1261,35 @@ class Network:
                 return False
 
             for chain, hook, iface_flag, _port in self._isolation_chain_specs():
-                if not self._ensure_rule(
-                        self,
-                        f"iptables -C {hook} {iface_flag} {br_name} -j {chain}",
-                        f"iptables -D {hook} {iface_flag} {br_name} -j {chain}",
-                        present=False):
+                # -D removes ONE match, so a duplicated jump would survive and
+                # keep the chain referenced, making -X fail. Loop until the
+                # hook is genuinely gone; bounded so a persistently failing
+                # delete cannot spin forever.
+                check = f"iptables -C {hook} {iface_flag} {br_name} -j {chain}"
+                for _ in range(16):
+                    if self.virsh.execute_shell(
+                            check, warn=True).return_code != 0:
+                        break
+                    if not self.virsh.execute_shell(
+                            f"iptables -D {hook} {iface_flag} {br_name} "
+                            f"-j {chain}", warn=True).ok:
+                        break
+                if self.virsh.execute_shell(check, warn=True).return_code == 0:
+                    self.logger.error(
+                        f"could not unhook {chain} from {hook}")
                     return False
-                # a chain must be empty before it can be deleted; both fail
-                # harmlessly when the chain was never created
-                self.virsh.execute_shell(f"iptables -F {chain}", warn=True)
-                self.virsh.execute_shell(f"iptables -X {chain}", warn=True)
+
+                # nothing to flush or delete if the chain was never created
+                if self._chain_rules(chain) is None:
+                    continue
+                if not self.virsh.execute_shell(
+                        f"iptables -F {chain}", warn=True).ok:
+                    self.logger.error(f"could not flush {chain}")
+                    return False
+                if not self.virsh.execute_shell(
+                        f"iptables -X {chain}", warn=True).ok:
+                    self.logger.error(f"could not delete {chain}")
+                    return False
 
             self._remove_legacy_isolation_rules(br_name)
 
@@ -1313,21 +1332,77 @@ class Network:
             (f"BXM_ISO_O_{safe_bridge}", 'OUTPUT', '-o', 68),
         ]
 
+    def _dhcp_offer_is_trimmed(self) -> bool:
+        """
+        Whether the *live* network suppresses dhcp options 3 and 6.
+
+        Opening the firewall for DHCP is only safe once dnsmasq has stopped
+        advertising the bridge as router and resolver, because both are
+        unreachable behind the isolation and the router option installs a
+        default route at metric 0 that black-holes the guest's traffic.
+
+        A network defined before that template change plans as ``action:
+        none`` -- ``parse_network_xml`` does not model these options -- so it
+        would otherwise keep the old offer while this code opened the hole,
+        producing exactly the breakage the trimming exists to prevent. Read
+        the live definition rather than assuming it matches the template.
+        """
+        dump = self.virsh.execute(
+            "net-dumpxml", self.name, hide=True, warn=True)
+        if not dump.ok or not dump.stdout:
+            return False
+        return "dhcp-option=3" in dump.stdout and "dhcp-option=6" in dump.stdout
+
+    def _dhcp_hole_wanted(self) -> bool:
+        """Whether this run should punch the DHCP exception."""
+        if not self._dhcp_is_declared():
+            return False
+        if not self._dhcp_offer_is_trimmed():
+            self.logger.warning(
+                f"network {self.name}: keeping DHCP blocked because the live "
+                f"definition still advertises a router and DNS server that "
+                f"this network's isolation makes unreachable. Recreate the "
+                f"network (boxman up --recreate-networks) to pick up the "
+                f"trimmed offer, after which DHCP will be allowed.")
+            return False
+        return True
+
+    def _chain_rules(self, chain: str) -> list[str] | None:
+        """``iptables -S`` for *chain*, or None when it does not exist."""
+        listed = self.virsh.execute_shell(f"iptables -S {chain}", warn=True)
+        if not listed.ok:
+            return None
+        return [line.strip() for line in (listed.stdout or "").splitlines()
+                if line.strip().startswith("-A ")]
+
     def _isolation_is_intact(self) -> bool:
         """
-        Whether both isolation chains are still hooked into INPUT/OUTPUT.
+        Whether the isolation is both hooked *and* correct.
 
-        These rules are in-memory host state, so a reboot or a manual flush
-        drops them while libvirt happily autostarts the network again. Used
-        to tell "already fine" from "was unprotected and has been repaired",
-        because the second case is worth telling the operator about.
+        Checking only the jump is not enough: a chain that is still hooked but
+        empty, or that lost its terminal DROP, returns from the user chain and
+        the traffic is no longer isolated at all -- while a jump-only probe
+        happily reports everything fine. So verify the contents too: a
+        terminal DROP, and the DHCP exception above it exactly when this run
+        would install one.
         """
         bridge_name = shlex.quote(self.bridge_name)
-        for chain, hook, iface_flag, _port in self._isolation_chain_specs():
+        want_hole = self._dhcp_hole_wanted()
+        for chain, hook, iface_flag, port in self._isolation_chain_specs():
             probe = self.virsh.execute_shell(
                 f"iptables -C {hook} {iface_flag} {bridge_name} -j {chain}",
                 warn=True)
             if probe.return_code != 0:
+                return False
+
+            rules = self._chain_rules(chain)
+            if not rules:
+                return False
+            if not rules[-1].endswith("-j DROP"):
+                return False
+            has_hole = any(f"--dport {port}" in rule and rule.endswith("-j ACCEPT")
+                           for rule in rules[:-1])
+            if has_hole != want_hole:
                 return False
         return True
 
@@ -1335,9 +1410,16 @@ class Network:
         """
         Re-assert this network's isolation, reporting whether it had drifted.
 
-        Returns one of ``skipped`` (not a routed network), ``ok`` (rules were
-        already in place), ``drifted`` (missing, and *check_only* asked us not
-        to touch them), ``repaired`` or ``failed``.
+        Returns one of:
+
+        ``skipped``  not a routed network, nothing to isolate
+        ``absent``   the network is not defined, so there is nothing to
+                     isolate and its own failure is reported elsewhere
+        ``ok``       rules were already in place and correct
+        ``drifted``  rules were missing or wrong and *check_only* asked us
+                     not to touch them
+        ``repaired`` rules were missing or wrong and have been re-applied
+        ``failed``   the rules could not be applied
         """
         if self.forward_mode != 'route':
             return 'skipped'
@@ -1415,7 +1497,7 @@ class Network:
                     self.logger.error(f"could not flush {chain}")
                     return False
 
-                if self._dhcp_is_declared():
+                if self._dhcp_hole_wanted():
                     accept = self.virsh.execute_shell(
                         f"iptables -A {chain} -p udp --dport {dhcp_port} "
                         f"-j ACCEPT", warn=True)
