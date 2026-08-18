@@ -1,0 +1,222 @@
+---
+# Arch Linux (rolling) from the official cloud image.
+#
+# Unlike the Ubuntu/Rocky boxes, the upstream image here MOVES: Arch publishes a
+# new cloud image roughly every two weeks and prunes the dated directories after
+# a handful of releases. The uri below is the *dated* path rather than
+# images/latest/, so the checksum stays valid — but expect it to 404 eventually
+# and to need a refresh. Pick the newest entry from
+# https://geo.mirror.pkgbuild.com/images/ and take its .SHA256 file.
+#
+# The same rolling property is why this template does a full `pacman -Syu`
+# (package_upgrade) rather than only refreshing the database: Arch does not
+# support partial upgrades, so installing a package against a stale image
+# without upgrading first is the one thing guaranteed to break.
+version: '1.0'
+project: boxman_dev_tiny-arch
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: True
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+    verbose: True
+
+templates:
+  template1:
+    name: arch-rolling-base-template-cloudinit
+    image:
+      uri: https://geo.mirror.pkgbuild.com/images/v20260815.573966/Arch-Linux-x86_64-cloudimg-20260815.573966.qcow2
+      checksum: sha256:5d8be8d28cfd290f051b0f67df0a6874596ad23de3f3f18b90c91aeb758eb878
+    disk_size: 20G
+    os_variant: archlinux
+    memory: 4096
+    vcpus: 2
+    cloudinit_done_marker: /var/log/hello-cloudinit.log
+    # A first-boot `pacman -Syu` on a rolling distro can pull a lot more than
+    # the package list below, so the done-marker poll needs more room than the
+    # 120s default. The other three are boxman's defaults, shown for reference.
+    cloudinit_done_timeout: 600
+    #cloudinit_agent_timeout: 300        # wait for the qemu guest agent
+    #cloudinit_guest_exec_timeout: 120   # wait for guest-exec to be usable
+    #cloudinit_fallback_timeout: 180     # blind wait when the guest can't be polled
+    #
+    # Why this box overrides the network config instead of taking boxman's
+    # default: Arch has no netplan, so cloud-init renders network config with
+    # its systemd-networkd renderer -- and that renderer writes the ethernet
+    # KEY into `[Match] Name=`, discarding any `match: {name: "en*"}` glob.
+    # boxman's built-in default (cloudinit_presets.DEFAULT_NETWORK_CONFIG) is
+    # keyed `all-en` / `all-eth`, so on Arch it emits `Name=all-en`, which
+    # matches no interface. The guest then never gets an address,
+    # systemd-networkd-wait-online times out, cloud-final never starts, and the
+    # done marker is never written -- template creation fails after the full
+    # cloudinit_done_timeout. Keys here are therefore the real interface names;
+    # the Arch cloud image boots with net.ifnames=0, so they are eth0/eth1.
+    #
+    # eth1 is static on purpose. The second adapter of this box lands on the
+    # `isolated1` network, which is `mode: route` -- and boxman answers a routed
+    # network by installing "complete isolation" iptables rules for its bridge
+    # (Network.apply_route_iptables_rule): `INPUT -i <br> -j DROP` plus
+    # `OUTPUT -o <br> -j DROP`. libvirt's dnsmasq for that network runs *on the
+    # host*, so those two rules drop the DHCPDISCOVER on the way in and the
+    # DHCPOFFER on the way out: DHCP on an isolated network can never complete,
+    # no matter which distro is in the guest. Left on dhcp4, eth1 sits at
+    # "degraded (configuring)" forever with only a link-local address. The
+    # address below is inside isolated1's subnet and outside its (inert) DHCP
+    # range, so it also survives if the network is ever switched to nat.
+    cloudinit_network_config: |
+      version: 2
+      ethernets:
+        eth0:
+          dhcp4: true
+        eth1:
+          dhcp4: false
+          addresses:
+            - 10.0.14.101/24
+    cloudinit: |
+      #cloud-config
+      hostname: hello-cloudinit
+      manage_etc_hosts: true
+
+      users:
+        - name: arch
+          plain_text_passwd: arch
+          lock_passwd: false
+          groups: [wheel]
+          sudo: ALL=(ALL) NOPASSWD:ALL
+          shell: /bin/bash
+        - name: admin
+          plain_text_passwd: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+          lock_passwd: false
+          groups: [wheel]
+          sudo: ALL=(ALL) NOPASSWD:ALL
+          shell: /bin/bash
+          homedir: /admin
+
+      ssh_pwauth: true
+
+      # -Sy alone would leave a partially-upgraded system; on Arch the full
+      # upgrade is the safe option, not the thorough one
+      package_update: true
+      package_upgrade: true
+      packages:
+        - qemu-guest-agent
+        - openssh
+        - sudo
+        - vim
+        - curl
+        # not cosmetic: boxman verifies a freshly key-authenticated VM by
+        # running plain `hostname` over ssh and treating empty stdout as a
+        # failed login (manager_parts/ssh.py::_verify_ssh_connection). The Arch
+        # cloud image ships no /usr/bin/hostname -- only hostnamectl -- so
+        # without inetutils every attempt fails with
+        # "bash: line 1: hostname: command not found" and provisioning gives up
+        # after 10 retries even though ssh itself works perfectly.
+        - inetutils
+
+      growpart:
+        mode: auto
+        devices: ['/']
+
+      resize_rootfs: true
+
+      write_files:
+        - path: /etc/hello-from-cloudinit
+          permissions: "0644"
+          content: |
+            hello world from cloud-init (Arch Linux, rolling)
+        # Supplying our own `cloudinit:` block means we lose the equivalent
+        # drop-in from boxman's DEFAULT_USER_DATA preset. Without it a single
+        # configured-but-absent interface makes wait-online block the whole
+        # boot, which is exactly how this box failed the first time.
+        - path: /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf
+          permissions: "0644"
+          content: |
+            [Service]
+            ExecStart=
+            ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any
+
+      runcmd:
+        - systemctl daemon-reload
+        # Arch names the ssh unit sshd.service, not ssh.service
+        - systemctl enable --now sshd
+        - systemctl enable --now qemu-guest-agent
+        - systemctl restart systemd-networkd || true
+        - [ sh, -c, "mkdir -p /admin/.ssh && chmod 700 /admin/.ssh && chown -R admin:admin /admin/.ssh" ]
+        - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]
+
+workspace:
+  path: ~/workspaces/boxmandev/tiny-libvirt-arch-cloudinit
+
+clusters:
+  cluster_1:
+    base_image: arch-rolling-base-template-cloudinit
+    proxy_host: localhost
+    admin_user: admin
+    admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}
+    admin_key_name: id_ed25519_boxman    # generated automatically at provisioning time
+    ssh_config: ssh_config               # generated automatically at provisioning time
+
+    networks:
+      # Subnet choice is not arbitrary: boxman refuses to define a network whose
+      # gateway address is already claimed by another project, and on a busy
+      # host the low 192.168.x/24 range fills up fast (192.168.10-15 are taken
+      # by other boxman projects, and docker hands itself 192.168.16.0/20,
+      # 32.0/20, 48.0/20, 64.0/20, 96.0/20 and 144.0/20). 192.168.214.0/24 sits
+      # clear of both. If you ever see
+      #   ERROR: ip address ... is already used by network ... in project ...
+      # then pick another free /24 here rather than deleting the other project.
+      nat1:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:0a:01'
+        ip:
+          address: '192.168.214.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.214.2'
+              end: '192.168.214.254'
+        enable: True
+        autostart: True
+      isolated1:
+        mode: route
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:0a:02'
+        ip:
+          address: '10.0.14.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '10.0.14.2'
+              end: '10.0.14.254'
+        enable: True
+        autostart: True
+
+    vms:
+      boxman01:
+        hostname: boxman01
+        cpus:
+          sockets: 1
+          cores: 2
+          threads: 1
+        memory: 2048
+        disks:
+          - name: disk01
+            driver:
+              name: qemu
+              type: qcow2
+            target: vdb
+            size: 2048
+        network_adapters:
+          - name: adapter_1
+            link_state: 'up'
+            network_source: 'nat1'
+          - name: adapter_2
+            link_state: 'up'
+            network_source: 'isolated1'

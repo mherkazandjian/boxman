@@ -38,6 +38,8 @@ OS_VARIANT_TO_ID = {
     "ubuntu24.04": "ubuntu",
     "rocky9": "rocky",
     "centos7.0": "centos",
+    # libvirt/osinfo calls it archlinux; /etc/os-release says ID=arch
+    "archlinux": "arch",
 }
 
 # ---------------------------------------------------------------------------
@@ -60,11 +62,22 @@ def discover_boxes():
     ``create-templates`` fails and every parametrized test skips
     (issue #81). They are covered under the docker runtime by
     ``tests/test_lifecycle_e2e.py`` instead.
+
+    ISO-boot boxes (``*-iso-boot``) are excluded too, and for a more basic
+    reason: they have no ``templates:`` block and deliberately never
+    provision a login. They boot a distro from an installer/live ISO and
+    stop there, so there is no admin user, no injected key and no
+    ``ssh_config`` for the assertions below to use -- every test in this
+    class would fail on them by design rather than find a defect. What
+    they *do* need verifying (ISO downloaded and checksummed, CDROM
+    attached, boot order hd,cdrom) is documented per box in their README.
     """
     pattern = os.path.join(BOXES_DIR, "*/conf.yml")
+    excluded_suffixes = ("-docker-runtime", "-iso-boot")
     return sorted(
         os.path.dirname(p) for p in glob.glob(pattern)
-        if not os.path.basename(os.path.dirname(p)).endswith("-docker-runtime")
+        if not os.path.basename(
+            os.path.dirname(p)).endswith(excluded_suffixes)
     )
 
 
