@@ -1,12 +1,17 @@
 # Example: boot a VM directly from the Guix System 1.5.0 installer ISO
 #
-# Why this is an ISO-boot box and not a cloud-init template box: Guix System
-# has no cloud image and no cloud-init. GNU does publish a bootable qcow2
-# (guix-system-vm-image-1.5.0.x86_64-linux.qcow2), but it is a GNOME desktop
-# demo image, not a cloud image — it has a fixed user and no way to take an
-# injected SSH key. boxman's `templates:` path always builds a NoCloud seed and
-# then waits for cloud-init plus the qemu guest agent, so either Guix artifact
-# put through it would time out and never receive a key.
+# Why this is an ISO-boot box and not a cloud-init template box: the artifact
+# pinned here is the *installer* ISO, which creates no user and consumes no
+# NoCloud seed, so boxman has nothing to inject a key into.
+#
+# Guix also has no native cloud-init, so boxman's dynamic key injection -- it
+# generates a keypair at provision time and expects the guest to pick it up
+# from the seed -- has no mechanism to work through. That is a narrower claim
+# than "Guix cannot be SSH-able": `guix system image --image-type=qcow2`
+# builds a qcow2 from an operating-system declaration that can include
+# openssh-service-type with authorized keys already in it. The boxman gaps are
+# dynamic key injection, image build/import, and the guest-agent assumptions
+# in template verification -- see #149.
 #
 # So this box uses the same shape as talos-iso-boot and
 # ubuntu-24.04-live-iso-boot: a bare VM with the installer ISO attached. It

@@ -35,9 +35,10 @@ oversight:
   declaration, and that declaration can include `openssh-service-type` with
   authorized keys baked in ahead of time.
 - boxman's `templates:` path **always** builds a NoCloud seed and then waits on
-  cloud-init plus the qemu guest agent
-  (`providers/libvirt/cloudinit.py`). Either Guix artifact pushed through it
-  would time out and never receive a key.
+  cloud-init plus the qemu guest agent (`providers/libvirt/cloudinit.py`).
+  Neither published Guix artifact consumes that seed, so either would time out
+  and never receive a key. A qcow2 built with keys already declared in it would
+  boot fine — it just would not be receiving them *from boxman*.
 
 So the real boxman gaps for Guix are narrower than "no cloud-init": **dynamic
 key injection** (boxman generates a keypair at provision time, which a

@@ -35,9 +35,12 @@ That is not an oversight, it is the current limit of the tooling:
   could point `templates:` at — the installer ISO is the only artifact this
   box can pin without building one.
 - boxman's `templates:` path **always** builds a NoCloud seed and then waits on
-  cloud-init plus the qemu guest agent (`providers/libvirt/cloudinit.py`). A
-  NixOS image pushed through it would time out and never receive a key, so
-  using `templates:` here would produce a box that looks supported and isn't.
+  cloud-init plus the qemu guest agent (`providers/libvirt/cloudinit.py`).
+  Pushing *this installer ISO* through it would time out and never receive a
+  key, so using `templates:` here would produce a box that looks supported and
+  isn't. A cloud-init-enabled NixOS **disk image** would work through that path
+  normally — the gap is that this box has no such image to point at, not that
+  the path is unusable for NixOS.
 
 Getting from "boots" to "usable, SSH-able NixOS guest" does **not** require a
 `nixos-rebuild` hook in boxman. The straightforward route is a
