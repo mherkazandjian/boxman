@@ -369,6 +369,25 @@ class TestDiscardUnsafeClone:
         assert caught.value.sanitizer_error is sanitizer
         assert caught.value.cleanup_error == "domain is busy"
 
+    def test_cleanup_failure_without_a_sanitizer_cause_is_still_terminal(
+        self, clone: CloneVM
+    ):
+        # discard_unsafe_clone() is reachable without a sanitizer error to
+        # chain from. The cleanup failure must still raise rather than leave
+        # an unsafe clone behind under a quiet return
+        with patch.object(
+            clone.virsh,
+            "execute",
+            return_value=_result(ok=False, stderr="domain is busy"),
+        ):
+            with pytest.raises(CloneCleanupError) as caught:
+                clone.discard_unsafe_clone()
+        assert "machine identity reset failed" in str(caught.value)
+        assert "domain is busy" in str(caught.value)
+        assert "manual cleanup" in str(caught.value)
+        assert caught.value.sanitizer_error is None
+        assert caught.value.__cause__ is None
+
     def test_cleanup_executor_exception_preserves_both_failures(
         self, clone: CloneVM
     ):

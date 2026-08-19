@@ -3,10 +3,12 @@ Tests for the boxman update feature: VMStateDiffer, hot/cold CPU/memory,
 disk resize, and update orchestration logic.
 """
 
+import types
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.disk import DiskManager
 from boxman.providers.libvirt.virsh_edit import VirshEdit
 from boxman.providers.libvirt.vm_differ import VMStateDiffer
@@ -964,3 +966,61 @@ class TestMemballoonUpdateResult:
         result = result_queue.put.call_args.args[0][1]
         assert result['status'] == 'needs_restart'
         mgr.provider.configure_vm_memballoon.assert_not_called()
+
+
+def _needs_restart_update_worker(_self, _cluster_name, _cluster_cfg, vm_name,
+                                 _vm_info, result_queue, _dry_run=False):
+    """Stand-in for ``_update_single_vm`` reporting a pending restart."""
+    result_queue.put((vm_name, {
+        'status': 'needs_restart',
+        'details': ("memballoon live state: {'autodeflate': False} -> "
+                    "{'autodeflate': True} (restart required to apply "
+                    "memballoon changes)"),
+    }))
+
+
+class TestMemballoonUpdateSummary:
+    """A pending restart must survive into ``update``'s closing summary.
+
+    ``_update_single_vm`` reports ``needs_restart`` per VM, but that is only
+    actionable if the run-level summary repeats it. Folded into the plain
+    ``updated`` list, a memballoon change still waiting for a boot reads
+    exactly like one that already took effect.
+    """
+
+    def test_needs_restart_vms_are_called_out_in_the_summary(self, monkeypatch):
+        mgr = BoxmanManager.__new__(BoxmanManager)
+        mgr.config = {
+            'project': 'demo',
+            'clusters': {
+                'cluster_1': {
+                    'workdir': '/tmp/ws/c1',
+                    'vms': {'node01': {'memballoon': {'autodeflate': True}}},
+                },
+            },
+        }
+        mgr.provider = MagicMock()
+        mgr.logger = MagicMock()
+        full = 'bprj__demo__bprj_cluster_1_node01'
+        for name, replacement in (
+                ('_update_sessions_with_runtime', lambda self: None),
+                ('ensure_shared_bridges', lambda self: None),
+                ('reconcile_networks', lambda self, **kw: {}),
+                ('report_network_results', lambda self, r: None),
+                ('_find_all_existing_project_vms', lambda self: [full]),
+                ('setup_ssh_access', lambda self: None),
+                ('connect_info', lambda self: None),
+                ('_update_single_vm', _needs_restart_update_worker)):
+            monkeypatch.setattr(BoxmanManager, name, replacement)
+
+        mgr.update(types.SimpleNamespace(
+            dry_run=False, yes=True, recreate_networks=False))
+
+        warnings = [c.args[0] for c in mgr.logger.warning.call_args_list
+                    if c.args]
+        assert any(w.startswith('restart required:') and 'node01' in w
+                   for w in warnings)
+        assert any('node01' in w and 'memballoon' in w for w in warnings)
+        # and it must not also be reported as a finished update
+        infos = [c.args[0] for c in mgr.logger.info.call_args_list if c.args]
+        assert not any(m.startswith('updated:') for m in infos)

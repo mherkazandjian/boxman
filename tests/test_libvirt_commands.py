@@ -14,6 +14,8 @@ from __future__ import annotations
 import shlex
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from boxman.providers.libvirt.commands import (
     LibVirtCommandBase,
     VirshCommand,
@@ -116,6 +118,16 @@ class TestBuildCommandQuoting:
             "timeout", "--signal=TERM", "--kill-after=10s", "300s",
             "sudo", "-n", "virt-sysprep",
         ]
+
+    @pytest.mark.parametrize("bad", [0, -1, True, False, "300", 1.5, [300]])
+    def test_virt_sysprep_rejects_an_unusable_execution_timeout(self, bad):
+        # a bad value must not reach `timeout`, which would either reject it
+        # with a shell-level error or (for 0) run the sanitizer unbounded.
+        # bools are excluded explicitly: True would otherwise render as `1s`
+        from boxman.exceptions import ConfigError
+        v = VirtSysprepCommand()
+        with pytest.raises(ConfigError, match="positive integer"):
+            v.build_command(domain="vm01", execution_timeout=bad)
 
 
 class TestExecutePassesQuotedCommandToShell:

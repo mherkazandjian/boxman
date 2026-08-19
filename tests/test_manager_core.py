@@ -25,6 +25,7 @@ from unittest.mock import patch
 
 import pytest
 
+from boxman.exceptions import ConfigError
 from boxman.manager import BoxmanManager
 from boxman.providers import merge_provider_configs
 
@@ -573,3 +574,60 @@ class TestCloneAndConfigureNewVmsExitCodeGuard:
             m._clone_and_configure_new_vms(new_vm_names)
         # clone batch + configure batch
         assert par.call_count == 2
+
+
+class TestReconcileNetworksValidationFailures:
+    """One invalid network block fails that network, not the whole run.
+
+    ``plan_network`` rejects a block libvirt would refuse -- a bridge-mode
+    network with no ``bridge.name``, say -- and reconcile has to report it
+    against the network it came from and carry on: the sibling networks,
+    and every VM, may be perfectly fine.
+    """
+
+    @staticmethod
+    def _mgr_with_two_networks(tmp_path: Path):
+        from unittest.mock import MagicMock
+        with patch("boxman.manager.BoxmanCache"):
+            m = BoxmanManager()
+        m.config = {
+            'project': 'demo',
+            'clusters': {
+                'cluster_1': {
+                    'workdir': str(tmp_path),
+                    'networks': {
+                        'broken': {'mode': 'bridge'},
+                        'healthy': {'mode': 'nat'},
+                    },
+                },
+            },
+        }
+        m._provider = MagicMock()
+        m._provider.provider_config = {}
+        return m
+
+    @pytest.mark.parametrize("error", [
+        # schema rejection raised by the bridge-mode validator
+        ConfigError("mode 'bridge' requires an existing Linux bridge name"),
+        # the pre-existing dhcp-reservation rejection path
+        ValueError("reservation is outside the network"),
+    ])
+    def test_a_bad_block_fails_alone_and_the_rest_still_plans(
+        self, tmp_path: Path, error
+    ):
+        m = self._mgr_with_two_networks(tmp_path)
+
+        def plan_network(name, info):
+            if info.get('mode') == 'bridge':
+                raise error
+            return {'action': 'none'}
+
+        m._provider.plan_network.side_effect = plan_network
+
+        results = m.reconcile_networks()
+
+        # only the broken network is recorded, and only as a failure
+        assert list(results.values()) == ['failed']
+        assert all('broken' in key for key in results)
+        # the healthy sibling was still reached
+        assert m._provider.plan_network.call_count == 2
