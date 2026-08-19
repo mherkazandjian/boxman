@@ -815,6 +815,8 @@ class VMsMixin:
 
         self.report_network_results(network_results)
 
+        self.raise_on_network_failures(network_results)
+
         # --- categorize VMs ---
         expected_vms = set(self._get_project_vm_names())
         all_existing_vms = set(self._find_all_existing_project_vms())

@@ -141,7 +141,7 @@ class TestDesiredState:
             "mode": "bridge", "bridge_name": "br-migrate",
             "bridge_stp": None, "bridge_delay": None, "mac": None,
             "ip_address": None, "netmask": None, "dhcp_range": None,
-            "dhcp_hosts": [],
+            "dhcp_hosts": [], "dhcp_options_trimmed": False,
         }
         assert nr.diff_network(
             state, nr.parse_network_xml(xml))["action"] == "none"
@@ -835,3 +835,57 @@ class TestApplyLivePlan:
             else _result(ok=False, stderr="boom"))
         assert net.apply_live_plan(
             {"host_ops": [("add-last", {"mac": "aa", "ip": "1.1.1.2"})]}) is False
+
+
+class TestDhcpOptionTrimmingIsReconciled:
+    """The dnsmasq option suppression has to be part of the comparison.
+
+    Left unmodelled, a routed network defined before those options existed
+    compares equal and plans as ``action: none`` -- so it can never be
+    migrated, not even with ``--recreate-networks``, which only permits an
+    already-planned recreate. It would then keep advertising an unreachable
+    router while the isolation chains started permitting DHCP.
+    """
+
+    TRIMMED = (
+        "<network xmlns:dnsmasq='http://libvirt.org/schemas/network/dnsmasq/1.0'>"
+        "<name>n</name><forward mode='route'/>"
+        "<bridge name='virbr9' stp='on' delay='0'/>"
+        "<mac address='52:54:00:00:0a:02'/>"
+        "<ip address='10.0.14.1' netmask='255.255.255.0'>"
+        "<dhcp><range start='10.0.14.10' end='10.0.14.99'/></dhcp></ip>"
+        "<dnsmasq:options>"
+        "<dnsmasq:option value='dhcp-option=3'/>"
+        "<dnsmasq:option value='dhcp-option=6'/>"
+        "</dnsmasq:options></network>"
+    )
+    UNTRIMMED = TRIMMED.replace(
+        "<dnsmasq:options>"
+        "<dnsmasq:option value='dhcp-option=3'/>"
+        "<dnsmasq:option value='dhcp-option=6'/>"
+        "</dnsmasq:options>", "")
+
+    def test_parser_detects_the_suppression(self):
+        assert nr.parse_network_xml(self.TRIMMED)["dhcp_options_trimmed"] is True
+
+    def test_parser_reports_a_legacy_network_as_untrimmed(self):
+        assert nr.parse_network_xml(self.UNTRIMMED)["dhcp_options_trimmed"] is False
+
+    def test_only_both_options_together_count(self):
+        partial = self.TRIMMED.replace(
+            "<dnsmasq:option value='dhcp-option=6'/>", "")
+        assert nr.parse_network_xml(partial)["dhcp_options_trimmed"] is False
+
+    def test_a_legacy_routed_network_plans_as_structural_drift(self):
+        # the whole point: without this the plan is `none` and the network is
+        # unmigratable
+        desired = nr.parse_network_xml(self.TRIMMED)
+        actual = nr.parse_network_xml(self.UNTRIMMED)
+        plan = nr.diff_network(desired, actual)
+        assert plan["action"] == "recreate"
+        assert any("dhcp router/dns suppression" in change
+                   for change in plan["structural"])
+
+    def test_an_already_migrated_network_shows_no_drift(self):
+        state = nr.parse_network_xml(self.TRIMMED)
+        assert nr.diff_network(state, state)["action"] == "none"

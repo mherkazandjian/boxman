@@ -288,7 +288,8 @@ class DestroyVM:
         try:
             self.logger.info(f"un-defining vm {self.name}")
 
-            self.virsh.execute("undefine", self.name)
+            # see force_undefine_vm: a managed save image blocks undefine
+            self.virsh.execute("undefine", self.name, "--managed-save")
 
             # verify that the vm is no longer defined
             if not self.is_vm_defined():
@@ -329,16 +330,27 @@ class DestroyVM:
             # requires a recent libvirt, so on failure fall back to a
             # plain undefine that only drops snapshot metadata — the
             # domain must always be removable.
+            # --managed-save is not optional: libvirt refuses with "Refusing to
+            # undefine while domain managed save image exists" for any domain
+            # that was suspended or snapshotted with memory state, which
+            # boxman itself creates. Without it destroy leaves the VM defined.
             result = self.virsh.execute(
                 "undefine", self.name,
                 "--remove-all-storage", "--wipe-storage",
                 "--delete-storage-volume-snapshots", "--snapshots-metadata",
+                "--managed-save",
                 warn=True)
             if not result.ok:
                 self.logger.warning(
                     f"undefine with storage removal failed for {self.name} "
                     f"({result.stderr.strip()}) — retrying plain undefine")
-                self.virsh.execute("undefine", self.name, "--snapshots-metadata")
+                fallback = self.virsh.execute(
+                    "undefine", self.name, "--snapshots-metadata",
+                    "--managed-save", warn=True)
+                if not fallback.ok:
+                    self.logger.error(
+                        f"plain undefine also failed for {self.name}: "
+                        f"{fallback.stderr.strip()}")
 
             # verify that the vm is no longer defined
             if not self.is_vm_defined():

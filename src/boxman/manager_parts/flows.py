@@ -243,6 +243,7 @@ class FlowsMixin:
                 allow_recreate=getattr(cli_args, 'recreate_networks', False),
                 auto_accept=getattr(cli_args, 'yes', False))
             self.report_network_results(network_results)
+            self.raise_on_network_failures(network_results)
 
             # a recreate power-cycles the guests attached to the network, so
             # the addresses connect_info() and the ssh config are about to be
@@ -277,9 +278,11 @@ class FlowsMixin:
         # to find the network it is wired to, and any reservation added to the
         # config since the last run has to be in dnsmasq before the guest asks
         # for a lease.
-        self.report_network_results(self.reconcile_networks(
+        network_results = self.reconcile_networks(
             allow_recreate=getattr(cli_args, 'recreate_networks', False),
-            auto_accept=getattr(cli_args, 'yes', False)))
+            auto_accept=getattr(cli_args, 'yes', False))
+        self.report_network_results(network_results)
+        self.raise_on_network_failures(network_results)
 
         # Build workdir lookup for restore operations
         vm_workdir_map = dict(self._control_vm_targets(cli_args))

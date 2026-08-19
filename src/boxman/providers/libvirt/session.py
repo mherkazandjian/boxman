@@ -399,6 +399,28 @@ class LibVirtSession(SessionConfigMixin):
             manager=self.manager)
         return network.start()
 
+    def reconcile_network_isolation(self,
+                                    name: str = None,
+                                    info: dict[str, Any] | None = None,
+                                    check_only: bool = False) -> str:
+        """
+        Re-assert the host isolation of a routed network.
+
+        The rules are in-memory iptables state, so a host reboot or a manual
+        flush drops them while libvirt autostarts the network again -- the
+        network then comes back up unprotected and stays that way until
+        something re-applies them. Nothing did, before this.
+
+        Returns ``skipped``, ``ok``, ``drifted``, ``repaired`` or ``failed``.
+        """
+        network = Network(
+            name=name,
+            info=info,
+            provider_config=self.provider_config,
+            assign_new_bridge=False,
+            manager=self.manager)
+        return network.reconcile_isolation(check_only=check_only)
+
     def apply_network_live_plan(self,
                                 name: str = None,
                                 info: dict[str, Any] | None = None,

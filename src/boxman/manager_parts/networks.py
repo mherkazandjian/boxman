@@ -8,7 +8,7 @@ import os
 import time
 from typing import Any
 
-from boxman.exceptions import ConfigError
+from boxman.exceptions import ConfigError, NetworkError
 from boxman.providers.libvirt import net_reconcile
 
 
@@ -150,7 +150,73 @@ class NetworksMixin:
                         allow_recreate=allow_recreate,
                         auto_accept=auto_accept)
 
+        # Isolation rules are host iptables state, not libvirt state, so they
+        # do not survive a reboot or a manual flush while the network itself
+        # autostarts happily without them. Re-assert them on every reconcile
+        # rather than only at define time.
+        for full_name, outcome in self._reconcile_network_isolation(
+                dry_run=dry_run).items():
+            # an unisolated routed network is a failed network: without this
+            # `up` exits 0 while the guests can reach the host
+            if outcome == 'failed':
+                results[full_name] = 'failed'
+
         return results
+
+    def _reconcile_network_isolation(
+            self, dry_run: bool = False) -> dict[str, str]:
+        """
+        Re-apply the host isolation of every routed network in the config.
+
+        Reported rather than done silently: a routed network that lost its
+        rules has been reachable from the host, and from the guests' point of
+        view unisolated, for however long it was up. That is worth a warning
+        even though it is being fixed here and now.
+        """
+        outcomes: dict[str, str] = {}
+        if not hasattr(self.provider, 'reconcile_network_isolation'):
+            return outcomes
+
+        for cluster_name, cluster in self.config['clusters'].items():
+            for network_name, network_info in (cluster.get('networks') or {}).items():
+                if (network_info or {}).get('mode') != 'route':
+                    continue
+                label = f"{cluster_name}/{network_name}"
+                full_name = self.full_network_name(
+                    project_config=self.config,
+                    cluster_name=cluster_name,
+                    network_name=network_name)
+                try:
+                    outcome = self.provider.reconcile_network_isolation(
+                        name=full_name, info=network_info,
+                        check_only=dry_run)
+                except Exception as exc:
+                    self.logger.error(
+                        f"network {label}: could not check isolation rules: {exc}")
+                    outcomes[full_name] = 'failed'
+                    continue
+                outcomes[full_name] = outcome
+
+                if outcome == 'absent':
+                    # the network is not defined; its own failure was already
+                    # reported by the define path
+                    self.logger.debug(
+                        f"network {label}: not defined, isolation not applicable")
+                elif outcome == 'repaired':
+                    self.logger.warning(
+                        f"network {label}: isolation rules were missing and "
+                        f"have been re-applied. A routed network is left "
+                        f"unprotected between a host reboot and the next "
+                        f"boxman run.")
+                elif outcome == 'drifted':
+                    self.logger.warning(
+                        f"[dry-run] network {label}: isolation rules are "
+                        f"missing; they would be re-applied.")
+                elif outcome == 'failed':
+                    self.logger.error(
+                        f"network {label}: could not apply isolation rules")
+
+        return outcomes
 
     def report_network_results(self, results: dict[str, str]) -> None:
         """
@@ -172,6 +238,22 @@ class NetworksMixin:
                     f"could not be reconnected")
             else:
                 self.logger.info(f"network {full_name}: {outcome}")
+
+    def raise_on_network_failures(self, results: dict[str, str]) -> None:
+        """
+        Turn failed networks into a failed run.
+
+        Reporting alone is not enough: a routed network that could not be
+        isolated, or one that could not be defined at all, leaves guests
+        without the connectivity -- or the containment -- the configuration
+        asked for. Continuing to exit 0 makes that look like success.
+        """
+        failed = sorted(name for name, outcome in results.items()
+                        if outcome == 'failed')
+        if failed:
+            raise NetworkError(
+                f"{len(failed)} network(s) could not be brought to the "
+                f"configured state: {', '.join(failed)}")
 
     def _vms_worth_waiting_for(self) -> list[str]:
         """
