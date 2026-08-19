@@ -38,6 +38,8 @@ OS_VARIANT_TO_ID = {
     "ubuntu24.04": "ubuntu",
     "rocky9": "rocky",
     "centos7.0": "centos",
+    # libvirt/osinfo calls it archlinux; /etc/os-release says ID=arch
+    "archlinux": "arch",
 }
 
 # ---------------------------------------------------------------------------
@@ -60,11 +62,26 @@ def discover_boxes():
     ``create-templates`` fails and every parametrized test skips
     (issue #81). They are covered under the docker runtime by
     ``tests/test_lifecycle_e2e.py`` instead.
+
+    ISO-boot boxes (``*-iso-boot``) are excluded too, and for a more basic
+    reason: they have no ``templates:`` block and deliberately never
+    provision a login. They boot a distro from an installer/live ISO and
+    stop there, so there is no admin user, no injected key and no
+    ``ssh_config`` for the assertions below to use -- every test in this
+    class would fail on them by design rather than find a defect. What
+    they *do* need verifying -- ISO downloaded and checksummed, CDROM
+    attached, boot devices configured -- is covered deterministically by
+    tests/test_iso_boot_boxes.py and documented per box in their README.
+    (The effective boot order is deliberately not asserted here: virt-install
+    does not honour the requested ordering for --cdrom installs, which the
+    per-box READMEs explain.)
     """
     pattern = os.path.join(BOXES_DIR, "*/conf.yml")
+    excluded_suffixes = ("-docker-runtime", "-iso-boot")
     return sorted(
         os.path.dirname(p) for p in glob.glob(pattern)
-        if not os.path.basename(os.path.dirname(p)).endswith("-docker-runtime")
+        if not os.path.basename(
+            os.path.dirname(p)).endswith(excluded_suffixes)
     )
 
 
@@ -181,14 +198,16 @@ def provisioned_box(request):
     # --- setup ---
     result = _run(f"boxman --conf {conf_path} create-templates --force", warn=True)
     if not result.ok:
-        pytest.skip(
+        # deliberately a failure, not a skip: this job exists to catch exactly
+        # this, and skipping leaves CI green after a box has stopped working
+        pytest.fail(
             f"create-templates failed for {os.path.basename(box_dir)}: "
             f"{result.stderr.strip()}"
         )
 
     result = _run(f"boxman --conf {conf_path} provision --force", warn=True)
     if not result.ok:
-        pytest.skip(
+        pytest.fail(
             f"provision failed for {os.path.basename(box_dir)}: "
             f"{result.stderr.strip()}"
         )

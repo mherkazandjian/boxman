@@ -1,0 +1,82 @@
+# Example: boot a VM directly from the NixOS 25.05 minimal installer ISO
+#
+# Why this is an ISO-boot box and not a cloud-init template box: the artifact
+# pinned here is the minimal *installer* ISO, a live installer that does not
+# consume boxman's NoCloud seed and creates no user to inject a key into.
+#
+# That is a property of this artifact, not of NixOS. NixOS supports cloud-init
+# (services.cloud-init.enable) and its official proxmoxImage job builds a disk
+# image with cloud-init, sshd and the qemu guest agent enabled. What NixOS does
+# not publish is a *generic* cloud qcow2 that `templates:` could point at, so a
+# template box would first have to build or import one -- see #149. Until then
+# this takes the same shape as talos-iso-boot and ubuntu-24.04-live-iso-boot:
+# a bare VM with the ISO attached.
+#
+# What this box does NOT do: install NixOS, create a user, or configure SSH.
+# It boots you to the installer's console shell. Finishing the install is
+# manual (or driven from outside by nixos-anywhere) — see README.md.
+#
+# Turning this into a box that yields a usable, SSH-able NixOS guest needs a
+# cloud-init-enabled NixOS image for `templates:` to clone -- built with
+# nixos-generators or modelled on upstream's proxmoxImage -- not necessarily
+# an in-guest rebuild hook. Tracked separately, not worked around here.
+#
+version: '1.0'
+project: boxman_dev_nixos-25.05-iso-boot
+
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: true
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+
+isos:
+  nixos-minimal-25.05:
+    # NixOS 25.05 minimal installer (x86_64). ~1.65 GB.
+    #
+    # This is the release-pinned path that channels.nixos.org redirects to, so
+    # the URL and its checksum stay stable. Do NOT substitute
+    # https://channels.nixos.org/nixos-25.05/latest-nixos-minimal-x86_64-linux.iso
+    # here: that alias is republished as the channel advances and the checksum
+    # below would start failing. Refresh both together from
+    # https://nixos.org/download/ and the sibling .iso.sha256 file.
+    uri: https://releases.nixos.org/nixos/25.05/nixos-25.05.813814.ac62194c3917/nixos-minimal-25.05.813814.ac62194c3917-x86_64-linux.iso
+    checksum: sha256:38dee38fd5b5f2429c35aef7d9cc039a21cafbd93809adf061d29149e3583c94
+
+workspace:
+  path: ~/workspaces/nixos-25.05-iso-boot
+
+clusters:
+  nixos:
+    workdir: ~/workspaces/nixos-25.05-iso-boot
+    networks:
+      nixos-net:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:97:01'
+        ip:
+          address: '192.168.151.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.151.2'
+              end: '192.168.151.254'
+        enable: True
+        autostart: True
+    vms:
+      nixos01:
+        vcpus: 2
+        memory: 4096
+        boot_order: [cdrom, hd]
+        # Empty disk: the ISO live-boots past it. It is only used if you go on
+        # to run a real `nixos-install` inside the guest. 20G is enough for a
+        # minimal system with room for a couple of generations.
+        disk_size: 20G
+        networks:
+          - name: nixos-net
+        cdroms:
+          - name: nixos-minimal-25.05

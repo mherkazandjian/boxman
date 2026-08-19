@@ -1,0 +1,95 @@
+# Example: boot a VM directly from the Guix System 1.5.0 installer ISO
+#
+# Why this is an ISO-boot box and not a cloud-init template box: the artifact
+# pinned here is the *installer* ISO, which creates no user and consumes no
+# NoCloud seed, so boxman has nothing to inject a key into.
+#
+# Guix also has no native cloud-init, so boxman's dynamic key injection -- it
+# generates a keypair at provision time and expects the guest to pick it up
+# from the seed -- has no mechanism to work through. That is a narrower claim
+# than "Guix cannot be SSH-able": `guix system image --image-type=qcow2`
+# builds a qcow2 from an operating-system declaration that can include
+# openssh-service-type with authorized keys already in it. The boxman gaps are
+# dynamic key injection, image build/import, and the guest-agent assumptions
+# in template verification -- see #149.
+#
+# So this box uses the same shape as talos-iso-boot and
+# ubuntu-24.04-live-iso-boot: a bare VM with the installer ISO attached. It
+# boots you into Guix's guided installer. It does NOT install Guix, create a
+# user, or configure SSH — see README.md.
+#
+# Turning this into a box that yields a usable, SSH-able Guix guest does not
+# strictly need an in-guest reconfigure hook: `guix system image
+# --image-type=qcow2` can build a qcow2 from an operating-system declaration
+# that already includes openssh-service-type and authorized keys. The boxman
+# gaps are dynamic key injection, image build/import, and the guest-agent
+# assumptions in template verification. Tracked separately.
+#
+version: '1.0'
+project: boxman_dev_guix-1.5.0-iso-boot
+
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: true
+    virt_install_cmd: '/bin/python3 /usr/bin/virt-install'
+    virt_clone_cmd: '/bin/python3 /usr/bin/virt-clone'
+    virsh_cmd: '/usr/bin/virsh'
+
+isos:
+  guix-system-install-1.5.0:
+    # Guix System 1.5.0 installer (x86_64). ~1.13 GB.
+    #
+    # NOTE ON THE CHECKSUM: unlike every other box here, upstream publishes NO
+    # sha256 for this artifact — ftp.gnu.org ships only a detached OpenPGP
+    # signature (.sig). The hash below was therefore computed locally from the
+    # downloaded file *after* verifying that signature. Reproduce it with:
+    #
+    #   curl -O https://ftp.gnu.org/gnu/guix/guix-system-install-1.5.0.x86_64-linux.iso
+    #   curl -O https://ftp.gnu.org/gnu/guix/guix-system-install-1.5.0.x86_64-linux.iso.sig
+    #   gpg --recv-keys A28BF40C3E551372662D14F741AAE7DCCA3D8351
+    #   gpg --verify guix-system-install-1.5.0.x86_64-linux.iso.sig
+    #   sha256sum guix-system-install-1.5.0.x86_64-linux.iso
+    #
+    # Signed 2026-01-22 by A28BF40C 3E551372 662D14F7 41AAE7DC CA3D8351
+    # (Efraim Flashner), a Guix maintainer. Treat the OpenPGP signature as the
+    # authority; the sha256 here only pins what boxman downloads.
+    uri: https://ftp.gnu.org/gnu/guix/guix-system-install-1.5.0.x86_64-linux.iso
+    checksum: sha256:107e0a8082f03a10b15c1fb9383d2d752c1cdeda41b8db575a15550e1c2d8b4a
+
+workspace:
+  path: ~/workspaces/guix-1.5.0-iso-boot
+
+clusters:
+  guix:
+    workdir: ~/workspaces/guix-1.5.0-iso-boot
+    networks:
+      guix-net:
+        mode: nat
+        bridge:
+          stp: 'on'
+          delay: '0'
+        mac: '52:54:00:00:98:01'
+        ip:
+          address: '192.168.152.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '192.168.152.2'
+              end: '192.168.152.254'
+        enable: True
+        autostart: True
+    vms:
+      guix01:
+        vcpus: 2
+        memory: 4096
+        boot_order: [cdrom, hd]
+        # Empty disk: the installer live-boots past it. It is only written to
+        # if you run the guided install inside the guest. Guix pulls a lot of
+        # substitutes during an install, so give it more room than the NixOS
+        # box gets.
+        disk_size: 30G
+        networks:
+          - name: guix-net
+        cdroms:
+          - name: guix-system-install-1.5.0
