@@ -1361,9 +1361,10 @@ class Network:
             self.logger.warning(
                 f"network {self.name}: keeping DHCP blocked because the live "
                 f"definition still advertises a router and DNS server that "
-                f"this network's isolation makes unreachable. Recreate the "
-                f"network (boxman up --recreate-networks) to pick up the "
-                f"trimmed offer, after which DHCP will be allowed.")
+                f"this network's isolation makes unreachable. Reconcile plans "
+                f"this as a structural change, so `boxman up "
+                f"--recreate-networks` will migrate it; DHCP is allowed once "
+                f"it has.")
             return False
         return True
 
@@ -1374,6 +1375,26 @@ class Network:
             return None
         return [line.strip() for line in (listed.stdout or "").splitlines()
                 if line.strip().startswith("-A ")]
+
+    @staticmethod
+    def _rule_body(rule: str) -> list[str]:
+        """
+        A rule reduced to what it *does*, for exact comparison.
+
+        Drops the leading ``-A <chain>`` and the ``-m <module>`` pairs iptables
+        inserts when echoing a rule back, so ``-p udp -m udp --dport 67 -j
+        ACCEPT`` compares equal to the ``-p udp --dport 67 -j ACCEPT`` that was
+        written.
+        """
+        tokens = rule.split()[2:]
+        body, index = [], 0
+        while index < len(tokens):
+            if tokens[index] == '-m':
+                index += 2
+                continue
+            body.append(tokens[index])
+            index += 1
+        return body
 
     def _isolation_is_intact(self) -> bool:
         """
@@ -1396,14 +1417,26 @@ class Network:
                 return False
 
             rules = self._chain_rules(chain)
-            if not rules:
+            if rules is None:
                 return False
-            if not rules[-1].endswith("-j DROP"):
+
+            # Compare against the exact rule list this run would install.
+            # Extras matter as much as omissions: a broad `-j ACCEPT` above
+            # the drop satisfies any "ends with a DROP, has the right hole"
+            # check while isolating precisely nothing. The terminal DROP is
+            # required to be unconditional for the same reason -- one carrying
+            # match criteria only drops some traffic.
+            wanted = []
+            if want_hole:
+                wanted.append(
+                    ['-p', 'udp', '--dport', str(port), '-j', 'ACCEPT'])
+            wanted.append(['-j', 'DROP'])
+
+            if len(rules) != len(wanted):
                 return False
-            has_hole = any(f"--dport {port}" in rule and rule.endswith("-j ACCEPT")
-                           for rule in rules[:-1])
-            if has_hole != want_hole:
-                return False
+            for expected, rule in zip(wanted, rules, strict=True):
+                if self._rule_body(rule) != expected:
+                    return False
         return True
 
     def reconcile_isolation(self, check_only: bool = False) -> str:

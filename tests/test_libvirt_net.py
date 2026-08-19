@@ -1434,6 +1434,37 @@ class TestIsolationContentsAreChecked:
         assert self._probe(self._net(), [
             "-A CHAIN -j DROP"]) is False
 
+    def test_a_broad_accept_is_not_intact(self):
+        # the case a "terminal DROP plus the right hole" check waves through:
+        # everything is accepted before either rule is reached
+        assert self._probe(self._net(), [
+            "-A CHAIN -j ACCEPT",
+            "-A CHAIN -p udp -m udp --dport PORT -j ACCEPT",
+            "-A CHAIN -j DROP"]) is False
+
+    def test_an_extra_rule_after_the_drop_is_not_intact(self):
+        assert self._probe(self._net(), [
+            "-A CHAIN -p udp -m udp --dport PORT -j ACCEPT",
+            "-A CHAIN -j DROP",
+            "-A CHAIN -j ACCEPT"]) is False
+
+    def test_a_conditional_drop_is_not_intact(self):
+        # a DROP carrying match criteria only drops some traffic
+        assert self._probe(self._net(with_dhcp=False), [
+            "-A CHAIN -p tcp -m tcp --dport 22 -j DROP"]) is False
+
+    def test_a_hole_on_the_wrong_port_is_not_intact(self):
+        assert self._probe(self._net(), [
+            "-A CHAIN -p udp -m udp --dport 9999 -j ACCEPT",
+            "-A CHAIN -j DROP"]) is False
+
+    def test_match_modules_are_normalised_not_compared(self):
+        # iptables echoes back `-m udp` that was never written; that must not
+        # read as drift
+        assert self._probe(self._net(), [
+            "-A CHAIN -p udp -m udp --dport PORT -j ACCEPT",
+            "-A CHAIN -j DROP"]) is True
+
     def test_untrimmed_offer_expects_no_hole(self):
         # while the live offer is untrimmed the hole must NOT be present,
         # so a drop-only chain is the correct state

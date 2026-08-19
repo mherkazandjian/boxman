@@ -8,7 +8,7 @@ import os
 import time
 from typing import Any
 
-from boxman.exceptions import ConfigError
+from boxman.exceptions import ConfigError, NetworkError
 from boxman.providers.libvirt import net_reconcile
 
 
@@ -238,6 +238,22 @@ class NetworksMixin:
                     f"could not be reconnected")
             else:
                 self.logger.info(f"network {full_name}: {outcome}")
+
+    def raise_on_network_failures(self, results: dict[str, str]) -> None:
+        """
+        Turn failed networks into a failed run.
+
+        Reporting alone is not enough: a routed network that could not be
+        isolated, or one that could not be defined at all, leaves guests
+        without the connectivity -- or the containment -- the configuration
+        asked for. Continuing to exit 0 makes that look like success.
+        """
+        failed = sorted(name for name, outcome in results.items()
+                        if outcome == 'failed')
+        if failed:
+            raise NetworkError(
+                f"{len(failed)} network(s) could not be brought to the "
+                f"configured state: {', '.join(failed)}")
 
     def _vms_worth_waiting_for(self) -> list[str]:
         """

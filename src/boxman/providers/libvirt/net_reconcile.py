@@ -36,7 +36,27 @@ STRUCTURAL_FIELDS = (
     ('bridge_stp', 'bridge stp'),
     ('bridge_delay', 'bridge delay'),
     ('mac', 'mac address'),
+    # libvirt cannot change dnsmasq options on a live network, and leaving
+    # them unmodelled meant a network defined before they existed planned as
+    # `action: none` -- so it could never be migrated, not even with
+    # --recreate-networks, which only permits an already-planned recreate
+    ('dhcp_options_trimmed', 'dhcp router/dns suppression'),
 )
+
+
+def _dhcp_options_trimmed(root) -> bool:
+    """
+    Whether the network tells dnsmasq to omit DHCP options 3 and 6.
+
+    A routed network isolates the host, so the gateway and resolver dnsmasq
+    would otherwise advertise -- both the bridge address -- are unreachable by
+    construction, and the router option installs a default route at metric 0
+    that black-holes the guest. The elements are namespaced, hence matching on
+    the local name rather than a fixed prefix.
+    """
+    values = {element.get('value') for element in root.iter()
+              if element.tag.rsplit('}', 1)[-1] == 'option'}
+    return 'dhcp-option=3' in values and 'dhcp-option=6' in values
 
 
 def parse_network_xml(xml_text: str) -> dict[str, Any]:
@@ -68,6 +88,7 @@ def parse_network_xml(xml_text: str) -> dict[str, Any]:
         'netmask': None,
         'dhcp_range': None,
         'dhcp_hosts': [],
+        'dhcp_options_trimmed': _dhcp_options_trimmed(root),
     }
 
     if ip is None:
@@ -126,6 +147,7 @@ def desired_state(network) -> dict[str, Any]:
             'netmask': None,
             'dhcp_range': None,
             'dhcp_hosts': [],
+            'dhcp_options_trimmed': False,
         }
 
     dhcp_range = None
@@ -146,6 +168,11 @@ def desired_state(network) -> dict[str, Any]:
         'netmask': network.netmask,
         'dhcp_range': dhcp_range,
         'dhcp_hosts': list(network.dhcp_hosts),
+        # mirrors the template: emitted only for a routed network that hands
+        # out addresses of its own
+        'dhcp_options_trimmed': bool(
+            network.forward_mode == 'route'
+            and (dhcp_range or network.dhcp_hosts)),
     }
 
 

@@ -39,6 +39,35 @@ def _mgr(tmp_path: Path, mode: str = "route") -> BoxmanManager:
 
 class TestIsolationOutcomeReachesTheCaller:
 
+    def test_a_failed_network_aborts_the_run(self, tmp_path: Path):
+        # reporting alone left `up` exiting 0 over a routed network that was
+        # never isolated, which reads as success
+        from boxman.exceptions import NetworkError
+        m = _mgr(tmp_path)
+        with pytest.raises(NetworkError, match="could not be brought"):
+            m.raise_on_network_failures({"net-a": "failed", "net-b": "created"})
+
+    def test_the_guard_names_every_failed_network(self, tmp_path: Path):
+        from boxman.exceptions import NetworkError
+        m = _mgr(tmp_path)
+        with pytest.raises(NetworkError) as caught:
+            m.raise_on_network_failures({"net-a": "failed", "net-b": "failed"})
+        assert "net-a" in str(caught.value) and "net-b" in str(caught.value)
+
+    def test_the_guard_is_quiet_when_nothing_failed(self, tmp_path: Path):
+        m = _mgr(tmp_path)
+        m.raise_on_network_failures(
+            {"a": "created", "b": "updated", "c": "skipped"})
+
+    def test_isolation_failure_reaches_the_guard(self, tmp_path: Path):
+        # end to end: a failed isolation becomes a failed network, and a
+        # failed network aborts the run
+        from boxman.exceptions import NetworkError
+        m = _mgr(tmp_path)
+        m._provider.reconcile_network_isolation.return_value = 'failed'
+        with pytest.raises(NetworkError):
+            m.raise_on_network_failures(m.reconcile_networks())
+
     def test_failed_isolation_fails_the_network(self, tmp_path: Path):
         # without this the run is reported as successful while the guests can
         # still reach the host -- the exact property the mode exists to deny
