@@ -261,6 +261,10 @@ graph TD
 
 ### Libvirt network modes
 
+> This is the short version. The full networking reference — diagrams per
+> mode, the routed-network isolation contract, reconciliation rules and
+> `shared_networks` — is in [doc/network.md](../network.md).
+
 Per-cluster libvirt networks support `nat`, `route`, and `bridge` modes. `nat`
 and `route` let libvirt create the Linux bridge; they take the `ip`, `mac`,
 `bridge.stp`, and `bridge.delay` settings shown in the examples. Bridge mode is
