@@ -49,6 +49,30 @@ def _validate_bridge_name(name: str, entry_name: str) -> None:
         )
 
 
+def _normalise_stp(value: Any, entry_name: str) -> bool:
+    """Coerce a configured ``stp`` value to a bool.
+
+    Same accepted spellings as a libvirt network's ``bridge.stp`` (see
+    ``Network._normalise_stp``): yaml reads an unquoted ``stp: on`` as the
+    boolean True, while a quoted ``stp: "off"`` arrives as a string. Plain
+    truthiness is wrong for the latter -- a non-empty ``"off"`` is truthy and
+    would switch STP *on*. Anything that is neither on nor off is rejected
+    rather than quietly becoming ``off``.
+    """
+    if isinstance(value, bool):
+        return value
+
+    text = str(value).strip().lower()
+    if text in ('on', 'true', 'yes', '1'):
+        return True
+    if text in ('off', 'false', 'no', '0'):
+        return False
+    raise ConfigError(
+        f"shared_networks[{entry_name!r}]: 'stp' must be on or off, "
+        f"got {value!r}"
+    )
+
+
 def _bridge_exists(name: str) -> bool:
     result = run(f"ip link show dev {shlex.quote(name)}", warn=True, hide=True)
     return result.ok
@@ -132,7 +156,11 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
       (``ip link set dev <br> mtu <n>``). Bridges default to 1500 while
       containerlab veth links default to 9500, so set this (e.g. 9500) on
       bridges that carry jumbo lab traffic to avoid a silent blackhole.
-    - ``stp`` (bool, default False): enable STP on the bridge.
+    - ``stp`` (bool, optional): enable STP on the bridge. Applied only when
+      declared. An entry that omits it leaves the current setting alone on a
+      bridge that already exists, and gets STP off on one boxman creates --
+      because the name is shared, so writing a default on every run would
+      clobber a co-tenant project's explicit choice.
     - ``disable_netfilter`` (bool, default **False**): when False (the
       default, decision D8), lab frames are allowed by an idempotent
       per-bridge scoped ``iptables`` accept rule and the host-global
@@ -164,22 +192,36 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
                 f"integer, got {mtu!r}"
             )
 
+        # normalised before anything is touched, so a typo does not leave a
+        # freshly created, half-configured bridge behind
+        stp = entry.get("stp")
+        stp_enabled = None if stp is None else _normalise_stp(stp, entry_name)
+
         qbridge = shlex.quote(bridge)
 
-        if _bridge_exists(bridge):
-            log.info(f"shared bridge {bridge!r} already present")
-        else:
+        created = not _bridge_exists(bridge)
+        if created:
             log.info(f"creating shared bridge {bridge!r}")
             _run_sudo(f"ip link add name {qbridge} type bridge")
+        else:
+            log.info(f"shared bridge {bridge!r} already present")
 
         _run_sudo(f"ip link set dev {qbridge} up")
 
         if mtu is not None:
             _run_sudo(f"ip link set dev {qbridge} mtu {mtu}")
 
-        stp = "on" if entry.get("stp", False) else "off"
-        _run_sudo(f"ip link set dev {qbridge} type bridge stp_state "
-                  f"{1 if stp == 'on' else 0}")
+        # Shared bridge names are global and not namespaced, so writing the
+        # default on every run is not a no-op: a project that never mentions
+        # `stp` would switch it off for every other project sharing the
+        # bridge. Write it only when this project has an opinion -- or when
+        # boxman just created the bridge and it needs a defined initial
+        # state. `mtu` above is guarded for the same reason.
+        if stp_enabled is not None:
+            _run_sudo(f"ip link set dev {qbridge} type bridge stp_state "
+                      f"{1 if stp_enabled else 0}")
+        elif created:
+            _run_sudo(f"ip link set dev {qbridge} type bridge stp_state 0")
 
         # Decision D8: default to scoped per-bridge accept rules; the
         # host-global sysctl disable is an explicit opt-in.
