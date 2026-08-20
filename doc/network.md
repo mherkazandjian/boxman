@@ -18,11 +18,19 @@ configures on the host beyond what libvirt does by itself.
 
 ## Choosing an attachment
 
-There are four ways to get a NIC into a VM, and picking the wrong one is the
-single most common networking mistake with boxman. They are not
-interchangeable: two are libvirt networks that boxman creates and destroys, one
-is a host bridge boxman creates but never destroys, and one is a reference to
-something boxman does not manage at all.
+There are five ways to get a NIC into a VM, and picking the wrong one is the
+single most common networking mistake with boxman. What separates them is who
+owns what:
+
+- **`nat`, `route` and `bridge`** are all boxman-owned libvirt networks,
+  declared per cluster, defined on provision and removed on destroy. They differ
+  in what sits *underneath*: for `nat` and `route` libvirt creates the Linux
+  bridge and deletes it again, while `bridge` wraps a host bridge that boxman
+  never creates, touches or removes.
+- **`shared_networks`** is a host Linux bridge that boxman creates but never
+  destroys.
+- **`is_global`** is a bare reference to something boxman does not manage at
+  all.
 
 ```mermaid
 flowchart TD
@@ -451,10 +459,30 @@ flowchart TB
     style BR fill:#3498db,color:#fff,stroke:none
 ```
 
-`ensure()` is idempotent and safe across projects: create if missing, bring up,
+`ensure()` is idempotent for a single declaration: create if missing, bring up,
 apply MTU and STP. There is **no teardown** — `boxman destroy` leaves shared
 bridges alone, because another project may still be using one. Removing them is
 an explicit user action.
+
+> **That "boxman will not tear it down" is the only sense in which a shared
+> bridge is safe across projects.** Bridge names are global and not namespaced,
+> and every run re-applies the settings to whatever bridge the name resolves to,
+> so two projects that declare the same bridge differently get last-run-wins.
+> Every project sharing a bridge must agree on its settings.
+
+The re-application is not uniform, which makes the disagreement easy to miss:
+
+| Setting | On every `ensure()` | If a project omits it |
+|---|---|---|
+| bridge exists, link `up` | re-applied | — |
+| `mtu` | applied only when declared | the existing MTU is left alone |
+| `stp` | **always applied** | forced **off** — the key defaults to `false` |
+| `disable_netfilter` | acts only when `true` | the host-global sysctl is **not** restored to `1` |
+
+So a project that simply does not mention `stp:` silently turns STP off for
+everyone else on that bridge, and one project's `disable_netfilter: true`
+outlives the run that set it — nothing puts `bridge-nf-call-iptables` back to
+`1` except a reboot or kubelet.
 
 By default boxman also installs a **scoped** per-bridge accept rule so bridged
 lab frames survive a docker-style `FORWARD` DROP policy:
