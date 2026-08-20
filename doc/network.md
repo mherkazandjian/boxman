@@ -490,6 +490,12 @@ as it is.
 has set it, `bridge-nf-call-iptables` stays at `0` until a reboot or kubelet puts
 it back. No later boxman run restores it.
 
+`stp` and `disable_netfilter` accept the same spellings as a libvirt network's
+`bridge.stp` — booleans, or `on`/`true`/`yes`/`1` and `off`/`false`/`no`/`0`.
+Anything else is rejected, and a key written with no value at all is an error
+rather than a silent "leave it alone": quoting matters here, because a bare
+truthiness test would read `"off"` as on.
+
 By default boxman also installs a **scoped** per-bridge accept rule so bridged
 lab frames survive a docker-style `FORWARD` DROP policy:
 

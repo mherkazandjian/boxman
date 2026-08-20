@@ -49,15 +49,16 @@ def _validate_bridge_name(name: str, entry_name: str) -> None:
         )
 
 
-def _normalise_stp(value: Any, entry_name: str) -> bool:
-    """Coerce a configured ``stp`` value to a bool.
+def _normalise_bool(value: Any, entry_name: str, key: str) -> bool:
+    """Coerce a configured on/off value to a bool.
 
     Same accepted spellings as a libvirt network's ``bridge.stp`` (see
-    ``Network._normalise_stp``): yaml reads an unquoted ``stp: on`` as the
-    boolean True, while a quoted ``stp: "off"`` arrives as a string. Plain
-    truthiness is wrong for the latter -- a non-empty ``"off"`` is truthy and
-    would switch STP *on*. Anything that is neither on nor off is rejected
-    rather than quietly becoming ``off``.
+    ``Network._normalise_stp``): yaml reads an unquoted ``on`` as the boolean
+    True, while a quoted ``"off"`` arrives as a string. Plain truthiness is
+    wrong for the latter -- a non-empty ``"off"`` is truthy, so it would turn
+    the setting *on*, which for ``disable_netfilter`` means silently weakening
+    bridge filtering host-wide. Anything that is neither on nor off is
+    rejected rather than quietly becoming ``off``.
     """
     if isinstance(value, bool):
         return value
@@ -68,7 +69,7 @@ def _normalise_stp(value: Any, entry_name: str) -> bool:
     if text in ('off', 'false', 'no', '0'):
         return False
     raise ConfigError(
-        f"shared_networks[{entry_name!r}]: 'stp' must be on or off, "
+        f"shared_networks[{entry_name!r}]: {key!r} must be on or off, "
         f"got {value!r}"
     )
 
@@ -145,7 +146,17 @@ def _ensure_scoped_accept(bridge: str) -> None:
 def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
     """Ensure every bridge declared in *shared_networks* exists and is up.
 
-    Idempotent. Safe to call repeatedly and across projects.
+    Idempotent for a given declaration, and safe to call repeatedly.
+
+    Across projects it is narrower than that. Bridge names are global and not
+    namespaced, and this re-writes whatever settings an entry declares onto
+    whichever bridge the name resolves to, so two projects declaring the same
+    bridge differently get last-run-wins. What *is* guaranteed across projects
+    is that boxman never tears a shared bridge down; agreeing on the settings
+    is the callers' problem. Omitting a key is how an entry stays out of a
+    co-tenant's way -- ``stp: false`` is an opinion, no ``stp`` key at all is
+    not. ``disable_netfilter`` escapes even that, being a host-global sysctl
+    nothing here restores.
 
     Each entry is a dict with:
 
@@ -161,7 +172,8 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
       bridge that already exists, and gets STP off on one boxman creates --
       because the name is shared, so writing a default on every run would
       clobber a co-tenant project's explicit choice.
-    - ``disable_netfilter`` (bool, default **False**): when False (the
+    - ``disable_netfilter`` (bool, default **False** when the key is absent;
+      a declared value is validated like ``stp``): when False (the
       default, decision D8), lab frames are allowed by an idempotent
       per-bridge scoped ``iptables`` accept rule and the host-global
       ``bridge-nf-call-iptables`` is left untouched. When True (an explicit,
@@ -184,18 +196,26 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
             )
         _validate_bridge_name(bridge, entry_name)
 
-        mtu = entry.get("mtu")
-        if mtu is not None and (
+        mtu = entry["mtu"] if "mtu" in entry else None
+        if "mtu" in entry and (
                 not isinstance(mtu, int) or isinstance(mtu, bool) or mtu <= 0):
             raise ConfigError(
                 f"shared_networks[{entry_name!r}]: 'mtu' must be a positive "
                 f"integer, got {mtu!r}"
             )
 
-        # normalised before anything is touched, so a typo does not leave a
-        # freshly created, half-configured bridge behind
-        stp = entry.get("stp")
-        stp_enabled = None if stp is None else _normalise_stp(stp, entry_name)
+        # Normalised before anything is touched, so a typo cannot leave a
+        # freshly created, half-configured bridge behind.
+        #
+        # Membership rather than ``.get()``: those collapse an explicit
+        # ``stp:`` carrying no value into "absent", so a config mistake would
+        # silently mean "leave the setting alone" instead of being reported.
+        stp_enabled = (_normalise_bool(entry["stp"], entry_name, 'stp')
+                       if "stp" in entry else None)
+        disable_netfilter = (
+            _normalise_bool(entry["disable_netfilter"], entry_name,
+                            'disable_netfilter')
+            if "disable_netfilter" in entry else False)
 
         qbridge = shlex.quote(bridge)
 
@@ -225,7 +245,7 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
 
         # Decision D8: default to scoped per-bridge accept rules; the
         # host-global sysctl disable is an explicit opt-in.
-        if entry.get("disable_netfilter", False):
+        if disable_netfilter:
             globally_disabled.append(bridge)
         else:
             _ensure_scoped_accept(bridge)
