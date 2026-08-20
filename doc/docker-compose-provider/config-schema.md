@@ -131,6 +131,16 @@ the same L2 domain. boxman creates each bridge on the host
 across projects); the docker-compose generator attaches a referencing
 container via a docker **macvlan** network whose `parent` is that bridge.
 
+Bridge names are **global and not namespaced**, and every run re-writes the
+settings an entry declares onto whatever bridge the name resolves to, so two
+projects declaring the same bridge differently get last-run-wins. Omitting a
+key is how an entry stays out of a co-tenant's way: `stp: false` is an
+opinion that overwrites anyone who asked for `true`, while no `stp` key at all
+leaves the bridge's current setting alone (a bridge boxman *creates* starts
+with STP off). `disable_netfilter` is the exception — it is a host-global
+sysctl and nothing restores it, so once any project sets it, it stays set
+until a reboot or kubelet.
+
 ```yaml
 version: '2.0'
 project: hybrid_lab
@@ -140,7 +150,7 @@ shared_networks:
     subnet: 10.10.0.0/24      # required when a box attaches (macvlan IPAM pool)
     gateway: 10.10.0.1        # optional
     ip_range: 10.10.0.128/25  # optional — restrict docker's auto-assign pool
-    stp: false                # optional (default false)
+    stp: false                # optional; omit to leave it as-is (see below)
     # disable_netfilter: false  # default; see the Netfilter note below
     # compose_extra: {...}      # optional, deep-merged onto the macvlan net
 clusters:
@@ -174,7 +184,8 @@ Notes and requirements:
 - `ipv4_address` is **only** wired for `shared_networks` (macvlan) attachments.
   On a cluster-internal network it is warned about and dropped — use
   `compose_extra:` if you need a static IP on a cluster-internal network.
-- **Netfilter (decision D8):** by default (`disable_netfilter: false`) boxman
+- **Netfilter (decision D8):** by default (`disable_netfilter` absent or
+  false) boxman
   leaves the host-global `bridge-nf-call-iptables` untouched and installs an
   idempotent per-bridge scoped `iptables` accept rule (on `FORWARD`, and
   `DOCKER-USER` when that chain exists) so bridged lab frames aren't dropped by

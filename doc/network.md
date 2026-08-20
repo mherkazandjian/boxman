@@ -460,29 +460,42 @@ flowchart TB
 ```
 
 `ensure()` is idempotent for a single declaration: create if missing, bring up,
-apply MTU and STP. There is **no teardown** — `boxman destroy` leaves shared
+apply MTU and STP when declared — plus, on a bridge it had to create, STP off as
+a defined starting point. There is **no teardown** — `boxman destroy` leaves shared
 bridges alone, because another project may still be using one. Removing them is
 an explicit user action.
 
 > **That "boxman will not tear it down" is the only sense in which a shared
 > bridge is safe across projects.** Bridge names are global and not namespaced,
-> and every run re-applies the settings to whatever bridge the name resolves to,
-> so two projects that declare the same bridge differently get last-run-wins.
+> and every run re-writes the settings it declares onto whatever bridge the name
+> resolves to, so two projects that declare the same bridge differently get
+> last-run-wins.
 > Every project sharing a bridge must agree on its settings.
 
-The re-application is not uniform, which makes the disagreement easy to miss:
+A setting you *do* declare is written on every run, so it is the declarations
+that collide — not the omissions:
 
 | Setting | On every `ensure()` | If a project omits it |
 |---|---|---|
 | bridge exists, link `up` | re-applied | — |
 | `mtu` | applied only when declared | the existing MTU is left alone |
-| `stp` | **always applied** | forced **off** — the key defaults to `false` |
+| `stp` | applied only when declared | left alone; a bridge boxman *creates* starts with STP off |
 | `disable_netfilter` | acts only when `true` | the host-global sysctl is **not** restored to `1` |
 
-So a project that simply does not mention `stp:` silently turns STP off for
-everyone else on that bridge, and one project's `disable_netfilter: true`
-outlives the run that set it — nothing puts `bridge-nf-call-iptables` back to
-`1` except a reboot or kubelet.
+So the way to stay out of a co-tenant's way is to leave a key out entirely.
+Declaring `stp: false` is not the same as omitting it — the first is an opinion
+that gets written over anyone who asked for `true`, the second leaves the bridge
+as it is.
+
+`disable_netfilter` is the one that cannot be undone this way: once any project
+has set it, `bridge-nf-call-iptables` stays at `0` until a reboot or kubelet puts
+it back. No later boxman run restores it.
+
+`stp` and `disable_netfilter` accept the same spellings as a libvirt network's
+`bridge.stp` — booleans, or `on`/`true`/`yes`/`1` and `off`/`false`/`no`/`0`.
+Anything else is rejected, and a key written with no value at all is an error
+rather than a silent "leave it alone": quoting matters here, because a bare
+truthiness test would read `"off"` as on.
 
 By default boxman also installs a **scoped** per-bridge accept rule so bridged
 lab frames survive a docker-style `FORWARD` DROP policy:

@@ -83,6 +83,77 @@ class TestEnsure:
 
         assert any("stp_state 1" in c.args[0] for c in run.call_args_list)
 
+    def test_stp_not_touched_when_absent_on_an_existing_bridge(self):
+        """An entry that omits `stp:` must not write it.
+
+        Bridge names are global and not namespaced, so writing the default on
+        every run is not a no-op: it would switch STP off for every other
+        project sharing the bridge (#162).
+        """
+        cfg = {"lab_mgmt": {"bridge": "br1"}}
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=self._fake_run()) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert "stp_state" not in all_cmds
+
+    def test_stp_initialised_off_on_a_bridge_boxman_creates(self):
+        """A bridge boxman creates still gets a defined initial state."""
+        def fake_run(cmd, **kwargs):
+            if cmd.startswith("ip link show dev"):
+                return _result(ok=False)      # absent -> created by this run
+            return _result(ok=True)
+
+        cfg = {"lab_mgmt": {"bridge": "br1"}}
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=fake_run) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert "stp_state 0" in all_cmds
+
+    def test_stp_false_declared_is_still_applied(self):
+        """An explicit `stp: false` is an opinion and must be written."""
+        cfg = {"lab_mgmt": {"bridge": "br1", "stp": False}}
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=self._fake_run()) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert "stp_state 0" in all_cmds
+
+    @pytest.mark.parametrize("value,expected", [
+        (True, 1), ("on", 1), ("true", 1), ("yes", 1), ("1", 1),
+        (False, 0), ("off", 0), ("false", 0), ("no", 0), ("0", 0),
+    ])
+    def test_stp_spellings_normalised(self, value, expected):
+        """A quoted `stp: "off"` must not switch STP on.
+
+        Plain truthiness would: a non-empty "off" is truthy. Same accepted
+        spellings as a libvirt network's `bridge.stp`.
+        """
+        cfg = {"lab_mgmt": {"bridge": "br1", "stp": value}}
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=self._fake_run()) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert f"stp_state {expected}" in all_cmds
+
+    @pytest.mark.parametrize("value", ["enabled", "maybe", 2, "", []])
+    def test_invalid_stp_rejected_before_touching_the_host(self, value):
+        """A typo is rejected, and rejected before anything is mutated."""
+        cfg = {"lab_mgmt": {"bridge": "br1", "stp": value}}
+        with patch("boxman.netlab.shared_bridges.run") as run:
+            with pytest.raises(ConfigError, match="'stp' must be on or off"):
+                shared_bridges.ensure(cfg)
+            run.assert_not_called()
+
     @staticmethod
     def _fake_run(rule_present=False, docker_user=False):
         """A run() double for the netfilter path.
@@ -157,6 +228,60 @@ class TestEnsure:
         assert "bridge-nf-call-iptables" in all_cmds and "echo 0" in all_cmds
         assert "-I FORWARD" not in all_cmds  # global disable, no scoped rule
         assert any("HOST-WIDE" in r.message for r in captured_logs.records)
+
+    def test_disable_netfilter_string_false_does_not_disable(self):
+        """A quoted `disable_netfilter: "false"` must not disable host-wide.
+
+        Plain truthiness would: a non-empty "false" is truthy, so the
+        host-global sysctl would be zeroed by a config asking for the exact
+        opposite. Same input-class bug as a quoted `stp: "off"`.
+        """
+        cfg = {"lab_mgmt": {"bridge": "br1", "disable_netfilter": "false"}}
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=self._fake_run()) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert "bridge-nf-call-iptables" not in all_cmds
+        assert "-I FORWARD" in all_cmds          # scoped rule instead
+
+    @pytest.mark.parametrize("value", ["true", "yes", "on", "1", True])
+    def test_disable_netfilter_truthy_spellings_disable(self, value):
+        cfg = {"lab_mgmt": {"bridge": "br1", "disable_netfilter": value}}
+        with patch("boxman.netlab.shared_bridges.run",
+                   side_effect=self._fake_run()) as run:
+            with patch("pathlib.Path.exists", return_value=True):
+                shared_bridges.ensure(cfg)
+        all_cmds = " | ".join(c.args[0] for c in run.call_args_list)
+        assert "bridge-nf-call-iptables" in all_cmds
+
+    @pytest.mark.parametrize("value", ["maybe", 2, "", []])
+    def test_invalid_disable_netfilter_rejected_before_touching_the_host(
+            self, value):
+        cfg = {"lab_mgmt": {"bridge": "br1", "disable_netfilter": value}}
+        with patch("boxman.netlab.shared_bridges.run") as run:
+            with pytest.raises(ConfigError,
+                               match="'disable_netfilter' must be on or off"):
+                shared_bridges.ensure(cfg)
+            run.assert_not_called()
+
+    @pytest.mark.parametrize("key,message", [
+        ("stp", "'stp' must be on or off"),
+        ("disable_netfilter", "'disable_netfilter' must be on or off"),
+        ("mtu", "'mtu' must be a positive"),
+    ])
+    def test_key_present_with_no_value_is_rejected(self, key, message):
+        """`stp:` with nothing after it is a mistake, not "leave it alone".
+
+        `entry.get(k)` collapses an explicit null into absent, which would
+        make a config typo silently mean the opposite of what these keys now
+        do on omission.
+        """
+        cfg = {"lab_mgmt": {"bridge": "br1", key: None}}
+        with patch("boxman.netlab.shared_bridges.run") as run:
+            with pytest.raises(ConfigError, match=message):
+                shared_bridges.ensure(cfg)
+            run.assert_not_called()
 
     def test_missing_bridge_key_raises(self):
         cfg = {"lab_mgmt": {"stp": False}}  # no 'bridge'
