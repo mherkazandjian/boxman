@@ -460,7 +460,8 @@ flowchart TB
 ```
 
 `ensure()` is idempotent for a single declaration: create if missing, bring up,
-and apply MTU and STP when they are declared. There is **no teardown** — `boxman destroy` leaves shared
+apply MTU and STP when declared — plus, on a bridge it had to create, STP off as
+a defined starting point. There is **no teardown** — `boxman destroy` leaves shared
 bridges alone, because another project may still be using one. Removing them is
 an explicit user action.
 

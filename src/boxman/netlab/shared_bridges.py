@@ -167,13 +167,14 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
       (``ip link set dev <br> mtu <n>``). Bridges default to 1500 while
       containerlab veth links default to 9500, so set this (e.g. 9500) on
       bridges that carry jumbo lab traffic to avoid a silent blackhole.
-    - ``stp`` (bool, optional): enable STP on the bridge. Applied only when
+    - ``stp`` (bool, or an ``on``/``off`` spelling, optional): enable STP on
+      the bridge. Applied only when
       declared. An entry that omits it leaves the current setting alone on a
       bridge that already exists, and gets STP off on one boxman creates --
       because the name is shared, so writing a default on every run would
       clobber a co-tenant project's explicit choice.
-    - ``disable_netfilter`` (bool, default **False** when the key is absent;
-      a declared value is validated like ``stp``): when False (the
+    - ``disable_netfilter`` (bool, or an ``on``/``off`` spelling; default
+      **False** when the key is absent): when False (the
       default, decision D8), lab frames are allowed by an idempotent
       per-bridge scoped ``iptables`` accept rule and the host-global
       ``bridge-nf-call-iptables`` is left untouched. When True (an explicit,
