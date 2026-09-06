@@ -762,8 +762,13 @@ This project is licensed under the [MIT License](LICENSE).
 - `destroy-runtime` — destroy the docker-compose runtime and clean up .boxman
 - `destroy` — full teardown (VMs + networks + files + runtime + workspace
   workdir) with a `[y/N]` prompt; use `-y`/`--auto-accept` to skip the prompt
-  and `--templates` to also remove template workdirs
-- `deprovision` — deprovision a configuration
+  and `--templates` to also remove template workdirs. Validates every path it
+  would delete before starting, and stops at exit 2 without running the
+  irreversible cleanup if the teardown did not complete — see
+  [Teardown safety](#teardown-safety)
+- `deprovision` — deprovision a configuration (VMs + networks). Exits 2 and
+  skips the cleanup if any resource survived — see
+  [Teardown safety](#teardown-safety)
 - `snapshot` — manage snapshots of VMs
   - `snapshot take` — take a snapshot (`--compress-memory` zstd-compresses
     the memory dump; restore decompresses transparently)
@@ -801,6 +806,43 @@ This project is licensed under the [MIT License](LICENSE).
 - `run` — run tasks with the workspace environment loaded
 - `ps` — show the state of VMs in the project (`-p` adds provider-specific columns, `--json` outputs JSON)
 - `ssh` — ssh into a VM
+
+## Teardown safety
+
+`deprovision` and `destroy` will not throw away the state you need to try
+again.
+
+Teardown is **not transactional**: removals that already succeeded are not
+rolled back, so one VM's disks can be gone before another VM's teardown fails.
+What is protected is the *recovery state*. If any resource is left behind — or
+if the teardown cannot be confirmed — the command exits 2 and does **not** run
+the irreversible cleanup that follows it. The generated files (SSH keys,
+inventory, `env.sh`), the workspace tree, the template workdirs, the docker
+runtime and the project's cache entry all stay, so the project is still listed
+by `boxman list` and the same command can be re-run to finish the job. Both
+commands are idempotent, so re-running is the normal recovery.
+
+The error names what survived. Fix that cause — start libvirtd, free the
+network, stop whatever is holding the compose volumes — then run it again.
+
+Details worth knowing:
+
+- **How completion is judged.** For libvirt projects the teardown is confirmed
+  against `virsh list --all --name`; a query that cannot be answered counts as
+  unconfirmed, never as "nothing left". A docker-compose-only project is not
+  given a libvirt dependency — its teardown is judged by the compose
+  operations themselves.
+- **Disks are only removed once the domain is confirmed gone.** A libvirt
+  query that fails is not proof of absence, so an unreachable libvirtd leaves
+  the disks alone instead of unlinking them under a guest that may still be
+  running.
+- **`destroy` validates its delete targets up front**, before any teardown
+  starts. It refuses a path that is empty, relative, a symlink, your home
+  directory, a filesystem root or mount point, a top-level path, or a
+  directory containing a `.git`. A `workspace.path` typo aborts the command
+  rather than deleting that tree.
+- **`provision --force` deprovisions first**, so it now aborts instead of
+  provisioning on top of resources it could not remove.
 
 ## Updating a Running Project
 

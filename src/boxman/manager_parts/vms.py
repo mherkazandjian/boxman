@@ -301,12 +301,25 @@ class VMsMixin:
         self.logger.info(f"destroying vm {full_vm_name}")
         session = self.session_for_cluster(cluster_name)
         session.destroy_vm(full_vm_name)
+        if not session.confirm_vm_absent(full_vm_name):
+            session.destroy_vm(full_vm_name, force=True)
+
+        # Unlinking the disk files is gated on a *positive* confirmation that
+        # the domain is gone. destroy_vm()'s return value cannot carry that:
+        # it reports success when the libvirt query itself could not be
+        # answered, so an outage looked like a finished teardown and the
+        # qcow2 files were removed out from under a still-running guest.
+        if not session.confirm_vm_absent(full_vm_name):
+            raise ProvisionError(
+                f"{full_vm_name}: could not confirm the domain was "
+                f"undefined; leaving its disks in place rather than removing "
+                f"storage under a possibly-live guest")
+
         session.destroy_disks(
             cluster['workdir'],
             vm_name=full_vm_name,
             disks=vm_info.get('disks', [])
         )
-        session.destroy_vm(full_vm_name, force=True)
 
     def _vm_disk_dirs(self, full_vm_name: str) -> list[str]:
         """
@@ -350,15 +363,28 @@ class VMsMixin:
         # Phase 1 (#49): stays on the default session — the VM is gone
         # from the config, so its cluster (and provider) can no longer be
         # resolved. Revisited in Phase 3 (#51).
+        #
+        # The disk directories come from libvirt, so they must be discovered
+        # *before* the domain is undefined.
         disk_dirs = self._vm_disk_dirs(full_vm_name)
         self.provider.destroy_vm(full_vm_name)
+        if not self.provider.confirm_vm_absent(full_vm_name):
+            self.provider.destroy_vm(full_vm_name, force=True)
+
+        # Same gate as _destroy_vm_and_disks: only a positive confirmation
+        # that the domain is gone authorises unlinking its disks.
+        if not self.provider.confirm_vm_absent(full_vm_name):
+            raise ProvisionError(
+                f"{full_vm_name}: could not confirm the domain was "
+                f"undefined; leaving its disks in place rather than removing "
+                f"storage under a possibly-live guest")
+
         for workdir in disk_dirs:
             self.provider.destroy_disks(
                 workdir,
                 vm_name=full_vm_name,
                 disks=[]
             )
-        self.provider.destroy_vm(full_vm_name, force=True)
 
     def configure_and_start_vms(self) -> None:
         """
@@ -429,6 +455,41 @@ class VMsMixin:
             v.strip() for v in result.stdout.strip().split("\n")
             if v.strip() and v.strip().startswith(prj_prefix)
         ]
+
+    def _confirm_project_torn_down(self) -> tuple[bool, str]:
+        """
+        Positively confirm that no libvirt VM of this project is left.
+
+        Fails closed, and is provider-aware: a docker-compose-only project has
+        no libvirt domains to look for and must not acquire a libvirt
+        dependency, so it confirms immediately. Otherwise the evidence has to
+        be a **successful** ``virsh list --all --name`` with no domain
+        carrying this project's prefix. A query that could not be answered is
+        reported as "not confirmed", never as "nothing left" — the callers use
+        this to decide whether it is safe to delete the workspace and forget
+        the project, and both are unrecoverable if resources actually survived.
+
+        Returns:
+            ``(True, '')`` when the teardown is confirmed complete, otherwise
+            ``(False, reason)``.
+        """
+        if not self._has_libvirt_clusters():
+            return True, ''
+
+        result = self._virsh().execute(
+            "list", "--all", "--name", hide=True, warn=True)
+        if not result.ok:
+            return False, ("could not query libvirt to confirm the teardown "
+                           "completed")
+
+        prj_prefix = f"bprj__{self.config.get('project', '')}__bprj_"
+        survivors = sorted(
+            v.strip() for v in (result.stdout or "").splitlines()
+            if v.strip() and v.strip().startswith(prj_prefix)
+        )
+        if survivors:
+            return False, f"VMs are still defined: {', '.join(survivors)}"
+        return True, ''
 
     def _get_vm_states(self) -> dict[str, str]:
         """

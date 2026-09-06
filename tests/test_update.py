@@ -788,6 +788,9 @@ class TestDestroyRemovedVm:
         mgr = self._make_manager()
         mock_virsh_cls.return_value.execute.return_value = MagicMock(
             ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
+        # Not gone after the graceful undefine, gone after the forced one:
+        # the disks may only be removed once absence is confirmed.
+        mgr.provider.confirm_vm_absent.side_effect = [False, True]
 
         mgr._destroy_removed_vm('test-vm')
 
@@ -841,6 +844,7 @@ class TestDestroyRemovedVm:
         virsh = mock_virsh_cls.return_value
         virsh.execute.return_value = MagicMock(
             ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
+        mgr.provider.confirm_vm_absent.side_effect = [False, True]
 
         parent = MagicMock()
         parent.attach_mock(virsh.execute, 'virsh_execute')
