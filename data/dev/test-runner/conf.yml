@@ -133,6 +133,19 @@ templates:
         # libvirt-qemu (uid 64055) must be able to reach boxman-templates
         # under /home/admin — Ubuntu 24.04 homes are 0750 by default
         - chmod 755 /home/admin
+        # containerlab is not in the Ubuntu archive, so it needs the vendor
+        # installer. Without it every hybrid libvirt+containerlab box in the
+        # integration tier fails: `provision` aborts in deploy_netlab() only
+        # *after* the network and the VM already exist, and that leftover
+        # state then collides with each box that follows
+        # ("found 1 conflicts for network ..."). Runs after docker, which
+        # containerlab needs. Pinned, like the base image above, so that
+        # rebuilding a runner is reproducible.
+        - bash -c "curl -sL https://get.containerlab.dev | bash -s -- -v 0.79.0"
+        # containerlab is invoked without sudo (see netlab/containerlab.py),
+        # so the test users need the group its installer creates
+        - usermod -aG clab_admins admin
+        - usermod -aG clab_admins ubuntu
         - echo ran at $(date -Is) >> /var/log/test-runner-cloudinit.log
 
 workspace:
