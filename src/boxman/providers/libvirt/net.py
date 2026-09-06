@@ -790,6 +790,38 @@ class Network:
         # Determine the current runtime scope for filtering
         current_runtime = getattr(self.manager, '_runtime_name', 'local')
 
+        # Live network names, fetched at most once and only if some cached
+        # entry actually looks like a conflict. ``None`` means libvirt could
+        # not be asked, which is not the same as "nothing is defined" — and
+        # an empty list is a legitimate answer, hence the separate flag rather
+        # than using ``[]`` as the not-yet-fetched sentinel.
+        listed_networks: list[str] | None = None
+        listed_fetched = False
+
+        def _is_stale_cache_entry(cached_name: str) -> bool:
+            """
+            Whether a cached network no longer exists in this runtime.
+
+            The conflict check reads only the cache, so an entry that outlived
+            its network — a provision aborted midway, a network removed
+            outside boxman — blocks every later run against something that is
+            not there. Confirming against libvirt is what tells a real
+            collision from a stale record.
+
+            Fails closed: only a *successful* listing that does not contain
+            *cached_name* counts as stale. If libvirt cannot be reached the
+            entry is treated as live and the conflict stands, because refusing
+            to create a network is recoverable while colliding with a real one
+            is not.
+            """
+            nonlocal listed_networks, listed_fetched
+            if not listed_fetched:
+                listed_networks = self._listed_networks()
+                listed_fetched = True
+            if listed_networks is None:
+                return False
+            return cached_name not in listed_networks
+
         conflicts = {}
         n_conflicts = 0
         for project_name, project_data in projects_in_cache.items():
@@ -815,20 +847,44 @@ class Network:
                             and net_name == self.name):
                         continue
 
+                    # Decide what overlaps first, so the libvirt lookup below
+                    # runs only for an entry that would actually be reported.
+                    name_clash = net_name == self.name
+                    bridge_clash = (
+                        self.forward_mode != 'bridge'
+                        and net_info.get('bridge_name') == self.bridge_name)
+                    ip_clash = (
+                        self.ip_address is not None
+                        and net_info.get('ip_address') == self.ip_address)
+                    if not (name_clash or bridge_clash or ip_clash):
+                        continue
+
+                    # The same wedge one project over: an entry that outlived
+                    # its network (a provision aborted midway, a network
+                    # removed outside boxman) would otherwise refuse every
+                    # later run by name, bridge and address against something
+                    # libvirt does not have. A network that really is there
+                    # still conflicts — only a confirmed absence is ignored.
+                    if _is_stale_cache_entry(net_name):
+                        self.logger.warning(
+                            f"ignoring stale cache entry for network "
+                            f"{net_name} (project: {project_name}): it is "
+                            f"registered in the boxman cache but libvirt does "
+                            f"not have it")
+                        continue
+
                     conflicts[project_name]['networks'][net_name] = {}
-                    if net_name == self.name:
+                    if name_clash:
                         # network already exists in the cache
                         msg = f"network {self.name} already exists in project {project_name}"
                         conflicts[project_name]['networks'][net_name]['name'] = msg
                         n_conflicts += 1
-                    if (self.forward_mode != 'bridge'
-                            and net_info.get('bridge_name') == self.bridge_name):
+                    if bridge_clash:
                         # bridge name conflict
                         msg = f"bridge {self.bridge_name} is already used by network {net_name} in project {project_name}"
                         conflicts[project_name]['networks'][net_name]['bridge'] = msg
                         n_conflicts += 1
-                    if (self.ip_address is not None
-                            and net_info.get('ip_address') == self.ip_address):
+                    if ip_clash:
                         # ip address conflict
                         msg = f"ip address {self.ip_address} is already used by network {net_name} in project {project_name}"
                         conflicts[project_name]['networks'][net_name]['ip'] = msg

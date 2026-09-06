@@ -85,13 +85,19 @@ class TestDiskDiff:
         assert diff["new_disks"][0]["name"] == "data"
 
     def test_stale_file_logs_warning(self, differ: VMStateDiffer,
-                                     tmp_path: Path, caplog):
+                                     tmp_path: Path, captured_logs):
+        # `captured_logs`, not the raw `caplog`: boxman's logger sets
+        # propagate = False, so pytest's root-attached handler does not see
+        # its records. That assignment sits inside an `if not
+        # logger.handlers:` guard, so whether raw caplog happens to work
+        # depends on import order — this test passed in the test-runner VM
+        # and failed on a workstation for exactly that reason.
         (tmp_path / "vm01_data.qcow2").write_bytes(b"x")
         desired = [{"name": "data", "target": "vdb", "size": 1024}]
-        with caplog.at_level("WARNING"):
+        with captured_logs.at_level("WARNING", logger="boxman"):
             _diff_disks(differ, desired, [], str(tmp_path))
         assert any("attach" in rec.message and "vdb" in rec.message
-                   for rec in caplog.records)
+                   for rec in captured_logs.records)
 
     def test_attached_disk_not_in_new_disks(self, differ: VMStateDiffer,
                                             tmp_path: Path):
