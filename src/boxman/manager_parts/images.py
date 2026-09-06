@@ -2,6 +2,7 @@
 
 
 import hashlib
+import re
 import os
 import shutil
 from urllib.parse import urlparse
@@ -461,6 +462,11 @@ class ImagesMixin:
             f"Affected paths:\n  {offenders}"
         )
 
+    #: MAC spelling accepted for a direct-boot VM's ``networks[].mac`` — the
+    #: same one ``dhcp.hosts`` reservations use (providers/libvirt/net.py), so a
+    #: pinned NIC and its reservation are guaranteed to compare equal.
+    _MAC_RE = re.compile(r'[0-9a-f]{1,2}(:[0-9a-f]{1,2}){5}')
+
     @staticmethod
     def _is_diskless_boot(vm_info: dict) -> bool:
         """True if a VM boots from network (PXE) or cdrom (ISO).
@@ -495,6 +501,46 @@ class ImagesMixin:
             return False, f"cdroms references unknown iso '{name}' (declare it under isos:)"
         return True, ""
 
+    @classmethod
+    def _validate_direct_boot_networks(cls, vm_info: dict, loc: str,
+                                       seen_macs: dict) -> list[str]:
+        """Validate a direct-boot VM's ``networks:`` list; returns reasons.
+
+        Entries are bare names or ``{name, mac}`` mappings. A ``mac`` must be
+        well-formed and unique across the project's direct-boot VMs — the NIC
+        is created by ``virt-install`` with exactly that address, so a typo or
+        a duplicate would otherwise surface only as a DHCP reservation that
+        never matches. ``seen_macs`` maps mac -> location and is shared across
+        the VMs of one validation pass.
+        """
+        networks = vm_info.get('networks')
+        if networks is None:
+            return []
+        if not isinstance(networks, list):
+            return ["'networks:' must be a list of names or {name, mac} mappings"]
+        reasons = []
+        for entry in networks:
+            if isinstance(entry, str):
+                continue
+            if not isinstance(entry, dict) or not entry.get('name'):
+                reasons.append(f"networks entry {entry!r} has no 'name'")
+                continue
+            mac = entry.get('mac')
+            if mac is None:
+                continue
+            mac_s = str(mac).lower()
+            if not cls._MAC_RE.fullmatch(mac_s):
+                reasons.append(
+                    f"network '{entry['name']}' has an invalid mac {mac!r}")
+                continue
+            if mac_s in seen_macs:
+                reasons.append(
+                    f"network '{entry['name']}' mac {mac_s} is already used "
+                    f"by {seen_macs[mac_s]}")
+                continue
+            seen_macs[mac_s] = loc
+        return reasons
+
     def validate_base_images(self) -> None:
         """
         Validate VM boot configuration up front, before any parallel cloning.
@@ -504,18 +550,26 @@ class ImagesMixin:
         - ``cdrom``-boot (ISO) VMs must declare a valid ``cdroms:`` entry
           referencing a known ``isos:`` entry (or an explicit ``source:``).
         - ``network``-boot (PXE) VMs need neither.
+        - direct-boot (``cdrom``/``network``) VMs may pin a NIC ``mac`` under
+          ``networks:``; it must be well-formed and unique.
 
         Raises ``ValueError`` aggregating every problem found.
         """
         iso_names = set((self.config.get('isos') or {}).keys())
         missing = []
         invalid = []
+        bad_networks = []
+        seen_macs: dict[str, str] = {}
         for cluster_name, cluster in self.config.get('clusters', {}).items():
             cluster_base = cluster.get('base_image', '')
             for vm_name, vm_info in cluster.get('vms', {}).items():
                 loc = f"{cluster_name}.vms.{vm_name}"
                 boot_order = vm_info.get('boot_order', ['hd'])
                 first_boot = boot_order[0] if boot_order else 'hd'
+                if first_boot in ('cdrom', 'network'):
+                    for reason in self._validate_direct_boot_networks(
+                            vm_info, loc, seen_macs):
+                        bad_networks.append(f"{loc} ({reason})")
                 if first_boot == 'cdrom':
                     ok, reason = self._validate_cdrom_boot(vm_info, iso_names)
                     if not ok:
@@ -534,6 +588,10 @@ class ImagesMixin:
             errors.append(
                 "the following ISO-boot VM(s) have an invalid 'cdroms:' "
                 f"configuration: {', '.join(invalid)}")
+        if bad_networks:
+            errors.append(
+                "the following direct-boot VM(s) have an invalid 'networks:' "
+                f"configuration: {', '.join(bad_networks)}")
         if errors:
             raise ValueError("; ".join(errors))
 
@@ -748,29 +806,45 @@ class ImagesMixin:
 
         return result
 
-    def _resolved_network_names(self, cluster_name: str, vm_info: dict) -> list[str]:
-        """Fully-qualified libvirt names for a VM's ``networks:`` (first-NIC list).
+    def _resolved_network_specs(self, cluster_name: str, vm_info: dict) -> list[dict]:
+        """Namespaced ``{name, mac}`` specs for a direct-boot VM's ``networks:``.
 
         Direct-boot VMs (ISO/PXE) attach networks at ``virt-install`` time, so
         the raw cluster-network name must be namespaced exactly as cluster
-        networks are defined (``bprj__…__clstr__…__<name>``).
+        networks are defined (``bprj__…__clstr__…__<name>``). An entry is a
+        bare name or a ``{name, mac}`` mapping; an optional ``mac`` pins the
+        NIC's address (lower-cased, so it compares equal to a ``dhcp.hosts``
+        reservation), ``None`` lets libvirt generate one.
         """
-        names = []
+        specs = []
         for net in vm_info.get("networks") or []:
-            if isinstance(net, dict) and net.get("name"):
-                names.append(self.full_network_name(
+            if isinstance(net, str) and net:
+                name, mac = net, None
+            elif isinstance(net, dict) and net.get("name"):
+                name, mac = net["name"], net.get("mac")
+            else:
+                continue
+            specs.append({
+                "name": self.full_network_name(
                     project_config=self.config,
                     cluster_name=cluster_name,
-                    network_name=net["name"],
-                ))
-        return names
+                    network_name=name,
+                ),
+                "mac": str(mac).lower() if mac else None,
+            })
+        return specs
+
+    def _resolved_network_names(self, cluster_name: str, vm_info: dict) -> list[str]:
+        """Fully-qualified libvirt names for a VM's ``networks:`` (first-NIC list)."""
+        return [s["name"] for s in self._resolved_network_specs(cluster_name, vm_info)]
 
     def _resolve_iso_config(self) -> None:
         """Resolve ISO/cdrom/network references for direct-boot VMs, in place.
 
         Downloads+caches declared ``isos:``, expands each VM's ``cdroms:`` to
         local sources, sets ``_resolved_iso_path`` for cdrom-boot VMs, and
-        namespaces ``networks:`` into ``_resolved_networks``. Mutating
+        namespaces ``networks:`` into ``_resolved_networks`` (``{name, mac}``
+        specs, see :meth:`_resolved_network_specs`). Mutating
         ``self.config`` means both the clone subprocesses and the later
         configure/start step observe the resolved values (otherwise the resolved
         ISO source never reaches the CDROM-attach path). Idempotent.
@@ -783,7 +857,7 @@ class ImagesMixin:
             for vm_name, vm_info in cluster.get("vms", {}).items():
                 resolved = self._inject_resolved_iso(vm_info, resolved_isos)
                 if self._is_diskless_boot(resolved):
-                    resolved["_resolved_networks"] = self._resolved_network_names(
+                    resolved["_resolved_networks"] = self._resolved_network_specs(
                         cluster_name, resolved)
                 cluster["vms"][vm_name] = resolved
 

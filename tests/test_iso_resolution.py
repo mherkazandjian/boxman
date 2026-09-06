@@ -257,3 +257,86 @@ class TestValidateBaseImages:
     def test_network_boot_needs_no_base_image(self):
         mgr = self._mgr({"c": {"vms": {"v": {"boot_order": ["network", "hd"]}}}})
         mgr.validate_base_images()  # no raise
+
+
+class TestResolvedNetworkSpecs:
+    def test_namespaces_and_lowercases_mac(self):
+        mgr = _manager_with_config({"project": "myproj"})
+        specs = mgr._resolved_network_specs(
+            "pve", {"networks": [{"name": "pvenet", "mac": "52:54:00:77:00:AA"}]})
+        assert specs == [{"name": "bprj__myproj__bprj__clstr__pve__clstr__pvenet",
+                          "mac": "52:54:00:77:00:aa"}]
+
+    def test_no_mac_is_none(self):
+        mgr = _manager_with_config({"project": "myproj"})
+        specs = mgr._resolved_network_specs("pve", {"networks": [{"name": "pvenet"}]})
+        assert specs == [{"name": "bprj__myproj__bprj__clstr__pve__clstr__pvenet",
+                          "mac": None}]
+
+    def test_bare_string_entries_are_namespaced(self):
+        mgr = _manager_with_config({"project": "myproj"})
+        specs = mgr._resolved_network_specs("pve", {"networks": ["pvenet"]})
+        assert specs == [{"name": "bprj__myproj__bprj__clstr__pve__clstr__pvenet",
+                          "mac": None}]
+
+    def test_unnamed_entries_are_skipped(self):
+        mgr = _manager_with_config({"project": "myproj"})
+        assert mgr._resolved_network_specs("pve", {"networks": [{"mac": "x"}, None, ""]}) == []
+
+    def test_names_wrapper_still_returns_strings(self):
+        mgr = _manager_with_config({"project": "myproj"})
+        names = mgr._resolved_network_names(
+            "pve", {"networks": [{"name": "pvenet", "mac": "52:54:00:77:00:11"}]})
+        assert names == ["bprj__myproj__bprj__clstr__pve__clstr__pvenet"]
+
+    def test_resolve_iso_config_stores_specs(self):
+        cfg = {"project": "p", "clusters": {"c": {"vms": {"v": {
+            "boot_order": ["cdrom", "hd"],
+            "cdroms": [{"source": "/x.iso"}],
+            "networks": [{"name": "n", "mac": "52:54:00:77:00:11"}]}}}}}
+        mgr = _manager_with_config(cfg)
+        mgr._resolve_iso_config()
+        assert cfg["clusters"]["c"]["vms"]["v"]["_resolved_networks"] == [
+            {"name": "bprj__p__bprj__clstr__c__clstr__n", "mac": "52:54:00:77:00:11"}]
+
+
+class TestValidateDirectBootNetworks:
+    def _mgr(self, vms):
+        return _manager_with_config({"project": "p", "clusters": {"c": {"vms": vms}}})
+
+    @staticmethod
+    def _iso_vm(**extra):
+        return {"boot_order": ["cdrom", "hd"], "cdroms": [{"source": "/x.iso"}], **extra}
+
+    def test_bad_mac_is_invalid(self):
+        mgr = self._mgr({"v": self._iso_vm(networks=[{"name": "n", "mac": "not-a-mac"}])})
+        with pytest.raises(ValueError, match="invalid mac"):
+            mgr.validate_base_images()
+
+    def test_duplicate_mac_across_vms_is_invalid(self):
+        mgr = self._mgr({
+            "v1": self._iso_vm(networks=[{"name": "n", "mac": "52:54:00:77:00:11"}]),
+            "v2": {"boot_order": ["network", "hd"],
+                   "networks": [{"name": "n", "mac": "52:54:00:77:00:11"}]},
+        })
+        with pytest.raises(ValueError, match="already used by c.vms.v1"):
+            mgr.validate_base_images()
+
+    def test_unnamed_entry_is_invalid(self):
+        mgr = self._mgr({"v": self._iso_vm(networks=[{"mac": "52:54:00:77:00:11"}])})
+        with pytest.raises(ValueError, match="has no 'name'"):
+            mgr.validate_base_images()
+
+    def test_valid_mac_passes(self):
+        mgr = self._mgr({
+            "v1": self._iso_vm(networks=[{"name": "n", "mac": "52:54:00:77:00:11"}]),
+            "v2": self._iso_vm(networks=["n", {"name": "m"}]),
+        })
+        mgr.validate_base_images()  # no raise
+
+    def test_hd_boot_networks_are_not_validated(self):
+        # `networks:` is inert on cloned VMs (NICs come from the template), so a
+        # stray value there must not block a provision
+        mgr = self._mgr({"v": {"base_image": "tpl",
+                               "networks": [{"name": "n", "mac": "nope"}]}})
+        mgr.validate_base_images()  # no raise

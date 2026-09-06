@@ -226,3 +226,34 @@ class TestMemballoonValidation:
                           return_value=_result(stdout=_domain_xml())):
             with pytest.raises(ConfigError):
                 ve.configure_memballoon("vm01", {"stats_period": True})
+
+
+class TestConfigureCpuMemoryEditsPersistentConfig:
+    """configure_cpu_memory must read the *inactive* (persistent) XML.
+
+    A direct-boot (ISO/PXE) VM is still running virt-install's transient
+    install XML (cdrom-first, on_reboot=destroy, install media inserted) when
+    the post-create configure step runs. Redefining from the live XML would
+    persist that and re-run the installer on every boot.
+    """
+
+    _XML = ("<domain type='kvm'><name>d</name>"
+            "<memory unit='KiB'>1048576</memory>"
+            "<currentMemory unit='KiB'>1048576</currentMemory>"
+            "<vcpu placement='static'>1</vcpu>"
+            "<os><type>hvm</type></os></domain>")
+
+    def test_reads_inactive_xml_then_defines(self, ve: VirshEdit):
+        def _exe(*args, **kwargs):
+            if args and args[0] == "dumpxml":
+                return _result(stdout=self._XML)
+            return _result()
+
+        with patch.object(ve.virsh, "execute", side_effect=_exe) as exe:
+            assert ve.configure_cpu_memory("d", None, 2048) is True
+
+        first = exe.call_args_list[0].args
+        assert first[0] == "dumpxml"
+        assert "d" in first
+        assert "--inactive" in first, first
+        assert any(c.args and c.args[0] == "define" for c in exe.call_args_list)
