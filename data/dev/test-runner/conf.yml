@@ -141,12 +141,28 @@ templates:
         # ("found 1 conflicts for network ..."). Runs after docker, which
         # containerlab needs. Pinned, like the base image above, so that
         # rebuilding a runner is reproducible.
-        - bash -c "curl -sL https://get.containerlab.dev | bash -s -- -v 0.79.0"
+        #
+        # The done-marker below lives INSIDE this guarded block on purpose.
+        # cloud-init's runcmd is not run under `set -e`, so a failed install
+        # would otherwise still reach the marker, boxman would accept the
+        # template, `make test-vm-up` would report success, and the tier
+        # would fail much later with the same confusing
+        # ContainerlabNotInstalled. `curl -f` matters for the same reason: a
+        # 404 otherwise pipes an error page into bash, which exits 0.
         # containerlab is invoked without sudo (see netlab/containerlab.py),
-        # so the test users need the group its installer creates
-        - usermod -aG clab_admins admin
-        - usermod -aG clab_admins ubuntu
-        - echo ran at $(date -Is) >> /var/log/test-runner-cloudinit.log
+        # so the test users need the group the installer creates.
+        - |
+          bash -euo pipefail <<'CLAB_SETUP'
+          curl -fsSL https://get.containerlab.dev | bash -s -- -v 0.79.0
+          usermod -aG clab_admins admin
+          usermod -aG clab_admins ubuntu
+          installed="$(containerlab version 2>&1 || true)"
+          case "$installed" in
+            *0.79.0*) : ;;
+            *) echo "containerlab 0.79.0 is not installed" >&2; exit 1 ;;
+          esac
+          echo "ran at $(date -Is)" >> /var/log/test-runner-cloudinit.log
+          CLAB_SETUP
 
 workspace:
   path: ~/workspaces/boxmandev/test-runner
