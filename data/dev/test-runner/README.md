@@ -6,6 +6,14 @@ never touch the host.
 
 - 2 vCPU / 16 GB RAM / 60 GB system disk + 20 GB data disk
 - Ubuntu 24.04 with `docker.io`, `python3-venv`, `git`, `rsync`
+- `containerlab` (pinned, installed via its vendor script — it is not in the
+  Ubuntu archive). The integration tier's hybrid libvirt + containerlab boxes
+  shell out to `containerlab deploy`; without it `provision` aborts in
+  `deploy_netlab()` *after* the network and VM already exist, and that
+  leftover state then collides with every box that runs afterwards
+  (`found 1 conflicts for network …`). Boxes whose node images are not
+  publicly pullable (Arista cEOS, Cisco IOSvL2) still need those images
+  loaded into the VM's docker by hand.
 - NAT network on `192.168.15.0/24` (chosen to not collide with the other
   projects on the dev host — check `virsh net-dumpxml` before changing it)
 - Integration tier needs `/dev/kvm` *inside* the VM, i.e. nested
