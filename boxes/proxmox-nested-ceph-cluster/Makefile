@@ -126,7 +126,9 @@ all: keys answer sync host-prep iso up wait-installed boot wait-first-boot mtu-c
 # needed. Open the tunnel first:  ssh -N -L 8006:10.77.0.11:8006 hpe1
 TF_DIR := $(BOX_DIR)/terraform
 TF := terraform -chdir=$(TF_DIR)
-VM_COUNT ?= 4
+# VM_COUNT only overrides when given (make tf-apply VM_COUNT=8); otherwise
+# terraform.tfvars (local, gitignored) or the variable default applies
+TF_VARS = $(if $(VM_COUNT),-var vm_count=$(VM_COUNT),)
 
 tf-token:   #@ create the API token root@pam!terraform on pve1 and write terraform/.env
 	@$(SSH) $(ORCH) 'source $(SCRIPTS)/lib.sh; pssh pve1 "pveum user token list root@pam --output-format json | grep -q \"\\\"terraform\\\"\" && pveum user token remove root@pam terraform >/dev/null; pveum user token add root@pam terraform --privsep 0 --comment lab-terraform --output-format json"' \
@@ -137,13 +139,13 @@ tf-init:   #@ terraform init
 	$(TF) init -input=false
 
 tf-plan:   #@ terraform plan (VM_COUNT=n)
-	@set -a; . $(TF_DIR)/.env; set +a; $(TF) plan -input=false -var vm_count=$(VM_COUNT)
+	@set -a; . $(TF_DIR)/.env; set +a; $(TF) plan -input=false $(TF_VARS)
 
 tf-apply:   #@ terraform apply: VM_COUNT Rocky 9 VMs round-robin over the nodes, disks on vmpool
-	@set -a; . $(TF_DIR)/.env; set +a; $(TF) apply -input=false -auto-approve -var vm_count=$(VM_COUNT)
+	@set -a; . $(TF_DIR)/.env; set +a; $(TF) apply -input=false -auto-approve $(TF_VARS)
 
 tf-output:   #@ show the VMs' nodes and addresses
 	@$(TF) output vms; $(TF) output ssh
 
 tf-destroy:   #@ terraform destroy (VMs and the downloaded images)
-	@set -a; . $(TF_DIR)/.env; set +a; $(TF) destroy -input=false -auto-approve -var vm_count=$(VM_COUNT)
+	@set -a; . $(TF_DIR)/.env; set +a; $(TF) destroy -input=false -auto-approve $(TF_VARS)

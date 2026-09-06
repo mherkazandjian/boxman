@@ -16,7 +16,8 @@ locals {
     for i in range(var.vm_count) :
     format("%s%02d", var.vm_name_prefix, i + 1) => {
       vm_id = var.vm_id_base + i
-      node  = var.nodes[i % length(var.nodes)]
+      node = lookup(var.node_overrides, format("%s%02d", var.vm_name_prefix, i + 1),
+      var.nodes[i % length(var.nodes)])
     }
   }
 
@@ -48,6 +49,7 @@ resource "proxmox_virtual_environment_vm" "rocky" {
   started         = true
   on_boot         = true
   stop_on_destroy = true
+  migrate         = true # a changed node_name is a (live) migration, never a re-create
 
   agent {
     enabled = true

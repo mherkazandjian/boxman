@@ -16,6 +16,12 @@ variable "nodes" {
   default     = ["pve1", "pve2", "pve3", "pve4"]
 }
 
+variable "node_overrides" {
+  description = "Pin VMs to nodes instead of round-robin, e.g. { rocky01 = \"pve2\" }; changing a VM's node live-migrates it"
+  type        = map(string)
+  default     = {}
+}
+
 variable "vm_count" {
   description = "How many Rocky 9 VMs to create"
   type        = number
