@@ -847,6 +847,18 @@ class Network:
                             and net_name == self.name):
                         continue
 
+                    # Decide what overlaps first, so the libvirt lookup below
+                    # runs only for an entry that would actually be reported.
+                    name_clash = net_name == self.name
+                    bridge_clash = (
+                        self.forward_mode != 'bridge'
+                        and net_info.get('bridge_name') == self.bridge_name)
+                    ip_clash = (
+                        self.ip_address is not None
+                        and net_info.get('ip_address') == self.ip_address)
+                    if not (name_clash or bridge_clash or ip_clash):
+                        continue
+
                     # The same wedge one project over: an entry that outlived
                     # its network (a provision aborted midway, a network
                     # removed outside boxman) would otherwise refuse every
@@ -862,19 +874,17 @@ class Network:
                         continue
 
                     conflicts[project_name]['networks'][net_name] = {}
-                    if net_name == self.name:
+                    if name_clash:
                         # network already exists in the cache
                         msg = f"network {self.name} already exists in project {project_name}"
                         conflicts[project_name]['networks'][net_name]['name'] = msg
                         n_conflicts += 1
-                    if (self.forward_mode != 'bridge'
-                            and net_info.get('bridge_name') == self.bridge_name):
+                    if bridge_clash:
                         # bridge name conflict
                         msg = f"bridge {self.bridge_name} is already used by network {net_name} in project {project_name}"
                         conflicts[project_name]['networks'][net_name]['bridge'] = msg
                         n_conflicts += 1
-                    if (self.ip_address is not None
-                            and net_info.get('ip_address') == self.ip_address):
+                    if ip_clash:
                         # ip address conflict
                         msg = f"ip address {self.ip_address} is already used by network {net_name} in project {project_name}"
                         conflicts[project_name]['networks'][net_name]['ip'] = msg
