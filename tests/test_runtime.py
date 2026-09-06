@@ -1158,10 +1158,15 @@ class TestDockerComposeRuntimeBridgeConflict:
             )
             network.bridge_name = 'virbr1'
 
-            # SHOULD raise because other_project is in same runtime
+            # SHOULD raise because other_project is in same runtime — and
+            # because its network really is defined there. A cached entry
+            # whose network no longer exists is ignored instead (see
+            # test_net_reconcile.py::TestCacheSelfConflict).
             import pytest
-            with pytest.raises(RuntimeError, match="conflicts"):
-                network.check_network_exists()
+            with patch.object(Network, '_listed_networks',
+                              return_value=['other_nat']):
+                with pytest.raises(RuntimeError, match="conflicts"):
+                    network.check_network_exists()
 
     def test_virsh_net_list_should_be_used_for_bridge_discovery(self):
         """Document that virsh net-list is the correct way to discover
