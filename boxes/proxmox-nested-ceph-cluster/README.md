@@ -156,6 +156,32 @@ On a node (`ssh -i keys/id_ed25519_pvelab root@10.77.0.11` from hpe1):
 status` (`vmpool` on every node), `qm list`, `grep -c svm /proc/cpuinfo` and
 `ls -l /dev/kvm` (the node is itself a KVM host).
 
+## Terraform on top of the cluster
+
+`terraform/` creates Rocky 9 VMs on the cluster with the
+[`bpg/proxmox`](https://registry.terraform.io/providers/bpg/proxmox) provider,
+API-only: each node downloads the GenericCloud qcow2 into `local:import/`
+itself (`proxmox_download_file`), every VM imports it onto Ceph
+(`disk { import_from }`, so the VMs stay live-migratable), and cloud-init uses
+the provider's built-in `user_account` / `ip_config` (user `rocky`, the lab
+key, DHCP from hpe1). No ssh from the workstation to the nodes is needed.
+Terraform runs on the workstation through an ssh tunnel to pve1's API:
+
+```bash
+ssh -N -L 8006:10.77.0.11:8006 hpe1 &      # API tunnel (also serves the web UI)
+make tf-token                              # API token root@pam!terraform -> terraform/.env (gitignored)
+make tf-init
+make tf-apply VM_COUNT=4                   # rocky01..04, one per node, 2 vCPU / 2 GiB / 16 GiB on vmpool
+make tf-output                             # nodes, ids, addresses reported by the guest agent
+make tf-destroy
+```
+
+Knobs are variables in `terraform/variables.tf` (`vm_count`, `cores`,
+`memory_mb`, `disk_gb`, `nodes`, `image_url`, …). VM ids start at 200 (the
+box's demo VM is 100). Placement is round-robin over `nodes`, i.e. two VMs per
+physical host for `vm_count = 4`; `qm migrate <id> <node> --online` (or the
+UI) moves them across hosts like the demo VM.
+
 ## Tear down
 
 ```bash
