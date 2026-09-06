@@ -149,3 +149,21 @@ tf-output:   #@ show the VMs' nodes and addresses
 
 tf-destroy:   #@ terraform destroy (VMs and the downloaded images)
 	@set -a; . $(TF_DIR)/.env; set +a; $(TF) destroy -input=false -auto-approve $(TF_VARS)
+
+# ---- HA placement policy (Proxmox owns *where* the HA VMs run) ------------
+NODE ?= pve4
+
+ha:   #@ dynamic CRS + auto-rebalance + node-affinity rules for the HA resources (after tf-apply)
+	$(call run,$(ORCH),pve-ha.sh)
+
+ha-status:   #@ ha-manager status, rules, crs settings
+	@$(SSH) $(ORCH) 'source $(SCRIPTS)/lib.sh; pssh pve1 "ha-manager status; echo; ha-manager rules list; echo; pvesh get /cluster/options --output-format json | grep -o \"\\\"crs\\\":\\\"[^\\\"]*\\\"\""'
+
+ha-failover:   #@ hard-kill NODE (default pve4) on its host, watch HA recover its VMs, bring the node back with boxman
+	@site=$$(ssh -o BatchMode=yes $(ORCH) 'source $(SCRIPTS)/lib.sh; echo $${NODE_SITE[$(NODE)]}'); \
+	echo "== pulling the plug on $(NODE) (host $$site)"; \
+	$(SSH) $$site 'virsh -c qemu:///system destroy bprj__pvelab__bprj_pve_$(NODE)'; \
+	$(call run,$(ORCH),ha-watch.sh $(NODE)); \
+	echo "== bringing $(NODE) back with boxman up on $$site"; \
+	$(call boxman,$$site,up) | grep -E "starting VM|infrastructure"; \
+	$(call run,$(ORCH),wait-first-boot.sh $(NODE))

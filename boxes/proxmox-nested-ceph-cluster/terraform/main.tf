@@ -28,12 +28,12 @@ locals {
 resource "proxmox_download_file" "rocky9" {
   for_each = local.image_nodes
 
-  node_name    = each.value
-  content_type = "import"
-  datastore_id = var.image_datastore
-  file_name    = var.image_file_name
-  url          = var.image_url
-  overwrite    = false
+  node_name      = each.value
+  content_type   = "import"
+  datastore_id   = var.image_datastore
+  file_name      = var.image_file_name
+  url            = var.image_url
+  overwrite      = false
   upload_timeout = 1800
 }
 
@@ -109,7 +109,10 @@ resource "proxmox_virtual_environment_vm" "rocky" {
   }
 
   lifecycle {
-    # the imported disk keeps its source reference only at creation time
-    ignore_changes = [disk[0].import_from]
+    # - the imported disk keeps its source reference only at creation time
+    # - Proxmox owns *where* a VM runs (HA recovery, node affinity, dynamic
+    #   CRS rebalancing) and whether HA has it started, so node_name is only
+    #   the initial placement and later moves are not drift
+    ignore_changes = [disk[0].import_from, node_name, started]
   }
 }

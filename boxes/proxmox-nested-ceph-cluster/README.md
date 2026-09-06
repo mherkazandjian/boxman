@@ -182,6 +182,60 @@ box's demo VM is 100). Placement is round-robin over `nodes`, i.e. two VMs per
 physical host for `vm_count = 4`; `qm migrate <id> <node> --online` (or the
 UI) moves them across hosts like the demo VM.
 
+## HA, placement and Terraform: who owns what
+
+Proxmox does not move VMs on its own unless they are HA resources. Once they
+are, the HA manager restarts them elsewhere when a node dies, and with the
+cluster resource scheduler (CRS) it may live-migrate them to balance load.
+That conflicts with a Terraform config that asserts `node_name`, so the
+ownership is split like this:
+
+| concern | owner | where |
+|---|---|---|
+| VM shape (CPU, RAM, disks, cloud-init, HA membership) | Terraform | `terraform/main.tf`, `terraform/ha.tf` |
+| initial node | Terraform (round-robin, `node_overrides`) | `terraform/main.tf` |
+| where a VM runs afterwards, whether HA has it started | Proxmox | `lifecycle { ignore_changes = [node_name, started] }` |
+| placement policy: CRS mode, auto-rebalance, node-affinity rules | Proxmox, applied by a script | `scripts/pve-ha.sh` (`make ha`) |
+
+The provider has no resource for HA *rules* (PVE 9 replaced HA groups with
+node-/resource-affinity rules), which is why the policy lives in a script:
+
+- `crs: ha=dynamic` (static + live CPU/RAM usage), `ha-auto-rebalance=1` with
+  threshold 20 %, margin 10 %, hold 3 HA rounds (~30 s), `ha-rebalance-on-start=1`
+  — Proxmox VE 9.2's built-in balancer; no ProxLB or cron needed.
+- rules `prefer-hpe1` (vm:200, 201, 204, 205 → pve1:1, pve2:1) and `prefer-hpe2`
+  (vm:202, 203, 206, 207 → pve3:1, pve4:1), non-strict: equal priorities let
+  CRS balance within a host, and a VM may be recovered on the other host when
+  both of its preferred nodes are down.
+
+```bash
+make tf-apply          # VMs + HA resources
+make ha                # CRS + rules (idempotent)
+make ha-status
+make ha-failover NODE=pve4   # virsh destroy pve4 on hpe2, watch HA restart its VMs, boxman up brings pve4 back
+```
+
+Observed on 2026-09-06 with two CPU burners in each of the three VMs on pve2
+(`ha-manager status` polled every 10 s): imbalance 11.9 % → 20.3 % → 35.2 %
+within 22 s; at +32 s the HA manager live-migrated vm:201 to pve1 (inside its
+`prefer-hpe1` rule); imbalance fell to 19 % and settled at ~18 %, below the
+threshold, so nothing else moved.
+
+Node failure, same day (`make ha-failover NODE=pve4`, i.e. `virsh destroy` of
+the pve4 domain on hpe2): HA marked vm:203/vm:207 `fence` at +175 s (pve4 was
+also the HA master, so a new master had to be elected first), restarted both
+on pve3 per `prefer-hpe2`, and had them `started` at +206 s. `boxman up` on
+hpe2 brought pve4 back 15 s later; within a minute the balancer moved vm:206
+from pve3 (four VMs) to the empty pve4, imbalance 24 % → 11 %.
+
+Because `node_name` is ignored, `terraform plan` stays clean after HA moves a
+VM: only the `vms`/`ssh` outputs show the new nodes, no resource changes.
+(The provider now prefers the shorter resource name `proxmox_haresource`; the
+config keeps `proxmox_virtual_environment_haresource` until a state move is
+worth doing.) If you would rather have Terraform own placement, drop the two entries
+from `ignore_changes`, keep `migrate = true`, use `node_overrides`, and do not
+enable auto-rebalance.
+
 ## Tear down
 
 ```bash

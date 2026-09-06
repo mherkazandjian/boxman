@@ -16,6 +16,12 @@ variable "nodes" {
   default     = ["pve1", "pve2", "pve3", "pve4"]
 }
 
+variable "ha_enabled" {
+  description = "Register every VM as an HA resource (restart on node failure, dynamic CRS balancing)"
+  type        = bool
+  default     = true
+}
+
 variable "node_overrides" {
   description = "Pin VMs to nodes instead of round-robin, e.g. { rocky01 = \"pve2\" }; changing a VM's node live-migrates it"
   type        = map(string)
