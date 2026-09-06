@@ -391,20 +391,7 @@ def _main():
             workdirs = manager.collect_workdirs()
             if workdirs:
                 manager.runtime_instance.workdirs = workdirs
-                # Pre-create each bind-mount dir on the host AS THE
-                # CURRENT USER. Without this, `docker compose up` would
-                # create the missing host directory (as root) when it
-                # sets up the bind mount, and subsequent host-side
-                # file writes (env.sh, ssh_config, …) would hit
-                # PermissionError. If the dir already exists as root
-                # from an earlier failed run, _ensure_writable_dir fixes
-                # ownership via `sudo chown`.
-                for wd in workdirs:
-                    log.info(f"runtime workdir: {wd}")
-                    try:
-                        manager._ensure_writable_dir(wd)
-                    except Exception as exc:
-                        log.warning(f"could not prepare {wd}: {exc}")
+                manager.prepare_runtime_workdirs(workdirs)
 
         # Handle destroy-runtime — tear down Docker resources without
         # starting the container first

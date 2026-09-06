@@ -397,8 +397,30 @@ class FlowsMixin:
 
         self.logger.info("infrastructure is down")
 
-    def deprovision(self, cli_args):
+    def deprovision(self, cli_args, finalize: bool = True):
+        """
+        Tear down the project's containerlab lab, compose clusters, VMs and
+        networks.
 
+        Teardown is kept separate from *cleanup*. The teardown steps always
+        run and their failures are collected; the parts that cannot be undone
+        — removing the generated provisioning files and forgetting the project
+        — happen only once every teardown step is confirmed complete. A
+        partial failure therefore leaves both the surviving resources and the
+        state needed to retry: the cache entry that keeps them visible to
+        ``boxman list``, and the ssh keys and inventory a second attempt needs.
+
+        Args:
+            cli_args: Parsed CLI arguments; ``--cleanup`` additionally removes
+                the generated provisioning files.
+            finalize: When False the caller owns the final cleanup. ``destroy``
+                passes False so it can finish its own teardown steps first and
+                only then remove files and cache entries.
+
+        Raises:
+            ProvisionError: If any resource survived the teardown, or the
+                teardown could not be confirmed.
+        """
         # Ensure provider configs reflect runtime settings.
         # Project-level provider settings (from conf.yml) always take
         # precedence over app-level defaults (from boxman.yml).
@@ -409,15 +431,22 @@ class FlowsMixin:
         self.destroy_netlab()
 
         # Tear down docker-compose clusters (`docker compose down`: remove
-        # containers + networks, keep named volumes). Best-effort, like
-        # destroy's step 2b: a failure here must not abort the libvirt VM /
-        # network / files / cache teardown that follows (deprovision is also
-        # invoked from `provision --force`).
+        # containers + networks, keep named volumes). A failure here must not
+        # abort the libvirt VM / network teardown that follows (deprovision is
+        # also invoked from `provision --force`), but it is remembered so the
+        # command cannot go on to report success.
+        # The flag is a bool of its own: deriving it from the message would
+        # lose an exception raised with an empty one.
+        compose_failed = False
+        compose_error = ''
         try:
             self.deprovision_compose_clusters()
         except Exception as exc:
-            self.logger.warning(
-                f"deprovision_compose_clusters raised: {exc} — continuing")
+            compose_failed = True
+            compose_error = str(exc) or exc.__class__.__name__
+            self.logger.error(
+                f"deprovision_compose_clusters raised: {compose_error} "
+                f"— continuing")
 
         processes = [
             (f"{cluster_name}/{vm_name}", self._destroy_vm_and_disks,
@@ -430,21 +459,40 @@ class FlowsMixin:
 
         net_failures = self.destroy_networks()
 
+        torn_down, reason = self._confirm_project_torn_down()
+
+        if vm_failures or net_failures or compose_failed or not torn_down:
+            # Resources survived the teardown, or we could not prove that they
+            # did not. Keep the project registered and its generated files in
+            # place, and fail loudly rather than exiting 0 over the leftovers.
+            problems: list[str] = []
+            if vm_failures:
+                problems.append("VMs: " + "; ".join(
+                    f"{name}: {why}"
+                    for name, why in sorted(vm_failures.items())))
+            if net_failures:
+                problems.append("networks: " + "; ".join(
+                    f"{name}: {why}"
+                    for name, why in sorted(net_failures.items())))
+            if compose_failed:
+                problems.append(f"docker-compose: {compose_error}")
+            if not torn_down:
+                problems.append(reason)
+
+            self.logger.error(
+                "deprovision left resources behind; keeping project "
+                f"'{self.config['project']}' registered in the cache and its "
+                f"generated files in place so the teardown can be retried")
+            raise ProvisionError(
+                "deprovision did not complete — " + " | ".join(problems))
+
+        if not finalize:
+            return
+
         if getattr(cli_args, 'cleanup', False):
             self.deprovision_files()
 
-        if vm_failures or net_failures:
-            # Resources survived the teardown: keep the project registered
-            # so it stays visible to `boxman list` and a later deprovision
-            # can finish the job instead of the leftovers becoming
-            # cache-invisible.
-            self.logger.warning(
-                "deprovision left resources behind; keeping project "
-                f"'{self.config['project']}' registered in the cache")
-        else:
-            self.unregister_from_cache()
-
-        return
+        self.unregister_from_cache()
 
     def destroy_runtime(self, cli_args):
         """
@@ -501,31 +549,108 @@ class FlowsMixin:
             self.logger.info("no .boxman directory to remove")
 
     @staticmethod
+    def _safe_delete_target(path: str) -> str:
+        """
+        Validate a recursive-deletion argument and return its canonical target.
+
+        ``destroy`` hands user-supplied configuration (``workspace.path``,
+        template workdirs) to a recursive delete that also bind-mounts the
+        directory into a throwaway container for ``rm -rf``. A typo such as
+        ``workspace.path: /`` or ``~`` would therefore delete that whole tree,
+        so every deletion is vetted here first.
+
+        The *original* argument is checked before it is resolved — an empty
+        string resolves to the current directory and a relative path would
+        silently become an absolute deletion target — and a leaf symlink is
+        refused outright rather than followed. What is then validated, and
+        returned, is the canonical path, so the target that was vetted is
+        exactly the target that gets deleted. ``destroy``'s preflight and
+        :meth:`_force_rmtree` share this one validator, so a path can never
+        pass the preflight and be rejected later, once teardown has begun.
+
+        This is a guardrail against mistakes, not a sandbox: it cannot know
+        that some deep, plausible-looking directory is precious.
+
+        Args:
+            path: The deletion argument, as configured.
+
+        Returns:
+            The canonical, symlink-resolved path that may be deleted.
+
+        Raises:
+            ProvisionError: If the argument, or its canonical target, is
+                unsafe to delete recursively.
+        """
+        if not path or not os.path.isabs(path):
+            raise ProvisionError(
+                f"refusing to recursively delete {path!r}: the path is "
+                f"empty or not absolute")
+        if os.path.islink(path):
+            raise ProvisionError(
+                f"refusing to recursively delete {path!r}: it is a symlink, "
+                f"so the deletion would land on whatever it points at")
+
+        real = os.path.realpath(path)
+
+        if real == os.path.realpath(os.path.expanduser("~")):
+            raise ProvisionError(
+                f"refusing to recursively delete the home directory ({real})")
+        if real == os.path.dirname(real) or os.path.ismount(real):
+            raise ProvisionError(
+                f"refusing to recursively delete {real}: it is a filesystem "
+                f"root or a mount point")
+        if len([part for part in real.split(os.sep) if part]) < 2:
+            raise ProvisionError(
+                f"refusing to recursively delete the top-level path {real}")
+        if os.path.exists(os.path.join(real, ".git")):
+            raise ProvisionError(
+                f"refusing to recursively delete {real}: it looks like a "
+                f"repository root (it contains .git)")
+
+        return real
+
+    @staticmethod
     def _force_rmtree(path: str) -> None:
         """
-        Remove *path* and everything under it. Falls back to a throwaway
-        ``docker run --rm alpine rm -rf`` when ``shutil.rmtree`` leaves
-        root-owned leftovers (created by the libvirt container running
-        as root). Safe to call for any absolute path — emits info/warning
-        logs, never raises.
+        Remove *path* and everything under it.
+
+        The argument is vetted by :meth:`_safe_delete_target` and the
+        canonical path it returns is what gets removed. Falls back to a
+        throwaway ``docker run --rm alpine rm -rf`` when ``shutil.rmtree``
+        leaves root-owned leftovers behind (created by the libvirt container
+        running as root).
+
+        ``ignore_errors=True`` stays on both attempts — partial failures are
+        expected, which is why the fallback exists — but if the directory is
+        *still* there at the end this raises instead of logging a warning, so
+        callers can stop and keep the rest of the project's state rather than
+        carrying on after a cleanup that silently failed.
+
+        Args:
+            path: Directory to remove.
+
+        Raises:
+            ProvisionError: If the target is unsafe to delete, or if it
+                survived both removal attempts.
         """
-        if not path or not os.path.isdir(path):
-            log.info(f"{path} does not exist — nothing to remove")
+        real = FlowsMixin._safe_delete_target(path)
+
+        if not os.path.isdir(real):
+            log.info(f"{real} does not exist — nothing to remove")
             return
 
-        abs_path = os.path.abspath(path)
-        log.info(f"removing {abs_path}")
-        shutil.rmtree(abs_path, ignore_errors=True)
-        if not os.path.isdir(abs_path):
-            log.info(f"removed {abs_path}")
+        log.info(f"removing {real}")
+        shutil.rmtree(real, ignore_errors=True)
+        if not os.path.isdir(real):
+            log.info(f"removed {real}")
             return
 
         log.info(
-            f"{abs_path} still exists (root-owned leftovers), "
+            f"{real} still exists (root-owned leftovers), "
             f"removing via docker")
         result = subprocess.run(
             ["docker", "run", "--rm",
-             "-v", f"{abs_path}:/cleanup",
+             "-v", f"{real}:/cleanup",
              "alpine", "sh", "-c", "rm -rf /cleanup/* /cleanup/.[!.]* || true"],
             check=False,
         )
@@ -534,11 +659,12 @@ class FlowsMixin:
                 f"docker alpine rm -rf exited with {result.returncode}")
         # The bind-mount dir itself can't be removed from inside the
         # container, but it should now be empty.
-        shutil.rmtree(abs_path, ignore_errors=True)
-        if os.path.isdir(abs_path):
-            log.warning(f"{abs_path} could not be fully removed")
-        else:
-            log.info(f"removed {abs_path}")
+        shutil.rmtree(real, ignore_errors=True)
+        if os.path.isdir(real):
+            raise ProvisionError(
+                f"could not remove {real}: it still exists after both the "
+                f"direct removal and the containerised fallback")
+        log.info(f"removed {real}")
 
     def destroy(self, cli_args):
         """
@@ -574,6 +700,18 @@ class FlowsMixin:
         runtime = self.runtime_instance
         is_docker = isinstance(runtime, DockerComposeRuntime)
         runtime_plan = runtime.plan_destroy_runtime() if is_docker else None
+
+        # Preflight every path this command would delete, with the same guard
+        # the deletion itself uses, before anything is torn down. Discovering
+        # a misconfigured workspace.path halfway through — with the VMs
+        # already gone — is exactly the failure this avoids.
+        delete_targets = list(template_dirs)
+        if workspace_path:
+            delete_targets.append(workspace_path)
+        if is_docker and runtime_plan:
+            delete_targets.extend(runtime_plan.get("paths_to_delete", []))
+        for target in delete_targets:
+            self._safe_delete_target(target)
 
         # --------- "nothing to do" short-circuit --------------------
         # Avoid prompting the user (and avoid spinning up the runtime
@@ -675,14 +813,21 @@ class FlowsMixin:
                 return
 
         # ------------- execute --------------------------------------
+        # Everything irreversible — the generated provisioning files, the
+        # cache entry, the workspace tree, the template trees — is deferred
+        # until the teardown above it is confirmed complete. Removing that
+        # state while VMs, networks or containers survive leaves resources
+        # that are both orphaned and invisible to `boxman list`, with the ssh
+        # keys needed to reach them gone.
+        teardown_ok = True
+        problems: list[str] = []
+
         # 1. Best-effort: start the runtime so we can run virsh to
         #    deprovision VMs. If it fails (port conflict, docker daemon
         #    unreachable, libvirtd unresponsive in a zombie mount
-        #    namespace, …) we still want to tear down docker state and
-        #    nuke the workspace — so we skip the VM-level step instead
-        #    of aborting. A short ready_timeout keeps the failure path
-        #    snappy: if the runtime is broken, we don't want to wait a
-        #    full minute during destroy.
+        #    namespace, …) we skip the VM-level step. A short ready_timeout
+        #    keeps the failure path snappy: if the runtime is broken, we
+        #    don't want to wait a full minute during destroy.
         runtime_up = True
         if is_docker:
             runtime.ready_timeout = min(
@@ -695,47 +840,79 @@ class FlowsMixin:
                 f"runtime could not be started ({exc}) — "
                 f"skipping VM-level deprovision")
 
-        # 2. deprovision VMs + networks + provisioning files (only when
-        #    the runtime and provider session are available)
+        # 2. deprovision VMs + networks. finalize=False: this command owns
+        #    the file and cache cleanup, and runs it only once every step
+        #    below has also passed.
         if runtime_up and self.provider is not None:
             cleanup_args = type("Args", (), {
                 "cleanup": True,
                 "docker_compose": getattr(cli_args, "docker_compose", False),
             })()
             try:
-                self.deprovision(cleanup_args)
+                self.deprovision(cleanup_args, finalize=False)
             except Exception as exc:
-                self.logger.warning(f"deprovision raised: {exc} — continuing")
+                teardown_ok = False
+                problems.append(str(exc))
+                self.logger.error(f"deprovision failed: {exc}")
+        elif self._has_libvirt_clusters():
+            teardown_ok = False
+            problems.append(
+                "the runtime or provider session was unavailable, so this "
+                "project's VMs and networks were never torn down")
 
         # 2b. fully tear down docker-compose clusters — destroy goes beyond
         #     deprovision's `docker compose down` (keeps named volumes) to
         #     `down --volumes` and removes the generated compose file. Runs
         #     regardless of the libvirt-in-container runtime state: the
-        #     compose provider shells out to the host docker directly.
+        #     compose provider shells out to the host docker directly. This
+        #     is a different operation from the one deprovision ran, so its
+        #     failure has to be caught separately.
         try:
             self.destroy_compose_clusters()
         except Exception as exc:
-            self.logger.warning(
-                f"destroy_compose_clusters raised: {exc} — continuing")
+            teardown_ok = False
+            detail = str(exc) or exc.__class__.__name__
+            problems.append(f"docker-compose teardown failed: {detail}")
+            self.logger.error(f"destroy_compose_clusters raised: {detail}")
+
+        # 2c. fail-closed confirmation that nothing of this project survived.
+        if teardown_ok:
+            confirmed, reason = self._confirm_project_torn_down()
+            if not confirmed:
+                teardown_ok = False
+                problems.append(reason)
+
+        if not teardown_ok:
+            summary = " | ".join(problems)
+            self.logger.error(
+                "keeping the workspace, template dirs, generated files, "
+                "runtime state and the cache entry so the surviving "
+                "resources stay visible and the teardown can be retried")
+            raise ProvisionError(f"destroy did not complete — {summary}")
 
         # 3. tear down the docker runtime (reuses _force_rmtree for the
-        #    .boxman dir, no double prompt)
+        #    .boxman dir, no double prompt). A failure here stops the
+        #    remaining cleanup rather than being logged and ignored: the
+        #    runtime holds the libvirt state, so removing the workspace and
+        #    the cache entry over a container that is still up loses the only
+        #    handles on it.
         if is_docker:
             try:
                 boxman_dir = runtime.destroy_runtime()
-                if boxman_dir and os.path.isdir(boxman_dir):
-                    self._force_rmtree(boxman_dir)
             except Exception as exc:
-                self.logger.warning(f"destroy_runtime raised: {exc}")
+                detail = str(exc) or exc.__class__.__name__
+                self.logger.error(
+                    "keeping the workspace, template dirs, generated files "
+                    "and the cache entry: the runtime teardown failed")
+                raise ProvisionError(
+                    f"destroy did not complete — runtime teardown failed: "
+                    f"{detail}") from exc
+            if boxman_dir and os.path.isdir(boxman_dir):
+                self._force_rmtree(boxman_dir)
 
-        # 4. unregister the project from the boxman cache. We do this
-        #    unconditionally (in addition to whatever deprovision did)
-        #    so that stale cache entries left over from earlier failed
-        #    runs don't block the next `up`.
-        try:
-            self.unregister_from_cache()
-        except Exception as exc:
-            self.logger.warning(f"unregister_from_cache raised: {exc}")
+        # 4. remove the generated provisioning files (env.sh, ansible.cfg,
+        #    inventory, ssh_config, generated SSH keys)
+        self.deprovision_files()
 
         # 5. nuke the workspace workdir
         if workspace_path:
@@ -744,5 +921,11 @@ class FlowsMixin:
         # 6. nuke template workdirs (only when --templates was passed)
         for tpl_dir in template_dirs:
             self._force_rmtree(tpl_dir)
+
+        # 7. unregister the project LAST. Every removal above raises on
+        #    failure, so reaching this point means there is nothing left to
+        #    stay visible for — and if one of them did fail, the project is
+        #    still in the cache and `boxman list` still shows what survived.
+        self.unregister_from_cache()
 
         self.logger.info("destroy complete")

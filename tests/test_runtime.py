@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.exceptions import BoxmanError, ConfigError
+from boxman.exceptions import BoxmanError, ConfigError, ProvisionError
 from boxman.runtime import create_runtime
 from boxman.runtime.docker_compose import DockerComposeRuntime
 from boxman.runtime.local import LocalRuntime
@@ -772,6 +772,46 @@ class TestDockerComposeDestroyRuntime:
 
         # Should still return the .boxman path despite cleanup failure
         assert result == "/tmp/test-project/.boxman"
+
+    @patch("invoke.run")
+    def test_destroy_runtime_raises_when_compose_down_reports_failure(
+            self, mock_run):
+        """A failed ``docker compose down`` used to be a warning, and the
+        .boxman path came back as if the runtime were gone — so the caller
+        went on to delete the workspace, the generated files and the cache
+        entry over a container that is still up."""
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        rt.project_dir = "/tmp/test-project"
+
+        mock_run.side_effect = [
+            MagicMock(ok=True, stdout="false\n"),               # inspect
+            MagicMock(ok=False, stderr="network ctr1_default in use\n"),
+        ]
+
+        with patch.object(
+                rt, "get_compose_file_path",
+                return_value="/tmp/test-project/.boxman/runtime/docker/"
+                             "docker-compose.yml"):
+            with pytest.raises(ProvisionError, match="down --volumes"):
+                rt.destroy_runtime()
+
+    @patch("invoke.run")
+    def test_destroy_runtime_raises_when_compose_down_errors(self, mock_run):
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        rt.project_dir = "/tmp/test-project"
+
+        mock_run.side_effect = [
+            MagicMock(ok=True, stdout="false\n"),               # inspect
+            Exception("docker daemon gone"),
+        ]
+
+        with patch.object(
+                rt, "get_compose_file_path",
+                return_value="/tmp/test-project/.boxman/runtime/docker/"
+                             "docker-compose.yml"):
+            with pytest.raises(ProvisionError,
+                               match="docker compose down failed"):
+                rt.destroy_runtime()
 
     def test_destroy_runtime_returns_none_when_no_compose_file(self, monkeypatch):
         """When no compose file exists, destroy_runtime returns None."""

@@ -712,6 +712,24 @@ class LibVirtSession(SessionConfigMixin):
             status = destroyer.force_undefine_vm()
         return status
 
+    def confirm_vm_absent(self, name: str) -> bool:
+        """
+        Positively confirm that domain *name* no longer exists.
+
+        Fails closed: only a successful libvirt query that proves the domain
+        is absent returns True. Callers gate destructive disk cleanup on this
+        rather than on :meth:`destroy_vm`'s return value, which reports
+        success when the underlying query could not be answered at all.
+
+        Args:
+            name: Full name of the VM.
+
+        Returns:
+            True only when the domain is confirmed gone.
+        """
+        destroyer = DestroyVM(name=name, provider_config=self.provider_config)
+        return destroyer.confirm_absent()
+
     def start_vm(self, vm_name: str) -> bool:
         """
         Start a VM.

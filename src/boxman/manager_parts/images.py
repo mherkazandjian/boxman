@@ -3,7 +3,7 @@
 
 import hashlib
 import os
-import shutil
+import shlex
 from urllib.parse import urlparse
 
 from boxman.image_cache import ImageCache
@@ -295,13 +295,15 @@ class ImagesMixin:
 
         return failed
 
-    def _ensure_writable_dir(self, path: str) -> None:
+    def _ensure_writable_dir(self, path: str,
+                             sweep_foreign: bool = True) -> None:
         """
         Ensure *path* exists and is writable by the current user.
 
         If the directory was created by another user (e.g. root via docker),
-        attempt to fix ownership with ``sudo chown``.  If ``sudo`` is not
-        available or fails, a clear error message is logged.
+        take ownership of **the directory itself** with a non-recursive
+        ``sudo chown``.  If ``sudo`` is not available or fails, a clear error
+        message is raised.
 
         When running under a non-local runtime the directory is also
         created inside the container so that commands executed via
@@ -309,6 +311,11 @@ class ImagesMixin:
 
         Args:
             path: Absolute or user-expandable directory path.
+            sweep_foreign: Whether :meth:`_normalize_ownership` may also
+                inspect the directory's existing entries. Callers that only
+                need the directory to exist and be writable — notably the CLI
+                startup pre-create pass — must pass ``False`` so a live
+                workdir's contents are never touched.
         """
         path = os.path.expanduser(path)
 
@@ -331,12 +338,12 @@ class ImagesMixin:
         # Two failure modes to repair here:
         #   1. The directory itself is not writable by us (e.g. created
         #      as root by docker compose mount).
-        #   2. The directory IS writable but contains stale entries
+        #   2. The directory IS writable but holds a stale build artifact
         #      owned by another user (typically root, left over from a
         #      previous docker-runtime run). Tools like `genisoimage`
         #      open their output with O_TRUNC and need write access on
         #      the existing file, not just the parent dir.
-        self._normalize_ownership(path)
+        self._normalize_ownership(path, sweep_foreign=sweep_foreign)
 
         # When using a non-local runtime (e.g. docker-compose), also
         # create the directory inside the container so that commands
@@ -356,110 +363,151 @@ class ImagesMixin:
         # later cross-runtime reuse triggers the collision prompt.
         self._write_runtime_sentinel(path, self._runtime_name)
 
-    def _normalize_ownership(self, path: str) -> None:
+    @staticmethod
+    def _is_disposable_artifact(name: str) -> bool:
         """
-        Make sure *path* and its top-level entries are usable by the
-        current user.
+        True when *name* is a boxman-generated build artifact that the next
+        run recreates from scratch.
 
-        Strategy (cheapest path first, sudo last resort):
+        Only entries matching this allowlist may be unlinked by the
+        foreign-ownership sweep. It is deliberately an allowlist rather than a
+        denylist of "precious" extensions: a denylist cannot protect a disk
+        that sits inside a foreign-owned *directory*, whereas an allowlist
+        preserves everything it does not recognise.
 
-        1. If the directory itself is not writable by us, escalate
-           straight to ``sudo chown -R``.
-        2. Else, scan the top-level entries; if any are owned by
-           another user, try to remove them (``unlink`` for files,
-           ``shutil.rmtree`` for dirs). This works WITHOUT sudo as
-           long as the parent dir is user-writable, because ``unlink``
-           only needs write+exec on the parent, not on the file.
-        3. If unlink/rmtree fails (e.g. nested foreign-owned tree we
-           can't traverse), fall back to ``sudo chown -R``.
-        4. If sudo also fails, raise ``PermissionError`` with a
-           copy-pasteable fix command.
+        Args:
+            name: Basename of a top-level entry in a workdir.
+        """
+        return (
+            name == 'seed.iso'
+            or name.endswith('_seed.iso')
+            or name.endswith('.rendered.yml')
+        )
 
-        Foreign-owned files inside boxman workdirs are always either
-        stale build artifacts (seed.iso, qcow2 disk images) or stale
-        provisioning files we are about to regenerate, so removing
-        them is safe.
+    def _take_ownership(self, target: str, my_uid: int, my_gid: int):
+        """
+        Hand *target* to the current user with a targeted ``sudo chown``.
+
+        Never recursive (``-R`` would rewrite the ownership of every VM disk
+        under a workdir) and never dereferences a symlink (``-h``). The path
+        is shell-quoted.
+
+        Args:
+            target: The single path to chown.
+            my_uid: Owning uid to set.
+            my_gid: Owning gid to set.
+
+        Returns:
+            The command result; ``.ok`` is False when the chown failed.
+        """
+        result = run(
+            f"sudo -n chown -h {my_uid}:{my_gid} {shlex.quote(target)}",
+            hide=True, warn=True,
+        )
+        if not result.ok:
+            self.logger.warning(
+                f"could not take ownership of '{target}': "
+                f"{(result.stderr or '').strip() or '(no stderr)'}")
+        return result
+
+    def _normalize_ownership(self, path: str,
+                             sweep_foreign: bool = True) -> None:
+        """
+        Make sure *path* is usable by the current user.
+
+        Two repairs, neither of which may destroy live state:
+
+        1. If the directory itself is not writable by us (typically created
+           as root by a docker bind mount), take ownership of **the directory
+           only**. Never ``chown -R``: recursing rewrites the ownership of
+           every VM disk underneath it.
+        2. When *sweep_foreign* is true, scan the top-level entries. A
+           foreign-owned entry is unlinked **only** when it is a regular file
+           on the disposable-artifact allowlist
+           (:meth:`_is_disposable_artifact`) — a stale seed ISO or rendered
+           config that the next run regenerates and that tools like
+           ``genisoimage`` must be able to truncate (they open their output
+           with ``O_TRUNC`` and need write access on the existing file, not
+           just on the parent dir). Everything else — VM disks, saved memory
+           state, unknown files and **every directory** — is preserved and
+           made writable in place with a targeted, non-recursive chown.
+
+        Callers that only need the directory to exist and be writable pass
+        ``sweep_foreign=False``. The CLI startup pre-create pass does, so that
+        merely running a boxman command can never touch a live workdir's
+        contents.
+
+        Args:
+            path: Directory to repair.
+            sweep_foreign: Whether to inspect the directory's entries at all.
+
+        Raises:
+            PermissionError: If the directory itself cannot be made writable.
         """
         my_uid = os.getuid()
         my_gid = os.getgid()
 
-        # Fast path: directory itself isn't writable → straight to sudo.
-        dir_writable = os.access(path, os.W_OK)
+        if not os.access(path, os.W_OK):
+            self.logger.info(
+                f"taking ownership of the directory '{path}' "
+                f"({my_uid}:{my_gid}) — not writable by the current user")
+            result = self._take_ownership(path, my_uid, my_gid)
+            if not result.ok:
+                stderr = (result.stderr or "").strip()
+                raise PermissionError(
+                    f"could not take ownership of '{path}'.\n"
+                    f"sudo chown failed: {stderr or '(no stderr)'}\n"
+                    f"\n"
+                    f"Run this to fix manually:\n"
+                    f"  sudo chown {my_uid}:{my_gid} '{path}'\n"
+                    f"\n"
+                    f"Do not delete the directory — it may hold this "
+                    f"project's VM disks."
+                )
 
-        foreign_entries: list = []
-        if dir_writable:
+        if not sweep_foreign:
+            return
+
+        try:
+            entries = list(os.scandir(path))
+        except OSError as exc:
+            self.logger.warning(f"could not inspect '{path}': {exc}")
+            return
+
+        for entry in entries:
             try:
-                for entry in os.scandir(path):
-                    try:
-                        if entry.stat(
-                            follow_symlinks=False
-                        ).st_uid != my_uid:
-                            foreign_entries.append(entry)
-                    except OSError:
-                        # Can't stat → treat as foreign so we attempt
-                        # the recovery path.
-                        foreign_entries.append(entry)
+                if entry.stat(follow_symlinks=False).st_uid == my_uid:
+                    continue
             except OSError:
-                # Can't scandir → fall through to sudo chown.
-                dir_writable = False
+                # Cannot stat it — treat as foreign, and therefore as
+                # something to preserve rather than to remove.
+                pass
 
-        if dir_writable and not foreign_entries:
-            return
+            # Only a *positively established* regular file may be unlinked.
+            # "not a directory" is not enough: it would also unlink a symlink,
+            # a fifo or a socket that happens to carry an allowlisted name,
+            # and an entry whose kind could not be determined at all.
+            try:
+                is_regular_file = entry.is_file(follow_symlinks=False)
+            except OSError:
+                is_regular_file = False   # unknown kind → preserve
 
-        # Try the cheap path first: just unlink/rmtree the foreign
-        # entries. No sudo needed when the parent dir is writable.
-        unrecoverable: list = []
-        if dir_writable and foreign_entries:
-            for entry in foreign_entries:
+            if is_regular_file and self._is_disposable_artifact(entry.name):
                 try:
-                    if entry.is_dir(follow_symlinks=False):
-                        shutil.rmtree(entry.path)
-                    else:
-                        os.unlink(entry.path)
+                    os.unlink(entry.path)
                     self.logger.info(
-                        f"removed stale foreign-owned entry: "
+                        f"removed stale foreign-owned build artifact: "
                         f"{entry.path}")
+                    continue
                 except OSError as exc:
-                    unrecoverable.append((entry.path, exc))
+                    self.logger.warning(
+                        f"could not remove stale artifact "
+                        f"{entry.path}: {exc}")
 
-            if not unrecoverable:
-                return
-
-        # Fall back to sudo chown -R.
-        self.logger.info(
-            f"fixing ownership of '{path}' to {my_uid}:{my_gid} "
-            f"via sudo chown -R "
-            f"(directory not writable or contained foreign entries "
-            f"that could not be removed)"
-        )
-        result = run(
-            f"sudo -n chown -R {my_uid}:{my_gid} '{path}'",
-            hide=True, warn=True,
-        )
-        if result.ok:
-            return
-
-        # Sudo failed — emit an actionable error so the user knows
-        # exactly what to fix.
-        offenders = "\n  ".join(
-            sorted(set(
-                [path]
-                + [p for p, _ in unrecoverable]
-                + [e.path for e in foreign_entries]
-            ))
-        )
-        stderr = (result.stderr or "").strip()
-        raise PermissionError(
-            f"could not normalise ownership of '{path}'.\n"
-            f"sudo chown failed: {stderr or '(no stderr)'}\n"
-            f"\n"
-            f"Run one of these to fix manually:\n"
-            f"  sudo chown -R {my_uid}:{my_gid} '{path}'\n"
-            f"  sudo rm -rf '{path}'   "
-            f"# safe — boxman will recreate it\n"
-            f"\n"
-            f"Affected paths:\n  {offenders}"
-        )
+            # Preserved: VM disks, saved state, unknown files, directories.
+            # Repair ownership in place so it stays usable; a failure here is
+            # not fatal — the entry is left intact either way.
+            self._take_ownership(entry.path, my_uid, my_gid)
 
     @staticmethod
     def _is_diskless_boot(vm_info: dict) -> bool:

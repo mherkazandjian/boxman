@@ -18,6 +18,7 @@ from typing import Any
 import yaml as pyyaml
 
 from boxman import log
+from boxman.exceptions import ProvisionError
 from boxman.runtime.base import RuntimeBase
 from boxman.utils.compose_names import sanitize_project_name
 from boxman.utils.shell import run as _shell_run
@@ -606,16 +607,28 @@ class DockerComposeRuntime(RuntimeBase):
                 self.logger.warning(
                     f"in-container cleanup failed: {exc}")
 
+        # Unlike the in-container cleanup above, this one is not best-effort:
+        # if the compose project is still up, its containers and volumes
+        # survive. Returning the .boxman path anyway told the caller the
+        # runtime was gone, and it went on to delete the workspace, the
+        # generated files and the cache entry on top of live state.
         try:
-            _shell_run(
+            result = _shell_run(
                 f"{self._compose_base_cmd(compose_path, compose_dir)} "
                 f"down --volumes --remove-orphans",
                 hide=False,
                 warn=True,
             )
         except Exception as exc:
-            self.logger.warning(
-                f"docker compose down failed: {exc}")
+            raise ProvisionError(
+                f"docker compose down failed: {exc}") from exc
+
+        if not getattr(result, "ok", False):
+            stderr = (getattr(result, "stderr", "") or "").strip()
+            raise ProvisionError(
+                f"docker compose down --volumes --remove-orphans failed "
+                f"({stderr or 'no stderr'}) — the runtime container, its "
+                f"networks and its volumes may still exist")
 
         # Return the .boxman directory path so the caller can remove it
         base = self.project_dir or os.getcwd()
