@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Live-migrate the demo VM to another node while pinging it from this host.
-# Usage: pve-migrate.sh [target-node]   (default pve3, i.e. hpe1 -> hpe2)
+# Live-migrate a VM to another node while pinging it from this host.
+# Usage: pve-migrate.sh [target-node] [vmid] [vm-ip]
+#   defaults: pve3 (i.e. hpe1 -> hpe2), the demo VM 100 at 10.77.0.50
 # The disk lives on Ceph, so only RAM moves. Run from hpe1.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 target=${1:-pve3}
+DEMO_VMID=${2:-$DEMO_VMID}
+DEMO_IP=${3:-$DEMO_IP}
 [[ -n ${NODE_IP[$target]:-} ]] || die "unknown node $target"
 
-src=$(pssh pve1 "pvesh get /cluster/resources --type vm --output-format json" \
-      | jq -r ".[] | select(.vmid == $DEMO_VMID) | .node")
-[[ -n $src ]] || die "VM $DEMO_VMID not found in the cluster"
+read -r src DEMO_NAME < <(pssh pve1 "pvesh get /cluster/resources --type vm --output-format json" \
+      | jq -r ".[] | select(.vmid == $DEMO_VMID) | \"\(.node) \(.name)\"")
+[[ -n ${src:-} ]] || die "VM $DEMO_VMID not found in the cluster"
 [[ $src != "$target" ]] || die "VM $DEMO_VMID is already on $target"
 log "VM $DEMO_VMID ($DEMO_NAME) on $src (${NODE_SITE[$src]}) -> $target (${NODE_SITE[$target]})"
 
@@ -29,4 +32,4 @@ stats=$(grep -E 'packets transmitted' "$pinglog" || echo "no ping stats")
 log "migration took $(( (t1 - t0) / 1000000 )) ms end to end (qm migrate call)"
 log "ping during migration: $stats"
 log "now on: $(pssh pve1 "pvesh get /cluster/resources --type vm --output-format json" | jq -r ".[] | select(.vmid == $DEMO_VMID) | \"\(.node) (\(.status))\"")"
-ssh "${SSH_OPTS[@]}" "demo@$DEMO_IP" 'echo "guest uptime: $(cut -d" " -f1 /proc/uptime)s"'
+ssh "${SSH_OPTS[@]}" "${4:-demo}@$DEMO_IP" 'echo "guest uptime: $(cut -d" " -f1 /proc/uptime)s"'
