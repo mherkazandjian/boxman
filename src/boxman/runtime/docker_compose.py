@@ -884,6 +884,17 @@ class DockerComposeRuntime(RuntimeBase):
             f"starting docker-compose environment "
             f"(compose file: {compose_path})")
 
+        # `up -d --build` recreates the container whenever the compose
+        # configuration differs from the running one — and adding the
+        # libvirt state mounts gave every pre-existing container such a
+        # difference. Reaching here with a container that is actually
+        # running means _container_is_running() answered False without
+        # knowing, since it reports False for a docker failure as readily
+        # as for a stopped container. The guard is a no-op for a stopped or
+        # absent container, which is the path that normally gets here.
+        self._assert_no_running_guests(
+            "recreate the container to apply the compose configuration")
+
         try:
             abs_data_dir = self._data_dir()
             host_uid = os.getuid()

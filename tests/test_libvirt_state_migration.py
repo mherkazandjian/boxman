@@ -567,3 +567,80 @@ class TestDataDirIsUnified:
         # the bug: the compose environment used the compose file's own dir
         assert captured["env"]["BOXMAN_DATA_DIR"] != str(
             custom_dir / "data")
+
+
+class TestStartPathIsGuarded:
+    """``up -d --build`` recreates on a compose-config change, so it is a
+    container-destroying path too — and it is reached when
+    ``_container_is_running()`` answers False without knowing, which it
+    does for a docker failure exactly as for a stopped container."""
+
+    def test_a_running_container_with_guests_is_not_rebuilt(self, tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        calls = []
+
+        def _run(command, *_a, **_kw):
+            calls.append(command)
+            if "docker ps -a" in command:
+                return MagicMock(ok=True, stdout="running\n")
+            if rt._GUEST_PROBE_MARKER in command:
+                return MagicMock(
+                    ok=True, stdout=f"{rt._GUEST_PROBE_MARKER}1\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                import json
+                return MagicMock(ok=True, stdout=json.dumps(
+                    [{"Source": rt._state_host_dir(sub),
+                      "Destination": path, "RW": True}
+                     for sub, path in rt._PERSISTED_STATE]))
+            if "docker inspect" in command:
+                # the conflated answer: a docker failure looks like this
+                return MagicMock(ok=True, stdout="false\n")
+            return MagicMock(ok=True, stdout="")
+
+        with patch.object(rt, "get_compose_file_path", return_value=compose), \
+                patch.object(rt, "_log_compose_file"), \
+                patch("invoke.run", side_effect=_run):
+            with pytest.raises(ProvisionError, match="1 QEMU guest"):
+                rt.ensure_ready()
+
+        assert not any(
+            "compose" in c and " up " in f" {c} " for c in calls)
+
+    def test_a_stopped_container_still_starts(self, tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        calls = []
+        started = {"yes": False}
+
+        def _run(command, *_a, **_kw):
+            calls.append(command)
+            if "compose" in command and " up " in f" {command} ":
+                started["yes"] = True
+                return MagicMock(ok=True, stdout="")
+            if "docker ps -a" in command:
+                return MagicMock(
+                    ok=True,
+                    stdout="running\n" if started["yes"] else "exited\n")
+            if rt._GUEST_PROBE_MARKER in command:
+                return MagicMock(
+                    ok=True, stdout=f"{rt._GUEST_PROBE_MARKER}0\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                import json
+                return MagicMock(ok=True, stdout=json.dumps(
+                    [{"Source": rt._state_host_dir(sub),
+                      "Destination": path, "RW": True}
+                     for sub, path in rt._PERSISTED_STATE]))
+            if "docker inspect" in command:
+                return MagicMock(
+                    ok=True,
+                    stdout="true\n" if started["yes"] else "false\n")
+            return MagicMock(ok=True, stdout="")
+
+        with patch.object(rt, "get_compose_file_path", return_value=compose), \
+                patch.object(rt, "_log_compose_file"), \
+                patch.object(rt, "verify_workdirs_accessible"), \
+                patch("invoke.run", side_effect=_run):
+            rt.ensure_ready()
+
+        assert any("compose" in c and " up " in f" {c} " for c in calls)
