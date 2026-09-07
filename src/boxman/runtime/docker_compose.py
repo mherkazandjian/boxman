@@ -806,8 +806,29 @@ class DockerComposeRuntime(RuntimeBase):
         """
         if not instance_name or instance_name == "default":
             return 0
-        digest = hashlib.md5(instance_name.encode()).hexdigest()
+        # usedforsecurity=False: this is a name-to-port hash, not a
+        # security primitive. Without it a FIPS-enabled host (fips=1 on
+        # RHEL/Rocky) raises ValueError from the OpenSSL backend and every
+        # docker-runtime command dies with a traceback (#164 FB-13).
+        digest = hashlib.md5(
+            instance_name.encode(), usedforsecurity=False).hexdigest()
         return int(digest[:4], 16) % 1000
+
+    @staticmethod
+    def _ports_for_offset(offset: int) -> tuple[int, int, int]:
+        """Return ``(ssh, libvirt_tcp, libvirt_tls)`` for a port *offset*.
+
+        The two libvirt families are strided by 2 so they can never land on
+        the same port. With a plain ``base + offset`` the TCP and TLS bases
+        differ by 5, so two instances whose offsets differ by 5 collided —
+        one instance's TLS port was another's TCP port (#164 FBN-15).
+        Striding makes a collision require ``2a - 2b == 5``, which has no
+        integer solution.
+
+        Offset 0 still yields 2222 / 16509 / 16514, so the ``default``
+        instance is unchanged.
+        """
+        return 2222 + offset, 16509 + offset * 2, 16514 + offset * 2
 
     def _instance_name(self) -> str:
         """Return the sanitised instance name used for port derivation
@@ -820,7 +841,8 @@ class DockerComposeRuntime(RuntimeBase):
     def ssh_port(self) -> int:
         """The host port on which the libvirt container's sshd is
         published (``127.0.0.1:<ssh_port> → container:22``)."""
-        return 2222 + self._derive_port_offset(self._instance_name())
+        return self._ports_for_offset(
+            self._derive_port_offset(self._instance_name()))[0]
 
     @property
     def ssh_identity_path(self) -> str:
@@ -849,9 +871,7 @@ class DockerComposeRuntime(RuntimeBase):
 
         instance_name = self._instance_name()
         offset = self._derive_port_offset(instance_name)
-        ssh_port = 2222 + offset
-        tcp_port = 16509 + offset
-        tls_port = 16514 + offset
+        ssh_port, tcp_port, tls_port = self._ports_for_offset(offset)
 
         with open(env_path, "w") as fobj:
             fobj.write(f"BOXMAN_INSTANCE_NAME={instance_name}\n")

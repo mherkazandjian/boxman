@@ -11,6 +11,10 @@ packages = [
 ]
 include = [
     { path = "containers/docker/docker-compose.yml", format = ["sdist", "wheel"] },
+    # The build context is containers/docker/, so this has to ship with the
+    # package: `include` is an explicit per-file list, and without an entry
+    # the .dockerignore exists in a checkout but not in a wheel install.
+    { path = "containers/docker/.dockerignore", format = ["sdist", "wheel"] },
     { path = "containers/docker/Dockerfile", format = ["sdist", "wheel"] },
     { path = "containers/docker/Makefile", format = ["sdist", "wheel"] },
     { path = "containers/docker/supervisord.conf", format = ["sdist", "wheel"] },
@@ -74,6 +78,10 @@ requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
+# Collect only tests/. Without this, a repo that has run the docker runtime
+# fails collection at the root: containers/docker/data/libvirt-run/ holds
+# root-owned directories and pytest raises PermissionError on seven of them.
+testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-m 'not slow and not integration'"
 markers = [
