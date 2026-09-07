@@ -246,6 +246,76 @@ class TestDestroyVMDelegation:
         mock_destroyer.remove.assert_not_called()
 
 
+class TestForceStopVM:
+    """#164 X3 — the stop that recovers a crashed guest.
+
+    Distinct from destroy_vm, which undefines the domain. libvirt refuses
+    `start` while a domain is still active, and a crashed one is active,
+    so this has to run first — and it must leave the definition alone.
+    """
+
+    def test_already_shut_off_is_a_noop(self):
+        s = _session({})
+        mock_destroyer = MagicMock()
+        mock_destroyer.is_vm_shut_off.return_value = True
+        with patch("boxman.providers.libvirt.session.DestroyVM",
+                   return_value=mock_destroyer):
+            assert s.force_stop_vm("vm01") is True
+        mock_destroyer.virsh.execute.assert_not_called()
+
+    def test_active_domain_is_destroyed_then_confirmed(self):
+        s = _session({})
+        mock_destroyer = MagicMock()
+        # active first, shut off after the virsh destroy
+        mock_destroyer.is_vm_shut_off.side_effect = [False, True]
+        mock_destroyer.virsh.execute.return_value = _result()
+        with patch("boxman.providers.libvirt.session.DestroyVM",
+                   return_value=mock_destroyer):
+            assert s.force_stop_vm("vm01") is True
+        mock_destroyer.virsh.execute.assert_called_once_with(
+            "destroy", "vm01", warn=True)
+        # the definition must survive
+        mock_destroyer.undefine_vm.assert_not_called()
+        mock_destroyer.force_undefine_vm.assert_not_called()
+
+    def test_failed_virsh_destroy_is_reported(self):
+        s = _session({})
+        mock_destroyer = MagicMock()
+        mock_destroyer.is_vm_shut_off.return_value = False
+        mock_destroyer.virsh.execute.return_value = _result(
+            ok=False, stderr="error: Domain not found")
+        with patch("boxman.providers.libvirt.session.DestroyVM",
+                   return_value=mock_destroyer):
+            assert s.force_stop_vm("vm01") is False
+
+    def test_domain_still_active_after_destroy_is_reported(self):
+        s = _session({})
+        mock_destroyer = MagicMock()
+        mock_destroyer.is_vm_shut_off.side_effect = [False, False]
+        mock_destroyer.virsh.execute.return_value = _result()
+        with patch("boxman.providers.libvirt.session.DestroyVM",
+                   return_value=mock_destroyer):
+            assert s.force_stop_vm("vm01") is False
+
+    def test_unreadable_state_reads_as_stopped(self):
+        """is_vm_shut_off() answers True when the `domstate` query itself
+        fails, so an unreachable libvirt reads as "stopped" here.
+
+        That is deliberate and safe *only* because this is never the
+        authority: `up` checks the start_vm() that follows, and libvirt
+        refuses to start a domain that is actually still active. Pinned so
+        the fail-open is a decision rather than an accident — if this helper
+        ever gains a caller that does not check the next step, it needs a
+        fail-closed variant instead.
+        """
+        s = _session({})
+        mock_destroyer = MagicMock()
+        mock_destroyer.is_vm_shut_off.return_value = True   # query failed
+        with patch("boxman.providers.libvirt.session.DestroyVM",
+                   return_value=mock_destroyer):
+            assert s.force_stop_vm("vm01") is True
+
+
 class TestStartVM:
 
     def test_noop_when_already_running(self):
