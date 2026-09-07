@@ -1104,10 +1104,15 @@ class DockerComposeRuntime(RuntimeBase):
             plan["actions"].append(
                 f"clean up root-owned data inside container "
                 f"'{self.container_name}'")
+            # Done as root inside the container because the host user
+            # cannot necessarily remove all of it: libvirtd creates
+            # directories of its own while running, and those are root's
+            # until the next container start repairs them.
             clean_cmd = (
                 f"docker exec --user root {self.container_name} "
                 f"bash -c 'rm -rf /var/run/libvirt/* "
-                f"/var/lib/libvirt/images/* /etc/boxman/ssh/*'")
+                f"/var/lib/libvirt/images/* /etc/boxman/ssh/* "
+                f"/etc/libvirt/* /var/lib/libvirt/qemu/*'")
             plan["commands"].append(clean_cmd)
 
         down_cmd = (

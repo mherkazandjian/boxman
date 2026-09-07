@@ -644,3 +644,36 @@ class TestStartPathIsGuarded:
             rt.ensure_ready()
 
         assert any("compose" in c and " up " in f" {c} " for c in calls)
+
+
+class TestDestroyRuntimeCleansTheStateTrees:
+    """`.boxman` now holds libvirt's state, so destroy-runtime has to be
+    able to remove it — and a fresh install's trees arrive owned by root,
+    because entrypoint.sh seeds them from the image with `cp -a`."""
+
+    def test_the_in_container_cleanup_covers_both_trees(self, tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        with patch.object(rt, "get_compose_file_path", return_value=compose), \
+                patch("invoke.run",
+                      return_value=MagicMock(ok=True, stdout="true\n")):
+            plan = rt.plan_destroy_runtime()
+
+        cleanup = next(c for c in plan["commands"] if "rm -rf" in c)
+        assert "/etc/libvirt/*" in cleanup
+        assert "/var/lib/libvirt/qemu/*" in cleanup
+        # as root inside the container: the host user cannot necessarily
+        # remove directories libvirtd created while running
+        assert "--user root" in cleanup
+
+    def test_the_plan_says_the_state_goes_too(self, tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        os.makedirs(rt._state_host_dir("etc-libvirt"))
+        with patch.object(rt, "get_compose_file_path", return_value=compose), \
+                patch("invoke.run",
+                      return_value=MagicMock(ok=True, stdout="false\n")):
+            plan = rt.plan_destroy_runtime()
+
+        removal = next(a for a in plan["actions"] if "remove directory" in a)
+        assert "snapshot" in removal
