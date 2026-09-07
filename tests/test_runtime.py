@@ -364,7 +364,14 @@ class TestDockerComposeRuntime:
         import yaml
         data = yaml.safe_load(open(override_path))
         vols = data["services"]["libvirt"]["volumes"]
-        assert vols == ["/data:/data"]
+        # /sys/fs/cgroup is already in the user's file; /data is not. The
+        # libvirt state mounts come too — they live in the bundled compose
+        # file, so without them a user-supplied one never persists state
+        # and every run re-migrates (#164 FB-2 review).
+        assert "/data:/data" in vols
+        assert "/sys/fs/cgroup:/sys/fs/cgroup" not in vols
+        assert set(vols) - {"/data:/data"} == {
+            f"{src}:{dst}" for src, dst in rt._state_mount_pairs()}
         assert compose_path.read_text() == self.USER_COMPOSE
 
     def test_write_bind_mount_override_no_services(self, tmp_path):
@@ -1357,8 +1364,39 @@ class TestMountDedupKey:
 
     def test_exact_pair_is_recognised(self):
         pairs = DockerComposeRuntime._declared_mount_pairs(
-            ["/var/tmp:/var/tmp:ro"])
+            ["/var/tmp:/var/tmp"])
         assert ("/var/tmp", "/var/tmp") in pairs
+
+    def test_read_only_declaration_does_not_satisfy(self):
+        """`:ro` used to hide the mount without providing it.
+
+        Injection skipped the pair as already declared, and the readiness
+        check then rejected the container for the very mapping it had
+        refused to add — a recreate that could not fix itself
+        (#164 FB-2 review).
+        """
+        pairs = DockerComposeRuntime._declared_mount_pairs(
+            ["/var/tmp:/var/tmp:ro"])
+        assert ("/var/tmp", "/var/tmp") not in pairs
+
+    def test_read_only_declaration_is_refused_up_front(self):
+        rt = DockerComposeRuntime(config={"project_dir": "/p"})
+        with pytest.raises(ProvisionError, match="read-only"):
+            rt._mounts_to_add(["/var/tmp:/var/tmp:ro"],
+                              [("/var/tmp", "/var/tmp")])
+
+    def test_a_destination_taken_by_another_source_is_refused(self):
+        """docker rejects duplicate destinations, so appending cannot fix
+        this — say so before anything is stopped."""
+        rt = DockerComposeRuntime(config={"project_dir": "/p"})
+        with pytest.raises(ProvisionError, match="already bound"):
+            rt._mounts_to_add(["/elsewhere:/var/tmp"],
+                              [("/var/tmp", "/var/tmp")])
+
+    def test_writable_declaration_needs_no_addition(self):
+        rt = DockerComposeRuntime(config={"project_dir": "/p"})
+        assert rt._mounts_to_add(["/var/tmp:/var/tmp:rw"],
+                                 [("/var/tmp", "/var/tmp")]) == []
 
     def test_non_string_entries_are_ignored(self):
         """A long-form or named volume contributes nothing, so the mount is

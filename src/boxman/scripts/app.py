@@ -157,6 +157,17 @@ def load_boxman_config(path: str) -> dict:
     return config
 
 
+#: Handlers whose ``--force`` already means "destroy the VMs that are there
+#: and start over", and which therefore also authorise recreating the
+#: runtime container while guests run inside it (#164 FB-2).
+#:
+#: Named rather than tested inline because ``force`` is a dest several
+#: unrelated subcommands share: ``snapshot take --overwrite`` and
+#: ``create-templates --force`` set it too, and neither asks to destroy a
+#: running guest.
+FORCE_AUTHORISES_RECREATE = ('provision', 'up')
+
+
 def main():
     """
     CLI entry point.
@@ -412,8 +423,16 @@ def _main():
             # runtime container while guests are running inside it
             # (#164 FB-2). Verbs without --force refuse instead: the fix
             # for `boxman ps` hitting a recreate is not to kill a guest.
-            manager.runtime_instance.allow_recreate = bool(
-                getattr(args, 'force', False))
+            #
+            # Restricted to those two handlers by name. `force` is a dest
+            # several unrelated subcommands share — `snapshot take
+            # --overwrite` and `create-templates --force` set it too — and
+            # neither of those asks to destroy a running guest, so reading
+            # the flag alone would let a snapshot overwrite authorise it
+            # (#164 FB-2 review).
+            manager.runtime_instance.allow_recreate = (
+                args.handler in FORCE_AUTHORISES_RECREATE
+                and bool(getattr(args, 'force', False)))
 
         # Handle destroy-runtime — tear down Docker resources without
         # starting the container first

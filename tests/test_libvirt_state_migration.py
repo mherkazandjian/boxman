@@ -76,11 +76,20 @@ def _dispatch(rt, *, state="running", guests=0, persisted=False,
     """An ``invoke.run`` stand-in covering the migration's shell-outs."""
     import json as _json
 
+    stopped = {"yes": False}
+
     def _run(command, *_args, **_kwargs):
         if calls is not None:
             calls.append(command)
+        if "compose" in command and command.rstrip().endswith("stop"):
+            # a real stop leaves the container exited, which the migration
+            # now confirms before it copies anything
+            stopped["yes"] = True
+            return MagicMock(ok=True, stdout="", stderr="")
         if "docker ps -a" in command:
-            return MagicMock(ok=True, stdout=f"{state}\n" if state else "")
+            current = "exited" if (stopped["yes"] and state) else state
+            return MagicMock(
+                ok=True, stdout=f"{current}\n" if current else "")
         if rt._GUEST_PROBE_MARKER in command:
             return MagicMock(
                 ok=True, stdout=f"{rt._GUEST_PROBE_MARKER}{guests}\n")
@@ -475,7 +484,8 @@ class TestStrandedDataDir:
         os.makedirs(legacy)
         with open(os.path.join(legacy, "disk.qcow2"), "w") as fobj:
             fobj.write("x")
-        with pytest.raises(ProvisionError, match="still holds"):
+        with pytest.raises(ProvisionError,
+                           match="still in the previous location"):
             rt._assert_no_stranded_data_dir(custom)
 
     def test_the_message_names_both_directories(self, tmp_path):
@@ -677,3 +687,212 @@ class TestDestroyRuntimeCleansTheStateTrees:
 
         removal = next(a for a in plan["actions"] if "remove directory" in a)
         assert "snapshot" in removal
+
+
+class TestReviewRegressions:
+    """The eight findings from the Part 2 implementation review, each with
+    the case that fails without its fix."""
+
+    # -- 1. force must migrate, not skip the migration ------------------
+    def test_force_migrates_before_recreating(self, tmp_path):
+        """`--force` used to defer the migration and then authorise the
+        `compose down` that destroys the writable layer holding it.
+
+        Deferring is only safe *without* force: with it, every recreate
+        guard below is satisfied, so skipping the copy loses exactly what
+        FB-2 exists to keep.
+        """
+        rt = _runtime(tmp_path)
+        rt.allow_recreate = True
+        compose = str(tmp_compose(rt))
+        calls = []
+        with patch("invoke.run",
+                   side_effect=_dispatch(rt, guests=2, calls=calls)):
+            rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+        assert any("docker cp" in c for c in calls), \
+            "force skipped the migration"
+        assert os.path.isfile(rt._state_marker_path())
+        assert os.path.isfile(os.path.join(
+            rt._data_dir(), "etc-libvirt/qemu/vm1.xml"))
+
+    def test_without_force_running_guests_still_defer(self, tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        calls = []
+        with patch("invoke.run",
+                   side_effect=_dispatch(rt, guests=2, calls=calls)):
+            rt._ensure_state_persisted(compose, os.path.dirname(compose))
+        assert not any("docker cp" in c for c in calls)
+
+    # -- 2. only provision/up may authorise it --------------------------
+    def test_only_provision_and_up_authorise_recreation(self):
+        """`force` is a dest several subcommands share — `snapshot take
+        --overwrite` and `create-templates --force` set it too, and
+        neither asks to destroy a running guest."""
+        from boxman.scripts.app import FORCE_AUTHORISES_RECREATE
+        assert set(FORCE_AUTHORISES_RECREATE) == {"provision", "up"}
+        for handler in ("snapshot", "create_templates", "ps", "ssh",
+                        "restore", "storage"):
+            assert handler not in FORCE_AUTHORISES_RECREATE
+
+    # -- 3. never clear a tree that is a live bind-mount source ---------
+    def test_a_mounted_tree_is_not_discarded(self, tmp_path):
+        """With one tree mounted and one not, the all-or-nothing check
+        sent both through the migration — and its first act is to clear the
+        destination, which for the mounted tree *is* the live source."""
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+
+        # /etc/libvirt is already bind-mounted and populated; the qemu tree
+        # is not mounted at all.
+        etc = rt._state_host_dir("etc-libvirt")
+        os.makedirs(os.path.join(etc, "qemu"))
+        with open(os.path.join(etc, "qemu", "irreplaceable.xml"), "w") as f:
+            f.write("<domain><name>irreplaceable</name></domain>")
+
+        import json
+
+        def _run(command, *_a, **_kw):
+            if "docker ps -a" in command:
+                return MagicMock(ok=True, stdout="exited\n")
+            if rt._GUEST_PROBE_MARKER in command:
+                return MagicMock(
+                    ok=True, stdout=f"{rt._GUEST_PROBE_MARKER}0\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=True, stdout=json.dumps(
+                    [{"Source": etc, "Destination": "/etc/libvirt",
+                      "RW": True}]))
+            if command.startswith("docker cp"):
+                source = command.split()[2].split(":", 1)[1]
+                root, entries = STATE_FIXTURES[source]
+                _make_tar(_redirect_target(command), root, entries)
+                return MagicMock(ok=True, stdout="", stderr="")
+            return MagicMock(ok=True, stdout="", stderr="")
+
+        with patch("invoke.run", side_effect=_run):
+            rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+        assert os.path.isfile(
+            os.path.join(etc, "qemu", "irreplaceable.xml")), \
+            "the live mount source was cleared"
+        assert os.path.isfile(os.path.join(
+            rt._data_dir(), "var-lib-libvirt-qemu/nvram/vm1_VARS.fd"))
+
+    def test_unpersisted_trees_is_per_tree(self, tmp_path):
+        rt = _runtime(tmp_path)
+        import json
+        etc = rt._state_host_dir("etc-libvirt")
+        with patch("invoke.run", return_value=MagicMock(
+                ok=True, stdout=json.dumps(
+                    [{"Source": etc, "Destination": "/etc/libvirt",
+                      "RW": True}]))):
+            pending = rt._unpersisted_trees()
+        assert pending == [("var-lib-libvirt-qemu", "/var/lib/libvirt/qemu")]
+
+    # -- 5. a failed stop must copy nothing -----------------------------
+    def test_a_failed_stop_copies_nothing(self, tmp_path):
+        """A container still writing to the tree yields an archive that
+        passes every completeness check and is a torn snapshot."""
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        calls = []
+
+        def _run(command, *_a, **_kw):
+            calls.append(command)
+            if "compose" in command and command.rstrip().endswith("stop"):
+                return MagicMock(ok=False, stdout="", stderr="boom")
+            return _dispatch(rt)(command)
+
+        with patch("invoke.run", side_effect=_run):
+            with pytest.raises(ProvisionError, match="could not stop"):
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+        assert not any("docker cp" in c for c in calls)
+        assert not os.path.isfile(rt._state_marker_path())
+
+    def test_a_container_that_stays_up_copies_nothing(self, tmp_path):
+        """compose stop can exit 0 without the container actually going
+        down; the state is then still changing under the copy."""
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        calls = []
+
+        def _run(command, *_a, **_kw):
+            calls.append(command)
+            if "docker ps -a" in command:
+                return MagicMock(ok=True, stdout="running\n")
+            if rt._GUEST_PROBE_MARKER in command:
+                return MagicMock(
+                    ok=True, stdout=f"{rt._GUEST_PROBE_MARKER}0\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=True, stdout="[]")
+            return MagicMock(ok=True, stdout="", stderr="")
+
+        with patch("invoke.run", side_effect=_run):
+            with pytest.raises(ProvisionError, match="still 'running'"):
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+        assert not any("docker cp" in c for c in calls)
+        assert not os.path.isfile(rt._state_marker_path())
+
+    # -- 6/7. the FB-11 relocation checks -------------------------------
+    def test_an_empty_subdirectory_does_not_count_as_populated(self,
+                                                               tmp_path):
+        """`os.listdir` said populated for a directory holding only an
+        empty `ssh/`, which loses nothing and proves nothing."""
+        rt = _runtime(tmp_path)
+        custom = tmp_path / "custom"
+        custom.mkdir()
+        legacy = custom / "data" / "images"
+        legacy.mkdir(parents=True)
+        (legacy / "disk.qcow2").write_text("x")
+        os.makedirs(os.path.join(rt._data_dir(), "ssh"))
+
+        with patch("invoke.run", return_value=MagicMock(ok=False, stdout="")):
+            with pytest.raises(ProvisionError,
+                               match="still in the previous location"):
+                rt._assert_no_stranded_data_dir(str(custom))
+
+    def test_a_container_still_mounting_the_old_dir_decides(self, tmp_path):
+        """A new location that merely looks populated does not mean the
+        container switched to it — its mount table is the authority."""
+        rt = _runtime(tmp_path)
+        custom = tmp_path / "custom"
+        custom.mkdir()
+        for base in (custom / "data", pathlib_path(rt._data_dir())):
+            (base / "images").mkdir(parents=True)
+            (base / "images" / "disk.qcow2").write_text("x")
+
+        import json
+        mounts = json.dumps([
+            {"Source": str(custom / "data" / "images"),
+             "Destination": "/var/lib/libvirt/images", "RW": True}])
+        with patch("invoke.run",
+                   return_value=MagicMock(ok=True, stdout=mounts)):
+            with pytest.raises(ProvisionError,
+                               match="still in the previous location"):
+                rt._assert_no_stranded_data_dir(str(custom))
+
+    def test_the_move_command_replaces_rather_than_nests(self, tmp_path):
+        """`mv legacy current` puts the tree at `current/data` when
+        `current` already exists, and the next run then accepts that
+        nonempty directory while `current/images` is still missing."""
+        rt = _runtime(tmp_path)
+        custom = tmp_path / "custom"
+        (custom / "data" / "images").mkdir(parents=True)
+        (custom / "data" / "images" / "d.qcow2").write_text("x")
+
+        with patch("invoke.run", return_value=MagicMock(ok=False, stdout="")):
+            with pytest.raises(ProvisionError) as excinfo:
+                rt._assert_no_stranded_data_dir(str(custom))
+
+        message = str(excinfo.value)
+        assert "mv -T " in message
+        assert str(custom / "data") in message
+        assert rt._data_dir() in message
+
+
+def pathlib_path(p):
+    import pathlib
+    return pathlib.Path(p)
