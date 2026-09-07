@@ -258,7 +258,11 @@ class SnapshotsMixin:
         force = getattr(cli_args, 'force', False)
 
         def _take(full_vm_name, vm_dir, snapshot_name, description):
-            self.session_for_vm(full_vm_name).snapshot_take(
+            # The provider returns False for a take it refused. Dropping
+            # that made the worker succeed on a snapshot it never wrote —
+            # and the verification below can pass an *older* snapshot of
+            # the same name left on disk, so nothing downstream notices.
+            created = self.session_for_vm(full_vm_name).snapshot_take(
                 vm_name=full_vm_name,
                 vm_dir=vm_dir,
                 snapshot_name=snapshot_name,
@@ -266,6 +270,10 @@ class SnapshotsMixin:
                 compress_memory=compress_memory,
                 compress_level=compress_level,
                 force=force)
+            if not created:
+                raise SnapshotError(
+                    f"provider refused to create snapshot "
+                    f"'{snapshot_name}' for {full_vm_name}")
 
         processes = [
             (full_vm_name, _take,
@@ -273,27 +281,39 @@ class SnapshotsMixin:
               cli_args.snapshot_name, cli_args.snapshot_descr))
             for full_vm_name, vm_dir in vm_targets
         ]
-        self._run_parallel(processes, op_label='snapshot take')
+        _results, take_failures = self._run_parallel(
+            processes, op_label='snapshot take')
 
         # Verify every snapshot in the main process after all takes complete.
         self.logger.info("verifying snapshots after take...")
-        all_ok = True
+        invalid: list[str] = []
         for full_vm_name, _ in vm_targets:
             valid, errors = self.session_for_vm(full_vm_name).validate_snapshot(
                 full_vm_name, cli_args.snapshot_name)
             if valid:
                 self.logger.info(f"snapshot ok: {full_vm_name} / '{cli_args.snapshot_name}'")
             else:
-                all_ok = False
+                invalid.append(full_vm_name)
                 for err in errors:
                     self.logger.error(
                         f"snapshot invalid: {full_vm_name} / '{cli_args.snapshot_name}': {err}")
 
-        if all_ok:
-            self.logger.info("all snapshots verified successfully")
-        else:
+        # A take that failed has to be reported even when verification
+        # passed: validating an older snapshot of the same name would
+        # otherwise turn a refused take into a clean exit 0.
+        if take_failures or invalid:
+            problems = []
+            if take_failures:
+                problems.append(
+                    f"take failed for {', '.join(sorted(take_failures))}")
+            if invalid:
+                problems.append(
+                    f"verification failed for {', '.join(sorted(invalid))}")
             raise SnapshotError(
-                "one or more snapshots failed verification — check errors above")
+                f"snapshot '{cli_args.snapshot_name}': "
+                f"{'; '.join(problems)} — check the errors above")
+
+        self.logger.info("all snapshots verified successfully")
         self._exit_if_dc_failed(dc_failed, 'take')
 
     def snapshot_restore(self, cli_args):
@@ -472,15 +492,54 @@ class SnapshotsMixin:
             self._exit_if_dc_failed(dc_failed, 'delete')
             return
 
+        # The provider returns False for a delete it refused — an external
+        # snapshot with newer ones above it, a broken chain. Reporting
+        # "deleted" regardless told the user the snapshot was gone while it
+        # was still on disk, and the command exited 0.
+        refused: list[str] = []
         for full_vm_name, _cluster_name, _vm_name, _workdir in targets:
-            self.session_for_cluster(_cluster_name).snapshot_delete(full_vm_name, cli_args.snapshot_name)
-            self.logger.info(f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
+            deleted = self.session_for_cluster(_cluster_name).snapshot_delete(
+                full_vm_name, cli_args.snapshot_name)
+            if deleted:
+                self.logger.info(
+                    f"Snapshot {cli_args.snapshot_name} deleted for VM {full_vm_name}")
+            else:
+                refused.append(full_vm_name)
+
+        if refused:
+            # Report the docker-compose side first: it has already been
+            # attempted and its failures are as relevant as these.
+            if dc_failed:
+                self.logger.error(
+                    f"snapshot delete also failed for docker-compose "
+                    f"cluster(s): {', '.join(dc_failed)}")
+            raise SnapshotError(
+                f"snapshot '{cli_args.snapshot_name}' could not be deleted "
+                f"from {len(refused)} VM(s): {', '.join(sorted(refused))}. "
+                f"See the preceding provider errors — an external snapshot "
+                f"with newer snapshots above it has to be dropped with "
+                f"`boxman snapshot collapse`.")
+
         self._exit_if_dc_failed(dc_failed, 'delete')
 
     @staticmethod
     def _collapse_one_vm(provider_config, full_vm_name, workdir, vm_info,
                          target, no_shutdown, dry_run):
-        """Worker target for parallel snapshot collapse — must be picklable."""
+        """Worker target for parallel snapshot collapse — must be picklable.
+
+        Raises:
+            SnapshotError: if the dry run rejected the target, if a
+                shutdown boxman attempted was lost, or if the collapse or
+                the restart failed. A running VM under ``--no-shutdown``
+                stays a deliberate skip and is *not* a failure — the user
+                asked for it. A shutdown boxman tried and lost is one:
+                the snapshots it was asked to collapse are still there.
+
+        Once boxman has powered a VM down the restart is attempted
+        whatever the collapse did, so a failed collapse can never leave a
+        guest that was running switched off. Both diagnostics survive
+        when the collapse and the restart fail together.
+        """
         from boxman.providers.libvirt.snapshot import SnapshotManager
         from boxman.providers.libvirt.storage import StorageManager
 
@@ -488,7 +547,13 @@ class SnapshotsMixin:
         storage = StorageManager(provider_config)
 
         if dry_run:
-            snapshot_mgr.collapse_to(full_vm_name, target, dry_run=True)
+            # collapse_to() returns False for a target that does not
+            # resolve. Discarding it let `--dry-run` exit 0 on a
+            # misspelled snapshot name — the one thing it is asked to check.
+            if not snapshot_mgr.collapse_to(full_vm_name, target, dry_run=True):
+                raise SnapshotError(
+                    f"collapse dry-run failed for {full_vm_name}: "
+                    f"'{target}' is not a usable collapse target")
             return
 
         was_running = storage.is_running(full_vm_name)
@@ -499,21 +564,35 @@ class SnapshotsMixin:
                     f"--no-shutdown was passed; skipping")
                 return
             if not storage.shutdown_and_wait(full_vm_name):
-                log.error(
-                    f"collapse: shutdown failed for {full_vm_name}, skipping")
-                return
+                raise SnapshotError(
+                    f"collapse: shutdown failed for {full_vm_name}, its "
+                    f"snapshots were left untouched")
 
-        ok = snapshot_mgr.collapse_to(full_vm_name, target, dry_run=False)
+        collapse_error = None
+        restart_error = None
+        try:
+            if snapshot_mgr.collapse_to(full_vm_name, target, dry_run=False):
+                log.info(
+                    f"collapse ok: {full_vm_name} — kept '{target}' and older")
+            else:
+                collapse_error = f"collapse failed: {full_vm_name}"
+        finally:
+            if was_running:
+                try:
+                    if not storage.start(full_vm_name):
+                        restart_error = (
+                            f"collapse: failed to restart {full_vm_name}")
+                except Exception as exc:
+                    # Never let a restart blow-up mask the collapse failure.
+                    restart_error = (
+                        f"collapse: failed to restart {full_vm_name}: "
+                        f"{type(exc).__name__}: {exc}")
+                if restart_error:
+                    log.error(restart_error)
 
-        if was_running:
-            if not storage.start(full_vm_name):
-                log.error(f"collapse: failed to restart {full_vm_name}")
-
-        if ok:
-            log.info(
-                f"collapse ok: {full_vm_name} — kept '{target}' and older")
-        else:
-            log.error(f"collapse failed: {full_vm_name}")
+        if collapse_error or restart_error:
+            raise SnapshotError(
+                '; '.join(m for m in (collapse_error, restart_error) if m))
 
     def snapshot_collapse(self, cli_args):
         """
@@ -558,7 +637,13 @@ class SnapshotsMixin:
               target, no_shutdown, dry_run))
             for full_vm_name, workdir, vm_info in targets
         ]
-        self._run_parallel(processes, op_label='snapshot collapse')
+        _results, failures = self._run_parallel(
+            processes, op_label='snapshot collapse')
+        if failures:
+            names = ', '.join(sorted(failures))
+            raise SnapshotError(
+                f"snapshot collapse failed for {len(failures)} VM(s) "
+                f"({names}); see the preceding per-VM errors for the cause.")
 
     ### end snapshot functions ####
     ### start storage functions ####
@@ -659,7 +744,22 @@ class SnapshotsMixin:
     @staticmethod
     def _compact_one_vm(provider_config, full_vm_name, workdir, vm_info,
                         method, drop_snapshots, no_shutdown, dry_run):
-        """Worker target for parallel compact — must be picklable."""
+        """Worker target for parallel compact — must be picklable.
+
+        Raises:
+            SnapshotError: if a shutdown boxman attempted was lost, if any
+                disk failed to compact, or if the restart failed. A
+                running VM under ``--no-shutdown`` stays a deliberate
+                skip and is *not* a failure; a shutdown boxman tried and
+                lost is one, since the disks it was asked to compact are
+                untouched.
+
+        Once boxman has powered a VM down the restart is attempted
+        whatever the disk loop did — including when it raised — so a
+        failed compact can never leave a guest that was running switched
+        off. Both diagnostics survive when a disk and the restart fail
+        together.
+        """
         from boxman.providers.libvirt.storage import StorageManager, vm_disk_paths
 
         storage = StorageManager(provider_config)
@@ -670,6 +770,7 @@ class SnapshotsMixin:
             return
 
         was_running = storage.is_running(full_vm_name)
+        did_shutdown = False
         if was_running:
             if no_shutdown:
                 log.error(
@@ -680,36 +781,61 @@ class SnapshotsMixin:
                 log.info(f"[dry-run] would shutdown {full_vm_name}")
             else:
                 if not storage.shutdown_and_wait(full_vm_name):
-                    log.error(f"compact: shutdown failed for {full_vm_name}, skipping")
-                    return
+                    raise SnapshotError(
+                        f"compact: shutdown failed for {full_vm_name}, its "
+                        f"disks were left untouched")
+                did_shutdown = True
 
-        has_snapshots = storage.count_snapshots(full_vm_name) > 0
-        for disk_path in disks:
-            before = storage.disk_info(disk_path).get('actual-size', 0)
-            if dry_run:
-                measure = storage.disk_measure(disk_path)
-                est = measure.get('required')
-                log.info(
-                    f"[dry-run] {full_vm_name}: would compact {os.path.basename(disk_path)} "
-                    f"method={method} allocated={before} estimated_after={est}")
-                continue
-            ok = storage.compact_disk(
-                disk_path,
-                method=method,
-                has_snapshots=has_snapshots,
-                drop_snapshots=drop_snapshots)
-            after = storage.disk_info(disk_path).get('actual-size', 0)
-            if ok:
-                log.info(
-                    f"compact ok: {full_vm_name}/{os.path.basename(disk_path)} "
-                    f"{before} -> {after}")
-            else:
-                log.error(
-                    f"compact failed: {full_vm_name}/{os.path.basename(disk_path)}")
+        failed_disks: list[str] = []
+        restart_error = None
+        try:
+            has_snapshots = storage.count_snapshots(full_vm_name) > 0
+            for disk_path in disks:
+                before = storage.disk_info(disk_path).get('actual-size', 0)
+                if dry_run:
+                    measure = storage.disk_measure(disk_path)
+                    est = measure.get('required')
+                    log.info(
+                        f"[dry-run] {full_vm_name}: would compact "
+                        f"{os.path.basename(disk_path)} "
+                        f"method={method} allocated={before} estimated_after={est}")
+                    continue
+                ok = storage.compact_disk(
+                    disk_path,
+                    method=method,
+                    has_snapshots=has_snapshots,
+                    drop_snapshots=drop_snapshots)
+                after = storage.disk_info(disk_path).get('actual-size', 0)
+                if ok:
+                    log.info(
+                        f"compact ok: {full_vm_name}/{os.path.basename(disk_path)} "
+                        f"{before} -> {after}")
+                else:
+                    failed_disks.append(os.path.basename(disk_path))
+                    log.error(
+                        f"compact failed: {full_vm_name}/{os.path.basename(disk_path)}")
+        finally:
+            if did_shutdown:
+                try:
+                    if not storage.start(full_vm_name):
+                        restart_error = (
+                            f"compact: failed to restart {full_vm_name}")
+                except Exception as exc:
+                    # Never let a restart blow-up mask the compact failure.
+                    restart_error = (
+                        f"compact: failed to restart {full_vm_name}: "
+                        f"{type(exc).__name__}: {exc}")
+                if restart_error:
+                    log.error(restart_error)
 
-        if was_running and not no_shutdown and not dry_run:
-            if not storage.start(full_vm_name):
-                log.error(f"compact: failed to restart {full_vm_name}")
+        problems = []
+        if failed_disks:
+            problems.append(
+                f"compact failed for {full_vm_name}: {', '.join(failed_disks)}")
+        if restart_error:
+            problems.append(restart_error)
+        if problems:
+            raise SnapshotError('; '.join(problems))
 
     def storage_compact(self, cli_args):
         """
@@ -735,7 +861,13 @@ class SnapshotsMixin:
               method, drop_snapshots, no_shutdown, dry_run))
             for full_vm_name, workdir, vm_info in targets
         ]
-        self._run_parallel(processes, op_label='storage compact')
+        _results, failures = self._run_parallel(
+            processes, op_label='storage compact')
+        if failures:
+            names = ', '.join(sorted(failures))
+            raise SnapshotError(
+                f"storage compact failed for {len(failures)} VM(s) "
+                f"({names}); see the preceding per-VM errors for the cause.")
 
     def storage_optimize(self, cli_args):
         """

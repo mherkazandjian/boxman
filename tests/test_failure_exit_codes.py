@@ -34,6 +34,21 @@ def _manager():
     return mgr
 
 
+def _sync_run_parallel(self, tasks, op_label='parallel task', max_workers=None):
+    """Run the real worker targets in-process, with _run_parallel's contract.
+
+    Lets a test drive the closures a verb hands to the pool (and their
+    return-value checks) instead of a stand-in for them.
+    """
+    results, failures = {}, {}
+    for label, target, args in tasks:
+        try:
+            results[label] = target(*args)
+        except Exception as exc:
+            failures[label] = f"{type(exc).__name__}: {exc}"
+    return results, failures
+
+
 @pytest.fixture
 def no_existing_state(monkeypatch):
     """No live VMs, no cache entry, cache registration succeeds."""
@@ -121,8 +136,59 @@ class TestSnapshotFailuresRaise:
         mgr.provider.validate_snapshot.return_value = (False, ["corrupt"])
         ns = types.SimpleNamespace(
             snapshot_name="s1", snapshot_descr="", vms="all", cluster=None)
-        with pytest.raises(SnapshotError, match="failed verification"):
+        with pytest.raises(SnapshotError, match="verification failed"):
             mgr.snapshot_take(ns)
+
+    def test_refused_take_fails_even_when_validation_passes(self, monkeypatch):
+        """A take the provider refused must reach the exit code.
+
+        Validation alone cannot catch it: an *older* snapshot of the same
+        name left on disk passes every check the validator makes, so the
+        refused take would be reported as a clean success (#164 X3).
+        """
+        mgr = _manager()
+        monkeypatch.setattr(
+            BoxmanManager, "_run_parallel", _sync_run_parallel)
+        mgr.provider.snapshot_take.return_value = False
+        mgr.provider.validate_snapshot.return_value = (True, [])
+        ns = types.SimpleNamespace(
+            snapshot_name="s1", snapshot_descr="", vms="all", cluster=None)
+        with pytest.raises(SnapshotError, match="take failed for"):
+            mgr.snapshot_take(ns)
+
+    def test_successful_take_and_validation_does_not_raise(self, monkeypatch):
+        mgr = _manager()
+        monkeypatch.setattr(
+            BoxmanManager, "_run_parallel", _sync_run_parallel)
+        mgr.provider.snapshot_take.return_value = True
+        mgr.provider.validate_snapshot.return_value = (True, [])
+        ns = types.SimpleNamespace(
+            snapshot_name="s1", snapshot_descr="", vms="all", cluster=None)
+        mgr.snapshot_take(ns)
+
+    def test_collapse_aggregates_worker_failures(self, monkeypatch):
+        mgr = _manager()
+        monkeypatch.setattr(
+            BoxmanManager, "_run_parallel",
+            lambda self, tasks, op_label='parallel task': (
+                {}, {"vm1": "SnapshotError: collapse failed"}))
+        ns = types.SimpleNamespace(
+            target="snap1", dry_run=False, no_shutdown=False, yes=True,
+            vms="all", cluster=None)
+        with pytest.raises(SnapshotError, match="snapshot collapse failed"):
+            mgr.snapshot_collapse(ns)
+
+    def test_compact_aggregates_worker_failures(self, monkeypatch):
+        mgr = _manager()
+        monkeypatch.setattr(
+            BoxmanManager, "_run_parallel",
+            lambda self, tasks, op_label='parallel task': (
+                {}, {"vm1": "SnapshotError: compact failed"}))
+        ns = types.SimpleNamespace(
+            method="in-place", drop_snapshots=False, dry_run=False,
+            no_shutdown=False, yes=True, vms="all", cluster=None)
+        with pytest.raises(SnapshotError, match="storage compact failed"):
+            mgr.storage_compact(ns)
 
     def test_restore_no_snapshot_found(self):
         mgr = _manager()
@@ -212,3 +278,76 @@ class TestLoadConfigFailuresRaise:
         mgr = _manager()
         with pytest.raises(ConfigError, match="project config not found"):
             mgr.load_config(str(tmp_path / "conf.yml"))
+
+
+class TestLifecycleFailuresRaise:
+    """#164 X3 — `up` and `down` discarded ``_run_parallel``'s failures.
+
+    Both now raise, but the raise is deferred: a lifecycle verb that has
+    already done half its work still finishes the rest before it reports.
+    Failing on the spot turned one dead VM into a project with no netlab,
+    no compose clusters and a stale ssh config — or, on ``down``, a set of
+    containers left running with nothing to say so.
+    """
+
+    def _down_manager(self, monkeypatch, failures):
+        mgr = _manager()
+        monkeypatch.setattr(
+            BoxmanManager, "_update_sessions_with_runtime", lambda cls: None)
+        monkeypatch.setattr(
+            BoxmanManager, "_control_vm_targets",
+            lambda cls, cli_args: [("vm1", "/tmp/ws/c1")])
+        monkeypatch.setattr(
+            BoxmanManager, "_run_parallel",
+            lambda self, tasks, op_label='parallel task': ({}, failures))
+        mgr.stop_compose_clusters = MagicMock()
+        return mgr
+
+    def test_down_stops_compose_clusters_before_raising(self, monkeypatch):
+        mgr = self._down_manager(monkeypatch, {"vm1": "OSError: no domain"})
+        with pytest.raises(ProvisionError, match="could not bring down"):
+            mgr.down(types.SimpleNamespace(suspend=False, vms="all", cluster=None))
+        mgr.stop_compose_clusters.assert_called_once()
+
+    def test_down_is_silent_when_every_vm_saves(self, monkeypatch):
+        mgr = self._down_manager(monkeypatch, {})
+        mgr.down(types.SimpleNamespace(suspend=False, vms="all", cluster=None))
+        mgr.stop_compose_clusters.assert_called_once()
+
+    def _up_manager(self, monkeypatch, failures):
+        mgr = _manager()
+        for name in ("_update_sessions_with_runtime", "ensure_shared_bridges",
+                     "report_network_results", "raise_on_network_failures"):
+            monkeypatch.setattr(BoxmanManager, name,
+                                lambda cls, *a, **kw: None)
+        monkeypatch.setattr(
+            BoxmanManager, "_get_vm_states", lambda cls: {"vm1": "shut off"})
+        monkeypatch.setattr(
+            BoxmanManager, "reconcile_networks", lambda cls, **kw: {})
+        monkeypatch.setattr(
+            BoxmanManager, "_control_vm_targets",
+            lambda cls, cli_args: [("vm1", "/tmp/ws/c1")])
+        monkeypatch.setattr(
+            BoxmanManager, "_get_project_vm_names", lambda cls: ["vm1"])
+        monkeypatch.setattr(
+            BoxmanManager, "wait_for_vm_ips", lambda cls, *a, **kw: None)
+        monkeypatch.setattr(
+            BoxmanManager, "_run_parallel",
+            lambda self, tasks, op_label='parallel task': ({}, failures))
+        for name in ("ensure_netlab_up", "provision_compose_clusters",
+                     "connect_info", "write_ssh_config"):
+            setattr(mgr, name, MagicMock())
+        return mgr
+
+    def test_up_reconciles_the_rest_before_raising(self, monkeypatch):
+        mgr = self._up_manager(monkeypatch, {"vm1": "OSError: no domain"})
+        with pytest.raises(ProvisionError, match="could not bring up"):
+            mgr.up(types.SimpleNamespace(force=True, vms="all", cluster=None))
+        mgr.ensure_netlab_up.assert_called_once()
+        mgr.provision_compose_clusters.assert_called_once()
+        mgr.write_ssh_config.assert_called_once()
+
+    def test_up_is_silent_when_every_vm_starts(self, monkeypatch):
+        mgr = self._up_manager(monkeypatch, {})
+        mgr.up(types.SimpleNamespace(force=True, vms="all", cluster=None))
+        mgr.write_ssh_config.assert_called_once()

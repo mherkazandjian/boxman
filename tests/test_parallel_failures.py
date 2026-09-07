@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 
 pytestmark = pytest.mark.unit
@@ -125,7 +126,10 @@ class TestUpdateParallelFailures:
             BoxmanManager, "_update_single_vm", _dying_update_worker)
         ns = types.SimpleNamespace(
             dry_run=False, yes=True, recreate_networks=False)
-        mgr.update(ns)
+        # the summary is still logged per VM, and the command now also fails:
+        # reporting the failure and then exiting 0 was the defect
+        with pytest.raises(ProvisionError, match="node01"):
+            mgr.update(ns)
         errors = [c.args[0] for c in mgr.logger.error.call_args_list if c.args]
         assert any("failed" in msg and "node01" in msg for msg in errors)
 
@@ -137,3 +141,91 @@ class TestGetConnectInfo:
         mgr = _manager()
         mgr.provider.get_vm_ip_addresses.side_effect = RuntimeError("virsh down")
         assert mgr.get_connect_info() is False
+
+
+def _big_payload_worker(size):
+    # Returns more than a pipe buffer's worth of data. The old
+    # join-then-drain loop deadlocked here: the child blocked in the queue
+    # feeder waiting for the parent to read, the parent sat in join().
+    return "x" * size
+
+
+def _concurrency_probe(live, peak, lock, hold):
+    """Track how many copies of this worker are alive at the same time."""
+    import time
+    with lock:
+        live.value += 1
+        peak.value = max(peak.value, live.value)
+    time.sleep(hold)
+    with lock:
+        live.value -= 1
+    return True
+
+
+class TestParallelWorkerLimit:
+    """The fan-out cap: one process per VM does not scale to a large
+    cluster, so the window is bounded (and still overridable)."""
+
+    def test_explicit_request_wins_over_env(self, monkeypatch):
+        mgr = _manager()
+        monkeypatch.setenv("BOXMAN_MAX_PARALLEL", "3")
+        assert mgr._parallel_worker_limit(2, 10) == 2
+
+    def test_env_override_is_used(self, monkeypatch):
+        mgr = _manager()
+        monkeypatch.setenv("BOXMAN_MAX_PARALLEL", "3")
+        assert mgr._parallel_worker_limit(None, 10) == 3
+
+    def test_default_is_capped_and_never_exceeds_batch(self, monkeypatch):
+        mgr = _manager()
+        monkeypatch.delenv("BOXMAN_MAX_PARALLEL", raising=False)
+        assert mgr._parallel_worker_limit(None, 200) <= 8
+        assert mgr._parallel_worker_limit(None, 2) == 2
+
+    def test_non_positive_means_unbounded(self, monkeypatch):
+        mgr = _manager()
+        monkeypatch.delenv("BOXMAN_MAX_PARALLEL", raising=False)
+        assert mgr._parallel_worker_limit(0, 50) == 50
+        assert mgr._parallel_worker_limit(-1, 50) == 50
+
+    def test_garbage_env_warns_and_falls_back(self, monkeypatch):
+        mgr = _manager()
+        monkeypatch.setenv("BOXMAN_MAX_PARALLEL", "lots")
+        assert mgr._parallel_worker_limit(None, 200) <= 8
+        mgr.logger.warning.assert_called()
+
+
+class TestRunParallelScheduling:
+
+    def test_large_payloads_do_not_deadlock(self):
+        """Four 1 MiB payloads: every result must come back."""
+        mgr = _manager()
+        size = 1024 * 1024
+        tasks = [(f"t{i}", _big_payload_worker, (size,)) for i in range(4)]
+        results, failures = mgr._run_parallel(tasks, max_workers=2)
+        assert failures == {}
+        assert sorted(results) == ["t0", "t1", "t2", "t3"]
+        assert all(len(v) == size for v in results.values())
+
+    def test_concurrency_never_exceeds_the_limit(self):
+        from multiprocessing import Lock, Value
+
+        mgr = _manager()
+        live = Value("i", 0)
+        peak = Value("i", 0)
+        lock = Lock()
+        tasks = [
+            (f"vm{i}", _concurrency_probe, (live, peak, lock, 0.15))
+            for i in range(8)
+        ]
+        results, failures = mgr._run_parallel(tasks, max_workers=2)
+        assert failures == {}
+        assert len(results) == 8
+        assert peak.value <= 2, f"peak concurrency was {peak.value}"
+
+    def test_all_tasks_still_run_when_bounded(self):
+        mgr = _manager()
+        tasks = [(f"n{i}", _ok_worker, (i,)) for i in range(10)]
+        results, failures = mgr._run_parallel(tasks, max_workers=3)
+        assert failures == {}
+        assert results == {f"n{i}": i for i in range(10)}

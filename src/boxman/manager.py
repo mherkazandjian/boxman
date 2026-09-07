@@ -28,6 +28,7 @@ from boxman.utils.jinja_env import create_jinja_env
 #: result missing (the child has already joined, so any wait here is just
 #: feeder-thread flush latency — or a child that died before queue.put).
 _PARALLEL_RESULT_TIMEOUT = 5
+_PARALLEL_POLL_INTERVAL = 0.2
 
 
 def _parallel_worker(result_queue, label, target, args):
@@ -63,6 +64,11 @@ class BoxmanManager(
 
         #: Optional[Dict[str, Any]]: the loaded configuration dictionary
         self.config: dict[str, Any] | None = None
+
+        #: Optional[str]: the rendered project config as text, kept from
+        #: :meth:`load_config` so ``boxman conf`` can show it without
+        #: depending on the best-effort ``*.rendered.yml`` dump.
+        self.rendered_config_text: str | None = None
 
         #: the private backing field for the provider property (the
         #: default session — see :meth:`register_session`)
@@ -364,15 +370,56 @@ class BoxmanManager(
         from boxman.providers.docker_compose.session import compose_project_name
         return compose_project_name(self.config, cluster_name)
 
-    def _run_parallel(self, tasks, op_label='parallel task'):
+    def _parallel_worker_limit(self, requested: int | None,
+                               n_tasks: int) -> int:
         """
-        Run picklable workers in child processes and report per-task failures.
+        Resolve how many workers may be alive at once.
+
+        Precedence: explicit *requested*, then ``BOXMAN_MAX_PARALLEL``, then a
+        default of ``min(8, cpu_count)``. Each worker costs a python
+        interpreter and pushes concurrent libvirt, disk and network work, so
+        the default exists to stop a large cluster from starting one process
+        per VM. A value <= 0 means "no cap" and restores the old fan-out.
+
+        Args:
+            requested: explicit cap from the caller, or ``None`` to resolve
+                from the environment / default.
+            n_tasks: batch size; the cap is never larger than this.
+
+        Returns:
+            The number of children to keep in flight, at least 1.
+        """
+        if requested is None:
+            raw = os.environ.get('BOXMAN_MAX_PARALLEL', '').strip()
+            if raw:
+                try:
+                    requested = int(raw)
+                except ValueError:
+                    self.logger.warning(
+                        f"ignoring non-integer BOXMAN_MAX_PARALLEL={raw!r}")
+        if requested is None:
+            requested = min(8, os.cpu_count() or 1)
+        if requested <= 0:
+            return max(1, n_tasks)
+        return max(1, min(requested, n_tasks))
+
+    def _run_parallel(self, tasks, op_label='parallel task', max_workers=None):
+        """
+        Run workers in child processes and report per-task failures.
+
+        Children run in a bounded window — at most ``max_workers`` alive at
+        once — and their results are drained *while* they run. Draining only
+        after joining every child can deadlock: a worker returning a payload
+        larger than the pipe buffer blocks in the queue feeder until the
+        parent reads, and the parent is sitting in ``join()``.
 
         Args:
             tasks: iterable of ``(label, target, args)`` tuples; ``target`` is
                 called as ``target(*args)`` in a child process. Labels must be
                 unique within the batch.
             op_label: verb phrase used in the per-failure error messages.
+            max_workers: cap on concurrently live children; ``None`` resolves
+                via :meth:`_parallel_worker_limit`, <= 0 means unbounded.
 
         Returns:
             ``(results, failures)`` dicts keyed by task label. A task lands in
@@ -382,38 +429,77 @@ class BoxmanManager(
             callers only need the return value when they react to failures
             (e.g. snapshot restore's retry rounds).
         """
+        from multiprocessing.connection import wait
         from queue import Empty
 
         tasks = list(tasks)
         if not tasks:
             return {}, {}
 
-        result_queue: Queue = Queue()
-        processes = [
-            Process(
-                target=_parallel_worker,
-                args=(result_queue, label, target, args))
-            for label, target, args in tasks
-        ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
+        limit = self._parallel_worker_limit(max_workers, len(tasks))
+        if limit < len(tasks):
+            self.logger.debug(
+                f"{op_label}: {len(tasks)} tasks, {limit} at a time")
 
-        reported = {}
-        for _ in processes:
+        result_queue: Queue = Queue()
+        reported: dict[str, tuple[bool, Any]] = {}
+        exitcodes: dict[str, int | None] = {}
+        running: dict[str, Process] = {}
+        pending = iter(tasks)
+
+        def _drain() -> None:
+            """Move everything already queued into *reported*."""
+            while True:
+                try:
+                    label, ok, payload = result_queue.get_nowait()
+                except Empty:
+                    return
+                reported[label] = (ok, payload)
+
+        while True:
+            while len(running) < limit:
+                try:
+                    label, target, args = next(pending)
+                except StopIteration:
+                    break
+                proc = Process(
+                    target=_parallel_worker,
+                    args=(result_queue, label, target, args))
+                proc.start()
+                running[label] = proc
+
+            if not running:
+                break
+
+            # Wake on the first child to exit, but time out so the queue is
+            # drained regularly even while every child is still working.
+            wait([proc.sentinel for proc in running.values()],
+                 timeout=_PARALLEL_POLL_INTERVAL)
+            _drain()
+            for label in [lbl for lbl, proc in running.items()
+                          if not proc.is_alive()]:
+                proc = running.pop(label)
+                proc.join()
+                exitcodes[label] = proc.exitcode
+
+        # Every child has exited; collect results its feeder thread flushed
+        # on the way out.
+        while len(reported) < len(tasks):
             try:
                 label, ok, payload = result_queue.get(
                     timeout=_PARALLEL_RESULT_TIMEOUT)
-                reported[label] = (ok, payload)
             except Empty:
                 # A child exited without reporting (killed, or the queue
-                # broke) — the per-process loop below marks it as failed.
+                # broke) — the per-task loop below marks it as failed.
                 break
+            reported[label] = (ok, payload)
 
         results: dict[str, Any] = {}
         failures: dict[str, str] = {}
-        for i, (label, _target, _args) in enumerate(tasks):
-            if processes[i].exitcode != 0:
-                failures[label] = f"worker exited with code {processes[i].exitcode}"
+        for label, _target, _args in tasks:
+            if exitcodes.get(label) != 0:
+                failures[label] = (
+                    f"worker exited with code {exitcodes.get(label)}")
             elif label not in reported:
                 failures[label] = "worker exited without reporting a result"
             else:

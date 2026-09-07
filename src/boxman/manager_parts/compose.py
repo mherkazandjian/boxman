@@ -11,7 +11,7 @@
 
 
 
-from boxman.exceptions import ConfigError
+from boxman.exceptions import ConfigError, SnapshotError
 
 
 class ComposeMixin:
@@ -93,12 +93,9 @@ class ComposeMixin:
         the command must not report success overall."""
         if not failed:
             return
-        import sys
-        self.logger.error(
+        raise SnapshotError(
             f"snapshot {op_label} failed for docker-compose cluster(s): "
-            f"{', '.join(failed)}"
-        )
-        sys.exit(1)
+            f"{', '.join(failed)}")
 
     # --- docker-compose clusters: coarse per-cluster lifecycle ------------
     # docker-compose is cluster-scoped (one `docker compose up --wait` per

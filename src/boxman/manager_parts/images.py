@@ -6,6 +6,7 @@ import os
 import shlex
 from urllib.parse import urlparse
 
+from boxman.exceptions import ProvisionError, TemplateError
 from boxman.image_cache import ImageCache
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.utils.http_download import download_url
@@ -46,8 +47,9 @@ class ImagesMixin:
             )
             print(f"successfully pushed image to {cli_args.image_ref}", flush=True)
         except (ValueError, RuntimeError) as exc:
-            print(f"error pushing image: {exc}", flush=True)
-            raise SystemExit(1) from exc
+            # exit 2 through the typed boundary, which prints the message --
+            # the print here duplicated it
+            raise ProvisionError(f"error pushing image: {exc}") from exc
 
     def inspect_image(self, cli_args) -> None:
         """
@@ -66,8 +68,7 @@ class ImagesMixin:
             summary = inspect_oci_image(cli_args.image_ref)
             print(format_inspect(summary), end="", flush=True)
         except (ValueError, RuntimeError) as exc:
-            print(f"error inspecting image: {exc}", flush=True)
-            raise SystemExit(1) from exc
+            raise ProvisionError(f"error inspecting image: {exc}") from exc
 
     def pxe_boot(self, cli_args):
         """
@@ -124,10 +125,9 @@ class ImagesMixin:
 
         failed = self._create_templates_impl(requested=requested, force=force)
         if failed:
-            self.logger.error(
+            raise TemplateError(
                 f"{len(failed)} template(s) could not be created: "
                 f"{', '.join(failed)}")
-            raise SystemExit(1)
 
     def _create_templates_impl(self, requested=None, force=False) -> list[str]:
         """

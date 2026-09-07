@@ -311,11 +311,16 @@ class FlowsMixin:
                     f"attempting to start...")
                 session.start_vm(vm_name)
 
-        self._run_parallel(
+        _results, failures = self._run_parallel(
             [(vm_name, _bring_up,
               (vm_name, state, vm_workdir_map.get(vm_name, '')))
              for vm_name, state in non_running.items()],
             op_label='bring up vm')
+        # The failure is carried to the end of `up` rather than raised
+        # here: the VMs that did come up still need their networks, their
+        # lab and their ssh config reconciled, and the operator still
+        # needs the connection info for them. Raising on the spot turned
+        # one dead VM into a wholly unconfigured project.
 
         # Wait for IP addresses
         self.wait_for_vm_ips(self._get_project_vm_names(), max_wait=300)
@@ -332,6 +337,13 @@ class FlowsMixin:
 
         # Re-write SSH config with current IPs
         self.write_ssh_config()
+
+        if failures:
+            names = ', '.join(sorted(failures))
+            raise ProvisionError(
+                f"could not bring up {len(failures)} VM(s) ({names}); "
+                f"the rest of the project was reconciled — see the "
+                f"preceding per-VM errors for the cause.")
 
         self.logger.info("infrastructure is up")
 
@@ -390,10 +402,20 @@ class FlowsMixin:
                 for vm_name, workdir in vm_list
             ]
 
-        self._run_parallel(processes, op_label='down')
+        _results, failures = self._run_parallel(processes, op_label='down')
 
-        # Stop docker-compose clusters (keep containers; reversible via `up`).
+        # Stop the compose clusters even when a VM failed: `down` was asked
+        # to bring the whole project down, and leaving the containers
+        # running because one guest would not save is a partial teardown
+        # the operator has no way to see.
         self.stop_compose_clusters()
+
+        if failures:
+            names = ', '.join(sorted(failures))
+            raise ProvisionError(
+                f"could not bring down {len(failures)} VM(s) ({names}); "
+                f"their state is undefined — see the preceding per-VM "
+                f"errors for the cause.")
 
         self.logger.info("infrastructure is down")
 

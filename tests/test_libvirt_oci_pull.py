@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
+from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt import oci_pull
 from boxman.providers.libvirt.oci_pull import (
@@ -665,15 +666,12 @@ class TestInspectImageCli:
         assert "image_ref: reg/repo:tag" in out
         assert "disk.qcow2" in out
 
-    def test_failure_exits_with_code_1(self, capsys):
+    def test_failure_raises_a_typed_error(self):
         cli_args = SimpleNamespace(image_ref="reg/repo:tag")
         fake = _FakeRun(returncode=1, stdout="", stderr="manifest unknown")
         with patch("boxman.providers.libvirt.oci_pull.subprocess.run", side_effect=fake):
-            with pytest.raises(SystemExit) as excinfo:
+            with pytest.raises(ProvisionError, match="error inspecting image"):
                 BoxmanManager.inspect_image(make_bare_manager(), cli_args)
-        assert excinfo.value.code == 1
-        out = capsys.readouterr().out
-        assert "error inspecting image" in out
 
 
 # ── CloudInitTemplate._oci_cache_url (collision-free cache key) ────────────────

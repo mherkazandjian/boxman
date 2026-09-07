@@ -24,6 +24,7 @@ import yaml
 from jinja2 import Environment
 
 from boxman import log
+from boxman.exceptions import ProvisionError
 from boxman.utils.shell import run
 
 
@@ -213,15 +214,32 @@ class ContainerlabManager:
     # lifecycle (CLI shell-outs)
     # ------------------------------------------------------------------
     def deploy(self) -> None:
-        """Run ``containerlab deploy -t <topology>``."""
+        """
+        Run ``containerlab deploy -t <topology>``.
+
+        Raises:
+            ProvisionError: If the topology is missing, or containerlab
+                reported a failure. Both used to escape untyped — a missing
+                topology as ``FileNotFoundError`` and a failed deploy as
+                invoke's ``UnexpectedExit`` — so the CLI printed a traceback
+                and exited 1 instead of a one-line error and exit 2.
+        """
         topology = self.topology_path
         if not topology.exists():
-            raise FileNotFoundError(
+            raise ProvisionError(
                 f"topology file not found: {topology} "
                 f"(did you call render_topology()?)"
             )
         self.logger.info(f"deploying containerlab lab {self.lab_name!r}")
-        run(f"containerlab deploy -t {shlex.quote(str(topology))}")
+        result = run(f"containerlab deploy -t {shlex.quote(str(topology))}",
+                     warn=True)
+        if not getattr(result, "ok", False):
+            stderr = (getattr(result, "stderr", "") or "").strip()
+            raise ProvisionError(
+                f"containerlab deploy failed for lab {self.lab_name!r} "
+                f"({stderr.splitlines()[-1] if stderr else 'no stderr'}). "
+                f"The lab may be partially deployed; `boxman netlab destroy` "
+                f"clears it before a retry.")
 
     def ensure_up(self) -> None:
         """Idempotent: deploy the lab if absent, else start any stopped nodes.

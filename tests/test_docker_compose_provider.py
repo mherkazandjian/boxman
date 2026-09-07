@@ -1426,9 +1426,9 @@ class TestSnapshotDcWiring:
         m.session_for_cluster = lambda c: sess
         args = SimpleNamespace(snapshot_name="v1", snapshot_descr="", cluster=None, vms="all")
         with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
-            with pytest.raises(SystemExit) as exc:   # non-zero overall
+            with pytest.raises(SnapshotError) as exc:   # non-zero overall
                 m.snapshot_take(args)
-        assert exc.value.code == 1
+        assert "services" in str(exc.value)
         assert seen == ["services", "other"]   # kept going after the failure
 
     def test_restore_failure_exits_nonzero(self):
@@ -1438,9 +1438,9 @@ class TestSnapshotDcWiring:
         m.session_for_cluster = lambda c: sess
         args = SimpleNamespace(snapshot_name="v1", cluster=None, vms="all")
         with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
-            with pytest.raises(SystemExit) as exc:
+            with pytest.raises(SnapshotError) as exc:
                 m.snapshot_restore(args)
-        assert exc.value.code == 1
+        assert "services" in str(exc.value)
 
     def test_select_dc_clusters_honors_cluster_filter(self):
         m = self._mgr({"other": {"provider": "docker-compose", "boxes": {"z": {}}}})

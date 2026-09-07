@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
+from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.oci_push import push_oci_image
 from conftest import make_bare_manager
@@ -280,14 +281,13 @@ class TestPushImageCli:
         assert "successfully pushed" in out
         assert "registry.com/repo:tag" in out
 
-    def test_failure_exits_with_code_1(self, capsys):
+    def test_failure_raises_a_typed_error(self):
         cli_args = SimpleNamespace(
             image_ref="registry.com/repo:tag",
             qcow2="/nonexistent/disk.qcow2",
             metadata=None,
         )
-        with pytest.raises(SystemExit) as excinfo:
+        # a typed error, so main() renders one line and exits 2 rather than
+        # printing here and exiting 1
+        with pytest.raises(ProvisionError, match="error pushing image"):
             BoxmanManager.push_image(make_bare_manager(), cli_args)
-        assert excinfo.value.code == 1
-        out = capsys.readouterr().out
-        assert "error pushing image" in out
