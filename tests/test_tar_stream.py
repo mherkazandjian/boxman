@@ -261,3 +261,86 @@ class TestExtractArchive:
         extracted = extract_archive(path, dest)
         assert "libvirt/qemu/nvram/vm1.fd" in extracted
         assert "libvirt/qemu" in extracted
+
+
+class TestTarExtensions:
+    """Formats ``docker cp`` actually produces.
+
+    Go's tar writer emits PAX records whenever a field does not fit USTAR
+    or an xattr is present — and ``/etc/libvirt`` carries SELinux labels on
+    an enforcing host, so PAX headers are the normal case rather than an
+    exotic one. A hand-rolled size parser is where that goes wrong, which
+    is why the member walk is delegated to :mod:`tarfile`.
+
+    The member *after* a PAX or GNU long-name header is the one whose size
+    decides where the archive ends, so each case is tested with the
+    extended member last.
+    """
+
+    @staticmethod
+    def _terminator_offset(path):
+        with tarfile.open(path) as tar:
+            last = tar.getmembers()[-1]
+        return last.offset_data + ((last.size + BLOCK - 1) // BLOCK) * BLOCK
+
+    def _both_ways(self, tmp_path, path, expected):
+        """Accepted whole; refused when cut at the terminator position."""
+        assert len(read_archive(path)) == expected
+
+        cut = tmp_path / "cut.tar"
+        cut.write_bytes(
+            open(path, "rb").read()[:self._terminator_offset(path)])
+        with pytest.raises(ArchiveError, match="truncated"):
+            read_archive(str(cut))
+
+    def test_pax_xattr_member_last(self, tmp_path):
+        path = str(tmp_path / "a.tar")
+        with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as tar:
+            top = tarfile.TarInfo("libvirt")
+            top.type, top.mode = tarfile.DIRTYPE, 0o755
+            tar.addfile(top)
+            plain = tarfile.TarInfo("libvirt/plain.xml")
+            plain.size = 5
+            tar.addfile(plain, io.BytesIO(b"<x/>\n"))
+            labelled = tarfile.TarInfo("libvirt/labelled.xml")
+            labelled.size = 7
+            labelled.pax_headers = {
+                "SCHILY.xattr.security.selinux":
+                    "system_u:object_r:virt_etc_t:s0"}
+            tar.addfile(labelled, io.BytesIO(b"<abcd/>"))
+        self._both_ways(tmp_path, path, 3)
+
+    def test_gnu_long_name_last(self, tmp_path):
+        long_name = "libvirt/qemu/" + "d" * 80 + "/" + "n" * 80 + ".xml"
+        path = str(tmp_path / "a.tar")
+        with tarfile.open(path, "w", format=tarfile.GNU_FORMAT) as tar:
+            top = tarfile.TarInfo("libvirt")
+            top.type, top.mode = tarfile.DIRTYPE, 0o755
+            tar.addfile(top)
+            info = tarfile.TarInfo(long_name)
+            info.size = 9
+            tar.addfile(info, io.BytesIO(b"<domain/>"))
+        self._both_ways(tmp_path, path, 2)
+
+    def test_pax_multi_record_payload_last(self, tmp_path):
+        """A payload spanning many records, so the skip arithmetic matters."""
+        path = str(tmp_path / "a.tar")
+        with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as tar:
+            top = tarfile.TarInfo("qemu")
+            top.type, top.mode = tarfile.DIRTYPE, 0o755
+            tar.addfile(top)
+            info = tarfile.TarInfo("qemu/save/vm1.save")
+            info.size = 9000
+            tar.addfile(info, io.BytesIO(b"z" * 9000))
+        self._both_ways(tmp_path, path, 2)
+
+    def test_pax_archive_extracts(self, tmp_path):
+        path = str(tmp_path / "a.tar")
+        with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as tar:
+            info = tarfile.TarInfo("libvirt/qemu/vm1.xml")
+            info.size = 9
+            info.pax_headers = {
+                "SCHILY.xattr.security.selinux": "system_u:object_r:x_t:s0"}
+            tar.addfile(info, io.BytesIO(b"<domain/>"))
+        extracted = extract_archive(path, str(tmp_path / "out"))
+        assert "libvirt/qemu/vm1.xml" in extracted

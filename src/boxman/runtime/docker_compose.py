@@ -566,15 +566,31 @@ class DockerComposeRuntime(RuntimeBase):
             )
         return os.path.isfile(self._state_marker_path())
 
-    def _destination_is_populated(self) -> bool:
-        """Whether anything is already sitting at the migration target."""
-        for subdir, _ in self._PERSISTED_STATE:
-            path = self._state_host_dir(subdir)
-            if os.path.isdir(path) and os.listdir(path):
-                return True
-            if os.path.exists(path + self._STAGING_SUFFIX):
-                return True
-        return False
+    def _interrupted_migration_present(self) -> bool:
+        """
+        Whether a staged tree from an interrupted migration is lying around.
+
+        This, not "the destination has files in it", is what says a
+        migration did not finish. A populated destination is the *normal*
+        state: entrypoint.sh seeds both directories on a first run, so any
+        instance whose container has since been removed has a populated
+        destination and has never migrated anything.
+
+        A staging directory is unambiguous. And it is sufficient: every
+        tree is extracted and validated before *any* of them is renamed, so
+        once the last rename lands the destination is complete whether or
+        not the marker was written. The marker is the belt to this braces.
+        """
+        return any(
+            os.path.exists(self._state_host_dir(subdir)
+                           + self._STAGING_SUFFIX)
+            for subdir, _ in self._PERSISTED_STATE)
+
+    def _mark_state_persisted(self, reason: str) -> None:
+        """Record that the destination is authoritative."""
+        os.makedirs(self._data_dir(), exist_ok=True)
+        with open(self._state_marker_path(), "w") as fobj:
+            fobj.write(f"{reason}\n")
 
     def _discard_untrusted_state(self) -> None:
         """
@@ -673,11 +689,9 @@ class DockerComposeRuntime(RuntimeBase):
             os.rename(inner, self._state_host_dir(subdir))
             shutil.rmtree(staging, ignore_errors=True)
 
-        with open(self._state_marker_path(), "w") as fobj:
-            fobj.write(
-                f"migrated from container {self.container_name}\n"
-                f"trees: "
-                f"{', '.join(p for _, p in self._PERSISTED_STATE)}\n")
+        self._mark_state_persisted(
+            f"migrated out of container {self.container_name}: "
+            f"{', '.join(path for _, path in self._PERSISTED_STATE)}")
 
         self.logger.info(
             "libvirt state migrated; it now lives on the host and "
@@ -690,6 +704,19 @@ class DockerComposeRuntime(RuntimeBase):
         out of an existing container when it is still in the writable layer.
         """
         if self._state_is_persisted():
+            # The live container is mounting the host trees, so they are
+            # the authority. Record that, so a later run finding the
+            # container gone can tell a seeded install from an interrupted
+            # migration. Best-effort only: the mounts already answered the
+            # question, and a read-only data dir must not fail the verb.
+            if not os.path.isfile(self._state_marker_path()):
+                try:
+                    self._mark_state_persisted(
+                        f"persisted by the mounts of container "
+                        f"{self.container_name}")
+                except OSError as exc:
+                    self.logger.debug(
+                        f"could not write {self._STATE_MARKER}: {exc}")
             return
 
         state = self._container_state()
@@ -702,19 +729,19 @@ class DockerComposeRuntime(RuntimeBase):
                 f"destroy. Check that the docker daemon is reachable.")
 
         if state == "":
-            # No container: nothing to migrate. A destination that is
-            # nonetheless populated has no trustworthy provenance and no
-            # source to re-migrate from, so it is the user's call.
-            if self._destination_is_populated() and not os.path.isfile(
-                    self._state_marker_path()):
+            # No container, so nothing to migrate. Files at the destination
+            # are the normal case here — entrypoint.sh seeds both trees on
+            # a first run — so their presence alone decides nothing.
+            if self._interrupted_migration_present():
                 raise ProvisionError(
-                    f"{self._data_dir()} already holds libvirt state, but "
-                    f"not the {self._STATE_MARKER} marker that says a "
-                    f"migration finished, and no container remains to "
-                    f"migrate from. The state may be incomplete. Inspect "
-                    f"it and either remove the etc-libvirt and "
-                    f"var-lib-libvirt-qemu directories to start clean, or "
-                    f"create the marker file to accept them as they are.")
+                    f"{self._data_dir()} holds a half-finished migration "
+                    f"({self._STAGING_SUFFIX} directories are still there) "
+                    f"and no container remains to migrate from, so the "
+                    f"state cannot be completed or verified. Inspect it, "
+                    f"then either remove the {self._STAGING_SUFFIX} "
+                    f"directories to accept what is already in place, or "
+                    f"remove the etc-libvirt and var-lib-libvirt-qemu "
+                    f"directories to start clean.")
             return
 
         if state == "running" and self._running_guest_count() != 0:
@@ -772,12 +799,10 @@ class DockerComposeRuntime(RuntimeBase):
 
         # Collect directories to bind-mount and make them visible inside
         # the container before starting.
-        # Both of these run before anything is stopped: one refuses a
-        # relocation that would silently start against an empty data dir,
-        # the other moves libvirt's own state out of the writable layer
-        # while the container that holds it is still there.
+        # A pure precondition, so it comes before anything is written:
+        # refuse to start against an empty data dir while a populated one
+        # sits where boxman used to derive it.
         self._assert_no_stranded_data_dir(compose_dir)
-        self._ensure_state_persisted(compose_path, compose_dir)
 
         bind_dirs = self._collect_bind_mount_dirs(abs_project_dir)
         if self._is_boxman_owned_compose(compose_path):
@@ -795,6 +820,14 @@ class DockerComposeRuntime(RuntimeBase):
 
         # Log the compose file so the user can see what will be started
         self._log_compose_file(compose_path)
+
+        # Move libvirt's own state out of the writable layer while the
+        # container holding it is still there. This runs after the override
+        # and .env files are written, because it issues a compose command
+        # and _compose_base_cmd merges both in for a user-supplied compose
+        # file — and before anything below, all of which can destroy the
+        # container.
+        self._ensure_state_persisted(compose_path, compose_dir)
 
         if self._container_is_running():
             # Check that every bind dir is actually *mounted* at the same

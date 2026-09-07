@@ -404,13 +404,29 @@ class TestMigration:
         assert not any("docker cp" in c for c in calls)
         assert not os.path.isfile(rt._state_marker_path())
 
-    def test_populated_destination_without_a_source_refuses(self, tmp_path):
+    def test_populated_destination_without_a_source_is_accepted(self,
+                                                               tmp_path):
+        """The normal state after any ``compose down``, not a failure.
+
+        entrypoint.sh seeds both trees on a first run, so every instance
+        whose container has since been removed has a populated destination
+        and has never migrated anything. Refusing that would break a
+        completely ordinary flow to catch a rare one.
+        """
         rt = _runtime(tmp_path)
         os.makedirs(rt._state_host_dir("etc-libvirt"))
         with open(os.path.join(
                 rt._state_host_dir("etc-libvirt"), "x.xml"), "w") as fobj:
             fobj.write("<domain/>")
-        with pytest.raises(ProvisionError, match="no container remains"):
+        self._migrate(rt, state="")
+
+    def test_interrupted_migration_without_a_source_refuses(self, tmp_path):
+        """A staged tree is unambiguous evidence, where files alone are not."""
+        rt = _runtime(tmp_path)
+        os.makedirs(rt._state_host_dir("etc-libvirt"))
+        os.makedirs(
+            rt._state_host_dir("var-lib-libvirt-qemu") + rt._STAGING_SUFFIX)
+        with pytest.raises(ProvisionError, match="half-finished migration"):
             self._migrate(rt, state="")
 
     def test_marked_destination_without_a_source_is_accepted(self, tmp_path):
@@ -418,6 +434,13 @@ class TestMigration:
         os.makedirs(rt._state_host_dir("etc-libvirt"))
         open(rt._state_marker_path(), "w").close()
         self._migrate(rt, state="")
+
+    def test_live_mounts_write_the_marker(self, tmp_path):
+        """Otherwise a later run cannot tell a seeded install from a
+        half-finished migration once the container is gone."""
+        rt = _runtime(tmp_path)
+        self._migrate(rt, persisted=True)
+        assert os.path.isfile(rt._state_marker_path())
 
     def test_unknown_container_existence_refuses(self, tmp_path):
         rt = _runtime(tmp_path)
