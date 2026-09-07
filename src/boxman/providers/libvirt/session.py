@@ -551,11 +551,14 @@ class LibVirtSession(SessionConfigMixin):
             workdir=workdir,
         )
 
+        # -> bool: the ISO path above returns True, so the ordinary clone
+        # must too, or the annotation lies about half the method.
         status = cloner.clone()
         if not status:
             raise RuntimeError(
                 f"Failed to clone VM {src_vm_name} to {new_vm_name}"
             )
+        return True
 
     def vm_exists(self, vm_name: str) -> bool:
         """Whether a domain named *vm_name* is registered with libvirt."""
@@ -694,6 +697,37 @@ class LibVirtSession(SessionConfigMixin):
                 elapsed += interval
         self.logger.error(f"SSH timeout after {timeout}s on {ip}:{port}")
         return False
+
+    def force_stop_vm(self, name: str) -> bool:
+        """
+        Force a domain to stop while keeping it defined (``virsh destroy``).
+
+        Distinct from :meth:`destroy_vm`, which *undefines* the domain.
+        This exists for recovering a crashed or dying guest: libvirt
+        refuses ``start`` while a domain is still active, and a crashed
+        domain is active.
+
+        ``DestroyVM.force_shutdown_vm()`` cannot be used here — it gates
+        on ``is_vm_running()``, which matches only the literal "running"
+        state, so it would no-op on exactly the crashed domain this is
+        meant to recover.
+
+        Args:
+            name: Name of the domain to force-stop
+
+        Returns:
+            True if the domain is shut off afterwards, False otherwise.
+        """
+        destroyer = DestroyVM(name=name, provider_config=self.provider_config)
+        if destroyer.is_vm_shut_off():
+            return True
+        result = destroyer.virsh.execute("destroy", name, warn=True)
+        if not result.ok:
+            self.logger.error(
+                f"could not force-stop {name}: "
+                f"{(result.stderr or '').strip() or 'no stderr'}")
+            return False
+        return destroyer.is_vm_shut_off()
 
     def destroy_vm(self, name: str, force: bool = False) -> bool:
         """

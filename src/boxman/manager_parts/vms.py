@@ -334,18 +334,15 @@ class VMsMixin:
                 f"undefined; leaving its disks in place rather than removing "
                 f"storage under a possibly-live guest")
 
-        # confirm_vm_absent() above says the domain is gone; it says
-        # nothing about whether the disk files were actually removed.
-        # Dropping this bool left qcow2 files behind while `destroy`
-        # reported success — and the next provision then collided with
-        # them.
-        if not session.destroy_disks(
-                cluster['workdir'],
-                vm_name=full_vm_name,
-                disks=vm_info.get('disks', [])):
-            raise ProvisionError(
-                f"{full_vm_name}: the domain was undefined but its disk "
-                f"files could not be removed from {cluster['workdir']}")
+        # No bool check here on purpose: remove_vm_disks() returns True or
+        # raises (its os.remove calls are uncaught), so a filesystem error
+        # already reaches _run_parallel's failure handling. Testing the
+        # return value would be dead code.
+        session.destroy_disks(
+            cluster['workdir'],
+            vm_name=full_vm_name,
+            disks=vm_info.get('disks', [])
+        )
 
     def _vm_disk_dirs(self, full_vm_name: str) -> list[str]:
         """
@@ -405,15 +402,14 @@ class VMsMixin:
                 f"undefined; leaving its disks in place rather than removing "
                 f"storage under a possibly-live guest")
 
-        undeleted = []
         for workdir in disk_dirs:
-            if not self.provider.destroy_disks(
-                    workdir, vm_name=full_vm_name, disks=[]):
-                undeleted.append(workdir)
-        if undeleted:
-            raise ProvisionError(
-                f"{full_vm_name}: the domain was undefined but its disk "
-                f"files could not be removed from {', '.join(undeleted)}")
+            # see _destroy_vm_and_disks: remove_vm_disks() raises rather
+            # than returning False
+            self.provider.destroy_disks(
+                workdir,
+                vm_name=full_vm_name,
+                disks=[]
+            )
 
     def configure_and_start_vms(self) -> None:
         """

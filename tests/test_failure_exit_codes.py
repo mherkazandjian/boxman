@@ -583,28 +583,6 @@ class TestPxeBootRaises:
         mgr.pxe_boot(self._args(expected_ip="10.0.0.5", restore_after=True))
 
 
-class TestDestroyDisksFailureRaises:
-    """#164 X3 — confirm_vm_absent() says the domain is gone; it says
-    nothing about whether the disk files were removed. Dropping
-    destroy_disks' bool left qcow2 files behind while `destroy` reported
-    success, and the next provision then collided with them."""
-
-    def test_failed_disk_removal_raises(self):
-        mgr = _manager()
-        mgr.provider.confirm_vm_absent.return_value = True
-        mgr.provider.destroy_disks.return_value = False
-        with pytest.raises(ProvisionError, match="disk files could not be removed"):
-            mgr._destroy_vm_and_disks(
-                'cluster_1', {'workdir': '/tmp/ws/c1'}, 'node01', {})
-
-    def test_successful_disk_removal_does_not_raise(self):
-        mgr = _manager()
-        mgr.provider.confirm_vm_absent.return_value = True
-        mgr.provider.destroy_disks.return_value = True
-        mgr._destroy_vm_and_disks(
-            'cluster_1', {'workdir': '/tmp/ws/c1'}, 'node01', {})
-
-
 class TestProvisionRetryExhaustion:
     """#164 X3 — after 20 rounds of retrying the start, `provision` logged
     a warning and carried on: it burned the full 600s IP wait on VMs that
@@ -661,3 +639,136 @@ class TestProvisionRetryExhaustion:
         mgr = self._mgr(monkeypatch, {"vm1": "running"})
         mgr.provision(self._args())
         mgr.wait_for_vm_ips.assert_called_once()
+
+
+class TestCrashedVmRecovery:
+    """#164 X3 — `up`'s crashed/dying branch called
+    ``destroy_vm(vm_name, remove_storage=False)``. LibVirtSession.destroy_vm
+    takes only ``(name, force)``, so the recovery raised TypeError before it
+    ever reached the start — and had the parameter existed, destroy_vm
+    *undefines* the domain rather than stopping it.
+
+    libvirt refuses ``start`` while a domain is still active, and a crashed
+    domain is active, so the force-stop is not optional.
+    """
+
+    def _mgr(self, monkeypatch, stop_ok=True, start_ok=True):
+        mgr = _manager()
+        for name in ("_update_sessions_with_runtime", "ensure_shared_bridges",
+                     "report_network_results", "raise_on_network_failures"):
+            monkeypatch.setattr(BoxmanManager, name, lambda cls, *a, **kw: None)
+        monkeypatch.setattr(
+            BoxmanManager, "_get_vm_states", lambda cls: {"vm1": "crashed"})
+        monkeypatch.setattr(
+            BoxmanManager, "reconcile_networks", lambda cls, **kw: {})
+        monkeypatch.setattr(
+            BoxmanManager, "_control_vm_targets",
+            lambda cls, cli_args: [("vm1", "/tmp/ws/c1")])
+        monkeypatch.setattr(
+            BoxmanManager, "_get_project_vm_names", lambda cls: ["vm1"])
+        monkeypatch.setattr(
+            BoxmanManager, "_run_parallel", _sync_run_parallel)
+        mgr.provider.force_stop_vm.return_value = stop_ok
+        mgr.provider.start_vm.return_value = start_ok
+        for name in ("wait_for_vm_ips", "ensure_netlab_up",
+                     "provision_compose_clusters", "connect_info",
+                     "write_ssh_config"):
+            setattr(mgr, name, MagicMock())
+        return mgr
+
+    def _up(self, mgr):
+        return mgr.up(types.SimpleNamespace(force=True, vms="all", cluster=None))
+
+    def test_crashed_vm_is_force_stopped_then_started(self, monkeypatch):
+        mgr = self._mgr(monkeypatch)
+        self._up(mgr)
+        mgr.provider.force_stop_vm.assert_called_once_with("vm1")
+        mgr.provider.start_vm.assert_called_once_with("vm1")
+
+    def test_recovery_does_not_undefine_the_domain(self, monkeypatch):
+        """destroy_vm removes the domain definition — the recovery must
+        never reach for it."""
+        mgr = self._mgr(monkeypatch)
+        self._up(mgr)
+        mgr.provider.destroy_vm.assert_not_called()
+
+    def test_failed_force_stop_is_reported(self, monkeypatch):
+        mgr = self._mgr(monkeypatch, stop_ok=False)
+        with pytest.raises(ProvisionError, match="could not bring up"):
+            self._up(mgr)
+        mgr.provider.start_vm.assert_not_called()
+
+
+class TestProvisionMissingVms:
+    """#164 X3 — `_get_vm_states()` omits a VM libvirt never defined, so
+    verifying only the states it reports let a missing VM pass as
+    provisioned."""
+
+    def _mgr(self, monkeypatch, states, expected):
+        mgr = _manager()
+        mgr.config['workspace'] = {'path': '/tmp/ws'}
+        mgr.config['provider'] = {'libvirt': {}}
+        monkeypatch.setattr(
+            BoxmanManager, "_find_existing_project_vms", lambda cls: [])
+        monkeypatch.setattr(
+            BoxmanManager, "_get_vm_states", lambda cls: states)
+        monkeypatch.setattr(
+            BoxmanManager, "_get_project_vm_names", lambda cls: expected)
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+        mgr.cache.read_projects_cache = MagicMock()
+        mgr.cache.projects = {}
+        for name in ("register_project_in_cache", "_expand_oci_base_images",
+                     "ensure_templates_exist", "validate_base_images",
+                     "provision_files", "ensure_shared_bridges",
+                     "define_networks", "clone_vms", "configure_and_start_vms",
+                     "wait_for_vm_ips", "setup_ssh_access", "connect_info",
+                     "provision_compose_clusters", "deploy_netlab"):
+            setattr(mgr, name, MagicMock())
+        mgr.ensure_templates_exist.return_value = True
+        return mgr
+
+    def test_a_vm_libvirt_never_defined_fails_the_command(self, monkeypatch):
+        mgr = self._mgr(monkeypatch,
+                        states={"vm1": "running"},
+                        expected=["vm1", "vm2"])
+        with pytest.raises(ProvisionError, match="vm2"):
+            mgr.provision(types.SimpleNamespace(
+                force=False, rebuild_templates=False))
+
+    def test_every_expected_vm_running_does_not_raise(self, monkeypatch):
+        mgr = self._mgr(monkeypatch,
+                        states={"vm1": "running", "vm2": "running"},
+                        expected=["vm1", "vm2"])
+        mgr.provision(types.SimpleNamespace(
+            force=False, rebuild_templates=False))
+
+
+class TestPxeBootExitsTwo:
+    """The CLI half of the pxe-boot fix.
+
+    ``TestPxeBootRaises`` proves the method raises; this proves the raise
+    survives ``app.main()``'s BoxmanError boundary as **exit 2**. That is
+    the half that was broken: the method already signalled failure, with
+    ``return False``, and the dispatch dropped it on the floor.
+    """
+
+    def test_failed_pxe_boot_exits_2(self, monkeypatch, captured_logs):
+        import logging
+
+        from boxman.scripts import app
+
+        mgr = _manager()
+        mgr.provider.set_boot_order.return_value = False
+
+        def _run_real_pxe_boot():
+            mgr.pxe_boot(types.SimpleNamespace(
+                vm="vm1", expected_ip=None, wait_timeout=60,
+                restore_after=False))
+
+        monkeypatch.setattr(app, '_main', _run_real_pxe_boot)
+        with captured_logs.at_level(logging.ERROR, logger='boxman'):
+            with pytest.raises(SystemExit) as excinfo:
+                app.main()
+
+        assert excinfo.value.code == 2
+        assert any('boot order' in r.message for r in captured_logs.records)

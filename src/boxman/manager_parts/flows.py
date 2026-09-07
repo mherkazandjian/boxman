@@ -103,12 +103,18 @@ class FlowsMixin:
         # With many VMs starting simultaneously, some may fail due to resource
         # contention. Retry starting any that are not in 'running' state.
         self.logger.info("verifying all VMs are running after parallel start...")
+        # A VM that was never defined does not appear in _get_vm_states()
+        # at all, so comparing only the states it *does* report would let a
+        # missing VM pass as provisioned. Expect every name the config
+        # declares and treat an absent one as not running.
+        _expected = self._get_project_vm_names()
         still_down: dict[str, str] = {}
         for _round in range(1, 21):
             vm_states = self._get_vm_states()
             not_running = {
-                name: state for name, state in vm_states.items()
-                if state != 'running'
+                name: vm_states.get(name, 'not defined')
+                for name in _expected
+                if vm_states.get(name) != 'running'
             }
             if not not_running:
                 self.logger.info("all VMs are running")
@@ -124,7 +130,11 @@ class FlowsMixin:
             time.sleep(3)
         else:
             vm_states = self._get_vm_states()
-            still_down = {n: s for n, s in vm_states.items() if s != 'running'}
+            still_down = {
+                name: vm_states.get(name, 'not defined')
+                for name in _expected
+                if vm_states.get(name) != 'running'
+            }
             if still_down:
                 self.logger.error(
                     f"gave up after 20 rounds; the following VMs are still not running: "
@@ -334,10 +344,18 @@ class FlowsMixin:
             elif state in ('crashed', 'dying'):
                 self.logger.warning(
                     f"VM '{vm_name}' is in state '{state}', "
-                    f"attempting to destroy and start...")
-                # The destroy is best-effort: the guest is already broken
-                # and the start below is what has to succeed.
-                session.destroy_vm(vm_name, remove_storage=False)
+                    f"force-stopping and starting it...")
+                # libvirt refuses `start` while a domain is still active,
+                # and a crashed one is active — so it has to be stopped
+                # first. This used to call
+                # destroy_vm(vm_name, remove_storage=False), which raised
+                # TypeError (no such parameter) and, had the argument
+                # existed, would have *undefined* the domain rather than
+                # stopping it (#164 X3).
+                if not session.force_stop_vm(vm_name):
+                    raise ProvisionError(
+                        f"could not force-stop vm '{vm_name}' (state "
+                        f"'{state}') before restarting it")
                 action, ok = 'restart', session.start_vm(vm_name)
             else:
                 self.logger.warning(
