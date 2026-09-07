@@ -376,3 +376,96 @@ class TestHelpers:
         cfg = {"lab_mgmt": {}}
         with pytest.raises(ValueError, match="missing required 'bridge' key"):
             shared_bridges.resolve_bridge("lab_mgmt", cfg)
+
+
+class TestSudoThreading:
+    """#164 FBN-12 — every bridge command hard-coded `sudo`, ignoring the
+    provider's `use_sudo` setting."""
+
+    @staticmethod
+    def _calls_for(use_sudo):
+        calls: list[str] = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(cmd)
+            if cmd.startswith("ip link show dev"):
+                return _result(ok=False)
+            return _result(ok=True)
+
+        cfg = {"lab": {"bridge": "br_lab"}}
+        with patch("boxman.netlab.shared_bridges.run", side_effect=fake_run):
+            with patch("pathlib.Path.exists", return_value=False):
+                shared_bridges.ensure(cfg, use_sudo=use_sudo)
+        return calls
+
+    def test_use_sudo_false_drops_the_prefix(self):
+        calls = self._calls_for(False)
+        assert any(c.startswith("ip link add name br_lab") for c in calls)
+        assert not any(c.startswith("sudo ") for c in calls)
+
+    def test_use_sudo_true_keeps_the_prefix(self):
+        calls = self._calls_for(True)
+        assert any("sudo ip link add name br_lab" in c for c in calls)
+
+    def test_privileged_probe_is_threaded_too(self):
+        """`iptables -L` needs root just as `iptables -I` does."""
+        calls = self._calls_for(False)
+        assert any("iptables -t filter -n -L" in c for c in calls)
+        assert not any("sudo iptables" in c for c in calls)
+
+    def test_link_probe_stays_unprivileged(self):
+        """`ip link show` reads netlink and must not require root, or a host
+        running boxman unprivileged for read-only work would break."""
+        calls = self._calls_for(True)
+        assert any(c.startswith("ip link show dev br_lab") for c in calls)
+
+
+class TestDockerRuntimeIsRefused:
+    """#164 FBN-12 — under the docker runtime the bridges land in the host
+    netns while the guests live in the container's, so boxman would report
+    creating a bridge and then fail to use it in the same run."""
+
+    @staticmethod
+    def _manager(runtime_name):
+        from unittest.mock import MagicMock
+
+        from boxman.manager import BoxmanManager
+        mgr = BoxmanManager.__new__(BoxmanManager)
+        mgr.config = {"shared_networks": {"lab": {"bridge": "br_lab"}}}
+        mgr.logger = MagicMock()
+        mgr._runtime_name = runtime_name
+        mgr._provider = MagicMock()
+        mgr._provider.provider_config = {"use_sudo": True}
+        return mgr
+
+    def test_docker_runtime_refuses(self):
+        from boxman.exceptions import ConfigError
+        mgr = self._manager("docker-compose")
+        with pytest.raises(ConfigError, match="not supported with the docker runtime"):
+            mgr.ensure_shared_bridges()
+
+    def test_docker_alias_refuses(self):
+        from boxman.exceptions import ConfigError
+        mgr = self._manager("docker")
+        with pytest.raises(ConfigError, match="not supported with the docker runtime"):
+            mgr.ensure_shared_bridges()
+
+    def test_local_runtime_proceeds(self):
+        mgr = self._manager("local")
+        with patch("boxman.netlab.shared_bridges.ensure") as ensure:
+            mgr.ensure_shared_bridges()
+        ensure.assert_called_once()
+        assert ensure.call_args.kwargs["use_sudo"] is True
+
+    def test_use_sudo_is_taken_from_the_provider_config(self):
+        mgr = self._manager("local")
+        mgr._provider.provider_config = {"use_sudo": False}
+        with patch("boxman.netlab.shared_bridges.ensure") as ensure:
+            mgr.ensure_shared_bridges()
+        assert ensure.call_args.kwargs["use_sudo"] is False
+
+    def test_no_shared_networks_is_a_noop_under_docker(self):
+        """The guard must not fire for a project that declares none."""
+        mgr = self._manager("docker-compose")
+        mgr.config = {}
+        mgr.ensure_shared_bridges()

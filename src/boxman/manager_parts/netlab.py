@@ -3,6 +3,7 @@
 import json
 import os
 
+from boxman.exceptions import ConfigError
 from boxman.netlab import shared_bridges
 
 
@@ -20,8 +21,34 @@ class NetlabMixin:
         shared = (self.config or {}).get('shared_networks')
         if not shared:
             return
+
+        # The bridges are created in the *host* network namespace, but under
+        # the docker runtime the guests live in the container's. A bridge
+        # made here would be invisible to them, and boxman would report
+        # creating it and then fail to use it in the same run (#164 FBN-12).
+        #
+        # Refusing is deliberate. Creating them where the VMs actually live
+        # is a feature, not a bug fix, and the failure it replaces is not
+        # even consistently visible: a `mode: bridge` libvirt network is
+        # checked in-runtime by Network.validate_runtime_prerequisites(),
+        # but an adapter naming a shared network directly becomes
+        # source_type='bridge' (naming.py) and is attached with
+        # `attach-device`, which never reaches that check at all.
+        if self.runtime in ('docker', 'docker-compose'):
+            raise ConfigError(
+                f"shared_networks is not supported with the docker runtime: "
+                f"the {len(shared)} declared bridge(s) would be created on "
+                f"the host, while the VMs run in the runtime container's "
+                f"network namespace and cannot see them. Use "
+                f"`--runtime local`, or drop the shared_networks block.")
+
         self.logger.info(f"ensuring {len(shared)} shared bridge(s) exist on host")
-        shared_bridges.ensure(shared)
+        shared_bridges.ensure(
+            shared,
+            use_sudo=bool(
+                (self.provider.provider_config or {}).get('use_sudo', True)
+                if self.provider is not None else True),
+        )
 
     def deploy_netlab(self) -> None:
         """Render and deploy the containerlab topology, if configured.
