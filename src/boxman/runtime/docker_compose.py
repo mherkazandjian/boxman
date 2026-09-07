@@ -8,10 +8,12 @@ directory next to the project's ``conf.yml``.
 """
 
 import hashlib
+import json
 import os
 import shlex
 import shutil
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -166,16 +168,107 @@ class DockerComposeRuntime(RuntimeBase):
     def _collect_bind_mount_dirs(self, abs_project_dir: str) -> list[str]:
         """
         Collect all unique absolute directories that must be bind-mounted
-        into the container: the project directory plus every workdir,
-        plus /tmp so that host-side temp files (e.g. XML for virsh define)
-        are accessible inside the container.
+        into the container: the project directory plus every workdir, plus
+        the temp directory, so host-side temp files (e.g. the XML written
+        for ``virsh define``) are reachable inside the container.
+
+        The temp directory is ``tempfile.gettempdir()``, not the literal
+        ``/tmp``: every host-side temp file boxman writes goes through
+        ``tempfile``, which honours ``TMPDIR``. With ``TMPDIR`` pointing
+        somewhere outside the mounted project and workdirs, the container
+        could not see the XML at all (#164 FBN-17). ``/tmp`` is kept as
+        well, since it is cheap and some paths still name it directly.
         """
         dirs = set()
         dirs.add(abs_project_dir)
         dirs.add("/tmp")
+        dirs.add(os.path.abspath(tempfile.gettempdir()))
         for wd in self.workdirs:
             dirs.add(os.path.abspath(wd))
         return sorted(dirs)
+
+    @staticmethod
+    def _declared_mount_pairs(volumes) -> set[tuple[str, str]]:
+        """``(source, destination)`` pairs from compose ``volumes:`` entries.
+
+        Only the short string form is understood; a long-form mapping or a
+        named volume contributes nothing, which is the safe direction — an
+        unrecognised entry means "not already present", so the mount is
+        added rather than silently skipped.
+        """
+        pairs: set[tuple[str, str]] = set()
+        for vol in volumes or []:
+            if not isinstance(vol, str):
+                continue
+            parts = vol.split(":")
+            if len(parts) >= 2:
+                pairs.add((parts[0], parts[1]))
+        return pairs
+
+    def _container_mounts(self) -> list[dict] | None:
+        """The container's live mount table, or None if it cannot be read.
+
+        None means *unknown*, never *empty*: callers must not read a failed
+        inspection as "nothing is mounted".
+        """
+        try:
+            result = _shell_run(
+                f"docker inspect -f '{{{{json .Mounts}}}}' "
+                f"{self.container_name}",
+                hide=True, warn=True,
+            )
+        except Exception:
+            return None
+        if not result.ok:
+            return None
+        try:
+            mounts = json.loads(result.stdout.strip() or "null")
+        except (ValueError, TypeError):
+            return None
+        return mounts if isinstance(mounts, list) else None
+
+    @staticmethod
+    def _mount_provides(mounts: list[dict],
+                        host_path: str,
+                        container_path: str,
+                        require_writable: bool = True) -> bool:
+        """Whether *host_path* is readable at *container_path* in *mounts*.
+
+        A source-only check is not enough: `/var/tmp:/scratch` shares the
+        source with the mount boxman needs while leaving the host's temp
+        files unreachable at the container's `/var/tmp` (#164 FBN-17).
+
+        A parent mount counts — `/var:/var` does provide `/var/tmp` — but
+        only the *most specific* mount covering the path decides, since a
+        narrower mount with a different source shadows the parent.
+        """
+        host_path = os.path.abspath(host_path)
+        container_path = os.path.abspath(container_path)
+
+        covering = None
+        for mount in mounts:
+            dest = mount.get("Destination")
+            source = mount.get("Source")
+            if not dest or not source:
+                continue
+            dest = os.path.abspath(dest)
+            if container_path == dest or container_path.startswith(
+                    dest.rstrip(os.sep) + os.sep):
+                # keep the deepest destination — it shadows its parents
+                if covering is None or len(dest) > len(covering[0]):
+                    covering = (dest, source, mount)
+
+        if covering is None:
+            return False
+
+        dest, source, mount = covering
+        relative = os.path.relpath(container_path, dest)
+        mapped = source if relative == "." else os.path.join(source, relative)
+        if os.path.abspath(mapped) != host_path:
+            return False
+        if require_writable and mount.get("RW") is False:
+            return False
+        return True
 
     def _inject_bind_mounts_into_compose(
         self, compose_path: str, bind_dirs: list[str]
@@ -198,16 +291,16 @@ class DockerComposeRuntime(RuntimeBase):
         service = services[service_name]
         volumes = service.setdefault("volumes", [])
 
-        # Collect existing host-side mount sources for dedup
-        existing_sources = set()
-        for vol in volumes:
-            if isinstance(vol, str) and ":" in vol:
-                src = vol.split(":")[0]
-                existing_sources.add(src)
+        # Dedup on the (source, destination) pair, not the source alone.
+        # boxman needs each host path visible at the *same* path inside the
+        # container; an unrelated `/var/tmp:/scratch` shares the source but
+        # does not provide that, and a source-only key would suppress the
+        # very mount being added (#164 FBN-17).
+        existing_pairs = self._declared_mount_pairs(volumes)
 
         added = []
         for d in bind_dirs:
-            if d not in existing_sources:
+            if (d, d) not in existing_pairs:
                 entry = f"{d}:{d}"
                 volumes.append(entry)
                 added.append(entry)
@@ -248,13 +341,12 @@ class DockerComposeRuntime(RuntimeBase):
 
         service_name = next(iter(services))
 
-        # collect existing host-side mount sources for dedup
-        existing_sources = set()
-        for vol in services[service_name].get("volumes", []) or []:
-            if isinstance(vol, str) and ":" in vol:
-                existing_sources.add(vol.split(":")[0])
+        # (source, destination) dedup — see _inject_bind_mounts_into_compose
+        existing_pairs = self._declared_mount_pairs(
+            services[service_name].get("volumes", []) or [])
 
-        added = [f"{d}:{d}" for d in bind_dirs if d not in existing_sources]
+        added = [f"{d}:{d}" for d in bind_dirs
+                 if (d, d) not in existing_pairs]
 
         override_path = self._bind_mount_override_path()
         os.makedirs(os.path.dirname(override_path), exist_ok=True)
@@ -300,10 +392,26 @@ class DockerComposeRuntime(RuntimeBase):
         self._log_compose_file(compose_path)
 
         if self._container_is_running():
-            # Check that every bind dir is accessible inside the container
-            all_accessible = all(
-                self._project_dir_accessible(d) for d in bind_dirs
-            )
+            # Check that every bind dir is actually *mounted* at the same
+            # path inside the container. `test -d` was not enough: the
+            # container has its own /tmp and /var/tmp, so the probe passed
+            # for a temp dir that was never bind-mounted and ensure_ready()
+            # returned without ever applying the mount (#164 FBN-17).
+            mounts = self._container_mounts()
+            if mounts is None:
+                # The mount table is unreadable — fall back to the weaker
+                # existence probe rather than forcing a recreate on a
+                # transient `docker inspect` failure.
+                self.logger.warning(
+                    "could not read the container's mount table; falling "
+                    "back to an existence check for the bind dirs")
+                all_accessible = all(
+                    self._project_dir_accessible(d) for d in bind_dirs
+                )
+            else:
+                all_accessible = all(
+                    self._mount_provides(mounts, d, d) for d in bind_dirs
+                )
             if all_accessible:
                 self.logger.info(
                     f"runtime container '{self.container_name}' is already "

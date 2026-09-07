@@ -53,6 +53,37 @@ class TestLocalRuntime:
         rt.ensure_ready()  # should not raise
 
 
+def _docker_cmd_dispatch(runtime, running: bool = True):
+    """A ``invoke.run`` stand-in that answers by command rather than by call
+    order.
+
+    The previous positional ``side_effect`` lists broke whenever
+    ``ensure_ready()`` gained or lost a shell-out — which it did when the
+    bind-dir check moved from ``test -d`` to reading the container's mount
+    table (#164 FBN-17). Dispatching on the command keeps these tests about
+    the behaviour they name.
+
+    The mount table is synthesised from the runtime's own bind dirs, so the
+    "already running" path is exercised with mounts that genuinely satisfy
+    the new check.
+    """
+    import json as _json
+    import os as _os
+
+    def _dispatch(command, *_args, **_kwargs):
+        if "docker inspect" in command and ".Mounts" in command:
+            bind_dirs = runtime._collect_bind_mount_dirs(
+                _os.path.abspath(runtime.project_dir or _os.getcwd()))
+            mounts = [{"Source": d, "Destination": d, "RW": True}
+                      for d in bind_dirs]
+            return MagicMock(ok=True, stdout=_json.dumps(mounts))
+        if "docker inspect" in command:
+            return MagicMock(ok=True, stdout="true\n" if running else "false\n")
+        return MagicMock(ok=True, stdout="")
+
+    return _dispatch
+
+
 class TestDockerComposeRuntime:
 
     def test_default_container_name(self):
@@ -301,12 +332,7 @@ class TestDockerComposeRuntime:
     def test_ensure_ready_skips_compose_up_when_already_running(self, mock_run):
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
 
-        mock_result_running = MagicMock(ok=True, stdout="true\n")
-        mock_result_virsh = MagicMock(ok=True)
-        # First call: docker inspect (running check)
-        # Second call: docker exec test -d (bind dir check) — one per bind dir
-        # Last call: virsh version
-        mock_run.side_effect = [mock_result_running, mock_result_running, mock_result_running, mock_result_virsh]
+        mock_run.side_effect = _docker_cmd_dispatch(rt)
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
              patch.object(rt, "_write_bind_mount_override"), \
@@ -367,10 +393,7 @@ class TestDockerComposeRuntime:
     def test_ensure_ready_checks_libvirtd_after_container_is_running(self, mock_run):
         rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
 
-        mock_running = MagicMock(ok=True, stdout="true\n")
-        mock_dir_ok = MagicMock(ok=True)
-        mock_virsh = MagicMock(ok=True)
-        mock_run.side_effect = [mock_running, mock_dir_ok, mock_dir_ok, mock_virsh]
+        mock_run.side_effect = _docker_cmd_dispatch(rt)
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
              patch.object(rt, "_write_bind_mount_override"), \
@@ -1226,3 +1249,136 @@ class TestDockerComposeRuntimeBridgeConflict:
         # Only virbr0 should be considered "taken" — virbr1 should be
         # available for the new project's network.
         assert "default" in expected_virsh_output
+
+
+class TestMountMapping:
+    """#164 FBN-17 — the bind-dir check has to validate the *mapping*.
+
+    `test -d /var/tmp` passes inside a container that has its own
+    /var/tmp, so `ensure_ready()` returned without ever applying the mount.
+    Checking only the mount *source* is no better: `/var/tmp:/scratch`
+    shares the source while leaving host temp files unreachable at the
+    container's /var/tmp.
+    """
+
+    def test_exact_mount_is_accepted(self):
+        mounts = [{"Source": "/var/tmp", "Destination": "/var/tmp", "RW": True}]
+        assert DockerComposeRuntime._mount_provides(mounts, "/var/tmp", "/var/tmp")
+
+    def test_source_only_decoy_is_rejected(self):
+        """The case a source-only check would wave through."""
+        mounts = [{"Source": "/var/tmp", "Destination": "/scratch", "RW": True}]
+        assert not DockerComposeRuntime._mount_provides(
+            mounts, "/var/tmp", "/var/tmp")
+
+    def test_covering_parent_mount_counts(self):
+        mounts = [{"Source": "/var", "Destination": "/var", "RW": True}]
+        assert DockerComposeRuntime._mount_provides(mounts, "/var/tmp", "/var/tmp")
+
+    def test_more_specific_mount_shadows_its_parent(self):
+        """A narrower mount with a different source hides the parent, so the
+        parent must not be allowed to vouch for the path."""
+        mounts = [
+            {"Source": "/var", "Destination": "/var", "RW": True},
+            {"Source": "/somewhere/else", "Destination": "/var/tmp", "RW": True},
+        ]
+        assert not DockerComposeRuntime._mount_provides(
+            mounts, "/var/tmp", "/var/tmp")
+
+    def test_read_only_mount_is_rejected_when_writable_required(self):
+        mounts = [{"Source": "/var/tmp", "Destination": "/var/tmp", "RW": False}]
+        assert not DockerComposeRuntime._mount_provides(
+            mounts, "/var/tmp", "/var/tmp")
+        assert DockerComposeRuntime._mount_provides(
+            mounts, "/var/tmp", "/var/tmp", require_writable=False)
+
+    def test_missing_mount_is_rejected(self):
+        assert not DockerComposeRuntime._mount_provides([], "/var/tmp", "/var/tmp")
+
+    def test_nested_path_maps_through_a_parent(self):
+        mounts = [{"Source": "/host/ws", "Destination": "/ws", "RW": True}]
+        assert DockerComposeRuntime._mount_provides(
+            mounts, "/host/ws/vm1", "/ws/vm1")
+        assert not DockerComposeRuntime._mount_provides(
+            mounts, "/host/other/vm1", "/ws/vm1")
+
+
+class TestContainerMountsIsUnknownNotEmpty:
+    """A failed inspection must never read as "nothing is mounted"."""
+
+    @patch("invoke.run")
+    def test_failed_inspect_returns_none(self, mock_run):
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        mock_run.return_value = MagicMock(ok=False, stdout="")
+        assert rt._container_mounts() is None
+
+    @patch("invoke.run")
+    def test_unparsable_output_returns_none(self, mock_run):
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        mock_run.return_value = MagicMock(ok=True, stdout="not json")
+        assert rt._container_mounts() is None
+
+    @patch("invoke.run")
+    def test_empty_mount_list_is_a_real_answer(self, mock_run):
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        mock_run.return_value = MagicMock(ok=True, stdout="[]")
+        assert rt._container_mounts() == []
+
+
+class TestMountDedupKey:
+    """#164 FBN-17 — deduping on the source alone would suppress the very
+    mount being added."""
+
+    def test_decoy_mount_does_not_suppress_the_needed_one(self):
+        pairs = DockerComposeRuntime._declared_mount_pairs(
+            ["/var/tmp:/scratch"])
+        assert ("/var/tmp", "/var/tmp") not in pairs
+
+    def test_exact_pair_is_recognised(self):
+        pairs = DockerComposeRuntime._declared_mount_pairs(
+            ["/var/tmp:/var/tmp:ro"])
+        assert ("/var/tmp", "/var/tmp") in pairs
+
+    def test_non_string_entries_are_ignored(self):
+        """A long-form or named volume contributes nothing, so the mount is
+        added rather than silently skipped."""
+        pairs = DockerComposeRuntime._declared_mount_pairs(
+            [{"type": "bind", "source": "/var/tmp", "target": "/var/tmp"}, None])
+        assert pairs == set()
+
+
+class TestTempDirIsMounted:
+    """#164 FBN-17 — the container bind-mounted the literal /tmp while every
+    host-side temp file goes through tempfile, which honours TMPDIR. With
+    TMPDIR outside the mounted project and workdirs, the XML written for
+    `virsh define` was unreachable inside the container."""
+
+    @staticmethod
+    def _retempdir(monkeypatch, value):
+        """Point TMPDIR at *value* and clear tempfile's per-process cache.
+
+        gettempdir() memoises into tempfile.tempdir on first use, which is
+        right for a short-lived CLI but hides an in-process env change.
+        """
+        import tempfile as _tempfile
+        monkeypatch.setenv("TMPDIR", value)
+        monkeypatch.setattr(_tempfile, "tempdir", None)
+
+    def test_tmpdir_outside_the_project_is_mounted(self, tmp_path, monkeypatch):
+        self._retempdir(monkeypatch, str(tmp_path))
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        dirs = rt._collect_bind_mount_dirs("/srv/project")
+        assert str(tmp_path) in dirs
+
+    def test_literal_tmp_is_still_mounted(self, monkeypatch):
+        import tempfile as _tempfile
+        monkeypatch.delenv("TMPDIR", raising=False)
+        monkeypatch.setattr(_tempfile, "tempdir", None)
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        assert "/tmp" in rt._collect_bind_mount_dirs("/srv/project")
+
+    def test_no_duplicate_when_tmpdir_is_tmp(self, monkeypatch):
+        self._retempdir(monkeypatch, "/tmp")
+        rt = DockerComposeRuntime(config={"runtime_container": "ctr1"})
+        dirs = rt._collect_bind_mount_dirs("/srv/project")
+        assert dirs.count("/tmp") == 1
