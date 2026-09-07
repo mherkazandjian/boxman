@@ -172,10 +172,22 @@ class VMsMixin:
         Configure and start a single VM: cpu/mem, network interfaces, disks, then start.
 
         Designed to be called in a separate process per VM after cloning is done.
+
+        Every step below returns a bool. They used to be logged at warning
+        level and dropped, so a VM whose disks, NICs and start command all
+        failed still reported success and the command exited 0 (#164 X3).
+        Each failure is now collected and raised once at the end: the
+        remaining steps are still attempted, so the operator sees
+        everything that is wrong in one run rather than one thing per
+        retry, and the VM is still started if it can be.
+
+        Raises:
+            ProvisionError: if any configuration step or the start failed.
         """
         prj_name = f'bprj__{self.config["project"]}__bprj'
         full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
         vm_info = vm_info.copy()
+        problems: list[str] = []
 
         # cpu / memory
         cpus = vm_info.get('cpus')
@@ -191,7 +203,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"successfully configured cpu and memory for vm {vm_name}")
             else:
-                self.logger.warning(f"failed to configure cpu and memory for vm {vm_name}")
+                self.logger.error(f"failed to configure cpu and memory for vm {vm_name}")
+                problems.append('cpu/memory')
         else:
             self.logger.warning(f"no cpu or memory configuration for vm {vm_name}, skipping")
 
@@ -205,7 +218,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"successfully configured memballoon for vm {vm_name}")
             else:
-                self.logger.warning(f"failed to configure memballoon for vm {vm_name}")
+                self.logger.error(f"failed to configure memballoon for vm {vm_name}")
+                problems.append('memballoon')
 
         # network interfaces
         if 'network_adapters' not in vm_info:
@@ -222,7 +236,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"network interfaces configured for vm {vm_name}")
             else:
-                self.logger.warning(f"some network interfaces could not be configured for vm {vm_name}")
+                self.logger.error(f"some network interfaces could not be configured for vm {vm_name}")
+                problems.append('network interfaces')
 
         # disks
         workdir = cluster.get('workdir', '.')
@@ -239,7 +254,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"all disks configured for vm {vm_name}")
             else:
-                self.logger.warning(f"some disks could not be configured for vm {vm_name}")
+                self.logger.error(f"some disks could not be configured for vm {vm_name}")
+                problems.append('disks')
 
         # shared folders (must be before start for virtiofs memfd backing)
         if vm_info.get('shared_folders'):
@@ -251,7 +267,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"shared folders configured for vm {vm_name}")
             else:
-                self.logger.warning(f"some shared folders could not be configured for vm {vm_name}")
+                self.logger.error(f"some shared folders could not be configured for vm {vm_name}")
+                problems.append('shared folders')
 
         # cdroms — the cdrom-boot ISO is already attached by virt-install at
         # create time, so attach only any *additional* cdroms here (avoids a
@@ -270,7 +287,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"CDROMs configured for vm {vm_name}")
             else:
-                self.logger.warning(f"some CDROMs could not be configured for vm {vm_name}")
+                self.logger.error(f"some CDROMs could not be configured for vm {vm_name}")
+                problems.append('cdroms')
 
         # start
         self.logger.info(f"starting vm {full_vm_name}")
@@ -278,7 +296,14 @@ class VMsMixin:
         if success:
             self.logger.info(f"successfully started the vm {full_vm_name}")
         else:
-            self.logger.warning(f"failed to start the vm {full_vm_name}")
+            self.logger.error(f"failed to start the vm {full_vm_name}")
+            problems.append('start')
+
+        if problems:
+            raise ProvisionError(
+                f"vm {full_vm_name} was not fully brought up "
+                f"({', '.join(problems)} failed) — see the preceding "
+                f"per-step errors for the cause.")
 
     def _destroy_vm_and_disks(
         self, cluster_name: str, cluster: dict[str, Any], vm_name: str, vm_info: dict[str, Any]

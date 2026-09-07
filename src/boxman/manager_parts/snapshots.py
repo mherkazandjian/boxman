@@ -559,7 +559,9 @@ class SnapshotsMixin:
         was_running = storage.is_running(full_vm_name)
         if was_running:
             if no_shutdown:
-                log.error(
+                # A requested skip, not a failure — the command exits 0,
+                # so it must not log at error level.
+                log.warning(
                     f"collapse: vm {full_vm_name} is running and "
                     f"--no-shutdown was passed; skipping")
                 return
@@ -773,7 +775,8 @@ class SnapshotsMixin:
         did_shutdown = False
         if was_running:
             if no_shutdown:
-                log.error(
+                # A requested skip, not a failure (see _collapse_one_vm).
+                log.warning(
                     f"compact: vm {full_vm_name} is running and --no-shutdown "
                     f"was passed; skipping")
                 return

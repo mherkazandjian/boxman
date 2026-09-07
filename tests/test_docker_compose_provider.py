@@ -1265,27 +1265,41 @@ class TestDockerComposeSession:
 # Manager dispatch (coarse per-cluster seam)
 # --------------------------------------------------------------------------
 class _RecordingSession:
-    def __init__(self):
+    """A stand-in for ComposeSession's coarse lifecycle surface.
+
+    Every one of those methods is annotated ``-> bool`` and returns a real
+    bool: False is how the session reports a compose command that failed.
+    This double returns the same, so the manager's checks are exercised
+    rather than bypassed (#164 FB-6). Set *ok* to False to model a
+    cluster that will not come up or down.
+    """
+
+    def __init__(self, ok: bool = True):
         self.calls: list = []
+        self.ok = ok
 
     def compose_project_name(self, name):
         # unique per cluster → no spurious collision in dispatch tests
         return f"proj_{name}"
 
+    def _record(self, op, name) -> bool:
+        self.calls.append((op, name))
+        return self.ok
+
     def up_cluster(self, name, cfg):
-        self.calls.append(("up", name))
+        return self._record("up", name)
 
     def stop_cluster(self, name, cfg):
-        self.calls.append(("stop", name))
+        return self._record("stop", name)
 
     def start_cluster(self, name, cfg):
-        self.calls.append(("start", name))
+        return self._record("start", name)
 
     def down_cluster(self, name, cfg):
-        self.calls.append(("down", name))
+        return self._record("down", name)
 
     def destroy_cluster(self, name, cfg):
-        self.calls.append(("destroy", name))
+        return self._record("destroy", name)
 
 
 # --------------------------------------------------------------------------
@@ -1499,6 +1513,86 @@ class TestManagerDispatch:
             ("down", "svc"),
             ("destroy", "svc"),
         ]
+
+    # ---- #164 FB-6: per-cluster isolation + explicit False handling ----
+
+    def _two_cluster_manager(self, session):
+        manager = BoxmanManager()
+        manager.config = {
+            "project": "proj",
+            "provider": {"libvirt": {}},
+            "clusters": {
+                "svc_a": {"provider": "docker-compose",
+                          "boxes": {"web": {"image": "x"}}},
+                "svc_b": {"provider": "docker-compose",
+                          "boxes": {"api": {"image": "y"}}},
+            },
+        }
+        manager.register_session("docker-compose", session)
+        return manager
+
+    def test_returned_false_is_a_failure_not_a_success(self):
+        """The sessions report a failed compose command by returning False.
+        Discarding it made `down`/`destroy` exit 0 with containers up."""
+        manager = self._two_cluster_manager(_RecordingSession(ok=False))
+        with pytest.raises(ProvisionError, match="svc_a, svc_b"):
+            manager.stop_compose_clusters()
+
+    def test_every_cluster_is_attempted_after_a_returned_failure(self):
+        session = _RecordingSession(ok=False)
+        manager = self._two_cluster_manager(session)
+        with pytest.raises(ProvisionError):
+            manager.stop_compose_clusters()
+        assert session.calls == [("stop", "svc_a"), ("stop", "svc_b")]
+
+    def test_every_cluster_is_attempted_after_an_exception(self):
+        """Without the isolator a raising cluster skipped every cluster
+        after it — and, in a mixed project, every VM as well."""
+
+        class _RaisingOnFirst(_RecordingSession):
+            def stop_cluster(self, name, cfg):
+                self.calls.append(("stop", name))
+                if name == "svc_a":
+                    raise RuntimeError("docker daemon is gone")
+                return True
+
+        session = _RaisingOnFirst()
+        manager = self._two_cluster_manager(session)
+        with pytest.raises(ProvisionError, match="svc_a"):
+            manager.stop_compose_clusters()
+        assert session.calls == [("stop", "svc_a"), ("stop", "svc_b")]
+
+    def test_successful_clusters_are_not_reported_as_failures(self):
+        class _FailsSecond(_RecordingSession):
+            def stop_cluster(self, name, cfg):
+                self.calls.append(("stop", name))
+                return name != "svc_b"
+
+        manager = self._two_cluster_manager(_FailsSecond())
+        with pytest.raises(ProvisionError) as excinfo:
+            manager.stop_compose_clusters()
+        message = str(excinfo.value)
+        assert "svc_b" in message
+        assert "svc_a" not in message
+
+    def test_failed_destroy_blocks_cleanup(self, tmp_path, monkeypatch):
+        """A compose-only project whose containers survived must not have
+        its workspace deleted or its cache entry removed: for such a
+        project _confirm_project_torn_down() has no VMs to look at and
+        returns True, so this raise is the only thing standing between a
+        failed teardown and the loss of the state that describes it."""
+        manager = self._two_cluster_manager(_RecordingSession(ok=False))
+        with pytest.raises(ProvisionError, match="down --volumes"):
+            manager.destroy_compose_clusters()
+
+    def test_snapshot_isolator_honours_the_returned_bool(self):
+        """_for_each_dc_cluster's callbacks return the session's bool too —
+        a `docker image rm` blocked by a running container reports False."""
+        manager = self._two_cluster_manager(_RecordingSession())
+        _selected, failed = manager._for_each_dc_cluster(
+            SimpleNamespace(cluster=None, vms="all"), 'delete',
+            lambda name, cfg: name != "svc_b")
+        assert failed == ["svc_b"]
 
     def test_libvirt_only_project_has_no_compose_work(self):
         manager = BoxmanManager()
