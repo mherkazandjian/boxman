@@ -334,11 +334,18 @@ class VMsMixin:
                 f"undefined; leaving its disks in place rather than removing "
                 f"storage under a possibly-live guest")
 
-        session.destroy_disks(
-            cluster['workdir'],
-            vm_name=full_vm_name,
-            disks=vm_info.get('disks', [])
-        )
+        # confirm_vm_absent() above says the domain is gone; it says
+        # nothing about whether the disk files were actually removed.
+        # Dropping this bool left qcow2 files behind while `destroy`
+        # reported success — and the next provision then collided with
+        # them.
+        if not session.destroy_disks(
+                cluster['workdir'],
+                vm_name=full_vm_name,
+                disks=vm_info.get('disks', [])):
+            raise ProvisionError(
+                f"{full_vm_name}: the domain was undefined but its disk "
+                f"files could not be removed from {cluster['workdir']}")
 
     def _vm_disk_dirs(self, full_vm_name: str) -> list[str]:
         """
@@ -398,12 +405,15 @@ class VMsMixin:
                 f"undefined; leaving its disks in place rather than removing "
                 f"storage under a possibly-live guest")
 
+        undeleted = []
         for workdir in disk_dirs:
-            self.provider.destroy_disks(
-                workdir,
-                vm_name=full_vm_name,
-                disks=[]
-            )
+            if not self.provider.destroy_disks(
+                    workdir, vm_name=full_vm_name, disks=[]):
+                undeleted.append(workdir)
+        if undeleted:
+            raise ProvisionError(
+                f"{full_vm_name}: the domain was undefined but its disk "
+                f"files could not be removed from {', '.join(undeleted)}")
 
     def configure_and_start_vms(self) -> None:
         """

@@ -103,6 +103,7 @@ class FlowsMixin:
         # With many VMs starting simultaneously, some may fail due to resource
         # contention. Retry starting any that are not in 'running' state.
         self.logger.info("verifying all VMs are running after parallel start...")
+        still_down: dict[str, str] = {}
         for _round in range(1, 21):
             vm_states = self._get_vm_states()
             not_running = {
@@ -117,19 +118,32 @@ class FlowsMixin:
                 f"({', '.join(f'{n}={s}' for n, s in not_running.items())}), retrying..."
             )
             for _vm_name in not_running:
+                # the loop re-reads the state each round, so the bool here
+                # adds nothing the next iteration would not see
                 self.session_for_vm(_vm_name).start_vm(_vm_name)
             time.sleep(3)
         else:
             vm_states = self._get_vm_states()
             still_down = {n: s for n, s in vm_states.items() if s != 'running'}
             if still_down:
-                self.logger.warning(
+                self.logger.error(
                     f"gave up after 20 rounds; the following VMs are still not running: "
                     f"{', '.join(f'{n}={s}' for n, s in still_down.items())}"
                 )
 
-        # use adaptive wait for ip address assignment
-        self.wait_for_vm_ips(self._get_project_vm_names(), max_wait=600)
+        # Carried to the end of provision rather than raised here: the VMs
+        # that did come up still need their ssh access, their compose
+        # clusters and their lab. Warning and continuing, though, meant
+        # `provision` exited 0 with dead VMs — after burning the full IP
+        # timeout on them (#164 X3).
+        undead = sorted(still_down) if still_down else []
+
+        # use adaptive wait for ip address assignment, skipping the VMs that
+        # never started — they have no lease coming
+        _waiting_for = [name for name in self._get_project_vm_names()
+                        if name not in undead]
+        if _waiting_for:
+            self.wait_for_vm_ips(_waiting_for, max_wait=600)
 
         # Eject cdrom (seed.iso) from every VM now that cloud-init has run.
         # This prevents snapshot-related failures caused by qcow2-over-raw
@@ -153,6 +167,12 @@ class FlowsMixin:
 
         # render and deploy the containerlab topology (no-op if not configured)
         self.deploy_netlab()
+
+        if undead:
+            raise ProvisionError(
+                f"provision finished, but {len(undead)} VM(s) never started: "
+                f"{', '.join(undead)}. The rest of the project was "
+                f"provisioned — see the preceding errors for the cause.")
 
     def up(self, cli_args):
         """

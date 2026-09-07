@@ -530,3 +530,134 @@ class TestControlVerbsRaise:
         mgr.resume_vm(ns)
         mgr.save_vm(ns)
         mgr.start_vm(ns)
+
+
+class TestPxeBootRaises:
+    """#164 X3 — every pxe-boot failure path did ``return False``, and
+    ``app.py``'s dispatch (``getattr(manager, args.handler)(args)``)
+    discards the handler's return value. So ``boxman pxe-boot`` exited 0
+    on a failed boot-order change, a VM that would not start, and an SSH
+    timeout alike.
+    """
+
+    def _mgr(self):
+        mgr = _manager()
+        mgr.provider.set_boot_order.return_value = True
+        mgr.provider.start_vm.return_value = True
+        mgr.provider.wait_for_ssh.return_value = True
+        mgr.provider.restore_boot_order.return_value = True
+        return mgr
+
+    def _args(self, **kw):
+        base = dict(vm="vm1", expected_ip=None, wait_timeout=60,
+                    restore_after=False)
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def test_failed_boot_order_raises(self):
+        mgr = self._mgr()
+        mgr.provider.set_boot_order.return_value = False
+        with pytest.raises(ProvisionError, match="boot order"):
+            mgr.pxe_boot(self._args())
+
+    def test_failed_start_raises(self):
+        mgr = self._mgr()
+        mgr.provider.start_vm.return_value = False
+        with pytest.raises(ProvisionError, match="failed to start"):
+            mgr.pxe_boot(self._args())
+
+    def test_ssh_timeout_raises(self):
+        mgr = self._mgr()
+        mgr.provider.wait_for_ssh.return_value = False
+        with pytest.raises(ProvisionError, match="timed out waiting for SSH"):
+            mgr.pxe_boot(self._args(expected_ip="10.0.0.5"))
+
+    def test_failed_boot_order_restore_raises(self):
+        mgr = self._mgr()
+        mgr.provider.restore_boot_order.return_value = False
+        with pytest.raises(ProvisionError, match="restore the boot order"):
+            mgr.pxe_boot(self._args(expected_ip="10.0.0.5", restore_after=True))
+
+    def test_successful_pxe_boot_does_not_raise(self):
+        mgr = self._mgr()
+        mgr.pxe_boot(self._args(expected_ip="10.0.0.5", restore_after=True))
+
+
+class TestDestroyDisksFailureRaises:
+    """#164 X3 — confirm_vm_absent() says the domain is gone; it says
+    nothing about whether the disk files were removed. Dropping
+    destroy_disks' bool left qcow2 files behind while `destroy` reported
+    success, and the next provision then collided with them."""
+
+    def test_failed_disk_removal_raises(self):
+        mgr = _manager()
+        mgr.provider.confirm_vm_absent.return_value = True
+        mgr.provider.destroy_disks.return_value = False
+        with pytest.raises(ProvisionError, match="disk files could not be removed"):
+            mgr._destroy_vm_and_disks(
+                'cluster_1', {'workdir': '/tmp/ws/c1'}, 'node01', {})
+
+    def test_successful_disk_removal_does_not_raise(self):
+        mgr = _manager()
+        mgr.provider.confirm_vm_absent.return_value = True
+        mgr.provider.destroy_disks.return_value = True
+        mgr._destroy_vm_and_disks(
+            'cluster_1', {'workdir': '/tmp/ws/c1'}, 'node01', {})
+
+
+class TestProvisionRetryExhaustion:
+    """#164 X3 — after 20 rounds of retrying the start, `provision` logged
+    a warning and carried on: it burned the full 600s IP wait on VMs that
+    would never come up, then reported success and exited 0."""
+
+    def _mgr(self, monkeypatch, states):
+        mgr = _manager()
+        mgr.config['workspace'] = {'path': '/tmp/ws'}
+        mgr.config['provider'] = {'libvirt': {}}
+        monkeypatch.setattr(
+            BoxmanManager, "_find_existing_project_vms", lambda cls: [])
+        monkeypatch.setattr(
+            BoxmanManager, "_get_vm_states", lambda cls: states)
+        monkeypatch.setattr(
+            BoxmanManager, "_get_project_vm_names",
+            lambda cls: sorted(states))
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+        mgr.cache.read_projects_cache = MagicMock()
+        mgr.cache.projects = {}
+        for name in ("register_project_in_cache", "_expand_oci_base_images",
+                     "ensure_templates_exist", "validate_base_images",
+                     "provision_files", "ensure_shared_bridges",
+                     "define_networks", "clone_vms", "configure_and_start_vms",
+                     "wait_for_vm_ips", "setup_ssh_access", "connect_info",
+                     "provision_compose_clusters", "deploy_netlab"):
+            setattr(mgr, name, MagicMock())
+        mgr.ensure_templates_exist.return_value = True
+        return mgr
+
+    def _args(self):
+        return types.SimpleNamespace(force=False, rebuild_templates=False)
+
+    def test_vms_that_never_start_fail_the_command(self, monkeypatch):
+        mgr = self._mgr(monkeypatch, {"vm1": "shut off", "vm2": "running"})
+        with pytest.raises(ProvisionError, match="never started"):
+            mgr.provision(self._args())
+
+    def test_the_rest_of_provision_still_runs(self, monkeypatch):
+        mgr = self._mgr(monkeypatch, {"vm1": "shut off"})
+        with pytest.raises(ProvisionError):
+            mgr.provision(self._args())
+        mgr.setup_ssh_access.assert_called_once()
+        mgr.provision_compose_clusters.assert_called_once()
+        mgr.deploy_netlab.assert_called_once()
+
+    def test_dead_vms_are_not_waited_on_for_ips(self, monkeypatch):
+        mgr = self._mgr(monkeypatch, {"vm1": "shut off", "vm2": "running"})
+        with pytest.raises(ProvisionError):
+            mgr.provision(self._args())
+        waited_for = mgr.wait_for_vm_ips.call_args.args[0]
+        assert waited_for == ["vm2"]
+
+    def test_all_running_does_not_raise(self, monkeypatch):
+        mgr = self._mgr(monkeypatch, {"vm1": "running"})
+        mgr.provision(self._args())
+        mgr.wait_for_vm_ips.assert_called_once()

@@ -76,19 +76,27 @@ class ImagesMixin:
         for SSH, and optionally restore the boot order afterwards.
 
         Designed to be used with a Cobbler PXE provisioning server.
+
+        Every failure here used to ``return False``, but ``app.py``'s
+        dispatch discards the handler's return value, so ``boxman
+        pxe-boot`` exited 0 on a failed boot-order change, a VM that
+        would not start, and an SSH timeout alike (#164 X3).
+
+        Raises:
+            ProvisionError: on any of those.
         """
         session = self.provider  # Phase 1 (#49): single-VM PXE flow stays on the default session until Phase 3
         vm_name = cli_args.vm
 
         self.logger.info(f"setting boot order to [network, hd] for '{vm_name}'")
         if not session.set_boot_order(vm_name, ['network', 'hd']):
-            self.logger.error(f"failed to set boot order for '{vm_name}'")
-            return False
+            raise ProvisionError(
+                f"pxe-boot: failed to set the boot order for '{vm_name}'")
 
         self.logger.info(f"starting VM '{vm_name}'")
         if not session.start_vm(vm_name):
-            self.logger.error(f"failed to start VM '{vm_name}'")
-            return False
+            raise ProvisionError(
+                f"pxe-boot: failed to start VM '{vm_name}'")
 
         if cli_args.expected_ip:
             ok = session.wait_for_ssh(
@@ -96,21 +104,18 @@ class ImagesMixin:
                 timeout=cli_args.wait_timeout,
             )
             if not ok:
-                self.logger.error(
-                    f"SSH timeout waiting for '{vm_name}' at "
-                    f"{cli_args.expected_ip}")
-                return False
+                raise ProvisionError(
+                    f"pxe-boot: timed out waiting for SSH on '{vm_name}' at "
+                    f"{cli_args.expected_ip} after {cli_args.wait_timeout}s; "
+                    f"the VM is left booting from the network")
 
             if cli_args.restore_after:
                 self.logger.info(
                     f"restoring boot order to [hd] for '{vm_name}'")
                 if not session.restore_boot_order(vm_name):
-                    self.logger.error(
-                        f"could not restore the boot order for '{vm_name}' — "
-                        f"it will boot from the network again")
-                    return False
-
-        return True
+                    raise ProvisionError(
+                        f"pxe-boot: could not restore the boot order for "
+                        f"'{vm_name}' — it will boot from the network again")
 
     def create_templates(self, cli_args) -> None:
         """
