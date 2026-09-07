@@ -972,6 +972,88 @@ class TestMemballoonUpdateResult:
         mgr.provider.configure_vm_memballoon.assert_not_called()
 
 
+class TestUpdateRestartFailures:
+    """#164 X3 — the restart branch ignored both ``shutdown_and_wait()`` and
+    ``start_vm()`` and then queued ``status='updated'`` with "(restarted)".
+
+    Two ways that lied. A lost shutdown left the restart-only changes
+    unapplied while ``update`` exited 0 — and ``start_vm()`` then returned
+    True *because* the guest was still running, so the failure hid behind a
+    successful start. A lost start left the guest shut off, also at exit 0.
+    """
+
+    @staticmethod
+    def _cpu_restart_diff():
+        return {
+            'cpu_changed': True,
+            'memory_changed': False,
+            'max_vcpus_changed': False,
+            'max_memory_changed': False,
+            'new_disks': [],
+            'resize_disks': [],
+            'new_cdroms': [],
+            'removed_cdroms': [],
+            'changed_cdroms': [],
+            'new_shared_folders': [],
+            'removed_shared_folders': [],
+            'changed_shared_folders': [],
+            'memballoon_changed': False,
+            'memballoon_restart_pending': False,
+            'actual_cpus': 2,
+            'desired_cpus': 4,
+            'actual_memory_mb': 2048,
+            'desired_memory_mb': 2048,
+            'desired_max_vcpus': None,
+            'desired_max_memory_mb': None,
+            'vm_state': 'running',
+        }
+
+    def _run(self, shutdown_ok, start_ok):
+        mgr = make_bare_manager({'project': 'demo'})
+        mgr.provider = MagicMock()
+        mgr.provider.provider_config = {'uri': 'qemu:///system'}
+        # the cold-only change that makes the restart necessary
+        mgr.provider.update_vm_cpu_memory.return_value = {
+            'success': True, 'restart_needed': True}
+        mgr.provider.shutdown_and_wait.return_value = shutdown_ok
+        mgr.provider.start_vm.return_value = start_ok
+        result_queue = MagicMock()
+
+        with patch.object(VMStateDiffer, 'diff_vm',
+                          return_value=self._cpu_restart_diff()):
+            mgr._update_single_vm(
+                'cluster1', {'workdir': '/tmp'}, 'node01',
+                {'cpus': 4}, result_queue)
+
+        result_queue.put.assert_called_once()
+        return mgr, result_queue.put.call_args.args[0][1]
+
+    def test_failed_shutdown_is_reported_and_start_is_skipped(self):
+        mgr, result = self._run(shutdown_ok=False, start_ok=True)
+
+        assert result['status'] == 'failed'
+        assert 'could not be shut down' in result['details']
+        # Starting a guest that never went down would report success and
+        # bury the real failure.
+        mgr.provider.start_vm.assert_not_called()
+
+    def test_failed_start_is_reported(self):
+        mgr, result = self._run(shutdown_ok=True, start_ok=False)
+
+        assert result['status'] == 'failed'
+        assert 'did not come back up' in result['details']
+        mgr.provider.start_vm.assert_called_once()
+
+    def test_successful_restart_reports_updated(self):
+        mgr, result = self._run(shutdown_ok=True, start_ok=True)
+
+        assert result['status'] == 'updated'
+        assert '(restarted)' in result['details']
+        assert 'CPU: 2 -> 4' in result['details']
+        mgr.provider.shutdown_and_wait.assert_called_once()
+        mgr.provider.start_vm.assert_called_once()
+
+
 def _needs_restart_update_worker(_self, _cluster_name, _cluster_cfg, vm_name,
                                  _vm_info, result_queue, _dry_run=False):
     """Stand-in for ``_update_single_vm`` reporting a pending restart."""

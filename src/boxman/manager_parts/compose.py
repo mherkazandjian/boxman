@@ -59,8 +59,12 @@ class ComposeMixin:
         failed = []
         for cname, cluster, snap in dc_plan:
             try:
-                self.session_for_cluster(cname).snapshot_restore_cluster(
-                    cname, cluster, snap)
+                # -> bool: a restore the session refused reports False
+                # rather than raising (#164 FB-6).
+                if not self.session_for_cluster(cname).snapshot_restore_cluster(
+                        cname, cluster, snap):
+                    failed.append(cname)
+                    self.logger.error(f"[{cname}] snapshot restore failed")
             except Exception as exc:
                 failed.append(cname)
                 self.logger.error(

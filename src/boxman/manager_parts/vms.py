@@ -843,12 +843,35 @@ class VMsMixin:
                 self.logger.info(
                     f"VM {vm_name}: restarting to apply changes "
                     f"(live max ceiling cannot be raised)")
-                self.provider.shutdown_and_wait(full_vm_name)
-                self.provider.start_vm(full_vm_name)
-                result_queue.put((vm_name, {
-                    'status': 'updated',
-                    'details': '; '.join(changes) + ' (restarted)'
-                }))
+                # Both calls return a bool and both were dropped, so a
+                # guest that never went down was reported "(restarted)"
+                # and `update` exited 0 with the restart-only changes not
+                # in effect (#164 X3). The shutdown has to be checked
+                # first for a second reason: start_vm() on a guest that is
+                # still running returns True, so a lost shutdown would
+                # hide itself behind a successful start.
+                if not self.provider.shutdown_and_wait(full_vm_name):
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': (
+                            '; '.join(changes) +
+                            ' — applied, but the VM could not be shut down, '
+                            'so the changes that need a restart are not in '
+                            'effect')
+                    }))
+                elif not self.provider.start_vm(full_vm_name):
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': (
+                            '; '.join(changes) +
+                            ' — applied, but the VM did not come back up '
+                            'after the restart and is still shut off')
+                    }))
+                else:
+                    result_queue.put((vm_name, {
+                        'status': 'updated',
+                        'details': '; '.join(changes) + ' (restarted)'
+                    }))
             elif pending_restart:
                 result_queue.put((vm_name, {
                     'status': 'needs_restart',

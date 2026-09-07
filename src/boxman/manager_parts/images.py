@@ -104,7 +104,11 @@ class ImagesMixin:
             if cli_args.restore_after:
                 self.logger.info(
                     f"restoring boot order to [hd] for '{vm_name}'")
-                session.restore_boot_order(vm_name)
+                if not session.restore_boot_order(vm_name):
+                    self.logger.error(
+                        f"could not restore the boot order for '{vm_name}' — "
+                        f"it will boot from the network again")
+                    return False
 
         return True
 

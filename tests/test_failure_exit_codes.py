@@ -471,3 +471,62 @@ class TestConfigureAndStartVmRaises:
         mgr.provider.configure_vm_disks.return_value = True
         mgr.provider.start_vm.return_value = True
         self._run(mgr)
+
+
+class TestControlVerbsRaise:
+    """#164 X3 — the control verbs discarded the session's bool and logged
+    success regardless.
+
+    ``boxman control save`` on a VM libvirt would not save printed "vm X
+    ..." and exited 0, so a scripted save/restore cycle would restore a
+    state that was never written.
+    """
+
+    def _mgr(self, monkeypatch, ok):
+        mgr = _manager()
+        monkeypatch.setattr(
+            BoxmanManager, "_update_sessions_with_runtime", lambda cls: None)
+        monkeypatch.setattr(
+            BoxmanManager, "_control_vm_targets",
+            lambda cls, cli_args: [("vm1", "/tmp/ws/c1")])
+        monkeypatch.setattr(
+            BoxmanManager, "_select_dc_clusters", lambda cls, cli_args: [])
+        for name in ("suspend_vm", "resume_vm", "save_vm",
+                     "start_vm", "restore_vm"):
+            getattr(mgr.provider, name).return_value = ok
+        return mgr
+
+    def test_failed_suspend_raises(self, monkeypatch):
+        mgr = self._mgr(monkeypatch, ok=False)
+        with pytest.raises(ProvisionError, match="control suspend failed"):
+            mgr.suspend_vm(types.SimpleNamespace(vms="all", cluster=None))
+
+    def test_failed_resume_raises(self, monkeypatch):
+        mgr = self._mgr(monkeypatch, ok=False)
+        with pytest.raises(ProvisionError, match="control resume failed"):
+            mgr.resume_vm(types.SimpleNamespace(vms="all", cluster=None))
+
+    def test_failed_save_raises(self, monkeypatch):
+        mgr = self._mgr(monkeypatch, ok=False)
+        with pytest.raises(ProvisionError, match="control save failed"):
+            mgr.save_vm(types.SimpleNamespace(vms="all", cluster=None))
+
+    def test_failed_start_raises(self, monkeypatch):
+        mgr = self._mgr(monkeypatch, ok=False)
+        with pytest.raises(ProvisionError, match="control start failed"):
+            mgr.start_vm(types.SimpleNamespace(
+                vms="all", cluster=None, restore=False))
+
+    def test_failed_restore_raises(self, monkeypatch):
+        mgr = self._mgr(monkeypatch, ok=False)
+        with pytest.raises(ProvisionError, match="control start failed"):
+            mgr.start_vm(types.SimpleNamespace(
+                vms="all", cluster=None, restore=True))
+
+    def test_successful_control_verbs_are_silent(self, monkeypatch):
+        mgr = self._mgr(monkeypatch, ok=True)
+        ns = types.SimpleNamespace(vms="all", cluster=None, restore=False)
+        mgr.suspend_vm(ns)
+        mgr.resume_vm(ns)
+        mgr.save_vm(ns)
+        mgr.start_vm(ns)

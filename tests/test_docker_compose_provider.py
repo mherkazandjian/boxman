@@ -1378,8 +1378,13 @@ class TestSnapshotDcWiring:
         m.session_for_cluster = lambda c: sess
         order = []
         m.ensure_shared_bridges = lambda: order.append("bridges")
-        sess.snapshot_restore_cluster.side_effect = (
-            lambda *a: order.append("restore"))
+        # the real session is -> bool; append() returns None, which the
+        # manager now correctly reads as a refused restore
+        def _record_restore(*_a):
+            order.append("restore")
+            return True
+
+        sess.snapshot_restore_cluster.side_effect = _record_restore
         args = SimpleNamespace(snapshot_name=None, cluster=None, vms="all")
         with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
             m.snapshot_restore(args)
@@ -1761,7 +1766,11 @@ class TestPhase6CliParity:
         m = self._mgr({"other": {"provider": "docker-compose", "boxes": {"z": {}}}})
         paused = []
         sess = mock.Mock()
-        sess.pause_cluster.side_effect = lambda name, cfg: paused.append(name)
+        def _record_pause(name, _cfg):
+            paused.append(name)
+            return True   # the real session is -> bool
+
+        sess.pause_cluster.side_effect = _record_pause
         m._dc_session = lambda c: sess
         m.process_vm_list = lambda a: []
         m.suspend_vm(SimpleNamespace(cluster="other"))

@@ -56,7 +56,7 @@ class LibVirtSession(SessionConfigMixin):
                      manifest_uri: str,
                      vm_name: str,
                      vm_dir: str,
-                     manifest_local_path: str | None = None) -> bool:
+                     manifest_local_path: str | None = None) -> None:
         """
         Import an image into the libvirt storage pool.
 
@@ -66,7 +66,8 @@ class LibVirtSession(SessionConfigMixin):
         :param manifest_local_path: optional pre-resolved local path of the
             manifest (passed by the CLI when it already fetched the manifest
             to determine the provider type — avoids a second HTTP request).
-        :return: True if successful, False otherwise
+        :raises: whatever ImageImporter raises on failure — this never
+                 returns a status, so callers must not test one.
         """
         if manifest_local_path is None:
             _, manifest_local_path = ImageImporter.load_manifest_from_uri(manifest_uri)

@@ -727,6 +727,7 @@ class SnapshotsMixin:
         but nothing will be returned to the host.
         """
         storage = self.provider.storage  # Phase 1 (#49): storage_trim stays on the default session until Phase 3
+        trim_failed: list[str] = []
         for full_vm_name, _c, _v, _workdir in self._select_vm_targets(cli_args):
             if not storage.is_running(full_vm_name):
                 self.logger.warning(
@@ -741,7 +742,15 @@ class SnapshotsMixin:
             if getattr(cli_args, 'dry_run', False):
                 self.logger.info(f"[dry-run] would fstrim: {full_vm_name}")
                 continue
-            storage.fstrim_guest(full_vm_name)
+            if not storage.fstrim_guest(full_vm_name):
+                trim_failed.append(full_vm_name)
+                self.logger.error(f"fstrim failed: {full_vm_name}")
+
+        if trim_failed:
+            raise SnapshotError(
+                f"fstrim failed for {len(trim_failed)} VM(s): "
+                f"{', '.join(trim_failed)} — see the preceding errors "
+                f"for the cause.")
 
     @staticmethod
     def _compact_one_vm(provider_config, full_vm_name, workdir, vm_info,
