@@ -53,35 +53,80 @@ class TestLocalRuntime:
         rt.ensure_ready()  # should not raise
 
 
-def _docker_cmd_dispatch(runtime, running: bool = True):
+def _docker_cmd_dispatch(runtime, running: bool = True,
+                         persisted: bool = True, guests: int = 0,
+                         exists: bool = True):
     """A ``invoke.run`` stand-in that answers by command rather than by call
     order.
 
-    The previous positional ``side_effect`` lists broke whenever
-    ``ensure_ready()`` gained or lost a shell-out — which it did when the
-    bind-dir check moved from ``test -d`` to reading the container's mount
-    table (#164 FBN-17). Dispatching on the command keeps these tests about
-    the behaviour they name.
+    Positional ``side_effect`` lists broke whenever ``ensure_ready()``
+    gained or lost a shell-out — which it did when the bind-dir check moved
+    from ``test -d`` to reading the container's mount table (#164 FBN-17),
+    and again when it grew a container-state query and a guest probe
+    (#164 FB-2). Dispatching on the command keeps these tests about the
+    behaviour they name.
 
     The mount table is synthesised from the runtime's own bind dirs, so the
     "already running" path is exercised with mounts that genuinely satisfy
-    the new check.
+    the check. ``persisted`` adds the libvirt state mounts, which is the
+    steady state once FB-2's migration has run; pass False to exercise a
+    container that predates them.
     """
     import json as _json
     import os as _os
 
+    #: ``compose up`` starts the container, so everything after it reports
+    #: running. Without this the post-up wait would spin on the initial
+    #: state and time out — which is what the positional lists encoded by
+    #: putting a "true" response after the compose call.
+    state = {"running": running, "exists": exists}
+
     def _dispatch(command, *_args, **_kwargs):
+        if "compose" in command and " up " in f" {command} ":
+            state["running"] = True
+            state["exists"] = True
+            return MagicMock(ok=True, stdout="")
+        if "docker ps -a" in command:
+            if not state["exists"]:
+                return MagicMock(ok=True, stdout="")
+            return MagicMock(
+                ok=True,
+                stdout="running\n" if state["running"] else "exited\n")
+        if runtime._GUEST_PROBE_MARKER in command:
+            return MagicMock(
+                ok=True,
+                stdout=f"{runtime._GUEST_PROBE_MARKER}{guests}\n")
         if "docker inspect" in command and ".Mounts" in command:
+            if not state["exists"]:
+                return MagicMock(ok=False, stdout="")
             bind_dirs = runtime._collect_bind_mount_dirs(
                 _os.path.abspath(runtime.project_dir or _os.getcwd()))
             mounts = [{"Source": d, "Destination": d, "RW": True}
                       for d in bind_dirs]
+            if persisted:
+                mounts += [
+                    {"Source": runtime._state_host_dir(subdir),
+                     "Destination": container_path, "RW": True}
+                    for subdir, container_path in runtime._PERSISTED_STATE
+                ]
             return MagicMock(ok=True, stdout=_json.dumps(mounts))
         if "docker inspect" in command:
-            return MagicMock(ok=True, stdout="true\n" if running else "false\n")
+            return MagicMock(
+                ok=True, stdout="true\n" if state["running"] else "false\n")
         return MagicMock(ok=True, stdout="")
 
     return _dispatch
+
+
+def _compose_up_call(mock_run):
+    """The ``docker compose ... up`` call recorded by *mock_run*."""
+    for call in mock_run.call_args_list:
+        cmd = call.args[0]
+        if "compose" in cmd and " up " in f" {cmd} ":
+            return call
+    raise AssertionError(
+        f"no compose-up call in "
+        f"{[c.args[0] for c in mock_run.call_args_list]}")
 
 
 class TestDockerComposeRuntime:
@@ -356,14 +401,7 @@ class TestDockerComposeRuntime:
              patch.object(rt, "_write_env_file"), \
              patch.object(rt, "_log_compose_file"), \
              patch.object(rt, "verify_workdirs_accessible"):
-            mock_not_running = MagicMock(ok=True, stdout="false\n")
-            mock_compose_up = MagicMock(ok=True)
-            mock_running = MagicMock(ok=True, stdout="true\n")
-            mock_virsh = MagicMock(ok=True)
-            mock_run.side_effect = [
-                mock_not_running, mock_compose_up,
-                mock_running, mock_virsh,
-            ]
+            mock_run.side_effect = _docker_cmd_dispatch(rt, running=False)
 
             rt.ensure_ready()
 
@@ -382,9 +420,7 @@ class TestDockerComposeRuntime:
              patch.object(rt, "_write_bind_mount_override"), \
              patch.object(rt, "_write_env_file"), \
              patch.object(rt, "_log_compose_file"):
-            mock_not_running = MagicMock(ok=True, stdout="false\n")
-            mock_compose_up = MagicMock(ok=True)
-            mock_run.side_effect = [mock_not_running, mock_compose_up]
+            mock_run.side_effect = _docker_cmd_dispatch(rt, running=False)
 
             with pytest.raises(RuntimeError, match="did not start"):
                 rt.ensure_ready()
@@ -612,19 +648,11 @@ class TestDockerComposeRuntime:
              patch.object(rt, "_write_env_file"), \
              patch.object(rt, "_log_compose_file"), \
              patch.object(rt, "verify_workdirs_accessible"):
-            mock_not_running = MagicMock(ok=True, stdout="false\n")
-            mock_compose_up = MagicMock(ok=True)
-            mock_running = MagicMock(ok=True, stdout="true\n")
-            mock_virsh = MagicMock(ok=True)
-            mock_run.side_effect = [
-                mock_not_running, mock_compose_up,
-                mock_running, mock_virsh,
-            ]
+            mock_run.side_effect = _docker_cmd_dispatch(rt, running=False)
 
             rt.ensure_ready()
 
-            compose_call = mock_run.call_args_list[1]
-            env_kwarg = compose_call.kwargs.get("env", {})
+            env_kwarg = _compose_up_call(mock_run).kwargs.get("env", {})
             assert env_kwarg.get("BOXMAN_PROJECT_DIR") == "/home/user/my-project"
             assert "BOXMAN_DATA_DIR" in env_kwarg
             assert "HOST_UID" in env_kwarg
@@ -652,14 +680,7 @@ class TestDockerComposeRuntime:
              patch.object(rt, "_write_env_file"), \
              patch.object(rt, "_log_compose_file"), \
              patch.object(rt, "verify_workdirs_accessible"):
-            mock_not_running = MagicMock(ok=True, stdout="false\n")
-            mock_compose_up = MagicMock(ok=True)
-            mock_running = MagicMock(ok=True, stdout="true\n")
-            mock_virsh = MagicMock(ok=True)
-            mock_run.side_effect = [
-                mock_not_running, mock_compose_up,
-                mock_running, mock_virsh,
-            ]
+            mock_run.side_effect = _docker_cmd_dispatch(rt, running=False)
 
             rt.ensure_ready()
 

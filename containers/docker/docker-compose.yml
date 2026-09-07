@@ -28,6 +28,13 @@ services:
       - ${BOXMAN_DATA_DIR:-./data}/images:/var/lib/libvirt/images
       - ${BOXMAN_DATA_DIR:-./data}/libvirt-run:/var/run/libvirt
       - ${BOXMAN_DATA_DIR:-./data}/ssh:/etc/boxman/ssh
+      # libvirt's own state: domain and network XML, snapshot metadata,
+      # NVRAM and saved state. Without these two the writable layer holds
+      # them and every container recreate discards the lot (#164 FB-2).
+      # entrypoint.sh seeds either directory from the image when it is
+      # mounted empty, so a first run still gets a configured libvirtd.
+      - ${BOXMAN_DATA_DIR:-./data}/etc-libvirt:/etc/libvirt
+      - ${BOXMAN_DATA_DIR:-./data}/var-lib-libvirt-qemu:/var/lib/libvirt/qemu
       - ../../:/boxman
 
     cap_add:

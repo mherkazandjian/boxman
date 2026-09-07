@@ -407,6 +407,14 @@ def _main():
                 manager.runtime_instance.workdirs = workdirs
                 manager.prepare_runtime_workdirs(workdirs)
 
+            # --force on provision/up already means "deprovision what is
+            # there first", so it is also the authorisation to recreate the
+            # runtime container while guests are running inside it
+            # (#164 FB-2). Verbs without --force refuse instead: the fix
+            # for `boxman ps` hitting a recreate is not to kill a guest.
+            manager.runtime_instance.allow_recreate = bool(
+                getattr(args, 'force', False))
+
         # Handle destroy-runtime — tear down Docker resources without
         # starting the container first
         if args.handler == 'destroy_runtime':

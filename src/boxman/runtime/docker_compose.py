@@ -22,6 +22,7 @@ import yaml as pyyaml
 from boxman import log
 from boxman.exceptions import ProvisionError
 from boxman.runtime.base import RuntimeBase
+from boxman.runtime.tar_stream import ArchiveError, extract_archive
 from boxman.utils.compose_names import sanitize_project_name
 from boxman.utils.shell import run as _shell_run
 
@@ -63,6 +64,13 @@ class DockerComposeRuntime(RuntimeBase):
         #: list[str]: workdirs from conf.yml (one per cluster) that need
         #: to be accessible inside the container; set by the manager
         self.workdirs: list = self.config.get("workdirs", [])
+
+        #: bool: whether destroying and recreating the runtime container is
+        #: authorised even though guests may be running inside it. Default
+        #: False; the manager raises it for verbs whose whole purpose is
+        #: destruction, and ``--force`` raises it on provision/up.
+        self.allow_recreate: bool = bool(
+            self.config.get("allow_recreate", False))
 
     @property
     def project_name(self) -> str | None:
@@ -364,6 +372,396 @@ class DockerComposeRuntime(RuntimeBase):
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # persisted libvirt state (#164 FB-2, FB-11)
+    # ------------------------------------------------------------------
+
+    #: ``(host subdirectory, container path)`` for the trees holding
+    #: libvirt's own state: domain and network XML, snapshot metadata,
+    #: NVRAM and saved state. ``docker-compose.yml`` bind-mounts both. A
+    #: container created before those mounts existed keeps them in its
+    #: writable layer instead, where the next recreate discards them.
+    _PERSISTED_STATE: tuple[tuple[str, str], ...] = (
+        ("etc-libvirt", "/etc/libvirt"),
+        ("var-lib-libvirt-qemu", "/var/lib/libvirt/qemu"),
+    )
+
+    #: Written into the data dir only once *every* state tree has been
+    #: renamed into place. Files at the destination are never the
+    #: completion signal — an interrupted copy leaves plenty of them.
+    _STATE_MARKER = ".libvirt-state-migrated"
+
+    #: Suffix of the directory a tree is extracted into before its rename.
+    _STAGING_SUFFIX = ".staging"
+
+    #: Container states in which no guest can be running. Anything else —
+    #: ``paused``, ``restarting``, ``removing``, or a state docker adds
+    #: later — is treated as "may have guests", which refuses.
+    _STATES_WITHOUT_GUESTS = frozenset({"created", "exited", "dead"})
+
+    #: Marker the in-container probe prints. A count is trusted only when
+    #: this line is present: ``docker exec`` overloads exit status 1 for
+    #: its own failures, so no exit status may be read as "no guests".
+    _GUEST_PROBE_MARKER = "BOXMAN_GUEST_PROBE:"
+
+    #: Counts QEMU processes by **name**, never by command line: matching
+    #: the command line would count the probe's own shell, since the
+    #: pattern appears in it, and every empty runtime would report a guest.
+    #: ``comm`` is truncated to 15 characters, so ``qemu-system-x86_64``
+    #: appears as ``qemu-system-x86`` — hence a prefix anchor with no tail.
+    #:
+    #: ``pgrep`` exits 0 when it matched and 1 when it did not; anything
+    #: else (127 for a missing pgrep, 2 usage, 3 fatal) is a probe that did
+    #: not complete and exits 9 without printing, so the marker is only
+    #: ever emitted after a probe that actually ran.
+    _GUEST_PROBE_SCRIPT = (
+        'n=$(pgrep -c "^qemu-(kvm|system-)" 2>/dev/null); st=$?; '
+        '[ "$st" -eq 0 ] || [ "$st" -eq 1 ] || exit 9; '
+        '[ "$st" -eq 1 ] && n=0; '
+        'echo "BOXMAN_GUEST_PROBE:${n}"'
+    )
+
+    def _data_dir(self) -> str:
+        """
+        The one derivation of ``BOXMAN_DATA_DIR`` (#164 FB-11).
+
+        Both the ``.env`` file and the environment ``docker compose`` is
+        invoked with must name the same directory. They used to disagree
+        for a user-supplied compose file — the process environment took it
+        from the compose file's directory, ``.env`` from the runtime dir —
+        so the container mounted one directory while every host-side
+        consumer, the ProxyJump ``IdentityFile`` included, looked in the
+        other.
+        """
+        return os.path.abspath(
+            os.path.join(self._get_local_runtime_dir(), "data"))
+
+    def _state_host_dir(self, subdir: str) -> str:
+        """Host directory bind-mounted at one of the state trees."""
+        return os.path.join(self._data_dir(), subdir)
+
+    def _state_marker_path(self) -> str:
+        """Path of the marker that makes a migrated destination trusted."""
+        return os.path.join(self._data_dir(), self._STATE_MARKER)
+
+    def _container_state(self) -> str | None:
+        """
+        The container's docker state, ``""`` when there is no such
+        container, or ``None`` when the state could not be determined.
+
+        ``None`` means *unknown* — never *absent*, never *stopped*. A
+        caller deciding whether it is safe to destroy a container must not
+        read a docker failure as "there is nothing there", which is why
+        this exists alongside :meth:`_container_is_running` rather than
+        reusing it: that one answers False to both questions.
+        """
+        try:
+            result = _shell_run(
+                f"docker ps -a --no-trunc "
+                f"--filter name=^{self.container_name}$ "
+                f"--format '{{{{.State}}}}'",
+                hide=True, warn=True,
+            )
+        except Exception:
+            return None
+        if not result.ok:
+            return None
+        lines = [ln.strip() for ln in (result.stdout or "").splitlines()
+                 if ln.strip()]
+        return lines[0] if lines else ""
+
+    def _running_guest_count(self) -> int | None:
+        """
+        Number of QEMU guests running inside the container, or ``None``
+        when the probe could not answer.
+
+        Acceptance needs both a clean ``docker exec`` **and** the marker
+        line: a non-zero exec status, a missing line or an unparsable
+        count are all unknown state, which callers refuse on exactly as
+        they would on a positive count.
+        """
+        try:
+            result = _shell_run(
+                docker_exec_wrap(
+                    self._GUEST_PROBE_SCRIPT, self.container_name),
+                hide=True, warn=True,
+            )
+        except Exception as exc:
+            self.logger.warning(f"guest probe could not run: {exc}")
+            return None
+        if not result.ok:
+            return None
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if not line.startswith(self._GUEST_PROBE_MARKER):
+                continue
+            raw = line[len(self._GUEST_PROBE_MARKER):].strip()
+            try:
+                return int(raw)
+            except ValueError:
+                self.logger.warning(
+                    f"guest probe returned an unparsable count: {raw!r}")
+                return None
+        return None
+
+    def _assert_no_running_guests(self, action: str) -> None:
+        """
+        Refuse *action* while the container may be running guests.
+
+        ``allow_recreate`` is the override, and it is read here rather than
+        after anything has been stopped. Unknown state refuses like a
+        positive count does: the question "are guests running?" has no safe
+        default answer of "no".
+        """
+        state = self._container_state()
+        if state == "":
+            return
+        if state is None:
+            problem = ("boxman could not determine whether the runtime "
+                       "container exists")
+        elif state in self._STATES_WITHOUT_GUESTS:
+            return
+        elif state == "running":
+            count = self._running_guest_count()
+            if count == 0:
+                return
+            problem = (
+                f"{count} QEMU guest(s) are running inside it"
+                if count is not None else
+                "boxman could not determine whether guests are running "
+                "inside it")
+        else:
+            problem = (
+                f"the container is {state!r}, a state in which guests may "
+                f"still be running")
+
+        if self.allow_recreate:
+            self.logger.warning(
+                f"{action} would destroy the runtime container and "
+                f"{problem} — proceeding anyway because recreation was "
+                f"explicitly authorised")
+            return
+
+        raise ProvisionError(
+            f"refusing to {action}: it destroys the runtime container "
+            f"'{self.container_name}' and {problem}. Shut the guests down "
+            f"first (boxman control suspend, or boxman down), or re-run "
+            f"with --force to recreate the container regardless.")
+
+    def _state_is_persisted(self) -> bool:
+        """
+        Whether libvirt's state already lives outside the writable layer.
+
+        A live container answers directly, from its own mount table: if
+        both trees are bind-mounted, they survive a recreate and there is
+        nothing to migrate. Only when no mount table is available does the
+        marker decide.
+        """
+        mounts = self._container_mounts()
+        if mounts is not None:
+            return all(
+                self._mount_provides(
+                    mounts, self._state_host_dir(subdir), container_path)
+                for subdir, container_path in self._PERSISTED_STATE
+            )
+        return os.path.isfile(self._state_marker_path())
+
+    def _destination_is_populated(self) -> bool:
+        """Whether anything is already sitting at the migration target."""
+        for subdir, _ in self._PERSISTED_STATE:
+            path = self._state_host_dir(subdir)
+            if os.path.isdir(path) and os.listdir(path):
+                return True
+            if os.path.exists(path + self._STAGING_SUFFIX):
+                return True
+        return False
+
+    def _discard_untrusted_state(self) -> None:
+        """
+        Remove everything at the destination before a migration writes it.
+
+        With the marker absent nothing there is trusted, and that has to
+        include trees already renamed into place: the crash window runs
+        from the first rename to the marker, so a retry can find one tree
+        complete, one staged and no marker. Both are discarded and the
+        migration restarts from the container, which is still there
+        precisely because the marker does not exist yet.
+        """
+        for subdir, _ in self._PERSISTED_STATE:
+            for path in (self._state_host_dir(subdir),
+                         self._state_host_dir(subdir) + self._STAGING_SUFFIX):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                elif os.path.lexists(path):
+                    os.unlink(path)
+
+    def _copy_state_out(self, container_path: str, archive_path: str) -> None:
+        """
+        Stream *container_path* out of the container as a tar archive.
+
+        ``docker cp`` rather than ``docker exec``: the container is stopped
+        by the time this runs, and ``exec`` needs a running one.
+        """
+        source = f"{self.container_name}:{container_path}"
+        result = _shell_run(
+            f"docker cp {shlex.quote(source)} - "
+            f"> {shlex.quote(archive_path)}",
+            hide=True, warn=True,
+        )
+        if not result.ok:
+            raise ProvisionError(
+                f"failed to copy {container_path} out of "
+                f"'{self.container_name}': "
+                f"{(result.stderr or '').strip() or 'docker cp failed'}")
+
+    def _migrate_libvirt_state(self, compose_path: str,
+                               compose_dir: str) -> None:
+        """
+        Move libvirt's state out of the container's writable layer and
+        onto the host, so a recreate stops discarding it (#164 FB-2).
+
+        Ordering matters and is the point of the method: authorise, probe,
+        **stop** (never ``down`` — the writable layer has to survive until
+        the copy is accepted), copy, validate, stage, rename both trees,
+        and only then write the marker. Nothing is removed on any failure
+        path: a refusal leaves the stopped container holding the only copy.
+        """
+        self._assert_no_running_guests("migrate libvirt state")
+
+        self.logger.info(
+            f"migrating libvirt state out of '{self.container_name}' so it "
+            f"survives a container recreate")
+
+        # stop, never down: down removes the container, and with it the
+        # writable layer this copy reads from.
+        _shell_run(
+            f"{self._compose_base_cmd(compose_path, compose_dir)} stop",
+            hide=False, warn=True,
+        )
+
+        os.makedirs(self._data_dir(), exist_ok=True)
+        self._discard_untrusted_state()
+
+        staged: list[tuple[str, str, str]] = []
+        with tempfile.TemporaryDirectory(prefix="boxman-libvirt-state-") as tmp:
+            for subdir, container_path in self._PERSISTED_STATE:
+                archive = os.path.join(tmp, f"{subdir}.tar")
+                self._copy_state_out(container_path, archive)
+                staging = self._state_host_dir(subdir) + self._STAGING_SUFFIX
+                try:
+                    extract_archive(archive, staging)
+                except ArchiveError as exc:
+                    raise ProvisionError(
+                        f"the copy of {container_path} out of "
+                        f"'{self.container_name}' did not complete: {exc}. "
+                        f"The container was left in place and still holds "
+                        f"the only copy — re-run the same command to retry."
+                    ) from exc
+                # docker cp roots the archive at the source's basename
+                inner = os.path.join(
+                    staging, os.path.basename(container_path))
+                if not os.path.isdir(inner):
+                    raise ProvisionError(
+                        f"the archive of {container_path} does not contain "
+                        f"the expected {os.path.basename(container_path)}/ "
+                        f"directory; refusing to migrate")
+                staged.append((subdir, staging, inner))
+
+        # Every tree is complete on disk before any of them is renamed, so
+        # a failure in the second copy cannot leave the first one accepted.
+        for subdir, staging, inner in staged:
+            os.rename(inner, self._state_host_dir(subdir))
+            shutil.rmtree(staging, ignore_errors=True)
+
+        with open(self._state_marker_path(), "w") as fobj:
+            fobj.write(
+                f"migrated from container {self.container_name}\n"
+                f"trees: "
+                f"{', '.join(p for _, p in self._PERSISTED_STATE)}\n")
+
+        self.logger.info(
+            "libvirt state migrated; it now lives on the host and "
+            "survives a container recreate")
+
+    def _ensure_state_persisted(self, compose_path: str,
+                                compose_dir: str) -> None:
+        """
+        Bring libvirt's state under the persistence mounts, migrating it
+        out of an existing container when it is still in the writable layer.
+        """
+        if self._state_is_persisted():
+            return
+
+        state = self._container_state()
+
+        if state is None:
+            raise ProvisionError(
+                f"cannot tell whether the runtime container "
+                f"'{self.container_name}' exists, so boxman cannot tell "
+                f"whether it holds libvirt state that a recreate would "
+                f"destroy. Check that the docker daemon is reachable.")
+
+        if state == "":
+            # No container: nothing to migrate. A destination that is
+            # nonetheless populated has no trustworthy provenance and no
+            # source to re-migrate from, so it is the user's call.
+            if self._destination_is_populated() and not os.path.isfile(
+                    self._state_marker_path()):
+                raise ProvisionError(
+                    f"{self._data_dir()} already holds libvirt state, but "
+                    f"not the {self._STATE_MARKER} marker that says a "
+                    f"migration finished, and no container remains to "
+                    f"migrate from. The state may be incomplete. Inspect "
+                    f"it and either remove the etc-libvirt and "
+                    f"var-lib-libvirt-qemu directories to start clean, or "
+                    f"create the marker file to accept them as they are.")
+            return
+
+        if state == "running" and self._running_guest_count() != 0:
+            # Migrating means stopping the container, which stops the
+            # guests. That is the user's call to schedule, not boxman's to
+            # force in the middle of an unrelated command.
+            self.logger.warning(
+                f"libvirt state in '{self.container_name}' is still in the "
+                f"container's writable layer and a recreate would discard "
+                f"every domain, network and snapshot. Migrating it needs "
+                f"the container stopped, and guests are running (or their "
+                f"state is unknown). Run 'boxman down', then any boxman "
+                f"command, to migrate — or 'boxman up --force' to migrate "
+                f"now and recreate regardless.")
+            return
+
+        self._migrate_libvirt_state(compose_path, compose_dir)
+
+    def _assert_no_stranded_data_dir(self, compose_dir: str) -> None:
+        """
+        Refuse to start against an empty data dir while a populated one
+        sits where boxman used to derive it (#164 FB-11).
+
+        The two derivations have been unified onto :meth:`_data_dir`, which
+        moves the directory for anyone using a compose file outside
+        ``.boxman``. Their images and generated SSH identity are still in
+        the old one. Moving it is not boxman's call — ``images`` can be
+        tens of gigabytes and the destination may be on another filesystem
+        — so name the directory instead of silently starting empty.
+        """
+        legacy = os.path.abspath(os.path.join(compose_dir, "data"))
+        current = self._data_dir()
+        if legacy == current:
+            return
+        if not os.path.isdir(legacy) or not os.listdir(legacy):
+            return
+        if os.path.isdir(current) and os.listdir(current):
+            return
+        raise ProvisionError(
+            f"boxman now keeps its runtime data in {current}, but the "
+            f"previous location {legacy} still holds this instance's "
+            f"images and SSH identity while the new one is empty. Move it "
+            f"before continuing:\n"
+            f"    mv {legacy} {current}\n"
+            f"(the two disagreed before: the container mounted the old "
+            f"path while host-side lookups used the new one — #164 FB-11)")
+
     def ensure_ready(self) -> None:
         """
         Make sure the docker-compose environment is up and healthy.
@@ -374,6 +772,13 @@ class DockerComposeRuntime(RuntimeBase):
 
         # Collect directories to bind-mount and make them visible inside
         # the container before starting.
+        # Both of these run before anything is stopped: one refuses a
+        # relocation that would silently start against an empty data dir,
+        # the other moves libvirt's own state out of the writable layer
+        # while the container that holds it is still there.
+        self._assert_no_stranded_data_dir(compose_dir)
+        self._ensure_state_persisted(compose_path, compose_dir)
+
         bind_dirs = self._collect_bind_mount_dirs(abs_project_dir)
         if self._is_boxman_owned_compose(compose_path):
             # boxman owns this copy — mutate it in place and drop the
@@ -430,11 +835,16 @@ class DockerComposeRuntime(RuntimeBase):
                     self.logger.warning(
                         f"container is running but libvirtd is not "
                         f"responsive ({exc}) — recreating...")
+                    self._assert_no_running_guests(
+                        "recreate the container because libvirtd is "
+                        "unresponsive")
                     self._stop_compose(compose_path, compose_dir)
             else:
                 self.logger.info(
                     "some bind-mount dirs are NOT accessible "
                     "inside container — recreating...")
+                self._assert_no_running_guests(
+                    "recreate the container to apply missing bind mounts")
                 self._stop_compose(compose_path, compose_dir)
 
         self.logger.info(
@@ -442,8 +852,7 @@ class DockerComposeRuntime(RuntimeBase):
             f"(compose file: {compose_path})")
 
         try:
-            data_dir = os.path.join(compose_dir, "data")
-            abs_data_dir = os.path.abspath(data_dir)
+            abs_data_dir = self._data_dir()
             host_uid = os.getuid()
             host_gid = os.getgid()
 
@@ -669,7 +1078,17 @@ class DockerComposeRuntime(RuntimeBase):
         boxman_dir = os.path.join(base, ".boxman")
         plan["boxman_dir"] = boxman_dir
         if os.path.isdir(boxman_dir):
-            plan["actions"].append(f"remove directory tree {boxman_dir}")
+            # .boxman now holds libvirt's own state as well as images and
+            # keys (#164 FB-2), so removing it destroys every domain,
+            # network and snapshot. The confirmation prompt has to say so.
+            detail = ""
+            if any(os.path.isdir(self._state_host_dir(subdir))
+                   for subdir, _ in self._PERSISTED_STATE):
+                detail = (" — this includes libvirt's own state, so every "
+                          "domain, network and snapshot definition goes "
+                          "with it")
+            plan["actions"].append(
+                f"remove directory tree {boxman_dir}{detail}")
             plan["paths_to_delete"].append(boxman_dir)
 
         return plan
@@ -970,7 +1389,7 @@ class DockerComposeRuntime(RuntimeBase):
         return its path.
         """
         os.makedirs(runtime_dir, exist_ok=True)
-        abs_data_dir = os.path.abspath(os.path.join(runtime_dir, "data"))
+        abs_data_dir = self._data_dir()
         if abs_project_dir is None:
             abs_project_dir = os.path.abspath(self.project_dir or os.getcwd())
         env_path = os.path.join(runtime_dir, ".env")
