@@ -142,3 +142,50 @@ class TestIsoBootVMCreate:
         mock_run.side_effect = [_result(ok=True), _result(ok=False, stderr="permission denied")]
         vm = _make_iso_vm(tmp_path)
         assert vm.create() is False
+
+
+class TestNetworkMacPinning:
+    """``networks[].mac`` pins the first NIC's MAC at virt-install time."""
+
+    def test_mac_from_raw_networks(self, tmp_path):
+        vm = _make_iso_vm(
+            tmp_path, networks=[{"name": "pvenet", "mac": "52:54:00:77:00:11"}])
+        assert vm._network_specs() == [{"name": "pvenet", "mac": "52:54:00:77:00:11"}]
+        assert vm._networks() == ["pvenet"]
+
+    def test_mac_from_resolved_dict_entries(self, tmp_path):
+        full = "bprj__p__bprj__clstr__pve__clstr__pvenet"
+        vm = _make_iso_vm(
+            tmp_path,
+            networks=[{"name": "pvenet", "mac": "00:00:00:00:00:01"}],
+            _resolved_networks=[{"name": full, "mac": "52:54:00:77:00:11"}],
+        )
+        assert vm._network_specs() == [{"name": full, "mac": "52:54:00:77:00:11"}]
+
+    def test_resolved_string_entries_have_no_mac(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, _resolved_networks=["bprj__p__net"])
+        assert vm._network_specs() == [{"name": "bprj__p__net", "mac": None}]
+
+    def test_empty_resolved_and_raw_lists_fall_back_to_default(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, networks=[], _resolved_networks=[])
+        assert vm._network_specs() == [{"name": "default", "mac": None}]
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_mac_is_passed_to_virt_install(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        full = "bprj__p__bprj__clstr__pve__clstr__pvenet"
+        vm = _make_iso_vm(
+            tmp_path, _resolved_networks=[{"name": full, "mac": "52:54:00:77:00:11"}])
+        vm.create()
+        virt_install_call = mock_run.call_args_list[1][0][0]
+        assert (f"--network=network={full},model=virtio,mac=52:54:00:77:00:11"
+                in virt_install_call)
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_no_mac_keeps_plain_network_arg(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path, _resolved_networks=[{"name": "n1", "mac": None}])
+        vm.create()
+        virt_install_call = mock_run.call_args_list[1][0][0]
+        assert "--network=network=n1,model=virtio" in virt_install_call
+        assert ",mac=" not in virt_install_call

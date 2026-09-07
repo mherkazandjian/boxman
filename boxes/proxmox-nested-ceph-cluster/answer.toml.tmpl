@@ -1,0 +1,34 @@
+# Proxmox VE automated-installation answer file (template).
+# `make answer` substitutes __PWHASH__ (openssl passwd -6 of PVE_ROOT_PASSWORD)
+# and __PUBKEY__ (the lab public key) into answer.toml, which prepare-iso.sh
+# bakes into the ISO. One generic ISO serves every node: identity comes from
+# DHCP (hpe1's libvirt reservations hand out the IP *and* the hostname).
+# Reference: https://pve.proxmox.com/wiki/Automated_Installation
+
+[global]
+keyboard = "en-us"
+country = "lb"
+timezone = "Asia/Beirut"
+mailto = "root@pve.lab"
+# hostname from DHCP option 12; the domain fallback is required because
+# libvirt's dnsmasq sends no domain option
+fqdn = { source = "from-dhcp", domain = "pve.lab" }
+root-password-hashed = "__PWHASH__"
+root-ssh-keys = ["__PUBKEY__"]
+reboot-on-error = false
+# power off instead of rebooting: virt-install's transient install domain ends
+# either way, and a shut-off domain is exactly what the next `boxman up`
+# starts from disk (persistent config: boot hd first, install media ejected)
+reboot-mode = "power-off"
+
+[network]
+source = "from-dhcp"
+
+[disk-setup]
+filesystem = "ext4"
+# only the boot disk; vdb/vdc are the Ceph OSDs and must stay untouched
+disk-list = ["vda"]
+
+[first-boot]
+source = "from-iso"
+ordering = "fully-up"

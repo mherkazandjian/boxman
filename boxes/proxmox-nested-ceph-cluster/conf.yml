@@ -1,0 +1,159 @@
+{#
+  proxmox-nested-ceph-cluster
+  ===========================
+
+  Four Proxmox VE nodes as nested-KVM guests, two per physical host, forming
+  one Proxmox cluster with Ceph across the two hosts. The same file renders
+  for either host; pick the site with BOXMAN_SITE (defaults to hpe1):
+
+      BOXMAN_SITE=hpe1 boxman up      # on hpe1: pve1 + pve2
+      BOXMAN_SITE=hpe2 boxman up      # on hpe2: pve3 + pve4
+
+  The two sites share one L2 (10.77.0.0/24) through a point-to-point VXLAN
+  that scripts/vxlan-up.sh enslaves to each site's bridge:
+
+    hpe1: libvirt `mode: nat` network on bridge virbr-pve — its dnsmasq is
+          the DHCP/DNS/default-route provider for the WHOLE L2, including the
+          nodes on hpe2, and holds the reservations that give every node its
+          hostname (the auto-installer takes the FQDN from DHCP).
+    hpe2: a plain shared bridge br-pve, referenced through a `mode: bridge`
+          network (no dnsmasq, no addresses — hpe1 serves it over the VXLAN).
+
+  Nodes boot the Proxmox auto-install ISO built by scripts/prepare-iso.sh,
+  install unattended, power off, and come up from disk on the next
+  `boxman up`. See README.md for the full flow and the Makefile driver.
+#}
+{% set site = env("BOXMAN_SITE") or "hpe1" %}   {# unset *or empty* -> hpe1 #}
+{% set lab = env("PVE_LAB_DIR", default="/home/mher/pve-lab") %}
+{% set iso = env("PVE_LAB_ISO", default=lab ~ "/iso/proxmox-ve_9.2-1-auto.iso") %}
+{% set key = env("PVE_LAB_KEY", default=lab ~ "/keys/id_ed25519_pvelab") %}
+{% set scripts = env("BOXMAN_CONF_DIR") ~ "/scripts" %}
+{#- one node table for both sites: the hpe1 network reserves every MAC #}
+{% set nodes = [
+     {'name': 'pve1', 'site': 'hpe1', 'mac': '52:54:00:77:00:11', 'ip': '10.77.0.11'},
+     {'name': 'pve2', 'site': 'hpe1', 'mac': '52:54:00:77:00:12', 'ip': '10.77.0.12'},
+     {'name': 'pve3', 'site': 'hpe2', 'mac': '52:54:00:77:00:13', 'ip': '10.77.0.13'},
+     {'name': 'pve4', 'site': 'hpe2', 'mac': '52:54:00:77:00:14', 'ip': '10.77.0.14'},
+   ] %}
+version: '1.0'
+project: pvelab
+
+provider:
+  libvirt:
+    uri: qemu:///system
+    use_sudo: false
+    virt_install_cmd: /usr/bin/virt-install
+    virt_clone_cmd: /usr/bin/virt-clone
+    virsh_cmd: /usr/bin/virsh
+
+workspace:
+  path: {{ lab }}/ws
+
+{% if site == 'hpe2' %}
+# Host-owned bridge that scripts/vxlan-up.sh creates (and enslaves the VXLAN
+# to) BEFORE `boxman up`, so the installers find hpe1's DHCP from their first
+# boot. boxman adopts it, re-asserts mtu/stp, and never tears it down.
+shared_networks:
+  pvelab:
+    bridge: br-pve
+    stp: false
+    mtu: 1450               # VXLAN over a 1500-byte VLAN: 50 bytes of overhead
+{% endif %}
+
+clusters:
+  pve:
+    workdir: {{ lab }}/vms
+    admin_user: root
+    # Pre-generated lab key (make keys; synced to every host). The auto-install
+    # answer file authorises its public half for root, and boxman's ssh_config
+    # points at it. Absolute so `boxman destroy` (which wipes the workspace)
+    # cannot take it with it. Deliberately no admin_pass: the ISO path has no
+    # login to push keys into, `boxman up` reports that and carries on.
+    admin_key_name: {{ key }}
+    ssh_config: ssh_config
+
+    networks:
+      pvenet:
+{% if site == 'hpe1' %}
+        mode: nat
+        bridge:
+          name: virbr-pve   # libvirt creates it; vxlan-up.sh enslaves the VXLAN afterwards
+          stp: 'off'
+          delay: '0'
+        mac: '52:54:00:77:00:01'
+        ip:
+          address: '10.77.0.1'
+          netmask: '255.255.255.0'
+          dhcp:
+            range:
+              start: '10.77.0.100'       # nested (L2) demo VMs
+              end: '10.77.0.199'
+            hosts:
+{% for n in nodes %}
+              - mac: '{{ n.mac }}'
+                ip: '{{ n.ip }}'
+                name: {{ n.name }}       # DHCP option 12 -> installer FQDN {{ n.name }}.pve.lab
+{% endfor %}
+              - mac: '52:54:00:77:00:50'
+                ip: '10.77.0.50'
+                name: demo01             # the nested VM created by scripts/pve-demo-vm.sh
+{% else %}
+        mode: bridge
+        bridge:
+          name: br-pve      # the shared bridge above; hpe1's dnsmasq serves it over the VXLAN
+{% endif %}
+
+    vms:
+{% for n in nodes if n.site == site %}
+      {{ n.name }}:
+        hostname: {{ n.name }}
+        vcpus: 16                # flat int: ISO-boot VMs are sized at virt-install time
+        memory: 32768
+        boot_order: [cdrom, hd]  # selects the ISO-boot path; firmware order is hd,cdrom
+        disk_size: 64G           # /dev/vda, the only disk the answer file lets the installer use
+        networks:
+          - name: pvenet
+            mac: '{{ n.mac }}'   # matches the hpe1 DHCP reservation -> fixed IP + hostname
+        cdroms:
+          - source: {{ iso }}
+        disks:                   # Ceph OSDs (MiB); left alone by the installer
+          - name: osd1
+            driver: { name: qemu, type: qcow2 }
+            target: vdb
+            size: 65536
+          - name: osd2
+            driver: { name: qemu, type: qcow2 }
+            target: vdc
+            size: 65536
+        virt_install_extra_args:
+          - '--cpu host-passthrough'     # expose svm so the node runs KVM guests itself
+          - '--channel unix,target_type=virtio,name=org.qemu.guest_agent.0'
+{% endfor %}
+
+# Per-host helpers, runnable as `BOXMAN_SITE=<site> boxman run <task>` on the
+# host itself; the Makefile drives the same scripts from a workstation.
+tasks:
+  vxlan-up:
+    description: "stretch the lab L2 to the peer host (idempotent; run after `boxman up` on hpe1, before it on hpe2)"
+    command: bash {{ scripts }}/vxlan-up.sh
+  wait-installed:
+    description: "block until this site's nodes finished the unattended install (domains shut off)"
+    command: bash {{ scripts }}/wait-installed.sh
+  wait-first-boot:
+    description: "block until every node's first-boot hook wrote its marker (run from hpe1)"
+    command: bash {{ scripts }}/wait-first-boot.sh
+  cluster:
+    description: "form the 4-node Proxmox cluster (run from hpe1)"
+    command: bash {{ scripts }}/pve-cluster.sh
+  ceph:
+    description: "install Ceph, 3 mons, 8 OSDs, replicated pool vmpool (run from hpe1)"
+    command: bash {{ scripts }}/pve-ceph.sh
+  demo-vm:
+    description: "create the nested Ubuntu VM demo01 on pve1 backed by vmpool (run from hpe1)"
+    command: bash {{ scripts }}/pve-demo-vm.sh
+  migrate:
+    description: "live-migrate demo01 to another node, e.g. `boxman run migrate -- pve3` (run from hpe1)"
+    command: bash {{ scripts }}/pve-migrate.sh
+  mtu-check:
+    description: "verify the 1450-byte path MTU across the VXLAN (run from hpe1)"
+    command: bash {{ scripts }}/mtu-check.sh

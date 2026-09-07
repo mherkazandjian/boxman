@@ -393,8 +393,12 @@ class VirshEdit:
             true if successful, false otherwise
         """
         try:
-            # get current xml
-            xml_content = self.get_domain_xml(domain_name)
+            # Edit the persistent definition, never the live one. A direct-boot
+            # (ISO/PXE) VM is still running virt-install's *transient* install
+            # XML when this runs (cdrom-first, on_reboot=destroy, install media
+            # inserted); redefining from the live XML would persist that and
+            # make the guest re-run the installer on every boot.
+            xml_content = self.get_domain_xml(domain_name, inactive=True)
 
             # debug: log current cpu configuration
             tree = etree.fromstring(xml_content.encode('utf-8'))
