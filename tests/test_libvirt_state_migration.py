@@ -929,20 +929,38 @@ class TestSecondReviewRegressions:
 
         assert not any("docker cp" in c for c in calls)
 
+    @staticmethod
+    def _blind_mount_table(rt):
+        def _run(command, *_a, **_kw):
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=False, stdout="")
+            return MagicMock(ok=True, stdout="exited\n")
+        return _run
+
     def test_an_unreadable_mount_table_with_a_marker_is_accepted(self,
                                                                  tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        rt._prepare_data_dir()
+        open(rt._state_marker_path(), "w").close()
+
+        with patch("invoke.run", side_effect=self._blind_mount_table(rt)):
+            rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+    def test_a_marker_without_its_trees_is_not_accepted(self, tmp_path):
+        """The marker survives whatever happens to the directories it
+        names, so on its own it cannot say they are still there. Accepting
+        it would start a container over absent state and let the entrypoint
+        seed the directories empty."""
         rt = _runtime(tmp_path)
         compose = str(tmp_compose(rt))
         os.makedirs(rt._data_dir(), exist_ok=True)
         open(rt._state_marker_path(), "w").close()
 
-        def _run(command, *_a, **_kw):
-            if "docker inspect" in command and ".Mounts" in command:
-                return MagicMock(ok=False, stdout="")
-            return MagicMock(ok=True, stdout="exited\n")
-
-        with patch("invoke.run", side_effect=_run):
-            rt._ensure_state_persisted(compose, os.path.dirname(compose))
+        with patch("invoke.run", side_effect=self._blind_mount_table(rt)):
+            with pytest.raises(ProvisionError,
+                               match="could not read the mount table"):
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))
 
     # -- 2. a read-only mount is still the live source ------------------
     def test_a_read_only_mount_counts_as_persisted(self, tmp_path):
@@ -1420,11 +1438,12 @@ class TestTheCleanupIsNotDestructive:
         assert not [d for d in os.listdir(rt._data_dir())
                     if ".superseded-" in d]
 
-    def test_a_relocated_copy_survives_a_stale_mount(self, tmp_path):
+    def test_a_relocated_copy_is_refused_not_overwritten(self, tmp_path):
         """After the FB-11 move the container still mounts the *old* path
-        until it is recreated, so the trees look unpersisted and the
-        migration runs against a destination that already holds the only
-        copy of the moved state."""
+        until it is recreated. Docker reads that recorded source, so
+        migrating would copy from whatever the old path now points at —
+        usually an empty directory docker recreated — over the only real
+        copy. Refuse instead, and leave the destination alone."""
         rt = _runtime(tmp_path)
         etc = rt._state_host_dir("etc-libvirt")
         os.makedirs(os.path.join(etc, "qemu"))
@@ -1455,15 +1474,61 @@ class TestTheCleanupIsNotDestructive:
 
         compose = str(tmp_compose(rt))
         with patch("invoke.run", side_effect=_run):
-            rt._ensure_state_persisted(compose, os.path.dirname(compose))
+            with pytest.raises(ProvisionError, match="bound to a different"):
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))
 
-        kept = [d for d in os.listdir(rt._data_dir())
-                if d.startswith("etc-libvirt.superseded-")]
-        assert kept, "the relocated copy was destroyed"
-        assert os.path.isfile(os.path.join(
-            rt._data_dir(), kept[0], "qemu", "moved.xml"))
+        # refused, and the moved copy is exactly where it was
+        assert os.path.isfile(moved)
+        assert open(moved).read() == "<domain><name>moved</name></domain>"
+        assert not [d for d in os.listdir(rt._data_dir())
+                    if ".superseded-" in d]
 
     def _migrate(self, rt):
         compose = str(tmp_compose(rt))
         with patch("invoke.run", side_effect=_dispatch(rt)):
             rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+
+class TestTheMarkerCannotOutliveItsTrees:
+    """#164 FB-2 review — the marker records that a migration finished, and
+    it survives whatever happens to the directories afterwards. It has to
+    be cleared before those directories are disturbed."""
+
+    def test_a_failed_migration_clears_an_earlier_marker(self, tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+
+        with patch("invoke.run", side_effect=_dispatch(rt)):
+            rt._ensure_state_persisted(compose, os.path.dirname(compose))
+        assert os.path.isfile(rt._state_marker_path())
+
+        # a second migration, this time with a truncated copy
+        rt._state_migrated_this_run = False
+        with pytest.raises(ProvisionError, match="did not complete"):
+            with patch("invoke.run", side_effect=_dispatch(
+                    rt, truncate=("/var/lib/libvirt/qemu",))):
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+        assert not os.path.isfile(rt._state_marker_path()), \
+            "a stale marker survived a failed migration"
+
+    def test_a_stale_marker_cannot_authorise_seeding_empty_trees(self,
+                                                                 tmp_path):
+        """The sequence the review names: a copy succeeds and writes the
+        marker, a later attempt disturbs the destinations and fails, and a
+        retry whose mount inspection also fails accepts the marker and
+        starts a container over directories that are no longer there."""
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        os.makedirs(rt._data_dir(), exist_ok=True)
+        open(rt._state_marker_path(), "w").close()   # from an earlier run
+
+        def _blind(command, *_a, **_kw):
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=False, stdout="")
+            return MagicMock(ok=True, stdout="exited\n")
+
+        with patch("invoke.run", side_effect=_blind):
+            with pytest.raises(ProvisionError,
+                               match="could not read the mount table"):
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))

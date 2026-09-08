@@ -791,6 +791,43 @@ class DockerComposeRuntime(RuntimeBase):
             return not pending
         return os.path.isfile(self._state_marker_path())
 
+    def _destination_is_complete(self) -> bool:
+        """Whether every state tree is present at the destination."""
+        return all(os.path.isdir(self._state_host_dir(subdir))
+                   for subdir, _ in self._PERSISTED_STATE)
+
+    def _relocated_bind_sources(
+            self, trees: list[tuple[str, str]]) -> list[str]:
+        """
+        Trees whose destination already holds state while the container
+        mounts the same container path from somewhere else.
+
+        This is what the FB-11 relocation leaves behind: the move puts the
+        tree in the canonical destination, but the container's recorded
+        bind source still names the old path until it is recreated. Docker
+        reads that recorded source, so migrating would copy from wherever
+        the old path now points — usually an empty directory docker
+        recreated — over the only real copy (#164 FB-2 review).
+        """
+        mounts = self._container_mounts()
+        if not mounts:
+            return []
+        relocated = []
+        for subdir, container_path in trees:
+            destination = self._state_host_dir(subdir)
+            if not (os.path.isdir(destination) and os.listdir(destination)):
+                continue
+            for mount in mounts:
+                if mount.get("Destination") != container_path:
+                    continue
+                source = mount.get("Source")
+                if source and os.path.abspath(source) != os.path.abspath(
+                        destination):
+                    relocated.append(
+                        f"{container_path} is bound from {source}, but "
+                        f"{destination} already holds state")
+        return relocated
+
     def _interrupted_migration_present(self) -> bool:
         """
         Whether a staged tree from an interrupted migration is lying around.
@@ -953,6 +990,17 @@ class DockerComposeRuntime(RuntimeBase):
         self._stop_for_migration(compose_path, compose_dir)
 
         os.makedirs(self._data_dir(), exist_ok=True)
+
+        # The marker stops being true the moment the destination is
+        # disturbed, so it goes first and is written again only on success.
+        # Left in place it would outlive a migration that failed halfway,
+        # and a later run whose mount inspection also failed would accept
+        # it, start a container over emptied directories and let the
+        # entrypoint seed them (#164 FB-2 review).
+        marker = self._state_marker_path()
+        if os.path.isfile(marker):
+            os.unlink(marker)
+
         self._discard_untrusted_state(trees)
 
         # The archives are staged in the data dir, not the system temp dir.
@@ -1026,9 +1074,12 @@ class DockerComposeRuntime(RuntimeBase):
                         f"could not write {self._STATE_MARKER}: {exc}")
             return
 
-        if pending is None and os.path.isfile(self._state_marker_path()):
+        if (pending is None and os.path.isfile(self._state_marker_path())
+                and self._destination_is_complete()):
             # No mount table to consult, but a completed migration says the
-            # destination is authoritative.
+            # destination is authoritative — and the directories it names
+            # are still there. The marker alone is not enough: it survives
+            # anything that happens to those directories afterwards.
             return
 
         state = self._container_state()
@@ -1090,6 +1141,20 @@ class DockerComposeRuntime(RuntimeBase):
                 f"command, to migrate — or 'boxman up --force' to migrate "
                 f"now and recreate regardless.")
             return
+
+        relocated = self._relocated_bind_sources(pending)
+        if relocated:
+            raise ProvisionError(
+                "refusing to migrate: the runtime container is bound to a "
+                "different directory than the one that already holds this "
+                "state, so copying from the container would overwrite the "
+                "only real copy.\n  - "
+                + "\n  - ".join(relocated)
+                + f"\n\nThis is what a moved data directory looks like "
+                f"before the container has been recreated. Remove the "
+                f"container so it is rebuilt against the current paths:\n"
+                f"    docker rm -f {shlex.quote(self.container_name)}\n"
+                f"then re-run. Nothing was copied or removed.")
 
         self._migrate_libvirt_state(compose_path, compose_dir, pending)
 
