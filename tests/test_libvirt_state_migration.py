@@ -1383,3 +1383,87 @@ class TestReadOnlyDeclarationsAreResolvedToo:
         src, dst = rt._state_mount_pairs()[0]
         with pytest.raises(ProvisionError, match="read-only"):
             rt._mounts_to_add([f"{src}:{dst}:ro"], [(src, dst)])
+
+
+class TestTheCleanupIsNotDestructive:
+    """Every judgement about what may be cleared rests on inference — which
+    trees the container mounts, whether a marker is current, whether the
+    user has moved a directory since — and that inference has been wrong in
+    four different ways during review. A populated destination is renamed
+    aside rather than deleted, so the next wrong one costs disk space
+    instead of a domain."""
+
+    def test_a_populated_destination_is_kept_aside(self, tmp_path):
+        rt = _runtime(tmp_path)
+        etc = rt._state_host_dir("etc-libvirt")
+        os.makedirs(os.path.join(etc, "qemu"))
+        with open(os.path.join(etc, "qemu", "precious.xml"), "w") as fobj:
+            fobj.write("<domain><name>precious</name></domain>")
+
+        self._migrate(rt)
+
+        kept = [d for d in os.listdir(rt._data_dir())
+                if d.startswith("etc-libvirt.superseded-")]
+        assert len(kept) == 1, os.listdir(rt._data_dir())
+        assert os.path.isfile(os.path.join(
+            rt._data_dir(), kept[0], "qemu", "precious.xml"))
+        # and the migration still landed
+        assert os.path.isfile(os.path.join(
+            rt._data_dir(), "etc-libvirt", "qemu", "vm1.xml"))
+
+    def test_the_ordinary_path_leaves_nothing_behind(self, tmp_path):
+        """`_prepare_data_dir` creates the trees empty, so a first
+        migration has nothing worth keeping."""
+        rt = _runtime(tmp_path)
+        rt._prepare_data_dir()
+        self._migrate(rt)
+        assert not [d for d in os.listdir(rt._data_dir())
+                    if ".superseded-" in d]
+
+    def test_a_relocated_copy_survives_a_stale_mount(self, tmp_path):
+        """After the FB-11 move the container still mounts the *old* path
+        until it is recreated, so the trees look unpersisted and the
+        migration runs against a destination that already holds the only
+        copy of the moved state."""
+        rt = _runtime(tmp_path)
+        etc = rt._state_host_dir("etc-libvirt")
+        os.makedirs(os.path.join(etc, "qemu"))
+        moved = os.path.join(etc, "qemu", "moved.xml")
+        with open(moved, "w") as fobj:
+            fobj.write("<domain><name>moved</name></domain>")
+
+        import json
+        stale = str(tmp_path / "old-location" / "etc-libvirt")
+
+        def _run(command, *_a, **_kw):
+            if "docker ps -a" in command:
+                return MagicMock(ok=True, stdout="exited\n")
+            if rt._GUEST_PROBE_MARKER in command:
+                return MagicMock(
+                    ok=True, stdout=f"{rt._GUEST_PROBE_MARKER}0\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                # still bound from where the data used to live
+                return MagicMock(ok=True, stdout=json.dumps(
+                    [{"Source": stale, "Destination": "/etc/libvirt",
+                      "RW": True}]))
+            if command.startswith("docker cp"):
+                source = command.split()[2].split(":", 1)[1]
+                root, entries = STATE_FIXTURES[source]
+                _make_tar(_redirect_target(command), root, entries)
+                return MagicMock(ok=True, stdout="", stderr="")
+            return MagicMock(ok=True, stdout="", stderr="")
+
+        compose = str(tmp_compose(rt))
+        with patch("invoke.run", side_effect=_run):
+            rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+        kept = [d for d in os.listdir(rt._data_dir())
+                if d.startswith("etc-libvirt.superseded-")]
+        assert kept, "the relocated copy was destroyed"
+        assert os.path.isfile(os.path.join(
+            rt._data_dir(), kept[0], "qemu", "moved.xml"))
+
+    def _migrate(self, rt):
+        compose = str(tmp_compose(rt))
+        with patch("invoke.run", side_effect=_dispatch(rt)):
+            rt._ensure_state_persisted(compose, os.path.dirname(compose))

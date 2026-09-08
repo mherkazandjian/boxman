@@ -834,14 +834,33 @@ class DockerComposeRuntime(RuntimeBase):
         already bind-mounting is not in *trees* and must not be touched:
         its destination is the live source of that mount, so clearing it
         would destroy the state rather than stage it.
+
+        Nothing that holds anything is deleted. A destination with content
+        is renamed aside instead, because every judgement that reaches this
+        point rests on inference — which trees the container mounts, whether
+        a marker is current, whether the user has moved a directory since —
+        and the same inference has been wrong in four different ways during
+        review. Renaming turns the next wrong one into recoverable clutter
+        rather than a destroyed domain. Empty directories, which is what a
+        first migration finds after ``_prepare_data_dir``, are simply
+        removed, so the ordinary path leaves nothing behind.
         """
         for subdir, _ in trees:
             for path in (self._state_host_dir(subdir),
                          self._state_host_dir(subdir) + self._STAGING_SUFFIX):
-                if os.path.isdir(path) and not os.path.islink(path):
-                    shutil.rmtree(path)
-                elif os.path.lexists(path):
+                if os.path.islink(path) or (
+                        os.path.lexists(path) and not os.path.isdir(path)):
                     os.unlink(path)
+                elif os.path.isdir(path):
+                    if os.listdir(path):
+                        kept = f"{path}.superseded-{int(time.time())}"
+                        os.rename(path, kept)
+                        self.logger.warning(
+                            f"{path} was not empty; kept it as {kept} "
+                            f"rather than deleting it. Remove it once the "
+                            f"migrated state is confirmed good.")
+                    else:
+                        os.rmdir(path)
 
     def _copy_state_out(self, container_path: str, archive_path: str) -> None:
         """
