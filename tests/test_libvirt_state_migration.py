@@ -1580,3 +1580,168 @@ class TestRelocationDetectionDoesNotOverfire:
                    return_value=MagicMock(ok=True, stdout="[]")):
             assert rt._relocated_bind_sources(
                 [("etc-libvirt", "/etc/libvirt")]) == []
+
+
+class TestFourthReviewRegressions:
+    """Round four."""
+
+    # -- 1. recovery advice must not destroy what is still only inside ---
+    def test_the_other_tree_is_migrated_before_the_refusal(self, tmp_path):
+        """With /etc/libvirt moved onto the host and the QEMU tree still in
+        the writable layer, refusing outright and telling the user to
+        `docker rm -f` would lose NVRAM and saved guest state for good."""
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        etc = rt._state_host_dir("etc-libvirt")
+        os.makedirs(os.path.join(etc, "qemu"))
+        with open(os.path.join(etc, "qemu", "moved.xml"), "w") as fobj:
+            fobj.write("<domain><name>moved</name></domain>")
+
+        import json
+        stale = str(tmp_path / "old" / "etc-libvirt")
+        calls = []
+        stopped = {"yes": False}
+
+        def _run(command, *_a, **_kw):
+            calls.append(command)
+            if "compose" in command and command.rstrip().endswith("stop"):
+                stopped["yes"] = True
+                return MagicMock(ok=True, stdout="", stderr="")
+            if "docker ps -a" in command:
+                return MagicMock(
+                    ok=True,
+                    stdout="exited\n" if stopped["yes"] else "running\n")
+            if rt._GUEST_PROBE_MARKER in command:
+                return MagicMock(
+                    ok=True, stdout=f"{rt._GUEST_PROBE_MARKER}0\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=True, stdout=json.dumps(
+                    [{"Source": stale, "Destination": "/etc/libvirt",
+                      "RW": True}]))
+            if command.startswith("docker cp"):
+                source = command.split()[2].split(":", 1)[1]
+                root, entries = STATE_FIXTURES[source]
+                _make_tar(_redirect_target(command), root, entries)
+                return MagicMock(ok=True, stdout="", stderr="")
+            return MagicMock(ok=True, stdout="", stderr="")
+
+        with patch("invoke.run", side_effect=_run):
+            with pytest.raises(ProvisionError, match="bound to a different"):
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+        # the QEMU tree was copied out before the refusal
+        assert os.path.isfile(os.path.join(
+            rt._data_dir(), "var-lib-libvirt-qemu", "nvram", "vm1_VARS.fd"))
+        assert any("var/lib/libvirt/qemu" in c
+                   for c in calls if c.startswith("docker cp"))
+        # /etc/libvirt was neither copied nor touched
+        assert not any("/etc/libvirt" in c
+                       for c in calls if c.startswith("docker cp"))
+        assert os.path.isfile(os.path.join(etc, "qemu", "moved.xml"))
+
+    def test_the_advice_only_promises_what_is_true(self, tmp_path):
+        """`docker rm -f` is named only once everything else is on the
+        host, and the message says so."""
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        etc = rt._state_host_dir("etc-libvirt")
+        os.makedirs(etc)
+        with open(os.path.join(etc, "x.xml"), "w") as fobj:
+            fobj.write("<domain/>")
+
+        import json
+        stale = str(tmp_path / "old" / "etc-libvirt")
+        stopped = {"yes": False}
+
+        def _run(command, *_a, **_kw):
+            if "compose" in command and command.rstrip().endswith("stop"):
+                stopped["yes"] = True
+                return MagicMock(ok=True, stdout="", stderr="")
+            if "docker ps -a" in command:
+                return MagicMock(
+                    ok=True,
+                    stdout="exited\n" if stopped["yes"] else "running\n")
+            if rt._GUEST_PROBE_MARKER in command:
+                return MagicMock(
+                    ok=True, stdout=f"{rt._GUEST_PROBE_MARKER}0\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=True, stdout=json.dumps(
+                    [{"Source": stale, "Destination": "/etc/libvirt",
+                      "RW": True}]))
+            if command.startswith("docker cp"):
+                source = command.split()[2].split(":", 1)[1]
+                root, entries = STATE_FIXTURES[source]
+                _make_tar(_redirect_target(command), root, entries)
+                return MagicMock(ok=True, stdout="", stderr="")
+            return MagicMock(ok=True, stdout="", stderr="")
+
+        with patch("invoke.run", side_effect=_run):
+            with pytest.raises(ProvisionError) as excinfo:
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))
+        message = str(excinfo.value)
+        assert f"docker rm -f {rt.container_name}" in message
+        assert "is on the host now" in message
+
+    # -- 2. a superseded staging dir is still an interrupted migration ---
+    def test_two_failed_attempts_then_an_absent_source_refuses(self,
+                                                               tmp_path):
+        """The cleanup renames rather than deletes, so a second failed
+        attempt turns `etc-libvirt.staging` into
+        `etc-libvirt.staging.superseded-…` and leaves no active staging
+        directory — which read as "nothing was interrupted" while the only
+        recovery data sat right beside it."""
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        data = rt._data_dir()
+        os.makedirs(data, exist_ok=True)
+
+        # attempt one left a staging directory behind
+        staging = rt._state_host_dir("etc-libvirt") + rt._STAGING_SUFFIX
+        os.makedirs(staging)
+        with open(os.path.join(staging, "partial.xml"), "w") as fobj:
+            fobj.write("<domain/>")
+
+        # attempt two renamed it aside and then failed too
+        rt._discard_untrusted_state([("etc-libvirt", "/etc/libvirt")])
+        assert not os.path.exists(staging)
+        assert any(d.startswith("etc-libvirt.staging" + rt._SUPERSEDED_PREFIX)
+                   for d in os.listdir(data))
+
+        # and now the container is gone
+        with patch("invoke.run", return_value=MagicMock(ok=True, stdout="")):
+            with pytest.raises(ProvisionError,
+                               match="half-finished migration"):
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+    # -- 3. compose applies `:-` to empty values too ---------------------
+    def test_an_empty_variable_falls_back_to_its_default(self, tmp_path,
+                                                         monkeypatch):
+        """`${STATE_ROOT:-/expected}` with STATE_ROOT="" resolved to the
+        empty string, so the source became `/etc-libvirt` and a legitimate
+        mapping was reported as a conflict."""
+        from boxman.runtime.docker_compose import _interpolate
+        monkeypatch.setenv("STATE_ROOT", "")
+        assert _interpolate("${STATE_ROOT:-/expected}/x", {}) == "/expected/x"
+
+    def test_an_empty_variable_without_a_colon_keeps_the_empty_value(
+            self, monkeypatch):
+        """`-` alone is unset-only; compose keeps an empty value there."""
+        from boxman.runtime.docker_compose import _interpolate
+        monkeypatch.setenv("STATE_ROOT", "")
+        assert _interpolate("${STATE_ROOT-/fallback}/x", {}) == "/x"
+
+    def test_a_set_variable_still_wins(self, monkeypatch):
+        from boxman.runtime.docker_compose import _interpolate
+        monkeypatch.setenv("STATE_ROOT", "/real")
+        assert _interpolate("${STATE_ROOT:-/expected}/x", {}) == "/real/x"
+
+    def test_boxmans_own_value_beats_the_environment(self, tmp_path,
+                                                     monkeypatch):
+        """A stray BOXMAN_DATA_DIR in the environment must not decide where
+        boxman thinks its own data lives — the runtime's value does."""
+        rt = _runtime(tmp_path)
+        src, dst = rt._state_mount_pairs()[0]
+        monkeypatch.setenv("BOXMAN_DATA_DIR", "/somewhere/unrelated")
+        assert rt._mounts_to_add(
+            [f"${{BOXMAN_DATA_DIR:-/nope}}/etc-libvirt:{dst}"],
+            [(src, dst)]) == []

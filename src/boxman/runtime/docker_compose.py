@@ -75,18 +75,29 @@ def _interpolate(value: str, values: dict[str, str]) -> str:
     """
     def _one(match: re.Match) -> str:
         body = match.group(1)
+        empty_counts_as_unset = False
         if body is None:
             name, default = match.group(2), None
         elif ":-" in body:
             name, _, default = body.partition(":-")
-        elif ":?" in body:
-            name, default = body.split(":?", 1)[0], None
+            # compose applies a `:-` default to an *empty* value as well as
+            # an unset one; only `-` is unset-only (#164 FB-2 review)
+            empty_counts_as_unset = True
+        elif "-" in body:
+            name, _, default = body.partition("-")
+        elif ":?" in body or "?" in body:
+            name = body.split(":?", 1)[0].split("?", 1)[0]
+            default = None
         else:
             name, default = body, None
-        if name in values:
-            return values[name]
-        if name in os.environ:
-            return os.environ[name]
+
+        for source in (values, os.environ):
+            if name in source:
+                value = source[name]
+                if value or not empty_counts_as_unset:
+                    return value
+                break
+
         if default is not None:
             return default
         return match.group(0)
@@ -556,6 +567,9 @@ class DockerComposeRuntime(RuntimeBase):
     #: Suffix of the directory a tree is extracted into before its rename.
     _STAGING_SUFFIX = ".staging"
 
+    #: Prefix given to a populated directory kept aside instead of deleted.
+    _SUPERSEDED_PREFIX = ".superseded-"
+
     #: Container states in which no guest can be running. Anything else —
     #: ``paused``, ``restarting``, ``removing``, or a state docker adds
     #: later — is treated as "may have guests", which refuses.
@@ -796,8 +810,26 @@ class DockerComposeRuntime(RuntimeBase):
         return all(os.path.isdir(self._state_host_dir(subdir))
                    for subdir, _ in self._PERSISTED_STATE)
 
+    def _split_relocated(
+        self, trees: list[tuple[str, str]]
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str]]:
+        """
+        Partition *trees* into ``(migratable, relocated, descriptions)``.
+
+        A relocated tree cannot be migrated — copying from the container
+        would read its stale bind source — but the trees beside it usually
+        can, and they have to be *before* any advice involving removal of
+        the container is safe to give (#164 FB-2 review).
+        """
+        found = self._relocated_bind_sources(trees)
+        relocated = [tree for tree, _ in found]
+        descriptions = [text for _, text in found]
+        migratable = [t for t in trees if t not in relocated]
+        return migratable, relocated, descriptions
+
     def _relocated_bind_sources(
-            self, trees: list[tuple[str, str]]) -> list[str]:
+        self, trees: list[tuple[str, str]]
+    ) -> list[tuple[tuple[str, str], str]]:
         """
         Trees whose destination already holds state while the container
         mounts the same container path from somewhere else.
@@ -812,7 +844,7 @@ class DockerComposeRuntime(RuntimeBase):
         mounts = self._container_mounts()
         if not mounts:
             return []
-        relocated = []
+        relocated: list[tuple[tuple[str, str], str]] = []
         for subdir, container_path in trees:
             destination = self._state_host_dir(subdir)
             if not (os.path.isdir(destination) and os.listdir(destination)):
@@ -826,9 +858,10 @@ class DockerComposeRuntime(RuntimeBase):
                 # otherwise look like a different one and be refused
                 if source and os.path.realpath(source) != os.path.realpath(
                         destination):
-                    relocated.append(
+                    relocated.append((
+                        (subdir, container_path),
                         f"{container_path} is bound from {source}, but "
-                        f"{destination} already holds state")
+                        f"{destination} already holds state"))
         return relocated
 
     def _interrupted_migration_present(self) -> bool:
@@ -845,11 +878,26 @@ class DockerComposeRuntime(RuntimeBase):
         tree is extracted and validated before *any* of them is renamed, so
         once the last rename lands the destination is complete whether or
         not the marker was written. The marker is the belt to this braces.
+
+        Staging directories kept aside by a later attempt count too. The
+        cleanup renames rather than deletes, so a second failed attempt
+        turns ``etc-libvirt.staging`` into
+        ``etc-libvirt.staging.superseded-…`` and leaves no active staging
+        directory — which would have read as "nothing was interrupted"
+        while the only recovery data sat right next to it
+        (#164 FB-2 review).
         """
-        return any(
-            os.path.exists(self._state_host_dir(subdir)
-                           + self._STAGING_SUFFIX)
-            for subdir, _ in self._PERSISTED_STATE)
+        data = self._data_dir()
+        if not os.path.isdir(data):
+            return False
+        for subdir, _ in self._PERSISTED_STATE:
+            staging = os.path.basename(
+                self._state_host_dir(subdir) + self._STAGING_SUFFIX)
+            for entry in os.listdir(data):
+                if entry == staging or entry.startswith(
+                        staging + self._SUPERSEDED_PREFIX):
+                    return True
+        return False
 
     def _mark_state_persisted(self, reason: str) -> None:
         """Record that the destination is authoritative."""
@@ -893,7 +941,8 @@ class DockerComposeRuntime(RuntimeBase):
                     os.unlink(path)
                 elif os.path.isdir(path):
                     if os.listdir(path):
-                        kept = f"{path}.superseded-{int(time.time())}"
+                        kept = (f"{path}{self._SUPERSEDED_PREFIX}"
+                                f"{int(time.time())}")
                         os.rename(path, kept)
                         self.logger.warning(
                             f"{path} was not empty; kept it as {kept} "
@@ -1145,21 +1194,31 @@ class DockerComposeRuntime(RuntimeBase):
                 f"now and recreate regardless.")
             return
 
-        relocated = self._relocated_bind_sources(pending)
+        migratable, relocated, descriptions = self._split_relocated(pending)
+
+        # Whatever *can* be copied out is copied out first. Refusing while
+        # the container still holds unmigrated trees would make the advice
+        # below destructive: `docker rm -f` on a container whose NVRAM and
+        # saved guest state exist nowhere else loses them
+        # (#164 FB-2 review).
+        if migratable:
+            self._migrate_libvirt_state(
+                compose_path, compose_dir, migratable)
+
         if relocated:
             raise ProvisionError(
                 "refusing to migrate: the runtime container is bound to a "
                 "different directory than the one that already holds this "
                 "state, so copying from the container would overwrite the "
                 "only real copy.\n  - "
-                + "\n  - ".join(relocated)
+                + "\n  - ".join(descriptions)
                 + f"\n\nThis is what a moved data directory looks like "
-                f"before the container has been recreated. Remove the "
-                f"container so it is rebuilt against the current paths:\n"
+                f"before the container has been recreated. Everything else "
+                f"it held is on the host now, so removing it loses "
+                f"nothing:\n"
                 f"    docker rm -f {shlex.quote(self.container_name)}\n"
-                f"then re-run. Nothing was copied or removed.")
-
-        self._migrate_libvirt_state(compose_path, compose_dir, pending)
+                f"then re-run, and it is rebuilt against the current "
+                f"paths.")
 
     #: Where the runtime data dir's two irreplaceable pieces are mounted.
     #: Used to tell, from a live container, which host directory it is
