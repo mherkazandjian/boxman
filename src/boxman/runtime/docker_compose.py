@@ -10,6 +10,7 @@ directory next to the project's ``conf.yml``.
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -25,6 +26,44 @@ from boxman.runtime.base import RuntimeBase
 from boxman.runtime.tar_stream import ArchiveError, extract_archive
 from boxman.utils.compose_names import sanitize_project_name
 from boxman.utils.shell import run as _shell_run
+
+#: ``${VAR}``/``${VAR:-default}``/``$VAR`` in a compose value. The default
+#: may itself contain a colon, which is why a volume entry cannot simply be
+#: split on ``:`` (#164 FB-2 review).
+_COMPOSE_VAR = re.compile(r"\$(?:\{([^{}]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _split_volume(entry: str) -> tuple[str, str, set[str]] | None:
+    """
+    Split a short-form compose volume into ``(source, destination, options)``.
+
+    Interpolation is deliberately *not* performed — the caller decides what an
+    unresolved value means — but the variable syntax still has to be respected
+    while splitting: ``${BOXMAN_DATA_DIR:-./data}/images:/var/lib/libvirt/images``
+    carries a colon inside the default, so a plain ``split(":")`` produces
+    nonsense (#164 FB-2 review).
+
+    Returns None for anything that is not a source/destination pair.
+    """
+    masked = _COMPOSE_VAR.sub(lambda m: "\0" * len(m.group(0)), entry)
+    fields: list[str] = []
+    start = 0
+    for index, char in enumerate(masked):
+        if char == ":":
+            fields.append(entry[start:index])
+            start = index + 1
+    fields.append(entry[start:])
+    if len(fields) < 2 or not fields[0] or not fields[1]:
+        return None
+    options = set()
+    if len(fields) >= 3:
+        options = {o.strip() for o in fields[2].split(",") if o.strip()}
+    return fields[0], fields[1], options
+
+
+def _is_interpolated(value: str) -> bool:
+    """Whether *value* still carries an unexpanded compose variable."""
+    return bool(_COMPOSE_VAR.search(value))
 
 
 def docker_exec_wrap(command: str, container: str) -> str:
@@ -208,13 +247,11 @@ class DockerComposeRuntime(RuntimeBase):
         for vol in volumes or []:
             if not isinstance(vol, str):
                 continue
-            parts = vol.split(":")
-            if len(parts) < 2:
+            parts = _split_volume(vol)
+            if parts is None:
                 continue
-            options = set()
-            if len(parts) >= 3:
-                options = {o.strip() for o in parts[2].split(",") if o.strip()}
-            out.append((parts[0], parts[1], "ro" not in options))
+            source, destination, options = parts
+            out.append((source, destination, "ro" not in options))
         return out
 
     @classmethod
@@ -246,7 +283,6 @@ class DockerComposeRuntime(RuntimeBase):
         declared = self._declared_mounts(volumes)
         writable = {(src, dst) for src, dst, ok in declared if ok}
         read_only = {(src, dst) for src, dst, ok in declared if not ok}
-        destinations = {dst for _, dst, _ in declared}
 
         problems: list[str] = []
         to_add: list[str] = []
@@ -258,10 +294,22 @@ class DockerComposeRuntime(RuntimeBase):
                     f"{src}:{dst} is declared read-only, and boxman needs "
                     f"it writable")
                 continue
-            if dst in destinations:
+            conflicting = [
+                other for other, target, _ in declared
+                if target == dst and other != src
+                and not _is_interpolated(other)
+            ]
+            if conflicting:
+                # An unresolved ${VAR} source is not a conflict: it may well
+                # interpolate to exactly this path, and compose merges
+                # override volumes by target anyway, so a second entry for
+                # the same destination is not a duplicate mount.
                 problems.append(
-                    f"{dst} is already bound from a different source, and "
+                    f"{dst} is already bound from {conflicting[0]}, and "
                     f"boxman needs {src} there")
+                continue
+            if any(target == dst for _, target, _ in declared):
+                # same destination, unresolved source: assume it is ours
                 continue
             to_add.append(f"{src}:{dst}")
 
@@ -504,6 +552,41 @@ class DockerComposeRuntime(RuntimeBase):
         """Path of the marker that makes a migrated destination trusted."""
         return os.path.join(self._data_dir(), self._STATE_MARKER)
 
+    def _prepare_data_dir(self) -> None:
+        """
+        Create the data dir and its bind-mount sources as the invoking user,
+        before the container is started.
+
+        Docker creates a missing bind-mount source itself, as ``root`` — so
+        left to it, ``data/`` and everything under it belongs to root and an
+        ordinary user cannot write the migration's staging directories. That
+        failure would land *after* the container had been stopped, with the
+        state still only in its writable layer (#164 FB-2 review).
+
+        Raises before anything is stopped when the directory exists and is
+        not writable, which is the same problem inherited from an earlier
+        run.
+        """
+        data = self._data_dir()
+        try:
+            os.makedirs(data, exist_ok=True)
+            for subdir, _ in self._PERSISTED_STATE:
+                os.makedirs(os.path.join(data, subdir), exist_ok=True)
+        except OSError as exc:
+            raise ProvisionError(
+                f"cannot create the runtime data directory {data}: {exc}. "
+                f"Docker creates missing bind-mount sources as root, so an "
+                f"earlier run may have left it owned by root; "
+                f"'sudo chown -R $(id -u):$(id -g) {shlex.quote(data)}' "
+                f"hands it back.") from exc
+
+        if not os.access(data, os.W_OK | os.X_OK):
+            raise ProvisionError(
+                f"the runtime data directory {data} is not writable by this "
+                f"user, so libvirt state could not be migrated into it. "
+                f"'sudo chown -R $(id -u):$(id -g) {shlex.quote(data)}' "
+                f"hands it back.")
+
     def _state_mount_pairs(self) -> list[tuple[str, str]]:
         """``(host source, container destination)`` for the state trees."""
         return [(self._state_host_dir(subdir), container_path)
@@ -633,7 +716,13 @@ class DockerComposeRuntime(RuntimeBase):
             (subdir, container_path)
             for subdir, container_path in self._PERSISTED_STATE
             if not self._mount_provides(
-                mounts, self._state_host_dir(subdir), container_path)
+                mounts, self._state_host_dir(subdir), container_path,
+                # Ownership, not writability: a read-only mount of the
+                # canonical source still means the host directory *is* the
+                # live state, and clearing it would destroy that. Whether
+                # the mode also needs fixing is _mounts_to_add's question
+                # (#164 FB-2 review).
+                require_writable=False)
         ]
 
     def _state_is_persisted(self) -> bool:
@@ -750,7 +839,16 @@ class DockerComposeRuntime(RuntimeBase):
                 f"could not confirm that '{self.container_name}' stopped, "
                 f"so its libvirt state may still be changing. Nothing was "
                 f"copied or removed.")
-        if state != "" and state not in self._STATES_WITHOUT_GUESTS:
+        if state == "":
+            # Absence is not a stopped source. The container is what the
+            # copy reads from, and clearing the destination for a source
+            # that has gone would destroy the only remaining state
+            # (#164 FB-2 review).
+            raise ProvisionError(
+                f"'{self.container_name}' disappeared while it was being "
+                f"stopped, so there is nothing left to migrate from. "
+                f"Nothing was copied or removed.")
+        if state not in self._STATES_WITHOUT_GUESTS:
             raise ProvisionError(
                 f"'{self.container_name}' is still {state!r} after compose "
                 f"stop, so its libvirt state may still be changing. "
@@ -784,8 +882,16 @@ class DockerComposeRuntime(RuntimeBase):
         os.makedirs(self._data_dir(), exist_ok=True)
         self._discard_untrusted_state(trees)
 
+        # The archives are staged in the data dir, not the system temp dir.
+        # /var/lib/libvirt/qemu/save holds saved guest memory, which runs to
+        # gigabytes per domain, and /tmp is a RAM-backed tmpfs on plenty of
+        # hosts — writing the copy there would consume memory equal to the
+        # state being rescued. Beside the destination it lands on the disk
+        # that has to hold the data anyway, which is also where running out
+        # of space is the honest failure.
         staged: list[tuple[str, str, str]] = []
-        with tempfile.TemporaryDirectory(prefix="boxman-libvirt-state-") as tmp:
+        with tempfile.TemporaryDirectory(
+                dir=self._data_dir(), prefix=".migration-") as tmp:
             for subdir, container_path in trees:
                 archive = os.path.join(tmp, f"{subdir}.tar")
                 self._copy_state_out(container_path, archive)
@@ -853,6 +959,20 @@ class DockerComposeRuntime(RuntimeBase):
 
         state = self._container_state()
 
+        if pending is None and state not in (None, ""):
+            # A container exists and its mount table could not be read, so
+            # boxman cannot tell which trees it is already bind-mounting.
+            # Migrating on that basis would clear destinations that may be
+            # the live sources — unknown ownership must never authorise
+            # deleting anything (#164 FB-2 review).
+            raise ProvisionError(
+                f"could not read the mount table of "
+                f"'{self.container_name}', so boxman cannot tell which of "
+                f"its libvirt state directories are already on the host. "
+                f"Refusing to migrate rather than risk clearing a live "
+                f"bind-mount source. Check that the docker daemon is "
+                f"reachable and re-run.")
+
         if state is None:
             raise ProvisionError(
                 f"cannot tell whether the runtime container "
@@ -897,9 +1017,7 @@ class DockerComposeRuntime(RuntimeBase):
                 f"now and recreate regardless.")
             return
 
-        self._migrate_libvirt_state(
-            compose_path, compose_dir,
-            pending if pending else list(self._PERSISTED_STATE))
+        self._migrate_libvirt_state(compose_path, compose_dir, pending)
 
     #: Where the runtime data dir's two irreplaceable pieces are mounted.
     #: Used to tell, from a live container, which host directory it is
@@ -910,36 +1028,89 @@ class DockerComposeRuntime(RuntimeBase):
     )
 
     @staticmethod
-    def _has_files(path: str) -> bool:
-        """Whether *path* holds a file anywhere beneath it.
+    def _has_files(path: str) -> bool | None:
+        """
+        Whether *path* holds a file anywhere beneath it, or ``None`` when
+        that could not be determined.
 
         ``os.listdir`` is not the question: a directory containing only an
         empty ``ssh/`` looks populated to it while holding nothing that
         would be lost (#164 FB-11 review).
+
+        ``os.walk`` swallows permission errors by default, which would
+        report an unreadable directory full of images as empty and let the
+        relocation go ahead. Unknown is returned instead, and the caller
+        refuses (#164 FB-2 review).
         """
         if not os.path.isdir(path):
             return False
-        for _, _, filenames in os.walk(path):
+        unreadable = []
+        for _, _, filenames in os.walk(
+                path, onerror=lambda exc: unreadable.append(exc)):
             if filenames:
                 return True
-        return False
+        return None if unreadable else False
 
-    def _container_uses_legacy_data_dir(self, legacy: str) -> bool:
+    def _container_uses_legacy_data_dir(self, legacy: str) -> bool | None:
         """
-        Whether the running container's own mounts still come from *legacy*.
+        Whether the running container's own mounts still come from *legacy*,
+        or ``None`` when there is a container whose mounts could not be read.
 
-        The mount table is the authority on which directory is in use. A
-        new location that merely *looks* populated does not mean the
-        container switched to it.
+        The mount table is the authority on which directory is in use: a new
+        location that merely *looks* populated does not mean the container
+        switched to it. An unreadable table is not evidence that it did.
         """
-        mounts = self._container_mounts()
-        if not mounts:
+        state = self._container_state()
+        if state == "":
             return False
+        mounts = self._container_mounts()
+        if mounts is None:
+            return None
         for subdir, container_path in self._DATA_DIR_PROBES:
             if self._mount_provides(
-                    mounts, os.path.join(legacy, subdir), container_path):
+                    mounts, os.path.join(legacy, subdir), container_path,
+                    require_writable=False):
                 return True
         return False
+
+    def _state_is_at_risk(self) -> bool:
+        """
+        Whether a container holds libvirt state that is not yet on the host.
+
+        Consulted immediately before anything destroys the container, and
+        deliberately separate from the guest probe. ``_ensure_state_persisted``
+        defers a migration while guests are running — including when their
+        number is merely *unknown* — and a second probe taken moments later
+        can come back zero, which used to let the recreate proceed over
+        state that was never copied (#164 FB-2 review).
+        """
+        if self._state_is_persisted():
+            return False
+        return self._container_state() not in (None, "")
+
+    def _assert_state_not_at_risk(self, action: str) -> None:
+        """Refuse *action* while a container holds unmigrated state."""
+        if not self._state_is_at_risk():
+            return
+        raise ProvisionError(
+            f"refusing to {action}: '{self.container_name}' still keeps "
+            f"libvirt's own state in its writable layer, and removing the "
+            f"container would discard every domain, network and snapshot "
+            f"with it. The migration needs the container stopped, so shut "
+            f"the guests down first ('boxman down') and re-run, or re-run "
+            f"with --force to migrate and recreate in one step.")
+
+    def _recreate_container(self, reason: str, compose_path: str,
+                            compose_dir: str) -> None:
+        """
+        Destroy the runtime container so it can be rebuilt, in the only
+        order that is safe: migrate what the container holds, refuse if any
+        of it is still unmigrated, refuse if guests are running, then stop.
+        """
+        self._ensure_state_persisted(compose_path, compose_dir)
+        self._assert_state_not_at_risk(reason)
+        self._assert_no_running_guests(reason)
+        self._stop_compose(compose_path, compose_dir)
 
     def _assert_no_stranded_data_dir(self, compose_dir: str) -> None:
         """
@@ -961,22 +1132,60 @@ class DockerComposeRuntime(RuntimeBase):
         current = self._data_dir()
         if legacy == current:
             return
-        if not self._has_files(legacy):
+
+        legacy_has_files = self._has_files(legacy)
+        if legacy_has_files is False:
             return
-        if (self._has_files(current)
-                and not self._container_uses_legacy_data_dir(legacy)):
+        if legacy_has_files is None:
+            raise ProvisionError(
+                f"cannot read {legacy} to tell whether this instance's data "
+                f"is still there, so boxman will not start against "
+                f"{current} and risk leaving it stranded. Make {legacy} "
+                f"readable, or remove it if it holds nothing.")
+
+        in_use = self._container_uses_legacy_data_dir(legacy)
+        if in_use is None:
+            raise ProvisionError(
+                f"a runtime container exists but its mount table could not "
+                f"be read, so boxman cannot tell whether it is still using "
+                f"{legacy}. Refusing to start against {current}. Check that "
+                f"the docker daemon is reachable and re-run.")
+        if in_use is False and self._has_files(current) is True:
             return
-        raise ProvisionError(
+
+        raise ProvisionError(self._relocation_instructions(legacy, current,
+                                                           in_use))
+
+    def _relocation_instructions(self, legacy: str, current: str,
+                                 in_use: bool) -> str:
+        """The message for a data directory that has to be moved by hand."""
+        stop_first = ""
+        if in_use:
+            # `mv` across filesystems copies and then unlinks, so moving a
+            # directory a running QEMU is writing to corrupts the disks it
+            # is writing. And telling the user to run `boxman down` first
+            # would be circular: that verb goes through this same check
+            # (#164 FB-2 review).
+            stop_first = (
+                f"\n\nThe container is still using the old location, so stop "
+                f"it before moving anything — moving a directory across "
+                f"filesystems copies and then deletes it, and a running "
+                f"guest writing to a disk mid-copy corrupts it. boxman's "
+                f"own verbs go through this same check, so stop it with "
+                f"docker directly:\n"
+                f"    docker stop {shlex.quote(self.container_name)}")
+        return (
             f"boxman now keeps its runtime data in {current}, but this "
             f"instance's images and SSH identity are still in the previous "
-            f"location {legacy}. Move it before continuing:\n"
-            f"    mv -T {shlex.quote(legacy)} {shlex.quote(current)}\n"
+            f"location {legacy}.{stop_first}\n\n"
+            f"Then move it:\n"
+            f"    mv -T {shlex.quote(legacy)} {shlex.quote(current)}\n\n"
             f"(-T so the directory replaces {os.path.basename(current)} "
             f"rather than being nested inside it; it refuses if the "
             f"destination is not empty, in which case merge them by hand. "
-            f"The two locations disagreed before: the container mounted "
-            f"the old path while host-side lookups used the new one — "
-            f"#164 FB-11)")
+            f"The two locations disagreed before: the container mounted the "
+            f"old path while host-side lookups used the new one — #164 "
+            f"FB-11)")
 
     def ensure_ready(self) -> None:
         """
@@ -988,10 +1197,12 @@ class DockerComposeRuntime(RuntimeBase):
 
         # Collect directories to bind-mount and make them visible inside
         # the container before starting.
-        # A pure precondition, so it comes before anything is written:
+        # Pure preconditions, before anything is written or stopped:
         # refuse to start against an empty data dir while a populated one
-        # sits where boxman used to derive it.
+        # sits where boxman used to derive it, and make sure the data dir
+        # belongs to this user rather than to the docker daemon.
         self._assert_no_stranded_data_dir(compose_dir)
+        self._prepare_data_dir()
 
         bind_dirs = self._collect_bind_mount_dirs(abs_project_dir)
         if self._is_boxman_owned_compose(compose_path):
@@ -1057,17 +1268,16 @@ class DockerComposeRuntime(RuntimeBase):
                     self.logger.warning(
                         f"container is running but libvirtd is not "
                         f"responsive ({exc}) — recreating...")
-                    self._assert_no_running_guests(
+                    self._recreate_container(
                         "recreate the container because libvirtd is "
-                        "unresponsive")
-                    self._stop_compose(compose_path, compose_dir)
+                        "unresponsive", compose_path, compose_dir)
             else:
                 self.logger.info(
                     "some bind-mount dirs are NOT accessible "
                     "inside container — recreating...")
-                self._assert_no_running_guests(
-                    "recreate the container to apply missing bind mounts")
-                self._stop_compose(compose_path, compose_dir)
+                self._recreate_container(
+                    "recreate the container to apply missing bind mounts",
+                    compose_path, compose_dir)
 
         self.logger.info(
             f"starting docker-compose environment "
@@ -1079,8 +1289,10 @@ class DockerComposeRuntime(RuntimeBase):
         # difference. Reaching here with a container that is actually
         # running means _container_is_running() answered False without
         # knowing, since it reports False for a docker failure as readily
-        # as for a stopped container. The guard is a no-op for a stopped or
-        # absent container, which is the path that normally gets here.
+        # as for a stopped container. Both guards are no-ops for a stopped
+        # or absent container, which is the path that normally gets here.
+        self._assert_state_not_at_risk(
+            "recreate the container to apply the compose configuration")
         self._assert_no_running_guests(
             "recreate the container to apply the compose configuration")
 
@@ -1293,15 +1505,7 @@ class DockerComposeRuntime(RuntimeBase):
             plan["actions"].append(
                 f"clean up root-owned data inside container "
                 f"'{self.container_name}'")
-            # Done as root inside the container because the host user
-            # cannot necessarily remove all of it: libvirtd creates
-            # directories of its own while running, and those are root's
-            # until the next container start repairs them.
-            clean_cmd = (
-                f"docker exec --user root {self.container_name} "
-                f"bash -c 'rm -rf /var/run/libvirt/* "
-                f"/var/lib/libvirt/images/* /etc/boxman/ssh/* "
-                f"/etc/libvirt/* /var/lib/libvirt/qemu/*'")
+            clean_cmd = self._container_cleanup_command()
             plan["commands"].append(clean_cmd)
 
         down_cmd = (
@@ -1330,6 +1534,26 @@ class DockerComposeRuntime(RuntimeBase):
             plan["paths_to_delete"].append(boxman_dir)
 
         return plan
+
+    def _container_cleanup_command(self) -> str:
+        """
+        The in-container cleanup ``destroy-runtime`` runs before teardown.
+
+        Done as root inside the container because the host user cannot
+        necessarily remove all of it: libvirtd creates directories of its
+        own while running, and those are root's until the next container
+        start repairs them.
+
+        One definition, used by both the plan and the teardown. They were
+        two copies of the same string, and adding the libvirt state trees
+        to the plan alone left the preview promising a cleanup that the
+        teardown did not perform (#164 FB-2 review).
+        """
+        return (
+            f"docker exec --user root {self.container_name} "
+            f"bash -c 'rm -rf /var/run/libvirt/* "
+            f"/var/lib/libvirt/images/* /etc/boxman/ssh/* "
+            f"/etc/libvirt/* /var/lib/libvirt/qemu/*'")
 
     def destroy_runtime(self) -> str | None:
         """
@@ -1362,9 +1586,7 @@ class DockerComposeRuntime(RuntimeBase):
                 f"'{self.container_name}'")
             try:
                 _shell_run(
-                    f"docker exec --user root {self.container_name} "
-                    f"bash -c 'rm -rf /var/run/libvirt/* "
-                    f"/var/lib/libvirt/images/* /etc/boxman/ssh/*'",
+                    self._container_cleanup_command(),
                     hide=False,
                     warn=True,
                 )

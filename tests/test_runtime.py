@@ -640,7 +640,8 @@ class TestDockerComposeRuntime:
                 rt.get_compose_file_path()
 
     @patch("invoke.run")
-    def test_ensure_ready_passes_project_dir_to_compose(self, mock_run):
+    def test_ensure_ready_passes_project_dir_to_compose(self, mock_run,
+                                                        tmp_path):
         """ensure_ready must pass BOXMAN_PROJECT_DIR so the container
         bind-mounts the project directory."""
         rt = DockerComposeRuntime(config={
@@ -648,7 +649,9 @@ class TestDockerComposeRuntime:
             "compose_file": "/dev/null",
             "ready_timeout": 5,
         })
-        rt.project_dir = "/home/user/my-project"
+        # a real directory: ensure_ready now creates the data dir itself,
+        # so that docker does not create it as root (#164 FB-2 review)
+        rt.project_dir = str(tmp_path / "my-project")
 
         with patch.object(rt, "get_compose_file_path", return_value="/tmp/docker-compose.yml"), \
              patch.object(rt, "_write_bind_mount_override"), \
@@ -660,13 +663,14 @@ class TestDockerComposeRuntime:
             rt.ensure_ready()
 
             env_kwarg = _compose_up_call(mock_run).kwargs.get("env", {})
-            assert env_kwarg.get("BOXMAN_PROJECT_DIR") == "/home/user/my-project"
+            assert env_kwarg.get("BOXMAN_PROJECT_DIR") == rt.project_dir
             assert "BOXMAN_DATA_DIR" in env_kwarg
             assert "HOST_UID" in env_kwarg
             assert "HOST_GID" in env_kwarg
 
     @patch("invoke.run")
-    def test_ensure_ready_injects_workdirs_into_compose(self, mock_run):
+    def test_ensure_ready_injects_workdirs_into_compose(self, mock_run,
+                                                       tmp_path):
         """ensure_ready must pass workdirs as bind-mount volumes (to the
         override file for a user-supplied compose file)."""
         rt = DockerComposeRuntime(config={
@@ -674,8 +678,8 @@ class TestDockerComposeRuntime:
             "compose_file": "/dev/null",
             "ready_timeout": 5,
         })
-        rt.project_dir = "/home/user/my-project"
-        rt.workdirs = ["/home/user/libvirt-tiny"]
+        rt.project_dir = str(tmp_path / "my-project")
+        rt.workdirs = [str(tmp_path / "libvirt-tiny")]
 
         inject_calls = []
 
@@ -692,8 +696,8 @@ class TestDockerComposeRuntime:
             rt.ensure_ready()
 
             assert len(inject_calls) == 1
-            assert "/home/user/my-project" in inject_calls[0]
-            assert "/home/user/libvirt-tiny" in inject_calls[0]
+            assert rt.project_dir in inject_calls[0]
+            assert str(tmp_path / "libvirt-tiny") in inject_calls[0]
 
 
 class TestVerifyWorkdirsAccessible:

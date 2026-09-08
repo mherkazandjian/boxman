@@ -849,7 +849,8 @@ class TestReviewRegressions:
         (legacy / "disk.qcow2").write_text("x")
         os.makedirs(os.path.join(rt._data_dir(), "ssh"))
 
-        with patch("invoke.run", return_value=MagicMock(ok=False, stdout="")):
+        # no container: docker ps -a returns nothing
+        with patch("invoke.run", return_value=MagicMock(ok=True, stdout="")):
             with pytest.raises(ProvisionError,
                                match="still in the previous location"):
                 rt._assert_no_stranded_data_dir(str(custom))
@@ -883,7 +884,7 @@ class TestReviewRegressions:
         (custom / "data" / "images").mkdir(parents=True)
         (custom / "data" / "images" / "d.qcow2").write_text("x")
 
-        with patch("invoke.run", return_value=MagicMock(ok=False, stdout="")):
+        with patch("invoke.run", return_value=MagicMock(ok=True, stdout="")):
             with pytest.raises(ProvisionError) as excinfo:
                 rt._assert_no_stranded_data_dir(str(custom))
 
@@ -896,3 +897,285 @@ class TestReviewRegressions:
 def pathlib_path(p):
     import pathlib
     return pathlib.Path(p)
+
+
+class TestSecondReviewRegressions:
+    """Round two of the implementation review — five more data-loss or
+    blocked-migration paths, all in the code that was meant to fix round
+    one."""
+
+    # -- 1. unknown mounts must never authorise deletion ---------------
+    def test_an_unreadable_mount_table_refuses_rather_than_migrating_all(
+            self, tmp_path):
+        """`pending is None` used to fall back to "migrate both trees",
+        whose first act clears the destinations — which may be the very
+        bind sources the unreadable table would have named."""
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        calls = []
+
+        def _run(command, *_a, **_kw):
+            calls.append(command)
+            if "docker ps -a" in command:
+                return MagicMock(ok=True, stdout="exited\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=False, stdout="")
+            return MagicMock(ok=True, stdout="", stderr="")
+
+        with patch("invoke.run", side_effect=_run):
+            with pytest.raises(ProvisionError, match="could not read the "
+                                                    "mount table"):
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+        assert not any("docker cp" in c for c in calls)
+
+    def test_an_unreadable_mount_table_with_a_marker_is_accepted(self,
+                                                                 tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        os.makedirs(rt._data_dir(), exist_ok=True)
+        open(rt._state_marker_path(), "w").close()
+
+        def _run(command, *_a, **_kw):
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=False, stdout="")
+            return MagicMock(ok=True, stdout="exited\n")
+
+        with patch("invoke.run", side_effect=_run):
+            rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+    # -- 2. a read-only mount is still the live source ------------------
+    def test_a_read_only_mount_counts_as_persisted(self, tmp_path):
+        """Ownership is not writability. A `:ro` mount of the canonical
+        source still means the host directory holds the live state, and
+        the migration's cleanup would have destroyed it."""
+        rt = _runtime(tmp_path)
+        import json
+        mounts = json.dumps([
+            {"Source": rt._state_host_dir(sub), "Destination": path,
+             "RW": False}
+            for sub, path in rt._PERSISTED_STATE])
+        with patch("invoke.run",
+                   return_value=MagicMock(ok=True, stdout=mounts)):
+            assert rt._unpersisted_trees() == []
+
+    # -- 3. a deferred migration blocks every removal -------------------
+    def test_a_recovered_guest_probe_cannot_authorise_removal(self,
+                                                              tmp_path):
+        """The two probes are independent. The first can return unknown,
+        deferring the migration; the second can return zero moments later
+        and let `compose down` proceed over state never copied."""
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        probes = iter([None, 0, 0, 0, 0])
+        calls = []
+
+        def _run(command, *_a, **_kw):
+            calls.append(command)
+            if "docker ps -a" in command:
+                return MagicMock(ok=True, stdout="running\n")
+            if rt._GUEST_PROBE_MARKER in command:
+                nxt = next(probes, 0)
+                if nxt is None:
+                    return MagicMock(ok=False, stdout="")
+                return MagicMock(
+                    ok=True, stdout=f"{rt._GUEST_PROBE_MARKER}{nxt}\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=True, stdout="[]")
+            return MagicMock(ok=True, stdout="", stderr="")
+
+        with patch("invoke.run", side_effect=_run):
+            with pytest.raises(ProvisionError,
+                               match="still keeps libvirt's own state"):
+                rt._recreate_container("recreate the container",
+                                       compose, os.path.dirname(compose))
+
+        assert not any(
+            "compose" in c and c.rstrip().endswith("down") for c in calls)
+
+    def test_a_persisted_container_recreates_normally(self, tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        calls = []
+        with patch("invoke.run",
+                   side_effect=_dispatch(rt, persisted=True, calls=calls)):
+            rt._recreate_container("recreate the container",
+                                   compose, os.path.dirname(compose))
+        assert any(
+            "compose" in c and c.rstrip().endswith("down") for c in calls)
+
+    # -- 4. the data dir must belong to the user ------------------------
+    def test_the_data_dir_is_created_before_docker_can(self, tmp_path):
+        """Docker creates a missing bind source as root, and the migration
+        then cannot write its staging directory — after it has already
+        stopped the container."""
+        rt = _runtime(tmp_path)
+        rt._prepare_data_dir()
+        assert os.path.isdir(rt._data_dir())
+        for subdir, _ in rt._PERSISTED_STATE:
+            assert os.path.isdir(rt._state_host_dir(subdir))
+
+    def test_an_unwritable_data_dir_refuses_before_anything_stops(
+            self, tmp_path):
+        """Creating the subdirectories fails first here."""
+        rt = _runtime(tmp_path)
+        data = rt._data_dir()
+        os.makedirs(data)
+        os.chmod(data, 0o500)
+        try:
+            with pytest.raises(ProvisionError, match="hands it back"):
+                rt._prepare_data_dir()
+        finally:
+            os.chmod(data, 0o700)
+
+    def test_an_unwritable_but_complete_data_dir_still_refuses(self,
+                                                               tmp_path):
+        """With the subdirectories already there, `makedirs` succeeds and
+        only the writability check stands between the migration and a
+        failure that lands after the container has been stopped."""
+        rt = _runtime(tmp_path)
+        data = rt._data_dir()
+        for subdir, _ in rt._PERSISTED_STATE:
+            os.makedirs(os.path.join(data, subdir))
+        os.chmod(data, 0o500)
+        try:
+            with pytest.raises(ProvisionError, match="not writable"):
+                rt._prepare_data_dir()
+        finally:
+            os.chmod(data, 0o700)
+
+    # -- 8. absence is not a stopped source -----------------------------
+    def test_a_container_that_vanishes_while_stopping_refuses(self,
+                                                              tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        seen = {"stopped": False}
+
+        def _run(command, *_a, **_kw):
+            if "compose" in command and command.rstrip().endswith("stop"):
+                seen["stopped"] = True
+                return MagicMock(ok=True, stdout="", stderr="")
+            if "docker ps -a" in command:
+                return MagicMock(
+                    ok=True, stdout="" if seen["stopped"] else "running\n")
+            if rt._GUEST_PROBE_MARKER in command:
+                return MagicMock(
+                    ok=True, stdout=f"{rt._GUEST_PROBE_MARKER}0\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=True, stdout="[]")
+            return MagicMock(ok=True, stdout="", stderr="")
+
+        with patch("invoke.run", side_effect=_run):
+            with pytest.raises(ProvisionError, match="disappeared while"):
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))
+        assert not os.path.isfile(rt._state_marker_path())
+
+    # -- 6. compose interpolation in volume entries ---------------------
+    @pytest.mark.parametrize("entry,expected", [
+        ("/a:/b", ("/a", "/b", set())),
+        ("/a:/b:ro", ("/a", "/b", {"ro"})),
+        ("${BOXMAN_DATA_DIR:-./data}/images:/var/lib/libvirt/images",
+         ("${BOXMAN_DATA_DIR:-./data}/images", "/var/lib/libvirt/images",
+          set())),
+        ("${BOXMAN_DATA_DIR}/etc-libvirt:/etc/libvirt:rw",
+         ("${BOXMAN_DATA_DIR}/etc-libvirt", "/etc/libvirt", {"rw"})),
+        ("/only", None),
+    ])
+    def test_a_default_value_colon_does_not_break_the_split(self, entry,
+                                                            expected):
+        """`${BOXMAN_DATA_DIR:-./data}` carries a colon inside the default,
+        so splitting on `:` produced nonsense."""
+        from boxman.runtime.docker_compose import _split_volume
+        assert _split_volume(entry) == expected
+
+    def test_an_unresolved_source_is_not_a_conflict(self, tmp_path):
+        """The bundled compose file declares the state mounts against
+        ${BOXMAN_DATA_DIR}, which may well interpolate to exactly the path
+        being added — and compose merges override volumes by target."""
+        rt = _runtime(tmp_path)
+        src, dst = rt._state_mount_pairs()[0]
+        assert rt._mounts_to_add(
+            [f"${{BOXMAN_DATA_DIR}}/etc-libvirt:{dst}"], [(src, dst)]) == []
+
+    # -- 7. unknown is not "empty" --------------------------------------
+    def test_an_unreadable_legacy_dir_refuses(self, tmp_path):
+        rt = _runtime(tmp_path)
+        custom = tmp_path / "custom"
+        (custom / "data" / "images").mkdir(parents=True)
+        (custom / "data" / "images" / "d.qcow2").write_text("x")
+        os.chmod(custom / "data" / "images", 0o000)
+        try:
+            with patch("invoke.run",
+                       return_value=MagicMock(ok=True, stdout="")):
+                with pytest.raises(ProvisionError, match="cannot read"):
+                    rt._assert_no_stranded_data_dir(str(custom))
+        finally:
+            os.chmod(custom / "data" / "images", 0o700)
+
+    def test_an_unreadable_mount_table_refuses_the_relocation(self,
+                                                              tmp_path):
+        rt = _runtime(tmp_path)
+        custom = tmp_path / "custom"
+        (custom / "data" / "images").mkdir(parents=True)
+        (custom / "data" / "images" / "d.qcow2").write_text("x")
+
+        def _run(command, *_a, **_kw):
+            if "docker ps -a" in command:
+                return MagicMock(ok=True, stdout="running\n")
+            return MagicMock(ok=False, stdout="")
+
+        with patch("invoke.run", side_effect=_run):
+            with pytest.raises(ProvisionError,
+                               match="mount table could not be read"):
+                rt._assert_no_stranded_data_dir(str(custom))
+
+    # -- 5. do not recommend moving a live directory --------------------
+    def test_a_live_container_is_told_to_stop_before_moving(self, tmp_path):
+        """`mv` across filesystems copies and unlinks, so moving disks a
+        running QEMU is writing corrupts them — and `boxman down` would be
+        circular, since it goes through this same check."""
+        rt = _runtime(tmp_path)
+        custom = tmp_path / "custom"
+        (custom / "data" / "images").mkdir(parents=True)
+        (custom / "data" / "images" / "d.qcow2").write_text("x")
+
+        import json
+        mounts = json.dumps([
+            {"Source": str(custom / "data" / "images"),
+             "Destination": "/var/lib/libvirt/images", "RW": True}])
+
+        def _run(command, *_a, **_kw):
+            if "docker ps -a" in command:
+                return MagicMock(ok=True, stdout="running\n")
+            return MagicMock(ok=True, stdout=mounts)
+
+        with patch("invoke.run", side_effect=_run):
+            with pytest.raises(ProvisionError) as excinfo:
+                rt._assert_no_stranded_data_dir(str(custom))
+
+        message = str(excinfo.value)
+        assert f"docker stop {rt.container_name}" in message
+        assert "corrupts it" in message
+        assert "mv -T " in message
+
+    # -- the cleanup command had drifted into two copies ----------------
+    def test_the_teardown_runs_the_command_the_plan_advertises(self,
+                                                               tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        with patch.object(rt, "get_compose_file_path", return_value=compose), \
+                patch("invoke.run",
+                      return_value=MagicMock(ok=True, stdout="true\n")):
+            plan = rt.plan_destroy_runtime()
+        advertised = next(c for c in plan["commands"] if "rm -rf" in c)
+        assert advertised == rt._container_cleanup_command()
+
+        calls = []
+        with patch.object(rt, "get_compose_file_path", return_value=compose), \
+                patch("invoke.run",
+                      side_effect=lambda c, *a, **k: (
+                          calls.append(c),
+                          MagicMock(ok=True, stdout="true\n"))[1]):
+            rt.destroy_runtime()
+        assert any("/etc/libvirt/*" in c for c in calls)
+        assert any("/var/lib/libvirt/qemu/*" in c for c in calls)
