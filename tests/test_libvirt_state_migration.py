@@ -1179,3 +1179,207 @@ class TestSecondReviewRegressions:
             rt.destroy_runtime()
         assert any("/etc/libvirt/*" in c for c in calls)
         assert any("/var/lib/libvirt/qemu/*" in c for c in calls)
+
+
+class TestEnsureReadyThroughAMigration:
+    """The gap that let a serious bug through: every migration test called
+    ``_ensure_state_persisted`` directly, so nothing exercised the whole of
+    ``ensure_ready`` across a migration.
+
+    The container the state was copied *from* does not mount the state
+    trees — that is why it is being replaced — so its mount table cannot
+    answer "is the state safe?" once the copy is done. Consulting it
+    anyway made the recreate guard refuse the very ``up`` the migration
+    exists to enable.
+    """
+
+    def _run(self, rt, compose, calls, *, guests=0):
+        stopped = {"yes": False}
+        started = {"yes": False}
+
+        def _dispatcher(command, *_a, **_kw):
+            calls.append(command)
+            if "compose" in command and " up " in f" {command} ":
+                started["yes"] = True
+                return MagicMock(ok=True, stdout="")
+            if "compose" in command and command.rstrip().endswith("stop"):
+                stopped["yes"] = True
+                return MagicMock(ok=True, stdout="", stderr="")
+            if "docker ps -a" in command:
+                if started["yes"]:
+                    return MagicMock(ok=True, stdout="running\n")
+                return MagicMock(
+                    ok=True,
+                    stdout="exited\n" if stopped["yes"] else "running\n")
+            if rt._GUEST_PROBE_MARKER in command:
+                return MagicMock(
+                    ok=True, stdout=f"{rt._GUEST_PROBE_MARKER}{guests}\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                import json
+                if not started["yes"]:
+                    # the pre-migration container: no state mounts at all
+                    return MagicMock(ok=True, stdout="[]")
+                bind = rt._collect_bind_mount_dirs(
+                    os.path.abspath(rt.project_dir))
+                return MagicMock(ok=True, stdout=json.dumps(
+                    [{"Source": d, "Destination": d, "RW": True}
+                     for d in bind]
+                    + [{"Source": rt._state_host_dir(sub),
+                        "Destination": path, "RW": True}
+                       for sub, path in rt._PERSISTED_STATE]))
+            if "docker inspect" in command:
+                return MagicMock(
+                    ok=True,
+                    stdout="true\n" if started["yes"] else "false\n")
+            if command.startswith("docker cp"):
+                source = command.split()[2].split(":", 1)[1]
+                root, entries = STATE_FIXTURES[source]
+                _make_tar(_redirect_target(command), root, entries)
+                return MagicMock(ok=True, stdout="", stderr="")
+            return MagicMock(ok=True, stdout="", stderr="")
+
+        with patch.object(rt, "get_compose_file_path", return_value=compose), \
+                patch.object(rt, "_log_compose_file"), \
+                patch.object(rt, "verify_workdirs_accessible"), \
+                patch("invoke.run", side_effect=_dispatcher):
+            rt.ensure_ready()
+
+    def test_a_migration_does_not_block_the_container_it_enables(self,
+                                                                 tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        calls = []
+        self._run(rt, compose, calls)
+
+        assert any("docker cp" in c for c in calls), "no migration happened"
+        assert any("compose" in c and " up " in f" {c} " for c in calls), \
+            "the container was never brought up after the migration"
+        assert os.path.isfile(rt._state_marker_path())
+        assert os.path.isfile(os.path.join(
+            rt._data_dir(), "etc-libvirt/qemu/vm1.xml"))
+
+    def test_the_data_dir_is_prepared_before_the_container_starts(self,
+                                                                  tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        calls = []
+        self._run(rt, compose, calls)
+        # docker would otherwise create these as root and the migration
+        # could not write beside them
+        assert os.path.isdir(rt._data_dir())
+
+    def test_running_guests_stop_the_recreate_rather_than_the_guests(
+            self, tmp_path):
+        """Without --force the migration defers, and the recreate that
+        would follow is then refused rather than allowed to take the
+        unmigrated state with it.
+
+        Refusing is the whole point: the alternative on this path is
+        destroying a container whose domains exist nowhere else.
+        """
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        calls = []
+        with pytest.raises(ProvisionError,
+                           match="still keeps libvirt's own state"):
+            self._run(rt, compose, calls, guests=2)
+        assert not any("docker cp" in c for c in calls)
+        assert not any(
+            "compose" in c and c.rstrip().endswith("down") for c in calls)
+
+
+class TestComposeVariableResolution:
+    """#164 FB-2 review, finding 6 — a compose file copied from the bundled
+    one spells these mounts as ``${BOXMAN_DATA_DIR}/...``, which is the same
+    path, not a conflict."""
+
+    def test_the_bundled_spelling_is_recognised(self, tmp_path):
+        rt = _runtime(tmp_path)
+        src, dst = rt._state_mount_pairs()[0]
+        assert rt._mounts_to_add(
+            [f"${{BOXMAN_DATA_DIR}}/etc-libvirt:{dst}"], [(src, dst)]) == []
+
+    def test_a_default_value_spelling_is_recognised(self, tmp_path):
+        rt = _runtime(tmp_path)
+        src, dst = rt._state_mount_pairs()[1]
+        assert rt._mounts_to_add(
+            [f"${{BOXMAN_DATA_DIR:-./data}}/var-lib-libvirt-qemu:{dst}"],
+            [(src, dst)]) == []
+
+    def test_a_genuinely_different_source_is_refused(self, tmp_path):
+        rt = _runtime(tmp_path)
+        src, dst = rt._state_mount_pairs()[0]
+        with pytest.raises(ProvisionError, match="already bound from"):
+            rt._mounts_to_add([f"/somewhere/else:{dst}"], [(src, dst)])
+
+    def test_an_unresolvable_source_is_refused_with_advice(self, tmp_path):
+        rt = _runtime(tmp_path)
+        src, dst = rt._state_mount_pairs()[0]
+        with pytest.raises(ProvisionError, match="cannot resolve"):
+            rt._mounts_to_add([f"${{SOMETHING_ELSE}}/x:{dst}"], [(src, dst)])
+
+
+class TestAtRiskFailsClosed:
+    """The at-risk check is consulted immediately before destruction, so
+    every unknown answer has to count as risk."""
+
+    def test_unknown_container_existence_counts_as_risk(self, tmp_path):
+        rt = _runtime(tmp_path)
+        with patch("invoke.run", return_value=MagicMock(ok=False, stdout="")):
+            assert rt._state_is_at_risk() is True
+
+    def test_unknown_mount_table_counts_as_risk(self, tmp_path):
+        rt = _runtime(tmp_path)
+
+        def _run(command, *_a, **_kw):
+            if "docker ps -a" in command:
+                return MagicMock(ok=True, stdout="running\n")
+            return MagicMock(ok=False, stdout="")
+
+        with patch("invoke.run", side_effect=_run):
+            assert rt._state_is_at_risk() is True
+
+    def test_an_absent_container_is_not_at_risk(self, tmp_path):
+        rt = _runtime(tmp_path)
+        with patch("invoke.run", return_value=MagicMock(ok=True, stdout="")):
+            assert rt._state_is_at_risk() is False
+
+    def test_a_stale_marker_does_not_clear_the_risk(self, tmp_path):
+        """The marker says a migration finished once, not that *this*
+        container's state is on the host. A container recreated later
+        without the mounts accumulates state the marker knows nothing of.
+        """
+        rt = _runtime(tmp_path)
+        os.makedirs(rt._data_dir(), exist_ok=True)
+        open(rt._state_marker_path(), "w").close()
+
+        def _run(command, *_a, **_kw):
+            if "docker ps -a" in command:
+                return MagicMock(ok=True, stdout="running\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=True, stdout="[]")
+            return MagicMock(ok=True, stdout="")
+
+        with patch("invoke.run", side_effect=_run):
+            assert rt._state_is_persisted() is False
+            assert rt._state_is_at_risk() is True
+
+
+class TestReadOnlyDeclarationsAreResolvedToo:
+    """A `:ro` entry spelled with a compose variable has to be recognised
+    as the mount boxman needs, or it is reported as an unrelated binding
+    rather than the read-only problem it is."""
+
+    def test_a_variable_spelled_read_only_mount_is_named_as_such(self,
+                                                                tmp_path):
+        rt = _runtime(tmp_path)
+        src, dst = rt._state_mount_pairs()[0]
+        with pytest.raises(ProvisionError, match="read-only"):
+            rt._mounts_to_add(
+                [f"${{BOXMAN_DATA_DIR}}/etc-libvirt:{dst}:ro"], [(src, dst)])
+
+    def test_a_literal_read_only_mount_is_named_as_such(self, tmp_path):
+        rt = _runtime(tmp_path)
+        src, dst = rt._state_mount_pairs()[0]
+        with pytest.raises(ProvisionError, match="read-only"):
+            rt._mounts_to_add([f"{src}:{dst}:ro"], [(src, dst)])

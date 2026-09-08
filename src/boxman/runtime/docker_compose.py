@@ -66,6 +66,34 @@ def _is_interpolated(value: str) -> bool:
     return bool(_COMPOSE_VAR.search(value))
 
 
+def _interpolate(value: str, values: dict[str, str]) -> str:
+    """
+    Expand ``${VAR}``, ``${VAR:-default}`` and ``$VAR`` in *value* using
+    *values*, falling back to the process environment and then to a
+    ``:-default`` if the entry carries one. Anything still unresolved is
+    left as written, so :func:`_is_interpolated` can spot it.
+    """
+    def _one(match: re.Match) -> str:
+        body = match.group(1)
+        if body is None:
+            name, default = match.group(2), None
+        elif ":-" in body:
+            name, _, default = body.partition(":-")
+        elif ":?" in body:
+            name, default = body.split(":?", 1)[0], None
+        else:
+            name, default = body, None
+        if name in values:
+            return values[name]
+        if name in os.environ:
+            return os.environ[name]
+        if default is not None:
+            return default
+        return match.group(0)
+
+    return _COMPOSE_VAR.sub(_one, value)
+
+
 def docker_exec_wrap(command: str, container: str) -> str:
     """
     Wrap *command* in a ``docker exec --user root <container> bash -c '…'``
@@ -110,6 +138,15 @@ class DockerComposeRuntime(RuntimeBase):
         #: destruction, and ``--force`` raises it on provision/up.
         self.allow_recreate: bool = bool(
             self.config.get("allow_recreate", False))
+
+        #: bool: whether this run has already copied libvirt's state out of
+        #: the container. The container it copied *from* still does not
+        #: mount the state trees — that is the whole reason it is being
+        #: replaced — so its mount table cannot answer "is the state safe?"
+        #: once the copy is done. Without this, the guard added for the
+        #: recreate paths refused the very `up` the migration exists to
+        #: enable.
+        self._state_migrated_this_run: bool = False
 
     @property
     def project_name(self) -> str | None:
@@ -281,8 +318,21 @@ class DockerComposeRuntime(RuntimeBase):
         anything is stopped, rather than looping through recreate.
         """
         declared = self._declared_mounts(volumes)
-        writable = {(src, dst) for src, dst, ok in declared if ok}
-        read_only = {(src, dst) for src, dst, ok in declared if not ok}
+        compose_vars = {
+            "BOXMAN_DATA_DIR": self._data_dir(),
+            "BOXMAN_PROJECT_DIR": os.path.abspath(
+                self.project_dir or os.getcwd()),
+            "BOXMAN_INSTANCE_NAME": self._instance_name(),
+        }
+        # (as written, resolved, destination, writable) — the original
+        # spelling is kept only so error messages quote what the user
+        # actually wrote.
+        resolved = [
+            (src, _interpolate(src, compose_vars), dst, ok)
+            for src, dst, ok in declared
+        ]
+        writable = {(res, dst) for _, res, dst, ok in resolved if ok}
+        read_only = {(res, dst) for _, res, dst, ok in resolved if not ok}
 
         problems: list[str] = []
         to_add: list[str] = []
@@ -294,22 +344,26 @@ class DockerComposeRuntime(RuntimeBase):
                     f"{src}:{dst} is declared read-only, and boxman needs "
                     f"it writable")
                 continue
-            conflicting = [
-                other for other, target, _ in declared
-                if target == dst and other != src
-                and not _is_interpolated(other)
+            # Sources are resolved against the values boxman itself writes
+            # to .env before comparing, so a compose file copied from the
+            # bundled one — which declares these mounts as
+            # ${BOXMAN_DATA_DIR}/... — is recognised as the same path
+            # spelled differently rather than reported as a conflict.
+            same_target = [
+                (written, res) for written, res, target, _ in resolved
+                if target == dst
             ]
-            if conflicting:
-                # An unresolved ${VAR} source is not a conflict: it may well
-                # interpolate to exactly this path, and compose merges
-                # override volumes by target anyway, so a second entry for
-                # the same destination is not a duplicate mount.
-                problems.append(
-                    f"{dst} is already bound from {conflicting[0]}, and "
-                    f"boxman needs {src} there")
-                continue
-            if any(target == dst for _, target, _ in declared):
-                # same destination, unresolved source: assume it is ours
+            if same_target:
+                other, res = same_target[0]
+                if _is_interpolated(res):
+                    problems.append(
+                        f"{dst} is bound from {other}, which boxman cannot "
+                        f"resolve, and it needs {src} there — use an "
+                        f"absolute path or remove the entry")
+                else:
+                    problems.append(
+                        f"{dst} is already bound from {other}, and boxman "
+                        f"needs {src} there")
                 continue
             to_add.append(f"{src}:{dst}")
 
@@ -925,6 +979,7 @@ class DockerComposeRuntime(RuntimeBase):
             f"migrated out of container {self.container_name}: "
             f"{', '.join(path for _, path in trees)}")
 
+        self._state_migrated_this_run = True
         self.logger.info(
             "libvirt state migrated; it now lives on the host and "
             "survives a container recreate")
@@ -1083,10 +1138,24 @@ class DockerComposeRuntime(RuntimeBase):
         number is merely *unknown* — and a second probe taken moments later
         can come back zero, which used to let the recreate proceed over
         state that was never copied (#164 FB-2 review).
+
+        Unknown answers count as risk, because the next step is destruction.
+        In particular the marker is *not* consulted here: it says a
+        migration finished at some point, not that this container's state is
+        on the host, and a container recreated later without the mounts
+        accumulates fresh state that the marker knows nothing about.
         """
-        if self._state_is_persisted():
+        if self._state_migrated_this_run:
             return False
-        return self._container_state() not in (None, "")
+        state = self._container_state()
+        if state == "":
+            return False
+        if state is None:
+            return True
+        pending = self._unpersisted_trees()
+        if pending is None:
+            return True
+        return bool(pending)
 
     def _assert_state_not_at_risk(self, action: str) -> None:
         """Refuse *action* while a container holds unmigrated state."""
