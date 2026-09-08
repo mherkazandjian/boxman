@@ -1532,3 +1532,51 @@ class TestTheMarkerCannotOutliveItsTrees:
             with pytest.raises(ProvisionError,
                                match="could not read the mount table"):
                 rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+
+class TestRelocationDetectionDoesNotOverfire:
+    """Refusing costs the user the whole verb, so the relocated-source
+    check has to be exact."""
+
+    def test_a_symlinked_data_dir_is_not_a_relocation(self, tmp_path):
+        """docker reports the resolved bind source, so a data directory
+        reached through a symlink would look like a different one."""
+        rt = _runtime(tmp_path)
+        real = tmp_path / "real-data"
+        (real / "etc-libvirt" / "qemu").mkdir(parents=True)
+        (real / "etc-libvirt" / "qemu" / "vm.xml").write_text("<domain/>")
+        os.makedirs(os.path.dirname(rt._data_dir()), exist_ok=True)
+        os.symlink(real, rt._data_dir())
+
+        import json
+        mounts = json.dumps([
+            {"Source": str(real / "etc-libvirt"),
+             "Destination": "/etc/libvirt", "RW": True}])
+        with patch("invoke.run",
+                   return_value=MagicMock(ok=True, stdout=mounts)):
+            assert rt._relocated_bind_sources(
+                [("etc-libvirt", "/etc/libvirt")]) == []
+
+    def test_an_empty_destination_is_not_a_relocation(self, tmp_path):
+        """A first migration finds the trees empty; there is nothing to
+        overwrite and nothing to refuse."""
+        rt = _runtime(tmp_path)
+        rt._prepare_data_dir()
+        import json
+        mounts = json.dumps([
+            {"Source": "/somewhere/else", "Destination": "/etc/libvirt",
+             "RW": True}])
+        with patch("invoke.run",
+                   return_value=MagicMock(ok=True, stdout=mounts)):
+            assert rt._relocated_bind_sources(
+                [("etc-libvirt", "/etc/libvirt")]) == []
+
+    def test_no_mount_at_that_path_is_not_a_relocation(self, tmp_path):
+        rt = _runtime(tmp_path)
+        etc = rt._state_host_dir("etc-libvirt")
+        os.makedirs(etc)
+        (pathlib_path(etc) / "x.xml").write_text("<domain/>")
+        with patch("invoke.run",
+                   return_value=MagicMock(ok=True, stdout="[]")):
+            assert rt._relocated_bind_sources(
+                [("etc-libvirt", "/etc/libvirt")]) == []

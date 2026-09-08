@@ -821,7 +821,10 @@ class DockerComposeRuntime(RuntimeBase):
                 if mount.get("Destination") != container_path:
                     continue
                 source = mount.get("Source")
-                if source and os.path.abspath(source) != os.path.abspath(
+                # realpath, not abspath: docker reports the resolved source,
+                # so a data directory reached through a symlink would
+                # otherwise look like a different one and be refused
+                if source and os.path.realpath(source) != os.path.realpath(
                         destination):
                     relocated.append(
                         f"{container_path} is bound from {source}, but "
