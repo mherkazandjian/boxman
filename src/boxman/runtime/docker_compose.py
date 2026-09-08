@@ -32,6 +32,9 @@ from boxman.utils.shell import run as _shell_run
 #: split on ``:`` (#164 FB-2 review).
 _COMPOSE_VAR = re.compile(r"\$(?:\{([^{}]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 
+#: A compose variable name, as it appears at the start of a ``${…}`` body.
+_VAR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 
 def _split_volume(entry: str) -> tuple[str, str, set[str]] | None:
     """
@@ -76,20 +79,30 @@ def _interpolate(value: str, values: dict[str, str]) -> str:
     def _one(match: re.Match) -> str:
         body = match.group(1)
         empty_counts_as_unset = False
+        default = None
         if body is None:
-            name, default = match.group(2), None
-        elif ":-" in body:
-            name, _, default = body.partition(":-")
-            # compose applies a `:-` default to an *empty* value as well as
-            # an unset one; only `-` is unset-only (#164 FB-2 review)
-            empty_counts_as_unset = True
-        elif "-" in body:
-            name, _, default = body.partition("-")
-        elif ":?" in body or "?" in body:
-            name = body.split(":?", 1)[0].split("?", 1)[0]
-            default = None
+            name = match.group(2)
         else:
-            name, default = body, None
+            # The operator is whatever follows the variable *name*, not the
+            # first one that appears anywhere in the expression: searching
+            # the whole body made `${VAR:?not-set}` parse as name
+            # `VAR:?not` with default `set` (#164 FB-2 review).
+            named = _VAR_NAME.match(body)
+            if named is None:
+                return match.group(0)
+            name, rest = named.group(0), body[named.end():]
+            if rest.startswith(":-"):
+                # compose applies a `:-` default to an *empty* value as
+                # well as an unset one; plain `-` is unset-only
+                default, empty_counts_as_unset = rest[2:], True
+            elif rest.startswith("-"):
+                default = rest[1:]
+            elif rest.startswith((":?", "?", ":+", "+")):
+                # required, or an alternate value — neither supplies a
+                # default this resolver can use
+                default = None
+            elif rest:
+                return match.group(0)
 
         for source in (values, os.environ):
             if name in source:
@@ -421,7 +434,19 @@ class DockerComposeRuntime(RuntimeBase):
         only the *most specific* mount covering the path decides, since a
         narrower mount with a different source shadows the parent.
         """
-        host_path = os.path.abspath(host_path)
+        # Host paths are compared by real path, container paths by
+        # absolute path. Docker reports a bind source with its symlinks
+        # already resolved, so a data directory reached through one would
+        # otherwise not match itself — and this is the check that decides
+        # whether a tree needs migrating, while _relocated_bind_sources
+        # resolves. Two answers about the same directory sent an
+        # already-mounted tree through a migration whose cleanup renames
+        # its live source aside (#164 FB-2 review).
+        #
+        # Container paths are *not* resolved: they name locations inside
+        # the container, and resolving them against the host filesystem
+        # would follow entirely unrelated symlinks.
+        host_path = os.path.realpath(host_path)
         container_path = os.path.abspath(container_path)
 
         covering = None
@@ -443,7 +468,7 @@ class DockerComposeRuntime(RuntimeBase):
         dest, source, mount = covering
         relative = os.path.relpath(container_path, dest)
         mapped = source if relative == "." else os.path.join(source, relative)
-        if os.path.abspath(mapped) != host_path:
+        if os.path.realpath(mapped) != host_path:
             return False
         if require_writable and mount.get("RW") is False:
             return False

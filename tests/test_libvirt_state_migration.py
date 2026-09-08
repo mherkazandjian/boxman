@@ -1796,3 +1796,100 @@ class TestSupersededDestinationsAlsoSignalAnInterruption:
         rt._state_migrated_this_run = False
         with patch("invoke.run", return_value=MagicMock(ok=True, stdout="")):
             rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+
+class TestFifthReviewRegressions:
+    """Round five."""
+
+    # -- 1. one notion of "the same host directory" ---------------------
+    def test_a_symlinked_data_dir_needs_no_migration_at_all(self, tmp_path):
+        """`_mount_provides` compared with abspath while
+        `_relocated_bind_sources` resolved, so a symlinked data directory
+        was called unpersisted by one and not-relocated by the other —
+        which sent an already-mounted tree through a migration whose
+        cleanup renames its own live source aside."""
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        real = tmp_path / "real-data"
+        for subdir, _ in rt._PERSISTED_STATE:
+            (real / subdir / "qemu").mkdir(parents=True)
+            (real / subdir / "qemu" / "live.xml").write_text("<domain/>")
+        os.makedirs(os.path.dirname(rt._data_dir()), exist_ok=True)
+        os.symlink(real, rt._data_dir())
+
+        import json
+        mounts = json.dumps([
+            {"Source": str(real / subdir), "Destination": path, "RW": True}
+            for subdir, path in rt._PERSISTED_STATE])
+        calls = []
+
+        def _run(command, *_a, **_kw):
+            calls.append(command)
+            if "docker ps -a" in command:
+                return MagicMock(ok=True, stdout="running\n")
+            if "docker inspect" in command and ".Mounts" in command:
+                return MagicMock(ok=True, stdout=mounts)
+            return MagicMock(ok=True, stdout="", stderr="")
+
+        with patch("invoke.run", side_effect=_run):
+            assert rt._unpersisted_trees() == []
+            rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+        assert not any("docker cp" in c for c in calls), "it copied"
+        assert not any("compose" in c and c.rstrip().endswith("stop")
+                       for c in calls), "it stopped the container"
+        assert not [d for d in os.listdir(real) if ".superseded-" in d], \
+            "it renamed the live bind source aside"
+        for subdir, _ in rt._PERSISTED_STATE:
+            assert (real / subdir / "qemu" / "live.xml").is_file()
+
+    def test_mount_provides_resolves_host_paths(self, tmp_path):
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        os.symlink(real, link)
+        assert DockerComposeRuntime._mount_provides(
+            [{"Source": str(real), "Destination": "/etc/libvirt",
+              "RW": True}],
+            str(link), "/etc/libvirt")
+
+    def test_mount_provides_does_not_resolve_container_paths(self, tmp_path):
+        """Container paths name locations inside the container; resolving
+        them against the host would follow unrelated symlinks."""
+        real = tmp_path / "real"
+        real.mkdir()
+        assert DockerComposeRuntime._mount_provides(
+            [{"Source": str(real), "Destination": "/etc/libvirt",
+              "RW": True}],
+            str(real), "/etc/libvirt")
+
+    # -- 3. the operator follows the name, it is not searched for -------
+    @pytest.mark.parametrize("entry,expected", [
+        ("${VAR:?not-set}/x", "/real/x"),
+        ("${VAR?not-set}/x", "/real/x"),
+        ("${VAR:-a-b}/x", "/real/x"),
+        ("${VAR:+other-value}/x", "/real/x"),
+    ])
+    def test_a_hyphen_in_an_operator_message_is_not_a_default(
+            self, entry, expected, monkeypatch):
+        """`${VAR:?not-set}` used to parse as name `VAR:?not` with default
+        `set`, so a correctly supplied variable produced `set/...` and a
+        false mount conflict."""
+        from boxman.runtime.docker_compose import _interpolate
+        monkeypatch.setenv("VAR", "/real")
+        assert _interpolate(entry, {}) == expected
+
+    def test_a_required_variable_that_is_unset_stays_unresolved(self,
+                                                                monkeypatch):
+        """Nothing here can satisfy `:?`, so it is left as written and the
+        caller refuses rather than inventing a path."""
+        from boxman.runtime.docker_compose import (
+            _interpolate,
+            _is_interpolated,
+        )
+        monkeypatch.delenv("VAR", raising=False)
+        assert _is_interpolated(_interpolate("${VAR:?not-set}/x", {}))
+
+    def test_a_malformed_expression_is_left_alone(self):
+        from boxman.runtime.docker_compose import _interpolate
+        assert _interpolate("${1BAD}/x", {}) == "${1BAD}/x"
