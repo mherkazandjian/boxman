@@ -891,11 +891,17 @@ class DockerComposeRuntime(RuntimeBase):
         if not os.path.isdir(data):
             return False
         for subdir, _ in self._PERSISTED_STATE:
-            staging = os.path.basename(
-                self._state_host_dir(subdir) + self._STAGING_SUFFIX)
+            staging = subdir + self._STAGING_SUFFIX
             for entry in os.listdir(data):
-                if entry == staging or entry.startswith(
-                        staging + self._SUPERSEDED_PREFIX):
+                if entry == staging:
+                    return True
+                # a second attempt renamed the staging tree aside
+                if entry.startswith(staging + self._SUPERSEDED_PREFIX):
+                    return True
+                # or renamed the *destination* aside, which is the only
+                # trace left when a populated destination was superseded
+                # and the copy that was to replace it then failed
+                if entry.startswith(subdir + self._SUPERSEDED_PREFIX):
                     return True
         return False
 

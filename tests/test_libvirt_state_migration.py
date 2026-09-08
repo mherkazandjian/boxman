@@ -1745,3 +1745,54 @@ class TestFourthReviewRegressions:
         assert rt._mounts_to_add(
             [f"${{BOXMAN_DATA_DIR:-/nope}}/etc-libvirt:{dst}"],
             [(src, dst)]) == []
+
+
+class TestSupersededDestinationsAlsoSignalAnInterruption:
+    """The cleanup renames both the staging tree and the destination. Only
+    the staging half was counted, so a failed copy that had superseded a
+    populated destination left recovery data with nothing pointing at it."""
+
+    def test_a_superseded_destination_with_no_source_refuses(self, tmp_path):
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        data = rt._data_dir()
+        etc = rt._state_host_dir("etc-libvirt")
+        os.makedirs(etc)
+        with open(os.path.join(etc, "real.xml"), "w") as fobj:
+            fobj.write("<domain><name>real</name></domain>")
+
+        # the destination is renamed aside; the copy meant to replace it
+        # then fails, so no staging directory is left behind
+        rt._discard_untrusted_state([("etc-libvirt", "/etc/libvirt")])
+        kept = [d for d in os.listdir(data)
+                if d.startswith("etc-libvirt" + rt._SUPERSEDED_PREFIX)]
+        assert kept and not any(".staging" in d for d in os.listdir(data))
+
+        with patch("invoke.run", return_value=MagicMock(ok=True, stdout="")):
+            with pytest.raises(ProvisionError,
+                               match="half-finished migration"):
+                rt._ensure_state_persisted(compose, os.path.dirname(compose))
+
+        assert os.path.isfile(os.path.join(data, kept[0], "real.xml"))
+
+    def test_a_completed_migration_is_not_read_as_interrupted(self,
+                                                              tmp_path):
+        """A successful migration can also leave a superseded destination.
+        The marker and the complete destination settle it before the
+        interruption check is ever reached."""
+        rt = _runtime(tmp_path)
+        compose = str(tmp_compose(rt))
+        etc = rt._state_host_dir("etc-libvirt")
+        os.makedirs(etc)
+        with open(os.path.join(etc, "old.xml"), "w") as fobj:
+            fobj.write("<domain/>")
+
+        with patch("invoke.run", side_effect=_dispatch(rt)):
+            rt._ensure_state_persisted(compose, os.path.dirname(compose))
+        assert any(d.startswith("etc-libvirt" + rt._SUPERSEDED_PREFIX)
+                   for d in os.listdir(rt._data_dir()))
+
+        # the container is gone now; this must still be accepted
+        rt._state_migrated_this_run = False
+        with patch("invoke.run", return_value=MagicMock(ok=True, stdout="")):
+            rt._ensure_state_persisted(compose, os.path.dirname(compose))
