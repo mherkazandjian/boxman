@@ -110,7 +110,11 @@ class ControlMixin:
         failed = []
         for vm_name, workdir in self._control_vm_targets(cli_args):
             if cli_args.restore:
-                ok = self.session_for_vm(vm_name).restore_vm(vm_name, workdir)
+                # The explicit opt-in: this is the one path allowed to apply
+                # an external save file left by an older boxman. `up` refuses
+                # to do it unasked (#164 FB-3).
+                ok = self.session_for_vm(vm_name).restore_vm(
+                    vm_name, workdir, allow_legacy=True)
                 what = 'restored'
             else:
                 ok = self.session_for_vm(vm_name).start_vm(vm_name)

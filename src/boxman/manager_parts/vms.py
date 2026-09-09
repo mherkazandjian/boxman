@@ -522,16 +522,34 @@ class VMsMixin:
             return False, f"VMs are still defined: {', '.join(survivors)}"
         return True, ''
 
+    #: How libvirt spells a domain that is defined but not running. Both
+    #: spellings appear across virsh versions and output modes.
+    _SHUT_OFF_STATES = frozenset({'shut off', 'shutoff'})
+
     def _get_vm_states(self) -> dict[str, str]:
         """
         Query libvirt and return a mapping of project VM name -> state string
         for all project VMs that exist.
 
-        State strings are as returned by ``virsh list --all``, e.g.
-        'running', 'shut off', 'paused', 'saved', etc.
+        State strings are as returned by ``virsh list --all`` — 'running',
+        'shut off', 'paused', … — with one addition boxman makes itself: a
+        domain libvirt reports as 'shut off' that also holds managed saved
+        state is reported as ``'managedsave'``.
+
+        That addition is the whole point. The State column of
+        ``virsh list --all`` has no 'saved' value to report, so without the
+        second query every saved guest reads as an ordinary cold 'shut off'
+        one, and ``up`` boots it from scratch — silently discarding the
+        memory image ``down`` had just written (#164 FB-3).
 
         Returns:
             Dict mapping full VM name to its state, only for VMs that exist.
+
+        Raises:
+            ProvisionError: if libvirt cannot be queried. Returning an empty
+                mapping used to read as "no VM exists", which sends ``up``
+                down the full-provision path against a project whose domains
+                are merely unreachable (#164 FB-3).
         """
         expected = set(self._get_project_vm_names())
         if not expected:
@@ -542,8 +560,10 @@ class VMsMixin:
         # Use the table output to get both name and state
         result = self._virsh().execute("list", "--all", hide=True, warn=True)
         if not result.ok:
-            self.logger.warning("could not query VM states via virsh")
-            return {}
+            raise ProvisionError(
+                f"could not query VM states via virsh (exit "
+                f"{result.return_code}): "
+                f"{(result.stderr or '').strip() or 'no error output'}")
 
         states: dict[str, str] = {}
         for line in result.stdout.strip().splitlines():
@@ -561,7 +581,44 @@ class VMsMixin:
                 if vm_name in expected:
                     states[vm_name] = vm_state
 
+        # Only ask about managed saved state when something is actually shut
+        # off — a running or paused domain cannot have a managed save waiting
+        # for it, so the extra query would be pure cost.
+        if any(state in self._SHUT_OFF_STATES for state in states.values()):
+            saved = self._managed_save_domains()
+            for vm_name, vm_state in states.items():
+                if vm_state in self._SHUT_OFF_STATES and vm_name in saved:
+                    states[vm_name] = 'managedsave'
+
         return states
+
+    def _managed_save_domains(self) -> set[str]:
+        """
+        Names of the domains that currently hold managed saved state.
+
+        One bulk query, not one per VM.
+
+        A failed query raises rather than returning an empty set, because an
+        empty set means "nothing is saved" — and acting on that would cold-boot
+        a guest whose memory image is sitting on disk. ``virsh list --all
+        --managed-save`` would fold this into the first query, but its display
+        logic reports a domain whose save-presence probe *failed* as an
+        ordinary shut-off one, which is exactly the fail-open answer this
+        method exists to avoid (#164 FB-3).
+        """
+        result = self._virsh().execute(
+            "list", "--all", "--with-managed-save", "--name",
+            hide=True, warn=True)
+        if not result.ok:
+            raise ProvisionError(
+                f"could not determine which domains hold managed saved state "
+                f"(exit {result.return_code}): "
+                f"{(result.stderr or '').strip() or 'no error output'}\n"
+                f"Refusing to continue: treating this as 'nothing is saved' "
+                f"would cold-boot guests whose memory image is on disk.")
+        return {
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        }
 
     ### end netlab CLI handlers ####
     ### update (runtime modification) functions ####
