@@ -435,3 +435,102 @@ class TestUpRefusesToColdBootOverAnExternalSave:
 
     def test_empty_workdir_is_a_no_op(self):
         self._mgr()._refuse_stale_external_save(VM1, '')
+
+
+# ---------------------------------------------------------------------------
+# FB-3 — a revert libvirt will refuse must not be retried twenty times
+# ---------------------------------------------------------------------------
+class TestSnapshotManagedSaveConflict:
+
+    def _mgr(self, saved, has_memory):
+        mgr = make_bare_manager(_config())
+        mgr.logger = MagicMock()
+        session = MagicMock()
+        session.has_managed_save.return_value = saved
+        session.snapshot_has_memory.return_value = has_memory
+        mgr.session_for_vm = MagicMock(return_value=session)
+        return mgr
+
+    def test_managed_save_plus_memoryless_snapshot_is_refused(self):
+        from boxman.exceptions import SnapshotError
+
+        mgr = self._mgr(saved=True, has_memory=False)
+
+        with pytest.raises(SnapshotError) as exc:
+            mgr._refuse_managed_save_conflicts([(VM1, 'snap1')])
+
+        message = str(exc.value)
+        assert 'managedsave-remove' in message
+        assert 'Nothing was changed' in message
+
+    def test_managed_save_plus_memory_snapshot_is_allowed(self):
+        mgr = self._mgr(saved=True, has_memory=True)
+
+        mgr._refuse_managed_save_conflicts([(VM1, 'snap1')])
+
+    def test_no_managed_save_is_allowed(self):
+        mgr = self._mgr(saved=False, has_memory=False)
+
+        mgr._refuse_managed_save_conflicts([(VM1, 'snap1')])
+
+    def test_unanswerable_managed_save_probe_is_refused(self):
+        from boxman.exceptions import SnapshotError
+
+        mgr = self._mgr(saved=None, has_memory=True)
+
+        with pytest.raises(SnapshotError, match='could not determine'):
+            mgr._refuse_managed_save_conflicts([(VM1, 'snap1')])
+
+    def test_unanswerable_memory_probe_is_refused(self):
+        from boxman.exceptions import SnapshotError
+
+        mgr = self._mgr(saved=True, has_memory=None)
+
+        with pytest.raises(SnapshotError, match='could not be determined'):
+            mgr._refuse_managed_save_conflicts([(VM1, 'snap1')])
+
+    def test_every_conflicting_vm_is_named(self):
+        from boxman.exceptions import SnapshotError
+
+        mgr = self._mgr(saved=True, has_memory=False)
+
+        with pytest.raises(SnapshotError) as exc:
+            mgr._refuse_managed_save_conflicts([(VM1, 's1'), (VM2, 's2')])
+
+        assert VM1 in str(exc.value)
+        assert VM2 in str(exc.value)
+
+
+class TestSnapshotHasMemory:
+
+    def _session(self, info):
+        from boxman.providers.libvirt.session import LibVirtSession
+        session = LibVirtSession(config={'provider': {'libvirt': {}}})
+        session.logger = MagicMock()
+        mgr = MagicMock()
+        mgr.snapshot_info.return_value = info
+        return session, mgr
+
+    @pytest.mark.parametrize('state,expected', [
+        ('running', True),
+        ('paused', True),
+        ('shutoff', False),
+        ('disk-snapshot', False),
+    ])
+    def test_state_maps_to_memory_presence(self, state, expected):
+        session, mgr = self._session({'state': state})
+        with patch('boxman.providers.libvirt.session.SnapshotManager',
+                   return_value=mgr):
+            assert session.snapshot_has_memory(VM1, 'snap1') is expected
+
+    def test_unknown_snapshot_is_unanswerable(self):
+        session, mgr = self._session(None)
+        with patch('boxman.providers.libvirt.session.SnapshotManager',
+                   return_value=mgr):
+            assert session.snapshot_has_memory(VM1, 'snap1') is None
+
+    def test_missing_state_field_is_unanswerable(self):
+        session, mgr = self._session({'name': 'snap1'})
+        with patch('boxman.providers.libvirt.session.SnapshotManager',
+                   return_value=mgr):
+            assert session.snapshot_has_memory(VM1, 'snap1') is None

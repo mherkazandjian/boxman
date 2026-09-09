@@ -417,6 +417,8 @@ class SnapshotsMixin:
             raise SnapshotError(
                 "aborting restore — one or more snapshots have errors (see above)")
 
+        self._refuse_managed_save_conflicts(vm_targets)
+
         # ── 3. Everything validated: mutate. Containers first (fast, coarse),
         #      then the parallel VM restores below. A dc failure is reported
         #      now but only exits after the VMs have had their turn.
@@ -462,6 +464,63 @@ class SnapshotsMixin:
         raise SnapshotError(
             f"restore gave up after {max_rounds} rounds. "
             f"still failing: {[vm for vm, _ in pending]}")
+
+    def _refuse_managed_save_conflicts(self, vm_targets) -> None:
+        """
+        Refuse a revert that libvirt will not perform.
+
+        libvirt will not revert a domain holding managed saved state to a
+        snapshot that captured no memory. The restore loop below retries every
+        failure up to twenty times, three seconds apart, so a refusal that can
+        never succeed costs a minute of spinning and then reports only that
+        the restore "gave up" (#164 FB-3).
+
+        An unanswerable probe counts as a conflict. The alternative is to
+        assume the revert is fine and let the loop discover otherwise.
+
+        Raises:
+            SnapshotError: naming every conflicting VM and both ways out.
+        """
+        conflicts = []
+        for full_vm_name, snapshot_name in vm_targets:
+            session = self.session_for_vm(full_vm_name)
+            if not hasattr(session, 'has_managed_save'):
+                continue
+
+            saved = session.has_managed_save(full_vm_name)
+            if saved is None:
+                conflicts.append(
+                    f"{full_vm_name}: could not determine whether it holds "
+                    f"managed saved state")
+                continue
+            if not saved:
+                continue
+
+            has_memory = session.snapshot_has_memory(
+                full_vm_name, snapshot_name)
+            if has_memory is True:
+                continue
+            if has_memory is None:
+                conflicts.append(
+                    f"{full_vm_name}: holds managed saved state, and whether "
+                    f"snapshot '{snapshot_name}' captured memory could not be "
+                    f"determined")
+            else:
+                conflicts.append(
+                    f"{full_vm_name}: holds managed saved state, and snapshot "
+                    f"'{snapshot_name}' captured no memory")
+
+        if not conflicts:
+            return
+
+        raise SnapshotError(
+            "refusing to restore: libvirt will not revert a domain that "
+            "holds managed saved state to a snapshot without memory.\n  - "
+            + "\n  - ".join(conflicts)
+            + "\n\nEither discard the saved memory first:\n"
+              "    virsh managedsave-remove <domain>\n"
+              "or bring the guest up so the saved state is consumed, then "
+              "restore. Nothing was changed.")
 
     def snapshot_delete(self, cli_args):
         """

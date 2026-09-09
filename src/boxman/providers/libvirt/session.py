@@ -1276,6 +1276,29 @@ class LibVirtSession(SessionConfigMixin):
 
         return snapshots
 
+    def snapshot_has_memory(self, vm_name: str,
+                            snapshot_name: str) -> bool | None:
+        """
+        Whether *snapshot_name* captured the guest's memory.
+
+        ``virsh snapshot-info`` reports the domain state the snapshot holds:
+        'running' or 'paused' carry a memory image, while 'shutoff' and
+        'disk-snapshot' do not.
+
+        Returns ``None`` when the question could not be answered — which is
+        not ``False``, because "no memory" is what makes a revert conflict
+        with managed saved state, and guessing it either way is wrong
+        (#164 FB-3).
+        """
+        snapshot_mgr = SnapshotManager(self.provider_config)
+        info = snapshot_mgr.snapshot_info(vm_name, snapshot_name)
+        if not info:
+            return None
+        state = (info.get('state') or '').strip().lower()
+        if not state:
+            return None
+        return state in ('running', 'paused')
+
     def snapshot_restore(self, vm_name, snapshot_name=None):
         """
         Restore a VM to a specific snapshot.

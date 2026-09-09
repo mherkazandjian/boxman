@@ -28,6 +28,10 @@ def _manager():
         },
     }
     mgr.provider = MagicMock()
+    # No managed saved state by default: these helpers build managers for
+    # tests about other things, and a MagicMock would otherwise answer the
+    # managed-save/snapshot conflict probe with a truthy mock (#164 FB-3).
+    mgr.provider.has_managed_save.return_value = False
     mgr.logger = MagicMock()
     return mgr
 
