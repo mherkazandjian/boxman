@@ -798,7 +798,9 @@ This project is licensed under the [MIT License](LICENSE).
 - `control` — control the state of VMs
   - `control suspend` — suspend VMs
   - `control resume` — resume VMs
-  - `control save` — save the state of VMs
+  - `control save` — save the state of VMs to disk (libvirt *managed*
+    save: the memory image belongs to libvirt and the next `up` or
+    `control start` restores it automatically)
   - `control start` — start VMs
 - `export` — export VMs
 - `update` — apply config changes to a running project (add/remove VMs, update CPU/memory/disks)
