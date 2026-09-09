@@ -821,7 +821,10 @@ def parse_args():
     #
     # sub parser for the 'control save' subsubcommand
     #
-    parser_ctrl_save = subparsers_ctrl.add_parser('save', parents=[common, vms_parent, cluster_parent], help='save the state of vms')
+    parser_ctrl_save = subparsers_ctrl.add_parser(
+        'save', parents=[common, vms_parent, cluster_parent],
+        help='save the state of vms to disk (libvirt managed save, restored '
+             'automatically by the next up/start)')
     parser_ctrl_save.set_defaults(handler='save_vm')
 
     #
@@ -833,7 +836,10 @@ def parse_args():
         '--restore',
         action='store_true',
         default=False,
-        help='restore the saved state of the vm before starting',
+        help='restore the saved state before starting. Managed saves are '
+             'restored automatically without this flag; pass it to apply an '
+             'external <workdir>/<vm>.save left by an older boxman, which up '
+             'refuses to use on its own',
         dest='restore'
     )
 

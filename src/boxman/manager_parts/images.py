@@ -1,12 +1,18 @@
 """Template, base-image, ISO, and OCI image handling for BoxmanManager."""
 
 
+import contextlib
 import hashlib
 import os
 import shlex
 from urllib.parse import urlparse
 
-from boxman.exceptions import ProvisionError, TemplateError
+from boxman.exceptions import (
+    BoxmanError,
+    ConfigError,
+    ProvisionError,
+    TemplateError,
+)
 from boxman.image_cache import ImageCache
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.utils.http_download import download_url
@@ -687,8 +693,211 @@ class ImagesMixin:
         digest = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:8]
         return f"{safe}-{digest}{ext}"
 
-    def _resolve_isos(self) -> dict[str, str]:
-        """Download and cache all ISOs declared in the ``isos:`` config section.
+    @staticmethod
+    def _cdrom_iso_names(vm_info: dict) -> set[str]:
+        """
+        The ``isos:`` names a VM's ``cdroms:`` still needs looked up.
+
+        An entry carrying an explicit ``source`` needs nothing: the source
+        wins and the name, if any, is only a label.
+        """
+        names: set = set()
+        for entry in (vm_info.get("cdroms") or []):
+            if isinstance(entry, str):
+                names.add(entry)
+            elif (isinstance(entry, dict) and not entry.get("source")
+                    and entry.get("name")):
+                names.add(entry["name"])
+        return names
+
+    def _iso_paths_from_cache(
+        self, names: set[str]
+    ) -> tuple[dict[str, str], dict[str, str], set]:
+        """
+        Local paths for the named ISOs, fetching nothing.
+
+        Returns ``(paths, errors, missing)``: iso name -> local path for those
+        present and verified, iso name -> reason for those that are not, and
+        the subset that is simply absent from the cache. ``missing`` is
+        separated out because it is the only condition a caller can fix by
+        downloading — a checksum mismatch must never be "fixed" by fetching
+        over the file (#164 FB-5).
+
+        ``update`` reconciles VMs that already exist, so it must be able to
+        answer "where is this ISO" without the side effects of
+        :meth:`_resolve_isos`, which downloads, writes to the cache, and
+        deletes a file whose checksum does not match. Running those from a
+        diff would make ``--dry-run`` mutate the cache and would fetch media
+        for a VM whose CPU count was the only thing that changed
+        (#164 FB-5).
+
+        The declared checksum is still enforced. Computing a cache path does
+        not establish that the file sitting at it is the right one, and
+        dropping the check here would quietly remove verification from every
+        media update.
+        """
+        isos_conf = (self.config or {}).get("isos") or {}
+        if not isinstance(isos_conf, dict):
+            raise ConfigError(
+                "'isos:' must be a mapping of <name>: {uri: ..., checksum: "
+                "...}, got " + type(isos_conf).__name__)
+
+        cache = ImageCache.from_config((self.app_config or {}).get("cache", {}))
+
+        paths: dict[str, str] = {}
+        errors: dict[str, str] = {}
+        missing: set = set()
+        for name in sorted(names):
+            iso_conf = isos_conf.get(name)
+            if not isinstance(iso_conf, dict):
+                errors[name] = (
+                    f"iso '{name}' is not declared in the 'isos:' section")
+                continue
+            uri = iso_conf.get("uri")
+            if not uri:
+                errors[name] = f"iso '{name}' has no 'uri'"
+                continue
+
+            local_path = cache.cache_path_for(
+                uri, filename=self._iso_cache_filename(name, uri))
+            if not os.path.isfile(local_path):
+                missing.add(name)
+                errors[name] = (
+                    f"iso '{name}' is not in the cache ({local_path})")
+                continue
+
+            checksum = iso_conf.get("checksum")
+            if checksum:
+                # verify_checksum raises for a malformed spec or an unknown
+                # algorithm; that has to fail this VM, not the whole run.
+                try:
+                    verified = ImageCache.verify_checksum(local_path, checksum)
+                except (ValueError, OSError) as exc:
+                    errors[name] = f"iso '{name}' checksum could not be "\
+                                   f"checked: {exc}"
+                    continue
+                if not verified:
+                    # Deliberately no eviction: this path is read-only, and
+                    # deleting the file would turn a diff into a mutation.
+                    errors[name] = (
+                        f"iso '{name}' does not match its declared checksum "
+                        f"({local_path})")
+                    continue
+
+            paths[name] = local_path
+
+        return paths, errors, missing
+
+    def _fetch_missing_isos(
+        self, names: set
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """
+        Download the named ISOs one at a time, aggregating failures.
+
+        Only ever called for media that is genuinely *absent*. Re-downloading
+        over a file that already exists is how an ISO a running guest has
+        open gets truncated: the downloader writes straight to the cache path
+        (#164 FB-5).
+
+        Failures are collected per ISO rather than raised, so one bad
+        reference fails its own VM instead of the whole update.
+        """
+        paths: dict[str, str] = {}
+        errors: dict[str, str] = {}
+        for name in sorted(names):
+            try:
+                paths.update(self._resolve_isos({name}))
+            except (ValueError, RuntimeError, OSError, BoxmanError) as exc:
+                errors[name] = str(exc)
+        return paths, errors
+
+    def _normalize_cdroms_for_update(
+        self, full_vm_names: set, allow_fetch: bool = True
+    ) -> dict[str, str]:
+        """
+        Resolve ``cdroms:`` to local paths for the VMs about to be diffed.
+
+        This is the pure half of :meth:`_resolve_iso_config`: it rewrites the
+        declared entries in place so the differ sees a real source, and it
+        downloads nothing.
+
+        Without it, an ``update`` where no VM is new never resolved media at
+        all — ``_resolve_iso_config()`` is only reached from the clone path —
+        so the differ received ``{name: <iso>}`` with no source, mapped it to
+        ``os.path.abspath('')``, and detached the guest's install ISO
+        (#164 FB-5).
+
+        Returns:
+            full VM name -> reason, for the VMs whose media could not be
+            resolved. Those fail individually; the rest of the update runs,
+            matching how every other per-VM failure behaves.
+        """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+
+        targets = []
+        wanted: set = set()
+        for cluster_name, cluster in self._vm_clusters.items():
+            for vm_name, vm_info in (cluster.get("vms") or {}).items():
+                full = f"{prj_name}_{cluster_name}_{vm_name}"
+                if full not in full_vm_names:
+                    continue
+                if not (vm_info.get("cdroms") or []):
+                    continue
+                needed = self._cdrom_iso_names(vm_info)
+                targets.append((cluster, vm_name, vm_info, full, needed))
+                wanted |= needed
+
+        if not targets:
+            return {}
+
+        paths, iso_errors, missing = self._iso_paths_from_cache(wanted)
+
+        if missing:
+            if allow_fetch:
+                # `update` is the only non-destructive way to give an existing
+                # VM media it does not have yet: neither `up` nor anything
+                # else resolves cdroms for a VM that already exists. Refusing
+                # to fetch here made a perfectly ordinary declaration —
+                # "attach this ISO to this VM" — impossible to satisfy
+                # (#164 FB-5).
+                fetched, fetch_errors = self._fetch_missing_isos(missing)
+                paths.update(fetched)
+                for name in fetched:
+                    iso_errors.pop(name, None)
+                iso_errors.update(fetch_errors)
+            else:
+                for name in sorted(missing):
+                    iso_errors[name] = (
+                        f"iso '{name}' is not in the cache; this run would "
+                        f"download it (skipped for --dry-run)")
+
+        failures: dict[str, str] = {}
+        for cluster, vm_name, vm_info, full, needed in targets:
+            reasons = [
+                iso_errors.get(
+                    name, f"iso '{name}' is not declared in the 'isos:' section")
+                for name in sorted(needed) if name not in paths
+            ]
+            if reasons:
+                failures[full] = "; ".join(reasons)
+                continue
+            try:
+                cluster["vms"][vm_name] = self._inject_resolved_iso(
+                    vm_info, paths)
+            except ValueError as exc:
+                # _inject_resolved_iso raises a bare ValueError for a
+                # malformed entry; it escapes _update_single_vm now that
+                # resolution happens outside the workers.
+                failures[full] = str(exc)
+
+        return failures
+
+    def _resolve_isos(self, names: set | None = None) -> dict[str, str]:
+        """Download and cache ISOs declared in the ``isos:`` config section.
+
+        Args:
+            names: restrict the work to these declarations. ``None`` means
+                every one, which is what a full provision wants.
 
         Returns a mapping of iso_name -> local_file_path.
         """
@@ -699,6 +908,11 @@ class ImagesMixin:
             raise ValueError(
                 "'isos:' must be a mapping of <name>: {uri: ..., checksum: ...}, "
                 f"got {type(isos_conf).__name__}")
+
+        if names is not None:
+            isos_conf = {k: v for k, v in isos_conf.items() if k in names}
+            if not isos_conf:
+                return {}
 
         # ISO boot needs the file visible to the in-container virt-install; the
         # host cache dir is not bind-mounted under a containerized runtime. Fail
@@ -726,33 +940,91 @@ class ImagesMixin:
             checksum = iso_conf.get("checksum")
             filename = self._iso_cache_filename(name, uri)
 
-            local_path = cache.ensure(uri, self._download_iso, filename=filename)
-            if local_path is None:
-                if not cache.enabled:
-                    # Caching disabled: download directly to a stable path so the
-                    # ISO is still available to virt-install (re-downloaded each
-                    # run). Mirrors the base-image direct-download fallback.
-                    local_path = cache.cache_path_for(uri, filename=filename)
-                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                    if not self._download_iso(uri, local_path):
-                        raise RuntimeError(
-                            f"Failed to download ISO '{name}' from {uri}")
-                else:
-                    raise RuntimeError(
-                        f"Failed to download ISO '{name}' from {uri}")
-
-            if checksum and not ImageCache.verify_checksum(local_path, checksum):
-                # Evict the bad file so a later run re-downloads instead of
-                # re-failing forever against the poisoned cache entry.
-                try:
-                    os.remove(local_path)
-                except OSError:
-                    pass
-                raise RuntimeError(f"Checksum mismatch for ISO '{name}'")
-
-            resolved[name] = local_path
+            resolved[name] = self._ensure_iso_present(
+                name, uri, cache.cache_path_for(uri, filename=filename),
+                checksum)
 
         return resolved
+
+    def _ensure_iso_present(self, name: str, uri: str, local_path: str,
+                            checksum: str | None) -> str:
+        """
+        Make sure the ISO for *name* sits at *local_path*, and return it.
+
+        Never writes over a file that already exists, and never deletes one.
+        The downloader writes straight to its destination — ``wget -O``
+        truncates on open, and the helper removes the file outright when an
+        attempt fails — so fetching over an existing ISO destroys media a
+        running guest may have attached, and evicting a checksum mismatch
+        does exactly the same. That held whether or not the cache was
+        enabled, and scoping resolution to the VMs being created does not
+        help when a new VM and a running one reference the *same* ISO
+        (#164 FB-5).
+
+        A new download goes to a private staging file beside the destination,
+        is verified there, and is published with a link that fails rather
+        than replaces — so a second resolver can never see a partially
+        written file at the destination, and a failed download can only ever
+        delete staging.
+        """
+        if os.path.isfile(local_path):
+            if checksum and not ImageCache.verify_checksum(local_path, checksum):
+                raise ProvisionError(
+                    f"iso '{name}' at {local_path} does not match its "
+                    f"declared checksum. Refusing to replace or remove it — a "
+                    f"guest may have it attached. Move it aside yourself and "
+                    f"re-run.")
+            return local_path
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        staging = f"{local_path}.part-{os.getpid()}"
+        try:
+            if not self._download_iso(uri, staging):
+                raise ProvisionError(
+                    f"failed to download iso '{name}' from {uri}")
+            if checksum and not ImageCache.verify_checksum(staging, checksum):
+                raise ProvisionError(
+                    f"iso '{name}' downloaded from {uri} does not match its "
+                    f"declared checksum")
+            try:
+                os.link(staging, local_path)
+            except FileExistsError:
+                # Another run published it while this one was downloading.
+                # Keep theirs: replacing it could swap media under a guest
+                # that already has it attached.
+                self.logger.info(
+                    f"iso '{name}' was published concurrently; keeping "
+                    f"{local_path}")
+                # But it satisfies *their* declaration, not necessarily
+                # this one — two projects can share a cache key while
+                # declaring different checksums, and only this run's staging
+                # file has been verified so far (#164 FB-5).
+                if checksum and not ImageCache.verify_checksum(
+                        local_path, checksum):
+                    raise ProvisionError(
+                        f"iso '{name}' at {local_path} was published by "
+                        f"another run and does not match the checksum this "
+                        f"project declares. Leaving it in place — a guest may "
+                        f"have it attached — and refusing to use it here."
+                    ) from None
+            except OSError as exc:
+                # No usable atomic publish. The obvious fallback — check that
+                # the destination is absent, then os.replace() — is a race:
+                # another run can publish and attach between the two, and
+                # this one then replaces media a guest is using. Refuse
+                # instead (#164 FB-5).
+                raise ProvisionError(
+                    f"could not publish iso '{name}' to {local_path}: {exc}. "
+                    f"boxman publishes a downloaded ISO with a hard link, "
+                    f"which fails rather than overwriting media a guest may "
+                    f"have open; put the image cache on a filesystem that "
+                    f"supports hard links."
+                ) from exc
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(staging)
+
+        return local_path
 
     def _inject_resolved_iso(
         self, vm_info: dict, resolved_isos: dict[str, str]
@@ -761,8 +1033,10 @@ class ImagesMixin:
 
         Returns a shallow copy of vm_info with:
         - Each cdrom entry expanded to carry ``source: <local_path>``. Entries
-          may be a plain string (an iso name), a ``{name: <iso>}`` mapping, or a
-          ``{source: <local path>}`` mapping; anything else is a clear error.
+          may be a plain string (an iso name), a ``{name: <iso>}`` mapping, a
+          ``{source: <local path>}`` mapping, or both together — in which case
+          the explicit source wins and the name is only a label; anything else
+          is a clear error.
         - ``_resolved_iso_path`` set to ``cdroms[0]['source']`` when
           ``boot_order[0] == 'cdrom'``
         """
@@ -783,11 +1057,16 @@ class ImagesMixin:
             if isinstance(cdrom, str):
                 resolved_cdroms.append(
                     {"name": cdrom, "source": _resolve_name(cdrom)})
+            elif isinstance(cdrom, dict) and cdrom.get("source"):
+                # An explicit source wins over a name. SKILL.md documents
+                # ``{name: installer, source: /iso/ubuntu.iso}``, where the
+                # name is a label rather than a lookup into ``isos:`` —
+                # checking name first rejected that documented form with
+                # "cdroms references unknown iso" (#164 FB-5).
+                resolved_cdroms.append(cdrom)
             elif isinstance(cdrom, dict) and cdrom.get("name"):
                 resolved_cdroms.append(
                     {**cdrom, "source": _resolve_name(cdrom["name"])})
-            elif isinstance(cdrom, dict) and cdrom.get("source"):
-                resolved_cdroms.append(cdrom)
             else:
                 raise ValueError(
                     f"invalid cdroms entry {cdrom!r}: expected a string iso "
@@ -822,7 +1101,7 @@ class ImagesMixin:
                 ))
         return names
 
-    def _resolve_iso_config(self) -> None:
+    def _resolve_iso_config(self, full_vm_names: set | None = None) -> None:
         """Resolve ISO/cdrom/network references for direct-boot VMs, in place.
 
         Downloads+caches declared ``isos:``, expands each VM's ``cdroms:`` to
@@ -831,18 +1110,46 @@ class ImagesMixin:
         ``self.config`` means both the clone subprocesses and the later
         configure/start step observe the resolved values (otherwise the resolved
         ISO source never reaches the CDROM-attach path). Idempotent.
+
+        This is the *fetching* half of media resolution, and it belongs to the
+        paths that create VMs. :meth:`_normalize_cdroms_for_update` is the
+        pure half.
+
+        Args:
+            full_vm_names: restrict the work to these VMs and the media they
+                reference. Resolving every declared ISO for every VM meant an
+                update adding one new VM would also fetch media used only by
+                guests already running — and with caching disabled the
+                downloader writes straight to the cache path, truncating an
+                ISO an existing guest has open (#164 FB-5).
         """
         clusters = self.config.get("clusters", {})
         if not clusters:
             return
-        resolved_isos = self._resolve_isos()
+
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        targets = []
         for cluster_name, cluster in clusters.items():
             for vm_name, vm_info in cluster.get("vms", {}).items():
-                resolved = self._inject_resolved_iso(vm_info, resolved_isos)
-                if self._is_diskless_boot(resolved):
-                    resolved["_resolved_networks"] = self._resolved_network_names(
-                        cluster_name, resolved)
-                cluster["vms"][vm_name] = resolved
+                full = f"{prj_name}_{cluster_name}_{vm_name}"
+                if full_vm_names is not None and full not in full_vm_names:
+                    continue
+                targets.append((cluster_name, cluster, vm_name, vm_info))
+
+        if not targets:
+            return
+
+        needed: set = set()
+        for _cluster_name, _cluster, _vm_name, vm_info in targets:
+            needed |= self._cdrom_iso_names(vm_info)
+
+        resolved_isos = self._resolve_isos(needed)
+        for cluster_name, cluster, vm_name, vm_info in targets:
+            resolved = self._inject_resolved_iso(vm_info, resolved_isos)
+            if self._is_diskless_boot(resolved):
+                resolved["_resolved_networks"] = self._resolved_network_names(
+                    cluster_name, resolved)
+            cluster["vms"][vm_name] = resolved
 
     def ensure_templates_exist(self) -> bool:
         """

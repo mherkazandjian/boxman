@@ -2,6 +2,7 @@ import os
 from typing import Any
 
 from boxman import log
+from boxman.exceptions import ProvisionError
 
 from .commands import VirshCommand
 from .virsh_edit import VirshEdit
@@ -20,6 +21,34 @@ class VMStateDiffer:
     _LIVE_DOMAIN_STATES = frozenset({
         'running', 'blocked', 'paused', 'in shutdown', 'pmsuspended', 'crashed',
     })
+
+    #: States with no active domain. Anything in neither set is unknown —
+    #: including the 'unknown' get_vm_state() returns when domstate fails.
+    _INACTIVE_DOMAIN_STATES = frozenset({'shut off', 'shutoff'})
+
+    @classmethod
+    def domain_is_active(cls, vm_state: str) -> bool:
+        """
+        Whether *vm_state* describes an active domain.
+
+        Active is not the same as running: a paused guest is still active,
+        and device edits applied only to its persistent configuration would
+        report success while leaving the running guest untouched until its
+        next boot (#164 FB-5).
+
+        Raises:
+            ProvisionError: for a state in neither set. Guessing either way
+                picks a wrong virsh flag, and 'unknown' is what
+                :meth:`get_vm_state` returns when the query failed.
+        """
+        state = (vm_state or '').strip().lower()
+        if state in cls._LIVE_DOMAIN_STATES:
+            return True
+        if state in cls._INACTIVE_DOMAIN_STATES:
+            return False
+        raise ProvisionError(
+            f"cannot tell whether the domain is active from state "
+            f"'{vm_state}'; refusing to guess which virsh flags to use")
 
     def __init__(self, provider_config: dict[str, Any] | None = None):
         self.virsh = VirshCommand(provider_config)
@@ -409,39 +438,98 @@ class VMStateDiffer:
                     )
 
         # --- CDROM diff ---
+        #
+        # Explicit targets are matched *before* source membership. The other
+        # order meant that when the desired ISO happened to be attached at
+        # some other target, no swap was generated and the requested target
+        # was simply removed: with hdc=A.iso and hdd=B.iso attached and
+        # hdc=B.iso desired, hdc was detached and B.iso left on hdd. Swapping
+        # two ISOs between explicit targets produced no changes at all
+        # (#164 FB-5).
         actual_cdroms = self.get_actual_cdroms(domain_name)
-        actual_cdrom_by_source = {c['source']: c for c in actual_cdroms}
-        actual_cdrom_sources = set(actual_cdrom_by_source.keys())
+        actual_by_target = {
+            c['target']: c for c in actual_cdroms if c.get('target')
+        }
 
         new_cdroms = []
         changed_cdroms = []
-        desired_cdrom_sources = set()
+        # Actual drives accounted for by a desired entry. Anything left over
+        # is what gets removed — computed from what was *matched* rather than
+        # from source membership, so a drive holding the right media at the
+        # wrong target is still reconciled.
+        matched_targets: set = set()
+        claimed_targets: set = set()
 
+        entries = []
         for cdrom_config in (desired_cdroms or []):
-            source = os.path.abspath(os.path.expanduser(cdrom_config.get('source', '')))
-            desired_cdrom_sources.add(source)
+            raw_source = cdrom_config.get('source')
+            if not raw_source:
+                # os.path.abspath('') is the current working directory. A
+                # cdrom entry that had not been resolved was therefore turned
+                # into a plausible-looking path matching nothing, so the ISO
+                # genuinely attached to the guest fell into removed_cdroms and
+                # was detached (#164 FB-5). Refuse instead of inventing a path.
+                raise ProvisionError(
+                    f"cdrom entry {cdrom_config!r} on domain '{domain_name}' "
+                    f"has no resolved source. Declared media must be resolved "
+                    f"to a local path before it can be compared with what is "
+                    f"attached; refusing to guess one.")
+            entries.append(
+                (cdrom_config,
+                 os.path.abspath(os.path.expanduser(raw_source))))
 
-            if source not in actual_cdrom_sources:
-                # check if there's an existing cdrom with a different source
-                # that should be swapped (match by target if specified)
-                target = cdrom_config.get('target')
-                if target:
-                    actual_for_target = next(
-                        (c for c in actual_cdroms if c['target'] == target), None)
-                    if actual_for_target and actual_for_target['source'] != source:
-                        changed_cdroms.append({
-                            'target': target,
-                            'source': source,
-                        })
-                        continue
+        # Every explicit target is reserved before any matching happens.
+        # Doing it inside a single loop made the result depend on declaration
+        # order: a targetless entry could match the very drive a later
+        # explicit entry was about to overwrite, so with hdc=a.iso and
+        # hdd=b.iso attached and `[{source: a.iso}, {target: hdc, source:
+        # b.iso}]` declared, hdc became b.iso, hdd was removed, and a.iso —
+        # still declared — ended up attached nowhere, with the update
+        # reporting success (#164 FB-5).
+        for cdrom_config, _source in entries:
+            target = cdrom_config.get('target')
+            if not target:
+                continue
+            if target in claimed_targets:
+                raise ProvisionError(
+                    f"domain '{domain_name}' declares more than one cdrom on "
+                    f"target '{target}'. Each target holds one device.")
+            claimed_targets.add(target)
+
+        for cdrom_config, source in entries:
+            target = cdrom_config.get('target')
+
+            if target:
+                actual_for_target = actual_by_target.get(target)
+                if actual_for_target is None:
+                    new_cdroms.append(cdrom_config)
+                    continue
+                matched_targets.add(target)
+                if actual_for_target['source'] != source:
+                    # Covers an empty drive too (source None): inserting media
+                    # into a drive that already exists is a media change, not
+                    # a second device.
+                    changed_cdroms.append({'target': target, 'source': source})
+                continue
+
+            # Targetless: match by source, one-to-one, and never against a
+            # drive some explicit entry has reserved.
+            actual = next(
+                (c for c in actual_cdroms
+                 if c['source'] == source
+                 and c['target'] not in matched_targets
+                 and c['target'] not in claimed_targets), None)
+            if actual is None:
                 new_cdroms.append(cdrom_config)
+            else:
+                matched_targets.add(actual['target'])
 
         removed_cdroms = [
             c for c in actual_cdroms
-            if c['source'] not in desired_cdrom_sources
-            and not any(
-                ch['target'] == c['target'] for ch in changed_cdroms
-            )
+            if c['target'] not in matched_targets
+            # An empty drive holds no media to remove, and dropping it would
+            # silently change the domain's topology.
+            and c.get('source') is not None
         ]
 
         # --- Shared folder diff ---

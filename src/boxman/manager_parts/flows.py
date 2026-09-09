@@ -2,6 +2,7 @@
 
 
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -339,6 +340,14 @@ class FlowsMixin:
                 self.logger.info(f"restoring VM '{vm_name}' from saved state...")
                 action, ok = 'restore', session.restore_vm(vm_name, workdir)
             elif state in ('shut off', 'shutoff'):
+                # A domain reported 'shut off' holds no managed saved state —
+                # _get_vm_states() would have said 'managedsave' — but an
+                # older boxman may have left an external save file beside it.
+                # Cold-booting over that discards the guest's memory, and
+                # restoring it unasked risks applying a stale image to a disk
+                # that has moved on. Refuse and let the user choose
+                # (#164 FB-3).
+                self._refuse_stale_external_save(vm_name, workdir)
                 self.logger.info(f"starting VM '{vm_name}'...")
                 action, ok = 'start', session.start_vm(vm_name)
             elif state in ('crashed', 'dying'):
@@ -430,13 +439,47 @@ class FlowsMixin:
             return str(exc)
         return ''
 
+    def _refuse_stale_external_save(self, vm_name: str, workdir: str) -> None:
+        """
+        Refuse to cold-boot a VM over an external save file.
+
+        Older boxman versions saved guest state with ``virsh save`` into the
+        cluster workdir, outside libvirt's control. ``up`` never restored
+        those files, so it silently discarded the memory image. Restoring one
+        automatically is no better: nothing ties an external save to the
+        current contents of the disk, so a stale one corrupts the guest.
+
+        The only safe move is to stop and let the user pick (#164 FB-3).
+
+        Raises:
+            ProvisionError: if an external save file exists for *vm_name*.
+        """
+        if not workdir:
+            return
+        save_path = os.path.join(
+            os.path.abspath(os.path.expanduser(workdir)), f"{vm_name}.save")
+        if not os.path.exists(save_path):
+            return
+        raise ProvisionError(
+            f"vm '{vm_name}' is shut off, but an external save file written "
+            f"by an older boxman exists at {save_path}.\n"
+            f"Starting the VM now would discard that memory image, and "
+            f"restoring it automatically is not safe either: nothing ties it "
+            f"to the current contents of the disk.\n"
+            f"  - to use it:     boxman control start --restore --vms "
+            f"{vm_name.split('_')[-1]}\n"
+            f"  - to discard it: rm {shlex.quote(save_path)}\n"
+            f"then run 'boxman up' again.")
+
     def down(self, cli_args):
         """
         Bring down the infrastructure by saving or suspending all VMs.
 
-        By default, saves each VM's state to disk (same as
-        ``boxman control save``). With ``--suspend``, pauses VMs in memory
-        instead (same as ``boxman control suspend``).
+        By default, saves each VM's state to disk with libvirt's *managed*
+        save (same as ``boxman control save``), so the next ``up`` or
+        ``control start`` restores it rather than cold-booting. With
+        ``--suspend``, pauses VMs in memory instead (same as
+        ``boxman control suspend``).
 
         docker-compose clusters are always brought down with
         ``docker compose stop`` (containers kept, reversible via ``up``);
@@ -477,7 +520,9 @@ class FlowsMixin:
                 self.logger.info("saving the state of all VMs to disk...")
 
             def _save(vm_name, workdir):
-                self.logger.info(f"saving VM '{vm_name}' state to '{workdir}'...")
+                # Not "to <workdir>": the memory image belongs to libvirt
+                # now, under /var/lib/libvirt/qemu/save (#164 FB-3).
+                self.logger.info(f"saving VM '{vm_name}' state...")
                 if not self.session_for_vm(vm_name).save_vm(vm_name, workdir):
                     raise ProvisionError(
                         f"could not save vm '{vm_name}' to '{workdir}'")

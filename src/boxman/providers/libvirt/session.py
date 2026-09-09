@@ -948,9 +948,21 @@ class LibVirtSession(SessionConfigMixin):
                          new_cdroms: list[dict[str, Any]],
                          removed_cdroms: list[dict[str, Any]],
                          changed_cdroms: list[dict[str, Any]],
-                         vm_running: bool) -> bool:
+                         vm_active: bool) -> bool:
         """
-        Apply CDROM changes: attach new, detach removed, swap changed.
+        Apply CDROM changes: attach new and swap changed, then detach removed.
+
+        Order and gating matter more here than they look. The old order was
+        attach, detach, swap, and a failed attach only set a flag — so the
+        guest's install ISO was detached even though the attach meant to
+        replace it had already failed, leaving it with no media at all
+        (#164 FB-5).
+
+        Now everything that adds media is validated before anything is
+        mutated, applied first, and removals happen last and only if nothing
+        before them failed. Several virsh calls cannot be made atomic, so a
+        partial application is reported as one rather than dressed up as a
+        rollback.
 
         Args:
             vm_name: Full VM domain name
@@ -958,14 +970,46 @@ class LibVirtSession(SessionConfigMixin):
             removed_cdroms: CDROM entries to detach (dicts with 'target')
             changed_cdroms: CDROM entries with changed source
                             (dicts with 'target' and 'source')
-            vm_running: Whether the VM is currently running
+            vm_active: Whether the domain is active — *not* merely running;
+                       see :meth:`VMStateDiffer.domain_is_active`
 
         Returns:
             True if all operations succeeded, False otherwise
         """
         cdrom_manager = CDROMManager(vm_name=vm_name, provider_config=self.provider_config)
+
+        def _usable(source) -> bool:
+            return bool(source) and os.path.isfile(
+                os.path.abspath(os.path.expanduser(source)))
+
+        # 1. Validate every addition and replacement up front. A missing ISO
+        #    found halfway through leaves the guest in a state nobody asked
+        #    for.
+        problems = []
+        for entry in new_cdroms:
+            if not _usable(entry.get('source')):
+                problems.append(
+                    f"cdrom '{entry.get('name', '?')}' has no usable source "
+                    f"({entry.get('source') or 'none given'})")
+        for entry in changed_cdroms:
+            if not entry.get('target'):
+                problems.append(f"cdrom media change with no target: {entry}")
+            elif not _usable(entry.get('source')):
+                problems.append(
+                    f"cdrom media change on {entry['target']} has no usable "
+                    f"source ({entry.get('source') or 'none given'})")
+
+        if problems:
+            for problem in problems:
+                self.logger.error(f"{vm_name}: {problem}")
+            self.logger.error(
+                f"refusing to change CDROMs on {vm_name}: nothing was "
+                f"attached, changed or detached")
+            return False
+
         success = True
 
+        # 2. Additions and media replacements.
         for cdrom_config in new_cdroms:
             name = cdrom_config.get('name', '?')
             self.logger.info(f"attaching new CDROM '{name}' to VM {vm_name}")
@@ -973,21 +1017,30 @@ class LibVirtSession(SessionConfigMixin):
                 self.logger.error(f"failed to attach CDROM '{name}' to {vm_name}")
                 success = False
 
-        for entry in removed_cdroms:
-            target = entry['target']
-            self.logger.info(f"detaching CDROM {target} from VM {vm_name}")
-            if not cdrom_manager.detach_cdrom(target):
-                self.logger.error(f"failed to detach CDROM {target} from {vm_name}")
-                success = False
-
         for entry in changed_cdroms:
             target = entry['target']
             source = entry['source']
             self.logger.info(
                 f"changing CDROM media on {target} to {source} on VM {vm_name}")
-            if not cdrom_manager.change_media(target, source):
+            if not cdrom_manager.change_media(target, source, live=vm_active):
                 self.logger.error(
                     f"failed to change CDROM media on {target} on {vm_name}")
+                success = False
+
+        # 3. Removals, and only if everything above worked.
+        if not success:
+            if removed_cdroms:
+                self.logger.error(
+                    f"not detaching any CDROM from {vm_name}: an earlier "
+                    f"attach or media change failed, and removing media now "
+                    f"would leave the guest with none")
+            return False
+
+        for entry in removed_cdroms:
+            target = entry['target']
+            self.logger.info(f"detaching CDROM {target} from VM {vm_name}")
+            if not cdrom_manager.detach_cdrom(target):
+                self.logger.error(f"failed to detach CDROM {target} from {vm_name}")
                 success = False
 
         return success
@@ -1275,6 +1328,29 @@ class LibVirtSession(SessionConfigMixin):
 
         return snapshots
 
+    def snapshot_has_memory(self, vm_name: str,
+                            snapshot_name: str) -> bool | None:
+        """
+        Whether *snapshot_name* captured the guest's memory.
+
+        ``virsh snapshot-info`` reports the domain state the snapshot holds:
+        'running' or 'paused' carry a memory image, while 'shutoff' and
+        'disk-snapshot' do not.
+
+        Returns ``None`` when the question could not be answered — which is
+        not ``False``, because "no memory" is what makes a revert conflict
+        with managed saved state, and guessing it either way is wrong
+        (#164 FB-3).
+        """
+        snapshot_mgr = SnapshotManager(self.provider_config)
+        info = snapshot_mgr.snapshot_info(vm_name, snapshot_name)
+        if not info:
+            return None
+        state = (info.get('state') or '').strip().lower()
+        if not state:
+            return None
+        return state in ('running', 'paused')
+
     def snapshot_restore(self, vm_name, snapshot_name=None):
         """
         Restore a VM to a specific snapshot.
@@ -1460,13 +1536,93 @@ class LibVirtSession(SessionConfigMixin):
             self.logger.error(f"error resuming the vm {vm_name}: {exc}")
             return False
 
+    def has_managed_save(self, vm_name: str) -> bool | None:
+        """
+        Whether *vm_name* holds managed saved state.
+
+        Returns ``None`` when the question could not be answered. That is
+        deliberately not ``False``: "no managed save" authorises a cold boot,
+        and an unanswered probe must never authorise one (#164 FB-3).
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        result = virsh.execute(
+            "list", "--all", "--with-managed-save", "--name",
+            hide=True, warn=True)
+        if not result.ok:
+            self.logger.error(
+                f"could not determine whether {vm_name} holds managed saved "
+                f"state: {(result.stderr or '').strip()}")
+            return None
+        names = {
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        }
+        return vm_name in names
+
+    def _quarantine_save_file(self, save_path: str) -> str | None:
+        """
+        Move an external save image aside before it is applied.
+
+        Returns the new path, or ``None`` if it could not be moved — in which
+        case the restore must not go ahead. Applying an image that cannot
+        first be taken out of the restore path risks leaving it there for a
+        second, corrupting restore (#164 FB-3).
+        """
+        quarantined = f"{save_path}.restoring-{int(time.time())}"
+        try:
+            os.rename(save_path, quarantined)
+            return quarantined
+        except OSError as exc:
+            self.logger.error(
+                f"refusing to restore from {save_path}: it could not be moved "
+                f"aside first ({exc}). Applying it where it lies risks leaving "
+                f"it behind for a second restore, against disks the guest "
+                f"would have written to by then.")
+            return None
+
+    def _discard_quarantined_save(self, quarantined: str) -> None:
+        """
+        Remove an image libvirt has now consumed.
+
+        A failure here is a warning, not an error: the file is already out of
+        the path :meth:`restore_vm` looks at, so it cannot be replayed. Only
+        the disk space is at stake.
+        """
+        try:
+            os.remove(quarantined)
+        except OSError as exc:
+            self.logger.warning(
+                f"could not remove the consumed save image {quarantined}: "
+                f"{exc}. It is out of the restore path and cannot be applied "
+                f"again; remove it by hand to reclaim the space.")
+
+    def _confirm_running(self, virsh, vm_name: str) -> bool:
+        """Confirm *vm_name* actually reached the running state."""
+        verify = virsh.execute("domstate", vm_name, warn=True)
+        if verify.ok and "running" in verify.stdout:
+            self.logger.info(f"vm {vm_name} is running")
+            return True
+        self.logger.error(
+            f"vm {vm_name} did not reach the running state "
+            f"(state: {(verify.stdout or '').strip() or 'unknown'})")
+        return False
+
     def save_vm(self, vm_name: str, workdir: str) -> bool:
         """
-        Save VM state to a file in the specified workdir.
+        Save the guest's memory to disk so that ``up`` can bring it back.
+
+        Uses ``virsh managedsave`` rather than an external ``virsh save``:
+        libvirt then owns the memory image and restores it on the next
+        ``start``. The external form left the domain plain 'shut off' with
+        no record that a save existed, so ``up`` cold-booted it and the
+        image was never read again (#164 FB-3).
+
+        *workdir* is accepted for signature compatibility and is deliberately
+        unused — libvirt chooses the location (``/var/lib/libvirt/qemu/save``,
+        which the docker runtime persists as of #164 FB-2).
 
         Args:
             vm_name: Name of the VM to save
-            workdir: Directory where the VM state will be saved
+            workdir: Ignored; libvirt owns the memory image's location
 
         Returns:
             True if successful, False otherwise
@@ -1474,46 +1630,74 @@ class LibVirtSession(SessionConfigMixin):
         try:
             virsh = VirshCommand(provider_config=self.provider_config)
 
-            # Check if VM is running
             result = virsh.execute("domstate", vm_name, warn=True)
-            if not result.ok or "running" not in result.stdout:
-                self.logger.warning(f"vm {vm_name} is not running, cannot save state")
-                return False
-
-            # expand the workdir path and ensure it exists
-            workdir = os.path.expanduser(workdir)
-            if not os.path.exists(workdir):
-                os.makedirs(workdir, exist_ok=True)
-
-            save_path = os.path.join(workdir, f"{vm_name}.save")
-
-            # try to save the vm state
-            self.logger.info(f"saving the vm {vm_name} state to {save_path}")
-            result = virsh.execute("save", vm_name, save_path)
-
             if not result.ok:
-                self.logger.error(f"failed to save the vm {vm_name} state: {result.stderr}")
+                self.logger.error(
+                    f"could not read the state of vm {vm_name}: "
+                    f"{(result.stderr or '').strip()}")
+                return False
+            if "running" not in result.stdout:
+                self.logger.warning(
+                    f"vm {vm_name} is not running, cannot save state")
                 return False
 
-            # verify the save file exists
-            if os.path.exists(save_path):
-                self.logger.info(f"vm {vm_name} state saved successfully to {save_path}")
-                return True
-            else:
-                self.logger.error(f"Save file {save_path} not created for VM {vm_name}")
+            self.logger.info(f"saving the vm {vm_name} state (managed save)")
+            result = virsh.execute("managedsave", vm_name, warn=True)
+            if not result.ok:
+                # A guest libvirt cannot save — one with PCI passthrough, for
+                # instance — is reported as a failure. Quietly shutting it
+                # down or destroying it instead would be exactly the silent
+                # substitution this fix exists to remove (#164 FB-3).
+                self.logger.error(
+                    f"failed to save the vm {vm_name} state: "
+                    f"{(result.stderr or '').strip()}")
                 return False
+
+            # Verify both halves. Either can hold while the save is useless:
+            # a stopped guest with no image, or an image whose guest kept
+            # running.
+            state = virsh.execute("domstate", vm_name, warn=True)
+            if not state.ok or "shut off" not in state.stdout:
+                self.logger.error(
+                    f"vm {vm_name} did not stop after managedsave "
+                    f"(state: {(state.stdout or '').strip() or 'unknown'})")
+                return False
+
+            saved = self.has_managed_save(vm_name)
+            if saved is not True:
+                self.logger.error(
+                    f"vm {vm_name} reports no managed saved state after "
+                    f"managedsave reported success"
+                    if saved is False else
+                    f"could not confirm managed saved state for vm {vm_name}")
+                return False
+
+            self.logger.info(f"vm {vm_name} state saved successfully")
+            return True
 
         except Exception as exc:
             self.logger.error(f"error saving the vm {vm_name} state: {exc}")
             return False
 
-    def restore_vm(self, vm_name: str, workdir: str) -> bool:
+    def restore_vm(self, vm_name: str, workdir: str,
+                   allow_legacy: bool = False) -> bool:
         """
-        Restore the vm from a saved state file in the specified workdir.
+        Bring a saved guest back.
+
+        Managed saved state is restored by ``virsh start``; libvirt reads the
+        memory image and removes it itself.
+
+        An *external* ``<workdir>/<vm>.save`` written by an older boxman is
+        honoured only when *allow_legacy* is set — that is, when the user
+        asked for it with ``boxman control start --restore``. Ordinary ``up``
+        refuses: nothing binds such a file to the disk's current contents, so
+        restoring one that has gone stale corrupts the guest. Silent state
+        loss is bad; silent state *corruption* is worse (#164 FB-3).
 
         Args:
             vm_name: Name of the VM to restore
-            workdir: Directory where the VM state was saved
+            workdir: Directory an older boxman may have written a save into
+            allow_legacy: Honour an external save file rather than refusing
 
         Returns:
             True if successful, False otherwise
@@ -1521,51 +1705,91 @@ class LibVirtSession(SessionConfigMixin):
         try:
             virsh = VirshCommand(provider_config=self.provider_config)
 
-            # expand the workdir path
-            workdir = os.path.expanduser(workdir)
-            save_path = os.path.join(workdir, f"{vm_name}.save")
-
-            # check if save file exists
-            if not os.path.exists(save_path):
-                self.logger.error(f"save file {save_path} does not exist")
-                return False
-
-            # check if the VM is defined but not running
-            exists_result = virsh.execute("domstate", vm_name, warn=True)
-            if exists_result.ok and "running" in exists_result.stdout:
-                self.logger.warning(f"vm {vm_name} is already running, shutting down first")
-                shutdown_result = virsh.execute("shutdown", vm_name)
-                if not shutdown_result.ok:
-                    self.logger.error(f"Failed to shutdown VM {vm_name} before restore: {shutdown_result.stderr}")
-                    return False
-
-                # wait for the vm to shut down
-                if not shutdown_and_wait(virsh, vm_name, timeout=30,
-                                         force_after=False,
-                                         poll_interval=1,
-                                         logger=self.logger):
-                    self.logger.error(f"vm {vm_name} did not shut down within timeout")
-                    return False
-
-            # try to restore the vm
-            self.logger.info(f"restoring the vm {vm_name} from {save_path}")
-            result = virsh.execute("restore", save_path)
-
-            if not result.ok:
-                self.logger.error(f"failed to restore the vm {vm_name}: {result.stderr}")
-                return False
-
-            # Verify VM is running
-            verify_result = virsh.execute("domstate", vm_name)
-            if "running" in verify_result.stdout:
-                self.logger.info(f"restoring vm {vm_name} successfully from {save_path}")
-                # Optionally remove the save file after successful restore
-                # os.remove(save_path)
-                return True
-            else:
+            saved = self.has_managed_save(vm_name)
+            if saved is None:
+                # Never fall through to a legacy restore on a failed probe:
+                # the domain may well hold managed saved state that the
+                # external file would then be applied on top of.
                 self.logger.error(
-                    f"vm {vm_name} not restored. Current state: {verify_result.stdout}")
+                    f"could not determine whether vm {vm_name} holds managed "
+                    f"saved state; refusing to guess")
                 return False
+
+            if saved:
+                self.logger.info(
+                    f"restoring the vm {vm_name} from managed save")
+                result = virsh.execute("start", vm_name, warn=True)
+                if not result.ok:
+                    self.logger.error(
+                        f"failed to restore the vm {vm_name}: "
+                        f"{(result.stderr or '').strip()}")
+                    return False
+                return self._confirm_running(virsh, vm_name)
+
+            save_path = os.path.join(
+                os.path.expanduser(workdir), f"{vm_name}.save")
+            if not os.path.exists(save_path):
+                self.logger.error(
+                    f"vm {vm_name} holds no managed saved state and there is "
+                    f"no save file at {save_path}")
+                return False
+
+            if not allow_legacy:
+                self.logger.error(
+                    f"vm {vm_name} has an external save file at {save_path}, "
+                    f"left by an older boxman. Restoring it automatically is "
+                    f"not safe: nothing ties it to the current contents of "
+                    f"the disk. Run 'boxman control start --restore' to use "
+                    f"it deliberately, or delete it to cold-boot.")
+                return False
+
+            state = virsh.execute("domstate", vm_name, warn=True)
+            if not state.ok:
+                self.logger.error(
+                    f"could not read the state of vm {vm_name}: "
+                    f"{(state.stderr or '').strip()}")
+                return False
+            if "running" in state.stdout:
+                # This used to shut a running guest down in order to apply a
+                # possibly stale external save. Refuse instead (#164 FB-3).
+                self.logger.error(
+                    f"vm {vm_name} is running; refusing to stop it to apply "
+                    f"the external save file at {save_path}")
+                return False
+
+            # Move the image out of the restore path *before* applying it.
+            # Deleting it afterwards is not enough: if that removal fails the
+            # file is still sitting at its usual name, and the next
+            # `control start --restore` replays it against disks the guest
+            # has written to in the meantime. Consumption has to be recorded
+            # durably, and the only durable record available here is the
+            # file's absence from the path the restore looks at (#164 FB-3).
+            consuming_path = self._quarantine_save_file(save_path)
+            if consuming_path is None:
+                return False
+
+            self.logger.info(f"restoring the vm {vm_name} from {save_path}")
+            result = virsh.execute("restore", consuming_path, warn=True)
+            if not result.ok:
+                # The image stays quarantined. A failed restore does not
+                # prove it was never applied: libvirt resumes the guest's
+                # CPUs before it finishes writing runtime status, and stops
+                # the guest again if that write fails — by which point the
+                # disks may already have changed. Putting the image back
+                # under its replayable name would offer it to the next
+                # restore as if nothing had happened (#164 FB-3).
+                self.logger.error(
+                    f"failed to restore the vm {vm_name}: "
+                    f"{(result.stderr or '').strip()}\n"
+                    f"The memory image is kept aside at {consuming_path} "
+                    f"rather than returned to {save_path}: a failed restore "
+                    f"cannot establish that the guest never ran, so applying "
+                    f"it again may not be safe. Inspect it there, and move it "
+                    f"back yourself only if you are sure.")
+                return False
+
+            self._discard_quarantined_save(consuming_path)
+            return self._confirm_running(virsh, vm_name)
 
         except Exception as exc:
             self.logger.error(f"error restoring the vm {vm_name}: {exc}")

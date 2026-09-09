@@ -522,16 +522,34 @@ class VMsMixin:
             return False, f"VMs are still defined: {', '.join(survivors)}"
         return True, ''
 
+    #: How libvirt spells a domain that is defined but not running. Both
+    #: spellings appear across virsh versions and output modes.
+    _SHUT_OFF_STATES = frozenset({'shut off', 'shutoff'})
+
     def _get_vm_states(self) -> dict[str, str]:
         """
         Query libvirt and return a mapping of project VM name -> state string
         for all project VMs that exist.
 
-        State strings are as returned by ``virsh list --all``, e.g.
-        'running', 'shut off', 'paused', 'saved', etc.
+        State strings are as returned by ``virsh list --all`` — 'running',
+        'shut off', 'paused', … — with one addition boxman makes itself: a
+        domain libvirt reports as 'shut off' that also holds managed saved
+        state is reported as ``'managedsave'``.
+
+        That addition is the whole point. The State column of
+        ``virsh list --all`` has no 'saved' value to report, so without the
+        second query every saved guest reads as an ordinary cold 'shut off'
+        one, and ``up`` boots it from scratch — silently discarding the
+        memory image ``down`` had just written (#164 FB-3).
 
         Returns:
             Dict mapping full VM name to its state, only for VMs that exist.
+
+        Raises:
+            ProvisionError: if libvirt cannot be queried. Returning an empty
+                mapping used to read as "no VM exists", which sends ``up``
+                down the full-provision path against a project whose domains
+                are merely unreachable (#164 FB-3).
         """
         expected = set(self._get_project_vm_names())
         if not expected:
@@ -542,8 +560,10 @@ class VMsMixin:
         # Use the table output to get both name and state
         result = self._virsh().execute("list", "--all", hide=True, warn=True)
         if not result.ok:
-            self.logger.warning("could not query VM states via virsh")
-            return {}
+            raise ProvisionError(
+                f"could not query VM states via virsh (exit "
+                f"{result.return_code}): "
+                f"{(result.stderr or '').strip() or 'no error output'}")
 
         states: dict[str, str] = {}
         for line in result.stdout.strip().splitlines():
@@ -561,7 +581,44 @@ class VMsMixin:
                 if vm_name in expected:
                     states[vm_name] = vm_state
 
+        # Only ask about managed saved state when something is actually shut
+        # off — a running or paused domain cannot have a managed save waiting
+        # for it, so the extra query would be pure cost.
+        if any(state in self._SHUT_OFF_STATES for state in states.values()):
+            saved = self._managed_save_domains()
+            for vm_name, vm_state in states.items():
+                if vm_state in self._SHUT_OFF_STATES and vm_name in saved:
+                    states[vm_name] = 'managedsave'
+
         return states
+
+    def _managed_save_domains(self) -> set[str]:
+        """
+        Names of the domains that currently hold managed saved state.
+
+        One bulk query, not one per VM.
+
+        A failed query raises rather than returning an empty set, because an
+        empty set means "nothing is saved" — and acting on that would cold-boot
+        a guest whose memory image is sitting on disk. ``virsh list --all
+        --managed-save`` would fold this into the first query, but its display
+        logic reports a domain whose save-presence probe *failed* as an
+        ordinary shut-off one, which is exactly the fail-open answer this
+        method exists to avoid (#164 FB-3).
+        """
+        result = self._virsh().execute(
+            "list", "--all", "--with-managed-save", "--name",
+            hide=True, warn=True)
+        if not result.ok:
+            raise ProvisionError(
+                f"could not determine which domains hold managed saved state "
+                f"(exit {result.return_code}): "
+                f"{(result.stderr or '').strip() or 'no error output'}\n"
+                f"Refusing to continue: treating this as 'nothing is saved' "
+                f"would cold-boot guests whose memory image is on disk.")
+        return {
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        }
 
     ### end netlab CLI handlers ####
     ### update (runtime modification) functions ####
@@ -587,8 +644,10 @@ class VMsMixin:
 
         # clone new VMs (parallel with retry)
         # resolve isos/cdroms/networks in place so both the clone subprocesses
-        # and the configure/start step below see the resolved values
-        self._resolve_iso_config()
+        # and the configure/start step below see the resolved values.
+        # Scoped to the new VMs: fetching media for guests that already exist
+        # can overwrite an ISO one of them currently has open (#164 FB-5).
+        self._resolve_iso_config(new_vm_names)
         clone_tasks = []
         for cluster_name, cluster in self._vm_clusters.items():
             for vm_name, vm_info in cluster['vms'].items():
@@ -811,12 +870,15 @@ class VMsMixin:
 
             # cdroms
             if diff['new_cdroms'] or diff['removed_cdroms'] or diff['changed_cdroms']:
+                # Active, not running: a paused guest is still active, and
+                # a persistent-only edit would report success while leaving
+                # the old media in place until the next boot (#164 FB-5).
                 cdrom_ok = self.provider.update_vm_cdroms(
                     vm_name=full_vm_name,
                     new_cdroms=diff['new_cdroms'],
                     removed_cdroms=diff['removed_cdroms'],
                     changed_cdroms=diff['changed_cdroms'],
-                    vm_running=vm_running
+                    vm_active=VMStateDiffer.domain_is_active(diff['vm_state'])
                 )
                 if not cdrom_ok:
                     result_queue.put((vm_name, {
@@ -1020,13 +1082,37 @@ class VMsMixin:
             prj_name = f'bprj__{config["project"]}__bprj'
             result_queue: Queue = Queue()
 
+            # Resolve declared media to real local paths *before* diffing.
+            # The differ cannot tell an unresolved entry from a resolved one,
+            # and an unresolved cdrom read as "remove the ISO that is
+            # attached": os.path.abspath('') is the working directory, which
+            # matches nothing, so the guest's install ISO landed in
+            # removed_cdroms (#164 FB-5).
+            #
+            # Resolution here downloads nothing, so --dry-run stays free of
+            # side effects and an update that changes only a CPU count does
+            # not reach for the network.
+            # A dry run resolves paths but never downloads, so previewing
+            # an update stays free of side effects.
+            media_failures = self._normalize_cdroms_for_update(
+                update_vm_names, allow_fetch=not dry_run)
+
             update_tasks = []
+            skipped_media = {}
             for cluster_name, cluster_cfg in self._vm_clusters.items():
                 for vm_name, vm_info in cluster_cfg['vms'].items():
                     full = f"{prj_name}_{cluster_name}_{vm_name}"
-                    if full in update_vm_names:
-                        update_tasks.append(
-                            (cluster_name, cluster_cfg, vm_name, vm_info))
+                    if full not in update_vm_names:
+                        continue
+                    if full in media_failures:
+                        # This VM's media could not be resolved. Fail it on
+                        # its own rather than aborting the run — one bad ISO
+                        # reference should not stop every other VM from
+                        # reconciling.
+                        skipped_media[vm_name] = media_failures[full]
+                        continue
+                    update_tasks.append(
+                        (cluster_name, cluster_cfg, vm_name, vm_info))
 
             # _run_parallel reports raised/killed workers as failures;
             # merge those into the collected results below so a dying
@@ -1048,6 +1134,12 @@ class VMsMixin:
                     'status': 'failed',
                     'details': reason,
                 })
+            # VMs whose declared media could not be resolved never ran.
+            for vm_name, reason in skipped_media.items():
+                results[vm_name] = {
+                    'status': 'failed',
+                    'details': f"could not resolve declared media: {reason}",
+                }
 
             # print summary
             no_change = [n for n, r in results.items() if r['status'] == 'no_change']
