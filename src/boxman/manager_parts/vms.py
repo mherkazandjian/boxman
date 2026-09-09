@@ -868,12 +868,15 @@ class VMsMixin:
 
             # cdroms
             if diff['new_cdroms'] or diff['removed_cdroms'] or diff['changed_cdroms']:
+                # Active, not running: a paused guest is still active, and
+                # a persistent-only edit would report success while leaving
+                # the old media in place until the next boot (#164 FB-5).
                 cdrom_ok = self.provider.update_vm_cdroms(
                     vm_name=full_vm_name,
                     new_cdroms=diff['new_cdroms'],
                     removed_cdroms=diff['removed_cdroms'],
                     changed_cdroms=diff['changed_cdroms'],
-                    vm_running=vm_running
+                    vm_active=VMStateDiffer.domain_is_active(diff['vm_state'])
                 )
                 if not cdrom_ok:
                     result_queue.put((vm_name, {
@@ -1077,13 +1080,34 @@ class VMsMixin:
             prj_name = f'bprj__{config["project"]}__bprj'
             result_queue: Queue = Queue()
 
+            # Resolve declared media to real local paths *before* diffing.
+            # The differ cannot tell an unresolved entry from a resolved one,
+            # and an unresolved cdrom read as "remove the ISO that is
+            # attached": os.path.abspath('') is the working directory, which
+            # matches nothing, so the guest's install ISO landed in
+            # removed_cdroms (#164 FB-5).
+            #
+            # Resolution here downloads nothing, so --dry-run stays free of
+            # side effects and an update that changes only a CPU count does
+            # not reach for the network.
+            media_failures = self._normalize_cdroms_for_update(update_vm_names)
+
             update_tasks = []
+            skipped_media = {}
             for cluster_name, cluster_cfg in self._vm_clusters.items():
                 for vm_name, vm_info in cluster_cfg['vms'].items():
                     full = f"{prj_name}_{cluster_name}_{vm_name}"
-                    if full in update_vm_names:
-                        update_tasks.append(
-                            (cluster_name, cluster_cfg, vm_name, vm_info))
+                    if full not in update_vm_names:
+                        continue
+                    if full in media_failures:
+                        # This VM's media could not be resolved. Fail it on
+                        # its own rather than aborting the run — one bad ISO
+                        # reference should not stop every other VM from
+                        # reconciling.
+                        skipped_media[vm_name] = media_failures[full]
+                        continue
+                    update_tasks.append(
+                        (cluster_name, cluster_cfg, vm_name, vm_info))
 
             # _run_parallel reports raised/killed workers as failures;
             # merge those into the collected results below so a dying
@@ -1105,6 +1129,12 @@ class VMsMixin:
                     'status': 'failed',
                     'details': reason,
                 })
+            # VMs whose declared media could not be resolved never ran.
+            for vm_name, reason in skipped_media.items():
+                results[vm_name] = {
+                    'status': 'failed',
+                    'details': f"could not resolve declared media: {reason}",
+                }
 
             # print summary
             no_change = [n for n, r in results.items() if r['status'] == 'no_change']

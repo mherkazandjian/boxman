@@ -9,6 +9,8 @@ cannot be resolved, is currently read as a benign answer ("nothing exists",
 "nothing is saved", "this path") and acted on destructively.
 """
 
+import hashlib
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -534,3 +536,458 @@ class TestSnapshotHasMemory:
         with patch('boxman.providers.libvirt.session.SnapshotManager',
                    return_value=mgr):
             assert session.snapshot_has_memory(VM1, 'snap1') is None
+
+
+# ---------------------------------------------------------------------------
+# FB-5 — update must not detach the ISO the guest is installing from
+# ---------------------------------------------------------------------------
+def _diff_cdroms(desired_cdroms, actual_cdroms, vm_state='running'):
+    """Run diff_vm with every probe but the CDROM one mocked out."""
+    from boxman.providers.libvirt.vm_differ import VMStateDiffer
+
+    differ = VMStateDiffer(provider_config={'use_sudo': False,
+                                            'uri': 'qemu:///system'})
+    with patch.object(differ, 'get_vm_state', return_value=vm_state), \
+         patch.object(differ, 'get_actual_cpu',
+                      return_value={'sockets': 1, 'cores': 1, 'threads': 1,
+                                    'total_vcpus': 1, 'current_vcpus': 1}), \
+         patch.object(differ, 'get_max_vcpus', return_value=1), \
+         patch.object(differ, 'get_actual_memory_mb', return_value=1024), \
+         patch.object(differ, 'get_max_memory_mb', return_value=1024), \
+         patch.object(differ, 'get_actual_disks', return_value=[]), \
+         patch.object(differ, 'get_actual_shared_folders', return_value=[]), \
+         patch.object(differ, 'get_actual_memballoon',
+                      return_value={'free_page_reporting': False,
+                                    'autodeflate': False,
+                                    'stats_period': None}), \
+         patch.object(differ, 'get_actual_cdroms',
+                      return_value=actual_cdroms):
+        return differ.diff_vm(
+            domain_name='vm01',
+            desired_cpus=None,
+            desired_memory_mb=None,
+            desired_disks=[],
+            desired_cdroms=desired_cdroms,
+            workdir='/tmp/wd',
+            disk_prefix='vm01',
+        )
+
+
+class TestCdromDiff:
+
+    def test_unresolved_entry_is_refused_not_turned_into_the_cwd(self):
+        """
+        ``os.path.abspath('')`` is the working directory. An unresolved
+        cdrom was silently turned into that plausible-looking path, which
+        matched nothing — so the ISO genuinely attached to the guest fell
+        into removed_cdroms and was detached (#164 FB-5).
+        """
+        with pytest.raises(ProvisionError, match='no resolved source'):
+            _diff_cdroms(
+                desired_cdroms=[{'name': 'ubuntu-noble-live'}],
+                actual_cdroms=[{'target': 'hdc',
+                                'source': '/isos/ubuntu.iso'}])
+
+    def test_attached_iso_that_is_still_declared_is_left_alone(self):
+        """The headline case: a resolved, unchanged ISO is not touched."""
+        diff = _diff_cdroms(
+            desired_cdroms=[{'name': 'ubuntu-noble-live',
+                             'source': '/isos/ubuntu.iso'}],
+            actual_cdroms=[{'target': 'hdc', 'source': '/isos/ubuntu.iso'}])
+
+        assert diff['new_cdroms'] == []
+        assert diff['removed_cdroms'] == []
+        assert diff['changed_cdroms'] == []
+
+    def test_explicit_target_wins_over_source_membership(self):
+        """
+        With hdc=A and hdd=B attached and hdc=B desired, source membership
+        was tested first: B was 'already attached somewhere', so no swap was
+        generated and hdc was simply removed, leaving B on the wrong target
+        (#164 FB-5).
+        """
+        diff = _diff_cdroms(
+            desired_cdroms=[{'target': 'hdc', 'source': '/isos/b.iso'}],
+            actual_cdroms=[{'target': 'hdc', 'source': '/isos/a.iso'},
+                           {'target': 'hdd', 'source': '/isos/b.iso'}])
+
+        assert diff['changed_cdroms'] == [{'target': 'hdc',
+                                           'source': '/isos/b.iso'}]
+        assert [c['target'] for c in diff['removed_cdroms']] == ['hdd']
+
+    def test_swapping_two_isos_between_targets_is_detected(self):
+        """This produced no changes at all."""
+        diff = _diff_cdroms(
+            desired_cdroms=[{'target': 'hdc', 'source': '/isos/b.iso'},
+                            {'target': 'hdd', 'source': '/isos/a.iso'}],
+            actual_cdroms=[{'target': 'hdc', 'source': '/isos/a.iso'},
+                           {'target': 'hdd', 'source': '/isos/b.iso'}])
+
+        assert sorted(diff['changed_cdroms'],
+                      key=lambda c: c['target']) == [
+            {'target': 'hdc', 'source': '/isos/b.iso'},
+            {'target': 'hdd', 'source': '/isos/a.iso'},
+        ]
+        assert diff['removed_cdroms'] == []
+
+    def test_media_for_an_empty_drive_is_a_change_not_an_addition(self):
+        """
+        An empty drive is where media gets inserted. Treating it as a free
+        slot produced an attempted device addition on a target that already
+        had a device (#164 FB-5).
+        """
+        diff = _diff_cdroms(
+            desired_cdroms=[{'target': 'hdc', 'source': '/isos/a.iso'}],
+            actual_cdroms=[{'target': 'hdc', 'source': None}])
+
+        assert diff['changed_cdroms'] == [{'target': 'hdc',
+                                           'source': '/isos/a.iso'}]
+        assert diff['new_cdroms'] == []
+
+    def test_an_empty_drive_is_never_removed(self):
+        """It holds no media, and dropping it changes the topology."""
+        diff = _diff_cdroms(
+            desired_cdroms=[],
+            actual_cdroms=[{'target': 'hdc', 'source': None}])
+
+        assert diff['removed_cdroms'] == []
+
+    def test_two_entries_on_one_target_are_refused(self):
+        with pytest.raises(ProvisionError, match='more than one cdrom'):
+            _diff_cdroms(
+                desired_cdroms=[{'target': 'hdc', 'source': '/isos/a.iso'},
+                                {'target': 'hdc', 'source': '/isos/b.iso'}],
+                actual_cdroms=[])
+
+    def test_an_undeclared_iso_is_removed(self):
+        diff = _diff_cdroms(
+            desired_cdroms=[],
+            actual_cdroms=[{'target': 'hdc', 'source': '/isos/a.iso'}])
+
+        assert [c['target'] for c in diff['removed_cdroms']] == ['hdc']
+
+
+# ---------------------------------------------------------------------------
+# FB-5 — resolving media for an update must fetch nothing and verify anyway
+# ---------------------------------------------------------------------------
+ISO_BYTES = b'pretend this is an installer'
+ISO_SHA = 'sha256:' + hashlib.sha256(ISO_BYTES).hexdigest()
+
+
+def _iso_manager(tmp_path, isos, cdroms):
+    cfg = {
+        'project': 'proj',
+        'isos': isos,
+        'clusters': {
+            'web': {
+                'workdir': '/tmp/wd',
+                'vms': {'node01': {'cdroms': cdroms}},
+            },
+        },
+    }
+    mgr = make_bare_manager(cfg)
+    mgr.app_config = {'cache': {'enabled': True,
+                                'cache_dir': str(tmp_path)}}
+    mgr.provider = MagicMock()
+    return mgr
+
+
+def _cache_the_iso(mgr, tmp_path, name, uri, content=ISO_BYTES):
+    filename = mgr._iso_cache_filename(name, uri)
+    path = tmp_path / filename
+    path.write_bytes(content)
+    return path
+
+
+class TestUpdateMediaResolution:
+
+    URI = 'https://example.invalid/ubuntu-noble-live.iso'
+
+    def test_cached_iso_resolves_without_downloading(self, tmp_path):
+        mgr = _iso_manager(tmp_path, {'live': {'uri': self.URI}},
+                           [{'name': 'live'}])
+        _cache_the_iso(mgr, tmp_path, 'live', self.URI)
+
+        with patch.object(type(mgr), '_download_iso',
+                          side_effect=AssertionError('must not download')):
+            failures = mgr._normalize_cdroms_for_update({VM1})
+
+        assert failures == {}
+        entry = mgr.config['clusters']['web']['vms']['node01']['cdroms'][0]
+        assert entry['source'].endswith('.iso')
+        assert os.path.isfile(entry['source'])
+
+    def test_cache_miss_is_an_actionable_per_vm_error(self, tmp_path):
+        """
+        update does not download, so a missing image has to say so rather
+        than reaching the differ with nothing resolved.
+        """
+        mgr = _iso_manager(tmp_path, {'live': {'uri': self.URI}},
+                           [{'name': 'live'}])
+
+        failures = mgr._normalize_cdroms_for_update({VM1})
+
+        assert VM1 in failures
+        assert 'not in the cache' in failures[VM1]
+        assert 'boxman up' in failures[VM1]
+
+    def test_checksum_mismatch_is_reported_and_the_file_is_kept(self, tmp_path):
+        """
+        Verification must survive the split away from _resolve_isos, and this
+        read-only path must not evict: deleting the file would turn a diff
+        into a mutation.
+        """
+        mgr = _iso_manager(
+            tmp_path,
+            {'live': {'uri': self.URI, 'checksum': ISO_SHA}},
+            [{'name': 'live'}])
+        path = _cache_the_iso(mgr, tmp_path, 'live', self.URI,
+                              content=b'not the declared bytes')
+
+        failures = mgr._normalize_cdroms_for_update({VM1})
+
+        assert 'checksum' in failures[VM1]
+        assert path.exists()
+
+    def test_matching_checksum_resolves(self, tmp_path):
+        mgr = _iso_manager(
+            tmp_path,
+            {'live': {'uri': self.URI, 'checksum': ISO_SHA}},
+            [{'name': 'live'}])
+        _cache_the_iso(mgr, tmp_path, 'live', self.URI)
+
+        assert mgr._normalize_cdroms_for_update({VM1}) == {}
+
+    def test_undeclared_iso_name_is_reported(self, tmp_path):
+        mgr = _iso_manager(tmp_path, {}, [{'name': 'nope'}])
+
+        failures = mgr._normalize_cdroms_for_update({VM1})
+
+        assert "not declared in the 'isos:' section" in failures[VM1]
+
+    def test_explicit_source_needs_no_isos_declaration(self, tmp_path):
+        """
+        SKILL.md documents ``{name: installer, source: /iso/ubuntu.iso}``.
+        Resolving name-first rejected it with "references unknown iso".
+        """
+        iso = tmp_path / 'ubuntu.iso'
+        iso.write_bytes(ISO_BYTES)
+        mgr = _iso_manager(tmp_path, {},
+                           [{'name': 'installer', 'source': str(iso)}])
+
+        failures = mgr._normalize_cdroms_for_update({VM1})
+
+        assert failures == {}
+        entry = mgr.config['clusters']['web']['vms']['node01']['cdroms'][0]
+        assert entry['source'] == str(iso)
+
+    def test_a_vm_with_no_cdroms_needs_no_resolution(self, tmp_path):
+        mgr = _iso_manager(tmp_path, {}, [])
+
+        assert mgr._normalize_cdroms_for_update({VM1}) == {}
+
+    def test_only_media_referenced_by_the_updated_vms_is_resolved(
+            self, tmp_path):
+        """
+        Resolution used to process every declared ISO. An update that touches
+        one VM should not care about an ISO only some other VM references.
+        """
+        mgr = _iso_manager(tmp_path, {'unused': {'uri': self.URI}}, [])
+
+        assert mgr._normalize_cdroms_for_update({VM1}) == {}
+
+
+class TestCdromApplyOrdering:
+
+    def _session(self):
+        from boxman.providers.libvirt.session import LibVirtSession
+        session = LibVirtSession(config={'provider': {'libvirt': {}}})
+        session.logger = MagicMock()
+        return session
+
+    def _run(self, tmp_path, new=(), removed=(), changed=(),
+             attach_ok=True, change_ok=True, vm_active=True):
+        iso = tmp_path / 'a.iso'
+        iso.write_bytes(ISO_BYTES)
+        manager = MagicMock()
+        manager.configure_from_config.return_value = attach_ok
+        manager.change_media.return_value = change_ok
+        manager.detach_cdrom.return_value = True
+        with patch('boxman.providers.libvirt.session.CDROMManager',
+                   return_value=manager):
+            ok = self._session().update_vm_cdroms(
+                vm_name=VM1,
+                new_cdroms=list(new),
+                removed_cdroms=list(removed),
+                changed_cdroms=list(changed),
+                vm_active=vm_active)
+        return ok, manager
+
+    def test_a_failed_attach_does_not_detach_the_existing_iso(self, tmp_path):
+        """
+        The old order was attach, detach, swap, and a failed attach only set
+        a flag — so the install ISO was detached anyway and the guest was
+        left with no media at all (#164 FB-5).
+        """
+        ok, manager = self._run(
+            tmp_path,
+            new=[{'name': 'new', 'source': str(tmp_path / 'a.iso')}],
+            removed=[{'target': 'hdc'}],
+            attach_ok=False)
+
+        assert ok is False
+        manager.detach_cdrom.assert_not_called()
+
+    def test_a_failed_media_change_does_not_detach_either(self, tmp_path):
+        """Gating removals on additions alone left replacements uncovered."""
+        ok, manager = self._run(
+            tmp_path,
+            changed=[{'target': 'hdc', 'source': str(tmp_path / 'a.iso')}],
+            removed=[{'target': 'hdd'}],
+            change_ok=False)
+
+        assert ok is False
+        manager.detach_cdrom.assert_not_called()
+
+    def test_a_missing_iso_is_refused_before_anything_is_mutated(
+            self, tmp_path):
+        ok, manager = self._run(
+            tmp_path,
+            new=[{'name': 'gone', 'source': str(tmp_path / 'missing.iso')}],
+            removed=[{'target': 'hdc'}])
+
+        assert ok is False
+        manager.configure_from_config.assert_not_called()
+        manager.change_media.assert_not_called()
+        manager.detach_cdrom.assert_not_called()
+
+    def test_a_media_change_with_no_target_is_refused(self, tmp_path):
+        ok, manager = self._run(
+            tmp_path,
+            changed=[{'source': str(tmp_path / 'a.iso')}])
+
+        assert ok is False
+        manager.change_media.assert_not_called()
+
+    def test_removals_run_when_everything_before_them_worked(self, tmp_path):
+        ok, manager = self._run(
+            tmp_path,
+            new=[{'name': 'new', 'source': str(tmp_path / 'a.iso')}],
+            removed=[{'target': 'hdc'}])
+
+        assert ok is True
+        manager.detach_cdrom.assert_called_once_with('hdc')
+
+    def test_activity_decides_the_media_change_scope(self, tmp_path):
+        _ok, manager = self._run(
+            tmp_path,
+            changed=[{'target': 'hdc', 'source': str(tmp_path / 'a.iso')}],
+            vm_active=False)
+
+        assert manager.change_media.call_args.kwargs['live'] is False
+
+
+class TestDomainActivity:
+
+    @pytest.mark.parametrize('state,expected', [
+        ('running', True),
+        ('paused', True),
+        ('in shutdown', True),
+        ('pmsuspended', True),
+        ('shut off', False),
+        ('shutoff', False),
+    ])
+    def test_known_states(self, state, expected):
+        from boxman.providers.libvirt.vm_differ import VMStateDiffer
+
+        assert VMStateDiffer.domain_is_active(state) is expected
+
+    def test_a_paused_guest_is_active_not_merely_running(self):
+        """
+        vm_running was `state == 'running'`. A paused guest would have had
+        only its persistent config edited, reported success, and still shown
+        the old media on resume (#164 FB-5).
+        """
+        from boxman.providers.libvirt.vm_differ import VMStateDiffer
+
+        assert VMStateDiffer.domain_is_active('paused') is True
+
+    @pytest.mark.parametrize('state', ['unknown', '', 'something else'])
+    def test_an_unknown_state_is_refused(self, state):
+        """'unknown' is what get_vm_state() returns when domstate failed."""
+        from boxman.providers.libvirt.vm_differ import VMStateDiffer
+
+        with pytest.raises(ProvisionError, match='cannot tell whether'):
+            VMStateDiffer.domain_is_active(state)
+
+
+class TestUpdateResolvesMediaBeforeDiffing:
+    """
+    The wiring, not just the helper.
+
+    Every other test in this file drives ``_normalize_cdroms_for_update``
+    directly, which says nothing about whether ``update()`` calls it. It did
+    not: ``_resolve_iso_config()`` lives inside ``_clone_and_configure_new_vms``,
+    so an update where no VM was new resolved nothing at all (#164 FB-5).
+    """
+
+    URI = 'https://example.invalid/ubuntu-noble-live.iso'
+
+    def _manager(self, tmp_path, cdroms):
+        mgr = _iso_manager(tmp_path, {'live': {'uri': self.URI}}, cdroms)
+        for name in ('_update_sessions_with_runtime', 'ensure_shared_bridges',
+                     'report_network_results', 'raise_on_network_failures',
+                     'setup_ssh_access', 'connect_info'):
+            setattr(mgr, name, MagicMock())
+        mgr.reconcile_networks = MagicMock(return_value={})
+        mgr._find_all_existing_project_vms = MagicMock(return_value=[VM1])
+        return mgr
+
+    @staticmethod
+    def _arm(mgr):
+        """Capture what update() dispatches, without running any worker."""
+        captured: dict = {'tasks': []}
+
+        def _capture(tasks, op_label='parallel task'):
+            captured['tasks'] = list(tasks)
+            for _label, _target, args in tasks:
+                captured['vm_info'] = args[3]
+            return {}, {}
+
+        mgr._run_parallel = MagicMock(side_effect=_capture)
+        return captured
+
+    @staticmethod
+    def _cli():
+        return MagicMock(dry_run=False, yes=True, recreate_networks=False)
+
+    def test_the_differ_receives_a_resolved_source(self, tmp_path):
+        mgr = self._manager(tmp_path, [{'name': 'live'}])
+        _cache_the_iso(mgr, tmp_path, 'live', self.URI)
+        captured = self._arm(mgr)
+
+        mgr.update(self._cli())
+
+        vm_info = captured.get('vm_info')
+        assert vm_info is not None, 'no VM was dispatched for update'
+        assert vm_info['cdroms'][0].get('source'), (
+            'the differ was handed an unresolved cdrom entry, which it maps '
+            'to the working directory and reports as a removal')
+
+    def test_an_unresolvable_iso_fails_its_vm_without_touching_media(
+            self, tmp_path):
+        """
+        A cache miss must not dispatch the VM into the differ — where the
+        unresolved entry would read as "detach what is attached" — and must
+        still reach the exit code as an aggregated failure.
+        """
+        mgr = self._manager(tmp_path, [{'name': 'live'}])
+        captured = self._arm(mgr)
+
+        with pytest.raises(ProvisionError, match='update finished with 1'):
+            mgr.update(self._cli())
+
+        assert captured['tasks'] == [], (
+            'the VM was dispatched into the differ with unresolved media')
+        errors = [c.args[0] for c in mgr.logger.error.call_args_list if c.args]
+        assert any('could not resolve declared media' in e for e in errors)

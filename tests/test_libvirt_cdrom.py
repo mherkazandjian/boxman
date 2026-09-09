@@ -225,15 +225,40 @@ class TestGetAttachedCDROMs:
             "file  cdrom   hdc     /isos/ubuntu.iso\n"
             "file  disk    vda     /disks/vm01.qcow2\n"
             "file  cdrom   hdd     /isos/seed.iso\n"  # seed ISO filtered out
-            "file  cdrom   hde     -\n"                # empty source filtered out
+            "file  cdrom   hde     -\n"                # empty drive, reported
         )
         with patch.object(cd.virsh, "execute", return_value=_result(stdout=out)):
             found = cd.get_attached_cdroms()
-        assert found == [{"target": "hdc", "source": "/isos/ubuntu.iso"}]
+        assert found == [
+            {"target": "hdc", "source": "/isos/ubuntu.iso"},
+            {"target": "hde", "source": None},
+        ]
 
-    def test_empty_on_execute_failure(self, cd: CDROMManager):
+    def test_empty_drives_are_reported_not_skipped(self, cd: CDROMManager):
+        """
+        An empty drive is topology: it is where media gets inserted, not a
+        free slot to add a second device to (#164 FB-5).
+        """
+        out = (
+            "Type  Device  Target  Source\n"
+            "---------------------------------------------\n"
+            "file  cdrom   hdc     -\n"
+        )
+        with patch.object(cd.virsh, "execute", return_value=_result(stdout=out)):
+            assert cd.get_attached_cdroms() == [
+                {"target": "hdc", "source": None}]
+
+    def test_query_failure_raises_rather_than_reporting_no_cdroms(
+            self, cd: CDROMManager):
+        """
+        Returning [] made a failed query look like a domain with no CDROMs,
+        and the caller then treats every declared cdrom as new (#164 FB-5).
+        """
+        from boxman.exceptions import ProvisionError
+
         with patch.object(cd.virsh, "execute", return_value=_result(ok=False)):
-            assert cd.get_attached_cdroms() == []
+            with pytest.raises(ProvisionError, match="could not list"):
+                cd.get_attached_cdroms()
 
 
 class TestXmlEscaping:

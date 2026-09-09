@@ -949,9 +949,21 @@ class LibVirtSession(SessionConfigMixin):
                          new_cdroms: list[dict[str, Any]],
                          removed_cdroms: list[dict[str, Any]],
                          changed_cdroms: list[dict[str, Any]],
-                         vm_running: bool) -> bool:
+                         vm_active: bool) -> bool:
         """
-        Apply CDROM changes: attach new, detach removed, swap changed.
+        Apply CDROM changes: attach new and swap changed, then detach removed.
+
+        Order and gating matter more here than they look. The old order was
+        attach, detach, swap, and a failed attach only set a flag — so the
+        guest's install ISO was detached even though the attach meant to
+        replace it had already failed, leaving it with no media at all
+        (#164 FB-5).
+
+        Now everything that adds media is validated before anything is
+        mutated, applied first, and removals happen last and only if nothing
+        before them failed. Several virsh calls cannot be made atomic, so a
+        partial application is reported as one rather than dressed up as a
+        rollback.
 
         Args:
             vm_name: Full VM domain name
@@ -959,14 +971,46 @@ class LibVirtSession(SessionConfigMixin):
             removed_cdroms: CDROM entries to detach (dicts with 'target')
             changed_cdroms: CDROM entries with changed source
                             (dicts with 'target' and 'source')
-            vm_running: Whether the VM is currently running
+            vm_active: Whether the domain is active — *not* merely running;
+                       see :meth:`VMStateDiffer.domain_is_active`
 
         Returns:
             True if all operations succeeded, False otherwise
         """
         cdrom_manager = CDROMManager(vm_name=vm_name, provider_config=self.provider_config)
+
+        def _usable(source) -> bool:
+            return bool(source) and os.path.isfile(
+                os.path.abspath(os.path.expanduser(source)))
+
+        # 1. Validate every addition and replacement up front. A missing ISO
+        #    found halfway through leaves the guest in a state nobody asked
+        #    for.
+        problems = []
+        for entry in new_cdroms:
+            if not _usable(entry.get('source')):
+                problems.append(
+                    f"cdrom '{entry.get('name', '?')}' has no usable source "
+                    f"({entry.get('source') or 'none given'})")
+        for entry in changed_cdroms:
+            if not entry.get('target'):
+                problems.append(f"cdrom media change with no target: {entry}")
+            elif not _usable(entry.get('source')):
+                problems.append(
+                    f"cdrom media change on {entry['target']} has no usable "
+                    f"source ({entry.get('source') or 'none given'})")
+
+        if problems:
+            for problem in problems:
+                self.logger.error(f"{vm_name}: {problem}")
+            self.logger.error(
+                f"refusing to change CDROMs on {vm_name}: nothing was "
+                f"attached, changed or detached")
+            return False
+
         success = True
 
+        # 2. Additions and media replacements.
         for cdrom_config in new_cdroms:
             name = cdrom_config.get('name', '?')
             self.logger.info(f"attaching new CDROM '{name}' to VM {vm_name}")
@@ -974,21 +1018,30 @@ class LibVirtSession(SessionConfigMixin):
                 self.logger.error(f"failed to attach CDROM '{name}' to {vm_name}")
                 success = False
 
-        for entry in removed_cdroms:
-            target = entry['target']
-            self.logger.info(f"detaching CDROM {target} from VM {vm_name}")
-            if not cdrom_manager.detach_cdrom(target):
-                self.logger.error(f"failed to detach CDROM {target} from {vm_name}")
-                success = False
-
         for entry in changed_cdroms:
             target = entry['target']
             source = entry['source']
             self.logger.info(
                 f"changing CDROM media on {target} to {source} on VM {vm_name}")
-            if not cdrom_manager.change_media(target, source):
+            if not cdrom_manager.change_media(target, source, live=vm_active):
                 self.logger.error(
                     f"failed to change CDROM media on {target} on {vm_name}")
+                success = False
+
+        # 3. Removals, and only if everything above worked.
+        if not success:
+            if removed_cdroms:
+                self.logger.error(
+                    f"not detaching any CDROM from {vm_name}: an earlier "
+                    f"attach or media change failed, and removing media now "
+                    f"would leave the guest with none")
+            return False
+
+        for entry in removed_cdroms:
+            target = entry['target']
+            self.logger.info(f"detaching CDROM {target} from VM {vm_name}")
+            if not cdrom_manager.detach_cdrom(target):
+                self.logger.error(f"failed to detach CDROM {target} from {vm_name}")
                 success = False
 
         return success
