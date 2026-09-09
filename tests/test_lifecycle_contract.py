@@ -786,6 +786,21 @@ class TestUpdateMediaResolution:
 
         assert mgr._normalize_cdroms_for_update({VM1}) == {}
 
+    def test_resolution_works_with_caching_disabled(self, tmp_path):
+        """
+        With `cache.enabled: false`, _resolve_isos still downloads to
+        cache_path_for(), so an update finds the image at the path this
+        read-only resolver computes. Correct, but only because two code
+        paths agree about the location — pin it so it stays that way.
+        """
+        mgr = _iso_manager(tmp_path, {'live': {'uri': self.URI}},
+                           [{'name': 'live'}])
+        mgr.app_config = {'cache': {'enabled': False,
+                                    'cache_dir': str(tmp_path)}}
+        _cache_the_iso(mgr, tmp_path, 'live', self.URI)
+
+        assert mgr._normalize_cdroms_for_update({VM1}) == {}
+
     def test_only_media_referenced_by_the_updated_vms_is_resolved(
             self, tmp_path):
         """
