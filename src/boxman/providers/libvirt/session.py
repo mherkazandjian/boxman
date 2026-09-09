@@ -1558,25 +1558,52 @@ class LibVirtSession(SessionConfigMixin):
         }
         return vm_name in names
 
-    def _consume_save_file(self, save_path: str) -> bool:
+    def _quarantine_save_file(self, save_path: str) -> str | None:
         """
-        Delete an external save file that has just been applied.
+        Move an external save image aside before it is applied.
 
-        A failed deletion is reported rather than suppressed. The image is
-        stale the moment libvirt reads it, and silently leaving one behind is
-        exactly the replay this deletion exists to prevent (#164 FB-3).
+        Returns the new path, or ``None`` if it could not be moved — in which
+        case the restore must not go ahead. Applying an image that cannot
+        first be taken out of the restore path risks leaving it there for a
+        second, corrupting restore (#164 FB-3).
         """
+        quarantined = f"{save_path}.restoring-{int(time.time())}"
         try:
-            os.remove(save_path)
-            return True
+            os.rename(save_path, quarantined)
+            return quarantined
         except OSError as exc:
             self.logger.error(
-                f"restored from {save_path}, but it could not be removed: "
-                f"{exc}. That memory image is now stale — applying it again "
-                f"would overwrite disks the guest has since written to. "
-                f"Delete it by hand before the next "
-                f"'boxman control start --restore'.")
-            return False
+                f"refusing to restore from {save_path}: it could not be moved "
+                f"aside first ({exc}). Applying it where it lies risks leaving "
+                f"it behind for a second restore, against disks the guest "
+                f"would have written to by then.")
+            return None
+
+    def _return_quarantined_save(self, quarantined: str,
+                                 save_path: str) -> None:
+        """Put an unapplied image back, so an explicit retry can find it."""
+        try:
+            os.rename(quarantined, save_path)
+        except OSError as exc:
+            self.logger.error(
+                f"the restore failed, and {quarantined} could not be moved "
+                f"back to {save_path}: {exc}")
+
+    def _discard_quarantined_save(self, quarantined: str) -> None:
+        """
+        Remove an image libvirt has now consumed.
+
+        A failure here is a warning, not an error: the file is already out of
+        the path :meth:`restore_vm` looks at, so it cannot be replayed. Only
+        the disk space is at stake.
+        """
+        try:
+            os.remove(quarantined)
+        except OSError as exc:
+            self.logger.warning(
+                f"could not remove the consumed save image {quarantined}: "
+                f"{exc}. It is out of the restore path and cannot be applied "
+                f"again; remove it by hand to reclaim the space.")
 
     def _confirm_running(self, virsh, vm_name: str) -> bool:
         """Confirm *vm_name* actually reached the running state."""
@@ -1740,24 +1767,30 @@ class LibVirtSession(SessionConfigMixin):
                     f"the external save file at {save_path}")
                 return False
 
+            # Move the image out of the restore path *before* applying it.
+            # Deleting it afterwards is not enough: if that removal fails the
+            # file is still sitting at its usual name, and the next
+            # `control start --restore` replays it against disks the guest
+            # has written to in the meantime. Consumption has to be recorded
+            # durably, and the only durable record available here is the
+            # file's absence from the path the restore looks at (#164 FB-3).
+            consuming_path = self._quarantine_save_file(save_path)
+            if consuming_path is None:
+                return False
+
             self.logger.info(f"restoring the vm {vm_name} from {save_path}")
-            result = virsh.execute("restore", save_path, warn=True)
+            result = virsh.execute("restore", consuming_path, warn=True)
             if not result.ok:
+                # Nothing was applied, so put it back where an explicit retry
+                # will find it.
+                self._return_quarantined_save(consuming_path, save_path)
                 self.logger.error(
                     f"failed to restore the vm {vm_name}: "
                     f"{(result.stderr or '').strip()}")
                 return False
-            # The image has been applied to the guest's disks by now,
-            # whatever the state check below reports. Consume it here: a file
-            # left behind after a failed confirmation stays eligible for a
-            # later restore, which would replay it against disks the guest has
-            # since written to — the replay hazard this deletion exists to
-            # prevent (#164 FB-3).
-            consumed = self._consume_save_file(save_path)
 
-            if not self._confirm_running(virsh, vm_name):
-                return False
-            return consumed
+            self._discard_quarantined_save(consuming_path)
+            return self._confirm_running(virsh, vm_name)
 
         except Exception as exc:
             self.logger.error(f"error restoring the vm {vm_name}: {exc}")

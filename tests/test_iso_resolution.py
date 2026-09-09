@@ -1,10 +1,11 @@
 """Unit tests for BoxmanManager ISO resolution helpers."""
 from __future__ import annotations
 
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 
 pytestmark = pytest.mark.unit
@@ -45,19 +46,27 @@ class TestResolveIsos:
             with pytest.raises(ValueError, match="'isos:' must be a mapping"):
                 mgr._resolve_isos()
 
-    def test_calls_image_cache_ensure(self):
+    def test_an_already_cached_iso_is_used_without_downloading(self, tmp_path):
+        """
+        Never re-fetch a file that is present: the downloader writes straight
+        to its destination, so that would truncate an ISO a running guest may
+        have attached (#164 FB-5).
+        """
+        present = tmp_path / "talos-omni-deadbeef.iso"
+        present.write_bytes(b"installer")
         mgr = _manager_with_config({
             "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}
         })
         with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
             mock_cache = MagicMock()
-            mock_cache.ensure.return_value = "/cache/talos.iso"
+            mock_cache.cache_path_for.return_value = str(present)
             mock_cache_cls.from_config.return_value = mock_cache
-            result = mgr._resolve_isos()
-        assert result == {"talos-omni": "/cache/talos.iso"}
-        mock_cache.ensure.assert_called_once_with(
-            "https://example.com/talos.iso", mgr._download_iso, filename=ANY
-        )
+            with patch.object(type(mgr), "_download_iso",
+                              side_effect=AssertionError("must not download")):
+                result = mgr._resolve_isos()
+
+        assert result == {"talos-omni": str(present)}
+        assert present.read_bytes() == b"installer"
 
     def test_iso_cache_filename_disambiguates_shared_basename(self):
         # two distinct ISOs sharing a basename must map to distinct cache files
@@ -68,7 +77,13 @@ class TestResolveIsos:
         assert a != b
         assert a.endswith(".iso") and "/" not in a
 
-    def test_evicts_cache_file_on_checksum_mismatch(self, tmp_path):
+    def test_a_bad_existing_file_is_reported_not_evicted(self, tmp_path):
+        """
+        Eviction used to delete the file so a later run would re-download it.
+        But a guest may have that ISO attached, and deleting or replacing it
+        is the same destruction the download itself would cause. Report and
+        let the operator decide (#164 FB-5).
+        """
         bad = tmp_path / "talos-omni-deadbeef.iso"
         bad.write_bytes(b"corrupt")
         mgr = _manager_with_config({
@@ -80,13 +95,15 @@ class TestResolveIsos:
         with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
             mock_cache = MagicMock()
             mock_cache.enabled = True
-            mock_cache.ensure.return_value = str(bad)
+            mock_cache.cache_path_for.return_value = str(bad)
             mock_cache_cls.from_config.return_value = mock_cache
             mock_cache_cls.verify_checksum = MagicMock(return_value=False)
-            with pytest.raises(RuntimeError, match="Checksum mismatch"):
+            with pytest.raises(ProvisionError,
+                               match="does not match its declared checksum"):
                 mgr._resolve_isos()
-        # the poisoned file is removed so a later run re-downloads
-        assert not bad.exists()
+
+        assert bad.exists()
+        assert bad.read_bytes() == b"corrupt"
 
     def test_raises_under_non_local_runtime(self):
         mgr = _manager_with_config({
@@ -96,18 +113,85 @@ class TestResolveIsos:
         with pytest.raises(RuntimeError, match="not yet supported under the 'docker' runtime"):
             mgr._resolve_isos()
 
-    def test_raises_when_download_fails(self):
+    def test_raises_when_download_fails(self, tmp_path):
+        dest = tmp_path / "talos-omni-deadbeef.iso"
         mgr = _manager_with_config({
             "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}
         })
         with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
             mock_cache = MagicMock()
-            mock_cache.ensure.return_value = None
+            mock_cache.cache_path_for.return_value = str(dest)
             mock_cache_cls.from_config.return_value = mock_cache
-            with pytest.raises(RuntimeError, match="Failed to download ISO"):
-                mgr._resolve_isos()
+            with patch.object(type(mgr), "_download_iso", return_value=False):
+                with pytest.raises(ProvisionError,
+                                   match="failed to download iso"):
+                    mgr._resolve_isos()
 
-    def test_verifies_checksum_when_provided(self):
+        assert not dest.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_download_is_staged_and_published_atomically(self, tmp_path):
+        """
+        Downloading straight to the destination lets a concurrent resolver
+        see a growing file, accept it, attach it, and then lose it when the
+        first download fails and deletes it (#164 FB-5).
+        """
+        dest = tmp_path / "talos-omni-deadbeef.iso"
+        seen = {}
+
+        def _fake_download(url, path):
+            seen["path"] = path
+            seen["dest_existed_during"] = dest.exists()
+            with open(path, "wb") as handle:
+                handle.write(b"installer")
+            return True
+
+        mgr = _manager_with_config({
+            "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}
+        })
+        with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
+            mock_cache = MagicMock()
+            mock_cache.cache_path_for.return_value = str(dest)
+            mock_cache_cls.from_config.return_value = mock_cache
+            with patch.object(type(mgr), "_download_iso",
+                              side_effect=_fake_download):
+                result = mgr._resolve_isos()
+
+        assert result == {"talos-omni": str(dest)}
+        assert seen["path"] != str(dest), "downloaded straight to the destination"
+        assert seen["dest_existed_during"] is False
+        assert dest.read_bytes() == b"installer"
+        # staging is cleaned up
+        assert [p.name for p in tmp_path.iterdir()] == [dest.name]
+
+    def test_a_concurrently_published_iso_is_not_replaced(self, tmp_path):
+        """Whoever published first wins; replacing could truncate it."""
+        dest = tmp_path / "talos-omni-deadbeef.iso"
+
+        def _fake_download(url, path):
+            with open(path, "wb") as handle:
+                handle.write(b"ours")
+            # another run publishes while this one downloads
+            dest.write_bytes(b"theirs")
+            return True
+
+        mgr = _manager_with_config({
+            "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}
+        })
+        with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
+            mock_cache = MagicMock()
+            mock_cache.cache_path_for.return_value = str(dest)
+            mock_cache_cls.from_config.return_value = mock_cache
+            with patch.object(type(mgr), "_download_iso",
+                              side_effect=_fake_download):
+                result = mgr._resolve_isos()
+
+        assert result == {"talos-omni": str(dest)}
+        assert dest.read_bytes() == b"theirs"
+
+    def test_verifies_checksum_when_provided(self, tmp_path):
+        present = tmp_path / "talos-omni-deadbeef.iso"
+        present.write_bytes(b"installer")
         mgr = _manager_with_config({
             "isos": {"talos-omni": {
                 "uri": "https://example.com/talos.iso",
@@ -116,15 +200,24 @@ class TestResolveIsos:
         })
         with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
             mock_cache = MagicMock()
-            mock_cache.ensure.return_value = "/cache/talos.iso"
-            mock_cache.verify_checksum.return_value = True
+            mock_cache.cache_path_for.return_value = str(present)
             mock_cache_cls.from_config.return_value = mock_cache
             mock_cache_cls.verify_checksum = MagicMock(return_value=True)
             result = mgr._resolve_isos()
-        assert result == {"talos-omni": "/cache/talos.iso"}
-        mock_cache_cls.verify_checksum.assert_called_once_with("/cache/talos.iso", "sha256:abc123")
+        assert result == {"talos-omni": str(present)}
+        mock_cache_cls.verify_checksum.assert_called_once_with(
+            str(present), "sha256:abc123")
 
-    def test_raises_on_checksum_mismatch(self):
+    def test_a_freshly_downloaded_bad_iso_never_reaches_the_cache(
+            self, tmp_path):
+        """A download that fails verification must not be published."""
+        dest = tmp_path / "talos-omni-deadbeef.iso"
+
+        def _fake_download(url, path):
+            with open(path, "wb") as handle:
+                handle.write(b"corrupt")
+            return True
+
         mgr = _manager_with_config({
             "isos": {"talos-omni": {
                 "uri": "https://example.com/talos.iso",
@@ -133,11 +226,17 @@ class TestResolveIsos:
         })
         with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
             mock_cache = MagicMock()
-            mock_cache.ensure.return_value = "/cache/talos.iso"
+            mock_cache.cache_path_for.return_value = str(dest)
             mock_cache_cls.from_config.return_value = mock_cache
             mock_cache_cls.verify_checksum = MagicMock(return_value=False)
-            with pytest.raises(RuntimeError, match="Checksum mismatch"):
-                mgr._resolve_isos()
+            with patch.object(type(mgr), "_download_iso",
+                              side_effect=_fake_download):
+                with pytest.raises(ProvisionError,
+                                   match="does not match its declared checksum"):
+                    mgr._resolve_isos()
+
+        assert not dest.exists()
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestInjectResolvedIso:

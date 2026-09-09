@@ -1,6 +1,7 @@
 """Template, base-image, ISO, and OCI image handling for BoxmanManager."""
 
 
+import contextlib
 import hashlib
 import os
 import shlex
@@ -766,13 +767,22 @@ class ImagesMixin:
                 continue
 
             checksum = iso_conf.get("checksum")
-            if checksum and not ImageCache.verify_checksum(local_path, checksum):
-                # Deliberately no eviction: this path is read-only, and
-                # deleting the file would turn a diff into a mutation.
-                errors[name] = (
-                    f"iso '{name}' does not match its declared checksum "
-                    f"({local_path})")
-                continue
+            if checksum:
+                # verify_checksum raises for a malformed spec or an unknown
+                # algorithm; that has to fail this VM, not the whole run.
+                try:
+                    verified = ImageCache.verify_checksum(local_path, checksum)
+                except (ValueError, OSError) as exc:
+                    errors[name] = f"iso '{name}' checksum could not be "\
+                                   f"checked: {exc}"
+                    continue
+                if not verified:
+                    # Deliberately no eviction: this path is read-only, and
+                    # deleting the file would turn a diff into a mutation.
+                    errors[name] = (
+                        f"iso '{name}' does not match its declared checksum "
+                        f"({local_path})")
+                    continue
 
             paths[name] = local_path
 
@@ -797,7 +807,7 @@ class ImagesMixin:
         for name in sorted(names):
             try:
                 paths.update(self._resolve_isos({name}))
-            except (ValueError, RuntimeError, BoxmanError) as exc:
+            except (ValueError, RuntimeError, OSError, BoxmanError) as exc:
                 errors[name] = str(exc)
         return paths, errors
 
@@ -930,33 +940,70 @@ class ImagesMixin:
             checksum = iso_conf.get("checksum")
             filename = self._iso_cache_filename(name, uri)
 
-            local_path = cache.ensure(uri, self._download_iso, filename=filename)
-            if local_path is None:
-                if not cache.enabled:
-                    # Caching disabled: download directly to a stable path so the
-                    # ISO is still available to virt-install (re-downloaded each
-                    # run). Mirrors the base-image direct-download fallback.
-                    local_path = cache.cache_path_for(uri, filename=filename)
-                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                    if not self._download_iso(uri, local_path):
-                        raise RuntimeError(
-                            f"Failed to download ISO '{name}' from {uri}")
-                else:
-                    raise RuntimeError(
-                        f"Failed to download ISO '{name}' from {uri}")
-
-            if checksum and not ImageCache.verify_checksum(local_path, checksum):
-                # Evict the bad file so a later run re-downloads instead of
-                # re-failing forever against the poisoned cache entry.
-                try:
-                    os.remove(local_path)
-                except OSError:
-                    pass
-                raise RuntimeError(f"Checksum mismatch for ISO '{name}'")
-
-            resolved[name] = local_path
+            resolved[name] = self._ensure_iso_present(
+                name, uri, cache.cache_path_for(uri, filename=filename),
+                checksum)
 
         return resolved
+
+    def _ensure_iso_present(self, name: str, uri: str, local_path: str,
+                            checksum: str | None) -> str:
+        """
+        Make sure the ISO for *name* sits at *local_path*, and return it.
+
+        Never writes over a file that already exists, and never deletes one.
+        The downloader writes straight to its destination — ``wget -O``
+        truncates on open, and the helper removes the file outright when an
+        attempt fails — so fetching over an existing ISO destroys media a
+        running guest may have attached, and evicting a checksum mismatch
+        does exactly the same. That held whether or not the cache was
+        enabled, and scoping resolution to the VMs being created does not
+        help when a new VM and a running one reference the *same* ISO
+        (#164 FB-5).
+
+        A new download goes to a private staging file beside the destination,
+        is verified there, and is published with a link that fails rather
+        than replaces — so a second resolver can never see a partially
+        written file at the destination, and a failed download can only ever
+        delete staging.
+        """
+        if os.path.isfile(local_path):
+            if checksum and not ImageCache.verify_checksum(local_path, checksum):
+                raise ProvisionError(
+                    f"iso '{name}' at {local_path} does not match its "
+                    f"declared checksum. Refusing to replace or remove it — a "
+                    f"guest may have it attached. Move it aside yourself and "
+                    f"re-run.")
+            return local_path
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        staging = f"{local_path}.part-{os.getpid()}"
+        try:
+            if not self._download_iso(uri, staging):
+                raise ProvisionError(
+                    f"failed to download iso '{name}' from {uri}")
+            if checksum and not ImageCache.verify_checksum(staging, checksum):
+                raise ProvisionError(
+                    f"iso '{name}' downloaded from {uri} does not match its "
+                    f"declared checksum")
+            try:
+                os.link(staging, local_path)
+            except FileExistsError:
+                # Another run published it while this one was downloading.
+                # Theirs is as good as ours, and replacing it could truncate
+                # a file already handed to a guest.
+                self.logger.info(
+                    f"iso '{name}' was published concurrently; keeping "
+                    f"{local_path}")
+            except OSError:
+                # A filesystem without hard links. Still refuse to replace.
+                if not os.path.isfile(local_path):
+                    os.replace(staging, local_path)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(staging)
+
+        return local_path
 
     def _inject_resolved_iso(
         self, vm_info: dict, resolved_isos: dict[str, str]

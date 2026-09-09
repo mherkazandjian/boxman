@@ -1125,8 +1125,12 @@ class TestCdromTargetReservation:
 class TestLegacySaveIsConsumed:
     """
     Once libvirt has read an external save file it is stale: the guest may
-    already have written to its disks. Leaving one behind lets a later
-    restore replay it against those changes (#164 FB-3).
+    already have written to its disks. Leaving one where a later restore can
+    find it lets that image be replayed against those changes (#164 FB-3).
+
+    The guarantee is the file's *absence from the restore path*, not the
+    success of a deletion — which is why it is moved aside before being
+    applied rather than deleted afterwards.
     """
 
     def _session(self):
@@ -1135,48 +1139,112 @@ class TestLegacySaveIsConsumed:
         session.logger = MagicMock()
         return session
 
-    def test_the_file_is_gone_even_when_the_guest_does_not_come_up(
-            self, tmp_path):
-        """
-        The confirmation failing does not un-apply the image. Returning
-        early left it eligible for another restore.
-        """
-        save = tmp_path / f'{VM1}.save'
-        save.write_bytes(b'memory')
-        fake = _FakeLibvirt(state='shut off', managed_saved=False)
-        # restore succeeds, but the domain does not report running
-        fake.restore_ok = True
-
+    def _restore(self, tmp_path, fake, **patches):
         with patch('boxman.providers.libvirt.session.VirshCommand',
                    return_value=fake):
             session = self._session()
-            with patch.object(type(session), '_confirm_running',
-                              return_value=False):
-                assert session.restore_vm(VM1, str(tmp_path),
-                                          allow_legacy=True) is False
+            for target, value in patches.items():
+                setattr(session, target, value)
+            return session, session.restore_vm(VM1, str(tmp_path),
+                                               allow_legacy=True)
 
+    @staticmethod
+    def _restored_paths(fake):
+        return [c[1] for c in fake.calls if c[0] == 'restore']
+
+    def test_the_image_is_moved_aside_before_it_is_applied(self, tmp_path):
+        save = tmp_path / f'{VM1}.save'
+        save.write_bytes(b'memory')
+        fake = _FakeLibvirt(state='shut off', managed_saved=False)
+
+        _session, ok = self._restore(tmp_path, fake)
+
+        assert ok is True
+        # restored from the quarantined name, never from the original
+        assert self._restored_paths(fake) != [str(save)]
         assert not save.exists()
 
-    def test_a_failed_deletion_is_reported_not_suppressed(self, tmp_path):
+    def test_a_restore_that_cannot_move_the_image_aside_is_refused(
+            self, tmp_path):
         """
-        contextlib.suppress(OSError) hid this and still returned success,
-        leaving a stale image the normal path would happily reuse.
+        Applying an image that cannot be taken out of the restore path first
+        risks leaving it there for a second, corrupting restore.
         """
         save = tmp_path / f'{VM1}.save'
         save.write_bytes(b'memory')
         fake = _FakeLibvirt(state='shut off', managed_saved=False)
 
-        with patch('boxman.providers.libvirt.session.VirshCommand',
-                   return_value=fake), \
-             patch('boxman.providers.libvirt.session.os.remove',
+        with patch('boxman.providers.libvirt.session.os.rename',
                    side_effect=OSError('read-only filesystem')):
-            session = self._session()
-            ok = session.restore_vm(VM1, str(tmp_path), allow_legacy=True)
+            _session, ok = self._restore(tmp_path, fake)
 
         assert ok is False
-        errors = [c.args[0] for c in session.logger.error.call_args_list
-                  if c.args]
-        assert any('stale' in e for e in errors)
+        assert self._restored_paths(fake) == []
+        assert save.exists()
+
+    def test_the_image_is_gone_even_when_the_guest_does_not_come_up(
+            self, tmp_path):
+        """A failed confirmation does not un-apply the image."""
+        save = tmp_path / f'{VM1}.save'
+        save.write_bytes(b'memory')
+        fake = _FakeLibvirt(state='shut off', managed_saved=False)
+
+        _session, ok = self._restore(
+            tmp_path, fake, _confirm_running=MagicMock(return_value=False))
+
+        assert ok is False
+        assert not save.exists()
+
+    def test_a_failed_restore_puts_the_image_back(self, tmp_path):
+        """Nothing was applied, so an explicit retry must still find it."""
+        save = tmp_path / f'{VM1}.save'
+        save.write_bytes(b'memory')
+        fake = _FakeLibvirt(state='shut off', managed_saved=False,
+                            restore_ok=False)
+
+        _session, ok = self._restore(tmp_path, fake)
+
+        assert ok is False
+        assert save.exists()
+
+    def test_a_second_restore_finds_nothing_to_replay(self, tmp_path):
+        """
+        The whole point. After the guest has been restored, written to its
+        disks and shut down, a fresh session must not apply that image again.
+        """
+        save = tmp_path / f'{VM1}.save'
+        save.write_bytes(b'memory')
+
+        first = _FakeLibvirt(state='shut off', managed_saved=False)
+        _session, ok = self._restore(tmp_path, first)
+        assert ok is True
+
+        second = _FakeLibvirt(state='shut off', managed_saved=False)
+        _session2, ok2 = self._restore(tmp_path, second)
+
+        assert ok2 is False
+        assert self._restored_paths(second) == []
+
+    def test_an_undeletable_image_still_cannot_be_replayed(self, tmp_path):
+        """
+        Deletion failing is only a space problem: the file is already out of
+        the path restore_vm looks at, so a second restore finds nothing.
+        """
+        save = tmp_path / f'{VM1}.save'
+        save.write_bytes(b'memory')
+        fake = _FakeLibvirt(state='shut off', managed_saved=False)
+
+        with patch('boxman.providers.libvirt.session.os.remove',
+                   side_effect=OSError('read-only filesystem')):
+            _session, ok = self._restore(tmp_path, fake)
+
+        assert ok is True
+        assert not save.exists()
+
+        second = _FakeLibvirt(state='shut off', managed_saved=False)
+        _session2, ok2 = self._restore(tmp_path, second)
+        assert ok2 is False
+        assert self._restored_paths(second) == []
 
 
 class TestCreationTimeResolutionIsScoped:
@@ -1225,6 +1293,41 @@ class TestCreationTimeResolutionIsScoped:
             mgr._resolve_iso_config()
 
         resolve.assert_called_once_with({'a', 'b'})
+
+    def test_media_shared_with_an_existing_vm_survives_a_failed_download(
+            self, tmp_path):
+        """
+        Scoping protects media referenced *only* by existing VMs. An ISO
+        referenced by both a new VM and a running one is still selected, and
+        the downloader truncates on open and deletes on failure — so the
+        running guest's media has to be protected by never fetching over a
+        file that is present, whatever the cache setting (#164 FB-5).
+        """
+        cfg = {
+            'project': 'proj',
+            'isos': {'shared': {'uri': 'https://x.invalid/shared.iso'}},
+            'clusters': {
+                'web': {
+                    'workdir': '/tmp/wd',
+                    'vms': {'node01': {'cdroms': [{'name': 'shared'}]},
+                            'node02': {'cdroms': [{'name': 'shared'}]}},
+                },
+            },
+        }
+        mgr = make_bare_manager(cfg)
+        # caching disabled: the path the old code downloaded straight over
+        mgr.app_config = {'cache': {'enabled': False,
+                                    'cache_dir': str(tmp_path)}}
+        attached = tmp_path / mgr._iso_cache_filename(
+            'shared', 'https://x.invalid/shared.iso')
+        attached.write_bytes(b'the running guest is booted from this')
+
+        # node02 is new; node01 is already running with this ISO attached
+        with patch.object(type(mgr), '_download_iso',
+                          side_effect=AssertionError('must not download')):
+            mgr._resolve_iso_config({VM2})
+
+        assert attached.read_bytes() == b'the running guest is booted from this'
 
     def test_the_clone_path_passes_only_the_new_vms(self, tmp_path):
         """
