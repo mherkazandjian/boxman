@@ -949,6 +949,12 @@ class FlowsMixin:
         if is_docker:
             runtime.ready_timeout = min(
                 getattr(runtime, "ready_timeout", 60), 10)
+            # destroy exists to tear this project down and has already been
+            # confirmed above, so a container recreate that stops guests is
+            # authorised here. Without this the guest guard would refuse,
+            # ensure_ready would fail, and the VM-level deprovision would be
+            # skipped — stranding the very VMs destroy was asked to remove.
+            runtime.allow_recreate = True
         try:
             runtime.ensure_ready()
         except Exception as exc:

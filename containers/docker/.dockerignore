@@ -1,0 +1,11 @@
+# Keep runtime state out of the Docker build context (#164 FB-12).
+#
+# The build context is this directory, so without these entries every VM
+# disk under data/ — and libvirt's runtime tree, which is root-owned — is
+# uploaded to the daemon on each image build.
+data/
+.env
+.assets-fingerprint
+*.qcow2
+*.raw
+*.zst

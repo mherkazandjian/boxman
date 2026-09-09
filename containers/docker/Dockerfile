@@ -98,6 +98,22 @@ RUN echo 'cgroup_device_acl = [' >> /etc/libvirt/qemu.conf && \
 # enable default network autostart
 RUN ln -sf /etc/libvirt/qemu/networks/default.xml /etc/libvirt/qemu/networks/autostart/default.xml
 
+# Stash a pristine copy of libvirt's own state directories.
+#
+# Both are bind-mounted from the host so that domains, networks, snapshot
+# metadata and NVRAM survive a container recreate (#164 FB-2) — without the
+# mounts they live in the writable layer and every recreate discards them.
+# A bind mount over an empty host directory would, however, hide everything
+# configured above and leave libvirtd with no libvirtd.conf, no qemu.conf and
+# no default network. entrypoint.sh seeds a mount it finds empty from this
+# stash, so a first run behaves exactly like the unmounted image did.
+#
+# Keep this as the last step that touches either directory: anything added to
+# /etc/libvirt after this line would never reach a seeded instance.
+RUN mkdir -p /var/lib/libvirt/qemu /opt/boxman/pristine && \
+    cp -a /etc/libvirt /opt/boxman/pristine/etc-libvirt && \
+    cp -a /var/lib/libvirt/qemu /opt/boxman/pristine/var-lib-libvirt-qemu
+
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

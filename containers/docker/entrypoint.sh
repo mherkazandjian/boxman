@@ -4,6 +4,55 @@ set -e
 # Ensure required directories exist
 mkdir -p /var/run/libvirt /var/lib/libvirt/images /etc/boxman/ssh
 
+# ---------------------------------------------------------------------------
+# Seed the persisted libvirt state directories (#164 FB-2).
+#
+# /etc/libvirt and /var/lib/libvirt/qemu are bind-mounted from the host so
+# domains, networks, snapshot metadata and NVRAM outlive the container. On a
+# first run those host directories are empty, and the mount hides the
+# configuration baked into the image, so copy the image's pristine stash in.
+#
+# Emptiness is the only trigger: once a directory holds anything at all it is
+# the authority and is never overwritten, so an upgrade cannot clobber a live
+# installation with image defaults.
+# ---------------------------------------------------------------------------
+seed_from_pristine() {
+    target="$1"
+    stash="$2"
+    [ -d "$stash" ] || return 0
+    mkdir -p "$target"
+    if [ -n "$(ls -A "$target" 2>/dev/null || true)" ]; then
+        return 0
+    fi
+    cp -a "$stash/." "$target/"
+    echo "Seeded $target from the image's pristine copy"
+}
+
+seed_from_pristine /etc/libvirt /opt/boxman/pristine/etc-libvirt
+seed_from_pristine /var/lib/libvirt/qemu /opt/boxman/pristine/var-lib-libvirt-qemu
+
+# Hand the state trees to the host user where libvirt permits it.
+#
+# `cp -a` above copies the image's root:root 0700 onto the bind-mount
+# target, so without this the host-side /etc/libvirt is unreadable to the
+# user who owns the project and they cannot so much as look at their own
+# domain XML. libvirtd runs as root here and reads and writes these
+# regardless of who owns them, and a migrated instance already arrives
+# user-owned because that copy is extracted host-side.
+#
+# /var/lib/libvirt/qemu is included but does not stay: libvirt's QEMU
+# driver resets its own state directories to the user/group from
+# qemu.conf, which this image sets to root. That is libvirt's call, not
+# ours, and nothing depends on winning it — destroy-runtime removes
+# root-owned leftovers through its containerised fallback.
+#
+# Run on every start rather than only after seeding, so directories
+# libvirtd created during the previous session are picked up too.
+if [ -n "${HOST_UID:-}" ] && [ "$HOST_UID" != "0" ]; then
+    chown -R "$HOST_UID:${HOST_GID:-$HOST_UID}" \
+        /etc/libvirt /var/lib/libvirt/qemu 2>/dev/null || true
+fi
+
 # Ensure the bind-mount root (common ancestor of project dir and workdirs)
 # exists inside the container.
 if [ -n "$BOXMAN_BIND_MOUNT_ROOT" ] && [ "$BOXMAN_BIND_MOUNT_ROOT" != "." ]; then
