@@ -4,7 +4,7 @@ import contextlib
 import logging
 import os
 import time
-from multiprocessing import Process, Queue
+from multiprocessing import Queue
 from typing import Any
 
 from boxman import log
@@ -146,27 +146,21 @@ class VMsMixin:
             (cluster, vm_info, new_vm_name)
             for cluster, vm_info, new_vm_name in vm_clone_tasks()
         ]
-        processes = [
-            Process(target=_clone_with_retry,
-                    args=(self.provider, cluster, vm_info, new_vm_name))
-            for cluster, vm_info, new_vm_name in clone_tasks
-        ]
-        [p.start() for p in processes]
-        [p.join() for p in processes]
-
-        # Abort provision if any clone subprocess exited non-zero. Without
-        # this check, the subsequent configure / start / wait-for-IP steps
-        # all spam errors against VMs that were never defined, and the
-        # wait-for-IP loop in particular looks like a hang.
-        failed = [
-            (task[2], p.exitcode)
-            for task, p in zip(clone_tasks, processes, strict=False)
-            if p.exitcode != 0
-        ]
-        if failed:
-            names = ', '.join(name for name, _ in failed)
-            raise RuntimeError(
-                f"clone failed for {len(failed)} VM(s) ({names}); aborting "
+        # Abort provision if any clone worker fails. Without this check, the
+        # subsequent configure / start / wait-for-IP steps all spam errors
+        # against VMs that were never defined, and the wait-for-IP loop in
+        # particular looks like a hang. Goes through the shared helper so the
+        # fan-out is bounded (one process per VM does not scale to a large
+        # cluster) and killed workers are reported, not just non-zero exits.
+        _results, failures = self._run_parallel(
+            [(new_vm_name, _clone_with_retry,
+              (self.provider, cluster, vm_info, new_vm_name))
+             for cluster, vm_info, new_vm_name in clone_tasks],
+            op_label='clone vm')
+        if failures:
+            names = ', '.join(sorted(failures))
+            raise ProvisionError(
+                f"clone failed for {len(failures)} VM(s) ({names}); aborting "
                 f"provision. See the preceding clone or guest-sanitizer log "
                 f"for the underlying cause and remediation.")
 
@@ -178,10 +172,22 @@ class VMsMixin:
         Configure and start a single VM: cpu/mem, network interfaces, disks, then start.
 
         Designed to be called in a separate process per VM after cloning is done.
+
+        Every step below returns a bool. They used to be logged at warning
+        level and dropped, so a VM whose disks, NICs and start command all
+        failed still reported success and the command exited 0 (#164 X3).
+        Each failure is now collected and raised once at the end: the
+        remaining steps are still attempted, so the operator sees
+        everything that is wrong in one run rather than one thing per
+        retry, and the VM is still started if it can be.
+
+        Raises:
+            ProvisionError: if any configuration step or the start failed.
         """
         prj_name = f'bprj__{self.config["project"]}__bprj'
         full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
         vm_info = vm_info.copy()
+        problems: list[str] = []
 
         # cpu / memory
         cpus = vm_info.get('cpus')
@@ -197,7 +203,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"successfully configured cpu and memory for vm {vm_name}")
             else:
-                self.logger.warning(f"failed to configure cpu and memory for vm {vm_name}")
+                self.logger.error(f"failed to configure cpu and memory for vm {vm_name}")
+                problems.append('cpu/memory')
         else:
             self.logger.warning(f"no cpu or memory configuration for vm {vm_name}, skipping")
 
@@ -211,7 +218,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"successfully configured memballoon for vm {vm_name}")
             else:
-                self.logger.warning(f"failed to configure memballoon for vm {vm_name}")
+                self.logger.error(f"failed to configure memballoon for vm {vm_name}")
+                problems.append('memballoon')
 
         # network interfaces
         if 'network_adapters' not in vm_info:
@@ -228,7 +236,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"network interfaces configured for vm {vm_name}")
             else:
-                self.logger.warning(f"some network interfaces could not be configured for vm {vm_name}")
+                self.logger.error(f"some network interfaces could not be configured for vm {vm_name}")
+                problems.append('network interfaces')
 
         # disks
         workdir = cluster.get('workdir', '.')
@@ -245,7 +254,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"all disks configured for vm {vm_name}")
             else:
-                self.logger.warning(f"some disks could not be configured for vm {vm_name}")
+                self.logger.error(f"some disks could not be configured for vm {vm_name}")
+                problems.append('disks')
 
         # shared folders (must be before start for virtiofs memfd backing)
         if vm_info.get('shared_folders'):
@@ -257,7 +267,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"shared folders configured for vm {vm_name}")
             else:
-                self.logger.warning(f"some shared folders could not be configured for vm {vm_name}")
+                self.logger.error(f"some shared folders could not be configured for vm {vm_name}")
+                problems.append('shared folders')
 
         # cdroms — the cdrom-boot ISO is already attached by virt-install at
         # create time, so attach only any *additional* cdroms here (avoids a
@@ -276,7 +287,8 @@ class VMsMixin:
             if success:
                 self.logger.info(f"CDROMs configured for vm {vm_name}")
             else:
-                self.logger.warning(f"some CDROMs could not be configured for vm {vm_name}")
+                self.logger.error(f"some CDROMs could not be configured for vm {vm_name}")
+                problems.append('cdroms')
 
         # start
         self.logger.info(f"starting vm {full_vm_name}")
@@ -284,7 +296,14 @@ class VMsMixin:
         if success:
             self.logger.info(f"successfully started the vm {full_vm_name}")
         else:
-            self.logger.warning(f"failed to start the vm {full_vm_name}")
+            self.logger.error(f"failed to start the vm {full_vm_name}")
+            problems.append('start')
+
+        if problems:
+            raise ProvisionError(
+                f"vm {full_vm_name} was not fully brought up "
+                f"({', '.join(problems)} failed) — see the preceding "
+                f"per-step errors for the cause.")
 
     def _destroy_vm_and_disks(
         self, cluster_name: str, cluster: dict[str, Any], vm_name: str, vm_info: dict[str, Any]
@@ -315,6 +334,10 @@ class VMsMixin:
                 f"undefined; leaving its disks in place rather than removing "
                 f"storage under a possibly-live guest")
 
+        # No bool check here on purpose: remove_vm_disks() returns True or
+        # raises (its os.remove calls are uncaught), so a filesystem error
+        # already reaches _run_parallel's failure handling. Testing the
+        # return value would be dead code.
         session.destroy_disks(
             cluster['workdir'],
             vm_name=full_vm_name,
@@ -380,6 +403,8 @@ class VMsMixin:
                 f"storage under a possibly-live guest")
 
         for workdir in disk_dirs:
+            # see _destroy_vm_and_disks: remove_vm_disks() raises rather
+            # than returning False
             self.provider.destroy_disks(
                 workdir,
                 vm_name=full_vm_name,
@@ -399,7 +424,13 @@ class VMsMixin:
             for cluster_name, cluster in self._vm_clusters.items()
             for vm_name, vm_info in cluster['vms'].items()
         ]
-        self._run_parallel(processes, op_label='configure and start vm')
+        _results, failures = self._run_parallel(
+            processes, op_label='configure and start vm')
+        if failures:
+            names = ', '.join(sorted(failures))
+            raise ProvisionError(
+                f"configure/start failed for {len(failures)} VM(s) ({names}); "
+                f"see the preceding per-VM errors for the cause.")
 
     def _get_project_vm_names(self) -> list[str]:
         """
@@ -577,7 +608,7 @@ class VMsMixin:
             op_label='clone vm')
         if failures:
             names = ', '.join(sorted(failures))
-            raise RuntimeError(
+            raise ProvisionError(
                 f"clone failed for {len(failures)} new VM(s) ({names}); "
                 f"aborting update. See the preceding clone or "
                 f"guest-sanitizer log for the underlying cause and "
@@ -591,11 +622,16 @@ class VMsMixin:
                 if full in new_vm_names:
                     configure_tasks.append((cluster_name, cluster, vm_name, vm_info))
 
-        self._run_parallel(
+        _results, failures = self._run_parallel(
             [(f"{cluster_name}/{vm_name}", self._configure_and_start_vm,
               (cluster_name, cluster, vm_name, vm_info))
              for cluster_name, cluster, vm_name, vm_info in configure_tasks],
             op_label='configure and start vm')
+        if failures:
+            names = ', '.join(sorted(failures))
+            raise ProvisionError(
+                f"configure/start failed for {len(failures)} new VM(s) "
+                f"({names}); aborting update.")
 
     def _update_single_vm(
         self,
@@ -813,12 +849,35 @@ class VMsMixin:
                 self.logger.info(
                     f"VM {vm_name}: restarting to apply changes "
                     f"(live max ceiling cannot be raised)")
-                self.provider.shutdown_and_wait(full_vm_name)
-                self.provider.start_vm(full_vm_name)
-                result_queue.put((vm_name, {
-                    'status': 'updated',
-                    'details': '; '.join(changes) + ' (restarted)'
-                }))
+                # Both calls return a bool and both were dropped, so a
+                # guest that never went down was reported "(restarted)"
+                # and `update` exited 0 with the restart-only changes not
+                # in effect (#164 X3). The shutdown has to be checked
+                # first for a second reason: start_vm() on a guest that is
+                # still running returns True, so a lost shutdown would
+                # hide itself behind a successful start.
+                if not self.provider.shutdown_and_wait(full_vm_name):
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': (
+                            '; '.join(changes) +
+                            ' — applied, but the VM could not be shut down, '
+                            'so the changes that need a restart are not in '
+                            'effect')
+                    }))
+                elif not self.provider.start_vm(full_vm_name):
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': (
+                            '; '.join(changes) +
+                            ' — applied, but the VM did not come back up '
+                            'after the restart and is still shut off')
+                    }))
+                else:
+                    result_queue.put((vm_name, {
+                        'status': 'updated',
+                        'details': '; '.join(changes) + ' (restarted)'
+                    }))
             elif pending_restart:
                 result_queue.put((vm_name, {
                     'status': 'needs_restart',
@@ -857,6 +916,12 @@ class VMsMixin:
         config = self.config
         dry_run = getattr(cli_args, 'dry_run', False)
         auto_accept = getattr(cli_args, 'yes', False)
+
+        # Collected across the phases below and raised once at the very end:
+        # a VM that fails to update must not leave the command reporting
+        # success, but it must also not stop the remaining independent work
+        # (other VMs, removals, ssh config) from completing.
+        update_failures: list[str] = []
 
         # ensure provider configs reflect runtime settings
         # Phase 1 (#49): the update/diff flow below stays on the default
@@ -1014,6 +1079,9 @@ class VMsMixin:
                 self.logger.error(f"failed: {', '.join(failed)}")
                 for vm_name in failed:
                     self.logger.error(f"  {vm_name}: {results[vm_name]['details']}")
+                update_failures.extend(
+                    f"{vm_name}: {results[vm_name]['details']}"
+                    for vm_name in failed)
 
         # --- handle removed VMs ---
         if removed_vm_names:
@@ -1026,7 +1094,11 @@ class VMsMixin:
                     (vm_name, self._destroy_removed_vm, (vm_name,))
                     for vm_name in removed_vm_names
                 ]
-                self._run_parallel(processes, op_label='destroy removed vm')
+                _res, destroy_failures = self._run_parallel(
+                    processes, op_label='destroy removed vm')
+                update_failures.extend(
+                    f"{label}: {reason}"
+                    for label, reason in sorted(destroy_failures.items()))
 
                 short = [n.split('_')[-1] for n in sorted(removed_vm_names)]
                 self.logger.info(
@@ -1042,5 +1114,10 @@ class VMsMixin:
                 self.wait_for_vm_ips(self._vms_worth_waiting_for())
             self.setup_ssh_access()
             self.connect_info()
+
+        if update_failures:
+            raise ProvisionError(
+                f"update finished with {len(update_failures)} failure(s): "
+                + "; ".join(update_failures))
 
     ### end update functions ####

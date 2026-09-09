@@ -6,6 +6,7 @@ import os
 import shlex
 from urllib.parse import urlparse
 
+from boxman.exceptions import ProvisionError, TemplateError
 from boxman.image_cache import ImageCache
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.utils.http_download import download_url
@@ -46,8 +47,9 @@ class ImagesMixin:
             )
             print(f"successfully pushed image to {cli_args.image_ref}", flush=True)
         except (ValueError, RuntimeError) as exc:
-            print(f"error pushing image: {exc}", flush=True)
-            raise SystemExit(1) from exc
+            # exit 2 through the typed boundary, which prints the message --
+            # the print here duplicated it
+            raise ProvisionError(f"error pushing image: {exc}") from exc
 
     def inspect_image(self, cli_args) -> None:
         """
@@ -66,8 +68,7 @@ class ImagesMixin:
             summary = inspect_oci_image(cli_args.image_ref)
             print(format_inspect(summary), end="", flush=True)
         except (ValueError, RuntimeError) as exc:
-            print(f"error inspecting image: {exc}", flush=True)
-            raise SystemExit(1) from exc
+            raise ProvisionError(f"error inspecting image: {exc}") from exc
 
     def pxe_boot(self, cli_args):
         """
@@ -75,19 +76,27 @@ class ImagesMixin:
         for SSH, and optionally restore the boot order afterwards.
 
         Designed to be used with a Cobbler PXE provisioning server.
+
+        Every failure here used to ``return False``, but ``app.py``'s
+        dispatch discards the handler's return value, so ``boxman
+        pxe-boot`` exited 0 on a failed boot-order change, a VM that
+        would not start, and an SSH timeout alike (#164 X3).
+
+        Raises:
+            ProvisionError: on any of those.
         """
         session = self.provider  # Phase 1 (#49): single-VM PXE flow stays on the default session until Phase 3
         vm_name = cli_args.vm
 
         self.logger.info(f"setting boot order to [network, hd] for '{vm_name}'")
         if not session.set_boot_order(vm_name, ['network', 'hd']):
-            self.logger.error(f"failed to set boot order for '{vm_name}'")
-            return False
+            raise ProvisionError(
+                f"pxe-boot: failed to set the boot order for '{vm_name}'")
 
         self.logger.info(f"starting VM '{vm_name}'")
         if not session.start_vm(vm_name):
-            self.logger.error(f"failed to start VM '{vm_name}'")
-            return False
+            raise ProvisionError(
+                f"pxe-boot: failed to start VM '{vm_name}'")
 
         if cli_args.expected_ip:
             ok = session.wait_for_ssh(
@@ -95,17 +104,18 @@ class ImagesMixin:
                 timeout=cli_args.wait_timeout,
             )
             if not ok:
-                self.logger.error(
-                    f"SSH timeout waiting for '{vm_name}' at "
-                    f"{cli_args.expected_ip}")
-                return False
+                raise ProvisionError(
+                    f"pxe-boot: timed out waiting for SSH on '{vm_name}' at "
+                    f"{cli_args.expected_ip} after {cli_args.wait_timeout}s; "
+                    f"the VM is left booting from the network")
 
             if cli_args.restore_after:
                 self.logger.info(
                     f"restoring boot order to [hd] for '{vm_name}'")
-                session.restore_boot_order(vm_name)
-
-        return True
+                if not session.restore_boot_order(vm_name):
+                    raise ProvisionError(
+                        f"pxe-boot: could not restore the boot order for "
+                        f"'{vm_name}' — it will boot from the network again")
 
     def create_templates(self, cli_args) -> None:
         """
@@ -124,10 +134,9 @@ class ImagesMixin:
 
         failed = self._create_templates_impl(requested=requested, force=force)
         if failed:
-            self.logger.error(
+            raise TemplateError(
                 f"{len(failed)} template(s) could not be created: "
                 f"{', '.join(failed)}")
-            raise SystemExit(1)
 
     def _create_templates_impl(self, requested=None, force=False) -> list[str]:
         """

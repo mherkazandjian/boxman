@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 
+import jinja2
 import yaml
 
 import boxman
@@ -15,6 +16,10 @@ from boxman.manager import BoxmanManager
 from boxman.providers import create_session, merge_provider_configs, primary_provider_type
 from boxman.providers.libvirt.import_image import ImageImporter
 from boxman.scripts.cli_parser import parse_args, resolve_verbosity
+from boxman.utils.config_diagnostics import (
+    template_config_error,
+    yaml_config_error,
+)
 from boxman.utils.jinja_env import create_jinja_env
 
 #: Names of the :class:`BoxmanManager` methods the CLI may dispatch to.
@@ -136,10 +141,19 @@ def load_boxman_config(path: str) -> dict:
     config_filename = os.path.basename(expanded)
 
     jinja_env = create_jinja_env(config_dir)
-    template = jinja_env.get_template(config_filename)
-    rendered = template.render(environ=os.environ)
+    try:
+        template = jinja_env.get_template(config_filename)
+        rendered = template.render(environ=os.environ)
+    except ConfigError:
+        # env_required() raises a typed error naming the variable.
+        raise
+    except jinja2.TemplateError as exc:
+        raise template_config_error(exc, expanded) from exc
 
-    config = yaml.safe_load(rendered)
+    try:
+        config = yaml.safe_load(rendered)
+    except yaml.YAMLError as exc:
+        raise yaml_config_error(exc, expanded) from exc
     return config
 
 

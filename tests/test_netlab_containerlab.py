@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
+from boxman.exceptions import ProvisionError
 from boxman.netlab.containerlab import (
     ContainerlabManager,
     ContainerlabNotInstalled,
@@ -215,7 +216,7 @@ class TestDeployDestroyInspect:
 
     def test_deploy_requires_rendered_topology(self, simple_lab_config, tmp_path):
         mgr = ContainerlabManager(simple_lab_config, tmp_path)
-        with pytest.raises(FileNotFoundError, match="did you call render_topology"):
+        with pytest.raises(ProvisionError, match="did you call render_topology"):
             mgr.deploy()
 
     def test_deploy_shells_out(self, simple_lab_config, tmp_path):

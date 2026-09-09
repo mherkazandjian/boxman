@@ -31,11 +31,23 @@ class NetworksMixin:
                     cluster_name=cluster_name,
                     network_name=network_name
                 )
-                self.session_for_cluster(cluster_name).define_network(
+                defined = self.session_for_cluster(cluster_name).define_network(
                     name=_network_name,
                     info=network_info,
                     workdir=cluster['workdir']
                 )
+                if not defined:
+                    # Dropping this status is how `provision` -- and therefore
+                    # every project's *first* `up`, which routes through it --
+                    # reported "defined network …" for a network libvirt had
+                    # rolled back, then went on to clone VMs and attach them
+                    # to something that does not exist. Only the second `up`
+                    # onward gets the guarded reconcile path.
+                    raise NetworkError(
+                        f"network {_network_name} could not be defined in "
+                        f"{cluster['workdir']}; see the preceding libvirt "
+                        f"error. Not continuing: the VMs about to be cloned "
+                        f"would be attached to a network that does not exist.")
                 self.logger.status(f"defined network {_network_name} in {cluster['workdir']}")
 
     def reconcile_networks(self,

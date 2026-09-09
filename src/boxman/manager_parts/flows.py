@@ -7,7 +7,7 @@ import subprocess
 import time
 
 from boxman import log
-from boxman.exceptions import ConfigError, ProvisionError
+from boxman.exceptions import BoxmanError, ConfigError, ProvisionError
 
 
 class FlowsMixin:
@@ -103,11 +103,18 @@ class FlowsMixin:
         # With many VMs starting simultaneously, some may fail due to resource
         # contention. Retry starting any that are not in 'running' state.
         self.logger.info("verifying all VMs are running after parallel start...")
+        # A VM that was never defined does not appear in _get_vm_states()
+        # at all, so comparing only the states it *does* report would let a
+        # missing VM pass as provisioned. Expect every name the config
+        # declares and treat an absent one as not running.
+        _expected = self._get_project_vm_names()
+        still_down: dict[str, str] = {}
         for _round in range(1, 21):
             vm_states = self._get_vm_states()
             not_running = {
-                name: state for name, state in vm_states.items()
-                if state != 'running'
+                name: vm_states.get(name, 'not defined')
+                for name in _expected
+                if vm_states.get(name) != 'running'
             }
             if not not_running:
                 self.logger.info("all VMs are running")
@@ -117,19 +124,36 @@ class FlowsMixin:
                 f"({', '.join(f'{n}={s}' for n, s in not_running.items())}), retrying..."
             )
             for _vm_name in not_running:
+                # the loop re-reads the state each round, so the bool here
+                # adds nothing the next iteration would not see
                 self.session_for_vm(_vm_name).start_vm(_vm_name)
             time.sleep(3)
         else:
             vm_states = self._get_vm_states()
-            still_down = {n: s for n, s in vm_states.items() if s != 'running'}
+            still_down = {
+                name: vm_states.get(name, 'not defined')
+                for name in _expected
+                if vm_states.get(name) != 'running'
+            }
             if still_down:
-                self.logger.warning(
+                self.logger.error(
                     f"gave up after 20 rounds; the following VMs are still not running: "
                     f"{', '.join(f'{n}={s}' for n, s in still_down.items())}"
                 )
 
-        # use adaptive wait for ip address assignment
-        self.wait_for_vm_ips(self._get_project_vm_names(), max_wait=600)
+        # Carried to the end of provision rather than raised here: the VMs
+        # that did come up still need their ssh access, their compose
+        # clusters and their lab. Warning and continuing, though, meant
+        # `provision` exited 0 with dead VMs — after burning the full IP
+        # timeout on them (#164 X3).
+        undead = sorted(still_down) if still_down else []
+
+        # use adaptive wait for ip address assignment, skipping the VMs that
+        # never started — they have no lease coming
+        _waiting_for = [name for name in self._get_project_vm_names()
+                        if name not in undead]
+        if _waiting_for:
+            self.wait_for_vm_ips(_waiting_for, max_wait=600)
 
         # Eject cdrom (seed.iso) from every VM now that cloud-init has run.
         # This prevents snapshot-related failures caused by qcow2-over-raw
@@ -153,6 +177,12 @@ class FlowsMixin:
 
         # render and deploy the containerlab topology (no-op if not configured)
         self.deploy_netlab()
+
+        if undead:
+            raise ProvisionError(
+                f"provision finished, but {len(undead)} VM(s) never started: "
+                f"{', '.join(undead)}. The rest of the project was "
+                f"provisioned — see the preceding errors for the cause.")
 
     def up(self, cli_args):
         """
@@ -255,12 +285,17 @@ class FlowsMixin:
             self.ensure_netlab_up()
             # Reconcile docker-compose clusters too: a host reboot or manual
             # `docker compose stop` may have left them down (idempotent).
-            self.provision_compose_clusters()
+            # A cluster that will not come up must not cost the operator
+            # their connection info and ssh config, so it is reported after
+            # the reconciliation rather than raised through it.
+            compose_error = self._reconcile_compose_clusters()
             self.connect_info()
             # Re-write SSH config in case IPs changed (DHCP renewals after
             # a host reboot, manual virsh net cycle, etc.) or in case the
             # file is missing/stale from an older boxman version.
             self.write_ssh_config()
+            if compose_error:
+                raise ProvisionError(compose_error)
             return
 
         # --- Start / resume VMs that are not running ---
@@ -288,44 +323,75 @@ class FlowsMixin:
         vm_workdir_map = dict(self._control_vm_targets(cli_args))
 
         def _bring_up(vm_name, state, workdir):
+            """Bring one VM up from whatever state it is in.
+
+            Every provider call here returns a bool. Discarding them made
+            the aggregation below unreachable for the ordinary case: a
+            guest that libvirt cleanly refused to start reported no
+            failure at all, only a log line (#164 X3).
+            """
             session = self.session_for_vm(vm_name)
             self.logger.info(f"VM '{vm_name}' is in state '{state}'")
             if state == 'paused':
                 self.logger.info(f"resuming VM '{vm_name}'...")
-                session.resume_vm(vm_name)
+                action, ok = 'resume', session.resume_vm(vm_name)
             elif state in ('saved', 'managedsave'):
                 self.logger.info(f"restoring VM '{vm_name}' from saved state...")
-                session.restore_vm(vm_name, workdir)
+                action, ok = 'restore', session.restore_vm(vm_name, workdir)
             elif state in ('shut off', 'shutoff'):
                 self.logger.info(f"starting VM '{vm_name}'...")
-                session.start_vm(vm_name)
+                action, ok = 'start', session.start_vm(vm_name)
             elif state in ('crashed', 'dying'):
                 self.logger.warning(
                     f"VM '{vm_name}' is in state '{state}', "
-                    f"attempting to destroy and start...")
-                session.destroy_vm(vm_name, remove_storage=False)
-                session.start_vm(vm_name)
+                    f"force-stopping and starting it...")
+                # libvirt refuses `start` while a domain is still active,
+                # and a crashed one is active — so it has to be stopped
+                # first. This used to call
+                # destroy_vm(vm_name, remove_storage=False), which raised
+                # TypeError (no such parameter) and, had the argument
+                # existed, would have *undefined* the domain rather than
+                # stopping it (#164 X3).
+                if not session.force_stop_vm(vm_name):
+                    raise ProvisionError(
+                        f"could not force-stop vm '{vm_name}' (state "
+                        f"'{state}') before restarting it")
+                action, ok = 'restart', session.start_vm(vm_name)
             else:
                 self.logger.warning(
                     f"VM '{vm_name}' is in unexpected state '{state}', "
                     f"attempting to start...")
-                session.start_vm(vm_name)
+                action, ok = 'start', session.start_vm(vm_name)
 
-        self._run_parallel(
+            if not ok:
+                raise ProvisionError(
+                    f"could not {action} vm '{vm_name}' (was '{state}')")
+
+        _results, failures = self._run_parallel(
             [(vm_name, _bring_up,
               (vm_name, state, vm_workdir_map.get(vm_name, '')))
              for vm_name, state in non_running.items()],
             op_label='bring up vm')
+        # The failure is carried to the end of `up` rather than raised
+        # here: the VMs that did come up still need their networks, their
+        # lab and their ssh config reconciled, and the operator still
+        # needs the connection info for them. Raising on the spot turned
+        # one dead VM into a wholly unconfigured project.
 
-        # Wait for IP addresses
-        self.wait_for_vm_ips(self._get_project_vm_names(), max_wait=300)
+        # Wait for IP addresses — but not for the VMs that failed to come
+        # up. They have no lease coming, and each one would burn the full
+        # timeout before `up` gets to report why.
+        waiting_for = [name for name in self._get_project_vm_names()
+                       if name not in failures]
+        if waiting_for:
+            self.wait_for_vm_ips(waiting_for, max_wait=300)
 
         # Reconcile the containerlab lab after the VMs are up so the
         # shared bridges have live endpoints on both sides.
         self.ensure_netlab_up()
 
         # Bring up docker-compose clusters after the VMs are up (idempotent).
-        self.provision_compose_clusters()
+        compose_error = self._reconcile_compose_clusters()
 
         # Display connection information
         self.connect_info()
@@ -333,7 +399,36 @@ class FlowsMixin:
         # Re-write SSH config with current IPs
         self.write_ssh_config()
 
+        problems = []
+        if failures:
+            problems.append(
+                f"could not bring up {len(failures)} VM(s) "
+                f"({', '.join(sorted(failures))})")
+        if compose_error:
+            problems.append(compose_error)
+        if problems:
+            raise ProvisionError(
+                f"{'; '.join(problems)}. The rest of the project was "
+                f"reconciled — see the preceding errors for the cause.")
+
         self.logger.info("infrastructure is up")
+
+    def _reconcile_compose_clusters(self) -> str:
+        """Bring the dc clusters up, returning the error instead of raising.
+
+        ``up`` still has connection info and the ssh config to write for
+        the parts of the project that did come up; a compose cluster that
+        will not start is reported once the rest is reconciled.
+
+        Returns:
+            The aggregated error message, or ``''`` when every cluster
+            came up.
+        """
+        try:
+            self.provision_compose_clusters()
+        except BoxmanError as exc:
+            return str(exc)
+        return ''
 
     def down(self, cli_args):
         """
@@ -369,7 +464,8 @@ class FlowsMixin:
 
             def _suspend(vm_name):
                 self.logger.info(f"suspending VM '{vm_name}'...")
-                self.session_for_vm(vm_name).suspend_vm(vm_name)
+                if not self.session_for_vm(vm_name).suspend_vm(vm_name):
+                    raise ProvisionError(f"could not suspend vm '{vm_name}'")
                 self.logger.info(f"VM '{vm_name}' suspended")
 
             processes = [
@@ -382,7 +478,9 @@ class FlowsMixin:
 
             def _save(vm_name, workdir):
                 self.logger.info(f"saving VM '{vm_name}' state to '{workdir}'...")
-                self.session_for_vm(vm_name).save_vm(vm_name, workdir)
+                if not self.session_for_vm(vm_name).save_vm(vm_name, workdir):
+                    raise ProvisionError(
+                        f"could not save vm '{vm_name}' to '{workdir}'")
                 self.logger.info(f"VM '{vm_name}' state saved")
 
             processes = [
@@ -390,10 +488,29 @@ class FlowsMixin:
                 for vm_name, workdir in vm_list
             ]
 
-        self._run_parallel(processes, op_label='down')
+        _results, failures = self._run_parallel(processes, op_label='down')
 
-        # Stop docker-compose clusters (keep containers; reversible via `up`).
-        self.stop_compose_clusters()
+        # Stop the compose clusters even when a VM failed: `down` was asked
+        # to bring the whole project down, and leaving the containers
+        # running because one guest would not save is a partial teardown
+        # the operator has no way to see.
+        compose_error = ''
+        try:
+            self.stop_compose_clusters()
+        except BoxmanError as exc:
+            compose_error = str(exc)
+
+        problems = []
+        if failures:
+            problems.append(
+                f"could not bring down {len(failures)} VM(s) "
+                f"({', '.join(sorted(failures))}); their state is undefined")
+        if compose_error:
+            problems.append(compose_error)
+        if problems:
+            raise ProvisionError(
+                f"{'; '.join(problems)} — see the preceding errors for "
+                f"the cause.")
 
         self.logger.info("infrastructure is down")
 
