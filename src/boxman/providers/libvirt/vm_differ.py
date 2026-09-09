@@ -460,6 +460,7 @@ class VMStateDiffer:
         matched_targets: set = set()
         claimed_targets: set = set()
 
+        entries = []
         for cdrom_config in (desired_cdroms or []):
             raw_source = cdrom_config.get('source')
             if not raw_source:
@@ -473,39 +474,55 @@ class VMStateDiffer:
                     f"has no resolved source. Declared media must be resolved "
                     f"to a local path before it can be compared with what is "
                     f"attached; refusing to guess one.")
-            source = os.path.abspath(os.path.expanduser(raw_source))
+            entries.append(
+                (cdrom_config,
+                 os.path.abspath(os.path.expanduser(raw_source))))
 
+        # Every explicit target is reserved before any matching happens.
+        # Doing it inside a single loop made the result depend on declaration
+        # order: a targetless entry could match the very drive a later
+        # explicit entry was about to overwrite, so with hdc=a.iso and
+        # hdd=b.iso attached and `[{source: a.iso}, {target: hdc, source:
+        # b.iso}]` declared, hdc became b.iso, hdd was removed, and a.iso —
+        # still declared — ended up attached nowhere, with the update
+        # reporting success (#164 FB-5).
+        for cdrom_config, _source in entries:
             target = cdrom_config.get('target')
             if not target:
-                # No target named: match by source, and only against a drive
-                # no other entry has claimed.
-                actual = next(
-                    (c for c in actual_cdroms
-                     if c['source'] == source
-                     and c['target'] not in matched_targets), None)
-                if actual is None:
-                    new_cdroms.append(cdrom_config)
-                else:
-                    matched_targets.add(actual['target'])
                 continue
-
             if target in claimed_targets:
                 raise ProvisionError(
                     f"domain '{domain_name}' declares more than one cdrom on "
                     f"target '{target}'. Each target holds one device.")
             claimed_targets.add(target)
 
-            actual_for_target = actual_by_target.get(target)
-            if actual_for_target is None:
-                new_cdroms.append(cdrom_config)
+        for cdrom_config, source in entries:
+            target = cdrom_config.get('target')
+
+            if target:
+                actual_for_target = actual_by_target.get(target)
+                if actual_for_target is None:
+                    new_cdroms.append(cdrom_config)
+                    continue
+                matched_targets.add(target)
+                if actual_for_target['source'] != source:
+                    # Covers an empty drive too (source None): inserting media
+                    # into a drive that already exists is a media change, not
+                    # a second device.
+                    changed_cdroms.append({'target': target, 'source': source})
                 continue
 
-            matched_targets.add(target)
-            if actual_for_target['source'] != source:
-                # Covers an empty drive too (source None): inserting media
-                # into a drive that already exists is a media change, not a
-                # second device.
-                changed_cdroms.append({'target': target, 'source': source})
+            # Targetless: match by source, one-to-one, and never against a
+            # drive some explicit entry has reserved.
+            actual = next(
+                (c for c in actual_cdroms
+                 if c['source'] == source
+                 and c['target'] not in matched_targets
+                 and c['target'] not in claimed_targets), None)
+            if actual is None:
+                new_cdroms.append(cdrom_config)
+            else:
+                matched_targets.add(actual['target'])
 
         removed_cdroms = [
             c for c in actual_cdroms

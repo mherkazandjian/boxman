@@ -475,9 +475,11 @@ class FlowsMixin:
         """
         Bring down the infrastructure by saving or suspending all VMs.
 
-        By default, saves each VM's state to disk (same as
-        ``boxman control save``). With ``--suspend``, pauses VMs in memory
-        instead (same as ``boxman control suspend``).
+        By default, saves each VM's state to disk with libvirt's *managed*
+        save (same as ``boxman control save``), so the next ``up`` or
+        ``control start`` restores it rather than cold-booting. With
+        ``--suspend``, pauses VMs in memory instead (same as
+        ``boxman control suspend``).
 
         docker-compose clusters are always brought down with
         ``docker compose stop`` (containers kept, reversible via ``up``);
@@ -518,7 +520,9 @@ class FlowsMixin:
                 self.logger.info("saving the state of all VMs to disk...")
 
             def _save(vm_name, workdir):
-                self.logger.info(f"saving VM '{vm_name}' state to '{workdir}'...")
+                # Not "to <workdir>": the memory image belongs to libvirt
+                # now, under /var/lib/libvirt/qemu/save (#164 FB-3).
+                self.logger.info(f"saving VM '{vm_name}' state...")
                 if not self.session_for_vm(vm_name).save_vm(vm_name, workdir):
                     raise ProvisionError(
                         f"could not save vm '{vm_name}' to '{workdir}'")

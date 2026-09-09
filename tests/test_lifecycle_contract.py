@@ -9,6 +9,7 @@ cannot be resolved, is currently read as a benign answer ("nothing exists",
 "nothing is saved", "this path") and acted on destructively.
 """
 
+import contextlib
 import hashlib
 import os
 from unittest.mock import MagicMock, patch
@@ -717,19 +718,80 @@ class TestUpdateMediaResolution:
         assert entry['source'].endswith('.iso')
         assert os.path.isfile(entry['source'])
 
-    def test_cache_miss_is_an_actionable_per_vm_error(self, tmp_path):
+    def test_a_dry_run_never_downloads(self, tmp_path):
         """
-        update does not download, so a missing image has to say so rather
-        than reaching the differ with nothing resolved.
+        Previewing an update must have no side effects, so a dry run reports
+        what it *would* fetch instead of fetching it.
         """
         mgr = _iso_manager(tmp_path, {'live': {'uri': self.URI}},
                            [{'name': 'live'}])
 
-        failures = mgr._normalize_cdroms_for_update({VM1})
+        with patch.object(type(mgr), '_resolve_isos',
+                          side_effect=AssertionError('must not download')):
+            failures = mgr._normalize_cdroms_for_update(
+                {VM1}, allow_fetch=False)
 
-        assert VM1 in failures
-        assert 'not in the cache' in failures[VM1]
-        assert 'boxman up' in failures[VM1]
+        assert 'would download it' in failures[VM1]
+        assert '--dry-run' in failures[VM1]
+
+    def test_a_missing_iso_is_fetched_on_a_real_run(self, tmp_path):
+        """
+        `update` is the only non-destructive verb that can give an existing
+        VM media it does not have: nothing else resolves cdroms for a VM that
+        already exists, so refusing to fetch made "attach this ISO" an
+        unsatisfiable declaration (#164 FB-5).
+        """
+        mgr = _iso_manager(tmp_path, {'live': {'uri': self.URI}},
+                           [{'name': 'live'}])
+        iso = tmp_path / 'fetched.iso'
+        iso.write_bytes(ISO_BYTES)
+
+        with patch.object(type(mgr), '_resolve_isos',
+                          return_value={'live': str(iso)}) as fetch:
+            failures = mgr._normalize_cdroms_for_update({VM1})
+
+        assert failures == {}
+        fetch.assert_called_once_with({'live'})
+        entry = mgr.config['clusters']['web']['vms']['node01']['cdroms'][0]
+        assert entry['source'] == str(iso)
+
+    def test_a_failed_fetch_fails_only_its_own_vm(self, tmp_path):
+        mgr = _iso_manager(tmp_path, {'live': {'uri': self.URI}},
+                           [{'name': 'live'}])
+
+        with patch.object(type(mgr), '_resolve_isos',
+                          side_effect=RuntimeError('404 not found')):
+            failures = mgr._normalize_cdroms_for_update({VM1})
+
+        assert '404 not found' in failures[VM1]
+
+    def test_media_already_present_is_never_re_downloaded(self, tmp_path):
+        """
+        The downloader writes straight to the cache path, so fetching over a
+        file that exists can truncate an ISO a running guest has open.
+        """
+        mgr = _iso_manager(tmp_path, {'live': {'uri': self.URI}},
+                           [{'name': 'live'}])
+        _cache_the_iso(mgr, tmp_path, 'live', self.URI)
+
+        with patch.object(type(mgr), '_resolve_isos',
+                          side_effect=AssertionError('must not re-download')):
+            assert mgr._normalize_cdroms_for_update({VM1}) == {}
+
+    def test_a_checksum_mismatch_is_never_fixed_by_downloading(self, tmp_path):
+        """A bad file is an error to report, not a reason to fetch over it."""
+        mgr = _iso_manager(
+            tmp_path,
+            {'live': {'uri': self.URI, 'checksum': ISO_SHA}},
+            [{'name': 'live'}])
+        _cache_the_iso(mgr, tmp_path, 'live', self.URI,
+                       content=b'not the declared bytes')
+
+        with patch.object(type(mgr), '_resolve_isos',
+                          side_effect=AssertionError('must not download')):
+            failures = mgr._normalize_cdroms_for_update({VM1})
+
+        assert 'checksum' in failures[VM1]
 
     def test_checksum_mismatch_is_reported_and_the_file_is_kept(self, tmp_path):
         """
@@ -999,10 +1061,211 @@ class TestUpdateResolvesMediaBeforeDiffing:
         mgr = self._manager(tmp_path, [{'name': 'live'}])
         captured = self._arm(mgr)
 
-        with pytest.raises(ProvisionError, match='update finished with 1'):
+        with patch.object(type(mgr), '_resolve_isos',
+                          side_effect=RuntimeError('404 not found')), \
+             pytest.raises(ProvisionError, match='update finished with 1'):
             mgr.update(self._cli())
 
         assert captured['tasks'] == [], (
             'the VM was dispatched into the differ with unresolved media')
         errors = [c.args[0] for c in mgr.logger.error.call_args_list if c.args]
         assert any('could not resolve declared media' in e for e in errors)
+
+
+class TestCdromTargetReservation:
+    """
+    Explicit targets are reserved before any matching happens.
+
+    Doing it inside one loop made the result depend on declaration order: a
+    targetless entry could match the very drive a later explicit entry was
+    about to overwrite (#164 FB-5).
+    """
+
+    ACTUAL = [{'target': 'hdc', 'source': '/isos/a.iso'},
+              {'target': 'hdd', 'source': '/isos/b.iso'}]
+
+    def test_a_targetless_entry_does_not_lose_its_media_to_a_later_one(self):
+        """
+        Declared: a.iso anywhere, and b.iso specifically on hdc.
+
+        hdc became b.iso and hdd was removed, so a.iso — still declared —
+        ended up attached nowhere, and the update reported success.
+        """
+        diff = _diff_cdroms(
+            desired_cdroms=[{'source': '/isos/a.iso'},
+                            {'target': 'hdc', 'source': '/isos/b.iso'}],
+            actual_cdroms=self.ACTUAL)
+
+        assert [c['source'] for c in diff['new_cdroms']] == ['/isos/a.iso']
+        assert diff['changed_cdroms'] == [{'target': 'hdc',
+                                           'source': '/isos/b.iso'}]
+
+    def test_the_same_holds_with_the_entries_reversed(self):
+        """Reservation happens up front, so declaration order cannot matter."""
+        diff = _diff_cdroms(
+            desired_cdroms=[{'target': 'hdc', 'source': '/isos/b.iso'},
+                            {'source': '/isos/a.iso'}],
+            actual_cdroms=self.ACTUAL)
+
+        assert [c['source'] for c in diff['new_cdroms']] == ['/isos/a.iso']
+        assert diff['changed_cdroms'] == [{'target': 'hdc',
+                                           'source': '/isos/b.iso'}]
+
+    def test_targetless_entries_match_one_to_one(self):
+        """Two declarations of the same ISO need two drives, not one twice."""
+        diff = _diff_cdroms(
+            desired_cdroms=[{'source': '/isos/a.iso'},
+                            {'source': '/isos/a.iso'}],
+            actual_cdroms=[{'target': 'hdc', 'source': '/isos/a.iso'}])
+
+        assert len(diff['new_cdroms']) == 1
+        assert diff['removed_cdroms'] == []
+
+
+class TestLegacySaveIsConsumed:
+    """
+    Once libvirt has read an external save file it is stale: the guest may
+    already have written to its disks. Leaving one behind lets a later
+    restore replay it against those changes (#164 FB-3).
+    """
+
+    def _session(self):
+        from boxman.providers.libvirt.session import LibVirtSession
+        session = LibVirtSession(config={'provider': {'libvirt': {}}})
+        session.logger = MagicMock()
+        return session
+
+    def test_the_file_is_gone_even_when_the_guest_does_not_come_up(
+            self, tmp_path):
+        """
+        The confirmation failing does not un-apply the image. Returning
+        early left it eligible for another restore.
+        """
+        save = tmp_path / f'{VM1}.save'
+        save.write_bytes(b'memory')
+        fake = _FakeLibvirt(state='shut off', managed_saved=False)
+        # restore succeeds, but the domain does not report running
+        fake.restore_ok = True
+
+        with patch('boxman.providers.libvirt.session.VirshCommand',
+                   return_value=fake):
+            session = self._session()
+            with patch.object(type(session), '_confirm_running',
+                              return_value=False):
+                assert session.restore_vm(VM1, str(tmp_path),
+                                          allow_legacy=True) is False
+
+        assert not save.exists()
+
+    def test_a_failed_deletion_is_reported_not_suppressed(self, tmp_path):
+        """
+        contextlib.suppress(OSError) hid this and still returned success,
+        leaving a stale image the normal path would happily reuse.
+        """
+        save = tmp_path / f'{VM1}.save'
+        save.write_bytes(b'memory')
+        fake = _FakeLibvirt(state='shut off', managed_saved=False)
+
+        with patch('boxman.providers.libvirt.session.VirshCommand',
+                   return_value=fake), \
+             patch('boxman.providers.libvirt.session.os.remove',
+                   side_effect=OSError('read-only filesystem')):
+            session = self._session()
+            ok = session.restore_vm(VM1, str(tmp_path), allow_legacy=True)
+
+        assert ok is False
+        errors = [c.args[0] for c in session.logger.error.call_args_list
+                  if c.args]
+        assert any('stale' in e for e in errors)
+
+
+class TestCreationTimeResolutionIsScoped:
+    """
+    Resolving every declared ISO for every VM meant an update adding one new
+    VM would also fetch media used only by guests already running — and with
+    caching disabled the downloader writes straight to the cache path,
+    truncating an ISO an existing guest has open (#164 FB-5).
+    """
+
+    def _manager(self, tmp_path):
+        cfg = {
+            'project': 'proj',
+            'isos': {'a': {'uri': 'https://x.invalid/a.iso'},
+                     'b': {'uri': 'https://x.invalid/b.iso'}},
+            'clusters': {
+                'web': {
+                    'workdir': '/tmp/wd',
+                    'vms': {'node01': {'cdroms': [{'name': 'a'}]},
+                            'node02': {'cdroms': [{'name': 'b'}]}},
+                },
+            },
+        }
+        mgr = make_bare_manager(cfg)
+        mgr.app_config = {'cache': {'enabled': True,
+                                    'cache_dir': str(tmp_path)}}
+        return mgr
+
+    def test_only_the_named_vms_media_is_resolved(self, tmp_path):
+        mgr = self._manager(tmp_path)
+
+        with patch.object(type(mgr), '_resolve_isos',
+                          return_value={'a': '/isos/a.iso',
+                                        'b': '/isos/b.iso'}) as resolve:
+            mgr._resolve_iso_config({VM1})
+
+        resolve.assert_called_once_with({'a'})
+
+    def test_no_names_means_every_vm(self, tmp_path):
+        """The full-provision path still resolves everything."""
+        mgr = self._manager(tmp_path)
+
+        with patch.object(type(mgr), '_resolve_isos',
+                          return_value={'a': '/isos/a.iso',
+                                        'b': '/isos/b.iso'}) as resolve:
+            mgr._resolve_iso_config()
+
+        resolve.assert_called_once_with({'a', 'b'})
+
+    def test_the_clone_path_passes_only_the_new_vms(self, tmp_path):
+        """
+        The wiring, not the helper: calling _resolve_iso_config() unscoped
+        from the clone path is exactly the bug, and asserting on the helper
+        alone does not catch it.
+        """
+        mgr = self._manager(tmp_path)
+        mgr._ensure_libvirt_storage_pool = MagicMock()
+        mgr._run_parallel = MagicMock(return_value=({}, {}))
+        mgr.wait_for_vm_ips = MagicMock()
+        mgr.provider = MagicMock()
+        mgr._resolve_iso_config = MagicMock()
+
+        mgr._clone_and_configure_new_vms({VM1})
+
+        mgr._resolve_iso_config.assert_called_once_with({VM1})
+
+
+class TestDryRunDoesNotFetch:
+
+    URI = 'https://example.invalid/ubuntu-noble-live.iso'
+
+    def test_update_dry_run_never_downloads(self, tmp_path):
+        """
+        The wiring for allow_fetch. Driving _normalize_cdroms_for_update with
+        allow_fetch=False directly says nothing about whether update() passes
+        it.
+        """
+        mgr = _iso_manager(tmp_path, {'live': {'uri': self.URI}},
+                           [{'name': 'live'}])
+        for name in ('_update_sessions_with_runtime', 'ensure_shared_bridges',
+                     'report_network_results', 'raise_on_network_failures',
+                     'setup_ssh_access', 'connect_info'):
+            setattr(mgr, name, MagicMock())
+        mgr.reconcile_networks = MagicMock(return_value={})
+        mgr._find_all_existing_project_vms = MagicMock(return_value=[VM1])
+        mgr._run_parallel = MagicMock(return_value=({}, {}))
+
+        with patch.object(type(mgr), '_resolve_isos',
+                          side_effect=AssertionError('must not download')):
+            with contextlib.suppress(ProvisionError):
+                mgr.update(MagicMock(dry_run=True, yes=True,
+                                     recreate_networks=False))

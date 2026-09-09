@@ -644,8 +644,10 @@ class VMsMixin:
 
         # clone new VMs (parallel with retry)
         # resolve isos/cdroms/networks in place so both the clone subprocesses
-        # and the configure/start step below see the resolved values
-        self._resolve_iso_config()
+        # and the configure/start step below see the resolved values.
+        # Scoped to the new VMs: fetching media for guests that already exist
+        # can overwrite an ISO one of them currently has open (#164 FB-5).
+        self._resolve_iso_config(new_vm_names)
         clone_tasks = []
         for cluster_name, cluster in self._vm_clusters.items():
             for vm_name, vm_info in cluster['vms'].items():
@@ -1090,7 +1092,10 @@ class VMsMixin:
             # Resolution here downloads nothing, so --dry-run stays free of
             # side effects and an update that changes only a CPU count does
             # not reach for the network.
-            media_failures = self._normalize_cdroms_for_update(update_vm_names)
+            # A dry run resolves paths but never downloads, so previewing
+            # an update stays free of side effects.
+            media_failures = self._normalize_cdroms_for_update(
+                update_vm_names, allow_fetch=not dry_run)
 
             update_tasks = []
             skipped_media = {}

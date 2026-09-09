@@ -90,7 +90,7 @@ class ControlMixin:
             if not self.session_for_vm(vm_name).save_vm(vm_name, workdir):
                 failed.append(vm_name)
                 self.logger.error(
-                    f"vm {vm_name} state could not be saved to {workdir}")
+                    f"vm {vm_name} state could not be saved")
         for cluster_name, _cluster in self._select_dc_clusters(cli_args):
             self.logger.warning(
                 f"'control save' is not supported for docker-compose cluster "
