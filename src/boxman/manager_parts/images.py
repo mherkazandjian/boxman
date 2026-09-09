@@ -990,15 +990,36 @@ class ImagesMixin:
                 os.link(staging, local_path)
             except FileExistsError:
                 # Another run published it while this one was downloading.
-                # Theirs is as good as ours, and replacing it could truncate
-                # a file already handed to a guest.
+                # Keep theirs: replacing it could swap media under a guest
+                # that already has it attached.
                 self.logger.info(
                     f"iso '{name}' was published concurrently; keeping "
                     f"{local_path}")
-            except OSError:
-                # A filesystem without hard links. Still refuse to replace.
-                if not os.path.isfile(local_path):
-                    os.replace(staging, local_path)
+                # But it satisfies *their* declaration, not necessarily
+                # this one — two projects can share a cache key while
+                # declaring different checksums, and only this run's staging
+                # file has been verified so far (#164 FB-5).
+                if checksum and not ImageCache.verify_checksum(
+                        local_path, checksum):
+                    raise ProvisionError(
+                        f"iso '{name}' at {local_path} was published by "
+                        f"another run and does not match the checksum this "
+                        f"project declares. Leaving it in place — a guest may "
+                        f"have it attached — and refusing to use it here."
+                    ) from None
+            except OSError as exc:
+                # No usable atomic publish. The obvious fallback — check that
+                # the destination is absent, then os.replace() — is a race:
+                # another run can publish and attach between the two, and
+                # this one then replaces media a guest is using. Refuse
+                # instead (#164 FB-5).
+                raise ProvisionError(
+                    f"could not publish iso '{name}' to {local_path}: {exc}. "
+                    f"boxman publishes a downloaded ISO with a hard link, "
+                    f"which fails rather than overwriting media a guest may "
+                    f"have open; put the image cache on a filesystem that "
+                    f"supports hard links."
+                ) from exc
         finally:
             with contextlib.suppress(OSError):
                 os.remove(staging)

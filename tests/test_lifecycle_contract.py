@@ -1195,17 +1195,43 @@ class TestLegacySaveIsConsumed:
         assert ok is False
         assert not save.exists()
 
-    def test_a_failed_restore_puts_the_image_back(self, tmp_path):
-        """Nothing was applied, so an explicit retry must still find it."""
+    def test_a_failed_restore_keeps_the_image_quarantined(self, tmp_path):
+        """
+        A failed restore does not prove the image was never applied: libvirt
+        resumes the guest's CPUs before it finishes writing runtime status,
+        and stops the guest again if that write fails — by which point the
+        disks may already have changed. Returning the image to its replayable
+        name would offer it to the next restore as if nothing had happened
+        (#164 FB-3).
+        """
         save = tmp_path / f'{VM1}.save'
         save.write_bytes(b'memory')
         fake = _FakeLibvirt(state='shut off', managed_saved=False,
                             restore_ok=False)
 
-        _session, ok = self._restore(tmp_path, fake)
+        session, ok = self._restore(tmp_path, fake)
 
         assert ok is False
-        assert save.exists()
+        assert not save.exists()
+        kept = list(tmp_path.glob(f'{VM1}.save.restoring-*'))
+        assert len(kept) == 1
+        errors = [c.args[0] for c in session.logger.error.call_args_list
+                  if c.args]
+        assert any(str(kept[0]) in e for e in errors)
+
+    def test_a_failed_restore_is_not_silently_retried(self, tmp_path):
+        """The quarantined image must not be found by a later restore."""
+        save = tmp_path / f'{VM1}.save'
+        save.write_bytes(b'memory')
+        first = _FakeLibvirt(state='shut off', managed_saved=False,
+                             restore_ok=False)
+        self._restore(tmp_path, first)
+
+        second = _FakeLibvirt(state='shut off', managed_saved=False)
+        _session, ok = self._restore(tmp_path, second)
+
+        assert ok is False
+        assert self._restored_paths(second) == []
 
     def test_a_second_restore_finds_nothing_to_replay(self, tmp_path):
         """

@@ -1579,16 +1579,6 @@ class LibVirtSession(SessionConfigMixin):
                 f"would have written to by then.")
             return None
 
-    def _return_quarantined_save(self, quarantined: str,
-                                 save_path: str) -> None:
-        """Put an unapplied image back, so an explicit retry can find it."""
-        try:
-            os.rename(quarantined, save_path)
-        except OSError as exc:
-            self.logger.error(
-                f"the restore failed, and {quarantined} could not be moved "
-                f"back to {save_path}: {exc}")
-
     def _discard_quarantined_save(self, quarantined: str) -> None:
         """
         Remove an image libvirt has now consumed.
@@ -1781,12 +1771,21 @@ class LibVirtSession(SessionConfigMixin):
             self.logger.info(f"restoring the vm {vm_name} from {save_path}")
             result = virsh.execute("restore", consuming_path, warn=True)
             if not result.ok:
-                # Nothing was applied, so put it back where an explicit retry
-                # will find it.
-                self._return_quarantined_save(consuming_path, save_path)
+                # The image stays quarantined. A failed restore does not
+                # prove it was never applied: libvirt resumes the guest's
+                # CPUs before it finishes writing runtime status, and stops
+                # the guest again if that write fails — by which point the
+                # disks may already have changed. Putting the image back
+                # under its replayable name would offer it to the next
+                # restore as if nothing had happened (#164 FB-3).
                 self.logger.error(
                     f"failed to restore the vm {vm_name}: "
-                    f"{(result.stderr or '').strip()}")
+                    f"{(result.stderr or '').strip()}\n"
+                    f"The memory image is kept aside at {consuming_path} "
+                    f"rather than returned to {save_path}: a failed restore "
+                    f"cannot establish that the guest never ran, so applying "
+                    f"it again may not be safe. Inspect it there, and move it "
+                    f"back yourself only if you are sure.")
                 return False
 
             self._discard_quarantined_save(consuming_path)

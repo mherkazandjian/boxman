@@ -356,3 +356,106 @@ class TestValidateBaseImages:
     def test_network_boot_needs_no_base_image(self):
         mgr = self._mgr({"c": {"vms": {"v": {"boot_order": ["network", "hd"]}}}})
         mgr.validate_base_images()  # no raise
+
+
+class TestIsoPublication:
+    """
+    Publishing a downloaded ISO must never replace one that is already there:
+    a guest may have it attached, and its configured path would then name
+    different media on reopening (#164 FB-5).
+    """
+
+    def _manager(self):
+        return _manager_with_config({
+            "isos": {"talos-omni": {
+                "uri": "https://example.com/talos.iso",
+                "checksum": "sha256:abc123",
+            }}
+        })
+
+    @staticmethod
+    def _writes(content):
+        def _download(url, path):
+            with open(path, "wb") as handle:
+                handle.write(content)
+            return True
+        return _download
+
+    def test_publication_that_cannot_be_atomic_is_refused(self, tmp_path):
+        """
+        The obvious fallback — check the destination is absent, then
+        os.replace() — is a race: another run can publish and attach between
+        the two, and this one then replaces media a guest is using.
+        """
+        dest = tmp_path / "talos-omni-deadbeef.iso"
+        mgr = self._manager()
+
+        with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
+            mock_cache = MagicMock()
+            mock_cache.cache_path_for.return_value = str(dest)
+            mock_cache_cls.from_config.return_value = mock_cache
+            mock_cache_cls.verify_checksum = MagicMock(return_value=True)
+            with patch.object(type(mgr), "_download_iso",
+                              side_effect=self._writes(b"installer")), \
+                 patch("boxman.manager_parts.images.os.link",
+                       side_effect=OSError("cross-device link")):
+                with pytest.raises(ProvisionError, match="could not publish"):
+                    mgr._resolve_isos()
+
+        assert not dest.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_concurrent_winner_must_satisfy_this_declaration(self, tmp_path):
+        """
+        Only this run's staging file was verified. Two projects can share a
+        name/URI cache key while declaring different checksums, so the file
+        that won the race need not satisfy this caller's declaration.
+        """
+        dest = tmp_path / "talos-omni-deadbeef.iso"
+        mgr = self._manager()
+
+        def _download_and_lose_the_race(url, path):
+            with open(path, "wb") as handle:
+                handle.write(b"ours")
+            dest.write_bytes(b"theirs")
+            return True
+
+        def _verify(path, _spec):
+            # this run's staging bytes are fine; the winner's are not
+            return path != str(dest)
+
+        with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
+            mock_cache = MagicMock()
+            mock_cache.cache_path_for.return_value = str(dest)
+            mock_cache_cls.from_config.return_value = mock_cache
+            mock_cache_cls.verify_checksum = MagicMock(side_effect=_verify)
+            with patch.object(type(mgr), "_download_iso",
+                              side_effect=_download_and_lose_the_race):
+                with pytest.raises(ProvisionError,
+                                   match="published by another run"):
+                    mgr._resolve_isos()
+
+        # preserved, not replaced or removed — a guest may have it attached
+        assert dest.read_bytes() == b"theirs"
+
+    def test_a_concurrent_winner_that_matches_is_accepted(self, tmp_path):
+        dest = tmp_path / "talos-omni-deadbeef.iso"
+        mgr = self._manager()
+
+        def _download_and_lose_the_race(url, path):
+            with open(path, "wb") as handle:
+                handle.write(b"ours")
+            dest.write_bytes(b"theirs")
+            return True
+
+        with patch("boxman.manager_parts.images.ImageCache") as mock_cache_cls:
+            mock_cache = MagicMock()
+            mock_cache.cache_path_for.return_value = str(dest)
+            mock_cache_cls.from_config.return_value = mock_cache
+            mock_cache_cls.verify_checksum = MagicMock(return_value=True)
+            with patch.object(type(mgr), "_download_iso",
+                              side_effect=_download_and_lose_the_race):
+                result = mgr._resolve_isos()
+
+        assert result == {"talos-omni": str(dest)}
+        assert dest.read_bytes() == b"theirs"
