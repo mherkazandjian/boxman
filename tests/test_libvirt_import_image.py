@@ -375,7 +375,7 @@ class TestImportImageEndToEnd:
         return root / "manifest.json"
 
     def test_happy_path_calls_define_vm(self, tmp_path: Path):
-        import re
+        import shlex
         import shutil as _shutil
 
         manifest_path = self._build_package(tmp_path / "pkg")
@@ -395,9 +395,11 @@ class TestImportImageEndToEnd:
             if cmd.startswith("virsh") and "list --all --name" in cmd:
                 return _result(stdout="other-vm\n", ok=True)
             if cmd.startswith("rsync"):
-                m = re.match(r'rsync --sparse --progress "([^"]+)" "([^"]+)"', cmd)
-                assert m, f"unexpected rsync cmd: {cmd}"
-                _shutil.copyfile(m.group(1), m.group(2))
+                # parse the arguments rather than one spelling of them: the
+                # paths are shell-quoted now (#164 F1)
+                parts = shlex.split(cmd)
+                assert len(parts) == 5, f"unexpected rsync cmd: {cmd}"
+                _shutil.copyfile(parts[3], parts[4])
                 return _result(ok=True)
             if cmd.startswith("sha256sum"):
                 return _result(stdout="dead  beef\n", ok=True)

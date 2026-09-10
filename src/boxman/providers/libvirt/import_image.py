@@ -9,6 +9,7 @@ uses the manifest to set up the VM in libvirt.
 
 import json
 import os
+import shlex
 import shutil
 import tempfile
 import traceback
@@ -262,7 +263,7 @@ class ImageImporter:
         """
         try:
             result = run(
-                f"virsh -c {self.uri} list --all --name",
+                f"virsh -c {shlex.quote(self.uri)} list --all --name",
                 hide=True,
                 warn=True
             )
@@ -291,7 +292,10 @@ class ImageImporter:
             self._log_info(f"Defining VM from {xml_path}...")
 
             result = run(
-                f"virsh -c {self.uri} define {xml_path}",
+                # The XML path is derived from the VM name, which comes
+                # from the manifest's XML — not from boxman (#164 F1).
+                f"virsh -c {shlex.quote(self.uri)} define "
+                f"{shlex.quote(xml_path)}",
                 hide=True,
                 warn=True
             )
@@ -339,7 +343,8 @@ class ImageImporter:
 
             # Use rsync with --sparse flag to preserve sparsity
             result = run(
-                f'rsync --sparse --progress "{src_path}" "{dst_path}"',
+                f'rsync --sparse --progress {shlex.quote(src_path)} '
+                f'{shlex.quote(dst_path)}',
                 hide=False,
                 warn=True
             )
@@ -437,8 +442,14 @@ class ImageImporter:
             return False
         else:
             self._log_info("Disk image size verified")
-        src_checksum = run(f"sha256sum '{src_image_path}'", hide=True).stdout.split()[0]
-        dst_checksum = run(f"sha256sum '{dst_image_path}'", hide=True).stdout.split()[0]
+        # Single-quote concatenation was not quoting: a path containing an
+        # apostrophe closes the quote and the rest is parsed as shell (#164 F1).
+        src_checksum = run(
+            f"sha256sum {shlex.quote(src_image_path)}",
+            hide=True).stdout.split()[0]
+        dst_checksum = run(
+            f"sha256sum {shlex.quote(dst_image_path)}",
+            hide=True).stdout.split()[0]
         if src_checksum != dst_checksum:
             self._log_error("Disk image copy failed: checksum mismatch")
             return False
