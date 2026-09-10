@@ -499,7 +499,14 @@ class ImageImporter:
 
         remote = self._manifest_is_remote()
         dst_root = os.path.abspath(os.path.expanduser(self.disk_dir))
-        os.makedirs(dst_root, exist_ok=True)
+        try:
+            os.makedirs(dst_root, exist_ok=True)
+        except OSError as exc:
+            # --directory pointing at an existing regular file raised
+            # FileExistsError as a traceback, exit 1 (#164 F1 review)
+            raise ImageImportError(
+                f"cannot use {dst_root} as the import directory: {exc}"
+            ) from exc
         # Two scratch directories with one job each. `staging` holds exactly
         # what the vm directory should end up containing, because it *is*
         # renamed into place -- so the raw fetched xml must not land in it,
@@ -507,8 +514,14 @@ class ImageImporter:
         # the publisher's original disk path. `meta_dir` holds that raw
         # download; it is small and always discarded.
         staging = os.path.join(dst_root, f".boxman-import-{uuid.uuid4().hex}")
-        os.makedirs(staging, exist_ok=False)
-        meta_dir = tempfile.mkdtemp(prefix="boxman-import-meta-") if remote else None
+        try:
+            os.makedirs(staging, exist_ok=False)
+            meta_dir = (tempfile.mkdtemp(prefix="boxman-import-meta-")
+                        if remote else None)
+        except OSError as exc:
+            raise ImageImportError(
+                f"could not create a staging directory under {dst_root}: {exc}"
+            ) from exc
 
         try:
             # The xml is fetched first and on its own: it is small, and the
@@ -588,7 +601,13 @@ class ImageImporter:
             # The xml is edited in staging but must already point at where
             # the disk will live once the staging directory is renamed.
             staged_xml_path = os.path.join(staging, f"{vm_name}.xml")
-            shutil.copy2(vm_xml_path, staged_xml_path)
+            try:
+                shutil.copy2(vm_xml_path, staged_xml_path)
+            except OSError as exc:
+                raise ImageImportError(
+                    f"could not copy the vm xml {vm_xml_path} -> "
+                    f"{staged_xml_path}: {exc}"
+                ) from exc
             if not self.edit_vm_xml(
                 staged_xml_path,
                 new_vm_name=vm_name,
@@ -633,10 +652,34 @@ class ImageImporter:
         self._log_info(f"  Disk image: {final_image_path}")
         self._log_info(f"  Connection URI: {self.uri}")
 
+    @staticmethod
+    def _sha256(path: str) -> str:
+        """Checksum *path*, translating a failed or unreadable run.
+
+        The bare call raised on a non-zero exit and, when it merely
+        produced no output, an IndexError off ``split()[0]`` -- both as
+        tracebacks (#164 F1 review).
+        """
+        try:
+            result = run(f"sha256sum {shlex.quote(path)}", hide=True, warn=True)
+        except Exception as exc:
+            raise ImageImportError(
+                f"could not checksum {path}: {exc}") from exc
+        if not result.ok or not (result.stdout or '').split():
+            raise ImageImportError(
+                f"could not checksum {path}: "
+                f"{(result.stderr or '').strip() or 'sha256sum produced no output'}")
+        return result.stdout.split()[0]
+
     def _verify_copy(self, src_path: str, dst_path: str) -> None:
         """Check a local disk-image copy by size and then by checksum."""
-        src_size = os.path.getsize(src_path)
-        dst_size = os.path.getsize(dst_path)
+        try:
+            src_size = os.path.getsize(src_path)
+            dst_size = os.path.getsize(dst_path)
+        except OSError as exc:
+            raise ImageImportError(
+                f"could not stat the disk image copy {dst_path}: {exc}"
+            ) from exc
         if src_size != dst_size:
             raise ImageImportError(
                 f"disk image copy failed: size mismatch "
@@ -645,10 +688,8 @@ class ImageImporter:
         self._log_info("Disk image size verified")
         # Single-quote concatenation was not quoting: a path containing an
         # apostrophe closes the quote and the rest is parsed as shell (#164 F1).
-        src_checksum = run(
-            f"sha256sum {shlex.quote(src_path)}", hide=True).stdout.split()[0]
-        dst_checksum = run(
-            f"sha256sum {shlex.quote(dst_path)}", hide=True).stdout.split()[0]
+        src_checksum = self._sha256(src_path)
+        dst_checksum = self._sha256(dst_path)
         if src_checksum != dst_checksum:
             raise ImageImportError(
                 f"disk image copy failed: checksum mismatch for {dst_path}"

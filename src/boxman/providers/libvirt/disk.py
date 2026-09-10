@@ -9,6 +9,20 @@ from .commands import LibVirtCommandBase, VirshCommand
 from .disk_ownership import DEFAULT_DISK_TARGET, record_attached_disk
 
 
+def libvirt_disk_source(disk_path: str) -> str:
+    """
+    The exact ``<source file=...>`` string written into a disk's XML.
+
+    Ownership records store this, not the path they were handed. The two
+    used to be computed independently -- the XML expanded and absolutised,
+    the record did not -- so a project with a relative or ``~`` workdir
+    recorded a source that could never equal what libvirt reports back,
+    and every removal on it was refused for a mismatch that was not real
+    (#164 F2 review).
+    """
+    return os.path.abspath(os.path.expanduser(disk_path))
+
+
 def disk_path_for(workdir: str,
                   disk_name: str,
                   driver_type: str = 'qcow2',
@@ -173,7 +187,7 @@ class DiskManager:
         """
         return f"""<disk type='file' device='disk'>
   <driver name='{driver_name}' type='{driver_type}' discard='unmap'/>
-  <source file='{os.path.abspath(os.path.expanduser(disk_path))}'/>
+  <source file='{libvirt_disk_source(disk_path)}'/>
   <target dev='{target_dev}' bus='{bus}'/>
 </disk>"""
 
@@ -241,7 +255,8 @@ class DiskManager:
             try:
                 record_attached_disk(
                     self.virsh, self.vm_name,
-                    name=disk_name, target=target_dev, source=disk_path)
+                    name=disk_name, target=target_dev,
+                    source=libvirt_disk_source(disk_path))
             except ProvisionError as exc:
                 # The disk is attached and working; only the bookkeeping
                 # failed. Do not fail the attach over it -- but say so

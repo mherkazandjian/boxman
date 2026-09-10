@@ -250,6 +250,54 @@ class TestDetachUsesTheConfiguredConnection:
         assert built.endswith('detach-disk node01 vdb --config')
 
 
+class TestTheRecordedSourceMatchesTheXml:
+    """The record must equal what libvirt will report back.
+
+    The attachment XML absolutised and expanded the path; the record
+    stored the raw one. A project with a relative or ``~`` workdir
+    therefore recorded a source that could never match, and every removal
+    on it was refused for a mismatch that was not real -- the feature
+    silently did nothing (#164 F2 review, finding 5).
+    """
+
+    @pytest.mark.parametrize("given", [
+        "relative/dir/vm01_data.qcow2",
+        "~/vms/vm01_data.qcow2",
+        "/abs/vms/vm01_data.qcow2",
+    ])
+    def test_record_and_xml_agree(self, given):
+        import os
+
+        from boxman.providers.libvirt.disk import (
+            DiskManager,
+            libvirt_disk_source,
+        )
+
+        manager = DiskManager.__new__(DiskManager)
+        xml = manager._generate_disk_xml(
+            disk_path=given, target_dev='vdb',
+            driver_name='qemu', driver_type='qcow2', bus='virtio')
+
+        recorded = libvirt_disk_source(given)
+        assert f"source file='{recorded}'" in xml
+        assert os.path.isabs(recorded)
+        assert '~' not in recorded
+
+    def test_a_relative_workdir_disk_is_still_removable(self):
+        """End to end through the rule, with the path libvirt would give."""
+        from boxman.providers.libvirt.disk import libvirt_disk_source
+
+        given = "relative/dir/vm01_data.qcow2"
+        source = libvirt_disk_source(given)
+        removals, refusals = plan_disk_removals(
+            records=[DiskRecord('data', 'vdb', 'data', source)],
+            desired_disks=[],
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', source)])
+
+        assert [r.name for r in removals] == ['data']
+        assert refusals == []
+
+
 class TestDomainsWithoutRecords:
     """A VM boxman has no ownership record for is reported, never touched."""
 

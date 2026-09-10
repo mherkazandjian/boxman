@@ -6,7 +6,11 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from boxman import log
-from boxman.exceptions import ConfigError, ProvisionError
+from boxman.exceptions import (
+    ConfigError,
+    ImageImportError,
+    ProvisionError,
+)
 
 from ..session_base import SessionConfigMixin
 from . import net_reconcile
@@ -71,7 +75,14 @@ class LibVirtSession(SessionConfigMixin):
                  returns a status, so callers must not test one.
         """
         if manifest_local_path is None:
-            _, manifest_local_path = ImageImporter.load_manifest_from_uri(manifest_uri)
+            # Only the inferred-provider path in app.py translated this; with
+            # an explicit --provider the ValueError escaped as a traceback
+            # (#164 F1 review).
+            try:
+                _, manifest_local_path = ImageImporter.load_manifest_from_uri(
+                    manifest_uri)
+            except ValueError as exc:
+                raise ImageImportError(str(exc)) from exc
 
         image_importer = ImageImporter(
             manifest_path=manifest_local_path,

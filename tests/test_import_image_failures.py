@@ -614,3 +614,104 @@ class TestRemoteImportThroughTheCli:
             code = _run_cli(argv)
         assert code == 2
         assert not (dst / "packaged-vm").exists()
+
+
+@pytest.mark.smoke
+class TestBoundaryFailuresStillExitTwo:
+    """Filesystem, subprocess and manifest failures at the boundaries.
+
+    These escaped the exit-2 contract as tracebacks with exit 1. The
+    assertions are on the CLI's exit status and the absence of a
+    traceback, not on an exception type -- the message is the interface
+    (#164 F1 review, finding 8).
+    """
+
+    def _argv(self, manifest: Path, conf: Path, dst, provider=None):
+        argv = [
+            "--boxman-conf", str(conf),
+            "import-image",
+            "--uri", f"file://{manifest}",
+            "--name", "vm1",
+            "--directory", str(dst),
+        ]
+        if provider:
+            argv += ["--provider", provider]
+        return argv
+
+    def test_directory_is_a_regular_file(self, tmp_path: Path, capsys):
+        manifest = _build_package(tmp_path / "pkg")
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("")
+
+        with patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            code = _run_cli(self._argv(manifest, _boxman_conf(tmp_path), blocker))
+
+        assert code == 2
+        assert "Traceback" not in capsys.readouterr().out
+
+    def test_unreadable_staging_parent(self, tmp_path: Path, capsys):
+        """A destination boxman cannot create a staging directory under."""
+        manifest = _build_package(tmp_path / "pkg")
+        dst = tmp_path / "readonly"
+        dst.mkdir()
+        dst.chmod(0o500)
+        try:
+            with patch("boxman.providers.libvirt.import_image.run",
+                       side_effect=_fake_run()):
+                code = _run_cli(self._argv(manifest, _boxman_conf(tmp_path), dst))
+        finally:
+            dst.chmod(0o700)
+
+        assert code == 2
+        assert "Traceback" not in capsys.readouterr().out
+
+    def test_bad_uri_scheme_with_an_explicit_provider(self, tmp_path: Path, capsys):
+        """--provider skips app.py's translation; the session must do it."""
+        argv = [
+            "--boxman-conf", str(_boxman_conf(tmp_path)),
+            "import-image",
+            "--uri", "gopher://nope/manifest.json",
+            "--name", "vm1",
+            "--directory", str(tmp_path / "dst"),
+            "--provider", "libvirt",
+        ]
+        code = _run_cli(argv)
+
+        assert code == 2
+        assert "Traceback" not in capsys.readouterr().out
+
+    def test_a_failing_checksum_command_exits_2(self, tmp_path: Path, capsys):
+        manifest = _build_package(tmp_path / "pkg")
+        base = _fake_run()
+
+        def failing_sha(cmd, *args, **kwargs):
+            if cmd.startswith("sha256sum"):
+                return _Result(stdout="", stderr="sha256sum: boom", ok=False)
+            return base(cmd, *args, **kwargs)
+
+        with patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=failing_sha):
+            code = _run_cli(self._argv(manifest, _boxman_conf(tmp_path),
+                                       tmp_path / "dst"))
+
+        assert code == 2
+        assert "Traceback" not in capsys.readouterr().out
+
+    def test_a_silent_checksum_command_exits_2(self, tmp_path: Path, capsys):
+        """Empty output used to raise IndexError off split()[0]."""
+        manifest = _build_package(tmp_path / "pkg")
+        base = _fake_run()
+
+        def silent_sha(cmd, *args, **kwargs):
+            if cmd.startswith("sha256sum"):
+                return _Result(stdout="", stderr="", ok=True)
+            return base(cmd, *args, **kwargs)
+
+        with patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=silent_sha):
+            code = _run_cli(self._argv(manifest, _boxman_conf(tmp_path),
+                                       tmp_path / "dst"))
+
+        assert code == 2
+        assert "Traceback" not in capsys.readouterr().out

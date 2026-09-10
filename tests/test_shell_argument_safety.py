@@ -140,3 +140,110 @@ class TestChecksumCommands:
             mod.run(f"sha256sum {shlex.quote(str(nasty))}", hide=True)
 
         assert str(nasty) in _args_of(seen[0])
+
+
+# ---------------------------------------------------------------------------
+# The assertions above parse the command with shlex.split, which does NOT
+# execute command substitution -- so a badly quoted command can keep a
+# literal $(...) and pass them (#164 F1 review, finding 9). What follows
+# runs the production code through a real shell against stub executables,
+# where an unsafe command actually fires.
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+#: slash-free, so it is a legal filename component, and it has a side
+#: effect a shell would leave behind: a file named `pwned` in the cwd.
+LIVE_PAYLOAD = "a$(touch pwned)b"
+
+
+def _stub_bin(directory: Path, names: list[str]) -> Path:
+    """Put argv-recording stubs for *names* on a fresh PATH directory."""
+    bindir = directory / "bin"
+    bindir.mkdir()
+    log = directory / "argv.log"
+    for name in names:
+        stub = bindir / name
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"open({str(log)!r}, 'a').write(chr(31).join(sys.argv) + chr(10))\n"
+            # sha256sum's caller parses stdout; give it a plausible line
+            "if sys.argv[0].endswith('sha256sum'):\n"
+            "    print('0' * 64 + '  ' + (sys.argv[-1] if len(sys.argv) > 1 else ''))\n"
+            "sys.exit(0)\n"
+        )
+        stub.chmod(0o755)
+    return bindir
+
+
+def _recorded(directory: Path) -> list[list[str]]:
+    log = directory / "argv.log"
+    if not log.exists():
+        return []
+    return [line.split(chr(31))
+            for line in log.read_text().splitlines() if line]
+
+
+class TestTheShellActuallyRunsThem:
+    """Production commands, a real shell, and stubs that record argv."""
+
+    def _run_in(self, workdir: Path, body: str) -> subprocess.CompletedProcess:
+        """Run *body* in a subprocess whose cwd and PATH we control."""
+        bindir = _stub_bin(workdir, ["wget", "curl", "sha256sum", "rsync"])
+        env = dict(os.environ)
+        env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        return subprocess.run(
+            [sys.executable, "-c", body],
+            cwd=workdir, env=env, capture_output=True, text=True, timeout=120)
+
+    def test_download_url_does_not_execute_a_hostile_url(self, tmp_path: Path):
+        url = f"https://example.invalid/{LIVE_PAYLOAD}.iso"
+        proc = self._run_in(tmp_path, (
+            "from boxman.utils.http_download import download_url\n"
+            f"download_url({url!r}, 'dst.iso')\n"
+        ))
+
+        assert proc.returncode == 0, proc.stderr
+        assert not (tmp_path / "pwned").exists(), (
+            "the shell executed $(touch pwned) from the url")
+        calls = _recorded(tmp_path)
+        assert calls, "no downloader ran"
+        assert any(url in call for call in calls), (
+            f"the url did not survive as one literal argument: {calls}")
+
+    def test_checksums_do_not_execute_a_hostile_path(self, tmp_path: Path):
+        """The apostrophe case: `'{path}'` was concatenation, not quoting."""
+        target = tmp_path / f"{LIVE_PAYLOAD}-it's.qcow2"
+        target.write_bytes(b"x")
+        proc = self._run_in(tmp_path, (
+            "from boxman.providers.libvirt.import_image import ImageImporter\n"
+            f"print(ImageImporter._sha256({str(target)!r}))\n"
+        ))
+
+        assert proc.returncode == 0, proc.stderr
+        assert not (tmp_path / "pwned").exists(), (
+            "the shell executed $(touch pwned) from the path")
+        calls = _recorded(tmp_path)
+        assert any(str(target) in call for call in calls), (
+            f"the path did not survive as one literal argument: {calls}")
+
+    def test_sparse_copy_does_not_execute_hostile_paths(self, tmp_path: Path):
+        src = tmp_path / f"src-{LIVE_PAYLOAD}.qcow2"
+        src.write_bytes(b"x")
+        dst = tmp_path / "dst-it's.qcow2"
+        proc = self._run_in(tmp_path, (
+            "from boxman.providers.libvirt.import_image import ImageImporter\n"
+            "imp = ImageImporter(uri='qemu:///system')\n"
+            f"imp.copy_disk_image_sparse({str(src)!r}, {str(dst)!r})\n"
+        ))
+
+        assert proc.returncode == 0, proc.stderr
+        assert not (tmp_path / "pwned").exists(), (
+            "the shell executed $(touch pwned) from a disk path")
+        calls = _recorded(tmp_path)
+        assert any(str(src) in call and str(dst) in call for call in calls), (
+            f"the paths did not survive as literal arguments: {calls}")
