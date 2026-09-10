@@ -621,6 +621,7 @@ class VMStateDiffer:
             'new_disks': new_disks,
             'resize_disks': resize_disks,
             'removed_disks': removed_disks,
+            'has_disk_records': disk_records is not None,
             'refused_disk_removals': refused_disk_removals,
             'unowned_disks': unowned,
             'new_cdroms': new_cdroms,

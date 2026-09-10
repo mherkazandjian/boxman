@@ -755,10 +755,23 @@ class VMsMixin:
                 self.logger.warning(
                     f"VM {vm_name}: not detaching '{record.name}' -- {reason}")
             for stray in diff['unowned_disks']:
-                self.logger.warning(
-                    f"VM {vm_name}: {stray['target']} ({stray['source']}) is "
-                    f"attached but neither declared nor recorded by boxman -- "
-                    f"leaving it alone")
+                if diff['has_disk_records']:
+                    self.logger.warning(
+                        f"VM {vm_name}: {stray['target']} ({stray['source']}) "
+                        f"is attached but neither declared nor recorded by "
+                        f"boxman -- leaving it alone")
+                else:
+                    # No record at all: this domain predates the ownership
+                    # metadata. It used to report nothing here, so dropping
+                    # a disk from its config looked like a no-op (#164 F2
+                    # review).
+                    self.logger.warning(
+                        f"VM {vm_name}: {stray['target']} ({stray['source']}) "
+                        f"is attached but not declared. This VM predates "
+                        f"boxman's disk ownership records, so boxman will "
+                        f"not detach anything on it. To remove it by hand: "
+                        f"virsh detach-disk {full_vm_name} {stray['target']} "
+                        f"--config (the image file is not deleted)")
 
             if not has_changes:
                 self.logger.info(f"VM {vm_name}: no changes detected")

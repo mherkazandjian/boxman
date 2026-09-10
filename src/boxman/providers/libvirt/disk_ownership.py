@@ -269,10 +269,15 @@ def unowned_disks(records: list[DiskRecord] | None,
 
     These are reported so an operator can see them, and never removed:
     boxman has no evidence it put them there.
+
+    A domain with **no** record at all (``records is None``) predates the
+    ownership metadata, so everything on it that is not declared lands
+    here. That is the point: such a domain used to produce no removals and
+    no report, so dropping a disk from its config looked like a no-op
+    (#164 F2 review, finding 10). The caller distinguishes the two cases
+    when it words the message.
     """
-    if records is None:
-        return []
-    recorded_targets = {r.target for r in records}
+    recorded_targets = {r.target for r in (records or ())}
     desired_targets = {
         d.get('target') or DEFAULT_DISK_TARGET for d in desired_disks}
     return [

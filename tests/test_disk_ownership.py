@@ -310,8 +310,23 @@ class TestDomainsWithoutRecords:
         assert removals == []
         assert refusals == []
 
-    def test_unowned_disks_are_not_listed_without_metadata(self):
-        assert unowned_disks(None, [], [_attached('vdb', DATA)]) == []
+    def test_unowned_disks_are_listed_without_metadata(self):
+        """A legacy domain's undeclared disks are reported, not hidden.
+
+        This used to return [], so a domain predating the ownership record
+        produced no removals *and* no report: dropping a disk from its
+        config looked like a no-op (#164 F2 review, finding 10). The
+        no-detach behaviour is unchanged; the silence is not.
+        """
+        listed = unowned_disks(None, [], [_attached('vdb', DATA)])
+
+        assert [d['source'] for d in listed] == [DATA]
+
+    def test_a_declared_disk_is_not_listed_on_a_legacy_domain(self):
+        assert unowned_disks(
+            None,
+            [{'name': 'data', 'target': 'vdb'}],
+            [_attached('vdb', DATA)]) == []
 
     def test_unowned_disks_are_listed_when_metadata_exists(self):
         stray = "/vm/attached-by-hand.qcow2"
@@ -402,6 +417,7 @@ def _diff(vm_state='shut off', removed=(), refused=(), unowned=(),
         'removed_disks': list(removed),
         'refused_disk_removals': list(refused),
         'unowned_disks': list(unowned),
+        'has_disk_records': True,
         'new_cdroms': [], 'removed_cdroms': [], 'changed_cdroms': [],
         'new_shared_folders': [], 'removed_shared_folders': [],
         'changed_shared_folders': [],
@@ -495,6 +511,31 @@ class TestRefusalsAndStraysAreReported:
         assert any('neither declared nor recorded' in w for w in warnings)
         assert mgr.provider.update_vm_disks.call_args.kwargs['removed_disks'] == [
             _record()]
+
+
+class TestLegacyDomainGuidance:
+    """A domain predating the record says so, and how to act (#164 F2 rev 10)."""
+
+    def test_the_message_names_the_manual_command(self):
+        diff = _diff(vm_state='shut off',
+                     unowned=[_attached('vdb', DATA)])
+        diff['has_disk_records'] = False
+        mgr, _result = _run(diff)
+
+        warnings = [c.args[0] for c in mgr.logger.warning.call_args_list if c.args]
+        legacy = [w for w in warnings if 'predates' in w]
+        assert legacy, f'no legacy notice among {warnings}'
+        assert 'virsh detach-disk' in legacy[0]
+        assert 'not deleted' in legacy[0]
+
+    def test_a_recorded_domain_gets_the_other_message(self):
+        diff = _diff(vm_state='shut off',
+                     unowned=[_attached('vdc', '/vm/by-hand.qcow2')])
+        mgr, _result = _run(diff)
+
+        warnings = [c.args[0] for c in mgr.logger.warning.call_args_list if c.args]
+        assert any('neither declared nor recorded' in w for w in warnings)
+        assert not any('predates' in w for w in warnings)
 
 
 class TestDetachOrderingAndSafety:
