@@ -461,3 +461,20 @@ class TestPausedTopologyOnlyChange:
         result = self._call(cpus={'sockets': 2, 'cores': 1, 'threads': 1})
 
         assert result['restart_needed'] is False
+
+
+class TestPausedTopologyDefaults(TestPausedTopologyOnlyChange):
+    """Omitted keys default the way the differ and XML writer default them.
+
+    ``{sockets: 1}`` against a 1x2x1 guest means one core, which is a
+    change — the helper skipped keys that were merely left out and
+    reported nothing pending (#164 C1 review round 3, finding 5).
+    """
+
+    def test_an_omitted_core_count_defaults_to_one(self):
+        result = self._call(
+            cpus={'sockets': 1},
+            actual_cpus={'sockets': 1, 'cores': 2, 'threads': 1,
+                         'total_vcpus': 2, 'current_vcpus': 1})
+
+        assert result['restart_needed'] is True

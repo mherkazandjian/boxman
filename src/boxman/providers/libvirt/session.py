@@ -2245,10 +2245,15 @@ class LibVirtSession(SessionConfigMixin):
             # change and the persistent XML is rewritten, but comparing
             # totals alone reported nothing pending and the worker called it
             # updated (#164 C1 review round 2, finding 6).
+            #
+            # Defaulted the way the differ and the XML writer default them:
+            # an omitted `cores` means 1 to both, and skipping the keys that
+            # were merely left out let `{sockets: 1}` against a 1x2x1 guest
+            # report nothing pending (#164 C1 review round 3, finding 5).
             for key in ('sockets', 'cores', 'threads'):
-                if key in cpus and actual_cpus.get(key) is not None:
-                    if cpus[key] != actual_cpus[key]:
-                        return True
+                actual_value = actual_cpus.get(key)
+                if actual_value is not None and cpus.get(key, 1) != actual_value:
+                    return True
         if memory_mb is not None and memory_mb != actual_memory_mb:
             return True
         if max_vcpus is not None and max_vcpus != actual_cpus.get('total_vcpus'):

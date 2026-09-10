@@ -10,6 +10,7 @@ from .disk_ownership import (
     DEFAULT_DISK_TARGET,
     ROLE_ADOPTED,
     ROLE_DATA,
+    disk_logical_name,
     record_attached_disk,
 )
 
@@ -215,7 +216,7 @@ class DiskManager:
         """
         try:
             # extract configuration
-            disk_name = disk_config.get("name", "disk")
+            disk_name = disk_logical_name(disk_config)
             disk_size = disk_config.get("size", 1024)  # default 1GB
 
             # get driver info

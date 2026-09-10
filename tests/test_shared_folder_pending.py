@@ -275,3 +275,70 @@ class TestPendingIsAskedAfterTheChanges:
             assert session.shared_folders_pending(
                 'node01', [_folder('logs', '/srv/logs')],
                 vm_active=False) is False
+
+
+class TestCancellationDoesNotForceARestart:
+    """Finding 4 (round 3): the flag had to be clearable, not only settable.
+
+    A folder exists only persistently and the operator drops it. The
+    config-only detach succeeds and reports restart_needed=True, while
+    live and desired are both empty — so the pre-apply pending flag is
+    false and the worker had no way to overrule the provider. It reported
+    pending, or restarted the guest with --restart, for a change that was
+    already fully in effect.
+    """
+
+    def _run(self, desired, live_after, folder_result, pre_pending):
+
+        from boxman.manager import BoxmanManager
+        from boxman.providers.libvirt.vm_differ import VMStateDiffer
+        from conftest import make_bare_manager
+
+        mgr = make_bare_manager({'project': 'demo'})
+        mgr.provider = MagicMock()
+        mgr.provider.provider_config = {'uri': 'qemu:///system'}
+        mgr.provider.update_vm_shared_folders.return_value = folder_result
+        mgr.provider.update_vm_cpu_memory.return_value = {
+            'success': True, 'restart_needed': False}
+        mgr.provider.shared_folders_pending.return_value = bool(
+            [f for f in (desired or []) if f not in live_after]
+            or [f for f in live_after if f not in (desired or [])])
+        queue = MagicMock()
+        diff = {
+            'cpu_changed': False, 'memory_changed': False,
+            'max_vcpus_changed': False, 'max_memory_changed': False,
+            'new_disks': [], 'resize_disks': [], 'removed_disks': [],
+            'refused_disk_removals': [], 'unowned_disks': [],
+            'has_disk_records': True, 'disk_conflicts': [],
+            'shared_folders_restart_pending': pre_pending,
+            'new_cdroms': [], 'removed_cdroms': [], 'changed_cdroms': [],
+            'new_shared_folders': [], 'changed_shared_folders': [],
+            'removed_shared_folders': [_folder('logs', '/srv/logs')],
+            'memballoon_changed': False, 'memballoon_restart_pending': False,
+            'actual_cpus': 2, 'desired_cpus': 2,
+            'actual_memory_mb': 2048, 'desired_memory_mb': 2048,
+            'desired_max_vcpus': None, 'desired_max_memory_mb': None,
+            'vm_state': 'running',
+        }
+        with patch.object(VMStateDiffer, 'diff_vm', return_value=diff):
+            mgr._update_single_vm('c', {'workdir': '/tmp'}, 'node01',
+                                  {'shared_folders': desired}, queue,
+                                  dry_run=False, allow_restart=False)
+        assert isinstance(mgr, BoxmanManager)
+        return mgr, queue.put.call_args.args[0][1]
+
+    def test_a_cancelled_config_only_share_needs_no_restart(self):
+        mgr, result = self._run(
+            desired=[], live_after=[],
+            folder_result={'success': True, 'restart_needed': True},
+            pre_pending=False)
+
+        assert result['status'] == 'updated', result['details']
+
+    def test_a_share_that_did_not_reach_the_guest_still_reports_pending(self):
+        mgr, result = self._run(
+            desired=[_folder('logs', '/srv/logs')], live_after=[],
+            folder_result={'success': True, 'restart_needed': True},
+            pre_pending=True)
+
+        assert result['status'] == 'needs_restart'

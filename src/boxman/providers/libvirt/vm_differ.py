@@ -7,6 +7,7 @@ from boxman.exceptions import ProvisionError
 from .commands import VirshCommand
 from .disk_ownership import (
     DEFAULT_DISK_TARGET,
+    disk_logical_name,
     occupied_target_conflicts,
     plan_disk_removals,
     read_disk_records,
@@ -502,8 +503,9 @@ class VMStateDiffer:
         disk_conflicts = occupied_target_conflicts(
             disk_records, desired_disks or [], actual_disks,
             expected_paths={
-                d.get('name'): self._expected_disk_path(d, workdir, disk_prefix)
-                for d in (desired_disks or []) if d.get('name')
+                disk_logical_name(d):
+                    self._expected_disk_path(d, workdir, disk_prefix)
+                for d in (desired_disks or [])
             })
         unowned = unowned_disks(
             disk_records, desired_disks or [], persistent_disks,

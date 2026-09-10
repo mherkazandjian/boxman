@@ -173,6 +173,17 @@ def _stub_bin(directory: Path, names: list[str]) -> Path:
             # sha256sum's caller parses stdout; give it a plausible line
             "if sys.argv[0].endswith('sha256sum'):\n"
             "    print('0' * 64 + '  ' + (sys.argv[-1] if len(sys.argv) > 1 else ''))\n"
+            # download_url only accepts a downloader's success if the
+            # destination exists and is non-empty -- a stub that merely
+            # exits 0 lets it fall through wget, curl and on to real
+            # urllib (#164 F1 review round 3, finding 7)
+            "if sys.argv[0].rstrip('0123456789.').endswith(('wget', 'curl')):\n"
+            "    dst = None\n"
+            "    for flag in ('-O', '-o'):\n"
+            "        if flag in sys.argv:\n"
+            "            dst = sys.argv[sys.argv.index(flag) + 1]\n"
+            "    if dst:\n"
+            "        open(dst, 'wb').write(b'stub-payload')\n"
             "sys.exit(0)\n"
         )
         stub.chmod(0o755)
@@ -304,17 +315,23 @@ class TestVirshCommandsThroughARealShell:
             "the shell executed $(touch pwned) from the destination path")
         assert any(dst in call for call in _recorded(tmp_path))
 
-    def test_the_urllib_fallback_is_not_allowed_to_reach_the_network(
-            self, tmp_path):
-        """The stubs report success, so urllib is never reached at all."""
+    def test_the_urllib_fallback_is_never_reached(self, tmp_path):
+        """The stubs write a real destination, so wget succeeds.
+
+        Asserted on a marker the subprocess prints, not on stderr:
+        ``download_url`` catches every exception and logs it, so an
+        AssertionError raised from a patched ``urlopen`` was swallowed and
+        the test passed even when the forbidden fallback ran (#164 F1
+        review round 3, finding 7).
+        """
         proc = self._run_in(tmp_path, (
             "import urllib.request\n"
-            "def _boom(*a, **k):\n"
-            "    raise AssertionError('urllib fallback reached the network')\n"
-            "urllib.request.urlopen = _boom\n"
+            "reached = []\n"
+            "urllib.request.urlopen = lambda *a, **k: reached.append(1)\n"
             "from boxman.utils.http_download import download_url\n"
-            "download_url('https://example.invalid/x.iso', 'dst.iso')\n"
+            "ok = download_url('https://example.invalid/x.iso', 'dst.iso')\n"
+            "print('RESULT', ok, 'URLLIB', bool(reached))\n"
         ))
 
         assert proc.returncode == 0, proc.stderr
-        assert 'urllib fallback reached the network' not in proc.stderr
+        assert 'RESULT True URLLIB False' in proc.stdout, proc.stdout

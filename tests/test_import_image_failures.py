@@ -745,3 +745,26 @@ class TestReadOnlyXmlStillExitsTwo:
         # it fails cleanly -- never a traceback, never exit 1
         assert code in (0, 2)
         assert "Traceback" not in capsys.readouterr().out
+
+
+@pytest.mark.smoke
+class TestManifestIoFailuresExitTwo:
+    """Finding 6 (round 3): open() failures escaped the boundary."""
+
+    @pytest.mark.parametrize("provider", [None, "libvirt"])
+    def test_a_directory_as_the_manifest_uri(self, tmp_path: Path, capsys,
+                                             provider):
+        adir = tmp_path / "manifest-dir"
+        adir.mkdir()
+        argv = [
+            "--boxman-conf", str(_boxman_conf(tmp_path)),
+            "import-image", "--uri", f"file://{adir}",
+            "--name", "vm1", "--directory", str(tmp_path / "dst"),
+        ]
+        if provider:
+            argv += ["--provider", provider]
+
+        code = _run_cli(argv)
+
+        assert code == 2
+        assert "Traceback" not in capsys.readouterr().out

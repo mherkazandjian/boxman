@@ -225,6 +225,12 @@ class ImageImporter:
                 manifest = json.load(fobj)
         except json.JSONDecodeError as exc:
             raise ValueError(f"failed to parse manifest JSON at {uri}: {exc}") from exc
+        except OSError as exc:
+            # A directory or an unreadable file as the manifest URI raised
+            # IsADirectoryError / PermissionError. Both callers catch only
+            # ValueError, so these escaped as tracebacks with exit 1
+            # (#164 F1 review round 3, finding 6).
+            raise ValueError(f"could not read the manifest at {uri}: {exc}") from exc
 
         cls._validate_manifest(manifest, uri)
         return manifest, local_path

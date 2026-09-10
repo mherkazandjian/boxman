@@ -433,7 +433,7 @@ def _diff(vm_state='shut off', removed=(), refused=(), unowned=(),
 
 
 def _run(diff, allow_restart=False, disks_ok=True, shutdown_ok=True,
-         remove_error=None, order=None):
+         remove_error=None, order=None, deferral=None):
     mgr = make_bare_manager({'project': 'demo'})
     mgr.provider = MagicMock()
     mgr.provider.provider_config = {'uri': 'qemu:///system'}
@@ -452,7 +452,7 @@ def _run(diff, allow_restart=False, disks_ok=True, shutdown_ok=True,
         steps.append('detach')
         if remove_error:
             raise remove_error
-        return []
+        return {'detached': [], 'deferred': deferral}
     def _start(*a, **kw):
         steps.append('start')
         return True
@@ -1088,3 +1088,98 @@ class TestManualAdviceCarriesTheRuntime:
             'detach-disk', 'node01', 'vdb', config=True)
 
         assert 'detach-disk node01 vdb --config' in advice
+
+
+class TestUnnamedDeclarationsKeepTheirIdentity:
+    """An omitted ``name:`` still names a disk (#164 F2 review 3, finding 2).
+
+    DiskManager defaults it to ``disk`` when it creates the image, so the
+    record is under that name. Leaving the default out of the removal
+    rule made an unnamed declaration look like a *different* logical disk
+    from the one recorded — so moving it to a vacant target read as "the
+    recorded disk is no longer declared" and authorised detaching it.
+    """
+
+    UNNAMED = "/vm/bprj__demo__bprj_cluster_node_disk.qcow2"
+
+    def test_moving_an_unnamed_disk_does_not_detach_the_original(self):
+        removals, _refusals = plan_disk_removals(
+            records=[DiskRecord('disk', 'vdb', 'data', self.UNNAMED)],
+            desired_disks=[{'target': 'vdc', 'size': 2048}],
+            actual_disks=[_attached('vda', ROOT),
+                          _attached('vdb', self.UNNAMED)])
+
+        assert removals == [], 'detached the disk the declaration still names'
+
+    def test_an_unnamed_disk_left_alone_is_no_conflict(self):
+        conflicts = occupied_target_conflicts(
+            records=[DiskRecord('disk', 'vdb', 'data', self.UNNAMED)],
+            desired_disks=[{'size': 2048}],
+            actual_disks=[_attached('vdb', self.UNNAMED)],
+            expected_paths={'disk': self.UNNAMED})
+
+        assert conflicts == []
+
+    def test_a_genuinely_dropped_unnamed_disk_is_still_removed(self):
+        removals, _refusals = plan_disk_removals(
+            records=[DiskRecord('disk', 'vdb', 'data', self.UNNAMED)],
+            desired_disks=[],
+            actual_disks=[_attached('vda', ROOT),
+                          _attached('vdb', self.UNNAMED)])
+
+        assert [r.name for r in removals] == ['disk']
+
+
+class TestAStaleRecordCannotVouchForAReplacement:
+    """Finding 1: name match alone let a replacement through to a resize."""
+
+    def test_a_replaced_source_under_the_same_name_is_a_conflict(self):
+        conflicts = occupied_target_conflicts(
+            records=[_record(name='data', target='vdb', source=DATA)],
+            desired_disks=[{'name': 'data', 'target': 'vdb', 'size': 4096}],
+            actual_disks=[_attached('vdb', '/vm/replacement.qcow2')],
+            expected_paths={'data': DATA})
+
+        assert conflicts == [('data', 'vdb', '/vm/replacement.qcow2')]
+
+    def test_the_unchanged_disk_is_still_fine(self):
+        conflicts = occupied_target_conflicts(
+            records=[_record(name='data', target='vdb', source=DATA)],
+            desired_disks=[{'name': 'data', 'target': 'vdb', 'size': 4096}],
+            actual_disks=[_attached('vdb', DATA)],
+            expected_paths={'data': DATA})
+
+        assert conflicts == []
+
+
+class TestDeferralsSurviveTheWorkerBoundary:
+    """Finding 3: a structured deferral must reach the result."""
+
+    def test_a_shut_off_guest_reports_the_deferral(self):
+        """It is not active, so the pending branch used to skip it."""
+        mgr, result = _run(_diff(vm_state='shut off', removed=[_record()]),
+                           deferral='it holds managed saved state')
+
+        assert result['status'] == 'needs_restart'
+        assert 'managed saved state' in result['details']
+
+    def test_a_partial_batch_deferral_is_reported(self):
+        mgr, result = _run(_diff(vm_state='shut off', removed=[_record()]),
+                           deferral='saved state appeared partway through')
+
+        assert result['status'] == 'needs_restart'
+        assert 'partway' in result['details']
+
+    def test_no_deferral_still_reports_updated(self):
+        _mgr, result = _run(_diff(vm_state='shut off', removed=[_record()]))
+
+        assert result['status'] == 'updated'
+
+    def test_a_deferral_after_the_restart_is_reported(self):
+        _mgr, result = _run(_diff(vm_state='running', removed=[_record()]),
+                            allow_restart=True,
+                            deferral='saved state appeared after shutdown')
+
+        assert result['status'] == 'needs_restart'
+        assert 'restarted' in result['details']
+        assert 'saved state' in result['details']

@@ -38,6 +38,24 @@ DISK_METADATA_KEY = "boxman"
 #: (#164 F2 review).
 DEFAULT_DISK_TARGET = "vdb"
 
+#: name a ``disks:`` entry gets when it does not give one. DiskManager
+#: defaults to this when it creates the image, so the removal rule and the
+#: conflict preflight have to as well: leaving it out made an unnamed
+#: declaration look like a *different* logical disk from the one recorded,
+#: and moving it to another target authorised detaching the original
+#: (#164 F2 review round 3, finding 2).
+DEFAULT_DISK_NAME = "disk"
+
+
+def disk_logical_name(declared: dict[str, Any]) -> str:
+    """The logical name a ``disks:`` entry is recorded under."""
+    return declared.get('name') or DEFAULT_DISK_NAME
+
+
+def disk_target(declared: dict[str, Any]) -> str:
+    """The target a ``disks:`` entry claims."""
+    return declared.get('target') or DEFAULT_DISK_TARGET
+
 #: role of a disk boxman created from a ``disks:`` entry. Only these are
 #: ever candidates for removal.
 ROLE_DATA = "data"
@@ -226,12 +244,11 @@ def plan_disk_removals(
         # Never grounds for detaching anything.
         return [], []
 
-    desired_names = {d.get('name') for d in desired_disks if d.get('name')}
+    desired_names = {disk_logical_name(d) for d in desired_disks}
     # ... including the ones that did not spell a target out: they still
     # claim one, and reading them as claiming nothing is how a rename
     # detached a disk that was still declared.
-    desired_targets = {
-        d.get('target') or DEFAULT_DISK_TARGET for d in desired_disks}
+    desired_targets = {disk_target(d) for d in desired_disks}
     actual_by_target = {d['target']: d for d in actual_disks}
 
     removals: list[DiskRecord] = []
@@ -315,16 +332,20 @@ def occupied_target_conflicts(
     expected_paths = expected_paths or {}
     conflicts = []
     for declared in desired_disks:
-        target = declared.get('target') or DEFAULT_DISK_TARGET
-        name = declared.get('name')
+        target = disk_target(declared)
+        name = disk_logical_name(declared)
         occupant = actual_by_target.get(target)
         if occupant is None:
             # vacant: a plain addition, whatever stale metadata may say
             continue
 
         record = recorded_by_target.get(target)
-        if record is not None and record.name == name:
-            # this declaration's own disk, still where it was put
+        if (record is not None and record.name == name
+                and occupant.get('source') == record.source):
+            # this declaration's own disk, still where it was put, and
+            # still the same file. Matching the name alone let a stale
+            # record vouch for a *replacement* at the target, which
+            # reconciliation then resized (#164 F2 review round 3, 1).
             continue
         if occupant.get('source') == expected_paths.get(name):
             # the occupant IS this declaration's image file -- unrecorded
@@ -356,8 +377,7 @@ def unowned_disks(records: list[DiskRecord] | None,
     when it words the message.
     """
     recorded_targets = {r.target for r in (records or ())}
-    desired_targets = {
-        d.get('target') or DEFAULT_DISK_TARGET for d in desired_disks}
+    desired_targets = {disk_target(d) for d in desired_disks}
     return [
         disk for disk in actual_disks
         if disk['target'] not in recorded_targets
