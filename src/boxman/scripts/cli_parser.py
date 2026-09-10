@@ -420,6 +420,19 @@ def parse_args():
         help='skip confirmation prompt for VM removal',
         dest='yes'
     )
+    parser_update.add_argument(
+        '--restart',
+        action='store_true',
+        default=False,
+        help=(
+            'allow restarting running VMs when a change cannot be applied '
+            'live (raising a vCPU/memory ceiling, some shared-folder and '
+            'memballoon changes). Without this, such changes are written to '
+            'the persistent config and the VM is reported as needing a '
+            'restart. --yes does not imply this.'
+        ),
+        dest='restart'
+    )
 
     #
     # sub parser for the 'down' subcommand

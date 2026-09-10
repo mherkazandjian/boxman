@@ -924,7 +924,7 @@ class TestMemballoonUpdateResult:
         mgr, result = self._run_update('running')
 
         assert result['status'] == 'needs_restart'
-        assert 'restart required to apply memballoon changes' in result['details']
+        assert 'restart the VM to apply them' in result['details']
         mgr.provider.shutdown_and_wait.assert_not_called()
         mgr.provider.start_vm.assert_not_called()
 
@@ -932,9 +932,7 @@ class TestMemballoonUpdateResult:
         mgr, result = self._run_update('paused')
 
         assert result['status'] == 'needs_restart'
-        assert (
-            'restart required to apply memballoon changes'
-            in result['details'])
+        assert 'restart the VM to apply them' in result['details']
         mgr.provider.shutdown_and_wait.assert_not_called()
         mgr.provider.start_vm.assert_not_called()
 
@@ -942,9 +940,7 @@ class TestMemballoonUpdateResult:
         mgr, result = self._run_update('crashed')
 
         assert result['status'] == 'needs_restart'
-        assert (
-            'restart required to apply memballoon changes'
-            in result['details'])
+        assert 'restart the VM to apply them' in result['details']
         mgr.provider.shutdown_and_wait.assert_not_called()
         mgr.provider.start_vm.assert_not_called()
 
@@ -1023,7 +1019,10 @@ class TestUpdateRestartFailures:
                           return_value=self._cpu_restart_diff()):
             mgr._update_single_vm(
                 'cluster1', {'workdir': '/tmp'}, 'node01',
-                {'cpus': 4}, result_queue)
+                {'cpus': 4}, result_queue,
+                # the restart is opt-in now; this class is about what
+                # happens once it is authorised (#164 C1)
+                dry_run=False, allow_restart=True)
 
         result_queue.put.assert_called_once()
         return mgr, result_queue.put.call_args.args[0][1]
@@ -1055,7 +1054,8 @@ class TestUpdateRestartFailures:
 
 
 def _needs_restart_update_worker(_self, _cluster_name, _cluster_cfg, vm_name,
-                                 _vm_info, result_queue, _dry_run=False):
+                                 _vm_info, result_queue, _dry_run=False,
+                                 _allow_restart=False):
     """Stand-in for ``_update_single_vm`` reporting a pending restart."""
     result_queue.put((vm_name, {
         'status': 'needs_restart',

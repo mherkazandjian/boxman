@@ -700,6 +700,7 @@ class VMsMixin:
         vm_info: dict[str, Any],
         result_queue: Queue,
         dry_run: bool = False,
+        allow_restart: bool = False,
     ) -> None:
         """
         Diff and apply updates to a single existing VM. Runs in its own process.
@@ -811,6 +812,10 @@ class VMsMixin:
 
             # apply changes
             vm_running = diff['vm_state'] == 'running'
+            # A paused guest is active but not running: it cannot be cleanly
+            # shut down and restarted, yet a change that needs a restart is
+            # just as pending for it.
+            vm_active = VMStateDiffer.domain_is_active(diff['vm_state'])
             restart_needed = False
             pending_restart = diff['memballoon_restart_pending']
 
@@ -848,8 +853,9 @@ class VMsMixin:
                     }))
                     return
                 if pending_restart:
-                    self.logger.warning(
-                        f"VM {vm_name}: restart required to apply memballoon changes")
+                    self.logger.info(
+                        f"VM {vm_name}: memballoon changes need a restart to "
+                        f"take effect")
 
             # disks
             if diff['new_disks'] or diff['resize_disks']:
@@ -878,7 +884,7 @@ class VMsMixin:
                     new_cdroms=diff['new_cdroms'],
                     removed_cdroms=diff['removed_cdroms'],
                     changed_cdroms=diff['changed_cdroms'],
-                    vm_active=VMStateDiffer.domain_is_active(diff['vm_state'])
+                    vm_active=vm_active
                 )
                 if not cdrom_ok:
                     result_queue.put((vm_name, {
@@ -906,8 +912,15 @@ class VMsMixin:
                 if folder_result.get('restart_needed'):
                     restart_needed = True
 
+            # Every change that cannot reach a live guest, in one place.
+            # memballoon only ever landed in the persistent config, and was
+            # reported through a separate branch that the other restart
+            # sources bypassed (#164 C1).
+            if pending_restart:
+                restart_needed = True
+
             # handle restart if needed
-            if restart_needed and vm_running:
+            if restart_needed and vm_running and allow_restart:
                 self.logger.info(
                     f"VM {vm_name}: restarting to apply changes "
                     f"(live max ceiling cannot be raised)")
@@ -940,12 +953,17 @@ class VMsMixin:
                         'status': 'updated',
                         'details': '; '.join(changes) + ' (restarted)'
                     }))
-            elif pending_restart:
+            elif restart_needed and vm_active:
+                # Deferred, not skipped: the persistent config already has
+                # the change, so it takes effect the next time the guest
+                # boots. `update` used to power-cycle a running guest for
+                # this without being asked (#164 C1).
                 result_queue.put((vm_name, {
                     'status': 'needs_restart',
                     'details': (
                         '; '.join(changes) +
-                        ' (restart required to apply memballoon changes)')
+                        ' — written to the persistent config; restart the VM '
+                        'to apply them, or re-run update with --restart')
                 }))
             else:
                 result_queue.put((vm_name, {
@@ -978,6 +996,10 @@ class VMsMixin:
         config = self.config
         dry_run = getattr(cli_args, 'dry_run', False)
         auto_accept = getattr(cli_args, 'yes', False)
+        # Deliberately not `auto_accept or ...`: --yes answers the VM-removal
+        # prompt, and someone passing it to avoid an interactive update has
+        # not thereby agreed to have a running guest power-cycled (#164 C1).
+        allow_restart = getattr(cli_args, 'restart', False)
 
         # Collected across the phases below and raised once at the very end:
         # a VM that fails to update must not leave the command reporting
@@ -1120,7 +1142,7 @@ class VMsMixin:
             _res, parallel_failures = self._run_parallel(
                 [(f"{cluster_name}/{vm_name}", self._update_single_vm,
                   (cluster_name, cluster_cfg, vm_name, vm_info,
-                   result_queue, dry_run))
+                   result_queue, dry_run, allow_restart))
                  for cluster_name, cluster_cfg, vm_name, vm_info in update_tasks],
                 op_label='update vm')
 

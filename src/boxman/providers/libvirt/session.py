@@ -1967,10 +1967,17 @@ class LibVirtSession(SessionConfigMixin):
                 # live max can't be raised on a running VM
                 restart_needed = True
 
+        differ = None
+
+        def _live_max_memory_mb() -> int:
+            nonlocal differ
+            if differ is None:
+                from .vm_differ import VMStateDiffer
+                differ = VMStateDiffer(provider_config=self.provider_config)
+            return differ.get_max_memory_mb(vm_name)
+
         if memory_mb is not None and memory_mb != actual_memory_mb:
-            from .vm_differ import VMStateDiffer
-            differ = VMStateDiffer(provider_config=self.provider_config)
-            current_max_mem = differ.get_max_memory_mb(vm_name)
+            current_max_mem = _live_max_memory_mb()
 
             if memory_mb <= current_max_mem:
                 if not editor.hot_set_memory(vm_name, memory_mb):
@@ -1982,6 +1989,20 @@ class LibVirtSession(SessionConfigMixin):
             else:
                 # live max can't be raised on a running VM
                 restart_needed = True
+
+        # The two blocks above only run when the current cpu count or memory
+        # size changed. A change to the *ceilings* alone leaves both `cpus`
+        # and `memory_mb` None, so nothing set restart_needed -- while the
+        # persistent config had already been rewritten above and libvirt
+        # cannot raise a live ceiling. `update` reported a plain "updated"
+        # and the guest kept the old ceiling (#164 C1).
+        #
+        # So decide from what is still different between the live domain and
+        # what was asked for, rather than from which branch happened to run.
+        if max_vcpus is not None and max_vcpus != actual_cpus.get('total_vcpus'):
+            restart_needed = True
+        if max_memory_mb is not None and max_memory_mb != _live_max_memory_mb():
+            restart_needed = True
 
         if restart_needed:
             self.logger.info(
