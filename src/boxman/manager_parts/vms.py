@@ -949,15 +949,23 @@ class VMsMixin:
             # Detach last of the disk work, and only if what came before
             # it worked: a removal applied after a failed addition detaches
             # a disk whose replacement never arrived (#164 F2).
+            detach_deferred = None
             if detach_offline:
                 try:
-                    self.provider.remove_vm_disks(full_vm_name, detach_plan)
+                    outcome = self.provider.remove_vm_disks(
+                        full_vm_name, detach_plan)
                 except BoxmanError as exc:
                     result_queue.put((vm_name, {
                         'status': 'failed',
                         'details': f"disk detach failed: {exc}"
                     }))
                     return
+                # A deferral is an ordinary outcome, not a failure: managed
+                # saved state means the detach would not reach the guest
+                # that is resumed (#164 F2 review round 2, finding 3).
+                detach_deferred = (outcome or {}).get('deferred')
+                if detach_deferred:
+                    restart_needed = True
 
             # cdroms
             if diff['new_cdroms'] or diff['removed_cdroms'] or diff['changed_cdroms']:
@@ -1045,12 +1053,18 @@ class VMsMixin:
                     try:
                         self.provider.remove_vm_disks(full_vm_name, detach_plan)
                     except BoxmanError as exc:
-                        self.provider.start_vm(full_vm_name)
+                        # start_vm()'s result was discarded and the message
+                        # claimed the guest was running again regardless
+                        # (#164 F2 review round 2, finding 7).
+                        restarted = self.provider.start_vm(full_vm_name)
+                        tail = ('the VM was started again' if restarted else
+                                'and the VM could not be started again — it '
+                                'is still shut off')
                         result_queue.put((vm_name, {
                             'status': 'failed',
                             'details': (
                                 f"disk detach failed after shutdown: {exc} — "
-                                f"the VM was started again")
+                                f"{tail}")
                         }))
                         return
                 if not self.provider.start_vm(full_vm_name):

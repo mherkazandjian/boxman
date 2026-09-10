@@ -2070,52 +2070,66 @@ class LibVirtSession(SessionConfigMixin):
         return differ.get_actual_disks(vm_name, inactive=True)
 
     def remove_vm_disks(self, vm_name: str,
-                        records: list[Any]) -> list[str]:
+                        records: list[Any]) -> dict[str, Any]:
         """
         Detach *records* from an inactive *vm_name*, re-verifying each.
 
-        The caller decides that a removal is allowed; this re-checks, as
-        late as possible, the two facts that made it safe -- the domain is
-        still inactive, and the target still holds the exact source that
-        was recorded. The plan was computed at diff time and the guest has
-        been shut down since.
+        Every check is repeated **immediately before each detach**, not once
+        for the batch. Detaching vdb and vdc in one call: if vdc's
+        attachment changes after vdb comes off -- or the guest is started
+        between the two -- a snapshot taken before the loop would authorise
+        the second detach against state that no longer holds (#164 F2
+        review round 2, finding 1).
 
         Never deletes an image. Never touches a record it did not detach.
 
         Returns:
-            The names detached, in order.
+            ``{'detached': [names], 'deferred': reason or None}``. A
+            deferral is an ordinary outcome the caller reports as pending;
+            it is not a failure.
 
         Raises:
-            ProvisionError: if the domain is not inactive, its state or
-                disks cannot be read, or a detach fails. Ownership records
-                survive every one of those.
+            ProvisionError: if the domain is active, a probe cannot be
+                answered, or a detach fails. Ownership records survive
+                every one of those.
         """
         from .vm_differ import VMStateDiffer
 
         differ = VMStateDiffer(provider_config=self.provider_config)
-        state = differ.get_vm_state(vm_name)
-        if VMStateDiffer.domain_is_active(state):
-            raise ProvisionError(
-                f"refusing to detach disks from {vm_name}: it is {state}, "
-                f"not inactive")
-
-        saved = self.has_managed_save(vm_name)
-        if saved is not False:
-            # True: the next start restores saved state, which carries its
-            # own domain XML -- editing the persistent definition does not
-            # give the resumed guest the new device layout. None: the probe
-            # failed, and an unanswered question never authorises a change
-            # (#164 F2 review, amendment 2).
-            raise ProvisionError(
-                f"refusing to detach disks from {vm_name}: it holds managed "
-                f"saved state" if saved else
-                f"refusing to detach disks from {vm_name}: could not "
-                f"determine whether it holds managed saved state")
-
-        by_target = {d['target']: d for d in self.persistent_disks(vm_name)}
         virsh = VirshCommand(provider_config=self.provider_config)
-        detached = []
+        detached: list[str] = []
+
         for record in records:
+            # --- re-checked for this record, not for the batch ---
+            state = differ.get_vm_state(vm_name)
+            if VMStateDiffer.domain_is_active(state):
+                raise ProvisionError(
+                    f"refusing to detach {record.target} from {vm_name}: it "
+                    f"is {state}, not inactive")
+
+            saved = self.has_managed_save(vm_name)
+            if saved is None:
+                # The probe failed. An unanswered question never authorises
+                # a change, and it must not read as an ordinary deferral --
+                # a pending status does not fail the command, so automation
+                # would never see it (#164 F2 review, amendment 2).
+                raise ProvisionError(
+                    f"refusing to detach disks from {vm_name}: could not "
+                    f"determine whether it holds managed saved state")
+            if saved:
+                # The next start restores saved state, which carries its own
+                # domain XML -- editing the persistent definition would not
+                # give the resumed guest the new layout. Expected, and
+                # reported as pending rather than as a failure.
+                return {
+                    'detached': detached,
+                    'deferred': (
+                        f"{vm_name} holds managed saved state, so a detach "
+                        f"would not reach the guest it resumes; start it and "
+                        f"shut it down, then update again"),
+                }
+
+            by_target = {d['target']: d for d in self.persistent_disks(vm_name)}
             attached = by_target.get(record.target)
             if attached is None:
                 self.logger.info(
@@ -2132,7 +2146,8 @@ class LibVirtSession(SessionConfigMixin):
             detach_disk(virsh, vm_name, record.target)
             forget_disk(virsh, vm_name, record.name)
             detached.append(record.name)
-        return detached
+
+        return {'detached': detached, 'deferred': None}
 
     def virsh_invocation(self) -> str:
         """

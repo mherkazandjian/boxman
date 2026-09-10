@@ -694,9 +694,9 @@ class TestRemoveVmDisksReVerifies:
 
     def test_an_inactive_domain_without_saved_state_detaches(self):
         session = self._session()
-        detached, det, forg = self._call(session)
+        outcome, det, forg = self._call(session)
 
-        assert detached == ['data']
+        assert outcome == {'detached': ['data'], 'deferred': None}
         det.assert_called_once()
         forg.assert_called_once()
 
@@ -705,14 +705,24 @@ class TestRemoveVmDisksReVerifies:
         with pytest.raises(ProvisionError, match='not inactive'):
             self._call(session)
 
-    def test_managed_saved_state_blocks_the_detach(self):
-        """The next start restores an XML that still has the disk."""
-        session = self._session(saved=True)
-        with pytest.raises(ProvisionError, match='managed saved state'):
-            self._call(session)
+    def test_managed_saved_state_defers_it_without_failing(self):
+        """The next start restores an XML that still has the disk.
 
-    def test_a_failed_managed_save_probe_blocks_the_detach(self):
-        """None is "could not tell", which never authorises a change."""
+        An *expected* deferral, reported as pending. It used to raise, so
+        the worker marked the VM failed and the command exited 2 -- which
+        contradicted the agreed three-way contract, and the test asserted
+        the wrong half of it (#164 F2 review round 2, finding 3).
+        """
+        session = self._session(saved=True)
+        outcome, det, forg = self._call(session)
+
+        assert outcome['detached'] == []
+        assert 'managed saved state' in outcome['deferred']
+        det.assert_not_called()
+        forg.assert_not_called()
+
+    def test_a_failed_probe_is_a_failure_not_a_deferral(self):
+        """None must reach exit 2, not hide behind a pending status."""
         session = self._session(saved=None)
         with pytest.raises(ProvisionError, match='could not determine'):
             self._call(session)
@@ -726,14 +736,14 @@ class TestRemoveVmDisksReVerifies:
 
     def test_an_already_absent_target_just_drops_the_record(self):
         session = self._session(persistent=[_attached('vda', ROOT)])
-        detached, det, forg = self._call(session)
+        outcome, det, forg = self._call(session)
 
-        assert detached == []
+        assert outcome['detached'] == []
         det.assert_not_called()
         forg.assert_called_once()
 
     def test_a_refusal_leaves_the_ownership_record_intact(self):
-        session = self._session(saved=True)
+        session = self._session(saved=None)
         with pytest.raises(ProvisionError):
             self._call(session)
         # forget_disk is only reachable past the gate; nothing was recorded
@@ -882,3 +892,108 @@ class TestAdoptedDisksAreReportedNotDetached:
         )
 
         assert ROLE_ADOPTED != ROLE_DATA
+
+
+class TestEachDetachIsVerifiedSeparately:
+    """The checks are per record, not per batch (#164 F2 review 2, finding 1).
+
+    Reading state, managed-save status and the inventory once before the
+    loop meant the second detach in a batch was authorised by a snapshot
+    taken before the first one happened.
+    """
+
+    def _session(self, states, saveds, inventories):
+        """A session whose probes return a different answer each call."""
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        session = LibVirtSession.__new__(LibVirtSession)
+        session.provider_config = {'uri': 'qemu:///system'}
+        session.logger = MagicMock()
+        session.has_managed_save = MagicMock(side_effect=list(saveds))
+        session.persistent_disks = MagicMock(side_effect=list(inventories))
+        self._states = list(states)
+        return session
+
+    def _call(self, session, records):
+        from boxman.providers.libvirt.vm_differ import VMStateDiffer
+
+        with patch.object(VMStateDiffer, 'get_vm_state',
+                          side_effect=self._states), \
+             patch('boxman.providers.libvirt.session.detach_disk') as det, \
+             patch('boxman.providers.libvirt.session.forget_disk') as forg:
+            return session.remove_vm_disks('node01', records), det, forg
+
+    def test_a_replacement_appearing_mid_batch_is_refused(self):
+        """vdc is replaced after vdb comes off."""
+        first = _record(name='data', target='vdb', source=DATA)
+        second = _record(name='logs', target='vdc', source='/vm/logs.qcow2')
+        session = self._session(
+            states=['shut off', 'shut off'],
+            saveds=[False, False],
+            inventories=[
+                # before the first detach: both as recorded
+                [_attached('vdb', DATA), _attached('vdc', '/vm/logs.qcow2')],
+                # before the second: vdc now holds something else
+                [_attached('vdc', '/vm/replacement.qcow2')],
+            ])
+
+        with pytest.raises(ProvisionError, match='replacement.qcow2'):
+            self._call(session, [first, second])
+
+    def test_the_first_detach_still_happened(self):
+        """It was verified against state that did hold at the time."""
+        first = _record(name='data', target='vdb', source=DATA)
+        second = _record(name='logs', target='vdc', source='/vm/logs.qcow2')
+        session = self._session(
+            states=['shut off', 'shut off'],
+            saveds=[False, False],
+            inventories=[
+                [_attached('vdb', DATA), _attached('vdc', '/vm/logs.qcow2')],
+                [_attached('vdc', '/vm/replacement.qcow2')],
+            ])
+
+        with pytest.raises(ProvisionError):
+            _out, det, _forg = self._call(session, [first, second])
+
+    def test_a_guest_started_mid_batch_is_refused(self):
+        """The inactivity requirement is re-checked, not assumed."""
+        first = _record(name='data', target='vdb', source=DATA)
+        second = _record(name='logs', target='vdc', source='/vm/logs.qcow2')
+        session = self._session(
+            states=['shut off', 'running'],
+            saveds=[False, False],
+            inventories=[
+                [_attached('vdb', DATA), _attached('vdc', '/vm/logs.qcow2')],
+            ])
+
+        with pytest.raises(ProvisionError, match='not inactive'):
+            self._call(session, [first, second])
+
+    def test_saved_state_appearing_mid_batch_defers_the_rest(self):
+        first = _record(name='data', target='vdb', source=DATA)
+        second = _record(name='logs', target='vdc', source='/vm/logs.qcow2')
+        session = self._session(
+            states=['shut off', 'shut off'],
+            saveds=[False, True],
+            inventories=[
+                [_attached('vdb', DATA), _attached('vdc', '/vm/logs.qcow2')],
+            ])
+
+        outcome, _det, _forg = self._call(session, [first, second])
+
+        assert outcome['detached'] == ['data']
+        assert 'managed saved state' in outcome['deferred']
+
+    def test_a_clean_batch_detaches_both(self):
+        first = _record(name='data', target='vdb', source=DATA)
+        second = _record(name='logs', target='vdc', source='/vm/logs.qcow2')
+        inventory = [_attached('vdb', DATA), _attached('vdc', '/vm/logs.qcow2')]
+        session = self._session(
+            states=['shut off', 'shut off'],
+            saveds=[False, False],
+            inventories=[inventory, inventory])
+
+        outcome, det, _forg = self._call(session, [first, second])
+
+        assert outcome == {'detached': ['data', 'logs'], 'deferred': None}
+        assert det.call_count == 2
