@@ -438,6 +438,7 @@ def _run(diff, allow_restart=False, disks_ok=True):
         'success': True, 'restart_needed': False}
     mgr.provider.shutdown_and_wait.return_value = True
     mgr.provider.start_vm.return_value = True
+    mgr.provider.virsh_invocation.return_value = 'virsh -c qemu+ssh://host/system'
     queue = MagicMock()
 
     with patch.object(VMStateDiffer, 'diff_vm', return_value=diff):
@@ -525,7 +526,9 @@ class TestLegacyDomainGuidance:
         warnings = [c.args[0] for c in mgr.logger.warning.call_args_list if c.args]
         legacy = [w for w in warnings if 'predates' in w]
         assert legacy, f'no legacy notice among {warnings}'
-        assert 'virsh detach-disk' in legacy[0]
+        # the advice has to name the connection it applies to -- a bare
+        # `virsh` reaches the default one (#164 F2 review, findings 2 + 10)
+        assert 'virsh -c qemu+ssh://host/system detach-disk' in legacy[0]
         assert 'not deleted' in legacy[0]
 
     def test_a_recorded_domain_gets_the_other_message(self):

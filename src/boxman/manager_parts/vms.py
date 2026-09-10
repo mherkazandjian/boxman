@@ -770,8 +770,9 @@ class VMsMixin:
                         f"is attached but not declared. This VM predates "
                         f"boxman's disk ownership records, so boxman will "
                         f"not detach anything on it. To remove it by hand: "
-                        f"virsh detach-disk {full_vm_name} {stray['target']} "
-                        f"--config (the image file is not deleted)")
+                        f"{self.provider.virsh_invocation()} detach-disk "
+                        f"{full_vm_name} {stray['target']} --config "
+                        f"(the image file is not deleted)")
 
             if not has_changes:
                 self.logger.info(f"VM {vm_name}: no changes detected")

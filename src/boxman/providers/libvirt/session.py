@@ -1910,14 +1910,37 @@ class LibVirtSession(SessionConfigMixin):
             Dict with 'success', 'method' ('hot'/'cold'), 'restart_needed' keys
         """
         editor = VirshEdit(provider_config=self.provider_config)
+        from .vm_differ import VMStateDiffer
         is_running = vm_state == 'running'
+        is_active = VMStateDiffer.domain_is_active(vm_state)
 
-        if not is_running:
-            # VM is stopped — use cold XML redefine
+        if not is_active:
+            # Genuinely down: a cold XML redefine is the whole change, and
+            # the next boot uses it. Nothing is pending.
             success = editor.configure_cpu_memory(
                 vm_name, cpus, memory_mb,
                 max_vcpus=max_vcpus, max_memory_mb=max_memory_mb)
             return {'success': success, 'method': 'cold', 'restart_needed': False}
+
+        if not is_running:
+            # Active but not running -- a paused guest. The redefine reaches
+            # the persistent config only; the live domain keeps the old
+            # values and cannot be hot-plugged in this state. Every
+            # non-running state used to take the branch above and report
+            # restart_needed=False, so the worker announced a change that
+            # was not in effect (#164 C1 review, finding 6).
+            success = editor.configure_cpu_memory(
+                vm_name, cpus, memory_mb,
+                max_vcpus=max_vcpus, max_memory_mb=max_memory_mb)
+            pending = self._live_config_differs(
+                vm_name, cpus, memory_mb, actual_cpus, actual_memory_mb,
+                max_vcpus, max_memory_mb)
+            if pending:
+                self.logger.info(
+                    f"VM {vm_name}: persistent config updated. The guest is "
+                    f"paused, so a restart is needed for it to take effect.")
+            return {'success': success, 'method': 'cold',
+                    'restart_needed': pending}
 
         # VM is running — update persistent config and apply live where
         # possible. Libvirt does NOT allow raising the live maximum vCPU
@@ -2024,6 +2047,43 @@ class LibVirtSession(SessionConfigMixin):
 
         method = 'cold' if restart_needed else 'hot'
         return {'success': success, 'method': method, 'restart_needed': restart_needed}
+
+    def virsh_invocation(self) -> str:
+        """
+        The virsh invocation an operator should copy, for this session.
+
+        A bare ``virsh …`` in advice reaches the default connection, which
+        is the same defect as issuing one -- it would act on a different
+        host, or fail, depending on the operator's environment (#164 F2
+        review, findings 2 and 10).
+        """
+        return VirshCommand(provider_config=self.provider_config).build_command(
+            '').rstrip()
+
+    def _live_config_differs(self, vm_name, cpus, memory_mb, actual_cpus,
+                             actual_memory_mb, max_vcpus, max_memory_mb) -> bool:
+        """Does the live domain still differ from what was asked for?
+
+        Asked of the live state rather than of which code branch ran --
+        which is what made a ceiling-only change report nothing pending
+        (#164 C1).
+        """
+        if cpus:
+            desired_total = (cpus.get('sockets', 1) * cpus.get('cores', 1)
+                             * cpus.get('threads', 1))
+            if desired_total != actual_cpus.get('current_vcpus',
+                                                actual_cpus.get('total_vcpus')):
+                return True
+        if memory_mb is not None and memory_mb != actual_memory_mb:
+            return True
+        if max_vcpus is not None and max_vcpus != actual_cpus.get('total_vcpus'):
+            return True
+        if max_memory_mb is not None:
+            from .vm_differ import VMStateDiffer
+            differ = VMStateDiffer(provider_config=self.provider_config)
+            if max_memory_mb != differ.get_max_memory_mb(vm_name):
+                return True
+        return False
 
     def update_vm_disks(self,
                         vm_name: str,

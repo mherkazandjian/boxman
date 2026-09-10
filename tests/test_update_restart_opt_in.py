@@ -346,3 +346,74 @@ class TestCeilingOnlyChangeNeedsARestart:
                 max_memory_mb=None)
 
         assert result['restart_needed'] is False
+
+
+class TestPausedGuestAtTheProvider:
+    """The provider half of the paused contract (#164 C1 review, finding 6).
+
+    ``TestPausedGuest`` drives the worker with a mocked provider result of
+    ``restart_needed: True`` -- which the real provider never produced for
+    a paused guest, because every non-running state took the cold path and
+    returned False. So the worker test passed while the actual behaviour
+    was: persistent config written, guest untouched, run reported clean.
+    """
+
+    def _session(self):
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        session = LibVirtSession.__new__(LibVirtSession)
+        session.provider_config = {'uri': 'qemu:///system'}
+        session.logger = MagicMock()
+        return session
+
+    def _editor(self):
+        editor = MagicMock()
+        editor.get_domain_xml.return_value = "<domain/>"
+        editor.cpu_memory_modifications.return_value = ([('x', 'v')], False)
+        editor.modify_xml_xpath.return_value = "<domain/>"
+        editor.redefine_domain.return_value = True
+        editor.configure_cpu_memory.return_value = True
+        return editor
+
+    def _call(self, vm_state, **kwargs):
+        session = self._session()
+        params = dict(
+            vm_name='node01', cpus=None, memory_mb=None, vm_state=vm_state,
+            actual_cpus={'total_vcpus': 2, 'current_vcpus': 2},
+            actual_memory_mb=2048, max_vcpus=None, max_memory_mb=None)
+        params.update(kwargs)
+        with patch('boxman.providers.libvirt.session.VirshEdit',
+                   return_value=self._editor()):
+            return session.update_vm_cpu_memory(**params)
+
+    def test_a_paused_cpu_change_reports_pending(self):
+        result = self._call('paused', cpus={'sockets': 1, 'cores': 4,
+                                            'threads': 1})
+
+        assert result['success'] is True
+        assert result['restart_needed'] is True
+
+    def test_a_paused_memory_change_reports_pending(self):
+        result = self._call('paused', memory_mb=4096)
+
+        assert result['restart_needed'] is True
+
+    def test_a_paused_ceiling_only_change_reports_pending(self):
+        result = self._call('paused', max_vcpus=8)
+
+        assert result['restart_needed'] is True
+
+    def test_a_paused_no_op_reports_nothing_pending(self):
+        """Self-correcting: matching live state needs no restart."""
+        result = self._call('paused', max_vcpus=2)
+
+        assert result['restart_needed'] is False
+
+    @pytest.mark.parametrize("state", ["shut off", "shutoff"])
+    def test_a_genuinely_stopped_guest_needs_no_restart(self, state):
+        """The next boot uses the new config; nothing is pending."""
+        result = self._call(state, cpus={'sockets': 1, 'cores': 4,
+                                         'threads': 1}, max_vcpus=8)
+
+        assert result['restart_needed'] is False
+        assert result['method'] == 'cold'
