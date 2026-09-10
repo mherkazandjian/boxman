@@ -14,6 +14,7 @@ import pytest
 from boxman.exceptions import ProvisionError
 from boxman.providers.libvirt.disk_ownership import (
     DiskRecord,
+    occupied_target_conflicts,
     plan_disk_removals,
     read_disk_records,
     record_attached_disk,
@@ -417,6 +418,7 @@ def _diff(vm_state='shut off', removed=(), refused=(), unowned=(),
         'removed_disks': list(removed),
         'refused_disk_removals': list(refused),
         'unowned_disks': list(unowned),
+        'disk_conflicts': [],
         'has_disk_records': True,
         'new_cdroms': [], 'removed_cdroms': [], 'changed_cdroms': [],
         'new_shared_folders': [], 'removed_shared_folders': [],
@@ -735,3 +737,91 @@ class TestRemoveVmDisksReVerifies:
             self._call(session)
         # forget_disk is only reachable past the gate; nothing was recorded
         # as detached, so the record survives for the next run to reconsider
+
+
+class TestOccupiedTargetConflicts:
+    """A declaration whose target still holds a different owned disk.
+
+    Rename ``data`` to ``logs``, keep its explicit target, change the size:
+    removal is refused because the target is claimed, but nothing stopped
+    the reconciliation, which matches the occupant by target and grew the
+    old ``data`` image -- the operator ended up with the disk they renamed
+    away from, enlarged, reported as success (#164 F2 review, finding 4).
+
+    Keyed on the actual occupant, not on the refusal: a refusal is also
+    produced when the target is vacant and only stale metadata names it,
+    and that is a legitimate addition.
+    """
+
+    def test_an_occupied_target_is_a_conflict(self):
+        conflicts = occupied_target_conflicts(
+            records=[_record(name='data', target='vdb', source=DATA)],
+            desired_disks=[{'name': 'logs', 'target': 'vdb', 'size': 4096}],
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', DATA)])
+
+        assert conflicts == [('logs', 'vdb', DATA)]
+
+    def test_an_omitted_target_conflicts_the_same_way(self):
+        conflicts = occupied_target_conflicts(
+            records=[_record(name='data', target='vdb', source=DATA)],
+            desired_disks=[{'name': 'logs', 'size': 4096}],
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', DATA)])
+
+        assert conflicts == [('logs', 'vdb', DATA)]
+
+    def test_a_vacant_target_with_stale_metadata_is_not_a_conflict(self):
+        """The operator already detached the old disk by hand.
+
+        Only the record remains. Rejecting this would refuse a legitimate
+        addition.
+        """
+        conflicts = occupied_target_conflicts(
+            records=[_record(name='data', target='vdb', source=DATA)],
+            desired_disks=[{'name': 'logs', 'target': 'vdb', 'size': 4096}],
+            actual_disks=[_attached('vda', ROOT)])
+
+        assert conflicts == []
+
+    def test_an_unrelated_occupant_is_not_a_conflict(self):
+        """Something else is at the target; the removal rule refuses it."""
+        conflicts = occupied_target_conflicts(
+            records=[_record(name='data', target='vdb', source=DATA)],
+            desired_disks=[{'name': 'logs', 'target': 'vdb', 'size': 4096}],
+            actual_disks=[_attached('vda', ROOT),
+                          _attached('vdb', '/vm/someone-elses.qcow2')])
+
+        assert conflicts == []
+
+    def test_a_still_declared_disk_is_not_a_conflict(self):
+        conflicts = occupied_target_conflicts(
+            records=[_record(name='data', target='vdb', source=DATA)],
+            desired_disks=[{'name': 'data', 'target': 'vdb', 'size': 4096}],
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', DATA)])
+
+        assert conflicts == []
+
+    def test_a_domain_without_records_has_no_conflicts(self):
+        assert occupied_target_conflicts(
+            None,
+            [{'name': 'logs', 'target': 'vdb'}],
+            [_attached('vdb', DATA)]) == []
+
+
+class TestAConflictFailsBeforeAnyMutation:
+    """Nothing is applied -- cpu and memory included."""
+
+    def test_the_vm_fails_and_nothing_is_touched(self):
+        diff = _diff(vm_state='shut off',
+                     resize_disks=[{'target': 'vdb', 'source': DATA,
+                                    'current_size_mb': 1024,
+                                    'desired_size_mb': 4096}])
+        diff['disk_conflicts'] = [('logs', 'vdb', DATA)]
+        diff['cpu_changed'] = True
+        mgr, result = _run(diff)
+
+        assert result['status'] == 'failed'
+        assert 'still holds' in result['details']
+        assert 'nothing was changed' in result['details']
+        mgr.provider.update_vm_disks.assert_not_called()
+        mgr.provider.update_vm_cpu_memory.assert_not_called()
+        mgr.provider.remove_vm_disks.assert_not_called()

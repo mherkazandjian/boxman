@@ -749,6 +749,25 @@ class VMsMixin:
                 diff['removed_disks']
             )
 
+            # A declaration whose target still holds a different disk that
+            # boxman owns is a conflict, not a warning: reconciliation
+            # matches the occupant by target, so it would grow the disk the
+            # operator renamed away from and report success. Refused before
+            # anything is applied -- cpu and memory included (#164 F2
+            # review, finding 4).
+            if diff['disk_conflicts']:
+                detail = '; '.join(
+                    f"'{name}' declares target {target}, which still holds "
+                    f"{source}"
+                    for name, target, source in diff['disk_conflicts'])
+                result_queue.put((vm_name, {
+                    'status': 'failed',
+                    'details': (
+                        f"{detail}. Detach it first, or give the new disk a "
+                        f"free target -- nothing was changed")
+                }))
+                return
+
             # Reported, never acted on: boxman recorded attaching these but
             # what is at the target now is not what it attached, so it has
             # no basis for detaching it (#164 F2).

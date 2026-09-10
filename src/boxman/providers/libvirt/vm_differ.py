@@ -7,6 +7,7 @@ from boxman.exceptions import ProvisionError
 from .commands import VirshCommand
 from .disk_ownership import (
     DEFAULT_DISK_TARGET,
+    occupied_target_conflicts,
     plan_disk_removals,
     read_disk_records,
     unowned_disks,
@@ -487,6 +488,8 @@ class VMStateDiffer:
         persistent_disks = self.get_actual_disks(domain_name, inactive=True)
         removed_disks, refused_disk_removals = plan_disk_removals(
             disk_records, desired_disks or [], persistent_disks)
+        disk_conflicts = occupied_target_conflicts(
+            disk_records, desired_disks or [], persistent_disks)
         unowned = unowned_disks(
             disk_records, desired_disks or [], persistent_disks,
             root_source=(persistent_disks[0]['source']
@@ -633,6 +636,7 @@ class VMStateDiffer:
             'resize_disks': resize_disks,
             'removed_disks': removed_disks,
             'has_disk_records': disk_records is not None,
+            'disk_conflicts': disk_conflicts,
             'refused_disk_removals': refused_disk_removals,
             'unowned_disks': unowned,
             'new_cdroms': new_cdroms,
