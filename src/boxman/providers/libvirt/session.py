@@ -1857,18 +1857,23 @@ class LibVirtSession(SessionConfigMixin):
 
     ### update operations (for `boxman update`)
 
-    def shutdown_and_wait(self, vm_name: str, timeout: int = 60) -> bool:
+    def shutdown_and_wait(self, vm_name: str, timeout: int = 60,
+                          force_after: bool = True) -> bool:
         """
         Gracefully shut down a VM and wait until it reaches 'shut off' state.
-
-        Falls back to virsh destroy (force stop) if the timeout is exceeded.
 
         Args:
             vm_name: Name of the VM
             timeout: Maximum seconds to wait for graceful shutdown
+            force_after: fall back to ``virsh destroy`` on timeout. The
+                default preserves the restart behaviour. Callers that are
+                about to *change* the domain pass False: a forced stop is
+                a guest that did not shut down cleanly, and it must not
+                come back as a success that then authorises a detach
+                (#164 F2 review, amendment 1).
 
         Returns:
-            True if the VM is shut off, False otherwise
+            True if the VM shut off, False otherwise
         """
         virsh = VirshCommand(provider_config=self.provider_config)
 
@@ -1882,6 +1887,7 @@ class LibVirtSession(SessionConfigMixin):
         virsh.execute('shutdown', vm_name, warn=True)
 
         return shutdown_and_wait(virsh, vm_name, timeout=timeout,
+                                 force_after=force_after,
                                  logger=self.logger)
 
     def update_vm_cpu_memory(self,
@@ -2048,6 +2054,86 @@ class LibVirtSession(SessionConfigMixin):
         method = 'cold' if restart_needed else 'hot'
         return {'success': success, 'method': method, 'restart_needed': restart_needed}
 
+    def persistent_disks(self, vm_name: str) -> list[dict[str, Any]]:
+        """
+        The domain's disks as its **persistent** definition has them.
+
+        `detach-disk --config` edits that definition, so it is the one a
+        removal has to be decided and verified against. Reading the live
+        domain instead meant a record for the disk running at vdb could
+        authorise detaching a different disk configured at vdb -- no race
+        needed, an earlier config-only replacement suffices (#164 F2
+        review, finding 3).
+        """
+        from .vm_differ import VMStateDiffer
+        differ = VMStateDiffer(provider_config=self.provider_config)
+        return differ.get_actual_disks(vm_name, inactive=True)
+
+    def remove_vm_disks(self, vm_name: str,
+                        records: list[Any]) -> list[str]:
+        """
+        Detach *records* from an inactive *vm_name*, re-verifying each.
+
+        The caller decides that a removal is allowed; this re-checks, as
+        late as possible, the two facts that made it safe -- the domain is
+        still inactive, and the target still holds the exact source that
+        was recorded. The plan was computed at diff time and the guest has
+        been shut down since.
+
+        Never deletes an image. Never touches a record it did not detach.
+
+        Returns:
+            The names detached, in order.
+
+        Raises:
+            ProvisionError: if the domain is not inactive, its state or
+                disks cannot be read, or a detach fails. Ownership records
+                survive every one of those.
+        """
+        from .vm_differ import VMStateDiffer
+
+        differ = VMStateDiffer(provider_config=self.provider_config)
+        state = differ.get_vm_state(vm_name)
+        if VMStateDiffer.domain_is_active(state):
+            raise ProvisionError(
+                f"refusing to detach disks from {vm_name}: it is {state}, "
+                f"not inactive")
+
+        saved = self.has_managed_save(vm_name)
+        if saved is not False:
+            # True: the next start restores saved state, which carries its
+            # own domain XML -- editing the persistent definition does not
+            # give the resumed guest the new device layout. None: the probe
+            # failed, and an unanswered question never authorises a change
+            # (#164 F2 review, amendment 2).
+            raise ProvisionError(
+                f"refusing to detach disks from {vm_name}: it holds managed "
+                f"saved state" if saved else
+                f"refusing to detach disks from {vm_name}: could not "
+                f"determine whether it holds managed saved state")
+
+        by_target = {d['target']: d for d in self.persistent_disks(vm_name)}
+        virsh = VirshCommand(provider_config=self.provider_config)
+        detached = []
+        for record in records:
+            attached = by_target.get(record.target)
+            if attached is None:
+                self.logger.info(
+                    f"VM {vm_name}: {record.target} is already absent from the "
+                    f"persistent definition; dropping its ownership record")
+                forget_disk(virsh, vm_name, record.name)
+                continue
+            if attached.get('source') != record.source:
+                raise ProvisionError(
+                    f"refusing to detach {record.target} from {vm_name}: its "
+                    f"persistent definition now has "
+                    f"{attached.get('source')!r}, not the {record.source!r} "
+                    f"boxman attached")
+            detach_disk(virsh, vm_name, record.target)
+            forget_disk(virsh, vm_name, record.name)
+            detached.append(record.name)
+        return detached
+
     def virsh_invocation(self) -> str:
         """
         The virsh invocation an operator should copy, for this session.
@@ -2142,26 +2228,5 @@ class LibVirtSession(SessionConfigMixin):
                 self.logger.error(
                     f"failed to resize disk {resize_info['target']} on {vm_name}")
                 success = False
-
-        # Detach last, and only if everything before it worked. A removal
-        # applied after a failed addition detaches a disk whose replacement
-        # never arrived (#164 F2) -- the same ordering the cdrom path uses.
-        if removed_disks:
-            if not success:
-                self.logger.warning(
-                    f"VM {vm_name}: not detaching "
-                    f"{', '.join(r.name for r in removed_disks)} because an "
-                    f"earlier disk change failed")
-                return success
-            for record in removed_disks:
-                self.logger.info(
-                    f"detaching disk '{record.name}' ({record.target}) from "
-                    f"{vm_name}; the image {record.source} is left on disk")
-                try:
-                    detach_disk(disk_manager.virsh, vm_name, record.target)
-                    forget_disk(disk_manager.virsh, vm_name, record.name)
-                except ProvisionError as exc:
-                    self.logger.error(str(exc))
-                    success = False
 
         return success

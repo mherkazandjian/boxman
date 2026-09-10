@@ -226,7 +226,8 @@ class VMStateDiffer:
         """
         return read_disk_records(self.virsh, domain_name)
 
-    def get_actual_disks(self, domain_name: str) -> list[dict[str, Any]]:
+    def get_actual_disks(self, domain_name: str,
+                         inactive: bool = False) -> list[dict[str, Any]]:
         """
         Get actual disk info from virsh domblklist + virsh domblkinfo.
 
@@ -246,7 +247,9 @@ class VMStateDiffer:
                 them all. Once a removal path reads this list, the same
                 empty result would read as "nothing is attached" (#164 F2).
         """
-        result = self.virsh.execute('domblklist', domain_name, '--details', warn=True)
+        flags = ['--details'] + (['--inactive'] if inactive else [])
+        result = self.virsh.execute(
+            'domblklist', domain_name, *flags, warn=True)
         if not result.ok:
             raise ProvisionError(
                 f"could not list the disks of {domain_name}: "
@@ -475,11 +478,19 @@ class VMStateDiffer:
         # too, so "attached but not declared" starts by removing it
         # (#164 F2). A domain with no ownership record yields nothing.
         disk_records = self.get_disk_records(domain_name)
+        # Against the PERSISTENT definition, which is what
+        # `detach-disk --config` edits. For a running domain the live view
+        # can differ -- an earlier config-only replacement is enough -- and
+        # deciding from it let a record for the disk running at a target
+        # authorise detaching the different disk configured there (#164 F2
+        # review, finding 3).
+        persistent_disks = self.get_actual_disks(domain_name, inactive=True)
         removed_disks, refused_disk_removals = plan_disk_removals(
-            disk_records, desired_disks or [], actual_disks)
+            disk_records, desired_disks or [], persistent_disks)
         unowned = unowned_disks(
-            disk_records, desired_disks or [], actual_disks,
-            root_source=root_disk_source)
+            disk_records, desired_disks or [], persistent_disks,
+            root_source=(persistent_disks[0]['source']
+                         if persistent_disks else root_disk_source))
 
         # --- CDROM diff ---
         #

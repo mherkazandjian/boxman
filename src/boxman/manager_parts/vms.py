@@ -9,6 +9,7 @@ from typing import Any
 
 from boxman import log
 from boxman.exceptions import (
+    BoxmanError,
     CloneSanitizerError,
     ConfigError,
     ProvisionError,
@@ -888,28 +889,53 @@ class VMsMixin:
 
             # disks
             #
-            # Detaching from a live guest pulls a device out from under a
-            # filesystem it may still be using, so it waits for a shut-off
-            # guest or for --restart, which is the operator saying the guest
-            # may go down (#164 F2).
-            detach_now = (not vm_active) or allow_restart
-            deferred_detach = [] if detach_now else diff['removed_disks']
-            if deferred_detach:
+            # A detach is only ever applied to an inactive domain, because
+            # `detach-disk --config` edits the persistent definition and a
+            # live guest keeps using the device until it goes down. Three
+            # cases (#164 F2 review, amendment 1):
+            #
+            #   inactive        -> detach now, after the additions succeed
+            #   running + --restart -> detach between the shutdown and the
+            #                          start, when live IS persistent
+            #   paused, or running without --restart -> pending, untouched
+            #
+            # A paused guest is never shut down for this: it did not ask to
+            # be resumed or stopped, and a forced stop is not a clean one.
+            detach_plan = diff['removed_disks']
+            detach_offline = bool(detach_plan) and not vm_active
+            detach_after_restart = (
+                bool(detach_plan) and vm_running and allow_restart)
+            if detach_plan and not detach_offline and not detach_after_restart:
                 restart_needed = True
-            if diff['new_disks'] or diff['resize_disks'] or diff['removed_disks']:
+            if detach_after_restart:
+                restart_needed = True
+
+            if diff['new_disks'] or diff['resize_disks']:
                 disk_ok = self.provider.update_vm_disks(
                     vm_name=full_vm_name,
                     new_disks=diff['new_disks'],
                     resize_disks=diff['resize_disks'],
                     workdir=workdir,
                     disk_prefix=full_vm_name,
-                    vm_running=vm_running,
-                    removed_disks=diff['removed_disks'] if detach_now else []
+                    vm_running=vm_running
                 )
                 if not disk_ok:
                     result_queue.put((vm_name, {
                         'status': 'failed',
                         'details': 'disk update failed'
+                    }))
+                    return
+
+            # Detach last of the disk work, and only if what came before
+            # it worked: a removal applied after a failed addition detaches
+            # a disk whose replacement never arrived (#164 F2).
+            if detach_offline:
+                try:
+                    self.provider.remove_vm_disks(full_vm_name, detach_plan)
+                except BoxmanError as exc:
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': f"disk detach failed: {exc}"
                     }))
                     return
 
@@ -970,7 +996,13 @@ class VMsMixin:
                 # first for a second reason: start_vm() on a guest that is
                 # still running returns True, so a lost shutdown would
                 # hide itself behind a successful start.
-                if not self.provider.shutdown_and_wait(full_vm_name):
+                # A detach must never follow a *forced* stop: force_after
+                # runs `virsh destroy` on timeout and still reports success,
+                # so a guest that did not shut down cleanly would go on to
+                # have a disk removed (#164 F2 review, amendment 1).
+                if not self.provider.shutdown_and_wait(
+                        full_vm_name,
+                        force_after=not detach_after_restart):
                     result_queue.put((vm_name, {
                         'status': 'failed',
                         'details': (
@@ -979,7 +1011,22 @@ class VMsMixin:
                             'so the changes that need a restart are not in '
                             'effect')
                     }))
-                elif not self.provider.start_vm(full_vm_name):
+                    return
+                if detach_after_restart:
+                    # The guest is down, so live is persistent; remove_vm_disks
+                    # re-verifies both facts before touching anything.
+                    try:
+                        self.provider.remove_vm_disks(full_vm_name, detach_plan)
+                    except BoxmanError as exc:
+                        self.provider.start_vm(full_vm_name)
+                        result_queue.put((vm_name, {
+                            'status': 'failed',
+                            'details': (
+                                f"disk detach failed after shutdown: {exc} — "
+                                f"the VM was started again")
+                        }))
+                        return
+                if not self.provider.start_vm(full_vm_name):
                     result_queue.put((vm_name, {
                         'status': 'failed',
                         'details': (

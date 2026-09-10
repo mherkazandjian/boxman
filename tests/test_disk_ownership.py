@@ -409,9 +409,9 @@ from conftest import make_bare_manager  # noqa: E402
 
 
 def _diff(vm_state='shut off', removed=(), refused=(), unowned=(),
-          new_disks=(), resize_disks=()):
+          new_disks=(), resize_disks=(), cpu_restart=False):
     return {
-        'cpu_changed': False, 'memory_changed': False,
+        'cpu_changed': cpu_restart, 'memory_changed': False,
         'max_vcpus_changed': False, 'max_memory_changed': False,
         'new_disks': list(new_disks), 'resize_disks': list(resize_disks),
         'removed_disks': list(removed),
@@ -429,16 +429,32 @@ def _diff(vm_state='shut off', removed=(), refused=(), unowned=(),
     }
 
 
-def _run(diff, allow_restart=False, disks_ok=True):
+def _run(diff, allow_restart=False, disks_ok=True, shutdown_ok=True,
+         remove_error=None, order=None):
     mgr = make_bare_manager({'project': 'demo'})
     mgr.provider = MagicMock()
     mgr.provider.provider_config = {'uri': 'qemu:///system'}
     mgr.provider.update_vm_disks.return_value = disks_ok
     mgr.provider.update_vm_cpu_memory.return_value = {
-        'success': True, 'restart_needed': False}
-    mgr.provider.shutdown_and_wait.return_value = True
-    mgr.provider.start_vm.return_value = True
+        'success': True, 'restart_needed': diff.get('cpu_changed', False)}
     mgr.provider.virsh_invocation.return_value = 'virsh -c qemu+ssh://host/system'
+    steps = order if order is not None else []
+
+    def _shutdown(*a, **kw):
+        steps.append('shutdown')
+        return shutdown_ok
+    def _detach(*a, **kw):
+        steps.append('detach')
+        if remove_error:
+            raise remove_error
+        return []
+    def _start(*a, **kw):
+        steps.append('start')
+        return True
+
+    mgr.provider.shutdown_and_wait.side_effect = _shutdown
+    mgr.provider.remove_vm_disks.side_effect = _detach
+    mgr.provider.start_vm.side_effect = _start
     queue = MagicMock()
 
     with patch.object(VMStateDiffer, 'diff_vm', return_value=diff):
@@ -455,8 +471,8 @@ class TestRemovalIsAppliedToAStoppedGuest:
         record = _record()
         mgr, result = _run(_diff(vm_state='shut off', removed=[record]))
 
-        kwargs = mgr.provider.update_vm_disks.call_args.kwargs
-        assert kwargs['removed_disks'] == [record]
+        mgr.provider.remove_vm_disks.assert_called_once_with(
+            'bprj__demo__bprj_cluster1_node01', [record])
         assert result['status'] == 'updated'
 
     def test_the_detach_is_named_in_the_changes(self):
@@ -464,28 +480,88 @@ class TestRemovalIsAppliedToAStoppedGuest:
 
         assert 'detach disks: data (vdb)' in result['details']
 
+    def test_a_refusing_provider_fails_the_vm(self):
+        """remove_vm_disks re-verifies; its refusal must not be swallowed."""
+        from boxman.exceptions import ProvisionError
+
+        mgr, result = _run(_diff(vm_state='shut off', removed=[_record()]),
+                           remove_error=ProvisionError('it holds managed saved state'))
+
+        assert result['status'] == 'failed'
+        assert 'managed saved state' in result['details']
+
 
 class TestRemovalIsDeferredOnALiveGuest:
-    """Pulling a disk out from under a mounted filesystem waits."""
+    """A detach is only ever applied to an inactive domain."""
 
     def test_a_running_guest_defers_without_the_flag(self):
         mgr, result = _run(_diff(vm_state='running', removed=[_record()]))
 
-        assert mgr.provider.update_vm_disks.call_args.kwargs['removed_disks'] == []
+        mgr.provider.remove_vm_disks.assert_not_called()
         assert result['status'] == 'needs_restart'
 
     def test_a_paused_guest_defers_too(self):
         mgr, result = _run(_diff(vm_state='paused', removed=[_record()]))
 
-        assert mgr.provider.update_vm_disks.call_args.kwargs['removed_disks'] == []
+        mgr.provider.remove_vm_disks.assert_not_called()
         assert result['status'] == 'needs_restart'
 
-    def test_the_restart_flag_authorises_the_detach(self):
-        record = _record()
-        mgr, _result = _run(_diff(vm_state='running', removed=[record]),
+    def test_a_paused_guest_is_never_shut_down_for_a_detach(self):
+        """Even with --restart. It did not ask to be stopped or resumed."""
+        mgr, result = _run(_diff(vm_state='paused', removed=[_record()]),
+                           allow_restart=True)
+
+        mgr.provider.shutdown_and_wait.assert_not_called()
+        mgr.provider.remove_vm_disks.assert_not_called()
+        assert result['status'] == 'needs_restart'
+
+
+class TestDetachHappensBetweenShutdownAndStart:
+    """With --restart on a running guest, the ordering is the safety."""
+
+    def test_the_order_is_shutdown_detach_start(self):
+        order = []
+        mgr, result = _run(_diff(vm_state='running', removed=[_record()]),
+                           allow_restart=True, order=order)
+
+        assert order == ['shutdown', 'detach', 'start']
+        assert result['status'] == 'updated'
+
+    def test_the_shutdown_is_not_forced(self):
+        """force_after runs `virsh destroy` on timeout and still reports
+        success, so a guest that never shut down cleanly would go on to
+        have a disk removed."""
+        mgr, _result = _run(_diff(vm_state='running', removed=[_record()]),
                             allow_restart=True)
 
-        assert mgr.provider.update_vm_disks.call_args.kwargs['removed_disks'] == [record]
+        kwargs = mgr.provider.shutdown_and_wait.call_args.kwargs
+        assert kwargs.get('force_after') is False
+
+    def test_a_restart_without_a_detach_still_forces(self):
+        """The existing restart behaviour is unchanged where no disk goes."""
+        mgr, _result = _run(
+            _diff(vm_state='running', cpu_restart=True), allow_restart=True)
+
+        kwargs = mgr.provider.shutdown_and_wait.call_args.kwargs
+        assert kwargs.get('force_after') is True
+
+    def test_a_failed_shutdown_prevents_the_detach(self):
+        mgr, result = _run(_diff(vm_state='running', removed=[_record()]),
+                           allow_restart=True, shutdown_ok=False)
+
+        mgr.provider.remove_vm_disks.assert_not_called()
+        assert result['status'] == 'failed'
+
+    def test_a_failed_detach_starts_the_guest_again(self):
+        from boxman.exceptions import ProvisionError
+
+        mgr, result = _run(_diff(vm_state='running', removed=[_record()]),
+                           allow_restart=True,
+                           remove_error=ProvisionError('source mismatch'))
+
+        mgr.provider.start_vm.assert_called_once()
+        assert result['status'] == 'failed'
+        assert 'started again' in result['details']
 
 
 class TestRefusalsAndStraysAreReported:
@@ -498,9 +574,7 @@ class TestRefusalsAndStraysAreReported:
 
         warnings = [c.args[0] for c in mgr.logger.warning.call_args_list if c.args]
         assert any("not detaching 'data'" in w for w in warnings)
-        # nothing to apply -- and the refusal is still reported, which it was
-        # not while the report sat after the "no changes detected" return
-        mgr.provider.update_vm_disks.assert_not_called()
+        mgr.provider.remove_vm_disks.assert_not_called()
 
     def test_a_stray_disk_is_reported_and_left_alone(self):
         mgr, _result = _run(_diff(
@@ -510,8 +584,47 @@ class TestRefusalsAndStraysAreReported:
 
         warnings = [c.args[0] for c in mgr.logger.warning.call_args_list if c.args]
         assert any('neither declared nor recorded' in w for w in warnings)
-        assert mgr.provider.update_vm_disks.call_args.kwargs['removed_disks'] == [
-            _record()]
+        mgr.provider.remove_vm_disks.assert_called_once()
+
+
+class TestDetachOrderingAndSafety:
+    """Removals come after the additions, and only if those worked."""
+
+    def test_removals_are_skipped_after_a_failed_addition(self):
+        mgr, result = _run(
+            _diff(vm_state='shut off', removed=[_record()],
+                  new_disks=[{'name': 'scratch', 'target': 'vdc'}]),
+            disks_ok=False)
+
+        mgr.provider.remove_vm_disks.assert_not_called()
+        assert result['status'] == 'failed'
+
+    def test_removals_run_when_everything_before_them_worked(self):
+        mgr, _result = _run(
+            _diff(vm_state='shut off', removed=[_record()],
+                  new_disks=[{'name': 'scratch', 'target': 'vdc'}]))
+
+        mgr.provider.update_vm_disks.assert_called_once()
+        mgr.provider.remove_vm_disks.assert_called_once()
+
+    def test_detaching_never_removes_the_image_file(self, tmp_path):
+        """The qcow2 outlives the detach, deliberately."""
+        from boxman.providers.libvirt.disk_ownership import detach_disk
+
+        image = tmp_path / "data.qcow2"
+        image.write_bytes(b"important")
+        virsh = MagicMock()
+        virsh.execute.return_value = MagicMock(ok=True, stderr='')
+
+        detach_disk(virsh, 'node01', 'vdb')
+
+        assert image.read_bytes() == b"important"
+        args = virsh.execute.call_args.args
+        kwargs = virsh.execute.call_args.kwargs
+        assert args[0] == 'detach-disk'
+        for destructive in ('wipe_storage', 'delete_storage',
+                            'delete_storage_volumes'):
+            assert destructive not in kwargs
 
 
 class TestLegacyDomainGuidance:
@@ -541,71 +654,84 @@ class TestLegacyDomainGuidance:
         assert not any('predates' in w for w in warnings)
 
 
-class TestDetachOrderingAndSafety:
-    """The provider-side half: ordering, and never deleting the image."""
+class TestRemoveVmDisksReVerifies:
+    """The provider re-checks, as late as possible, what made it safe.
 
-    def _session(self):
+    The plan is computed at diff time and the guest has been shut down
+    since. Two facts have to still hold at the moment of the detach: the
+    domain is inactive, and the target holds the exact recorded source
+    (#164 F2 review, amendment 1).
+    """
+
+    def _session(self, state='shut off', saved=False, persistent=None):
         from boxman.providers.libvirt.session import LibVirtSession
 
         session = LibVirtSession.__new__(LibVirtSession)
         session.provider_config = {'uri': 'qemu:///system'}
         session.logger = MagicMock()
+        session.has_managed_save = MagicMock(return_value=saved)
+        session.persistent_disks = MagicMock(
+            return_value=persistent if persistent is not None
+            else [_attached('vda', ROOT), _attached('vdb', DATA)])
+        self._state = state
         return session
 
-    def test_removals_are_skipped_after_a_failed_addition(self):
-        """A detach after a failed add removes a disk whose replacement
-        never arrived."""
+    def _call(self, session, records=None):
+        from boxman.providers.libvirt.vm_differ import VMStateDiffer
+
+        # only the state probe is stubbed; domain_is_active stays real, so
+        # the classification under test is the production one
+        with patch.object(VMStateDiffer, 'get_vm_state',
+                          return_value=self._state), \
+             patch('boxman.providers.libvirt.session.detach_disk') as det, \
+             patch('boxman.providers.libvirt.session.forget_disk') as forg:
+            result = session.remove_vm_disks(
+                'node01', records if records is not None else [_record()])
+        return result, det, forg
+
+    def test_an_inactive_domain_without_saved_state_detaches(self):
         session = self._session()
-        disk_manager = MagicMock()
-        disk_manager.configure_from_disk_config.return_value = False
+        detached, det, forg = self._call(session)
 
-        with patch('boxman.providers.libvirt.session.DiskManager',
-                   return_value=disk_manager), \
-             patch('boxman.providers.libvirt.session.detach_disk') as detach:
-            ok = session.update_vm_disks(
-                vm_name='node01',
-                new_disks=[{'name': 'scratch', 'target': 'vdc'}],
-                resize_disks=[], workdir='/tmp', disk_prefix='node01',
-                vm_running=False, removed_disks=[_record()])
+        assert detached == ['data']
+        det.assert_called_once()
+        forg.assert_called_once()
 
-        assert ok is False
-        detach.assert_not_called()
+    def test_an_active_domain_is_refused(self):
+        session = self._session(state='running')
+        with pytest.raises(ProvisionError, match='not inactive'):
+            self._call(session)
 
-    def test_removals_run_when_everything_before_them_worked(self):
-        session = self._session()
-        disk_manager = MagicMock()
-        disk_manager.configure_from_disk_config.return_value = True
+    def test_managed_saved_state_blocks_the_detach(self):
+        """The next start restores an XML that still has the disk."""
+        session = self._session(saved=True)
+        with pytest.raises(ProvisionError, match='managed saved state'):
+            self._call(session)
 
-        with patch('boxman.providers.libvirt.session.DiskManager',
-                   return_value=disk_manager), \
-             patch('boxman.providers.libvirt.session.detach_disk') as detach, \
-             patch('boxman.providers.libvirt.session.forget_disk') as forget:
-            ok = session.update_vm_disks(
-                vm_name='node01',
-                new_disks=[{'name': 'scratch', 'target': 'vdc'}],
-                resize_disks=[], workdir='/tmp', disk_prefix='node01',
-                vm_running=False, removed_disks=[_record()])
+    def test_a_failed_managed_save_probe_blocks_the_detach(self):
+        """None is "could not tell", which never authorises a change."""
+        session = self._session(saved=None)
+        with pytest.raises(ProvisionError, match='could not determine'):
+            self._call(session)
 
-        assert ok is True
-        detach.assert_called_once()
-        forget.assert_called_once()
+    def test_a_changed_persistent_source_is_refused(self):
+        session = self._session(
+            persistent=[_attached('vda', ROOT),
+                        _attached('vdb', '/vm/something-else.qcow2')])
+        with pytest.raises(ProvisionError, match='not the'):
+            self._call(session)
 
-    def test_detaching_never_removes_the_image_file(self, tmp_path):
-        """The qcow2 outlives the detach, deliberately."""
-        from boxman.providers.libvirt.disk_ownership import detach_disk
+    def test_an_already_absent_target_just_drops_the_record(self):
+        session = self._session(persistent=[_attached('vda', ROOT)])
+        detached, det, forg = self._call(session)
 
-        image = tmp_path / "data.qcow2"
-        image.write_bytes(b"important")
-        virsh = MagicMock()
-        virsh.execute.return_value = MagicMock(ok=True, stderr='')
+        assert detached == []
+        det.assert_not_called()
+        forg.assert_called_once()
 
-        detach_disk(virsh, 'node01', 'vdb')
-
-        assert image.read_bytes() == b"important"
-        args = virsh.execute.call_args.args
-        kwargs = virsh.execute.call_args.kwargs
-        assert args[0] == 'detach-disk'
-        # no flag that would take the image with it
-        for destructive in ('wipe_storage', 'delete_storage',
-                            'delete_storage_volumes'):
-            assert destructive not in kwargs
+    def test_a_refusal_leaves_the_ownership_record_intact(self):
+        session = self._session(saved=True)
+        with pytest.raises(ProvisionError):
+            self._call(session)
+        # forget_disk is only reachable past the gate; nothing was recorded
+        # as detached, so the record survives for the next run to reconsider
