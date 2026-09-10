@@ -275,7 +275,16 @@ class ImageImporter:
             self._log_error("Could not find disk source element in XML")
             return False
 
-        tree.write(xml_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
+        try:
+            tree.write(xml_path, encoding='utf-8', xml_declaration=True,
+                       pretty_print=True)
+        except OSError as exc:
+            # copy2() preserves a read-only source XML's mode, so editing
+            # the staged copy raises for a non-root user -- untranslated,
+            # that escaped as a traceback (#164 F1 review round 2, 10).
+            raise ImageImportError(
+                f"could not write the edited vm xml {xml_path}: {exc}"
+            ) from exc
         self._log_info("XML file updated successfully")
 
         return True

@@ -791,8 +791,7 @@ class VMsMixin:
                         f"is attached but not declared. This VM predates "
                         f"boxman's disk ownership records, so boxman will "
                         f"not detach anything on it. To remove it by hand: "
-                        f"{self.provider.virsh_invocation()} detach-disk "
-                        f"{full_vm_name} {stray['target']} --config "
+                        f"{self.provider.virsh_invocation('detach-disk', full_vm_name, stray['target'], config=True)} "
                         f"(the image file is not deleted)")
 
             if not has_changes:
@@ -1005,12 +1004,21 @@ class VMsMixin:
                 if folder_result.get('restart_needed'):
                     restart_needed = True
 
-            # A share that is configured but not live is pending whether or
-            # not this run is what configured it -- otherwise an attachment
-            # that fell back to config-only last time reported nothing
-            # outstanding (#164 C1 review, finding 7).
+            # Asked again *after* the changes were applied. The differ's
+            # answer describes the state before them, so propagating it
+            # made a successful live attachment report a pending restart --
+            # and with --restart, power-cycle the guest for nothing
+            # (#164 C1 review round 2, finding 5). Re-probed only when
+            # something is declared or was just changed; otherwise the
+            # differ's answer already covers it.
             if diff['shared_folders_restart_pending']:
-                restart_needed = True
+                if vm_active:
+                    if self.provider.shared_folders_pending(
+                            full_vm_name, vm_info.get('shared_folders'),
+                            vm_active):
+                        restart_needed = True
+                else:
+                    restart_needed = True
 
             # Every change that cannot reach a live guest, in one place.
             # memballoon only ever landed in the persistent config, and was
@@ -1085,12 +1093,34 @@ class VMsMixin:
                 # the change, so it takes effect the next time the guest
                 # boots. `update` used to power-cycle a running guest for
                 # this without being asked (#164 C1).
-                result_queue.put((vm_name, {
-                    'status': 'needs_restart',
-                    'details': (
-                        '; '.join(changes) +
+                # A deferred *detach* is not a written change waiting for a
+                # boot: no detach command ran, so an ordinary reboot leaves
+                # the disk attached. Saying otherwise sent the operator to
+                # a remedy that does not work (#164 F2 review round 2, 8).
+                pending_detach = bool(detach_plan) and not detach_offline
+                if pending_detach:
+                    if vm_running:
+                        tail = (
+                            ' — the configuration changes are written and a '
+                            'restart applies them, but the disk detach has '
+                            'not been performed: re-run update with '
+                            '--restart, which shuts the guest down cleanly '
+                            'and detaches it')
+                    else:
+                        tail = (
+                            ' — the configuration changes are written, but '
+                            'the disk detach has not been performed: it '
+                            'needs the guest fully shut down (a paused guest '
+                            'is not), then update again')
+                else:
+                    tail = (
                         ' — written to the persistent config; restart the VM '
                         'to apply them, or re-run update with --restart')
+                if detach_deferred:
+                    tail = f" — {detach_deferred}"
+                result_queue.put((vm_name, {
+                    'status': 'needs_restart',
+                    'details': '; '.join(changes) + tail
                 }))
             else:
                 result_queue.put((vm_name, {

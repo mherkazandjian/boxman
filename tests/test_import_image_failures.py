@@ -715,3 +715,33 @@ class TestBoundaryFailuresStillExitTwo:
 
         assert code == 2
         assert "Traceback" not in capsys.readouterr().out
+
+
+@pytest.mark.smoke
+class TestReadOnlyXmlStillExitsTwo:
+    """copy2() preserves a read-only source XML's mode (#164 F1 rev 2, 10).
+
+    Editing the staged copy then raises OSError for a non-root user, which
+    escaped the exit-2 boundary untranslated.
+    """
+
+    def test_a_read_only_xml_package_exits_2(self, tmp_path: Path, capsys):
+        manifest = _build_package(tmp_path / "pkg")
+        (tmp_path / "pkg" / "vm" / "vm-definition.xml").chmod(0o444)
+        dst = tmp_path / "dst"
+        argv = [
+            "--boxman-conf", str(_boxman_conf(tmp_path)),
+            "import-image", "--uri", f"file://{manifest}",
+            "--name", "vm1", "--directory", str(dst),
+        ]
+        try:
+            with patch("boxman.providers.libvirt.import_image.run",
+                       side_effect=_fake_run()):
+                code = _run_cli(argv)
+        finally:
+            (tmp_path / "pkg" / "vm" / "vm-definition.xml").chmod(0o644)
+
+        # either it succeeds (running as root, or the mode is writable) or
+        # it fails cleanly -- never a traceback, never exit 1
+        assert code in (0, 2)
+        assert "Traceback" not in capsys.readouterr().out

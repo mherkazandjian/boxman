@@ -419,3 +419,45 @@ class TestPausedGuestAtTheProvider:
 
         assert result['restart_needed'] is False
         assert result['method'] == 'cold'
+
+
+class TestPausedTopologyOnlyChange:
+    """Same vCPU count, different shape (#164 C1 review round 2, finding 6).
+
+    Two sockets of one core to one socket of two cores keeps the total.
+    diff_vm() sees the change and the persistent XML is rewritten, but
+    comparing totals alone reported nothing pending, so the worker called
+    the run updated while the paused guest kept the old topology.
+    """
+
+    def _call(self, **kwargs):
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        session = LibVirtSession.__new__(LibVirtSession)
+        session.provider_config = {'uri': 'qemu:///system'}
+        session.logger = MagicMock()
+        editor = MagicMock()
+        editor.get_domain_xml.return_value = "<domain/>"
+        editor.cpu_memory_modifications.return_value = ([('x', 'v')], False)
+        editor.modify_xml_xpath.return_value = "<domain/>"
+        editor.redefine_domain.return_value = True
+        editor.configure_cpu_memory.return_value = True
+        params = dict(
+            vm_name='node01', cpus=None, memory_mb=None, vm_state='paused',
+            actual_cpus={'sockets': 2, 'cores': 1, 'threads': 1,
+                         'total_vcpus': 2, 'current_vcpus': 2},
+            actual_memory_mb=2048, max_vcpus=None, max_memory_mb=None)
+        params.update(kwargs)
+        with patch('boxman.providers.libvirt.session.VirshEdit',
+                   return_value=editor):
+            return session.update_vm_cpu_memory(**params)
+
+    def test_a_reshaped_topology_is_pending(self):
+        result = self._call(cpus={'sockets': 1, 'cores': 2, 'threads': 1})
+
+        assert result['restart_needed'] is True
+
+    def test_an_identical_topology_is_not(self):
+        result = self._call(cpus={'sockets': 2, 'cores': 1, 'threads': 1})
+
+        assert result['restart_needed'] is False

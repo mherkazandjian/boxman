@@ -440,7 +440,9 @@ def _run(diff, allow_restart=False, disks_ok=True, shutdown_ok=True,
     mgr.provider.update_vm_disks.return_value = disks_ok
     mgr.provider.update_vm_cpu_memory.return_value = {
         'success': True, 'restart_needed': diff.get('cpu_changed', False)}
-    mgr.provider.virsh_invocation.return_value = 'virsh -c qemu+ssh://host/system'
+    mgr.provider.virsh_invocation.side_effect = (
+        lambda *a, **k: "docker exec c bash -c 'virsh -c qemu+ssh://host/system "
+                        + ' '.join(str(x) for x in a) + " --config'")
     steps = order if order is not None else []
 
     def _shutdown(*a, **kw):
@@ -644,7 +646,10 @@ class TestLegacyDomainGuidance:
         assert legacy, f'no legacy notice among {warnings}'
         # the advice has to name the connection it applies to -- a bare
         # `virsh` reaches the default one (#164 F2 review, findings 2 + 10)
-        assert 'virsh -c qemu+ssh://host/system detach-disk' in legacy[0]
+        # the complete, runtime-wrapped command -- arguments inside the
+        # quotes, not appended after them (#164 F2 review round 2, 9)
+        assert "docker exec c bash -c 'virsh -c qemu+ssh://host/system " in legacy[0]
+        assert "detach-disk" in legacy[0]
         assert 'not deleted' in legacy[0]
 
     def test_a_recorded_domain_gets_the_other_message(self):
@@ -793,15 +798,41 @@ class TestOccupiedTargetConflicts:
 
         assert conflicts == []
 
-    def test_an_unrelated_occupant_is_not_a_conflict(self):
-        """Something else is at the target; the removal rule refuses it."""
+    def test_an_unrelated_occupant_is_also_a_conflict(self):
+        """Replacing the recorded disk does not make the target free.
+
+        The removal rule refuses to detach it, but nothing stopped the
+        reconciliation from resizing it -- so declaring logs/vdb with a
+        larger size grew a disk nobody had any claim to (#164 F2 review
+        round 2, finding 2).
+        """
         conflicts = occupied_target_conflicts(
             records=[_record(name='data', target='vdb', source=DATA)],
             desired_disks=[{'name': 'logs', 'target': 'vdb', 'size': 4096}],
             actual_disks=[_attached('vda', ROOT),
                           _attached('vdb', '/vm/someone-elses.qcow2')])
 
-        assert conflicts == []
+        assert conflicts == [('logs', 'vdb', '/vm/someone-elses.qcow2')]
+
+    def test_swapping_targets_between_declared_disks_is_a_conflict(self):
+        """Each one's target holds the other's file."""
+        other = '/vm/vm01_logs.qcow2'
+        conflicts = occupied_target_conflicts(
+            records=[_record(name='data', target='vdb', source=DATA),
+                     _record(name='logs', target='vdc', source=other)],
+            desired_disks=[{'name': 'data', 'target': 'vdc'},
+                           {'name': 'logs', 'target': 'vdb'}],
+            actual_disks=[_attached('vdb', DATA), _attached('vdc', other)])
+
+        assert len(conflicts) == 2
+
+    def test_an_adopted_occupant_is_a_conflict_for_another_name(self):
+        conflicts = occupied_target_conflicts(
+            records=[DiskRecord('data', 'vdb', 'adopted', DATA)],
+            desired_disks=[{'name': 'logs', 'target': 'vdb', 'size': 4096}],
+            actual_disks=[_attached('vdb', DATA)])
+
+        assert conflicts == [('logs', 'vdb', DATA)]
 
     def test_a_still_declared_disk_is_not_a_conflict(self):
         conflicts = occupied_target_conflicts(
@@ -811,11 +842,27 @@ class TestOccupiedTargetConflicts:
 
         assert conflicts == []
 
-    def test_a_domain_without_records_has_no_conflicts(self):
+    def test_a_legacy_disk_at_its_expected_path_is_not_a_conflict(self):
+        """A domain predating the record still updates.
+
+        Nothing is recorded there, so keying purely on the record would
+        make every one of its disks a conflict and no such project could
+        be updated at all. The occupant being the declaration's own
+        expected image file settles it.
+        """
+        assert occupied_target_conflicts(
+            None,
+            [{'name': 'data', 'target': 'vdb'}],
+            [_attached('vdb', DATA)],
+            expected_paths={'data': DATA}) == []
+
+    def test_an_unrecorded_stranger_at_the_target_is_a_conflict(self):
         assert occupied_target_conflicts(
             None,
             [{'name': 'logs', 'target': 'vdb'}],
-            [_attached('vdb', DATA)]) == []
+            [_attached('vdb', '/vm/attached-by-hand.qcow2')],
+            expected_paths={'logs': '/vm/vm01_logs.qcow2'}) == [
+                ('logs', 'vdb', '/vm/attached-by-hand.qcow2')]
 
 
 class TestAConflictFailsBeforeAnyMutation:
@@ -997,3 +1044,47 @@ class TestEachDetachIsVerifiedSeparately:
 
         assert outcome == {'detached': ['data', 'logs'], 'deferred': None}
         assert det.call_count == 2
+
+
+class TestManualAdviceCarriesTheRuntime:
+    """Built and wrapped whole, against a real runtime configuration.
+
+    build_command() alone omits the runtime wrapper, so under the
+    docker-compose runtime the advice named host libvirt. And because the
+    wrapper *quotes* the command, arguments appended after a prefix would
+    land outside the quotes and not run at all (#164 F2 review round 2, 9).
+    """
+
+    def _session(self, **provider_config):
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        session = LibVirtSession.__new__(LibVirtSession)
+        session.provider_config = {'uri': 'qemu:///system', 'use_sudo': False,
+                                   **provider_config}
+        session.logger = MagicMock()
+        return session
+
+    def test_the_local_runtime_gives_a_plain_command(self):
+        advice = self._session().virsh_invocation(
+            'detach-disk', 'node01', 'vdb', config=True)
+
+        assert advice == 'virsh -c qemu:///system detach-disk node01 vdb --config'
+
+    def test_the_docker_runtime_wraps_the_whole_command(self):
+        advice = self._session(
+            runtime='docker-compose',
+            runtime_container='boxman-libvirt').virsh_invocation(
+                'detach-disk', 'node01', 'vdb', config=True)
+
+        assert advice.startswith('docker exec')
+        assert 'boxman-libvirt' in advice
+        # the arguments are inside the wrapper's quoting, not after it
+        assert advice.rstrip().endswith("--config'")
+        assert 'detach-disk node01 vdb --config' in advice
+
+    def test_an_unwrappable_runtime_does_not_abort_the_run(self):
+        """Generating a suggestion must never raise."""
+        advice = self._session(runtime='docker-compose').virsh_invocation(
+            'detach-disk', 'node01', 'vdb', config=True)
+
+        assert 'detach-disk node01 vdb --config' in advice

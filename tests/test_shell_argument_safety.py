@@ -247,3 +247,74 @@ class TestTheShellActuallyRunsThem:
         calls = _recorded(tmp_path)
         assert any(str(src) in call and str(dst) in call for call in calls), (
             f"the paths did not survive as literal arguments: {calls}")
+
+
+class TestVirshCommandsThroughARealShell:
+    """The agreed additions: a virsh stub, and a blocked urllib fallback.
+
+    The URI and definition-path cases were still ``shlex.split`` assertions,
+    which cannot execute substitution, and the downloader test fell through
+    into real urllib (#164 F1 review round 2, finding 11).
+    """
+
+    def _run_in(self, workdir: Path, body: str) -> subprocess.CompletedProcess:
+        bindir = _stub_bin(workdir, ["virsh", "wget", "curl", "sha256sum"])
+        env = dict(os.environ)
+        env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        return subprocess.run(
+            [sys.executable, "-c", body],
+            cwd=workdir, env=env, capture_output=True, text=True, timeout=120)
+
+    def test_a_hostile_connection_uri_is_one_literal_argument(self, tmp_path):
+        uri = f"qemu+ssh://{LIVE_PAYLOAD}/system"
+        proc = self._run_in(tmp_path, (
+            "from boxman.providers.libvirt.import_image import ImageImporter\n"
+            f"ImageImporter(uri={uri!r}).check_vm_exists('node01')\n"
+        ))
+
+        assert proc.returncode == 0, proc.stderr
+        assert not (tmp_path / "pwned").exists(), (
+            "the shell executed $(touch pwned) from the connection uri")
+        assert any(uri in call for call in _recorded(tmp_path)), _recorded(tmp_path)
+
+    def test_a_hostile_definition_path_is_one_literal_argument(self, tmp_path):
+        xml = tmp_path / f"{LIVE_PAYLOAD}-it's.xml"
+        xml.write_text("<domain/>")
+        proc = self._run_in(tmp_path, (
+            "from boxman.providers.libvirt.import_image import ImageImporter\n"
+            "imp = ImageImporter(uri='qemu:///system')\n"
+            f"imp.define_vm({str(xml)!r})\n"
+        ))
+
+        assert proc.returncode == 0, proc.stderr
+        assert not (tmp_path / "pwned").exists(), (
+            "the shell executed $(touch pwned) from the xml path")
+        assert any(str(xml) in call for call in _recorded(tmp_path))
+
+    def test_a_hostile_download_destination_is_one_literal_argument(self, tmp_path):
+        dst = f"dst-{LIVE_PAYLOAD}-it's.iso"
+        proc = self._run_in(tmp_path, (
+            "from boxman.utils.http_download import download_url\n"
+            f"download_url('https://example.invalid/x.iso', {dst!r})\n"
+        ))
+
+        assert proc.returncode == 0, proc.stderr
+        assert not (tmp_path / "pwned").exists(), (
+            "the shell executed $(touch pwned) from the destination path")
+        assert any(dst in call for call in _recorded(tmp_path))
+
+    def test_the_urllib_fallback_is_not_allowed_to_reach_the_network(
+            self, tmp_path):
+        """The stubs report success, so urllib is never reached at all."""
+        proc = self._run_in(tmp_path, (
+            "import urllib.request\n"
+            "def _boom(*a, **k):\n"
+            "    raise AssertionError('urllib fallback reached the network')\n"
+            "urllib.request.urlopen = _boom\n"
+            "from boxman.utils.http_download import download_url\n"
+            "download_url('https://example.invalid/x.iso', 'dst.iso')\n"
+        ))
+
+        assert proc.returncode == 0, proc.stderr
+        assert 'urllib fallback reached the network' not in proc.stderr

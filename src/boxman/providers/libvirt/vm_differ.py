@@ -495,8 +495,16 @@ class VMStateDiffer:
         persistent_disks = self.get_actual_disks(domain_name, inactive=True)
         removed_disks, refused_disk_removals = plan_disk_removals(
             disk_records, desired_disks or [], persistent_disks)
+        # Against the view the add/resize path acts on -- the live one for
+        # a running guest -- so preflight and reconciliation cannot
+        # disagree about whether a target is occupied (#164 F2 review
+        # round 2, finding 2).
         disk_conflicts = occupied_target_conflicts(
-            disk_records, desired_disks or [], persistent_disks)
+            disk_records, desired_disks or [], actual_disks,
+            expected_paths={
+                d.get('name'): self._expected_disk_path(d, workdir, disk_prefix)
+                for d in (desired_disks or []) if d.get('name')
+            })
         unowned = unowned_disks(
             disk_records, desired_disks or [], persistent_disks,
             root_source=(persistent_disks[0]['source']

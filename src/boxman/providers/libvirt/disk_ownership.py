@@ -280,50 +280,60 @@ def occupied_target_conflicts(
     records: list[DiskRecord] | None,
     desired_disks: list[dict[str, Any]],
     actual_disks: list[dict[str, Any]],
+    expected_paths: dict[str, str] | None = None,
 ) -> list[tuple[str, str, str]]:
     """
-    Declarations whose target still holds a *different* disk.
+    Declarations whose target is held by a disk that is not theirs.
 
-    Rename ``data`` to ``logs``, keep its explicit target, and change the
-    size: removal is refused (the target is claimed) but nothing stops the
-    reconciliation, which matches the occupant by target and grows the old
-    ``data`` image — so the operator ends up with the disk they renamed
-    away from, enlarged, reported as success (#164 F2 review, finding 4).
+    Rename ``data`` to ``logs``, keep its explicit target, change the size:
+    the removal is refused because the target is claimed, but nothing
+    stopped reconciliation, which matches the occupant by target and grew
+    the old ``data`` image — so the operator got the disk they renamed away
+    from, enlarged, reported as success (#164 F2 review, finding 4).
 
-    This is a hard conflict and the caller fails the VM on it, before any
-    change is applied.
+    Keyed on the **occupant** rather than on removal eligibility. Whether
+    boxman may *detach* what is there is a separate question from whether
+    this declaration may *write to* it, and answering only the first let a
+    replacement disk, an adopted disk, or a swapped pair through to a
+    resize (#164 F2 review round 2, finding 2).
 
-    Keyed on the **actual occupant**, not on the refusal. A refusal is also
-    produced when the target is vacant and only stale metadata names it —
-    an operator who detached the old disk by hand — and that case is a
-    legitimate addition, not a conflict.
+    *actual_disks* must be the view the add/resize path will act on, so the
+    two cannot disagree about whether the target is occupied.
+
+    *expected_paths* maps a declared name to the image file boxman would
+    use for it. An occupant that *is* that file belongs to the
+    declaration, whatever the metadata says -- which is how a domain
+    predating the ownership record keeps working: nothing is recorded
+    there, and without this every one of its disks would read as a
+    conflict and no such project could be updated at all.
 
     Returns:
         ``(declared_name, target, occupant_source)`` per conflict.
     """
-    if records is None:
-        return []
-    recorded_by_target = {r.target: r for r in records if r.role == ROLE_DATA}
     actual_by_target = {d['target']: d for d in actual_disks}
-    desired_names = {d.get('name') for d in desired_disks if d.get('name')}
-
+    recorded_by_target = {r.target: r for r in (records or ())}
+    expected_paths = expected_paths or {}
     conflicts = []
     for declared in desired_disks:
         target = declared.get('target') or DEFAULT_DISK_TARGET
         name = declared.get('name')
-        record = recorded_by_target.get(target)
-        if record is None or record.name == name or record.name in desired_names:
-            # not boxman's, already this declaration's, or the recorded disk
-            # is still declared under its own name elsewhere
-            continue
         occupant = actual_by_target.get(target)
         if occupant is None:
-            # vacant: stale metadata only, the addition may proceed
+            # vacant: a plain addition, whatever stale metadata may say
             continue
-        if occupant.get('source') != record.source:
-            # something else again is there; the removal rule refuses it and
-            # this declaration is not competing with a disk boxman owns
+
+        record = recorded_by_target.get(target)
+        if record is not None and record.name == name:
+            # this declaration's own disk, still where it was put
             continue
+        if occupant.get('source') == expected_paths.get(name):
+            # the occupant IS this declaration's image file -- unrecorded
+            # (a domain predating the record) but unambiguously its own
+            continue
+        # something else holds the target: a replacement, a disk boxman
+        # never recorded, an adopted one, or the other half of a swap
+        # between two declared disks. Writing to it is not this
+        # declaration's to do.
         conflicts.append((name, target, occupant.get('source')))
     return conflicts
 

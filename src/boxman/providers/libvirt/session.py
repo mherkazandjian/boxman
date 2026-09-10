@@ -1150,9 +1150,19 @@ class LibVirtSession(SessionConfigMixin):
             name = folder_config.get('name', '?')
             self.logger.info(
                 f"updating shared folder '{name}' on VM {vm_name}")
-            # Detach the old version first (get current state from XML)
-            current_folders = folder_manager.get_attached_shared_folders()
+            # Detach the old version first. From the **persistent**
+            # definition: that is what holds the target, and an attachment
+            # that fell back to config-only is not in the live view at all
+            # -- so the old entry was not found, the detach was skipped,
+            # and the re-attach hit an occupied persistent target and was
+            # rejected (#164 C1 review round 2, finding 4).
+            current_folders = folder_manager.get_attached_shared_folders(
+                inactive=True)
             current = next((f for f in current_folders if f['name'] == name), None)
+            if current is None:
+                current = next(
+                    (f for f in folder_manager.get_attached_shared_folders()
+                     if f['name'] == name), None)
             if current:
                 detach_result = folder_manager.detach_shared_folder(
                     name, current['host_path'], current['readonly'])
@@ -2054,6 +2064,43 @@ class LibVirtSession(SessionConfigMixin):
         method = 'cold' if restart_needed else 'hot'
         return {'success': success, 'method': method, 'restart_needed': restart_needed}
 
+    def shared_folders_pending(self, vm_name: str,
+                               desired_folders: list[dict[str, Any]] | None,
+                               vm_active: bool) -> bool:
+        """
+        Do any shared folders still differ between live and desired?
+
+        Asked **after** the changes are applied. The differ computes the
+        same thing before them, and propagating that answer meant a
+        successful live attachment still reported a pending restart -- and
+        with --restart, power-cycled the guest for nothing (#164 C1 review
+        round 2, finding 5).
+        """
+        if not vm_active:
+            # nothing is running, so nothing is waiting for a boot
+            return False
+        import os as _os
+
+        manager = SharedFolderManager(
+            vm_name=vm_name, provider_config=self.provider_config)
+        live = {f['name']: f for f in manager.get_attached_shared_folders()}
+
+        def _norm(folder):
+            return (
+                _os.path.abspath(
+                    _os.path.expanduser(folder.get('host_path', ''))),
+                bool(folder.get('readonly', False)),
+            )
+
+        desired_names = set()
+        for folder in (desired_folders or []):
+            name = folder.get('name', '')
+            desired_names.add(name)
+            attached = live.get(name)
+            if attached is None or _norm(attached) != _norm(folder):
+                return True
+        return any(name not in desired_names for name in live)
+
     def persistent_disks(self, vm_name: str) -> list[dict[str, Any]]:
         """
         The domain's disks as its **persistent** definition has them.
@@ -2149,17 +2196,35 @@ class LibVirtSession(SessionConfigMixin):
 
         return {'detached': detached, 'deferred': None}
 
-    def virsh_invocation(self) -> str:
+    def virsh_invocation(self, *args: Any, **kwargs: Any) -> str:
         """
-        The virsh invocation an operator should copy, for this session.
+        A complete virsh command an operator can copy, for this session.
 
-        A bare ``virsh …`` in advice reaches the default connection, which
-        is the same defect as issuing one -- it would act on a different
-        host, or fail, depending on the operator's environment (#164 F2
-        review, findings 2 and 10).
+        Takes the arguments rather than returning a prefix: under a
+        container runtime the wrapper quotes the command, so arguments
+        appended afterwards would land *outside* the quotes and the
+        suggestion would not run (#164 F2 review round 2, finding 9).
+
+        A bare ``virsh …`` also reaches the default connection, which is
+        the same defect as issuing one -- it would act on a different host,
+        or fail, depending on the operator's environment (findings 2, 10).
         """
-        return VirshCommand(provider_config=self.provider_config).build_command(
-            '').rstrip()
+        virsh = VirshCommand(provider_config=self.provider_config)
+        built = virsh.build_command(*args, **kwargs)
+        # build_command() alone omits the runtime wrapper, which is applied
+        # separately at execution time -- so under the docker-compose
+        # runtime the advice named host libvirt instead of the container
+        # (#164 F2 review round 2, finding 9).
+        try:
+            built = virsh._wrap_for_runtime(built)
+        except ConfigError:
+            # Generating a suggestion must never abort the run; an
+            # unwrappable runtime is a misconfiguration that surfaces on
+            # the next real command anyway.
+            self.logger.debug(
+                "could not wrap the suggested virsh invocation for the "
+                "runtime; reporting it unwrapped")
+        return built.rstrip()
 
     def _live_config_differs(self, vm_name, cpus, memory_mb, actual_cpus,
                              actual_memory_mb, max_vcpus, max_memory_mb) -> bool:
@@ -2175,6 +2240,15 @@ class LibVirtSession(SessionConfigMixin):
             if desired_total != actual_cpus.get('current_vcpus',
                                                 actual_cpus.get('total_vcpus')):
                 return True
+            # ...and the shape, not only the count. Two sockets of one core
+            # to one socket of two cores keeps the count: diff_vm() sees the
+            # change and the persistent XML is rewritten, but comparing
+            # totals alone reported nothing pending and the worker called it
+            # updated (#164 C1 review round 2, finding 6).
+            for key in ('sockets', 'cores', 'threads'):
+                if key in cpus and actual_cpus.get(key) is not None:
+                    if cpus[key] != actual_cpus[key]:
+                        return True
         if memory_mb is not None and memory_mb != actual_memory_mb:
             return True
         if max_vcpus is not None and max_vcpus != actual_cpus.get('total_vcpus'):

@@ -149,3 +149,129 @@ class TestNothingPendingWhenLiveAgrees:
 
         assert diff['shared_folders_restart_pending'] is False
         assert diff['new_shared_folders'] == []
+
+
+# ---------------------------------------------------------------------------
+# The application half. The tests above exercise the differ only, so they
+# cannot see the *application* reading live state, nor a pending flag that
+# describes the state before the changes were applied (#164 C1 review
+# round 2, findings 4 and 5).
+# ---------------------------------------------------------------------------
+
+from unittest.mock import MagicMock  # noqa: E402
+
+
+class TestApplicationReconcilesThePersistentOccupant:
+    """Finding 4: changing a *pending* share must detach the old entry."""
+
+    def _session(self, persistent, live):
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        session = LibVirtSession.__new__(LibVirtSession)
+        session.provider_config = {'uri': 'qemu:///system'}
+        session.logger = MagicMock()
+        manager = MagicMock()
+        manager.get_attached_shared_folders.side_effect = (
+            lambda inactive=False: persistent if inactive else live)
+        manager.configure_from_config.return_value = {
+            'success': True, 'restart_needed': False}
+        manager.detach_shared_folder.return_value = {
+            'success': True, 'restart_needed': False}
+        return session, manager
+
+    def test_the_old_persistent_entry_is_detached(self):
+        """persistent logs=A, nothing live, desired logs=B."""
+        old = _folder('logs', '/srv/A')
+        session, manager = self._session(persistent=[old], live=[])
+
+        with patch('boxman.providers.libvirt.session.SharedFolderManager',
+                   return_value=manager):
+            result = session.update_vm_shared_folders(
+                vm_name='node01', new_folders=[], removed_folders=[],
+                changed_folders=[_folder('logs', '/srv/B')],
+                vm_running=True)
+
+        assert result['success'] is True
+        manager.detach_shared_folder.assert_called_once()
+        assert manager.detach_shared_folder.call_args.args[1] == '/srv/A', (
+            'skipped the old entry, so the re-attach would hit an occupied '
+            'persistent target')
+
+    def test_a_live_entry_is_still_found_when_persistent_lacks_it(self):
+        live_only = _folder('logs', '/srv/A')
+        session, manager = self._session(persistent=[], live=[live_only])
+
+        with patch('boxman.providers.libvirt.session.SharedFolderManager',
+                   return_value=manager):
+            session.update_vm_shared_folders(
+                vm_name='node01', new_folders=[], removed_folders=[],
+                changed_folders=[_folder('logs', '/srv/B')],
+                vm_running=True)
+
+        manager.detach_shared_folder.assert_called_once()
+
+
+class TestPendingIsAskedAfterTheChanges:
+    """Finding 5: a successful hot attach must not report pending."""
+
+    def _session(self, live):
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        session = LibVirtSession.__new__(LibVirtSession)
+        session.provider_config = {'uri': 'qemu:///system'}
+        session.logger = MagicMock()
+        manager = MagicMock()
+        manager.get_attached_shared_folders.return_value = live
+        return session, manager
+
+    def test_a_share_that_reached_the_live_domain_is_not_pending(self):
+        share = _folder('logs', '/srv/logs')
+        session, manager = self._session(live=[share])
+
+        with patch('boxman.providers.libvirt.session.SharedFolderManager',
+                   return_value=manager):
+            assert session.shared_folders_pending(
+                'node01', [share], vm_active=True) is False
+
+    def test_a_share_that_did_not_reach_it_is_pending(self):
+        session, manager = self._session(live=[])
+
+        with patch('boxman.providers.libvirt.session.SharedFolderManager',
+                   return_value=manager):
+            assert session.shared_folders_pending(
+                'node01', [_folder('logs', '/srv/logs')],
+                vm_active=True) is True
+
+    def test_a_changed_source_that_reached_it_is_not_pending(self):
+        session, manager = self._session(live=[_folder('logs', '/srv/B')])
+
+        with patch('boxman.providers.libvirt.session.SharedFolderManager',
+                   return_value=manager):
+            assert session.shared_folders_pending(
+                'node01', [_folder('logs', '/srv/B')],
+                vm_active=True) is False
+
+    def test_a_removal_that_reached_it_is_not_pending(self):
+        session, manager = self._session(live=[])
+
+        with patch('boxman.providers.libvirt.session.SharedFolderManager',
+                   return_value=manager):
+            assert session.shared_folders_pending(
+                'node01', [], vm_active=True) is False
+
+    def test_a_removal_still_live_is_pending(self):
+        session, manager = self._session(live=[_folder('logs', '/srv/logs')])
+
+        with patch('boxman.providers.libvirt.session.SharedFolderManager',
+                   return_value=manager):
+            assert session.shared_folders_pending(
+                'node01', [], vm_active=True) is True
+
+    def test_an_inactive_guest_is_never_pending(self):
+        session, manager = self._session(live=[])
+
+        with patch('boxman.providers.libvirt.session.SharedFolderManager',
+                   return_value=manager):
+            assert session.shared_folders_pending(
+                'node01', [_folder('logs', '/srv/logs')],
+                vm_active=False) is False
