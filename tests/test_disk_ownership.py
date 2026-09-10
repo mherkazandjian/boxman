@@ -419,6 +419,7 @@ def _diff(vm_state='shut off', removed=(), refused=(), unowned=(),
         'refused_disk_removals': list(refused),
         'unowned_disks': list(unowned),
         'disk_conflicts': [],
+        'shared_folders_restart_pending': False,
         'has_disk_records': True,
         'new_cdroms': [], 'removed_cdroms': [], 'changed_cdroms': [],
         'new_shared_folders': [], 'removed_shared_folders': [],
@@ -825,3 +826,59 @@ class TestAConflictFailsBeforeAnyMutation:
         mgr.provider.update_vm_disks.assert_not_called()
         mgr.provider.update_vm_cpu_memory.assert_not_called()
         mgr.provider.remove_vm_disks.assert_not_called()
+
+
+class TestAdoptedDisksAreReportedNotDetached:
+    """boxman attached it, but did not create it (#164 F2 review, finding 5).
+
+    ``attach_only`` follows an existence check at the expected pathname.
+    That is not proof boxman made the file — it could have been put there
+    by hand, or be a naming collision. Such a disk is never detached
+    automatically, and the ``role != data`` check used to skip it in
+    silence, which is the same silence finding 10 was about.
+    """
+
+    def _adopted(self):
+        return DiskRecord('data', 'vdb', 'adopted', DATA)
+
+    def test_an_adopted_disk_is_not_removed(self):
+        removals, _refusals = plan_disk_removals(
+            records=[self._adopted()],
+            desired_disks=[],
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', DATA)])
+
+        assert removals == []
+
+    def test_an_adopted_disk_is_reported(self):
+        _removals, refusals = plan_disk_removals(
+            records=[self._adopted()],
+            desired_disks=[],
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', DATA)])
+
+        assert len(refusals) == 1
+        assert 'did not create it' in refusals[0][1]
+
+    def test_the_root_disk_is_still_silent(self):
+        """It is recorded so it need not be guessed at, not to be reported."""
+        _removals, refusals = plan_disk_removals(
+            records=[DiskRecord('root', 'vda', 'root', ROOT)],
+            desired_disks=[],
+            actual_disks=[_attached('vda', ROOT)])
+
+        assert refusals == []
+
+    def test_a_still_declared_adopted_disk_is_quiet(self):
+        _removals, refusals = plan_disk_removals(
+            records=[self._adopted()],
+            desired_disks=[{'name': 'data', 'target': 'vdb'}],
+            actual_disks=[_attached('vdb', DATA)])
+
+        assert refusals == []
+
+    def test_attach_only_is_recorded_as_adopted(self):
+        from boxman.providers.libvirt.disk_ownership import (
+            ROLE_ADOPTED,
+            ROLE_DATA,
+        )
+
+        assert ROLE_ADOPTED != ROLE_DATA

@@ -329,9 +329,15 @@ class VMStateDiffer:
         return CDROMManager(
             domain_name, provider_config=self.provider_config).get_attached_cdroms()
 
-    def get_actual_shared_folders(self, domain_name: str) -> list[dict[str, Any]]:
+    def get_actual_shared_folders(self, domain_name: str,
+                                  inactive: bool = False) -> list[dict[str, Any]]:
         """
         Get actual filesystem (shared folder) devices from domain XML.
+
+        Args:
+            inactive: read the persistent definition instead of the live
+                domain. See
+                :meth:`SharedFolderManager.get_attached_shared_folders`.
 
         Returns:
             List of dicts with 'name', 'host_path', and 'readonly' keys.
@@ -339,7 +345,8 @@ class VMStateDiffer:
         from .shared_folder import SharedFolderManager
         return SharedFolderManager(
             domain_name,
-            provider_config=self.provider_config).get_attached_shared_folders()
+            provider_config=self.provider_config).get_attached_shared_folders(
+                inactive=inactive)
 
     def diff_vm(self,
                 domain_name: str,
@@ -591,33 +598,58 @@ class VMStateDiffer:
         ]
 
         # --- Shared folder diff ---
-        actual_folders = self.get_actual_shared_folders(domain_name)
-        actual_folder_by_name = {f['name']: f for f in actual_folders}
-        actual_folder_names = set(actual_folder_by_name.keys())
+        # What boxman *configures* is the persistent definition, so that is
+        # what the reconcile compares against. Reading the live domain
+        # instead meant an attachment that had fallen back to config-only
+        # was invisible next run: it was proposed again, and libvirt
+        # rejected the duplicate persistent target -- so even a follow-up
+        # `update --restart` failed before it could restart. It also missed
+        # cancellation entirely: a pending share removed from the config
+        # before the restart produced no removal, because it had never
+        # appeared live (#164 C1 review, finding 7).
+        persistent_folders = self.get_actual_shared_folders(
+            domain_name, inactive=True)
+        live_folders = (
+            self.get_actual_shared_folders(domain_name)
+            if vm_state in self._LIVE_DOMAIN_STATES else persistent_folders)
+
+        def _normalised(folder):
+            return (
+                os.path.abspath(os.path.expanduser(folder.get('host_path', ''))),
+                bool(folder.get('readonly', False)),
+            )
+
+        persistent_by_name = {f['name']: f for f in persistent_folders}
+        live_by_name = {f['name']: f for f in live_folders}
 
         new_shared_folders = []
         changed_shared_folders = []
         desired_folder_names = set()
+        shared_folders_restart_pending = False
 
         for folder_config in (desired_shared_folders or []):
             name = folder_config.get('name', '')
             desired_folder_names.add(name)
-            host_path = os.path.abspath(
-                os.path.expanduser(folder_config.get('host_path', '')))
-            readonly = folder_config.get('readonly', False)
+            desired_state = _normalised(folder_config)
 
-            if name not in actual_folder_names:
+            configured = persistent_by_name.get(name)
+            if configured is None:
                 new_shared_folders.append(folder_config)
-            else:
-                actual = actual_folder_by_name[name]
-                if (actual['host_path'] != host_path or
-                        actual['readonly'] != readonly):
-                    changed_shared_folders.append(folder_config)
+            elif _normalised(configured) != desired_state:
+                changed_shared_folders.append(folder_config)
+
+            # ...and, separately, whether the *live* domain reflects it yet
+            attached = live_by_name.get(name)
+            if attached is None or _normalised(attached) != desired_state:
+                shared_folders_restart_pending = True
 
         removed_shared_folders = [
-            f for f in actual_folders
+            f for f in persistent_folders
             if f['name'] not in desired_folder_names
         ]
+        # a share still live but no longer configured also waits for a boot
+        if any(f['name'] not in desired_folder_names for f in live_folders):
+            shared_folders_restart_pending = True
 
         return {
             'cpu_changed': cpu_changed,
@@ -642,6 +674,7 @@ class VMStateDiffer:
             'new_cdroms': new_cdroms,
             'removed_cdroms': removed_cdroms,
             'changed_cdroms': changed_cdroms,
+            'shared_folders_restart_pending': shared_folders_restart_pending,
             'new_shared_folders': new_shared_folders,
             'removed_shared_folders': removed_shared_folders,
             'changed_shared_folders': changed_shared_folders,

@@ -36,6 +36,7 @@ def _diff(**overrides):
         'refused_disk_removals': [],
         'unowned_disks': [],
         'disk_conflicts': [],
+        'shared_folders_restart_pending': False,
         'new_cdroms': [],
         'removed_cdroms': [],
         'changed_cdroms': [],

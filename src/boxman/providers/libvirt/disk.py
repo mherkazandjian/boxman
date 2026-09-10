@@ -6,7 +6,12 @@ from boxman import log
 from boxman.exceptions import ProvisionError
 
 from .commands import LibVirtCommandBase, VirshCommand
-from .disk_ownership import DEFAULT_DISK_TARGET, record_attached_disk
+from .disk_ownership import (
+    DEFAULT_DISK_TARGET,
+    ROLE_ADOPTED,
+    ROLE_DATA,
+    record_attached_disk,
+)
 
 
 def libvirt_disk_source(disk_path: str) -> str:
@@ -256,7 +261,11 @@ class DiskManager:
                 record_attached_disk(
                     self.virsh, self.vm_name,
                     name=disk_name, target=target_dev,
-                    source=libvirt_disk_source(disk_path))
+                    source=libvirt_disk_source(disk_path),
+                    # attach_only means the image already existed, which is
+                    # not proof boxman created it (#164 F2 review)
+                    role=(ROLE_ADOPTED if disk_config.get("attach_only")
+                          else ROLE_DATA))
             except ProvisionError as exc:
                 # The disk is attached and working; only the bookkeeping
                 # failed. Do not fail the attach over it -- but say so

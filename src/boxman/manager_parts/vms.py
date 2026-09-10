@@ -746,7 +746,8 @@ class VMsMixin:
                 diff['changed_shared_folders'] or
                 diff['memballoon_changed'] or
                 diff['memballoon_restart_pending'] or
-                diff['removed_disks']
+                diff['removed_disks'] or
+                diff['shared_folders_restart_pending']
             )
 
             # A declaration whose target still holds a different disk that
@@ -995,6 +996,13 @@ class VMsMixin:
                     return
                 if folder_result.get('restart_needed'):
                     restart_needed = True
+
+            # A share that is configured but not live is pending whether or
+            # not this run is what configured it -- otherwise an attachment
+            # that fell back to config-only last time reported nothing
+            # outstanding (#164 C1 review, finding 7).
+            if diff['shared_folders_restart_pending']:
+                restart_needed = True
 
             # Every change that cannot reach a live guest, in one place.
             # memballoon only ever landed in the persistent config, and was

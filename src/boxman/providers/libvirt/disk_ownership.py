@@ -42,6 +42,14 @@ DEFAULT_DISK_TARGET = "vdb"
 #: ever candidates for removal.
 ROLE_DATA = "data"
 
+#: role of a disk boxman attached but did **not** create -- its image file
+#: already existed at the expected pathname, so it was attached as-is
+#: rather than recreated. An existence check at a predictable path is not
+#: proof boxman made the file: it could have been supplied by hand, or be
+#: a naming collision. Never removed automatically, and reported rather
+#: than silently skipped (#164 F2 review, finding 5).
+ROLE_ADOPTED = "adopted"
+
 #: role of the disk the VM boots from. Recorded so that a future reader
 #: never has to infer it, and refused explicitly by the removal rule.
 ROLE_ROOT = "root"
@@ -230,10 +238,18 @@ def plan_disk_removals(
     refusals: list[tuple[DiskRecord, str]] = []
 
     for record in records:
-        if record.role != ROLE_DATA:
+        if record.role == ROLE_ROOT:
             # the root disk is recorded so it never has to be guessed at
             continue
         if record.name in desired_names:
+            continue
+        if record.role != ROLE_DATA:
+            # adopted, or a role a future version added: boxman did not
+            # create it, so it says so instead of quietly doing nothing
+            refusals.append((
+                record,
+                f"boxman attached it but did not create it (role "
+                f"{record.role!r}); detach it by hand if you want it gone"))
             continue
 
         if record.target in desired_targets:
