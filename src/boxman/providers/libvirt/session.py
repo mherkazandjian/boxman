@@ -79,7 +79,10 @@ class LibVirtSession(SessionConfigMixin):
             uri=self.uri,
             disk_dir=vm_dir,
             vm_name=vm_name,
-            keep_uuid=False)
+            keep_uuid=False,
+            # so manifest-relative xml_path / image_path can be resolved
+            # against the manifest's own origin (#164 F1)
+            manifest_uri=manifest_uri)
 
         image_importer.import_image()
 

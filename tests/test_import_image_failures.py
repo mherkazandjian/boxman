@@ -124,7 +124,7 @@ class TestImporterRaises:
     def test_unreadable_xml_raises(self, tmp_path: Path):
         manifest = _build_package(tmp_path / "pkg", write_xml=False)
         importer = self._importer(manifest, tmp_path / "dst", vm_name="vm1")
-        with pytest.raises(ImageImportError, match="vm definition xml"):
+        with pytest.raises(ImageImportError, match="xml_path not found"):
             importer.import_image()
 
     def test_unreadable_xml_copies_nothing(self, tmp_path: Path):
@@ -182,7 +182,7 @@ class TestImporterRaises:
         importer = self._importer(manifest, tmp_path / "dst", vm_name="vm1")
         with patch("boxman.providers.libvirt.import_image.run",
                    side_effect=_fake_run()):
-            with pytest.raises(ImageImportError, match="disk image file not found"):
+            with pytest.raises(ImageImportError, match="image_path not found"):
                 importer.import_image()
 
     def test_size_mismatch_raises(self, tmp_path: Path):
@@ -359,3 +359,258 @@ class TestProviderLookupIsSafe:
         assert code == 0
         issued = [c.args[0] for c in run_fn.call_args_list]
         assert any("virsh -c qemu:///system" in c for c in issued)
+
+
+def _remote_package(served: dict[str, bytes], base: str = "https://images.example/pkg/"):
+    """A ``download_url`` double serving *served* (URL -> bytes)."""
+
+    def download_url(url: str, dst_path: str, **kwargs) -> bool:
+        if url not in served:
+            return False
+        Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(dst_path).write_bytes(served[url])
+        return True
+
+    return download_url
+
+
+def _served_package(base: str = "https://images.example/pkg/",
+                    xml_path: str = "vm/vm.xml",
+                    image_path: str = "vm/disk.qcow2",
+                    xml_body: str = SAMPLE_VM_XML) -> tuple[dict, dict[str, bytes]]:
+    manifest = {"xml_path": xml_path, "image_path": image_path,
+                "provider": "libvirt"}
+    served = {
+        base + "vm/vm.xml": xml_body.encode(),
+        base + "vm/disk.qcow2": b"y" * 2048,
+    }
+    return manifest, served
+
+
+@pytest.mark.unit
+class TestRemoteManifestImport:
+    """A manifest fetched over http(s) resolves its siblings against itself.
+
+    ``load_manifest_from_uri`` has always accepted http(s), and the CLI
+    advertises ``--uri``. But the manifest was downloaded to a temp
+    directory of its own and ``xml_path`` / ``image_path`` were then
+    resolved against *that* directory, where nothing else existed -- so a
+    remote import could not succeed at all (#164 F1).
+    """
+
+    BASE = "https://images.example/pkg/"
+
+    def _importer(self, tmp_path: Path, manifest: dict, **kwargs):
+        local = tmp_path / "manifest.json"
+        local.write_text(json.dumps(manifest))
+        return ImageImporter(
+            manifest_path=str(local),
+            manifest_uri=self.BASE + "manifest.json",
+            uri="qemu:///system",
+            disk_dir=str(tmp_path / "dst"),
+            **kwargs,
+        )
+
+    def test_remote_siblings_are_fetched(self, tmp_path: Path):
+        manifest, served = _served_package(self.BASE)
+        importer = self._importer(tmp_path, manifest)
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            importer.import_image()
+        vm_dir = tmp_path / "dst" / "packaged-vm"
+        assert (vm_dir / "disk.qcow2").read_bytes() == b"y" * 2048
+        assert (vm_dir / "packaged-vm.xml").exists()
+
+    def test_raw_fetched_xml_is_not_left_in_the_vm_directory(self, tmp_path: Path):
+        """Only the edited definition ships, not the publisher's original.
+
+        Everything in the staging directory becomes the vm directory, so a
+        raw download landing there would leave a second, unedited domain
+        definition still pointing at the publisher's disk path.
+        """
+        manifest, served = _served_package(self.BASE)
+        importer = self._importer(tmp_path, manifest)
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            importer.import_image()
+        vm_dir = tmp_path / "dst" / "packaged-vm"
+        assert sorted(p.name for p in vm_dir.iterdir()) == [
+            "disk.qcow2", "packaged-vm.xml"]
+
+    def test_imported_xml_points_at_the_final_disk(self, tmp_path: Path):
+        manifest, served = _served_package(self.BASE)
+        importer = self._importer(tmp_path, manifest)
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            importer.import_image()
+        vm_dir = tmp_path / "dst" / "packaged-vm"
+        xml = (vm_dir / "packaged-vm.xml").read_text()
+        assert str(vm_dir / "disk.qcow2") in xml
+        assert "/original/location/disk.qcow2" not in xml
+
+    @pytest.mark.parametrize("key", ["xml_path", "image_path"])
+    def test_absolute_reference_is_refused(self, tmp_path: Path, key: str):
+        """An absolute reference used to resolve to a local host path.
+
+        ``os.path.join(dirname(manifest), '/etc/shadow')`` is
+        ``/etc/shadow`` -- a remote manifest could name any readable file on
+        the importing host and have it copied in as the vm's disk.
+        """
+        manifest, served = _served_package(self.BASE)
+        manifest[key] = "/etc/shadow"
+        importer = self._importer(tmp_path, manifest)
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            with pytest.raises(ImageImportError, match="absolute"):
+                importer.import_image()
+
+    @pytest.mark.parametrize("reference", [
+        "file:///etc/shadow",
+        "ftp://elsewhere/disk.qcow2",
+        "gopher://old/disk.qcow2",
+    ])
+    def test_non_http_scheme_is_refused(self, tmp_path: Path, reference: str):
+        manifest, served = _served_package(self.BASE)
+        manifest["image_path"] = reference
+        importer = self._importer(tmp_path, manifest)
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            with pytest.raises(ImageImportError, match="scheme"):
+                importer.import_image()
+
+    def test_failed_download_raises(self, tmp_path: Path):
+        manifest, served = _served_package(self.BASE)
+        del served[self.BASE + "vm/disk.qcow2"]
+        importer = self._importer(tmp_path, manifest)
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            with pytest.raises(ImageImportError, match="failed to download"):
+                importer.import_image()
+
+    def test_failure_leaves_no_directory_behind(self, tmp_path: Path):
+        """Neither the vm directory nor the staging directory survives."""
+        manifest, served = _served_package(self.BASE)
+        del served[self.BASE + "vm/disk.qcow2"]
+        importer = self._importer(tmp_path, manifest)
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            with pytest.raises(ImageImportError):
+                importer.import_image()
+        dst = tmp_path / "dst"
+        assert not (dst / "packaged-vm").exists()
+        assert list(dst.iterdir()) == []
+
+
+@pytest.mark.unit
+class TestVmNameValidation:
+    """The vm name becomes a directory component under ``--directory``.
+
+    For a remote import it can come from an XML supplied by whoever
+    published the manifest, so a name like ``../../etc`` would place the
+    import outside the directory the user asked for (#164 F1).
+    """
+
+    BASE = "https://images.example/pkg/"
+
+    def _importer(self, tmp_path: Path, manifest: dict, **kwargs):
+        local = tmp_path / "manifest.json"
+        local.write_text(json.dumps(manifest))
+        return ImageImporter(
+            manifest_path=str(local),
+            manifest_uri=self.BASE + "manifest.json",
+            uri="qemu:///system",
+            disk_dir=str(tmp_path / "dst"),
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("bad", ["../escape", "../../etc", "a/b", "/abs",
+                                     "..", ".", "   "])
+    def test_bad_name_from_xml_is_refused(self, tmp_path: Path, bad: str):
+        xml = SAMPLE_VM_XML.replace("<name>packaged-vm</name>", f"<name>{bad}</name>")
+        manifest, served = _served_package(self.BASE, xml_body=xml)
+        importer = self._importer(tmp_path, manifest)
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            with pytest.raises(ImageImportError, match="vm name"):
+                importer.import_image()
+        assert not (tmp_path / "dst" / "escape").exists()
+        assert not (tmp_path.parent / "escape").exists()
+
+    @pytest.mark.parametrize("bad", ["../escape", "a/b", "/abs", ".."])
+    def test_bad_name_from_cli_is_refused(self, tmp_path: Path, bad: str):
+        manifest, served = _served_package(self.BASE)
+        importer = self._importer(tmp_path, manifest, vm_name=bad)
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            with pytest.raises(ImageImportError, match="vm name"):
+                importer.import_image()
+
+
+@pytest.mark.smoke
+class TestRemoteImportThroughTheCli:
+    """The remote path end to end, through ``LibVirtSession``.
+
+    ``TestRemoteManifestImport`` builds the importer directly and so cannot
+    see the session forgetting to pass ``manifest_uri`` -- without it the
+    importer treats a remote manifest as local and resolves its siblings
+    against a temp directory that holds only the manifest. This drives the
+    CLI so the plumbing is covered too.
+    """
+
+    BASE = "https://images.example/pkg/"
+
+    def test_remote_import_via_cli(self, tmp_path: Path):
+        manifest, served = _served_package(self.BASE)
+        served[self.BASE + "manifest.json"] = json.dumps(manifest).encode()
+        dst = tmp_path / "dst"
+        argv = [
+            "--boxman-conf", str(_boxman_conf(tmp_path)),
+            "import-image",
+            "--uri", self.BASE + "manifest.json",
+            "--directory", str(dst),
+        ]
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            code = _run_cli(argv)
+        assert code == 0
+        assert (dst / "packaged-vm" / "disk.qcow2").read_bytes() == b"y" * 2048
+        assert (dst / "packaged-vm" / "packaged-vm.xml").exists()
+
+    def test_remote_import_failure_via_cli_exits_2(self, tmp_path: Path):
+        manifest, served = _served_package(self.BASE)
+        served[self.BASE + "manifest.json"] = json.dumps(manifest).encode()
+        del served[self.BASE + "vm/disk.qcow2"]
+        dst = tmp_path / "dst"
+        argv = [
+            "--boxman-conf", str(_boxman_conf(tmp_path)),
+            "import-image",
+            "--uri", self.BASE + "manifest.json",
+            "--directory", str(dst),
+        ]
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            code = _run_cli(argv)
+        assert code == 2
+        assert not (dst / "packaged-vm").exists()
