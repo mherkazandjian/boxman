@@ -310,9 +310,18 @@ class VMStateDiffer:
                             disk_prefix: str) -> str:
         """
         Compute the expected disk file path, matching DiskManager.configure_from_disk_config logic.
+
+        Through the same normalisation DiskManager uses -- not a second
+        copy of it. ``.get("name", "disk")`` defaults only an *absent*
+        key, so ``name: null`` predicted ``<prefix>_None.qcow2`` and
+        ``name: ""`` predicted ``<prefix>_.qcow2`` while creation resolved
+        both to ``disk``. The predicted file was absent, so the entry was
+        not marked attach_only, and creation then ran ``qemu-img create``
+        over the existing ``<prefix>_disk.qcow2`` and destroyed it. No
+        race, no detach (#164 F2 review round 4).
         """
         from .disk import disk_path_for
-        disk_name = disk_config.get("name", "disk")
+        disk_name = disk_logical_name(disk_config)
         driver = disk_config.get("driver", {})
         driver_type = driver.get("type", "qcow2")
         return disk_path_for(workdir, disk_name,

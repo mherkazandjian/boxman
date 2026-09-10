@@ -207,8 +207,16 @@ class TestTheShellActuallyRunsThem:
         env = dict(os.environ)
         env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        # urllib is blocked in every downloader subprocess, not only in
+        # the dedicated guard test -- otherwise a stub that fails lets the
+        # real fallback run behind a passing assertion (#164 F1 review 4).
+        preamble = (
+            "import urllib.request\n"
+            "urllib.request.urlopen = lambda *a, **k: ("
+            "_ for _ in ()).throw(RuntimeError('urllib blocked in test'))\n"
+        )
         return subprocess.run(
-            [sys.executable, "-c", body],
+            [sys.executable, "-c", preamble + body],
             cwd=workdir, env=env, capture_output=True, text=True, timeout=120)
 
     def test_download_url_does_not_execute_a_hostile_url(self, tmp_path: Path):
@@ -273,8 +281,16 @@ class TestVirshCommandsThroughARealShell:
         env = dict(os.environ)
         env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        # urllib is blocked in every downloader subprocess, not only in
+        # the dedicated guard test -- otherwise a stub that fails lets the
+        # real fallback run behind a passing assertion (#164 F1 review 4).
+        preamble = (
+            "import urllib.request\n"
+            "urllib.request.urlopen = lambda *a, **k: ("
+            "_ for _ in ()).throw(RuntimeError('urllib blocked in test'))\n"
+        )
         return subprocess.run(
-            [sys.executable, "-c", body],
+            [sys.executable, "-c", preamble + body],
             cwd=workdir, env=env, capture_output=True, text=True, timeout=120)
 
     def test_a_hostile_connection_uri_is_one_literal_argument(self, tmp_path):
@@ -335,3 +351,54 @@ class TestVirshCommandsThroughARealShell:
 
         assert proc.returncode == 0, proc.stderr
         assert 'RESULT True URLLIB False' in proc.stdout, proc.stdout
+
+
+class TestTheCurlFallbackIsExercised:
+    """wget succeeding would otherwise hide curl's shell handling.
+
+    The stub downloaders now write a destination, so wget always wins and
+    curl is never reached — its quoting would go untested (#164 F1 review
+    round 4, non-blocking follow-up).
+    """
+
+    def _run_with_failing_wget(self, workdir: Path, body: str):
+        bindir = _stub_bin(workdir, ["curl", "sha256sum"])
+        # a wget that records its argv and then fails
+        wget = bindir / "wget"
+        log = workdir / "argv.log"
+        wget.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"open({str(log)!r}, 'a').write(chr(31).join(sys.argv) + chr(10))\n"
+            "sys.exit(1)\n"
+        )
+        wget.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        preamble = (
+            "import urllib.request\n"
+            "urllib.request.urlopen = lambda *a, **k: ("
+            "_ for _ in ()).throw(RuntimeError('urllib blocked in test'))\n"
+        )
+        return subprocess.run(
+            [sys.executable, "-c", preamble + body],
+            cwd=workdir, env=env, capture_output=True, text=True, timeout=120)
+
+    def test_curl_receives_a_hostile_url_literally(self, tmp_path: Path):
+        url = f"https://example.invalid/{LIVE_PAYLOAD}.iso"
+        proc = self._run_with_failing_wget(tmp_path, (
+            "from boxman.utils.http_download import download_url\n"
+            f"ok = download_url({url!r}, 'dst.iso')\n"
+            "print('RESULT', ok)\n"
+        ))
+
+        assert proc.returncode == 0, proc.stderr
+        assert not (tmp_path / "pwned").exists(), (
+            "the shell executed $(touch pwned) from the url via curl")
+        calls = _recorded(tmp_path)
+        # reachability: both downloaders ran, so curl really was exercised
+        assert any(c[0].endswith('wget') for c in calls), calls
+        assert any(c[0].endswith('curl') for c in calls), calls
+        assert any(url in c for c in calls if c[0].endswith('curl')), calls
+        assert 'RESULT True' in proc.stdout, proc.stdout
