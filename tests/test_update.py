@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.disk import DiskManager
 from boxman.providers.libvirt.virsh_edit import VirshEdit
@@ -737,14 +738,30 @@ class TestVMStateDifferDiskParsing:
         mock_size.assert_any_call('test-vm', 'vda')
         mock_size.assert_any_call('test-vm', 'vdb')
 
-    def test_get_actual_disks_handles_failure(self):
+    def test_get_actual_disks_raises_on_failure(self):
+        """A failed query must not read as "this domain has no disks".
+
+        It used to return [], which is a real answer -- so every declared
+        disk looked absent and the diff proposed attaching them all
+        (#164 F2).
+        """
         differ = VMStateDiffer.__new__(VMStateDiffer)
         differ.virsh = MagicMock()
         differ.logger = MagicMock()
-        differ.virsh.execute.return_value = MagicMock(ok=False)
+        differ.virsh.execute.return_value = MagicMock(ok=False, stderr='boom')
 
-        disks = differ.get_actual_disks('test-vm')
-        assert disks == []
+        with pytest.raises(ProvisionError, match='could not list the disks'):
+            differ.get_actual_disks('test-vm')
+
+    def test_get_actual_disks_returns_empty_for_a_diskless_domain(self):
+        """The other half: an empty list is still a valid answer."""
+        differ = VMStateDiffer.__new__(VMStateDiffer)
+        differ.virsh = MagicMock()
+        differ.logger = MagicMock()
+        differ.virsh.execute.return_value = MagicMock(
+            ok=True, stdout='Target   Source\n----------------\n')
+
+        assert differ.get_actual_disks('test-vm') == []
 
 
 # ---------------------------------------------------------------------------

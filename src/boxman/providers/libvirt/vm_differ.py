@@ -220,11 +220,21 @@ class VMStateDiffer:
         Returns:
             List of dicts with 'target', 'source', 'size_mb' keys.
             Only includes file-backed disk devices (excludes cdroms, etc.).
+
+        Raises:
+            ProvisionError: if the domain's disks cannot be listed. An empty
+                list is a real answer -- "this domain has no file-backed
+                disks" -- and returning it for "the query failed" made every
+                declared disk look absent, so the diff proposed attaching
+                them all. Once a removal path reads this list, the same
+                empty result would read as "nothing is attached" (#164 F2).
         """
         result = self.virsh.execute('domblklist', domain_name, '--details', warn=True)
         if not result.ok:
-            self.logger.warning(f"failed to get disk list for {domain_name}")
-            return []
+            raise ProvisionError(
+                f"could not list the disks of {domain_name}: "
+                f"{(result.stderr or '').strip() or 'virsh domblklist failed'}"
+            )
 
         disks = []
         for row in parse_domblklist(result.stdout):
