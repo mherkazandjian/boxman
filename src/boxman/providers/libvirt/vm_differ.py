@@ -5,6 +5,11 @@ from boxman import log
 from boxman.exceptions import ProvisionError
 
 from .commands import VirshCommand
+from .disk_ownership import (
+    plan_disk_removals,
+    read_disk_records,
+    unowned_disks,
+)
 from .virsh_edit import VirshEdit
 from .virsh_parse import parse_domblklist
 
@@ -209,6 +214,17 @@ class VMStateDiffer:
             'stats_period': config.get('stats_period'),
         }
 
+    def get_disk_records(self, domain_name: str):
+        """
+        The disks boxman recorded attaching to *domain_name*.
+
+        A probe of its own, like :meth:`get_actual_disks`, so it can be
+        stubbed the same way. ``None`` means the domain carries no boxman
+        ownership metadata -- which is never grounds for detaching
+        anything (#164 F2).
+        """
+        return read_disk_records(self.virsh, domain_name)
+
     def get_actual_disks(self, domain_name: str) -> list[dict[str, Any]]:
         """
         Get actual disk info from virsh domblklist + virsh domblkinfo.
@@ -405,6 +421,10 @@ class VMStateDiffer:
 
         # --- Disk diff ---
         actual_disks = self.get_actual_disks(domain_name)
+        # The disk the VM boots from, so it can be excluded from the
+        # "attached but neither declared nor recorded" report rather than
+        # shown to the operator as a stray every single run.
+        root_disk_source = actual_disks[0]['source'] if actual_disks else None
         actual_targets = {d['target'] for d in actual_disks}
         actual_by_target = {d['target']: d for d in actual_disks}
 
@@ -446,6 +466,19 @@ class VMStateDiffer:
                         f"({desired_size}M) < actual size ({actual_disk['size_mb']}M). "
                         f"Shrinking is not supported, skipping."
                     )
+
+        # --- Disk removals ---
+        #
+        # Decided against what boxman recorded attaching, never inferred
+        # from what is attached: get_actual_disks() returns the root disk
+        # too, so "attached but not declared" starts by removing it
+        # (#164 F2). A domain with no ownership record yields nothing.
+        disk_records = self.get_disk_records(domain_name)
+        removed_disks, refused_disk_removals = plan_disk_removals(
+            disk_records, desired_disks or [], actual_disks)
+        unowned = unowned_disks(
+            disk_records, desired_disks or [], actual_disks,
+            root_source=root_disk_source)
 
         # --- CDROM diff ---
         #
@@ -586,6 +619,9 @@ class VMStateDiffer:
             'actual_max_memory_mb': actual_max_memory_mb,
             'new_disks': new_disks,
             'resize_disks': resize_disks,
+            'removed_disks': removed_disks,
+            'refused_disk_removals': refused_disk_removals,
+            'unowned_disks': unowned,
             'new_cdroms': new_cdroms,
             'removed_cdroms': removed_cdroms,
             'changed_cdroms': changed_cdroms,

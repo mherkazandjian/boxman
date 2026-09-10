@@ -744,8 +744,21 @@ class VMsMixin:
                 diff['removed_shared_folders'] or
                 diff['changed_shared_folders'] or
                 diff['memballoon_changed'] or
-                diff['memballoon_restart_pending']
+                diff['memballoon_restart_pending'] or
+                diff['removed_disks']
             )
+
+            # Reported, never acted on: boxman recorded attaching these but
+            # what is at the target now is not what it attached, so it has
+            # no basis for detaching it (#164 F2).
+            for record, reason in diff['refused_disk_removals']:
+                self.logger.warning(
+                    f"VM {vm_name}: not detaching '{record.name}' -- {reason}")
+            for stray in diff['unowned_disks']:
+                self.logger.warning(
+                    f"VM {vm_name}: {stray['target']} ({stray['source']}) is "
+                    f"attached but neither declared nor recorded by boxman -- "
+                    f"leaving it alone")
 
             if not has_changes:
                 self.logger.info(f"VM {vm_name}: no changes detected")
@@ -775,6 +788,9 @@ class VMsMixin:
                     for r in diff['resize_disks']
                 ]
                 changes.append(f"resize disks: {', '.join(resizes)}")
+            if diff['removed_disks']:
+                names = [f"{r.name} ({r.target})" for r in diff['removed_disks']]
+                changes.append(f"detach disks: {', '.join(names)}")
             if diff['new_cdroms']:
                 names = [c.get('name', '?') for c in diff['new_cdroms']]
                 changes.append(f"new cdroms: {', '.join(names)}")
@@ -802,7 +818,6 @@ class VMsMixin:
                     f"memballoon live state: {diff['live_memballoon']} -> "
                     f"{diff['desired_memballoon']}")
             self.logger.info(f"VM {vm_name}: changes detected: {'; '.join(changes)}")
-
             if dry_run:
                 result_queue.put((vm_name, {
                     'status': 'dry_run',
@@ -858,14 +873,24 @@ class VMsMixin:
                         f"take effect")
 
             # disks
-            if diff['new_disks'] or diff['resize_disks']:
+            #
+            # Detaching from a live guest pulls a device out from under a
+            # filesystem it may still be using, so it waits for a shut-off
+            # guest or for --restart, which is the operator saying the guest
+            # may go down (#164 F2).
+            detach_now = (not vm_active) or allow_restart
+            deferred_detach = [] if detach_now else diff['removed_disks']
+            if deferred_detach:
+                restart_needed = True
+            if diff['new_disks'] or diff['resize_disks'] or diff['removed_disks']:
                 disk_ok = self.provider.update_vm_disks(
                     vm_name=full_vm_name,
                     new_disks=diff['new_disks'],
                     resize_disks=diff['resize_disks'],
                     workdir=workdir,
                     disk_prefix=full_vm_name,
-                    vm_running=vm_running
+                    vm_running=vm_running,
+                    removed_disks=diff['removed_disks'] if detach_now else []
                 )
                 if not disk_ok:
                     result_queue.put((vm_name, {

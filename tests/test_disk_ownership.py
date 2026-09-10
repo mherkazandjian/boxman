@@ -268,3 +268,185 @@ class TestReadingRecordsFromADomain:
         records = records_from_xml(written)
         assert [(r.name, r.source) for r in records] == [
             ('scratch', '/vm/scratch.qcow2')]
+
+
+# ---------------------------------------------------------------------------
+# The wiring: what `update` actually does with a cleared removal.
+# ---------------------------------------------------------------------------
+
+from unittest.mock import patch  # noqa: E402
+
+from boxman.providers.libvirt.vm_differ import VMStateDiffer  # noqa: E402
+from conftest import make_bare_manager  # noqa: E402
+
+
+def _diff(vm_state='shut off', removed=(), refused=(), unowned=(),
+          new_disks=(), resize_disks=()):
+    return {
+        'cpu_changed': False, 'memory_changed': False,
+        'max_vcpus_changed': False, 'max_memory_changed': False,
+        'new_disks': list(new_disks), 'resize_disks': list(resize_disks),
+        'removed_disks': list(removed),
+        'refused_disk_removals': list(refused),
+        'unowned_disks': list(unowned),
+        'new_cdroms': [], 'removed_cdroms': [], 'changed_cdroms': [],
+        'new_shared_folders': [], 'removed_shared_folders': [],
+        'changed_shared_folders': [],
+        'memballoon_changed': False, 'memballoon_restart_pending': False,
+        'actual_cpus': 2, 'desired_cpus': 2,
+        'actual_memory_mb': 2048, 'desired_memory_mb': 2048,
+        'desired_max_vcpus': None, 'desired_max_memory_mb': None,
+        'vm_state': vm_state,
+    }
+
+
+def _run(diff, allow_restart=False, disks_ok=True):
+    mgr = make_bare_manager({'project': 'demo'})
+    mgr.provider = MagicMock()
+    mgr.provider.provider_config = {'uri': 'qemu:///system'}
+    mgr.provider.update_vm_disks.return_value = disks_ok
+    mgr.provider.update_vm_cpu_memory.return_value = {
+        'success': True, 'restart_needed': False}
+    mgr.provider.shutdown_and_wait.return_value = True
+    mgr.provider.start_vm.return_value = True
+    queue = MagicMock()
+
+    with patch.object(VMStateDiffer, 'diff_vm', return_value=diff):
+        mgr._update_single_vm('cluster1', {'workdir': '/tmp'}, 'node01',
+                              {'disks': []}, queue,
+                              dry_run=False, allow_restart=allow_restart)
+
+    return mgr, queue.put.call_args.args[0][1]
+
+
+class TestRemovalIsAppliedToAStoppedGuest:
+
+    def test_the_detach_is_handed_to_the_provider(self):
+        record = _record()
+        mgr, result = _run(_diff(vm_state='shut off', removed=[record]))
+
+        kwargs = mgr.provider.update_vm_disks.call_args.kwargs
+        assert kwargs['removed_disks'] == [record]
+        assert result['status'] == 'updated'
+
+    def test_the_detach_is_named_in_the_changes(self):
+        _mgr, result = _run(_diff(vm_state='shut off', removed=[_record()]))
+
+        assert 'detach disks: data (vdb)' in result['details']
+
+
+class TestRemovalIsDeferredOnALiveGuest:
+    """Pulling a disk out from under a mounted filesystem waits."""
+
+    def test_a_running_guest_defers_without_the_flag(self):
+        mgr, result = _run(_diff(vm_state='running', removed=[_record()]))
+
+        assert mgr.provider.update_vm_disks.call_args.kwargs['removed_disks'] == []
+        assert result['status'] == 'needs_restart'
+
+    def test_a_paused_guest_defers_too(self):
+        mgr, result = _run(_diff(vm_state='paused', removed=[_record()]))
+
+        assert mgr.provider.update_vm_disks.call_args.kwargs['removed_disks'] == []
+        assert result['status'] == 'needs_restart'
+
+    def test_the_restart_flag_authorises_the_detach(self):
+        record = _record()
+        mgr, _result = _run(_diff(vm_state='running', removed=[record]),
+                            allow_restart=True)
+
+        assert mgr.provider.update_vm_disks.call_args.kwargs['removed_disks'] == [record]
+
+
+class TestRefusalsAndStraysAreReported:
+
+    def test_a_refusal_is_logged_and_not_applied(self):
+        record = _record()
+        mgr, _result = _run(_diff(
+            vm_state='shut off',
+            refused=[(record, 'the disk at vdb is now something else')]))
+
+        warnings = [c.args[0] for c in mgr.logger.warning.call_args_list if c.args]
+        assert any("not detaching 'data'" in w for w in warnings)
+        # nothing to apply -- and the refusal is still reported, which it was
+        # not while the report sat after the "no changes detected" return
+        mgr.provider.update_vm_disks.assert_not_called()
+
+    def test_a_stray_disk_is_reported_and_left_alone(self):
+        mgr, _result = _run(_diff(
+            vm_state='shut off',
+            removed=[_record()],
+            unowned=[_attached('vdc', '/vm/attached-by-hand.qcow2')]))
+
+        warnings = [c.args[0] for c in mgr.logger.warning.call_args_list if c.args]
+        assert any('neither declared nor recorded' in w for w in warnings)
+        assert mgr.provider.update_vm_disks.call_args.kwargs['removed_disks'] == [
+            _record()]
+
+
+class TestDetachOrderingAndSafety:
+    """The provider-side half: ordering, and never deleting the image."""
+
+    def _session(self):
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        session = LibVirtSession.__new__(LibVirtSession)
+        session.provider_config = {'uri': 'qemu:///system'}
+        session.logger = MagicMock()
+        return session
+
+    def test_removals_are_skipped_after_a_failed_addition(self):
+        """A detach after a failed add removes a disk whose replacement
+        never arrived."""
+        session = self._session()
+        disk_manager = MagicMock()
+        disk_manager.configure_from_disk_config.return_value = False
+
+        with patch('boxman.providers.libvirt.session.DiskManager',
+                   return_value=disk_manager), \
+             patch('boxman.providers.libvirt.session.detach_disk') as detach:
+            ok = session.update_vm_disks(
+                vm_name='node01',
+                new_disks=[{'name': 'scratch', 'target': 'vdc'}],
+                resize_disks=[], workdir='/tmp', disk_prefix='node01',
+                vm_running=False, removed_disks=[_record()])
+
+        assert ok is False
+        detach.assert_not_called()
+
+    def test_removals_run_when_everything_before_them_worked(self):
+        session = self._session()
+        disk_manager = MagicMock()
+        disk_manager.configure_from_disk_config.return_value = True
+
+        with patch('boxman.providers.libvirt.session.DiskManager',
+                   return_value=disk_manager), \
+             patch('boxman.providers.libvirt.session.detach_disk') as detach, \
+             patch('boxman.providers.libvirt.session.forget_disk') as forget:
+            ok = session.update_vm_disks(
+                vm_name='node01',
+                new_disks=[{'name': 'scratch', 'target': 'vdc'}],
+                resize_disks=[], workdir='/tmp', disk_prefix='node01',
+                vm_running=False, removed_disks=[_record()])
+
+        assert ok is True
+        detach.assert_called_once()
+        forget.assert_called_once()
+
+    def test_detaching_never_removes_the_image_file(self, tmp_path):
+        """The qcow2 outlives the detach, deliberately."""
+        from boxman.providers.libvirt.disk_ownership import detach_disk
+
+        image = tmp_path / "data.qcow2"
+        image.write_bytes(b"important")
+        virsh = MagicMock()
+        virsh.execute_shell.return_value = MagicMock(ok=True, stderr='')
+
+        detach_disk(virsh, 'node01', 'vdb')
+
+        assert image.read_bytes() == b"important"
+        issued = virsh.execute_shell.call_args.args[0]
+        assert 'detach-disk' in issued
+        for destructive in ('rm ', 'qemu-img', '--wipe-storage',
+                            '--delete-storage'):
+            assert destructive not in issued

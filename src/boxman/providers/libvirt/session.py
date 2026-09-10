@@ -6,7 +6,7 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from boxman import log
-from boxman.exceptions import ConfigError
+from boxman.exceptions import ConfigError, ProvisionError
 
 from ..session_base import SessionConfigMixin
 from . import net_reconcile
@@ -16,6 +16,7 @@ from .commands import VirshCommand
 from .destroy_vm import DestroyVM, shutdown_and_wait
 from .disk import DiskManager
 from .disk_cleanup import remove_vm_disks
+from .disk_ownership import detach_disk, forget_disk
 from .import_image import ImageImporter
 from .iso_boot_vm import IsoBootVM
 from .net import Network, NetworkInterface
@@ -2019,7 +2020,8 @@ class LibVirtSession(SessionConfigMixin):
                         resize_disks: list[dict[str, Any]],
                         workdir: str,
                         disk_prefix: str,
-                        vm_running: bool) -> bool:
+                        vm_running: bool,
+                        removed_disks: list[Any] | None = None) -> bool:
         """
         Apply disk changes: create+attach new disks and resize existing ones.
 
@@ -2030,6 +2032,10 @@ class LibVirtSession(SessionConfigMixin):
             workdir: Working directory for disk images
             disk_prefix: Prefix for disk image filenames
             vm_running: Whether the VM is currently running
+            removed_disks: DiskRecords cleared for detaching by
+                :func:`plan_disk_removals`. The caller decides *whether*
+                a detach is allowed to happen now; this applies the ones
+                it is handed.
 
         Returns:
             True if all operations succeeded, False otherwise
@@ -2065,5 +2071,26 @@ class LibVirtSession(SessionConfigMixin):
                 self.logger.error(
                     f"failed to resize disk {resize_info['target']} on {vm_name}")
                 success = False
+
+        # Detach last, and only if everything before it worked. A removal
+        # applied after a failed addition detaches a disk whose replacement
+        # never arrived (#164 F2) -- the same ordering the cdrom path uses.
+        if removed_disks:
+            if not success:
+                self.logger.warning(
+                    f"VM {vm_name}: not detaching "
+                    f"{', '.join(r.name for r in removed_disks)} because an "
+                    f"earlier disk change failed")
+                return success
+            for record in removed_disks:
+                self.logger.info(
+                    f"detaching disk '{record.name}' ({record.target}) from "
+                    f"{vm_name}; the image {record.source} is left on disk")
+                try:
+                    detach_disk(disk_manager.virsh, vm_name, record.target)
+                    forget_disk(disk_manager.virsh, vm_name, record.name)
+                except ProvisionError as exc:
+                    self.logger.error(str(exc))
+                    success = False
 
         return success

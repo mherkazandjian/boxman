@@ -19,6 +19,20 @@ import pytest
 from boxman.exceptions import ProvisionError
 from conftest import make_bare_manager
 
+
+@pytest.fixture(autouse=True)
+def _no_disk_ownership_records():
+    """diff_vm probes boxman's disk ownership metadata via virsh.
+
+    Default it to "this domain has none" -- what every domain predating
+    the record looks like, and which proposes no removals. Tests about
+    removals patch it themselves (#164 F2).
+    """
+    with patch('boxman.providers.libvirt.vm_differ.VMStateDiffer'
+               '.get_disk_records', return_value=None):
+        yield
+
+
 PRJ = 'bprj__proj__bprj'
 VM1 = f'{PRJ}_web_node01'
 VM2 = f'{PRJ}_web_node02'

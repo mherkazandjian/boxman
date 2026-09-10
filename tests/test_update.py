@@ -17,6 +17,18 @@ from conftest import make_bare_manager
 
 pytestmark = pytest.mark.unit
 
+@pytest.fixture(autouse=True)
+def _no_disk_ownership_records():
+    """diff_vm probes boxman's disk ownership metadata via virsh.
+
+    Default it to "this domain has none" -- what every domain predating
+    the record looks like, and which proposes no removals. Tests about
+    removals patch it themselves (#164 F2).
+    """
+    with patch.object(VMStateDiffer, 'get_disk_records', return_value=None):
+        yield
+
+
 
 @pytest.fixture(autouse=True)
 def _default_memballoon_state():
@@ -891,6 +903,9 @@ class TestMemballoonUpdateResult:
             'max_memory_changed': False,
             'new_disks': [],
             'resize_disks': [],
+            'removed_disks': [],
+            'refused_disk_removals': [],
+            'unowned_disks': [],
             'new_cdroms': [],
             'removed_cdroms': [],
             'changed_cdroms': [],
@@ -1004,6 +1019,9 @@ class TestUpdateRestartFailures:
             'max_memory_changed': False,
             'new_disks': [],
             'resize_disks': [],
+            'removed_disks': [],
+            'refused_disk_removals': [],
+            'unowned_disks': [],
             'new_cdroms': [],
             'removed_cdroms': [],
             'changed_cdroms': [],

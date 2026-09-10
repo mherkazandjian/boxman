@@ -3,8 +3,10 @@ import tempfile
 from typing import Any
 
 from boxman import log
+from boxman.exceptions import ProvisionError
 
 from .commands import LibVirtCommandBase, VirshCommand
+from .disk_ownership import record_attached_disk
 
 
 def disk_path_for(workdir: str,
@@ -231,6 +233,25 @@ class DiskManager:
             ):
                 self.logger.error(f"Failed to attach disk {disk_path} to VM {self.vm_name}")
                 return False
+
+            # Record what was attached, so a later `update` that no longer
+            # declares this disk can tell it apart from the root disk, from
+            # one attached by hand, and from a different disk that has since
+            # taken the same target (#164 F2).
+            try:
+                record_attached_disk(
+                    self.virsh, self.vm_name,
+                    name=disk_name, target=target_dev, source=disk_path)
+            except ProvisionError as exc:
+                # The disk is attached and working; only the bookkeeping
+                # failed. Do not fail the attach over it -- but say so
+                # clearly, because without the record boxman will refuse to
+                # detach this disk later rather than guess.
+                self.logger.warning(
+                    f"disk {disk_name} is attached to {self.vm_name}, but "
+                    f"boxman could not record that it owns it ({exc}). It "
+                    f"will not be detached automatically if it is later "
+                    f"removed from the config.")
 
             self.logger.info(f"successfully configured disk {disk_name} for VM {self.vm_name}")
             return True
