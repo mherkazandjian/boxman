@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import ImageImportError
 from boxman.providers.libvirt.import_image import ImageImporter
 
 pytestmark = pytest.mark.unit
@@ -411,7 +412,8 @@ class TestImportImageEndToEnd:
             "boxman.providers.libvirt.import_image.run",
             side_effect=fake_run,
         ) as run_fn:
-            assert importer.import_image() is True
+            # raises on failure, returns None on success (#164 F1)
+            assert importer.import_image() is None
 
         commands_run = [c.args[0] for c in run_fn.call_args_list]
         assert any("virsh -c qemu:///system list --all --name" in c for c in commands_run)
@@ -437,6 +439,8 @@ class TestImportImageEndToEnd:
             "boxman.providers.libvirt.import_image.run",
             return_value=_result(stdout="dup\nother\n", ok=True),
         ):
-            assert importer.import_image() is False
+            # used to return False, which every caller discarded (#164 F1)
+            with pytest.raises(ImageImportError, match="already exists"):
+                importer.import_image()
         # Nothing copied since we bailed early.
         assert not (dst_dir / "dup").exists()

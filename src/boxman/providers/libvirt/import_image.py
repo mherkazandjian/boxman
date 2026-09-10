@@ -20,11 +20,25 @@ from typing import Any
 from lxml import etree
 
 from boxman import log
+from boxman.exceptions import ImageImportError
 from boxman.utils.http_download import download_url
 from boxman.utils.shell import run
 
 SUPPORTED_PROVIDERS = ("libvirt",)
 REQUIRED_MANIFEST_KEYS = ("xml_path", "image_path", "provider")
+
+
+def normalise_provider_name(value: str) -> str:
+    """
+    Canonicalise a manifest-supplied provider name.
+
+    Manifest validation and the caller that turns the name into a lookup
+    key (against ``boxman.yml`` and the provider registry) must agree on
+    exactly one spelling. They used to normalise independently -- one
+    lowercased, the other did not -- so ``"LibVirt"`` passed validation
+    and then raised ``KeyError`` (#164 F1). Both now call this.
+    """
+    return value.strip().lower()
 
 
 class ImageImporter:
@@ -118,7 +132,8 @@ class ImageImporter:
                     f"non-empty string, got {value!r}"
                 )
         provider = manifest["provider"]
-        if not isinstance(provider, str) or provider.lower() not in SUPPORTED_PROVIDERS:
+        if (not isinstance(provider, str)
+                or normalise_provider_name(provider) not in SUPPORTED_PROVIDERS):
             raise ValueError(
                 f"manifest at {source!r} provider {provider!r} not supported "
                 f"(supported: {', '.join(SUPPORTED_PROVIDERS)})"
@@ -360,7 +375,7 @@ class ImageImporter:
             self._log_error(f"Failed to copy disk image: {exc}")
             return False
 
-    def import_image(self, package_url: str = None, vm_name: str = None) -> bool:
+    def import_image(self, package_url: str = None, vm_name: str = None) -> None:
         """
         Import and initialize a VM from a .tar.gz package.
 
@@ -369,7 +384,12 @@ class ImageImporter:
             vm_name: Name for the new VM
 
         Returns:
-            True if successful, False otherwise
+            None on success.
+
+        Raises:
+            ImageImportError: on any failure. This deliberately does not
+                report failure through a return value: callers used to
+                discard the ``False`` and a failed import exited 0 (#164 F1).
         """
         self._log_info("vm image import utility")
 
@@ -377,31 +397,44 @@ class ImageImporter:
         # .. todo:: this is redundant with what is done in the session and the manager and the app
         # implement a generic manfest reader and use it in all these places
         manifest = self.load_manifest(self.manifest_path)
+        if manifest is None:
+            raise ImageImportError(
+                f"could not read the manifest at {self.manifest_path!r}"
+            )
 
-        # read the xml definition of the vm
+        # read the xml definition of the vm. Validate it here, before any
+        # destination directory is created or any disk is copied -- an
+        # unreadable XML used to surface much later, as a FileNotFoundError
+        # from the copy step, after the disk had already been written.
         vm_xml_path = os.path.join(os.path.dirname(self.manifest_path), manifest['xml_path'])
         vm_xml = self.load_xml(vm_xml_path)
+        if vm_xml is None:
+            raise ImageImportError(
+                f"could not read the vm definition xml at {vm_xml_path!r}"
+            )
 
         # get the name of the vm
         # perform some basic validation of the inputs and get/set the vm name
         vm_name = vm_name if vm_name else self.vm_name
         if not vm_name:
             # use xpath to get the name of the vm from the xml at "domain/name"
-            vm_name = vm_xml.xpath('/domain/name')[0].text.strip()
+            name_elements = vm_xml.xpath('/domain/name')
+            if not name_elements or not (name_elements[0].text or '').strip():
+                raise ImageImportError(
+                    f"no vm name given and the xml at {vm_xml_path!r} has no "
+                    f"usable /domain/name element -- pass --name explicitly"
+                )
+            vm_name = name_elements[0].text.strip()
 
-        if not vm_name:
-            self._log_error("vm name must be specified")
-            return False
-        else:
-            self._log_info(f"VM name: {vm_name}")
+        self._log_info(f"VM name: {vm_name}")
 
         # check that a vm with the same name already exists
         if self.check_vm_exists(vm_name):
             if not self.force:
-                self._log_error(f"VM '{vm_name}' already exists. Use force=True to override.")
-                return False
-            else:
-                self._log_warning(f"Warning: VM '{vm_name}' already exists but force was specified")
+                raise ImageImportError(
+                    f"VM '{vm_name}' already exists. Use force=True to override."
+                )
+            self._log_warning(f"Warning: VM '{vm_name}' already exists but force was specified")
         else:
             self._log_info(f"VM '{vm_name}' does not already exist. Proceeding with import.")
 
@@ -410,19 +443,19 @@ class ImageImporter:
         if not os.path.isabs(src_image_path):
             src_image_path = os.path.join(os.path.dirname(self.manifest_path), src_image_path)
         if not os.path.exists(src_image_path):
-            self._log_error(f"Disk image file not found: {src_image_path}")
-            return False
+            raise ImageImportError(f"disk image file not found: {src_image_path}")
 
         # copy the image to the disk directory, create the dir first if needed
         # exit if the vm dir already exists
         dst_image_dir = os.path.abspath(os.path.expanduser(self.disk_dir))
         dst_image_dir_path = os.path.join(dst_image_dir, vm_name)
+        if os.path.exists(dst_image_dir_path):
+            raise ImageImportError(
+                f"vm directory already exists: {dst_image_dir_path} -- refusing "
+                f"to import into it, move it aside or pick another --directory"
+            )
         self._log_info(f"Creating disk image directory: {dst_image_dir_path}")
-        if not os.path.exists(dst_image_dir_path):
-            os.makedirs(dst_image_dir_path, exist_ok=False)
-        else:
-            self._log_info(f"vm directory already exists: {dst_image_dir_path}, exiting...")
-            return False
+        os.makedirs(dst_image_dir_path, exist_ok=False)
 
         #
         # Use sparse-aware copy instead of shutil.copy2
@@ -432,16 +465,18 @@ class ImageImporter:
         dst_image_path = os.path.join(dst_image_dir_path, src_image_base_name)
         self._log_info(f"Copying disk image to: {dst_image_path}")
         if not self.copy_disk_image_sparse(src_image_path, dst_image_path):
-            self._log_error("Failed to copy disk image")
-            return False
+            raise ImageImportError(
+                f"failed to copy the disk image {src_image_path} -> {dst_image_path}"
+            )
         # compare the checksum of the source and destination files
         src_size = os.path.getsize(src_image_path)
         dst_size = os.path.getsize(dst_image_path)
         if src_size != dst_size:
-            self._log_error("Disk image copy failed: size mismatch")
-            return False
-        else:
-            self._log_info("Disk image size verified")
+            raise ImageImportError(
+                f"disk image copy failed: size mismatch "
+                f"({src_size} != {dst_size}) for {dst_image_path}"
+            )
+        self._log_info("Disk image size verified")
         # Single-quote concatenation was not quoting: a path containing an
         # apostrophe closes the quote and the rest is parsed as shell (#164 F1).
         src_checksum = run(
@@ -451,10 +486,10 @@ class ImageImporter:
             f"sha256sum {shlex.quote(dst_image_path)}",
             hide=True).stdout.split()[0]
         if src_checksum != dst_checksum:
-            self._log_error("Disk image copy failed: checksum mismatch")
-            return False
-        else:
-            self._log_info("Disk image checksum verified")
+            raise ImageImportError(
+                f"disk image copy failed: checksum mismatch for {dst_image_path}"
+            )
+        self._log_info("Disk image checksum verified")
 
         # make a copy of the xml file in the dst vm dir and update it
         dst_xml_path = os.path.join(dst_image_dir_path, f"{vm_name}.xml")
@@ -462,23 +497,20 @@ class ImageImporter:
         shutil.copy2(vm_xml_path, dst_xml_path)
 
         # update the xml file of the vm to be imported
-        status = self.edit_vm_xml(
+        if not self.edit_vm_xml(
             dst_xml_path,
             new_vm_name=vm_name,
             disk_path=dst_image_path,
             change_uuid=not self.keep_uuid
-        )
-        if not status:
-            self._log_error("Failed to edit VM XML")
-            return False
+        ):
+            raise ImageImportError(f"failed to edit the vm xml at {dst_xml_path}")
 
         self._log_info("Defining VM in libvirt...")
         if not self.define_vm(dst_xml_path):
-            self._log_error("Failed to define VM")
-            return False
+            raise ImageImportError(
+                f"libvirt refused to define the vm '{vm_name}' from {dst_xml_path}"
+            )
 
         self._log_info(f"Successfully imported VM '{vm_name}'")
         self._log_info(f"  Disk image: {dst_image_path}")
         self._log_info(f"  Connection URI: {self.uri}")
-
-        return True

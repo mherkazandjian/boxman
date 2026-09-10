@@ -74,7 +74,9 @@ class LibVirtSession(SessionConfigMixin):
 
         image_importer = ImageImporter(
             manifest_path=manifest_local_path,
-            uri=self.manager.config['uri'],
+            # the defaulting accessor, not manager.config['uri'] --
+            # a boxman.yml without a libvirt 'uri' raised KeyError (#164 F1)
+            uri=self.uri,
             disk_dir=vm_dir,
             vm_name=vm_name,
             keep_uuid=False)
