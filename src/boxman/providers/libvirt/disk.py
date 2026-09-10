@@ -6,7 +6,7 @@ from boxman import log
 from boxman.exceptions import ProvisionError
 
 from .commands import LibVirtCommandBase, VirshCommand
-from .disk_ownership import record_attached_disk
+from .disk_ownership import DEFAULT_DISK_TARGET, record_attached_disk
 
 
 def disk_path_for(workdir: str,
@@ -205,7 +205,7 @@ class DiskManager:
             driver_type = driver.get("type", "qcow2")
 
             # get target device and bus
-            target_dev = disk_config.get("target", "vdb")
+            target_dev = disk_config.get("target", DEFAULT_DISK_TARGET)
             bus = disk_config.get("bus", "virtio")
 
             # create disk path

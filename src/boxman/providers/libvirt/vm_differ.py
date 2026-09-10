@@ -6,6 +6,7 @@ from boxman.exceptions import ProvisionError
 
 from .commands import VirshCommand
 from .disk_ownership import (
+    DEFAULT_DISK_TARGET,
     plan_disk_removals,
     read_disk_records,
     unowned_disks,
@@ -432,7 +433,7 @@ class VMStateDiffer:
         resize_disks = []
 
         for disk_config in (desired_disks or []):
-            target = disk_config.get('target', 'vdb')
+            target = disk_config.get('target', DEFAULT_DISK_TARGET)
             desired_size = disk_config.get('size', 1024)
             expected_path = self._expected_disk_path(disk_config, workdir, disk_prefix)
 

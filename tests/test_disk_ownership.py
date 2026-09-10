@@ -185,6 +185,71 @@ class TestIndependentOverlayBackedByTheRecordedFile:
         assert 'not the' in refusals[0][1]
 
 
+class TestAnOmittedTargetStillClaimsOne:
+    """A declaration without an explicit ``target:`` still occupies vdb.
+
+    The differ and DiskManager both default it. The removal rule filtered
+    those declarations out of its claimed-target set, so renaming a disk
+    without spelling out a target detached the very disk the operator had
+    just renamed (#164 F2 review, finding 1).
+    """
+
+    def test_a_rename_without_an_explicit_target_is_refused(self):
+        removals, refusals = plan_disk_removals(
+            records=[_record(name='data', target='vdb', source=DATA)],
+            desired_disks=[{'name': 'logs', 'size': 2048}],   # no target
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', DATA)])
+
+        assert removals == [], 'detached a disk the operator still declares'
+        assert 'claims target vdb' in refusals[0][1]
+
+    def test_an_omitted_target_is_not_reported_as_a_stray(self):
+        listed = unowned_disks(
+            records=[_record()],
+            desired_disks=[{'name': 'logs', 'size': 2048}],
+            actual_disks=[_attached('vda', ROOT), _attached('vdb', DATA)],
+            root_source=ROOT)
+
+        assert listed == []
+
+
+class TestDetachUsesTheConfiguredConnection:
+    """The mutation must reach the domain the checks looked at.
+
+    execute_shell() applies the sudo and runtime wrappers but supplies
+    neither the configured virsh executable nor ``-c <uri>``, so the
+    ownership checks ran against the configured connection and the detach
+    against the default one (#164 F2 review, finding 2).
+    """
+
+    def test_detach_goes_through_the_command_builder(self):
+        from boxman.providers.libvirt.disk_ownership import detach_disk
+
+        virsh = MagicMock()
+        virsh.execute.return_value = MagicMock(ok=True, stderr='')
+
+        detach_disk(virsh, 'node01', 'vdb')
+
+        virsh.execute.assert_called_once()
+        assert virsh.execute_shell.call_count == 0, (
+            'execute_shell carries no connection uri')
+        args = virsh.execute.call_args.args
+        assert args[0] == 'detach-disk'
+        assert args[1:] == ('node01', 'vdb')
+        assert virsh.execute.call_args.kwargs['config'] is True
+
+    def test_the_built_command_carries_the_configured_uri(self):
+        from boxman.providers.libvirt.commands import VirshCommand
+
+        virsh = VirshCommand(provider_config={
+            'uri': 'qemu+ssh://elsewhere/system', 'use_sudo': False})
+        built = virsh.build_command('detach-disk', 'node01', 'vdb',
+                                    config=True, live=None)
+
+        assert '-c qemu+ssh://elsewhere/system' in built
+        assert built.endswith('detach-disk node01 vdb --config')
+
+
 class TestDomainsWithoutRecords:
     """A VM boxman has no ownership record for is reported, never touched."""
 
@@ -440,13 +505,15 @@ class TestDetachOrderingAndSafety:
         image = tmp_path / "data.qcow2"
         image.write_bytes(b"important")
         virsh = MagicMock()
-        virsh.execute_shell.return_value = MagicMock(ok=True, stderr='')
+        virsh.execute.return_value = MagicMock(ok=True, stderr='')
 
         detach_disk(virsh, 'node01', 'vdb')
 
         assert image.read_bytes() == b"important"
-        issued = virsh.execute_shell.call_args.args[0]
-        assert 'detach-disk' in issued
-        for destructive in ('rm ', 'qemu-img', '--wipe-storage',
-                            '--delete-storage'):
-            assert destructive not in issued
+        args = virsh.execute.call_args.args
+        kwargs = virsh.execute.call_args.kwargs
+        assert args[0] == 'detach-disk'
+        # no flag that would take the image with it
+        for destructive in ('wipe_storage', 'delete_storage',
+                            'delete_storage_volumes'):
+            assert destructive not in kwargs

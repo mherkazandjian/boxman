@@ -18,7 +18,6 @@ variants of it that were tried and what each one detaches by mistake.
 
 from __future__ import annotations
 
-import shlex
 from dataclasses import dataclass
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -31,6 +30,13 @@ DISK_METADATA_URI = "https://github.com/mherkazandjian/boxman/disks/1.0"
 
 #: the key virsh files the block under
 DISK_METADATA_KEY = "boxman"
+
+#: target a ``disks:`` entry gets when it does not name one. The differ and
+#: DiskManager both default to this, so the removal rule has to as well: a
+#: declaration without an explicit target still occupies vdb, and treating
+#: it as claiming nothing detached the disk the operator had just renamed
+#: (#164 F2 review).
+DEFAULT_DISK_TARGET = "vdb"
 
 #: role of a disk boxman created from a ``disks:`` entry. Only these are
 #: ever candidates for removal.
@@ -213,7 +219,11 @@ def plan_disk_removals(
         return [], []
 
     desired_names = {d.get('name') for d in desired_disks if d.get('name')}
-    desired_targets = {d.get('target') for d in desired_disks if d.get('target')}
+    # ... including the ones that did not spell a target out: they still
+    # claim one, and reading them as claiming nothing is how a rename
+    # detached a disk that was still declared.
+    desired_targets = {
+        d.get('target') or DEFAULT_DISK_TARGET for d in desired_disks}
     actual_by_target = {d['target']: d for d in actual_disks}
 
     removals: list[DiskRecord] = []
@@ -263,7 +273,8 @@ def unowned_disks(records: list[DiskRecord] | None,
     if records is None:
         return []
     recorded_targets = {r.target for r in records}
-    desired_targets = {d.get('target') for d in desired_disks if d.get('target')}
+    desired_targets = {
+        d.get('target') or DEFAULT_DISK_TARGET for d in desired_disks}
     return [
         disk for disk in actual_disks
         if disk['target'] not in recorded_targets
@@ -280,13 +291,17 @@ def detach_disk(virsh, domain_name: str, target: str,
     The qcow2 is left on disk deliberately: an operator who removed a disk
     from ``conf.yml`` has asked for it to stop being attached, which is not
     the same as asking for its contents to be destroyed.
+
+    Goes through ``execute()``, like every query that decided this detach
+    was safe. ``execute_shell()`` applies the sudo and runtime wrappers but
+    supplies neither the configured virsh executable nor ``-c <uri>``, so
+    the checks ran against the configured connection while the mutation
+    went to the default one -- with a same-named domain on both, it would
+    detach a disk nothing had verified (#164 F2 review).
     """
-    flags = ['--config']
-    if live:
-        flags.append('--live')
-    result = virsh.execute_shell(
-        f"virsh detach-disk {shlex.quote(domain_name)} "
-        f"{shlex.quote(target)} {' '.join(flags)}",
+    result = virsh.execute(
+        'detach-disk', domain_name, target,
+        config=True, live=live or None,
         warn=True)
     if not result.ok:
         raise ProvisionError(
