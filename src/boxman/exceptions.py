@@ -59,6 +59,18 @@ class CloneCleanupError(CloneSanitizerError):
         self.cleanup_error = cleanup_error
 
 
+class ImageImportError(ProvisionError):
+    """Raised when importing a VM image fails — unreadable manifest or XML,
+    a destination that is already occupied, a disk copy that did not verify,
+    or a domain libvirt refused to define.
+
+    The importer's helpers still report their individual outcomes as
+    booleans; this is what the orchestration raises so a failed import can
+    never be mistaken for a successful one by a caller that ignores a
+    return value.
+    """
+
+
 class NetworkError(ProvisionError):
     """Raised when a libvirt network cannot be created, destroyed, or
     inspected. Includes bridge collisions and missing NAT config."""

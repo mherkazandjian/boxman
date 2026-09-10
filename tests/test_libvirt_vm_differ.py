@@ -32,6 +32,18 @@ def _default_memballoon_state():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_disk_ownership_records():
+    """diff_vm also probes boxman's disk ownership metadata.
+
+    Default it to "this domain has none", which is what every domain
+    predating the record looks like and which proposes no removals. Tests
+    that are about removals patch it themselves (#164 F2).
+    """
+    with patch.object(VMStateDiffer, 'get_disk_records', return_value=None):
+        yield
+
+
 @pytest.fixture
 def differ() -> VMStateDiffer:
     return VMStateDiffer(provider_config={"use_sudo": False,
@@ -281,3 +293,182 @@ class TestMemballoonDiff:
              "stats_period": None})
         assert diff["memballoon_changed"] is True
         assert diff["desired_memballoon"]["autodeflate"] is desired
+
+
+class TestDiskRemovalsReachTheDiff:
+    """``diff_vm`` computes removals from the ownership record (#164 F2).
+
+    Every other removal test either calls ``plan_disk_removals`` directly
+    or hands ``_update_single_vm`` a diff built by hand. Neither notices if
+    ``diff_vm`` stops asking for removals at all -- which is the wire the
+    feature actually runs on.
+    """
+
+    ROOT = "/vm/vm01.qcow2"
+    DATA = "/vm/vm01_data.qcow2"
+
+    def _diff(self, differ, desired_disks, actual_disks, records, workdir):
+        with patch.object(differ, "get_vm_state", return_value="running"), \
+             patch.object(differ, "get_actual_cpu",
+                          return_value={"sockets": 1, "cores": 1,
+                                        "threads": 1, "total_vcpus": 1,
+                                        "current_vcpus": 1}), \
+             patch.object(differ, "get_max_vcpus", return_value=1), \
+             patch.object(differ, "get_actual_memory_mb", return_value=1024), \
+             patch.object(differ, "get_max_memory_mb", return_value=1024), \
+             patch.object(differ, "get_actual_disks", return_value=actual_disks), \
+             patch.object(differ, "get_disk_records", return_value=records), \
+             patch.object(differ, "get_actual_memballoon",
+                          return_value={'free_page_reporting': False,
+                                        'autodeflate': False,
+                                        'stats_period': None}), \
+             patch.object(differ, "get_actual_cdroms", return_value=[]), \
+             patch.object(differ, "get_actual_shared_folders", return_value=[]):
+            return differ.diff_vm(
+                domain_name="vm01",
+                desired_cpus=None,
+                desired_memory_mb=None,
+                desired_disks=desired_disks,
+                workdir=workdir,
+                disk_prefix="vm01",
+            )
+
+    def test_an_undeclared_recorded_disk_is_proposed_for_removal(
+            self, differ: VMStateDiffer, tmp_path: Path):
+        from boxman.providers.libvirt.disk_ownership import DiskRecord
+
+        diff = self._diff(
+            differ,
+            desired_disks=[],
+            actual_disks=[{'target': 'vda', 'source': self.ROOT, 'size_mb': 4096},
+                          {'target': 'vdb', 'source': self.DATA, 'size_mb': 1024}],
+            records=[DiskRecord('data', 'vdb', 'data', self.DATA)],
+            workdir=str(tmp_path))
+
+        assert [r.name for r in diff['removed_disks']] == ['data']
+
+    def test_the_root_disk_is_never_proposed(
+            self, differ: VMStateDiffer, tmp_path: Path):
+        diff = self._diff(
+            differ,
+            desired_disks=[],
+            actual_disks=[{'target': 'vda', 'source': self.ROOT, 'size_mb': 4096}],
+            records=[],
+            workdir=str(tmp_path))
+
+        assert diff['removed_disks'] == []
+
+    def test_a_domain_without_records_proposes_nothing(
+            self, differ: VMStateDiffer, tmp_path: Path):
+        diff = self._diff(
+            differ,
+            desired_disks=[],
+            actual_disks=[{'target': 'vda', 'source': self.ROOT, 'size_mb': 4096},
+                          {'target': 'vdb', 'source': self.DATA, 'size_mb': 1024}],
+            records=None,
+            workdir=str(tmp_path))
+
+        assert diff['removed_disks'] == []
+
+    def test_a_replacement_at_the_recorded_target_is_refused(
+            self, differ: VMStateDiffer, tmp_path: Path):
+        from boxman.providers.libvirt.disk_ownership import DiskRecord
+
+        diff = self._diff(
+            differ,
+            desired_disks=[],
+            actual_disks=[{'target': 'vda', 'source': self.ROOT, 'size_mb': 4096},
+                          {'target': 'vdb', 'source': '/vm/other.qcow2',
+                           'size_mb': 1024}],
+            records=[DiskRecord('data', 'vdb', 'data', self.DATA)],
+            workdir=str(tmp_path))
+
+        assert diff['removed_disks'] == []
+        assert len(diff['refused_disk_removals']) == 1
+
+
+class TestRemovalsAreDecidedFromThePersistentDefinition:
+    """Live and persistent can disagree, and only one of them matters.
+
+    ``detach-disk --config`` edits the persistent definition. Deciding a
+    removal from the live view let a record for the disk *running* at a
+    target authorise detaching the different disk *configured* there. No
+    race is needed — an earlier config-only replacement is enough
+    (#164 F2 review, finding 3).
+    """
+
+    ROOT = "/vm/vm01.qcow2"
+    LIVE = "/vm/vm01_data.qcow2"
+    PERSISTENT = "/vm/vm01_replacement.qcow2"
+
+    def _diff(self, differ, records, live, persistent, workdir):
+        def disks(_domain, inactive=False):
+            return persistent if inactive else live
+
+        with patch.object(differ, "get_vm_state", return_value="running"), \
+             patch.object(differ, "get_actual_cpu",
+                          return_value={"sockets": 1, "cores": 1,
+                                        "threads": 1, "total_vcpus": 1,
+                                        "current_vcpus": 1}), \
+             patch.object(differ, "get_max_vcpus", return_value=1), \
+             patch.object(differ, "get_actual_memory_mb", return_value=1024), \
+             patch.object(differ, "get_max_memory_mb", return_value=1024), \
+             patch.object(differ, "get_actual_disks", side_effect=disks), \
+             patch.object(differ, "get_disk_records", return_value=records), \
+             patch.object(differ, "get_actual_memballoon",
+                          return_value={'free_page_reporting': False,
+                                        'autodeflate': False,
+                                        'stats_period': None}), \
+             patch.object(differ, "get_actual_cdroms", return_value=[]), \
+             patch.object(differ, "get_actual_shared_folders", return_value=[]):
+            return differ.diff_vm(
+                domain_name="vm01", desired_cpus=None, desired_memory_mb=None,
+                desired_disks=[], workdir=workdir, disk_prefix="vm01")
+
+    def test_a_replaced_persistent_disk_is_refused(self, differ: VMStateDiffer,
+                                                   tmp_path: Path):
+        """The record matches what is running, not what is configured."""
+        from boxman.providers.libvirt.disk_ownership import DiskRecord
+
+        diff = self._diff(
+            differ,
+            records=[DiskRecord('data', 'vdb', 'data', self.LIVE)],
+            live=[{'target': 'vda', 'source': self.ROOT, 'size_mb': 4096},
+                  {'target': 'vdb', 'source': self.LIVE, 'size_mb': 1024}],
+            persistent=[{'target': 'vda', 'source': self.ROOT, 'size_mb': 4096},
+                        {'target': 'vdb', 'source': self.PERSISTENT,
+                         'size_mb': 1024}],
+            workdir=str(tmp_path))
+
+        assert diff['removed_disks'] == [], (
+            'planned a detach of the disk configured at vdb using a record '
+            'for the different disk running there')
+        assert len(diff['refused_disk_removals']) == 1
+
+    def test_a_disk_only_in_the_live_view_is_not_planned(self, differ,
+                                                         tmp_path: Path):
+        """Attached live but not persistent: `--config` would not touch it."""
+        from boxman.providers.libvirt.disk_ownership import DiskRecord
+
+        diff = self._diff(
+            differ,
+            records=[DiskRecord('data', 'vdb', 'data', self.LIVE)],
+            live=[{'target': 'vda', 'source': self.ROOT, 'size_mb': 4096},
+                  {'target': 'vdb', 'source': self.LIVE, 'size_mb': 1024}],
+            persistent=[{'target': 'vda', 'source': self.ROOT, 'size_mb': 4096}],
+            workdir=str(tmp_path))
+
+        assert diff['removed_disks'] == []
+        assert diff['refused_disk_removals'] == []
+
+    def test_agreement_still_plans_the_removal(self, differ, tmp_path: Path):
+        from boxman.providers.libvirt.disk_ownership import DiskRecord
+
+        both = [{'target': 'vda', 'source': self.ROOT, 'size_mb': 4096},
+                {'target': 'vdb', 'source': self.LIVE, 'size_mb': 1024}]
+        diff = self._diff(
+            differ,
+            records=[DiskRecord('data', 'vdb', 'data', self.LIVE)],
+            live=both, persistent=both, workdir=str(tmp_path))
+
+        assert [r.name for r in diff['removed_disks']] == ['data']

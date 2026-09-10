@@ -1925,8 +1925,10 @@ class TestFlowWiring:
         m.cache.projects = {"proj": {"conf": "x", "runtime": "local"}}  # already provisioned
         m.up(SimpleNamespace(force=False))
         # a host reboot drops the non-persistent bridge; recreate it before
-        # the macvlan-attached containers reconcile.
-        assert order == ["bridges", "provision_compose_clusters"]
+        # the macvlan-attached containers reconcile. The same reboot leaves
+        # the lab down, so it is reconciled too, after the containers --
+        # matching provision()'s order (#164 C3).
+        assert order == ["bridges", "provision_compose_clusters", "netlab_up"]
 
     def test_up_all_vms_running_reconciles_compose(self, monkeypatch):
         m = self._mgr()

@@ -9,6 +9,7 @@ from typing import Any
 
 from boxman import log
 from boxman.exceptions import (
+    BoxmanError,
     CloneSanitizerError,
     ConfigError,
     ProvisionError,
@@ -700,6 +701,7 @@ class VMsMixin:
         vm_info: dict[str, Any],
         result_queue: Queue,
         dry_run: bool = False,
+        allow_restart: bool = False,
     ) -> None:
         """
         Diff and apply updates to a single existing VM. Runs in its own process.
@@ -743,8 +745,54 @@ class VMsMixin:
                 diff['removed_shared_folders'] or
                 diff['changed_shared_folders'] or
                 diff['memballoon_changed'] or
-                diff['memballoon_restart_pending']
+                diff['memballoon_restart_pending'] or
+                diff['removed_disks'] or
+                diff['shared_folders_restart_pending']
             )
+
+            # A declaration whose target still holds a different disk that
+            # boxman owns is a conflict, not a warning: reconciliation
+            # matches the occupant by target, so it would grow the disk the
+            # operator renamed away from and report success. Refused before
+            # anything is applied -- cpu and memory included (#164 F2
+            # review, finding 4).
+            if diff['disk_conflicts']:
+                detail = '; '.join(
+                    f"'{name}' declares target {target}, which still holds "
+                    f"{source}"
+                    for name, target, source in diff['disk_conflicts'])
+                result_queue.put((vm_name, {
+                    'status': 'failed',
+                    'details': (
+                        f"{detail}. Detach it first, or give the new disk a "
+                        f"free target -- nothing was changed")
+                }))
+                return
+
+            # Reported, never acted on: boxman recorded attaching these but
+            # what is at the target now is not what it attached, so it has
+            # no basis for detaching it (#164 F2).
+            for record, reason in diff['refused_disk_removals']:
+                self.logger.warning(
+                    f"VM {vm_name}: not detaching '{record.name}' -- {reason}")
+            for stray in diff['unowned_disks']:
+                if diff['has_disk_records']:
+                    self.logger.warning(
+                        f"VM {vm_name}: {stray['target']} ({stray['source']}) "
+                        f"is attached but neither declared nor recorded by "
+                        f"boxman -- leaving it alone")
+                else:
+                    # No record at all: this domain predates the ownership
+                    # metadata. It used to report nothing here, so dropping
+                    # a disk from its config looked like a no-op (#164 F2
+                    # review).
+                    self.logger.warning(
+                        f"VM {vm_name}: {stray['target']} ({stray['source']}) "
+                        f"is attached but not declared. This VM predates "
+                        f"boxman's disk ownership records, so boxman will "
+                        f"not detach anything on it. To remove it by hand: "
+                        f"{self.provider.virsh_invocation('detach-disk', full_vm_name, stray['target'], config=True)} "
+                        f"(the image file is not deleted)")
 
             if not has_changes:
                 self.logger.info(f"VM {vm_name}: no changes detected")
@@ -774,6 +822,9 @@ class VMsMixin:
                     for r in diff['resize_disks']
                 ]
                 changes.append(f"resize disks: {', '.join(resizes)}")
+            if diff['removed_disks']:
+                names = [f"{r.name} ({r.target})" for r in diff['removed_disks']]
+                changes.append(f"detach disks: {', '.join(names)}")
             if diff['new_cdroms']:
                 names = [c.get('name', '?') for c in diff['new_cdroms']]
                 changes.append(f"new cdroms: {', '.join(names)}")
@@ -801,7 +852,6 @@ class VMsMixin:
                     f"memballoon live state: {diff['live_memballoon']} -> "
                     f"{diff['desired_memballoon']}")
             self.logger.info(f"VM {vm_name}: changes detected: {'; '.join(changes)}")
-
             if dry_run:
                 result_queue.put((vm_name, {
                     'status': 'dry_run',
@@ -811,7 +861,12 @@ class VMsMixin:
 
             # apply changes
             vm_running = diff['vm_state'] == 'running'
+            # A paused guest is active but not running: it cannot be cleanly
+            # shut down and restarted, yet a change that needs a restart is
+            # just as pending for it.
+            vm_active = VMStateDiffer.domain_is_active(diff['vm_state'])
             restart_needed = False
+            folders_touched = False
             pending_restart = diff['memballoon_restart_pending']
 
             # CPU / memory / max ceilings
@@ -848,10 +903,34 @@ class VMsMixin:
                     }))
                     return
                 if pending_restart:
-                    self.logger.warning(
-                        f"VM {vm_name}: restart required to apply memballoon changes")
+                    self.logger.info(
+                        f"VM {vm_name}: memballoon changes need a restart to "
+                        f"take effect")
 
             # disks
+            #
+            # A detach is only ever applied to an inactive domain, because
+            # `detach-disk --config` edits the persistent definition and a
+            # live guest keeps using the device until it goes down. Three
+            # cases (#164 F2 review, amendment 1):
+            #
+            #   inactive        -> detach now, after the additions succeed
+            #   running + --restart -> detach between the shutdown and the
+            #                          start, when live IS persistent
+            #   paused, or running without --restart -> pending, untouched
+            #
+            # A paused guest is never shut down for this: it did not ask to
+            # be resumed or stopped, and a forced stop is not a clean one.
+            detach_plan = diff['removed_disks']
+            detach_deferred = None
+            detach_offline = bool(detach_plan) and not vm_active
+            detach_after_restart = (
+                bool(detach_plan) and vm_running and allow_restart)
+            if detach_plan and not detach_offline and not detach_after_restart:
+                restart_needed = True
+            if detach_after_restart:
+                restart_needed = True
+
             if diff['new_disks'] or diff['resize_disks']:
                 disk_ok = self.provider.update_vm_disks(
                     vm_name=full_vm_name,
@@ -868,6 +947,26 @@ class VMsMixin:
                     }))
                     return
 
+            # Detach last of the disk work, and only if what came before
+            # it worked: a removal applied after a failed addition detaches
+            # a disk whose replacement never arrived (#164 F2).
+            if detach_offline:
+                try:
+                    outcome = self.provider.remove_vm_disks(
+                        full_vm_name, detach_plan)
+                except BoxmanError as exc:
+                    result_queue.put((vm_name, {
+                        'status': 'failed',
+                        'details': f"disk detach failed: {exc}"
+                    }))
+                    return
+                # A deferral is an ordinary outcome, not a failure: managed
+                # saved state means the detach would not reach the guest
+                # that is resumed (#164 F2 review round 2, finding 3).
+                detach_deferred = (outcome or {}).get('deferred')
+                if detach_deferred:
+                    restart_needed = True
+
             # cdroms
             if diff['new_cdroms'] or diff['removed_cdroms'] or diff['changed_cdroms']:
                 # Active, not running: a paused guest is still active, and
@@ -878,7 +977,7 @@ class VMsMixin:
                     new_cdroms=diff['new_cdroms'],
                     removed_cdroms=diff['removed_cdroms'],
                     changed_cdroms=diff['changed_cdroms'],
-                    vm_active=VMStateDiffer.domain_is_active(diff['vm_state'])
+                    vm_active=vm_active
                 )
                 if not cdrom_ok:
                     result_queue.put((vm_name, {
@@ -903,11 +1002,36 @@ class VMsMixin:
                         'details': 'shared folder update failed'
                     }))
                     return
-                if folder_result.get('restart_needed'):
+                # folder_result['restart_needed'] is deliberately not read
+                # here; the post-apply probe below is what decides.
+                folders_touched = True
+
+            # Decided *after* reconciliation, and able to clear as well as
+            # set. The provider's restart_needed describes one operation --
+            # a config-only detach reports it even when live and desired
+            # both end up empty -- and the differ's flag describes the
+            # state before the changes. Neither could say "the live domain
+            # now matches", so a successful hot change or a cancellation
+            # still reported pending, or power-cycled the guest with
+            # --restart (#164 C1 review rounds 2 and 3, findings 5 and 4).
+            if vm_active and (folders_touched
+                              or diff['shared_folders_restart_pending']):
+                if self.provider.shared_folders_pending(
+                        full_vm_name, vm_info.get('shared_folders'),
+                        vm_active):
                     restart_needed = True
+            elif diff['shared_folders_restart_pending'] and not vm_active:
+                restart_needed = True
+
+            # Every change that cannot reach a live guest, in one place.
+            # memballoon only ever landed in the persistent config, and was
+            # reported through a separate branch that the other restart
+            # sources bypassed (#164 C1).
+            if pending_restart:
+                restart_needed = True
 
             # handle restart if needed
-            if restart_needed and vm_running:
+            if restart_needed and vm_running and allow_restart:
                 self.logger.info(
                     f"VM {vm_name}: restarting to apply changes "
                     f"(live max ceiling cannot be raised)")
@@ -918,7 +1042,13 @@ class VMsMixin:
                 # first for a second reason: start_vm() on a guest that is
                 # still running returns True, so a lost shutdown would
                 # hide itself behind a successful start.
-                if not self.provider.shutdown_and_wait(full_vm_name):
+                # A detach must never follow a *forced* stop: force_after
+                # runs `virsh destroy` on timeout and still reports success,
+                # so a guest that did not shut down cleanly would go on to
+                # have a disk removed (#164 F2 review, amendment 1).
+                if not self.provider.shutdown_and_wait(
+                        full_vm_name,
+                        force_after=not detach_after_restart):
                     result_queue.put((vm_name, {
                         'status': 'failed',
                         'details': (
@@ -927,7 +1057,30 @@ class VMsMixin:
                             'so the changes that need a restart are not in '
                             'effect')
                     }))
-                elif not self.provider.start_vm(full_vm_name):
+                    return
+                if detach_after_restart:
+                    # The guest is down, so live is persistent; remove_vm_disks
+                    # re-verifies both facts before touching anything.
+                    try:
+                        outcome = self.provider.remove_vm_disks(
+                            full_vm_name, detach_plan)
+                        detach_deferred = (outcome or {}).get('deferred')
+                    except BoxmanError as exc:
+                        # start_vm()'s result was discarded and the message
+                        # claimed the guest was running again regardless
+                        # (#164 F2 review round 2, finding 7).
+                        restarted = self.provider.start_vm(full_vm_name)
+                        tail = ('the VM was started again' if restarted else
+                                'and the VM could not be started again — it '
+                                'is still shut off')
+                        result_queue.put((vm_name, {
+                            'status': 'failed',
+                            'details': (
+                                f"disk detach failed after shutdown: {exc} — "
+                                f"{tail}")
+                        }))
+                        return
+                if not self.provider.start_vm(full_vm_name):
                     result_queue.put((vm_name, {
                         'status': 'failed',
                         'details': (
@@ -935,17 +1088,51 @@ class VMsMixin:
                             ' — applied, but the VM did not come back up '
                             'after the restart and is still shut off')
                     }))
+                elif detach_deferred:
+                    # restarted, but some detaches did not happen
+                    result_queue.put((vm_name, {
+                        'status': 'needs_restart',
+                        'details': ('; '.join(changes) +
+                                    f' (restarted) — {detach_deferred}')
+                    }))
                 else:
                     result_queue.put((vm_name, {
                         'status': 'updated',
                         'details': '; '.join(changes) + ' (restarted)'
                     }))
-            elif pending_restart:
+            elif restart_needed and (vm_active or detach_deferred):
+                # Deferred, not skipped: the persistent config already has
+                # the change, so it takes effect the next time the guest
+                # boots. `update` used to power-cycle a running guest for
+                # this without being asked (#164 C1).
+                # A deferred *detach* is not a written change waiting for a
+                # boot: no detach command ran, so an ordinary reboot leaves
+                # the disk attached. Saying otherwise sent the operator to
+                # a remedy that does not work (#164 F2 review round 2, 8).
+                pending_detach = bool(detach_plan) and not detach_offline
+                if pending_detach:
+                    if vm_running:
+                        tail = (
+                            ' — the configuration changes are written and a '
+                            'restart applies them, but the disk detach has '
+                            'not been performed: re-run update with '
+                            '--restart, which shuts the guest down cleanly '
+                            'and detaches it')
+                    else:
+                        tail = (
+                            ' — the configuration changes are written, but '
+                            'the disk detach has not been performed: it '
+                            'needs the guest fully shut down (a paused guest '
+                            'is not), then update again')
+                else:
+                    tail = (
+                        ' — written to the persistent config; restart the VM '
+                        'to apply them, or re-run update with --restart')
+                if detach_deferred:
+                    tail = f" — {detach_deferred}"
                 result_queue.put((vm_name, {
                     'status': 'needs_restart',
-                    'details': (
-                        '; '.join(changes) +
-                        ' (restart required to apply memballoon changes)')
+                    'details': '; '.join(changes) + tail
                 }))
             else:
                 result_queue.put((vm_name, {
@@ -978,6 +1165,10 @@ class VMsMixin:
         config = self.config
         dry_run = getattr(cli_args, 'dry_run', False)
         auto_accept = getattr(cli_args, 'yes', False)
+        # Deliberately not `auto_accept or ...`: --yes answers the VM-removal
+        # prompt, and someone passing it to avoid an interactive update has
+        # not thereby agreed to have a running guest power-cycled (#164 C1).
+        allow_restart = getattr(cli_args, 'restart', False)
 
         # Collected across the phases below and raised once at the very end:
         # a VM that fails to update must not leave the command reporting
@@ -1120,7 +1311,7 @@ class VMsMixin:
             _res, parallel_failures = self._run_parallel(
                 [(f"{cluster_name}/{vm_name}", self._update_single_vm,
                   (cluster_name, cluster_cfg, vm_name, vm_info,
-                   result_queue, dry_run))
+                   result_queue, dry_run, allow_restart))
                  for cluster_name, cluster_cfg, vm_name, vm_info in update_tasks],
                 op_label='update vm')
 

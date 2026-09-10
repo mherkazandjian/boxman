@@ -21,7 +21,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - **Runtime environments**: execute provider commands locally or inside a Docker container
 - **Per-cluster providers**: a project can mix `libvirt` VM clusters and `docker-compose` container clusters, with every verb (`up`, `ps`, `snapshot`, `control`, ansible inventory) working across both — and VM↔container L2 adjacency over a shared bridge. See [Providers](#providers)
 - **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
-- **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow disks
+- **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow and detach disks; changes that need a guest restart are deferred unless `--restart` is given
 - **Disk reclaim and storage hygiene**: `boxman storage` inspects qcow2 footprint, runs guest-side fstrim, compacts qcow2 files, and compresses snapshot memory dumps with zstd — see [Disk Reclaim and Storage](doc/storage.md)
 
 ## Quick Start
@@ -863,6 +863,28 @@ Edit `conf.yml` and run `boxman update` to reconcile the live state with the con
   created and attached
 - **Grow disks**: increase the `size` of an existing disk — the disk image is
   resized in place (shrinking is not supported)
+- **Remove disks**: remove a disk entry from a VM's `disks:` section — the disk
+  is detached, and **its image file is left on disk**. Boxman detaches only a
+  disk it recorded attaching, still at the target it recorded, with the exact
+  source it recorded. Anything else — a replacement disk at a reused target, a
+  snapshot overlay, a disk attached by hand, a VM predating the record — is
+  reported and left alone
+
+### Restarts
+
+Some changes cannot be applied to a live guest: raising a vCPU or memory
+ceiling, and some shared-folder and memballoon changes. `update` writes
+them to the persistent config and reports the VM as needing a restart. It
+does **not** restart the guest by itself.
+
+Detaching a disk is different: it is not written and waiting for a boot.
+Nothing is detached until the guest is fully shut down (a paused guest is
+not), so an ordinary reboot leaves the disk attached. Either shut the VM
+down and run `update` again, or pass `--restart`, which shuts it down
+cleanly, detaches, and starts it back up.
+
+Pass `--restart` to let it. `--yes` does not imply `--restart` — it answers
+the VM-removal prompt only.
 
 ### What cannot be updated
 
@@ -885,8 +907,11 @@ boxman update --dry-run
 # Apply changes (prompts for confirmation before destroying VMs)
 boxman update
 
-# Apply changes without confirmation prompt
+# Apply changes without confirmation prompt for VM removal
 boxman update --yes
+
+# Also allow restarting guests for changes that cannot be applied live
+boxman update --restart
 ```
 
 ## Tasks

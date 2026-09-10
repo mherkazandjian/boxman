@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shlex
 import urllib.request
 
 from boxman import log
@@ -15,12 +16,21 @@ def download_url(url: str, dst_path: str) -> bool:
     Tries wget first (best progress + redirect handling), then curl, and
     finally a urllib fallback. A partial *dst_path* left by a failed
     attempt is removed before the next attempt.
+
+    Both operands are shell-quoted. These commands run through a shell, and
+    ``$(…)`` inside double quotes is still evaluated by it — so a URL or
+    destination carrying a command substitution would execute it. That is
+    survivable while every caller passes a value from the project's own
+    config; it stops being survivable the moment a URL comes from a
+    *remote manifest* (#164 F1).
     """
     log.status(f"downloading {url} -> {dst_path}")
+    q_url = shlex.quote(url)
+    q_dst = shlex.quote(dst_path)
 
     # wget: handles redirects, proxies, SSL well; prints chunky progress.
     result = _shell_run(
-        f'wget --progress=dot:mega -O "{dst_path}" "{url}"',
+        f'wget --progress=dot:mega -O {q_dst} {q_url}',
         hide=not is_verbose(logging.DEBUG), warn=True,
     )
     if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
@@ -32,7 +42,7 @@ def download_url(url: str, dst_path: str) -> bool:
     # curl fallback. --fail so an HTTP 4xx/5xx error page is not written
     # and accepted as a valid download (wget already fails on HTTP errors).
     result = _shell_run(
-        f'curl -fL --progress-bar -o "{dst_path}" "{url}"',
+        f'curl -fL --progress-bar -o {q_dst} {q_url}',
         hide=not is_verbose(logging.DEBUG), warn=True,
     )
     if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:

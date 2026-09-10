@@ -222,6 +222,19 @@ class FlowsMixin:
                     # "all VMs running" path (ensure_shared_bridges → up).
                     self.ensure_shared_bridges()
                     self.provision_compose_clusters()
+                    # ...and the lab, for the same reason the bridges are
+                    # recreated above: a host reboot or a manual `docker
+                    # stop` leaves its containers down, and nothing else on
+                    # this branch brings them back. The hybrid path (Case 3)
+                    # has always done this; a compose-only project simply
+                    # never reached it, so its lab stopped being reconciled
+                    # the moment the project was registered. No-op when no
+                    # netlab is configured.
+                    #
+                    # reconcile_networks() deliberately stays out: those are
+                    # libvirt networks, which a compose-only project has
+                    # none of.
+                    self.ensure_netlab_up()
                 else:
                     self.logger.info(
                         "no existing project state found, running full provision...")

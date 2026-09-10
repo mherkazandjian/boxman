@@ -14,7 +14,10 @@ from boxman.exceptions import BoxmanError, ConfigError
 from boxman.loggers.logger import set_quiet, set_verbosity, suppressed
 from boxman.manager import BoxmanManager
 from boxman.providers import create_session, merge_provider_configs, primary_provider_type
-from boxman.providers.libvirt.import_image import ImageImporter
+from boxman.providers.libvirt.import_image import (
+    ImageImporter,
+    normalise_provider_name,
+)
 from boxman.scripts.cli_parser import parse_args, resolve_verbosity
 from boxman.utils.config_diagnostics import (
     template_config_error,
@@ -473,8 +476,20 @@ def _main():
                 # Stash the resolved local path so the session reuses it.
                 args.manifest_local_path = manifest_local_path
 
-            # fetch the provider configuration from the boxman config
-            manager.config = boxman_config['providers'][provider_type]
+            # The manifest schema accepts the provider name in any case --
+            # validation lowercases before comparing -- so normalise before
+            # it is used as a lookup key. A manifest saying 'LibVirt'
+            # validated and then raised KeyError against boxman.yml and the
+            # provider registry (#164 F1).
+            provider_type = normalise_provider_name(provider_type)
+
+            # fetch the provider configuration from the boxman config. Both
+            # levels are optional: a boxman.yml without a 'providers:'
+            # section, or without a block for this provider, leaves the
+            # session on its documented defaults (qemu:///system for
+            # libvirt) rather than raising a bare KeyError (#164 F1).
+            manager.config = (boxman_config.get('providers') or {}).get(
+                provider_type) or {}
         else:
             provider_type = primary_provider_type(manager.config)
 
