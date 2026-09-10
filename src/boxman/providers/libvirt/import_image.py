@@ -466,6 +466,13 @@ class ImageImporter:
             )
         return resolved
 
+    def _staged_basename(self, reference: str, key: str, remote: bool) -> str:
+        """The filename the image will occupy in the staging directory."""
+        if remote:
+            url = self._resolve_remote_reference(reference, key)
+            return os.path.basename(urlsplit(url).path) or key
+        return os.path.basename(reference)
+
     def _fetch_reference(self, reference: str, key: str, dest_dir: str) -> str:
         """Download a manifest sibling into *dest_dir*; return its path."""
         url = self._resolve_remote_reference(reference, key)
@@ -592,6 +599,26 @@ class ImageImporter:
                     f"refusing to import into it, move it aside or pick "
                     f"another --directory"
                 )
+
+            # The generated domain definition is written to
+            # <staging>/<vm_name>.xml. An image whose own filename is that
+            # would be overwritten by it: the copy lands first, then the
+            # XML lands on top, and the edit points the disk source at the
+            # XML. The imported disk was the domain definition, corrupted
+            # before define_vm() ever ran -- and for a local import the
+            # checksum verification happens before the overwrite, so it
+            # could not catch it either. Refused here, before anything is
+            # fetched or copied, so a large download is not wasted
+            # (#164 F1 review round 5).
+            image_basename = self._staged_basename(
+                manifest['image_path'], 'image_path', remote)
+            if image_basename == f"{vm_name}.xml":
+                raise ImageImportError(
+                    f"the disk image is named {image_basename!r}, which is "
+                    f"where boxman writes the vm definition for "
+                    f"'{vm_name}' -- the definition would overwrite the "
+                    f"disk. Rename the image in the package, or import "
+                    f"under a different --name")
 
             # Now the disk image, into the same staging directory.
             if remote:

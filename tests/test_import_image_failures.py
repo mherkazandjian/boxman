@@ -768,3 +768,96 @@ class TestManifestIoFailuresExitTwo:
 
         assert code == 2
         assert "Traceback" not in capsys.readouterr().out
+
+
+DISK_MAGIC = b"QFI\xfb\x00\x00\x00\x03REAL-DISK-BYTES"
+
+
+@pytest.mark.unit
+class TestTheImageIsNeverOverwrittenByTheDefinition:
+    """An image named ``<vm-name>.xml`` shares the definition's destination.
+
+    The copy lands first, the generated domain XML lands on top, and the
+    edit points the disk source at the XML. The imported disk *was* the
+    definition, corrupted before ``define_vm()`` ran — and for a local
+    import the checksum verification happens before the overwrite, so it
+    could not catch it (#164 F1 review round 5).
+
+    Pre-existing on main; the remote import path this branch enables
+    inherits it.
+    """
+
+    def _package(self, root: Path, image_name: str) -> Path:
+        (root / "images").mkdir(parents=True)
+        (root / "metadata").mkdir(parents=True)
+        (root / "images" / image_name).write_bytes(DISK_MAGIC)
+        (root / "metadata" / "domain.xml").write_text(SAMPLE_VM_XML)
+        manifest = {"provider": "libvirt",
+                    "xml_path": "metadata/domain.xml",
+                    "image_path": f"images/{image_name}"}
+        (root / "manifest.json").write_text(json.dumps(manifest))
+        return root / "manifest.json"
+
+    def test_a_colliding_local_image_is_refused_before_any_copy(
+            self, tmp_path: Path):
+        manifest = self._package(tmp_path / "pkg", "node.xml")
+        dst = tmp_path / "dst"
+        importer = ImageImporter(
+            manifest_path=str(manifest), uri="qemu:///system",
+            disk_dir=str(dst), vm_name="node")
+
+        with patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            with pytest.raises(ImageImportError, match="would overwrite"):
+                importer.import_image()
+
+        assert not (dst / "node").exists()
+        # the package's own image is untouched either way
+        assert (tmp_path / "pkg" / "images" / "node.xml").read_bytes() == DISK_MAGIC
+
+    def test_a_colliding_remote_image_is_refused(self, tmp_path: Path):
+        base = "https://images.example/pkg/"
+        manifest = {"provider": "libvirt",
+                    "xml_path": "metadata/domain.xml",
+                    "image_path": "images/node.xml"}
+        served = {
+            base + "metadata/domain.xml": SAMPLE_VM_XML.encode(),
+            base + "images/node.xml": DISK_MAGIC,
+        }
+        local = tmp_path / "manifest.json"
+        local.write_text(json.dumps(manifest))
+        importer = ImageImporter(
+            manifest_path=str(local), manifest_uri=base + "manifest.json",
+            uri="qemu:///system", disk_dir=str(tmp_path / "dst"),
+            vm_name="node")
+
+        with patch("boxman.providers.libvirt.import_image.download_url",
+                   side_effect=_remote_package(served)), \
+             patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            with pytest.raises(ImageImportError, match="would overwrite"):
+                importer.import_image()
+
+        assert not (tmp_path / "dst" / "node").exists()
+
+    @pytest.mark.parametrize("image_name", ["disk.qcow2", "node.qcow2",
+                                            "other.xml"])
+    def test_a_non_colliding_image_survives_xml_preparation(
+            self, tmp_path: Path, image_name: str):
+        """The bytes, checked after the definition has been written."""
+        manifest = self._package(tmp_path / "pkg", image_name)
+        dst = tmp_path / "dst"
+        importer = ImageImporter(
+            manifest_path=str(manifest), uri="qemu:///system",
+            disk_dir=str(dst), vm_name="node")
+
+        with patch("boxman.providers.libvirt.import_image.run",
+                   side_effect=_fake_run()):
+            importer.import_image()
+
+        imported = dst / "node" / image_name
+        assert imported.read_bytes() == DISK_MAGIC, (
+            'the disk image was overwritten during xml preparation')
+        # reachability: the definition really was written alongside it
+        assert (dst / "node" / "node.xml").exists()
+        assert (dst / "node" / "node.xml").read_text().startswith("<?xml")
