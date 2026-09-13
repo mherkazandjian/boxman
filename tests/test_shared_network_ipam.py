@@ -191,3 +191,96 @@ class TestAMissingIpRangeIsWarnedAbout:
                          shared_networks=SHARED)
 
         assert not any("ip_range" in str(c) for c in warn.call_args_list)
+
+
+class TestValidationFollowsEffectiveUse:
+    """`referenced_shared` is what was asked for *before* overrides merged.
+
+    Validating against it rejects configurations that deploy: an override
+    may remove the attachment entirely, and Compose then drops the unused
+    network from its resolved model (#164 FBN-16).
+    """
+
+    def _bad_gateway(self):
+        return {"lab": {"bridge": "br-lab", "subnet": "10.10.0.0/24",
+                        "gateway": "10.99.0.1"}}
+
+    def test_network_mode_host_removes_the_network_from_use(self):
+        out = _generate(_cluster({}, ["lab"],
+                                 extra={"network_mode": "host"}),
+                        shared=self._bad_gateway())
+
+        assert "networks" not in out["services"]["web"]
+
+    def test_an_override_clearing_the_attachment_removes_it(self):
+        out = _generate(_cluster({}, ["lab"],
+                                 cluster_extra={"services": {
+                                     "web": {"networks": []}}}),
+                        shared=self._bad_gateway())
+
+        assert not out["services"]["web"].get("networks")
+
+    def test_a_profiled_service_does_not_trigger_validation(self):
+        """Whether its profile is active is not decidable here."""
+        out = _generate(_cluster({}, ["lab"],
+                                 extra={"profiles": ["debug"]}),
+                        shared=self._bad_gateway())
+
+        assert out["services"]["web"]["networks"] == ["lab"]
+
+    def test_a_network_still_in_use_is_still_validated(self):
+        with pytest.raises(ConfigError, match=r"gateway.*outside"):
+            _generate(_cluster({}, ["lab"]), shared=self._bad_gateway())
+
+
+class TestAutomaticIpamIsPreserved:
+    """`ipam: {config: [{}]}` asks docker to select a predefined pool."""
+
+    def test_an_empty_pool_request_is_not_rejected(self):
+        out = _generate(
+            _cluster({}, ["lab"],
+                     cluster_extra={"networks": {"lab": {
+                         "ipam": {"config": [{}]}}}}))
+
+        assert out["networks"]["lab"]["ipam"]["config"] == [{}]
+
+    def test_it_is_not_warned_about_either(self):
+        gen = ComposeGenerator()
+        cluster = _cluster({}, ["lab"],
+                           cluster_extra={"networks": {"lab": {
+                               "ipam": {"config": [{}]}}}})
+        with mock.patch.object(gen.logger, "warning") as warn:
+            gen.generate("proj", cluster, conf_dir="/proj",
+                         shared_networks=SHARED)
+
+        assert not any("ip_range" in str(c) for c in warn.call_args_list)
+
+
+class TestTheMissingRangeWarningDoesNotDependOnParsing:
+    """It is the whole NET-C2 safeguard, so a deferred membership
+    comparison must not take it down with it (#164 NET-C2)."""
+
+    def test_an_interpolated_subnet_still_warns(self):
+        gen = ComposeGenerator()
+        shared = {"lab": {"bridge": "br-lab", "subnet": "${SUBNET}"}}
+        with mock.patch.object(gen.logger, "warning") as warn:
+            gen.generate("proj", _cluster({}, ["lab"]), conf_dir="/proj",
+                         shared_networks=shared)
+
+        assert any("ip_range" in str(c) for c in warn.call_args_list)
+
+
+class TestAddressFamilyMismatchIsADiagnostic:
+    """It used to raise an uncaught TypeError from the containment test."""
+
+    def test_an_ipv6_range_against_an_ipv4_subnet(self):
+        shared = {"lab": {"bridge": "br-lab", "subnet": "10.10.0.0/24",
+                          "ip_range": "fd00::/64"}}
+        with pytest.raises(ConfigError, match=r"IPv6.*IPv4"):
+            _generate(_cluster({}, ["lab"]), shared=shared)
+
+    def test_an_ipv6_gateway_against_an_ipv4_subnet(self):
+        shared = {"lab": {"bridge": "br-lab", "subnet": "10.10.0.0/24",
+                          "gateway": "fd00::1"}}
+        with pytest.raises(ConfigError, match=r"IPv6.*IPv4"):
+            _generate(_cluster({}, ["lab"]), shared=shared)

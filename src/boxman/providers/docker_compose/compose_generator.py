@@ -616,6 +616,32 @@ class ComposeGenerator:
         """
         return any(isinstance(v, str) and "$" in v for v in values)
 
+    @staticmethod
+    def _effectively_attached(compose: dict[str, Any]) -> set[str]:
+        """Networks some service in the assembled file actually attaches to.
+
+        ``referenced_shared`` records what was referenced *before* overrides
+        merged, so validating against it rejects configurations that deploy:
+        a `network_mode:` override, or one clearing the attachment, leaves the
+        network unused and Compose drops it from the resolved model entirely.
+
+        A service gated behind ``profiles:`` is not counted. Whether its
+        profile is active is not decidable here, and refusing on a network
+        only such a service uses would reject a working deployment -- the
+        same fail-only-when-certain rule the rest of this module follows
+        (#164 NET-C2/FBN-16).
+        """
+        used: set[str] = set()
+        for svc in (compose.get("services") or {}).values():
+            if not isinstance(svc, dict) or svc.get("profiles"):
+                continue
+            attached = svc.get("networks")
+            if not attached:
+                continue
+            used.update(
+                attached if isinstance(attached, list) else list(attached))
+        return used
+
     def _assert_macvlan_ipam_sane(
         self, cluster_name: str, compose: dict[str, Any],
         referenced: set[str],
@@ -627,66 +653,92 @@ class ComposeGenerator:
         subnet, or an ``ip_range`` that is not inside it, is reported by
         Docker obscurely and late (#164 FBN-16).
 
-        Run on the **assembled** file, because ``compose_extra:`` may replace
-        the IPAM block wholesale -- a raw gateway that looks wrong here can be
-        corrected by an override, and checking before the merge would reject
-        a configuration that deploys.
+        Run on the **assembled** file and only for networks still in
+        effective use, because ``compose_extra:`` may replace the IPAM block
+        wholesale or remove the attachment altogether.
         """
-        for name in sorted(referenced):
+        in_use = self._effectively_attached(compose)
+        for name in sorted(referenced & in_use):
             spec = (compose.get("networks") or {}).get(name) or {}
             configs = ((spec.get("ipam") or {}).get("config") or [])
             for cfg in configs:
                 if not isinstance(cfg, dict):
                     continue
-                subnet = cfg.get("subnet")
-                gateway = cfg.get("gateway")
-                ip_range = cfg.get("ip_range")
-                if self._unresolved(subnet):
-                    continue
-                try:
-                    net = ipaddress.ip_network(str(subnet), strict=False)
-                except ValueError as exc:
-                    raise ConfigError(
-                        f"shared network '{name}': 'subnet: {subnet}' is not "
-                        f"a valid network ({exc})."
-                    ) from exc
-                if gateway and not self._unresolved(gateway):
-                    try:
-                        addr = ipaddress.ip_address(str(gateway))
-                    except ValueError as exc:
-                        raise ConfigError(
-                            f"shared network '{name}': 'gateway: {gateway}' "
-                            f"is not a valid address ({exc})."
-                        ) from exc
-                    if addr not in net:
-                        raise ConfigError(
-                            f"shared network '{name}': 'gateway: {gateway}' "
-                            f"is outside 'subnet: {subnet}'."
-                        )
-                if ip_range and not self._unresolved(ip_range):
-                    try:
-                        rng = ipaddress.ip_network(str(ip_range), strict=False)
-                    except ValueError as exc:
-                        raise ConfigError(
-                            f"shared network '{name}': 'ip_range: {ip_range}' "
-                            f"is not a valid network ({exc})."
-                        ) from exc
-                    if not rng.subnet_of(net):
-                        raise ConfigError(
-                            f"shared network '{name}': 'ip_range: {ip_range}' "
-                            f"is not inside 'subnet: {subnet}'."
-                        )
-                elif not ip_range:
-                    self.logger.warning(
-                        f"shared network '{name}' declares no 'ip_range', so "
-                        f"docker allocates from the whole of {subnet}, "
-                        f"starting at the first free address. This bridge is "
-                        f"a shared L2 -- docker's IPAM sees only its own "
-                        f"pools, so it will hand a container an address a VM "
-                        f"or a DHCP server on that bridge is already using. "
-                        f"Reserve docker a range that nothing else allocates "
-                        f"from: 'ip_range:' under shared_networks['{name}']."
-                    )
+                self._check_ipam_entry(name, cfg)
+
+    def _check_ipam_entry(self, name: str, cfg: dict[str, Any]) -> None:
+        """One ``ipam.config`` element of a shared macvlan network."""
+        subnet = cfg.get("subnet")
+        gateway = cfg.get("gateway")
+        ip_range = cfg.get("ip_range")
+
+        # The missing-range warning does not depend on parsing anything, and
+        # must not be skipped along with a deferred membership comparison --
+        # it is the whole NET-C2 safeguard (#164 NET-C2).
+        if subnet and not ip_range:
+            self.logger.warning(
+                f"shared network '{name}' declares no 'ip_range', so docker "
+                f"allocates from the whole of {subnet}, starting at the "
+                f"first free address. This bridge is a shared L2 -- docker's "
+                f"IPAM sees only its own pools, never the wire, so it will "
+                f"hand a container an address a VM or a DHCP server on that "
+                f"bridge is already using. Reserve docker a range nothing "
+                f"else allocates from: 'ip_range:' under "
+                f"shared_networks['{name}']."
+            )
+        if not subnet:
+            # An override asking for automatic IPAM: docker selects a
+            # predefined pool. Nothing declared here to check.
+            return
+        if self._unresolved(subnet):
+            return
+        try:
+            net = ipaddress.ip_network(str(subnet), strict=False)
+        except ValueError as exc:
+            raise ConfigError(
+                f"shared network '{name}': 'subnet: {subnet}' is not a valid "
+                f"network ({exc})."
+            ) from exc
+
+        if gateway and not self._unresolved(gateway):
+            try:
+                addr = ipaddress.ip_address(str(gateway))
+            except ValueError as exc:
+                raise ConfigError(
+                    f"shared network '{name}': 'gateway: {gateway}' is not a "
+                    f"valid address ({exc})."
+                ) from exc
+            if addr.version != net.version:
+                raise ConfigError(
+                    f"shared network '{name}': 'gateway: {gateway}' is IPv"
+                    f"{addr.version} but 'subnet: {subnet}' is IPv"
+                    f"{net.version}."
+                )
+            if addr not in net:
+                raise ConfigError(
+                    f"shared network '{name}': 'gateway: {gateway}' is "
+                    f"outside 'subnet: {subnet}'."
+                )
+
+        if ip_range and not self._unresolved(ip_range):
+            try:
+                rng = ipaddress.ip_network(str(ip_range), strict=False)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"shared network '{name}': 'ip_range: {ip_range}' is not "
+                    f"a valid network ({exc})."
+                ) from exc
+            if rng.version != net.version:
+                raise ConfigError(
+                    f"shared network '{name}': 'ip_range: {ip_range}' is IPv"
+                    f"{rng.version} but 'subnet: {subnet}' is IPv"
+                    f"{net.version}."
+                )
+            if not rng.subnet_of(net):
+                raise ConfigError(
+                    f"shared network '{name}': 'ip_range: {ip_range}' is not "
+                    f"inside 'subnet: {subnet}'."
+                )
 
     def _service_networks(
         self,
