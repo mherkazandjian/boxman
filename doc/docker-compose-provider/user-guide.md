@@ -222,6 +222,60 @@ expression interpolating to empty) leaves the service on its declared
 networks rather than silently detaching it.
 
 
+
+### One alias, one L2
+
+A name may not appear in both a cluster's `networks:` and the project's
+`shared_networks:`. They are different broadcast domains, boxman resolves
+the cluster-internal one, and a box asking for the shared bridge would be
+quietly isolated instead. Rename one of the two declarations.
+
+The refusal is on the *attachment*, not the declaration: a colliding name
+nothing attaches to, or one an override removes, deploys fine.
+
+### Sharing one bridge between clusters
+
+Docker's IPAM knows only its own pools — it never looks at the wire. Two
+consequences, and they need different handling:
+
+**Between Docker networks**, Docker polices itself. Two clusters referencing
+one `shared_networks` alias each emit their own macvlan network over the same
+bridge, requesting the *same* pool, and the Engine refuses the second:
+
+```
+failed to create network <proj>_<alias>:
+  invalid pool request: Pool overlaps with other one on this address space
+```
+
+`ip_range` alone does not fix that, because one global `ip_range` is emitted
+unchanged into every referencing cluster. Supported arrangements:
+
+| you want | do this |
+|---|---|
+| two clusters on one bridge | declare **separate aliases** over the same `bridge:`, each with a disjoint `ip_range` |
+| ditto, one config | give each cluster a `compose_extra:` that overrides `networks.<alias>.ipam.config` with its own range |
+| full control | manage the Docker network externally and attach it through `compose_extra:` |
+
+**Between Docker and everything else on that bridge**, nothing polices
+anything. A container can be handed an address a VM already holds, and `up`
+will succeed. Declare an `ip_range` that nothing else allocates from —
+boxman warns when a shared network a cluster uses has none, because Docker
+then owns the whole subnet and starts at the first free address:
+
+```yaml
+shared_networks:
+  app_bridge:
+    bridge: bx_app
+    subnet: 10.10.0.0/24
+    ip_range: 10.10.0.128/25   # docker gets .128-.255; VMs keep the rest
+```
+
+Reserving that range against your VM addresses **and any DHCP pool on the
+bridge** is the operator's job: boxman creates no DHCP service for these
+bridges, but it reuses existing ones and excludes nothing served by libvirt,
+a guest, or another machine. A declared `gateway:` must be inside `subnet:`,
+and `ip_range:` must be inside it too — both are checked.
+
 ## How the compose file is published
 
 Every generated file is validated with `docker compose config` **before the
