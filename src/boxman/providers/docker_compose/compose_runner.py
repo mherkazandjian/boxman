@@ -13,6 +13,7 @@ service is ``healthy`` (when a healthcheck exists) or ``running``.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -93,10 +94,43 @@ class ComposeRunner:
         a *candidate* is what lets boxman defer those cases safely instead of
         guessing at them (#164 NET-C1).
         """
-        cmd = (f"{self._sudo}env COMPOSE_PROJECT_NAME= docker compose "
-               f"-p {self.project} "
-               f"-f {shlex.quote(compose_file)} config --quiet")
-        return run(cmd, hide=True, warn=True)
+        return run(f"{self._base_for(compose_file)} config --quiet",
+                   hide=True, warn=True)
+
+    def resolved_model(self, compose_file: str) -> dict:
+        """``docker compose config --format json`` — the model Compose built.
+
+        Boxman needs this for one question it cannot answer itself: what an
+        interpolated ``networks:`` reference actually resolved to. Compose
+        does the interpolation, ``include:`` and ``extends:`` and hands back
+        the result, so boxman never implements any of that (#164 NET-C3).
+
+        A successful resolution *is* a validation -- it is the same model
+        ``config --quiet`` checks -- so callers do not run both. Raises
+        rather than returning a partial model: an unchecked model must never
+        reach publication.
+        """
+        result = run(f"{self._base_for(compose_file)} config --format json",
+                     hide=True, warn=True)
+        if not result.ok:
+            raise ProvisionError(
+                f"could not resolve '{compose_file}' for project "
+                f"'{self.project}': "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+        try:
+            model = json.loads(result.stdout)
+        except ValueError as exc:
+            raise ProvisionError(
+                f"compose returned output for '{compose_file}' that is not "
+                f"valid JSON: {exc}"
+            ) from exc
+        if not isinstance(model, dict):
+            raise ProvisionError(
+                f"compose returned a {type(model).__name__} for "
+                f"'{compose_file}', not a project model."
+            )
+        return model
 
     def up(self, timeout: int = DEFAULT_READINESS_TIMEOUT,
            force_recreate: bool = False):
@@ -214,20 +248,36 @@ class ComposeRunner:
             argv += ["--project-directory", self.workdir]
         return argv
 
-    def _base(self) -> str:
-        # ``-f`` / ``--project-directory`` are included only when set. A
-        # teardown runner with neither operates on the project purely by its
-        # compose labels (``docker compose -p <project> down`` — compose v2
-        # resolves containers/networks from ``com.docker.compose.project``),
-        # so containers can be removed even after the workdir/file is gone.
+    def _base_for(self, compose_file: str | None = None) -> str:
+        """The command prefix, optionally against a *different* file.
+
+        One construction for every invocation, so a call aimed at a staged
+        candidate cannot drift from the one used to deploy: same project,
+        project directory, ``COMPOSE_PROJECT_NAME`` pin, quoting and sudo.
+        With an explicit ``-f <workdir>/<candidate>`` Compose already derives
+        its project directory from that file's parent, so passing
+        ``--project-directory`` as well preserves directory selection --
+        including the default ``.env`` lookup -- while stating it explicitly
+        (#164 NET-C3).
+
+        ``-f`` / ``--project-directory`` are included only when set. A
+        teardown runner with neither operates on the project purely by its
+        compose labels (``docker compose -p <project> down`` — compose v2
+        resolves containers/networks from ``com.docker.compose.project``),
+        so containers can be removed even after the workdir/file is gone.
+        """
+        compose_file = compose_file or self.compose_file
         parts = [f"{self._sudo}env COMPOSE_PROJECT_NAME= docker compose"]
-        if not self.compose_file:
+        if not compose_file:
             # label-only: a `.env` COMPOSE_FILE would supply a file we did
             # not ask for, and there is no `-f` here to beat it.
             parts.append(f"--env-file {os.devnull}")
         parts.append(f"-p {shlex.quote(self.project)}")
-        if self.compose_file:
-            parts.append(f"-f {shlex.quote(self.compose_file)}")
+        if compose_file:
+            parts.append(f"-f {shlex.quote(compose_file)}")
         if self.workdir:
             parts.append(f"--project-directory {shlex.quote(self.workdir)}")
         return " ".join(parts)
+
+    def _base(self) -> str:
+        return self._base_for()

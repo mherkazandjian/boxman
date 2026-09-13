@@ -33,6 +33,7 @@ with ``docker compose -f <cluster_workdir>/docker-compose.yml ps`` (D5).
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from typing import Any
@@ -46,6 +47,12 @@ from boxman.exceptions import ConfigError
 #: [default]`` needs no top-level declaration and attaches to it, so the
 #: resolver accepts the literal name (#164 NET-C1).
 IMPLICIT_DEFAULT_NETWORK = "default"
+
+#: Compose ignores unknown top-level ``x-`` fields but *does* interpolate
+#: their values and return them in ``config --format json`` -- which is how
+#: boxman learns what an interpolated ``networks:`` reference resolved to
+#: without interpolating anything itself (#164 NET-C3).
+NET_PROVENANCE_KEY = "x-boxman-net-provenance"
 
 #: compose service keys copied through verbatim from a box definition
 _PASSTHROUGH_KEYS = (
@@ -148,17 +155,32 @@ class ComposeGenerator:
         #: matched no cluster-internal or shared network — the only refs
         #: boxman is entitled to judge (#164 NET-C1).
         unmatched_native: dict[str, set[str]] = {}
+        #: per-box refs naming BOTH a cluster-internal network and a shared
+        #: bridge. Resolution picks the cluster-internal one silently, so the
+        #: box lands on an isolated bridge instead of the shared L2 it asked
+        #: for (#164 NET-C3).
+        ambiguous_native: dict[str, set[str]] = {}
+        #: per-box refs exactly as the box wrote them, interpolations
+        #: included. Compose resolves these for us through the provenance
+        #: extension; boxman never interpolates anything (#164 NET-C3).
+        native_refs: dict[str, list[str]] = {}
 
         services: dict[str, Any] = {}
         for box_name, box in (cluster_cfg.get("boxes") or {}).items():
             box_unmatched: set[str] = set()
+            box_ambiguous: set[str] = set()
+            box_native: list[str] = []
             services[box_name] = self._service(
                 cluster_name, box_name, box or {}, conf_dir,
                 cluster_networks, shared_networks, referenced_shared,
-                named_volumes, box_unmatched,
+                named_volumes, box_unmatched, box_ambiguous, box_native,
             )
             if box_unmatched:
                 unmatched_native[box_name] = box_unmatched
+            if box_ambiguous:
+                ambiguous_native[box_name] = box_ambiguous
+            if box_native:
+                native_refs[box_name] = box_native
 
         compose: dict[str, Any] = {}
         if project_name:
@@ -180,6 +202,12 @@ class ComposeGenerator:
         # is then no reference left to judge.
         self._apply_network_mode(compose)
         self._assert_networks_resolve(cluster_name, compose, unmatched_native)
+        self._assert_no_ambiguous_alias(
+            cluster_name, compose, ambiguous_native, cluster_networks,
+            shared_networks)
+        self._assert_macvlan_ipam_sane(cluster_name, compose, referenced_shared)
+        self._emit_net_provenance(
+            compose, native_refs, cluster_networks, shared_networks)
         return compose
 
     def write(self, compose_dict: dict[str, Any], workdir: str,
@@ -212,6 +240,8 @@ class ComposeGenerator:
         referenced_shared: set[str],
         named_volumes: dict[str, Any],
         unmatched_native: set[str],
+        ambiguous_native: set[str],
+        native_refs: list[str],
     ) -> dict[str, Any]:
         svc: dict[str, Any] = {}
 
@@ -236,7 +266,7 @@ class ComposeGenerator:
         nets = self._service_networks(
             cluster_name, box_name, box.get("networks"),
             cluster_networks, shared_networks, referenced_shared,
-            unmatched_native,
+            unmatched_native, ambiguous_native, native_refs,
         )
         if nets:
             svc["networks"] = nets
@@ -536,6 +566,255 @@ class ComposeGenerator:
                     f"it is one boxman does not manage."
                 )
 
+    def _assert_no_ambiguous_alias(
+        self,
+        cluster_name: str,
+        compose: dict[str, Any],
+        ambiguous_native: dict[str, set[str]],
+        cluster_networks: dict[str, Any],
+        shared_networks: dict[str, Any],
+    ) -> None:
+        """Refuse a name that means both a cluster network and a shared bridge.
+
+        :meth:`_service_networks` resolves cluster-internal names first, so a
+        box asking for a shared L2 by a name the cluster also declares lands
+        on an isolated bridge instead -- silently, and the two are different
+        broadcast domains. The precedence is unguessable and either choice is
+        wrong for somebody, so the operator has to say which they meant.
+
+        Judged on the **surviving** attachment, after ``compose_extra:`` and
+        network-mode handling, for the same reason NET-C1 is: the colliding
+        alias may be unused, or an override may remove the attachment, and
+        neither of those deploys onto the wrong L2.
+
+        Unlike NET-C1 this has **no** ``include:``/``extends:`` deferral.
+        Those deferrals are safe there because Compose is a complete oracle
+        for an undeclared network -- it refuses one itself. It is not an
+        oracle here: Compose knows nothing about boxman's
+        ``shared_networks:``, so an unrelated ``include:`` would simply let
+        the ambiguous attachment resolve to the internal bridge (#164
+        NET-C3).
+        """
+        if not ambiguous_native:
+            return
+        services = compose.get("services") or {}
+        for box_name, refs in ambiguous_native.items():
+            svc = services.get(box_name) or {}
+            attached = svc.get("networks")
+            if not attached:
+                continue
+            attached_names = set(
+                attached if isinstance(attached, list) else list(attached))
+            for ref in sorted(refs):
+                if ref not in attached_names:
+                    continue
+                bridge = (shared_networks.get(ref) or {}).get("bridge", "?")
+                raise ConfigError(
+                    f"box '{cluster_name}.{box_name}': network '{ref}' names "
+                    f"both a cluster-internal network (under this cluster's "
+                    f"'networks:') and a shared bridge (under the project's "
+                    f"'shared_networks:', bridge '{bridge}'). Those are "
+                    f"different L2 domains, and boxman resolves the "
+                    f"cluster-internal one -- so this box would be isolated "
+                    f"rather than on the shared bridge with the VMs. Rename "
+                    f"one of the two declarations so the attachment says "
+                    f"which you meant."
+                )
+
+    @staticmethod
+    def _unresolved(*values: Any) -> bool:
+        """Whether any operand still contains a Compose expression.
+
+        A comparison is deferred when **either** side is unresolved, not just
+        the one being parsed: ``subnet: ${SUBNET}`` with a literal gateway
+        and range is valid, and skipping only the subnet must not turn its
+        dependent comparisons into errors (#164 FBN-16).
+        """
+        return any(isinstance(v, str) and "$" in v for v in values)
+
+    @staticmethod
+    def _effectively_attached(compose: dict[str, Any]) -> set[str]:
+        """Networks some service in the assembled file actually attaches to.
+
+        ``referenced_shared`` records what was referenced *before* overrides
+        merged, so validating against it rejects configurations that deploy:
+        a `network_mode:` override, or one clearing the attachment, leaves the
+        network unused and Compose drops it from the resolved model entirely.
+
+        A service gated behind ``profiles:`` is not counted. Whether its
+        profile is active is not decidable here, and refusing on a network
+        only such a service uses would reject a working deployment -- the
+        same fail-only-when-certain rule the rest of this module follows
+        (#164 NET-C2/FBN-16).
+        """
+        used: set[str] = set()
+        for svc in (compose.get("services") or {}).values():
+            if not isinstance(svc, dict) or svc.get("profiles"):
+                continue
+            attached = svc.get("networks")
+            if not attached:
+                continue
+            used.update(
+                attached if isinstance(attached, list) else list(attached))
+        return used
+
+    def _assert_macvlan_ipam_sane(
+        self, cluster_name: str, compose: dict[str, Any],
+        referenced: set[str],
+    ) -> None:
+        """Check the shared-bridge IPAM boxman emitted actually holds together.
+
+        ``_require_macvlan_ipam`` only checks that ``bridge:`` and ``subnet:``
+        are *present*. Presence is not membership: a gateway outside the
+        subnet, or an ``ip_range`` that is not inside it, is reported by
+        Docker obscurely and late (#164 FBN-16).
+
+        Run on the **assembled** file and only for networks still in
+        effective use, because ``compose_extra:`` may replace the IPAM block
+        wholesale or remove the attachment altogether.
+        """
+        in_use = self._effectively_attached(compose)
+        for name in sorted(referenced & in_use):
+            spec = (compose.get("networks") or {}).get(name) or {}
+            configs = ((spec.get("ipam") or {}).get("config") or [])
+            for cfg in configs:
+                if not isinstance(cfg, dict):
+                    continue
+                self._check_ipam_entry(name, cfg)
+
+    def _check_ipam_entry(self, name: str, cfg: dict[str, Any]) -> None:
+        """One ``ipam.config`` element of a shared macvlan network."""
+        subnet = cfg.get("subnet")
+        gateway = cfg.get("gateway")
+        ip_range = cfg.get("ip_range")
+
+        # The missing-range warning does not depend on parsing anything, and
+        # must not be skipped along with a deferred membership comparison --
+        # it is the whole NET-C2 safeguard (#164 NET-C2).
+        if subnet and not ip_range:
+            self.logger.warning(
+                f"shared network '{name}' declares no 'ip_range', so docker "
+                f"allocates from the whole of {subnet}, starting at the "
+                f"first free address. This bridge is a shared L2 -- docker's "
+                f"IPAM sees only its own pools, never the wire, so it will "
+                f"hand a container an address a VM or a DHCP server on that "
+                f"bridge is already using. Reserve docker a range nothing "
+                f"else allocates from: 'ip_range:' under "
+                f"shared_networks['{name}']."
+            )
+        if not subnet:
+            # An override asking for automatic IPAM: docker selects a
+            # predefined pool. Nothing declared here to check.
+            return
+        if self._unresolved(subnet):
+            return
+        try:
+            net = ipaddress.ip_network(str(subnet), strict=False)
+        except ValueError as exc:
+            raise ConfigError(
+                f"shared network '{name}': 'subnet: {subnet}' is not a valid "
+                f"network ({exc})."
+            ) from exc
+
+        if gateway and not self._unresolved(gateway):
+            try:
+                addr = ipaddress.ip_address(str(gateway))
+            except ValueError as exc:
+                raise ConfigError(
+                    f"shared network '{name}': 'gateway: {gateway}' is not a "
+                    f"valid address ({exc})."
+                ) from exc
+            if addr.version != net.version:
+                raise ConfigError(
+                    f"shared network '{name}': 'gateway: {gateway}' is IPv"
+                    f"{addr.version} but 'subnet: {subnet}' is IPv"
+                    f"{net.version}."
+                )
+            if addr not in net:
+                raise ConfigError(
+                    f"shared network '{name}': 'gateway: {gateway}' is "
+                    f"outside 'subnet: {subnet}'."
+                )
+
+        if ip_range and not self._unresolved(ip_range):
+            try:
+                rng = ipaddress.ip_network(str(ip_range), strict=False)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"shared network '{name}': 'ip_range: {ip_range}' is not "
+                    f"a valid network ({exc})."
+                ) from exc
+            if rng.version != net.version:
+                raise ConfigError(
+                    f"shared network '{name}': 'ip_range: {ip_range}' is IPv"
+                    f"{rng.version} but 'subnet: {subnet}' is IPv"
+                    f"{net.version}."
+                )
+            if not rng.subnet_of(net):
+                raise ConfigError(
+                    f"shared network '{name}': 'ip_range: {ip_range}' is not "
+                    f"inside 'subnet: {subnet}'."
+                )
+
+    def _emit_net_provenance(
+        self,
+        compose: dict[str, Any],
+        native_refs: dict[str, list[str]],
+        cluster_networks: dict[str, Any],
+        shared_networks: dict[str, Any],
+    ) -> None:
+        """Record which attachments boxman itself asked for, verbatim.
+
+        One alias may not mean two L2s (NET-C3), but a reference written as
+        ``${LAN}`` hides which name it is until Compose interpolates it, and
+        boxman must not interpolate anything itself -- that road produced
+        four rounds of findings elsewhere in this issue.
+
+        So the references go out as written, in an extension Compose
+        interpolates and hands back resolved. The bring-up check then reads
+        the *resolved* names back without implementing any resolution.
+
+        Two things make this correct rather than merely convenient:
+
+        - the ambiguous set comes from the **declarations**
+          (``cluster_networks & shared_networks``), not from references that
+          literally matched both. ``${LAN}`` matches nothing literally, so
+          keying off matched references would emit nothing and leave the
+          bypass exactly as it was;
+        - entries are the original native references **intersected with the
+          attachments that survived** the merge and network-mode handling. A
+          reference an override removed must not be carried: a stale
+          ``${VAR:?err}`` makes Compose fail while interpolating the
+          extension itself, and a stale name would also falsely accuse a
+          service that ``extends:`` legitimately attached elsewhere.
+
+        Emitted only when there is an ambiguous alias to judge, and only for
+        services with a surviving native reference -- Compose turns an empty
+        list into ``null`` on the way back, so an empty entry would be
+        indistinguishable from a dropped one (#164 NET-C3).
+        """
+        ambiguous = sorted(set(cluster_networks) & set(shared_networks))
+        if not ambiguous:
+            return
+        services = compose.get("services") or {}
+        native: dict[str, list[str]] = {}
+        for box_name, refs in native_refs.items():
+            svc = services.get(box_name) or {}
+            attached = svc.get("networks")
+            if not attached:
+                continue
+            surviving = set(
+                attached if isinstance(attached, list) else list(attached))
+            kept = [r for r in refs if r in surviving]
+            if kept:
+                native[box_name] = kept
+        if not native:
+            return
+        compose[NET_PROVENANCE_KEY] = {
+            "native": native,
+            "ambiguous": ambiguous,
+        }
+
     def _service_networks(
         self,
         cluster_name: str,
@@ -545,6 +824,8 @@ class ComposeGenerator:
         shared_networks: dict[str, Any],
         referenced_shared: set[str],
         unmatched_native: set[str],
+        ambiguous_native: set[str],
+        native_refs: list[str],
     ) -> list[str] | dict[str, Any]:
         """Resolve a box's ``networks:`` to the service's compose ``networks``.
 
@@ -569,6 +850,11 @@ class ComposeGenerator:
         attached: dict[str, dict[str, Any]] = {}
         any_opts = False
         for ref, opts in entries:
+            native_refs.append(ref)
+            if ref in cluster_networks and ref in shared_networks:
+                # One alias, two different L2s. Resolution below would pick
+                # the cluster-internal one silently (#164 NET-C3).
+                ambiguous_native.add(ref)
             if ref in cluster_networks:
                 if opts.get("ipv4_address"):
                     self.logger.warning(

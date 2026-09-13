@@ -26,6 +26,7 @@ from boxman.exceptions import (
     ProvisionError,
 )
 from boxman.providers.docker_compose.compose_generator import (
+    NET_PROVENANCE_KEY,
     ComposeGenerator,
     resolve_local_path,
 )
@@ -700,13 +701,19 @@ class DockerComposeSession(SessionConfigMixin):
                     f"'{workdir}': {exc}"
                 ) from exc
 
-            result = probe.validate(staged)
-            if not getattr(result, "ok", True):
-                raise ProvisionError(
-                    f"[{cluster_name}] the generated compose file does not "
-                    f"resolve: {_result_error(result)} — "
-                    f"'{final}' was left unchanged."
-                )
+            if compose.get(NET_PROVENANCE_KEY):
+                # Resolving the model *is* validating it -- same model
+                # `config --quiet` checks -- so the two are not both run.
+                self._assert_resolved_aliases(
+                    cluster_name, compose, probe.resolved_model(staged))
+            else:
+                result = probe.validate(staged)
+                if not getattr(result, "ok", True):
+                    raise ProvisionError(
+                        f"[{cluster_name}] the generated compose file does "
+                        f"not resolve: {_result_error(result)} — "
+                        f"'{final}' was left unchanged."
+                    )
             try:
                 # (3) the only write to `final`, and it is atomic.
                 os.replace(staged, final)
@@ -723,6 +730,127 @@ class DockerComposeSession(SessionConfigMixin):
                 except OSError:
                     pass
         return final
+
+    def _assert_resolved_aliases(
+        self, cluster_name: str, compose: dict[str, Any], model: dict[str, Any]
+    ) -> None:
+        """Refuse a native attachment that *resolved* to an ambiguous alias.
+
+        The generator can only see ``${LAN}``; Compose knows it means
+        ``lab``. So the references went out verbatim in an extension, and
+        this reads them back resolved -- boxman interpolates nothing.
+
+        A service is refused only when all three hold:
+
+        1. the name came from **boxman's own** ``networks:`` for that box --
+           attachments alone cannot establish that, and an ``extends:``
+           inherited attachment to an ambiguous alias is legitimate;
+        2. the name is ambiguous -- declared as both a cluster network and a
+           shared bridge;
+        3. it is still **attached** in the resolved model -- provenance alone
+           cannot establish that the reference is still in effect.
+
+        Services absent from the resolved model are skipped: Compose keeps
+        root extension metadata for inactive services, so their provenance
+        survives even though they deploy nothing.
+
+        Everything the model says about the provenance is checked against
+        what was emitted before any of that runs. The check is only as good
+        as the round trip, and a damaged one must fail loudly rather than
+        quietly accept: a missing or altered ambiguity list, a non-string
+        element, or an absent ``services`` field would each otherwise make
+        this pass without checking anything (#164 NET-C3).
+        """
+        sent = (compose.get(NET_PROVENANCE_KEY) or {})
+        emitted = sent.get("native") or {}
+        emitted_ambiguous = list(sent.get("ambiguous") or [])
+
+        def _damaged(what: str) -> ProvisionError:
+            return ProvisionError(
+                f"[{cluster_name}] the network provenance boxman wrote did "
+                f"not survive compose resolution ({what}), so the attachment "
+                f"cannot be checked. Nothing was published."
+            )
+
+        resolved = model.get(NET_PROVENANCE_KEY)
+        if not isinstance(resolved, dict):
+            raise _damaged("the extension is missing or not a mapping")
+        resolved_native = resolved.get("native")
+        if not isinstance(resolved_native, dict):
+            raise _damaged("'native' is missing or not a mapping")
+        ambiguous = resolved.get("ambiguous")
+        if not isinstance(ambiguous, list) or not all(
+                isinstance(a, str) for a in ambiguous):
+            raise _damaged("'ambiguous' is missing or not a list of names")
+        if sorted(ambiguous) != sorted(emitted_ambiguous):
+            raise _damaged(
+                f"'ambiguous' came back as {sorted(ambiguous)!r}, not "
+                f"{sorted(emitted_ambiguous)!r}")
+        if "services" not in model:
+            raise _damaged("the model has no 'services'")
+        services = model.get("services")
+        if not isinstance(services, dict):
+            raise _damaged("'services' is not a mapping")
+
+        ambiguous_set = set(ambiguous)
+        for box_name, box_sent in emitted.items():
+            if box_name not in services:
+                # inactive: compose keeps the metadata, deploys nothing
+                continue
+            got = resolved_native.get(box_name)
+            if not isinstance(got, list) or len(got) != len(box_sent) or not \
+                    all(isinstance(name, str) for name in got):
+                raise _damaged(
+                    f"'{box_name}' came back as {got!r}, not a list of "
+                    f"{len(box_sent)} name(s)")
+            svc = services.get(box_name)
+            if not isinstance(svc, dict):
+                raise _damaged(f"service '{box_name}' is not a mapping")
+            attached_names = self._attached_names(_damaged, box_name, svc)
+            for name in got:
+                if name in ambiguous_set and name in attached_names:
+                    raise ConfigError(
+                        f"box '{cluster_name}.{box_name}': this box attaches "
+                        f"to '{name}', which names both a cluster-internal "
+                        f"network and a shared bridge. Those are different "
+                        f"L2 domains and boxman resolves the "
+                        f"cluster-internal one, so the box would be isolated "
+                        f"rather than on the shared bridge with the VMs. "
+                        f"Rename one of the two declarations so the "
+                        f"attachment says which you meant."
+                    )
+
+    @staticmethod
+    def _attached_names(damaged, box_name: str, svc: dict[str, Any]) -> set[str]:
+        """The networks a resolved service is attached to.
+
+        Shape-checked before use. A bare string was the interesting one:
+        ``networks: "lab"`` coerced to a set of its individual *characters*,
+        so nothing matched an alias and the check failed open. ``false`` and
+        ``0`` fell through as empty, and a number or a nested list raised
+        ``TypeError`` rather than the agreed error (#164 NET-C3).
+
+        Absent or null stays legitimate -- a service need not attach to
+        anything -- so only a present value of the wrong shape is refused.
+        """
+        if "networks" not in svc:
+            return set()
+        attached = svc["networks"]
+        if attached is None:
+            return set()
+        if isinstance(attached, dict):
+            names = list(attached)
+        elif isinstance(attached, list):
+            names = attached
+        else:
+            raise damaged(
+                f"service '{box_name}' has 'networks: {attached!r}', which is "
+                f"neither a mapping nor a list")
+        if not all(isinstance(n, str) for n in names):
+            raise damaged(
+                f"service '{box_name}' has a non-name entry in "
+                f"'networks': {names!r}")
+        return set(names)
 
     def _teardown_runner(
         self, cluster_name: str, cluster_cfg: dict[str, Any]

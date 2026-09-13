@@ -624,6 +624,45 @@ class TestComposeRunner:
         assert argv[:4] == ["env", "COMPOSE_PROJECT_NAME=",
                             "docker", "compose"]
 
+    def test_resolved_model_rejects_a_non_object(self):
+        """`[]` used to reach the caller and raise AttributeError there."""
+        runner = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok("[]")
+        ):
+            with pytest.raises(ProvisionError, match=r"not a project model"):
+                runner.resolved_model("/wd/dc.yml")
+
+    def test_resolved_model_targets_the_file_it_is_given(self):
+        runner = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok("{}")
+        ) as run:
+            runner.resolved_model("/wd/.candidate")
+
+        cmd = run.call_args.args[0]
+        assert "-f /wd/.candidate" in cmd
+        assert "config --format json" in cmd
+
+    def test_validate_and_resolved_model_share_the_deployment_context(self):
+        """One builder, so a candidate call cannot drift from deployment."""
+        runner = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok("{}")
+        ) as run:
+            runner.validate("/wd/.candidate")
+            validated = run.call_args.args[0]
+            runner.resolved_model("/wd/.candidate")
+            resolved = run.call_args.args[0]
+
+        prefix = runner._base_for("/wd/.candidate")
+        assert validated.startswith(prefix)
+        assert resolved.startswith(prefix)
+        assert "--project-directory /wd" in prefix
+
     def test_base_command_shape(self):
         base = self._runner()._base()
         assert base == (
@@ -846,6 +885,9 @@ class _FakeRunner:
         self.down_result = None
         self.down_volumes_result = None
         self.start_result = None
+        #: the resolved compose model (#164 NET-C3)
+        self.resolved_model_result = None
+        self.resolved_model_error = None
         #: `None` means "stop succeeded" (the `_check` default)
         self.stop_result = None
         #: the real runner carries this; `None` means a label-only runner,
@@ -856,6 +898,12 @@ class _FakeRunner:
         self.calls.append(("preflight",))
         if not self.compose_available:
             raise RuntimeUnavailable("'docker' is not on PATH")
+
+    def resolved_model(self, compose_file):
+        self.calls.append(("resolved_model", compose_file))
+        if self.resolved_model_error:
+            raise self.resolved_model_error
+        return self.resolved_model_result
 
     def validate(self, compose_file):
         self.calls.append(("validate", compose_file))
@@ -2472,3 +2520,189 @@ class TestResourceRemovalIsBlockedWhenTheFileCannotBeRead:
 
         said = " ".join(str(c) for c in err.call_args_list)
         assert "could NOT be stopped" in said
+
+
+class TestAnInterpolatedReferenceToAnAmbiguousAliasIsRefused:
+    """`${LAN}` hides which network it means until compose interpolates it.
+
+    boxman emits its own references verbatim in an extension, asks compose
+    for the resolved model, and reads them back — interpolating nothing
+    itself (#164 NET-C3).
+    """
+
+    KEY = "x-boxman-net-provenance"
+
+    def _session(self, tmp_path):
+        session = DockerComposeSession({
+            "provider": {"docker-compose": {}},
+            # `lab` is declared in BOTH blocks — that is the ambiguity
+            "shared_networks": {"lab": {"bridge": "br-lab",
+                                        "subnet": "10.10.0.0/24",
+                                        "ip_range": "10.10.0.128/25"}},
+        })
+        session.manager = SimpleNamespace(
+            runtime="local", config_path=str(tmp_path / "conf.yml"))
+        return session
+
+    def _cfg(self, tmp_path):
+        return {"workdir": str(tmp_path),
+                "networks": {"lab": {}},
+                "boxes": {"web": {"image": "nginx", "networks": ["${LAN}"]}}}
+
+    def _model(self, native, attached, ambiguous=("lab",), services=("web",)):
+        return {
+            self.KEY: {"native": native, "ambiguous": list(ambiguous)},
+            "services": {n: {"networks": {a: None for a in attached}}
+                         for n in services},
+        }
+
+    def _run(self, tmp_path, model):
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.resolved_model_result = model
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            return session.up_cluster("stack", self._cfg(tmp_path))
+
+    def test_resolving_to_the_ambiguous_alias_is_refused(self, tmp_path):
+        with pytest.raises(ConfigError, match=r"names both|attaches to 'lab'"):
+            self._run(tmp_path, self._model({"web": ["lab"]}, ["lab"]))
+
+        assert not (tmp_path / "docker-compose.yml").exists()
+
+    def test_an_inherited_attachment_to_the_alias_is_allowed(self, tmp_path):
+        """codex's counterexample.
+
+        `${LAN}` resolved to `other`; `extends` supplied `lab` as well. The
+        service is attached to both, but boxman only asked for `other` — so
+        refusing it would be wrong.
+        """
+        assert self._run(
+            tmp_path,
+            self._model({"web": ["other"]}, ["other", "lab"])) is True
+
+    def test_provenance_without_a_surviving_attachment_is_allowed(self,
+                                                                  tmp_path):
+        """Provenance alone cannot establish the reference is in effect."""
+        assert self._run(
+            tmp_path, self._model({"web": ["lab"]}, ["other"])) is True
+
+    def test_a_service_absent_from_the_model_is_skipped(self, tmp_path):
+        """Compose keeps root extension metadata for inactive services."""
+        model = self._model({"web": ["lab"]}, ["lab"], services=())
+        assert self._run(tmp_path, model) is True
+
+    def test_missing_provenance_in_the_model_fails(self, tmp_path):
+        with pytest.raises(ProvisionError, match=r"did not survive"):
+            self._run(tmp_path, self._model({}, ["lab"]))
+
+        assert not (tmp_path / "docker-compose.yml").exists()
+
+    def test_a_mangled_round_trip_fails(self, tmp_path):
+        """`null` where a non-empty list was sent is not a valid answer."""
+        with pytest.raises(ProvisionError, match=r"did not survive"):
+            self._run(tmp_path, self._model({"web": None}, ["lab"]))
+
+    def test_a_resolution_failure_publishes_nothing(self, tmp_path):
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.resolved_model_error = ProvisionError("could not resolve")
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            with pytest.raises(ProvisionError, match=r"could not resolve"):
+                session.up_cluster("stack", self._cfg(tmp_path))
+
+        assert not (tmp_path / "docker-compose.yml").exists()
+
+    def test_snapshot_restore_takes_the_same_path(self, tmp_path):
+        session = self._session(tmp_path)
+        cfg = self._cfg(tmp_path)
+        session._save_snapshots("stack", cfg, {
+            "v1": {"created": "t", "boxes": {"web": "boxman/p_web:v1"}}})
+        runner = _FakeRunner()
+        runner.resolved_model_result = self._model({"web": ["lab"]}, ["lab"])
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            with pytest.raises(ConfigError):
+                session.snapshot_restore_cluster("stack", cfg, "v1")
+
+    def test_a_config_without_provenance_still_uses_quiet_validation(self,
+                                                                     tmp_path):
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        cfg = {"workdir": str(tmp_path),
+               "boxes": {"web": {"image": "nginx"}}}
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            session.up_cluster("stack", cfg)
+
+        assert any(c[0] == "validate" for c in runner.calls)
+        assert not any(c[0] == "resolved_model" for c in runner.calls)
+
+    # -- the check is only as good as the round trip -----------------------
+    # Each of these made an earlier version accept an ambiguous attachment
+    # without checking anything (#164 NET-C3).
+
+    def _damaged(self, tmp_path, mutate):
+        model = self._model({"web": ["lab"]}, ["lab"])
+        mutate(model)
+        with pytest.raises(ProvisionError, match=r"did not survive"):
+            self._run(tmp_path, model)
+        assert not (tmp_path / "docker-compose.yml").exists()
+
+    def test_a_removed_ambiguity_list_fails(self, tmp_path):
+        self._damaged(tmp_path, lambda m: m[self.KEY].pop("ambiguous"))
+
+    def test_an_emptied_ambiguity_list_fails(self, tmp_path):
+        self._damaged(tmp_path,
+                      lambda m: m[self.KEY].update(ambiguous=[]))
+
+    def test_an_altered_ambiguity_list_fails(self, tmp_path):
+        self._damaged(tmp_path,
+                      lambda m: m[self.KEY].update(ambiguous=["other"]))
+
+    def test_a_non_string_native_element_fails(self, tmp_path):
+        self._damaged(tmp_path,
+                      lambda m: m[self.KEY]["native"].update(web=[None]))
+
+    def test_a_missing_services_field_fails(self, tmp_path):
+        self._damaged(tmp_path, lambda m: m.pop("services"))
+
+    def test_a_removed_extension_fails(self, tmp_path):
+        self._damaged(tmp_path, lambda m: m.pop(self.KEY))
+
+    def test_a_present_but_empty_services_mapping_is_not_a_failure(self,
+                                                                   tmp_path):
+        """Distinct from a missing field: nothing is active, nothing to check."""
+        model = self._model({"web": ["lab"]}, ["lab"])
+        model["services"] = {}
+
+        assert self._run(tmp_path, model) is True
+
+    def _damaged_attachment(self, tmp_path, networks):
+        model = self._model({"web": ["lab"]}, ["lab"])
+        model["services"]["web"]["networks"] = networks
+        with pytest.raises(ProvisionError, match=r"did not survive"):
+            self._run(tmp_path, model)
+
+    @pytest.mark.parametrize("networks", [
+        "lab", 42, {"lab": {}, 7: {}},
+        # falsy but still the wrong shape: an `or {}` coercion placed before
+        # the shape check swallows these silently, and every other test here
+        # still passes (#164 NET-C3).
+        False, 0, "",
+    ])
+    def test_a_malformed_attachment_field_fails(self, tmp_path, networks):
+        """`networks: "lab"` used to compare individual characters."""
+        self._damaged_attachment(tmp_path, networks)
+
+    def test_a_non_string_attachment_entry_fails(self, tmp_path):
+        self._damaged_attachment(tmp_path, [None])
+
+    @pytest.mark.parametrize("networks", [None, [], {}])
+    def test_an_empty_attachment_is_legitimate(self, tmp_path, networks):
+        """A service need not attach to anything."""
+        model = self._model({"web": ["lab"]}, ["lab"])
+        model["services"]["web"]["networks"] = networks
+
+        assert self._run(tmp_path, model) is True
