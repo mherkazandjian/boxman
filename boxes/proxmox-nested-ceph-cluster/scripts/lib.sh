@@ -33,6 +33,10 @@ NODES=(pve1 pve2 pve3 pve4)
 declare -A NODE_IP=([pve1]=10.77.0.11 [pve2]=10.77.0.12 [pve3]=10.77.0.13 [pve4]=10.77.0.14)
 declare -A NODE_SITE=([pve1]=hpe1 [pve2]=hpe1 [pve3]=hpe2 [pve4]=hpe2)
 DOMAIN=pve.lab
+#: the host the orchestration scripts run from (migration, ceph, HA):
+#: it needs jq, which the nodes do not have
+ORCH_SITE="${PVE_ORCH_SITE:-hpe1}"
+
 CLUSTER_NAME=pvelab
 CEPH_POOL=vmpool
 

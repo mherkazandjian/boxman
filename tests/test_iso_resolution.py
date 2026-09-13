@@ -1,11 +1,12 @@
 """Unit tests for BoxmanManager ISO resolution helpers."""
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.exceptions import ProvisionError
+from boxman.exceptions import ConfigError, ProvisionError
 from boxman.manager import BoxmanManager
 
 pytestmark = pytest.mark.unit
@@ -647,3 +648,56 @@ class TestDeclaredButUnresolvableNetworks:
         if networks is not None:
             vm["networks"] = networks
         self._mgr({"v": vm}).validate_base_images()
+
+
+class TestConfigIsRefusedBeforeAnythingIsBuilt:
+    """#171 A3. These checks need no template, no libvirt and no filesystem,
+    so paying for a template build or a forced deprovision before reporting a
+    typo'd mac is avoidable -- and in `update` the networks had already been
+    reconciled by the time the old call site was reached.
+    """
+
+    _BAD = {"project": "p", "clusters": {"c": {"vms": {
+        "v": {"boot_order": ["cdrom", "hd"],
+              "cdroms": [{"source": "/x.iso"}],
+              "networks": [{"name": "n", "mac": "not-a-mac"}]}}}}}
+
+    def test_provision_refuses_before_templates_or_clones(self):
+        mgr = _manager_with_config(self._BAD)
+        cls = type(mgr)
+        with patch.object(cls, "_update_sessions_with_runtime"), \
+             patch.object(cls, "ensure_templates_exist") as templates, \
+             patch.object(cls, "_create_templates_impl") as build, \
+             patch.object(cls, "deprovision") as deprovision, \
+             patch.object(cls, "clone_vms") as clone, \
+             patch.object(cls, "define_networks") as networks:
+            with pytest.raises(ConfigError, match="invalid mac"):
+                mgr.provision(SimpleNamespace(force=False, rebuild_templates=False))
+
+        templates.assert_not_called()
+        build.assert_not_called()
+        deprovision.assert_not_called()
+        clone.assert_not_called()
+        networks.assert_not_called()
+
+    def test_update_refuses_before_reconciling_anything(self):
+        mgr = _manager_with_config(self._BAD)
+        cls = type(mgr)
+        with patch.object(cls, "_update_sessions_with_runtime"), \
+             patch.object(cls, "ensure_templates_exist") as templates, \
+             patch.object(cls, "reconcile_networks") as networks:
+            with pytest.raises(ConfigError, match="invalid mac"):
+                mgr.update(SimpleNamespace(
+                    force=False, yes=False, dry_run=False, restart=False,
+                    vms=None, cluster=None))
+
+        templates.assert_not_called()
+        networks.assert_not_called()
+
+    def test_a_good_config_is_not_refused(self):
+        """Without this the check could pass by rejecting everything."""
+        good = {"project": "p", "clusters": {"c": {"vms": {
+            "v": {"boot_order": ["cdrom", "hd"],
+                  "cdroms": [{"source": "/x.iso"}],
+                  "networks": [{"name": "n", "mac": "52:54:00:0c:01:09"}]}}}}}
+        _manager_with_config(good).validate_direct_boot_config()

@@ -21,6 +21,16 @@ check "docker usable (ISO build)"             docker info
 check "python3.12 + venv"                     python3.12 -m venv --help
 check "passwordless sudo"                     sudo -n true
 check "vxlan kernel module"                   modinfo -n vxlan
+# Both are used unconditionally by later stages, and a missing one surfaced
+# minutes later inside a script instead of here (#171 docs B3). firewalld has
+# to be *usable*, not merely installed: vxlan-up.sh binds the lab bridge to a
+# zone, which a dead daemon cannot do.
+check "firewalld usable"                      sudo firewall-cmd --state
+# An `&&` list whose test fails returns 1, and this file runs under `set -e`,
+# so the orchestration-only check needs a real `if`.
+if [[ $SITE == "$ORCH_SITE" ]]; then
+    check "jq (migration + HA json parsing)"  command -v jq
+fi
 check "internet egress"                       curl -fsSI -m 10 "$ISO_URL"
 check "lab key present at $KEY"               test -f "$KEY"
 [[ -f $KEY ]] && chmod 600 "$KEY"

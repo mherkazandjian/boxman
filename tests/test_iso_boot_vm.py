@@ -233,3 +233,34 @@ class TestDeclaredButUnresolvableNetworks:
             vm.create()
         assert mock_run.call_count == 0, (
             f"{mock_run.call_count} shell command(s) ran before the refusal")
+
+
+class TestTheBootDiskIsDeclaredQcow2:
+    """#171 C4. `format=` governs volume *creation*; for a file that already
+    exists libvirt consults its pool record, and a stale one gave a qcow2 boot
+    disk `<driver type='raw'>` -- the guest then saw a 64 GiB image as 197 KiB.
+    `driver.type=qcow2` states it outright. Nothing covered it.
+    """
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_virt_install_is_told_the_driver_type(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path, iso_path="/data/talos.iso")
+        assert vm.create() is True
+
+        cmd = " ".join(str(c.args[0]) for c in mock_run.call_args_list)
+        disk_args = [a for a in cmd.split() if a.startswith("--disk=")]
+        assert disk_args, cmd
+        assert "driver.type=qcow2" in disk_args[0], disk_args[0]
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_the_image_is_created_as_qcow2_too(self, mock_run, tmp_path):
+        """The two have to agree: declaring qcow2 over a raw file is the same
+        class of mismatch, pointing the other way."""
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path, iso_path="/data/talos.iso")
+        vm.create()
+
+        qemu_img = str(mock_run.call_args_list[0].args[0])
+        assert "qemu-img create" in qemu_img
+        assert "-f qcow2" in qemu_img, qemu_img

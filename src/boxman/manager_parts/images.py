@@ -625,6 +625,38 @@ class ImagesMixin:
             seen_macs[mac_s] = loc
         return reasons
 
+    def validate_direct_boot_config(self) -> None:
+        """
+        Check what can be checked from the configuration alone, before the
+        command does anything.
+
+        The direct-boot network and mac rules need no filesystem, no libvirt
+        and no templates, yet they only ran from :meth:`validate_base_images`,
+        which sits after template creation -- and in ``update`` after the
+        networks had been reconciled. So a typo'd mac was reported only once a
+        template had been built or a network changed, and "exit 2 before any
+        virt-install" held solely for a project that needed no template work
+        (#171 A3).
+
+        Raises:
+            ConfigError: naming every offending VM at once.
+        """
+        bad = []
+        adapter_macs = self._adapter_mac_index()
+        seen_macs: dict[str, str] = {}
+        for cluster_name, cluster in (self.config.get('clusters') or {}).items():
+            for vm_name, vm_info in (cluster.get('vms') or {}).items():
+                boot_order = vm_info.get('boot_order', ['hd'])
+                if (boot_order[0] if boot_order else 'hd') not in ('cdrom', 'network'):
+                    continue
+                loc = f"{cluster_name}.vms.{vm_name}"
+                for reason in self._validate_direct_boot_networks(
+                        vm_info, loc, seen_macs, adapter_macs):
+                    bad.append(f"{loc} ({reason})")
+        if bad:
+            raise ConfigError(
+                "invalid direct-boot network configuration: " + ", ".join(bad))
+
     def _adapter_mac_index(self) -> dict[str, str]:
         """Canonical ``network_adapters[].mac`` -> where it was declared.
 

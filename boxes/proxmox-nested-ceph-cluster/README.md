@@ -57,9 +57,17 @@ Verified end to end on 2026-09-06 (hpe1/hpe2: Rocky 9.8, EPYC 9825, libvirt
 
 ## Read this first: what this box does *not* do
 
-- It is **not HA**: three Ceph monitors on two hosts cannot survive losing
-  hpe1. It demonstrates clustering, shared storage and live migration, not
-  fault tolerance.
+- It is **not HA**, and neither physical host's loss is survivable. Two
+  separate things stop it:
+  - **Corosync quorum.** Four voting nodes with no external voter (no QDevice)
+    need three votes for a majority. Losing either host leaves two of four, so
+    the survivors go inquorate and stop acting — this applies to hpe1 *and*
+    hpe2.
+  - **Ceph monitors.** Two of the three (mon.pve1, mon.pve2) are on hpe1, so
+    losing that host also loses the monitor majority and the storage.
+
+  It demonstrates clustering, shared storage, live migration and recovery from
+  a single *nested* node failure — not fault tolerance of a physical host.
 - It **stretches the L2 with a VXLAN that boxman does not manage.**
   `scripts/vxlan-up.sh` creates it (idempotently) and the Makefile runs it at
   the right moments; a host reboot or `boxman destroy` on hpe1 (which deletes
@@ -73,9 +81,13 @@ Verified end to end on 2026-09-06 (hpe1/hpe2: Rocky 9.8, EPYC 9825, libvirt
 
 On both hosts (checked by `make host-prep`): nested KVM on, `/dev/kvm`
 usable, libvirt + `virt-install`, docker (ISO build), `python3.12` + venv,
-passwordless sudo, the `vxlan` module, internet egress, ~100 GB free under
+passwordless sudo, the `vxlan` module, a **usable firewalld** (`vxlan-up.sh`
+binds the lab bridge to a zone and opens the tunnel port), `jq` on the
+orchestration host (`hpe1` — the migration and HA scripts parse JSON there,
+and the nodes themselves have no `jq`), internet egress, ~100 GB free under
 `~/pve-lab`. On the workstation: ssh aliases `hpe1`/`hpe2`, `rsync`,
-`openssl`, `ssh-keygen`.
+`openssl`, `ssh-keygen`, and `jq` + `terraform` for the Terraform and HA
+targets.
 
 Site-specific values live in one place, `scripts/lib.sh` (host IPs, the VLAN
 interface `bond0.1439`, node IPs/MACs, VXLAN id), and must match `conf.yml`
@@ -205,8 +217,15 @@ node-/resource-affinity rules), which is why the policy lives in a script:
   — Proxmox VE 9.2's built-in balancer; no ProxLB or cron needed.
 - rules `prefer-hpe1` (vm:200, 201, 204, 205 → pve1:1, pve2:1) and `prefer-hpe2`
   (vm:202, 203, 206, 207 → pve3:1, pve4:1), non-strict: equal priorities let
-  CRS balance within a host, and a VM may be recovered on the other host when
-  both of its preferred nodes are down.
+  CRS balance within a host.
+
+  Non-strict affinity *permits* placement on the other host, but in this lab
+  that fallback cannot actually happen. Both of a group's preferred nodes are
+  down only when their physical host is gone, and with four voting nodes and no
+  external voter that leaves two of four votes — no quorum, so nothing is
+  recovered anywhere. What the failover drill demonstrates is the case that
+  does work: **one nested node lost, its guests fenced and restarted on the
+  surviving node of the same host.** See "what this box does *not* do".
 
 ```bash
 make tf-apply          # VMs + HA resources

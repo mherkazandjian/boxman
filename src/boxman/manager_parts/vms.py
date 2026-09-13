@@ -1163,6 +1163,12 @@ class VMsMixin:
         Use --yes to skip the confirmation prompt for VM removal.
         """
         config = self.config
+
+        # Before anything is reconciled: `update` can create direct-boot VMs,
+        # and its network reconciliation runs before the old validation point,
+        # so a bad mac was reported only after the networks had changed
+        # (#171 A3).
+        self.validate_direct_boot_config()
         dry_run = getattr(cli_args, 'dry_run', False)
         auto_accept = getattr(cli_args, 'yes', False)
         # Deliberately not `auto_accept or ...`: --yes answers the VM-removal
