@@ -249,3 +249,99 @@ exit 0
     r = _make(box, "ha-failover", SSH=str(ssh), ORCH="hpe1", NODE="pve4")
     assert r.returncode != 0, (
         f"a node that never became ready reported success:\n{r.stdout}\n{r.stderr}")
+
+
+# ── HA placement policy comes from terraform, not from arithmetic (D1) ───────
+
+_HA_STUB_LIB = r"""
+set -euo pipefail
+NODES=(pve1 pve2 pve3 pve4)
+declare -A NODE_SITE=([pve1]=hpe1 [pve2]=hpe1 [pve3]=hpe2 [pve4]=hpe2)
+LOGS=$PWD
+CALLS="$PWD/calls"; : > "$CALLS"
+log() { :; }
+die() { echo "die $*" >> "$CALLS"; exit 1; }
+join_by() { local IFS="$1"; shift; echo "$*"; }
+pssh() {
+    local node=$1; shift; local cmd="$*"
+    echo "$cmd" >> "$CALLS"
+    case "$cmd" in
+        *"/cluster/ha/resources"*) echo "$HA_RESOURCES" ;;
+        *"/cluster/ha/rules/"*)    [ "${RULE_EXISTS:-0}" = 1 ] && return 0 || return 1 ;;
+        *"/cluster/options"*)      echo '{"crs":"ha=dynamic"}' ;;
+    esac
+    return 0
+}
+"""
+
+
+def _run_ha(box, tmp_path, homes=None, resources=None, rule_exists=False, tag="x"):
+    work = tmp_path / f"ha-policy-{tag}"
+    work.mkdir(exist_ok=True)
+    shutil.copy(box / "scripts" / "pve-ha.sh", work / "pve-ha.sh")
+    (work / "lib.sh").write_text(_HA_STUB_LIB)
+    res = resources if resources is not None else [200, 201, 202, 203]
+    env = dict(os.environ,
+               HA_RESOURCES=str([{"sid": f"vm:{i}"} for i in res]).replace("'", '"'),
+               RULE_EXISTS="1" if rule_exists else "0")
+    if homes is not None:
+        env["PVE_HA_POLICY_HOMES"] = homes
+    else:
+        env.pop("PVE_HA_POLICY_HOMES", None)
+    proc = subprocess.run(["bash", "./pve-ha.sh"], cwd=work, env=env,
+                          capture_output=True, text=True, timeout=60)
+    calls = (work / "calls")
+    return proc, calls.read_text().splitlines() if calls.exists() else []
+
+
+def test_the_policy_is_required_with_no_fallback(box, tmp_path):
+    """Guessing and warning would preserve the defect: the arithmetic could
+    silently disagree with the placement terraform applied (#171 D1)."""
+    proc, calls = _run_ha(box, tmp_path, homes=None, tag="missing")
+    assert proc.returncode != 0
+    assert not [c for c in calls if "/cluster/options" in c], \
+        "CRS was changed before the policy was validated"
+
+
+@pytest.mark.parametrize("homes,why", [
+    ("vm:200", "no '=' separator"),
+    ("200=pve1", "not a vm resource id"),
+    ("vm:200=pve9", "unknown node"),
+    ("", "empty"),
+])
+def test_a_malformed_policy_is_refused_before_anything_is_written(
+        box, tmp_path, homes, why):
+    proc, calls = _run_ha(box, tmp_path, homes=homes, tag=why.split()[0])
+    assert proc.returncode != 0, why
+    assert not [c for c in calls if "pvesh set" in c or "pvesh create" in c], \
+        f"something was written despite {why}"
+
+
+def test_placement_follows_the_policy_not_the_vm_id_arithmetic(box, tmp_path):
+    """The discriminating case. `(200 - 200) % 4 == 0` puts vm:200 on hpe1 by
+    the old rule; an override placing it on pve3 must win."""
+    proc, calls = _run_ha(
+        box, tmp_path, resources=[200],
+        homes="vm:200=pve3", tag="override")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rules = [c for c in calls if "pvesh create" in c or "pvesh set /cluster/ha/rules" in c]
+    assert any("prefer-hpe2" in c and "vm:200" in c for c in rules), rules
+    assert not any("prefer-hpe1" in c and "vm:200" in c for c in rules), rules
+
+
+def test_an_emptied_group_loses_its_rule(box, tmp_path):
+    """A group with no members must not keep the membership it had last time."""
+    proc, calls = _run_ha(box, tmp_path, resources=[200, 201],
+                          homes="vm:200=pve1,vm:201=pve2",
+                          rule_exists=True, tag="empty")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert any("pvesh delete /cluster/ha/rules/prefer-hpe2" in c for c in calls), calls
+
+
+def test_a_resource_outside_the_policy_is_left_alone(box, tmp_path):
+    """Not filed under whichever group the arithmetic would have picked."""
+    proc, calls = _run_ha(box, tmp_path, resources=[200, 999],
+                          homes="vm:200=pve1", tag="unowned")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rules = [c for c in calls if "/cluster/ha/rules" in c]
+    assert not any("vm:999" in c for c in rules), rules

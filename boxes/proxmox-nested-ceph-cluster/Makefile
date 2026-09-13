@@ -239,8 +239,17 @@ tf-destroy:   #@ terraform destroy (VMs and the downloaded images)
 # ---- HA placement policy (Proxmox owns *where* the HA VMs run) ------------
 NODE ?= pve4
 
+# The placement policy comes from Terraform's *configured* placement, handed
+# to the script rather than re-derived from vm ids. There is no fallback: the
+# arithmetic it replaced silently disagreed with `node_overrides` (#171 D1).
 ha:   #@ dynamic CRS + auto-rebalance + node-affinity rules for the HA resources (after tf-apply)
-	$(call run,$(ORCH),pve-ha.sh)
+	@command -v jq >/dev/null || { echo "jq is required on the workstation for 'make ha'"; exit 1; }; \
+	$(TF_ENV); \
+	homes=$$($(TF) output -json ha_policy_homes \
+	  | jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")') \
+	  || { echo "could not read the ha_policy_homes output; run 'make tf-apply' first"; exit 1; }; \
+	test -n "$$homes" || { echo "ha_policy_homes is empty; run 'make tf-apply' first"; exit 1; }; \
+	$(SSH) $(ORCH) "PVE_LAB_DIR=$(LAB) PVE_HA_POLICY_HOMES='$$homes' bash $(SCRIPTS)/pve-ha.sh"
 
 ha-status:   #@ ha-manager status, rules, crs settings
 	@$(SSH) $(ORCH) 'PVE_LAB_DIR=$(LAB) source $(SCRIPTS)/lib.sh; pssh pve1 "ha-manager status; echo; ha-manager rules list; echo; pvesh get /cluster/options --output-format json | grep -o \"\\\"crs\\\":\\\"[^\\\"]*\\\"\""'

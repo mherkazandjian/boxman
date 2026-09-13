@@ -20,3 +20,20 @@ output "ssh" {
     try([for ip in flatten(vm.ipv4_addresses) : ip if ip != "127.0.0.1"][0], "?"), name, vm.node_name)
   ]
 }
+
+output "ha_policy_homes" {
+  description = <<-EOT
+    Configured policy home per HA resource: `vm:<id>` -> the node that
+    `node_overrides`, or the round-robin over `nodes`, placed it on.
+
+    Deliberately derived from local.vms and NOT from `node_name` in state.
+    `ignore_changes` permits the HA manager to move a VM between nodes, so
+    refreshed state records wherever it ended up; feeding that back would make
+    the affinity rule follow the drift the rule exists to correct.
+
+    `scripts/pve-ha.sh` requires this, with no fallback. Changing
+    `node_overrides`, `nodes` or `vm_id_base` therefore changes the affinity
+    rules the next time `make ha` runs.
+  EOT
+  value       = { for name, v in local.vms : "vm:${v.vm_id}" => v.node }
+}

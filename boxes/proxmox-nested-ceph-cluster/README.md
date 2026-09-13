@@ -219,6 +219,16 @@ node-/resource-affinity rules), which is why the policy lives in a script:
   (vm:202, 203, 206, 207 → pve3:1, pve4:1), non-strict: equal priorities let
   CRS balance within a host.
 
+  **Membership comes from Terraform's configured placement**, not from the VM
+  id: `make ha` reads the `ha_policy_homes` output and hands it to
+  `scripts/pve-ha.sh`, which requires it and has no fallback. So changing
+  `node_overrides`, `nodes` or `vm_id_base` changes the affinity rules on the
+  next `make ha`. The output is derived from the *declared* placement and
+  deliberately not from `node_name` in state: `ignore_changes` lets the HA
+  manager move a VM, and feeding that back would make the rule follow the drift
+  it exists to correct. A registered HA resource this configuration does not
+  own is left out of both rules rather than guessed at.
+
   Non-strict affinity *permits* placement on the other host, but in this lab
   that fallback cannot actually happen. Both of a group's preferred nodes are
   down only when their physical host is gone, and with four voting nodes and no
