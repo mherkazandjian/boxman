@@ -122,6 +122,29 @@ view of what you wrote (`boxes:`), not boxman's internal `vms:` form. This
 is by design; the internal normalization is what the provisioning flows act
 on.
 
+### Unresolvable network references are refused
+
+A box `networks:` entry naming neither a cluster-internal network nor a
+`shared_networks` bridge raises `ConfigError` and the cluster does not
+deploy. It previously warned and dropped the reference, which left the
+service on Compose's default network rather than the one requested
+(#164 NET-C1).
+
+boxman refuses only what it can prove: a reference **it** emitted from a
+box's `networks:`, checked against the assembled compose file after every
+`compose_extra:` has merged. References Compose resolves for itself —
+`${VAR}` interpolation, a network from an `include:`d file, a service using
+`extends:`, anything `compose_extra:` adds — are emitted as written, never
+dropped, and Compose refuses them itself if they are wrong.
+
+An **undeclared** `default` resolves without a declaration and is emitted as
+*no* `networks:` key — identical to Compose, and it cannot collide with a
+`network_mode:` override; an `ipv4_address` on it is meaningless (boxman
+declares no IPAM pool) and is warned about and dropped. A `default` the
+cluster **declares** is a real network and is always emitted. An omitted or empty `networks:` means *use the default network*;
+for none, `compose_extra: {network_mode: none}`. Only a mode actually in
+effect drops the attachments — `network_mode: ""` does not.
+
 ## Shared networks (macvlan L2 to VMs)
 
 A top-level `shared_networks:` block declares host Linux bridges that both a

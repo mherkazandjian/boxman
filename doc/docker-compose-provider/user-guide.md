@@ -150,6 +150,77 @@ the global switch; it is discouraged and logged loudly.
 See [`boxes/hybrid-libvirt-docker-compose`](../../boxes/hybrid-libvirt-docker-compose)
 for the full worked example.
 
+
+### Every network a box names must exist
+
+A `networks:` entry that matches neither a cluster-internal network nor a
+`shared_networks` bridge is a **config error**: the cluster refuses to
+deploy and nothing is written.
+
+> **Behaviour change.** This used to warn and drop the reference. The
+> service was then left with no explicit attachment at all — and Compose
+> places such a service on the project's *default* network. So a typo
+> quietly changed which L2 a container joined:
+>
+> ```yaml
+> boxes:
+>   db:  {image: postgres, networks: [app_bridge]}
+>   web: {image: nginx,    networks: [app_brige]}   # typo
+> ```
+>
+> `db` was isolated on `app_bridge` as asked; `web` was on the default
+> network with whatever else had no explicit attachment, and the single
+> warning scrolled past.
+
+**If an upgrade starts refusing a config that used to deploy**, boxman is
+naming a reference it cannot resolve. One of these applies:
+
+| you meant | do this |
+|---|---|
+| a typo | correct the name |
+| a network you never declared | add it under the cluster's `networks:` or project `shared_networks:` |
+| a leftover you no longer need | delete the reference |
+| a network boxman does not manage | declare **and** attach it through `compose_extra:` (below) |
+
+#### What boxman decides, and what Compose decides
+
+boxman refuses only a reference it can *prove* is unresolvable — one it
+emitted itself from a box's `networks:`, checked against the finished file
+after every `compose_extra:` has merged. Everything else is left to
+Compose, which resolves `include:`, `extends:` and `${VAR}` first and then
+refuses any reference to an undeclared network on its own.
+
+So these are **not** refused by boxman, and are not silently dropped either
+— they are emitted as written and Compose rules on them:
+
+| reference | why boxman defers |
+|---|---|
+| `${NET:-corp}` | only Compose interpolates it |
+| a network defined in an `include:`d file | boxman cannot see the other file |
+| a service using `extends:` | the effective service is not visible here |
+| anything added by `compose_extra:` | you are deliberately reaching past boxman |
+
+Two references resolve without any declaration:
+
+- **`default`** — Compose's implicit per-project network. When the cluster
+  does not declare one, `networks: [default]` is emitted as *no* `networks:`
+  key: the same thing to Compose, and it cannot collide with a
+  `network_mode:` override. A `default` the cluster **declares** under
+  `networks:` is a real network and is always emitted — under `extends:` an
+  omitted key means "inherit the parent's attachments", so the explicit
+  entry is not redundant there.
+- **anything `compose_extra:` supplies** — an override that declares a
+  network satisfies a reference to it, and one that removes a reference
+  takes it out of the question.
+
+#### `network_mode:` and `networks:`
+
+Compose refuses a service that declares both, so a `compose_extra:`
+override setting `network_mode:` drops the attachments boxman generated.
+Only a mode actually *in effect* does this: `network_mode: ""` (or an
+expression interpolating to empty) leaves the service on its declared
+networks rather than silently detaching it.
+
 ## Getting into a container
 
 `boxman ssh` stays **VM-only** — SSH into a container would mean an sshd
