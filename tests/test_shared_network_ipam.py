@@ -284,3 +284,67 @@ class TestAddressFamilyMismatchIsADiagnostic:
                           "gateway": "fd00::1"}}
         with pytest.raises(ConfigError, match=r"IPv6.*IPv4"):
             _generate(_cluster({}, ["lab"]), shared=shared)
+
+
+class TestProvenanceIsEmittedForInterpolatedReferences:
+    """`${LAN}` hides which network it means until compose interpolates it.
+
+    boxman must not interpolate anything itself, so the references go out
+    verbatim in an extension compose resolves and hands back (#164 NET-C3).
+    """
+
+    KEY = "x-boxman-net-provenance"
+
+    def test_nothing_is_emitted_without_an_ambiguous_alias(self):
+        out = _generate(_cluster({}, ["lab"]))
+
+        assert self.KEY not in out
+
+    def test_the_ambiguous_set_comes_from_declarations(self):
+        """Not from references that literally matched both.
+
+        `${LAN}` matches nothing literally — keying emission off matched
+        references would emit nothing and leave the bypass exactly as it was.
+        """
+        out = _generate(_cluster({"lab": {}}, ["${LAN}"]))
+
+        assert out[self.KEY]["ambiguous"] == ["lab"]
+        assert out[self.KEY]["native"] == {"web": ["${LAN}"]}
+
+    def test_a_reference_removed_by_network_mode_is_not_carried(self):
+        """A stale `${VAR:?err}` makes compose fail interpolating the
+        extension itself."""
+        out = _generate(_cluster({"lab": {}}, ["${REQUIRED:?missing}"],
+                                 extra={"network_mode": "host"}))
+
+        assert self.KEY not in out
+
+    def test_a_reference_removed_by_an_override_is_not_carried(self):
+        out = _generate(_cluster({"lab": {}}, ["${LAN}"],
+                                 cluster_extra={"services": {
+                                     "web": {"networks": []}}}))
+
+        assert self.KEY not in out
+
+    def test_a_service_with_no_surviving_reference_is_omitted(self):
+        """Compose turns an empty list into `null` on the way back."""
+        cluster = _cluster({"lab": {}}, ["${LAN}"])
+        cluster["boxes"]["idle"] = {"image": "x"}
+
+        out = _generate(cluster)
+
+        assert set(out[self.KEY]["native"]) == {"web"}
+
+    def test_only_the_references_that_survive_are_carried(self):
+        """An override may keep some attachments and drop others.
+
+        Carrying a dropped reference would falsely accuse the service, and a
+        dropped `${VAR:?err}` would make compose fail interpolating the
+        extension itself (#164 NET-C3).
+        """
+        out = _generate(_cluster({"lab": {}, "keep": {}},
+                                 ["${LAN}", "keep"],
+                                 cluster_extra={"services": {
+                                     "web": {"networks": ["keep"]}}}))
+
+        assert out[self.KEY]["native"] == {"web": ["keep"]}

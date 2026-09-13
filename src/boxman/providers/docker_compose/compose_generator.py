@@ -48,6 +48,12 @@ from boxman.exceptions import ConfigError
 #: resolver accepts the literal name (#164 NET-C1).
 IMPLICIT_DEFAULT_NETWORK = "default"
 
+#: Compose ignores unknown top-level ``x-`` fields but *does* interpolate
+#: their values and return them in ``config --format json`` -- which is how
+#: boxman learns what an interpolated ``networks:`` reference resolved to
+#: without interpolating anything itself (#164 NET-C3).
+NET_PROVENANCE_KEY = "x-boxman-net-provenance"
+
 #: compose service keys copied through verbatim from a box definition
 _PASSTHROUGH_KEYS = (
     "image",
@@ -154,20 +160,27 @@ class ComposeGenerator:
         #: box lands on an isolated bridge instead of the shared L2 it asked
         #: for (#164 NET-C3).
         ambiguous_native: dict[str, set[str]] = {}
+        #: per-box refs exactly as the box wrote them, interpolations
+        #: included. Compose resolves these for us through the provenance
+        #: extension; boxman never interpolates anything (#164 NET-C3).
+        native_refs: dict[str, list[str]] = {}
 
         services: dict[str, Any] = {}
         for box_name, box in (cluster_cfg.get("boxes") or {}).items():
             box_unmatched: set[str] = set()
             box_ambiguous: set[str] = set()
+            box_native: list[str] = []
             services[box_name] = self._service(
                 cluster_name, box_name, box or {}, conf_dir,
                 cluster_networks, shared_networks, referenced_shared,
-                named_volumes, box_unmatched, box_ambiguous,
+                named_volumes, box_unmatched, box_ambiguous, box_native,
             )
             if box_unmatched:
                 unmatched_native[box_name] = box_unmatched
             if box_ambiguous:
                 ambiguous_native[box_name] = box_ambiguous
+            if box_native:
+                native_refs[box_name] = box_native
 
         compose: dict[str, Any] = {}
         if project_name:
@@ -193,6 +206,8 @@ class ComposeGenerator:
             cluster_name, compose, ambiguous_native, cluster_networks,
             shared_networks)
         self._assert_macvlan_ipam_sane(cluster_name, compose, referenced_shared)
+        self._emit_net_provenance(
+            compose, native_refs, cluster_networks, shared_networks)
         return compose
 
     def write(self, compose_dict: dict[str, Any], workdir: str,
@@ -226,6 +241,7 @@ class ComposeGenerator:
         named_volumes: dict[str, Any],
         unmatched_native: set[str],
         ambiguous_native: set[str],
+        native_refs: list[str],
     ) -> dict[str, Any]:
         svc: dict[str, Any] = {}
 
@@ -250,7 +266,7 @@ class ComposeGenerator:
         nets = self._service_networks(
             cluster_name, box_name, box.get("networks"),
             cluster_networks, shared_networks, referenced_shared,
-            unmatched_native, ambiguous_native,
+            unmatched_native, ambiguous_native, native_refs,
         )
         if nets:
             svc["networks"] = nets
@@ -740,6 +756,65 @@ class ComposeGenerator:
                     f"inside 'subnet: {subnet}'."
                 )
 
+    def _emit_net_provenance(
+        self,
+        compose: dict[str, Any],
+        native_refs: dict[str, list[str]],
+        cluster_networks: dict[str, Any],
+        shared_networks: dict[str, Any],
+    ) -> None:
+        """Record which attachments boxman itself asked for, verbatim.
+
+        One alias may not mean two L2s (NET-C3), but a reference written as
+        ``${LAN}`` hides which name it is until Compose interpolates it, and
+        boxman must not interpolate anything itself -- that road produced
+        four rounds of findings elsewhere in this issue.
+
+        So the references go out as written, in an extension Compose
+        interpolates and hands back resolved. The bring-up check then reads
+        the *resolved* names back without implementing any resolution.
+
+        Two things make this correct rather than merely convenient:
+
+        - the ambiguous set comes from the **declarations**
+          (``cluster_networks & shared_networks``), not from references that
+          literally matched both. ``${LAN}`` matches nothing literally, so
+          keying off matched references would emit nothing and leave the
+          bypass exactly as it was;
+        - entries are the original native references **intersected with the
+          attachments that survived** the merge and network-mode handling. A
+          reference an override removed must not be carried: a stale
+          ``${VAR:?err}`` makes Compose fail while interpolating the
+          extension itself, and a stale name would also falsely accuse a
+          service that ``extends:`` legitimately attached elsewhere.
+
+        Emitted only when there is an ambiguous alias to judge, and only for
+        services with a surviving native reference -- Compose turns an empty
+        list into ``null`` on the way back, so an empty entry would be
+        indistinguishable from a dropped one (#164 NET-C3).
+        """
+        ambiguous = sorted(set(cluster_networks) & set(shared_networks))
+        if not ambiguous:
+            return
+        services = compose.get("services") or {}
+        native: dict[str, list[str]] = {}
+        for box_name, refs in native_refs.items():
+            svc = services.get(box_name) or {}
+            attached = svc.get("networks")
+            if not attached:
+                continue
+            surviving = set(
+                attached if isinstance(attached, list) else list(attached))
+            kept = [r for r in refs if r in surviving]
+            if kept:
+                native[box_name] = kept
+        if not native:
+            return
+        compose[NET_PROVENANCE_KEY] = {
+            "native": native,
+            "ambiguous": ambiguous,
+        }
+
     def _service_networks(
         self,
         cluster_name: str,
@@ -750,6 +825,7 @@ class ComposeGenerator:
         referenced_shared: set[str],
         unmatched_native: set[str],
         ambiguous_native: set[str],
+        native_refs: list[str],
     ) -> list[str] | dict[str, Any]:
         """Resolve a box's ``networks:`` to the service's compose ``networks``.
 
@@ -774,6 +850,7 @@ class ComposeGenerator:
         attached: dict[str, dict[str, Any]] = {}
         any_opts = False
         for ref, opts in entries:
+            native_refs.append(ref)
             if ref in cluster_networks and ref in shared_networks:
                 # One alias, two different L2s. Resolution below would pick
                 # the cluster-internal one silently (#164 NET-C3).

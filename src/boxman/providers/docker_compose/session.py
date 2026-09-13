@@ -26,6 +26,7 @@ from boxman.exceptions import (
     ProvisionError,
 )
 from boxman.providers.docker_compose.compose_generator import (
+    NET_PROVENANCE_KEY,
     ComposeGenerator,
     resolve_local_path,
 )
@@ -700,13 +701,19 @@ class DockerComposeSession(SessionConfigMixin):
                     f"'{workdir}': {exc}"
                 ) from exc
 
-            result = probe.validate(staged)
-            if not getattr(result, "ok", True):
-                raise ProvisionError(
-                    f"[{cluster_name}] the generated compose file does not "
-                    f"resolve: {_result_error(result)} — "
-                    f"'{final}' was left unchanged."
-                )
+            if compose.get(NET_PROVENANCE_KEY):
+                # Resolving the model *is* validating it -- same model
+                # `config --quiet` checks -- so the two are not both run.
+                self._assert_resolved_aliases(
+                    cluster_name, compose, probe.resolved_model(staged))
+            else:
+                result = probe.validate(staged)
+                if not getattr(result, "ok", True):
+                    raise ProvisionError(
+                        f"[{cluster_name}] the generated compose file does "
+                        f"not resolve: {_result_error(result)} — "
+                        f"'{final}' was left unchanged."
+                    )
             try:
                 # (3) the only write to `final`, and it is atomic.
                 os.replace(staged, final)
@@ -723,6 +730,67 @@ class DockerComposeSession(SessionConfigMixin):
                 except OSError:
                     pass
         return final
+
+    def _assert_resolved_aliases(
+        self, cluster_name: str, compose: dict[str, Any], model: dict[str, Any]
+    ) -> None:
+        """Refuse a native attachment that *resolved* to an ambiguous alias.
+
+        The generator can only see ``${LAN}``; Compose knows it means
+        ``lab``. So the references went out verbatim in an extension, and
+        this reads them back resolved -- boxman interpolates nothing.
+
+        A service is refused only when all three hold:
+
+        1. the name came from **boxman's own** ``networks:`` for that box --
+           attachments alone cannot establish that, and an ``extends:``
+           inherited attachment to an ambiguous alias is legitimate;
+        2. the name is ambiguous -- declared as both a cluster network and a
+           shared bridge;
+        3. it is still **attached** in the resolved model -- provenance alone
+           cannot establish that the reference is still in effect.
+
+        Services absent from the resolved model are skipped: Compose keeps
+        root extension metadata for inactive services, so their provenance
+        survives even though they deploy nothing (#164 NET-C3).
+        """
+        emitted = (compose.get(NET_PROVENANCE_KEY) or {}).get("native") or {}
+        resolved = model.get(NET_PROVENANCE_KEY) or {}
+        resolved_native = resolved.get("native") or {}
+        ambiguous = set(resolved.get("ambiguous") or [])
+        services = model.get("services") or {}
+
+        for box_name, sent in emitted.items():
+            if box_name not in services:
+                continue
+            got = resolved_native.get(box_name)
+            if got is None:
+                raise ProvisionError(
+                    f"[{cluster_name}] compose did not return the network "
+                    f"provenance boxman wrote for '{box_name}', so the "
+                    f"attachment cannot be checked. Nothing was published."
+                )
+            if not isinstance(got, list) or len(got) != len(sent):
+                raise ProvisionError(
+                    f"[{cluster_name}] the network provenance for "
+                    f"'{box_name}' did not survive compose resolution "
+                    f"({sent!r} -> {got!r}). Nothing was published."
+                )
+            attached = services[box_name].get("networks") or {}
+            attached_names = set(
+                attached if isinstance(attached, list) else list(attached))
+            for name in got:
+                if name in ambiguous and name in attached_names:
+                    raise ConfigError(
+                        f"box '{cluster_name}.{box_name}': this box attaches "
+                        f"to '{name}', which names both a cluster-internal "
+                        f"network and a shared bridge. Those are different "
+                        f"L2 domains and boxman resolves the "
+                        f"cluster-internal one, so the box would be isolated "
+                        f"rather than on the shared bridge with the VMs. "
+                        f"Rename one of the two declarations so the "
+                        f"attachment says which you meant."
+                    )
 
     def _teardown_runner(
         self, cluster_name: str, cluster_cfg: dict[str, Any]
