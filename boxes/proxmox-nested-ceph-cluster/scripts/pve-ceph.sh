@@ -40,11 +40,33 @@ wait_quorum() {
     die "ceph monitors did not reach quorum (checked from $n)"
 }
 
+# mon_dump: the monmap as text, or nothing at all.
+#
+# Bounded deliberately. `ceph mon dump` reaches out to a monitor, so on a
+# cluster that has none yet it blocks on its own default timeout instead of
+# answering "there are none" -- which is precisely the state this script is in
+# on a from-scratch run.
+mon_dump() {
+    pssh "$first" "timeout 10 ceph mon dump 2>/dev/null" 2>/dev/null
+}
+
 for n in "${MONS[@]}"; do
-    if ! pssh "$first" "ceph mon dump 2>/dev/null | grep -qw mon.$n"; then
-        # each new mon must see a quorate cluster before joining it; the
-        # election after the previous mon takes a few seconds
-        wait_quorum "$first"
+    monmap=$(mon_dump)
+    if ! grep -qw "mon\.$n" <<<"$monmap"; then
+        if grep -q "mon\." <<<"$monmap"; then
+            # Every monitor after the first has to see a quorate cluster before
+            # it joins: the election following the previous mon takes a few
+            # seconds, and `pveceph mon create` fails with "Could not connect
+            # to ceph cluster" if it runs during that window.
+            wait_quorum "$first"
+        else
+            # The first monitor bootstraps the cluster and therefore cannot
+            # wait for it. `pveceph init` above writes /etc/pve/ceph.conf --
+            # configuration, not a monitor -- so until this `mon create` runs
+            # there is nothing that could become quorate, and waiting here
+            # could only ever time out and die (#171 B1).
+            log "bootstrapping the first ceph monitor on $n"
+        fi
         pssh "$n" "pveceph mon create"
     fi
     wait_quorum "$n"

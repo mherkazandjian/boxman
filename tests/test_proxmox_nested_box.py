@@ -12,6 +12,8 @@ NIC. Those are the things pinned here, without touching libvirt.
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 
 import pytest
 import yaml
@@ -118,3 +120,95 @@ def test_tasks_wrap_the_scripts(monkeypatch):
         script = cfg["tasks"][name]["command"].split()[-1]
         assert script.startswith(BOX + "/scripts/"), name
         assert os.path.isfile(script), script
+
+
+#: A stand-in for scripts/lib.sh. The real pve-ceph.sh sources whatever
+#: lib.sh sits beside it, so copying the script next to this one exercises
+#: its actual control flow -- no reimplementation of the loop under test.
+#: `pssh` answers as a cluster would: `ceph mon dump` reports only the
+#: monitors created so far, and `ceph quorum_status` fails while there are
+#: none, which is the state a from-scratch run starts in.
+_CEPH_STUB_LIB = r"""
+NODES=(pve1 pve2 pve3 pve4)
+LOGS="$T/logs"; mkdir -p "$LOGS"
+LAB_NET=10.77.0.0/24
+CEPH_POOL=vmpool
+MONSTATE="$T/mons"; : > "$MONSTATE"
+CALLS="$T/calls";  : > "$CALLS"
+
+log() { :; }
+die() { echo "die $*" >> "$CALLS"; exit 9; }
+sleep() { :; }
+
+pssh() {
+    local node=$1; shift; local cmd="$*"
+    case "$cmd" in
+        *"ceph mon dump"*)
+            if [ -s "$MONSTATE" ]; then
+                echo "epoch 1"; local i=0
+                while read -r m; do
+                    echo "$i: [v2:10.77.0.1$i:3300/0] mon.$m"; i=$((i+1))
+                done < "$MONSTATE"
+            fi
+            return 0 ;;
+        *"pveceph mon create"*)
+            echo "mon_create $node" >> "$CALLS"
+            echo "$node" >> "$MONSTATE"; return 0 ;;
+        *"ceph quorum_status"*)
+            echo "quorum_probe $node" >> "$CALLS"
+            [ -s "$MONSTATE" ] && return 0 || return 1 ;;
+        *"ceph --version"*) echo "ceph version 19.2.0"; return 0 ;;
+        *"ceph health"*)    echo "HEALTH_OK"; return 0 ;;
+        *) return 0 ;;
+    esac
+}
+"""
+
+
+def _run_ceph_bootstrap(tmp_path) -> tuple[int, list[str]]:
+    """Run the real pve-ceph.sh against the stub; return (exit code, trace).
+
+    The trace keeps only the two events the monitor order depends on:
+    ``mon_create <node>`` and ``quorum_probe <node>``.
+    """
+    work = tmp_path / "cephrun"
+    work.mkdir()
+    shutil.copy(os.path.join(BOX, "scripts", "pve-ceph.sh"), work / "pve-ceph.sh")
+    (work / "lib.sh").write_text(_CEPH_STUB_LIB)
+    proc = subprocess.run(
+        ["bash", "./pve-ceph.sh"], cwd=work, timeout=120,
+        env=dict(os.environ, T=str(work)), capture_output=True, text=True)
+    calls = work / "calls"
+    trace = [ln for ln in (calls.read_text().splitlines() if calls.exists() else [])
+             if ln.startswith(("mon_create", "quorum_probe", "die"))]
+    return proc.returncode, trace
+
+
+def test_the_first_ceph_monitor_is_created_without_waiting_for_quorum(tmp_path):
+    """
+    #171 B1. ``pveceph init`` writes /etc/pve/ceph.conf -- configuration, not a
+    monitor -- so on four fresh nodes nothing can be quorate until the first
+    ``pveceph mon create`` has run. Waiting first could only time out: the
+    from-scratch run died after 60 probes having created no monitor at all.
+    """
+    rc, trace = _run_ceph_bootstrap(tmp_path)
+
+    creates = [i for i, ln in enumerate(trace) if ln.startswith("mon_create")]
+    assert creates, f"no monitor was ever created; trace={trace}"
+    assert trace[creates[0]] == "mon_create pve1"
+    assert not any(ln.startswith("quorum_probe") for ln in trace[:creates[0]]), (
+        f"a quorum probe ran before any monitor existed; trace={trace}")
+    assert rc == 0, f"bootstrap exited {rc}; trace={trace}"
+
+
+def test_every_monitor_after_the_first_still_waits_for_quorum(tmp_path):
+    """The wait is correct for monitors 2..n: the election after the previous
+    one takes a few seconds and ``mon create`` fails with "Could not connect to
+    ceph cluster" inside that window. Only the bootstrap monitor is exempt."""
+    _rc, trace = _run_ceph_bootstrap(tmp_path)
+
+    for node in ("pve2", "pve3"):
+        assert f"mon_create {node}" in trace, f"{node} was never created; trace={trace}"
+        idx = trace.index(f"mon_create {node}")
+        assert trace[idx - 1] == "quorum_probe pve1", (
+            f"{node} was created without first waiting for quorum; trace={trace}")
