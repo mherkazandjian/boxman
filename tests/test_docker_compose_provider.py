@@ -485,13 +485,19 @@ class TestComposeGenerator:
         )["networks"]["labnet"]
         assert net["driver_opts"] == {"parent": "br-lab", "macvlan_mode": "bridge"}
 
-    def test_unknown_network_ref_warned_and_skipped(self):
+    def test_unknown_network_ref_is_a_config_error(self):
+        """#164 NET-C1 — this used to warn, drop the reference and continue.
+
+        The service was then left with no explicit attachment at all, so
+        Compose placed it on the project's default network instead of the
+        one that was asked for: a one-character typo in a network name
+        silently changed which L2 the container joined. This test
+        previously asserted ``"networks" not in svc`` — it pinned the bug.
+        """
         gen = ComposeGenerator()
         cluster = {"boxes": {"w": {"image": "x", "networks": ["ghost"]}}}
-        with mock.patch.object(gen.logger, "warning") as warn:
-            svc = gen.generate("s", cluster, conf_dir="/proj")["services"]["w"]
-        assert "networks" not in svc
-        assert warn.called
+        with pytest.raises(ConfigError, match="ghost"):
+            gen.generate("s", cluster, conf_dir="/proj")
 
     # -- malformed networks: fail fast, never silently drop -----------------
     def test_bare_string_networks_is_attached_not_silently_dropped(self):

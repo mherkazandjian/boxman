@@ -42,6 +42,11 @@ import yaml
 from boxman import log
 from boxman.exceptions import ConfigError
 
+#: Compose's implicit per-project network. An explicit ``networks:
+#: [default]`` needs no top-level declaration and attaches to it, so the
+#: resolver accepts the literal name (#164 NET-C1).
+IMPLICIT_DEFAULT_NETWORK = "default"
+
 #: compose service keys copied through verbatim from a box definition
 _PASSTHROUGH_KEYS = (
     "image",
@@ -139,14 +144,21 @@ class ComposeGenerator:
         #: named volumes defined by any box → the top-level ``volumes:`` block,
         #: in first-seen order (a name shared by two boxes is defined once).
         named_volumes: dict[str, Any] = {}
+        #: per-box refs that came from the box's own ``networks:`` key and
+        #: matched no cluster-internal or shared network — the only refs
+        #: boxman is entitled to judge (#164 NET-C1).
+        unmatched_native: dict[str, set[str]] = {}
 
         services: dict[str, Any] = {}
         for box_name, box in (cluster_cfg.get("boxes") or {}).items():
+            box_unmatched: set[str] = set()
             services[box_name] = self._service(
                 cluster_name, box_name, box or {}, conf_dir,
                 cluster_networks, shared_networks, referenced_shared,
-                named_volumes,
+                named_volumes, box_unmatched,
             )
+            if box_unmatched:
+                unmatched_native[box_name] = box_unmatched
 
         compose: dict[str, Any] = {}
         if project_name:
@@ -162,13 +174,27 @@ class ComposeGenerator:
             compose["volumes"] = named_volumes
 
         # D7: per-cluster escape hatch, deep-merged verbatim.
-        return self._deep_merge(compose, cluster_cfg.get("compose_extra") or {})
+        compose = self._deep_merge(
+            compose, cluster_cfg.get("compose_extra") or {})
+        # order matters: a mode in effect removes the attachments, so there
+        # is then no reference left to judge.
+        self._apply_network_mode(compose)
+        self._assert_networks_resolve(cluster_name, compose, unmatched_native)
+        return compose
 
-    def write(self, compose_dict: dict[str, Any], workdir: str) -> str:
-        """Write *compose_dict* to ``<workdir>/docker-compose.yml`` (D5)."""
+    def write(self, compose_dict: dict[str, Any], workdir: str,
+              filename: str = "docker-compose.yml") -> str:
+        """Write *compose_dict* to ``<workdir>/<filename>`` (D5).
+
+        *filename* exists so a caller can stage a **candidate** next to the
+        working file, validate it, and only then move it into place -- an
+        invalid file written over a working one strands the running stack,
+        because teardown reuses the on-disk file and Compose refuses to read
+        a project it cannot resolve (#164 NET-C1).
+        """
         workdir = os.path.expanduser(workdir)
         os.makedirs(workdir, exist_ok=True)
-        path = os.path.join(workdir, "docker-compose.yml")
+        path = os.path.join(workdir, filename)
         with open(path, "w") as fobj:
             yaml.safe_dump(compose_dict, fobj, sort_keys=False, default_flow_style=False)
         return path
@@ -185,6 +211,7 @@ class ComposeGenerator:
         shared_networks: dict[str, Any],
         referenced_shared: set[str],
         named_volumes: dict[str, Any],
+        unmatched_native: set[str],
     ) -> dict[str, Any]:
         svc: dict[str, Any] = {}
 
@@ -209,6 +236,7 @@ class ComposeGenerator:
         nets = self._service_networks(
             cluster_name, box_name, box.get("networks"),
             cluster_networks, shared_networks, referenced_shared,
+            unmatched_native,
         )
         if nets:
             svc["networks"] = nets
@@ -404,6 +432,110 @@ class ComposeGenerator:
                     )
         return mounts
 
+    @staticmethod
+    def _effective_network_mode(svc: dict[str, Any]) -> str | None:
+        """The ``network_mode`` actually in effect, or ``None``.
+
+        A *present* key is not a mode in effect. ``network_mode: ""`` (or an
+        expression interpolating to empty) leaves the service on its declared
+        networks, and an interpolated value cannot be resolved here at all --
+        only Compose knows what it becomes. Treating "key present" as "mode
+        set" silently erased declared attachments (#164 NET-C1).
+        """
+        mode = svc.get("network_mode")
+        if not isinstance(mode, str) or not mode.strip():
+            return None
+        if "$" in mode:
+            # Only Compose can resolve this, and it may interpolate to empty.
+            # boxman no longer emits a redundant `networks: [default]`, so
+            # leaving both keys alone cannot manufacture a conflict that a
+            # plain box config would not already have.
+            return None
+        return mode
+
+    def _apply_network_mode(self, compose: dict[str, Any]) -> None:
+        """Drop ``networks:`` from any service with a mode actually in effect.
+
+        Compose refuses a service declaring both, so an override asking for
+        ``network_mode:`` takes the attachments with it. This runs over the
+        **assembled** dict, after the cluster-level ``compose_extra:`` has
+        merged: a mode set (or cancelled) at cluster level, or inherited
+        through ``extends:``, is only visible at that point (#164 NET-C1).
+        """
+        for svc in (compose.get("services") or {}).values():
+            if not isinstance(svc, dict):
+                continue
+            if self._effective_network_mode(svc) is not None:
+                svc.pop("networks", None)
+
+    def _assert_networks_resolve(
+        self,
+        cluster_name: str,
+        compose: dict[str, Any],
+        unmatched_native: dict[str, set[str]],
+    ) -> None:
+        """Refuse a reference boxman can *prove* Compose will reject.
+
+        Compose is the authority here, and a good one: it refuses any service
+        reference to an undeclared network -- including one that only appears
+        after ``include:`` is merged or ``${VAR}`` is interpolated -- with
+        ``service "x" refers to undefined network y``. boxman's own check
+        exists to say the same thing earlier and better (naming the cluster,
+        the box and the available names), never to be the only thing that
+        catches it.
+
+        So this refuses only where refusal is certain, and stays quiet
+        everywhere Compose knows something boxman does not:
+
+        - only refs boxman itself emitted from a box's ``networks:`` key are
+          judged; anything arriving through ``compose_extra:`` is the user
+          deliberately reaching past boxman;
+        - checked against the **final** top-level ``networks:``, so an
+          override that declares the network satisfies the reference;
+        - ``default`` is Compose's implicit network and needs no declaration;
+        - a ref containing ``$`` is an interpolation boxman cannot resolve;
+        - a top-level ``include:`` may define networks in another file;
+        - a service with ``extends:`` is not fully visible here.
+
+        Everything deferred still fails -- in Compose, by its own message --
+        so deferring costs a less specific diagnostic, never a silent
+        misattachment (#164 NET-C1).
+        """
+        if not unmatched_native:
+            return
+        if compose.get("include"):
+            return
+        declared = set(compose.get("networks") or {})
+        services = compose.get("services") or {}
+        for box_name, refs in unmatched_native.items():
+            svc = services.get(box_name) or {}
+            if svc.get("extends"):
+                continue
+            attached = svc.get("networks")
+            if not attached:
+                # an override removed the attachment, or a mode took it
+                continue
+            attached_names = set(
+                attached if isinstance(attached, list) else list(attached))
+            for ref in sorted(refs):
+                if ref not in attached_names:
+                    continue
+                if ref in declared or ref == IMPLICIT_DEFAULT_NETWORK:
+                    continue
+                if "$" in ref:
+                    continue
+                known = sorted(declared | {IMPLICIT_DEFAULT_NETWORK})
+                raise ConfigError(
+                    f"box '{cluster_name}.{box_name}': network '{ref}' is "
+                    f"not defined by this cluster "
+                    f"(available: {', '.join(known) or 'none'}). "
+                    f"Compose would refuse this file with "
+                    f"'service \"{box_name}\" refers to undefined network "
+                    f"{ref}'. Correct the name, declare the network under "
+                    f"'networks:', or attach it through 'compose_extra:' if "
+                    f"it is one boxman does not manage."
+                )
+
     def _service_networks(
         self,
         cluster_name: str,
@@ -412,6 +544,7 @@ class ComposeGenerator:
         cluster_networks: dict[str, Any],
         shared_networks: dict[str, Any],
         referenced_shared: set[str],
+        unmatched_native: set[str],
     ) -> list[str] | dict[str, Any]:
         """Resolve a box's ``networks:`` to the service's compose ``networks``.
 
@@ -420,7 +553,14 @@ class ComposeGenerator:
         meaningful on a shared/macvlan bridge). Cluster-internal and shared
         refs are attached; a shared ref is recorded in *referenced_shared* so
         :meth:`_shared_macvlan_networks` emits the top-level macvlan network.
-        Unknown refs are warned about and dropped.
+        A ref matching neither is **still attached**, and recorded in
+        *unmatched_native* for :meth:`_assert_networks_resolve` to judge once
+        every override has merged. It used to be warned about and dropped,
+        which left the service with no explicit attachment at all -- so
+        Compose placed it on the project's default network rather than
+        refusing it (#164 NET-C1). The literal ``default`` resolves to that
+        same implicit network; names boxman does not manage can be attached
+        through ``compose_extra:``, which bypasses this resolver.
 
         Returns the mapping form (``{name: {ipv4_address: …}}``) when any ref
         carries per-network options, else the plain list form.
@@ -444,12 +584,26 @@ class ComposeGenerator:
                                            shared_networks[ref] or {})
                 referenced_shared.add(ref)
             else:
-                self.logger.warning(
-                    f"box '{cluster_name}.{box_name}': network '{ref}' is "
-                    f"neither a cluster-internal network nor a shared_networks "
-                    f"bridge — skipping."
-                )
-                continue
+                # Not a name boxman manages -- which is not yet an error. It
+                # may be `default` (Compose provides it), or something an
+                # override supplies. Attach it as declared and remember it:
+                # the final pass decides, once every override has merged
+                # (#164 NET-C1). Crucially the ref is never dropped -- that
+                # was the original defect, because a dropped ref left the
+                # service with no attachment and Compose silently placed it
+                # on the project default instead of refusing it.
+                unmatched_native.add(ref)
+                if (ref == IMPLICIT_DEFAULT_NETWORK
+                        and opts.get("ipv4_address")):
+                    self.logger.warning(
+                        f"box '{cluster_name}.{box_name}': ignoring "
+                        f"'ipv4_address' on the implicit 'default' network — "
+                        f"boxman declares no IPAM pool for it. Declare a "
+                        f"'default' network under the cluster's 'networks:', "
+                        f"or use 'compose_extra:'."
+                    )
+                    opts = {k: v for k, v in opts.items()
+                            if k != "ipv4_address"}
             svc_opts = {"ipv4_address": opts["ipv4_address"]} \
                 if opts.get("ipv4_address") else {}
             if svc_opts:
@@ -457,6 +611,25 @@ class ComposeGenerator:
             attached[ref] = svc_opts
 
         if not attached:
+            return []
+        if (not any_opts
+                and list(attached) == [IMPLICIT_DEFAULT_NETWORK]
+                and IMPLICIT_DEFAULT_NETWORK in unmatched_native):
+            # Emitting the *implicit* `networks: [default]` is redundant --
+            # a service with no `networks:` key lands on the project default
+            # anyway -- and it is the sole reason a `network_mode:` override
+            # becomes Compose's "mutually exclusive" error. That includes
+            # modes boxman cannot see: one inherited through `extends:` or
+            # written `${VAR:-none}` is invisible here, so the safe move is
+            # not to emit the redundant attachment at all.
+            #
+            # A `default` that boxman *resolved* -- declared by the cluster
+            # or by `shared_networks:` -- is a different thing: it is a real
+            # network, and under `extends:` an omitted `networks:` means
+            # "inherit the parent's attachments", so dropping the explicit
+            # entry would silently change where the service lands. Keying
+            # off `unmatched_native` is exactly "matched nothing", which is
+            # what makes it the implicit one (#164 NET-C1).
             return []
         return attached if any_opts else list(attached)
 
