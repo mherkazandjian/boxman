@@ -25,7 +25,7 @@ from unittest.mock import patch
 
 import pytest
 
-from boxman.exceptions import ConfigError
+from boxman.exceptions import ConfigError, ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers import merge_provider_configs
 
@@ -368,15 +368,6 @@ class TestCloneVmsExitCodeGuard:
     exited non-zero.
     """
 
-    @staticmethod
-    def _fake_process(exitcode: int):
-        from unittest.mock import MagicMock
-        proc = MagicMock()
-        proc.exitcode = exitcode
-        proc.start = MagicMock()
-        proc.join = MagicMock()
-        return proc
-
     def _mgr_with_one_vm(self, tmp_path: Path):
         with patch("boxman.manager.BoxmanCache"):
             m = BoxmanManager()
@@ -397,20 +388,22 @@ class TestCloneVmsExitCodeGuard:
         return m
 
     def test_raises_when_clone_subprocess_fails(self, tmp_path: Path):
+        # clone now goes through the shared _run_parallel helper (bounded
+        # fan-out), so the failure arrives as its failures dict and surfaces
+        # as a typed ProvisionError rather than a bare RuntimeError
         from unittest.mock import patch as _patch
         m = self._mgr_with_one_vm(tmp_path)
-        fake = self._fake_process(exitcode=1)
+        failures = {'bprj__demo__bprj_cluster_1_node01': 'worker exited with code 1'}
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
-             _patch("boxman.manager_parts.vms.Process", return_value=fake):
-            with pytest.raises(RuntimeError, match="clone failed for 1 VM"):
+             _patch.object(m, '_run_parallel', return_value=({}, failures)):
+            with pytest.raises(ProvisionError, match="clone failed for 1 VM"):
                 m.clone_vms()
 
     def test_no_raise_when_all_clones_succeed(self, tmp_path: Path):
         from unittest.mock import patch as _patch
         m = self._mgr_with_one_vm(tmp_path)
-        fake = self._fake_process(exitcode=0)
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
-             _patch("boxman.manager_parts.vms.Process", return_value=fake):
+             _patch.object(m, '_run_parallel', return_value=({}, {})):
             # No exception, no return value either.
             m.clone_vms()
 
@@ -560,7 +553,7 @@ class TestCloneAndConfigureNewVmsExitCodeGuard:
             'bprj__demo__bprj_cluster_1_node01': 'worker exited with code 1'}
         with _patch.object(m, '_ensure_libvirt_storage_pool'), \
              _patch.object(m, '_run_parallel', return_value=({}, failures)):
-            with pytest.raises(RuntimeError, match="clone failed for 1 new VM"):
+            with pytest.raises(ProvisionError, match="clone failed for 1 new VM"):
                 m._clone_and_configure_new_vms(new_vm_names)
 
     def test_no_raise_when_all_clones_succeed(self, tmp_path: Path):

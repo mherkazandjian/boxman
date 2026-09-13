@@ -281,7 +281,7 @@ Configured in `.env` or overridden on the command line:
 | Variable | Default | Description |
 |---|---|---|
 | `BOXMAN_INSTANCE_NAME` | `default` | Instance name (used in container name and SSH config) |
-| `BOXMAN_DATA_DIR` | `./data` | Host directory for images, sockets, and SSH keys |
+| `BOXMAN_DATA_DIR` | `./data` | Host directory for images, sockets, SSH keys and libvirt's own state |
 | `BOXMAN_PROJECT_DIR` | `.` | Project directory where conf.yml lives |
 | `BOXMAN_WORKDIR` | `BOXMAN_PROJECT_DIR` | Workdir from conf.yml (disk images, network XMLs, etc.) |
 | `BOXMAN_SSH_PORT` | `2222` | Host port mapped to container SSH |
@@ -289,6 +289,34 @@ Configured in `.env` or overridden on the command line:
 | `BOXMAN_LIBVIRT_TLS_PORT` | `16514` | Host port for libvirt TLS |
 | `HOST_UID` | *(auto-detected)* | UID of the host user (set automatically by Makefile) |
 | `HOST_GID` | *(auto-detected)* | GID of the host user (set automatically by Makefile) |
+
+### What lives in `BOXMAN_DATA_DIR`
+
+| Subdirectory | Mounted at | Holds |
+|---|---|---|
+| `images/` | `/var/lib/libvirt/images` | VM disks |
+| `libvirt-run/` | `/var/run/libvirt` | libvirtd sockets |
+| `ssh/` | `/etc/boxman/ssh` | the container's generated SSH identity |
+| `etc-libvirt/` | `/etc/libvirt` | domain and network XML, libvirtd/qemu config |
+| `var-lib-libvirt-qemu/` | `/var/lib/libvirt/qemu` | NVRAM, saved state, snapshot metadata |
+
+The last two are what makes a container recreate non-destructive. Before
+they were bind-mounted they lived in the container's writable layer, so
+anything that recreated the container — a workdir change, an unresponsive
+libvirtd, a compose-file edit — discarded every domain, network and
+snapshot (#164 FB-2).
+
+On a first run both are empty and `entrypoint.sh` seeds them from a
+pristine copy baked into the image, so libvirtd still starts configured.
+A container created before the mounts existed has its state copied out
+with `docker cp` and validated before anything stops it; the copy is only
+accepted once a `.libvirt-state-migrated` marker is written, so an
+interrupted migration is retried from the container rather than half
+believed.
+
+Because this directory now holds libvirt's state, `boxman destroy-runtime`
+destroys every domain and snapshot along with the images. It says so in
+its confirmation prompt.
 
 ## Container Details
 

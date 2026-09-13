@@ -273,9 +273,19 @@ class SharedFolderManager:
             'restart_needed': restart_needed,
         }
 
-    def get_attached_shared_folders(self) -> list[dict[str, Any]]:
+    def get_attached_shared_folders(
+            self, inactive: bool = False) -> list[dict[str, Any]]:
         """
-        Get all filesystem (shared folder) devices currently attached to the VM.
+        Get all filesystem (shared folder) devices attached to the VM.
+
+        Args:
+            inactive: read the **persistent** definition rather than the
+                live domain. What boxman configures is the persistent one,
+                so that is what a reconcile has to compare against: an
+                attachment that fell back to config-only is invisible in
+                the live view, and reading that view meant the next update
+                proposed it again and libvirt rejected the duplicate
+                persistent target (#164 C1 review, finding 7).
 
         Returns:
             List of dicts with 'name', 'host_path', and 'readonly' keys.
@@ -283,7 +293,7 @@ class SharedFolderManager:
         from lxml import etree
 
         editor = VirshEdit(provider_config=self.provider_config)
-        xml_content = editor.get_domain_xml(self.vm_name)
+        xml_content = editor.get_domain_xml(self.vm_name, inactive=inactive)
 
         tree = etree.fromstring(xml_content.encode('utf-8'))
 

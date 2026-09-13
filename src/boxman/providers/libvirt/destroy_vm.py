@@ -157,6 +157,10 @@ class DestroyVM:
         """
         Check if the VM exists (is defined).
 
+        Note: this answers False when the *query itself* fails, so it must
+        never be used to authorise a destructive step — use
+        :meth:`confirm_absent`, which fails closed, for that.
+
         Returns:
             True if VM exists, False otherwise
         """
@@ -165,6 +169,63 @@ class DestroyVM:
             return result.ok
         except RuntimeError:
             return False
+
+    def confirm_absent(self) -> bool:
+        """
+        Positively confirm that this domain no longer exists.
+
+        Fails closed. :meth:`is_vm_defined` cannot serve this purpose: it
+        returns False when the *query* fails, so an unreachable libvirtd
+        reads as "the VM is gone" and would authorise deleting its disks.
+        Here the evidence must be a **successful** ``virsh list --all --name``
+        in which the name does not appear; a failed, raised or otherwise
+        inconclusive observation returns False.
+
+        An error string such as "failed to get domain" is deliberately not
+        accepted as proof: it reports a failed lookup, not a confirmed
+        absence.
+
+        Returns:
+            True only when a successful listing proves the domain is absent.
+        """
+        try:
+            result = self.virsh.execute("list", "--all", "--name", warn=True)
+        except RuntimeError:
+            return False
+        if not result.ok:
+            return False
+        names = {
+            line.strip()
+            for line in (result.stdout or "").splitlines()
+            if line.strip()
+        }
+        return self.name not in names
+
+    def _confirm_shut_off_or_absent(self) -> bool:
+        """
+        Positively confirm the domain is shut off, or gone.
+
+        Fails closed, like :meth:`confirm_absent`: a query that could not be
+        answered is never read as "stopped". This gates every
+        storage-removing undefine.
+
+        The state is matched exactly. A substring test would also accept
+        text like "not shut off", and anything unexpected must read as
+        "cannot confirm", not as "stopped".
+
+        Returns:
+            True only on a successful ``domstate`` reporting exactly
+            "shut off", or a successful listing proving the domain is absent.
+        """
+        try:
+            result = self.virsh.execute("domstate", self.name, warn=True)
+        except RuntimeError:
+            return False
+        if result.ok:
+            return (result.stdout or "").strip() == "shut off"
+        # domstate failed: the domain may be gone, or libvirtd may be
+        # unreachable. Only a successful listing can tell the two apart.
+        return self.confirm_absent()
 
     def shutdown_vm(self,
                     timeout: int | None = None,
@@ -313,13 +374,24 @@ class DestroyVM:
             self.logger.info(f"vm {self.name} is not defined, nothing to undefine")
             return True
 
-        # --remove-all-storage requires the domain to be fully stopped.
-        # If the domain is still alive (running, in-shutdown, paused, etc.)
-        # force-kill it before attempting storage removal.
-        if not self.is_vm_shut_off():
+        # --remove-all-storage requires the domain to be fully stopped, and
+        # "fully stopped" has to be *positively observed*. is_vm_shut_off()
+        # answers True when the query itself failed, so an unreachable
+        # libvirtd used to read as a stopped domain and storage removal went
+        # ahead regardless. Require positive evidence both on the
+        # already-stopped path and again after a forced kill — otherwise a
+        # domain whose qemu process has not actually released its disks can
+        # have them removed underneath it.
+        if not self._confirm_shut_off_or_absent():
             self.logger.warning(
                 f"vm {self.name} is not shut off, force-killing before undefine")
             self.virsh.execute("destroy", self.name, warn=True)
+            if not self._confirm_shut_off_or_absent():
+                self.logger.error(
+                    f"vm {self.name}: could not confirm it is shut off; "
+                    f"refusing to undefine with --remove-all-storage, which "
+                    f"would remove its disks under a possibly-live guest")
+                return False
 
         try:
             self.logger.info(f"**force** un-defining vm {self.name}")

@@ -21,7 +21,7 @@ The main goal is to avoid having many dependencies and to keep it simple and cus
 - **Runtime environments**: execute provider commands locally or inside a Docker container
 - **Per-cluster providers**: a project can mix `libvirt` VM clusters and `docker-compose` container clusters, with every verb (`up`, `ps`, `snapshot`, `control`, ansible inventory) working across both — and VM↔container L2 adjacency over a shared bridge. See [Providers](#providers)
 - **`boxman up`**: idempotent bring-up command — provisions if no infrastructure exists, starts/resumes VMs if they are powered off or paused
-- **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow disks
+- **`boxman update`**: incrementally apply config changes to a running project — add/remove VMs, adjust CPU/memory, grow and detach disks; changes that need a guest restart are deferred unless `--restart` is given
 - **Disk reclaim and storage hygiene**: `boxman storage` inspects qcow2 footprint, runs guest-side fstrim, compacts qcow2 files, and compresses snapshot memory dumps with zstd — see [Disk Reclaim and Storage](doc/storage.md)
 
 ## Quick Start
@@ -762,8 +762,13 @@ This project is licensed under the [MIT License](LICENSE).
 - `destroy-runtime` — destroy the docker-compose runtime and clean up .boxman
 - `destroy` — full teardown (VMs + networks + files + runtime + workspace
   workdir) with a `[y/N]` prompt; use `-y`/`--auto-accept` to skip the prompt
-  and `--templates` to also remove template workdirs
-- `deprovision` — deprovision a configuration
+  and `--templates` to also remove template workdirs. Validates every path it
+  would delete before starting, and stops at exit 2 without running the
+  irreversible cleanup if the teardown did not complete — see
+  [Teardown safety](#teardown-safety)
+- `deprovision` — deprovision a configuration (VMs + networks). Exits 2 and
+  skips the cleanup if any resource survived — see
+  [Teardown safety](#teardown-safety)
 - `snapshot` — manage snapshots of VMs
   - `snapshot take` — take a snapshot (`--compress-memory` zstd-compresses
     the memory dump; restore decompresses transparently)
@@ -793,7 +798,9 @@ This project is licensed under the [MIT License](LICENSE).
 - `control` — control the state of VMs
   - `control suspend` — suspend VMs
   - `control resume` — resume VMs
-  - `control save` — save the state of VMs
+  - `control save` — save the state of VMs to disk (libvirt *managed*
+    save: the memory image belongs to libvirt and the next `up` or
+    `control start` restores it automatically)
   - `control start` — start VMs
 - `export` — export VMs
 - `update` — apply config changes to a running project (add/remove VMs, update CPU/memory/disks)
@@ -801,6 +808,43 @@ This project is licensed under the [MIT License](LICENSE).
 - `run` — run tasks with the workspace environment loaded
 - `ps` — show the state of VMs in the project (`-p` adds provider-specific columns, `--json` outputs JSON)
 - `ssh` — ssh into a VM
+
+## Teardown safety
+
+`deprovision` and `destroy` will not throw away the state you need to try
+again.
+
+Teardown is **not transactional**: removals that already succeeded are not
+rolled back, so one VM's disks can be gone before another VM's teardown fails.
+What is protected is the *recovery state*. If any resource is left behind — or
+if the teardown cannot be confirmed — the command exits 2 and does **not** run
+the irreversible cleanup that follows it. The generated files (SSH keys,
+inventory, `env.sh`), the workspace tree, the template workdirs, the docker
+runtime and the project's cache entry all stay, so the project is still listed
+by `boxman list` and the same command can be re-run to finish the job. Both
+commands are idempotent, so re-running is the normal recovery.
+
+The error names what survived. Fix that cause — start libvirtd, free the
+network, stop whatever is holding the compose volumes — then run it again.
+
+Details worth knowing:
+
+- **How completion is judged.** For libvirt projects the teardown is confirmed
+  against `virsh list --all --name`; a query that cannot be answered counts as
+  unconfirmed, never as "nothing left". A docker-compose-only project is not
+  given a libvirt dependency — its teardown is judged by the compose
+  operations themselves.
+- **Disks are only removed once the domain is confirmed gone.** A libvirt
+  query that fails is not proof of absence, so an unreachable libvirtd leaves
+  the disks alone instead of unlinking them under a guest that may still be
+  running.
+- **`destroy` validates its delete targets up front**, before any teardown
+  starts. It refuses a path that is empty, relative, a symlink, your home
+  directory, a filesystem root or mount point, a top-level path, or a
+  directory containing a `.git`. A `workspace.path` typo aborts the command
+  rather than deleting that tree.
+- **`provision --force` deprovisions first**, so it now aborts instead of
+  provisioning on top of resources it could not remove.
 
 ## Updating a Running Project
 
@@ -819,6 +863,28 @@ Edit `conf.yml` and run `boxman update` to reconcile the live state with the con
   created and attached
 - **Grow disks**: increase the `size` of an existing disk — the disk image is
   resized in place (shrinking is not supported)
+- **Remove disks**: remove a disk entry from a VM's `disks:` section — the disk
+  is detached, and **its image file is left on disk**. Boxman detaches only a
+  disk it recorded attaching, still at the target it recorded, with the exact
+  source it recorded. Anything else — a replacement disk at a reused target, a
+  snapshot overlay, a disk attached by hand, a VM predating the record — is
+  reported and left alone
+
+### Restarts
+
+Some changes cannot be applied to a live guest: raising a vCPU or memory
+ceiling, and some shared-folder and memballoon changes. `update` writes
+them to the persistent config and reports the VM as needing a restart. It
+does **not** restart the guest by itself.
+
+Detaching a disk is different: it is not written and waiting for a boot.
+Nothing is detached until the guest is fully shut down (a paused guest is
+not), so an ordinary reboot leaves the disk attached. Either shut the VM
+down and run `update` again, or pass `--restart`, which shuts it down
+cleanly, detaches, and starts it back up.
+
+Pass `--restart` to let it. `--yes` does not imply `--restart` — it answers
+the VM-removal prompt only.
 
 ### What cannot be updated
 
@@ -841,8 +907,11 @@ boxman update --dry-run
 # Apply changes (prompts for confirmation before destroying VMs)
 boxman update
 
-# Apply changes without confirmation prompt
+# Apply changes without confirmation prompt for VM removal
 boxman update --yes
+
+# Also allow restarting guests for changes that cannot be applied live
+boxman update --restart
 ```
 
 ## Tasks

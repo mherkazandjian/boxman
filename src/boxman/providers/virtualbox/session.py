@@ -213,7 +213,8 @@ class VirtualBoxSession(SessionConfigMixin):
     def save_vm(self, vm_name: str, workdir: str) -> bool:
         raise _phase('save_vm', 2)
 
-    def restore_vm(self, vm_name: str, workdir: str) -> bool:
+    def restore_vm(self, vm_name: str, workdir: str,
+                   allow_legacy: bool = False) -> bool:
         raise _phase('restore_vm', 2)
 
     # --- snapshots ----------------------------------------------------------

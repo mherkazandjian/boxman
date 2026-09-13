@@ -171,7 +171,7 @@ class TestForceUndefine:
 
     def test_kills_running_domain_before_undefine(self, dv: DestroyVM):
         with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "is_vm_shut_off", return_value=False), \
+             patch.object(dv, "_confirm_shut_off_or_absent", side_effect=[False, True]), \
              patch.object(dv.virsh, "execute", return_value=_result()) as execute:
             assert dv.force_undefine_vm() is True
         calls = [c.args[0] for c in execute.call_args_list]
@@ -182,7 +182,7 @@ class TestForceUndefine:
 
     def test_skips_kill_when_already_shut_off(self, dv: DestroyVM):
         with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
              patch.object(dv.virsh, "execute", return_value=_result()) as execute:
             dv.force_undefine_vm()
         calls = [c.args[0] for c in execute.call_args_list]
@@ -192,7 +192,7 @@ class TestForceUndefine:
         """Regression for issue #85 item 25: flags must be separate
         args, not one re-split string."""
         with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
              patch.object(dv.virsh, "execute", return_value=_result()) as execute:
             assert dv.force_undefine_vm() is True
         undefine = [c for c in execute.call_args_list
@@ -216,7 +216,7 @@ class TestForceUndefine:
             return _result()
 
         with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
              patch.object(dv.virsh, "execute", side_effect=fake_execute):
             assert dv.force_undefine_vm() is True
         undefines = [args for args, _ in calls if args[0] == "undefine"]
@@ -234,7 +234,7 @@ class TestForceUndefine:
 
     def test_no_fallback_when_rich_undefine_succeeds(self, dv: DestroyVM):
         with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
              patch.object(dv.virsh, "execute", return_value=_result()) as execute:
             assert dv.force_undefine_vm() is True
         undefines = [c for c in execute.call_args_list
@@ -277,7 +277,7 @@ class TestRemove:
         # is_vm_running False -> graceful skipped; force_undefine_vm runs for real
         with patch.object(dv, "is_vm_running", return_value=False), \
              patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "is_vm_shut_off", return_value=False), \
+             patch.object(dv, "_confirm_shut_off_or_absent", side_effect=[False, True]), \
              patch.object(dv.virsh, "execute", return_value=_result()) as execute:
             assert dv.remove() is True
         calls = [c.args[0] for c in execute.call_args_list]
@@ -288,7 +288,7 @@ class TestRemove:
     def test_never_issues_per_snapshot_snapshot_delete(self, dv: DestroyVM):
         with patch.object(dv, "is_vm_running", return_value=False), \
              patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
              patch.object(dv.virsh, "execute", return_value=_result()) as execute:
             assert dv.remove() is True
         commands = [c.args[0] for c in execute.call_args_list]
@@ -308,7 +308,7 @@ class TestManagedSaveBlocksUndefine:
 
     def test_force_undefine_passes_managed_save(self, dv: DestroyVM):
         with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
              patch.object(dv.virsh, "execute",
                           return_value=_result()) as execute:
             assert dv.force_undefine_vm() is True
@@ -325,7 +325,7 @@ class TestManagedSaveBlocksUndefine:
         # the storage-removal form is not idempotent, so the fallback is the
         # path a real destroy usually takes -- it needs the flag too
         with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
              patch.object(
                  dv.virsh, "execute",
                  side_effect=[_result(ok=False, stderr="not managed by libvirt"),
@@ -337,9 +337,118 @@ class TestManagedSaveBlocksUndefine:
         # destroy used to exit 0 while leaving the domain defined; the whole
         # point is that this surfaces
         with patch.object(dv, "is_vm_defined", return_value=True), \
-             patch.object(dv, "is_vm_shut_off", return_value=True), \
+             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
              patch.object(
                  dv.virsh, "execute",
                  side_effect=[_result(ok=False, stderr="storage gone"),
                               _result(ok=False, stderr="still refusing")]):
             assert dv.force_undefine_vm() is False
+
+
+class TestConfirmAbsent:
+    """FB-4: only a *successful* observation may authorise deleting a VM's
+    disks. ``is_vm_defined`` answers False when the query itself failed, so
+    an unreachable libvirtd used to read as "the VM is gone"."""
+
+    def test_true_when_a_successful_listing_omits_the_name(self, dv: DestroyVM):
+        with patch.object(dv.virsh, "execute",
+                          return_value=_result(stdout="other01\nother02\n")):
+            assert dv.confirm_absent() is True
+
+    def test_false_when_the_listing_still_shows_the_name(self, dv: DestroyVM):
+        with patch.object(dv.virsh, "execute",
+                          return_value=_result(stdout="other01\nvm01\n")):
+            assert dv.confirm_absent() is False
+
+    def test_false_when_the_listing_fails(self, dv: DestroyVM):
+        with patch.object(
+                dv.virsh, "execute",
+                return_value=_result(ok=False,
+                                     stderr="failed to connect to the hypervisor")):
+            assert dv.confirm_absent() is False
+
+    def test_false_on_runtime_error(self, dv: DestroyVM):
+        with patch.object(dv.virsh, "execute", side_effect=RuntimeError("boom")):
+            assert dv.confirm_absent() is False
+
+    def test_a_failed_lookup_is_not_proof_of_absence(self, dv: DestroyVM):
+        """"failed to get domain" reports a failed lookup, not an absence,
+        so it must not authorise anything."""
+        with patch.object(
+                dv.virsh, "execute",
+                return_value=_result(ok=False,
+                                     stderr="error: failed to get domain 'vm01'")):
+            assert dv.confirm_absent() is False
+
+
+class TestConfirmShutOffOrAbsent:
+
+    def test_true_on_a_successful_shut_off_domstate(self, dv: DestroyVM):
+        with patch.object(dv.virsh, "execute",
+                          return_value=_result(stdout="shut off\n")):
+            assert dv._confirm_shut_off_or_absent() is True
+
+    def test_false_when_the_domain_is_running(self, dv: DestroyVM):
+        with patch.object(dv.virsh, "execute",
+                          return_value=_result(stdout="running\n")):
+            assert dv._confirm_shut_off_or_absent() is False
+
+    def test_falls_back_to_the_listing_when_domstate_fails(self, dv: DestroyVM):
+        def fake_execute(*args, **kwargs):
+            if args[0] == "domstate":
+                return _result(ok=False, stderr="failed to get domain")
+            return _result(stdout="other01\n")
+
+        with patch.object(dv.virsh, "execute", side_effect=fake_execute):
+            assert dv._confirm_shut_off_or_absent() is True
+
+    def test_false_when_every_query_fails(self, dv: DestroyVM):
+        with patch.object(
+                dv.virsh, "execute",
+                return_value=_result(ok=False, stderr="failed to connect")):
+            assert dv._confirm_shut_off_or_absent() is False
+
+
+class TestStorageRemovalRequiresConfirmedShutdown:
+    """FB-4: ``--remove-all-storage`` may only run once the domain has been
+    positively observed to be stopped or gone — on the already-stopped path
+    as well as after a forced kill."""
+
+    def test_a_failed_state_query_never_removes_storage(self, dv: DestroyVM):
+        """The libvirt-outage case: every query fails, so shut-off can never
+        be confirmed and the storage-removing undefine must not be issued."""
+        with patch.object(dv, "is_vm_defined", return_value=True), \
+             patch.object(
+                 dv.virsh, "execute",
+                 return_value=_result(ok=False,
+                                      stderr="failed to connect")) as execute:
+            assert dv.force_undefine_vm() is False
+
+        assert not any(
+            call.args[0] == "undefine" and "--remove-all-storage" in call.args
+            for call in execute.call_args_list
+        ), "storage was removed without confirming the domain was stopped"
+
+    def test_a_shutdown_confirmed_after_the_kill_may_proceed(self, dv: DestroyVM):
+        """Unconfirmed at first, confirmed after the forced kill: correct to
+        go ahead."""
+        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
+             patch.object(dv, "_confirm_shut_off_or_absent",
+                          side_effect=[False, True]), \
+             patch.object(dv.virsh, "execute",
+                          return_value=_result()) as execute:
+            assert dv.force_undefine_vm() is True
+
+        assert any(
+            call.args[0] == "undefine" and "--remove-all-storage" in call.args
+            for call in execute.call_args_list
+        )
+
+    def test_unexpected_domstate_output_is_not_confirmation(self, dv: DestroyVM):
+        """The state is matched exactly: a substring test would accept text
+        such as "not shut off", and anything unexpected must read as
+        "cannot confirm"."""
+        for stdout in ("not shut off\n", "in shutdown\n", "pmsuspended\n", ""):
+            with patch.object(dv.virsh, "execute",
+                              return_value=_result(stdout=stdout)):
+                assert dv._confirm_shut_off_or_absent() is False, stdout

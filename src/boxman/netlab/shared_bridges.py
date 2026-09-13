@@ -74,19 +74,39 @@ def _normalise_bool(value: Any, entry_name: str, key: str) -> bool:
     )
 
 
+def _sudo_prefix(use_sudo: bool) -> str:
+    """``"sudo "`` when the provider asks for it, else nothing.
+
+    ``sudo`` used to be hard-coded here, so a host where boxman already
+    runs with the privileges it needs — or one that deliberately sets
+    ``use_sudo: false`` — still had every bridge command shelled out
+    through sudo (#164 FBN-12). Threaded through the privileged probes as
+    well as the writes: ``iptables -L`` needs root just as ``iptables -I``
+    does. ``ip link show`` does not, and stays unprivileged.
+    """
+    return "sudo " if use_sudo else ""
+
+
 def _bridge_exists(name: str) -> bool:
+    """Whether *name* exists as a link on the host.
+
+    Deliberately not sudo'd: ``ip link show`` reads netlink, which is
+    world-readable, so requiring root here would break a host that runs
+    boxman unprivileged for read-only work. ``iptables -L`` below is the
+    probe that genuinely needs it.
+    """
     result = run(f"ip link show dev {shlex.quote(name)}", warn=True, hide=True)
     return result.ok
 
 
-def _run_sudo(cmd: str) -> None:
-    """Run a root-required command via sudo, raising on failure."""
-    run(f"sudo {cmd}", hide=True)
+def _run_sudo(cmd: str, use_sudo: bool = True) -> None:
+    """Run a root-required command, raising on failure."""
+    run(f"{_sudo_prefix(use_sudo)}{cmd}", hide=True)
 
 
-def _set_sysfs(path: str, value: str) -> None:
+def _set_sysfs(path: str, value: str, use_sudo: bool = True) -> None:
     """Write *value* to *path* under sysfs / procfs via ``tee``."""
-    run(f"echo {value} | sudo tee {path}", hide=True)
+    run(f"echo {value} | {_sudo_prefix(use_sudo)}tee {path}", hide=True)
 
 
 def _scoped_rule_body(bridge: str) -> str:
@@ -107,24 +127,24 @@ def _scoped_rule_body(bridge: str) -> str:
             f"-m physdev --physdev-is-bridged -j ACCEPT")
 
 
-def _iptables_chain_exists(chain: str) -> bool:
-    return run(f"sudo iptables -t filter -n -L {chain}",
+def _iptables_chain_exists(chain: str, use_sudo: bool = True) -> bool:
+    return run(f"{_sudo_prefix(use_sudo)}iptables -t filter -n -L {chain}",
                warn=True, hide=True).ok
 
 
-def _ensure_iptables_rule(chain: str, body: str) -> None:
+def _ensure_iptables_rule(chain: str, body: str, use_sudo: bool = True) -> None:
     """Idempotently insert ``body`` at the top of filter table *chain*.
 
     Uses ``-C`` (check) before ``-I`` (insert at position 1) so repeated
     ``ensure()`` calls don't stack duplicate rules (spike scenario 7).
     """
-    if run(f"sudo iptables -t filter -C {chain} {body}",
+    if run(f"{_sudo_prefix(use_sudo)}iptables -t filter -C {chain} {body}",
            warn=True, hide=True).ok:
         return  # already present
-    _run_sudo(f"iptables -t filter -I {chain} 1 {body}")
+    _run_sudo(f"iptables -t filter -I {chain} 1 {body}", use_sudo=use_sudo)
 
 
-def _ensure_scoped_accept(bridge: str) -> None:
+def _ensure_scoped_accept(bridge: str, use_sudo: bool = True) -> None:
     """Allow bridged lab frames on *bridge* via scoped per-bridge rules (D8).
 
     Inserts into ``FORWARD`` (works without docker) and, when the
@@ -138,12 +158,13 @@ def _ensure_scoped_accept(bridge: str) -> None:
     forwarded between bridge ports may be dropped on such hosts.
     """
     body = _scoped_rule_body(bridge)
-    _ensure_iptables_rule("FORWARD", body)
-    if _iptables_chain_exists("DOCKER-USER"):
-        _ensure_iptables_rule("DOCKER-USER", body)
+    _ensure_iptables_rule("FORWARD", body, use_sudo=use_sudo)
+    if _iptables_chain_exists("DOCKER-USER", use_sudo=use_sudo):
+        _ensure_iptables_rule("DOCKER-USER", body, use_sudo=use_sudo)
 
 
-def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
+def ensure(shared_networks: dict[str, dict[str, Any]] | None,
+           use_sudo: bool = True) -> None:
     """Ensure every bridge declared in *shared_networks* exists and is up.
 
     Idempotent for a given declaration, and safe to call repeatedly.
@@ -223,14 +244,15 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
         created = not _bridge_exists(bridge)
         if created:
             log.info(f"creating shared bridge {bridge!r}")
-            _run_sudo(f"ip link add name {qbridge} type bridge")
+            _run_sudo(f"ip link add name {qbridge} type bridge",
+                      use_sudo=use_sudo)
         else:
             log.info(f"shared bridge {bridge!r} already present")
 
-        _run_sudo(f"ip link set dev {qbridge} up")
+        _run_sudo(f"ip link set dev {qbridge} up", use_sudo=use_sudo)
 
         if mtu is not None:
-            _run_sudo(f"ip link set dev {qbridge} mtu {mtu}")
+            _run_sudo(f"ip link set dev {qbridge} mtu {mtu}", use_sudo=use_sudo)
 
         # Shared bridge names are global and not namespaced, so writing the
         # default on every run is not a no-op: a project that never mentions
@@ -240,16 +262,17 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
         # state. `mtu` above is guarded for the same reason.
         if stp_enabled is not None:
             _run_sudo(f"ip link set dev {qbridge} type bridge stp_state "
-                      f"{1 if stp_enabled else 0}")
+                      f"{1 if stp_enabled else 0}", use_sudo=use_sudo)
         elif created:
-            _run_sudo(f"ip link set dev {qbridge} type bridge stp_state 0")
+            _run_sudo(f"ip link set dev {qbridge} type bridge stp_state 0",
+                      use_sudo=use_sudo)
 
         # Decision D8: default to scoped per-bridge accept rules; the
         # host-global sysctl disable is an explicit opt-in.
         if disable_netfilter:
             globally_disabled.append(bridge)
         else:
-            _ensure_scoped_accept(bridge)
+            _ensure_scoped_accept(bridge, use_sudo=use_sudo)
 
     if globally_disabled:
         log.warning(
@@ -264,7 +287,7 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
         )
         nf_path = Path("/proc/sys/net/bridge/bridge-nf-call-iptables")
         if nf_path.exists():
-            _set_sysfs(str(nf_path), "0")
+            _set_sysfs(str(nf_path), "0", use_sudo=use_sudo)
         else:
             log.warning(
                 "br_netfilter not loaded; skipping bridge-nf-call-iptables=0. "

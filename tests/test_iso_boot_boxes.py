@@ -110,14 +110,42 @@ class TestIsoBoxConfig:
         assert "boxman ssh" in text and "not" in text
 
 
+def _is_placeholder_iso(spec: dict) -> bool:
+    """
+    Whether an ``isos:`` entry is a stand-in the operator has to replace.
+
+    Not every ISO can be pinned to a public URL. ``talos-iso-boot`` boots an
+    image generated per-instance by Omni (``omnictl download iso``), so the
+    box ships a marker instead of a real artifact and its README/comments say
+    to substitute one. Such an entry has nothing to reach, and asserting that
+    it resolves fails for a box that is behaving exactly as documented.
+
+    Recognised markers, both of which that box carries: an all-zero checksum
+    (no real artifact is pinned) and ``placeholder`` in the URI.
+    """
+    checksum = str(spec.get("checksum", ""))
+    digest = checksum.split(":", 1)[-1]
+    if digest and set(digest) == {"0"}:
+        return True
+    return "placeholder" in str(spec.get("uri", "")).lower()
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("box_dir", ISO_BOXES,
                          ids=[os.path.basename(d) for d in ISO_BOXES])
 def test_pinned_iso_urls_are_still_reachable(box_dir):
     """The pinned URLs still resolve (a HEAD request, no download)."""
     import urllib.request
+    checked = 0
     for name, spec in (_config(box_dir).get("isos") or {}).items():
+        if _is_placeholder_iso(spec):
+            continue
         request = urllib.request.Request(spec["uri"], method="HEAD")
         with urllib.request.urlopen(request, timeout=30) as response:
             assert response.status == 200, f"{name}: {spec['uri']}"
             assert int(response.headers.get("Content-Length", 0)) > 0
+        checked += 1
+    if not checked:
+        pytest.skip(
+            "every ISO in this box is an operator-supplied placeholder "
+            "(see its conf.yml) — there is no pinned URL to reach")

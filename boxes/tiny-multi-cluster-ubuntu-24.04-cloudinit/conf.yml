@@ -95,7 +95,7 @@ templates:
         - netplan generate || true
         - netplan apply || true
         - dhclient -v || true
-        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /admin -s /bin/bash -G sudo admin" ]
+        - [ sh, -c, "id admin >/dev/null 2>&1 || useradd -m -d /admin -s /bin/bash -g admin -G sudo admin" ]
         - [ sh, -c, "echo 'admin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/admin && chmod 0440 /etc/sudoers.d/admin" ]
         - [ sh, -c, "echo 'admin:{{ env('BOXMAN_ADMIN_PASS', default='boxman') }}' | chpasswd" ]
         - [ sh, -c, "echo ran at $(date -Is) >> /var/log/hello-cloudinit.log" ]

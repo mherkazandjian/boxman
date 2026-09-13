@@ -42,8 +42,8 @@ on mismatch — a corrupted file is re-downloaded on the next run rather
 than silently used. See the README "Image Caching" section for the
 checksum-spec format and the full hit/miss matrix.
 
-The same cache is reused by manifest URIs in `boxman import-image` (see
-below) so that a remote `manifest.json` is fetched once.
+`boxman import-image` does **not** use this cache: a remote manifest and
+the files it references are downloaded fresh on each import.
 
 ---
 
@@ -100,21 +100,50 @@ boxman import-image \
 | `provider` | string | yes | Must be `libvirt` |
 
 Unknown fields are ignored. Validation runs before any disk I/O — bad
-manifests fail fast with a `ValueError` describing the offending field.
+manifests fail fast with a one-line message describing the offending
+field and **exit 2**.
+
+`provider` is compared case-insensitively, so `LibVirt` is accepted.
+
+Every failure path exits 2. A failed import used to exit **0**: the
+importer signalled failure with a return value that the caller discarded,
+so `boxman import-image && …` ran the next step against a VM that was
+never imported.
 
 ### Manifest URI schemes
 
 | Scheme | Status | Behaviour |
 |---|---|---|
 | `file://` | supported | Local manifest; `xml_path` and `image_path` are resolved relative to the manifest's directory |
-| `http://`, `https://` | supported | Manifest is downloaded (wget → curl → urllib fallback) to a temp file; relative `xml_path` / `image_path` are resolved alongside the downloaded copy |
+| `http://`, `https://` | supported | Manifest is downloaded (wget → curl → urllib fallback) to a temp file; `xml_path` / `image_path` are resolved **against the manifest's own URI** and fetched |
 
-> **Known limitation**: when the manifest is fetched over HTTP, the
-> `xml_path` and `image_path` referenced by it must still be locally
-> resolvable from the downloaded manifest's directory. Fully-remote
-> packages (HTTP `xml_path` / `image_path`) are tracked as a follow-up
-> — see `data/templates/libvirt_image_manifest_web.json` for the
-> intended shape.
+Fully-remote packages work: `xml_path` and `image_path` are resolved
+against the manifest's URI and downloaded. See
+`data/templates/libvirt_image_manifest_web.json` for the shape.
+
+Because a remote manifest names files boxman then goes and fetches, its
+references are constrained:
+
+- **Absolute references are refused.** `/etc/shadow` as an `image_path`
+  would otherwise resolve to that local file on the importing host and be
+  copied in as the VM's disk.
+- **References must resolve to `http(s)`.** A `file://` or `ftp://`
+  reference is refused rather than handed to the downloader.
+- **The VM name is validated** before it is used as a directory name. For
+  a remote import it can come from an XML written by whoever published the
+  manifest, so `<name>../../etc</name>` would place the import outside
+  `--directory`.
+
+> **No integrity check**: the manifest schema carries no checksums, so a
+> downloaded image is not verified against a published hash. Prefer
+> `https://` sources you control. (The size and checksum verification
+> below applies to local copies only.)
+
+The import is assembled in a staging directory next to the target and
+moved into place with a single rename, so a failed import leaves no
+half-built VM directory behind. A failure *after* that rename — libvirt
+refusing to define the domain — leaves the files in place deliberately,
+and the error says so, rather than forcing a multi-gigabyte re-download.
 
 ### Example workflow — local package
 

@@ -11,7 +11,7 @@
 
 
 
-from boxman.exceptions import ConfigError
+from boxman.exceptions import ConfigError, ProvisionError, SnapshotError
 
 
 class ComposeMixin:
@@ -59,8 +59,12 @@ class ComposeMixin:
         failed = []
         for cname, cluster, snap in dc_plan:
             try:
-                self.session_for_cluster(cname).snapshot_restore_cluster(
-                    cname, cluster, snap)
+                # -> bool: a restore the session refused reports False
+                # rather than raising (#164 FB-6).
+                if not self.session_for_cluster(cname).snapshot_restore_cluster(
+                        cname, cluster, snap):
+                    failed.append(cname)
+                    self.logger.error(f"[{cname}] snapshot restore failed")
             except Exception as exc:
                 failed.append(cname)
                 self.logger.error(
@@ -75,13 +79,20 @@ class ComposeMixin:
         failing dc cluster — e.g. one that was never brought up — would raise
         straight out of the verb and skip both the remaining dc clusters and
         every VM in a mixed project.
+
+        The snapshot session methods are annotated ``-> bool`` and report a
+        refusal by returning False — a ``docker image rm`` blocked by a
+        running container, for one. Discarding that made a failed dc
+        snapshot delete report success (#164 FB-6).
         """
         any_selected = False
         failed: list[str] = []
         for cname, cluster in self._select_dc_clusters(cli_args):
             any_selected = True
             try:
-                func(cname, cluster)
+                if not func(cname, cluster):
+                    failed.append(cname)
+                    self.logger.error(f"[{cname}] snapshot {op_label} failed")
             except Exception as exc:
                 failed.append(cname)
                 self.logger.error(f"[{cname}] snapshot {op_label} failed: {exc}")
@@ -93,12 +104,46 @@ class ComposeMixin:
         the command must not report success overall."""
         if not failed:
             return
-        import sys
-        self.logger.error(
+        raise SnapshotError(
             f"snapshot {op_label} failed for docker-compose cluster(s): "
-            f"{', '.join(failed)}"
-        )
-        sys.exit(1)
+            f"{', '.join(failed)}")
+
+    def _for_each_compose_cluster(self, op_label, func) -> list[str]:
+        """Apply *func(cluster_name, cluster_cfg)* to every dc cluster,
+        isolating failures and checking what the session reported.
+
+        The lifecycle verbs used to call the session methods in a bare
+        loop and discard their return value, so a cluster that cleanly
+        failed to stop was reported as stopped, and a cluster that
+        *raised* skipped every cluster after it (#164 FB-6). This is the
+        lifecycle sibling of :meth:`_for_each_dc_cluster`, which already
+        does the same for the snapshot verbs — the difference is that
+        these verbs act on every cluster rather than a ``--cluster``
+        selection, and that the sessions report failure by returning
+        False as well as by raising.
+
+        Returns:
+            The names of the clusters that failed, in config order.
+        """
+        failed: list[str] = []
+        for cname, cluster in self._compose_clusters.items():
+            try:
+                if not func(cname, cluster):
+                    failed.append(cname)
+                    self.logger.error(f"[{cname}] {op_label} failed")
+            except Exception as exc:
+                failed.append(cname)
+                self.logger.error(f"[{cname}] {op_label} failed: {exc}")
+        return failed
+
+    @staticmethod
+    def _raise_for_compose_failures(failed, op_label) -> None:
+        """Raise one aggregated error naming every cluster that failed."""
+        if failed:
+            raise ProvisionError(
+                f"docker-compose {op_label} failed for "
+                f"{len(failed)} cluster(s): {', '.join(failed)} — "
+                f"see the preceding per-cluster errors for the cause.")
 
     # --- docker-compose clusters: coarse per-cluster lifecycle ------------
     # docker-compose is cluster-scoped (one `docker compose up --wait` per
@@ -109,8 +154,10 @@ class ComposeMixin:
     def provision_compose_clusters(self) -> None:
         """``docker compose up --wait`` every docker-compose cluster."""
         self._reject_compose_project_collisions()
-        for cluster_name, cluster in self._compose_clusters.items():
-            self.session_for_cluster(cluster_name).up_cluster(cluster_name, cluster)
+        failed = self._for_each_compose_cluster(
+            'up',
+            lambda name, cfg: self.session_for_cluster(name).up_cluster(name, cfg))
+        self._raise_for_compose_failures(failed, 'up')
 
     def _reject_compose_project_collisions(self) -> None:
         """
@@ -141,8 +188,10 @@ class ComposeMixin:
 
     def stop_compose_clusters(self) -> None:
         """``docker compose stop`` every docker-compose cluster (boxman down)."""
-        for cluster_name, cluster in self._compose_clusters.items():
-            self.session_for_cluster(cluster_name).stop_cluster(cluster_name, cluster)
+        failed = self._for_each_compose_cluster(
+            'stop',
+            lambda name, cfg: self.session_for_cluster(name).stop_cluster(name, cfg))
+        self._raise_for_compose_failures(failed, 'stop')
 
     def start_compose_clusters(self) -> None:
         """``docker compose start`` every docker-compose cluster.
@@ -153,15 +202,30 @@ class ComposeMixin:
         :meth:`provision_compose_clusters` (``up -d --wait``), which also
         starts stopped containers and re-asserts readiness.
         """
-        for cluster_name, cluster in self._compose_clusters.items():
-            self.session_for_cluster(cluster_name).start_cluster(cluster_name, cluster)
+        failed = self._for_each_compose_cluster(
+            'start',
+            lambda name, cfg: self.session_for_cluster(name).start_cluster(name, cfg))
+        self._raise_for_compose_failures(failed, 'start')
 
     def deprovision_compose_clusters(self) -> None:
-        """``docker compose down`` every docker-compose cluster (keep volumes)."""
-        for cluster_name, cluster in self._compose_clusters.items():
-            self.session_for_cluster(cluster_name).down_cluster(cluster_name, cluster)
+        """``docker compose down`` every docker-compose cluster (keep volumes).
+
+        Raises on failure so ``deprovision``'s existing gate records it and
+        the workspace/cache are not torn down over surviving containers.
+        """
+        failed = self._for_each_compose_cluster(
+            'down',
+            lambda name, cfg: self.session_for_cluster(name).down_cluster(name, cfg))
+        self._raise_for_compose_failures(failed, 'down')
 
     def destroy_compose_clusters(self) -> None:
-        """``docker compose down --volumes`` every docker-compose cluster."""
-        for cluster_name, cluster in self._compose_clusters.items():
-            self.session_for_cluster(cluster_name).destroy_cluster(cluster_name, cluster)
+        """``docker compose down --volumes`` every docker-compose cluster.
+
+        Raises on failure so ``destroy``'s ``teardown_ok`` gate sees it —
+        without this a cluster whose containers survived still let the
+        workspace be deleted and the project be unregistered (#164 X2).
+        """
+        failed = self._for_each_compose_cluster(
+            'down --volumes',
+            lambda name, cfg: self.session_for_cluster(name).destroy_cluster(name, cfg))
+        self._raise_for_compose_failures(failed, 'down --volumes')

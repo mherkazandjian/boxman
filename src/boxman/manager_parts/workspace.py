@@ -213,6 +213,38 @@ class WorkspaceMixin:
                 "control_path = /tmp/ansible-ssh-%%h-%%p-%%r\n"
             )
 
+    def prepare_runtime_workdirs(self, workdirs) -> None:
+        """
+        Pre-create each bind-mount directory on the host as the current user.
+
+        Without this, ``docker compose up`` creates a missing host directory
+        as root when it sets up the bind mount, and subsequent host-side
+        writes (env.sh, ssh_config, …) fail with ``PermissionError``. If the
+        directory already exists as root from an earlier failed run, its
+        ownership is repaired.
+
+        The foreign-entry sweep is deliberately disabled here. This runs for
+        **every** docker-runtime command, across every cluster and template
+        workdir — including ones holding live VM disks, which are root-owned
+        under that runtime because the container execs as root with
+        ``dynamic_ownership = 0``. Letting the sweep touch their contents on
+        this pass is what made a second boxman command (``ps`` included)
+        delete a running cluster's disks. All this pass needs is a directory
+        that exists and is writable.
+
+        Failures are logged, not raised: this is best-effort preparation and
+        the command that follows reports its own errors.
+
+        Args:
+            workdirs: Directories to pre-create.
+        """
+        for workdir in workdirs:
+            self.logger.info(f"runtime workdir: {workdir}")
+            try:
+                self._ensure_writable_dir(workdir, sweep_foreign=False)
+            except Exception as exc:
+                self.logger.warning(f"could not prepare {workdir}: {exc}")
+
     def collect_workdirs(self) -> list:
         """
         Return the absolute paths of every workdir referenced by the project

@@ -4,6 +4,7 @@ from typing import Any
 from xml.sax.saxutils import escape
 
 from boxman import log
+from boxman.exceptions import ProvisionError
 
 from .commands import VirshCommand
 from .virsh_parse import parse_domblklist
@@ -138,13 +139,20 @@ class CDROMManager:
                 os.unlink(temp_path)
             return False
 
-    def change_media(self, target_dev: str, source_path: str) -> bool:
+    def change_media(self, target_dev: str, source_path: str,
+                     live: bool = True) -> bool:
         """
         Swap ISO media in an existing CDROM slot.
 
         Args:
             target_dev: Target device name (e.g., 'hdc')
             source_path: Path to the new ISO image
+            live: Whether the domain is active. ``--live`` against an
+                inactive domain is rejected by libvirt, and omitting
+                ``--live`` for an active one changes only the persistent
+                configuration — the guest keeps the old media until it is
+                next booted, while the caller is told the swap worked
+                (#164 FB-5).
 
         Returns:
             True if successful, False otherwise
@@ -155,9 +163,10 @@ class CDROMManager:
                 self.logger.error(f"ISO file does not exist: {source_path}")
                 return False
 
+            scope = ["--live", "--config"] if live else ["--config"]
             result = self.virsh.execute(
                 "change-media", self.vm_name, target_dev,
-                source_path, "--live", "--config",
+                source_path, *scope,
                 warn=True)
 
             if not result.ok:
@@ -193,14 +202,30 @@ class CDROMManager:
 
     def get_attached_cdroms(self) -> list[dict[str, Any]]:
         """
-        Get all CDROM devices currently attached to the VM.
+        Every CDROM device on the VM, empty drives included.
 
-        Returns a list of dicts with 'target' and 'source' keys.
-        Excludes seed ISOs (used for cloud-init).
+        Returns a list of dicts with 'target' and 'source' keys; ``source``
+        is ``None`` for a drive with no media. Seed ISOs (cloud-init) are
+        excluded.
+
+        Empty drives are reported rather than skipped because they are part
+        of the domain's topology: a drive that exists but holds nothing is
+        where media gets *inserted*, not a place to add a second device.
+        Dropping them made a media request on an existing empty target look
+        like a device addition (#164 FB-5).
+
+        Raises:
+            ProvisionError: if the device list cannot be read. Returning an
+                empty list made a failed query indistinguishable from a
+                domain with no CDROMs at all, and the caller then treats
+                every declared cdrom as new (#164 FB-5).
         """
         result = self.virsh.execute("domblklist", self.vm_name, "--details", warn=True)
         if not result.ok:
-            return []
+            raise ProvisionError(
+                f"could not list the block devices of {self.vm_name} (exit "
+                f"{result.return_code}): "
+                f"{(result.stderr or '').strip() or 'no error output'}")
 
         cdroms = []
         for row in parse_domblklist(result.stdout):
@@ -208,6 +233,7 @@ class CDROMManager:
                 continue
             source = row.source or '-'
             if source == '-':
+                cdroms.append({'target': row.target, 'source': None})
                 continue
             # exclude seed ISOs (cloud-init)
             if os.path.basename(source).startswith('seed'):

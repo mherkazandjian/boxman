@@ -625,8 +625,37 @@ class TestCacheSelfConflict:
             'p2': {'runtime': 'local', 'networks': {
                 'bprj__p2__bprj__clstr__c1__clstr__nat': {
                     'ip_address': '10.5.3.1', 'bridge_name': 'virbr9'}}}})
-        with pytest.raises(RuntimeError, match="conflict"):
-            net.check_network_exists()
+        # the other project's network really is defined, so it really collides
+        with patch.object(Network, '_listed_networks',
+                          return_value=['bprj__p2__bprj__clstr__c1__clstr__nat']):
+            with pytest.raises(RuntimeError, match="conflict"):
+                net.check_network_exists()
+
+    def test_a_stale_entry_from_another_project_is_ignored(self, tmp_path):
+        """The cross-project half of the same wedge.
+
+        A provision that aborted midway leaves the cache claiming a network
+        that libvirt does not have. Trusting the cache alone then refuses
+        every later run -- by name, bridge and address -- against something
+        that is not there. Observed with the box suite: one box aborting in
+        deploy_netlab() blocked the boxes that followed.
+        """
+        net, _ = self._net_with_cache(tmp_path, {
+            'p2': {'runtime': 'local', 'networks': {
+                'bprj__p2__bprj__clstr__c1__clstr__nat': {
+                    'ip_address': '10.5.3.1', 'bridge_name': 'virbr9'}}}})
+        with patch.object(Network, '_listed_networks', return_value=[]):
+            net.check_network_exists()      # must not raise
+
+    def test_an_unreachable_libvirt_keeps_the_conflict(self, tmp_path):
+        """Fails closed: refusing to create is recoverable, colliding is not."""
+        net, _ = self._net_with_cache(tmp_path, {
+            'p2': {'runtime': 'local', 'networks': {
+                'bprj__p2__bprj__clstr__c1__clstr__nat': {
+                    'ip_address': '10.5.3.1', 'bridge_name': 'virbr9'}}}})
+        with patch.object(Network, '_listed_networks', return_value=None):
+            with pytest.raises(RuntimeError, match="conflict"):
+                net.check_network_exists()
 
     def test_the_cache_is_written_only_after_the_define_succeeds(self, tmp_path):
         # a failed net-define must not leave an entry behind
@@ -708,8 +737,11 @@ class TestRuntimeScopeFiltering:
             cached = {**self._OTHER, 'p2': {**self._OTHER['p2'],
                                             'runtime': runtime}}
             net = self._net(tmp_path, cached, runtime=runtime)
-            with pytest.raises(RuntimeError, match="conflict"):
-                net.check_network_exists()
+            # the colliding network is really defined in this runtime
+            with patch.object(Network, '_listed_networks',
+                              return_value=['net-a']):
+                with pytest.raises(RuntimeError, match="conflict"):
+                    net.check_network_exists()
 
 
 class TestElementRendering:

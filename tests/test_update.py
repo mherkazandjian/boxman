@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.disk import DiskManager
 from boxman.providers.libvirt.virsh_edit import VirshEdit
@@ -15,6 +16,18 @@ from boxman.providers.libvirt.vm_differ import VMStateDiffer
 from conftest import make_bare_manager
 
 pytestmark = pytest.mark.unit
+
+@pytest.fixture(autouse=True)
+def _no_disk_ownership_records():
+    """diff_vm probes boxman's disk ownership metadata via virsh.
+
+    Default it to "this domain has none" -- what every domain predating
+    the record looks like, and which proposes no removals. Tests about
+    removals patch it themselves (#164 F2).
+    """
+    with patch.object(VMStateDiffer, 'get_disk_records', return_value=None):
+        yield
+
 
 
 @pytest.fixture(autouse=True)
@@ -737,14 +750,30 @@ class TestVMStateDifferDiskParsing:
         mock_size.assert_any_call('test-vm', 'vda')
         mock_size.assert_any_call('test-vm', 'vdb')
 
-    def test_get_actual_disks_handles_failure(self):
+    def test_get_actual_disks_raises_on_failure(self):
+        """A failed query must not read as "this domain has no disks".
+
+        It used to return [], which is a real answer -- so every declared
+        disk looked absent and the diff proposed attaching them all
+        (#164 F2).
+        """
         differ = VMStateDiffer.__new__(VMStateDiffer)
         differ.virsh = MagicMock()
         differ.logger = MagicMock()
-        differ.virsh.execute.return_value = MagicMock(ok=False)
+        differ.virsh.execute.return_value = MagicMock(ok=False, stderr='boom')
 
-        disks = differ.get_actual_disks('test-vm')
-        assert disks == []
+        with pytest.raises(ProvisionError, match='could not list the disks'):
+            differ.get_actual_disks('test-vm')
+
+    def test_get_actual_disks_returns_empty_for_a_diskless_domain(self):
+        """The other half: an empty list is still a valid answer."""
+        differ = VMStateDiffer.__new__(VMStateDiffer)
+        differ.virsh = MagicMock()
+        differ.logger = MagicMock()
+        differ.virsh.execute.return_value = MagicMock(
+            ok=True, stdout='Target   Source\n----------------\n')
+
+        assert differ.get_actual_disks('test-vm') == []
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +817,9 @@ class TestDestroyRemovedVm:
         mgr = self._make_manager()
         mock_virsh_cls.return_value.execute.return_value = MagicMock(
             ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
+        # Not gone after the graceful undefine, gone after the forced one:
+        # the disks may only be removed once absence is confirmed.
+        mgr.provider.confirm_vm_absent.side_effect = [False, True]
 
         mgr._destroy_removed_vm('test-vm')
 
@@ -841,6 +873,7 @@ class TestDestroyRemovedVm:
         virsh = mock_virsh_cls.return_value
         virsh.execute.return_value = MagicMock(
             ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
+        mgr.provider.confirm_vm_absent.side_effect = [False, True]
 
         parent = MagicMock()
         parent.attach_mock(virsh.execute, 'virsh_execute')
@@ -870,6 +903,11 @@ class TestMemballoonUpdateResult:
             'max_memory_changed': False,
             'new_disks': [],
             'resize_disks': [],
+            'removed_disks': [],
+            'refused_disk_removals': [],
+            'unowned_disks': [],
+            'disk_conflicts': [],
+            'shared_folders_restart_pending': False,
             'new_cdroms': [],
             'removed_cdroms': [],
             'changed_cdroms': [],
@@ -920,7 +958,7 @@ class TestMemballoonUpdateResult:
         mgr, result = self._run_update('running')
 
         assert result['status'] == 'needs_restart'
-        assert 'restart required to apply memballoon changes' in result['details']
+        assert 'restart the VM to apply them' in result['details']
         mgr.provider.shutdown_and_wait.assert_not_called()
         mgr.provider.start_vm.assert_not_called()
 
@@ -928,9 +966,7 @@ class TestMemballoonUpdateResult:
         mgr, result = self._run_update('paused')
 
         assert result['status'] == 'needs_restart'
-        assert (
-            'restart required to apply memballoon changes'
-            in result['details'])
+        assert 'restart the VM to apply them' in result['details']
         mgr.provider.shutdown_and_wait.assert_not_called()
         mgr.provider.start_vm.assert_not_called()
 
@@ -938,9 +974,7 @@ class TestMemballoonUpdateResult:
         mgr, result = self._run_update('crashed')
 
         assert result['status'] == 'needs_restart'
-        assert (
-            'restart required to apply memballoon changes'
-            in result['details'])
+        assert 'restart the VM to apply them' in result['details']
         mgr.provider.shutdown_and_wait.assert_not_called()
         mgr.provider.start_vm.assert_not_called()
 
@@ -968,8 +1002,99 @@ class TestMemballoonUpdateResult:
         mgr.provider.configure_vm_memballoon.assert_not_called()
 
 
+class TestUpdateRestartFailures:
+    """#164 X3 — the restart branch ignored both ``shutdown_and_wait()`` and
+    ``start_vm()`` and then queued ``status='updated'`` with "(restarted)".
+
+    Two ways that lied. A lost shutdown left the restart-only changes
+    unapplied while ``update`` exited 0 — and ``start_vm()`` then returned
+    True *because* the guest was still running, so the failure hid behind a
+    successful start. A lost start left the guest shut off, also at exit 0.
+    """
+
+    @staticmethod
+    def _cpu_restart_diff():
+        return {
+            'cpu_changed': True,
+            'memory_changed': False,
+            'max_vcpus_changed': False,
+            'max_memory_changed': False,
+            'new_disks': [],
+            'resize_disks': [],
+            'removed_disks': [],
+            'refused_disk_removals': [],
+            'unowned_disks': [],
+            'disk_conflicts': [],
+            'shared_folders_restart_pending': False,
+            'new_cdroms': [],
+            'removed_cdroms': [],
+            'changed_cdroms': [],
+            'new_shared_folders': [],
+            'removed_shared_folders': [],
+            'changed_shared_folders': [],
+            'memballoon_changed': False,
+            'memballoon_restart_pending': False,
+            'actual_cpus': 2,
+            'desired_cpus': 4,
+            'actual_memory_mb': 2048,
+            'desired_memory_mb': 2048,
+            'desired_max_vcpus': None,
+            'desired_max_memory_mb': None,
+            'vm_state': 'running',
+        }
+
+    def _run(self, shutdown_ok, start_ok):
+        mgr = make_bare_manager({'project': 'demo'})
+        mgr.provider = MagicMock()
+        mgr.provider.provider_config = {'uri': 'qemu:///system'}
+        # the cold-only change that makes the restart necessary
+        mgr.provider.update_vm_cpu_memory.return_value = {
+            'success': True, 'restart_needed': True}
+        mgr.provider.shutdown_and_wait.return_value = shutdown_ok
+        mgr.provider.start_vm.return_value = start_ok
+        result_queue = MagicMock()
+
+        with patch.object(VMStateDiffer, 'diff_vm',
+                          return_value=self._cpu_restart_diff()):
+            mgr._update_single_vm(
+                'cluster1', {'workdir': '/tmp'}, 'node01',
+                {'cpus': 4}, result_queue,
+                # the restart is opt-in now; this class is about what
+                # happens once it is authorised (#164 C1)
+                dry_run=False, allow_restart=True)
+
+        result_queue.put.assert_called_once()
+        return mgr, result_queue.put.call_args.args[0][1]
+
+    def test_failed_shutdown_is_reported_and_start_is_skipped(self):
+        mgr, result = self._run(shutdown_ok=False, start_ok=True)
+
+        assert result['status'] == 'failed'
+        assert 'could not be shut down' in result['details']
+        # Starting a guest that never went down would report success and
+        # bury the real failure.
+        mgr.provider.start_vm.assert_not_called()
+
+    def test_failed_start_is_reported(self):
+        mgr, result = self._run(shutdown_ok=True, start_ok=False)
+
+        assert result['status'] == 'failed'
+        assert 'did not come back up' in result['details']
+        mgr.provider.start_vm.assert_called_once()
+
+    def test_successful_restart_reports_updated(self):
+        mgr, result = self._run(shutdown_ok=True, start_ok=True)
+
+        assert result['status'] == 'updated'
+        assert '(restarted)' in result['details']
+        assert 'CPU: 2 -> 4' in result['details']
+        mgr.provider.shutdown_and_wait.assert_called_once()
+        mgr.provider.start_vm.assert_called_once()
+
+
 def _needs_restart_update_worker(_self, _cluster_name, _cluster_cfg, vm_name,
-                                 _vm_info, result_queue, _dry_run=False):
+                                 _vm_info, result_queue, _dry_run=False,
+                                 _allow_restart=False):
     """Stand-in for ``_update_single_vm`` reporting a pending restart."""
     result_queue.put((vm_name, {
         'status': 'needs_restart',

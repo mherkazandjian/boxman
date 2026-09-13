@@ -8,10 +8,15 @@ import os
 import re
 from typing import Any
 
+import jinja2
 import yaml
 
 from boxman.exceptions import ConfigError
 from boxman.providers import PROVIDERS, primary_provider_type
+from boxman.utils.config_diagnostics import (
+    template_config_error,
+    yaml_config_error,
+)
 from boxman.utils.jinja_env import create_jinja_env
 
 
@@ -87,25 +92,47 @@ class ConfigMixin:
 
         preserved = re.sub(r"\{\{\s*(\w+)\s*\}\}", _preserve_jinja_vars, raw_content)
 
-        # load and render the template from the pre-processed string
-        template = env.from_string(preserved)
-
-        # render the template
+        # load and render the template from the pre-processed string.
         # NOTE: pass os.environ as 'environ' (not 'env') to avoid shadowing
         # the env() helper function registered in the Jinja globals.
-        rendered_yaml = template.render(
-            environ=os.environ,
-        )
+        try:
+            template = env.from_string(preserved)
+            rendered_yaml = template.render(
+                environ=os.environ,
+            )
+        except ConfigError:
+            # env_required() already raises a typed error of its own, with
+            # a message naming the variable. Don't bury it.
+            raise
+        except jinja2.TemplateError as exc:
+            raise template_config_error(exc, raw_path) from exc
 
-        # parse the rendered yaml
-        conf = yaml.safe_load(rendered_yaml)
-
-        # dump the rendered yaml file for debugging/inspection
+        # Dump the rendered YAML *before* parsing it, so a parse failure can
+        # point at the artifact whose line numbers the error refers to.
+        # The dump is a debugging aid: a read-only config dir, an `ro`
+        # worktree or a full disk must not fail the command (#164 CL-C1).
         rendered_filename = f"{os.path.splitext(config_filename)[0]}.rendered.yml"
         rendered_path = os.path.join(config_dir, rendered_filename)
-        with open(rendered_path, 'w') as fobj:
-            fobj.write(rendered_yaml)
+        try:
+            with open(rendered_path, 'w') as fobj:
+                fobj.write(rendered_yaml)
+        except OSError as exc:
+            self.logger.warning(
+                f"could not write the rendered config to {rendered_path} "
+                f"({exc.strerror or exc}); continuing without it")
+            rendered_path = None
+        else:
             self.logger.info(f"rendered YAML template written to {rendered_path}")
+
+        # Keep the rendered text in memory: `boxman conf` reads it back to
+        # show the effective config, and the dump above may not exist.
+        self.rendered_config_text = rendered_yaml
+
+        # parse the rendered yaml
+        try:
+            conf = yaml.safe_load(rendered_yaml)
+        except yaml.YAMLError as exc:
+            raise yaml_config_error(exc, raw_path, rendered_path) from exc
 
         # apply schema-version handling (v2.0 boxes:→vms: normalization etc.)
         # before returning, so every downstream consumer sees the internal

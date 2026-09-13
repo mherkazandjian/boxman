@@ -3,8 +3,30 @@ import tempfile
 from typing import Any
 
 from boxman import log
+from boxman.exceptions import ProvisionError
 
 from .commands import LibVirtCommandBase, VirshCommand
+from .disk_ownership import (
+    DEFAULT_DISK_TARGET,
+    ROLE_ADOPTED,
+    ROLE_DATA,
+    disk_logical_name,
+    record_attached_disk,
+)
+
+
+def libvirt_disk_source(disk_path: str) -> str:
+    """
+    The exact ``<source file=...>`` string written into a disk's XML.
+
+    Ownership records store this, not the path they were handed. The two
+    used to be computed independently -- the XML expanded and absolutised,
+    the record did not -- so a project with a relative or ``~`` workdir
+    recorded a source that could never equal what libvirt reports back,
+    and every removal on it was refused for a mismatch that was not real
+    (#164 F2 review).
+    """
+    return os.path.abspath(os.path.expanduser(disk_path))
 
 
 def disk_path_for(workdir: str,
@@ -171,7 +193,7 @@ class DiskManager:
         """
         return f"""<disk type='file' device='disk'>
   <driver name='{driver_name}' type='{driver_type}' discard='unmap'/>
-  <source file='{os.path.abspath(os.path.expanduser(disk_path))}'/>
+  <source file='{libvirt_disk_source(disk_path)}'/>
   <target dev='{target_dev}' bus='{bus}'/>
 </disk>"""
 
@@ -194,7 +216,7 @@ class DiskManager:
         """
         try:
             # extract configuration
-            disk_name = disk_config.get("name", "disk")
+            disk_name = disk_logical_name(disk_config)
             disk_size = disk_config.get("size", 1024)  # default 1GB
 
             # get driver info
@@ -203,7 +225,7 @@ class DiskManager:
             driver_type = driver.get("type", "qcow2")
 
             # get target device and bus
-            target_dev = disk_config.get("target", "vdb")
+            target_dev = disk_config.get("target", DEFAULT_DISK_TARGET)
             bus = disk_config.get("bus", "virtio")
 
             # create disk path
@@ -231,6 +253,30 @@ class DiskManager:
             ):
                 self.logger.error(f"Failed to attach disk {disk_path} to VM {self.vm_name}")
                 return False
+
+            # Record what was attached, so a later `update` that no longer
+            # declares this disk can tell it apart from the root disk, from
+            # one attached by hand, and from a different disk that has since
+            # taken the same target (#164 F2).
+            try:
+                record_attached_disk(
+                    self.virsh, self.vm_name,
+                    name=disk_name, target=target_dev,
+                    source=libvirt_disk_source(disk_path),
+                    # attach_only means the image already existed, which is
+                    # not proof boxman created it (#164 F2 review)
+                    role=(ROLE_ADOPTED if disk_config.get("attach_only")
+                          else ROLE_DATA))
+            except ProvisionError as exc:
+                # The disk is attached and working; only the bookkeeping
+                # failed. Do not fail the attach over it -- but say so
+                # clearly, because without the record boxman will refuse to
+                # detach this disk later rather than guess.
+                self.logger.warning(
+                    f"disk {disk_name} is attached to {self.vm_name}, but "
+                    f"boxman could not record that it owns it ({exc}). It "
+                    f"will not be detached automatically if it is later "
+                    f"removed from the config.")
 
             self.logger.info(f"successfully configured disk {disk_name} for VM {self.vm_name}")
             return True

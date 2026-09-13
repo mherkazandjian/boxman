@@ -193,6 +193,56 @@ class TestMultiProjectPortIsolationEca430e:
 
 
 # ---------------------------------------------------------------------------
+# #164 FBN-15 / FB-13 — port striding and FIPS-safe hashing
+# ---------------------------------------------------------------------------
+
+class TestPortFamiliesCannotCollide:
+    """FBN-15: with a plain ``base + offset`` the TCP and TLS bases differ by
+    5, so two instances whose offsets differ by 5 collided — one instance's
+    TLS port was another instance's libvirt TCP port."""
+
+    def test_default_instance_keeps_its_historic_ports(self):
+        assert DockerComposeRuntime._ports_for_offset(0) == (2222, 16509, 16514)
+
+    def test_no_two_offsets_can_ever_collide(self):
+        """Exhaustive over the whole offset space, which is only 0-999."""
+        tcp = {DockerComposeRuntime._ports_for_offset(o)[1]
+               for o in range(1000)}
+        tls = {DockerComposeRuntime._ports_for_offset(o)[2]
+               for o in range(1000)}
+        assert not (tcp & tls)
+
+    def test_the_old_scheme_really_did_collide(self):
+        """Counterfactual, so this test cannot pass for the wrong reason: the
+        pre-fix arithmetic collides for every pair of offsets differing by 5."""
+        assert 16509 + (7 + 5) == 16514 + 7
+
+    def test_ports_are_distinct_within_one_instance(self):
+        for offset in (0, 1, 499, 999):
+            assert len(set(DockerComposeRuntime._ports_for_offset(offset))) == 3
+
+
+class TestPortOffsetOnFipsHost:
+    """FB-13: ``hashlib.md5()`` without ``usedforsecurity=False`` raises on a
+    FIPS-enabled host, so every docker-runtime command died with a
+    traceback while deriving a port offset."""
+
+    def test_offset_still_derives_when_md5_requires_the_flag(self, monkeypatch):
+        import hashlib as _hashlib
+
+        real_md5 = _hashlib.md5
+
+        def _fips_md5(*args, **kwargs):
+            if not kwargs.get("usedforsecurity", True):
+                return real_md5(*args)
+            raise ValueError("[digital envelope routines] unsupported")
+
+        monkeypatch.setattr(
+            "boxman.runtime.docker_compose.hashlib.md5", _fips_md5)
+        assert 0 < DockerComposeRuntime._derive_port_offset("my-project") < 1000
+
+
+# ---------------------------------------------------------------------------
 # 380b776 — allow excluding some commands from sudo
 # ---------------------------------------------------------------------------
 

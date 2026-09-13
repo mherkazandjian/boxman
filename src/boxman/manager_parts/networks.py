@@ -31,11 +31,23 @@ class NetworksMixin:
                     cluster_name=cluster_name,
                     network_name=network_name
                 )
-                self.session_for_cluster(cluster_name).define_network(
+                defined = self.session_for_cluster(cluster_name).define_network(
                     name=_network_name,
                     info=network_info,
                     workdir=cluster['workdir']
                 )
+                if not defined:
+                    # Dropping this status is how `provision` -- and therefore
+                    # every project's *first* `up`, which routes through it --
+                    # reported "defined network …" for a network libvirt had
+                    # rolled back, then went on to clone VMs and attach them
+                    # to something that does not exist. Only the second `up`
+                    # onward gets the guarded reconcile path.
+                    raise NetworkError(
+                        f"network {_network_name} could not be defined in "
+                        f"{cluster['workdir']}; see the preceding libvirt "
+                        f"error. Not continuing: the VMs about to be cloned "
+                        f"would be attached to a network that does not exist.")
                 self.logger.status(f"defined network {_network_name} in {cluster['workdir']}")
 
     def reconcile_networks(self,
@@ -500,10 +512,20 @@ class NetworksMixin:
                 cluster_name=cluster_name,
                 network_name=network_name
             )
-            self.session_for_cluster(cluster_name).remove_network(
+            removed = self.session_for_cluster(cluster_name).remove_network(
                 name=_network_name,
                 info=network_info
             )
+            if not removed:
+                # Swallowing this used to log "removed network …" and delete
+                # the XML while the network was still defined, so an orphaned
+                # libvirt network looked like a clean teardown. Raising lands
+                # it in _run_parallel's failure dict, which now gates the
+                # cache unregistration and the workspace removal.
+                raise NetworkError(
+                    f"failed to remove network {_network_name}: it is still "
+                    f"defined. Keeping {_network_name}_net_define.xml so the "
+                    f"teardown can be retried.")
             self.logger.info(f"removed network {_network_name} in {cluster['workdir']}")
             xml_path = os.path.expanduser(
                 os.path.join(cluster['workdir'], f'{_network_name}_net_define.xml'))

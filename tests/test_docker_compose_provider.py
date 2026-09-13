@@ -485,13 +485,19 @@ class TestComposeGenerator:
         )["networks"]["labnet"]
         assert net["driver_opts"] == {"parent": "br-lab", "macvlan_mode": "bridge"}
 
-    def test_unknown_network_ref_warned_and_skipped(self):
+    def test_unknown_network_ref_is_a_config_error(self):
+        """#164 NET-C1 — this used to warn, drop the reference and continue.
+
+        The service was then left with no explicit attachment at all, so
+        Compose placed it on the project's default network instead of the
+        one that was asked for: a one-character typo in a network name
+        silently changed which L2 the container joined. This test
+        previously asserted ``"networks" not in svc`` — it pinned the bug.
+        """
         gen = ComposeGenerator()
         cluster = {"boxes": {"w": {"image": "x", "networks": ["ghost"]}}}
-        with mock.patch.object(gen.logger, "warning") as warn:
-            svc = gen.generate("s", cluster, conf_dir="/proj")["services"]["w"]
-        assert "networks" not in svc
-        assert warn.called
+        with pytest.raises(ConfigError, match="ghost"):
+            gen.generate("s", cluster, conf_dir="/proj")
 
     # -- malformed networks: fail fast, never silently drop -----------------
     def test_bare_string_networks_is_attached_not_silently_dropped(self):
@@ -596,9 +602,71 @@ class TestComposeRunner:
             workdir="/wd",
         )
 
+    def test_ambient_compose_project_name_is_cleared(self):
+        """Compose falls back to it, silently, instead of failing.
+
+        On a model-loading error compose 2.40.3 uses COMPOSE_PROJECT_NAME
+        rather than the explicit `-p`. Measured: with an unreadable file,
+        `-p ourproj` and COMPOSE_PROJECT_NAME=victimproj, `ps` exited 0 and
+        `down --dry-run` reported "Container victimproj-v-1  Stopping" — it
+        would have torn down a different project (#164 NET-C1).
+        """
+        runner_project = "proj_stack"
+        base = self._runner()._base()
+        argv = self._runner()._base_argv()
+
+        assert "env COMPOSE_PROJECT_NAME= docker compose" in base
+        # empty, NOT the project name: present so `.env` cannot supply one,
+        # empty so compose's silent fallback has nothing to fall back to and
+        # an unloadable file fails instead of proceeding without it.
+        assert f"COMPOSE_PROJECT_NAME={runner_project}" not in base
+        assert base.index("env ") < base.index("docker compose")
+        assert argv[:4] == ["env", "COMPOSE_PROJECT_NAME=",
+                            "docker", "compose"]
+
+    def test_resolved_model_rejects_a_non_object(self):
+        """`[]` used to reach the caller and raise AttributeError there."""
+        runner = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok("[]")
+        ):
+            with pytest.raises(ProvisionError, match=r"not a project model"):
+                runner.resolved_model("/wd/dc.yml")
+
+    def test_resolved_model_targets_the_file_it_is_given(self):
+        runner = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok("{}")
+        ) as run:
+            runner.resolved_model("/wd/.candidate")
+
+        cmd = run.call_args.args[0]
+        assert "-f /wd/.candidate" in cmd
+        assert "config --format json" in cmd
+
+    def test_validate_and_resolved_model_share_the_deployment_context(self):
+        """One builder, so a candidate call cannot drift from deployment."""
+        runner = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok("{}")
+        ) as run:
+            runner.validate("/wd/.candidate")
+            validated = run.call_args.args[0]
+            runner.resolved_model("/wd/.candidate")
+            resolved = run.call_args.args[0]
+
+        prefix = runner._base_for("/wd/.candidate")
+        assert validated.startswith(prefix)
+        assert resolved.startswith(prefix)
+        assert "--project-directory /wd" in prefix
+
     def test_base_command_shape(self):
         base = self._runner()._base()
         assert base == (
+            "env COMPOSE_PROJECT_NAME= "
             "docker compose -p proj_stack "
             "-f /wd/docker-compose.yml "
             "--project-directory /wd"
@@ -607,13 +675,15 @@ class TestComposeRunner:
     def test_base_command_label_only(self):
         """A teardown runner with no file/workdir operates by project label."""
         runner = ComposeRunner(project="proj_stack")
-        assert runner._base() == "docker compose -p proj_stack"
+        assert runner._base() == (
+            "env COMPOSE_PROJECT_NAME= docker compose "
+            "--env-file /dev/null -p proj_stack")
 
     def test_use_sudo_prefixes_command(self):
         runner = ComposeRunner(
             project="proj_stack", compose_file="/wd/docker-compose.yml",
             workdir="/wd", use_sudo=True)
-        assert runner._base().startswith("sudo docker compose -p proj_stack")
+        assert runner._base().startswith("sudo env COMPOSE_PROJECT_NAME= docker compose -p proj_stack")
 
     def test_up_without_compose_file_raises(self):
         runner = ComposeRunner(project="proj_stack")  # label-only
@@ -629,7 +699,7 @@ class TestComposeRunner:
             runner.up(45)
         cmd = run.call_args[0][0]
         assert "up -d --wait --wait-timeout 45" in cmd
-        assert cmd.startswith("docker compose -p proj_stack")
+        assert cmd.startswith("env COMPOSE_PROJECT_NAME= docker compose -p proj_stack")
 
     def test_up_default_timeout(self):
         runner = self._runner()
@@ -711,6 +781,7 @@ class TestComposeRunner:
     def test_exec_command_interactive_and_cmd(self):
         r = self._runner()  # project proj_stack, file /wd/docker-compose.yml, wd /wd
         assert r.exec_command("web") == [
+            "env", "COMPOSE_PROJECT_NAME=",
             "docker", "compose", "-p", "proj_stack",
             "-f", "/wd/docker-compose.yml", "--project-directory", "/wd",
             "exec", "web", "sh"]
@@ -767,6 +838,32 @@ class TestComposeRunner:
 # --------------------------------------------------------------------------
 # DockerComposeSession
 # --------------------------------------------------------------------------
+def _runner_factory(runner):
+    """A ComposeRunner stand-in that reflects how it was constructed.
+
+    `_teardown_runner` signals "I could not use the on-disk file" by building
+    a runner with no `compose_file`, so a double that ignores its kwargs
+    cannot tell the two paths apart (#164 NET-C1).
+    """
+    def make(**kwargs):
+        runner.compose_file = kwargs.get("compose_file")
+        return runner
+    return make
+
+
+def _staging_write(compose, workdir, filename="docker-compose.yml"):
+    """A `write` stub that really stages the file.
+
+    `_compose_context` writes a candidate and moves it into place once
+    Compose has validated it (#164 NET-C1), so a stub returning a path that
+    does not exist cannot stand in for it.
+    """
+    path = os.path.join(workdir, filename)
+    with open(path, "w") as fobj:
+        fobj.write("services: {}\n")
+    return path
+
+
 class _FakeRunner:
     """Records coarse-method calls without touching docker."""
 
@@ -778,24 +875,58 @@ class _FakeRunner:
         self.commit_fail_on = None      # container name whose commit fails
         self.image_rm_result = None     # override the image_rm Result
         self.image_exists_result = True
+        #: candidate-validation knobs (#164 NET-C1) — `validate_result` None
+        #: means "Compose accepted it".
+        self.compose_available = True
+        self.validate_result = None
+        #: a file compose cannot load makes the operation itself fail:
+        #: COMPOSE_PROJECT_NAME is pinned *empty*, so the silent fallback
+        #: has nothing to fall back to.
+        self.down_result = None
+        self.down_volumes_result = None
+        self.start_result = None
+        #: the resolved compose model (#164 NET-C3)
+        self.resolved_model_result = None
+        self.resolved_model_error = None
+        #: `None` means "stop succeeded" (the `_check` default)
+        self.stop_result = None
+        #: the real runner carries this; `None` means a label-only runner,
+        #: which is how teardown signals it could not use the on-disk file.
+        self.compose_file = "/wd/docker-compose.yml"
 
     def preflight(self):
         self.calls.append(("preflight",))
+        if not self.compose_available:
+            raise RuntimeUnavailable("'docker' is not on PATH")
+
+    def resolved_model(self, compose_file):
+        self.calls.append(("resolved_model", compose_file))
+        if self.resolved_model_error:
+            raise self.resolved_model_error
+        return self.resolved_model_result
+
+    def validate(self, compose_file):
+        self.calls.append(("validate", compose_file))
+        return self.validate_result
 
     def up(self, timeout, force_recreate=False):
         self.calls.append(("up", timeout, force_recreate))
 
     def down(self):
         self.calls.append(("down",))
+        return self.down_result
 
     def down_volumes(self):
         self.calls.append(("down_volumes",))
+        return self.down_volumes_result
 
     def stop(self):
         self.calls.append(("stop",))
+        return self.stop_result
 
     def start(self):
         self.calls.append(("start",))
+        return self.start_result
 
     def pause(self, services=None):
         self.calls.append(("pause", services))
@@ -930,7 +1061,7 @@ class TestDockerComposeSession:
         runner = _FakeRunner()
         with self._patch_teardown(session, runner):
             session.down_cluster("stack", {})
-        assert runner.calls == [("down",)]
+        assert ("down",) in runner.calls
 
     def test_destroy_cluster_downs_volumes_and_removes_file(self, tmp_path):
         session = self._session()
@@ -939,7 +1070,7 @@ class TestDockerComposeSession:
         compose_file.write_text("services: {}\n")
         with self._patch_teardown(session, runner, str(compose_file)):
             session.destroy_cluster("stack", {})
-        assert runner.calls == [("down_volumes",)]
+        assert ("down_volumes",) in runner.calls
         assert not compose_file.exists()
 
     # -- teardown is best-effort but not silent (Finding 7) ----------------
@@ -984,7 +1115,8 @@ class TestDockerComposeSession:
         assert runner.compose_file is None
         base = runner._base()
         assert "-f " not in base
-        assert base.startswith("docker compose -p ")
+        assert base.startswith("env COMPOSE_PROJECT_NAME= ")
+        assert "--env-file /dev/null" in base
 
     def test_teardown_missing_workdir_raises_configerror(self):
         session = self._session()
@@ -1093,7 +1225,7 @@ class TestDockerComposeSession:
         fake = _FakeRunner()
         with mock.patch.object(session._generator, "generate",
                                return_value={"services": {}}) as gen, \
-             mock.patch.object(session._generator, "write", return_value="/wd/dc.yml"), \
+             mock.patch.object(session._generator, "write", side_effect=_staging_write), \
              mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
                         return_value=fake):
             session.snapshot_restore_cluster("services", cfg, "v1")
@@ -1220,7 +1352,7 @@ class TestDockerComposeSession:
         fake = _FakeRunner()
         with mock.patch.object(session._generator, "generate",
                                return_value={"services": {}}), \
-             mock.patch.object(session._generator, "write", return_value="/wd/dc.yml"), \
+             mock.patch.object(session._generator, "write", side_effect=_staging_write), \
              mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
                         return_value=fake), \
              mock.patch.object(session, "_ensure_bind_dirs") as binds:
@@ -1265,27 +1397,41 @@ class TestDockerComposeSession:
 # Manager dispatch (coarse per-cluster seam)
 # --------------------------------------------------------------------------
 class _RecordingSession:
-    def __init__(self):
+    """A stand-in for ComposeSession's coarse lifecycle surface.
+
+    Every one of those methods is annotated ``-> bool`` and returns a real
+    bool: False is how the session reports a compose command that failed.
+    This double returns the same, so the manager's checks are exercised
+    rather than bypassed (#164 FB-6). Set *ok* to False to model a
+    cluster that will not come up or down.
+    """
+
+    def __init__(self, ok: bool = True):
         self.calls: list = []
+        self.ok = ok
 
     def compose_project_name(self, name):
         # unique per cluster → no spurious collision in dispatch tests
         return f"proj_{name}"
 
+    def _record(self, op, name) -> bool:
+        self.calls.append((op, name))
+        return self.ok
+
     def up_cluster(self, name, cfg):
-        self.calls.append(("up", name))
+        return self._record("up", name)
 
     def stop_cluster(self, name, cfg):
-        self.calls.append(("stop", name))
+        return self._record("stop", name)
 
     def start_cluster(self, name, cfg):
-        self.calls.append(("start", name))
+        return self._record("start", name)
 
     def down_cluster(self, name, cfg):
-        self.calls.append(("down", name))
+        return self._record("down", name)
 
     def destroy_cluster(self, name, cfg):
-        self.calls.append(("destroy", name))
+        return self._record("destroy", name)
 
 
 # --------------------------------------------------------------------------
@@ -1364,8 +1510,13 @@ class TestSnapshotDcWiring:
         m.session_for_cluster = lambda c: sess
         order = []
         m.ensure_shared_bridges = lambda: order.append("bridges")
-        sess.snapshot_restore_cluster.side_effect = (
-            lambda *a: order.append("restore"))
+        # the real session is -> bool; append() returns None, which the
+        # manager now correctly reads as a refused restore
+        def _record_restore(*_a):
+            order.append("restore")
+            return True
+
+        sess.snapshot_restore_cluster.side_effect = _record_restore
         args = SimpleNamespace(snapshot_name=None, cluster=None, vms="all")
         with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
             m.snapshot_restore(args)
@@ -1426,9 +1577,9 @@ class TestSnapshotDcWiring:
         m.session_for_cluster = lambda c: sess
         args = SimpleNamespace(snapshot_name="v1", snapshot_descr="", cluster=None, vms="all")
         with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
-            with pytest.raises(SystemExit) as exc:   # non-zero overall
+            with pytest.raises(SnapshotError) as exc:   # non-zero overall
                 m.snapshot_take(args)
-        assert exc.value.code == 1
+        assert "services" in str(exc.value)
         assert seen == ["services", "other"]   # kept going after the failure
 
     def test_restore_failure_exits_nonzero(self):
@@ -1438,9 +1589,9 @@ class TestSnapshotDcWiring:
         m.session_for_cluster = lambda c: sess
         args = SimpleNamespace(snapshot_name="v1", cluster=None, vms="all")
         with mock.patch.object(BoxmanManager, "_select_vm_targets", lambda self, a: []):
-            with pytest.raises(SystemExit) as exc:
+            with pytest.raises(SnapshotError) as exc:
                 m.snapshot_restore(args)
-        assert exc.value.code == 1
+        assert "services" in str(exc.value)
 
     def test_select_dc_clusters_honors_cluster_filter(self):
         m = self._mgr({"other": {"provider": "docker-compose", "boxes": {"z": {}}}})
@@ -1499,6 +1650,86 @@ class TestManagerDispatch:
             ("down", "svc"),
             ("destroy", "svc"),
         ]
+
+    # ---- #164 FB-6: per-cluster isolation + explicit False handling ----
+
+    def _two_cluster_manager(self, session):
+        manager = BoxmanManager()
+        manager.config = {
+            "project": "proj",
+            "provider": {"libvirt": {}},
+            "clusters": {
+                "svc_a": {"provider": "docker-compose",
+                          "boxes": {"web": {"image": "x"}}},
+                "svc_b": {"provider": "docker-compose",
+                          "boxes": {"api": {"image": "y"}}},
+            },
+        }
+        manager.register_session("docker-compose", session)
+        return manager
+
+    def test_returned_false_is_a_failure_not_a_success(self):
+        """The sessions report a failed compose command by returning False.
+        Discarding it made `down`/`destroy` exit 0 with containers up."""
+        manager = self._two_cluster_manager(_RecordingSession(ok=False))
+        with pytest.raises(ProvisionError, match="svc_a, svc_b"):
+            manager.stop_compose_clusters()
+
+    def test_every_cluster_is_attempted_after_a_returned_failure(self):
+        session = _RecordingSession(ok=False)
+        manager = self._two_cluster_manager(session)
+        with pytest.raises(ProvisionError):
+            manager.stop_compose_clusters()
+        assert session.calls == [("stop", "svc_a"), ("stop", "svc_b")]
+
+    def test_every_cluster_is_attempted_after_an_exception(self):
+        """Without the isolator a raising cluster skipped every cluster
+        after it — and, in a mixed project, every VM as well."""
+
+        class _RaisingOnFirst(_RecordingSession):
+            def stop_cluster(self, name, cfg):
+                self.calls.append(("stop", name))
+                if name == "svc_a":
+                    raise RuntimeError("docker daemon is gone")
+                return True
+
+        session = _RaisingOnFirst()
+        manager = self._two_cluster_manager(session)
+        with pytest.raises(ProvisionError, match="svc_a"):
+            manager.stop_compose_clusters()
+        assert session.calls == [("stop", "svc_a"), ("stop", "svc_b")]
+
+    def test_successful_clusters_are_not_reported_as_failures(self):
+        class _FailsSecond(_RecordingSession):
+            def stop_cluster(self, name, cfg):
+                self.calls.append(("stop", name))
+                return name != "svc_b"
+
+        manager = self._two_cluster_manager(_FailsSecond())
+        with pytest.raises(ProvisionError) as excinfo:
+            manager.stop_compose_clusters()
+        message = str(excinfo.value)
+        assert "svc_b" in message
+        assert "svc_a" not in message
+
+    def test_failed_destroy_blocks_cleanup(self, tmp_path, monkeypatch):
+        """A compose-only project whose containers survived must not have
+        its workspace deleted or its cache entry removed: for such a
+        project _confirm_project_torn_down() has no VMs to look at and
+        returns True, so this raise is the only thing standing between a
+        failed teardown and the loss of the state that describes it."""
+        manager = self._two_cluster_manager(_RecordingSession(ok=False))
+        with pytest.raises(ProvisionError, match="down --volumes"):
+            manager.destroy_compose_clusters()
+
+    def test_snapshot_isolator_honours_the_returned_bool(self):
+        """_for_each_dc_cluster's callbacks return the session's bool too —
+        a `docker image rm` blocked by a running container reports False."""
+        manager = self._two_cluster_manager(_RecordingSession())
+        _selected, failed = manager._for_each_dc_cluster(
+            SimpleNamespace(cluster=None, vms="all"), 'delete',
+            lambda name, cfg: name != "svc_b")
+        assert failed == ["svc_b"]
 
     def test_libvirt_only_project_has_no_compose_work(self):
         manager = BoxmanManager()
@@ -1667,7 +1898,11 @@ class TestPhase6CliParity:
         m = self._mgr({"other": {"provider": "docker-compose", "boxes": {"z": {}}}})
         paused = []
         sess = mock.Mock()
-        sess.pause_cluster.side_effect = lambda name, cfg: paused.append(name)
+        def _record_pause(name, _cfg):
+            paused.append(name)
+            return True   # the real session is -> bool
+
+        sess.pause_cluster.side_effect = _record_pause
         m._dc_session = lambda c: sess
         m.process_vm_list = lambda a: []
         m.suspend_vm(SimpleNamespace(cluster="other"))
@@ -1822,8 +2057,10 @@ class TestFlowWiring:
         m.cache.projects = {"proj": {"conf": "x", "runtime": "local"}}  # already provisioned
         m.up(SimpleNamespace(force=False))
         # a host reboot drops the non-persistent bridge; recreate it before
-        # the macvlan-attached containers reconcile.
-        assert order == ["bridges", "provision_compose_clusters"]
+        # the macvlan-attached containers reconcile. The same reboot leaves
+        # the lab down, so it is reconciled too, after the containers --
+        # matching provision()'s order (#164 C3).
+        assert order == ["bridges", "provision_compose_clusters", "netlab_up"]
 
     def test_up_all_vms_running_reconciles_compose(self, monkeypatch):
         m = self._mgr()
@@ -1837,3 +2074,635 @@ class TestFlowWiring:
         assert order.index("netlab_up") < order.index("provision_compose_clusters")
         # bridges reconciled before compose on the hybrid all-running path too
         assert order.index("bridges") < order.index("provision_compose_clusters")
+
+
+class TestTheComposeFileIsValidatedBeforeItReplacesTheWorkingOne:
+    """An invalid compose file written over a working one strands the stack.
+
+    Teardown deliberately reuses the on-disk file, and Compose refuses to
+    read a project it cannot resolve — so `down` exits 1 and the containers
+    keep running. boxman defers `include:`, `extends:` and `${VAR}` to
+    Compose, so the candidate must be validated before it is moved into
+    place (#164 NET-C1).
+    """
+
+    def _session(self, tmp_path):
+        session = DockerComposeSession({"provider": {"docker-compose": {}}})
+        session.manager = SimpleNamespace(
+            runtime="local", config_path=str(tmp_path / "conf.yml"))
+        return session
+
+    def _cfg(self, tmp_path):
+        return {"workdir": str(tmp_path),
+                "boxes": {"web": {"image": "nginx", "networks": ["corp"]}},
+                "compose_extra": {"include": ["extra.yml"]}}
+
+    def test_a_rejected_candidate_leaves_the_previous_file_untouched(
+            self, tmp_path):
+        previous = tmp_path / "docker-compose.yml"
+        previous.write_text("services: {web: {image: old}}\n")
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.validate_result = _fail("service \"web\" refers to undefined "
+                                       "network corp")
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            with pytest.raises(ProvisionError, match=r"does not resolve"):
+                session.up_cluster("stack", self._cfg(tmp_path))
+
+        assert previous.read_text() == "services: {web: {image: old}}\n"
+
+    def test_the_rejected_candidate_is_not_left_behind(self, tmp_path):
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.validate_result = _fail("nope")
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            with pytest.raises(ProvisionError):
+                session.up_cluster("stack", self._cfg(tmp_path))
+
+        assert list(tmp_path.glob(".docker-compose.yml.candidate")) == []
+
+    def test_validation_runs_before_the_working_file_is_touched(
+            self, tmp_path):
+        """Reachability, and the reason the order matters.
+
+        Validating in place — moving the working file aside first — meant two
+        concurrent failures could restore each other's file and destroy the
+        last good one, and an OSError could delete the backup without putting
+        it back. Nothing is undone here because nothing is moved until a
+        validated candidate exists.
+        """
+        previous = tmp_path / "docker-compose.yml"
+        previous.write_text("services: {web: {image: old}}\n")
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        seen: list[str] = []
+
+        def record(compose_file):
+            runner.calls.append(("validate", compose_file))
+            seen.append((tmp_path / "docker-compose.yml").read_text())
+            return None
+
+        runner.validate = record
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            session.up_cluster("stack", self._cfg(tmp_path))
+
+        validated = [c for c in runner.calls if c[0] == "validate"]
+        assert len(validated) == 1
+        assert validated[0][1] != str(tmp_path / "docker-compose.yml")
+        # the working file was still the old one while validation ran
+        assert seen == ["services: {web: {image: old}}\n"]
+
+    def test_the_staged_file_is_not_a_fixed_name(self, tmp_path):
+        """Two concurrent runs must not promote each other's bytes."""
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        staged = []
+        real_write = session._generator.write
+
+        def record(compose, workdir, filename="docker-compose.yml"):
+            staged.append(filename)
+            return real_write(compose, workdir, filename)
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner), \
+             mock.patch.object(session._generator, "write", side_effect=record):
+            session.up_cluster("stack", self._cfg(tmp_path))
+            session.up_cluster("stack", self._cfg(tmp_path))
+
+        assert len(staged) == 2
+        assert staged[0] != staged[1]
+
+    def test_an_accepted_candidate_becomes_the_working_file(self, tmp_path):
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            session.up_cluster("stack", self._cfg(tmp_path))
+
+        written = yaml.safe_load((tmp_path / "docker-compose.yml").read_text())
+        assert written["services"]["web"]["networks"] == ["corp"]
+        assert list(tmp_path.glob(".docker-compose.yml.candidate")) == []
+
+    def test_nothing_is_published_when_compose_cannot_be_run(self, tmp_path):
+        """No validation, no publication.
+
+        Writing an unvalidated file over a working one is exactly the
+        stranding failure, and "docker is broken right now" is no reason to
+        risk it — the run cannot deploy anything either way.
+        """
+        previous = tmp_path / "docker-compose.yml"
+        previous.write_text("services: {web: {image: old}}\n")
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.compose_available = False
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            with pytest.raises(RuntimeUnavailable):
+                session.up_cluster("stack", self._cfg(tmp_path))
+
+        assert previous.read_text() == "services: {web: {image: old}}\n"
+        assert not any(c[0] == "validate" for c in runner.calls)
+
+
+class TestPublicationCannotDestroyTheWorkingFile:
+    """The working file is not moved until a validated candidate exists.
+
+    An earlier version validated in place, moving the working file aside and
+    restoring it on failure. Two concurrent failures could then restore each
+    other's file and destroy the last good one, and the OSError path deleted
+    the backup without restoring it — leaving neither file (#164 NET-C1).
+    """
+
+    def _session(self, tmp_path):
+        session = DockerComposeSession({"provider": {"docker-compose": {}}})
+        session.manager = SimpleNamespace(
+            runtime="local", config_path=str(tmp_path / "conf.yml"))
+        return session
+
+    def _cfg(self, tmp_path):
+        return {"workdir": str(tmp_path),
+                "boxes": {"web": {"image": "nginx"}}}
+
+    def _seed(self, tmp_path):
+        previous = tmp_path / "docker-compose.yml"
+        previous.write_text("services: {web: {image: good}}\n")
+        return previous
+
+    def test_a_failed_rename_leaves_the_working_file(self, tmp_path):
+        previous = self._seed(tmp_path)
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner), \
+             mock.patch("boxman.providers.docker_compose.session.os.replace",
+                        side_effect=OSError("disk full")):
+            with pytest.raises(ProvisionError, match=r"cannot publish"):
+                session.up_cluster("stack", self._cfg(tmp_path))
+
+        assert previous.read_text() == "services: {web: {image: good}}\n"
+
+    def test_two_failing_runs_cannot_destroy_it(self, tmp_path):
+        """Interleaved failures: neither run ever moves the working file."""
+        previous = self._seed(tmp_path)
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.validate_result = _fail("undefined network ghost")
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            for _ in range(2):
+                with pytest.raises(ProvisionError):
+                    session.up_cluster("stack", self._cfg(tmp_path))
+
+        assert previous.read_text() == "services: {web: {image: good}}\n"
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "docker-compose.yml"]
+
+    def test_a_rejected_candidate_leaves_no_staged_files(self, tmp_path):
+        self._seed(tmp_path)
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.validate_result = _fail("nope")
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            with pytest.raises(ProvisionError):
+                session.up_cluster("stack", self._cfg(tmp_path))
+
+        assert [p.name for p in tmp_path.iterdir()] == ["docker-compose.yml"]
+
+
+class TestAnUnreadableComposeFileDoesNotStrandTheStack:
+    """Presence is not readability.
+
+    A file compose cannot resolve — a hand-edit, a half-written file, one
+    that ``include:``s itself — made every file-based teardown fail, so
+    ``down`` exited 1 and the containers kept running. Boxman used to try to
+    reject the self-include case before publishing, which meant
+    re-implementing compose's resolution (interpolated paths,
+    ``extends.file``, ``project_directory``, YAML tags PyYAML rejects); every
+    version both missed cycles and refused working configs. The file is now
+    left to compose, and teardown is made resilient instead (#164 NET-C1).
+    """
+
+    def _session(self, tmp_path):
+        session = DockerComposeSession({"provider": {"docker-compose": {}}})
+        session.manager = SimpleNamespace(
+            runtime="local", config_path=str(tmp_path / "conf.yml"))
+        return session
+
+    def _unreadable(self, tmp_path):
+        (tmp_path / "docker-compose.yml").write_text("include: [docker-compose.yml]\n")
+        return {"workdir": str(tmp_path), "boxes": {"web": {"image": "nginx"}}}
+
+    def _readable(self, tmp_path):
+        (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+        return {"workdir": str(tmp_path), "boxes": {"web": {"image": "nginx"}}}
+
+    def test_a_self_include_is_no_longer_refused_at_generation(self, tmp_path):
+        """Compose diagnoses it at up; boxman does not predict it."""
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {"image": "nginx"}},
+               "compose_extra": {"include": ["docker-compose.yml"]}}
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            session.up_cluster("stack", cfg)
+
+        assert (tmp_path / "docker-compose.yml").is_file()
+
+    def test_a_read_only_op_falls_back_to_the_project_label(self, tmp_path):
+        """`ps` is read-only: its failure hides nothing the file defines."""
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.ps_json_result = _fail("include cycle detected")
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            got, _wd, _cf = session._teardown_runner(
+                "stack", self._unreadable(tmp_path))
+            got.ps_json()
+
+        assert [c for c in runner.calls if c[0] == "ps_json"] == [
+            ("ps_json",), ("ps_json",)]
+
+    def test_stop_is_not_retried_by_label(self, tmp_path):
+        """A `stop` failure may be a failed `pre_stop` hook.
+
+        Retrying without the file stopped the container without completing
+        the hook and reported success — dropping exactly the file-defined
+        behaviour that failed (#164 NET-C1).
+        """
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.stop_result = _fail("pre_stop hook failed")
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            got, _wd, _cf = session._teardown_runner(
+                "stack", self._unreadable(tmp_path))
+            got.stop()
+
+        assert [c for c in runner.calls if c[0] == "stop"] == [("stop",)]
+
+    def test_start_is_not_retried_by_label(self, tmp_path):
+        """The `post_start` counterpart."""
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.start_result = _fail("post_start hook failed")
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            got, _wd, _cf = session._teardown_runner(
+                "stack", self._unreadable(tmp_path))
+            got.start()
+
+        assert [c for c in runner.calls if c[0] == "start"] == [("start",)]
+
+    def test_a_readable_file_is_still_used(self, tmp_path):
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            session._teardown_runner("stack", self._readable(tmp_path))
+
+        assert not any(c[0] == "validate" for c in runner.calls)
+
+    def test_stop_still_works_over_an_unreadable_file(self, tmp_path):
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            assert session.stop_cluster("stack", self._unreadable(tmp_path))
+
+        assert ("stop",) in runner.calls
+
+
+class TestResourceRemovalIsBlockedWhenTheFileCannotBeRead:
+    """Compose's label reconstruction does not carry ``external: true``.
+
+    Verified against Compose 2.40.3: with a volume declared external, a
+    file-based ``down --volumes`` left it and a label-only one deleted it.
+    So containers may be stopped by label, but resources must not be removed
+    by label when the file that declares them is unreadable (#164 NET-C1).
+    """
+
+    def _session(self, tmp_path):
+        session = DockerComposeSession({"provider": {"docker-compose": {}}})
+        session.manager = SimpleNamespace(
+            runtime="local", config_path=str(tmp_path / "conf.yml"))
+        return session
+
+    def _cfg(self, tmp_path):
+        (tmp_path / "docker-compose.yml").write_text("include: [docker-compose.yml]\n")
+        return {"workdir": str(tmp_path), "boxes": {"web": {"image": "nginx"}}}
+
+    def _blocked_runner(self):
+        """A file compose cannot load: the removal itself fails."""
+        runner = _FakeRunner()
+        runner.down_result = _fail("include cycle detected")
+        runner.down_volumes_result = _fail("include cycle detected")
+        return runner
+
+    def test_destroy_does_not_remove_volumes_by_label(self, tmp_path):
+        session = self._session(tmp_path)
+        runner = self._blocked_runner()
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            assert session.destroy_cluster("stack", self._cfg(tmp_path)) is False
+
+        # attempted once with the file, and never retried by label
+        assert [c for c in runner.calls if c[0] == "down_volumes"] == [
+            ("down_volumes",)]
+
+    def test_deprovision_does_not_remove_resources_by_label(self, tmp_path):
+        session = self._session(tmp_path)
+        runner = self._blocked_runner()
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            assert session.down_cluster("stack", self._cfg(tmp_path)) is False
+
+        assert [c for c in runner.calls if c[0] == "down"] == [("down",)]
+
+    def test_nothing_ran_so_the_containers_are_stopped(self, tmp_path):
+        """No file to run a removal with: a stop cannot skip a hook."""
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {"image": "nginx"}}}
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            session.destroy_cluster("stack", cfg)
+
+        assert ("stop",) in runner.calls
+
+    def test_a_failed_removal_does_not_stop_by_label(self, tmp_path):
+        """The failure may be a `pre_stop` hook compose deliberately honoured.
+
+        Stopping by label afterwards performs exactly the step compose
+        withheld (#164 NET-C1).
+        """
+        session = self._session(tmp_path)
+        runner = self._blocked_runner()
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            assert session.destroy_cluster("stack", self._cfg(tmp_path)) is False
+
+        assert ("stop",) not in runner.calls
+
+    def test_the_file_is_kept_so_a_retry_can_resolve_it(self, tmp_path):
+        session = self._session(tmp_path)
+        runner = self._blocked_runner()
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            session.destroy_cluster("stack", self._cfg(tmp_path))
+
+        assert (tmp_path / "docker-compose.yml").is_file()
+
+    def test_an_absent_file_also_blocks_removal(self, tmp_path):
+        """Losing the file establishes ownership no better than breaking it.
+
+        This path used to remove by label, which deletes volumes declared
+        `external: true`. A missing file is not evidence that nothing
+        contradicts the labels.
+        """
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {"image": "nginx"}}}
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            assert session.destroy_cluster("stack", cfg) is False
+
+        assert not any(c[0] == "down_volumes" for c in runner.calls)
+        assert ("stop",) in runner.calls
+
+    def test_the_message_does_not_advise_deleting_the_file(self, tmp_path):
+        """An earlier message recommended the data-loss path outright."""
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {"image": "nginx"}}}
+
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)), \
+             mock.patch.object(session.logger, "error") as err:
+            session.destroy_cluster("stack", cfg)
+
+        said = " ".join(str(c) for c in err.call_args_list)
+        assert "delete it" not in said
+        assert "docker compose -p" in said
+
+    def test_a_failed_stop_is_not_reported_as_stopped(self, tmp_path):
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.stop_result = _fail("boom")
+
+        cfg = {"workdir": str(tmp_path), "boxes": {"web": {"image": "nginx"}}}
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)), \
+             mock.patch.object(session.logger, "error") as err:
+            session.destroy_cluster("stack", cfg)
+
+        said = " ".join(str(c) for c in err.call_args_list)
+        assert "could NOT be stopped" in said
+
+
+class TestAnInterpolatedReferenceToAnAmbiguousAliasIsRefused:
+    """`${LAN}` hides which network it means until compose interpolates it.
+
+    boxman emits its own references verbatim in an extension, asks compose
+    for the resolved model, and reads them back — interpolating nothing
+    itself (#164 NET-C3).
+    """
+
+    KEY = "x-boxman-net-provenance"
+
+    def _session(self, tmp_path):
+        session = DockerComposeSession({
+            "provider": {"docker-compose": {}},
+            # `lab` is declared in BOTH blocks — that is the ambiguity
+            "shared_networks": {"lab": {"bridge": "br-lab",
+                                        "subnet": "10.10.0.0/24",
+                                        "ip_range": "10.10.0.128/25"}},
+        })
+        session.manager = SimpleNamespace(
+            runtime="local", config_path=str(tmp_path / "conf.yml"))
+        return session
+
+    def _cfg(self, tmp_path):
+        return {"workdir": str(tmp_path),
+                "networks": {"lab": {}},
+                "boxes": {"web": {"image": "nginx", "networks": ["${LAN}"]}}}
+
+    def _model(self, native, attached, ambiguous=("lab",), services=("web",)):
+        return {
+            self.KEY: {"native": native, "ambiguous": list(ambiguous)},
+            "services": {n: {"networks": {a: None for a in attached}}
+                         for n in services},
+        }
+
+    def _run(self, tmp_path, model):
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.resolved_model_result = model
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            return session.up_cluster("stack", self._cfg(tmp_path))
+
+    def test_resolving_to_the_ambiguous_alias_is_refused(self, tmp_path):
+        with pytest.raises(ConfigError, match=r"names both|attaches to 'lab'"):
+            self._run(tmp_path, self._model({"web": ["lab"]}, ["lab"]))
+
+        assert not (tmp_path / "docker-compose.yml").exists()
+
+    def test_an_inherited_attachment_to_the_alias_is_allowed(self, tmp_path):
+        """codex's counterexample.
+
+        `${LAN}` resolved to `other`; `extends` supplied `lab` as well. The
+        service is attached to both, but boxman only asked for `other` — so
+        refusing it would be wrong.
+        """
+        assert self._run(
+            tmp_path,
+            self._model({"web": ["other"]}, ["other", "lab"])) is True
+
+    def test_provenance_without_a_surviving_attachment_is_allowed(self,
+                                                                  tmp_path):
+        """Provenance alone cannot establish the reference is in effect."""
+        assert self._run(
+            tmp_path, self._model({"web": ["lab"]}, ["other"])) is True
+
+    def test_a_service_absent_from_the_model_is_skipped(self, tmp_path):
+        """Compose keeps root extension metadata for inactive services."""
+        model = self._model({"web": ["lab"]}, ["lab"], services=())
+        assert self._run(tmp_path, model) is True
+
+    def test_missing_provenance_in_the_model_fails(self, tmp_path):
+        with pytest.raises(ProvisionError, match=r"did not survive"):
+            self._run(tmp_path, self._model({}, ["lab"]))
+
+        assert not (tmp_path / "docker-compose.yml").exists()
+
+    def test_a_mangled_round_trip_fails(self, tmp_path):
+        """`null` where a non-empty list was sent is not a valid answer."""
+        with pytest.raises(ProvisionError, match=r"did not survive"):
+            self._run(tmp_path, self._model({"web": None}, ["lab"]))
+
+    def test_a_resolution_failure_publishes_nothing(self, tmp_path):
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        runner.resolved_model_error = ProvisionError("could not resolve")
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            with pytest.raises(ProvisionError, match=r"could not resolve"):
+                session.up_cluster("stack", self._cfg(tmp_path))
+
+        assert not (tmp_path / "docker-compose.yml").exists()
+
+    def test_snapshot_restore_takes_the_same_path(self, tmp_path):
+        session = self._session(tmp_path)
+        cfg = self._cfg(tmp_path)
+        session._save_snapshots("stack", cfg, {
+            "v1": {"created": "t", "boxes": {"web": "boxman/p_web:v1"}}})
+        runner = _FakeRunner()
+        runner.resolved_model_result = self._model({"web": ["lab"]}, ["lab"])
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            with pytest.raises(ConfigError):
+                session.snapshot_restore_cluster("stack", cfg, "v1")
+
+    def test_a_config_without_provenance_still_uses_quiet_validation(self,
+                                                                     tmp_path):
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        cfg = {"workdir": str(tmp_path),
+               "boxes": {"web": {"image": "nginx"}}}
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        side_effect=_runner_factory(runner)):
+            session.up_cluster("stack", cfg)
+
+        assert any(c[0] == "validate" for c in runner.calls)
+        assert not any(c[0] == "resolved_model" for c in runner.calls)
+
+    # -- the check is only as good as the round trip -----------------------
+    # Each of these made an earlier version accept an ambiguous attachment
+    # without checking anything (#164 NET-C3).
+
+    def _damaged(self, tmp_path, mutate):
+        model = self._model({"web": ["lab"]}, ["lab"])
+        mutate(model)
+        with pytest.raises(ProvisionError, match=r"did not survive"):
+            self._run(tmp_path, model)
+        assert not (tmp_path / "docker-compose.yml").exists()
+
+    def test_a_removed_ambiguity_list_fails(self, tmp_path):
+        self._damaged(tmp_path, lambda m: m[self.KEY].pop("ambiguous"))
+
+    def test_an_emptied_ambiguity_list_fails(self, tmp_path):
+        self._damaged(tmp_path,
+                      lambda m: m[self.KEY].update(ambiguous=[]))
+
+    def test_an_altered_ambiguity_list_fails(self, tmp_path):
+        self._damaged(tmp_path,
+                      lambda m: m[self.KEY].update(ambiguous=["other"]))
+
+    def test_a_non_string_native_element_fails(self, tmp_path):
+        self._damaged(tmp_path,
+                      lambda m: m[self.KEY]["native"].update(web=[None]))
+
+    def test_a_missing_services_field_fails(self, tmp_path):
+        self._damaged(tmp_path, lambda m: m.pop("services"))
+
+    def test_a_removed_extension_fails(self, tmp_path):
+        self._damaged(tmp_path, lambda m: m.pop(self.KEY))
+
+    def test_a_present_but_empty_services_mapping_is_not_a_failure(self,
+                                                                   tmp_path):
+        """Distinct from a missing field: nothing is active, nothing to check."""
+        model = self._model({"web": ["lab"]}, ["lab"])
+        model["services"] = {}
+
+        assert self._run(tmp_path, model) is True
+
+    def _damaged_attachment(self, tmp_path, networks):
+        model = self._model({"web": ["lab"]}, ["lab"])
+        model["services"]["web"]["networks"] = networks
+        with pytest.raises(ProvisionError, match=r"did not survive"):
+            self._run(tmp_path, model)
+
+    @pytest.mark.parametrize("networks", [
+        "lab", 42, {"lab": {}, 7: {}},
+        # falsy but still the wrong shape: an `or {}` coercion placed before
+        # the shape check swallows these silently, and every other test here
+        # still passes (#164 NET-C3).
+        False, 0, "",
+    ])
+    def test_a_malformed_attachment_field_fails(self, tmp_path, networks):
+        """`networks: "lab"` used to compare individual characters."""
+        self._damaged_attachment(tmp_path, networks)
+
+    def test_a_non_string_attachment_entry_fails(self, tmp_path):
+        self._damaged_attachment(tmp_path, [None])
+
+    @pytest.mark.parametrize("networks", [None, [], {}])
+    def test_an_empty_attachment_is_legitimate(self, tmp_path, networks):
+        """A service need not attach to anything."""
+        model = self._model({"web": ["lab"]}, ["lab"])
+        model["services"]["web"]["networks"] = networks
+
+        assert self._run(tmp_path, model) is True

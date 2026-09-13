@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 
+import jinja2
 import yaml
 
 import boxman
@@ -13,8 +14,15 @@ from boxman.exceptions import BoxmanError, ConfigError
 from boxman.loggers.logger import set_quiet, set_verbosity, suppressed
 from boxman.manager import BoxmanManager
 from boxman.providers import create_session, merge_provider_configs, primary_provider_type
-from boxman.providers.libvirt.import_image import ImageImporter
+from boxman.providers.libvirt.import_image import (
+    ImageImporter,
+    normalise_provider_name,
+)
 from boxman.scripts.cli_parser import parse_args, resolve_verbosity
+from boxman.utils.config_diagnostics import (
+    template_config_error,
+    yaml_config_error,
+)
 from boxman.utils.jinja_env import create_jinja_env
 
 #: Names of the :class:`BoxmanManager` methods the CLI may dispatch to.
@@ -136,11 +144,31 @@ def load_boxman_config(path: str) -> dict:
     config_filename = os.path.basename(expanded)
 
     jinja_env = create_jinja_env(config_dir)
-    template = jinja_env.get_template(config_filename)
-    rendered = template.render(environ=os.environ)
+    try:
+        template = jinja_env.get_template(config_filename)
+        rendered = template.render(environ=os.environ)
+    except ConfigError:
+        # env_required() raises a typed error naming the variable.
+        raise
+    except jinja2.TemplateError as exc:
+        raise template_config_error(exc, expanded) from exc
 
-    config = yaml.safe_load(rendered)
+    try:
+        config = yaml.safe_load(rendered)
+    except yaml.YAMLError as exc:
+        raise yaml_config_error(exc, expanded) from exc
     return config
+
+
+#: Handlers whose ``--force`` already means "destroy the VMs that are there
+#: and start over", and which therefore also authorise recreating the
+#: runtime container while guests run inside it (#164 FB-2).
+#:
+#: Named rather than tested inline because ``force`` is a dest several
+#: unrelated subcommands share: ``snapshot take --overwrite`` and
+#: ``create-templates --force`` set it too, and neither asks to destroy a
+#: running guest.
+FORCE_AUTHORISES_RECREATE = ('provision', 'up')
 
 
 def main():
@@ -391,20 +419,23 @@ def _main():
             workdirs = manager.collect_workdirs()
             if workdirs:
                 manager.runtime_instance.workdirs = workdirs
-                # Pre-create each bind-mount dir on the host AS THE
-                # CURRENT USER. Without this, `docker compose up` would
-                # create the missing host directory (as root) when it
-                # sets up the bind mount, and subsequent host-side
-                # file writes (env.sh, ssh_config, …) would hit
-                # PermissionError. If the dir already exists as root
-                # from an earlier failed run, _ensure_writable_dir fixes
-                # ownership via `sudo chown`.
-                for wd in workdirs:
-                    log.info(f"runtime workdir: {wd}")
-                    try:
-                        manager._ensure_writable_dir(wd)
-                    except Exception as exc:
-                        log.warning(f"could not prepare {wd}: {exc}")
+                manager.prepare_runtime_workdirs(workdirs)
+
+            # --force on provision/up already means "deprovision what is
+            # there first", so it is also the authorisation to recreate the
+            # runtime container while guests are running inside it
+            # (#164 FB-2). Verbs without --force refuse instead: the fix
+            # for `boxman ps` hitting a recreate is not to kill a guest.
+            #
+            # Restricted to those two handlers by name. `force` is a dest
+            # several unrelated subcommands share — `snapshot take
+            # --overwrite` and `create-templates --force` set it too — and
+            # neither of those asks to destroy a running guest, so reading
+            # the flag alone would let a snapshot overwrite authorise it
+            # (#164 FB-2 review).
+            manager.runtime_instance.allow_recreate = (
+                args.handler in FORCE_AUTHORISES_RECREATE
+                and bool(getattr(args, 'force', False)))
 
         # Handle destroy-runtime — tear down Docker resources without
         # starting the container first
@@ -445,8 +476,20 @@ def _main():
                 # Stash the resolved local path so the session reuses it.
                 args.manifest_local_path = manifest_local_path
 
-            # fetch the provider configuration from the boxman config
-            manager.config = boxman_config['providers'][provider_type]
+            # The manifest schema accepts the provider name in any case --
+            # validation lowercases before comparing -- so normalise before
+            # it is used as a lookup key. A manifest saying 'LibVirt'
+            # validated and then raised KeyError against boxman.yml and the
+            # provider registry (#164 F1).
+            provider_type = normalise_provider_name(provider_type)
+
+            # fetch the provider configuration from the boxman config. Both
+            # levels are optional: a boxman.yml without a 'providers:'
+            # section, or without a block for this provider, leaves the
+            # session on its documented defaults (qemu:///system for
+            # libvirt) rather than raising a bare KeyError (#164 F1).
+            manager.config = (boxman_config.get('providers') or {}).get(
+                provider_type) or {}
         else:
             provider_type = primary_provider_type(manager.config)
 

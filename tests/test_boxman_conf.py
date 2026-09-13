@@ -760,6 +760,9 @@ class TestNormalizeOwnership:
             def is_dir(self, follow_symlinks=False):
                 return self._real.is_dir(follow_symlinks=follow_symlinks)
 
+            def is_file(self, follow_symlinks=False):
+                return self._real.is_file(follow_symlinks=follow_symlinks)
+
         def _fake_scandir(p):
             for e in real_scandir(p):
                 yield _FakeEntry(e, fake_uid=0)
@@ -771,11 +774,12 @@ class TestNormalizeOwnership:
         assert not stale.exists()
         assert all("sudo" not in c for c in run_calls), run_calls
 
-    def test_unwritable_dir_falls_back_to_sudo_chown(
+    def test_unwritable_dir_is_repaired_without_recursing(
         self, tmp_path, monkeypatch
     ):
-        """When the parent dir itself is not writable, the cheap path
-        is impossible — sudo chown -R must be invoked."""
+        """An unwritable workdir is repaired by chowning the directory
+        itself, never recursively: ``chown -R`` would rewrite the ownership
+        of every VM disk stored underneath it."""
         from unittest.mock import MagicMock
         mgr = BoxmanManager()
 
@@ -795,9 +799,45 @@ class TestNormalizeOwnership:
         mgr._normalize_ownership(str(tmp_path))
 
         assert any(
-            "sudo -n chown -R" in c and str(tmp_path) in c
+            "sudo -n chown" in c and str(tmp_path) in c
             for c in run_calls
         ), run_calls
+        assert not any("-R" in c for c in run_calls), run_calls
+
+    def test_no_sweep_never_inspects_the_directory_contents(
+        self, tmp_path, monkeypatch
+    ):
+        """``sweep_foreign=False`` is the CLI startup pre-create pass: it
+        must not scan the workdir at all, let alone remove anything from
+        it — even an entry it would otherwise consider disposable."""
+        from unittest.mock import MagicMock
+        stale = tmp_path / "seed.iso"
+        stale.write_bytes(b"stale")
+
+        mgr = BoxmanManager()
+        run_calls: list = []
+
+        def _capture_run(cmd, *_a, **_kw):
+            run_calls.append(cmd)
+            return MagicMock(ok=True, stderr="", stdout="")
+
+        def _explode(_path):
+            raise AssertionError("the directory contents must not be scanned")
+
+        monkeypatch.setattr("boxman.manager_parts.images.run", _capture_run)
+        monkeypatch.setattr(
+            "boxman.manager_parts.images.os.scandir", _explode)
+        # Not writable, so the directory-only repair still has to run.
+        monkeypatch.setattr(
+            "boxman.manager_parts.images.os.access",
+            lambda p, mode: False if p == str(tmp_path) else True,
+        )
+
+        mgr._normalize_ownership(str(tmp_path), sweep_foreign=False)
+
+        assert stale.exists()
+        assert any("sudo -n chown" in c for c in run_calls), run_calls
+        assert not any("-R" in c for c in run_calls), run_calls
 
     def test_sudo_failure_raises_with_actionable_message(
         self, tmp_path, monkeypatch
@@ -823,10 +863,211 @@ class TestNormalizeOwnership:
             mgr._normalize_ownership(str(tmp_path))
 
         msg = str(exc_info.value)
-        assert "sudo chown -R" in msg
-        assert "sudo rm -rf" in msg
+        assert "sudo chown" in msg
         assert str(tmp_path) in msg
         assert "password is required" in msg
+        # The old message offered `sudo rm -rf <workdir>` as a safe fix. It
+        # is not safe: a cluster workdir holds that cluster's VM disks.
+        assert "rm -rf" not in msg
+
+    @staticmethod
+    def _scandir_reports_everything_foreign(monkeypatch, unstattable=()):
+        """Make every top-level entry look root-owned, as it is under the
+        docker runtime (the container execs as root, dynamic_ownership=0).
+
+        Names listed in *unstattable* additionally raise ``OSError`` from
+        every metadata probe, standing in for an entry whose kind cannot be
+        determined.
+        """
+        real_scandir = os.scandir
+
+        class _FakeEntry:
+            def __init__(self, real):
+                self._real = real
+                self.path = real.path
+                self.name = real.name
+
+            def stat(self, follow_symlinks=False):
+                if self.name in unstattable:
+                    raise OSError("cannot stat")
+
+                class _Stat:
+                    st_uid = 0
+                return _Stat()
+
+            def is_dir(self, follow_symlinks=False):
+                if self.name in unstattable:
+                    raise OSError("cannot stat")
+                return self._real.is_dir(follow_symlinks=follow_symlinks)
+
+            def is_file(self, follow_symlinks=False):
+                if self.name in unstattable:
+                    raise OSError("cannot stat")
+                return self._real.is_file(follow_symlinks=follow_symlinks)
+
+        def _fake_scandir(path):
+            for entry in real_scandir(path):
+                yield _FakeEntry(entry)
+
+        monkeypatch.setattr(
+            "boxman.manager_parts.images.os.scandir", _fake_scandir)
+
+    def test_foreign_disk_is_preserved_not_unlinked(
+        self, tmp_path, monkeypatch
+    ):
+        """The FB-1 regression: a root-owned VM disk must survive the sweep.
+
+        Under the docker runtime every disk in a cluster workdir is
+        root-owned, so the old sweep deleted a running cluster's disks on
+        the next boxman command — ``ps`` included.
+        """
+        from unittest.mock import MagicMock
+        disk = tmp_path / "node01.qcow2"
+        disk.write_bytes(b"disk")
+        saved = tmp_path / "node01.save"
+        saved.write_bytes(b"memory")
+
+        mgr = BoxmanManager()
+        run_calls: list = []
+
+        def _capture_run(cmd, *_a, **_kw):
+            run_calls.append(cmd)
+            return MagicMock(ok=True, stderr="", stdout="")
+
+        monkeypatch.setattr("boxman.manager_parts.images.run", _capture_run)
+        self._scandir_reports_everything_foreign(monkeypatch)
+
+        mgr._normalize_ownership(str(tmp_path))
+
+        assert disk.exists(), "the VM disk was deleted by the sweep"
+        assert saved.exists(), "the saved memory state was deleted"
+        # preserved in place, and made usable with a targeted chown
+        assert any("chown" in c and "node01.qcow2" in c for c in run_calls)
+        assert not any("-R" in c for c in run_calls), run_calls
+
+    def test_foreign_directory_and_its_disks_are_preserved(
+        self, tmp_path, monkeypatch
+    ):
+        """A foreign-owned *directory* is never removed recursively.
+
+        A suffix denylist could not protect this: the directory name carries
+        no disk suffix, so an rmtree would take the disks inside it with it.
+        """
+        from unittest.mock import MagicMock
+        subdir = tmp_path / "cluster_1"
+        subdir.mkdir()
+        nested_disk = subdir / "node01.qcow2"
+        nested_disk.write_bytes(b"disk")
+
+        mgr = BoxmanManager()
+
+        def _ok_run(cmd, *_a, **_kw):
+            return MagicMock(ok=True, stderr="", stdout="")
+
+        monkeypatch.setattr("boxman.manager_parts.images.run", _ok_run)
+        self._scandir_reports_everything_foreign(monkeypatch)
+
+        mgr._normalize_ownership(str(tmp_path))
+
+        assert subdir.is_dir(), "the foreign directory was removed"
+        assert nested_disk.exists(), "a disk inside it was removed"
+
+    def test_stale_seed_iso_is_still_removed(self, tmp_path, monkeypatch):
+        """The allowlisted build artifacts are still swept, so genisoimage
+        can recreate a seed ISO it would otherwise fail to truncate."""
+        from unittest.mock import MagicMock
+        stale = tmp_path / "seed.iso"
+        stale.write_bytes(b"stale")
+        rendered = tmp_path / "conf.rendered.yml"
+        rendered.write_text("x")
+        disk = tmp_path / "node01.qcow2"
+        disk.write_bytes(b"disk")
+
+        mgr = BoxmanManager()
+
+        def _ok_run(cmd, *_a, **_kw):
+            return MagicMock(ok=True, stderr="", stdout="")
+
+        monkeypatch.setattr("boxman.manager_parts.images.run", _ok_run)
+        self._scandir_reports_everything_foreign(monkeypatch)
+
+        mgr._normalize_ownership(str(tmp_path))
+
+        assert not stale.exists()
+        assert not rendered.exists()
+        assert disk.exists()
+
+    def test_failed_chown_leaves_the_disk_intact(self, tmp_path, monkeypatch):
+        """If the ownership repair fails there is still no deletion: the
+        entry is left exactly as it was."""
+        from unittest.mock import MagicMock
+        disk = tmp_path / "node01.qcow2"
+        disk.write_bytes(b"disk")
+
+        mgr = BoxmanManager()
+
+        def _failing_run(cmd, *_a, **_kw):
+            return MagicMock(
+                ok=False, stderr="sudo: a password is required\n", stdout="")
+
+        monkeypatch.setattr("boxman.manager_parts.images.run", _failing_run)
+        self._scandir_reports_everything_foreign(monkeypatch)
+
+        # The directory itself is writable, so only the entry repair fails —
+        # which must not raise, and must not delete.
+        mgr._normalize_ownership(str(tmp_path))
+
+        assert disk.exists()
+        assert disk.read_bytes() == b"disk"
+
+    def test_only_regular_files_are_ever_unlinked(self, tmp_path, monkeypatch):
+        """Carrying an allowlisted *name* is not enough — the entry also has
+        to be a regular file. A symlink, fifo or socket named ``seed.iso``
+        must be preserved, not unlinked."""
+        from unittest.mock import MagicMock
+        disk = tmp_path / "node01.qcow2"
+        disk.write_bytes(b"disk")
+        # a symlink whose name is on the allowlist, pointing at the disk
+        link = tmp_path / "seed.iso"
+        link.symlink_to(disk)
+        fifo = tmp_path / "other_seed.iso"
+        os.mkfifo(fifo)
+
+        mgr = BoxmanManager()
+
+        def _ok_run(cmd, *_a, **_kw):
+            return MagicMock(ok=True, stderr="", stdout="")
+
+        monkeypatch.setattr("boxman.manager_parts.images.run", _ok_run)
+        self._scandir_reports_everything_foreign(monkeypatch)
+
+        mgr._normalize_ownership(str(tmp_path))
+
+        assert link.is_symlink(), "an allowlisted symlink was unlinked"
+        assert fifo.exists(), "an allowlisted fifo was unlinked"
+        assert disk.exists()
+
+    def test_an_entry_that_cannot_be_inspected_is_preserved(
+        self, tmp_path, monkeypatch
+    ):
+        """If the kind of an entry cannot be established, it is preserved —
+        an unreadable entry must never be treated as a disposable file."""
+        from unittest.mock import MagicMock
+        stale = tmp_path / "seed.iso"
+        stale.write_bytes(b"stale")
+
+        mgr = BoxmanManager()
+
+        def _ok_run(cmd, *_a, **_kw):
+            return MagicMock(ok=True, stderr="", stdout="")
+
+        monkeypatch.setattr("boxman.manager_parts.images.run", _ok_run)
+        self._scandir_reports_everything_foreign(
+            monkeypatch, unstattable={"seed.iso"})
+
+        mgr._normalize_ownership(str(tmp_path))
+
+        assert stale.exists()
 
 
 class TestConfigSchemaV2:

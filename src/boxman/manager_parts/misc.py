@@ -5,7 +5,6 @@ import os
 
 import yaml
 
-from boxman import log
 from boxman.exceptions import ConfigError
 from boxman.task_runner import TaskRunner
 
@@ -193,15 +192,13 @@ class MiscMixin:
                     while i < len(remaining):
                         arg = remaining[i]
                         if not arg.startswith("--"):
-                            log.error(f"unrecognized argument: {arg}")
-                            import sys
-                            sys.exit(1)
+                            raise ConfigError(
+                                f"unrecognized argument: {arg}")
 
                         name = arg[2:].replace("-", "_")
                         if name not in placeholder_set:
-                            log.error(f"unrecognized argument: {arg}")
-                            import sys
-                            sys.exit(1)
+                            raise ConfigError(
+                                f"unrecognized argument: {arg}")
 
                         # Determine the value for this flag.  Normal case:
                         # remaining[i + 1] is the value.  Exception: if that
@@ -225,21 +222,17 @@ class MiscMixin:
                         if value is None:
                             # Value not in remaining; consume from extra_args.
                             if not extra_args:
-                                log.error(f"argument {arg}: expected a value")
-                                import sys
-                                sys.exit(1)
+                                raise ConfigError(
+                                    f"argument {arg}: expected a value")
                             value = extra_args.pop(0)
                             i += 1
 
                         task_flags[name] = value
                 elif remaining:
-                    log.error(
+                    raise ConfigError(
                         f"unrecognized arguments: {' '.join(remaining)}. "
                         f"Task '{task_name}' has no {{placeholder}} markers "
-                        f"in its command."
-                    )
-                    import sys
-                    sys.exit(1)
+                        f"in its command.")
 
             exit_code = runner.run(task_name, extra_args, task_flags=task_flags)
 
@@ -296,9 +289,12 @@ class MiscMixin:
         """
         as_json = getattr(cli_args, 'json', False)
 
-        # Read the rendered config file
-        rendered_config = None
-        if self.config_path:
+        # The text load_config() rendered, when this manager did the load.
+        # Preferred over the on-disk dump: the dump is best-effort and is
+        # absent on a read-only config dir (#164 CL-C1), and when both
+        # exist the in-memory copy is the one that was actually parsed.
+        rendered_config = getattr(self, 'rendered_config_text', None)
+        if rendered_config is None and self.config_path:
             config_dir = os.path.dirname(os.path.abspath(self.config_path))
             config_basename = os.path.splitext(os.path.basename(self.config_path))[0]
             rendered_path = os.path.join(config_dir, f"{config_basename}.rendered.yml")
@@ -329,7 +325,7 @@ class MiscMixin:
         if rendered_config:
             print(rendered_config)
         else:
-            print("  (conf.rendered.yml not found — run 'boxman provision' first)")
+            print("  (no rendered config available — run 'boxman provision' first)")
 
     def ps(self, cli_args):
         """

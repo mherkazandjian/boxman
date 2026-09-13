@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import ImageImportError
 from boxman.providers.libvirt.import_image import ImageImporter
 
 pytestmark = pytest.mark.unit
@@ -375,7 +376,7 @@ class TestImportImageEndToEnd:
         return root / "manifest.json"
 
     def test_happy_path_calls_define_vm(self, tmp_path: Path):
-        import re
+        import shlex
         import shutil as _shutil
 
         manifest_path = self._build_package(tmp_path / "pkg")
@@ -395,9 +396,11 @@ class TestImportImageEndToEnd:
             if cmd.startswith("virsh") and "list --all --name" in cmd:
                 return _result(stdout="other-vm\n", ok=True)
             if cmd.startswith("rsync"):
-                m = re.match(r'rsync --sparse --progress "([^"]+)" "([^"]+)"', cmd)
-                assert m, f"unexpected rsync cmd: {cmd}"
-                _shutil.copyfile(m.group(1), m.group(2))
+                # parse the arguments rather than one spelling of them: the
+                # paths are shell-quoted now (#164 F1)
+                parts = shlex.split(cmd)
+                assert len(parts) == 5, f"unexpected rsync cmd: {cmd}"
+                _shutil.copyfile(parts[3], parts[4])
                 return _result(ok=True)
             if cmd.startswith("sha256sum"):
                 return _result(stdout="dead  beef\n", ok=True)
@@ -409,7 +412,8 @@ class TestImportImageEndToEnd:
             "boxman.providers.libvirt.import_image.run",
             side_effect=fake_run,
         ) as run_fn:
-            assert importer.import_image() is True
+            # raises on failure, returns None on success (#164 F1)
+            assert importer.import_image() is None
 
         commands_run = [c.args[0] for c in run_fn.call_args_list]
         assert any("virsh -c qemu:///system list --all --name" in c for c in commands_run)
@@ -435,6 +439,8 @@ class TestImportImageEndToEnd:
             "boxman.providers.libvirt.import_image.run",
             return_value=_result(stdout="dup\nother\n", ok=True),
         ):
-            assert importer.import_image() is False
+            # used to return False, which every caller discarded (#164 F1)
+            with pytest.raises(ImageImportError, match="already exists"):
+                importer.import_image()
         # Nothing copied since we bailed early.
         assert not (dst_dir / "dup").exists()

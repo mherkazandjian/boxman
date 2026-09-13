@@ -2,8 +2,17 @@ import os
 from typing import Any
 
 from boxman import log
+from boxman.exceptions import ProvisionError
 
 from .commands import VirshCommand
+from .disk_ownership import (
+    DEFAULT_DISK_TARGET,
+    disk_logical_name,
+    occupied_target_conflicts,
+    plan_disk_removals,
+    read_disk_records,
+    unowned_disks,
+)
 from .virsh_edit import VirshEdit
 from .virsh_parse import parse_domblklist
 
@@ -20,6 +29,34 @@ class VMStateDiffer:
     _LIVE_DOMAIN_STATES = frozenset({
         'running', 'blocked', 'paused', 'in shutdown', 'pmsuspended', 'crashed',
     })
+
+    #: States with no active domain. Anything in neither set is unknown —
+    #: including the 'unknown' get_vm_state() returns when domstate fails.
+    _INACTIVE_DOMAIN_STATES = frozenset({'shut off', 'shutoff'})
+
+    @classmethod
+    def domain_is_active(cls, vm_state: str) -> bool:
+        """
+        Whether *vm_state* describes an active domain.
+
+        Active is not the same as running: a paused guest is still active,
+        and device edits applied only to its persistent configuration would
+        report success while leaving the running guest untouched until its
+        next boot (#164 FB-5).
+
+        Raises:
+            ProvisionError: for a state in neither set. Guessing either way
+                picks a wrong virsh flag, and 'unknown' is what
+                :meth:`get_vm_state` returns when the query failed.
+        """
+        state = (vm_state or '').strip().lower()
+        if state in cls._LIVE_DOMAIN_STATES:
+            return True
+        if state in cls._INACTIVE_DOMAIN_STATES:
+            return False
+        raise ProvisionError(
+            f"cannot tell whether the domain is active from state "
+            f"'{vm_state}'; refusing to guess which virsh flags to use")
 
     def __init__(self, provider_config: dict[str, Any] | None = None):
         self.virsh = VirshCommand(provider_config)
@@ -180,7 +217,19 @@ class VMStateDiffer:
             'stats_period': config.get('stats_period'),
         }
 
-    def get_actual_disks(self, domain_name: str) -> list[dict[str, Any]]:
+    def get_disk_records(self, domain_name: str):
+        """
+        The disks boxman recorded attaching to *domain_name*.
+
+        A probe of its own, like :meth:`get_actual_disks`, so it can be
+        stubbed the same way. ``None`` means the domain carries no boxman
+        ownership metadata -- which is never grounds for detaching
+        anything (#164 F2).
+        """
+        return read_disk_records(self.virsh, domain_name)
+
+    def get_actual_disks(self, domain_name: str,
+                         inactive: bool = False) -> list[dict[str, Any]]:
         """
         Get actual disk info from virsh domblklist + virsh domblkinfo.
 
@@ -191,11 +240,23 @@ class VMStateDiffer:
         Returns:
             List of dicts with 'target', 'source', 'size_mb' keys.
             Only includes file-backed disk devices (excludes cdroms, etc.).
+
+        Raises:
+            ProvisionError: if the domain's disks cannot be listed. An empty
+                list is a real answer -- "this domain has no file-backed
+                disks" -- and returning it for "the query failed" made every
+                declared disk look absent, so the diff proposed attaching
+                them all. Once a removal path reads this list, the same
+                empty result would read as "nothing is attached" (#164 F2).
         """
-        result = self.virsh.execute('domblklist', domain_name, '--details', warn=True)
+        flags = ['--details'] + (['--inactive'] if inactive else [])
+        result = self.virsh.execute(
+            'domblklist', domain_name, *flags, warn=True)
         if not result.ok:
-            self.logger.warning(f"failed to get disk list for {domain_name}")
-            return []
+            raise ProvisionError(
+                f"could not list the disks of {domain_name}: "
+                f"{(result.stderr or '').strip() or 'virsh domblklist failed'}"
+            )
 
         disks = []
         for row in parse_domblklist(result.stdout):
@@ -249,9 +310,18 @@ class VMStateDiffer:
                             disk_prefix: str) -> str:
         """
         Compute the expected disk file path, matching DiskManager.configure_from_disk_config logic.
+
+        Through the same normalisation DiskManager uses -- not a second
+        copy of it. ``.get("name", "disk")`` defaults only an *absent*
+        key, so ``name: null`` predicted ``<prefix>_None.qcow2`` and
+        ``name: ""`` predicted ``<prefix>_.qcow2`` while creation resolved
+        both to ``disk``. The predicted file was absent, so the entry was
+        not marked attach_only, and creation then ran ``qemu-img create``
+        over the existing ``<prefix>_disk.qcow2`` and destroyed it. No
+        race, no detach (#164 F2 review round 4).
         """
         from .disk import disk_path_for
-        disk_name = disk_config.get("name", "disk")
+        disk_name = disk_logical_name(disk_config)
         driver = disk_config.get("driver", {})
         driver_type = driver.get("type", "qcow2")
         return disk_path_for(workdir, disk_name,
@@ -269,9 +339,15 @@ class VMStateDiffer:
         return CDROMManager(
             domain_name, provider_config=self.provider_config).get_attached_cdroms()
 
-    def get_actual_shared_folders(self, domain_name: str) -> list[dict[str, Any]]:
+    def get_actual_shared_folders(self, domain_name: str,
+                                  inactive: bool = False) -> list[dict[str, Any]]:
         """
         Get actual filesystem (shared folder) devices from domain XML.
+
+        Args:
+            inactive: read the persistent definition instead of the live
+                domain. See
+                :meth:`SharedFolderManager.get_attached_shared_folders`.
 
         Returns:
             List of dicts with 'name', 'host_path', and 'readonly' keys.
@@ -279,7 +355,8 @@ class VMStateDiffer:
         from .shared_folder import SharedFolderManager
         return SharedFolderManager(
             domain_name,
-            provider_config=self.provider_config).get_attached_shared_folders()
+            provider_config=self.provider_config).get_attached_shared_folders(
+                inactive=inactive)
 
     def diff_vm(self,
                 domain_name: str,
@@ -366,6 +443,10 @@ class VMStateDiffer:
 
         # --- Disk diff ---
         actual_disks = self.get_actual_disks(domain_name)
+        # The disk the VM boots from, so it can be excluded from the
+        # "attached but neither declared nor recorded" report rather than
+        # shown to the operator as a stray every single run.
+        root_disk_source = actual_disks[0]['source'] if actual_disks else None
         actual_targets = {d['target'] for d in actual_disks}
         actual_by_target = {d['target']: d for d in actual_disks}
 
@@ -373,7 +454,7 @@ class VMStateDiffer:
         resize_disks = []
 
         for disk_config in (desired_disks or []):
-            target = disk_config.get('target', 'vdb')
+            target = disk_config.get('target', DEFAULT_DISK_TARGET)
             desired_size = disk_config.get('size', 1024)
             expected_path = self._expected_disk_path(disk_config, workdir, disk_prefix)
 
@@ -408,70 +489,186 @@ class VMStateDiffer:
                         f"Shrinking is not supported, skipping."
                     )
 
+        # --- Disk removals ---
+        #
+        # Decided against what boxman recorded attaching, never inferred
+        # from what is attached: get_actual_disks() returns the root disk
+        # too, so "attached but not declared" starts by removing it
+        # (#164 F2). A domain with no ownership record yields nothing.
+        disk_records = self.get_disk_records(domain_name)
+        # Against the PERSISTENT definition, which is what
+        # `detach-disk --config` edits. For a running domain the live view
+        # can differ -- an earlier config-only replacement is enough -- and
+        # deciding from it let a record for the disk running at a target
+        # authorise detaching the different disk configured there (#164 F2
+        # review, finding 3).
+        persistent_disks = self.get_actual_disks(domain_name, inactive=True)
+        removed_disks, refused_disk_removals = plan_disk_removals(
+            disk_records, desired_disks or [], persistent_disks)
+        # Against the view the add/resize path acts on -- the live one for
+        # a running guest -- so preflight and reconciliation cannot
+        # disagree about whether a target is occupied (#164 F2 review
+        # round 2, finding 2).
+        disk_conflicts = occupied_target_conflicts(
+            disk_records, desired_disks or [], actual_disks,
+            expected_paths={
+                disk_logical_name(d):
+                    self._expected_disk_path(d, workdir, disk_prefix)
+                for d in (desired_disks or [])
+            })
+        unowned = unowned_disks(
+            disk_records, desired_disks or [], persistent_disks,
+            root_source=(persistent_disks[0]['source']
+                         if persistent_disks else root_disk_source))
+
         # --- CDROM diff ---
+        #
+        # Explicit targets are matched *before* source membership. The other
+        # order meant that when the desired ISO happened to be attached at
+        # some other target, no swap was generated and the requested target
+        # was simply removed: with hdc=A.iso and hdd=B.iso attached and
+        # hdc=B.iso desired, hdc was detached and B.iso left on hdd. Swapping
+        # two ISOs between explicit targets produced no changes at all
+        # (#164 FB-5).
         actual_cdroms = self.get_actual_cdroms(domain_name)
-        actual_cdrom_by_source = {c['source']: c for c in actual_cdroms}
-        actual_cdrom_sources = set(actual_cdrom_by_source.keys())
+        actual_by_target = {
+            c['target']: c for c in actual_cdroms if c.get('target')
+        }
 
         new_cdroms = []
         changed_cdroms = []
-        desired_cdrom_sources = set()
+        # Actual drives accounted for by a desired entry. Anything left over
+        # is what gets removed — computed from what was *matched* rather than
+        # from source membership, so a drive holding the right media at the
+        # wrong target is still reconciled.
+        matched_targets: set = set()
+        claimed_targets: set = set()
 
+        entries = []
         for cdrom_config in (desired_cdroms or []):
-            source = os.path.abspath(os.path.expanduser(cdrom_config.get('source', '')))
-            desired_cdrom_sources.add(source)
+            raw_source = cdrom_config.get('source')
+            if not raw_source:
+                # os.path.abspath('') is the current working directory. A
+                # cdrom entry that had not been resolved was therefore turned
+                # into a plausible-looking path matching nothing, so the ISO
+                # genuinely attached to the guest fell into removed_cdroms and
+                # was detached (#164 FB-5). Refuse instead of inventing a path.
+                raise ProvisionError(
+                    f"cdrom entry {cdrom_config!r} on domain '{domain_name}' "
+                    f"has no resolved source. Declared media must be resolved "
+                    f"to a local path before it can be compared with what is "
+                    f"attached; refusing to guess one.")
+            entries.append(
+                (cdrom_config,
+                 os.path.abspath(os.path.expanduser(raw_source))))
 
-            if source not in actual_cdrom_sources:
-                # check if there's an existing cdrom with a different source
-                # that should be swapped (match by target if specified)
-                target = cdrom_config.get('target')
-                if target:
-                    actual_for_target = next(
-                        (c for c in actual_cdroms if c['target'] == target), None)
-                    if actual_for_target and actual_for_target['source'] != source:
-                        changed_cdroms.append({
-                            'target': target,
-                            'source': source,
-                        })
-                        continue
+        # Every explicit target is reserved before any matching happens.
+        # Doing it inside a single loop made the result depend on declaration
+        # order: a targetless entry could match the very drive a later
+        # explicit entry was about to overwrite, so with hdc=a.iso and
+        # hdd=b.iso attached and `[{source: a.iso}, {target: hdc, source:
+        # b.iso}]` declared, hdc became b.iso, hdd was removed, and a.iso —
+        # still declared — ended up attached nowhere, with the update
+        # reporting success (#164 FB-5).
+        for cdrom_config, _source in entries:
+            target = cdrom_config.get('target')
+            if not target:
+                continue
+            if target in claimed_targets:
+                raise ProvisionError(
+                    f"domain '{domain_name}' declares more than one cdrom on "
+                    f"target '{target}'. Each target holds one device.")
+            claimed_targets.add(target)
+
+        for cdrom_config, source in entries:
+            target = cdrom_config.get('target')
+
+            if target:
+                actual_for_target = actual_by_target.get(target)
+                if actual_for_target is None:
+                    new_cdroms.append(cdrom_config)
+                    continue
+                matched_targets.add(target)
+                if actual_for_target['source'] != source:
+                    # Covers an empty drive too (source None): inserting media
+                    # into a drive that already exists is a media change, not
+                    # a second device.
+                    changed_cdroms.append({'target': target, 'source': source})
+                continue
+
+            # Targetless: match by source, one-to-one, and never against a
+            # drive some explicit entry has reserved.
+            actual = next(
+                (c for c in actual_cdroms
+                 if c['source'] == source
+                 and c['target'] not in matched_targets
+                 and c['target'] not in claimed_targets), None)
+            if actual is None:
                 new_cdroms.append(cdrom_config)
+            else:
+                matched_targets.add(actual['target'])
 
         removed_cdroms = [
             c for c in actual_cdroms
-            if c['source'] not in desired_cdrom_sources
-            and not any(
-                ch['target'] == c['target'] for ch in changed_cdroms
-            )
+            if c['target'] not in matched_targets
+            # An empty drive holds no media to remove, and dropping it would
+            # silently change the domain's topology.
+            and c.get('source') is not None
         ]
 
         # --- Shared folder diff ---
-        actual_folders = self.get_actual_shared_folders(domain_name)
-        actual_folder_by_name = {f['name']: f for f in actual_folders}
-        actual_folder_names = set(actual_folder_by_name.keys())
+        # What boxman *configures* is the persistent definition, so that is
+        # what the reconcile compares against. Reading the live domain
+        # instead meant an attachment that had fallen back to config-only
+        # was invisible next run: it was proposed again, and libvirt
+        # rejected the duplicate persistent target -- so even a follow-up
+        # `update --restart` failed before it could restart. It also missed
+        # cancellation entirely: a pending share removed from the config
+        # before the restart produced no removal, because it had never
+        # appeared live (#164 C1 review, finding 7).
+        persistent_folders = self.get_actual_shared_folders(
+            domain_name, inactive=True)
+        live_folders = (
+            self.get_actual_shared_folders(domain_name)
+            if vm_state in self._LIVE_DOMAIN_STATES else persistent_folders)
+
+        def _normalised(folder):
+            return (
+                os.path.abspath(os.path.expanduser(folder.get('host_path', ''))),
+                bool(folder.get('readonly', False)),
+            )
+
+        persistent_by_name = {f['name']: f for f in persistent_folders}
+        live_by_name = {f['name']: f for f in live_folders}
 
         new_shared_folders = []
         changed_shared_folders = []
         desired_folder_names = set()
+        shared_folders_restart_pending = False
 
         for folder_config in (desired_shared_folders or []):
             name = folder_config.get('name', '')
             desired_folder_names.add(name)
-            host_path = os.path.abspath(
-                os.path.expanduser(folder_config.get('host_path', '')))
-            readonly = folder_config.get('readonly', False)
+            desired_state = _normalised(folder_config)
 
-            if name not in actual_folder_names:
+            configured = persistent_by_name.get(name)
+            if configured is None:
                 new_shared_folders.append(folder_config)
-            else:
-                actual = actual_folder_by_name[name]
-                if (actual['host_path'] != host_path or
-                        actual['readonly'] != readonly):
-                    changed_shared_folders.append(folder_config)
+            elif _normalised(configured) != desired_state:
+                changed_shared_folders.append(folder_config)
+
+            # ...and, separately, whether the *live* domain reflects it yet
+            attached = live_by_name.get(name)
+            if attached is None or _normalised(attached) != desired_state:
+                shared_folders_restart_pending = True
 
         removed_shared_folders = [
-            f for f in actual_folders
+            f for f in persistent_folders
             if f['name'] not in desired_folder_names
         ]
+        # a share still live but no longer configured also waits for a boot
+        if any(f['name'] not in desired_folder_names for f in live_folders):
+            shared_folders_restart_pending = True
 
         return {
             'cpu_changed': cpu_changed,
@@ -488,9 +685,15 @@ class VMStateDiffer:
             'actual_max_memory_mb': actual_max_memory_mb,
             'new_disks': new_disks,
             'resize_disks': resize_disks,
+            'removed_disks': removed_disks,
+            'has_disk_records': disk_records is not None,
+            'disk_conflicts': disk_conflicts,
+            'refused_disk_removals': refused_disk_removals,
+            'unowned_disks': unowned,
             'new_cdroms': new_cdroms,
             'removed_cdroms': removed_cdroms,
             'changed_cdroms': changed_cdroms,
+            'shared_folders_restart_pending': shared_folders_restart_pending,
             'new_shared_folders': new_shared_folders,
             'removed_shared_folders': removed_shared_folders,
             'changed_shared_folders': changed_shared_folders,
