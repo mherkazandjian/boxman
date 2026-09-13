@@ -13,6 +13,7 @@ service is ``healthy`` (when a healthcheck exists) or ``running``.
 
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 
@@ -26,6 +27,24 @@ DEFAULT_READINESS_TIMEOUT = 120
 #: default interactive shell for ``boxman exec`` (POSIX-universal; override
 #: with ``--shell``)
 DEFAULT_EXEC_SHELL = "sh"
+
+#: Compose falls back to ``COMPOSE_PROJECT_NAME`` *silently* when it cannot
+#: load a file, rather than failing, so a broken file plus that variable
+#: redirects the command at whatever project it names -- measured on 2.40.3,
+#: where ``down --dry-run`` with an explicit ``-p ourproj`` reported
+#: "Container victimproj-v-1  Stopping".
+#:
+#: Unsetting it is not enough: compose then reads ``COMPOSE_*`` from the
+#: project directory's ``.env`` (and from ``COMPOSE_ENV_FILES``), which
+#: reintroduces it. The shell environment takes precedence over both, so the
+#: variable is set -- to the **empty string**, not to the project name.
+#:
+#: Empty is what matters. Present, so ``.env`` cannot supply one; empty, so
+#: the fallback has nothing to fall back *to* and compose fails on a file it
+#: cannot load instead of silently proceeding without it. Pinning it to the
+#: real project name stopped the redirection but re-enabled that silent
+#: path, and ``down --volumes`` then deleted a volume declared
+#: ``external: true``. ``-p`` still carries the real name (#164 NET-C1).
 
 
 class ComposeRunner:
@@ -57,6 +76,27 @@ class ComposeRunner:
                 "'docker compose' (Compose v2 plugin) is not available — "
                 "install it or upgrade Docker."
             )
+
+    def available(self) -> bool:
+        """Whether ``docker`` and the Compose v2 plugin can be invoked."""
+        if shutil.which("docker") is None:
+            return False
+        return run(f"{self._sudo}docker compose version",
+                   hide=True, warn=True).ok
+
+    def validate(self, compose_file: str):
+        """``docker compose -f <file> config --quiet`` — resolve and check.
+
+        Compose is the authority on whether a file resolves: it performs
+        ``include:``, ``extends:`` and ``${VAR}`` interpolation first and then
+        refuses any service reference to an undeclared network. Running it on
+        a *candidate* is what lets boxman defer those cases safely instead of
+        guessing at them (#164 NET-C1).
+        """
+        cmd = (f"{self._sudo}env COMPOSE_PROJECT_NAME= docker compose "
+               f"-p {self.project} "
+               f"-f {shlex.quote(compose_file)} config --quiet")
+        return run(cmd, hide=True, warn=True)
 
     def up(self, timeout: int = DEFAULT_READINESS_TIMEOUT,
            force_recreate: bool = False):
@@ -162,7 +202,12 @@ class ComposeRunner:
         """The ``docker compose -p <project> …`` prefix as an argv list (for
         commands run with ``shell=False``)."""
         argv = (["sudo"] if self._sudo else []) + [
-            "docker", "compose", "-p", self.project]
+            "env", "COMPOSE_PROJECT_NAME=", "docker", "compose"]
+        if not self.compose_file:
+            # label-only: no file is wanted, and a `.env` COMPOSE_FILE would
+            # supply one anyway. `-f` beats `.env`, but here there is no `-f`.
+            argv += ["--env-file", os.devnull]
+        argv += ["-p", self.project]
         if self.compose_file:
             argv += ["-f", self.compose_file]
         if self.workdir:
@@ -175,7 +220,12 @@ class ComposeRunner:
         # compose labels (``docker compose -p <project> down`` — compose v2
         # resolves containers/networks from ``com.docker.compose.project``),
         # so containers can be removed even after the workdir/file is gone.
-        parts = [f"{self._sudo}docker compose -p {shlex.quote(self.project)}"]
+        parts = [f"{self._sudo}env COMPOSE_PROJECT_NAME= docker compose"]
+        if not self.compose_file:
+            # label-only: a `.env` COMPOSE_FILE would supply a file we did
+            # not ask for, and there is no `-f` here to beat it.
+            parts.append(f"--env-file {os.devnull}")
+        parts.append(f"-p {shlex.quote(self.project)}")
         if self.compose_file:
             parts.append(f"-f {shlex.quote(self.compose_file)}")
         if self.workdir:
