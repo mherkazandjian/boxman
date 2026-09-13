@@ -752,35 +752,65 @@ class DockerComposeSession(SessionConfigMixin):
 
         Services absent from the resolved model are skipped: Compose keeps
         root extension metadata for inactive services, so their provenance
-        survives even though they deploy nothing (#164 NET-C3).
-        """
-        emitted = (compose.get(NET_PROVENANCE_KEY) or {}).get("native") or {}
-        resolved = model.get(NET_PROVENANCE_KEY) or {}
-        resolved_native = resolved.get("native") or {}
-        ambiguous = set(resolved.get("ambiguous") or [])
-        services = model.get("services") or {}
+        survives even though they deploy nothing.
 
-        for box_name, sent in emitted.items():
+        Everything the model says about the provenance is checked against
+        what was emitted before any of that runs. The check is only as good
+        as the round trip, and a damaged one must fail loudly rather than
+        quietly accept: a missing or altered ambiguity list, a non-string
+        element, or an absent ``services`` field would each otherwise make
+        this pass without checking anything (#164 NET-C3).
+        """
+        sent = (compose.get(NET_PROVENANCE_KEY) or {})
+        emitted = sent.get("native") or {}
+        emitted_ambiguous = list(sent.get("ambiguous") or [])
+
+        def _damaged(what: str) -> ProvisionError:
+            return ProvisionError(
+                f"[{cluster_name}] the network provenance boxman wrote did "
+                f"not survive compose resolution ({what}), so the attachment "
+                f"cannot be checked. Nothing was published."
+            )
+
+        resolved = model.get(NET_PROVENANCE_KEY)
+        if not isinstance(resolved, dict):
+            raise _damaged("the extension is missing or not a mapping")
+        resolved_native = resolved.get("native")
+        if not isinstance(resolved_native, dict):
+            raise _damaged("'native' is missing or not a mapping")
+        ambiguous = resolved.get("ambiguous")
+        if not isinstance(ambiguous, list) or not all(
+                isinstance(a, str) for a in ambiguous):
+            raise _damaged("'ambiguous' is missing or not a list of names")
+        if sorted(ambiguous) != sorted(emitted_ambiguous):
+            raise _damaged(
+                f"'ambiguous' came back as {sorted(ambiguous)!r}, not "
+                f"{sorted(emitted_ambiguous)!r}")
+        if "services" not in model:
+            raise _damaged("the model has no 'services'")
+        services = model.get("services")
+        if not isinstance(services, dict):
+            raise _damaged("'services' is not a mapping")
+
+        ambiguous_set = set(ambiguous)
+        for box_name, box_sent in emitted.items():
             if box_name not in services:
+                # inactive: compose keeps the metadata, deploys nothing
                 continue
             got = resolved_native.get(box_name)
-            if got is None:
-                raise ProvisionError(
-                    f"[{cluster_name}] compose did not return the network "
-                    f"provenance boxman wrote for '{box_name}', so the "
-                    f"attachment cannot be checked. Nothing was published."
-                )
-            if not isinstance(got, list) or len(got) != len(sent):
-                raise ProvisionError(
-                    f"[{cluster_name}] the network provenance for "
-                    f"'{box_name}' did not survive compose resolution "
-                    f"({sent!r} -> {got!r}). Nothing was published."
-                )
-            attached = services[box_name].get("networks") or {}
+            if not isinstance(got, list) or len(got) != len(box_sent) or not \
+                    all(isinstance(name, str) for name in got):
+                raise _damaged(
+                    f"'{box_name}' came back as {got!r}, not a list of "
+                    f"{len(box_sent)} name(s)")
+            svc = services.get(box_name)
+            if not isinstance(svc, dict):
+                raise _damaged(f"service '{box_name}' is not a mapping")
+            attached = svc.get("networks") or {}
             attached_names = set(
                 attached if isinstance(attached, list) else list(attached))
             for name in got:
-                if name in ambiguous and name in attached_names:
+                if name in ambiguous_set and name in attached_names:
                     raise ConfigError(
                         f"box '{cluster_name}.{box_name}': this box attaches "
                         f"to '{name}', which names both a cluster-internal "

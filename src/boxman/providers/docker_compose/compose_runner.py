@@ -119,12 +119,18 @@ class ComposeRunner:
                 f"{(result.stderr or result.stdout).strip()}"
             )
         try:
-            return json.loads(result.stdout)
+            model = json.loads(result.stdout)
         except ValueError as exc:
             raise ProvisionError(
                 f"compose returned output for '{compose_file}' that is not "
                 f"valid JSON: {exc}"
             ) from exc
+        if not isinstance(model, dict):
+            raise ProvisionError(
+                f"compose returned a {type(model).__name__} for "
+                f"'{compose_file}', not a project model."
+            )
+        return model
 
     def up(self, timeout: int = DEFAULT_READINESS_TIMEOUT,
            force_recreate: bool = False):

@@ -624,6 +624,45 @@ class TestComposeRunner:
         assert argv[:4] == ["env", "COMPOSE_PROJECT_NAME=",
                             "docker", "compose"]
 
+    def test_resolved_model_rejects_a_non_object(self):
+        """`[]` used to reach the caller and raise AttributeError there."""
+        runner = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok("[]")
+        ):
+            with pytest.raises(ProvisionError, match=r"not a project model"):
+                runner.resolved_model("/wd/dc.yml")
+
+    def test_resolved_model_targets_the_file_it_is_given(self):
+        runner = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok("{}")
+        ) as run:
+            runner.resolved_model("/wd/.candidate")
+
+        cmd = run.call_args.args[0]
+        assert "-f /wd/.candidate" in cmd
+        assert "config --format json" in cmd
+
+    def test_validate_and_resolved_model_share_the_deployment_context(self):
+        """One builder, so a candidate call cannot drift from deployment."""
+        runner = self._runner()
+        with mock.patch(
+            "boxman.providers.docker_compose.compose_runner.run",
+            return_value=_ok("{}")
+        ) as run:
+            runner.validate("/wd/.candidate")
+            validated = run.call_args.args[0]
+            runner.resolved_model("/wd/.candidate")
+            resolved = run.call_args.args[0]
+
+        prefix = runner._base_for("/wd/.candidate")
+        assert validated.startswith(prefix)
+        assert resolved.startswith(prefix)
+        assert "--project-directory /wd" in prefix
+
     def test_base_command_shape(self):
         base = self._runner()._base()
         assert base == (
@@ -2554,14 +2593,14 @@ class TestAnInterpolatedReferenceToAnAmbiguousAliasIsRefused:
         assert self._run(tmp_path, model) is True
 
     def test_missing_provenance_in_the_model_fails(self, tmp_path):
-        with pytest.raises(ProvisionError, match=r"did not return"):
+        with pytest.raises(ProvisionError, match=r"did not survive"):
             self._run(tmp_path, self._model({}, ["lab"]))
 
         assert not (tmp_path / "docker-compose.yml").exists()
 
     def test_a_mangled_round_trip_fails(self, tmp_path):
         """`null` where a non-empty list was sent is not a valid answer."""
-        with pytest.raises(ProvisionError, match=r"did not survive|did not return"):
+        with pytest.raises(ProvisionError, match=r"did not survive"):
             self._run(tmp_path, self._model({"web": None}, ["lab"]))
 
     def test_a_resolution_failure_publishes_nothing(self, tmp_path):
@@ -2599,3 +2638,43 @@ class TestAnInterpolatedReferenceToAnAmbiguousAliasIsRefused:
 
         assert any(c[0] == "validate" for c in runner.calls)
         assert not any(c[0] == "resolved_model" for c in runner.calls)
+
+    # -- the check is only as good as the round trip -----------------------
+    # Each of these made an earlier version accept an ambiguous attachment
+    # without checking anything (#164 NET-C3).
+
+    def _damaged(self, tmp_path, mutate):
+        model = self._model({"web": ["lab"]}, ["lab"])
+        mutate(model)
+        with pytest.raises(ProvisionError, match=r"did not survive"):
+            self._run(tmp_path, model)
+        assert not (tmp_path / "docker-compose.yml").exists()
+
+    def test_a_removed_ambiguity_list_fails(self, tmp_path):
+        self._damaged(tmp_path, lambda m: m[self.KEY].pop("ambiguous"))
+
+    def test_an_emptied_ambiguity_list_fails(self, tmp_path):
+        self._damaged(tmp_path,
+                      lambda m: m[self.KEY].update(ambiguous=[]))
+
+    def test_an_altered_ambiguity_list_fails(self, tmp_path):
+        self._damaged(tmp_path,
+                      lambda m: m[self.KEY].update(ambiguous=["other"]))
+
+    def test_a_non_string_native_element_fails(self, tmp_path):
+        self._damaged(tmp_path,
+                      lambda m: m[self.KEY]["native"].update(web=[None]))
+
+    def test_a_missing_services_field_fails(self, tmp_path):
+        self._damaged(tmp_path, lambda m: m.pop("services"))
+
+    def test_a_removed_extension_fails(self, tmp_path):
+        self._damaged(tmp_path, lambda m: m.pop(self.KEY))
+
+    def test_a_present_but_empty_services_mapping_is_not_a_failure(self,
+                                                                   tmp_path):
+        """Distinct from a missing field: nothing is active, nothing to check."""
+        model = self._model({"web": ["lab"]}, ["lab"])
+        model["services"] = {}
+
+        assert self._run(tmp_path, model) is True

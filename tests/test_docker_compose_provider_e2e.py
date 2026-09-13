@@ -409,3 +409,87 @@ class TestHybridVmContainer:
             f"reachable (isolation regression) or ping never ran:\n"
             f"{out.stdout}{out.stderr}")
         assert not out.ok
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(shutil.which("docker") is None, reason="needs docker")
+class TestCandidateResolutionMatchesDeployment:
+    """A candidate must resolve exactly as the deployment command does.
+
+    `validate()` and `resolved_model()` both aim at a *staged* file rather
+    than the published one, so they carry the project directory explicitly.
+    If that drifted, a candidate could resolve against a different `.env` or
+    resolve a relative path differently from the `up` that follows — and pass
+    a check the deployment then fails (#164 NET-C3).
+
+    No containers are started: this compares configuration resolution only.
+    """
+
+    def _project(self, tmp_path):
+        """A workdir whose .env disagrees with the caller's directory."""
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        (workdir / ".env").write_text("TAG=alpine\nEXTRA=./included.yml\n")
+        (workdir / "included.yml").write_text(
+            "services:\n  extra: {image: busybox}\n")
+        (tmp_path / ".env").write_text("TAG=latest\nEXTRA=./wrong.yml\n")
+        body = (
+            'include: ["${EXTRA}"]\n'
+            'services:\n'
+            '  web:\n'
+            '    image: "nginx:${TAG}"\n'
+            '    volumes: ["./data:/d"]\n'
+        )
+        (workdir / "docker-compose.yml").write_text(body)
+        (workdir / ".candidate.yml").write_text(body)
+        (workdir / "data").mkdir()
+        return workdir
+
+    def _config(self, cwd, compose_file, workdir):
+        out = invoke.run(
+            f"env COMPOSE_PROJECT_NAME= docker compose -p dirctx "
+            f"-f {compose_file} --project-directory {workdir} "
+            f"config --format json",
+            hide=True, warn=True, in_stream=False)
+        assert out.ok, out.stderr
+        return json.loads(out.stdout)
+
+    def test_candidate_and_published_resolve_identically(self, tmp_path):
+        from boxman.providers.docker_compose.compose_runner import ComposeRunner
+
+        workdir = self._project(tmp_path)
+        # run from a directory that is NOT the workdir, with its own .env
+        runner = ComposeRunner(project="dirctx", workdir=str(workdir),
+                               compose_file=str(workdir / "docker-compose.yml"))
+        cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            candidate = runner.resolved_model(str(workdir / ".candidate.yml"))
+            deployed = self._config(
+                tmp_path, workdir / "docker-compose.yml", workdir)
+        finally:
+            os.chdir(cwd)
+
+        # the workdir's .env wins over the caller's, for both
+        assert candidate["services"]["web"]["image"] == "nginx:alpine"
+        assert deployed["services"]["web"]["image"] == "nginx:alpine"
+        # the relative include resolved against the workdir, for both
+        assert "extra" in candidate["services"]
+        assert "extra" in deployed["services"]
+        # and the relative bind path resolved to the same absolute path
+        assert (candidate["services"]["web"]["volumes"][0]["source"] ==
+                deployed["services"]["web"]["volumes"][0]["source"])
+
+    def test_validate_accepts_the_candidate_from_another_directory(self,
+                                                                   tmp_path):
+        from boxman.providers.docker_compose.compose_runner import ComposeRunner
+
+        workdir = self._project(tmp_path)
+        runner = ComposeRunner(project="dirctx", workdir=str(workdir),
+                               compose_file=str(workdir / "docker-compose.yml"))
+        cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            assert runner.validate(str(workdir / ".candidate.yml")).ok
+        finally:
+            os.chdir(cwd)
