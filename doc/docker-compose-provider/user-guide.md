@@ -221,6 +221,73 @@ Only a mode actually *in effect* does this: `network_mode: ""` (or an
 expression interpolating to empty) leaves the service on its declared
 networks rather than silently detaching it.
 
+
+## How the compose file is published
+
+Every generated file is validated with `docker compose config` **before the
+working `docker-compose.yml` is touched at all**: boxman writes a candidate
+under a unique temporary name, validates that, and publishes it with a
+single atomic rename. A file that does not resolve fails the run with
+Compose's own message and leaves the previous file exactly as it was.
+
+That matters because teardown reuses the on-disk file: a file Compose cannot
+read makes `down` fail while the containers keep running. Nothing is rolled
+back, because nothing is moved until a validated candidate exists — a
+rejected candidate, an I/O error, a crash, or another run failing
+concurrently all leave the working file untouched. If `docker compose`
+cannot be run at all, boxman publishes **nothing**.
+
+One case this cannot catch: a file whose `compose_extra.include:` reaches
+the `docker-compose.yml` boxman generates for that cluster. While staged the
+name still refers to the *previous* file, so Compose accepts it, and it
+becomes an include cycle once published. `up` then fails with Compose's own
+"include cycle detected" — boxman does not try to predict it, because doing
+so means re-implementing Compose's resolution of interpolated paths,
+`extends.file`, `project_directory` and YAML tags.
+
+> boxman sets `COMPOSE_PROJECT_NAME` to the **empty string** for every
+> `docker compose` call, and passes the real name with `-p`. Compose falls
+> back to that variable *silently* when it cannot load a file, so an
+> unreadable file plus an inherited value could point a teardown at a
+> different project entirely. Clearing it is not enough — Compose then reads
+> `COMPOSE_*` from the project directory's `.env` (or `COMPOSE_ENV_FILES`)
+> and the value comes back; the shell environment outranks both, so it has
+> to be *set*. Empty rather than the project name, so the fallback has
+> nothing to fall back to and a file Compose cannot load fails the command
+> instead of quietly proceeding without it. A label-only call additionally
+> passes `--env-file /dev/null`, since it has no `-f` to outrank a `.env`
+> that names one.
+
+## If the compose file cannot be read
+
+boxman does not try to predict whether the file is usable — every such check
+asked a different question than teardown does. It simply **attempts the
+operation with the file first**, because the file is authoritative when it
+works. A file that fails `docker compose config` may still tear down
+perfectly: delete a service's `env_file:` after deploying and `config` exits
+1 while `down --volumes` succeeds and still honours `external: true`. That
+case is not degraded.
+
+| operation | behaviour when the attempt fails |
+|---|---|
+| `ps` | retried by project label, with a warning. Read-only, so nothing the file defines is lost. |
+| `stop`, `start`, `pause`, `exec` | **not retried.** A failed `stop`/`start` may be a failed `pre_stop`/`post_start` hook, and stepping over it would report success while your hook never ran. |
+| `deprovision` (`down`), `destroy` (`down --volumes`) | **not retried.** The file is kept so a retry can use it. If there was no file to run them with, the containers are stopped; if the removal itself failed, they are left exactly as Compose left them — the failure may be a `pre_stop` hook, and stopping anyway would perform the step Compose withheld. |
+
+Resource removal is never retried by label because Compose reconstructs a
+project from container labels, and that reconstruction does not carry
+`external: true`. A label-only `down --volumes` would delete resources the
+config says to keep. **A missing compose file is refused for the same
+reason** — losing the file does not establish what the project owns.
+
+Restore or repair the file and re-run. If you accept that every resource
+carrying the project's labels will be removed, external ones included, run
+that explicitly yourself:
+
+```bash
+docker compose -p <project> down --volumes
+```
+
 ## Getting into a container
 
 `boxman ssh` stays **VM-only** — SSH into a container would mean an sshd

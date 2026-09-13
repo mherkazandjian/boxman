@@ -145,6 +145,11 @@ cluster **declares** is a real network and is always emitted. An omitted or empt
 for none, `compose_extra: {network_mode: none}`. Only a mode actually in
 effect drops the attachments — `network_mode: ""` does not.
 
+The generated file is validated with `docker compose config` **before** it
+replaces the working `docker-compose.yml`, so a file that does not resolve
+fails the run and leaves the previous one in place (teardown reuses that
+file). If Compose cannot be run, nothing is published.
+
 ## Shared networks (macvlan L2 to VMs)
 
 A top-level `shared_networks:` block declares host Linux bridges that both a
