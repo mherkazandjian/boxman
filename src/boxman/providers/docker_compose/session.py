@@ -806,9 +806,7 @@ class DockerComposeSession(SessionConfigMixin):
             svc = services.get(box_name)
             if not isinstance(svc, dict):
                 raise _damaged(f"service '{box_name}' is not a mapping")
-            attached = svc.get("networks") or {}
-            attached_names = set(
-                attached if isinstance(attached, list) else list(attached))
+            attached_names = self._attached_names(_damaged, box_name, svc)
             for name in got:
                 if name in ambiguous_set and name in attached_names:
                     raise ConfigError(
@@ -821,6 +819,38 @@ class DockerComposeSession(SessionConfigMixin):
                         f"Rename one of the two declarations so the "
                         f"attachment says which you meant."
                     )
+
+    @staticmethod
+    def _attached_names(damaged, box_name: str, svc: dict[str, Any]) -> set[str]:
+        """The networks a resolved service is attached to.
+
+        Shape-checked before use. A bare string was the interesting one:
+        ``networks: "lab"`` coerced to a set of its individual *characters*,
+        so nothing matched an alias and the check failed open. ``false`` and
+        ``0`` fell through as empty, and a number or a nested list raised
+        ``TypeError`` rather than the agreed error (#164 NET-C3).
+
+        Absent or null stays legitimate -- a service need not attach to
+        anything -- so only a present value of the wrong shape is refused.
+        """
+        if "networks" not in svc:
+            return set()
+        attached = svc["networks"]
+        if attached is None:
+            return set()
+        if isinstance(attached, dict):
+            names = list(attached)
+        elif isinstance(attached, list):
+            names = attached
+        else:
+            raise damaged(
+                f"service '{box_name}' has 'networks: {attached!r}', which is "
+                f"neither a mapping nor a list")
+        if not all(isinstance(n, str) for n in names):
+            raise damaged(
+                f"service '{box_name}' has a non-name entry in "
+                f"'networks': {names!r}")
+        return set(names)
 
     def _teardown_runner(
         self, cluster_name: str, cluster_cfg: dict[str, Any]

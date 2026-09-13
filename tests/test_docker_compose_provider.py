@@ -2678,3 +2678,25 @@ class TestAnInterpolatedReferenceToAnAmbiguousAliasIsRefused:
         model["services"] = {}
 
         assert self._run(tmp_path, model) is True
+
+    def _damaged_attachment(self, tmp_path, networks):
+        model = self._model({"web": ["lab"]}, ["lab"])
+        model["services"]["web"]["networks"] = networks
+        with pytest.raises(ProvisionError, match=r"did not survive"):
+            self._run(tmp_path, model)
+
+    @pytest.mark.parametrize("networks", ["lab", 42, {"lab": {}, 7: {}}])
+    def test_a_malformed_attachment_field_fails(self, tmp_path, networks):
+        """`networks: "lab"` used to compare individual characters."""
+        self._damaged_attachment(tmp_path, networks)
+
+    def test_a_non_string_attachment_entry_fails(self, tmp_path):
+        self._damaged_attachment(tmp_path, [None])
+
+    @pytest.mark.parametrize("networks", [None, [], {}])
+    def test_an_empty_attachment_is_legitimate(self, tmp_path, networks):
+        """A service need not attach to anything."""
+        model = self._model({"web": ["lab"]}, ["lab"])
+        model["services"]["web"]["networks"] = networks
+
+        assert self._run(tmp_path, model) is True
