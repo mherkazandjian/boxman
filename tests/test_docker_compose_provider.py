@@ -2685,7 +2685,13 @@ class TestAnInterpolatedReferenceToAnAmbiguousAliasIsRefused:
         with pytest.raises(ProvisionError, match=r"did not survive"):
             self._run(tmp_path, model)
 
-    @pytest.mark.parametrize("networks", ["lab", 42, {"lab": {}, 7: {}}])
+    @pytest.mark.parametrize("networks", [
+        "lab", 42, {"lab": {}, 7: {}},
+        # falsy but still the wrong shape: an `or {}` coercion placed before
+        # the shape check swallows these silently, and every other test here
+        # still passes (#164 NET-C3).
+        False, 0, "",
+    ])
     def test_a_malformed_attachment_field_fails(self, tmp_path, networks):
         """`networks: "lab"` used to compare individual characters."""
         self._damaged_attachment(tmp_path, networks)
