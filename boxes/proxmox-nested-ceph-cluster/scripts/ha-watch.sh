@@ -16,6 +16,12 @@ if [[ ${1:-} == --list ]]; then list_only=1; shift; fi
 timeout=${1:-600}; shift || true
 # any remaining arguments are a victim list captured before the kill
 preset_victims=("$@")
+# They cross a remote shell as words, so check each one is the shape we expect
+# rather than trusting whatever arrived (#171 B13).
+for _v in "${preset_victims[@]}"; do
+    [[ $_v =~ ^[a-z]+:[A-Za-z0-9._-]+$ ]] \
+        || die "not a usable HA resource id: '$_v' (expected e.g. vm:200)"
+done
 
 [[ -n ${NODE_IP[$node]:-} ]] || die "usage: ha-watch.sh <node> [--list] [timeout] [sid...]"
 # ask a surviving node: the first one that is not the victim

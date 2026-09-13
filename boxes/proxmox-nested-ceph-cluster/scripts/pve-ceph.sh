@@ -40,38 +40,58 @@ wait_quorum() {
     die "ceph monitors did not reach quorum (checked from $n)"
 }
 
-# mon_dump: the monmap as text, or nothing at all.
+# mon_exists <node>: does <node> already run a monitor?
 #
-# Bounded deliberately. `ceph mon dump` reaches out to a monitor, so on a
-# cluster that has none yet it blocks on its own default timeout instead of
-# answering "there are none" -- which is precisely the state this script is in
-# on a from-scratch run.
-mon_dump() {
-    pssh "$first" "timeout 10 ceph mon dump 2>/dev/null" 2>/dev/null
+# Asks the node, not the cluster. `ceph mon dump` reaches out to a monitor, so
+# on a cluster that has none yet it blocks until `timeout` kills it -- and an
+# assignment from a failing command substitution ends the script outright under
+# this file's `set -e`, which is how the first attempt at this fix still exited
+# with no monitor created. /var/lib/ceph/mon/ceph-<node> is local, needs no
+# running cluster and cannot hang. The mgr loop below already uses exactly this
+# test. Only an explicit `yes`/`no` is an answer: anything else -- ssh failing,
+# empty output, an unexpected reply -- is reported, never read as absence
+# (#171 B1).
+mon_exists() {
+    local node=$1 out
+    out=$(pssh "$node" "test -d /var/lib/ceph/mon/ceph-$node && echo yes || echo no") \
+        || die "cannot ask $node whether it already runs a ceph monitor"
+    case $out in
+        yes) return 0 ;;
+        no)  return 1 ;;
+        *)   die "unexpected reply from $node when checking for a ceph monitor: ${out:-<empty>}" ;;
+    esac
 }
 
+# Reachability first, so a later probe failure is a real failure and not
+# mistaken for "this node has no monitor".
+for n in "${MONS[@]}"; do wait_ssh "$n" 300; done
+
+# Is there a monitor anywhere yet? Decided before the loop, because only the
+# genuinely first monitor may skip the quorum wait.
+bootstrapped=0
 for n in "${MONS[@]}"; do
-    monmap=$(mon_dump)
-    if ! grep -qw "mon\.$n" <<<"$monmap"; then
-        if grep -q "mon\." <<<"$monmap"; then
-            # Every monitor after the first has to see a quorate cluster before
-            # it joins: the election following the previous mon takes a few
-            # seconds, and `pveceph mon create` fails with "Could not connect
-            # to ceph cluster" if it runs during that window.
+    if mon_exists "$n"; then bootstrapped=1; break; fi
+done
+
+for n in "${MONS[@]}"; do
+    if ! mon_exists "$n"; then
+        if (( bootstrapped )); then
+            # Every monitor after the first must see a quorate cluster before it
+            # joins: the election following the previous one takes a few seconds,
+            # and `pveceph mon create` fails with "Could not connect to ceph
+            # cluster" inside that window.
             wait_quorum "$first"
         else
-            # The first monitor bootstraps the cluster and therefore cannot
-            # wait for it. `pveceph init` above writes /etc/pve/ceph.conf --
-            # configuration, not a monitor -- so until this `mon create` runs
-            # there is nothing that could become quorate, and waiting here
-            # could only ever time out and die (#171 B1).
             log "bootstrapping the first ceph monitor on $n"
         fi
         pssh "$n" "pveceph mon create"
+        bootstrapped=1
+        mon_exists "$n" || die "pveceph mon create on $n reported success but left no monitor"
     fi
     wait_quorum "$n"
     log "mon $n ok"
 done
+
 for n in "${MGRS[@]}"; do
     pssh "$n" "test -d /var/lib/ceph/mgr/ceph-$n || pveceph mgr create"
     log "mgr $n ok"

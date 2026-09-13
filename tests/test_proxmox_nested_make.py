@@ -1,0 +1,251 @@
+"""
+Executed behaviour tests for boxes/proxmox-nested-ceph-cluster's Makefile.
+
+`make -n` proves a recipe expands and `bash -n` proves it parses. Neither can
+see an exit status being discarded, a credential written from a failed run, or
+a plaintext secret reaching a host -- which is how six defects survived a round
+of review with both checks green (#171). Everything here runs `make` for real,
+with stub executables on PATH, and asserts what actually happened.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import stat
+import subprocess
+
+import pytest
+
+pytestmark = pytest.mark.unit
+
+BOX = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "boxes", "proxmox-nested-ceph-cluster")
+
+PASSWORD = "s3cret-under-test"
+
+
+def _stub(path, body: str) -> None:
+    path.write_text("#!/usr/bin/env bash\n" + body)
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+
+@pytest.fixture
+def box(tmp_path):
+    """A throwaway copy of the box with its own key, and a stub bin/ on PATH."""
+    dst = tmp_path / "repo" / "boxes" / "proxmox-nested-ceph-cluster"
+    dst.parent.mkdir(parents=True)
+    shutil.copytree(BOX, dst, ignore=shutil.ignore_patterns(
+        "keys", "answer.toml", "*.iso", "conf.rendered.yml", ".terraform",
+        "*.tfstate*", ".env", "terraform.tfvars"))
+    (dst / "keys").mkdir()
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "test",
+                    "-f", str(dst / "keys" / "id_ed25519_pvelab")], check=True)
+    (tmp_path / "bin").mkdir()
+    return dst
+
+
+def _make(box, *targets, env=None, **overrides):
+    args = ["make", "-C", str(box), *targets]
+    args += [f"{k}={v}" for k, v in overrides.items()]
+    e = dict(os.environ, PATH=f"{box.parent.parent.parent / 'bin'}:{os.environ['PATH']}")
+    e.update(env or {})
+    return subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+
+
+# ── tf-token: a token must never come from a run that failed (B7, B8) ────────
+
+def test_a_token_from_a_failed_run_is_refused(box, tmp_path):
+    """ssh emitting a token and *then* failing must not be accepted.
+
+    pipefail makes the pipeline's status visible, but the status of the
+    assignment was never checked, so make exited 0 and replaced the
+    credentials with a token from a failed run (#171 B7).
+    """
+    tf = tmp_path / "tf"; tf.mkdir()
+    (tf / ".env").write_text("export TF_VAR_pve_api_token='existing'\n")
+    ssh = tmp_path / "bin" / "ssh-stub"
+    _stub(ssh, 'echo \'{"value":"leaked-token"}\'\nexit 255\n')
+
+    r = _make(box, "tf-token", SSH=str(ssh), TF_DIR=str(tf))
+
+    assert r.returncode != 0, f"a failed token run reported success:\n{r.stdout}"
+    assert (tf / ".env").read_text() == "export TF_VAR_pve_api_token='existing'\n", \
+        "existing credentials were replaced from a failed run"
+
+
+def test_a_run_returning_no_token_is_refused(box, tmp_path):
+    tf = tmp_path / "tf"; tf.mkdir()
+    ssh = tmp_path / "bin" / "ssh-stub"
+    _stub(ssh, 'echo "no json here"\n')
+
+    r = _make(box, "tf-token", SSH=str(ssh), TF_DIR=str(tf))
+
+    assert r.returncode != 0
+    assert not (tf / ".env").exists()
+
+
+def test_an_accepted_token_lands_0600(box, tmp_path):
+    """The token is root@pam with --privsep 0 (#171 B8)."""
+    tf = tmp_path / "tf"; tf.mkdir()
+    (tf / ".env").write_text("stale\n")
+    os.chmod(tf / ".env", 0o644)
+    ssh = tmp_path / "bin" / "ssh-stub"
+    _stub(ssh, 'echo \'{"value":"good-token"}\'\n')
+
+    r = _make(box, "tf-token", SSH=str(ssh), TF_DIR=str(tf))
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "good-token" in (tf / ".env").read_text()
+    assert stat.S_IMODE((tf / ".env").stat().st_mode) == 0o600, \
+        "an existing permissive file was not repaired"
+
+
+# ── terraform must not run on the ambient environment (B9) ───────────────────
+
+@pytest.mark.parametrize("content,why", [
+    ("export TF_VAR_pve_api_token='unterminated\n", "unterminated quote"),
+    ("exit 42\n", "non-zero return"),
+])
+def test_terraform_refuses_an_env_that_cannot_be_sourced(box, tmp_path, content, why):
+    """`test -r` proves the file opens, not that it parsed (#171 B9)."""
+    tf = tmp_path / "tf"; tf.mkdir()
+    (tf / ".env").write_text(content)
+    terraform = tmp_path / "bin" / "terraform"
+    _stub(terraform, f'echo "$@" >> {tmp_path}/terraform-calls\n')
+
+    r = _make(box, "tf-plan", TF_DIR=str(tf), TF=str(terraform))
+
+    assert r.returncode != 0, f"terraform ran despite a {why} in .env"
+    assert not (tmp_path / "terraform-calls").exists(), \
+        f"terraform was invoked with a {why} in .env"
+
+
+# ── the root password must not be left on disk (B15) ─────────────────────────
+
+def test_rendering_the_answer_file_leaves_no_password_behind(box):
+    """The stamp that recorded the password was 0644 and not rsync-excluded,
+    so `make sync` shipped the plaintext root password to both hosts -- the
+    very trap B14 is about (#171 B15)."""
+    r = _make(box, "answer", PVE_ROOT_PASSWORD=PASSWORD)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    holding = []
+    for root, _dirs, files in os.walk(box):
+        for f in files:
+            p = os.path.join(root, f)
+            if os.path.basename(p) in ("answer.toml", "Makefile"):
+                continue
+            try:
+                if PASSWORD in open(p, encoding="utf-8", errors="ignore").read():
+                    holding.append(os.path.relpath(p, box))
+            except OSError:
+                pass
+    assert not holding, f"the plaintext password was written to {holding}"
+
+
+def test_a_changed_password_actually_re_renders(box):
+    _make(box, "answer", PVE_ROOT_PASSWORD="first-one")
+    first = (box / "answer.toml").read_text()
+    _make(box, "answer", PVE_ROOT_PASSWORD="second-one")
+    assert (box / "answer.toml").read_text() != first, \
+        "the password override was a no-op; the ISO would install the old one"
+
+
+# ── host-clean must not call a failed teardown clean (B18) ───────────────────
+
+def test_host_clean_refuses_to_report_clean_after_a_failed_removal(box, tmp_path):
+    """The removals sat in `&&` lists whose status nothing inspected, so the
+    script printed "host <site> clean" having removed nothing (#171 B18)."""
+    fake = tmp_path / "bin"
+    _stub(fake / "ip", 'exit 1\n')          # no bridge, no vxlan
+    _stub(fake / "bridge", 'exit 0\n')
+    _stub(fake / "sudo", '''
+shift_args=("$@")
+if [[ "${shift_args[0]}" == firewall-cmd ]]; then
+    for a in "$@"; do
+        [[ $a == --query-* ]] && exit 0      # "it is bound"
+        [[ $a == --remove-* ]] && exit 1     # ...but removal fails
+    done
+fi
+exit 0
+''')
+    env = dict(PATH=f"{fake}:{os.environ['PATH']}", BOXMAN_SITE="hpe2",
+               PVE_LAB_DIR=str(tmp_path / "lab"))
+    r = subprocess.run(["bash", str(box / "scripts" / "host-clean.sh")],
+                       capture_output=True, text=True, env=dict(os.environ, **env),
+                       timeout=60)
+
+    assert r.returncode != 0, f"a failed teardown reported success:\n{r.stdout}"
+    assert "clean" not in r.stdout.split("ERROR")[-1], r.stdout
+
+
+# ── the failover drill: victims as data, and a verdict that survives (B12/B13) ─
+
+#: The watcher polls until every victim is `started` somewhere other than the
+#: dead node, so a stub that keeps reporting them on it never terminates.
+#: `on` selects which node the snapshot puts them on.
+def _ha_stub_lib(on: str) -> str:
+    return (
+        'set -euo pipefail\n'
+        'NODES=(pve1 pve2 pve3 pve4)\n'
+        'declare -A NODE_IP=([pve1]=10.77.0.11 [pve2]=10.77.0.12 '
+        '[pve3]=10.77.0.13 [pve4]=10.77.0.14)\n'
+        'LOGS=$PWD; log() { :; }; die() { echo "die $*"; exit 1; }; sleep() { :; }\n'
+        'pssh() {\n'
+        '  printf \'[{"type":"node","node":"pve4","status":"offline"},\'\n'
+        f'  printf \'{{"type":"service","node":"{on}","sid":"vm:200","state":"started"}},\'\n'
+        f'  printf \'{{"type":"service","node":"{on}","sid":"vm:201","state":"started"}}]\'\n'
+        '}\n')
+
+
+def _ha_watch(box, tmp_path, *args, on="pve1"):
+    work = tmp_path / f"ha-{on}-{len(args)}"
+    work.mkdir(exist_ok=True)
+    shutil.copy(box / "scripts" / "ha-watch.sh", work / "ha-watch.sh")
+    (work / "lib.sh").write_text(_ha_stub_lib(on))
+    return subprocess.run(["bash", "./ha-watch.sh", *args], cwd=work,
+                          capture_output=True, text=True, timeout=30)
+
+
+def test_the_victim_inventory_is_listed_one_per_line(box, tmp_path):
+    """--list takes the snapshot before the kill, so it reads the node the
+    services are still on (#171 B13)."""
+    r = _ha_watch(box, tmp_path, "pve4", "--list", on="pve4")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.split() == ["vm:200", "vm:201"]
+
+
+@pytest.mark.parametrize("victims", [[], ["vm:200"], ["vm:200", "vm:201"]])
+def test_preset_victims_are_accepted_as_arguments(box, tmp_path, victims):
+    """They cross a remote shell as words. Passed with their newlines intact,
+    everything after the first became a command of its own (#171 B13)."""
+    r = _ha_watch(box, tmp_path, "pve4", "30", *victims)
+    assert "not a usable HA resource id" not in r.stdout + r.stderr, r.stdout
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_a_sid_that_is_not_a_sid_is_refused(box, tmp_path):
+    r = _ha_watch(box, tmp_path, "pve4", "30", "vm:200 ; rm -rf /")
+    assert r.returncode != 0
+    assert "not a usable HA resource id" in r.stdout + r.stderr
+
+
+def test_the_failover_drill_reports_a_failed_readiness_check(box, tmp_path):
+    """`${restore_rc:-1}` substitutes only for unset or empty, so with
+    restore_rc already 0 a failed readiness check was swallowed (#171 B12)."""
+    ssh = tmp_path / "bin" / "ssh-stub"
+    _stub(ssh, """
+for a in "$@"; do
+  case "$a" in
+    *--list*)          echo "vm:200"; exit 0 ;;
+    *wait-first-boot*) exit 42 ;;
+    *ha-watch.sh*)     exit 0 ;;
+  esac
+done
+exit 0
+""")
+    r = _make(box, "ha-failover", SSH=str(ssh), ORCH="hpe1", NODE="pve4")
+    assert r.returncode != 0, (
+        f"a node that never became ready reported success:\n{r.stdout}\n{r.stderr}")

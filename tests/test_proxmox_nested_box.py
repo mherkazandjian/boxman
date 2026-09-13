@@ -122,34 +122,38 @@ def test_tasks_wrap_the_scripts(monkeypatch):
         assert os.path.isfile(script), script
 
 
-#: A stand-in for scripts/lib.sh. The real pve-ceph.sh sources whatever
-#: lib.sh sits beside it, so copying the script next to this one exercises
-#: its actual control flow -- no reimplementation of the loop under test.
-#: `pssh` answers as a cluster would: `ceph mon dump` reports only the
-#: monitors created so far, and `ceph quorum_status` fails while there are
-#: none, which is the state a from-scratch run starts in.
+#: A stand-in for scripts/lib.sh. The real pve-ceph.sh sources whatever lib.sh
+#: sits beside it, so copying the script next to this one exercises its actual
+#: control flow -- no reimplementation of the loop under test.
+#:
+#: `set -euo pipefail` is here because the real lib.sh sets it, and its absence
+#: is what let the first version of this fix pass: an assignment from a failing
+#: command substitution ends the script outright under `set -e`, and a stub that
+#: always answered successfully could never produce that. STUB_MODE selects the
+#: failure being modelled.
 _CEPH_STUB_LIB = r"""
+set -euo pipefail
 NODES=(pve1 pve2 pve3 pve4)
 LOGS="$T/logs"; mkdir -p "$LOGS"
 LAB_NET=10.77.0.0/24
 CEPH_POOL=vmpool
 MONSTATE="$T/mons"; : > "$MONSTATE"
 CALLS="$T/calls";  : > "$CALLS"
+MODE="${STUB_MODE:-normal}"
 
 log() { :; }
 die() { echo "die $*" >> "$CALLS"; exit 9; }
 sleep() { :; }
+wait_ssh() { return 0; }
 
 pssh() {
     local node=$1; shift; local cmd="$*"
     case "$cmd" in
-        *"ceph mon dump"*)
-            if [ -s "$MONSTATE" ]; then
-                echo "epoch 1"; local i=0
-                while read -r m; do
-                    echo "$i: [v2:10.77.0.1$i:3300/0] mon.$m"; i=$((i+1))
-                done < "$MONSTATE"
-            fi
+        *"/var/lib/ceph/mon/ceph-"*)
+            echo "mon_probe $node" >> "$CALLS"
+            [ "$MODE" = ssh_fail ]  && return 255
+            [ "$MODE" = odd_reply ] && { echo "maybe"; return 0; }
+            if grep -qx "$node" "$MONSTATE" 2>/dev/null; then echo yes; else echo no; fi
             return 0 ;;
         *"pveceph mon create"*)
             echo "mon_create $node" >> "$CALLS"
@@ -165,19 +169,15 @@ pssh() {
 """
 
 
-def _run_ceph_bootstrap(tmp_path) -> tuple[int, list[str]]:
-    """Run the real pve-ceph.sh against the stub; return (exit code, trace).
-
-    The trace keeps only the two events the monitor order depends on:
-    ``mon_create <node>`` and ``quorum_probe <node>``.
-    """
-    work = tmp_path / "cephrun"
+def _run_ceph_bootstrap(tmp_path, mode: str = "normal") -> tuple[int, list[str]]:
+    """Run the real pve-ceph.sh against the stub; return (exit code, trace)."""
+    work = tmp_path / f"cephrun-{mode}"
     work.mkdir()
     shutil.copy(os.path.join(BOX, "scripts", "pve-ceph.sh"), work / "pve-ceph.sh")
     (work / "lib.sh").write_text(_CEPH_STUB_LIB)
     proc = subprocess.run(
-        ["bash", "./pve-ceph.sh"], cwd=work, timeout=120,
-        env=dict(os.environ, T=str(work)), capture_output=True, text=True)
+        ["bash", "./pve-ceph.sh"], cwd=work, timeout=120, capture_output=True,
+        text=True, env=dict(os.environ, T=str(work), STUB_MODE=mode))
     calls = work / "calls"
     trace = [ln for ln in (calls.read_text().splitlines() if calls.exists() else [])
              if ln.startswith(("mon_create", "quorum_probe", "die"))]
@@ -188,8 +188,7 @@ def test_the_first_ceph_monitor_is_created_without_waiting_for_quorum(tmp_path):
     """
     #171 B1. ``pveceph init`` writes /etc/pve/ceph.conf -- configuration, not a
     monitor -- so on four fresh nodes nothing can be quorate until the first
-    ``pveceph mon create`` has run. Waiting first could only time out: the
-    from-scratch run died after 60 probes having created no monitor at all.
+    ``pveceph mon create`` has run, and waiting first could only time out.
     """
     rc, trace = _run_ceph_bootstrap(tmp_path)
 
@@ -203,8 +202,7 @@ def test_the_first_ceph_monitor_is_created_without_waiting_for_quorum(tmp_path):
 
 def test_every_monitor_after_the_first_still_waits_for_quorum(tmp_path):
     """The wait is correct for monitors 2..n: the election after the previous
-    one takes a few seconds and ``mon create`` fails with "Could not connect to
-    ceph cluster" inside that window. Only the bootstrap monitor is exempt."""
+    one takes a few seconds and ``mon create`` fails inside that window."""
     _rc, trace = _run_ceph_bootstrap(tmp_path)
 
     for node in ("pve2", "pve3"):
@@ -212,3 +210,26 @@ def test_every_monitor_after_the_first_still_waits_for_quorum(tmp_path):
         idx = trace.index(f"mon_create {node}")
         assert trace[idx - 1] == "quorum_probe pve1", (
             f"{node} was created without first waiting for quorum; trace={trace}")
+
+
+def test_a_node_that_cannot_be_asked_is_reported_not_assumed_monitorless(tmp_path):
+    """A failed probe says nothing about whether a monitor exists.
+
+    Reading ssh failure as absence would bootstrap a second monitor onto a
+    cluster that already has one. The run must stop and say so instead.
+    """
+    rc, trace = _run_ceph_bootstrap(tmp_path, mode="ssh_fail")
+
+    assert rc != 0, f"an unreachable node was tolerated; trace={trace}"
+    assert not [ln for ln in trace if ln.startswith("mon_create")], (
+        f"a monitor was created despite an unusable probe; trace={trace}")
+    assert any(ln.startswith("die") and "cannot ask" in ln for ln in trace), trace
+
+
+def test_an_unexpected_probe_reply_is_refused(tmp_path):
+    """Only ``yes``/``no`` is an answer. Anything else -- empty output, a
+    changed message -- must not be read as "no monitor here"."""
+    rc, trace = _run_ceph_bootstrap(tmp_path, mode="odd_reply")
+
+    assert rc != 0, f"an unexpected reply was tolerated; trace={trace}"
+    assert not [ln for ln in trace if ln.startswith("mon_create")], trace

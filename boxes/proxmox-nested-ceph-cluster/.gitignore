@@ -3,4 +3,3 @@ keys/
 answer.toml
 *.iso
 conf.rendered.yml
-.answer-password.stamp
