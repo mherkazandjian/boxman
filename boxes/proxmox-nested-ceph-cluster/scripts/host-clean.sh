@@ -9,12 +9,18 @@ peer=${PEER[$SITE]}; remote_ip=${HOST_IP[$peer]}; bridge=${SITE_BRIDGE[$SITE]}
 if ip link show "$VXLAN_IF" &>/dev/null; then
     sudo ip link del "$VXLAN_IF"; log "removed $VXLAN_IF"
 fi
-if [[ $SITE == hpe2 ]] && ip link show "$bridge" &>/dev/null; then
-    if [[ -z $(bridge link show master "$bridge") ]]; then
-        sudo ip link del "$bridge"; log "removed $bridge"
-    else
-        log "keeping $bridge: it still has ports (VMs attached?)"
+if [[ $SITE == hpe2 ]]; then
+    if ip link show "$bridge" &>/dev/null; then
+        if [[ -z $(bridge link show master "$bridge") ]]; then
+            sudo ip link del "$bridge"; log "removed $bridge"
+        else
+            log "keeping $bridge: it still has ports (VMs attached?)"
+        fi
     fi
+    # Deliberately outside the "bridge still exists" test. The permanent zone
+    # assignment outlives the interface, so after a reboot -- when the bridge
+    # is gone but firewalld's config still names it -- the old nesting skipped
+    # this entirely and reported a clean host (#171 B18).
     for perm in "" "--permanent"; do
         sudo firewall-cmd -q $perm --zone=trusted --query-interface="$bridge" \
             && sudo firewall-cmd -q $perm --zone=trusted --remove-interface="$bridge" \

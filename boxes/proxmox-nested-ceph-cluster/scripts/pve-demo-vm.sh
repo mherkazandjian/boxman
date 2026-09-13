@@ -7,6 +7,19 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 node=${1:-pve1}
 wait_ssh "$node"
 
+# `qm` is node-local, so after the documented `make demo; make migrate` the VM
+# lives on another node and a status probe on pve1 alone reported "absent".
+# The rerun then took the create branch, where `qm create 100` fails because
+# the id is already taken cluster-wide. Ask the cluster, and reconcile the VM
+# wherever it actually is (#171 B20).
+existing_node=$(pssh "$node" "pvesh get /cluster/resources --type vm --output-format json" \
+    | jq -r ".[] | select(.vmid == $DEMO_VMID) | .node")
+if [[ -n ${existing_node:-} && $existing_node != "$node" ]]; then
+    log "VM $DEMO_VMID already exists on $existing_node; reconciling it there"
+    node=$existing_node
+    wait_ssh "$node"
+fi
+
 # the RBD storage shows up as inactive for a few seconds after pool creation
 for _ in $(seq 1 30); do
     pssh "$node" "pvesm status --storage $CEPH_POOL 2>/dev/null | grep -qw active" && break
@@ -17,7 +30,7 @@ pssh "$node" "pvesm status --storage $CEPH_POOL | grep -qw active" || die "stora
 pssh "$node" "test -f /root/noble.img || curl -fsSL --retry 3 -o /root/noble.img $DEMO_IMG_URL"
 pscp -q "$KEY.pub" "root@${NODE_IP[$node]}:/root/pvelab.pub"
 
-if ! pssh "$node" "qm status $DEMO_VMID" &>/dev/null; then
+if [[ -z ${existing_node:-} ]]; then
     log "creating VM $DEMO_VMID ($DEMO_NAME) on $node"
     pssh "$node" "qm create $DEMO_VMID --name $DEMO_NAME --memory 2048 --cores 2 \
         --net0 virtio=$DEMO_MAC,bridge=vmbr0,mtu=1 \

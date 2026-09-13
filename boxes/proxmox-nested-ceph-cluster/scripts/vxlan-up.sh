@@ -43,11 +43,17 @@ if [[ $SITE == hpe2 ]]; then
     # worked. boxman's physdev ACCEPT lives in the iptables table and cannot
     # override a later nftables reject, so bind the lab bridge to `trusted`.
     # (hpe1 needs nothing: libvirt puts virbr-pve into its own zone.)
-    if [[ $(sudo firewall-cmd --get-zone-of-interface="$bridge" 2>/dev/null) != trusted ]]; then
-        sudo firewall-cmd -q --zone=trusted --add-interface="$bridge"
-        sudo firewall-cmd -q --permanent --zone=trusted --add-interface="$bridge"
-        log "firewalld: $bridge bound to zone trusted (bridged frames were being rejected)"
-    fi
+    # Runtime and permanent are reconciled independently. Inferring the
+    # permanent binding from the runtime zone cannot repair a half-applied
+    # state -- a runtime add that was never persisted, or a permanent entry
+    # whose runtime counterpart was dropped -- because the one test guarded
+    # both writes (#171 B19).
+    for perm in "" "--permanent"; do
+        if ! sudo firewall-cmd -q $perm --zone=trusted --query-interface="$bridge"; then
+            sudo firewall-cmd -q $perm --zone=trusted --add-interface="$bridge"
+            log "firewalld${perm:+ (permanent)}: $bridge bound to zone trusted (bridged frames were being rejected)"
+        fi
+    done
     if ! ip -4 addr show dev "$bridge" | grep -qw "$PEER_BRIDGE_IP"; then
         # a host address on the bridge: lets hpe2 reach the nodes directly and
         # gives libvirt's ARP-based IP discovery something to work with

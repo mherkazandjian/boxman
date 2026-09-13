@@ -23,7 +23,7 @@ variable "ha_enabled" {
 }
 
 variable "node_overrides" {
-  description = "Pin VMs to nodes instead of round-robin, e.g. { rocky01 = \"pve2\" }; changing a VM's node live-migrates it"
+  description = "Initial placement for VMs instead of round-robin, e.g. { rocky01 = \"pve2\" }. Applies when a VM is created: node_name is in ignore_changes (unconditionally, HA or not), so editing this later does NOT move a running VM -- migrate = true does not override an ignore. Use `qm migrate`, or an HA rule, to move one."
   type        = map(string)
   default     = {}
 }

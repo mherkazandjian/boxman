@@ -22,14 +22,33 @@ pingpid=$!
 sleep 1
 
 t0=$(date +%s%N)
-pssh "$src" "qm migrate $DEMO_VMID $target --online" 2>&1 | tee "$LOGS/qm-migrate-$src-$target.log" | grep -E "starting|migration (status|speed|finished)|downtime|successfully|ERROR" || true
+# `... | tee | grep` reports *grep's* exit status, and the `|| true` that was
+# there to tolerate a no-match swallowed a failed migration along with it, so
+# a rejected `qm migrate` was reported as a success (#171 B10). Keep the
+# migration's own status; filter the log afterwards for the readable lines.
+migrate_rc=0
+pssh "$src" "qm migrate $DEMO_VMID $target --online" \
+    > "$LOGS/qm-migrate-$src-$target.log" 2>&1 || migrate_rc=$?
 t1=$(date +%s%N)
+grep -E "starting|migration (status|speed|finished)|downtime|successfully|ERROR" \
+    "$LOGS/qm-migrate-$src-$target.log" || true
 
 sleep 2
+# stop the ping before any exit, so a failed migration does not leak it
 kill -INT "$pingpid" 2>/dev/null; wait "$pingpid" 2>/dev/null || true   # INT makes ping print its stats
 stats=$(grep -E 'packets transmitted' "$pinglog" || echo "no ping stats")
 
+(( migrate_rc == 0 )) || die "qm migrate $DEMO_VMID $src -> $target failed (exit $migrate_rc); see $LOGS/qm-migrate-$src-$target.log"
+
 log "migration took $(( (t1 - t0) / 1000000 )) ms end to end (qm migrate call)"
 log "ping during migration: $stats"
-log "now on: $(pssh pve1 "pvesh get /cluster/resources --type vm --output-format json" | jq -r ".[] | select(.vmid == $DEMO_VMID) | \"\(.node) (\(.status))\"")"
+
+# Assert where it landed. The placement was printed but never checked, so a
+# migration that returned 0 and left the guest on its source node still read
+# as a successful demo (#171 B10).
+placement=$(pssh pve1 "pvesh get /cluster/resources --type vm --output-format json" \
+    | jq -r ".[] | select(.vmid == $DEMO_VMID) | \"\(.node) (\(.status))\"")
+log "now on: $placement"
+[[ ${placement%% *} == "$target" ]] || \
+    die "VM $DEMO_VMID ended up on ${placement%% *}, not the requested $target"
 ssh "${SSH_OPTS[@]}" "${4:-demo}@$DEMO_IP" 'echo "guest uptime: $(cut -d" " -f1 /proc/uptime)s"'
