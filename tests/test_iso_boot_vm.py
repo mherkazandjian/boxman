@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import ProvisionError
 from boxman.providers.libvirt.direct_vm import normalize_disk_size
 from boxman.providers.libvirt.iso_boot_vm import IsoBootVM
 
@@ -189,3 +190,46 @@ class TestNetworkMacPinning:
         virt_install_call = mock_run.call_args_list[1][0][0]
         assert "--network=network=n1,model=virtio" in virt_install_call
         assert ",mac=" not in virt_install_call
+
+
+class TestDeclaredButUnresolvableNetworks:
+    """#171 A4, the runtime half.
+
+    `networks: [""]` passed validation, was skipped at resolution, and fell
+    through to libvirt's shared `default` network with nothing reported --
+    the libvirt twin of #164 NET-C1.
+    """
+
+    def test_a_declared_list_that_resolves_to_nothing_is_refused(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, networks=[""])
+        with pytest.raises(ProvisionError, match="declared"):
+            vm._networks()
+
+    def test_the_refusal_names_the_vm_and_what_was_declared(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, networks=[{"mac": "52:54:00:0c:01:01"}])
+        with pytest.raises(ProvisionError) as exc:
+            vm._networks()
+        assert vm.vm_name in str(exc.value)
+
+    def test_an_omitted_list_still_selects_the_default_network(self, tmp_path):
+        """`_resolve_iso_config` writes `_resolved_networks: []` even when no
+        `networks:` was given, so an empty list must mean "ask the next
+        source", not "declared and unresolvable"."""
+        vm = _make_iso_vm(tmp_path, networks=[])
+        assert vm._networks() == ["default"]
+
+    def test_an_empty_resolved_list_falls_through_to_the_raw_names(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, networks=[{"name": "talos-net"}],
+                          _resolved_networks=[])
+        assert vm._networks() == ["talos-net"]
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_no_disk_is_created_when_the_networks_are_refused(self, mock_run, tmp_path):
+        """The refusal has to come before qemu-img, or a rejected VM still
+        leaves a boot disk behind."""
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path, networks=[""], iso_path="/data/talos.iso")
+        with pytest.raises(ProvisionError):
+            vm.create()
+        assert mock_run.call_count == 0, (
+            f"{mock_run.call_count} shell command(s) ran before the refusal")

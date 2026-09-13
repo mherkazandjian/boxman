@@ -8,6 +8,7 @@ import os
 import shlex
 from urllib.parse import urlparse
 
+from boxman.utils.mac import canonical_mac, is_mac_like
 from boxman.exceptions import (
     BoxmanError,
     ConfigError,
@@ -566,7 +567,8 @@ class ImagesMixin:
 
     @classmethod
     def _validate_direct_boot_networks(cls, vm_info: dict, loc: str,
-                                       seen_macs: dict) -> list[str]:
+                                       seen_macs: dict,
+                                       adapter_macs: dict | None = None) -> list[str]:
         """Validate a direct-boot VM's ``networks:`` list; returns reasons.
 
         Entries are bare names or ``{name, mac}`` mappings. A ``mac`` must be
@@ -577,32 +579,75 @@ class ImagesMixin:
         the VMs of one validation pass.
         """
         networks = vm_info.get('networks')
+        # Omitted or null means "nothing declared", which legitimately falls
+        # back to libvirt's `default` network. An empty list means the same.
+        # What is refused below is a reference that was *declared* and cannot
+        # resolve -- the same rule the compose provider follows (#164 NET-C1).
         if networks is None:
             return []
         if not isinstance(networks, list):
             return ["'networks:' must be a list of names or {name, mac} mappings"]
+        adapter_macs = adapter_macs or {}
         reasons = []
         for entry in networks:
             if isinstance(entry, str):
+                # A blank string passed silently, was skipped at resolution
+                # time, and left the VM on libvirt's `default` network with
+                # nothing reported (#171 A4).
+                if not entry.strip():
+                    reasons.append(
+                        "networks entry is blank; remove it, or name a network "
+                        "(an omitted 'networks:' is what selects the default)")
                 continue
-            if not isinstance(entry, dict) or not entry.get('name'):
+            if not isinstance(entry, dict) or not str(entry.get('name') or '').strip():
                 reasons.append(f"networks entry {entry!r} has no 'name'")
                 continue
             mac = entry.get('mac')
             if mac is None:
                 continue
-            mac_s = str(mac).lower()
-            if not cls._MAC_RE.fullmatch(mac_s):
+            if not is_mac_like(mac):
                 reasons.append(
                     f"network '{entry['name']}' has an invalid mac {mac!r}")
                 continue
+            # Canonical, so `52:54:0:c:1:1` and `52:54:00:0c:01:01` are one key
+            # rather than two that both reach virt-install (#171 A1).
+            mac_s = canonical_mac(mac)
             if mac_s in seen_macs:
                 reasons.append(
                     f"network '{entry['name']}' mac {mac_s} is already used "
                     f"by {seen_macs[mac_s]}")
                 continue
+            if mac_s in adapter_macs:
+                reasons.append(
+                    f"network '{entry['name']}' mac {mac_s} is already used "
+                    f"by {adapter_macs[mac_s]}")
+                continue
             seen_macs[mac_s] = loc
         return reasons
+
+    def _adapter_mac_index(self) -> dict[str, str]:
+        """Canonical ``network_adapters[].mac`` -> where it was declared.
+
+        Built in one pass over every VM before the per-VM checks, so a pin is
+        caught whichever side is declared first (#171 A2).
+
+        Adapter MACs are indexed only to compare against direct-boot pins.
+        Two adapters sharing an address is *not* reported: adapters on separate
+        isolated L2s may legitimately do so, and prohibiting it project-wide
+        would refuse configurations well outside what this validation is for.
+        """
+        index: dict[str, str] = {}
+        for cluster_name, cluster in (self.config.get('clusters') or {}).items():
+            for vm_name, vm_info in (cluster.get('vms') or {}).items():
+                for i, adapter in enumerate(vm_info.get('network_adapters') or []):
+                    if not isinstance(adapter, dict):
+                        continue
+                    mac = adapter.get('mac')
+                    if mac and is_mac_like(mac):
+                        index.setdefault(
+                            canonical_mac(mac),
+                            f"{cluster_name}.vms.{vm_name}.network_adapters[{i}]")
+        return index
 
     def validate_base_images(self) -> None:
         """
@@ -623,6 +668,7 @@ class ImagesMixin:
         invalid = []
         bad_networks = []
         seen_macs: dict[str, str] = {}
+        adapter_macs = self._adapter_mac_index()
         for cluster_name, cluster in self.config.get('clusters', {}).items():
             cluster_base = cluster.get('base_image', '')
             for vm_name, vm_info in cluster.get('vms', {}).items():
@@ -631,7 +677,7 @@ class ImagesMixin:
                 first_boot = boot_order[0] if boot_order else 'hd'
                 if first_boot in ('cdrom', 'network'):
                     for reason in self._validate_direct_boot_networks(
-                            vm_info, loc, seen_macs):
+                            vm_info, loc, seen_macs, adapter_macs):
                         bad_networks.append(f"{loc} ({reason})")
                 if first_boot == 'cdrom':
                     ok, reason = self._validate_cdrom_boot(vm_info, iso_names)
@@ -1166,7 +1212,10 @@ class ImagesMixin:
                     cluster_name=cluster_name,
                     network_name=name,
                 ),
-                "mac": str(mac).lower() if mac else None,
+                # canonical, not merely lowercased: the spec is what reaches
+                # virt-install, and it has to compare equal to a dhcp.hosts
+                # reservation spelled the other way (#171 A1)
+                "mac": canonical_mac(mac) if mac else None,
             })
         return specs
 

@@ -542,3 +542,108 @@ class TestIsoPublication:
 
         assert result == {"talos-omni": str(dest)}
         assert dest.read_bytes() == b"theirs"
+
+
+class TestMacCollisionsAcrossSpellingsAndAdapters:
+    """#171 A1/A2. A mac is an address, not a string.
+
+    libvirt parses `52:54:0:c:1:1` and stores `52:54:00:0c:01:01`, so a check
+    that compares spellings lets one address through twice, and a `dhcp.hosts`
+    reservation silently fails to match the NIC written for it.
+    """
+
+    def _mgr(self, vms):
+        return _manager_with_config({"project": "p", "clusters": {"c": {"vms": vms}}})
+
+    @staticmethod
+    def _iso_vm(**extra):
+        return {"boot_order": ["cdrom", "hd"], "cdroms": [{"source": "/x.iso"}], **extra}
+
+    def test_two_spellings_of_one_address_collide(self):
+        mgr = self._mgr({
+            "v1": self._iso_vm(networks=[{"name": "n", "mac": "52:54:0:c:1:1"}]),
+            "v2": self._iso_vm(networks=[{"name": "n", "mac": "52:54:00:0c:01:01"}]),
+        })
+        with pytest.raises(ValueError, match="already used"):
+            mgr.validate_base_images()
+
+    def test_the_stored_spec_is_canonical(self):
+        """It is what reaches virt-install, so it must compare equal to a
+        reservation written the padded way."""
+        mgr = _manager_with_config({"project": "p"})
+        specs = mgr._resolved_network_specs(
+            "c", {"networks": [{"name": "n", "mac": "52:54:0:C:1:1"}]})
+        assert specs[0]["mac"] == "52:54:00:0c:01:01"
+
+    def test_a_pin_collides_with_an_adapter_on_another_vm(self):
+        mgr = self._mgr({
+            "v1": self._iso_vm(networks=[{"name": "n", "mac": "52:54:00:0c:01:01"}]),
+            "v2": {"base_image": "t", "network_adapters": [{"mac": "52:54:00:0c:01:01"}]},
+        })
+        with pytest.raises(ValueError, match="network_adapters"):
+            mgr.validate_base_images()
+
+    def test_the_collision_is_found_whichever_side_is_declared_first(self):
+        """The adapter index is built in one pass before the per-VM checks, so
+        declaration order cannot hide the clash."""
+        mgr = self._mgr({
+            "aaa": {"base_image": "t", "network_adapters": [{"mac": "52:54:00:0c:01:02"}]},
+            "zzz": self._iso_vm(networks=[{"name": "n", "mac": "52:54:0:c:1:2"}]),
+        })
+        with pytest.raises(ValueError, match="already used"):
+            mgr.validate_base_images()
+
+    def test_two_adapters_sharing_an_address_are_not_reported(self):
+        """#171 A2(b). Adapters on separate isolated L2s may legitimately
+        share one, and prohibiting it project-wide would refuse configurations
+        outside what this validation is for."""
+        mgr = self._mgr({
+            "v1": {"base_image": "t", "network_adapters": [{"mac": "52:54:00:0c:01:03"}]},
+            "v2": {"base_image": "t", "network_adapters": [{"mac": "52:54:00:0c:01:03"}]},
+        })
+        mgr.validate_base_images()
+
+    def test_a_pin_that_matches_only_its_own_reservation_is_fine(self):
+        """The positive case: without it this check could pass by refusing
+        everything."""
+        mgr = self._mgr({"v1": self._iso_vm(
+            networks=[{"name": "n", "mac": "52:54:00:0c:01:04"}])})
+        mgr.validate_base_images()
+
+
+class TestDeclaredButUnresolvableNetworks:
+    """#171 A4. The libvirt twin of #164 NET-C1: an explicit reference that
+    cannot resolve must be refused, never dropped onto the default network."""
+
+    def _mgr(self, vms):
+        return _manager_with_config({"project": "p", "clusters": {"c": {"vms": vms}}})
+
+    @staticmethod
+    def _iso_vm(**extra):
+        return {"boot_order": ["cdrom", "hd"], "cdroms": [{"source": "/x.iso"}], **extra}
+
+    @pytest.mark.parametrize("entry", ["", "   "])
+    def test_a_blank_entry_is_refused(self, entry):
+        mgr = self._mgr({"v": self._iso_vm(networks=[entry])})
+        with pytest.raises(ValueError, match="blank"):
+            mgr.validate_base_images()
+
+    def test_a_mapping_with_a_blank_name_is_refused(self):
+        mgr = self._mgr({"v": self._iso_vm(networks=[{"name": "  "}])})
+        with pytest.raises(ValueError, match="no 'name'"):
+            mgr.validate_base_images()
+
+    def test_one_bad_entry_among_good_ones_is_refused(self):
+        mgr = self._mgr({"v": self._iso_vm(networks=["good", ""])})
+        with pytest.raises(ValueError, match="blank"):
+            mgr.validate_base_images()
+
+    @pytest.mark.parametrize("networks", [None, []])
+    def test_omitted_or_empty_still_means_the_default_network(self, networks):
+        """`_resolve_iso_config` writes `_resolved_networks: []` even when no
+        `networks:` was given, so an empty list must not be read as a failed
+        resolution."""
+        vm = self._iso_vm()
+        if networks is not None:
+            vm["networks"] = networks
+        self._mgr({"v": vm}).validate_base_images()
