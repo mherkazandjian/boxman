@@ -26,6 +26,28 @@ BOX = os.path.join(
 
 PASSWORD = "s3cret-under-test"
 
+#: An ssh stub that actually *executes* the remote command string in a second
+#: shell, so word splitting happens the way it does on the far side. `$1` is
+#: the host and the rest is the command, exactly as ssh receives them.
+SSH_RUNS_REMOTE = """
+shift
+case "$*" in
+  *--list*) printf 'vm:200\\nvm:201\\n'; exit 0 ;;
+  *ha-watch.sh*)
+      # the one command under test: run it in a real second shell, so the
+      # word splitting is the far side's and not Python's idea of it
+      bash -c "$*" ;;
+  *) exit 0 ;;
+esac
+"""
+
+#: Stands in for ha-watch.sh and records the argv it was handed.
+RECORD_ARGV = """
+printf 'ARGC=%s\\n' "$#" >> @LOG@
+for a in "$@"; do printf 'ARG=%s\\n' "$a" >> @LOG@; done
+"""
+
+
 
 def _stub(path, body: str) -> None:
     path.write_text("#!/usr/bin/env bash\n" + body)
@@ -379,46 +401,34 @@ def test_a_resource_outside_the_policy_is_left_alone(box, tmp_path):
 
 
 def test_multiple_victims_cross_the_remote_shell_as_arguments(box, tmp_path):
-    """#171 B13, the Makefile half.
+    """#171 B13, the Makefile half, tested through a real second shell.
 
     `ha-watch.sh --list` prints one sid per line. Interpolated into the remote
-    command string with the newlines intact, everything after the first became
-    a command of its own. The script-side tests could not see this: they are
-    handed clean argv by pytest.
+    command with the newlines intact, everything after the first became a
+    command of its own.
+
+    The remote command is a *string* a second shell parses, so inspecting it
+    with `str.split()` proves nothing: Python treats quote characters as
+    ordinary text, so `\' vm:200 vm:201 \'` splits into two plausible tokens
+    while the real shell delivers one invalid argument. This runs the string
+    through `bash -c` and records the argv the watcher actually receives.
     """
-    log = tmp_path / "ssh-argv.log"
+    argv_log = tmp_path / "watch-argv.log"
     ssh = tmp_path / "bin" / "ssh-stub"
-    # One line per argument, so quoting the whole list into a single argument
-    # is visible. `"$*"` joins them and cannot tell the two apart -- which is
-    # how an earlier version of this test passed with the list quoted.
-    _stub(ssh, f'''
-printf 'ARGC=%s\\n' "$#" >> {log}
-for a in "$@"; do printf 'ARG=%s\\n' "$a" >> {log}; done
-for a in "$@"; do
-  case "$a" in
-    *--list*)          printf 'vm:200\\nvm:201\\n'; exit 0 ;;
-    *wait-first-boot*) exit 0 ;;
-    *ha-watch.sh*)     exit 0 ;;
-  esac
-done
-exit 0
-''')
-    _make(box, "ha-failover", SSH=str(ssh), ORCH="hpe1", NODE="pve4")
+    _stub(ssh, SSH_RUNS_REMOTE)
+    recorder = tmp_path / "bin" / "ha-watch.sh"
+    _stub(recorder, RECORD_ARGV.replace("@LOG@", str(argv_log)))
 
-    args = [ln[4:] for ln in log.read_text().splitlines() if ln.startswith("ARG=")]
-    watch = [a for a in args if "ha-watch.sh" in a and "--list" not in a]
-    assert watch, args
+    r = _make(box, "ha-failover", SSH=str(ssh), ORCH="hpe1", NODE="pve4",
+              SCRIPTS=str(tmp_path / "bin"))
 
-    # The remote command is one ssh argument; the sids have to arrive inside it
-    # as separate *words*, neither glued together by quoting nor split across
-    # lines. Split it the way the remote shell would.
-    words = watch[0].split()
-    assert "vm:200" in words and "vm:201" in words, (
-        f"the sids did not arrive as separate words: {watch[0]!r}")
-    assert not any(w.startswith("vm:200 ") or " vm:201" in w for w in words), (
-        f"the victim list was quoted into a single argument: {watch[0]!r}")
-    assert "\n" not in watch[0], (
-        f"a newline survived into the remote command: {watch[0]!r}")
+    assert r.returncode == 0, "the drill failed:\n" + r.stdout + r.stderr
+    args = [ln[4:] for ln in argv_log.read_text().splitlines()
+            if ln.startswith("ARG=")]
+    assert args[-2:] == ["vm:200", "vm:201"], (
+        "the sids did not arrive as separate arguments: %r" % (args,))
+    assert all(" " not in a for a in args), "an argument contains a space: %r" % (args,)
+
 
 
 # ── HA rules, against a stub that actually keeps state (D1 follow-ups) ───────
@@ -459,6 +469,14 @@ pssh() {
             echo "$HA_RESOURCES"; return 0 ;;
         *"pvesh get /cluster/ha/rules --output-format json"*|*"pvesh get /cluster/ha/rules"*)
             [ "${RULE_LIST_FAILS:-0}" = 1 ] && { echo "[]"; return 255; }
+            # exit 0, valid JSON, but the section-config parser warned that it
+            # skipped something -- so the listing is not the whole truth
+            [ "${RULE_LIST_WARNS:-0}" = 1 ] && {
+                echo "ignoring invalid configuration line" >&2
+                echo '[{"rule":"prefer-hpe1","resources":"vm:200"}]'; return 0; }
+            [ "${RULE_LIST_SHAPE:-}" = notarray ] && { echo '{"oops":true}'; return 0; }
+            [ "${RULE_LIST_SHAPE:-}" = noname ] && {
+                echo '[{"resources":"vm:200"}]'; return 0; }
             local out="[" first_e=1 r
             for r in "$RULES"/*; do
                 [ -e "$r" ] || continue
@@ -595,3 +613,39 @@ def test_no_per_rule_lookup_is_issued(box, tmp_path):
     per_rule = [c for c in calls
                 if c.startswith("pvesh get /cluster/ha/rules/")]
     assert not per_rule, f"a per-rule lookup was issued: {per_rule}"
+
+
+@pytest.mark.parametrize("env,why", [
+    ({"RULE_LIST_WARNS": 1}, "the rule config did not parse cleanly"),
+    ({"RULE_LIST_SHAPE": "notarray"}, "the listing is not an array"),
+    ({"RULE_LIST_SHAPE": "noname"}, "an entry has no rule name"),
+])
+def test_an_untrustworthy_rule_listing_prevents_every_write(box, tmp_path, env, why):
+    """Finding 1. Exit 0 with valid JSON is not a certificate: Proxmox's
+    section-config parser warns on stderr and *skips* a malformed header or an
+    unknown section type, so a rule can vanish from the listing with nothing in
+    the status to say so. And parsing the listing through
+    `< <(jq … || true)` let a jq that emitted some entries and then failed
+    produce a partial inventory -- the same process-substitution defect as B11
+    and the HA inventory read, for the third time.
+    """
+    tag = "untrust-" + (list(env.values())[0] if isinstance(list(env.values())[0], str) else "warn")
+    proc, rules = _run_ha_stateful(
+        box, tmp_path, homes="vm:200=pve1", resources=[200],
+        preset={"prefer-hpe2": "vm:201"}, tag=tag, **env)
+
+    assert proc.returncode != 0, f"{why}, but the run continued:\n{proc.stdout}"
+    calls = (tmp_path / ("ha-stateful-" + tag) / "calls").read_text()
+    assert "pvesh set" not in calls and "pvesh create" not in calls \
+        and "pvesh delete" not in calls, f"a write happened although {why}"
+    assert "prefer-hpe2" in rules, "a rule was removed on an untrustworthy listing"
+
+
+def test_an_empty_rule_listing_is_a_valid_answer(box, tmp_path):
+    """A cluster with no rules yet must not be mistaken for a failure -- the
+    listing callback returns exit 0 and `[]` for a clean empty configuration."""
+    proc, rules = _run_ha_stateful(
+        box, tmp_path, homes="vm:200=pve1", resources=[200], preset={}, tag="emptylist")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert rules.get("prefer-hpe1", "") == "vm:200", rules

@@ -62,13 +62,44 @@ log "policy homes: ${#POLICY_HOME[@]} resources"
 # (absence surfaces as 255, a query failure can be 13). Listing the rules once
 # and checking *that* command's status removes the question -- afterwards,
 # "does this rule exist" is a lookup in data we know we read successfully.
-rules_json=$(pssh "$first" "pvesh get /cluster/ha/rules --output-format json") \
+rules_json=$(pssh "$first" "pvesh get /cluster/ha/rules --output-format json" 2>"$LOGS/ha-rules.err") \
     || die "could not list the HA rules on $first"
+
+# Exit 0 with valid JSON is not a certificate that the on-disk rule config
+# parsed completely: Proxmox's section-config parser warns on stderr and
+# *skips* a malformed header or an unknown section type, so a rule can vanish
+# from the listing without any status saying so. Refuse to treat a warned
+# listing as authoritative.
+if [[ -s $LOGS/ha-rules.err ]]; then
+    die "the HA rule configuration on $first did not parse cleanly, so the
+         listing cannot be trusted: $(tr '\n' ' ' < "$LOGS/ha-rules.err")"
+fi
+
+# Parse in one checked step. Reading through `< <(jq … || true)` meant a jq
+# that emitted some entries and then failed produced a *partial* inventory
+# that nothing rejected -- the same process-substitution defect as B11 and the
+# HA inventory read, for the third time. The result is captured, its status
+# checked, and its shape validated before it becomes the inventory.
+jq -e 'type == "array"' <<<"$rules_json" >/dev/null 2>&1 \
+    || die "the HA rule listing from $first is not a JSON array"
+# Checked in jq, not by the read loop below: with IFS set to a tab -- which is
+# IFS *whitespace* -- bash discards a leading empty field, so an entry with no
+# name arrives with its resources shifted into the name and the loop's own
+# guard can never fire.
+jq -e 'all(.[]; ((.rule // .name // "") | length) > 0)' <<<"$rules_json" >/dev/null 2>&1 \
+    || die "the HA rule listing from $first has an entry with no rule name"
+rules_tsv=$(jq -r '.[] | [(.rule // .name // ""), (.resources // "")] | @tsv' \
+            <<<"$rules_json") \
+    || die "could not parse the HA rule listing from $first"
+
 declare -A RULE_RESOURCES=()
-while IFS=$'\t' read -r _rule _res; do
-    [[ -n $_rule ]] && RULE_RESOURCES[$_rule]=$_res
-done < <(jq -r '.[] | [.rule // .name // empty, (.resources // "")] | @tsv' \
-         <<<"$rules_json" 2>/dev/null || true)
+if [[ -n $rules_tsv ]]; then
+    while IFS=$'\t' read -r _rule _res; do
+        [[ -n $_rule ]] || die "the HA rule listing from $first has an entry with no name"
+        RULE_RESOURCES[$_rule]=$_res
+    done <<<"$rules_tsv"
+fi
+# An empty array is a legitimate answer: a cluster with no rules yet.
 
 rule_exists() { [[ -v RULE_RESOURCES[$1] ]]; }
 rule_members() { echo "${RULE_RESOURCES[$1]:-}"; }

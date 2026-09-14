@@ -93,13 +93,23 @@ for n in "${MONS[@]}"; do
     if mon_exists "$n"; then bootstrapped=1; break; fi
 done
 
-# mon_registered <node>: is <node> in the monmap? Only meaningful once some
-# monitor exists -- with none, nothing can answer, which is why this is asked
-# inside the loop and only when the cluster is already up.
+# mon_registered <node>: is <node> in the *monmap*?
+#
+# Registration and quorum are different facts and ceph reports them in
+# different fields. A monitor that is offline, or whose store was lost, stays
+# in `monmap.mons` while being absent from `quorum_names` -- which is exactly
+# the state this is here to detect, so reading quorum_names would answer the
+# wrong question and miss it. Only meaningful once some monitor exists; with
+# none, nothing can answer, which is why the caller asks only when the cluster
+# is already up. A failed query or an unparseable answer is an error, never
+# "not registered".
 mon_registered() {
-    local node=$1 out
-    out=$(pssh "$first" "timeout 10 ceph quorum_status --format json 2>/dev/null" 2>/dev/null) || return 1
-    jq -e --arg n "$node" '.quorum_names | index($n)' <<<"$out" >/dev/null 2>&1
+    local node=$1 out rc=0
+    out=$(pssh "$first" "timeout 10 ceph mon dump --format json 2>/dev/null") || rc=$?
+    (( rc == 0 )) || die "could not read the ceph monmap from $first (exit $rc)"
+    jq -e 'has("mons")' <<<"$out" >/dev/null 2>&1 \
+        || die "the ceph monmap from $first did not parse"
+    jq -e --arg n "$node" '[.mons[].name] | index($n)' <<<"$out" >/dev/null 2>&1
 }
 
 for n in "${MONS[@]}"; do
@@ -108,10 +118,16 @@ for n in "${MONS[@]}"; do
     # `pveceph mon create` into an "already exists" error with no explanation
     # of what to do about it.
     if (( bootstrapped )) && mon_registered "$n" && ! mon_exists "$n"; then
+        # NOT `pveceph mon destroy`: its removal API checks that
+        # /var/lib/ceph/mon/ceph-<node> exists before it starts, and again
+        # under the config lock, so it refuses precisely the state described
+        # here. `ceph mon remove` edits the monmap and needs no local store.
         die "ceph reports mon.$n in the monmap, but $n has no
-             /var/lib/ceph/mon/ceph-$n. The monitor was removed or its storage
-             was lost without the monmap being updated. Recover with:
-             'pveceph mon destroy $n' on $n, then re-run this script."
+             /var/lib/ceph/mon/ceph-$n -- the monitor's store was lost, or it
+             was removed without the monmap being updated. 'pveceph mon
+             destroy $n' will refuse this state (it requires that directory).
+             Recover from a surviving monitor with: 'ceph mon remove $n',
+             then re-run this script to recreate it."
     fi
     if ! mon_exists "$n"; then
         if (( bootstrapped )); then
