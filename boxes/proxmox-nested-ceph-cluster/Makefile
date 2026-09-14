@@ -244,6 +244,7 @@ NODE ?= pve4
 # arithmetic it replaced silently disagreed with `node_overrides` (#171 D1).
 ha:   #@ dynamic CRS + auto-rebalance + node-affinity rules for the HA resources (after tf-apply)
 	@command -v jq >/dev/null || { echo "jq is required on the workstation for 'make ha'"; exit 1; }; \
+	set -o pipefail; \
 	$(TF_ENV); \
 	homes=$$($(TF) output -json ha_policy_homes \
 	  | jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")') \

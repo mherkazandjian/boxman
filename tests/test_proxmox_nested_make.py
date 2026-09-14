@@ -11,6 +11,7 @@ with stub executables on PATH, and asserts what actually happened.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -106,7 +107,10 @@ def test_an_accepted_token_lands_0600(box, tmp_path):
 
 @pytest.mark.parametrize("content,why", [
     ("export TF_VAR_pve_api_token='unterminated\n", "unterminated quote"),
-    ("exit 42\n", "non-zero return"),
+    # `exit 42` ends the recipe's shell outright, so it fails with or without
+    # the fix. `false` as the last command makes `.` return non-zero while the
+    # shell survives -- which is the case the check is actually for.
+    ("export TF_VAR_pve_endpoint='https://x/'\nfalse\n", "non-zero return"),
 ])
 def test_terraform_refuses_an_env_that_cannot_be_sourced(box, tmp_path, content, why):
     """`test -r` proves the file opens, not that it parsed (#171 B9)."""
@@ -145,12 +149,33 @@ def test_rendering_the_answer_file_leaves_no_password_behind(box):
     assert not holding, f"the plaintext password was written to {holding}"
 
 
-def test_a_changed_password_actually_re_renders(box):
+def _hash_is_for(answer_toml: str, password: str) -> bool:
+    """Whether the rendered SHA-512 crypt hash is the one for *password*.
+
+    Comparing rendered bytes proves nothing: `openssl passwd -6` picks a random
+    salt, so two renders of the *same* password already differ. Re-deriving the
+    hash with the salt it actually used is the only check that discriminates.
+    """
+    m = re.search(r"\$6\$[A-Za-z0-9./]+\$[A-Za-z0-9./]+", answer_toml)
+    assert m, f"no sha512-crypt hash in the rendered answer file:\n{answer_toml}"
+    full = m.group(0)
+    salt = full.split("$")[2]
+    out = subprocess.run(["openssl", "passwd", "-6", "-salt", salt, password],
+                         capture_output=True, text=True, check=True)
+    return out.stdout.strip() == full
+
+
+def test_the_rendered_hash_is_the_one_for_the_requested_password(box):
+    """#171 B15. The earlier version compared file bytes across two renders,
+    which differ whatever the password is."""
     _make(box, "answer", PVE_ROOT_PASSWORD="first-one")
-    first = (box / "answer.toml").read_text()
+    assert _hash_is_for((box / "answer.toml").read_text(), "first-one")
+
     _make(box, "answer", PVE_ROOT_PASSWORD="second-one")
-    assert (box / "answer.toml").read_text() != first, \
+    rendered = (box / "answer.toml").read_text()
+    assert _hash_is_for(rendered, "second-one"), \
         "the password override was a no-op; the ISO would install the old one"
+    assert not _hash_is_for(rendered, "first-one")
 
 
 # ── host-clean must not call a failed teardown clean (B18) ───────────────────
@@ -345,3 +370,179 @@ def test_a_resource_outside_the_policy_is_left_alone(box, tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     rules = [c for c in calls if "/cluster/ha/rules" in c]
     assert not any("vm:999" in c for c in rules), rules
+
+
+def test_multiple_victims_cross_the_remote_shell_as_arguments(box, tmp_path):
+    """#171 B13, the Makefile half.
+
+    `ha-watch.sh --list` prints one sid per line. Interpolated into the remote
+    command string with the newlines intact, everything after the first became
+    a command of its own. The script-side tests could not see this: they are
+    handed clean argv by pytest.
+    """
+    log = tmp_path / "ssh-argv.log"
+    ssh = tmp_path / "bin" / "ssh-stub"
+    _stub(ssh, f'''
+printf '%s\\n' "$*" >> {log}
+for a in "$@"; do
+  case "$a" in
+    *--list*)          printf 'vm:200\\nvm:201\\n'; exit 0 ;;
+    *wait-first-boot*) exit 0 ;;
+    *ha-watch.sh*)     exit 0 ;;
+  esac
+done
+exit 0
+''')
+    _make(box, "ha-failover", SSH=str(ssh), ORCH="hpe1", NODE="pve4")
+
+    lines = log.read_text().splitlines()
+    watch = [ln for ln in lines if "ha-watch.sh" in ln and "--list" not in ln]
+    assert watch, lines
+    assert "vm:200 vm:201" in watch[0], (
+        f"the sids did not reach the watcher as arguments on one line: {watch[0]!r}")
+    assert not any(ln.strip() == "vm:201" for ln in lines), \
+        "vm:201 was run as a command of its own"
+
+
+# ── HA rules, against a stub that actually keeps state (D1 follow-ups) ───────
+
+#: Unlike the first stub, this one *retains* rule membership and enforces the
+#: feasibility check Proxmox performs: a node-affinity rule is refused if one
+#: of its resources already belongs to another. Without that, a rule update
+#: that added a member before its old rule released it looked fine.
+_HA_STATEFUL_LIB = r"""
+set -euo pipefail
+NODES=(pve1 pve2 pve3 pve4)
+declare -A NODE_SITE=([pve1]=hpe1 [pve2]=hpe1 [pve3]=hpe2 [pve4]=hpe2)
+LOGS=$PWD
+CALLS="$PWD/calls"; : > "$CALLS"
+RULES="$PWD/rules"; mkdir -p "$RULES"
+log() { :; }
+die() { echo "die $*" >> "$CALLS"; exit 1; }
+join_by() { local IFS="$1"; shift; echo "$*"; }
+
+_members_elsewhere() {   # _members_elsewhere <rule> <csv>
+    local self=$1 csv=$2 other r m
+    for other in "$RULES"/*; do
+        [ -e "$other" ] || continue
+        r=$(basename "$other"); [ "$r" = "$self" ] && continue
+        for m in ${csv//,/ }; do
+            grep -qw -- "$m" "$other" && return 0
+        done
+    done
+    return 1
+}
+
+pssh() {
+    local node=$1; shift; local cmd="$*"
+    echo "$cmd" >> "$CALLS"
+    case "$cmd" in
+        *"/cluster/ha/resources"*)
+            [ "${INVENTORY_FAILS:-0}" = 1 ] && { echo "$HA_RESOURCES"; return 255; }
+            echo "$HA_RESOURCES"; return 0 ;;
+        *"pvesh get /cluster/ha/rules/"*)
+            local rule=${cmd##*/cluster/ha/rules/}; rule=${rule%% *}
+            [ "${GET_RULE_FAILS:-}" = "$rule" ] && return 255
+            [ -f "$RULES/$rule" ] || return 2
+            echo "{\"resources\":\"$(cat "$RULES/$rule")\"}"; return 0 ;;
+        *"pvesh set /cluster/ha/rules/"*|*"pvesh create /cluster/ha/rules"*)
+            local rule res
+            if [[ $cmd == *"pvesh set"* ]]; then
+                rule=${cmd##*/cluster/ha/rules/}; rule=${rule%% *}
+            else
+                rule=$(sed -n "s/.*--rule \([^ ]*\).*/\1/p" <<<"$cmd")
+            fi
+            res=$(sed -n "s/.*--resources '\([^']*\)'.*/\1/p" <<<"$cmd")
+            if _members_elsewhere "$rule" "$res"; then
+                echo "rule $rule not feasible: resource already in another rule" >&2
+                return 1
+            fi
+            printf '%s' "$res" > "$RULES/$rule"; return 0 ;;
+        *"pvesh delete /cluster/ha/rules/"*)
+            local rule=${cmd##*/cluster/ha/rules/}; rule=${rule%% *}
+            rm -f "$RULES/$rule"; return 0 ;;
+        *"/cluster/options"*) echo '{"crs":"ha=dynamic"}'; return 0 ;;
+    esac
+    return 0
+}
+"""
+
+
+def _run_ha_stateful(box, tmp_path, homes, resources, preset=None, tag="s", **env_extra):
+    work = tmp_path / f"ha-stateful-{tag}"
+    work.mkdir(exist_ok=True)
+    shutil.copy(box / "scripts" / "pve-ha.sh", work / "pve-ha.sh")
+    (work / "lib.sh").write_text(_HA_STATEFUL_LIB)
+    (work / "rules").mkdir(exist_ok=True)
+    for rule, members in (preset or {}).items():
+        (work / "rules" / rule).write_text(members)
+    env = dict(os.environ, PVE_HA_POLICY_HOMES=homes,
+               HA_RESOURCES=str([{"sid": f"vm:{i}"} for i in resources]).replace("'", '"'),
+               **{k: str(v) for k, v in env_extra.items()})
+    proc = subprocess.run(["bash", "./pve-ha.sh"], cwd=work, env=env,
+                          capture_output=True, text=True, timeout=60)
+    rules = {p.name: p.read_text() for p in (work / "rules").iterdir()}
+    return proc, rules
+
+
+def test_a_resource_can_move_from_one_hosts_rule_to_the_others(box, tmp_path):
+    """Proxmox refuses a rule whose resource is already in another one, so the
+    additions have to wait for the withdrawals. The reverse direction happened
+    to work, which is why one-directional testing missed it (#171 D1)."""
+    proc, rules = _run_ha_stateful(
+        box, tmp_path, homes="vm:200=pve1,vm:201=pve1", resources=[200, 201],
+        preset={"prefer-hpe1": "vm:200", "prefer-hpe2": "vm:201"}, tag="move")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "vm:201" in rules.get("prefer-hpe1", ""), rules
+    assert "vm:201" not in rules.get("prefer-hpe2", ""), rules
+
+
+def test_a_simultaneous_swap_is_applied(box, tmp_path):
+    proc, rules = _run_ha_stateful(
+        box, tmp_path, homes="vm:200=pve3,vm:201=pve1", resources=[200, 201],
+        preset={"prefer-hpe1": "vm:200", "prefer-hpe2": "vm:201"}, tag="swap")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert rules.get("prefer-hpe1", "") == "vm:201", rules
+    assert rules.get("prefer-hpe2", "") == "vm:200", rules
+
+
+def test_a_failed_inventory_does_not_delete_a_rule(box, tmp_path):
+    """`mapfile < <(cmd)` hides the failure even under pipefail, so a partial
+    list was used as if complete and the cleanup deleted a live rule."""
+    proc, rules = _run_ha_stateful(
+        box, tmp_path, homes="vm:200=pve1,vm:201=pve3", resources=[200],
+        preset={"prefer-hpe2": "vm:201"}, tag="inv", INVENTORY_FAILS=1)
+
+    assert proc.returncode != 0, proc.stdout
+    assert "prefer-hpe2" in rules, "a rule was deleted on the strength of a failed query"
+
+
+def test_a_failed_rule_lookup_is_not_read_as_absence(box, tmp_path):
+    """A GET that fails is not evidence the rule is gone; treating it as such
+    skipped the cleanup and still exited 0."""
+    proc, rules = _run_ha_stateful(
+        box, tmp_path, homes="vm:200=pve1", resources=[200],
+        preset={"prefer-hpe2": "vm:201"}, tag="get",
+        GET_RULE_FAILS="prefer-hpe2")
+
+    assert proc.returncode != 0, (
+        f"a stale rule survived and the run still reported success:\n{proc.stdout}")
+
+
+def test_make_ha_refuses_a_failed_terraform_output(box, tmp_path):
+    """Terraform emitting valid JSON and then failing still triggered the
+    remote HA command; make exited 0 (#171 D1 follow-up)."""
+    tf = tmp_path / "tf"; tf.mkdir()
+    (tf / ".env").write_text("export TF_VAR_pve_endpoint='https://localhost:8006/'\n")
+    terraform = tmp_path / "bin" / "terraform"
+    _stub(terraform, 'echo \'{"vm:200":"pve1"}\'\nexit 42\n')
+    ssh = tmp_path / "bin" / "ssh-stub"
+    _stub(ssh, f'echo "$@" >> {tmp_path}/ha-ssh.log\n')
+
+    r = _make(box, "ha", TF_DIR=str(tf), TF=str(terraform), SSH=str(ssh))
+
+    assert r.returncode != 0, f"a failed terraform output was accepted:\n{r.stdout}"
+    assert not (tmp_path / "ha-ssh.log").exists(), \
+        "the remote HA command ran despite the failed output"

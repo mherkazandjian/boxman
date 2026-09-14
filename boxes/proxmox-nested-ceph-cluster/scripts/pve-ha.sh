@@ -70,25 +70,48 @@ pssh "$first" "pvesh set /cluster/options --crs '$crs'"
 # Registered HA resources, intersected with the policy: a resource this
 # configuration does not own is left out of the rules rather than filed under
 # whichever group the arithmetic would have picked.
-mapfile -t sids < <(pssh "$first" "pvesh get /cluster/ha/resources --output-format json" \
-                    | jq -r '.[].sid' | grep '^vm:' | sort)
-(( ${#sids[@]} )) || die "no HA resources registered yet (run make tf-apply first)"
+#
+# `mapfile -t x < <(cmd | jq)` cannot see the process substitution's exit
+# status -- not even under `pipefail` -- so inventory that printed a partial
+# list and then failed was used as if complete, and with the rule cleanup
+# below that silently deleted a rule (the same defect already fixed in
+# ha-watch.sh, reintroduced here).
+inventory=$(pssh "$first" "pvesh get /cluster/ha/resources --output-format json") \
+    || die "could not read the HA resources from $first"
+sids_raw=$(jq -r '.[].sid' <<<"$inventory" | grep '^vm:' | sort) \
+    || die "could not parse the HA resource list from $first"
+[[ -n $sids_raw ]] || die "no HA resources registered yet (run make tf-apply first)"
+mapfile -t sids <<<"$sids_raw"
 
+declare -A DESIRED=()          # sid -> rule it belongs in
 hpe1_res=() hpe2_res=() unowned=()
 for sid in "${sids[@]}"; do
     node=${POLICY_HOME[$sid]:-}
     if [[ -z $node ]]; then unowned+=("$sid"); continue; fi
     case ${NODE_SITE[$node]} in
-        hpe1) hpe1_res+=("$sid") ;;
-        hpe2) hpe2_res+=("$sid") ;;
+        hpe1) hpe1_res+=("$sid"); DESIRED[$sid]=prefer-hpe1 ;;
+        hpe2) hpe2_res+=("$sid"); DESIRED[$sid]=prefer-hpe2 ;;
     esac
 done
 (( ${#unowned[@]} )) && log "not covered by this policy, left alone: ${unowned[*]}"
 
-# ensure_rule <rule> <nodes> <resources-csv>
-ensure_rule() {
+# rule_state <rule>: prints the rule's resources csv, or nothing when it does
+# not exist. A *query* that fails is not evidence of absence: ssh answers 255
+# for a connection problem, and treating that as "no such rule" skipped a
+# cleanup and still reported success.
+rule_state() {
+    local rule=$1 out rc=0
+    out=$(pssh "$first" "pvesh get /cluster/ha/rules/$rule --output-format json 2>/dev/null") || rc=$?
+    case $rc in
+        0)   jq -r '.resources // ""' <<<"$out" 2>/dev/null || echo "" ;;
+        255) die "could not reach $first to query rule $rule" ;;
+        *)   echo "" ;;                       # pvesh said no such rule
+    esac
+}
+
+set_rule() {   # set_rule <rule> <nodes> <resources-csv>
     local rule=$1 nodes=$2 resources=$3
-    if pssh "$first" "pvesh get /cluster/ha/rules/$rule >/dev/null 2>&1"; then
+    if [[ -n $(rule_state "$rule") ]] || pssh "$first" "pvesh get /cluster/ha/rules/$rule >/dev/null 2>&1"; then
         pssh "$first" "pvesh set /cluster/ha/rules/$rule --nodes '$nodes' --resources '$resources' --strict 0 --disable 0"
         log "rule $rule updated: nodes=$nodes resources=$resources"
     else
@@ -97,25 +120,51 @@ ensure_rule() {
     fi
 }
 
-# drop_rule <rule>: a group with no members must not keep the membership it had
-# last time. The old `(( ${#x[@]} )) && ensure_rule …` left a stale rule in
-# place -- and, being an `&&` list under `set -e`, ended the script outright
-# when a group was empty (#171 D1).
 drop_rule() {
     local rule=$1
-    if pssh "$first" "pvesh get /cluster/ha/rules/$rule >/dev/null 2>&1"; then
+    if [[ -n $(rule_state "$rule") ]] || pssh "$first" "pvesh get /cluster/ha/rules/$rule >/dev/null 2>&1"; then
         pssh "$first" "pvesh delete /cluster/ha/rules/$rule"
         log "rule $rule removed: no resources are assigned to it any more"
     fi
 }
 
+# --- withdraw first, then add ----------------------------------------------
+#
+# Proxmox checks a node-affinity rule for feasibility before persisting it and
+# refuses a resource that is already a member of another one. Adding the
+# incoming member before its old rule had released it therefore failed, and a
+# VM could never move from one host's rule to the other's -- the reverse
+# direction happened to work, which is why one-directional testing missed it.
+for rule in prefer-hpe1 prefer-hpe2; do
+    current=$(rule_state "$rule")
+    [[ -n $current ]] || continue
+    keep=()
+    IFS=',' read -ra _members <<<"$current"
+    for m in "${_members[@]}"; do
+        m=${m// /}
+        [[ -z $m ]] && continue
+        [[ ${DESIRED[$m]:-} == "$rule" ]] && keep+=("$m")
+    done
+    if (( ${#keep[@]} == ${#_members[@]} )); then
+        continue                      # nothing is leaving this rule
+    fi
+    if (( ${#keep[@]} )); then
+        nodes=$([[ $rule == prefer-hpe1 ]] && echo "pve1:1,pve2:1" || echo "pve3:1,pve4:1")
+        pssh "$first" "pvesh set /cluster/ha/rules/$rule --nodes '$nodes' --resources '$(join_by , "${keep[@]}")' --strict 0 --disable 0"
+        log "rule $rule: released departing members before the additions"
+    else
+        pssh "$first" "pvesh delete /cluster/ha/rules/$rule"
+        log "rule $rule: released every member before the additions"
+    fi
+done
+
 if (( ${#hpe1_res[@]} )); then
-    ensure_rule prefer-hpe1 "pve1:1,pve2:1" "$(join_by , "${hpe1_res[@]}")"
+    set_rule prefer-hpe1 "pve1:1,pve2:1" "$(join_by , "${hpe1_res[@]}")"
 else
     drop_rule prefer-hpe1
 fi
 if (( ${#hpe2_res[@]} )); then
-    ensure_rule prefer-hpe2 "pve3:1,pve4:1" "$(join_by , "${hpe2_res[@]}")"
+    set_rule prefer-hpe2 "pve3:1,pve4:1" "$(join_by , "${hpe2_res[@]}")"
 else
     drop_rule prefer-hpe2
 fi

@@ -160,7 +160,17 @@ pssh() {
             echo "$node" >> "$MONSTATE"; return 0 ;;
         *"ceph quorum_status"*)
             echo "quorum_probe $node" >> "$CALLS"
-            [ -s "$MONSTATE" ] && return 0 || return 1 ;;
+            [ -s "$MONSTATE" ] || return 1
+            # Report quorum_names, so "a monitor answered" cannot be mistaken
+            # for "this node's monitor joined". MON_NOT_IN_QUORUM names a node
+            # whose directory exists but which never joined.
+            names=""
+            while read -r m; do
+                [ "$m" = "${MON_NOT_IN_QUORUM:-}" ] && continue
+                names="$names${names:+,}\"$m\""
+            done < "$MONSTATE"
+            echo "{\"quorum_names\":[$names]}"
+            return 0 ;;
         *"ceph --version"*) echo "ceph version 19.2.0"; return 0 ;;
         *"ceph health"*)    echo "HEALTH_OK"; return 0 ;;
         *) return 0 ;;
@@ -169,15 +179,17 @@ pssh() {
 """
 
 
-def _run_ceph_bootstrap(tmp_path, mode: str = "normal") -> tuple[int, list[str]]:
+def _run_ceph_bootstrap(tmp_path, mode: str = "normal",
+                        not_in_quorum: str = "") -> tuple[int, list[str]]:
     """Run the real pve-ceph.sh against the stub; return (exit code, trace)."""
-    work = tmp_path / f"cephrun-{mode}"
+    work = tmp_path / ("cephrun-" + mode + "-" + (not_in_quorum or "all"))
     work.mkdir()
     shutil.copy(os.path.join(BOX, "scripts", "pve-ceph.sh"), work / "pve-ceph.sh")
     (work / "lib.sh").write_text(_CEPH_STUB_LIB)
     proc = subprocess.run(
         ["bash", "./pve-ceph.sh"], cwd=work, timeout=120, capture_output=True,
-        text=True, env=dict(os.environ, T=str(work), STUB_MODE=mode))
+        text=True, env=dict(os.environ, T=str(work), STUB_MODE=mode,
+                 MON_NOT_IN_QUORUM=not_in_quorum))
     calls = work / "calls"
     trace = [ln for ln in (calls.read_text().splitlines() if calls.exists() else [])
              if ln.startswith(("mon_create", "quorum_probe", "die"))]
@@ -233,3 +245,15 @@ def test_an_unexpected_probe_reply_is_refused(tmp_path):
 
     assert rc != 0, f"an unexpected reply was tolerated; trace={trace}"
     assert not [ln for ln in trace if ln.startswith("mon_create")], trace
+
+
+def test_a_monitor_that_never_joined_the_quorum_is_not_reported_ok(tmp_path):
+    """#171 B1, amended. "The cluster answered" is not "this monitor joined":
+    with pve3's directory present but pve3 absent from quorum_names, an answer
+    from any surviving monitor read as success, so the loop logged `mon pve3
+    ok` and carried on into OSD creation against a monitor that had never
+    joined."""
+    rc, trace = _run_ceph_bootstrap(tmp_path, not_in_quorum="pve3")
+
+    assert rc != 0, f"a monitor outside the quorum was reported ok; trace={trace}"
+    assert any(ln.startswith("die") and "pve3" in ln for ln in trace), trace

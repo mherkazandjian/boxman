@@ -8,6 +8,7 @@ import pytest
 
 from boxman.exceptions import ConfigError, ProvisionError
 from boxman.manager import BoxmanManager
+from boxman.utils.mac import canonical_mac
 
 pytestmark = pytest.mark.unit
 
@@ -604,12 +605,36 @@ class TestMacCollisionsAcrossSpellingsAndAdapters:
         })
         mgr.validate_base_images()
 
-    def test_a_pin_that_matches_only_its_own_reservation_is_fine(self):
-        """The positive case: without it this check could pass by refusing
-        everything."""
-        mgr = self._mgr({"v1": self._iso_vm(
-            networks=[{"name": "n", "mac": "52:54:00:0c:01:04"}])})
+    def test_a_pin_and_its_own_reservation_resolve_to_one_address(self):
+        """The positive case, with an actual reservation in it.
+
+        The earlier version had none, so it asserted nothing: reservations do
+        not take part in the duplicate index, and a config without one passes
+        however the code behaves. Here the reservation is written padded and
+        the pin unpadded -- the spelling difference #167's whole DHCP-hostname
+        scheme depends on surviving.
+        """
+        reservation = "52:54:00:0c:01:09"
+        pin = "52:54:0:C:1:9"
+        cfg = {"project": "p", "clusters": {"c": {
+            "networks": {"pvenet": {"mode": "nat", "ip": {
+                "address": "10.77.0.1", "netmask": "255.255.255.0",
+                "dhcp": {"hosts": [
+                    {"mac": reservation, "ip": "10.77.0.19", "name": "node01"}]}}}},
+            "vms": {"node01": {
+                "boot_order": ["cdrom", "hd"],
+                "cdroms": [{"source": "/x.iso"}],
+                "networks": [{"name": "pvenet", "mac": pin}]}}}}}
+        mgr = _manager_with_config(cfg)
+
+        # not a duplicate: it is the same NIC as the reservation, not a clash
         mgr.validate_base_images()
+
+        spec = mgr._resolved_network_specs(
+            "c", cfg["clusters"]["c"]["vms"]["node01"])[0]
+        assert spec["mac"] == canonical_mac(reservation), (
+            "the pinned NIC and its DHCP reservation are different strings for "
+            "one address; dnsmasq would never match them")
 
 
 class TestDeclaredButUnresolvableNetworks:

@@ -30,8 +30,28 @@ log "ceph $(pssh "$first" ceph --version | awk '{print $3}') installed on all no
 
 pssh "$first" "test -f /etc/pve/ceph.conf || pveceph init --network $LAB_NET --size 3 --min_size 2"
 
-# wait_quorum [node]: block until the mon cluster answers on that node
+# wait_quorum <node>: block until <node>'s own monitor is *in* the quorum.
+#
+# "the cluster answered" is not the same as "this monitor joined": with pve3's
+# monitor directory present but pve3 absent from quorum_names, an answer from
+# any surviving monitor read as success, so the loop logged `mon pve3 ok` and
+# carried on into OSD creation against a monitor that had never joined.
 wait_quorum() {
+    local n=${1:-$first} names
+    for _ in $(seq 1 60); do
+        names=$(pssh "$n" "timeout 10 ceph quorum_status --format json 2>/dev/null" 2>/dev/null) || names=""
+        if [[ -n $names ]] \
+           && jq -e --arg n "$n" '.quorum_names | index($n)' <<<"$names" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 3
+    done
+    die "ceph monitor on $n did not join the quorum (checked from $n)"
+}
+
+# wait_cluster_quorum: any quorate answer, for the "is there a cluster yet"
+# question that precedes creating the next monitor.
+wait_cluster_quorum() {
     local n=${1:-$first}
     for _ in $(seq 1 60); do
         pssh "$n" "timeout 10 ceph quorum_status >/dev/null 2>&1" && return 0
@@ -80,7 +100,7 @@ for n in "${MONS[@]}"; do
             # joins: the election following the previous one takes a few seconds,
             # and `pveceph mon create` fails with "Could not connect to ceph
             # cluster" inside that window.
-            wait_quorum "$first"
+            wait_cluster_quorum "$first"
         else
             log "bootstrapping the first ceph monitor on $n"
         fi
