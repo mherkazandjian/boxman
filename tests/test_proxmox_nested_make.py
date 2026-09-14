@@ -292,7 +292,13 @@ pssh() {
     echo "$cmd" >> "$CALLS"
     case "$cmd" in
         *"/cluster/ha/resources"*) echo "$HA_RESOURCES" ;;
-        *"/cluster/ha/rules/"*)    [ "${RULE_EXISTS:-0}" = 1 ] && return 0 || return 1 ;;
+        *"/cluster/ha/rules"*)
+            if [ "${RULE_EXISTS:-0}" = 1 ]; then
+                echo '[{"rule":"prefer-hpe1","resources":"vm:200"},{"rule":"prefer-hpe2","resources":"vm:999"}]'
+            else
+                echo '[]'
+            fi
+            return 0 ;;
         *"/cluster/options"*)      echo '{"crs":"ha=dynamic"}' ;;
     esac
     return 0
@@ -382,8 +388,12 @@ def test_multiple_victims_cross_the_remote_shell_as_arguments(box, tmp_path):
     """
     log = tmp_path / "ssh-argv.log"
     ssh = tmp_path / "bin" / "ssh-stub"
+    # One line per argument, so quoting the whole list into a single argument
+    # is visible. `"$*"` joins them and cannot tell the two apart -- which is
+    # how an earlier version of this test passed with the list quoted.
     _stub(ssh, f'''
-printf '%s\\n' "$*" >> {log}
+printf 'ARGC=%s\\n' "$#" >> {log}
+for a in "$@"; do printf 'ARG=%s\\n' "$a" >> {log}; done
 for a in "$@"; do
   case "$a" in
     *--list*)          printf 'vm:200\\nvm:201\\n'; exit 0 ;;
@@ -395,13 +405,20 @@ exit 0
 ''')
     _make(box, "ha-failover", SSH=str(ssh), ORCH="hpe1", NODE="pve4")
 
-    lines = log.read_text().splitlines()
-    watch = [ln for ln in lines if "ha-watch.sh" in ln and "--list" not in ln]
-    assert watch, lines
-    assert "vm:200 vm:201" in watch[0], (
-        f"the sids did not reach the watcher as arguments on one line: {watch[0]!r}")
-    assert not any(ln.strip() == "vm:201" for ln in lines), \
-        "vm:201 was run as a command of its own"
+    args = [ln[4:] for ln in log.read_text().splitlines() if ln.startswith("ARG=")]
+    watch = [a for a in args if "ha-watch.sh" in a and "--list" not in a]
+    assert watch, args
+
+    # The remote command is one ssh argument; the sids have to arrive inside it
+    # as separate *words*, neither glued together by quoting nor split across
+    # lines. Split it the way the remote shell would.
+    words = watch[0].split()
+    assert "vm:200" in words and "vm:201" in words, (
+        f"the sids did not arrive as separate words: {watch[0]!r}")
+    assert not any(w.startswith("vm:200 ") or " vm:201" in w for w in words), (
+        f"the victim list was quoted into a single argument: {watch[0]!r}")
+    assert "\n" not in watch[0], (
+        f"a newline survived into the remote command: {watch[0]!r}")
 
 
 # ── HA rules, against a stub that actually keeps state (D1 follow-ups) ───────
@@ -440,11 +457,15 @@ pssh() {
         *"/cluster/ha/resources"*)
             [ "${INVENTORY_FAILS:-0}" = 1 ] && { echo "$HA_RESOURCES"; return 255; }
             echo "$HA_RESOURCES"; return 0 ;;
-        *"pvesh get /cluster/ha/rules/"*)
-            local rule=${cmd##*/cluster/ha/rules/}; rule=${rule%% *}
-            [ "${GET_RULE_FAILS:-}" = "$rule" ] && return 255
-            [ -f "$RULES/$rule" ] || return 2
-            echo "{\"resources\":\"$(cat "$RULES/$rule")\"}"; return 0 ;;
+        *"pvesh get /cluster/ha/rules --output-format json"*|*"pvesh get /cluster/ha/rules"*)
+            [ "${RULE_LIST_FAILS:-0}" = 1 ] && { echo "[]"; return 255; }
+            local out="[" first_e=1 r
+            for r in "$RULES"/*; do
+                [ -e "$r" ] || continue
+                [ $first_e -eq 1 ] || out="$out,"; first_e=0
+                out="$out{\"rule\":\"$(basename "$r")\",\"resources\":\"$(cat "$r")\"}"
+            done
+            echo "$out]"; return 0 ;;
         *"pvesh set /cluster/ha/rules/"*|*"pvesh create /cluster/ha/rules"*)
             local rule res
             if [[ $cmd == *"pvesh set"* ]]; then
@@ -517,18 +538,29 @@ def test_a_failed_inventory_does_not_delete_a_rule(box, tmp_path):
 
     assert proc.returncode != 0, proc.stdout
     assert "prefer-hpe2" in rules, "a rule was deleted on the strength of a failed query"
+    # ...and nothing else was written either. Setting CRS before reading the
+    # inventory left the cluster reconfigured but unreconciled.
+    calls = (tmp_path / "ha-stateful-inv" / "calls").read_text()
+    assert "pvesh set /cluster/options" not in calls, (
+        "CRS was changed before the inventory had been read")
 
 
-def test_a_failed_rule_lookup_is_not_read_as_absence(box, tmp_path):
-    """A GET that fails is not evidence the rule is gone; treating it as such
-    skipped the cleanup and still exited 0."""
+def test_a_failed_rule_listing_stops_the_run(box, tmp_path):
+    """Absence and failure are indistinguishable in a per-rule GET: the
+    upstream handler dies for both, and the status it produces is not a stable
+    discriminator (absence surfaces as 255, a query failure can be 13). So the
+    rules are listed once and *that* command's status is checked; a failure
+    must stop the run rather than be read as "there are no rules"."""
     proc, rules = _run_ha_stateful(
         box, tmp_path, homes="vm:200=pve1", resources=[200],
-        preset={"prefer-hpe2": "vm:201"}, tag="get",
-        GET_RULE_FAILS="prefer-hpe2")
+        preset={"prefer-hpe2": "vm:201"}, tag="list", RULE_LIST_FAILS=1)
 
     assert proc.returncode != 0, (
-        f"a stale rule survived and the run still reported success:\n{proc.stdout}")
+        f"a failed rule listing was read as 'no rules':\n{proc.stdout}")
+    assert "prefer-hpe2" in rules, "a stale rule was deleted on a failed listing"
+    calls = (tmp_path / "ha-stateful-list" / "calls").read_text()
+    assert "pvesh set /cluster/options" not in calls, \
+        "CRS was changed despite the failed listing"
 
 
 def test_make_ha_refuses_a_failed_terraform_output(box, tmp_path):
@@ -546,3 +578,20 @@ def test_make_ha_refuses_a_failed_terraform_output(box, tmp_path):
     assert r.returncode != 0, f"a failed terraform output was accepted:\n{r.stdout}"
     assert not (tmp_path / "ha-ssh.log").exists(), \
         "the remote HA command ran despite the failed output"
+
+
+def test_no_per_rule_lookup_is_issued(box, tmp_path):
+    """Finding 1. A per-rule `pvesh get` cannot distinguish "no such rule" from
+    "the query failed": the upstream handler dies for both and the status is
+    not a stable discriminator. The script must not ask that question at all --
+    it lists the rules once, checks *that* status, and decides from data.
+    """
+    proc, _rules = _run_ha_stateful(
+        box, tmp_path, homes="vm:200=pve1", resources=[200],
+        preset={"prefer-hpe1": "vm:200"}, tag="norule")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = (tmp_path / "ha-stateful-norule" / "calls").read_text().splitlines()
+    per_rule = [c for c in calls
+                if c.startswith("pvesh get /cluster/ha/rules/")]
+    assert not per_rule, f"a per-rule lookup was issued: {per_rule}"

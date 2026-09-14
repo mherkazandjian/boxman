@@ -153,6 +153,10 @@ pssh() {
             echo "mon_probe $node" >> "$CALLS"
             [ "$MODE" = ssh_fail ]  && return 255
             [ "$MODE" = odd_reply ] && { echo "maybe"; return 0; }
+            # registered in the monmap, but its storage is gone
+            if [ "$MODE" = registered_no_storage ] && [ "$node" = pve3 ]; then
+                echo no; return 0
+            fi
             if grep -qx "$node" "$MONSTATE" 2>/dev/null; then echo yes; else echo no; fi
             return 0 ;;
         *"pveceph mon create"*)
@@ -169,18 +173,21 @@ pssh() {
                 [ "$m" = "${MON_NOT_IN_QUORUM:-}" ] && continue
                 names="$names${names:+,}\"$m\""
             done < "$MONSTATE"
+            if [ "$MODE" = registered_no_storage ]; then
+                names="$names${names:+,}\"pve3\""
+            fi
             echo "{\"quorum_names\":[$names]}"
             return 0 ;;
         *"ceph --version"*) echo "ceph version 19.2.0"; return 0 ;;
         *"ceph health"*)    echo "HEALTH_OK"; return 0 ;;
-        *) return 0 ;;
+        *) echo "cmd $cmd" >> "$CALLS"; return 0 ;;
     esac
 }
 """
 
 
 def _run_ceph_bootstrap(tmp_path, mode: str = "normal",
-                        not_in_quorum: str = "") -> tuple[int, list[str]]:
+                        not_in_quorum: str = "", full: bool = False):
     """Run the real pve-ceph.sh against the stub; return (exit code, trace)."""
     work = tmp_path / ("cephrun-" + mode + "-" + (not_in_quorum or "all"))
     work.mkdir()
@@ -191,8 +198,11 @@ def _run_ceph_bootstrap(tmp_path, mode: str = "normal",
         text=True, env=dict(os.environ, T=str(work), STUB_MODE=mode,
                  MON_NOT_IN_QUORUM=not_in_quorum))
     calls = work / "calls"
-    trace = [ln for ln in (calls.read_text().splitlines() if calls.exists() else [])
+    every = calls.read_text().splitlines() if calls.exists() else []
+    trace = [ln for ln in every
              if ln.startswith(("mon_create", "quorum_probe", "die"))]
+    if full:
+        return proc.returncode, trace, every
     return proc.returncode, trace
 
 
@@ -253,7 +263,33 @@ def test_a_monitor_that_never_joined_the_quorum_is_not_reported_ok(tmp_path):
     from any surviving monitor read as success, so the loop logged `mon pve3
     ok` and carried on into OSD creation against a monitor that had never
     joined."""
-    rc, trace = _run_ceph_bootstrap(tmp_path, not_in_quorum="pve3")
+    rc, trace, full = _run_ceph_bootstrap(tmp_path, not_in_quorum="pve3", full=True)
 
     assert rc != 0, f"a monitor outside the quorum was reported ok; trace={trace}"
     assert any(ln.startswith("die") and "pve3" in ln for ln in trace), trace
+    # ...and it refused *before* doing any work on the strength of it. Moving
+    # the check after OSD creation still fails the run, just eight commands too
+    # late.
+    osd = [i for i, ln in enumerate(full) if "osd create" in ln or "ceph-volume" in ln]
+    died = [i for i, ln in enumerate(full) if ln.startswith("die")]
+    assert died, full
+    assert not [i for i in osd if i < died[0]], (
+        f"{len(osd)} osd command(s) ran before the bad monitor was refused")
+
+
+def test_a_monitor_in_the_monmap_without_its_storage_is_diagnosed(tmp_path):
+    """#171 B1, the registration/storage consistency half.
+
+    After a half-finished removal, or a node restored from an older image, the
+    monmap can name a monitor whose /var/lib/ceph/mon directory is gone. The
+    old code ran `pveceph mon create` straight into an "already exists" error
+    with nothing said about how to recover.
+    """
+    rc, trace, full = _run_ceph_bootstrap(tmp_path, mode="registered_no_storage",
+                                          full=True)
+
+    assert rc != 0, f"the mismatch was not reported; trace={trace}"
+    assert any("pveceph mon destroy" in ln for ln in full), (
+        f"no recovery advice was given; trace={full[-6:]}")
+    assert not [ln for ln in full if "mon_create pve3" in ln], (
+        "a monitor already in the monmap was created again")

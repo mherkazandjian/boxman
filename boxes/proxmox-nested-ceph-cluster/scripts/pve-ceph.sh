@@ -93,7 +93,26 @@ for n in "${MONS[@]}"; do
     if mon_exists "$n"; then bootstrapped=1; break; fi
 done
 
+# mon_registered <node>: is <node> in the monmap? Only meaningful once some
+# monitor exists -- with none, nothing can answer, which is why this is asked
+# inside the loop and only when the cluster is already up.
+mon_registered() {
+    local node=$1 out
+    out=$(pssh "$first" "timeout 10 ceph quorum_status --format json 2>/dev/null" 2>/dev/null) || return 1
+    jq -e --arg n "$node" '.quorum_names | index($n)' <<<"$out" >/dev/null 2>&1
+}
+
 for n in "${MONS[@]}"; do
+    # Registration and on-disk state must agree. They disagree after a
+    # half-finished removal or a restored node, and the old code then ran
+    # `pveceph mon create` into an "already exists" error with no explanation
+    # of what to do about it.
+    if (( bootstrapped )) && mon_registered "$n" && ! mon_exists "$n"; then
+        die "ceph reports mon.$n in the monmap, but $n has no
+             /var/lib/ceph/mon/ceph-$n. The monitor was removed or its storage
+             was lost without the monmap being updated. Recover with:
+             'pveceph mon destroy $n' on $n, then re-run this script."
+    fi
     if ! mon_exists "$n"; then
         if (( bootstrapped )); then
             # Every monitor after the first must see a quorate cluster before it

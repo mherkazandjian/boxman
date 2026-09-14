@@ -55,17 +55,23 @@ done
 (( ${#POLICY_HOME[@]} )) || die "PVE_HA_POLICY_HOMES is empty"
 log "policy homes: ${#POLICY_HOME[@]} resources"
 
-# Everything above is validated before the first write, so a bad mapping cannot
-# leave the cluster with new CRS settings and stale rules (#171 D1).
-crs="ha=dynamic,ha-auto-rebalance=1"
-crs+=",ha-auto-rebalance-threshold=${PVE_CRS_THRESHOLD:-20}"
-crs+=",ha-auto-rebalance-margin=${PVE_CRS_MARGIN:-10}"
-crs+=",ha-auto-rebalance-hold-duration=${PVE_CRS_HOLD:-3}"
-crs+=",ha-auto-rebalance-method=${PVE_CRS_METHOD:-bruteforce}"
-crs+=",ha-rebalance-on-start=1"
+# --- one authoritative read, then decisions are data ------------------------
+#
+# Per-rule `pvesh get` cannot tell absence from failure: the upstream handler
+# dies for both, and the exit status it produces is not a stable discriminator
+# (absence surfaces as 255, a query failure can be 13). Listing the rules once
+# and checking *that* command's status removes the question -- afterwards,
+# "does this rule exist" is a lookup in data we know we read successfully.
+rules_json=$(pssh "$first" "pvesh get /cluster/ha/rules --output-format json") \
+    || die "could not list the HA rules on $first"
+declare -A RULE_RESOURCES=()
+while IFS=$'\t' read -r _rule _res; do
+    [[ -n $_rule ]] && RULE_RESOURCES[$_rule]=$_res
+done < <(jq -r '.[] | [.rule // .name // empty, (.resources // "")] | @tsv' \
+         <<<"$rules_json" 2>/dev/null || true)
 
-log "cluster resource scheduling: $crs"
-pssh "$first" "pvesh set /cluster/options --crs '$crs'"
+rule_exists() { [[ -v RULE_RESOURCES[$1] ]]; }
+rule_members() { echo "${RULE_RESOURCES[$1]:-}"; }
 
 # Registered HA resources, intersected with the policy: a resource this
 # configuration does not own is left out of the rules rather than filed under
@@ -73,9 +79,7 @@ pssh "$first" "pvesh set /cluster/options --crs '$crs'"
 #
 # `mapfile -t x < <(cmd | jq)` cannot see the process substitution's exit
 # status -- not even under `pipefail` -- so inventory that printed a partial
-# list and then failed was used as if complete, and with the rule cleanup
-# below that silently deleted a rule (the same defect already fixed in
-# ha-watch.sh, reintroduced here).
+# list and then failed was used as if complete.
 inventory=$(pssh "$first" "pvesh get /cluster/ha/resources --output-format json") \
     || die "could not read the HA resources from $first"
 sids_raw=$(jq -r '.[].sid' <<<"$inventory" | grep '^vm:' | sort) \
@@ -83,7 +87,7 @@ sids_raw=$(jq -r '.[].sid' <<<"$inventory" | grep '^vm:' | sort) \
 [[ -n $sids_raw ]] || die "no HA resources registered yet (run make tf-apply first)"
 mapfile -t sids <<<"$sids_raw"
 
-declare -A DESIRED=()          # sid -> rule it belongs in
+declare -A DESIRED=()
 hpe1_res=() hpe2_res=() unowned=()
 for sid in "${sids[@]}"; do
     node=${POLICY_HOME[$sid]:-}
@@ -95,37 +99,38 @@ for sid in "${sids[@]}"; do
 done
 (( ${#unowned[@]} )) && log "not covered by this policy, left alone: ${unowned[*]}"
 
-# rule_state <rule>: prints the rule's resources csv, or nothing when it does
-# not exist. A *query* that fails is not evidence of absence: ssh answers 255
-# for a connection problem, and treating that as "no such rule" skipped a
-# cleanup and still reported success.
-rule_state() {
-    local rule=$1 out rc=0
-    out=$(pssh "$first" "pvesh get /cluster/ha/rules/$rule --output-format json 2>/dev/null") || rc=$?
-    case $rc in
-        0)   jq -r '.resources // ""' <<<"$out" 2>/dev/null || echo "" ;;
-        255) die "could not reach $first to query rule $rule" ;;
-        *)   echo "" ;;                       # pvesh said no such rule
-    esac
-}
+# Only now is anything written. Setting CRS before the inventory had been read
+# left the cluster with new scheduling options and unreconciled rules when the
+# query failed.
+crs="ha=dynamic,ha-auto-rebalance=1"
+crs+=",ha-auto-rebalance-threshold=${PVE_CRS_THRESHOLD:-20}"
+crs+=",ha-auto-rebalance-margin=${PVE_CRS_MARGIN:-10}"
+crs+=",ha-auto-rebalance-hold-duration=${PVE_CRS_HOLD:-3}"
+crs+=",ha-auto-rebalance-method=${PVE_CRS_METHOD:-bruteforce}"
+crs+=",ha-rebalance-on-start=1"
+log "cluster resource scheduling: $crs"
+pssh "$first" "pvesh set /cluster/options --crs '$crs'"
 
-set_rule() {   # set_rule <rule> <nodes> <resources-csv>
-    local rule=$1 nodes=$2 resources=$3
-    if [[ -n $(rule_state "$rule") ]] || pssh "$first" "pvesh get /cluster/ha/rules/$rule >/dev/null 2>&1"; then
+nodes_for() { [[ $1 == prefer-hpe1 ]] && echo "pve1:1,pve2:1" || echo "pve3:1,pve4:1"; }
+
+set_rule() {   # set_rule <rule> <resources-csv>
+    local rule=$1 resources=$2 nodes; nodes=$(nodes_for "$rule")
+    if rule_exists "$rule"; then
         pssh "$first" "pvesh set /cluster/ha/rules/$rule --nodes '$nodes' --resources '$resources' --strict 0 --disable 0"
         log "rule $rule updated: nodes=$nodes resources=$resources"
     else
         pssh "$first" "pvesh create /cluster/ha/rules --type node-affinity --rule $rule --nodes '$nodes' --resources '$resources' --strict 0 --comment 'prefer this physical host; non-strict'"
         log "rule $rule created: nodes=$nodes resources=$resources"
     fi
+    RULE_RESOURCES[$rule]=$resources
 }
 
 drop_rule() {
     local rule=$1
-    if [[ -n $(rule_state "$rule") ]] || pssh "$first" "pvesh get /cluster/ha/rules/$rule >/dev/null 2>&1"; then
-        pssh "$first" "pvesh delete /cluster/ha/rules/$rule"
-        log "rule $rule removed: no resources are assigned to it any more"
-    fi
+    rule_exists "$rule" || return 0
+    pssh "$first" "pvesh delete /cluster/ha/rules/$rule"
+    log "rule $rule removed: no resources are assigned to it any more"
+    unset 'RULE_RESOURCES[$rule]'
 }
 
 # --- withdraw first, then add ----------------------------------------------
@@ -136,38 +141,30 @@ drop_rule() {
 # VM could never move from one host's rule to the other's -- the reverse
 # direction happened to work, which is why one-directional testing missed it.
 for rule in prefer-hpe1 prefer-hpe2; do
-    current=$(rule_state "$rule")
+    rule_exists "$rule" || continue
+    current=$(rule_members "$rule")
     [[ -n $current ]] || continue
-    keep=()
+    keep=(); total=0
     IFS=',' read -ra _members <<<"$current"
     for m in "${_members[@]}"; do
-        m=${m// /}
-        [[ -z $m ]] && continue
+        m=${m// /}; [[ -z $m ]] && continue
+        total=$(( total + 1 ))
         [[ ${DESIRED[$m]:-} == "$rule" ]] && keep+=("$m")
     done
-    if (( ${#keep[@]} == ${#_members[@]} )); then
-        continue                      # nothing is leaving this rule
-    fi
+    (( ${#keep[@]} == total )) && continue      # nothing is leaving
     if (( ${#keep[@]} )); then
-        nodes=$([[ $rule == prefer-hpe1 ]] && echo "pve1:1,pve2:1" || echo "pve3:1,pve4:1")
-        pssh "$first" "pvesh set /cluster/ha/rules/$rule --nodes '$nodes' --resources '$(join_by , "${keep[@]}")' --strict 0 --disable 0"
+        pssh "$first" "pvesh set /cluster/ha/rules/$rule --nodes '$(nodes_for "$rule")' --resources '$(join_by , "${keep[@]}")' --strict 0 --disable 0"
+        RULE_RESOURCES[$rule]=$(join_by , "${keep[@]}")
         log "rule $rule: released departing members before the additions"
     else
         pssh "$first" "pvesh delete /cluster/ha/rules/$rule"
+        unset 'RULE_RESOURCES[$rule]'
         log "rule $rule: released every member before the additions"
     fi
 done
 
-if (( ${#hpe1_res[@]} )); then
-    set_rule prefer-hpe1 "pve1:1,pve2:1" "$(join_by , "${hpe1_res[@]}")"
-else
-    drop_rule prefer-hpe1
-fi
-if (( ${#hpe2_res[@]} )); then
-    set_rule prefer-hpe2 "pve3:1,pve4:1" "$(join_by , "${hpe2_res[@]}")"
-else
-    drop_rule prefer-hpe2
-fi
+if (( ${#hpe1_res[@]} )); then set_rule prefer-hpe1 "$(join_by , "${hpe1_res[@]}")"; else drop_rule prefer-hpe1; fi
+if (( ${#hpe2_res[@]} )); then set_rule prefer-hpe2 "$(join_by , "${hpe2_res[@]}")"; else drop_rule prefer-hpe2; fi
 
 echo "--- crs";   pssh "$first" "pvesh get /cluster/options --output-format json" | jq -r '.crs'
 echo "--- rules"; pssh "$first" "ha-manager rules list"
