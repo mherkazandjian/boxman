@@ -107,9 +107,20 @@ mon_registered() {
     local node=$1 out rc=0
     out=$(pssh "$first" "timeout 10 ceph mon dump --format json 2>/dev/null") || rc=$?
     (( rc == 0 )) || die "could not read the ceph monmap from $first (exit $rc)"
-    jq -e 'has("mons")' <<<"$out" >/dev/null 2>&1 \
-        || die "the ceph monmap from $first did not parse"
-    jq -e --arg n "$node" '[.mons[].name] | index($n)' <<<"$out" >/dev/null 2>&1
+    # `has("mons")` only proves the key is present: {"mons":null},
+    # {"mons":42} and {"mons":[false]} all pass it, and the extraction below
+    # then fails -- whose status, read inside the caller's `if`, becomes
+    # "not registered". A monitor that is registered would be treated as
+    # absent and recreated.
+    jq -e '(.mons | type) == "array"
+           and all(.mons[]; (.name | type) == "string" and (.name | length) > 0)' \
+        <<<"$out" >/dev/null 2>&1 \
+        || die "the ceph monmap from $first is unusable (mons is not a list of
+                named monitors); refusing to guess whether $node is registered"
+    local names
+    names=$(jq -r '[.mons[].name] | join(" ")' <<<"$out") \
+        || die "could not read the monitor names from $first's monmap"
+    [[ " $names " == *" $node "* ]]
 }
 
 for n in "${MONS[@]}"; do
@@ -118,16 +129,24 @@ for n in "${MONS[@]}"; do
     # `pveceph mon create` into an "already exists" error with no explanation
     # of what to do about it.
     if (( bootstrapped )) && mon_registered "$n" && ! mon_exists "$n"; then
-        # NOT `pveceph mon destroy`: its removal API checks that
-        # /var/lib/ceph/mon/ceph-<node> exists before it starts, and again
-        # under the config lock, so it refuses precisely the state described
-        # here. `ceph mon remove` edits the monmap and needs no local store.
+        # Three separate pieces of state, and removing only one is not
+        # enough. `pveceph mon destroy` is out: its API requires
+        # /var/lib/ceph/mon/ceph-<node> to exist, which is the very thing that
+        # is missing. `ceph mon remove` clears the monmap but not Proxmox's
+        # own records, and a later `pveceph mon create` then refuses with
+        # "address already in use" (mon_host still lists it) or "monitor
+        # already exists" (the ceph.conf section or the enabled unit survives).
         die "ceph reports mon.$n in the monmap, but $n has no
-             /var/lib/ceph/mon/ceph-$n -- the monitor's store was lost, or it
-             was removed without the monmap being updated. 'pveceph mon
-             destroy $n' will refuse this state (it requires that directory).
-             Recover from a surviving monitor with: 'ceph mon remove $n',
-             then re-run this script to recreate it."
+             /var/lib/ceph/mon/ceph-$n -- its store was lost, or it was removed
+             without the monmap being updated. 'pveceph mon destroy $n' cannot
+             help: it requires that directory. Recover in three steps, then
+             re-run this script:
+               1. from a surviving monitor:  ceph mon remove $n
+               2. on $n:  systemctl disable --now ceph-mon@$n.service
+               3. in /etc/pve/ceph.conf: delete the [mon.$n] section and remove
+                  $n's address from mon_host
+             Removing only the monmap entry leaves the address and the service
+             record behind, and the recreate refuses."
     fi
     if ! mon_exists "$n"; then
         if (( bootstrapped )); then

@@ -10,8 +10,16 @@ DEMO_VMID=${2:-$DEMO_VMID}
 DEMO_IP=${3:-$DEMO_IP}
 [[ -n ${NODE_IP[$target]:-} ]] || die "unknown node $target"
 
-read -r src DEMO_NAME < <(pssh pve1 "pvesh get /cluster/resources --type vm --output-format json" \
-      | jq -r ".[] | select(.vmid == $DEMO_VMID) | \"\(.node) \(.name)\"")
+# `read < <(cmd | jq)` sees whether *read* got a row, not whether the producer
+# finished: ssh printing a valid row and then exiting 255, or jq failing after
+# emitting one, both left a usable-looking $src and the migration started
+# anyway. Capture and check each step before anything is done with the answer.
+# (Predates this work -- caa4be2 -- and is the fourth instance of the defect.)
+resources=$(pssh pve1 "pvesh get /cluster/resources --type vm --output-format json") \
+    || die "could not read the cluster resources from pve1"
+row=$(jq -r ".[] | select(.vmid == $DEMO_VMID) | \"\(.node) \(.name)\"" <<<"$resources") \
+    || die "could not parse the cluster resources from pve1"
+read -r src DEMO_NAME <<<"$row"
 [[ -n ${src:-} ]] || die "VM $DEMO_VMID not found in the cluster"
 [[ $src != "$target" ]] || die "VM $DEMO_VMID is already on $target"
 log "VM $DEMO_VMID ($DEMO_NAME) on $src (${NODE_SITE[$src]}) -> $target (${NODE_SITE[$target]})"

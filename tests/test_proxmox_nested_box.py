@@ -175,13 +175,20 @@ pssh() {
         *"ceph mon dump"*)
             echo "mon_dump" >> "$CALLS"
             [ "$MODE" = dump_fail ] && return 1
+            case "${MONMAP_BODY:-}" in
+                null)    echo '{"mons":null}';    return 0 ;;
+                number)  echo '{"mons":42}';      return 0 ;;
+                nonames) echo '{"mons":[false]}'; return 0 ;;
+                noname)  echo '{"mons":[{"rank":0}]}'; return 0 ;;
+            esac
             echo "{\"mons\":[$(_json_list "$_registered" | sed 's/^\[//;s/\]$//' \
                  | sed 's/"\([^"]*\)"/{"name":"\1"}/g')]}"
             return 0 ;;
         *"pveceph mon create"*)
             echo "mon_create $node" >> "$CALLS"
             _storage="$_storage $node"; _registered="$_registered $node"
-            _quorum="$_quorum $node"
+            # a monitor can be created and still fail to join
+            [ "${MON_NEVER_JOINS:-}" = "$node" ] || _quorum="$_quorum $node"
             return 0 ;;
         *"ceph quorum_status"*)
             echo "quorum_probe $node" >> "$CALLS"
@@ -197,7 +204,8 @@ pssh() {
 
 
 def _run_ceph_bootstrap(tmp_path, mode: str = "normal", storage: str = "",
-                        registered: str = "", quorum: str = "", tag: str = ""):
+                        registered: str = "", quorum: str = "", tag: str = "",
+                        monmap_body: str = "", never_joins: str = ""):
     """Run the real pve-ceph.sh against the stub; return (rc, trace, full)."""
     work = tmp_path / ("cephrun-" + (tag or mode))
     work.mkdir(exist_ok=True)
@@ -207,7 +215,8 @@ def _run_ceph_bootstrap(tmp_path, mode: str = "normal", storage: str = "",
         ["bash", "./pve-ceph.sh"], cwd=work, timeout=120, capture_output=True,
         text=True, env=dict(os.environ, T=str(work), STUB_MODE=mode,
                             MON_STORAGE=storage, MON_REGISTERED=registered,
-                            MON_QUORUM=quorum))
+                            MON_QUORUM=quorum, MONMAP_BODY=monmap_body,
+                            MON_NEVER_JOINS=never_joins))
     calls = work / "calls"
     full = calls.read_text().splitlines() if calls.exists() else []
     trace = [ln for ln in full
@@ -298,5 +307,68 @@ def test_a_registered_monitor_without_its_storage_is_diagnosed(tmp_path):
         "a monitor already in the monmap was created again"
     advice = " ".join(ln for ln in full if ln.startswith("die"))
     assert "ceph mon remove" in advice, f"no usable recovery was named: {advice}"
-    assert "pveceph mon destroy" not in advice or "will refuse" in advice, (
-        "advised a command whose own precondition is the missing directory")
+    # If the obvious command is mentioned at all, it must be to say why it
+    # cannot be used: its own precondition is the directory that is missing.
+    if "pveceph mon destroy" in advice:
+        assert "cannot help" in advice or "requires that directory" in advice, (
+            "named a command whose precondition is the very thing that is gone, "
+            "without saying so")
+
+
+@pytest.mark.parametrize("body", ["null", "number", "nonames", "noname"])
+def test_an_unusable_monmap_is_not_read_as_absence(tmp_path, body):
+    """#171 B1. `has("mons")` proves only that the key is there: {"mons":null},
+    {"mons":42} and {"mons":[false]} all pass it and the extraction then fails
+    -- and its status, read inside the caller's `if`, becomes "not
+    registered". A monitor that *is* registered would be recreated."""
+    rc, _trace, full = _run_ceph_bootstrap(
+        tmp_path, storage="pve1 pve2", registered="pve1 pve2 pve3",
+        quorum="pve1 pve2", monmap_body=body, tag="body-" + body)
+
+    assert rc != 0, f"an unusable monmap was accepted: {full[-5:]}"
+    assert not [ln for ln in full if "mon_create pve3" in ln], \
+        "pve3 was recreated on the strength of an unreadable monmap"
+
+
+def test_a_failed_monmap_query_stops_the_run(tmp_path):
+    """A command failure is not absence either."""
+    rc, _trace, full = _run_ceph_bootstrap(
+        tmp_path, mode="dump_fail", storage="pve1 pve2",
+        registered="pve1 pve2 pve3", quorum="pve1 pve2", tag="dumpfail")
+
+    assert rc != 0, full[-5:]
+    assert not [ln for ln in full if "mon_create pve3" in ln], full
+    osd = [ln for ln in full if "osd create" in ln or "ceph-volume" in ln]
+    assert not osd, "OSD work proceeded after a failed monmap query"
+
+
+def test_a_newly_created_monitor_that_never_joins_is_refused(tmp_path):
+    """The cold-bootstrap path: pve3 is created here rather than pre-existing,
+    and never appears in quorum_names. Checking quorum only for monitors that
+    already existed reports it OK and runs eight OSD commands."""
+    rc, _trace, full = _run_ceph_bootstrap(
+        tmp_path, never_joins="pve3", tag="newnojoin")
+
+    assert rc != 0, f"a newly created monitor that never joined was accepted: {full[-5:]}"
+    assert not [ln for ln in full if ln == "log mon pve3 ok"], \
+        "pve3 was reported ok although it never joined"
+    osd = [i for i, ln in enumerate(full) if "osd create" in ln or "ceph-volume" in ln]
+    died = [i for i, ln in enumerate(full) if ln.startswith("die")]
+    assert died and not [i for i in osd if i < died[0]], full
+
+
+def test_the_recovery_names_every_step_the_recreate_needs(tmp_path):
+    """#171 B1. `ceph mon remove` alone leaves Proxmox's own records behind and
+    the recreate then refuses -- "address already in use" while mon_host still
+    lists it, "monitor already exists" while the ceph.conf section or the
+    enabled unit survives. Advice that stops at step one is unusable."""
+    rc, _trace, full = _run_ceph_bootstrap(
+        tmp_path, storage="pve1 pve2", registered="pve1 pve2 pve3",
+        quorum="pve1 pve2", tag="advice")
+
+    assert rc != 0
+    advice = " ".join(ln for ln in full if ln.startswith("die"))
+    assert "ceph mon remove pve3" in advice, advice
+    assert "ceph-mon@pve3" in advice, f"the service record is not mentioned: {advice}"
+    assert "mon_host" in advice, f"the address entry is not mentioned: {advice}"
+    assert "ceph.conf" in advice, f"the config section is not mentioned: {advice}"

@@ -425,9 +425,12 @@ def test_multiple_victims_cross_the_remote_shell_as_arguments(box, tmp_path):
     assert r.returncode == 0, "the drill failed:\n" + r.stdout + r.stderr
     args = [ln[4:] for ln in argv_log.read_text().splitlines()
             if ln.startswith("ARG=")]
-    assert args[-2:] == ["vm:200", "vm:201"], (
-        "the sids did not arrive as separate arguments: %r" % (args,))
-    assert all(" " not in a for a in args), "an argument contains a space: %r" % (args,)
+    # The *complete* argv, not its tail: checking only the last two permits
+    # dropping the timeout, after which the first sid silently becomes the
+    # timeout argument and the drill reports a recovery it never watched.
+    assert args == ["pve4", "600", "vm:200", "vm:201"], (
+        "the watcher did not receive node, timeout and both sids as four "
+        "separate arguments: %r" % (args,))
 
 
 
@@ -477,6 +480,11 @@ pssh() {
             [ "${RULE_LIST_SHAPE:-}" = notarray ] && { echo '{"oops":true}'; return 0; }
             [ "${RULE_LIST_SHAPE:-}" = noname ] && {
                 echo '[{"resources":"vm:200"}]'; return 0; }
+            # valid names, so the shape checks pass, but @tsv cannot render the
+            # second entry: jq emits one row and *then* fails
+            [ "${RULE_LIST_SHAPE:-}" = tsvfail ] && {
+                echo '[{"rule":"prefer-hpe1","resources":"vm:200"},{"rule":"prefer-hpe2","resources":{}}]'
+                return 0; }
             local out="[" first_e=1 r
             for r in "$RULES"/*; do
                 [ -e "$r" ] || continue
@@ -619,6 +627,9 @@ def test_no_per_rule_lookup_is_issued(box, tmp_path):
     ({"RULE_LIST_WARNS": 1}, "the rule config did not parse cleanly"),
     ({"RULE_LIST_SHAPE": "notarray"}, "the listing is not an array"),
     ({"RULE_LIST_SHAPE": "noname"}, "an entry has no rule name"),
+    # the converter emits a usable prefix and then fails -- the exact shape of
+    # the process-substitution defect this replaced
+    ({"RULE_LIST_SHAPE": "tsvfail"}, "the tsv conversion failed after a row"),
 ])
 def test_an_untrustworthy_rule_listing_prevents_every_write(box, tmp_path, env, why):
     """Finding 1. Exit 0 with valid JSON is not a certificate: Proxmox's
@@ -649,3 +660,68 @@ def test_an_empty_rule_listing_is_a_valid_answer(box, tmp_path):
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert rules.get("prefer-hpe1", "") == "vm:200", rules
+
+
+# ── the fourth process substitution, in the migration script ────────────────
+
+_MIGRATE_STUB_LIB = r"""
+set -euo pipefail
+NODES=(pve1 pve2 pve3 pve4)
+declare -A NODE_IP=([pve1]=10.77.0.11 [pve2]=10.77.0.12 [pve3]=10.77.0.13 [pve4]=10.77.0.14)
+declare -A NODE_SITE=([pve1]=hpe1 [pve2]=hpe1 [pve3]=hpe2 [pve4]=hpe2)
+LOGS="$PWD"; CALLS="$PWD/calls"; : > "$CALLS"
+SSH_OPTS=(-o BatchMode=yes)
+DEMO_VMID=100; DEMO_NAME=demo01; DEMO_IP=10.77.0.50
+log() { :; }
+die() { echo "die $*" >> "$CALLS"; exit 1; }
+sleep() { :; }
+ping() { return 0; }
+ssh()  { return 0; }
+pssh() {
+    local node=$1; shift; local cmd="$*"
+    echo "$cmd" >> "$CALLS"
+    case "$cmd" in
+        *"/cluster/resources"*)
+            echo '[{"vmid":100,"node":"pve1","name":"demo01","status":"running"}]'
+            [ "${LOOKUP_FAILS:-0}" = 1 ] && return 255
+            return 0 ;;
+        *"qm migrate"*) echo "migrate $cmd" >> "$CALLS"; return 0 ;;
+    esac
+    return 0
+}
+"""
+
+
+@pytest.mark.parametrize("mode", ["ssh_after_output"])
+def test_a_migration_never_starts_from_a_failed_source_lookup(box, tmp_path, mode):
+    """`read -r src … < <(pssh … | jq …)` sees whether *read* got a row, not
+    whether the producer finished. ssh printing the valid row and then exiting
+    255 left a usable-looking source node and `qm migrate` ran anyway.
+
+    Predates this work (caa4be2); found by the wider scan for the pattern.
+    """
+    work = tmp_path / ("migrate-" + mode)
+    work.mkdir()
+    shutil.copy(box / "scripts" / "pve-migrate.sh", work / "pve-migrate.sh")
+    (work / "lib.sh").write_text(_MIGRATE_STUB_LIB)
+    proc = subprocess.run(["bash", "./pve-migrate.sh", "pve3"], cwd=work,
+                          env=dict(os.environ, LOOKUP_FAILS="1"),
+                          capture_output=True, text=True, timeout=60)
+    calls = (work / "calls").read_text()
+
+    assert proc.returncode != 0, f"a failed lookup still reported success:\n{proc.stdout}"
+    assert "migrate" not in calls, "qm migrate ran after the source lookup failed"
+
+
+def test_a_successful_lookup_still_migrates(box, tmp_path):
+    """The control: without it the check above could pass by refusing every
+    migration."""
+    work = tmp_path / "migrate-ok"
+    work.mkdir()
+    shutil.copy(box / "scripts" / "pve-migrate.sh", work / "pve-migrate.sh")
+    (work / "lib.sh").write_text(_MIGRATE_STUB_LIB)
+    proc = subprocess.run(["bash", "./pve-migrate.sh", "pve3"], cwd=work,
+                          env=dict(os.environ, LOOKUP_FAILS="0"),
+                          capture_output=True, text=True, timeout=60)
+    calls = (work / "calls").read_text()
+    assert "qm migrate 100 pve3" in calls, calls
