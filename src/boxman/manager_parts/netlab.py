@@ -43,12 +43,13 @@ class NetlabMixin:
                 f"`--runtime local`, or drop the shared_networks block.")
 
         self.logger.info(f"ensuring {len(shared)} shared bridge(s) exist on host")
-        shared_bridges.ensure(
-            shared,
-            use_sudo=bool(
-                (self.provider.provider_config or {}).get('use_sudo', True)
-                if self.provider is not None else True),
-        )
+        # Deliberately no privilege argument. Host bridge commands need
+        # CAP_NET_ADMIN no matter what the libvirt provider's `use_sudo` says
+        # about virsh -- the two settings share a word and mean different
+        # things, and forwarding that flag here (#164 FBN-12) left every
+        # project with `use_sudo: false` unable to bring its bridges up at
+        # all. shared_bridges decides from the process's own euid.
+        shared_bridges.ensure(shared)
 
     def deploy_netlab(self) -> None:
         """Render and deploy the containerlab topology, if configured.
