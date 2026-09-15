@@ -174,6 +174,14 @@ pssh() {
             return 0 ;;
         *"ceph mon dump"*)
             echo "mon_dump" >> "$CALLS"
+            # A *complete, valid* monmap followed by a non-zero exit. An
+            # empty response would be stopped by the later shape validation,
+            # which masks whether the command's own status is checked at all.
+            if [ -n "${MONMAP_FAIL_AFTER_OUTPUT:-}" ]; then
+                echo "{\"mons\":[$(_json_list "$_registered" | sed 's/^\[//;s/\]$//' \
+                     | sed 's/"\([^"]*\)"/{"name":"\1"}/g')]}"
+                return "$MONMAP_FAIL_AFTER_OUTPUT"
+            fi
             [ "$MODE" = dump_fail ] && return 1
             case "${MONMAP_BODY:-}" in
                 null)    echo '{"mons":null}';    return 0 ;;
@@ -205,7 +213,8 @@ pssh() {
 
 def _run_ceph_bootstrap(tmp_path, mode: str = "normal", storage: str = "",
                         registered: str = "", quorum: str = "", tag: str = "",
-                        monmap_body: str = "", never_joins: str = ""):
+                        monmap_body: str = "", never_joins: str = "",
+                        fail_after: str = ""):
     """Run the real pve-ceph.sh against the stub; return (rc, trace, full)."""
     work = tmp_path / ("cephrun-" + (tag or mode))
     work.mkdir(exist_ok=True)
@@ -216,7 +225,8 @@ def _run_ceph_bootstrap(tmp_path, mode: str = "normal", storage: str = "",
         text=True, env=dict(os.environ, T=str(work), STUB_MODE=mode,
                             MON_STORAGE=storage, MON_REGISTERED=registered,
                             MON_QUORUM=quorum, MONMAP_BODY=monmap_body,
-                            MON_NEVER_JOINS=never_joins))
+                            MON_NEVER_JOINS=never_joins,
+                            MONMAP_FAIL_AFTER_OUTPUT=fail_after))
     calls = work / "calls"
     full = calls.read_text().splitlines() if calls.exists() else []
     trace = [ln for ln in full
@@ -330,14 +340,22 @@ def test_an_unusable_monmap_is_not_read_as_absence(tmp_path, body):
         "pve3 was recreated on the strength of an unreadable monmap"
 
 
-def test_a_failed_monmap_query_stops_the_run(tmp_path):
-    """A command failure is not absence either."""
-    rc, _trace, full = _run_ceph_bootstrap(
-        tmp_path, mode="dump_fail", storage="pve1 pve2",
-        registered="pve1 pve2 pve3", quorum="pve1 pve2", tag="dumpfail")
+@pytest.mark.parametrize("code", ["1", "13", "255"])
+def test_a_monmap_query_that_fails_after_answering_stops_the_run(tmp_path, code):
+    """A command failure is not absence either.
 
-    assert rc != 0, full[-5:]
-    assert not [ln for ln in full if "mon_create pve3" in ln], full
+    The cluster here is otherwise healthy -- every store present, every
+    monitor registered and quorate -- and the dump returns a *complete, valid*
+    monmap and then exits non-zero. An empty response would be caught by the
+    shape validation instead, which masks whether the command's own status is
+    checked at all: removing that check passed the earlier fixture.
+    """
+    rc, _trace, full = _run_ceph_bootstrap(
+        tmp_path, storage="pve1 pve2 pve3", registered="pve1 pve2 pve3",
+        quorum="pve1 pve2 pve3", fail_after=code, tag="dumpfail-" + code)
+
+    assert rc != 0, f"exit {code} from the monmap query was ignored: {full[-5:]}"
+    assert any("monmap" in ln for ln in full if ln.startswith("die")), full
     osd = [ln for ln in full if "osd create" in ln or "ceph-volume" in ln]
     assert not osd, "OSD work proceeded after a failed monmap query"
 
@@ -368,7 +386,15 @@ def test_the_recovery_names_every_step_the_recreate_needs(tmp_path):
 
     assert rc != 0
     advice = " ".join(ln for ln in full if ln.startswith("die"))
+    # The operations and their targets, not merely the names of the objects.
+    # Naming the unit while telling the operator to *enable* it leaves pve3's
+    # service record in place and the upstream guard then refuses the recreate
+    # with "monitor 'pve3' already exists".
     assert "ceph mon remove pve3" in advice, advice
-    assert "ceph-mon@pve3" in advice, f"the service record is not mentioned: {advice}"
-    assert "mon_host" in advice, f"the address entry is not mentioned: {advice}"
-    assert "ceph.conf" in advice, f"the config section is not mentioned: {advice}"
+    assert "systemctl disable --now ceph-mon@pve3.service" in advice, (
+        f"the service is not disabled by the advice: {advice}")
+    assert "enable --now" not in advice, (
+        f"the advice re-enables the unit it needs removed: {advice}")
+    assert "delete the [mon.pve3] section" in advice, advice
+    assert "remove" in advice and "mon_host" in advice, (
+        f"the address entry is named but not removed: {advice}")

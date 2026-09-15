@@ -664,64 +664,105 @@ def test_an_empty_rule_listing_is_a_valid_answer(box, tmp_path):
 
 # ── the fourth process substitution, in the migration script ────────────────
 
+#: `ping` must stay alive until the script signals it: a stub that returns at
+#: once leaves `kill -INT $pingpid` failing, which ends the run before the
+#: placement check and made a "successful migration" control pass on a script
+#: that exited 1. `command sleep` because lib.sh's sleep is stubbed out, and
+#: only two seconds because bash cannot act on the INT until the command it is
+#: waiting on returns -- so `wait` blocks for however long this sleeps.
+#:
+#: Placement is state, not a constant: the resource query answers pve1 until a
+#: migration succeeds and pve3 afterwards, so the script's final placement
+#: assertion has something true to find.
 _MIGRATE_STUB_LIB = r"""
 set -euo pipefail
 NODES=(pve1 pve2 pve3 pve4)
 declare -A NODE_IP=([pve1]=10.77.0.11 [pve2]=10.77.0.12 [pve3]=10.77.0.13 [pve4]=10.77.0.14)
 declare -A NODE_SITE=([pve1]=hpe1 [pve2]=hpe1 [pve3]=hpe2 [pve4]=hpe2)
 LOGS="$PWD"; CALLS="$PWD/calls"; : > "$CALLS"
+PLACE="$PWD/placement"; echo pve1 > "$PLACE"
 SSH_OPTS=(-o BatchMode=yes)
 DEMO_VMID=100; DEMO_NAME=demo01; DEMO_IP=10.77.0.50
 log() { :; }
 die() { echo "die $*" >> "$CALLS"; exit 1; }
 sleep() { :; }
-ping() { return 0; }
+ping() { case "$*" in *-w*) command sleep 2 ;; *) return 0 ;; esac; }
 ssh()  { return 0; }
 pssh() {
     local node=$1; shift; local cmd="$*"
     echo "$cmd" >> "$CALLS"
     case "$cmd" in
         *"/cluster/resources"*)
-            echo '[{"vmid":100,"node":"pve1","name":"demo01","status":"running"}]'
+            printf '[{"vmid":100,"node":"%s","name":"demo01","status":"running"}]' "$(cat "$PLACE")"
             [ "${LOOKUP_FAILS:-0}" = 1 ] && return 255
             return 0 ;;
-        *"qm migrate"*) echo "migrate $cmd" >> "$CALLS"; return 0 ;;
+        *"qm migrate"*)
+            echo "migrate $cmd" >> "$CALLS"
+            [ "${MIGRATE_FAILS:-0}" = 1 ] && return 1
+            echo pve3 > "$PLACE"; return 0 ;;
     esac
     return 0
 }
 """
 
+#: A jq that emits the valid source row and *then* fails -- the producer-side
+#: half of the defect. The SSH fixture stops before jq is reached, so without
+#: this the new parser-status check is never exercised.
+_JQ_ROW_THEN_FAIL = """
+printf 'pve1 demo01\n'
+exit 5
+"""
 
-@pytest.mark.parametrize("mode", ["ssh_after_output"])
-def test_a_migration_never_starts_from_a_failed_source_lookup(box, tmp_path, mode):
-    """`read -r src … < <(pssh … | jq …)` sees whether *read* got a row, not
-    whether the producer finished. ssh printing the valid row and then exiting
-    255 left a usable-looking source node and `qm migrate` ran anyway.
 
-    Predates this work (caa4be2); found by the wider scan for the pattern.
-    """
-    work = tmp_path / ("migrate-" + mode)
+def _run_migrate(box, tmp_path, tag, jq_stub=None, **env):
+    work = tmp_path / ("migrate-" + tag)
     work.mkdir()
     shutil.copy(box / "scripts" / "pve-migrate.sh", work / "pve-migrate.sh")
     (work / "lib.sh").write_text(_MIGRATE_STUB_LIB)
-    proc = subprocess.run(["bash", "./pve-migrate.sh", "pve3"], cwd=work,
-                          env=dict(os.environ, LOOKUP_FAILS="1"),
-                          capture_output=True, text=True, timeout=60)
-    calls = (work / "calls").read_text()
+    path = os.environ["PATH"]
+    if jq_stub is not None:
+        binn = work / "bin"; binn.mkdir()
+        _stub(binn / "jq", jq_stub)
+        path = f"{binn}:{path}"
+    proc = subprocess.run(
+        ["bash", "./pve-migrate.sh", "pve3"], cwd=work, timeout=120,
+        env=dict(os.environ, PATH=path, **{k: str(v) for k, v in env.items()}),
+        capture_output=True, text=True)
+    calls = (work / "calls")
+    return proc, (calls.read_text() if calls.exists() else "")
 
-    assert proc.returncode != 0, f"a failed lookup still reported success:\n{proc.stdout}"
+
+def test_a_migration_never_starts_from_a_failed_source_lookup(box, tmp_path):
+    """`read -r src … < <(pssh … | jq …)` sees whether *read* got a row, not
+    whether the producer finished, so ssh printing the valid row and then
+    exiting 255 left a usable-looking source node and `qm migrate` ran anyway.
+    Predates this work (caa4be2); found by the wider scan for the pattern."""
+    proc, calls = _run_migrate(box, tmp_path, "sshfail", LOOKUP_FAILS=1)
+
+    assert proc.returncode != 0, "a failed lookup still reported success:\n" + proc.stdout
     assert "migrate" not in calls, "qm migrate ran after the source lookup failed"
 
 
-def test_a_successful_lookup_still_migrates(box, tmp_path):
-    """The control: without it the check above could pass by refusing every
-    migration."""
-    work = tmp_path / "migrate-ok"
-    work.mkdir()
-    shutil.copy(box / "scripts" / "pve-migrate.sh", work / "pve-migrate.sh")
-    (work / "lib.sh").write_text(_MIGRATE_STUB_LIB)
-    proc = subprocess.run(["bash", "./pve-migrate.sh", "pve3"], cwd=work,
-                          env=dict(os.environ, LOOKUP_FAILS="0"),
-                          capture_output=True, text=True, timeout=60)
-    calls = (work / "calls").read_text()
+def test_a_migration_never_starts_from_a_failed_parse(box, tmp_path):
+    """The other half: the lookup succeeds and the *parser* fails after
+    emitting a usable row. The ssh fixture stops before jq is reached, so it
+    cannot exercise this."""
+    proc, calls = _run_migrate(box, tmp_path, "jqfail", jq_stub=_JQ_ROW_THEN_FAIL)
+
+    assert proc.returncode != 0, "a failed parse still reported success:\n" + proc.stdout
+    assert "migrate" not in calls, "qm migrate ran after the parse failed"
+
+
+def test_a_successful_migration_runs_to_completion(box, tmp_path):
+    """The positive control. Without it the checks above could pass by
+    refusing every migration -- and a control that only looks for the command
+    having *started* is not one: the earlier version passed on a script that
+    exited 1, because the ping stub had already gone and the kill failed."""
+    proc, calls = _run_migrate(box, tmp_path, "ok")
+
+    assert proc.returncode == 0, (
+        "the unmodified script did not complete:\n" + proc.stdout + proc.stderr)
     assert "qm migrate 100 pve3" in calls, calls
+    # the placement assertion the script makes must have had something to find
+    assert calls.count("/cluster/resources") >= 2, (
+        "the final placement was never queried: " + calls)

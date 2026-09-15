@@ -146,7 +146,10 @@ for n in "${MONS[@]}"; do
                3. in /etc/pve/ceph.conf: delete the [mon.$n] section and remove
                   $n's address from mon_host
              Removing only the monmap entry leaves the address and the service
-             record behind, and the recreate refuses."
+             record behind, and the recreate refuses. Give pvestatd a few
+             seconds after step 2 before re-running: Proxmox serves the service
+             inventory from a cache it refreshes on a ~10s cycle, so an
+             immediate retry can still see the old unit."
     fi
     if ! mon_exists "$n"; then
         if (( bootstrapped )); then
