@@ -143,9 +143,34 @@ unattended install the domain is simply `shut off`; `make wait-installed`
 watches for that, and `make boot` (`boxman up` again) starts the persistent
 definition from disk. The first-boot hook (`scripts/first-boot.sh`, baked into
 the ISO) then disables the enterprise repos, enables `pve-no-subscription`,
-sets MTU 1450 on `vmbr0`, installs `qemu-guest-agent` and writes
-`/var/lib/pve-lab/first-boot.done`, which `make wait-first-boot` polls before
-anything touches the node.
+sets MTU 1450 on `vmbr0`, runs a **`dist-upgrade`**, installs
+`qemu-guest-agent` and writes `/var/lib/pve-lab/first-boot.done`, which
+`make wait-first-boot` polls before anything touches the node.
+
+### Why the nodes are upgraded on first boot
+
+The ISO's packages are frozen when it is built, but `pveceph install
+--repository no-subscription` takes whatever Ceph is *current*. Without the
+upgrade a node therefore pairs ISO-era PVE with a newer Ceph, and that
+combination can be fatal: on 2026-09-15, Ceph 20.2.4 issued `aes256k` keys
+(32 bytes, base64 ending in a single `=`) while `libpve-storage-perl` 9.1.5's
+rbd keyring check demanded `==`. PVE rejected the keyring PVE itself had
+written, every rbd storage stayed `inactive`, and `make demo` failed against a
+`HEALTH_OK` cluster. It is fixed upstream in `libpve-storage-perl` 9.1.10 — the
+nodes simply had 9.1.5, because nothing ever upgraded them. An earlier build on
+2026-09-06 worked only because the ISO's PVE and the repo's Ceph were still in
+step; that was luck with a nine-day shelf life, not a working design.
+
+Two consequences worth knowing:
+
+- **The upgrade stages a kernel the node is not running.** `proxmox-kernel`
+  updates take effect at the next reboot, which this box never performs after
+  first boot. Harmless for a lab; reboot a node if you need the new kernel.
+- **A build is only as reproducible as the repo on the day.** Upgrading makes
+  both halves move together rather than one, which is the point, but it does not
+  pin them. If you need a byte-reproducible lab, pin `PVE_CEPH_VERSION` *and*
+  the PVE packages — and accept that you are then shipping a deliberately frozen
+  stack that will drift out of support.
 
 This relies on the post-create CPU/memory step editing the persistent config
 (`dumpxml --inactive`) — the fix that ships with this box. Before it, boxman
@@ -292,6 +317,7 @@ the next `make up`.
 | `virsh net-start` fails on host1: bridge in use | `virbr-pve` already existed (a leftover from `vxlan-up.sh` run too early). `sudo ip link del virbr-pve`, then `boxman up`, then `vxlan-up.sh`. |
 | Nodes on host2 lose connectivity after a host reboot / `boxman destroy` on host1 | The VXLAN is not persistent, and host1's bridge is recreated by libvirt. `make boot` (or `vxlan-up.sh` on both hosts) restores it. |
 | ssh works but `pvecm`/`pveceph` fail with a dpkg lock | The first-boot hook is still running apt. Use `make wait-first-boot`. |
+| `Not a proper rbd authentication file` and `vmpool` `inactive` on a HEALTH_OK cluster | PVE's storage layer is older than the Ceph it installed (see *Why the nodes are upgraded on first boot*). Check `apt-cache policy libpve-storage-perl` on a node; the first-boot `dist-upgrade` is what prevents it. |
 | `pvecm add` prompts or refuses | `--use_ssh` needs root ssh between nodes: `pve-cluster.sh` pushes the lab key and known_hosts first; re-run it. |
 | `ceph -s` stuck below HEALTH_OK | Fresh OSDs peer for a minute or two; the script waits up to 5 min. Clock skew between the *hosts* (host2 runs a few minutes behind host1) is corrected inside the nodes by chrony via NAT, but check `ceph time-sync-status` if mons complain. |
 | Big transfers hang while ping works | MTU: something is at 1500 on a 1450 path. `make mtu-check`; `ip -d link show vxlan-pve`, `ip link show vmbr0` on the node. |

@@ -5,8 +5,9 @@
 #
 #   1. repositories: disable the enterprise ones, enable pve-no-subscription
 #   2. MTU 1450 on the lab NIC + vmbr0 (the L2 rides a VXLAN over a 1500 VLAN)
-#   3. qemu-guest-agent, so boxman can discover the node's IP via the agent
-#   4. a marker the orchestration scripts wait for before touching the node
+#   3. dist-upgrade, so the ISO's PVE matches the Ceph the repo will install
+#   4. qemu-guest-agent, so boxman can discover the node's IP via the agent
+#   5. a marker the orchestration scripts wait for before touching the node
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p /var/lib/pve-lab
@@ -35,11 +36,31 @@ if ! grep -q 'mtu 1450' /etc/network/interfaces; then
 fi
 ip link show vmbr0 | head -1
 
-# 3. guest agent
+# 3. bring PVE in step with the repo before Ceph is installed from it.
+#
+# The ISO's packages are frozen when it is built, but `pveceph install
+# --repository no-subscription` takes whatever Ceph is current, so an
+# un-upgraded node pairs ISO-era PVE with a newer Ceph. On 2026-09-15 that
+# combination was fatal: Ceph 20.2.4 issues aes256k keys (32 bytes, base64
+# ending in ONE '='), while libpve-storage-perl 9.1.5's rbd keyring check
+# demanded '==' -- so PVE rejected the keyring PVE itself had just written,
+# every rbd storage stayed inactive, and `make demo` failed against a
+# HEALTH_OK cluster. Fixed upstream in libpve-storage-perl 9.1.10; the nodes
+# were on 9.1.5 because nothing ever upgraded them. The 2026-09-06 build only
+# worked because the ISO's PVE and the repo's Ceph happened to still be in
+# step -- luck with a nine-day shelf life.
+#
+# Deliberately no `|| true`: under `set -e` a failed upgrade leaves the marker
+# below unwritten, and wait-first-boot.sh then fails pointing at this log,
+# which is what should happen. It also stages a kernel the node will not run
+# until it reboots; fine for a lab, noted in the README.
 apt-get update -qq
+apt-get dist-upgrade -y -qq
+
+# 4. guest agent
 apt-get install -y -qq qemu-guest-agent
 systemctl enable --now qemu-guest-agent
 
-# 4. marker
+# 5. marker
 date -Is > /var/lib/pve-lab/first-boot.done
 echo "== done $(date -Is)"
