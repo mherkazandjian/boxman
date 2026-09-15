@@ -2,7 +2,7 @@
 #
 #   node (per node)  : downloads the GenericCloud qcow2 into local:import/
 #   each VM          : root disk imported from that file onto Ceph (vmpool),
-#                      cloud-init drive on Ceph, DHCP from hpe1's dnsmasq via
+#                      cloud-init drive on Ceph, DHCP from host1's dnsmasq via
 #                      vmbr0 (reservation range .100-.199), lab ssh key,
 #                      qemu-guest-agent reports the address back.
 #

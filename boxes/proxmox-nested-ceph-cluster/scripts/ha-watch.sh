@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Watch the HA manager move the resources of one node, printing a timeline.
-# Usage: ha-watch.sh <failed-node> [timeout-s]   (run from hpe1; the node was
+# Usage: ha-watch.sh <failed-node> [timeout-s]   (run from host1; the node was
 # just hard-killed on its host, e.g. `virsh destroy bprj__pvelab__bprj_pve_pve4`)
 # Exits 0 once every HA resource that was on <failed-node> is `started` on
 # another node. Typical: fencing ~1-2 min, then restarts.

@@ -3,14 +3,23 @@
 # file only sequences it. `make help` lists the targets; `make all` runs the
 # happy path end to end (~45-90 min, mostly unattended installs).
 #
-#   HOSTS               physical hosts (ssh aliases) — hpe1 must be first: it
+#   HOSTS               physical hosts (ssh aliases) — host1 must be first: it
 #                       runs the DHCP/NAT side and the orchestration scripts
 #   LAB                 lab directory on the hosts
 #   PVE_ROOT_PASSWORD   root password baked into the ISO (hashed)
 #   TARGET / BACK       migration target node, and whether to migrate back
 SHELL := /bin/bash
-HOSTS ?= hpe1 hpe2
-ORCH ?= hpe1
+HOSTS ?= host1 host2
+ORCH ?= host1
+# The sites are named host1/host2 throughout the box. `ssh host1` still has to
+# resolve, so each site maps to an ssh alias -- defaulting to this lab's, and
+# overridable per site:  make all SSH_ALIAS_host1=myhost
+SSH_ALIAS_host1 ?= hpe1
+SSH_ALIAS_host2 ?= hpe2
+# exported, because the lookup below happens in the recipe's shell (the site is
+# a shell loop variable there, so make cannot resolve it at expansion time)
+export SSH_ALIAS_host1
+export SSH_ALIAS_host2
 LAB ?= /home/mher/pve-lab
 PVE_ROOT_PASSWORD ?= pvelab123
 TARGET ?= pve3
@@ -22,7 +31,10 @@ BOX_REL := boxes/proxmox-nested-ceph-cluster
 REMOTE_BOX := $(LAB)/src/$(BOX_REL)
 SCRIPTS := $(REMOTE_BOX)/scripts
 BOXMAN := $(LAB)/venv/bin/boxman
-SSH := ssh -o BatchMode=yes
+# Resolves host1/host2 to their ssh aliases (see scripts/ssh-site); every
+# recipe that reaches a host goes through it, so the mapping lives in one
+# place rather than at a dozen call sites.
+SSH := $(BOX_DIR)/scripts/ssh-site
 # Being git-ignored does not make rsync skip a file: without these the API
 # token, the Terraform state that owns the running VMs, and terraform.tfvars
 # were all copied to both physical hosts (#171 B14).
@@ -37,11 +49,17 @@ RSYNC_EXCLUDES := --exclude .git --exclude .venv --exclude .boxman --exclude __p
 	--exclude '$(BOX_REL)/terraform/terraform.tfvars'
 
 # $(call run,<host>,<script>[ args])
-# PVE_LAB_DIR is forwarded because scripts/lib.sh defaults LAB to ~/pve-lab on
-# its own; without it a LAB= override changed only the workstation's idea of
-# the paths and the scripts kept using the default (#171 B16).
+# Double-quoted, like the boxman macro below and for the same reason: a site
+# used from a shell loop must be expanded here, not handed to the remote shell
+# as a literal `$h`.
+#
+# BOXMAN_SITE is passed because lib.sh otherwise falls back to the short
+# hostname, which worked only while the machines happened to be named exactly
+# like the sites. PVE_LAB_DIR is forwarded because lib.sh defaults LAB to
+# ~/pve-lab on its own; without it a LAB= override changed only the
+# workstation's idea of the paths (#171 B16).
 define run
-$(SSH) $(1) 'PVE_LAB_DIR=$(LAB) bash $(SCRIPTS)/$(2)'
+$(SSH) $(1) "BOXMAN_SITE=$(1) PVE_LAB_DIR=$(LAB) bash $(SCRIPTS)/$(2)"
 endef
 # $(call boxman,<host>,<verb and flags>) — double quotes so a loop variable
 # used as <host> is expanded by the local shell, not handed to the remote one
@@ -83,8 +101,9 @@ sync: keys   #@ rsync this repo + keys to the hosts, build the venv, install box
 	@for h in $(HOSTS); do \
 	  echo "== $$h"; \
 	  $(SSH) $$h 'mkdir -p $(LAB)/src $(LAB)/keys' && \
-	  rsync -a --delete $(RSYNC_EXCLUDES) $(REPO)/ $$h:$(LAB)/src/ && \
-	  rsync -a keys/ $$h:$(LAB)/keys/ && \
+	  a=$$(eval printf '%s' \"\$$SSH_ALIAS_$$h\"); a=$${a:-$$h}; \
+	  rsync -a --delete $(RSYNC_EXCLUDES) $(REPO)/ $$a:$(LAB)/src/ && \
+	  rsync -a keys/ $$a:$(LAB)/keys/ && \
 	  $(SSH) $$h 'chmod 600 $(LAB)/keys/id_ed25519_pvelab; \
 	    test -x $(LAB)/venv/bin/pip || python3.12 -m venv $(LAB)/venv; \
 	    $(LAB)/venv/bin/pip install -q -e $(LAB)/src && $(BOXMAN) --version' || exit 1; \
@@ -110,17 +129,17 @@ iso:   #@ download + bake the auto-install ISO on every host (parallel, ~5 min)
 	exit $$rc
 	@# ...and an existing file is not evidence of a successful rebuild: compare
 	@# against a marker touched on the same host, so no clock skew is involved
-	@# (hpe2 runs a few minutes behind hpe1) (#171 B6).
+	@# (host2 runs a few minutes behind host1) (#171 B6).
 	@for h in $(HOSTS); do \
 	  $(SSH) $$h 'test $(LAB)/iso/proxmox-ve_9.2-1-auto.iso -nt $(LAB)/.iso-build-marker' \
 	    || { echo "ISO on $$h was not rebuilt; a stale one is still in place"; exit 1; }; \
 	done
 
-up:   #@ hpe2 vxlan -> hpe1 boxman up -> hpe1 vxlan -> hpe2 boxman up (installs start)
-	$(call run,hpe2,vxlan-up.sh)
-	$(call boxman,hpe1,up)
-	$(call run,hpe1,vxlan-up.sh)
-	$(call boxman,hpe2,up)
+up:   #@ host2 vxlan -> host1 boxman up -> host1 vxlan -> host2 boxman up (installs start)
+	$(call run,host2,vxlan-up.sh)
+	$(call boxman,host1,up)
+	$(call run,host1,vxlan-up.sh)
+	$(call boxman,host2,up)
 
 wait-installed:   #@ wait until every node powered off after its unattended install
 	@# a timed-out installer wait must stop `all`, not let it advance to boot
@@ -149,31 +168,32 @@ cluster:   #@ pvecm create on pve1, pvecm add pve2..pve4
 ceph:   #@ pveceph install/init, 3 mons, 2 mgrs, 8 OSDs, pool vmpool
 	$(call run,$(ORCH),pve-ceph.sh)
 
-demo:   #@ nested Ubuntu VM demo01 on pve1, disk on vmpool, DHCP from hpe1
+demo:   #@ nested Ubuntu VM demo01 on pve1, disk on vmpool, DHCP from host1
 	$(call run,$(ORCH),pve-demo-vm.sh)
 
-migrate:   #@ live-migrate demo01 to TARGET (default pve3 on hpe2); BACK=1 returns it to pve1
+migrate:   #@ live-migrate demo01 to TARGET (default pve3 on host2); BACK=1 returns it to pve1
 	$(call run,$(ORCH),pve-migrate.sh $(TARGET))
 	@if [ -n "$(BACK)" ]; then $(call run,$(ORCH),pve-migrate.sh pve1); fi
 
 mtu-check:   #@ verify the 1450-byte path MTU across the vxlan
 	$(call run,$(ORCH),mtu-check.sh)
 
-status:   #@ boxman ps on both hosts, then bridge/cluster/ceph/vm picture from hpe1
+status:   #@ boxman ps on both hosts, then bridge/cluster/ceph/vm picture from host1
 	@rc=0; for h in $(HOSTS); do echo "== $$h"; $(call boxman,$$h,ps) || rc=1; done; exit $$rc
 	$(call run,$(ORCH),status.sh)
 
 down:   #@ boxman down (save) on both hosts
 	@rc=0; for h in $(HOSTS); do $(call boxman,$$h,down) || rc=1; done; exit $$rc
 
-destroy:   #@ boxman destroy -y on both hosts (nodes, disks, hpe1's nat bridge); keys re-synced after
+destroy:   #@ boxman destroy -y on both hosts (nodes, disks, host1's nat bridge); keys re-synced after
 	@rc=0; for h in $(HOSTS); do $(call boxman,$$h,destroy -y) || rc=1; done; exit $$rc
 	@# boxman removes the admin key as a generated artifact; put the lab key back
 	@rc=0; for h in $(HOSTS); do \
-	  rsync -a keys/ $$h:$(LAB)/keys/ && $(SSH) $$h 'chmod 600 $(LAB)/keys/id_ed25519_pvelab' || rc=1; \
+	  a=$$(eval printf '%s' \"\$$SSH_ALIAS_$$h\"); a=$${a:-$$h}; \
+	  rsync -a keys/ $$a:$(LAB)/keys/ && $(SSH) $$h 'chmod 600 $(LAB)/keys/id_ed25519_pvelab' || rc=1; \
 	done; exit $$rc
 
-host-clean: #@ remove the vxlan, hpe2's bridge and the firewall rule (after destroy)
+host-clean: #@ remove the vxlan, host2's bridge and the firewall rule (after destroy)
 	@rc=0; for h in $(HOSTS); do $(call run,$$h,host-clean.sh) || rc=1; done; exit $$rc
 
 all: keys answer sync host-prep iso up wait-installed boot wait-first-boot mtu-check cluster ceph demo migrate   #@ everything, in order
@@ -181,7 +201,7 @@ all: keys answer sync host-prep iso up wait-installed boot wait-first-boot mtu-c
 # ---- Terraform on top of the cluster (runs HERE, through an ssh tunnel) ----
 # The provider talks to the API only (image download by the node, import_from,
 # built-in cloud-init), so no ssh access from the workstation to the nodes is
-# needed. Open the tunnel first:  ssh -N -L 8006:10.77.0.11:8006 hpe1
+# needed. Open the tunnel first:  ssh -N -L 8006:10.77.0.11:8006 host1
 TF_DIR := $(BOX_DIR)/terraform
 TF := terraform -chdir=$(TF_DIR)
 # VM_COUNT only overrides when given (make tf-apply VM_COUNT=8); otherwise

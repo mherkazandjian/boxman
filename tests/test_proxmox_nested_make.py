@@ -218,7 +218,7 @@ if [[ "${shift_args[0]}" == firewall-cmd ]]; then
 fi
 exit 0
 ''')
-    env = dict(PATH=f"{fake}:{os.environ['PATH']}", BOXMAN_SITE="hpe2",
+    env = dict(PATH=f"{fake}:{os.environ['PATH']}", BOXMAN_SITE="host2",
                PVE_LAB_DIR=str(tmp_path / "lab"))
     r = subprocess.run(["bash", str(box / "scripts" / "host-clean.sh")],
                        capture_output=True, text=True, env=dict(os.environ, **env),
@@ -293,7 +293,7 @@ for a in "$@"; do
 done
 exit 0
 """)
-    r = _make(box, "ha-failover", SSH=str(ssh), ORCH="hpe1", NODE="pve4")
+    r = _make(box, "ha-failover", SSH=str(ssh), ORCH="host1", NODE="pve4")
     assert r.returncode != 0, (
         f"a node that never became ready reported success:\n{r.stdout}\n{r.stderr}")
 
@@ -303,7 +303,7 @@ exit 0
 _HA_STUB_LIB = r"""
 set -euo pipefail
 NODES=(pve1 pve2 pve3 pve4)
-declare -A NODE_SITE=([pve1]=hpe1 [pve2]=hpe1 [pve3]=hpe2 [pve4]=hpe2)
+declare -A NODE_SITE=([pve1]=host1 [pve2]=host1 [pve3]=host2 [pve4]=host2)
 LOGS=$PWD
 CALLS="$PWD/calls"; : > "$CALLS"
 log() { :; }
@@ -316,7 +316,7 @@ pssh() {
         *"/cluster/ha/resources"*) echo "$HA_RESOURCES" ;;
         *"/cluster/ha/rules"*)
             if [ "${RULE_EXISTS:-0}" = 1 ]; then
-                echo '[{"rule":"prefer-hpe1","resources":"vm:200"},{"rule":"prefer-hpe2","resources":"vm:999"}]'
+                echo '[{"rule":"prefer-host1","resources":"vm:200"},{"rule":"prefer-host2","resources":"vm:999"}]'
             else
                 echo '[]'
             fi
@@ -371,15 +371,15 @@ def test_a_malformed_policy_is_refused_before_anything_is_written(
 
 
 def test_placement_follows_the_policy_not_the_vm_id_arithmetic(box, tmp_path):
-    """The discriminating case. `(200 - 200) % 4 == 0` puts vm:200 on hpe1 by
+    """The discriminating case. `(200 - 200) % 4 == 0` puts vm:200 on host1 by
     the old rule; an override placing it on pve3 must win."""
     proc, calls = _run_ha(
         box, tmp_path, resources=[200],
         homes="vm:200=pve3", tag="override")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     rules = [c for c in calls if "pvesh create" in c or "pvesh set /cluster/ha/rules" in c]
-    assert any("prefer-hpe2" in c and "vm:200" in c for c in rules), rules
-    assert not any("prefer-hpe1" in c and "vm:200" in c for c in rules), rules
+    assert any("prefer-host2" in c and "vm:200" in c for c in rules), rules
+    assert not any("prefer-host1" in c and "vm:200" in c for c in rules), rules
 
 
 def test_an_emptied_group_loses_its_rule(box, tmp_path):
@@ -388,7 +388,7 @@ def test_an_emptied_group_loses_its_rule(box, tmp_path):
                           homes="vm:200=pve1,vm:201=pve2",
                           rule_exists=True, tag="empty")
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert any("pvesh delete /cluster/ha/rules/prefer-hpe2" in c for c in calls), calls
+    assert any("pvesh delete /cluster/ha/rules/prefer-host2" in c for c in calls), calls
 
 
 def test_a_resource_outside_the_policy_is_left_alone(box, tmp_path):
@@ -419,7 +419,7 @@ def test_multiple_victims_cross_the_remote_shell_as_arguments(box, tmp_path):
     recorder = tmp_path / "bin" / "ha-watch.sh"
     _stub(recorder, RECORD_ARGV.replace("@LOG@", str(argv_log)))
 
-    r = _make(box, "ha-failover", SSH=str(ssh), ORCH="hpe1", NODE="pve4",
+    r = _make(box, "ha-failover", SSH=str(ssh), ORCH="host1", NODE="pve4",
               SCRIPTS=str(tmp_path / "bin"))
 
     assert r.returncode == 0, "the drill failed:\n" + r.stdout + r.stderr
@@ -443,7 +443,7 @@ def test_multiple_victims_cross_the_remote_shell_as_arguments(box, tmp_path):
 _HA_STATEFUL_LIB = r"""
 set -euo pipefail
 NODES=(pve1 pve2 pve3 pve4)
-declare -A NODE_SITE=([pve1]=hpe1 [pve2]=hpe1 [pve3]=hpe2 [pve4]=hpe2)
+declare -A NODE_SITE=([pve1]=host1 [pve2]=host1 [pve3]=host2 [pve4]=host2)
 LOGS=$PWD
 CALLS="$PWD/calls"; : > "$CALLS"
 RULES="$PWD/rules"; mkdir -p "$RULES"
@@ -476,14 +476,14 @@ pssh() {
             # skipped something -- so the listing is not the whole truth
             [ "${RULE_LIST_WARNS:-0}" = 1 ] && {
                 echo "ignoring invalid configuration line" >&2
-                echo '[{"rule":"prefer-hpe1","resources":"vm:200"}]'; return 0; }
+                echo '[{"rule":"prefer-host1","resources":"vm:200"}]'; return 0; }
             [ "${RULE_LIST_SHAPE:-}" = notarray ] && { echo '{"oops":true}'; return 0; }
             [ "${RULE_LIST_SHAPE:-}" = noname ] && {
                 echo '[{"resources":"vm:200"}]'; return 0; }
             # valid names, so the shape checks pass, but @tsv cannot render the
             # second entry: jq emits one row and *then* fails
             [ "${RULE_LIST_SHAPE:-}" = tsvfail ] && {
-                echo '[{"rule":"prefer-hpe1","resources":"vm:200"},{"rule":"prefer-hpe2","resources":{}}]'
+                echo '[{"rule":"prefer-host1","resources":"vm:200"},{"rule":"prefer-host2","resources":{}}]'
                 return 0; }
             local out="[" first_e=1 r
             for r in "$RULES"/*; do
@@ -538,21 +538,21 @@ def test_a_resource_can_move_from_one_hosts_rule_to_the_others(box, tmp_path):
     to work, which is why one-directional testing missed it (#171 D1)."""
     proc, rules = _run_ha_stateful(
         box, tmp_path, homes="vm:200=pve1,vm:201=pve1", resources=[200, 201],
-        preset={"prefer-hpe1": "vm:200", "prefer-hpe2": "vm:201"}, tag="move")
+        preset={"prefer-host1": "vm:200", "prefer-host2": "vm:201"}, tag="move")
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "vm:201" in rules.get("prefer-hpe1", ""), rules
-    assert "vm:201" not in rules.get("prefer-hpe2", ""), rules
+    assert "vm:201" in rules.get("prefer-host1", ""), rules
+    assert "vm:201" not in rules.get("prefer-host2", ""), rules
 
 
 def test_a_simultaneous_swap_is_applied(box, tmp_path):
     proc, rules = _run_ha_stateful(
         box, tmp_path, homes="vm:200=pve3,vm:201=pve1", resources=[200, 201],
-        preset={"prefer-hpe1": "vm:200", "prefer-hpe2": "vm:201"}, tag="swap")
+        preset={"prefer-host1": "vm:200", "prefer-host2": "vm:201"}, tag="swap")
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert rules.get("prefer-hpe1", "") == "vm:201", rules
-    assert rules.get("prefer-hpe2", "") == "vm:200", rules
+    assert rules.get("prefer-host1", "") == "vm:201", rules
+    assert rules.get("prefer-host2", "") == "vm:200", rules
 
 
 def test_a_failed_inventory_does_not_delete_a_rule(box, tmp_path):
@@ -560,10 +560,10 @@ def test_a_failed_inventory_does_not_delete_a_rule(box, tmp_path):
     list was used as if complete and the cleanup deleted a live rule."""
     proc, rules = _run_ha_stateful(
         box, tmp_path, homes="vm:200=pve1,vm:201=pve3", resources=[200],
-        preset={"prefer-hpe2": "vm:201"}, tag="inv", INVENTORY_FAILS=1)
+        preset={"prefer-host2": "vm:201"}, tag="inv", INVENTORY_FAILS=1)
 
     assert proc.returncode != 0, proc.stdout
-    assert "prefer-hpe2" in rules, "a rule was deleted on the strength of a failed query"
+    assert "prefer-host2" in rules, "a rule was deleted on the strength of a failed query"
     # ...and nothing else was written either. Setting CRS before reading the
     # inventory left the cluster reconfigured but unreconciled.
     calls = (tmp_path / "ha-stateful-inv" / "calls").read_text()
@@ -579,11 +579,11 @@ def test_a_failed_rule_listing_stops_the_run(box, tmp_path):
     must stop the run rather than be read as "there are no rules"."""
     proc, rules = _run_ha_stateful(
         box, tmp_path, homes="vm:200=pve1", resources=[200],
-        preset={"prefer-hpe2": "vm:201"}, tag="list", RULE_LIST_FAILS=1)
+        preset={"prefer-host2": "vm:201"}, tag="list", RULE_LIST_FAILS=1)
 
     assert proc.returncode != 0, (
         f"a failed rule listing was read as 'no rules':\n{proc.stdout}")
-    assert "prefer-hpe2" in rules, "a stale rule was deleted on a failed listing"
+    assert "prefer-host2" in rules, "a stale rule was deleted on a failed listing"
     calls = (tmp_path / "ha-stateful-list" / "calls").read_text()
     assert "pvesh set /cluster/options" not in calls, \
         "CRS was changed despite the failed listing"
@@ -614,7 +614,7 @@ def test_no_per_rule_lookup_is_issued(box, tmp_path):
     """
     proc, _rules = _run_ha_stateful(
         box, tmp_path, homes="vm:200=pve1", resources=[200],
-        preset={"prefer-hpe1": "vm:200"}, tag="norule")
+        preset={"prefer-host1": "vm:200"}, tag="norule")
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     calls = (tmp_path / "ha-stateful-norule" / "calls").read_text().splitlines()
@@ -643,13 +643,13 @@ def test_an_untrustworthy_rule_listing_prevents_every_write(box, tmp_path, env, 
     tag = "untrust-" + (list(env.values())[0] if isinstance(list(env.values())[0], str) else "warn")
     proc, rules = _run_ha_stateful(
         box, tmp_path, homes="vm:200=pve1", resources=[200],
-        preset={"prefer-hpe2": "vm:201"}, tag=tag, **env)
+        preset={"prefer-host2": "vm:201"}, tag=tag, **env)
 
     assert proc.returncode != 0, f"{why}, but the run continued:\n{proc.stdout}"
     calls = (tmp_path / ("ha-stateful-" + tag) / "calls").read_text()
     assert "pvesh set" not in calls and "pvesh create" not in calls \
         and "pvesh delete" not in calls, f"a write happened although {why}"
-    assert "prefer-hpe2" in rules, "a rule was removed on an untrustworthy listing"
+    assert "prefer-host2" in rules, "a rule was removed on an untrustworthy listing"
 
 
 def test_an_empty_rule_listing_is_a_valid_answer(box, tmp_path):
@@ -659,7 +659,7 @@ def test_an_empty_rule_listing_is_a_valid_answer(box, tmp_path):
         box, tmp_path, homes="vm:200=pve1", resources=[200], preset={}, tag="emptylist")
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert rules.get("prefer-hpe1", "") == "vm:200", rules
+    assert rules.get("prefer-host1", "") == "vm:200", rules
 
 
 # ── the fourth process substitution, in the migration script ────────────────
@@ -678,7 +678,7 @@ _MIGRATE_STUB_LIB = r"""
 set -euo pipefail
 NODES=(pve1 pve2 pve3 pve4)
 declare -A NODE_IP=([pve1]=10.77.0.11 [pve2]=10.77.0.12 [pve3]=10.77.0.13 [pve4]=10.77.0.14)
-declare -A NODE_SITE=([pve1]=hpe1 [pve2]=hpe1 [pve3]=hpe2 [pve4]=hpe2)
+declare -A NODE_SITE=([pve1]=host1 [pve2]=host1 [pve3]=host2 [pve4]=host2)
 LOGS="$PWD"; CALLS="$PWD/calls"; : > "$CALLS"
 PLACE="$PWD/placement"; echo pve1 > "$PLACE"
 SSH_OPTS=(-o BatchMode=yes)

@@ -4,6 +4,12 @@
 set -euo pipefail
 
 LAB="${PVE_LAB_DIR:-$HOME/pve-lab}"
+# BOXMAN_SITE names which of the two sites this is. The fallback to the short
+# hostname only ever worked because the machines happened to be called hpe1 and
+# hpe2, exactly matching the site names; renaming the sites to host1/host2 broke
+# that coincidence and every table lookup below with it. Both Makefile macros
+# pass it explicitly now, so the fallback is a last resort -- and an unknown
+# site is reported here rather than as an "unbound variable" five scripts away.
 SITE="${BOXMAN_SITE:-$(hostname -s)}"
 KEY="${PVE_LAB_KEY:-$LAB/keys/id_ed25519_pvelab}"
 LOGS="$LAB/logs"
@@ -21,21 +27,27 @@ VXLAN_ID="${PVE_VXLAN_ID:-7700}"
 VXLAN_PORT=4789
 VXLAN_IF="vxlan-pve"
 LAB_MTU=1450                               # 1500 - 50 bytes VXLAN overhead
-declare -A HOST_IP=([hpe1]=192.168.139.57 [hpe2]=192.168.139.58)
-declare -A PEER=([hpe1]=hpe2 [hpe2]=hpe1)
-declare -A SITE_BRIDGE=([hpe1]=virbr-pve [hpe2]=br-pve)
+declare -A HOST_IP=([host1]=192.168.139.57 [host2]=192.168.139.58)
+declare -A PEER=([host1]=host2 [host2]=host1)
+declare -A SITE_BRIDGE=([host1]=virbr-pve [host2]=br-pve)
 
 # --- the lab L2 and its nodes (must match conf.yml) ------------------------
 LAB_NET=10.77.0.0/24
-GATEWAY=10.77.0.1                          # hpe1's virbr-pve (libvirt nat: DHCP/DNS/NAT)
-PEER_BRIDGE_IP=10.77.0.2                   # hpe2's br-pve (host access + ARP discovery only)
+GATEWAY=10.77.0.1                          # host1's virbr-pve (libvirt nat: DHCP/DNS/NAT)
+PEER_BRIDGE_IP=10.77.0.2                   # host2's br-pve (host access + ARP discovery only)
 NODES=(pve1 pve2 pve3 pve4)
 declare -A NODE_IP=([pve1]=10.77.0.11 [pve2]=10.77.0.12 [pve3]=10.77.0.13 [pve4]=10.77.0.14)
-declare -A NODE_SITE=([pve1]=hpe1 [pve2]=hpe1 [pve3]=hpe2 [pve4]=hpe2)
+declare -A NODE_SITE=([pve1]=host1 [pve2]=host1 [pve3]=host2 [pve4]=host2)
+
+# Fail here, with the name, rather than at whichever table is read first.
+if [[ -z ${HOST_IP[$SITE]:-} ]]; then
+    echo "ERROR: unknown site '$SITE'. Set BOXMAN_SITE to one of: ${!HOST_IP[*]}" >&2
+    exit 1
+fi
 DOMAIN=pve.lab
 #: the host the orchestration scripts run from (migration, ceph, HA):
 #: it needs jq, which the nodes do not have
-ORCH_SITE="${PVE_ORCH_SITE:-hpe1}"
+ORCH_SITE="${PVE_ORCH_SITE:-host1}"
 
 CLUSTER_NAME=pvelab
 CEPH_POOL=vmpool

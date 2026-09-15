@@ -11,7 +11,7 @@ check() {  # check <label> <command...>
     if "$@" &>/dev/null; then log "ok   $label"; else log "FAIL $label"; fail=1; fi
 }
 
-check "site '$SITE' is known (hpe1|hpe2)"     test -n "${HOST_IP[$SITE]:-}"
+check "site '$SITE' is known (host1|host2)"     test -n "${HOST_IP[$SITE]:-}"
 check "underlay $VXLAN_DEV has ${HOST_IP[$SITE]}" bash -c "ip -4 addr show dev $VXLAN_DEV | grep -qw ${HOST_IP[$SITE]}"
 check "nested KVM enabled"                    bash -c "grep -qx 1 /sys/module/kvm_amd/parameters/nested 2>/dev/null || grep -qx Y /sys/module/kvm_intel/parameters/nested 2>/dev/null"
 check "/dev/kvm usable"                       test -r /dev/kvm -a -w /dev/kvm

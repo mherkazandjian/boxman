@@ -5,12 +5,12 @@
 #   * cluster resource scheduling `dynamic` (static + live CPU/RAM usage),
 #     automatic rebalancing when node imbalance exceeds a threshold for a few
 #     HA rounds, and CRS placement when an HA resource starts
-#   * two non-strict node-affinity rules: the VMs Terraform placed on hpe1's
+#   * two non-strict node-affinity rules: the VMs Terraform placed on host1's
 #     nodes prefer pve1/pve2 (equal priority, so CRS balances between them),
-#     the hpe2 ones prefer pve3/pve4; when both preferred nodes are down the
+#     the host2 ones prefer pve3/pve4; when both preferred nodes are down the
 #     HA manager may recover them anywhere (non-strict)
 #
-# Idempotent. Run from hpe1 after `make tf-apply` (the rules need the HA
+# Idempotent. Run from host1 after `make tf-apply` (the rules need the HA
 # resources to exist). Knobs: PVE_CRS_THRESHOLD / MARGIN / HOLD (percent,
 # percent, HA rounds) and PVE_CRS_METHOD (bruteforce|topsis).
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -119,13 +119,13 @@ sids_raw=$(jq -r '.[].sid' <<<"$inventory" | grep '^vm:' | sort) \
 mapfile -t sids <<<"$sids_raw"
 
 declare -A DESIRED=()
-hpe1_res=() hpe2_res=() unowned=()
+host1_res=() host2_res=() unowned=()
 for sid in "${sids[@]}"; do
     node=${POLICY_HOME[$sid]:-}
     if [[ -z $node ]]; then unowned+=("$sid"); continue; fi
     case ${NODE_SITE[$node]} in
-        hpe1) hpe1_res+=("$sid"); DESIRED[$sid]=prefer-hpe1 ;;
-        hpe2) hpe2_res+=("$sid"); DESIRED[$sid]=prefer-hpe2 ;;
+        host1) host1_res+=("$sid"); DESIRED[$sid]=prefer-host1 ;;
+        host2) host2_res+=("$sid"); DESIRED[$sid]=prefer-host2 ;;
     esac
 done
 (( ${#unowned[@]} )) && log "not covered by this policy, left alone: ${unowned[*]}"
@@ -142,7 +142,7 @@ crs+=",ha-rebalance-on-start=1"
 log "cluster resource scheduling: $crs"
 pssh "$first" "pvesh set /cluster/options --crs '$crs'"
 
-nodes_for() { [[ $1 == prefer-hpe1 ]] && echo "pve1:1,pve2:1" || echo "pve3:1,pve4:1"; }
+nodes_for() { [[ $1 == prefer-host1 ]] && echo "pve1:1,pve2:1" || echo "pve3:1,pve4:1"; }
 
 set_rule() {   # set_rule <rule> <resources-csv>
     local rule=$1 resources=$2 nodes; nodes=$(nodes_for "$rule")
@@ -171,7 +171,7 @@ drop_rule() {
 # incoming member before its old rule had released it therefore failed, and a
 # VM could never move from one host's rule to the other's -- the reverse
 # direction happened to work, which is why one-directional testing missed it.
-for rule in prefer-hpe1 prefer-hpe2; do
+for rule in prefer-host1 prefer-host2; do
     rule_exists "$rule" || continue
     current=$(rule_members "$rule")
     [[ -n $current ]] || continue
@@ -194,8 +194,8 @@ for rule in prefer-hpe1 prefer-hpe2; do
     fi
 done
 
-if (( ${#hpe1_res[@]} )); then set_rule prefer-hpe1 "$(join_by , "${hpe1_res[@]}")"; else drop_rule prefer-hpe1; fi
-if (( ${#hpe2_res[@]} )); then set_rule prefer-hpe2 "$(join_by , "${hpe2_res[@]}")"; else drop_rule prefer-hpe2; fi
+if (( ${#host1_res[@]} )); then set_rule prefer-host1 "$(join_by , "${host1_res[@]}")"; else drop_rule prefer-host1; fi
+if (( ${#host2_res[@]} )); then set_rule prefer-host2 "$(join_by , "${host2_res[@]}")"; else drop_rule prefer-host2; fi
 
 echo "--- crs";   pssh "$first" "pvesh get /cluster/options --output-format json" | jq -r '.crs'
 echo "--- rules"; pssh "$first" "ha-manager rules list"

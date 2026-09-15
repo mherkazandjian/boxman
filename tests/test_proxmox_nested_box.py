@@ -4,8 +4,8 @@ Deterministic shape checks for boxes/proxmox-nested-ceph-cluster.
 The box spans two physical hosts joined by a VXLAN and boots a locally built
 Proxmox auto-install ISO, so the provisioning integration job excludes it.
 What makes it work is a contract between the two renders of one conf.yml:
-hpe1's libvirt NAT network must reserve the MAC of every node — including the
-two that live on hpe2 — and every node must pin exactly that MAC on its first
+host1's libvirt NAT network must reserve the MAC of every node — including the
+two that live on host2 — and every node must pin exactly that MAC on its first
 NIC. Those are the things pinned here, without touching libvirt.
 """
 
@@ -40,13 +40,13 @@ def _vms(cfg: dict) -> dict:
     return cfg["clusters"]["pve"]["vms"]
 
 
-def _reservations(cfg_hpe1: dict) -> dict:
-    hosts = cfg_hpe1["clusters"]["pve"]["networks"]["pvenet"]["ip"]["dhcp"]["hosts"]
+def _reservations(cfg_host1: dict) -> dict:
+    hosts = cfg_host1["clusters"]["pve"]["networks"]["pvenet"]["ip"]["dhcp"]["hosts"]
     return {h["name"]: h for h in hosts}
 
 
-def test_hpe1_is_the_nat_side_and_reserves_every_node(monkeypatch):
-    cfg = _render(monkeypatch, "hpe1")
+def test_host1_is_the_nat_side_and_reserves_every_node(monkeypatch):
+    cfg = _render(monkeypatch, "host1")
     net = cfg["clusters"]["pve"]["networks"]["pvenet"]
     assert net["mode"] == "nat"
     assert net["bridge"]["name"] == "virbr-pve"
@@ -55,11 +55,11 @@ def test_hpe1_is_the_nat_side_and_reserves_every_node(monkeypatch):
     assert set(_vms(cfg)) == {"pve1", "pve2"}
     res = _reservations(cfg)
     assert set(res) == {"pve1", "pve2", "pve3", "pve4", "demo01"}
-    assert res["pve3"]["ip"] == "10.77.0.13"  # hpe2's node, reserved on hpe1
+    assert res["pve3"]["ip"] == "10.77.0.13"  # host2's node, reserved on host1
 
 
-def test_hpe2_is_the_bridge_side(monkeypatch):
-    cfg = _render(monkeypatch, "hpe2")
+def test_host2_is_the_bridge_side(monkeypatch):
+    cfg = _render(monkeypatch, "host2")
     assert cfg["shared_networks"] == {
         "pvelab": {"bridge": "br-pve", "stp": False, "mtu": 1450}}
     assert cfg["clusters"]["pve"]["networks"]["pvenet"] == {
@@ -67,7 +67,7 @@ def test_hpe2_is_the_bridge_side(monkeypatch):
     assert set(_vms(cfg)) == {"pve3", "pve4"}
 
 
-def test_default_site_is_hpe1(monkeypatch):
+def test_default_site_is_host1(monkeypatch):
     monkeypatch.delenv("BOXMAN_SITE", raising=False)
     monkeypatch.setenv("BOXMAN_CONF_DIR", BOX)
     env = create_jinja_env(BOX)
@@ -75,9 +75,9 @@ def test_default_site_is_hpe1(monkeypatch):
     assert set(_vms(cfg)) == {"pve1", "pve2"}
 
 
-@pytest.mark.parametrize("site", ["hpe1", "hpe2"])
-def test_every_node_pins_the_mac_hpe1_reserves(monkeypatch, site):
-    reservations = _reservations(_render(monkeypatch, "hpe1"))
+@pytest.mark.parametrize("site", ["host1", "host2"])
+def test_every_node_pins_the_mac_host1_reserves(monkeypatch, site):
+    reservations = _reservations(_render(monkeypatch, "host1"))
     cfg = _render(monkeypatch, site)
     for name, vm in _vms(cfg).items():
         nic = vm["networks"][0]
@@ -86,7 +86,7 @@ def test_every_node_pins_the_mac_hpe1_reserves(monkeypatch, site):
         assert vm["hostname"] == name == reservations[name]["name"]
 
 
-@pytest.mark.parametrize("site", ["hpe1", "hpe2"])
+@pytest.mark.parametrize("site", ["host1", "host2"])
 def test_nodes_use_the_iso_boot_schema(monkeypatch, site):
     cfg = _render(monkeypatch, site)
     cluster = cfg["clusters"]["pve"]
@@ -103,7 +103,7 @@ def test_nodes_use_the_iso_boot_schema(monkeypatch, site):
         assert any("guest_agent" in a for a in vm["virt_install_extra_args"]), name
 
 
-@pytest.mark.parametrize("site", ["hpe1", "hpe2"])
+@pytest.mark.parametrize("site", ["host1", "host2"])
 def test_config_passes_boot_validation(monkeypatch, site):
     mgr = BoxmanManager.__new__(BoxmanManager)
     mgr.config = _render(monkeypatch, site)
@@ -112,7 +112,7 @@ def test_config_passes_boot_validation(monkeypatch, site):
 
 
 def test_tasks_wrap_the_scripts(monkeypatch):
-    cfg = _render(monkeypatch, "hpe1")
+    cfg = _render(monkeypatch, "host1")
     expected = {"vxlan-up", "wait-installed", "wait-first-boot", "cluster",
                 "ceph", "demo-vm", "migrate", "mtu-check"}
     assert expected <= set(cfg["tasks"])

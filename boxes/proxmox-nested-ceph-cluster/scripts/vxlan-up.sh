@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Stretch the lab L2 to the peer host with a point-to-point VXLAN. Idempotent:
-# safe to re-run after `boxman up`, `boxman destroy` (which deletes hpe1's
+# safe to re-run after `boxman up`, `boxman destroy` (which deletes host1's
 # libvirt bridge and orphans the tunnel) or a host reboot (the tunnel is not
 # persistent; the firewall rule is).
 #
-#   hpe2: run BEFORE `boxman up` — creates br-pve so the installers find hpe1's
+#   host2: run BEFORE `boxman up` — creates br-pve so the installers find host1's
 #         DHCP from their first boot (boxman adopts the existing bridge).
-#   hpe1: run AFTER `boxman up` — libvirt must create virbr-pve itself; a
+#   host1: run AFTER `boxman up` — libvirt must create virbr-pve itself; a
 #         pre-existing bridge of that name makes `virsh net-start` fail.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -17,14 +17,14 @@ bridge=${SITE_BRIDGE[$SITE]}
 
 sudo modprobe vxlan
 
-if [[ $SITE == hpe2 ]]; then
+if [[ $SITE == host2 ]]; then
     if ! ip link show "$bridge" &>/dev/null; then
         log "creating shared bridge $bridge"
         sudo ip link add name "$bridge" type bridge
     fi
     sudo ip link set dev "$bridge" type bridge stp_state 0
 elif ! ip link show "$bridge" &>/dev/null; then
-    die "$bridge does not exist: run 'BOXMAN_SITE=hpe1 boxman up' first so libvirt creates it"
+    die "$bridge does not exist: run 'BOXMAN_SITE=host1 boxman up' first so libvirt creates it"
 fi
 sudo ip link set dev "$bridge" mtu "$LAB_MTU" up
 
@@ -35,14 +35,14 @@ if ! ip link show "$VXLAN_IF" &>/dev/null; then
 fi
 sudo ip link set dev "$VXLAN_IF" mtu "$LAB_MTU" master "$bridge" up
 
-if [[ $SITE == hpe2 ]]; then
+if [[ $SITE == host2 ]]; then
     # With br_netfilter loaded (docker does that), frames *bridged* through
     # br-pve traverse firewalld's forward hook, and a bridge bound to no zone
-    # ends in the public zone's `reject`: guests' DHCP never reached hpe1
+    # ends in the public zone's `reject`: guests' DHCP never reached host1
     # (tunnel counters 29 sent / 3 received) while host-originated pings
     # worked. boxman's physdev ACCEPT lives in the iptables table and cannot
     # override a later nftables reject, so bind the lab bridge to `trusted`.
-    # (hpe1 needs nothing: libvirt puts virbr-pve into its own zone.)
+    # (host1 needs nothing: libvirt puts virbr-pve into its own zone.)
     # Runtime and permanent are reconciled independently. Inferring the
     # permanent binding from the runtime zone cannot repair a half-applied
     # state -- a runtime add that was never persisted, or a permanent entry
@@ -55,7 +55,7 @@ if [[ $SITE == hpe2 ]]; then
         fi
     done
     if ! ip -4 addr show dev "$bridge" | grep -qw "$PEER_BRIDGE_IP"; then
-        # a host address on the bridge: lets hpe2 reach the nodes directly and
+        # a host address on the bridge: lets host2 reach the nodes directly and
         # gives libvirt's ARP-based IP discovery something to work with
         sudo ip addr add "$PEER_BRIDGE_IP/24" dev "$bridge"
     fi

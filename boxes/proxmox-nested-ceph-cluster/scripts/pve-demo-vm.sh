@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Create the nested demo VM: Ubuntu 24.04 cloud image imported onto the Ceph
-# pool, cloud-init with the lab key, DHCP from hpe1 (reservation demo01 ->
-# 10.77.0.50), started on pve1. Idempotent. Run from hpe1.
+# pool, cloud-init with the lab key, DHCP from host1 (reservation demo01 ->
+# 10.77.0.50), started on pve1. Idempotent. Run from host1.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 node=${1:-pve1}

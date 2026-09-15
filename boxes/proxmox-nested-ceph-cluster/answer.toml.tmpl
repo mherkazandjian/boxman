@@ -2,7 +2,7 @@
 # `make answer` substitutes __PWHASH__ (openssl passwd -6 of PVE_ROOT_PASSWORD)
 # and __PUBKEY__ (the lab public key) into answer.toml, which prepare-iso.sh
 # bakes into the ISO. One generic ISO serves every node: identity comes from
-# DHCP (hpe1's libvirt reservations hand out the IP *and* the hostname).
+# DHCP (host1's libvirt reservations hand out the IP *and* the hostname).
 # Reference: https://pve.proxmox.com/wiki/Automated_Installation
 
 [global]

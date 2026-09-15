@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Undo vxlan-up.sh on this host: remove the VXLAN, hpe2's shared bridge, and
+# Undo vxlan-up.sh on this host: remove the VXLAN, host2's shared bridge, and
 # the firewalld rule. Run after `boxman destroy` on both sites. boxman never
 # removes shared bridges itself, so this is the explicit teardown.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -31,7 +31,7 @@ fw_drop() {   # fw_drop <perm|""> <zone> <--query-x> <--remove-x> <value> <label
 if ip link show "$VXLAN_IF" &>/dev/null; then
     sudo ip link del "$VXLAN_IF"; log "removed $VXLAN_IF"
 fi
-if [[ $SITE == hpe2 ]]; then
+if [[ $SITE == host2 ]]; then
     if ip link show "$bridge" &>/dev/null; then
         if [[ -z $(bridge link show master "$bridge") ]]; then
             sudo ip link del "$bridge"; log "removed $bridge"

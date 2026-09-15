@@ -2,7 +2,7 @@
 # Hyper-converged Ceph on the four nodes: packages everywhere (parallel),
 # init on pve1, mons on pve1-3, mgrs on pve1+pve3, one OSD per data disk
 # (/dev/vdb, /dev/vdc on every node = 8 OSDs), replicated pool `vmpool`
-# registered as Proxmox storage. Idempotent. Run from hpe1.
+# registered as Proxmox storage. Idempotent. Run from host1.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 first=${NODES[0]}

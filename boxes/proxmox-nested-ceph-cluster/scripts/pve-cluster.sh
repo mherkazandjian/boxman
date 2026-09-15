@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Form the Proxmox cluster: pve1 creates it, pve2..pve4 join sequentially over
-# ssh. Idempotent (a node already in a cluster is skipped). Run from hpe1.
+# ssh. Idempotent (a node already in a cluster is skipped). Run from host1.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 first=${NODES[0]}

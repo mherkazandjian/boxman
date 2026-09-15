@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-screen picture of the lab from hpe1: bridge ports, cluster, Ceph, VMs.
+# One-screen picture of the lab from host1: bridge ports, cluster, Ceph, VMs.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 bridge=${SITE_BRIDGE[$SITE]}

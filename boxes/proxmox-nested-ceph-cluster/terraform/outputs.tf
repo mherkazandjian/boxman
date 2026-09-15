@@ -11,7 +11,7 @@ output "vms" {
 }
 
 output "ssh" {
-  description = "ready-made ssh commands (run from hpe1, which sits on the 10.77.0.0/24 L2)"
+  description = "ready-made ssh commands (run from host1, which sits on the 10.77.0.0/24 L2)"
   value = [
     for name, vm in proxmox_virtual_environment_vm.rocky :
     # var.cloud_user, not a hardcoded "rocky": the two disagree the moment

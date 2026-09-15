@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Live-migrate a VM to another node while pinging it from this host.
 # Usage: pve-migrate.sh [target-node] [vmid] [vm-ip]
-#   defaults: pve3 (i.e. hpe1 -> hpe2), the demo VM 100 at 10.77.0.50
-# The disk lives on Ceph, so only RAM moves. Run from hpe1.
+#   defaults: pve3 (i.e. host1 -> host2), the demo VM 100 at 10.77.0.50
+# The disk lives on Ceph, so only RAM moves. Run from host1.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 target=${1:-pve3}

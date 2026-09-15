@@ -2,7 +2,7 @@
 # Wait until the nodes are reachable over ssh AND their first-boot hook has
 # written its marker (repos, MTU, guest agent done). sshd is up well before
 # the hook finishes, so "ssh works" alone would race the hook's apt-get.
-# Usage: wait-first-boot.sh [node ...]   (default: all four; run from hpe1)
+# Usage: wait-first-boot.sh [node ...]   (default: all four; run from host1)
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 nodes=("$@"); (( ${#nodes[@]} )) || nodes=("${NODES[@]}")

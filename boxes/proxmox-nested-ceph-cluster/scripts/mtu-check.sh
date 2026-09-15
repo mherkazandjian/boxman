@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prove the 1450-byte path MTU across the VXLAN: a 1422-byte payload
 # (1450 - 28 bytes IP/ICMP) must pass with DF set, 1472 (a 1500 frame) must not.
-# Run from hpe1.
+# Run from host1.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 from=${1:-pve1}; to=${2:-pve3}
