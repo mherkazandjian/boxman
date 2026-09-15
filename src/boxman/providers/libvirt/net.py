@@ -13,10 +13,10 @@ from urllib.parse import urlsplit
 
 from jinja2 import Environment, FileSystemLoader
 
-from boxman.utils.mac import canonical_mac, is_mac_like
 from boxman import log
 from boxman.exceptions import ConfigError
 from boxman.netlab.shared_bridges import BRIDGE_NAME_RE
+from boxman.utils.mac import canonical_mac, is_mac_like
 
 from . import net_reconcile
 from .commands import VirshCommand

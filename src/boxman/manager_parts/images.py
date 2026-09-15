@@ -3,12 +3,11 @@
 
 import contextlib
 import hashlib
-import re
 import os
+import re
 import shlex
 from urllib.parse import urlparse
 
-from boxman.utils.mac import canonical_mac, is_mac_like
 from boxman.exceptions import (
     BoxmanError,
     ConfigError,
@@ -18,6 +17,7 @@ from boxman.exceptions import (
 from boxman.image_cache import ImageCache
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.utils.http_download import download_url
+from boxman.utils.mac import canonical_mac, is_mac_like
 from boxman.utils.shell import run
 
 
