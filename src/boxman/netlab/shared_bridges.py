@@ -20,6 +20,7 @@ explicit user action, not a side effect of ``boxman destroy``.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from pathlib import Path
@@ -60,6 +61,11 @@ def _normalise_bool(value: Any, entry_name: str, key: str) -> bool:
     bridge filtering host-wide. Anything that is neither on nor off is
     rejected rather than quietly becoming ``off``.
     """
+    # A fast path only: str(True).lower() is "true" and str(False).lower() is
+    # "false", both of which the tables below already accept, so removing this
+    # changes nothing observable. Noted because a branch-guard mutation sweep
+    # reports it as a survivor, and it is an equivalent mutant rather than a
+    # gap in the tests -- no test can kill it.
     if isinstance(value, bool):
         return value
 
@@ -74,17 +80,41 @@ def _normalise_bool(value: Any, entry_name: str, key: str) -> bool:
     )
 
 
-def _sudo_prefix(use_sudo: bool) -> str:
-    """``"sudo "`` when the provider asks for it, else nothing.
+def _needs_sudo() -> bool:
+    """Whether the privileged bridge commands have to go through ``sudo``.
 
-    ``sudo`` used to be hard-coded here, so a host where boxman already
-    runs with the privileges it needs — or one that deliberately sets
-    ``use_sudo: false`` — still had every bridge command shelled out
-    through sudo (#164 FBN-12). Threaded through the privileged probes as
-    well as the writes: ``iptables -L`` needs root just as ``iptables -I``
-    does. ``ip link show`` does not, and stays unprivileged.
+    Creating a bridge, ``ip link set``, the ``iptables`` accept rules and the
+    ``bridge-nf-call-iptables`` sysctl all require CAP_NET_ADMIN — in practice,
+    root. **No group membership grants it.** That is the whole point of
+    deciding it here rather than taking it from the caller: a user in the
+    ``libvirt`` group, for whom ``provider.libvirt.use_sudo: false`` is the
+    *correct* setting because virsh genuinely needs no sudo for them, still
+    gets ``RTNETLINK answers: Operation not permitted`` from ``ip link add``.
+    The two settings share a word and mean different things, and threading the
+    provider's flag in here (#164 FBN-12) broke every project that set it —
+    bridges could no longer be brought up at all.
+
+    So this is not a configuration question but a fact about the process:
+    prefix ``sudo`` unless we are already root. When we are root the prefix is
+    not merely redundant, it is a liability — ``sudo`` is frequently absent
+    from a container image, which is the case FBN-12 was actually right about.
+
+    Two things this does not detect, both failing loudly on the first command
+    rather than being guessed at:
+
+    - a *non-root* process that holds CAP_NET_ADMIN directly (``setcap
+      cap_net_admin+ep`` on ``ip``, or a container granted the capability) does
+      not need sudo, but still gets the prefix.
+    - a *root* process whose bounding set excludes CAP_NET_ADMIN (a container
+      without ``--cap-add=NET_ADMIN``) is refused anyway, and no prefix would
+      help: sudo cannot grant a capability the bounding set excludes.
     """
-    return "sudo " if use_sudo else ""
+    return os.geteuid() != 0
+
+
+def _sudo_prefix(needs_sudo: bool) -> str:
+    """``"sudo "`` when the process is not already root, else nothing."""
+    return "sudo " if needs_sudo else ""
 
 
 def _bridge_exists(name: str) -> bool:
@@ -99,14 +129,14 @@ def _bridge_exists(name: str) -> bool:
     return result.ok
 
 
-def _run_sudo(cmd: str, use_sudo: bool = True) -> None:
+def _run_sudo(cmd: str, needs_sudo: bool = True) -> None:
     """Run a root-required command, raising on failure."""
-    run(f"{_sudo_prefix(use_sudo)}{cmd}", hide=True)
+    run(f"{_sudo_prefix(needs_sudo)}{cmd}", hide=True)
 
 
-def _set_sysfs(path: str, value: str, use_sudo: bool = True) -> None:
+def _set_sysfs(path: str, value: str, needs_sudo: bool = True) -> None:
     """Write *value* to *path* under sysfs / procfs via ``tee``."""
-    run(f"echo {value} | {_sudo_prefix(use_sudo)}tee {path}", hide=True)
+    run(f"echo {value} | {_sudo_prefix(needs_sudo)}tee {path}", hide=True)
 
 
 def _scoped_rule_body(bridge: str) -> str:
@@ -127,24 +157,24 @@ def _scoped_rule_body(bridge: str) -> str:
             f"-m physdev --physdev-is-bridged -j ACCEPT")
 
 
-def _iptables_chain_exists(chain: str, use_sudo: bool = True) -> bool:
-    return run(f"{_sudo_prefix(use_sudo)}iptables -t filter -n -L {chain}",
+def _iptables_chain_exists(chain: str, needs_sudo: bool = True) -> bool:
+    return run(f"{_sudo_prefix(needs_sudo)}iptables -t filter -n -L {chain}",
                warn=True, hide=True).ok
 
 
-def _ensure_iptables_rule(chain: str, body: str, use_sudo: bool = True) -> None:
+def _ensure_iptables_rule(chain: str, body: str, needs_sudo: bool = True) -> None:
     """Idempotently insert ``body`` at the top of filter table *chain*.
 
     Uses ``-C`` (check) before ``-I`` (insert at position 1) so repeated
     ``ensure()`` calls don't stack duplicate rules (spike scenario 7).
     """
-    if run(f"{_sudo_prefix(use_sudo)}iptables -t filter -C {chain} {body}",
+    if run(f"{_sudo_prefix(needs_sudo)}iptables -t filter -C {chain} {body}",
            warn=True, hide=True).ok:
         return  # already present
-    _run_sudo(f"iptables -t filter -I {chain} 1 {body}", use_sudo=use_sudo)
+    _run_sudo(f"iptables -t filter -I {chain} 1 {body}", needs_sudo=needs_sudo)
 
 
-def _ensure_scoped_accept(bridge: str, use_sudo: bool = True) -> None:
+def _ensure_scoped_accept(bridge: str, needs_sudo: bool = True) -> None:
     """Allow bridged lab frames on *bridge* via scoped per-bridge rules (D8).
 
     Inserts into ``FORWARD`` (works without docker) and, when the
@@ -158,16 +188,21 @@ def _ensure_scoped_accept(bridge: str, use_sudo: bool = True) -> None:
     forwarded between bridge ports may be dropped on such hosts.
     """
     body = _scoped_rule_body(bridge)
-    _ensure_iptables_rule("FORWARD", body, use_sudo=use_sudo)
-    if _iptables_chain_exists("DOCKER-USER", use_sudo=use_sudo):
-        _ensure_iptables_rule("DOCKER-USER", body, use_sudo=use_sudo)
+    _ensure_iptables_rule("FORWARD", body, needs_sudo=needs_sudo)
+    if _iptables_chain_exists("DOCKER-USER", needs_sudo=needs_sudo):
+        _ensure_iptables_rule("DOCKER-USER", body, needs_sudo=needs_sudo)
 
 
-def ensure(shared_networks: dict[str, dict[str, Any]] | None,
-           use_sudo: bool = True) -> None:
+def ensure(shared_networks: dict[str, dict[str, Any]] | None) -> None:
     """Ensure every bridge declared in *shared_networks* exists and is up.
 
     Idempotent for a given declaration, and safe to call repeatedly.
+
+    **API note.** This took a ``use_sudo`` keyword between #164 FBN-12 and this
+    change. It is gone rather than deprecated: its only caller passed the
+    libvirt provider's flag, which answers a different question and disabled
+    sudo for callers who needed it (see :func:`_needs_sudo`). Privilege is
+    decided here now, so there is no correct value a caller could pass.
 
     Across projects it is narrower than that. Bridge names are global and not
     namespaced, and this re-writes whatever settings an entry declares onto
@@ -209,6 +244,11 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None,
     if not shared_networks:
         return
 
+    # Derived from the process rather than taken from configuration --
+    # see _needs_sudo(). Resolved once so a single run cannot be
+    # internally inconsistent.
+    needs_sudo = _needs_sudo()
+
     globally_disabled: list[str] = []
     for entry_name, entry in shared_networks.items():
         bridge = entry.get("bridge")
@@ -245,14 +285,14 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None,
         if created:
             log.info(f"creating shared bridge {bridge!r}")
             _run_sudo(f"ip link add name {qbridge} type bridge",
-                      use_sudo=use_sudo)
+                      needs_sudo=needs_sudo)
         else:
             log.info(f"shared bridge {bridge!r} already present")
 
-        _run_sudo(f"ip link set dev {qbridge} up", use_sudo=use_sudo)
+        _run_sudo(f"ip link set dev {qbridge} up", needs_sudo=needs_sudo)
 
         if mtu is not None:
-            _run_sudo(f"ip link set dev {qbridge} mtu {mtu}", use_sudo=use_sudo)
+            _run_sudo(f"ip link set dev {qbridge} mtu {mtu}", needs_sudo=needs_sudo)
 
         # Shared bridge names are global and not namespaced, so writing the
         # default on every run is not a no-op: a project that never mentions
@@ -262,17 +302,17 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None,
         # state. `mtu` above is guarded for the same reason.
         if stp_enabled is not None:
             _run_sudo(f"ip link set dev {qbridge} type bridge stp_state "
-                      f"{1 if stp_enabled else 0}", use_sudo=use_sudo)
+                      f"{1 if stp_enabled else 0}", needs_sudo=needs_sudo)
         elif created:
             _run_sudo(f"ip link set dev {qbridge} type bridge stp_state 0",
-                      use_sudo=use_sudo)
+                      needs_sudo=needs_sudo)
 
         # Decision D8: default to scoped per-bridge accept rules; the
         # host-global sysctl disable is an explicit opt-in.
         if disable_netfilter:
             globally_disabled.append(bridge)
         else:
-            _ensure_scoped_accept(bridge, use_sudo=use_sudo)
+            _ensure_scoped_accept(bridge, needs_sudo=needs_sudo)
 
     if globally_disabled:
         log.warning(
@@ -287,7 +327,7 @@ def ensure(shared_networks: dict[str, dict[str, Any]] | None,
         )
         nf_path = Path("/proc/sys/net/bridge/bridge-nf-call-iptables")
         if nf_path.exists():
-            _set_sysfs(str(nf_path), "0", use_sudo=use_sudo)
+            _set_sysfs(str(nf_path), "0", needs_sudo=needs_sudo)
         else:
             log.warning(
                 "br_netfilter not loaded; skipping bridge-nf-call-iptables=0. "
