@@ -86,7 +86,8 @@ def test_a_token_from_a_failed_run_is_refused(box, tmp_path):
     assignment was never checked, so make exited 0 and replaced the
     credentials with a token from a failed run (#171 B7).
     """
-    tf = tmp_path / "tf"; tf.mkdir()
+    tf = tmp_path / "tf"
+    tf.mkdir()
     (tf / ".env").write_text("export TF_VAR_pve_api_token='existing'\n")
     ssh = tmp_path / "bin" / "ssh-stub"
     _stub(ssh, 'echo \'{"value":"leaked-token"}\'\nexit 255\n')
@@ -99,7 +100,8 @@ def test_a_token_from_a_failed_run_is_refused(box, tmp_path):
 
 
 def test_a_run_returning_no_token_is_refused(box, tmp_path):
-    tf = tmp_path / "tf"; tf.mkdir()
+    tf = tmp_path / "tf"
+    tf.mkdir()
     ssh = tmp_path / "bin" / "ssh-stub"
     _stub(ssh, 'echo "no json here"\n')
 
@@ -111,7 +113,8 @@ def test_a_run_returning_no_token_is_refused(box, tmp_path):
 
 def test_an_accepted_token_lands_0600(box, tmp_path):
     """The token is root@pam with --privsep 0 (#171 B8)."""
-    tf = tmp_path / "tf"; tf.mkdir()
+    tf = tmp_path / "tf"
+    tf.mkdir()
     (tf / ".env").write_text("stale\n")
     os.chmod(tf / ".env", 0o644)
     ssh = tmp_path / "bin" / "ssh-stub"
@@ -136,7 +139,8 @@ def test_an_accepted_token_lands_0600(box, tmp_path):
 ])
 def test_terraform_refuses_an_env_that_cannot_be_sourced(box, tmp_path, content, why):
     """`test -r` proves the file opens, not that it parsed (#171 B9)."""
-    tf = tmp_path / "tf"; tf.mkdir()
+    tf = tmp_path / "tf"
+    tf.mkdir()
     (tf / ".env").write_text(content)
     terraform = tmp_path / "bin" / "terraform"
     _stub(terraform, f'echo "$@" >> {tmp_path}/terraform-calls\n')
@@ -430,7 +434,7 @@ def test_multiple_victims_cross_the_remote_shell_as_arguments(box, tmp_path):
     # timeout argument and the drill reports a recovery it never watched.
     assert args == ["pve4", "600", "vm:200", "vm:201"], (
         "the watcher did not receive node, timeout and both sids as four "
-        "separate arguments: %r" % (args,))
+        f"separate arguments: {args!r}")
 
 
 
@@ -592,7 +596,8 @@ def test_a_failed_rule_listing_stops_the_run(box, tmp_path):
 def test_make_ha_refuses_a_failed_terraform_output(box, tmp_path):
     """Terraform emitting valid JSON and then failing still triggered the
     remote HA command; make exited 0 (#171 D1 follow-up)."""
-    tf = tmp_path / "tf"; tf.mkdir()
+    tf = tmp_path / "tf"
+    tf.mkdir()
     (tf / ".env").write_text("export TF_VAR_pve_endpoint='https://localhost:8006/'\n")
     terraform = tmp_path / "bin" / "terraform"
     _stub(terraform, 'echo \'{"vm:200":"pve1"}\'\nexit 42\n')
@@ -721,7 +726,8 @@ def _run_migrate(box, tmp_path, tag, jq_stub=None, **env):
     (work / "lib.sh").write_text(_MIGRATE_STUB_LIB)
     path = os.environ["PATH"]
     if jq_stub is not None:
-        binn = work / "bin"; binn.mkdir()
+        binn = work / "bin"
+        binn.mkdir()
         _stub(binn / "jq", jq_stub)
         path = f"{binn}:{path}"
     proc = subprocess.run(
