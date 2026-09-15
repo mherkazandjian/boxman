@@ -396,5 +396,10 @@ def test_the_recovery_names_every_step_the_recreate_needs(tmp_path):
     assert "enable --now" not in advice, (
         f"the advice re-enables the unit it needs removed: {advice}")
     assert "delete the [mon.pve3] section" in advice, advice
-    assert "remove" in advice and "mon_host" in advice, (
-        f"the address entry is named but not removed: {advice}")
+    # One operation, not two substrings that happen to both appear: `remove` is
+    # already supplied by `ceph mon remove pve3`, so checking it separately
+    # from `mon_host` would accept advice that says to *keep* the address
+    # there. The message wraps, so compare on normalised whitespace.
+    flat = " ".join(advice.split())
+    assert "remove pve3's address from mon_host" in flat, (
+        f"the advice does not say to remove pve3's address from mon_host: {flat}")
