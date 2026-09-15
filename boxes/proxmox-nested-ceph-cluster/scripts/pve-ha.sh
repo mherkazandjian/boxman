@@ -164,6 +164,24 @@ drop_rule() {
     unset 'RULE_RESOURCES[$rule]'
 }
 
+# --- migrate rules persisted under the pre-rename site names ---------------
+#
+# A lab built before the host1/host2 rename carries prefer-hpe1 / prefer-hpe2,
+# and those rules still own their resources. Proxmox refuses a resource that
+# already belongs to another rule, so creating prefer-host1 fails against every
+# pre-rename cluster until its predecessor lets go -- and the withdrawal loop
+# below only knows the new names, so nothing would ever release them.
+#
+# Dropping the old rule loses nothing: the policy is recomputed from
+# PVE_HA_POLICY_HOMES on every run and the members are reassigned a few lines
+# further down.
+for legacy in prefer-hpe1 prefer-hpe2; do
+    rule_exists "$legacy" || continue
+    pssh "$first" "pvesh delete /cluster/ha/rules/$legacy"
+    unset 'RULE_RESOURCES[$legacy]'
+    log "rule $legacy: removed (renamed to prefer-host1/host2); members reassigned below"
+done
+
 # --- withdraw first, then add ----------------------------------------------
 #
 # Proxmox checks a node-affinity rule for feasibility before persisting it and

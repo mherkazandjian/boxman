@@ -85,7 +85,7 @@ passwordless sudo, the `vxlan` module, a **usable firewalld** (`vxlan-up.sh`
 binds the lab bridge to a zone and opens the tunnel port), `jq` on the
 orchestration host (`host1` — the migration and HA scripts parse JSON there,
 and the nodes themselves have no `jq`), internet egress, ~100 GB free under
-`~/pve-lab`. On the workstation: ssh aliases `host1`/`host2`, `rsync`,
+`~/pve-lab`. On the workstation: ssh access to both hosts, `rsync`,
 `openssl`, `ssh-keygen`, and `jq` + `terraform` for the Terraform and HA
 targets.
 
@@ -159,7 +159,8 @@ written, every rbd storage stayed `inactive`, and `make demo` failed against a
 `HEALTH_OK` cluster. It is fixed upstream in `libpve-storage-perl` 9.1.10 — the
 nodes simply had 9.1.5, because nothing ever upgraded them. An earlier build on
 2026-09-06 worked only because the ISO's PVE and the repo's Ceph were still in
-step; that was luck with a nine-day shelf life, not a working design.
+step. That was a combination which worked but was exposed to repository
+drift, and it drifted nine days later.
 
 Two consequences worth knowing:
 
@@ -168,9 +169,11 @@ Two consequences worth knowing:
   first boot. Harmless for a lab; reboot a node if you need the new kernel.
 - **A build is only as reproducible as the repo on the day.** Upgrading makes
   both halves move together rather than one, which is the point, but it does not
-  pin them. If you need a byte-reproducible lab, pin `PVE_CEPH_VERSION` *and*
-  the PVE packages — and accept that you are then shipping a deliberately frozen
-  stack that will drift out of support.
+  pin them. Note that `PVE_CEPH_VERSION` is *not* enough on its own either: it
+  selects a Ceph release codename, and the patch packages within it still float.
+  A genuinely reproducible lab needs exact package versions or a repository
+  snapshot, and then ships a deliberately frozen stack that drifts out of
+  support.
 
 This relies on the post-create CPU/memory step editing the persistent config
 (`dumpxml --inactive`) — the fix that ships with this box. Before it, boxman
@@ -181,10 +184,12 @@ VM with `memory:` set would have re-run its installer on the second boot.
 
 ```bash
 make status                          # boxman ps on both hosts, pvecm status, ceph -s, qm list
-ssh host1 'bridge link show master virbr-pve'      # vnet ports + vxlan-pve
-ssh host2 'bridge link show master br-pve'
-ssh host1 'ping -c2 10.77.0.13'                    # host1 → a node on host2, over the VXLAN
-ssh host1 'virsh -c qemu:///system dumpxml bprj__pvelab__bprj_pve_pve1 --inactive | grep -A1 "<os>\|<cpu "'
+# `host1`/`host2` are SITE names, not necessarily ssh hosts -- scripts/ssh-site
+# maps them through SSH_ALIAS_<site>. Use it, or substitute your own alias.
+scripts/ssh-site host1 'bridge link show master virbr-pve'   # vnet ports + vxlan-pve
+scripts/ssh-site host2 'bridge link show master br-pve'
+scripts/ssh-site host1 'ping -c2 10.77.0.13'                 # host1 → a node on host2, over the VXLAN
+scripts/ssh-site host1 'virsh -c qemu:///system dumpxml bprj__pvelab__bprj_pve_pve1 --inactive | grep -A1 "<os>\|<cpu "'
 ssh -L 8006:10.77.0.11:8006 host1                  # then https://localhost:8006, root / PVE_ROOT_PASSWORD
 ```
 
@@ -205,7 +210,7 @@ key, DHCP from host1). No ssh from the workstation to the nodes is needed.
 Terraform runs on the workstation through an ssh tunnel to pve1's API:
 
 ```bash
-ssh -N -L 8006:10.77.0.11:8006 host1 &      # API tunnel (also serves the web UI)
+ssh -N -L 8006:10.77.0.11:8006 "${SSH_ALIAS_host1:-host1}" &   # API tunnel (also the web UI)
 make tf-token                              # API token root@pam!terraform -> terraform/.env (gitignored)
 make tf-init
 make tf-apply VM_COUNT=4                   # rocky01..04, one per node, 2 vCPU / 2 GiB / 16 GiB on vmpool

@@ -766,3 +766,64 @@ def test_a_successful_migration_runs_to_completion(box, tmp_path):
     # the placement assertion the script makes must have had something to find
     assert calls.count("/cluster/resources") >= 2, (
         "the final placement was never queried: " + calls)
+
+
+# --- site propagation -------------------------------------------------------
+#
+# `lib.sh` resolves SITE from BOXMAN_SITE and falls back to `hostname -s`. The
+# fallback is a trap rather than a convenience: on the machines this box was
+# written against, `hostname -s` returned the *old* site names, so every call
+# that forgot BOXMAN_SITE worked by coincidence until the rename -- and then
+# aborted with "unknown site". `make all` does not exercise tf-token, ha,
+# ha-status or ha-failover, so two clean end-to-end runs said nothing about
+# them; a reviewer found four broken targets afterwards.
+#
+# These are static assertions on the Makefile on purpose. The failure mode is
+# "one call site out of N was missed", and only reading all N catches it.
+
+def _makefile_lines() -> list[tuple[int, str]]:
+    with open(os.path.join(BOX, "Makefile")) as fh:
+        return list(enumerate(fh.read().splitlines(), 1))
+
+
+def test_every_orchestration_call_forwards_the_site():
+    """Any `$(SSH) $(ORCH) …` that reaches lib.sh must set BOXMAN_SITE."""
+    offenders = [
+        (n, line.strip()) for n, line in _makefile_lines()
+        if "$(SSH) $(ORCH)" in line and "BOXMAN_SITE=" not in line
+    ]
+    assert not offenders, (
+        "orchestration-host calls without BOXMAN_SITE (lib.sh would fall back "
+        f"to `hostname -s`): {offenders}")
+
+
+def test_the_site_macros_forward_the_site():
+    """The two macros every other recipe is supposed to go through."""
+    text = "\n".join(line for _, line in _makefile_lines())
+    for macro in ("define run", "define boxman"):
+        body = text.split(macro, 1)[1].split("endef", 1)[0]
+        assert "BOXMAN_SITE=$(1)" in body, f"{macro} does not forward the site"
+
+
+def test_sync_resolves_the_alias_before_it_can_be_skipped():
+    """The alias must be resolved before the first command that can fail.
+
+    It used to sit after an `&&`, followed by `;`: a failed mkdir on the second
+    host skipped the assignment but not the rsyncs, so `a` still held the FIRST
+    host's alias and both transfers went there again -- reporting success.
+    """
+    lines = [line for _, line in _makefile_lines()]
+    start = next(i for i, line in enumerate(lines) if line.startswith("sync:"))
+    end = next(i for i, line in enumerate(lines[start + 1:], start + 1)
+               if line and not line[0].isspace())
+    # recipe lines only: the target line's own `#@ rsync …` help text and the
+    # `@#` commentary are prose, and matching them as commands is how the first
+    # draft of this test failed against correct code.
+    body = [line for line in lines[start + 1:end]
+            if line.startswith("\t") and not line.lstrip().startswith("@#")]
+    alias_at = next(i for i, line in enumerate(body) if "SSH_ALIAS_$$h" in line)
+    first_rsync = next(i for i, line in enumerate(body) if "rsync " in line)
+    first_ssh = next(i for i, line in enumerate(body) if "$(SSH) $$h" in line)
+    assert alias_at < first_rsync, "alias resolved after it is used"
+    assert alias_at < first_ssh, (
+        "alias resolved after a command that can fail and skip it")

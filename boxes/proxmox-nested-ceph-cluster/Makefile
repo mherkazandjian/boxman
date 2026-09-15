@@ -98,12 +98,16 @@ answer: keys   #@ render answer.toml from the template (pubkey + password hash)
 	  && echo "rendered answer.toml"
 
 sync: keys   #@ rsync this repo + keys to the hosts, build the venv, install boxman
+	@# The alias is resolved FIRST and every step fails immediately. It used to
+	@# sit after an `&&` and be followed by `;`, so a failed mkdir on the second
+	@# host skipped the assignment but not the rsyncs: `a` still held the FIRST
+	@# host's alias, both transfers went there again, and sync reported success.
 	@for h in $(HOSTS); do \
 	  echo "== $$h"; \
-	  $(SSH) $$h 'mkdir -p $(LAB)/src $(LAB)/keys' && \
 	  a=$$(eval printf '%s' \"\$$SSH_ALIAS_$$h\"); a=$${a:-$$h}; \
-	  rsync -a --delete $(RSYNC_EXCLUDES) $(REPO)/ $$a:$(LAB)/src/ && \
-	  rsync -a keys/ $$a:$(LAB)/keys/ && \
+	  $(SSH) $$h 'mkdir -p $(LAB)/src $(LAB)/keys' || exit 1; \
+	  rsync -a --delete $(RSYNC_EXCLUDES) $(REPO)/ $$a:$(LAB)/src/ || exit 1; \
+	  rsync -a keys/ $$a:$(LAB)/keys/ || exit 1; \
 	  $(SSH) $$h 'chmod 600 $(LAB)/keys/id_ed25519_pvelab; \
 	    test -x $(LAB)/venv/bin/pip || python3.12 -m venv $(LAB)/venv; \
 	    $(LAB)/venv/bin/pip install -q -e $(LAB)/src && $(BOXMAN) --version' || exit 1; \
@@ -220,7 +224,7 @@ tf-token:   #@ create the API token root@pam!terraform on pve1 and write terrafo
 	@# under umask 077 via a temp file and renamed, which also repairs an
 	@# existing 0644 .env rather than leaving its mode alone (#171 B8).
 	@set -o pipefail; umask 077; \
-	if ! secret=$$($(SSH) $(ORCH) 'PVE_LAB_DIR=$(LAB) source $(SCRIPTS)/lib.sh; pssh pve1 "pveum user token list root@pam --output-format json | grep -q \"\\\"terraform\\\"\" && pveum user token remove root@pam terraform >/dev/null; pveum user token add root@pam terraform --privsep 0 --comment lab-terraform --output-format json"' \
+	if ! secret=$$($(SSH) $(ORCH) 'BOXMAN_SITE=$(ORCH) PVE_LAB_DIR=$(LAB) source $(SCRIPTS)/lib.sh; pssh pve1 "pveum user token list root@pam --output-format json | grep -q \"\\\"terraform\\\"\" && pveum user token remove root@pam terraform >/dev/null; pveum user token add root@pam terraform --privsep 0 --comment lab-terraform --output-format json"' \
 	  | sed -n 's/.*"value":"\([^"]*\)".*/\1/p'); then \
 	  echo "token creation failed on $(ORCH); nothing written, existing credentials left alone"; \
 	  exit 1; \
@@ -270,10 +274,10 @@ ha:   #@ dynamic CRS + auto-rebalance + node-affinity rules for the HA resources
 	  | jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")') \
 	  || { echo "could not read the ha_policy_homes output; run 'make tf-apply' first"; exit 1; }; \
 	test -n "$$homes" || { echo "ha_policy_homes is empty; run 'make tf-apply' first"; exit 1; }; \
-	$(SSH) $(ORCH) "PVE_LAB_DIR=$(LAB) PVE_HA_POLICY_HOMES='$$homes' bash $(SCRIPTS)/pve-ha.sh"
+	$(SSH) $(ORCH) "BOXMAN_SITE=$(ORCH) PVE_LAB_DIR=$(LAB) PVE_HA_POLICY_HOMES='$$homes' bash $(SCRIPTS)/pve-ha.sh"
 
 ha-status:   #@ ha-manager status, rules, crs settings
-	@$(SSH) $(ORCH) 'PVE_LAB_DIR=$(LAB) source $(SCRIPTS)/lib.sh; pssh pve1 "ha-manager status; echo; ha-manager rules list; echo; pvesh get /cluster/options --output-format json | grep -o \"\\\"crs\\\":\\\"[^\\\"]*\\\"\""'
+	@$(SSH) $(ORCH) 'BOXMAN_SITE=$(ORCH) PVE_LAB_DIR=$(LAB) source $(SCRIPTS)/lib.sh; pssh pve1 "ha-manager status; echo; ha-manager rules list; echo; pvesh get /cluster/options --output-format json | grep -o \"\\\"crs\\\":\\\"[^\\\"]*\\\"\""'
 
 # The victim sids are collapsed to one space-separated line before they cross
 # the remote shell: they used to arrive with their newlines intact, so every sid
@@ -289,13 +293,13 @@ ha-failover:   #@ hard-kill NODE (default pve4) on its host, watch HA recover it
 	@# and an inventory taken afterwards can miss the ones that already
 	@# relocated, then call the drill complete (#171 B13).
 	@set -o pipefail; \
-	site=$$($(SSH) $(ORCH) 'source $(SCRIPTS)/lib.sh; echo $${NODE_SITE[$(NODE)]}') || exit 1; \
-	victims=$$($(SSH) $(ORCH) 'PVE_LAB_DIR=$(LAB) bash $(SCRIPTS)/ha-watch.sh $(NODE) --list' | tr '\n' ' ') || exit 1; \
+	site=$$($(SSH) $(ORCH) 'BOXMAN_SITE=$(ORCH) PVE_LAB_DIR=$(LAB) source $(SCRIPTS)/lib.sh; echo $${NODE_SITE[$(NODE)]}') || exit 1; \
+	victims=$$($(SSH) $(ORCH) 'BOXMAN_SITE=$(ORCH) PVE_LAB_DIR=$(LAB) bash $(SCRIPTS)/ha-watch.sh $(NODE) --list' | tr '\n' ' ') || exit 1; \
 	echo "== HA resources on $(NODE) before the kill: $${victims:-none}"; \
 	echo "== pulling the plug on $(NODE) (host $$site)"; \
 	$(SSH) $$site 'virsh -c qemu:///system destroy bprj__pvelab__bprj_pve_$(NODE)' || exit 1; \
 	watch_rc=0; \
-	$(SSH) $(ORCH) "PVE_LAB_DIR=$(LAB) bash $(SCRIPTS)/ha-watch.sh $(NODE) 600 $$victims" || watch_rc=$$?; \
+	$(SSH) $(ORCH) "BOXMAN_SITE=$(ORCH) PVE_LAB_DIR=$(LAB) bash $(SCRIPTS)/ha-watch.sh $(NODE) 600 $$victims" || watch_rc=$$?; \
 	echo "== bringing $(NODE) back with boxman up on $$site"; \
 	restore_rc=0; \
 	$(call boxman,$$site,up) > /tmp/pve-failover-up.log 2>&1 || restore_rc=$$?; \

@@ -55,7 +55,18 @@ ip link show vmbr0 | head -1
 # which is what should happen. It also stages a kernel the node will not run
 # until it reboots; fine for a lab, noted in the README.
 apt-get update -qq
-apt-get dist-upgrade -y -qq
+# --force-conf*: step 1 above edits /etc/apt/sources.list.d/pve-enterprise.sources,
+# which IS a dpkg conffile. If an upgrade also changes its packaged contents dpkg
+# prompts -- and DEBIAN_FRONTEND=noninteractive does not answer a conffile prompt.
+# This hook runs as a service with null stdin, so the prompt fails with EOF, the
+# upgrade aborts, and the marker below is never written. confold keeps our edit;
+# confdef takes the package default wherever one is defined.
+# (/etc/network/interfaces, edited in step 2, is NOT a conffile and is preserved
+# by ifupdown2 regardless.)
+apt-get -y -qq \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confold \
+    dist-upgrade
 
 # 4. guest agent
 apt-get install -y -qq qemu-guest-agent
