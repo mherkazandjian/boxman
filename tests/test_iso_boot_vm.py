@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import ProvisionError
 from boxman.providers.libvirt.direct_vm import normalize_disk_size
 from boxman.providers.libvirt.iso_boot_vm import IsoBootVM
 
@@ -142,3 +143,124 @@ class TestIsoBootVMCreate:
         mock_run.side_effect = [_result(ok=True), _result(ok=False, stderr="permission denied")]
         vm = _make_iso_vm(tmp_path)
         assert vm.create() is False
+
+
+class TestNetworkMacPinning:
+    """``networks[].mac`` pins the first NIC's MAC at virt-install time."""
+
+    def test_mac_from_raw_networks(self, tmp_path):
+        vm = _make_iso_vm(
+            tmp_path, networks=[{"name": "pvenet", "mac": "52:54:00:77:00:11"}])
+        assert vm._network_specs() == [{"name": "pvenet", "mac": "52:54:00:77:00:11"}]
+        assert vm._networks() == ["pvenet"]
+
+    def test_mac_from_resolved_dict_entries(self, tmp_path):
+        full = "bprj__p__bprj__clstr__pve__clstr__pvenet"
+        vm = _make_iso_vm(
+            tmp_path,
+            networks=[{"name": "pvenet", "mac": "00:00:00:00:00:01"}],
+            _resolved_networks=[{"name": full, "mac": "52:54:00:77:00:11"}],
+        )
+        assert vm._network_specs() == [{"name": full, "mac": "52:54:00:77:00:11"}]
+
+    def test_resolved_string_entries_have_no_mac(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, _resolved_networks=["bprj__p__net"])
+        assert vm._network_specs() == [{"name": "bprj__p__net", "mac": None}]
+
+    def test_empty_resolved_and_raw_lists_fall_back_to_default(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, networks=[], _resolved_networks=[])
+        assert vm._network_specs() == [{"name": "default", "mac": None}]
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_mac_is_passed_to_virt_install(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        full = "bprj__p__bprj__clstr__pve__clstr__pvenet"
+        vm = _make_iso_vm(
+            tmp_path, _resolved_networks=[{"name": full, "mac": "52:54:00:77:00:11"}])
+        vm.create()
+        virt_install_call = mock_run.call_args_list[1][0][0]
+        assert (f"--network=network={full},model=virtio,mac=52:54:00:77:00:11"
+                in virt_install_call)
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_no_mac_keeps_plain_network_arg(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path, _resolved_networks=[{"name": "n1", "mac": None}])
+        vm.create()
+        virt_install_call = mock_run.call_args_list[1][0][0]
+        assert "--network=network=n1,model=virtio" in virt_install_call
+        assert ",mac=" not in virt_install_call
+
+
+class TestDeclaredButUnresolvableNetworks:
+    """#171 A4, the runtime half.
+
+    `networks: [""]` passed validation, was skipped at resolution, and fell
+    through to libvirt's shared `default` network with nothing reported --
+    the libvirt twin of #164 NET-C1.
+    """
+
+    def test_a_declared_list_that_resolves_to_nothing_is_refused(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, networks=[""])
+        with pytest.raises(ProvisionError, match="declared"):
+            vm._networks()
+
+    def test_the_refusal_names_the_vm_and_what_was_declared(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, networks=[{"mac": "52:54:00:0c:01:01"}])
+        with pytest.raises(ProvisionError) as exc:
+            vm._networks()
+        assert vm.vm_name in str(exc.value)
+
+    def test_an_omitted_list_still_selects_the_default_network(self, tmp_path):
+        """`_resolve_iso_config` writes `_resolved_networks: []` even when no
+        `networks:` was given, so an empty list must mean "ask the next
+        source", not "declared and unresolvable"."""
+        vm = _make_iso_vm(tmp_path, networks=[])
+        assert vm._networks() == ["default"]
+
+    def test_an_empty_resolved_list_falls_through_to_the_raw_names(self, tmp_path):
+        vm = _make_iso_vm(tmp_path, networks=[{"name": "talos-net"}],
+                          _resolved_networks=[])
+        assert vm._networks() == ["talos-net"]
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_no_disk_is_created_when_the_networks_are_refused(self, mock_run, tmp_path):
+        """The refusal has to come before qemu-img, or a rejected VM still
+        leaves a boot disk behind."""
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path, networks=[""], iso_path="/data/talos.iso")
+        with pytest.raises(ProvisionError):
+            vm.create()
+        assert mock_run.call_count == 0, (
+            f"{mock_run.call_count} shell command(s) ran before the refusal")
+
+
+class TestTheBootDiskIsDeclaredQcow2:
+    """#171 C4. `format=` governs volume *creation*; for a file that already
+    exists libvirt consults its pool record, and a stale one gave a qcow2 boot
+    disk `<driver type='raw'>` -- the guest then saw a 64 GiB image as 197 KiB.
+    `driver.type=qcow2` states it outright. Nothing covered it.
+    """
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_virt_install_is_told_the_driver_type(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path, iso_path="/data/talos.iso")
+        assert vm.create() is True
+
+        cmd = " ".join(str(c.args[0]) for c in mock_run.call_args_list)
+        disk_args = [a for a in cmd.split() if a.startswith("--disk=")]
+        assert disk_args, cmd
+        assert "driver.type=qcow2" in disk_args[0], disk_args[0]
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_the_image_is_created_as_qcow2_too(self, mock_run, tmp_path):
+        """The two have to agree: declaring qcow2 over a raw file is the same
+        class of mismatch, pointing the other way."""
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path, iso_path="/data/talos.iso")
+        vm.create()
+
+        qemu_img = str(mock_run.call_args_list[0].args[0])
+        assert "qemu-img create" in qemu_img
+        assert "-f qcow2" in qemu_img, qemu_img

@@ -16,6 +16,7 @@ from jinja2 import Environment, FileSystemLoader
 from boxman import log
 from boxman.exceptions import ConfigError
 from boxman.netlab.shared_bridges import BRIDGE_NAME_RE
+from boxman.utils.mac import canonical_mac, is_mac_like
 
 from . import net_reconcile
 from .commands import VirshCommand
@@ -276,22 +277,10 @@ class Network:
                 "exists but is administratively down in the active runtime; "
                 f"run: sudo ip link set dev {self.bridge_name} up")
 
-    @staticmethod
-    def _canonical_mac(value: str) -> str:
-        """
-        Zero-pad and lowercase a mac, the way libvirt stores a network's own.
-
-        Left alone if it does not look like six hex groups, so that anything
-        unexpected still reaches libvirt and gets libvirt's own error rather
-        than being silently mangled here.
-        """
-        groups = str(value).split(':')
-        if len(groups) != 6:
-            return str(value).lower()
-        try:
-            return ':'.join(f"{int(group, 16):02x}" for group in groups)
-        except ValueError:
-            return str(value).lower()
+    #: Shared with the direct-boot MAC pin validation in
+    #: ``manager_parts/images.py`` so a reservation and a pin cannot disagree
+    #: about how the same address is spelled (#171 A1).
+    _canonical_mac = staticmethod(canonical_mac)
 
     @staticmethod
     def _normalise_stp(value: Any) -> str:
@@ -386,13 +375,17 @@ class Network:
             # libvirt compares these case-insensitively, so normalise before
             # looking for duplicates or the same mac twice in two cases slips
             # through and the last one silently wins
+            # Stored verbatim (bar case): libvirt writes reservation macs
+            # back exactly as given, so zero-padding the stored value here
+            # would create the very mismatch this is meant to avoid. Only the
+            # duplicate check below uses the canonical form (#171 A1).
             mac = str(mac).lower()
 
             # six colon-separated hex groups. libvirt tolerates a group written
             # with a single digit (52:54:0:c:1:1 parses), so this is deliberately
             # looser than the canonical form; it is only here to reject the
             # dash-separated and run-together spellings early
-            if not re.fullmatch(r'[0-9a-f]{1,2}(:[0-9a-f]{1,2}){5}', mac):
+            if not is_mac_like(mac):
                 raise ValueError(
                     f"network {self.name}: the dhcp reservation for {ip} has "
                     f"a malformed mac {entry.get('mac')!r}, expected six "
@@ -427,17 +420,21 @@ class Network:
             # be fooled by a non-canonical spelling
             ip = str(address)
 
-            if mac in seen_macs:
+            # Keyed on the canonical form so two spellings of one address --
+            # `52:54:0:c:1:1` and `52:54:00:0c:01:01` -- are caught as the
+            # duplicate they are, while the value stored stays verbatim.
+            mac_key = canonical_mac(mac)
+            if mac_key in seen_macs:
                 raise ValueError(
                     f"network {self.name}: mac {mac} is reserved twice, for "
-                    f"{seen_macs[mac]} and {ip}")
+                    f"{seen_macs[mac_key]} and {ip}")
 
             if ip in seen_ips:
                 raise ValueError(
                     f"network {self.name}: ip {ip} is reserved twice, for "
                     f"{seen_ips[ip]} and {mac}")
 
-            seen_macs[mac] = ip
+            seen_macs[mac_key] = ip
             seen_ips[ip] = mac
 
             host = {'mac': mac, 'ip': ip}

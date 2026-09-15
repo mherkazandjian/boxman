@@ -211,6 +211,17 @@ Use it when several hypervisors should map one stable network name onto their
 own local bridge, which is what live migration wants. Use `shared_networks`
 instead when you want boxman to *create* the bridge on this host.
 
+The two combine: a `mode: bridge` network may name a bridge that a top-level
+`shared_networks:` entry in the same `conf.yml` creates, because
+`ensure_shared_bridges()` runs before `define_networks()` on every `provision`
+and `up`. That gives direct-boot (ISO/PXE) VMs — whose first NIC is a
+`networks: [{name: …}]` entry resolved as a libvirt network, not an adapter —
+a way onto a host bridge. `boxes/proxmox-nested-ceph-cluster/` uses it to
+stretch one L2 across two hypervisors: hpe1 runs a `mode: nat` network whose
+dnsmasq holds `dhcp.hosts` reservations for *every* node's pinned
+`networks[].mac`, hpe2 runs a `shared_networks` bridge + `mode: bridge`
+network, and a VXLAN enslaved to both bridges (outside boxman) joins them.
+
 > **Ownership warning.** Moving a network between `nat`/`route` and `bridge`
 > crosses bridge ownership: libvirt deletes a bridge it manages, and preserves
 > one it does not. Use different bridge names across that transition, or omit
@@ -465,6 +476,31 @@ a defined starting point. There is **no teardown** — `boxman destroy` leaves s
 bridges alone, because another project may still be using one. Removing them is
 an explicit user action.
 
+**Privileges.** Creating a bridge, setting its MTU or STP, installing the accept
+rule and writing `bridge-nf-call-iptables` are netlink and sysfs writes that need
+`CAP_NET_ADMIN` — root, in practice. No group membership substitutes for it: a
+user in the `libvirt` group still gets `RTNETLINK answers: Operation not
+permitted` from `ip link add`. So boxman prefixes these commands with `sudo`
+unless it is already running as root, where the prefix would be not just
+redundant but a liability — a container image frequently has no `sudo` at all.
+
+Being root is not sufficient — and, strictly, not necessary either. What the
+kernel checks is `CAP_NET_ADMIN` in the process's *effective* set. uid 0
+normally carries it, but a container started without `--cap-add=NET_ADMIN` is
+refused even as uid 0, and `sudo` cannot recover a capability that the bounding
+set excludes. Conversely a non-root process that has been granted the capability
+directly does not need `sudo` at all — boxman does not detect that case and will
+still add the prefix.
+
+A seccomp profile is a third, separate restriction: it filters the syscall
+itself, so granting the capability does not lift it.
+
+This is deliberately **not** governed by `provider.libvirt.use_sudo`. That
+setting answers a different question — whether *virsh* needs sudo — and `false`
+is the correct answer for a libvirt-group user whose `ip link` nonetheless needs
+root. The presence probe `ip link show` reads netlink and is never privileged, so
+a host running boxman unprivileged for read-only work still works.
+
 > **That "boxman will not tear it down" is the only sense in which a shared
 > bridge is safe across projects.** Bridge names are global and not namespaced,
 > and every run re-writes the settings it declares onto whatever bridge the name
@@ -559,6 +595,24 @@ network.
 **`bridge '<name>' is already in use by another active network`.** Two networks
 want the same bridge. Either pin distinct `bridge.name` values or omit them and
 let boxman allocate free `virbrX` names.
+
+**`ip link ...` fails with `RTNETLINK answers: Operation not permitted`.**
+Possible causes include insufficient privileges and syscall restrictions. They
+look identical from the error and need different fixes:
+
+- *Not root, and `sudo` unavailable or unauthorised.* Give the invoking user a
+  working `sudo`; for an unattended run, a passwordless rule covering `ip`,
+  `iptables`, and `tee` as well if any entry sets `disable_netfilter: true`.
+- *Already root, but `CAP_NET_ADMIN` is not in the bounding set* — typically a
+  container started without `--cap-add=NET_ADMIN`. Adding `sudo` changes
+  nothing, because it cannot grant a capability the bounding set excludes;
+  grant it to the container instead.
+- *The capability is present but a seccomp profile blocks the syscall.* A
+  different fix again — granting `CAP_NET_ADMIN` does not lift a syscall
+  filter; relax or replace the profile.
+
+`provider.libvirt.use_sudo` is unrelated to all three and will not fix any of
+them — see **Privileges** above.
 
 **A network change appears to do nothing.** It is probably structural, and
 boxman reports the drift but applies nothing without `--recreate-networks`. Run
