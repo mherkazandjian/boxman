@@ -841,55 +841,91 @@ if [[ -z ${{HOST_IP[$SITE]:-}} ]]; then
     exit 1
 fi
 printf '%s\\n' "$SITE" >> {log}
-pssh() {{ :; }}
+# tf-token extracts the secret from pssh's output and refuses an empty one
+pssh() {{ case "$*" in *"token add"*) echo '{{"value":"stub-token"}}' ;; esac; }}
 log() {{ :; }}
 die() {{ echo "$*" >&2; exit 1; }}
 """
 
 
 def _site_probe(tmp_path):
-    """Remote scripts dir, the log of resolved sites, and an ssh that executes."""
+    """Everything the four targets touch on the far side, all of it succeeding.
+
+    Returns the remote scripts dir, the log of the site each remote call ended
+    up with, an ssh that *executes* its command, and a boxman stand-in. The
+    targets have to be able to run to a clean exit: one that stops early -- at
+    a missing stub, or at a wrong site on a later call -- leaves its earlier,
+    correct calls in the log, and a test that ignores the exit status then
+    passes on those.
+    """
     scripts = tmp_path / "remote-scripts"
     scripts.mkdir(exist_ok=True)
     log = tmp_path / "resolved-sites"
     (scripts / "lib.sh").write_text(_SITE_PROBE_LIB.format(log=log))
-    for name in ("pve-ha.sh", "ha-watch.sh"):
+    for name in ("pve-ha.sh", "ha-watch.sh", "wait-first-boot.sh"):
         _stub(scripts / name, 'source "$(dirname "$0")/lib.sh"\nexit 0\n')
-    ssh = tmp_path / "bin" / "ssh-stub"
+    binn = tmp_path / "bin"
+    ssh = binn / "ssh-stub"
     _stub(ssh, 'shift\nbash -c "$*"\n')      # run it, do not just record it
-    return scripts, log, ssh
+    # ha-failover kills the node with `virsh destroy` over ssh, which the
+    # executing stub above would otherwise run against THIS machine's libvirt.
+    # bin/ leads PATH for everything make runs.
+    _stub(binn / "virsh", "exit 0\n")
+    # lib.sh falls back to `hostname -s`; pin it so a call that relies on the
+    # fallback is refused on every machine, not only on ones not named host1
+    _stub(binn / "hostname", "echo not-a-site\n")
+    # `boxman up` on the victim's host does not go through lib.sh; its stand-in
+    # records the site it was handed in the same log
+    boxman = binn / "boxman-stub"
+    _stub(boxman, f'printf \'%s\\n\' "${{BOXMAN_SITE:-UNSET}}" >> {log}\n')
+    return scripts, log, ssh, boxman
 
 
-@pytest.mark.parametrize("target,extra", [
-    ("tf-token", {}),
-    ("ha-status", {}),
-    ("ha", {}),
-    ("ha-failover", {"NODE": "pve4"}),
+#: The site each remote call must end up with, per target, in call order.
+#: Everything goes to the orchestrator except `boxman up`, which restores the
+#: killed node on the host that owns it.
+@pytest.mark.parametrize("target,extra,expected", [
+    ("tf-token", {}, ["host1"]),
+    ("ha-status", {}, ["host1"]),
+    ("ha", {}, ["host1"]),
+    ("ha-failover", {"NODE": "pve4"}, [
+        "host1",    # which host owns the node
+        "host1",    # ha-watch.sh --list: the victims, taken before the kill
+        "host1",    # ha-watch.sh <node> 600 <victims>
+        "host2",    # boxman up, on the node's own host
+        "host1",    # wait-first-boot.sh <node>
+    ]),
 ])
-def test_orchestration_targets_deliver_the_orchestrator_site(box, tmp_path, target, extra):
-    """The site the far side *resolves* must be the orchestrator's.
+def test_orchestration_targets_deliver_the_orchestrator_site(box, tmp_path, target, extra,
+                                                              expected):
+    """The site each remote call *resolves* must be the one the target meant.
 
     `lib.sh` falls back to `hostname -s`, which on the machines this box grew up
     on returned the old site names -- so a call that forgets the variable works
     by coincidence until something is renamed, then aborts with "unknown site".
+
+    Make has to succeed, and the log has to hold one entry per remote call in
+    order. The previous version collapsed the log into a set and ignored the
+    exit status, so ha-failover stopping at an unstubbed virsh -- or at a wrong
+    site on its watcher call -- still left {"host1"} from the calls before it.
     """
-    scripts, log, ssh = _site_probe(tmp_path)
+    scripts, log, ssh, boxman = _site_probe(tmp_path)
     tf = tmp_path / "tf"
     tf.mkdir(exist_ok=True)
     (tf / ".env").write_text("export TF_VAR_pve_api_token='x'\n")
     terraform = tmp_path / "bin" / "terraform"
     _stub(terraform, 'echo \'{"vm:200":"pve1"}\'\n')
 
-    _make(box, target, SSH=str(ssh), ORCH="host1", SCRIPTS=str(scripts),
-          TF_DIR=str(tf), TF=str(terraform), **extra)
+    r = _make(box, target, SSH=str(ssh), ORCH="host1", SCRIPTS=str(scripts),
+              TF_DIR=str(tf), TF=str(terraform), REMOTE_BOX=str(tmp_path),
+              BOXMAN=str(boxman), **extra)
 
-    assert log.exists(), (
-        f"{target}: no site was ever resolved -- the remote lib.sh refused it "
-        f"(an unknown or wrong BOXMAN_SITE), or it was never invoked")
-    resolved = set(log.read_text().split())
-    assert resolved == {"host1"}, (
-        f"{target} resolved {resolved or 'nothing'} on the far side, not the "
-        f"orchestrator site")
+    assert r.returncode == 0, (
+        f"{target} did not run to completion:\n{r.stdout}{r.stderr}")
+    resolved = log.read_text().split() if log.exists() else []
+    assert resolved == expected, (
+        f"{target}: its remote calls ended up with the sites {resolved}, in "
+        f"order; expected {expected}")
 
 
 def test_sync_does_not_retarget_after_a_failed_setup_on_the_second_host(box, tmp_path):
