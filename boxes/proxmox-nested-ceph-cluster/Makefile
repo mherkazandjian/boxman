@@ -13,9 +13,14 @@ HOSTS ?= host1 host2
 ORCH ?= host1
 # The sites are named host1/host2 throughout the box. `ssh host1` still has to
 # resolve, so each site maps to an ssh alias -- defaulting to this lab's, and
-# overridable per site:  make all SSH_ALIAS_host1=myhost
-SSH_ALIAS_host1 ?= hpe1
-SSH_ALIAS_host2 ?= hpe2
+# Which machine is `host1`/`host2`. Unset means the site name is used as the
+# ssh host, which is also what scripts/ssh-site does on its own -- the two must
+# agree, or `make` and a copy-pasted command from the README reach DIFFERENT
+# machines. Defaulting these to particular hostnames here would re-introduce
+# exactly what naming the sites host1/host2 was meant to remove.
+#   export SSH_ALIAS_host1=myhost   (or: make all SSH_ALIAS_host1=myhost)
+SSH_ALIAS_host1 ?=
+SSH_ALIAS_host2 ?=
 # exported, because the lookup below happens in the recipe's shell (the site is
 # a shell loop variable there, so make cannot resolve it at expansion time)
 export SSH_ALIAS_host1
@@ -205,7 +210,8 @@ all: keys answer sync host-prep iso up wait-installed boot wait-first-boot mtu-c
 # ---- Terraform on top of the cluster (runs HERE, through an ssh tunnel) ----
 # The provider talks to the API only (image download by the node, import_from,
 # built-in cloud-init), so no ssh access from the workstation to the nodes is
-# needed. Open the tunnel first:  ssh -N -L 8006:10.77.0.11:8006 host1
+# needed. Open the tunnel first:
+#   ssh -N -L 8006:10.77.0.11:8006 "${SSH_ALIAS_host1:-host1}"
 TF_DIR := $(BOX_DIR)/terraform
 TF := terraform -chdir=$(TF_DIR)
 # VM_COUNT only overrides when given (make tf-apply VM_COUNT=8); otherwise

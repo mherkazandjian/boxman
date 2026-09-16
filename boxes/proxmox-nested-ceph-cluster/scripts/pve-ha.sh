@@ -172,9 +172,12 @@ drop_rule() {
 # pre-rename cluster until its predecessor lets go -- and the withdrawal loop
 # below only knows the new names, so nothing would ever release them.
 #
-# Dropping the old rule loses nothing: the policy is recomputed from
-# PVE_HA_POLICY_HOMES on every run and the members are reassigned a few lines
-# further down.
+# Dropping the old rule does not unmanage anything -- deleting a node-affinity
+# rule only touches the rules config, and the resources stay registered with HA.
+# It does drop their placement *preference* until the replacement is created a
+# few lines below, so if that create fails the guests stay under HA with no
+# affinity until a successful rerun. Acceptable: the policy is recomputed from
+# PVE_HA_POLICY_HOMES every run, and a rerun restores it.
 for legacy in prefer-hpe1 prefer-hpe2; do
     rule_exists "$legacy" || continue
     pssh "$first" "pvesh delete /cluster/ha/rules/$legacy"

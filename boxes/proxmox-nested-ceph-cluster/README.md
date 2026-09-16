@@ -184,13 +184,16 @@ VM with `memory:` set would have re-run its installer on the second boot.
 
 ```bash
 make status                          # boxman ps on both hosts, pvecm status, ceph -s, qm list
-# `host1`/`host2` are SITE names, not necessarily ssh hosts -- scripts/ssh-site
-# maps them through SSH_ALIAS_<site>. Use it, or substitute your own alias.
+# `host1`/`host2` are SITE names, not ssh hosts. Export the mapping once in the
+# shell you run these from -- `make` reads the same variables, so exporting is
+# what keeps a copy-pasted command and a Make recipe pointing at one machine:
+#     export SSH_ALIAS_host1=my-first-host SSH_ALIAS_host2=my-second-host
+# Unset, both fall back to the site name itself.
 scripts/ssh-site host1 'bridge link show master virbr-pve'   # vnet ports + vxlan-pve
 scripts/ssh-site host2 'bridge link show master br-pve'
 scripts/ssh-site host1 'ping -c2 10.77.0.13'                 # host1 → a node on host2, over the VXLAN
 scripts/ssh-site host1 'virsh -c qemu:///system dumpxml bprj__pvelab__bprj_pve_pve1 --inactive | grep -A1 "<os>\|<cpu "'
-ssh -L 8006:10.77.0.11:8006 host1                  # then https://localhost:8006, root / PVE_ROOT_PASSWORD
+ssh -L 8006:10.77.0.11:8006 "${SSH_ALIAS_host1:-host1}"   # then https://localhost:8006
 ```
 
 On a node (`ssh -i keys/id_ed25519_pvelab root@10.77.0.11` from host1):

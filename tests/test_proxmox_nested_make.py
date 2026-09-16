@@ -319,7 +319,9 @@ pssh() {
     case "$cmd" in
         *"/cluster/ha/resources"*) echo "$HA_RESOURCES" ;;
         *"/cluster/ha/rules"*)
-            if [ "${RULE_EXISTS:-0}" = 1 ]; then
+            if [ -n "${RULES_JSON:-}" ]; then
+                echo "$RULES_JSON"
+            elif [ "${RULE_EXISTS:-0}" = 1 ]; then
                 echo '[{"rule":"prefer-host1","resources":"vm:200"},{"rule":"prefer-host2","resources":"vm:999"}]'
             else
                 echo '[]'
@@ -332,7 +334,8 @@ pssh() {
 """
 
 
-def _run_ha(box, tmp_path, homes=None, resources=None, rule_exists=False, tag="x"):
+def _run_ha(box, tmp_path, homes=None, resources=None, rule_exists=False, tag="x",
+            rules_json=None):
     work = tmp_path / f"ha-policy-{tag}"
     work.mkdir(exist_ok=True)
     shutil.copy(box / "scripts" / "pve-ha.sh", work / "pve-ha.sh")
@@ -341,6 +344,8 @@ def _run_ha(box, tmp_path, homes=None, resources=None, rule_exists=False, tag="x
     env = dict(os.environ,
                HA_RESOURCES=str([{"sid": f"vm:{i}"} for i in res]).replace("'", '"'),
                RULE_EXISTS="1" if rule_exists else "0")
+    if rules_json is not None:
+        env["RULES_JSON"] = rules_json
     if homes is not None:
         env["PVE_HA_POLICY_HOMES"] = homes
     else:
@@ -796,11 +801,11 @@ def test_every_orchestration_call_forwards_the_site():
     """Any `$(SSH) $(ORCH) …` that reaches lib.sh must set BOXMAN_SITE."""
     offenders = [
         (n, line.strip()) for n, line in _makefile_lines()
-        if "$(SSH) $(ORCH)" in line and "BOXMAN_SITE=" not in line
+        if "$(SSH) $(ORCH)" in line and "BOXMAN_SITE=$(ORCH)" not in line
     ]
     assert not offenders, (
-        "orchestration-host calls without BOXMAN_SITE (lib.sh would fall back "
-        f"to `hostname -s`): {offenders}")
+        "orchestration-host calls not forwarding BOXMAN_SITE=$(ORCH) (lib.sh "
+        f"would fall back to `hostname -s`, or to the wrong site): {offenders}")
 
 
 def test_the_site_macros_forward_the_site():
@@ -811,25 +816,92 @@ def test_the_site_macros_forward_the_site():
         assert "BOXMAN_SITE=$(1)" in body, f"{macro} does not forward the site"
 
 
-def test_sync_resolves_the_alias_before_it_can_be_skipped():
-    """The alias must be resolved before the first command that can fail.
 
-    It used to sit after an `&&`, followed by `;`: a failed mkdir on the second
-    host skipped the assignment but not the rsyncs, so `a` still held the FIRST
-    host's alias and both transfers went there again -- reporting success.
+
+# ── executed counterparts to the static site checks ─────────────────────────
+#
+# The static assertions above read the Makefile. That catches a missed call
+# site, but a reviewer showed they all pass when the calls forward a *wrong*
+# site, and when sync's setup check is deleted. These run the targets and look
+# at what the far side actually received.
+
+@pytest.mark.parametrize("target,extra", [
+    ("tf-token", {}),
+    ("ha-status", {}),
+])
+def test_orchestration_targets_deliver_the_orchestrator_site(box, tmp_path, target, extra):
+    """The remote command must carry BOXMAN_SITE=<the orchestrator>.
+
+    `lib.sh` falls back to `hostname -s`, which on the machines this box grew up
+    on returned the old site names -- so a call that forgets the variable works
+    by coincidence until something is renamed, then aborts with "unknown site".
     """
-    lines = [line for _, line in _makefile_lines()]
-    start = next(i for i, line in enumerate(lines) if line.startswith("sync:"))
-    end = next(i for i, line in enumerate(lines[start + 1:], start + 1)
-               if line and not line[0].isspace())
-    # recipe lines only: the target line's own `#@ rsync …` help text and the
-    # `@#` commentary are prose, and matching them as commands is how the first
-    # draft of this test failed against correct code.
-    body = [line for line in lines[start + 1:end]
-            if line.startswith("\t") and not line.lstrip().startswith("@#")]
-    alias_at = next(i for i, line in enumerate(body) if "SSH_ALIAS_$$h" in line)
-    first_rsync = next(i for i, line in enumerate(body) if "rsync " in line)
-    first_ssh = next(i for i, line in enumerate(body) if "$(SSH) $$h" in line)
-    assert alias_at < first_rsync, "alias resolved after it is used"
-    assert alias_at < first_ssh, (
-        "alias resolved after a command that can fail and skip it")
+    log = tmp_path / "remote-cmds"
+    ssh = tmp_path / "bin" / "ssh-stub"
+    # record the remote command, then fail: tf-token must not write anything
+    _stub(ssh, f'printf "%s\\n" "$*" >> {log}\nexit 1\n')
+
+    _make(box, target, SSH=str(ssh), ORCH="host1",
+          TF_DIR=str(tmp_path / "tf"), **extra)
+
+    assert log.exists(), f"{target} never invoked ssh"
+    sent = log.read_text()
+    assert "BOXMAN_SITE=host1" in sent, (
+        f"{target} did not forward the orchestrator site; remote got:\n{sent}")
+
+
+def test_sync_does_not_retarget_after_a_failed_setup_on_the_second_host(box, tmp_path):
+    """host2's transfers must not be re-aimed at host1.
+
+    The alias used to be resolved after an `&&` and followed by `;`: a failed
+    mkdir on the second host skipped the assignment but not the rsyncs, so `a`
+    still held the FIRST host's alias, both transfers went there again, and
+    sync exited 0. Deleting the setup check reproduces it, which is why this
+    is executed rather than read off the Makefile.
+    """
+    log = tmp_path / "rsync-targets"
+    _stub(tmp_path / "bin" / "rsync", f'printf "%s\\n" "${{@: -1}}" >> {log}\n')
+    ssh = tmp_path / "bin" / "ssh-stub"
+    _stub(ssh, 'if [ "$1" = host2 ]; then exit 1; fi\nexit 0\n')
+
+    r = _make(box, "sync", SSH=str(ssh),
+              env={"SSH_ALIAS_host1": "alpha", "SSH_ALIAS_host2": "beta"})
+
+    assert r.returncode != 0, "sync reported success after host2's setup failed"
+    targets = log.read_text().split() if log.exists() else []
+    assert not [t for t in targets if t.startswith("beta:")], \
+        f"transfers reached host2 despite its setup failing: {targets}"
+    assert len([t for t in targets if t.startswith("alpha:")]) == 2, \
+        f"host2's transfers were re-aimed at host1: {targets}"
+
+
+def test_rules_persisted_under_the_old_site_names_are_migrated(box, tmp_path):
+    """A lab built before the host1/host2 rename holds prefer-hpe1/2.
+
+    Proxmox refuses a resource that already belongs to another rule, so unless
+    the legacy rule is released first, creating prefer-host1 fails for good --
+    and the withdrawal loop only knows the new names.
+    """
+    legacy = ('[{"rule":"prefer-hpe1","resources":"vm:200,vm:201"},'
+              '{"rule":"prefer-hpe2","resources":"vm:202,vm:203"}]')
+    proc, calls = _run_ha(box, tmp_path, homes="vm:200=pve1,vm:201=pve1,"
+                                               "vm:202=pve3,vm:203=pve3",
+                          rules_json=legacy, tag="legacy")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    deletes = [c for c in calls if "delete /cluster/ha/rules/prefer-hpe" in c]
+    assert len(deletes) == 2, f"legacy rules were not released: {calls}"
+    # and the replacements are created afterwards, not before
+    created = next((i for i, c in enumerate(calls) if "prefer-host1" in c), None)
+    dropped = next(i for i, c in enumerate(calls) if "prefer-hpe1" in c and "delete" in c)
+    assert created is None or dropped < created, \
+        f"a replacement was created before its predecessor was released: {calls}"
+
+
+def test_no_legacy_delete_on_a_cluster_that_never_had_them(box, tmp_path):
+    """The migration must be a no-op where it does not apply."""
+    proc, calls = _run_ha(box, tmp_path, homes="vm:200=pve1", rules_json="[]",
+                          tag="nolegacy")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not [c for c in calls if "prefer-hpe" in c], \
+        f"touched rules that do not exist: {calls}"
