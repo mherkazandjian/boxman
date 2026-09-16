@@ -825,29 +825,71 @@ def test_the_site_macros_forward_the_site():
 # site, and when sync's setup check is deleted. These run the targets and look
 # at what the far side actually received.
 
+#: A remote `lib.sh` that enforces the real site guard and records what it
+#: resolved. An unknown site must FAIL here exactly as lib.sh does on a host:
+#: a stub that only records the command *text* cannot tell a correct
+#: BOXMAN_SITE from a second, wrong one appended after it -- which is how the
+#: first version of these tests stayed green under that mutation.
+_SITE_PROBE_LIB = """
+SITE=${{BOXMAN_SITE:-$(hostname -s)}}
+declare -A HOST_IP=([host1]=10.0.0.1 [host2]=10.0.0.2)
+declare -A NODE_SITE=([pve1]=host1 [pve2]=host1 [pve3]=host2 [pve4]=host2)
+declare -A PEER=([host1]=host2 [host2]=host1)
+NODES=(pve1 pve2 pve3 pve4)
+if [[ -z ${{HOST_IP[$SITE]:-}} ]]; then
+    echo "ERROR: unknown site '$SITE'" >&2
+    exit 1
+fi
+printf '%s\\n' "$SITE" >> {log}
+pssh() {{ :; }}
+log() {{ :; }}
+die() {{ echo "$*" >&2; exit 1; }}
+"""
+
+
+def _site_probe(tmp_path):
+    """Remote scripts dir, the log of resolved sites, and an ssh that executes."""
+    scripts = tmp_path / "remote-scripts"
+    scripts.mkdir(exist_ok=True)
+    log = tmp_path / "resolved-sites"
+    (scripts / "lib.sh").write_text(_SITE_PROBE_LIB.format(log=log))
+    for name in ("pve-ha.sh", "ha-watch.sh"):
+        _stub(scripts / name, 'source "$(dirname "$0")/lib.sh"\nexit 0\n')
+    ssh = tmp_path / "bin" / "ssh-stub"
+    _stub(ssh, 'shift\nbash -c "$*"\n')      # run it, do not just record it
+    return scripts, log, ssh
+
+
 @pytest.mark.parametrize("target,extra", [
     ("tf-token", {}),
     ("ha-status", {}),
+    ("ha", {}),
+    ("ha-failover", {"NODE": "pve4"}),
 ])
 def test_orchestration_targets_deliver_the_orchestrator_site(box, tmp_path, target, extra):
-    """The remote command must carry BOXMAN_SITE=<the orchestrator>.
+    """The site the far side *resolves* must be the orchestrator's.
 
     `lib.sh` falls back to `hostname -s`, which on the machines this box grew up
     on returned the old site names -- so a call that forgets the variable works
     by coincidence until something is renamed, then aborts with "unknown site".
     """
-    log = tmp_path / "remote-cmds"
-    ssh = tmp_path / "bin" / "ssh-stub"
-    # record the remote command, then fail: tf-token must not write anything
-    _stub(ssh, f'printf "%s\\n" "$*" >> {log}\nexit 1\n')
+    scripts, log, ssh = _site_probe(tmp_path)
+    tf = tmp_path / "tf"
+    tf.mkdir(exist_ok=True)
+    (tf / ".env").write_text("export TF_VAR_pve_api_token='x'\n")
+    terraform = tmp_path / "bin" / "terraform"
+    _stub(terraform, 'echo \'{"vm:200":"pve1"}\'\n')
 
-    _make(box, target, SSH=str(ssh), ORCH="host1",
-          TF_DIR=str(tmp_path / "tf"), **extra)
+    _make(box, target, SSH=str(ssh), ORCH="host1", SCRIPTS=str(scripts),
+          TF_DIR=str(tf), TF=str(terraform), **extra)
 
-    assert log.exists(), f"{target} never invoked ssh"
-    sent = log.read_text()
-    assert "BOXMAN_SITE=host1" in sent, (
-        f"{target} did not forward the orchestrator site; remote got:\n{sent}")
+    assert log.exists(), (
+        f"{target}: no site was ever resolved -- the remote lib.sh refused it "
+        f"(an unknown or wrong BOXMAN_SITE), or it was never invoked")
+    resolved = set(log.read_text().split())
+    assert resolved == {"host1"}, (
+        f"{target} resolved {resolved or 'nothing'} on the far side, not the "
+        f"orchestrator site")
 
 
 def test_sync_does_not_retarget_after_a_failed_setup_on_the_second_host(box, tmp_path):
@@ -881,21 +923,40 @@ def test_rules_persisted_under_the_old_site_names_are_migrated(box, tmp_path):
     Proxmox refuses a resource that already belongs to another rule, so unless
     the legacy rule is released first, creating prefer-host1 fails for good --
     and the withdrawal loop only knows the new names.
+
+    Asserting the *end state* rather than the call sequence: an earlier version
+    of this test allowed `created is None`, so deleting both legacy rules and
+    exiting without creating anything passed it, leaving the cluster with no
+    affinity rules at all.
     """
-    legacy = ('[{"rule":"prefer-hpe1","resources":"vm:200,vm:201"},'
-              '{"rule":"prefer-hpe2","resources":"vm:202,vm:203"}]')
-    proc, calls = _run_ha(box, tmp_path, homes="vm:200=pve1,vm:201=pve1,"
-                                               "vm:202=pve3,vm:203=pve3",
-                          rules_json=legacy, tag="legacy")
+    proc, rules = _run_ha_stateful(
+        box, tmp_path,
+        homes="vm:200=pve1,vm:201=pve1,vm:202=pve3,vm:203=pve3",
+        resources=[200, 201, 202, 203],
+        preset={"prefer-hpe1": "vm:200,vm:201", "prefer-hpe2": "vm:202,vm:203"},
+        tag="legacy")
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    deletes = [c for c in calls if "delete /cluster/ha/rules/prefer-hpe" in c]
-    assert len(deletes) == 2, f"legacy rules were not released: {calls}"
-    # and the replacements are created afterwards, not before
-    created = next((i for i, c in enumerate(calls) if "prefer-host1" in c), None)
-    dropped = next(i for i, c in enumerate(calls) if "prefer-hpe1" in c and "delete" in c)
-    assert created is None or dropped < created, \
-        f"a replacement was created before its predecessor was released: {calls}"
+    assert "prefer-hpe1" not in rules, f"legacy rule survived: {rules}"
+    assert "prefer-hpe2" not in rules, f"legacy rule survived: {rules}"
+    assert rules.get("prefer-host1", "") == "vm:200,vm:201", rules
+    assert rules.get("prefer-host2", "") == "vm:202,vm:203", rules
+
+
+def test_a_legacy_member_moving_to_the_other_host_is_migrated(box, tmp_path):
+    """Migration and a cross-host move in the same run: vm:201 was on the old
+    host1 rule and now belongs to host2."""
+    proc, rules = _run_ha_stateful(
+        box, tmp_path,
+        homes="vm:200=pve1,vm:201=pve3",
+        resources=[200, 201],
+        preset={"prefer-hpe1": "vm:200,vm:201"},
+        tag="legacymove")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "prefer-hpe1" not in rules, rules
+    assert rules.get("prefer-host1", "") == "vm:200", rules
+    assert rules.get("prefer-host2", "") == "vm:201", rules
 
 
 def test_no_legacy_delete_on_a_cluster_that_never_had_them(box, tmp_path):

@@ -1,5 +1,5 @@
 variable "pve_endpoint" {
-  description = "Proxmox API URL. Through an ssh tunnel: ssh -L 8006:10.77.0.11:8006 \"${SSH_ALIAS_host1:-host1}\""
+  description = "Proxmox API URL. Through an ssh tunnel: ssh -L 8006:10.77.0.11:8006 \"$${SSH_ALIAS_host1:-host1}\""
   type        = string
   default     = "https://localhost:8006/"
 }
