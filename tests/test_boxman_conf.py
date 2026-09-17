@@ -1080,10 +1080,12 @@ class TestEnsureWritableDir:
             _fake_run(fail=True, stderr="sudo: a password is required\n",
                       calls=run_calls))
 
-        with pytest.raises(PermissionError, match="even with sudo"):
+        with pytest.raises(PermissionError, match="even with sudo") as exc_info:
             mgr._ensure_writable_dir(target)
 
         assert run_calls == [f"sudo mkdir -p '{target}'"]
+        # the message must name the directory, or the user has nothing to act on
+        assert target in str(exc_info.value)
 
     def test_in_container_mkdir_failure_is_a_warning_not_an_error(
             self, tmp_path, monkeypatch):
