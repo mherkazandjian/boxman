@@ -1258,7 +1258,7 @@ class FakeIptables:
             out[out.index("--dport"):out.index("--dport")] = ["-m", proto]
         rendered = []
         for i, tok in enumerate(out):
-            if i and out[i - 1] == "--comment":
+            if i and out[i - 1] in Network._QUOTED_OPTIONS:
                 escaped = re.sub(r"([\"\\'])", r"\\\1", tok)
                 rendered.append(f'"{escaped}"')
             else:
@@ -1956,6 +1956,72 @@ class TestListingsAreReadAsIptablesWrites:
         assert table.listing() == state
         assert net.remove_route_iptables_rule() is True
         assert table.mentions(name) == []
+
+    # lines exactly as iptables 1.8.10 printed them, nf_tables and legacy
+    # alike, captured on the test VM during review
+    STRINGS = ('-N BXM_R4_PARSE\n'
+               '-A BXM_R4_PARSE -m comment --comment "" -j RETURN\n'
+               '-A BXM_R4_PARSE -m string --string "round 4" --algo bm -j RETURN\n'
+               '-A BXM_R4_PARSE -m string --string "r4\\"quote" --algo bm -j RETURN\n'
+               '-A BXM_R4_PARSE -m string --string "r4\\\\slash" --algo bm -j RETURN\n'
+               "-A BXM_R4_PARSE -m string --string \"r4'quote\" --algo bm -j RETURN\n"
+               '-A BXM_R4_PARSE -j LOG --log-prefix "R4 log "\n'
+               '-A BXM_R4_PARSE -j LOG --log-prefix "R4\\\\"\n'
+               '-A BXM_R4_PARSE -j LOG --log-prefix "R4 \\\\\\" log"\n'
+               '-A BXM_R4_PARSE -i bxmr4sentinel -j RETURN\n')
+
+    def test_string_option_values_are_decoded_as_iptables_escaped_them(self):
+        parsed = Network._parse_listing(self.STRINGS)
+        values = [rule[rule.index(opt) + 1] for rule in parsed
+                  for opt in ("--comment", "--string", "--log-prefix") if opt in rule]
+        assert values == ["", "round 4", 'r4"quote', "r4\\slash", "r4'quote",
+                          "R4 log ", "R4\\", 'R4 \\" log']
+        assert parsed[-1] == ["-A", "BXM_R4_PARSE", "-i", "bxmr4sentinel", "-j", "RETURN"]
+        assert len(parsed) == 10
+
+    @pytest.mark.parametrize("name", ['"bxmr4', '"bxmr4"'])
+    def test_a_quote_leading_interface_is_read_raw_and_swallows_nothing(self, name):
+        # a `"` opens a quoted value only after an option iptables quotes;
+        # in an interface position it is part of the name -- and an
+        # unterminated one must not eat the rules that follow
+        listing = (f'-N BXM_R4_PARSE\n-A BXM_R4_PARSE -i {name} -j DROP\n'
+                   '-A BXM_R4_PARSE -i bxmr4sentinel -j RETURN\n')
+        assert Network._parse_listing(listing) == [
+            ['-N', 'BXM_R4_PARSE'],
+            ['-A', 'BXM_R4_PARSE', '-i', name, '-j', 'DROP'],
+            ['-A', 'BXM_R4_PARSE', '-i', 'bxmr4sentinel', '-j', 'RETURN'],
+        ]
+
+    def test_an_unterminated_string_value_is_a_listing_that_cannot_be_read(self):
+        net = Network("routed-net", {"mode": "route", "bridge": {"name": "virbr9"}},
+                      assign_new_bridge=True, provider_config={"use_sudo": False})
+        broken = ('-P INPUT ACCEPT\n-A INPUT -m comment --comment "never closed\n'
+                  '-A INPUT -i virbr9 -j BXM_ISO_I_virbr9\n')
+        with pytest.raises(ValueError, match="unterminated"):
+            Network._parse_listing(broken)
+        net.virsh.execute_shell = MagicMock(return_value=_result(stdout=broken))
+        with pytest.raises(NetworkError, match="cannot be parsed"):
+            net._rule_is_present("INPUT -i virbr9 -j BXM_ISO_I_virbr9")
+
+    def test_a_hook_for_the_interface_named_with_quotes_is_not_this_hook(self):
+        # `"virbr9"` is a distinct, legal interface name; its hook decoded to
+        # virbr9 impersonated the plain bridge's hook, and apply reported an
+        # isolation intact that packets on virbr9 bypassed (review finding,
+        # reproduced against a real kernel)
+        net = Network("routed-net", {"mode": "route", "bridge": {"name": "virbr9"}},
+                      assign_new_bridge=True, provider_config={"use_sudo": False})
+        other = ("INPUT", ['-i', '"virbr9"', '-j', 'BXM_ISO_I_virbr9'])
+        table = _installed()
+        table.rules = [other if r[0] == "INPUT" else r for r in table.rules]
+        _attach(net, table)
+
+        assert net._rule_is_present("INPUT -i virbr9 -j BXM_ISO_I_virbr9") is False
+        assert net._isolation_is_intact() is False
+
+        assert net.apply_route_iptables_rule() is True
+        assert table.rule("INPUT", "-i virbr9 -j BXM_ISO_I_virbr9")
+        assert other in table.rules                  # not ours to touch
+        assert net._isolation_is_intact() is True
 
     def test_foreign_rules_with_awkward_content_are_neither_a_problem_nor_touched(self):
         net = Network("routed-net", {"mode": "route", "bridge": {"name": "virbr9"}},

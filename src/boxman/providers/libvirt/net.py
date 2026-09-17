@@ -1289,21 +1289,41 @@ class Network:
             f"{(result.stderr or '').strip() or '(no stderr)'}")
         return True
 
-    @staticmethod
-    def _parse_listing(text: str) -> list[list[str]]:
+    #: Options whose value iptables prints as a double-quoted string with
+    #: ``"``, ``\\`` and ``'`` backslash-escaped (``xtables_save_string``).
+    #: Every other operand — an interface, an address, a chain, a port — is
+    #: printed raw, quotes and backslashes included.
+    _QUOTED_OPTIONS: frozenset = frozenset({
+        '--comment', '--string', '--hex-string',
+        '--log-prefix', '--nflog-prefix', '--ulog-prefix',
+    })
+
+    @classmethod
+    def _parse_listing(cls, text: str) -> list[list[str]]:
         """
         Tokenise ``iptables -S`` output the way iptables wrote it.
 
-        Arguments are printed raw — an interface name is whatever the kernel
+        Operands are printed raw — an interface name is whatever the kernel
         holds, quotes and backslashes included, since a name may contain
-        anything but whitespace, ``/`` and NUL — except string values such as
-        ``--comment``, which iptables double-quotes with ``"``, ``\\`` and
-        ``'`` backslash-escaped, and which may span lines. So a token that
-        *starts* with ``"`` runs to its closing quote across newlines with
-        those escapes undone, any other token runs to the next space as it
-        is, and a newline outside quotes ends the rule. Shell splitting
-        cannot do this: it chokes on a raw ``'`` in a name and eats a raw
-        backslash (review finding, reproduced against a real listing).
+        anything but whitespace, ``/`` and NUL — except the values of the
+        string options in :attr:`_QUOTED_OPTIONS`, which iptables
+        double-quotes with ``"``, ``\\`` and ``'`` backslash-escaped and
+        which may span lines. So a ``"`` that opens a token *directly after
+        one of those options* starts a quoted value running to its closing
+        quote across newlines with the escapes undone; any other token runs
+        to the next space exactly as printed, a leading ``"`` included; and a
+        newline outside a quoted value ends the rule.
+
+        Position matters: a bridge may legally be named ``"bxm4"``, and its
+        hook decoded as ``bxm4`` would impersonate the hook of the bridge
+        actually named ``bxm4`` — an isolation reported intact that packets on
+        that bridge bypass (review finding, reproduced against a real
+        kernel). Shell splitting cannot do any of this: it chokes on a raw
+        ``'`` and eats a raw backslash.
+
+        Raises:
+            ValueError: When a quoted value is not terminated — a listing
+                that cannot be read is reported, never taken as the table.
         """
         rules: list[list[str]] = []
         tokens: list[str] = []
@@ -1311,13 +1331,21 @@ class Network:
         i, n = 0, len(text)
         while i < n:
             char = text[i]
-            if char == '"' and not current:
+            if (char == '"' and not current and tokens
+                    and tokens[-1] in cls._QUOTED_OPTIONS):
                 i += 1
-                while i < n and text[i] != '"':
+                closed = False
+                while i < n:
+                    if text[i] == '"':
+                        closed = True
+                        break
                     if text[i] == '\\' and i + 1 < n:
                         i += 1
                     current.append(text[i])
                     i += 1
+                if not closed:
+                    raise ValueError(
+                        f"unterminated quoted value after {tokens[-1]}")
                 tokens.append("".join(current))
                 current = []
                 i += 1     # the closing quote
@@ -1357,7 +1385,8 @@ class Network:
         kernel that answered.
 
         Raises:
-            NetworkError: When the listing did not succeed.
+            NetworkError: When the listing did not succeed, or cannot be
+                parsed (an unterminated quoted value).
         """
         listed = self._firewall("iptables -S")
         if not listed.ok:
@@ -1365,7 +1394,13 @@ class Network:
                 f"network {self.name}: cannot read the firewall — "
                 f"'iptables -S' exited {listed.return_code}: "
                 f"{(listed.stderr or '').strip() or '(no stderr)'}")
-        return self._parse_listing(listed.stdout or "")
+        try:
+            return self._parse_listing(listed.stdout or "")
+        except ValueError as exc:
+            raise NetworkError(
+                f"network {self.name}: cannot read the firewall — "
+                f"'iptables -S' printed a listing that cannot be parsed: "
+                f"{exc}") from exc
 
     def _rule_is_present(self, rule: str) -> bool:
         """
