@@ -4,10 +4,14 @@ Test that --boxman-conf overrides the default ~/.config/boxman/boxman.yml.
 
 import logging
 import os
+import shlex
 import shutil as _shutil
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
+from invoke.exceptions import UnexpectedExit
+from invoke.runners import Result
 
 from boxman.exceptions import ConfigError
 from boxman.manager import BoxmanManager
@@ -691,6 +695,34 @@ class TestDockerComposeSshPort:
         assert str(tmp_path) in rt.ssh_identity_path
 
 
+def _fake_run(*, fail: bool = False, stderr: str = "",
+              calls: list | None = None):
+    """
+    Stand in for ``boxman.manager_parts.images.run`` with invoke's contract.
+
+    ``run`` is a thin ``invoke.run`` wrapper, so a non-zero exit **raises**
+    ``UnexpectedExit`` unless the caller passed ``warn=True``. Every call
+    site in ``images.py`` relies on that to get a result it can branch on,
+    and a stub that only ever *returns* a result makes ``warn=True``
+    unverifiable — delete it and nothing fails (#182). This is the one stub
+    the ownership tests use, so the contract is modelled once.
+
+    Args:
+        fail: Whether every command exits 1.
+        stderr: What a failing command writes to stderr.
+        calls: If given, every command line is appended to it, in order.
+    """
+    def _run(cmd, *_args, **kwargs):
+        if calls is not None:
+            calls.append(cmd)
+        result = Result(command=cmd, exited=1 if fail else 0,
+                        stderr=stderr if fail else "", stdout="")
+        if fail and not kwargs.get("warn", False):
+            raise UnexpectedExit(result)
+        return result
+    return _run
+
+
 class TestNormalizeOwnership:
     """Tests for BoxmanManager._normalize_ownership — the helper that
     fixes stale root-owned entries inside otherwise-user-writable
@@ -705,13 +737,8 @@ class TestNormalizeOwnership:
         mgr = BoxmanManager()
 
         run_calls: list = []
-
-        def _capture_run(cmd, *_a, **_kw):
-            run_calls.append(cmd)
-            from unittest.mock import MagicMock
-            return MagicMock(ok=True, stderr="", stdout="")
-
-        monkeypatch.setattr("boxman.manager_parts.images.run", _capture_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run",
+                            _fake_run(calls=run_calls))
         mgr._normalize_ownership(str(tmp_path))
 
         # No sudo invoked.
@@ -731,13 +758,8 @@ class TestNormalizeOwnership:
         mgr = BoxmanManager()
 
         run_calls: list = []
-
-        def _capture_run(cmd, *_a, **_kw):
-            run_calls.append(cmd)
-            from unittest.mock import MagicMock
-            return MagicMock(ok=True, stderr="", stdout="")
-
-        monkeypatch.setattr("boxman.manager_parts.images.run", _capture_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run",
+                            _fake_run(calls=run_calls))
 
         # Pretend the file is owned by uid=0 (root) by patching scandir
         # to return an entry whose stat reports st_uid=0.
@@ -780,16 +802,12 @@ class TestNormalizeOwnership:
         """An unwritable workdir is repaired by chowning the directory
         itself, never recursively: ``chown -R`` would rewrite the ownership
         of every VM disk stored underneath it."""
-        from unittest.mock import MagicMock
         mgr = BoxmanManager()
 
         run_calls: list = []
 
-        def _capture_run(cmd, *_a, **_kw):
-            run_calls.append(cmd)
-            return MagicMock(ok=True, stderr="", stdout="")
-
-        monkeypatch.setattr("boxman.manager_parts.images.run", _capture_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run",
+                            _fake_run(calls=run_calls))
         # Pretend the dir is not writable.
         monkeypatch.setattr(
             "boxman.manager_parts.images.os.access",
@@ -810,21 +828,17 @@ class TestNormalizeOwnership:
         """``sweep_foreign=False`` is the CLI startup pre-create pass: it
         must not scan the workdir at all, let alone remove anything from
         it — even an entry it would otherwise consider disposable."""
-        from unittest.mock import MagicMock
         stale = tmp_path / "seed.iso"
         stale.write_bytes(b"stale")
 
         mgr = BoxmanManager()
         run_calls: list = []
 
-        def _capture_run(cmd, *_a, **_kw):
-            run_calls.append(cmd)
-            return MagicMock(ok=True, stderr="", stdout="")
-
         def _explode(_path):
             raise AssertionError("the directory contents must not be scanned")
 
-        monkeypatch.setattr("boxman.manager_parts.images.run", _capture_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run",
+                            _fake_run(calls=run_calls))
         monkeypatch.setattr(
             "boxman.manager_parts.images.os.scandir", _explode)
         # Not writable, so the directory-only repair still has to run.
@@ -844,16 +858,11 @@ class TestNormalizeOwnership:
     ):
         """When the cheap path can't run AND sudo fails, the user gets
         a copy-pasteable fix command in the exception."""
-        from unittest.mock import MagicMock
         mgr = BoxmanManager()
 
-        def _failing_run(cmd, *_a, **_kw):
-            return MagicMock(
-                ok=False, stderr="sudo: a password is required\n",
-                stdout="",
-            )
-
-        monkeypatch.setattr("boxman.manager_parts.images.run", _failing_run)
+        monkeypatch.setattr(
+            "boxman.manager_parts.images.run",
+            _fake_run(fail=True, stderr="sudo: a password is required\n"))
         monkeypatch.setattr(
             "boxman.manager_parts.images.os.access",
             lambda p, mode: False,
@@ -921,7 +930,6 @@ class TestNormalizeOwnership:
         root-owned, so the old sweep deleted a running cluster's disks on
         the next boxman command — ``ps`` included.
         """
-        from unittest.mock import MagicMock
         disk = tmp_path / "node01.qcow2"
         disk.write_bytes(b"disk")
         saved = tmp_path / "node01.save"
@@ -930,11 +938,8 @@ class TestNormalizeOwnership:
         mgr = BoxmanManager()
         run_calls: list = []
 
-        def _capture_run(cmd, *_a, **_kw):
-            run_calls.append(cmd)
-            return MagicMock(ok=True, stderr="", stdout="")
-
-        monkeypatch.setattr("boxman.manager_parts.images.run", _capture_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run",
+                            _fake_run(calls=run_calls))
         self._scandir_reports_everything_foreign(monkeypatch)
 
         mgr._normalize_ownership(str(tmp_path))
@@ -953,7 +958,6 @@ class TestNormalizeOwnership:
         A suffix denylist could not protect this: the directory name carries
         no disk suffix, so an rmtree would take the disks inside it with it.
         """
-        from unittest.mock import MagicMock
         subdir = tmp_path / "cluster_1"
         subdir.mkdir()
         nested_disk = subdir / "node01.qcow2"
@@ -961,10 +965,7 @@ class TestNormalizeOwnership:
 
         mgr = BoxmanManager()
 
-        def _ok_run(cmd, *_a, **_kw):
-            return MagicMock(ok=True, stderr="", stdout="")
-
-        monkeypatch.setattr("boxman.manager_parts.images.run", _ok_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run", _fake_run())
         self._scandir_reports_everything_foreign(monkeypatch)
 
         mgr._normalize_ownership(str(tmp_path))
@@ -975,7 +976,6 @@ class TestNormalizeOwnership:
     def test_stale_seed_iso_is_still_removed(self, tmp_path, monkeypatch):
         """The allowlisted build artifacts are still swept, so genisoimage
         can recreate a seed ISO it would otherwise fail to truncate."""
-        from unittest.mock import MagicMock
         stale = tmp_path / "seed.iso"
         stale.write_bytes(b"stale")
         rendered = tmp_path / "conf.rendered.yml"
@@ -985,10 +985,7 @@ class TestNormalizeOwnership:
 
         mgr = BoxmanManager()
 
-        def _ok_run(cmd, *_a, **_kw):
-            return MagicMock(ok=True, stderr="", stdout="")
-
-        monkeypatch.setattr("boxman.manager_parts.images.run", _ok_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run", _fake_run())
         self._scandir_reports_everything_foreign(monkeypatch)
 
         mgr._normalize_ownership(str(tmp_path))
@@ -1000,17 +997,14 @@ class TestNormalizeOwnership:
     def test_failed_chown_leaves_the_disk_intact(self, tmp_path, monkeypatch):
         """If the ownership repair fails there is still no deletion: the
         entry is left exactly as it was."""
-        from unittest.mock import MagicMock
         disk = tmp_path / "node01.qcow2"
         disk.write_bytes(b"disk")
 
         mgr = BoxmanManager()
 
-        def _failing_run(cmd, *_a, **_kw):
-            return MagicMock(
-                ok=False, stderr="sudo: a password is required\n", stdout="")
-
-        monkeypatch.setattr("boxman.manager_parts.images.run", _failing_run)
+        monkeypatch.setattr(
+            "boxman.manager_parts.images.run",
+            _fake_run(fail=True, stderr="sudo: a password is required\n"))
         self._scandir_reports_everything_foreign(monkeypatch)
 
         # The directory itself is writable, so only the entry repair fails —
@@ -1024,7 +1018,6 @@ class TestNormalizeOwnership:
         """Carrying an allowlisted *name* is not enough — the entry also has
         to be a regular file. A symlink, fifo or socket named ``seed.iso``
         must be preserved, not unlinked."""
-        from unittest.mock import MagicMock
         disk = tmp_path / "node01.qcow2"
         disk.write_bytes(b"disk")
         # a symlink whose name is on the allowlist, pointing at the disk
@@ -1035,10 +1028,7 @@ class TestNormalizeOwnership:
 
         mgr = BoxmanManager()
 
-        def _ok_run(cmd, *_a, **_kw):
-            return MagicMock(ok=True, stderr="", stdout="")
-
-        monkeypatch.setattr("boxman.manager_parts.images.run", _ok_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run", _fake_run())
         self._scandir_reports_everything_foreign(monkeypatch)
 
         mgr._normalize_ownership(str(tmp_path))
@@ -1052,22 +1042,75 @@ class TestNormalizeOwnership:
     ):
         """If the kind of an entry cannot be established, it is preserved —
         an unreadable entry must never be treated as a disposable file."""
-        from unittest.mock import MagicMock
         stale = tmp_path / "seed.iso"
         stale.write_bytes(b"stale")
 
         mgr = BoxmanManager()
 
-        def _ok_run(cmd, *_a, **_kw):
-            return MagicMock(ok=True, stderr="", stdout="")
-
-        monkeypatch.setattr("boxman.manager_parts.images.run", _ok_run)
+        monkeypatch.setattr("boxman.manager_parts.images.run", _fake_run())
         self._scandir_reports_everything_foreign(
             monkeypatch, unstattable={"seed.iso"})
 
         mgr._normalize_ownership(str(tmp_path))
 
         assert stale.exists()
+
+
+class TestEnsureWritableDir:
+    """The two ``run()`` sites in ``_ensure_writable_dir`` — the ``sudo
+    mkdir`` fallback and the in-container ``mkdir`` — had no failure test,
+    so their ``warn=True`` was unverifiable for a different reason than the
+    sites above: not a stub that never raised, but no test at all (#182)."""
+
+    def test_sudo_mkdir_failure_raises_with_actionable_message(
+            self, tmp_path, monkeypatch):
+        """A parent nobody can write to, and sudo refused too: the caller
+        gets a PermissionError naming the directory, not invoke's
+        UnexpectedExit escaping through the typed-error boundary."""
+        mgr = BoxmanManager()
+        target = str(tmp_path / "root-owned" / "workdir")
+
+        def _refuse(path, exist_ok=False):
+            raise PermissionError(13, "Permission denied", path)
+
+        monkeypatch.setattr("boxman.manager_parts.images.os.makedirs", _refuse)
+        run_calls: list = []
+        monkeypatch.setattr(
+            "boxman.manager_parts.images.run",
+            _fake_run(fail=True, stderr="sudo: a password is required\n",
+                      calls=run_calls))
+
+        with pytest.raises(PermissionError, match="even with sudo"):
+            mgr._ensure_writable_dir(target)
+
+        assert run_calls == [f"sudo mkdir -p '{target}'"]
+
+    def test_in_container_mkdir_failure_is_a_warning_not_an_error(
+            self, tmp_path, monkeypatch):
+        """Under a non-local runtime the directory is also created inside
+        the container. That mkdir failing is logged and stepped over — the
+        host directory is usable — rather than aborting the command."""
+        mgr = BoxmanManager()
+        mgr.logger = MagicMock()
+        mgr.runtime = "docker-compose"
+        runtime = MagicMock()
+        runtime.wrap_command = lambda cmd: (
+            f"docker exec boxman-libvirt bash -c {shlex.quote(cmd)}")
+        mgr._runtime_instance = runtime
+        run_calls: list = []
+        monkeypatch.setattr(
+            "boxman.manager_parts.images.run",
+            _fake_run(fail=True, stderr="mkdir: cannot create directory\n",
+                      calls=run_calls))
+
+        mgr._ensure_writable_dir(str(tmp_path))   # must not raise
+
+        # the host side needed no repair, so the only command is the
+        # wrapped in-container mkdir
+        assert run_calls == [runtime.wrap_command(f"mkdir -p '{tmp_path}'")]
+        warnings = [str(c.args[0]) for c in mgr.logger.warning.call_args_list]
+        assert any("inside container" in w and "cannot create directory" in w
+                   for w in warnings), warnings
 
 
 class TestConfigSchemaV2:
