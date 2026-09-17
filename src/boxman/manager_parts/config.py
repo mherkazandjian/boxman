@@ -154,6 +154,10 @@ class ConfigMixin:
           validation).
         - anything else → :class:`~boxman.exceptions.ConfigError`.
 
+        Whatever the version, a ``clusters:``, ``vms:`` or ``boxes:`` block
+        that rendered empty is then normalised from ``None`` to ``{}`` by
+        :meth:`_normalize_empty_blocks`.
+
         The value is compared as a string so unquoted YAML numerics work:
         ``version: 2`` and ``version: 2.0`` both select v2.0. Quoting
         (``version: '2.0'``) is still recommended — see
@@ -179,14 +183,40 @@ class ConfigMixin:
         if version in ('1', '1.0'):
             self._reject_v1_docker_compose(conf)
             self._warn_on_v1_boxes(conf)
-            return conf
-        if version in ('2', '2.0'):
-            return self.normalize_v2_config(conf)
+        elif version in ('2', '2.0'):
+            conf = self.normalize_v2_config(conf)
+        else:
+            raise ConfigError(
+                f"unsupported config version: '{version}' "
+                f"(supported: '1.0', '2.0')"
+            )
 
-        raise ConfigError(
-            f"unsupported config version: '{version}' "
-            f"(supported: '1.0', '2.0')"
-        )
+        return self._normalize_empty_blocks(conf)
+
+    @staticmethod
+    def _normalize_empty_blocks(conf: dict[str, Any]) -> dict[str, Any]:
+        """
+        Turn a block that rendered empty into the empty mapping its readers
+        expect.
+
+        ``clusters:``, ``vms:`` or ``boxes:`` followed by nothing parses as
+        ``None`` — the natural output of a Jinja loop that selected no entry,
+        such as a per-site ``vms:`` block on the site that owns no VM. Every
+        downstream reader iterates these as mappings, so the ``None`` surfaced
+        as an ``AttributeError`` traceback from ``boxman ps`` (and any other
+        verb) instead of "nothing defined". Only a *present* empty block is
+        normalised; an absent key stays absent, so "no such block" keeps its
+        meaning for the readers that test for it.
+        """
+        if 'clusters' in conf and conf['clusters'] is None:
+            conf['clusters'] = {}
+        for cluster in (conf.get('clusters') or {}).values():
+            if not isinstance(cluster, dict):
+                continue
+            for key in ('vms', 'boxes'):
+                if key in cluster and cluster[key] is None:
+                    cluster[key] = {}
+        return conf
 
     def _reject_v1_docker_compose(self, conf: dict[str, Any]) -> None:
         """
