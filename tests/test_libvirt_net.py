@@ -1247,12 +1247,23 @@ class FakeIptables:
 
     @staticmethod
     def _echo(spec: list[str]) -> str:
+        """As iptables prints a rule: the implicit protocol module inserted,
+        every argument raw -- an interface name keeps its quotes and
+        backslashes -- except string values (``--comment``), which are
+        double-quoted with ``"``, ``\\`` and ``'`` backslash-escaped, newlines
+        included."""
         out = list(spec)
         if "-p" in out and "--dport" in out and "-m" not in out:
             proto = out[out.index("-p") + 1]
             out[out.index("--dport"):out.index("--dport")] = ["-m", proto]
-        return " ".join(f'"{tok}"' if re.search(r"[\s;'\"$]", tok) else tok
-                        for tok in out)
+        rendered = []
+        for i, tok in enumerate(out):
+            if i and out[i - 1] == "--comment":
+                escaped = re.sub(r"([\"\\'])", r"\\\1", tok)
+                rendered.append(f'"{escaped}"')
+            else:
+                rendered.append(tok)
+        return " ".join(rendered)
 
     # -- operations --------------------------------------------------------
 
@@ -1498,6 +1509,9 @@ class TestRouteIsolationChains:
         assert not any("BXM_ISO_I_br-a.b" in c for c in table.calls)
 
     def test_bridge_name_with_metacharacters_is_quoted(self):
+        # a shell-injection guard: this is not a legal interface name (a
+        # space, a slash, over 15 bytes), so it says nothing about listings;
+        # legal awkward names are covered in TestListingsAreReadAsIptablesWrites
         name = "virbr 9;touch /tmp/x"
         net = self._net(bridge_name=name)
         table = self._apply(net)
@@ -1506,12 +1520,6 @@ class TestRouteIsolationChains:
         assert actions
         for cmd in actions:
             assert f"'{name}'" in cmd
-        # the kernel holds the raw name, the listing quotes it, and the round
-        # trip through that listing still recognises the rules: removal is
-        # complete
-        assert table.rule("FORWARD", f"-i '{name}' -o '{name}' -j ACCEPT")
-        assert net.remove_route_iptables_rule() is True
-        assert table.mentions(name) == []
 
     def test_a_plain_bridge_name_is_left_unquoted(self):
         table = self._apply(self._net())
@@ -1642,8 +1650,8 @@ class TestTheFirewallIsNeverGuessed:
         assert net._rule_is_present("BXM_ISO_I_virbr9 -p udp --dport 67 -j ACCEPT")
         assert not net._rule_is_present("INPUT -i virbr9 -j DROP")
         assert net._chain_rules("BXM_ISO_I_virbr9") == [
-            "-A BXM_ISO_I_virbr9 -p udp -m udp --dport 67 -j ACCEPT",
-            "-A BXM_ISO_I_virbr9 -j DROP"]
+            "-A BXM_ISO_I_virbr9 -p udp -m udp --dport 67 -j ACCEPT".split(),
+            "-A BXM_ISO_I_virbr9 -j DROP".split()]
         assert net._chain_rules("BXM_ISO_I_other") is None
         assert set(table.calls) == {self.LISTING}
 
@@ -1704,6 +1712,30 @@ class TestTheFirewallIsNeverGuessed:
         for command in successful:
             assert replay(command).ok
         assert (table.chains, table.rules) == (replay.chains, replay.rules)
+        # and the report says what refused it, not just that something did
+        stderr = FakeIptables.STDERR[codes[-1]]
+        assert any(stderr in m for m in self._errors(net)), self._errors(net)
+
+    @pytest.mark.parametrize("verb", ["remove", "apply"])
+    def test_a_refused_legacy_deletion_fails_the_run(self, verb):
+        # the pre-chain sweep is best-effort about absence, not about a
+        # refusal: a loose INPUT DROP left behind keeps guest-to-host traffic
+        # blocked after a "successful" removal
+        net = self._net()
+        legacy = "iptables -D INPUT -i virbr9 -j DROP"
+        table = _installed() if verb == "remove" else FakeIptables()
+        table.rules.append(("INPUT", ["-i", "virbr9", "-j", "DROP"]))
+        table.refuse = {legacy: [1]}
+        _attach(net, table)
+
+        if verb == "remove":
+            assert net.remove_route_iptables_rule() is False
+        else:
+            assert net.apply_route_iptables_rule() is False
+
+        assert table.calls[-1] == legacy, table.calls
+        assert table.rule("INPUT", "-i virbr9 -j DROP")
+        assert any(FakeIptables.STDERR[1] in m for m in self._errors(net))
 
     def test_the_legacy_sweep_does_not_infer_absence_either(self):
         # best-effort about absence, not about an unreadable firewall
@@ -1828,6 +1860,118 @@ class TestLaunchersAreNotIptables:
             assert net._rule_is_present("INPUT -i virbr9 -j DROP") is False
             assert net._chain_rules("BXM_ISO_I_virbr9") is None
         assert set(issued) == {"sudo iptables -S"}
+
+
+class TestAConditionalHookIsNotTheHook:
+    """``-i br -m socket -j BXM_ISO_I_br`` jumps to the chain only for
+    packets the extra match accepts; everything else bypasses the isolation.
+    Dropping every ``-m`` pair when comparing made it equal to the
+    unconditional hook, so apply reported success and the intact check
+    reported intact while the kernel held only the conditional rule (review
+    finding, reproduced against a real kernel). Only the implicit protocol
+    module iptables echoes for a port match is dropped.
+    """
+
+    CONDITIONAL = "-i virbr9 -m socket -j BXM_ISO_I_virbr9"
+    HOOK = "-i virbr9 -j BXM_ISO_I_virbr9"
+
+    @staticmethod
+    def _net() -> Network:
+        return Network("routed-net", {"mode": "route", "bridge": {"name": "virbr9"}},
+                       assign_new_bridge=True, provider_config={"use_sudo": False})
+
+    def _conditionally_hooked(self, net: Network) -> FakeIptables:
+        table = _installed()
+        table.rules = [(c, s) for c, s in table.rules if c != "INPUT"]
+        table.rules.insert(1, ("INPUT", shlex.split(self.CONDITIONAL)))
+        return _attach(net, table)
+
+    def test_the_conditional_hook_is_not_intact(self):
+        net = self._net()
+        self._conditionally_hooked(net)
+        assert net._rule_is_present(f"INPUT {self.HOOK}") is False
+        assert net._isolation_is_intact() is False
+
+    def test_apply_installs_the_unconditional_hook_beside_it(self):
+        net = self._net()
+        table = self._conditionally_hooked(net)
+        assert net.apply_route_iptables_rule() is True
+        assert table.rule("INPUT", self.HOOK)
+        assert net._isolation_is_intact() is True
+
+    def test_only_the_implicit_protocol_module_is_dropped(self):
+        body = Network._rule_body
+        assert body("-A C -p udp -m udp --dport 67 -j ACCEPT".split()) == \
+            "-p udp --dport 67 -j ACCEPT".split()
+        assert body("-A C -p tcp -m tcp --dport 22 -j DROP".split()) == \
+            "-p tcp --dport 22 -j DROP".split()
+        assert body("-A C -i br -m socket -j X".split()) == \
+            "-i br -m socket -j X".split()
+        assert body("-A C -p udp -m state --state NEW -j X".split()) == \
+            "-p udp -m state --state NEW -j X".split()
+
+
+class TestListingsAreReadAsIptablesWrites:
+    """``iptables -S`` prints arguments raw: an interface name is whatever
+    the kernel holds, and the kernel forbids only whitespace, ``/`` and NUL,
+    so ``bxm'3``, ``bxm"3`` and ``bxm\\3`` are legal and appear as such.
+    String values (``--comment``) are double-quoted with backslash escapes
+    and may span lines. Shell-splitting such a listing raised on the quote
+    and ate the backslash, so a legal foreign rule in a built-in chain made
+    an ordinary network's operations fail (review finding, reproduced against
+    a real listing).
+    """
+
+    # lines as a real iptables 1.8.10 nf_tables backend printed them
+    REAL = ('-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n'
+            '-N BXM_R3_PARSE\n'
+            "-A FORWARD -i bxm'3 -j DROP\n"
+            '-A FORWARD -i bxm"3 -j DROP\n'
+            '-A FORWARD -i bxm\\3 -j DROP\n'
+            '-A FORWARD -m comment --comment "first line\nsecond \\"quoted\\" line" -j ACCEPT\n'
+            "-A BXM_R3_PARSE -i bxm'3 -j DROP\n")
+
+    def test_the_parser_reads_a_real_listing(self):
+        parsed = Network._parse_listing(self.REAL)
+        assert parsed[3] == ["-N", "BXM_R3_PARSE"]
+        assert parsed[4] == ["-A", "FORWARD", "-i", "bxm'3", "-j", "DROP"]
+        assert parsed[5] == ["-A", "FORWARD", "-i", 'bxm"3', "-j", "DROP"]
+        assert parsed[6] == ["-A", "FORWARD", "-i", "bxm\\3", "-j", "DROP"]
+        assert parsed[7] == ["-A", "FORWARD", "-m", "comment", "--comment",
+                             'first line\nsecond "quoted" line', "-j", "ACCEPT"]
+        assert parsed[8] == ["-A", "BXM_R3_PARSE", "-i", "bxm'3", "-j", "DROP"]
+        assert len(parsed) == 9
+
+    @pytest.mark.parametrize("name", ["bxm'3", 'bxm"3', "bxm\\3", "bxm$3"])
+    def test_a_legal_awkward_bridge_name_round_trips(self, name):
+        net = Network("routed-net", {"mode": "route", "bridge": {"name": name}},
+                      assign_new_bridge=True, provider_config={"use_sudo": False})
+        table = _attach(net, FakeIptables())
+        assert net.apply_route_iptables_rule() is True
+        assert table.rule("FORWARD", f"-i {shlex.quote(name)} -o {shlex.quote(name)} -j ACCEPT")
+        assert net._isolation_is_intact() is True
+        # a second apply recognises its own rules through the raw listing
+        state = table.listing()
+        assert net.apply_route_iptables_rule() is True
+        assert table.listing() == state
+        assert net.remove_route_iptables_rule() is True
+        assert table.mentions(name) == []
+
+    def test_foreign_rules_with_awkward_content_are_neither_a_problem_nor_touched(self):
+        net = Network("routed-net", {"mode": "route", "bridge": {"name": "virbr9"}},
+                      assign_new_bridge=True, provider_config={"use_sudo": False})
+        # kernel-side values, as token lists: a shell could not spell these
+        foreign = [("FORWARD", ["-i", "bxm'3", "-j", "DROP"]),
+                   ("FORWARD", ["-i", 'bxm"3', "-j", "DROP"]),
+                   ("FORWARD", ["-i", "bxm\\3", "-j", "DROP"]),
+                   ("FORWARD", ["-m", "comment", "--comment",
+                                'first line\nsecond "quoted" line', "-j", "ACCEPT"])]
+        table = _installed()
+        table.rules = list(foreign) + table.rules
+        _attach(net, table)
+        assert net._isolation_is_intact() is True
+        assert net.remove_route_iptables_rule() is True
+        assert table.chain_rules("FORWARD") == [" ".join(t) for _, t in foreign]
 
 
 class TestIsolationContentsAreChecked:

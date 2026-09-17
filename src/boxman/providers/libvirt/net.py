@@ -1271,10 +1271,78 @@ class Network:
         """
         return self.virsh.execute_shell(command, warn=True, privileged=True)
 
-    def _ruleset(self) -> list[str]:
+    def _refused(self, command: str) -> bool:
+        """
+        Run a change and report it if it failed; True when it did.
+
+        The failure is logged with the command, its exit status and its
+        stderr, because the status alone says nothing: ``sudo`` refusing the
+        command, ``docker exec`` finding no container and iptables rejecting
+        the rule all exit 1, and only the stderr tells them apart.
+        """
+        result = self._firewall(command)
+        if result.ok:
+            return False
+        self.logger.error(
+            f"network {self.name}: failed to execute '{command}' — "
+            f"exited {result.return_code}: "
+            f"{(result.stderr or '').strip() or '(no stderr)'}")
+        return True
+
+    @staticmethod
+    def _parse_listing(text: str) -> list[list[str]]:
+        """
+        Tokenise ``iptables -S`` output the way iptables wrote it.
+
+        Arguments are printed raw — an interface name is whatever the kernel
+        holds, quotes and backslashes included, since a name may contain
+        anything but whitespace, ``/`` and NUL — except string values such as
+        ``--comment``, which iptables double-quotes with ``"``, ``\\`` and
+        ``'`` backslash-escaped, and which may span lines. So a token that
+        *starts* with ``"`` runs to its closing quote across newlines with
+        those escapes undone, any other token runs to the next space as it
+        is, and a newline outside quotes ends the rule. Shell splitting
+        cannot do this: it chokes on a raw ``'`` in a name and eats a raw
+        backslash (review finding, reproduced against a real listing).
+        """
+        rules: list[list[str]] = []
+        tokens: list[str] = []
+        current: list[str] = []
+        i, n = 0, len(text)
+        while i < n:
+            char = text[i]
+            if char == '"' and not current:
+                i += 1
+                while i < n and text[i] != '"':
+                    if text[i] == '\\' and i + 1 < n:
+                        i += 1
+                    current.append(text[i])
+                    i += 1
+                tokens.append("".join(current))
+                current = []
+                i += 1     # the closing quote
+                continue
+            if char in (' ', '\n'):
+                if current:
+                    tokens.append("".join(current))
+                    current = []
+                if char == '\n' and tokens:
+                    rules.append(tokens)
+                    tokens = []
+                i += 1
+                continue
+            current.append(char)
+            i += 1
+        if current:
+            tokens.append("".join(current))
+        if tokens:
+            rules.append(tokens)
+        return rules
+
+    def _ruleset(self) -> list[list[str]]:
         """
         The filter table as ``iptables -S`` prints it, from one listing that
-        must have succeeded.
+        must have succeeded, one token list per line of it.
 
         Every question boxman asks the firewall is answered from this listing:
         a rule is present when the listing shows it, a chain exists when the
@@ -1297,8 +1365,7 @@ class Network:
                 f"network {self.name}: cannot read the firewall — "
                 f"'iptables -S' exited {listed.return_code}: "
                 f"{(listed.stderr or '').strip() or '(no stderr)'}")
-        return [line.strip() for line in (listed.stdout or "").splitlines()
-                if line.strip()]
+        return self._parse_listing(listed.stdout or "")
 
     def _rule_is_present(self, rule: str) -> bool:
         """
@@ -1306,22 +1373,21 @@ class Network:
         spelling the action commands use — is in the ruleset.
 
         Compared token by token against each ``-A <chain> …`` line of a
-        successful listing (:meth:`_ruleset`), with the ``-m <module>`` pairs
-        iptables inserts when echoing a rule dropped (:meth:`_rule_body`), so
-        ``-p udp --dport 67 -j ACCEPT`` matches what was written. Both sides
-        are shell-split, so an interface name that had to be quoted compares
-        as one token on both.
+        successful listing (:meth:`_ruleset`), with only the implicit
+        protocol module iptables echoes dropped (:meth:`_rule_body`), so
+        ``-p udp --dport 67 -j ACCEPT`` matches what was written while a
+        rule carrying any other match condition does not.
 
         Raises:
             NetworkError: When the firewall could not be listed.
         """
-        tokens = shlex.split(rule)
-        if len(tokens) < 3:
+        spec = shlex.split(rule)
+        if len(spec) < 3:
             raise ValueError(f"not a rule: {rule!r}")
-        chain, spec = tokens[0], tokens[1:]
-        return any(self._rule_body(line) == spec
-                   for line in self._ruleset()
-                   if line.split()[:2] == ['-A', chain])
+        chain, body = spec[0], spec[1:]
+        return any(self._rule_body(listed) == body
+                   for listed in self._ruleset()
+                   if listed[:2] == ['-A', chain])
 
     def _ensure_rule(self,
                      rule: str,
@@ -1346,11 +1412,7 @@ class Network:
             return True
 
         # need an action to reach desired state
-        apply_res = self._firewall(action_cmd)
-        if not apply_res.ok:
-            self.logger.error(f"failed to execute '{action_cmd}': {apply_res.stderr}")
-            return False
-        return True
+        return not self._refused(action_cmd)
 
     def remove_route_iptables_rule(self) -> bool:
         """
@@ -1391,7 +1453,7 @@ class Network:
                 for _ in range(16):
                     if not self._rule_is_present(jump):
                         break
-                    if not self._firewall(f"iptables -D {jump}").ok:
+                    if self._refused(f"iptables -D {jump}"):
                         break
                 if self._rule_is_present(jump):
                     self.logger.error(
@@ -1401,14 +1463,13 @@ class Network:
                 # nothing to flush or delete if the chain was never created
                 if self._chain_rules(chain) is None:
                     continue
-                if not self._firewall(f"iptables -F {chain}").ok:
-                    self.logger.error(f"could not flush {chain}")
+                if self._refused(f"iptables -F {chain}"):
                     return False
-                if not self._firewall(f"iptables -X {chain}").ok:
-                    self.logger.error(f"could not delete {chain}")
+                if self._refused(f"iptables -X {chain}"):
                     return False
 
-            self._remove_legacy_isolation_rules(br_name)
+            if not self._remove_legacy_isolation_rules(br_name):
+                return False
 
             self.logger.info(f"successfully removed isolation rules for routed network {self.name}")
             return True
@@ -1485,40 +1546,47 @@ class Network:
             return False
         return True
 
-    def _chain_rules(self, chain: str) -> list[str] | None:
+    def _chain_rules(self, chain: str) -> list[list[str]] | None:
         """
-        The ``-A <chain> …`` lines of a successful listing, or None when the
-        listing does not declare the chain (``-N``, or ``-P`` for a built-in).
+        The ``-A <chain> …`` lines of a successful listing as token lists, or
+        None when the listing does not declare the chain (``-N``, or ``-P``
+        for a built-in).
 
         Raises:
             NetworkError: When the firewall could not be listed.
         """
         ruleset = self._ruleset()
-        if not any(line.split()[:2] in (['-N', chain], ['-P', chain])
-                   for line in ruleset):
+        if not any(listed[:2] in (['-N', chain], ['-P', chain])
+                   for listed in ruleset):
             return None
-        return [line for line in ruleset if line.split()[:2] == ['-A', chain]]
+        return [listed for listed in ruleset if listed[:2] == ['-A', chain]]
 
     @staticmethod
-    def _rule_body(rule: str) -> list[str]:
+    def _rule_body(tokens: list[str]) -> list[str]:
         """
-        A rule reduced to what it *does*, for exact comparison.
+        A listed rule reduced to what it *does*, for exact comparison.
 
-        Drops the leading ``-A <chain>`` and the ``-m <module>`` pairs iptables
-        inserts when echoing a rule back, so ``-p udp -m udp --dport 67 -j
-        ACCEPT`` compares equal to the ``-p udp --dport 67 -j ACCEPT`` that was
-        written. Shell-split, so an argument iptables had to quote (an
-        interface name with a space) is one token.
+        Drops the leading ``-A <chain>`` and the *implicit* protocol module:
+        iptables echoes ``-p udp --dport 67`` back as ``-p udp -m udp --dport
+        67``, the module it loaded for the port options rather than a
+        condition the rule carries, so ``-m <proto>`` naming the rule's own
+        ``-p <proto>`` is dropped. Nothing else is: ``-m socket``, ``-m
+        comment …``, ``-m state …`` are conditions, and a hook carrying one
+        is not the unconditional hook boxman installs — treating it as such
+        reported an isolation intact that packets could bypass (review
+        finding, reproduced against a real kernel).
         """
-        tokens = shlex.split(rule)[2:]
-        body, index = [], 0
-        while index < len(tokens):
-            if tokens[index] == '-m':
+        body = list(tokens[2:])
+        proto = body[body.index('-p') + 1] if '-p' in body[:-1] else None
+        out, index = [], 0
+        while index < len(body):
+            if (body[index] == '-m' and index + 1 < len(body)
+                    and body[index + 1] == proto):
                 index += 2
                 continue
-            body.append(tokens[index])
+            out.append(body[index])
             index += 1
-        return body
+        return out
 
     def _isolation_is_intact(self) -> bool:
         """
@@ -1658,21 +1726,15 @@ class Network:
 
                 # flush and refill: the contents are declarative, so drift in
                 # ordering or leftovers from an older boxman cannot survive
-                if not self._firewall(f"iptables -F {chain}").ok:
-                    self.logger.error(f"could not flush {chain}")
+                if self._refused(f"iptables -F {chain}"):
                     return False
 
                 if self._dhcp_hole_wanted():
-                    accept = self._firewall(
-                        f"iptables -A {chain} -p udp --dport {dhcp_port} "
-                        f"-j ACCEPT")
-                    if not accept.ok:
-                        self.logger.error(
-                            f"could not add the dhcp exception to {chain}")
+                    if self._refused(f"iptables -A {chain} -p udp "
+                                     f"--dport {dhcp_port} -j ACCEPT"):
                         return False
 
-                if not self._firewall(f"iptables -A {chain} -j DROP").ok:
-                    self.logger.error(f"could not add the drop rule to {chain}")
+                if self._refused(f"iptables -A {chain} -j DROP"):
                     return False
 
                 jump = f"{hook} {iface_flag} {bridge_name} -j {chain}"
@@ -1682,7 +1744,8 @@ class Network:
             # 3. drop the loose rules older boxman versions inserted straight
             # into INPUT/OUTPUT. Left behind they are dead weight at best and,
             # if one ever lands above the jump, an unreachable-DHCP bug again
-            self._remove_legacy_isolation_rules(bridge_name)
+            if not self._remove_legacy_isolation_rules(bridge_name):
+                return False
 
             self.logger.info(f"successfully applied complete isolation for routed network {self.name}")
             return True
@@ -1691,15 +1754,21 @@ class Network:
             self.logger.error(f"error applying route isolation rules: {exc}")
             return False
 
-    def _remove_legacy_isolation_rules(self, bridge_name: str) -> None:
+    def _remove_legacy_isolation_rules(self, bridge_name: str) -> bool:
         """
         Delete the pre-chain isolation rules, if this host still carries them.
 
         Best-effort about *absence*: a host that never ran an older boxman
         simply has nothing to delete, and the rules not being in the listing
-        is the normal case. A listing that fails is not absence — it raises
-        through :meth:`_rule_is_present`, and the caller reports the run as
-        failed.
+        is the normal case. Neither a listing that fails nor a deletion that
+        is refused is absence: the first raises through
+        :meth:`_rule_is_present`, the second is reported here, and the caller
+        fails the run on it — a loose ``INPUT … -j DROP`` left behind keeps
+        guest-to-host traffic blocked after a "successful" removal (review
+        finding, reproduced against a real kernel).
+
+        Returns:
+            True when every legacy rule is gone.
         """
         legacy = [
             f"INPUT -i {bridge_name} -j DROP",
@@ -1708,7 +1777,9 @@ class Network:
             f"OUTPUT -o {bridge_name} -p udp --dport 68 -j ACCEPT",
         ]
         for spec in legacy:
-            self._ensure_rule(spec, f"iptables -D {spec}", present=False)
+            if not self._ensure_rule(spec, f"iptables -D {spec}", present=False):
+                return False
+        return True
 
     @staticmethod
     def get_bridge_from_network(network_name: str,

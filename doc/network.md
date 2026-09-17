@@ -402,8 +402,11 @@ the container is not running, and a shell that cannot find the binary — and a
 launcher's refusal read as "absent" is how a removal once reported success
 having deleted nothing. If the listing fails, the run fails with
 `cannot read the firewall — 'iptables -S' exited N: <stderr>`; if a change is
-refused, the run fails on that command. Either way the chains it could not read
-or change stay exactly where they were for the next, privileged, attempt.
+refused, the run fails on that command with its status and stderr. Neither
+path is transactional: the changes made before the refusal are kept, nothing
+is rolled back, and what the run could not read or change stays exactly where
+it was. The next privileged `boxman up` reconciles the isolation and the next
+`boxman destroy` finishes the removal.
 
 ## Reconciliation: changing a network after it exists
 
@@ -635,8 +638,9 @@ them — see **Privileges** above.
 **`cannot read the firewall — 'iptables -S' exited N: …`** or
 **`failed to execute 'iptables -D …': …`** during a routed network's setup or
 teardown. The isolation code could not read or change the firewall and reports
-that instead of assuming the rules absent, so nothing was deleted or left
-half-applied — see [what a failed query
+that instead of assuming the rules absent. The changes it made before the
+refusal are kept, and a privileged `boxman up` or `boxman destroy` finishes the
+job — see [what a failed query
 means](#privileges-and-what-a-failed-query-means). The tail of the message
 says which launcher or backend refused:
 
