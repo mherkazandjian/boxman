@@ -52,6 +52,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from boxman.exceptions import ConfigError
 from boxman.manager import BoxmanManager
 
 pytestmark = pytest.mark.unit
@@ -88,6 +89,15 @@ PLANS = {
                  'range_ops': [], 'host_ops': [], 'attached_vms': []},
 }
 
+#: The destructive plan, with a guest on the network. Reached only with
+#: ``allow_recreate``: without it ``_recreate_network`` returns 'skipped' at the
+#: authorisation guard, ahead of every line that removes or redefines anything.
+RECREATE_AUTHORIZED = {
+    'action': 'recreate', 'structural': ['mode nat -> route'],
+    'range_ops': [], 'host_ops': [],
+    'attached_vms': ['bprj__demo__bprj_cluster_1_node01'],
+}
+
 
 def _manager(workdir, *, networks=DEFAULT, adapters=None, plan='none'):
     """
@@ -118,10 +128,14 @@ def _manager(workdir, *, networks=DEFAULT, adapters=None, plan='none'):
     session.remove_network.return_value = True
     session.start_network.return_value = True
     session.apply_network_live_plan.return_value = True
-    session.plan_network.return_value = PLANS[plan]
+    session.plan_network.return_value = (
+        plan if isinstance(plan, dict) else PLANS[plan])
     session.reconcile_network_isolation.return_value = 'ok'
     mgr._provider = session
     mgr.session_for_cluster = MagicMock(return_value=session)
+    # the recreate path drops the removed network from the projects cache
+    # before redefining it; mocking the store keeps that call in the path
+    mgr.cache = MagicMock()
 
     def _synchronous(tasks, op_label=''):
         """Run each task in-process, mirroring _run_parallel's contract."""
@@ -267,6 +281,59 @@ class TestReconcileNeverPlansIt:
     def test_a_dry_run_does_not_look_at_it_either(self, tmp_path):
         mgr, session = _manager(tmp_path, plan='recreate')
         mgr.reconcile_networks(dry_run=True)
+        assert not _mentions(session, FOREIGN)
+
+
+class TestTheDestructiveBranchesToo:
+    """
+    Where a wrong "while we are here, clean up" belongs.
+
+    `skipped` and the quiet plans are the easy arms. The arms that actually
+    remove things -- an authorised recreate, and the error path of a failed
+    definition -- are where extra cleanup would plausibly be written, and both
+    return before their work with the fixtures above.
+    """
+
+    def test_an_authorized_recreate_acts_only_on_the_declared_network(
+            self, tmp_path):
+        # control: prove the destructive path really executes, so its
+        # foreign-call guard below is not vacuous
+        mgr, session = _manager(tmp_path, plan=RECREATE_AUTHORIZED)
+        results = mgr.reconcile_networks(allow_recreate=True, auto_accept=True)
+
+        assert results == {FULL_OWNED: 'recreated'}
+        assert _names_passed(session.remove_network) == [FULL_OWNED]
+        assert _names_passed(session.define_network) == [FULL_OWNED]
+        session.reattach_domain_network.assert_called_once_with(
+            RECREATE_AUTHORIZED['attached_vms'][0], FULL_OWNED)
+
+    def test_an_authorized_recreate_asks_nothing_about_the_foreign_one(
+            self, tmp_path):
+        mgr, session = _manager(tmp_path, plan=RECREATE_AUTHORIZED)
+        mgr.reconcile_networks(allow_recreate=True, auto_accept=True)
+        assert not _mentions(session, FOREIGN)
+
+    def test_an_authorized_dry_run_removes_nothing_at_all(self, tmp_path):
+        # the other early return: authorised, but told not to do it
+        mgr, session = _manager(tmp_path, plan=RECREATE_AUTHORIZED)
+        results = mgr.reconcile_networks(
+            dry_run=True, allow_recreate=True, auto_accept=True)
+        assert results == {FULL_OWNED: 'skipped'}
+        session.remove_network.assert_not_called()
+        assert not _mentions(session, FOREIGN)
+
+    @pytest.mark.parametrize('failure', [ConfigError('bad network block'),
+                                         RuntimeError('libvirt said no')],
+                             ids=['config-error', 'runtime-error'])
+    def test_a_failed_definition_asks_nothing_about_the_foreign_one(
+            self, tmp_path, failure):
+        """
+        `_define_network` catches both of these and returns 'failed'. Nothing
+        exercised that arm, so a cleanup written into it was unobserved.
+        """
+        mgr, session = _manager(tmp_path, plan='create')
+        session.define_network.side_effect = failure
+        assert mgr.reconcile_networks() == {FULL_OWNED: 'failed'}
         assert not _mentions(session, FOREIGN)
 
 
