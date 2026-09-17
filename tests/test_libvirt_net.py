@@ -11,6 +11,8 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
+import re
+import shlex
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1181,6 +1183,185 @@ TRIMMED_XML = (
 UNTRIMMED_XML = "<network><forward mode='route'/></network>"
 
 
+class FakeIptables:
+    """A minimal iptables filter table behind ``execute_shell``.
+
+    Answers ``-S`` from state, applies ``-N/-F/-X/-I/-A/-D`` to it, echoes
+    rules the way iptables does (``-m udp`` inserted, awkward names quoted)
+    and refuses scripted commands with a chosen exit status -- so a test
+    asserts the end state of the table and exactly which commands were
+    issued, instead of scripting answers to probes.
+    """
+
+    BUILTIN = ("INPUT", "FORWARD", "OUTPUT")
+    STDERR = {
+        1: "sudo: a password is required",
+        2: "iptables v1.8.11 (nf_tables): unknown option",
+        4: ("iptables v1.8.11 (nf_tables): Could not fetch rule set "
+            "generation id: Permission denied (you must be root)"),
+        127: "bash: iptables: command not found",
+    }
+
+    def __init__(self, rules=(), chains=(), refuse=None):
+        self.chains: list[str] = list(chains)
+        self.rules: list[tuple[str, list[str]]] = [
+            (chain, shlex.split(spec)) for chain, spec in rules]
+        # command -> the exit codes it answers with in turn (last repeats);
+        # 0 means "behave normally"
+        self.refuse: dict[str, list[int]] = {
+            cmd: list(codes) for cmd, codes in (refuse or {}).items()}
+        self.calls: list[str] = []
+
+    def __call__(self, command, *_args, **_kwargs):
+        self.calls.append(command)
+        if command in self.refuse:
+            codes = self.refuse[command]
+            code = codes.pop(0) if len(codes) > 1 else codes[0]
+            if code:
+                return _result(ok=False, return_code=code,
+                               stderr=self.STDERR[code])
+        tokens = shlex.split(command)
+        assert tokens[0] == "iptables", command
+        return getattr(self, "op_" + tokens[1].lstrip("-"))(*tokens[2:])
+
+    # -- state -------------------------------------------------------------
+
+    def rule(self, chain: str, spec: str) -> bool:
+        return (chain, shlex.split(spec)) in self.rules
+
+    def chain_rules(self, chain: str) -> list[str]:
+        return [" ".join(spec) for c, spec in self.rules if c == chain]
+
+    def mentions(self, needle: str) -> list[str]:
+        return [f"{c} {' '.join(spec)}" for c, spec in self.rules
+                if needle in " ".join(spec)] + [c for c in self.chains
+                                                if needle in c]
+
+    def listing(self) -> str:
+        lines = [f"-P {c} ACCEPT" for c in self.BUILTIN]
+        lines += [f"-N {c}" for c in self.chains]
+        for chain in (*self.BUILTIN, *self.chains):
+            lines += [f"-A {chain} {self._echo(spec)}"
+                      for c, spec in self.rules if c == chain]
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _echo(spec: list[str]) -> str:
+        out = list(spec)
+        if "-p" in out and "--dport" in out and "-m" not in out:
+            proto = out[out.index("-p") + 1]
+            out[out.index("--dport"):out.index("--dport")] = ["-m", proto]
+        return " ".join(f'"{tok}"' if re.search(r"[\s;'\"$]", tok) else tok
+                        for tok in out)
+
+    # -- operations --------------------------------------------------------
+
+    def _known(self, chain: str) -> bool:
+        return chain in self.BUILTIN or chain in self.chains
+
+    @staticmethod
+    def _no_chain():
+        return _result(ok=False, return_code=1,
+                       stderr="iptables: No chain/target/match by that name.")
+
+    def op_S(self, *args):
+        if not args:
+            return _result(stdout=self.listing())
+        chain = args[0]
+        if not self._known(chain):
+            return self._no_chain()
+        head = (f"-P {chain} ACCEPT" if chain in self.BUILTIN
+                else f"-N {chain}")
+        body = "".join(f"-A {chain} {self._echo(spec)}\n"
+                       for c, spec in self.rules if c == chain)
+        return _result(stdout=f"{head}\n{body}")
+
+    def op_N(self, chain):
+        if self._known(chain):
+            return _result(ok=False, return_code=1,
+                           stderr="iptables: Chain already exists.")
+        self.chains.append(chain)
+        return _result()
+
+    def op_F(self, chain):
+        if not self._known(chain):
+            return self._no_chain()
+        self.rules = [(c, s) for c, s in self.rules if c != chain]
+        return _result()
+
+    def op_X(self, chain):
+        if chain not in self.chains:
+            return self._no_chain()
+        if any(c == chain for c, _ in self.rules):
+            return _result(ok=False, return_code=1,
+                           stderr="iptables: Directory not empty.")
+        if any(s[-2:] == ["-j", chain] for _, s in self.rules):
+            return _result(ok=False, return_code=1,
+                           stderr="iptables: Too many links.")
+        self.chains.remove(chain)
+        return _result()
+
+    def _add(self, chain, spec, *, front):
+        if not self._known(chain):
+            return self._no_chain()
+        target = spec[spec.index("-j") + 1]
+        if target not in ("ACCEPT", "DROP", "RETURN") and not self._known(target):
+            return self._no_chain()
+        entry = (chain, list(spec))
+        firsts = [i for i, (c, _) in enumerate(self.rules) if c == chain]
+        if front and firsts:
+            self.rules.insert(firsts[0], entry)
+        else:
+            self.rules.append(entry)
+        return _result()
+
+    def op_I(self, chain, *spec):
+        return self._add(chain, spec, front=True)
+
+    def op_A(self, chain, *spec):
+        return self._add(chain, spec, front=False)
+
+    def op_D(self, chain, *spec):
+        entry = (chain, list(spec))
+        if entry not in self.rules:
+            return _result(ok=False, return_code=1,
+                           stderr="iptables: Bad rule (does a matching rule "
+                                  "exist in that chain?).")
+        self.rules.remove(entry)
+        return _result()
+
+    def op_C(self, chain, *spec):
+        # not issued by the code any more; kept so a mutant that reverts to
+        # probing meets an iptables that answers it
+        return _result() if (chain, list(spec)) in self.rules else _result(
+            ok=False, return_code=1,
+            stderr="iptables: Bad rule (does a matching rule exist in that chain?).")
+
+
+def _installed(bridge: str = "virbr9", hole: bool = False,
+               refuse=None) -> FakeIptables:
+    """A table carrying this bridge's isolation, as apply leaves it."""
+    chain_i, chain_o = f"BXM_ISO_I_{bridge}", f"BXM_ISO_O_{bridge}"
+    rules = [("FORWARD", f"-i {bridge} -o {bridge} -j ACCEPT"),
+             ("INPUT", f"-i {bridge} -j {chain_i}"),
+             ("OUTPUT", f"-o {bridge} -j {chain_o}")]
+    if hole:
+        rules += [(chain_i, "-p udp --dport 67 -j ACCEPT"),
+                  (chain_o, "-p udp --dport 68 -j ACCEPT")]
+    rules += [(chain_i, "-j DROP"), (chain_o, "-j DROP")]
+    return FakeIptables(rules=rules, chains=[chain_i, chain_o], refuse=refuse)
+
+
+def _attach(net: Network, table: FakeIptables,
+            trimmed: bool = True) -> FakeIptables:
+    """Put *table* behind the network's executors."""
+    net.virsh.execute_shell = MagicMock(side_effect=table)
+    net.virsh.execute = MagicMock(side_effect=lambda cmd, *a, **k: _result(
+        stdout=(TRIMMED_XML if trimmed else UNTRIMMED_XML)
+        if cmd == "net-dumpxml" else ""))
+    return table
+
+
 class TestRouteIsolationChains:
     """Routed-network isolation lives in a chain per direction.
 
@@ -1188,12 +1369,14 @@ class TestRouteIsolationChains:
     -I`` pushes to the top, so a DROP re-inserted after an ACCEPT ends up
     above it and silently re-breaks DHCP. A chain is declarative -- flush and
     refill -- so ordering is owned rather than inherited from insertion
-    history.
+    history. The tests run against a stateful fake table and assert what it
+    holds afterwards.
     """
 
+    CHAIN_I, CHAIN_O = "BXM_ISO_I_virbr9", "BXM_ISO_O_virbr9"
+
     @staticmethod
-    def _net(with_dhcp: bool = True, bridge_name: str = "virbr9",
-             use_sudo: bool = False) -> Network:
+    def _net(with_dhcp: bool = True, bridge_name: str = "virbr9") -> Network:
         info: dict = {"mode": "route", "bridge": {"name": bridge_name}}
         if with_dhcp:
             info["ip"] = {
@@ -1202,67 +1385,37 @@ class TestRouteIsolationChains:
                                    "end": "10.0.14.254"}},
             }
         return Network(name="routed-net", info=info, assign_new_bridge=True,
-                       provider_config={"use_sudo": use_sudo})
+                       provider_config={"use_sudo": False})
 
     @staticmethod
-    def _record(net: Network, rules_present: bool = False,
-                trimmed: bool = True, chain_rules: list | None = None):
-        """Stub both executors and record every iptables command."""
-        calls: list[str] = []
-
-        def shell(command, *_args, **_kwargs):
-            calls.append(command)
-            if command == "iptables -S FORWARD":
-                # the reachability listing: a built-in chain always exists
-                return _result(stdout="-P FORWARD ACCEPT")
-            if command.startswith("iptables -S "):
-                if chain_rules is None:
-                    return _result(ok=False, return_code=1)
-                return _result(stdout="\n".join(chain_rules))
-            if " -C " in f" {command} ":
-                return _result(ok=rules_present,
-                               return_code=0 if rules_present else 1)
-            return _result(ok=True, return_code=0)
-
-        def execute(cmd, *_args, **_kwargs):
-            if cmd == "net-dumpxml":
-                return _result(
-                    stdout=TRIMMED_XML if trimmed else UNTRIMMED_XML)
-            return _result()
-
-        net.virsh.execute_shell = MagicMock(side_effect=shell)
-        net.virsh.execute = MagicMock(side_effect=execute)
-        return calls
-
-    def _apply(self, net: Network, **kwargs) -> list[str]:
-        calls = self._record(net, **kwargs)
+    def _apply(net: Network, table: FakeIptables | None = None,
+               trimmed: bool = True) -> FakeIptables:
+        table = _attach(net, table or FakeIptables(), trimmed)
         assert net.apply_route_iptables_rule() is True
-        return calls
+        return table
 
     def test_chain_is_created_flushed_and_hooked(self):
-        calls = self._apply(self._net())
-        for chain, hook, flag in (("BXM_ISO_I_virbr9", "INPUT", "-i"),
-                                  ("BXM_ISO_O_virbr9", "OUTPUT", "-o")):
-            assert f"iptables -N {chain}" in calls
-            assert f"iptables -F {chain}" in calls
-            assert f"iptables -I {hook} {flag} virbr9 -j {chain}" in calls
+        table = self._apply(self._net())
+        for chain, hook, flag in ((self.CHAIN_I, "INPUT", "-i"),
+                                  (self.CHAIN_O, "OUTPUT", "-o")):
+            assert chain in table.chains
+            assert f"iptables -F {chain}" in table.calls
+            assert table.rule(hook, f"{flag} virbr9 -j {chain}")
 
     def test_accept_is_filled_before_drop(self):
-        calls = self._apply(self._net())
-        accept = calls.index("iptables -A BXM_ISO_I_virbr9 -p udp --dport 67 -j ACCEPT")
-        drop = calls.index("iptables -A BXM_ISO_I_virbr9 -j DROP")
-        assert accept < drop
+        table = self._apply(self._net())
+        assert table.chain_rules(self.CHAIN_I) == [
+            "-p udp --dport 67 -j ACCEPT", "-j DROP"]
 
     def test_dhcp_ports_are_direction_specific(self):
-        calls = self._apply(self._net())
-        assert "iptables -A BXM_ISO_I_virbr9 -p udp --dport 67 -j ACCEPT" in calls
-        assert "iptables -A BXM_ISO_O_virbr9 -p udp --dport 68 -j ACCEPT" in calls
+        table = self._apply(self._net())
+        assert table.chain_rules(self.CHAIN_I)[0] == "-p udp --dport 67 -j ACCEPT"
+        assert table.chain_rules(self.CHAIN_O)[0] == "-p udp --dport 68 -j ACCEPT"
 
     def test_no_dhcp_hole_without_a_dhcp_block(self):
-        calls = self._apply(self._net(with_dhcp=False))
-        assert not any(c.startswith("iptables -A") and "--dport" in c
-                       for c in calls)
-        assert "iptables -A BXM_ISO_I_virbr9 -j DROP" in calls
+        table = self._apply(self._net(with_dhcp=False))
+        assert table.chain_rules(self.CHAIN_I) == ["-j DROP"]
+        assert table.chain_rules(self.CHAIN_O) == ["-j DROP"]
 
     def test_hole_stays_shut_until_the_live_offer_is_trimmed(self):
         # an upgrade must not open DHCP on a network whose dnsmasq still
@@ -1270,10 +1423,8 @@ class TestRouteIsolationChains:
         # installs a metric-0 default route to an unreachable gateway and
         # black-holes the guest. Such a network plans as `action: none`, so
         # nothing else would stop this.
-        calls = self._apply(self._net(), trimmed=False)
-        assert not any(c.startswith("iptables -A") and "--dport" in c
-                       for c in calls)
-        assert "iptables -A BXM_ISO_I_virbr9 -j DROP" in calls
+        table = self._apply(self._net(), trimmed=False)
+        assert table.chain_rules(self.CHAIN_I) == ["-j DROP"]
 
     def test_reservations_alone_also_open_the_hole(self):
         info = {
@@ -1284,88 +1435,87 @@ class TestRouteIsolationChains:
         }
         net = Network("routed-net", info, assign_new_bridge=True,
                       provider_config={"use_sudo": False})
-        assert any("--dport 67" in c for c in self._apply(net))
+        table = self._apply(net)
+        assert table.chain_rules(self.CHAIN_I)[0] == "-p udp --dport 67 -j ACCEPT"
 
     def test_vm_to_vm_forward_rule_survives(self):
-        calls = self._apply(self._net())
-        assert ("iptables -I FORWARD -i virbr9 -o virbr9 -j ACCEPT") in calls
+        table = self._apply(self._net())
+        assert table.rule("FORWARD", "-i virbr9 -o virbr9 -j ACCEPT")
+
+    def test_apply_is_idempotent(self):
+        net = self._net()
+        table = self._apply(net)
+        state = table.listing()
+        assert net.apply_route_iptables_rule() is True
+        assert table.listing() == state
+        assert table.chain_rules("FORWARD") == ["-i virbr9 -o virbr9 -j ACCEPT"]
 
     def test_legacy_loose_rules_are_migrated_away(self):
-        calls = self._apply(self._net(), rules_present=True)
-        assert "iptables -D INPUT -i virbr9 -j DROP" in calls
-        assert "iptables -D OUTPUT -o virbr9 -j DROP" in calls
+        legacy = FakeIptables(rules=[
+            ("INPUT", "-i virbr9 -j DROP"),
+            ("OUTPUT", "-o virbr9 -j DROP"),
+            ("INPUT", "-i virbr9 -p udp --dport 67 -j ACCEPT"),
+            ("OUTPUT", "-o virbr9 -p udp --dport 68 -j ACCEPT"),
+        ])
+        table = self._apply(self._net(), legacy)
+        assert table.chain_rules("INPUT") == [f"-i virbr9 -j {self.CHAIN_I}"]
+        assert table.chain_rules("OUTPUT") == [f"-o virbr9 -j {self.CHAIN_O}"]
 
     def test_removal_unhooks_flushes_and_deletes(self):
         net = self._net()
-        calls = self._record(net, rules_present=False,
-                             chain_rules=["-A BXM_ISO_I_virbr9 -j DROP"])
+        table = self._apply(net)
         assert net.remove_route_iptables_rule() is True
-        for chain in ("BXM_ISO_I_virbr9", "BXM_ISO_O_virbr9"):
-            assert f"iptables -F {chain}" in calls
-            assert f"iptables -X {chain}" in calls
+        assert table.chains == []
+        assert table.mentions("virbr9") == []
+
+    def test_removal_when_nothing_was_ever_installed_changes_nothing(self):
+        net = self._net()
+        table = _attach(net, FakeIptables())
+        assert net.remove_route_iptables_rule() is True
+        assert set(table.calls) == {"iptables -S"}
 
     def test_removal_deletes_every_duplicate_hook(self):
         # -D removes ONE match; a duplicated jump would keep the chain
         # referenced and make -X fail, while teardown still reported success
         net = self._net()
-        seen: list[str] = []
-        remaining = {"INPUT": 3, "OUTPUT": 1}
-
-        def shell(command, *_a, **_k):
-            seen.append(command)
-            if command.startswith("iptables -S "):
-                return _result(stdout="-A chain -j DROP")
-            for hook in remaining:
-                if f" -C {hook} " in command and "BXM_ISO" in command:
-                    return _result(ok=remaining[hook] > 0,
-                                   return_code=0 if remaining[hook] > 0 else 1)
-                if f" -D {hook} " in command and "BXM_ISO" in command:
-                    remaining[hook] -= 1
-                    return _result(ok=True, return_code=0)
-            if " -C " in f" {command} ":
-                return _result(ok=False, return_code=1)
-            return _result(ok=True, return_code=0)
-
-        net.virsh.execute_shell = MagicMock(side_effect=shell)
-        net.virsh.execute = MagicMock(return_value=_result(stdout=TRIMMED_XML))
+        table = _installed()
+        for _ in range(2):
+            table.rules.insert(1, ("INPUT", shlex.split(f"-i virbr9 -j {self.CHAIN_I}")))
+        _attach(net, table)
         assert net.remove_route_iptables_rule() is True
-        assert remaining == {"INPUT": 0, "OUTPUT": 0}
+        assert table.chains == []
+        assert table.mentions("virbr9") == []
 
     def test_removal_fails_loudly_when_the_chain_cannot_be_deleted(self):
         net = self._net()
-
-        def shell(command, *_a, **_k):
-            if command.startswith("iptables -S "):
-                return _result(stdout="-A BXM_ISO_I_virbr9 -j DROP")
-            if command.startswith("iptables -X "):
-                return _result(ok=False, return_code=1,
-                               stderr="chain is still referenced")
-            if " -C " in f" {command} ":
-                return _result(ok=False, return_code=1)
-            return _result(ok=True, return_code=0)
-
-        net.virsh.execute_shell = MagicMock(side_effect=shell)
-        net.virsh.execute = MagicMock(return_value=_result(stdout=TRIMMED_XML))
+        _attach(net, _installed(refuse={f"iptables -X {self.CHAIN_I}": [1]}))
         assert net.remove_route_iptables_rule() is False
 
     def test_chain_name_is_sanitised_not_quoted(self):
         net = self._net(bridge_name="br-a.b")
-        calls = self._apply(net)
-        assert any("BXM_ISO_I_br_a_b" in c for c in calls)
-        assert not any("BXM_ISO_I_br-a.b" in c for c in calls)
+        table = self._apply(net)
+        assert "BXM_ISO_I_br_a_b" in table.chains
+        assert not any("BXM_ISO_I_br-a.b" in c for c in table.calls)
 
     def test_bridge_name_with_metacharacters_is_quoted(self):
-        net = self._net(bridge_name="virbr 9;touch /tmp/x")
-        calls = self._apply(net)
-        matches = [c for c in calls if "-i " in c or "-o " in c]
-        assert matches
-        for cmd in matches:
-            assert "'virbr 9;touch /tmp/x'" in cmd
+        name = "virbr 9;touch /tmp/x"
+        net = self._net(bridge_name=name)
+        table = self._apply(net)
+        actions = [c for c in table.calls if c.split()[1] in ("-I", "-A", "-D")
+                   and ("-i " in c or "-o " in c)]
+        assert actions
+        for cmd in actions:
+            assert f"'{name}'" in cmd
+        # the kernel holds the raw name, the listing quotes it, and the round
+        # trip through that listing still recognises the rules: removal is
+        # complete
+        assert table.rule("FORWARD", f"-i '{name}' -o '{name}' -j ACCEPT")
+        assert net.remove_route_iptables_rule() is True
+        assert table.mentions(name) == []
 
     def test_a_plain_bridge_name_is_left_unquoted(self):
-        calls = self._apply(self._net())
-        assert not any("'" in c for c in calls)
-
+        table = self._apply(self._net())
+        assert not any("'" in c for c in table.calls)
 
 
 class TestIsolationPrivilege:
@@ -1381,22 +1531,25 @@ class TestIsolationPrivilege:
     executor here, with only the shell runner replaced.
     """
 
+    LISTING = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n"
+
     @staticmethod
     def _net(provider_config: dict) -> Network:
         info = {"mode": "route", "bridge": {"name": "virbr9"}}
         return Network(name="routed-net", info=info, assign_new_bridge=True,
                        provider_config=provider_config)
 
-    @staticmethod
-    def _issued(net: Network, euid: int) -> list[str]:
+    @classmethod
+    def _issued(cls, net: Network, euid: int) -> list[str]:
         """Apply the isolation and return the command lines that reached
-        the shell; every probe answers "absent", every action succeeds."""
+        the shell; the listing shows an empty table, every action succeeds."""
         issued: list[str] = []
 
         def run(command, **_kwargs):
             issued.append(command)
-            probe = " -C " in f" {command} "
-            return _result(ok=not probe, return_code=1 if probe else 0)
+            if command.rstrip("'").endswith("iptables -S"):
+                return _result(stdout=cls.LISTING)
+            return _result()
 
         net.virsh.execute = MagicMock(return_value=_result(stdout=""))
         with patch("boxman.providers.libvirt.commands._shell_run",
@@ -1447,20 +1600,19 @@ class TestIsolationPrivilege:
         assert all(c.startswith("sudo iptables ") for c in issued), issued
 
 
-class TestFirewallQueriesAreNotGuessed:
-    """A failed ``iptables`` query is not a negative answer.
+class TestTheFirewallIsNeverGuessed:
+    """Every answer comes from the contents of a listing that succeeded.
 
-    ``-C`` exits 0 for present and 1 for absent -- on both the nf_tables and
-    the legacy backend, for a missing rule and for a missing chain; the values
-    were measured, not assumed. Anything else (4: ``Permission denied (you
-    must be root)``; 2: a malformed rule) means the query itself failed and
-    the rule's state is unknown. The removal path used to read every non-zero
-    status as "already absent", so an unprivileged teardown reported success
-    having deleted nothing (#181, #164 NET-R3).
+    Nothing is inferred from a non-zero exit: ``iptables -C`` says "absent"
+    with exit 1, but so does sudo when it is refused for that command and
+    docker exec when the container is down, and a launcher's refusal read as
+    an answer is how a removal reported success having deleted nothing
+    (#181, #164 NET-R3 -- and again in review of the first fix). A listing
+    that fails, or a change that is refused, fails the run right there.
     """
 
-    DENIED = ("iptables v1.8.11 (nf_tables): Could not fetch rule set "
-              "generation id: Permission denied (you must be root)")
+    LISTING = "iptables -S"
+    HOOK_I = "iptables -D INPUT -i virbr9 -j BXM_ISO_I_virbr9"
 
     @staticmethod
     def _net() -> Network:
@@ -1470,143 +1622,93 @@ class TestFirewallQueriesAreNotGuessed:
         net.logger = MagicMock()
         return net
 
-    REACHABLE = "iptables -S FORWARD"   # the built-in listing, always issued first
+    def _errors(self, net: Network) -> list[str]:
+        return [str(c.args[0]) for c in net.logger.error.call_args_list]
 
-    def _denied(self, net: Network) -> list[str]:
-        """Every iptables command is refused for lack of privilege."""
-        calls: list[str] = []
-
-        def shell(command, *_args, **_kwargs):
-            calls.append(command)
-            return _result(ok=False, return_code=4, stderr=self.DENIED)
-
-        net.virsh.execute_shell = MagicMock(side_effect=shell)
-        net.virsh.execute = MagicMock(return_value=_result(stdout=""))
-        return calls
-
-    def _answering(self, net: Network, code: int, stderr: str = "") -> list[str]:
-        """iptables is reachable; every probe exits *code*."""
-        calls: list[str] = []
-
-        def shell(command, *_args, **_kwargs):
-            calls.append(command)
-            if command == self.REACHABLE:
-                return _result(stdout="-P FORWARD ACCEPT")
-            return _result(ok=code == 0, return_code=code, stderr=stderr)
-
-        net.virsh.execute_shell = MagicMock(side_effect=shell)
-        net.virsh.execute = MagicMock(return_value=_result(stdout=""))
-        return calls
-
-    def _scripted(self, net: Network, script: dict) -> list[str]:
-        """iptables is reachable; *script* maps a command to the exit codes
-        it answers in turn (the last one repeats); any other probe answers 1
-        (absent), any other listing succeeds, any other action succeeds."""
-        calls: list[str] = []
-        answers = {cmd: list(codes) for cmd, codes in script.items()}
-
-        def shell(command, *_args, **_kwargs):
-            calls.append(command)
-            if command == self.REACHABLE:
-                return _result(stdout="-P FORWARD ACCEPT")
-            if command in answers:
-                code = answers[command].pop(0) if len(answers[command]) > 1 \
-                    else answers[command][0]
-                return _result(ok=code == 0, return_code=code,
-                               stderr=self.DENIED if code == 4 else "")
-            if " -C " in f" {command} ":
-                return _result(ok=False, return_code=1)
-            if command.startswith("iptables -S "):
-                return _result(stdout=f"-A {command.split()[-1]} -j DROP")
-            return _result()
-
-        net.virsh.execute_shell = MagicMock(side_effect=shell)
-        net.virsh.execute = MagicMock(return_value=_result(stdout=""))
-        return calls
-
-    @staticmethod
-    def _mutations(calls: list[str]) -> list[str]:
-        """The commands that change the ruleset."""
-        return [c for c in calls if c.split()[1] in ("-I", "-A", "-N", "-D", "-F", "-X")]
-
-    def test_a_probe_answers_present_absent_or_refuses(self):
+    @pytest.mark.parametrize("code", [1, 2, 4, 127])
+    def test_a_listing_that_fails_raises_whatever_the_status(self, code):
         net = self._net()
-        for code, expected in ((0, True), (1, False)):
-            self._answering(net, code)
-            assert net._rule_is_present("iptables -C INPUT -j DROP") is expected
-        for code in (2, 3, 4):
-            self._answering(net, code, stderr=self.DENIED)
-            with pytest.raises(NetworkError, match="Permission denied"):
-                net._rule_is_present("iptables -C INPUT -j DROP")
+        _attach(net, FakeIptables(refuse={self.LISTING: [code]}))
+        with pytest.raises(NetworkError,
+                           match=re.escape(FakeIptables.STDERR[code][:20])):
+            net._rule_is_present("INPUT -i virbr9 -j DROP")
+        with pytest.raises(NetworkError, match=f"exited {code}"):
+            net._chain_rules("BXM_ISO_I_virbr9")
 
-    def test_a_refused_removal_fails_and_deletes_nothing(self):
+    def test_answers_come_from_the_listing_contents(self):
         net = self._net()
-        calls = self._denied(net)
+        table = _attach(net, _installed(hole=True))
+        assert net._rule_is_present("FORWARD -i virbr9 -o virbr9 -j ACCEPT")
+        assert net._rule_is_present("BXM_ISO_I_virbr9 -p udp --dport 67 -j ACCEPT")
+        assert not net._rule_is_present("INPUT -i virbr9 -j DROP")
+        assert net._chain_rules("BXM_ISO_I_virbr9") == [
+            "-A BXM_ISO_I_virbr9 -p udp -m udp --dport 67 -j ACCEPT",
+            "-A BXM_ISO_I_virbr9 -j DROP"]
+        assert net._chain_rules("BXM_ISO_I_other") is None
+        assert set(table.calls) == {self.LISTING}
+
+    def test_a_refused_listing_fails_a_removal_that_deletes_nothing(self):
+        net = self._net()
+        table = _attach(net, _installed(refuse={self.LISTING: [4]}))
+        before = (list(table.chains), list(table.rules))
 
         assert net.remove_route_iptables_rule() is False
 
-        # it stopped at the reachability listing: no probe was trusted and no
-        # delete, flush or chain drop was attempted against an unread state
-        assert calls == [self.REACHABLE], calls
-        logged = [str(c.args[0]) for c in net.logger.error.call_args_list]
-        assert any("Permission denied" in m for m in logged), logged
+        assert table.calls == [self.LISTING]
+        assert (list(table.chains), list(table.rules)) == before
+        assert any("Permission denied" in m for m in self._errors(net))
 
-    HOOK = "iptables -C INPUT -i virbr9 -j BXM_ISO_I_virbr9"
-    UNHOOK = "iptables -D INPUT -i virbr9 -j BXM_ISO_I_virbr9"
-
-    @pytest.mark.parametrize("script, unhooks", [
-        ({HOOK: [4]}, 0),                            # the loop's first probe
-        ({HOOK: [0, 4]}, 1),                         # its re-probe after a -D
-        ({HOOK: [0, 1, 4]}, 1),                      # the confirmation after the loop
-        ({"iptables -S BXM_ISO_I_virbr9": [4]}, 0),  # the chain listing
-    ], ids=["first-probe", "re-probe", "confirmation", "listing"])
-    def test_a_refusal_anywhere_in_a_removal_fails_it_at_once(
-            self, script, unhooks):
-        # iptables was reachable and answered the probes before; then one is
-        # refused (a sudo timestamp expiring mid-run, say). That is not
-        # "absent": the removal fails right there, probes nothing further,
-        # and has changed nothing beyond the unhooks the earlier answers
-        # justified
+    def test_a_refused_listing_fails_an_apply(self):
         net = self._net()
-        (refused, codes), = script.items()
-        calls = self._scripted(net, script)
-
-        assert net.remove_route_iptables_rule() is False
-
-        assert calls[-1] == refused, calls
-        assert calls.count(refused) == len(codes), calls
-        assert self._mutations(calls) == unhooks * [self.UNHOOK], calls
-
-    def test_a_refused_apply_fails(self):
-        net = self._net()
-        calls = self._denied(net)
+        table = _attach(net, FakeIptables(refuse={self.LISTING: [4]}))
         assert net.apply_route_iptables_rule() is False
-        assert calls == [self.REACHABLE], calls
+        assert table.calls == [self.LISTING]
 
-    def test_reconcile_reports_failed_not_drift_when_the_probe_is_refused(self):
+    def test_reconcile_reports_failed_not_drift_when_the_listing_is_refused(self):
         net = self._net()
-        self._denied(net)
+        _attach(net, _installed(refuse={self.LISTING: [4]}))
         net.apply_route_iptables_rule = MagicMock()
 
         assert net.reconcile_isolation(check_only=True) == 'failed'
         assert net.reconcile_isolation() == 'failed'
-        # a repair on top of an unanswerable probe would fail the same way
+        # a repair on top of an unreadable firewall would fail the same way
         net.apply_route_iptables_rule.assert_not_called()
 
-    def test_a_missing_chain_lists_as_none_but_a_refused_listing_raises(self):
+    @pytest.mark.parametrize("refuse", [
+        {"iptables -S": [0, 4]},                        # the 2nd listing
+        {"iptables -S": [0, 0, 0, 4]},                  # the 4th
+        {"iptables -D FORWARD -i virbr9 -o virbr9 -j ACCEPT": [1]},
+        {"iptables -D INPUT -i virbr9 -j BXM_ISO_I_virbr9": [1]},
+        {"iptables -F BXM_ISO_I_virbr9": [1]},
+        {"iptables -X BXM_ISO_O_virbr9": [1]},
+    ], ids=["listing-2", "listing-4", "unaccept", "unhook", "flush", "delete"])
+    def test_a_refusal_anywhere_in_a_removal_fails_it_at_once(self, refuse):
+        # the table answered until one command is refused -- a sudo policy
+        # that covers some arguments and not others, a timestamp expiring
+        # mid-run. The removal fails right there: at most a read-only listing
+        # follows (the confirmation after a refused unhook), never another
+        # change, and the table is exactly what the successful commands
+        # before it left
         net = self._net()
-        self._answering(net, 1,
-                        stderr="iptables: No chain/target/match by that name.")
-        assert net._chain_rules("BXM_ISO_I_virbr9") is None
+        (refused, codes), = refuse.items()
+        table = _attach(net, _installed(refuse=refuse))
 
-        self._answering(net, 4, stderr=self.DENIED)
-        with pytest.raises(NetworkError, match="Permission denied"):
-            net._chain_rules("BXM_ISO_I_virbr9")
+        assert net.remove_route_iptables_rule() is False
+
+        assert table.calls.count(refused) == len(codes), table.calls
+        after = table.calls[len(table.calls) - table.calls[::-1].index(refused):]
+        assert all(c == "iptables -S" for c in after), table.calls
+        successful = [c for c in table.calls if c.split()[1] != "-S"
+                      and c != refused]
+        replay = _installed()
+        for command in successful:
+            assert replay(command).ok
+        assert (table.chains, table.rules) == (replay.chains, replay.rules)
 
     def test_the_legacy_sweep_does_not_infer_absence_either(self):
-        # best-effort about absence, not about an unanswerable probe
+        # best-effort about absence, not about an unreadable firewall
         net = self._net()
-        self._denied(net)
+        _attach(net, FakeIptables(refuse={self.LISTING: [4]}))
         with pytest.raises(NetworkError, match="Permission denied"):
             net._remove_legacy_isolation_rules("virbr9")
 
@@ -1616,15 +1718,17 @@ class TestLaunchersAreNotIptables:
     when it cannot authenticate or is not permitted, docker exec when the
     container is not running. Read naively that is "absent" for every probe,
     and a refused-sudo removal reported success having deleted nothing --
-    #181 one process up, found by review of the first fix. So an exit-1
-    answer is trusted only after one listing of a built-in chain succeeded
-    through the same privileged path. Real executor; only the shell runner is
-    replaced, with real invoke results.
+    #181 one process up, found by review of the first fix. A sudo policy
+    that permits the listing but not the changes was the second review's
+    reproduction: it defeats any preflight, and only answering from the
+    listing's contents and checking every change survives it. Real executor;
+    only the shell runner is replaced, with real invoke results.
     """
 
     REFUSED = "sudo: a password is required"
     DEAD = ("Error response from daemon: container boxman-libvirt-p1 is not "
             "running")
+    INSTALLED = _installed().listing()
 
     @staticmethod
     def _net(**provider_config) -> Network:
@@ -1636,71 +1740,94 @@ class TestLaunchersAreNotIptables:
         return net
 
     @staticmethod
-    def _launcher_fails(prefix: str, stderr: str):
-        """A shell runner whose launcher fails before iptables runs -- exit 1,
-        as sudo and docker exec both do."""
+    def _shell(policy):
+        """A shell runner: *policy* maps a command line to the Result it
+        gets; anything else is refused by the launcher with exit 1."""
         issued: list[str] = []
 
         def run(command, **_kwargs):
             issued.append(command)
-            assert command.startswith(prefix), command
-            return Result(command=command, exited=1, stderr=stderr)
+            if command in policy:
+                return policy[command]
+            return Result(command=command, exited=1,
+                          stderr=TestLaunchersAreNotIptables.REFUSED)
 
         return issued, run
 
     def test_a_refused_sudo_is_a_failure_not_an_answer(self):
         net = self._net()   # use_sudo absent: the provider default
-        issued, run = self._launcher_fails("sudo iptables ", self.REFUSED)
+        issued, run = self._shell({})
         with patch("boxman.providers.libvirt.commands._shell_run",
                    side_effect=run), \
              patch("boxman.providers.libvirt.commands.os.geteuid",
                    return_value=1000):
             with pytest.raises(NetworkError, match="a password is required"):
-                net._rule_is_present("iptables -C INPUT -i virbr9 -j DROP")
+                net._rule_is_present("INPUT -i virbr9 -j DROP")
             with pytest.raises(NetworkError, match="a password is required"):
                 net._chain_rules("BXM_ISO_I_virbr9")
             assert net.remove_route_iptables_rule() is False
             assert net.reconcile_isolation(check_only=True) == 'failed'
-        # nothing but the reachability listing was ever issued
-        assert set(issued) == {"sudo iptables -S FORWARD"}, issued
+        # nothing but the listing was ever issued
+        assert set(issued) == {"sudo iptables -S"}, issued
 
     def test_a_dead_container_is_a_failure_not_an_answer(self):
         net = self._net(runtime="docker-compose",
                         runtime_container="boxman-libvirt-p1")
-        issued, run = self._launcher_fails(
-            "docker exec --user root boxman-libvirt-p1 ", self.DEAD)
-        with patch("boxman.providers.libvirt.commands._shell_run",
-                   side_effect=run):
-            assert net.remove_route_iptables_rule() is False
-            with pytest.raises(NetworkError, match="not running"):
-                net._rule_is_present("iptables -C INPUT -i virbr9 -j DROP")
-        assert issued and all(
-            c.endswith("bash -c 'iptables -S FORWARD'") for c in issued), issued
-
-    def test_once_iptables_answered_its_one_means_absent(self):
-        # the positive control: after a successful listing, exit 1 from a probe
-        # is iptables' own answer, and the listing is not repeated
-        net = self._net()
         issued: list[str] = []
 
         def run(command, **_kwargs):
             issued.append(command)
-            if command == "sudo iptables -S FORWARD":
-                return Result(command=command, exited=0,
-                              stdout="-P FORWARD ACCEPT\n")
-            return Result(command=command, exited=1,
-                          stderr="iptables: Bad rule (does a matching rule "
-                                 "exist in that chain?).")
+            return Result(command=command, exited=1, stderr=self.DEAD)
 
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=run):
+            assert net.remove_route_iptables_rule() is False
+            with pytest.raises(NetworkError, match="not running"):
+                net._rule_is_present("INPUT -i virbr9 -j DROP")
+        assert issued and all(
+            c.endswith("bash -c 'iptables -S'") for c in issued), issued
+
+    @pytest.mark.parametrize("verb", ["remove", "apply"])
+    def test_a_policy_that_permits_only_the_listing_cannot_fake_a_result(
+            self, verb):
+        # sudoers matches arguments, so `NOPASSWD: /usr/sbin/iptables -S`
+        # lets the listing succeed and refuses every change with exit 1
+        net = self._net()
+        listing = Result(command="sudo iptables -S", exited=0,
+                         stdout=self.INSTALLED if verb == "remove" else
+                         "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n")
+        issued, run = self._shell({"sudo iptables -S": listing})
         with patch("boxman.providers.libvirt.commands._shell_run",
                    side_effect=run), \
              patch("boxman.providers.libvirt.commands.os.geteuid",
                    return_value=1000):
-            assert net._rule_is_present(
-                "iptables -C INPUT -i virbr9 -j DROP") is False
+            if verb == "remove":
+                assert net.remove_route_iptables_rule() is False
+            else:
+                assert net.apply_route_iptables_rule() is False
+        # the first refused change ends the run: one listing, one change
+        assert issued[0] == "sudo iptables -S"
+        assert issued[1].startswith(
+            "sudo iptables -D FORWARD " if verb == "remove"
+            else "sudo iptables -I FORWARD "), issued
+        assert len(issued) == 2, issued
+        assert any("a password is required" in str(c.args[0])
+                   for c in net.logger.error.call_args_list)
+
+    def test_once_iptables_answered_its_listing_speaks(self):
+        # the positive control: a listing that succeeded answers by content
+        net = self._net()
+        empty = Result(command="sudo iptables -S", exited=0,
+                       stdout="-P INPUT ACCEPT\n-P FORWARD ACCEPT\n"
+                              "-P OUTPUT ACCEPT\n")
+        issued, run = self._shell({"sudo iptables -S": empty})
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=run), \
+             patch("boxman.providers.libvirt.commands.os.geteuid",
+                   return_value=1000):
+            assert net._rule_is_present("INPUT -i virbr9 -j DROP") is False
             assert net._chain_rules("BXM_ISO_I_virbr9") is None
-        assert issued[0] == "sudo iptables -S FORWARD"
-        assert issued.count("sudo iptables -S FORWARD") == 1
+        assert set(issued) == {"sudo iptables -S"}
 
 
 class TestIsolationContentsAreChecked:
@@ -1724,19 +1851,16 @@ class TestIsolationContentsAreChecked:
 
     @staticmethod
     def _probe(net: Network, chain_rules: list, trimmed: bool = True):
-        def shell(command, *_a, **_k):
-            if command.startswith("iptables -S "):
-                chain = command.split()[-1]
-                port = 67 if chain.startswith("BXM_ISO_I_") else 68
-                rules = [r.replace("CHAIN", chain).replace("PORT", str(port))
-                         for r in chain_rules]
-                return _result(stdout="\n".join(rules))
-            if " -C " in f" {command} ":
-                return _result(ok=True, return_code=0)   # jump present
-            return _result(ok=True, return_code=0)
-        net.virsh.execute_shell = MagicMock(side_effect=shell)
-        net.virsh.execute = MagicMock(return_value=_result(
-            stdout=TRIMMED_XML if trimmed else UNTRIMMED_XML))
+        """Both chains hooked and holding *chain_rules* (CHAIN and PORT
+        substituted per direction), as iptables would echo them."""
+        rules = [("INPUT", "-i virbr9 -j BXM_ISO_I_virbr9"),
+                 ("OUTPUT", "-o virbr9 -j BXM_ISO_O_virbr9")]
+        for chain, port in (("BXM_ISO_I_virbr9", 67), ("BXM_ISO_O_virbr9", 68)):
+            for template in chain_rules:
+                spec = template.replace("-A CHAIN ", "").replace("PORT", str(port))
+                rules.append((chain, spec))
+        _attach(net, FakeIptables(rules=rules, chains=[
+            "BXM_ISO_I_virbr9", "BXM_ISO_O_virbr9"]), trimmed)
         return net._isolation_is_intact()
 
     def test_correct_contents_are_intact(self):
@@ -1819,19 +1943,18 @@ class TestRouteIsolationDrift:
         # the jump can be there while the chain is empty, which isolates
         # nothing; contents are checked in TestIsolationContentsAreChecked
         net = self._net()
-        net.virsh.execute_shell = MagicMock(return_value=_result(return_code=0))
-        net.virsh.execute = MagicMock(return_value=_result(stdout=""))
+        _attach(net, FakeIptables(
+            rules=[("INPUT", "-i virbr9 -j BXM_ISO_I_virbr9"),
+                   ("OUTPUT", "-o virbr9 -j BXM_ISO_O_virbr9")],
+            chains=["BXM_ISO_I_virbr9", "BXM_ISO_O_virbr9"]))
         assert net._isolation_is_intact() is False
 
     def test_not_intact_when_a_jump_is_missing(self):
         net = self._net()
-
-        def shell(command, *_a, **_k):
-            if command == "iptables -S FORWARD":     # iptables is reachable
-                return _result(stdout="-P FORWARD ACCEPT")
-            return _result(ok=False, return_code=1)  # every probe: absent
-
-        net.virsh.execute_shell = MagicMock(side_effect=shell)
+        _attach(net, FakeIptables(
+            rules=[("BXM_ISO_I_virbr9", "-j DROP"),
+                   ("BXM_ISO_O_virbr9", "-j DROP")],
+            chains=["BXM_ISO_I_virbr9", "BXM_ISO_O_virbr9"]))
         assert net._isolation_is_intact() is False
 
     def test_reconcile_reports_repaired_when_rules_had_vanished(self):

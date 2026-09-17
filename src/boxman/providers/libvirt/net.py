@@ -1257,11 +1257,6 @@ class Network:
                 f"{', '.join(owners)}; destroying an owner removes the Linux "
                 "bridge underneath this network")
 
-    #: Set once :meth:`_firewall_answers` has proven that ``iptables`` itself
-    #: is the process answering. A Network lives for one operation, so the
-    #: proof is per operation.
-    _firewall_reachable: bool = False
-
     def _firewall(self, command: str) -> Any:
         """
         Run one ``iptables`` command line with the privilege it needs.
@@ -1276,88 +1271,78 @@ class Network:
         """
         return self.virsh.execute_shell(command, warn=True, privileged=True)
 
-    def _firewall_answers(self) -> None:
+    def _ruleset(self) -> list[str]:
         """
-        Establish, once per operation, that ``iptables`` itself is the process
-        answering — not ``sudo`` refusing, ``docker exec`` failing, or a
-        missing binary.
+        The filter table as ``iptables -S`` prints it, from one listing that
+        must have succeeded.
 
-        ``-C`` and ``-S`` report a missing rule or chain with exit 1, but the
-        *launcher* in front of iptables uses 1 as well: ``sudo`` exits 1 when
-        it cannot authenticate or is not permitted, and ``docker exec`` exits 1
-        when the container is not running. Read naively, a refused sudo
-        answers "absent" to every probe, and a removal reports success having
-        deleted nothing — the failure #181 describes, one process up (found
-        by review of the first fix). So an exit-1 answer is trusted only after
-        one listing of a built-in chain succeeded through the same privileged
-        path: built-in chains always exist, so ``iptables -S FORWARD`` exits 0
-        exactly when the launcher worked and iptables could read the ruleset.
+        Every question boxman asks the firewall is answered from this listing:
+        a rule is present when the listing shows it, a chain exists when the
+        listing declares it. Nothing is inferred from a non-zero exit status.
+        ``iptables -C`` reports "absent" with exit 1 — but so does ``sudo``
+        when it is refused for that particular command, and ``docker exec``
+        when the container is down, and a launcher's refusal read as an answer
+        is how a removal reported success having deleted nothing (#181, and
+        again in review of the first fix). A listing either succeeds and
+        speaks for itself, or the operation fails carrying the exit status and
+        stderr; a launcher refusing the listing cannot be mistaken for a
+        kernel that answered.
 
         Raises:
-            NetworkError: When the listing fails, carrying its exit status and
-                stderr — ``sudo: a password is required``, ``Permission denied
-                (you must be root)``, the daemon's error, or ``command not
-                found``.
+            NetworkError: When the listing did not succeed.
         """
-        if self._firewall_reachable:
-            return
-        listed = self._firewall("iptables -S FORWARD")
+        listed = self._firewall("iptables -S")
         if not listed.ok:
             raise NetworkError(
-                f"network {self.name}: cannot reach the firewall — "
-                f"'iptables -S FORWARD' exited {listed.return_code}: "
+                f"network {self.name}: cannot read the firewall — "
+                f"'iptables -S' exited {listed.return_code}: "
                 f"{(listed.stderr or '').strip() or '(no stderr)'}")
-        self._firewall_reachable = True
+        return [line.strip() for line in (listed.stdout or "").splitlines()
+                if line.strip()]
 
-    def _rule_is_present(self, check_cmd: str) -> bool:
+    def _rule_is_present(self, rule: str) -> bool:
         """
-        Answer an ``iptables -C`` probe, refusing to guess when it failed.
+        Whether *rule* — ``"<chain> <match …> -j <target>"``, in the shell
+        spelling the action commands use — is in the ruleset.
 
-        ``-C`` exits 0 when the rule exists and 1 when it does not — measured
-        on iptables 1.8.10 and 1.8.11 with both the nf_tables and the legacy
-        backend, for a missing rule and for a missing chain alike. Any other
-        status means the *query* failed — 4 for ``Permission denied (you must
-        be root)`` on both backends, 2 for a malformed rule — and says nothing
-        about the rule. Reading it as "absent" is how a removal once reported
-        success having queried nothing and deleted nothing (#181), so it is
-        an error rather than an answer. The 1 itself is trusted only once
-        :meth:`_firewall_answers` has shown that iptables, and not the
-        launcher in front of it, is what exited.
+        Compared token by token against each ``-A <chain> …`` line of a
+        successful listing (:meth:`_ruleset`), with the ``-m <module>`` pairs
+        iptables inserts when echoing a rule dropped (:meth:`_rule_body`), so
+        ``-p udp --dport 67 -j ACCEPT`` matches what was written. Both sides
+        are shell-split, so an interface name that had to be quoted compares
+        as one token on both.
 
         Raises:
-            NetworkError: When the firewall cannot be reached, or the probe
-                exited with a status other than 0 or 1.
+            NetworkError: When the firewall could not be listed.
         """
-        self._firewall_answers()
-        probe = self._firewall(check_cmd)
-        if probe.return_code == 0:
-            return True
-        if probe.return_code == 1:
-            return False
-        raise NetworkError(
-            f"network {self.name}: could not query the firewall — "
-            f"{check_cmd!r} exited {probe.return_code}: "
-            f"{(probe.stderr or '').strip() or '(no stderr)'}")
+        tokens = shlex.split(rule)
+        if len(tokens) < 3:
+            raise ValueError(f"not a rule: {rule!r}")
+        chain, spec = tokens[0], tokens[1:]
+        return any(self._rule_body(line) == spec
+                   for line in self._ruleset()
+                   if line.split()[:2] == ['-A', chain])
 
     def _ensure_rule(self,
-                     check_cmd: str,
+                     rule: str,
                      action_cmd: str,
                      present: bool = True) -> bool:
         """
         Make sure a rule is either present (present=True) or absent (present=False).
 
         Args:
-            check_cmd  : iptables -C ... command used to probe rule existence
+            rule       : ``"<chain> <match …> -j <target>"``, the rule as the
+                         action command spells it (see :meth:`_rule_is_present`)
             action_cmd : command that adds the rule (present) or deletes the rule (absent)
             present    : True -> ensure rule exists, False -> ensure rule is removed
 
         Raises:
-            NetworkError: When the probe failed, so the rule's state is
-                unknown (see :meth:`_rule_is_present`).
+            NetworkError: When the firewall could not be listed, so the rule's
+                state is unknown.
         """
         # desired state already reached
-        if self._rule_is_present(check_cmd) == present:
-            self.logger.debug(f"rule already in desired state: {check_cmd}")
+        if self._rule_is_present(rule) == present:
+            self.logger.debug(f"rule already in desired state: {rule}")
             return True
 
         # need an action to reach desired state
@@ -1392,10 +1377,9 @@ class Network:
             # every iptables call is privileged: the executor decides the
             # sudo prefix from the execution context, never from use_sudo
             # (#181 — that flag describes virsh, not the firewall)
-            if not self._ensure_rule(
-                    f"iptables -C FORWARD -i {br_name} -o {br_name} -j ACCEPT",
-                    f"iptables -D FORWARD -i {br_name} -o {br_name} -j ACCEPT",
-                    present=False):
+            vm2vm = f"FORWARD -i {br_name} -o {br_name} -j ACCEPT"
+            if not self._ensure_rule(vm2vm, f"iptables -D {vm2vm}",
+                                     present=False):
                 return False
 
             for chain, hook, iface_flag, _port in self._isolation_chain_specs():
@@ -1403,15 +1387,13 @@ class Network:
                 # keep the chain referenced, making -X fail. Loop until the
                 # hook is genuinely gone; bounded so a persistently failing
                 # delete cannot spin forever.
-                check = f"iptables -C {hook} {iface_flag} {br_name} -j {chain}"
+                jump = f"{hook} {iface_flag} {br_name} -j {chain}"
                 for _ in range(16):
-                    if not self._rule_is_present(check):
+                    if not self._rule_is_present(jump):
                         break
-                    if not self._firewall(
-                            f"iptables -D {hook} {iface_flag} {br_name} "
-                            f"-j {chain}").ok:
+                    if not self._firewall(f"iptables -D {jump}").ok:
                         break
-                if self._rule_is_present(check):
+                if self._rule_is_present(jump):
                     self.logger.error(
                         f"could not unhook {chain} from {hook}")
                     return False
@@ -1505,29 +1487,17 @@ class Network:
 
     def _chain_rules(self, chain: str) -> list[str] | None:
         """
-        ``iptables -S`` for *chain*, or None when it does not exist.
-
-        A missing chain exits 1 on both backends (``No chain/target/match by
-        that name``; the nf_tables backend words it ``Incompatible with this
-        kernel``). Any other failure is a failed query, not an empty answer —
-        the same distinction as :meth:`_rule_is_present`, and the 1 is likewise
-        trusted only after :meth:`_firewall_answers`.
+        The ``-A <chain> …`` lines of a successful listing, or None when the
+        listing does not declare the chain (``-N``, or ``-P`` for a built-in).
 
         Raises:
-            NetworkError: When the firewall cannot be reached, or the listing
-                failed for a reason other than the chain not existing.
+            NetworkError: When the firewall could not be listed.
         """
-        self._firewall_answers()
-        listed = self._firewall(f"iptables -S {chain}")
-        if listed.return_code == 1:
+        ruleset = self._ruleset()
+        if not any(line.split()[:2] in (['-N', chain], ['-P', chain])
+                   for line in ruleset):
             return None
-        if not listed.ok:
-            raise NetworkError(
-                f"network {self.name}: could not list chain {chain} — "
-                f"'iptables -S {chain}' exited {listed.return_code}: "
-                f"{(listed.stderr or '').strip() or '(no stderr)'}")
-        return [line.strip() for line in (listed.stdout or "").splitlines()
-                if line.strip().startswith("-A ")]
+        return [line for line in ruleset if line.split()[:2] == ['-A', chain]]
 
     @staticmethod
     def _rule_body(rule: str) -> list[str]:
@@ -1537,9 +1507,10 @@ class Network:
         Drops the leading ``-A <chain>`` and the ``-m <module>`` pairs iptables
         inserts when echoing a rule back, so ``-p udp -m udp --dport 67 -j
         ACCEPT`` compares equal to the ``-p udp --dport 67 -j ACCEPT`` that was
-        written.
+        written. Shell-split, so an argument iptables had to quote (an
+        interface name with a space) is one token.
         """
-        tokens = rule.split()[2:]
+        tokens = shlex.split(rule)[2:]
         body, index = [], 0
         while index < len(tokens):
             if tokens[index] == '-m':
@@ -1561,14 +1532,14 @@ class Network:
         would install one.
 
         Raises:
-            NetworkError: When the firewall could not be queried at all; an
-                unanswerable probe is reported, never read as drift.
+            NetworkError: When the firewall could not be listed; an
+                unanswerable question is reported, never read as drift.
         """
         bridge_name = shlex.quote(self.bridge_name)
         want_hole = self._dhcp_hole_wanted()
         for chain, hook, iface_flag, port in self._isolation_chain_specs():
             if not self._rule_is_present(
-                    f"iptables -C {hook} {iface_flag} {bridge_name} -j {chain}"):
+                    f"{hook} {iface_flag} {bridge_name} -j {chain}"):
                 return False
 
             rules = self._chain_rules(chain)
@@ -1628,7 +1599,7 @@ class Network:
         try:
             intact = self._isolation_is_intact()
         except NetworkError as exc:
-            # An unanswerable probe is not drift: a repair on top of it would
+            # An unreadable firewall is not drift: a repair on top of it would
             # fail the same way, and 'drifted' would claim knowledge of a
             # state that was never read.
             self.logger.error(str(exc))
@@ -1676,9 +1647,8 @@ class Network:
             # iptables call here and below is privileged: the executor decides
             # the sudo prefix from the execution context, never from use_sudo
             # (#181 — that flag describes virsh, not the firewall)
-            vm2vm_check = f"iptables -C FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
-            vm2vm_cmd   = f"iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
-            if not self._ensure_rule(vm2vm_check, vm2vm_cmd):
+            vm2vm = f"FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
+            if not self._ensure_rule(vm2vm, f"iptables -I {vm2vm}"):
                 return False
 
             # 2. host<->guest block, held in a chain per direction
@@ -1705,9 +1675,8 @@ class Network:
                     self.logger.error(f"could not add the drop rule to {chain}")
                     return False
 
-                if not self._ensure_rule(
-                        f"iptables -C {hook} {iface_flag} {bridge_name} -j {chain}",
-                        f"iptables -I {hook} {iface_flag} {bridge_name} -j {chain}"):
+                jump = f"{hook} {iface_flag} {bridge_name} -j {chain}"
+                if not self._ensure_rule(jump, f"iptables -I {jump}"):
                     return False
 
             # 3. drop the loose rules older boxman versions inserted straight
@@ -1727,9 +1696,10 @@ class Network:
         Delete the pre-chain isolation rules, if this host still carries them.
 
         Best-effort about *absence*: a host that never ran an older boxman
-        simply has nothing to delete, and ``-C`` answering 1 is the normal
-        case. A probe that fails outright is not absence — it raises through
-        :meth:`_rule_is_present`, and the caller reports the run as failed.
+        simply has nothing to delete, and the rules not being in the listing
+        is the normal case. A listing that fails is not absence — it raises
+        through :meth:`_rule_is_present`, and the caller reports the run as
+        failed.
         """
         legacy = [
             f"INPUT -i {bridge_name} -j DROP",
@@ -1738,9 +1708,7 @@ class Network:
             f"OUTPUT -o {bridge_name} -p udp --dport 68 -j ACCEPT",
         ]
         for spec in legacy:
-            self._ensure_rule(f"iptables -C {spec}",
-                              f"iptables -D {spec}",
-                              present=False)
+            self._ensure_rule(spec, f"iptables -D {spec}", present=False)
 
     @staticmethod
     def get_bridge_from_network(network_name: str,

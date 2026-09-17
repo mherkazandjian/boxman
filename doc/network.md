@@ -393,24 +393,17 @@ describes *virsh*, and `false` is the right value for a libvirt-group user whose
 `sudo_skip_commands: [iptables]` suppresses the prefix, `force_sudo_commands`
 forces it.
 
-A probe that fails is **not** a negative answer. `iptables -C` exits 0 when the
-rule is present and 1 when it is not — on both the nf_tables and the legacy
-backend, for a missing rule and for a missing chain alike. Any other status (4
-for a permission failure, 2 for a malformed rule) means the query itself failed,
-and boxman reports the run as `failed` with that error instead of guessing. The
-removal path used to read every non-zero status as "already absent", so an
-unprivileged `destroy` logged a successful cleanup having deleted nothing; a
-failed removal now fails, and the chains it could not read stay exactly where
-they were for the next, privileged, attempt.
-
-The launcher in front of `iptables` exits 1 too when *it* fails: `sudo` when it
-cannot authenticate or is not permitted, `docker exec` when the container is not
-running. Read naively, a refused `sudo` would answer "absent" to every probe. So
-an exit-1 answer is trusted only after one listing of a built-in chain
-(`iptables -S FORWARD`, which always exists) succeeded through the same
-privileged path in the same operation. A refused `sudo` therefore surfaces as
-`cannot reach the firewall … exited 1: sudo: a password is required`, never as
-a clean removal.
+Nothing is inferred from a failed command. Every question — is this rule
+present, does this chain exist — is answered from the contents of one
+`iptables -S` listing that **succeeded**; the exit status of a probe is never
+read as an answer. `iptables -C` reports a missing rule with exit 1, but so
+does `sudo` when it is refused for that particular command, `docker exec` when
+the container is not running, and a shell that cannot find the binary — and a
+launcher's refusal read as "absent" is how a removal once reported success
+having deleted nothing. If the listing fails, the run fails with
+`cannot read the firewall — 'iptables -S' exited N: <stderr>`; if a change is
+refused, the run fails on that command. Either way the chains it could not read
+or change stay exactly where they were for the next, privileged, attempt.
 
 ## Reconciliation: changing a network after it exists
 
@@ -639,12 +632,13 @@ look identical from the error and need different fixes:
 `provider.libvirt.use_sudo` is unrelated to all three and will not fix any of
 them — see **Privileges** above.
 
-**`cannot reach the firewall — 'iptables -S FORWARD' exited N: …`** or
-**`could not query the firewall — 'iptables -C …' exited N: …`.** The isolation
-code could not get an answer from `iptables` and reports that instead of
-assuming the rules absent, so nothing was deleted or left half-applied — see
-[what a failed query means](#privileges-and-what-a-failed-query-means). The
-tail of the message says which launcher or backend refused:
+**`cannot read the firewall — 'iptables -S' exited N: …`** or
+**`failed to execute 'iptables -D …': …`** during a routed network's setup or
+teardown. The isolation code could not read or change the firewall and reports
+that instead of assuming the rules absent, so nothing was deleted or left
+half-applied — see [what a failed query
+means](#privileges-and-what-a-failed-query-means). The tail of the message
+says which launcher or backend refused:
 
 - `sudo: a password is required`, or `… is not in the sudoers file` (exit 1):
   `sudo` refused before `iptables` ran. Give the invoking user a passwordless
