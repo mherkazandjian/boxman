@@ -337,6 +337,89 @@ class TestTheDestructiveBranchesToo:
         assert not _mentions(session, FOREIGN)
 
 
+# Every way a reconcile can go wrong, because "while we are here, tidy up" is
+# written in recovery arms far more often than on the happy path. Each entry
+# breaks one step and states what the declared network's outcome becomes: the
+# outcome is the control (it proves the arm was actually taken) and the
+# foreign-call guard is the claim.
+def _removal_raises(session, _mgr):
+    # remove_network destroys and undefines before it touches iptables, so the
+    # network is already gone: the recreate carries on
+    session.remove_network.side_effect = RuntimeError('iptables cleanup failed')
+
+
+def _removal_refused(session, _mgr):
+    session.remove_network.return_value = False
+
+
+def _redefinition_refused(session, _mgr):
+    session.define_network.return_value = False
+
+
+def _reattachment_fails(session, _mgr):
+    session.reattach_domain_network.return_value = 'failed'
+
+
+def _cache_unregister_raises(_session, mgr):
+    mgr.cache.unregister_network.side_effect = OSError('cache file is gone')
+
+
+def _planning_raises(session, _mgr):
+    session.plan_network.side_effect = ConfigError('bad dhcp reservation')
+
+
+def _isolation_raises(session, _mgr):
+    session.reconcile_network_isolation.side_effect = RuntimeError('no iptables')
+
+
+RECOVERY_CASES = [
+    # id, plan, break it, expected outcome, needs authorisation
+    ('removal-raises', RECREATE_AUTHORIZED, _removal_raises, 'recreated', True),
+    ('removal-refused', RECREATE_AUTHORIZED, _removal_refused, 'failed', True),
+    ('redefinition-refused', RECREATE_AUTHORIZED, _redefinition_refused,
+     'failed', True),
+    ('reattachment-fails', RECREATE_AUTHORIZED, _reattachment_fails,
+     'partial', True),
+    ('cache-unregister-raises', RECREATE_AUTHORIZED, _cache_unregister_raises,
+     'recreated', True),
+    ('planning-raises', 'none', _planning_raises, 'failed', False),
+    ('isolation-raises', 'none', _isolation_raises, 'failed', False),
+]
+
+
+class TestEveryRecoveryArmToo:
+    """
+    The arms reached only when something has already gone wrong.
+
+    A reconcile that half-failed is exactly where an extra "clean up the other
+    networks while we are here" would be written, and every one of these arms
+    returns before the fixtures above could observe it.
+    """
+
+    @pytest.mark.parametrize(
+        'plan,break_it,expected,authorised',
+        [case[1:] for case in RECOVERY_CASES],
+        ids=[case[0] for case in RECOVERY_CASES])
+    def test_a_broken_step_still_asks_nothing_about_the_foreign_network(
+            self, tmp_path, plan, break_it, expected, authorised):
+        mgr, session = _manager(tmp_path, plan=plan)
+        break_it(session, mgr)
+
+        results = mgr.reconcile_networks(
+            allow_recreate=authorised, auto_accept=authorised)
+
+        # the control: this is the arm we meant to take
+        assert results == {FULL_OWNED: expected}
+        assert not _mentions(session, FOREIGN)
+
+    def test_an_error_plan_asks_nothing_about_the_foreign_network(
+            self, tmp_path):
+        # 'error' returns before the plan is even described
+        mgr, session = _manager(tmp_path, plan={'action': 'error'})
+        assert mgr.reconcile_networks() == {FULL_OWNED: 'failed'}
+        assert not _mentions(session, FOREIGN)
+
+
 class TestIsolationNeverTouchesIt:
     """
     The one that would hurt most.

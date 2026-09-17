@@ -15,6 +15,7 @@ import re
 import shutil
 import stat
 import subprocess
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -1006,36 +1007,43 @@ def test_no_legacy_delete_on_a_cluster_that_never_had_them(box, tmp_path):
 
 
 
+
 # ── first boot: the upgrade that keeps PVE and Ceph in step (#171, 2026-09-15) ─
 #
 # The nodes install from a frozen ISO while `pveceph install` takes whatever
 # Ceph is current, so an un-upgraded node runs ISO-era PVE against a newer
 # Ceph. On 2026-09-15 that pairing rejected the rbd keyring PVE had just
 # written and left every storage inactive on a HEALTH_OK cluster. The fix is a
-# `dist-upgrade` in the first-boot hook, and it carries promises the hook
-# cannot keep by accident.
+# `dist-upgrade` in the first-boot hook.
 #
-# The marker is the one the whole lab waits on: wait-first-boot.sh polls it and
-# describes it as certifying that repositories, MTU and the guest agent are
-# done, so it must appear only after every prerequisite has succeeded -- not
-# merely after the upgrade. Every stub therefore reports whether the marker
-# already exists when it is called, and the tests demand that none of them ever
-# saw it.
+# The marker is what the whole lab waits on: wait-first-boot.sh polls it and
+# treats it as certifying repositories, MTU and the guest agent, so it must
+# appear only after every prerequisite has succeeded. *Every* stub the hook
+# calls -- apt, systemctl, ifreload, ip -- therefore reports whether the marker
+# already exists when it runs, and the tests demand that none of them saw it.
 #
 # The hook is run from a copy whose absolute paths are rebased under a temp
 # root. That is a rewrite for *reachability*, not a sandbox: it proves control
 # flow and ordering, and a hook that grew a new absolute path would write to
 # the real one. Containment is the disposable VM's job, not this fixture's.
 
-#: apt-get stub. Records each invocation and whether the marker was already
-#: published when it ran, parses the options apt would forward to dpkg, checks
-#: the repositories it was pointed at, and acts only on the mode under test.
+#: Reports the marker if it is already there, then does whatever the test needs.
+#: Every prerequisite the hook shells out to wears this.
+MARKER_WATCH = """
+printf '@NAME@ %s\\n' "$*" >> @LOG@
+[ -e @MARKER@ ] && printf 'MARKER-PRESENT-AT @NAME@\\n' >> @LOG@
+@BODY@
+exit 0
+"""
+
+#: apt-get stub. Records each invocation, parses the options apt would forward
+#: to dpkg, snapshots the sources as apt saw them, and acts on the mode.
 #:
 #: Parsing rather than substring-matching matters: counting arguments that
 #: merely contain `--force-confold` accepts `-o Dpkg::Option::=--force-confold`,
-#: a misspelt key apt puts in no list at all. Keys are compared case-insensitively
-#: because apt's configuration keys are -- `DPkg::Options::` is the spelling in
-#: apt's own documentation and must be accepted.
+#: a misspelt key apt puts in no list at all. Keys fold case, because apt's
+#: configuration keys are case-insensitive and `DPkg::Options::` is apt's own
+#: spelling.
 APT_STUB = """
 printf 'apt %s\\n' "$*" >> @LOG@
 mode=; prev=; dpkg_opts=
@@ -1054,18 +1062,8 @@ done
 [ -e @MARKER@ ] && printf 'MARKER-PRESENT-AT %s\\n' "${mode:-apt}" >> @LOG@
 
 if [ "$mode" = update ]; then
-    grep -h '^Enabled:' @SOURCES@/pve-enterprise.sources 2>/dev/null >> @LOG@
-    src=@SOURCES@/proxmox.sources
-    if [ -f "$src" ] \\
-       && grep -qiE '^Types:.*(^| )deb( |$)' "$src" \\
-       && grep -qiE '^URIs:.*download\\.proxmox\\.com/debian/pve' "$src" \\
-       && grep -qiE '^Suites:.*(^| )trixie( |$)' "$src" \\
-       && grep -qiE '^Components:.*(^| )pve-no-subscription( |$)' "$src" \\
-       && ! grep -qiE '^Enabled:[[:space:]]*false' "$src"; then
-        printf 'NOSUB-OK\\n' >> @LOG@
-    else
-        printf 'NOSUB-BAD\\n' >> @LOG@
-    fi
+    cp -a @SOURCES@/. @SNAPSHOT@/ 2>/dev/null
+    printf 'SOURCES-SNAPSHOT\\n' >> @LOG@
 fi
 
 if [ "$mode" = dist-upgrade ]; then
@@ -1077,13 +1075,30 @@ fi
 exit 0
 """
 
-#: systemctl stub: the last prerequisite before the marker, and another place
-#: the marker must not have appeared yet.
-SYSTEMCTL_STUB = """
-printf 'systemctl %s\\n' "$*" >> @LOG@
-[ -e @MARKER@ ] && printf 'MARKER-PRESENT-AT systemctl\\n' >> @LOG@
-@SYSTEMCTL@
-exit 0
+#: A dist-upgrade meeting a conffile edited locally *and* changed in the new
+#: package -- the conflict step 1 of the hook creates by editing
+#: pve-enterprise.sources. dpkg asks; with null stdin the answer is EOF and apt
+#: dies, and DEBIAN_FRONTEND does not help because dpkg reads that prompt
+#: itself.
+#:
+#: Any one of the three force options answers *this* conflict: dpkg's own
+#: default for it is keep-old, so `--force-confdef` returns that without
+#: reading stdin, and confold/confnew answer it outright. That the hook sends a
+#: pair is policy, asserted separately; a behavioural test cannot see one of
+#: them go missing, and modelling confdef as insufficient would fail a
+#: legitimate hook.
+CONFFILE_PROMPT = """
+    answered=0
+    for o in $dpkg_opts; do
+        case "$o" in
+            --force-confold|--force-confnew|--force-confdef) answered=1 ;;
+        esac
+    done
+    if [ "$answered" -eq 0 ]; then
+        echo "Configuration file '/etc/apt/sources.list.d/pve-enterprise.sources'" >&2
+        echo "EOF on stdin at conffile prompt" >&2
+        exit 1
+    fi
 """
 
 #: A failing step that says something recognisable on stderr. Without a
@@ -1096,40 +1111,12 @@ STEP_FAILS = """
 """
 
 
-def _conffile_prompt(default_action: bool) -> str:
-    """
-    A dist-upgrade meeting a conffile that was edited locally *and* changed in
-    the new package. dpkg asks; with null stdin the answer is EOF and apt dies.
-
-    Which options answer it depends on whether dpkg has a default action for
-    the conflict, so the caller picks the scenario rather than the test
-    assuming one. `--force-confold`/`--force-confnew` answer it either way;
-    `--force-confdef` takes dpkg's default and so answers it only when there is
-    one -- which for this ordinary conflict there is (keep-old). Modelling
-    confdef as never sufficient would fail a hook whose policy is legitimate.
-    """
-    return """
-    answered=0
-    for o in $dpkg_opts; do
-        case "$o" in
-            --force-confold|--force-confnew) answered=1 ;;
-            --force-confdef) [ @HASDEFAULT@ -eq 1 ] && answered=1 ;;
-        esac
-    done
-    if [ "$answered" -eq 0 ]; then
-        echo "Configuration file '/etc/apt/sources.list.d/pve-enterprise.sources'" >&2
-        echo "EOF on stdin at conffile prompt" >&2
-        exit 1
-    fi
-""".replace("@HASDEFAULT@", "1" if default_action else "0")
-
-
-def _first_boot(box, tmp_path, upgrade: str, *,
-                install: str = "    :", systemctl: str = ":"):
+def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
+                systemctl: str = ":", ifreload: str = ":", ip: str = ":"):
     """
     Run the real hook with its absolute paths rebased under a temp root.
 
-    Returns ``(completed_process, marker_path, event_log_text, hook_log_path)``.
+    Returns ``(completed_process, marker, event_log, hook_log, sources_snapshot)``.
     """
     root = tmp_path / "root"
     for d in ("var/lib", "var/log", "etc/apt/sources.list.d", "etc/network"):
@@ -1152,27 +1139,31 @@ def _first_boot(box, tmp_path, upgrade: str, *,
     fake.mkdir(exist_ok=True)
     log = tmp_path / "events.log"
     marker = root / "var/lib/pve-lab/first-boot.done"
+    snapshot = tmp_path / "sources-as-apt-saw-them"
+    snapshot.mkdir(exist_ok=True)
 
     def _fill(body, **extra):
         body = (body.replace("@LOG@", str(log))
                     .replace("@MARKER@", str(marker))
-                    .replace("@SOURCES@", str(root / "etc/apt/sources.list.d")))
+                    .replace("@SOURCES@", str(root / "etc/apt/sources.list.d"))
+                    .replace("@SNAPSHOT@", str(snapshot)))
         for key, value in extra.items():
             body = body.replace(key, value)
         return body
 
     _stub(fake / "apt-get",
           _fill(APT_STUB, **{"@UPGRADE@": upgrade, "@INSTALL@": install}))
-    _stub(fake / "systemctl", _fill(SYSTEMCTL_STUB, **{"@SYSTEMCTL@": systemctl}))
-    for noop in ("ifreload", "ip"):
-        _stub(fake / noop, "exit 0\n")
+    for name, body in (("systemctl", systemctl), ("ifreload", ifreload),
+                       ("ip", ip)):
+        _stub(fake / name,
+              _fill(MARKER_WATCH, **{"@NAME@": name, "@BODY@": body}))
 
     r = subprocess.run(
         ["bash", str(hook)], capture_output=True, text=True, timeout=60,
         stdin=subprocess.DEVNULL,       # as the service runs it: no answers
         env=dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}"))
     return (r, marker, log.read_text() if log.exists() else "",
-            root / "var/log/pve-lab-first-boot.log")
+            root / "var/log/pve-lab-first-boot.log", snapshot)
 
 
 def _dpkg_options_of(events: str) -> list[str]:
@@ -1184,8 +1175,74 @@ def _dpkg_options_of(events: str) -> list[str]:
             if prev == "-o" and a.split("=", 1)[0].lower() == "dpkg::options::"]
 
 
+def _deb822_stanzas(text: str) -> list[dict[str, list[str]]]:
+    """
+    Parse deb822 into stanzas of ``{field: [values]}``.
+
+    A grep cannot do this job: sources.list(5) allows any spacing after the
+    colon, values continued on indented lines, and whitespace-separated
+    multivalues -- and a field matched anywhere in the file says nothing about
+    which *stanza* it belongs to, which is the only thing that selects a
+    repository.
+    """
+    stanzas: list[dict[str, list[str]]] = []
+    current: dict[str, list[str]] = {}
+    last: str | None = None
+    for raw in text.splitlines():
+        if not raw.strip():
+            if current:
+                stanzas.append(current)
+            current, last = {}, None
+            continue
+        if raw.lstrip().startswith("#"):
+            continue
+        if raw[0] in " \t":                       # continuation of the field
+            if last:
+                current[last].extend(raw.split())
+            continue
+        field, _, value = raw.partition(":")
+        last = field.strip().lower()
+        current[last] = value.split()
+    if current:
+        stanzas.append(current)
+    return stanzas
+
+
+def _is_enabled(stanza: dict[str, list[str]]) -> bool:
+    """`Enabled:` is per stanza, and its false spellings are not just 'false'."""
+    values = stanza.get("enabled")
+    if not values:
+        return True
+    return values[0].lower() not in ("no", "false", "0", "off")
+
+
+def _selects_pve_no_subscription(text: str) -> bool:
+    """
+    Whether *text* activates the repository `pveceph install` will use.
+
+    Every field has to hold in the SAME active stanza: a Debian stanza and a
+    PVE stanza that between them mention trixie and pve-no-subscription select
+    neither.
+    """
+    for stanza in _deb822_stanzas(text):
+        if not _is_enabled(stanza):
+            continue
+        if "deb" not in stanza.get("types", []):
+            continue
+        if "trixie" not in stanza.get("suites", []):
+            continue
+        if "pve-no-subscription" not in stanza.get("components", []):
+            continue
+        for uri in stanza.get("uris", []):
+            parts = urlsplit(uri)
+            if (parts.netloc == "download.proxmox.com"
+                    and parts.path.rstrip("/") == "/debian/pve"):
+                return True
+    return False
+
+
 def test_the_upgrade_runs_before_the_guest_agent(box, tmp_path):
-    r, marker, events, _ = _first_boot(box, tmp_path, "    :")
+    r, marker, events, *_ = _first_boot(box, tmp_path, "    :")
     assert r.returncode == 0, r.stderr
     assert marker.exists(), "a completed hook must leave its marker"
     calls = [ln for ln in events.splitlines() if ln.startswith("apt")]
@@ -1196,19 +1253,24 @@ def test_the_upgrade_runs_before_the_guest_agent(box, tmp_path):
 
 def test_the_marker_is_published_only_after_every_prerequisite(box, tmp_path):
     """
-    Not just after the upgrade.
+    After all of them, not just after the upgrade.
 
-    wait-first-boot.sh polls this file and treats it as certifying repositories,
-    MTU and the guest agent. A hook that published it after the upgrade but
-    before installing and enabling the agent leaves the same filesystem behind
-    and the same apt call order -- and releases the cluster build over a node
-    that is not ready. Every stub reports the marker it can see, so the claim is
-    checked where it matters rather than inferred afterwards.
+    wait-first-boot.sh polls this file and treats it as certifying
+    repositories, MTU and the guest agent. A hook that published it earlier --
+    after the upgrade but before the agent, or before the MTU block -- leaves
+    the same filesystem behind and the same call order, and releases the
+    cluster build over a node that is not ready. Every prerequisite the hook
+    shells out to reports the marker it can see, so this is checked where it
+    happens rather than inferred afterwards.
     """
-    _r, marker, events, _ = _first_boot(box, tmp_path, "    :")
-    early = [ln for ln in events.splitlines() if ln.startswith("MARKER-PRESENT-AT")]
+    _r, marker, events, *_ = _first_boot(box, tmp_path, "    :")
+    early = [ln for ln in events.splitlines()
+             if ln.startswith("MARKER-PRESENT-AT")]
     assert not early, f"the marker was already published during: {early}"
     assert marker.exists()
+    # the control: those stubs really did run, so their silence means something
+    for step in ("ifreload", "ip", "systemctl"):
+        assert f"{step} " in events, f"{step} was never called:\n{events}"
 
 
 def test_a_failed_upgrade_leaves_the_marker_unwritten(box, tmp_path):
@@ -1219,42 +1281,60 @@ def test_a_failed_upgrade_leaves_the_marker_unwritten(box, tmp_path):
     node's log; swallowed, the run would carry on to build a cluster on nodes
     whose PVE does not match the Ceph about to be installed.
     """
-    r, marker, _events, _ = _first_boot(box, tmp_path, STEP_FAILS)
+    r, marker, *_ = _first_boot(box, tmp_path, STEP_FAILS)
     assert r.returncode != 0, "a failed dist-upgrade reported success"
     assert not marker.exists(), "the marker must not survive a failed upgrade"
 
 
 def test_a_failed_upgrade_stops_before_the_guest_agent(box, tmp_path):
     # set -e must abort the hook there and then, not run on to the next step
-    _r, _marker, events, _ = _first_boot(box, tmp_path, STEP_FAILS)
+    _r, _marker, events, *_ = _first_boot(box, tmp_path, STEP_FAILS)
     assert "qemu-guest-agent" not in events, events
 
 
 def test_a_failed_guest_agent_install_leaves_the_marker_unwritten(box, tmp_path):
     # the marker certifies the agent too: boxman discovers a node's IP through it
-    r, marker, _events, _ = _first_boot(box, tmp_path, "    :", install=STEP_FAILS)
+    r, marker, *_ = _first_boot(box, tmp_path, "    :", install=STEP_FAILS)
     assert r.returncode != 0, "a failed guest-agent install reported success"
     assert not marker.exists()
 
 
 def test_a_failed_service_enable_leaves_the_marker_unwritten(box, tmp_path):
-    r, marker, _events, _ = _first_boot(box, tmp_path, "    :", systemctl="exit 1")
+    r, marker, *_ = _first_boot(box, tmp_path, "    :", systemctl="exit 1")
     assert r.returncode != 0, "a failed systemctl enable reported success"
     assert not marker.exists()
 
 
-@pytest.mark.parametrize("default_action", [True, False],
-                         ids=["dpkg-has-a-default", "dpkg-has-no-default"])
-def test_the_upgrade_answers_the_conffile_prompt(box, tmp_path, default_action):
+def test_a_failed_mtu_probe_leaves_the_marker_unwritten(box, tmp_path):
+    """
+    `ip link show vmbr0 | head -1` is the MTU stage's last word, and `pipefail`
+    makes its failure the pipeline's. The marker must not follow it.
+    """
+    r, marker, *_ = _first_boot(box, tmp_path, "    :", ip="exit 1")
+    assert r.returncode != 0, "a failed MTU probe reported success"
+    assert not marker.exists()
+
+
+def test_a_failed_reload_is_deliberately_not_fatal(box, tmp_path):
+    """
+    The counterweight to the test above: `ifreload -a || true` is best-effort
+    on purpose -- ifupdown2 can refuse a reload on a node whose interfaces are
+    already right -- so this one must NOT abort the hook. Pinned so that
+    "propagate every failure" is not applied to it by mistake.
+    """
+    r, marker, *_ = _first_boot(box, tmp_path, "    :", ifreload="exit 1")
+    assert r.returncode == 0, "a best-effort reload was made fatal"
+    assert marker.exists()
+
+
+def test_the_upgrade_answers_the_conffile_prompt(box, tmp_path):
     """
     Counterfactual: the bare `apt-get dist-upgrade -y -qq` that actually ran on
-    the lab on 2026-09-15 fails this in both scenarios. Step 1 of the hook edits
+    the lab on 2026-09-15 fails this. Step 1 of the hook edits
     pve-enterprise.sources, which IS a dpkg conffile, so an upgrade that also
-    changes it prompts -- and DEBIAN_FRONTEND=noninteractive does not answer a
-    conffile prompt: dpkg reads it from stdin itself and treats EOF as an error.
+    changes it prompts, and with null stdin that prompt is EOF.
     """
-    r, marker, events, hooklog = _first_boot(
-        box, tmp_path, _conffile_prompt(default_action))
+    r, marker, events, hooklog, _ = _first_boot(box, tmp_path, CONFFILE_PROMPT)
     assert r.returncode == 0, \
         hooklog.read_text() if hooklog.exists() else r.stderr
     assert marker.exists(), "the hook stalled on a conffile prompt"
@@ -1265,12 +1345,12 @@ def test_the_upgrade_forwards_both_dpkg_options(box, tmp_path):
     """
     Policy, kept apart from the behaviour above.
 
-    Either force option answers the ordinary conflict on its own, so no
-    behavioural test can notice one of the pair going missing. Assert the pair
-    the hook is documented to send, parsed out of apt's own option list rather
-    than matched as a substring -- a misspelt key reaches no list at all.
+    Any one of the force options answers the ordinary conflict, so no
+    behavioural test can notice one of the documented pair going missing.
+    Assert the pair, parsed out of apt's own option list rather than matched as
+    a substring -- a misspelt key reaches no list at all.
     """
-    _r, _marker, events, _ = _first_boot(box, tmp_path, "    :")
+    _r, _marker, events, *_ = _first_boot(box, tmp_path, "    :")
     assert sorted(_dpkg_options_of(events)) == \
         ["--force-confdef", "--force-confold"]
 
@@ -1281,7 +1361,7 @@ def test_the_failure_reaches_the_log_wait_first_boot_names(box, tmp_path):
     stopped redirecting stderr, the file would still hold the banner and the
     operator would still have nothing to read.
     """
-    _r, _marker, _events, hooklog = _first_boot(box, tmp_path, STEP_FAILS)
+    _r, _marker, _events, hooklog, _ = _first_boot(box, tmp_path, STEP_FAILS)
     assert hooklog.exists(), "the hook wrote no log at the advertised path"
     text = hooklog.read_text()
     assert "pve-lab first boot" in text
@@ -1291,16 +1371,67 @@ def test_the_failure_reaches_the_log_wait_first_boot_names(box, tmp_path):
 
 def test_the_upgrade_comes_from_the_no_subscription_repository(box, tmp_path):
     """
-    The upgrade is only in step with Ceph if it comes from the same repository
+    The upgrade is only in step with Ceph if it comes from the repository
     `pveceph install` will use.
 
-    Checked at `update` time and on content, not on a pathname: a proxmox.sources
-    holding nothing but a comment is a file that exists and a node still on its
-    ISO-era packages.
+    Read from the sources as apt saw them at `update` time, and parsed as
+    deb822 rather than grepped: a file that exists, or one whose fields are
+    spread across two stanzas, is not a configured repository.
     """
-    _r, _marker, events, _ = _first_boot(box, tmp_path, "    :")
-    assert "NOSUB-OK" in events, \
-        f"no usable pve-no-subscription source when apt updated:\n{events}"
-    assert "NOSUB-BAD" not in events
-    assert "Enabled: false" in events, "the enterprise repository was still on"
-    assert "Enabled: true" not in events
+    _r, _marker, events, _hooklog, snapshot = _first_boot(box, tmp_path, "    :")
+    assert "SOURCES-SNAPSHOT" in events, "apt never reached its update"
+
+    proxmox = (snapshot / "proxmox.sources").read_text()
+    assert _selects_pve_no_subscription(proxmox), \
+        f"no active pve-no-subscription stanza when apt updated:\n{proxmox}"
+
+    enterprise = (snapshot / "pve-enterprise.sources").read_text()
+    assert not any(_is_enabled(s) for s in _deb822_stanzas(enterprise)), \
+        f"the enterprise repository was still enabled:\n{enterprise}"
+
+
+#: Formats a working configuration can legitimately take, and selections that
+#: only look like one. The parser above decides the repository test's verdict,
+#: so it gets its own controls rather than being trusted.
+GOOD = """\
+Types: deb
+URIs: http://download.proxmox.com/debian/pve
+Suites: trixie
+Components: pve-no-subscription
+"""
+
+SOURCE_VARIANTS = [
+    ("plain", GOOD, True),
+    ("tabs-after-colon", GOOD.replace(": ", ":\t"), True),
+    ("no-space-after-colon", GOOD.replace(": ", ":"), True),
+    ("continuation-lines",
+     "Types: deb\nURIs:\n http://download.proxmox.com/debian/pve\n"
+     "Suites:\n trixie\nComponents:\n pve-no-subscription\n", True),
+    ("extra-fields", GOOD + "Architectures: amd64\nX-Extra: something\n", True),
+    ("two-uris-one-line",
+     GOOD.replace("URIs: http://download.proxmox.com/debian/pve",
+                  "URIs: https://download.proxmox.com/debian/pve"
+                  " http://download.proxmox.com/debian/pve"), True),
+    ("trailing-slash-uri",
+     GOOD.replace("/debian/pve", "/debian/pve/"), True),
+    ("plus-a-disabled-unrelated-stanza",
+     GOOD + "\nTypes: deb\nURIs: http://example.invalid/x\nSuites: trixie\n"
+            "Components: main\nEnabled: false\n", True),
+    ("disabled-with-no", GOOD + "Enabled: no\n", False),
+    ("disabled-with-false", GOOD + "Enabled: false\n", False),
+    ("fields-split-across-stanzas",
+     "Types: deb\nURIs: http://deb.debian.org/debian\nSuites: trixie\n"
+     "Components: main\n\nTypes: deb\n"
+     "URIs: http://download.proxmox.com/debian/pve\nSuites: bookworm\n"
+     "Components: pve-no-subscription\n", False),
+    ("different-uri-path",
+     GOOD.replace("/debian/pve", "/debian/pve-not-a-repository"), False),
+    ("only-a-comment", "# No package repositories configured\n", False),
+]
+
+
+@pytest.mark.parametrize("source,selects",
+                         [(v[1], v[2]) for v in SOURCE_VARIANTS],
+                         ids=[v[0] for v in SOURCE_VARIANTS])
+def test_the_source_parser_agrees_with_apt(source, selects):
+    assert _selects_pve_no_subscription(source) is selects
