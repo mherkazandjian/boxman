@@ -387,6 +387,38 @@ Per network, the outcome is one of:
 A `failed` isolation fails the whole run. Exiting 0 while guests can still reach
 the host would report containment that does not exist.
 
+### Privileges, and what a failed query means
+
+`iptables` needs `CAP_NET_ADMIN` even to *read* a chain — an unprivileged
+`iptables -C` fails with `Permission denied (you must be root)` rather than
+answering. So every isolation command is issued as a **privileged** command:
+boxman prefixes `sudo` unless the command already runs as root *where it
+executes*. Under the local runtime that is the boxman process; under the
+docker-compose runtime every command is already `docker exec --user root`, so
+no prefix is added there — the host user's identity is irrelevant, and the
+container may not ship `sudo` at all. This is not governed by
+`provider.libvirt.use_sudo`, for the reason given under
+[`shared_networks`](#shared_networks-host-bridges-for-hybrid-labs): that flag
+describes *virsh*, and `false` is the right value for a libvirt-group user whose
+`iptables` still needs root. The explicit per-command lists are honoured —
+`sudo_skip_commands: [iptables]` suppresses the prefix, `force_sudo_commands`
+forces it.
+
+Nothing is inferred from a failed command. Every question — is this rule
+present, does this chain exist — is answered from the contents of one
+`iptables -S` listing that **succeeded**; the exit status of a probe is never
+read as an answer. `iptables -C` reports a missing rule with exit 1, but so
+does `sudo` when it is refused for that particular command, `docker exec` when
+the container is not running, and a shell that cannot find the binary — and a
+launcher's refusal read as "absent" is how a removal once reported success
+having deleted nothing. If the listing fails, the run fails with
+`cannot read the firewall — 'iptables -S' exited N: <stderr>`; if a change is
+refused, the run fails on that command with its status and stderr. Neither
+path is transactional: the changes made before the refusal are kept, nothing
+is rolled back, and what the run could not read or change stays exactly where
+it was. The next privileged `boxman up` reconciles the isolation and the next
+`boxman destroy` finishes the removal.
+
 ## Reconciliation: changing a network after it exists
 
 Edit a network in `conf.yml` and the next `boxman up` or `boxman update` picks
@@ -613,6 +645,28 @@ look identical from the error and need different fixes:
 
 `provider.libvirt.use_sudo` is unrelated to all three and will not fix any of
 them — see **Privileges** above.
+
+**`cannot read the firewall — 'iptables -S' exited N: …`** or
+**`failed to execute 'iptables -D …': …`** during a routed network's setup or
+teardown. The isolation code could not read or change the firewall and reports
+that instead of assuming the rules absent. The changes it made before the
+refusal are kept, and a privileged `boxman up` or `boxman destroy` finishes the
+job — see [what a failed query
+means](#privileges-and-what-a-failed-query-means). The tail of the message
+says which launcher or backend refused:
+
+- `sudo: a password is required`, or `… is not in the sudoers file` (exit 1):
+  `sudo` refused before `iptables` ran. Give the invoking user a passwordless
+  rule for `iptables`; an unattended run cannot answer a prompt.
+- `Permission denied (you must be root)` (exit 4): `iptables` itself ran
+  unprivileged — `iptables` is listed in `sudo_skip_commands`, or the process
+  is root without `CAP_NET_ADMIN` (see the `ip link` entry above).
+- `container … is not running` (exit 1): the docker runtime's container is
+  down; `boxman up` starts it again.
+- `command not found` (exit 127): no `sudo` or no `iptables` where the command
+  executes.
+
+`use_sudo` will not fix any of these, for the same reason as above.
 
 **A network change appears to do nothing.** It is probably structural, and
 boxman reports the drift but applies nothing without `--recreate-networks`. Run

@@ -201,8 +201,53 @@ class LibVirtCommandBase:
             return False
         return self.use_sudo
 
+    def _runs_as_root(self) -> bool:
+        """
+        Whether a shell command issued here executes as root *where it runs*,
+        before any ``sudo`` prefix.
+
+        Under the docker-compose runtime every command is wrapped as
+        ``docker exec --user root`` (:func:`docker_exec_wrap`), so the
+        executing identity is root inside the container whatever the boxman
+        process on the host is. Under the local runtime it is the boxman
+        process itself. The host euid must therefore never decide a
+        docker-runtime command: it would prefix ``sudo`` inside a container
+        that is already root and may not even ship a ``sudo`` binary.
+        """
+        if self.runtime == 'docker-compose':
+            return True
+        return os.geteuid() == 0
+
+    def _privileged_needs_sudo(self, command: str) -> bool:
+        """
+        Decide the ``sudo`` prefix for a command that needs root wherever it
+        runs (``iptables``, ``ip link set``, sysctl writes).
+
+        Resolution order (first match wins):
+        1. ``force_sudo_commands`` — always sudo
+        2. ``sudo_skip_commands`` — never sudo: the operator's statement that
+           this command needs no prefix here, e.g. because the process was
+           granted the capability directly, which boxman cannot detect
+        3. otherwise, sudo unless the execution context is already root
+           (:meth:`_runs_as_root`)
+
+        The global ``use_sudo`` flag is deliberately absent from the list. It
+        describes *virsh*, and ``false`` is the correct setting for a
+        libvirt-group user whose ``iptables`` nonetheless needs
+        ``CAP_NET_ADMIN`` (#181).
+        """
+        first_token = command.split()[0] if command.strip() else ''
+        cmd_name = os.path.basename(first_token)
+
+        if cmd_name in self.force_sudo_commands:
+            return True
+        if cmd_name in self.sudo_skip_commands:
+            return False
+        return not self._runs_as_root()
+
     def execute_shell(self, command: str, hide: bool = True, warn: bool = False,
-                      force_sudo: bool = False) -> invoke.runners.Result:
+                      force_sudo: bool = False,
+                      privileged: bool = False) -> invoke.runners.Result:
         """
         Execute a raw shell command.
 
@@ -215,6 +260,11 @@ class LibVirtCommandBase:
             warn: Whether to warn instead of raising exceptions
             force_sudo: When True, prepend sudo regardless of sudo_skip_commands
                         (still requires use_sudo to be True)
+            privileged: The command needs root *wherever it runs*. The prefix
+                        is then decided by :meth:`_privileged_needs_sudo` from
+                        the execution context, and ``use_sudo`` is not
+                        consulted — that flag answers whether **virsh** needs
+                        sudo, which is a different question (#181).
 
         Returns:
             Result of the command execution
@@ -224,7 +274,12 @@ class LibVirtCommandBase:
         """
         # add sudo if needed (respects force_sudo_commands / sudo_skip_commands)
         if not command.startswith("sudo "):
-            if (force_sudo and self.use_sudo) or self._should_use_sudo_for_command(command):
+            if privileged:
+                needs_sudo = self._privileged_needs_sudo(command)
+            else:
+                needs_sudo = ((force_sudo and self.use_sudo)
+                              or self._should_use_sudo_for_command(command))
+            if needs_sudo:
                 command = f"sudo {command}"
 
         # wrap for runtime environment
