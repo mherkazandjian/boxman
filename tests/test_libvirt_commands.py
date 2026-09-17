@@ -282,3 +282,54 @@ class TestSharedDockerExecWrap:
             "docker exec --user root boxman-libvirt-demo bash -c '")
         assert "virt-sysprep" in wrapped
         assert "--operations=machine-id" in wrapped
+
+
+class TestPrivilegedShellCommands:
+    """``execute_shell(privileged=True)`` is for commands that need root
+    wherever they run (iptables, ``ip link set``). Its sudo decision comes
+    from the execution context, not from ``use_sudo``, which describes virsh
+    and is rightly ``false`` for a libvirt-group user (#181)."""
+
+    @staticmethod
+    def _issued(provider_config: dict, euid: int,
+                command: str = "iptables -S INPUT") -> str:
+        v = VirshCommand(provider_config=provider_config)
+        with patch(SHELL_RUN, return_value=_result()) as run, \
+             patch("boxman.providers.libvirt.commands.os.geteuid",
+                   return_value=euid):
+            v.execute_shell(command, warn=True, privileged=True)
+        return run.call_args.args[0]
+
+    @pytest.mark.parametrize("provider_config",
+                             [{}, {"use_sudo": False}, {"use_sudo": True}])
+    def test_a_non_root_local_process_is_prefixed_whatever_use_sudo_says(
+            self, provider_config):
+        assert self._issued(provider_config, euid=1000) == \
+            "sudo iptables -S INPUT"
+
+    @pytest.mark.parametrize("provider_config",
+                             [{"use_sudo": False}, {"use_sudo": True}])
+    def test_root_is_not_prefixed(self, provider_config):
+        assert self._issued(provider_config, euid=0) == "iptables -S INPUT"
+
+    @pytest.mark.parametrize("use_sudo", [False, True])
+    def test_the_docker_runtime_is_root_inside_the_container(self, use_sudo):
+        issued = self._issued({"use_sudo": use_sudo,
+                               "runtime": "docker-compose",
+                               "runtime_container": "c"}, euid=1000)
+        assert issued == "docker exec --user root c bash -c 'iptables -S INPUT'"
+
+    def test_the_explicit_per_command_lists_still_win(self):
+        assert self._issued({"sudo_skip_commands": ["iptables"]},
+                            euid=1000) == "iptables -S INPUT"
+        assert self._issued({"force_sudo_commands": ["iptables"]},
+                            euid=0) == "sudo iptables -S INPUT"
+
+    def test_an_unprivileged_command_still_follows_use_sudo(self):
+        # the contract for everything else is untouched
+        v = VirshCommand(provider_config={"use_sudo": False})
+        with patch(SHELL_RUN, return_value=_result()) as run, \
+             patch("boxman.providers.libvirt.commands.os.geteuid",
+                   return_value=1000):
+            v.execute_shell("cat /sys/class/net/br0/flags", warn=True)
+        assert run.call_args.args[0] == "cat /sys/class/net/br0/flags"

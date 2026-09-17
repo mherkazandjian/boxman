@@ -376,6 +376,33 @@ Per network, the outcome is one of:
 A `failed` isolation fails the whole run. Exiting 0 while guests can still reach
 the host would report containment that does not exist.
 
+### Privileges, and what a failed query means
+
+`iptables` needs `CAP_NET_ADMIN` even to *read* a chain — an unprivileged
+`iptables -C` fails with `Permission denied (you must be root)` rather than
+answering. So every isolation command is issued as a **privileged** command:
+boxman prefixes `sudo` unless the command already runs as root *where it
+executes*. Under the local runtime that is the boxman process; under the
+docker-compose runtime every command is already `docker exec --user root`, so
+no prefix is added there — the host user's identity is irrelevant, and the
+container may not ship `sudo` at all. This is not governed by
+`provider.libvirt.use_sudo`, for the reason given under
+[`shared_networks`](#shared_networks-host-bridges-for-hybrid-labs): that flag
+describes *virsh*, and `false` is the right value for a libvirt-group user whose
+`iptables` still needs root. The explicit per-command lists are honoured —
+`sudo_skip_commands: [iptables]` suppresses the prefix, `force_sudo_commands`
+forces it.
+
+A probe that fails is **not** a negative answer. `iptables -C` exits 0 when the
+rule is present and 1 when it is not — on both the nf_tables and the legacy
+backend, for a missing rule and for a missing chain alike. Any other status (4
+for a permission failure, 2 for a malformed rule) means the query itself failed,
+and boxman reports the run as `failed` with that error instead of guessing. The
+removal path used to read every non-zero status as "already absent", so an
+unprivileged `destroy` logged a successful cleanup having deleted nothing; a
+failed removal now fails, and the chains it could not read stay exactly where
+they were for the next, privileged, attempt.
+
 ## Reconciliation: changing a network after it exists
 
 Edit a network in `conf.yml` and the next `boxman up` or `boxman update` picks
@@ -602,6 +629,15 @@ look identical from the error and need different fixes:
 
 `provider.libvirt.use_sudo` is unrelated to all three and will not fix any of
 them — see **Privileges** above.
+
+**`could not query the firewall — 'iptables -C …' exited 4: … Permission denied
+(you must be root)`.** An isolation probe ran unprivileged. boxman prefixes
+`sudo` itself on the local runtime, so this means `sudo` is unavailable or
+unauthorised for `iptables` — or `iptables` is listed in `sudo_skip_commands`.
+Fix the sudo rule; `use_sudo` will not help, for the same reason as above. The
+run is reported as failed rather than the rules being assumed absent, so nothing
+was deleted or left half-applied — see [what a failed query
+means](#privileges-and-what-a-failed-query-means).
 
 **A network change appears to do nothing.** It is probably structural, and
 boxman reports the drift but applies nothing without `--recreate-networks`. Run

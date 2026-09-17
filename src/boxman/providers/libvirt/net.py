@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from jinja2 import Environment, FileSystemLoader
 
 from boxman import log
-from boxman.exceptions import ConfigError
+from boxman.exceptions import ConfigError, NetworkError
 from boxman.netlab.shared_bridges import BRIDGE_NAME_RE
 
 from . import net_reconcile
@@ -1257,8 +1257,47 @@ class Network:
                 f"{', '.join(owners)}; destroying an owner removes the Linux "
                 "bridge underneath this network")
 
-    @staticmethod
-    def _ensure_rule(cls,
+    def _firewall(self, command: str) -> Any:
+        """
+        Run one ``iptables`` command line with the privilege it needs.
+
+        ``iptables`` needs ``CAP_NET_ADMIN`` even to *read* a chain, so every
+        isolation command goes through here as ``privileged``: the executor
+        decides the ``sudo`` prefix from the execution context — the boxman
+        process on the local runtime, always root under the docker runtime's
+        ``docker exec --user root`` — and never from ``use_sudo``, which
+        describes virsh and is rightly ``false`` for a libvirt-group user
+        (#181). ``warn`` is set because every caller reads the exit status.
+        """
+        return self.virsh.execute_shell(command, warn=True, privileged=True)
+
+    def _rule_is_present(self, check_cmd: str) -> bool:
+        """
+        Answer an ``iptables -C`` probe, refusing to guess when it failed.
+
+        ``-C`` exits 0 when the rule exists and 1 when it does not — measured
+        on iptables 1.8.10 and 1.8.11 with both the nf_tables and the legacy
+        backend, for a missing rule and for a missing chain alike. Any other
+        status means the *query* failed — 4 for ``Permission denied (you must
+        be root)`` on both backends, 2 for a malformed rule — and says nothing
+        about the rule. Reading it as "absent" is how a removal once reported
+        success having queried nothing and deleted nothing (#181), so it is
+        an error rather than an answer.
+
+        Raises:
+            NetworkError: When the probe exited with a status other than 0 or 1.
+        """
+        probe = self._firewall(check_cmd)
+        if probe.return_code == 0:
+            return True
+        if probe.return_code == 1:
+            return False
+        raise NetworkError(
+            f"network {self.name}: could not query the firewall — "
+            f"{check_cmd!r} exited {probe.return_code}: "
+            f"{(probe.stderr or '').strip() or '(no stderr)'}")
+
+    def _ensure_rule(self,
                      check_cmd: str,
                      action_cmd: str,
                      present: bool = True) -> bool:
@@ -1266,22 +1305,23 @@ class Network:
         Make sure a rule is either present (present=True) or absent (present=False).
 
         Args:
-            cls        : object with a ``virsh`` executor and a ``logger``
             check_cmd  : iptables -C ... command used to probe rule existence
             action_cmd : command that adds the rule (present) or deletes the rule (absent)
             present    : True -> ensure rule exists, False -> ensure rule is removed
-        """
-        chk_res = cls.virsh.execute_shell(check_cmd, warn=True)
 
+        Raises:
+            NetworkError: When the probe failed, so the rule's state is
+                unknown (see :meth:`_rule_is_present`).
+        """
         # desired state already reached
-        if (present and chk_res.return_code == 0) or (not present and chk_res.return_code != 0):
-            cls.logger.debug(f"rule already in desired state: {check_cmd}")
+        if self._rule_is_present(check_cmd) == present:
+            self.logger.debug(f"rule already in desired state: {check_cmd}")
             return True
 
         # need an action to reach desired state
-        apply_res = cls.virsh.execute_shell(action_cmd, warn=True)
+        apply_res = self._firewall(action_cmd)
         if not apply_res.ok:
-            cls.logger.error(f"failed to execute '{action_cmd}': {apply_res.stderr}")
+            self.logger.error(f"failed to execute '{action_cmd}': {apply_res.stderr}")
             return False
         return True
 
@@ -1307,10 +1347,10 @@ class Network:
             br_name = shlex.quote(self.bridge_name)
             self.logger.info(f"removing route isolation rules for bridge {self.bridge_name}")
 
-            # no embedded 'sudo': execute_shell routes that decision through
-            # _should_use_sudo_for_command, so use_sudo: false is honoured
+            # every iptables call is privileged: the executor decides the
+            # sudo prefix from the execution context, never from use_sudo
+            # (#181 — that flag describes virsh, not the firewall)
             if not self._ensure_rule(
-                    self,
                     f"iptables -C FORWARD -i {br_name} -o {br_name} -j ACCEPT",
                     f"iptables -D FORWARD -i {br_name} -o {br_name} -j ACCEPT",
                     present=False):
@@ -1323,14 +1363,13 @@ class Network:
                 # delete cannot spin forever.
                 check = f"iptables -C {hook} {iface_flag} {br_name} -j {chain}"
                 for _ in range(16):
-                    if self.virsh.execute_shell(
-                            check, warn=True).return_code != 0:
+                    if not self._rule_is_present(check):
                         break
-                    if not self.virsh.execute_shell(
+                    if not self._firewall(
                             f"iptables -D {hook} {iface_flag} {br_name} "
-                            f"-j {chain}", warn=True).ok:
+                            f"-j {chain}").ok:
                         break
-                if self.virsh.execute_shell(check, warn=True).return_code == 0:
+                if self._rule_is_present(check):
                     self.logger.error(
                         f"could not unhook {chain} from {hook}")
                     return False
@@ -1338,12 +1377,10 @@ class Network:
                 # nothing to flush or delete if the chain was never created
                 if self._chain_rules(chain) is None:
                     continue
-                if not self.virsh.execute_shell(
-                        f"iptables -F {chain}", warn=True).ok:
+                if not self._firewall(f"iptables -F {chain}").ok:
                     self.logger.error(f"could not flush {chain}")
                     return False
-                if not self.virsh.execute_shell(
-                        f"iptables -X {chain}", warn=True).ok:
+                if not self._firewall(f"iptables -X {chain}").ok:
                     self.logger.error(f"could not delete {chain}")
                     return False
 
@@ -1425,10 +1462,26 @@ class Network:
         return True
 
     def _chain_rules(self, chain: str) -> list[str] | None:
-        """``iptables -S`` for *chain*, or None when it does not exist."""
-        listed = self.virsh.execute_shell(f"iptables -S {chain}", warn=True)
-        if not listed.ok:
+        """
+        ``iptables -S`` for *chain*, or None when it does not exist.
+
+        A missing chain exits 1 on both backends (``No chain/target/match by
+        that name``; the nf_tables backend words it ``Incompatible with this
+        kernel``). Any other failure is a failed query, not an empty answer —
+        the same distinction as :meth:`_rule_is_present`.
+
+        Raises:
+            NetworkError: When the listing failed for a reason other than the
+                chain not existing.
+        """
+        listed = self._firewall(f"iptables -S {chain}")
+        if listed.return_code == 1:
             return None
+        if not listed.ok:
+            raise NetworkError(
+                f"network {self.name}: could not list chain {chain} — "
+                f"'iptables -S {chain}' exited {listed.return_code}: "
+                f"{(listed.stderr or '').strip() or '(no stderr)'}")
         return [line.strip() for line in (listed.stdout or "").splitlines()
                 if line.strip().startswith("-A ")]
 
@@ -1462,14 +1515,16 @@ class Network:
         happily reports everything fine. So verify the contents too: a
         terminal DROP, and the DHCP exception above it exactly when this run
         would install one.
+
+        Raises:
+            NetworkError: When the firewall could not be queried at all; an
+                unanswerable probe is reported, never read as drift.
         """
         bridge_name = shlex.quote(self.bridge_name)
         want_hole = self._dhcp_hole_wanted()
         for chain, hook, iface_flag, port in self._isolation_chain_specs():
-            probe = self.virsh.execute_shell(
-                f"iptables -C {hook} {iface_flag} {bridge_name} -j {chain}",
-                warn=True)
-            if probe.return_code != 0:
+            if not self._rule_is_present(
+                    f"iptables -C {hook} {iface_flag} {bridge_name} -j {chain}"):
                 return False
 
             rules = self._chain_rules(chain)
@@ -1526,7 +1581,14 @@ class Network:
                 f"network {self.name}: no bridge name, cannot check isolation")
             return 'failed'
 
-        intact = self._isolation_is_intact()
+        try:
+            intact = self._isolation_is_intact()
+        except NetworkError as exc:
+            # An unanswerable probe is not drift: a repair on top of it would
+            # fail the same way, and 'drifted' would claim knowledge of a
+            # state that was never read.
+            self.logger.error(str(exc))
+            return 'failed'
         if check_only:
             return 'ok' if intact else 'drifted'
         if not self.apply_route_iptables_rule():
@@ -1566,42 +1628,40 @@ class Network:
             self.logger.info(
                 f"configuring complete isolation for routed network with bridge {self.bridge_name}")
 
-            # 1. allow vm-to-vm communication on the same bridge. No embedded
-            # 'sudo' here or below: execute_shell routes that decision through
-            # _should_use_sudo_for_command, so use_sudo: false is honoured
+            # 1. allow vm-to-vm communication on the same bridge. Every
+            # iptables call here and below is privileged: the executor decides
+            # the sudo prefix from the execution context, never from use_sudo
+            # (#181 — that flag describes virsh, not the firewall)
             vm2vm_check = f"iptables -C FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
             vm2vm_cmd   = f"iptables -I FORWARD -i {bridge_name} -o {bridge_name} -j ACCEPT"
-            if not self._ensure_rule(self, vm2vm_check, vm2vm_cmd):
+            if not self._ensure_rule(vm2vm_check, vm2vm_cmd):
                 return False
 
             # 2. host<->guest block, held in a chain per direction
             for chain, hook, iface_flag, dhcp_port in self._isolation_chain_specs():
                 # -N fails harmlessly when the chain is already there
-                self.virsh.execute_shell(f"iptables -N {chain}", warn=True)
+                self._firewall(f"iptables -N {chain}")
 
                 # flush and refill: the contents are declarative, so drift in
                 # ordering or leftovers from an older boxman cannot survive
-                if not self.virsh.execute_shell(
-                        f"iptables -F {chain}", warn=True).ok:
+                if not self._firewall(f"iptables -F {chain}").ok:
                     self.logger.error(f"could not flush {chain}")
                     return False
 
                 if self._dhcp_hole_wanted():
-                    accept = self.virsh.execute_shell(
+                    accept = self._firewall(
                         f"iptables -A {chain} -p udp --dport {dhcp_port} "
-                        f"-j ACCEPT", warn=True)
+                        f"-j ACCEPT")
                     if not accept.ok:
                         self.logger.error(
                             f"could not add the dhcp exception to {chain}")
                         return False
 
-                if not self.virsh.execute_shell(
-                        f"iptables -A {chain} -j DROP", warn=True).ok:
+                if not self._firewall(f"iptables -A {chain} -j DROP").ok:
                     self.logger.error(f"could not add the drop rule to {chain}")
                     return False
 
                 if not self._ensure_rule(
-                        self,
                         f"iptables -C {hook} {iface_flag} {bridge_name} -j {chain}",
                         f"iptables -I {hook} {iface_flag} {bridge_name} -j {chain}"):
                     return False
@@ -1622,8 +1682,10 @@ class Network:
         """
         Delete the pre-chain isolation rules, if this host still carries them.
 
-        Best-effort: a host that never ran an older boxman simply has nothing
-        to delete, and ``-C`` failing is the normal case rather than an error.
+        Best-effort about *absence*: a host that never ran an older boxman
+        simply has nothing to delete, and ``-C`` answering 1 is the normal
+        case. A probe that fails outright is not absence — it raises through
+        :meth:`_rule_is_present`, and the caller reports the run as failed.
         """
         legacy = [
             f"INPUT -i {bridge_name} -j DROP",
@@ -1632,8 +1694,7 @@ class Network:
             f"OUTPUT -o {bridge_name} -p udp --dport 68 -j ACCEPT",
         ]
         for spec in legacy:
-            self._ensure_rule(self,
-                              f"iptables -C {spec}",
+            self._ensure_rule(f"iptables -C {spec}",
                               f"iptables -D {spec}",
                               present=False)
 

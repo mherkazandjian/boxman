@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.exceptions import ConfigError
+from boxman.exceptions import ConfigError, NetworkError
 from boxman.providers.libvirt.net import Network, NetworkInterface
 
 pytestmark = pytest.mark.unit
@@ -1362,17 +1362,180 @@ class TestRouteIsolationChains:
         calls = self._apply(self._net())
         assert not any("'" in c for c in calls)
 
-    @pytest.mark.parametrize("use_sudo, expected_prefix", [
-        (False, "iptables"),
-        (True, "sudo iptables"),
-    ])
-    def test_sudo_comes_from_use_sudo_via_execute_shell(
-            self, use_sudo, expected_prefix):
-        net = self._net(use_sudo=use_sudo)
+
+
+class TestIsolationPrivilege:
+    """iptables needs CAP_NET_ADMIN even to read a chain, so the sudo prefix
+    for the isolation rules comes from the *execution context*, never from
+    ``use_sudo`` -- that flag describes virsh, and ``false`` is the correct
+    setting for a libvirt-group user whose iptables still needs root (#181).
+
+    The context differs per runtime: locally it is the boxman process; under
+    the docker-compose runtime every command is already ``docker exec --user
+    root``, so a prefix would run sudo inside a container that is root and
+    may not even ship sudo. The whole apply path is driven through the real
+    executor here, with only the shell runner replaced.
+    """
+
+    @staticmethod
+    def _net(provider_config: dict) -> Network:
+        info = {"mode": "route", "bridge": {"name": "virbr9"}}
+        return Network(name="routed-net", info=info, assign_new_bridge=True,
+                       provider_config=provider_config)
+
+    @staticmethod
+    def _issued(net: Network, euid: int) -> list[str]:
+        """Apply the isolation and return the command lines that reached
+        the shell; every probe answers "absent", every action succeeds."""
+        issued: list[str] = []
+
+        def run(command, **_kwargs):
+            issued.append(command)
+            probe = " -C " in f" {command} "
+            return _result(ok=not probe, return_code=1 if probe else 0)
+
+        net.virsh.execute = MagicMock(return_value=_result(stdout=""))
         with patch("boxman.providers.libvirt.commands._shell_run",
-                   return_value=_result()) as run:
-            net.virsh.execute_shell("iptables -C INPUT -i virbr9 -j DROP", warn=True)
-        assert run.call_args.args[0].startswith(expected_prefix)
+                   side_effect=run), \
+             patch("boxman.providers.libvirt.commands.os.geteuid",
+                   return_value=euid):
+            assert net.apply_route_iptables_rule() is True
+        assert issued
+        return issued
+
+    @pytest.mark.parametrize("use_sudo", [False, True, None])
+    def test_a_non_root_local_process_prefixes_sudo_whatever_use_sudo_says(
+            self, use_sudo):
+        # None: the key absent, which is the provider default and the case
+        # the defect actually hit
+        cfg = {} if use_sudo is None else {"use_sudo": use_sudo}
+        issued = self._issued(self._net(cfg), euid=1000)
+        assert all(c.startswith("sudo iptables ") for c in issued), issued
+
+    @pytest.mark.parametrize("use_sudo", [False, True])
+    def test_root_gets_no_prefix(self, use_sudo):
+        issued = self._issued(self._net({"use_sudo": use_sudo}), euid=0)
+        assert all(c.startswith("iptables ") for c in issued), issued
+
+    @pytest.mark.parametrize("use_sudo", [False, True])
+    def test_the_docker_runtime_is_root_inside_the_container(self, use_sudo):
+        cfg = {"use_sudo": use_sudo, "runtime": "docker-compose",
+               "runtime_container": "boxman-libvirt-p1"}
+        # the host euid is irrelevant: the command executes in the container
+        issued = self._issued(self._net(cfg), euid=1000)
+        for command in issued:
+            assert command.startswith(
+                "docker exec --user root boxman-libvirt-p1 bash -c 'iptables "
+            ), command
+            assert "sudo" not in command
+
+    def test_sudo_skip_commands_is_still_honoured(self):
+        # the operator's explicit statement wins over the derived default --
+        # e.g. a process granted CAP_NET_ADMIN directly, which boxman cannot
+        # detect
+        issued = self._issued(self._net(
+            {"use_sudo": True, "sudo_skip_commands": ["iptables"]}), euid=1000)
+        assert all(c.startswith("iptables ") for c in issued), issued
+
+    def test_force_sudo_commands_is_still_honoured(self):
+        issued = self._issued(self._net(
+            {"use_sudo": False, "force_sudo_commands": ["iptables"]}), euid=0)
+        assert all(c.startswith("sudo iptables ") for c in issued), issued
+
+
+class TestFirewallQueriesAreNotGuessed:
+    """A failed ``iptables`` query is not a negative answer.
+
+    ``-C`` exits 0 for present and 1 for absent -- on both the nf_tables and
+    the legacy backend, for a missing rule and for a missing chain; the values
+    were measured, not assumed. Anything else (4: ``Permission denied (you
+    must be root)``; 2: a malformed rule) means the query itself failed and
+    the rule's state is unknown. The removal path used to read every non-zero
+    status as "already absent", so an unprivileged teardown reported success
+    having deleted nothing (#181, #164 NET-R3).
+    """
+
+    DENIED = ("iptables v1.8.11 (nf_tables): Could not fetch rule set "
+              "generation id: Permission denied (you must be root)")
+
+    @staticmethod
+    def _net() -> Network:
+        info = {"mode": "route", "bridge": {"name": "virbr9"}}
+        net = Network(name="routed-net", info=info, assign_new_bridge=True,
+                      provider_config={"use_sudo": False})
+        net.logger = MagicMock()
+        return net
+
+    def _denied(self, net: Network) -> list[str]:
+        """Every iptables command is refused for lack of privilege."""
+        calls: list[str] = []
+
+        def shell(command, *_args, **_kwargs):
+            calls.append(command)
+            return _result(ok=False, return_code=4, stderr=self.DENIED)
+
+        net.virsh.execute_shell = MagicMock(side_effect=shell)
+        net.virsh.execute = MagicMock(return_value=_result(stdout=""))
+        return calls
+
+    def test_a_probe_answers_present_absent_or_refuses(self):
+        net = self._net()
+        for code, expected in ((0, True), (1, False)):
+            net.virsh.execute_shell = MagicMock(
+                return_value=_result(ok=code == 0, return_code=code))
+            assert net._rule_is_present("iptables -C INPUT -j DROP") is expected
+        for code in (2, 3, 4):
+            net.virsh.execute_shell = MagicMock(return_value=_result(
+                ok=False, return_code=code, stderr=self.DENIED))
+            with pytest.raises(NetworkError, match="Permission denied"):
+                net._rule_is_present("iptables -C INPUT -j DROP")
+
+    def test_a_refused_removal_fails_and_deletes_nothing(self):
+        net = self._net()
+        calls = self._denied(net)
+
+        assert net.remove_route_iptables_rule() is False
+
+        # it stopped at the first unanswerable probe: no delete, flush or
+        # chain drop was attempted against a state that was never read
+        assert calls and all(" -C " in f" {c} " for c in calls), calls
+        logged = [str(c.args[0]) for c in net.logger.error.call_args_list]
+        assert any("Permission denied" in m for m in logged), logged
+
+    def test_a_refused_apply_fails(self):
+        net = self._net()
+        calls = self._denied(net)
+        assert net.apply_route_iptables_rule() is False
+        assert calls and all(" -C " in f" {c} " for c in calls), calls
+
+    def test_reconcile_reports_failed_not_drift_when_the_probe_is_refused(self):
+        net = self._net()
+        self._denied(net)
+        net.apply_route_iptables_rule = MagicMock()
+
+        assert net.reconcile_isolation(check_only=True) == 'failed'
+        assert net.reconcile_isolation() == 'failed'
+        # a repair on top of an unanswerable probe would fail the same way
+        net.apply_route_iptables_rule.assert_not_called()
+
+    def test_a_missing_chain_lists_as_none_but_a_refused_listing_raises(self):
+        net = self._net()
+        net.virsh.execute_shell = MagicMock(return_value=_result(
+            ok=False, return_code=1,
+            stderr="iptables: No chain/target/match by that name."))
+        assert net._chain_rules("BXM_ISO_I_virbr9") is None
+
+        net.virsh.execute_shell = MagicMock(return_value=_result(
+            ok=False, return_code=4, stderr=self.DENIED))
+        with pytest.raises(NetworkError, match="Permission denied"):
+            net._chain_rules("BXM_ISO_I_virbr9")
+
+    def test_the_legacy_sweep_does_not_infer_absence_either(self):
+        # best-effort about absence, not about an unanswerable probe
+        net = self._net()
+        self._denied(net)
+        with pytest.raises(NetworkError, match="Permission denied"):
+            net._remove_legacy_isolation_rules("virbr9")
 
 
 class TestIsolationContentsAreChecked:
