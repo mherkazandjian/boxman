@@ -1004,47 +1004,85 @@ def test_no_legacy_delete_on_a_cluster_that_never_had_them(box, tmp_path):
         f"touched rules that do not exist: {calls}"
 
 
+
 # ── first boot: the upgrade that keeps PVE and Ceph in step (#171, 2026-09-15) ─
 #
 # The nodes install from a frozen ISO while `pveceph install` takes whatever
 # Ceph is current, so an un-upgraded node runs ISO-era PVE against a newer
 # Ceph. On 2026-09-15 that pairing rejected the rbd keyring PVE had just
 # written and left every storage inactive on a HEALTH_OK cluster. The fix is a
-# `dist-upgrade` in the first-boot hook, and it carries two promises the hook
+# `dist-upgrade` in the first-boot hook, and it carries promises the hook
 # cannot keep by accident: a failed upgrade must leave the marker unwritten
-# (`wait-first-boot.sh` is what then fails, pointing at the node's log), and
-# the upgrade must survive a dpkg conffile prompt, which `DEBIAN_FRONTEND`
-# alone does not answer -- the hook runs as a service with null stdin, so a
-# prompt is EOF, and the bare `dist-upgrade` that ran on the lab would abort.
+# (`wait-first-boot.sh` is what then fails, pointing at the node's log), the
+# marker must not appear *while* the upgrade runs, the failure must reach that
+# log, and the upgrade must survive a dpkg conffile prompt -- which
+# DEBIAN_FRONTEND does not answer, because dpkg reads that prompt from stdin
+# itself and treats EOF as an error.
+#
+# The hook is run from a copy whose absolute paths are rebased under a temp
+# root. That is a rewrite for *reachability*, not a sandbox: it proves control
+# flow and ordering, and a hook that grew a new absolute path would write to
+# the real one. Containment is the disposable VM's job, not this fixture's.
 
-#: apt-get stub: records every invocation, and acts only on `dist-upgrade`.
+#: apt-get stub. Records each invocation, parses the options apt would actually
+#: forward to dpkg, and acts only on `dist-upgrade`.
+#:
+#: Parsing rather than substring-matching matters: counting arguments that
+#: merely contain `--force-confold` accepts `-o Dpkg::Option::=--force-confold`,
+#: a misspelt key apt puts in no list at all, so a stub that counts would bless
+#: a hook that still prompts. Only values under the exact `Dpkg::Options::` key
+#: are collected.
 APT_STUB = """
 printf 'apt %s\\n' "$*" >> @LOG@
-mode=
+mode=; prev=; dpkg_opts=
 for a in "$@"; do
-    case "$a" in update|dist-upgrade|install) mode=$a; break ;; esac
+    case "$a" in
+        update|dist-upgrade|install) [ -n "$mode" ] || mode=$a ;;
+    esac
+    if [ "$prev" = "-o" ]; then
+        case "$a" in
+            Dpkg::Options::=*) dpkg_opts="$dpkg_opts ${a#Dpkg::Options::=}" ;;
+        esac
+    fi
+    prev=$a
 done
+
+if [ "$mode" = update ]; then
+    grep -h '^Enabled:' @SOURCES@/pve-enterprise.sources 2>/dev/null >> @LOG@
+    [ -f @SOURCES@/proxmox.sources ] && printf 'NOSUB-PRESENT\\n' >> @LOG@
+fi
+
 if [ "$mode" = dist-upgrade ]; then
+    [ -e @MARKER@ ] && printf 'MARKER-EARLY\\n' >> @LOG@
 @UPGRADE@
 fi
 exit 0
 """
 
 #: A dist-upgrade that hits a changed conffile. dpkg asks; with null stdin the
-#: answer is EOF and apt-get dies. Both --force-conf* options answer it up
-#: front, so only the invocation that carries them gets through.
+#: answer is EOF and apt-get dies. `--force-confold` (or confnew) is what
+#: actually answers it -- `--force-confdef` alone only selects a default action
+#: where the package defines one -- so the simulation keys on the former. That
+#: the hook sends both is a policy, asserted separately below.
 CONFFILE_PROMPT = """
-    n=0
-    for a in "$@"; do
-        case "$a" in
-            *--force-confold*|*--force-confdef*) n=$((n + 1)) ;;
-        esac
+    answered=0
+    for o in $dpkg_opts; do
+        case "$o" in --force-confold|--force-confnew) answered=1 ;; esac
     done
-    if [ "$n" -lt 2 ]; then
+    if [ "$answered" -eq 0 ]; then
         echo "Configuration file '/etc/apt/sources.list.d/pve-enterprise.sources'" >&2
         echo "EOF on stdin at conffile prompt" >&2
         exit 1
     fi
+"""
+
+#: A failing upgrade that says something recognisable on stderr. Without a
+#: diagnostic, a log test can pass on the startup banner alone while the hook's
+#: `exec` has stopped capturing stderr at all -- which is the dead end the log
+#: is there to prevent.
+UPGRADE_FAILS = """
+    echo "PVE_LAB_TEST_APT_BROKE: held broken packages" >&2
+    exit 100
 """
 
 
@@ -1052,14 +1090,13 @@ def _first_boot(box, tmp_path, upgrade: str):
     """
     Run the real hook with its absolute paths rebased under a temp root.
 
-    The hook writes to /var/lib, /var/log and /etc, so it cannot run in place;
-    rebasing is mechanical and asserted, and leaves the control flow -- which
-    is what these tests are about -- exactly as shipped.
+    Returns ``(completed_process, marker_path, apt_log_text, hook_log_path)``.
     """
     root = tmp_path / "root"
     for d in ("var/lib", "var/log", "etc/apt/sources.list.d", "etc/network"):
         (root / d).mkdir(parents=True, exist_ok=True)
     (root / "etc/network/interfaces").write_text(
+        "auto ens18\niface ens18 inet manual\n\n"
         "auto vmbr0\niface vmbr0 inet static\n        bridge-ports ens18\n")
     (root / "etc/apt/sources.list.d/pve-enterprise.sources").write_text(
         "Types: deb\nEnabled: true\n")
@@ -1075,8 +1112,12 @@ def _first_boot(box, tmp_path, upgrade: str):
     fake = tmp_path / "bin"
     fake.mkdir(exist_ok=True)
     log = tmp_path / "apt.log"
-    _stub(fake / "apt-get", APT_STUB.replace("@LOG@", str(log))
-                                    .replace("@UPGRADE@", upgrade))
+    marker = root / "var/lib/pve-lab/first-boot.done"
+    _stub(fake / "apt-get",
+          APT_STUB.replace("@LOG@", str(log))
+                  .replace("@MARKER@", str(marker))
+                  .replace("@SOURCES@", str(root / "etc/apt/sources.list.d"))
+                  .replace("@UPGRADE@", upgrade))
     for noop in ("ifreload", "systemctl", "ip"):
         _stub(fake / noop, "exit 0\n")
 
@@ -1084,20 +1125,42 @@ def _first_boot(box, tmp_path, upgrade: str):
         ["bash", str(hook)], capture_output=True, text=True, timeout=60,
         stdin=subprocess.DEVNULL,       # as the service runs it: no answers
         env=dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}"))
-    return (r, root / "var/lib/pve-lab/first-boot.done",
-            log.read_text() if log.exists() else "",
-            (root / "var/log/pve-lab-first-boot.log"))
+    return (r, marker, log.read_text() if log.exists() else "",
+            root / "var/log/pve-lab-first-boot.log")
 
 
-def test_a_successful_run_upgrades_before_writing_the_marker(box, tmp_path):
+def _dpkg_options_of(apt_log: str) -> list[str]:
+    """The values the hook forwarded under apt's `Dpkg::Options::` key."""
+    line = next(ln for ln in apt_log.splitlines() if "dist-upgrade" in ln)
+    args = line.split()
+    return [a.split("=", 1)[1]
+            for prev, a in zip(args, args[1:], strict=False)   # pairwise
+            if prev == "-o" and a.startswith("Dpkg::Options::=")]
+
+
+def test_the_upgrade_runs_before_the_guest_agent(box, tmp_path):
     r, marker, apt, _ = _first_boot(box, tmp_path, "    :")
     assert r.returncode == 0, r.stderr
     assert marker.exists(), "a completed hook must leave its marker"
-    assert "dist-upgrade" in apt, apt
-    lines = [ln for ln in apt.splitlines() if ln.startswith("apt")]
-    upgrade_at = next(i for i, ln in enumerate(lines) if "dist-upgrade" in ln)
-    agent_at = next(i for i, ln in enumerate(lines) if "qemu-guest-agent" in ln)
-    assert upgrade_at < agent_at, lines
+    calls = [ln for ln in apt.splitlines() if ln.startswith("apt")]
+    upgrade_at = next(i for i, ln in enumerate(calls) if "dist-upgrade" in ln)
+    agent_at = next(i for i, ln in enumerate(calls) if "qemu-guest-agent" in ln)
+    assert upgrade_at < agent_at, calls
+
+
+def test_the_marker_is_not_published_while_the_upgrade_runs(box, tmp_path):
+    """
+    Ordering, observed during the upgrade rather than inferred after it.
+
+    A hook that wrote the marker first and removed it again on failure leaves
+    the same filesystem behind as this one, and the same apt call order -- but
+    `wait-first-boot.sh` polls that marker, so it would release the cluster
+    build while the nodes were still upgrading.
+    """
+    _r, marker, apt, _ = _first_boot(box, tmp_path, "    :")
+    assert "MARKER-EARLY" not in apt, \
+        "the marker already existed when the upgrade started"
+    assert marker.exists()
 
 
 def test_a_failed_upgrade_leaves_the_marker_unwritten(box, tmp_path):
@@ -1108,34 +1171,68 @@ def test_a_failed_upgrade_leaves_the_marker_unwritten(box, tmp_path):
     node's log; swallowed, the run would carry on to build a cluster on nodes
     whose PVE does not match the Ceph about to be installed.
     """
-    r, marker, _, _ = _first_boot(box, tmp_path, "    exit 100")
+    r, marker, _apt, _ = _first_boot(box, tmp_path, UPGRADE_FAILS)
     assert r.returncode != 0, "a failed dist-upgrade reported success"
     assert not marker.exists(), "the marker must not survive a failed upgrade"
 
 
 def test_a_failed_upgrade_stops_before_the_guest_agent(box, tmp_path):
     # set -e must abort the hook there and then, not run on to the next step
-    _r, _marker, apt, _ = _first_boot(box, tmp_path, "    exit 100")
+    _r, _marker, apt, _ = _first_boot(box, tmp_path, UPGRADE_FAILS)
     assert "qemu-guest-agent" not in apt, apt
 
 
 def test_the_upgrade_answers_the_conffile_prompt(box, tmp_path):
     """
-    Counterfactual: the bare `apt-get dist-upgrade -y -qq` that actually ran
-    on the lab on 2026-09-15 fails this test. Step 1 of the hook edits
+    Counterfactual: the bare `apt-get dist-upgrade -y -qq` that actually ran on
+    the lab on 2026-09-15 fails this test. Step 1 of the hook edits
     pve-enterprise.sources, which IS a dpkg conffile, so an upgrade that also
     changes it prompts -- and DEBIAN_FRONTEND=noninteractive does not answer a
     conffile prompt.
     """
     r, marker, apt, hooklog = _first_boot(box, tmp_path, CONFFILE_PROMPT)
-    assert r.returncode == 0, hooklog.read_text() if hooklog.exists() else r.stderr
+    assert r.returncode == 0, \
+        hooklog.read_text() if hooklog.exists() else r.stderr
     assert marker.exists(), "the hook stalled on a conffile prompt"
     assert "dist-upgrade" in apt, apt
 
 
-def test_the_hook_logs_where_wait_first_boot_says_to_look(box, tmp_path):
-    # wait-first-boot.sh names this path when the marker never appears; an
-    # empty or absent file there turns a real failure into a dead end
-    _r, _marker, _apt, hooklog = _first_boot(box, tmp_path, "    exit 100")
+def test_the_upgrade_forwards_both_dpkg_options(box, tmp_path):
+    """
+    Policy, kept apart from the behaviour above.
+
+    `--force-confold` alone answers the prompt the test above simulates, so
+    that test cannot notice `--force-confdef` going missing. Assert the pair
+    the hook is documented to send, parsed out of apt's own option list rather
+    than matched as a substring -- a misspelt key reaches no list at all.
+    """
+    _r, _marker, apt, _ = _first_boot(box, tmp_path, "    :")
+    assert sorted(_dpkg_options_of(apt)) == \
+        ["--force-confdef", "--force-confold"]
+
+
+def test_the_failure_reaches_the_log_wait_first_boot_names(box, tmp_path):
+    """
+    wait-first-boot.sh sends the operator to this file. If the hook's `exec`
+    stopped redirecting stderr, the file would still hold the banner and the
+    operator would still have nothing to read.
+    """
+    _r, _marker, _apt, hooklog = _first_boot(box, tmp_path, UPGRADE_FAILS)
     assert hooklog.exists(), "the hook wrote no log at the advertised path"
-    assert "pve-lab first boot" in hooklog.read_text()
+    text = hooklog.read_text()
+    assert "pve-lab first boot" in text
+    assert "PVE_LAB_TEST_APT_BROKE" in text, \
+        f"the upgrade's own error never reached the advertised log:\n{text}"
+
+
+def test_the_enterprise_repository_is_disabled_before_apt_runs(box, tmp_path):
+    """
+    The upgrade is only in step with Ceph if it comes from no-subscription.
+
+    Asserted from what apt saw at `update` time, not from the final file: the
+    ordering is the claim.
+    """
+    _r, _marker, apt, _ = _first_boot(box, tmp_path, "    :")
+    assert "Enabled: false" in apt, apt
+    assert "Enabled: true" not in apt, "the enterprise repository was still on"
+    assert "NOSUB-PRESENT" in apt, "no pve-no-subscription source was written"
