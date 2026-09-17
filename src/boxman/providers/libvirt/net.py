@@ -1290,12 +1290,15 @@ class Network:
         return True
 
     #: Options whose value iptables prints as a double-quoted string with
-    #: ``"``, ``\\`` and ``'`` backslash-escaped (``xtables_save_string``).
-    #: Every other operand — an interface, an address, a chain, a port — is
-    #: printed raw, quotes and backslashes included.
+    #: ``"``, ``\\`` and ``'`` backslash-escaped: every ``xtables_save_string``
+    #: caller among the filter-table extensions of iptables 1.8.10 (comment,
+    #: string, LOG, NFLOG, ULOG, helper, nfacct, cgroup). Every other operand —
+    #: an interface, an address, a chain, a port — is printed raw, quotes and
+    #: backslashes included.
     _QUOTED_OPTIONS: frozenset = frozenset({
         '--comment', '--string', '--hex-string',
         '--log-prefix', '--nflog-prefix', '--ulog-prefix',
+        '--helper', '--nfacct-name', '--path',
     })
 
     @classmethod

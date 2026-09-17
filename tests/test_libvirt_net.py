@@ -1979,6 +1979,21 @@ class TestListingsAreReadAsIptablesWrites:
         assert parsed[-1] == ["-A", "BXM_R4_PARSE", "-i", "bxmr4sentinel", "-j", "RETURN"]
         assert len(parsed) == 10
 
+    def test_every_string_option_iptables_quotes_is_decoded(self):
+        # the remaining xtables_save_string callers in the 1.8.10 filter-table
+        # extensions: a value with a space must stay one token and the rule
+        # after it must stay intact
+        listing = ('-A FORWARD -m helper --helper "ftp 21" -j ACCEPT\n'
+                   '-A FORWARD -m nfacct --nfacct-name "acct 1" -j ACCEPT\n'
+                   '-A FORWARD -m cgroup --path "user.slice/x y" -j ACCEPT\n'
+                   '-A FORWARD -i bxmr4sentinel -j RETURN\n')
+        parsed = Network._parse_listing(listing)
+        assert [r[r.index(o) + 1] for r in parsed for o in
+                ("--helper", "--nfacct-name", "--path") if o in r] == [
+            "ftp 21", "acct 1", "user.slice/x y"]
+        assert parsed[-1] == ["-A", "FORWARD", "-i", "bxmr4sentinel", "-j", "RETURN"]
+        assert len(parsed) == 4
+
     @pytest.mark.parametrize("name", ['"bxmr4', '"bxmr4"'])
     def test_a_quote_leading_interface_is_read_raw_and_swallows_nothing(self, name):
         # a `"` opens a quoted value only after an option iptables quotes;
