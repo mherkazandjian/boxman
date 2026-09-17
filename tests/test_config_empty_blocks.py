@@ -103,6 +103,24 @@ clusters:
         assert cluster['vms'] == {}
         assert 'boxes' not in cluster
 
+    def test_boxes_that_rendered_empty_on_a_compose_cluster_stays_boxes(
+            self, tmp_path):
+        # the docker-compose provider keeps `boxes:` as its own key, so the
+        # normalisation must reach it there too -- the libvirt case above
+        # cannot show that, since its `boxes:` is renamed to `vms:` first
+        conf = _manager().load_config(_write(tmp_path, """
+version: '2.0'
+project: demo
+clusters:
+  services:
+    provider: docker-compose
+    boxes:
+"""))
+
+        cluster = conf['clusters']['services']
+        assert cluster['boxes'] == {}
+        assert 'vms' not in cluster
+
     def test_clusters_that_rendered_empty_is_an_empty_mapping(self, tmp_path):
         conf = _manager().load_config(_write(tmp_path, """
 project: demo
