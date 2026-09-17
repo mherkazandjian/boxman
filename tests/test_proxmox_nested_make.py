@@ -1002,3 +1002,140 @@ def test_no_legacy_delete_on_a_cluster_that_never_had_them(box, tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not [c for c in calls if "prefer-hpe" in c], \
         f"touched rules that do not exist: {calls}"
+
+
+# ── first boot: the upgrade that keeps PVE and Ceph in step (#171, 2026-09-15) ─
+#
+# The nodes install from a frozen ISO while `pveceph install` takes whatever
+# Ceph is current, so an un-upgraded node runs ISO-era PVE against a newer
+# Ceph. On 2026-09-15 that pairing rejected the rbd keyring PVE had just
+# written and left every storage inactive on a HEALTH_OK cluster. The fix is a
+# `dist-upgrade` in the first-boot hook, and it carries two promises the hook
+# cannot keep by accident: a failed upgrade must leave the marker unwritten
+# (`wait-first-boot.sh` is what then fails, pointing at the node's log), and
+# the upgrade must survive a dpkg conffile prompt, which `DEBIAN_FRONTEND`
+# alone does not answer -- the hook runs as a service with null stdin, so a
+# prompt is EOF, and the bare `dist-upgrade` that ran on the lab would abort.
+
+#: apt-get stub: records every invocation, and acts only on `dist-upgrade`.
+APT_STUB = """
+printf 'apt %s\\n' "$*" >> @LOG@
+mode=
+for a in "$@"; do
+    case "$a" in update|dist-upgrade|install) mode=$a; break ;; esac
+done
+if [ "$mode" = dist-upgrade ]; then
+@UPGRADE@
+fi
+exit 0
+"""
+
+#: A dist-upgrade that hits a changed conffile. dpkg asks; with null stdin the
+#: answer is EOF and apt-get dies. Both --force-conf* options answer it up
+#: front, so only the invocation that carries them gets through.
+CONFFILE_PROMPT = """
+    n=0
+    for a in "$@"; do
+        case "$a" in
+            *--force-confold*|*--force-confdef*) n=$((n + 1)) ;;
+        esac
+    done
+    if [ "$n" -lt 2 ]; then
+        echo "Configuration file '/etc/apt/sources.list.d/pve-enterprise.sources'" >&2
+        echo "EOF on stdin at conffile prompt" >&2
+        exit 1
+    fi
+"""
+
+
+def _first_boot(box, tmp_path, upgrade: str):
+    """
+    Run the real hook with its absolute paths rebased under a temp root.
+
+    The hook writes to /var/lib, /var/log and /etc, so it cannot run in place;
+    rebasing is mechanical and asserted, and leaves the control flow -- which
+    is what these tests are about -- exactly as shipped.
+    """
+    root = tmp_path / "root"
+    for d in ("var/lib", "var/log", "etc/apt/sources.list.d", "etc/network"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    (root / "etc/network/interfaces").write_text(
+        "auto vmbr0\niface vmbr0 inet static\n        bridge-ports ens18\n")
+    (root / "etc/apt/sources.list.d/pve-enterprise.sources").write_text(
+        "Types: deb\nEnabled: true\n")
+
+    src = (box / "scripts" / "first-boot.sh").read_text()
+    for absolute in ("/var/lib/pve-lab", "/var/log/pve-lab-first-boot.log",
+                     "/etc/apt/sources.list.d", "/etc/network/interfaces"):
+        assert absolute in src, f"the hook no longer writes {absolute}"
+        src = src.replace(absolute, f"{root}{absolute}")
+    hook = tmp_path / "first-boot.sh"
+    hook.write_text(src)
+
+    fake = tmp_path / "bin"
+    fake.mkdir(exist_ok=True)
+    log = tmp_path / "apt.log"
+    _stub(fake / "apt-get", APT_STUB.replace("@LOG@", str(log))
+                                    .replace("@UPGRADE@", upgrade))
+    for noop in ("ifreload", "systemctl", "ip"):
+        _stub(fake / noop, "exit 0\n")
+
+    r = subprocess.run(
+        ["bash", str(hook)], capture_output=True, text=True, timeout=60,
+        stdin=subprocess.DEVNULL,       # as the service runs it: no answers
+        env=dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}"))
+    return (r, root / "var/lib/pve-lab/first-boot.done",
+            log.read_text() if log.exists() else "",
+            (root / "var/log/pve-lab-first-boot.log"))
+
+
+def test_a_successful_run_upgrades_before_writing_the_marker(box, tmp_path):
+    r, marker, apt, _ = _first_boot(box, tmp_path, "    :")
+    assert r.returncode == 0, r.stderr
+    assert marker.exists(), "a completed hook must leave its marker"
+    assert "dist-upgrade" in apt, apt
+    lines = [ln for ln in apt.splitlines() if ln.startswith("apt")]
+    upgrade_at = next(i for i, ln in enumerate(lines) if "dist-upgrade" in ln)
+    agent_at = next(i for i, ln in enumerate(lines) if "qemu-guest-agent" in ln)
+    assert upgrade_at < agent_at, lines
+
+
+def test_a_failed_upgrade_leaves_the_marker_unwritten(box, tmp_path):
+    """
+    The whole point of refusing `|| true`.
+
+    An unwritten marker is what makes wait-first-boot.sh fail and name the
+    node's log; swallowed, the run would carry on to build a cluster on nodes
+    whose PVE does not match the Ceph about to be installed.
+    """
+    r, marker, _, _ = _first_boot(box, tmp_path, "    exit 100")
+    assert r.returncode != 0, "a failed dist-upgrade reported success"
+    assert not marker.exists(), "the marker must not survive a failed upgrade"
+
+
+def test_a_failed_upgrade_stops_before_the_guest_agent(box, tmp_path):
+    # set -e must abort the hook there and then, not run on to the next step
+    _r, _marker, apt, _ = _first_boot(box, tmp_path, "    exit 100")
+    assert "qemu-guest-agent" not in apt, apt
+
+
+def test_the_upgrade_answers_the_conffile_prompt(box, tmp_path):
+    """
+    Counterfactual: the bare `apt-get dist-upgrade -y -qq` that actually ran
+    on the lab on 2026-09-15 fails this test. Step 1 of the hook edits
+    pve-enterprise.sources, which IS a dpkg conffile, so an upgrade that also
+    changes it prompts -- and DEBIAN_FRONTEND=noninteractive does not answer a
+    conffile prompt.
+    """
+    r, marker, apt, hooklog = _first_boot(box, tmp_path, CONFFILE_PROMPT)
+    assert r.returncode == 0, hooklog.read_text() if hooklog.exists() else r.stderr
+    assert marker.exists(), "the hook stalled on a conffile prompt"
+    assert "dist-upgrade" in apt, apt
+
+
+def test_the_hook_logs_where_wait_first_boot_says_to_look(box, tmp_path):
+    # wait-first-boot.sh names this path when the marker never appears; an
+    # empty or absent file there turns a real failure into a dead end
+    _r, _marker, _apt, hooklog = _first_boot(box, tmp_path, "    exit 100")
+    assert hooklog.exists(), "the hook wrote no log at the advertised path"
+    assert "pve-lab first boot" in hooklog.read_text()
