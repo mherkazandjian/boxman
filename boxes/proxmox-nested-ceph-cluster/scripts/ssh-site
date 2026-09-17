@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# ssh to a *site*, not to an ssh alias.
+#
+# The box calls its two physical hosts host1 and host2. Those are rarely what
+# ssh knows them as, so each site maps to an alias through SSH_ALIAS_<site>,
+# defaulting to the site name itself when no mapping is set:
+#
+#     SSH_ALIAS_host1=hpe1 scripts/ssh-site host1 hostname
+#
+# This exists so the mapping lives in one place. The Makefile drives ssh from a
+# dozen recipes -- some with a literal site, some with a shell loop variable --
+# and translating at each of them is how one gets missed.
+set -euo pipefail
+
+[[ $# -ge 1 ]] || { echo "usage: ssh-site <site> [command...]" >&2; exit 2; }
+site=$1; shift
+
+var="SSH_ALIAS_${site}"
+alias=${!var:-$site}
+
+exec ssh -o BatchMode=yes "$alias" "$@"

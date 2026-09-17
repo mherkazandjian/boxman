@@ -22,6 +22,11 @@ class FlowsMixin:
         # precedence over app-level defaults (from boxman.yml).
         self._update_sessions_with_runtime()
 
+        # Config-only checks first: they need nothing built, and running them
+        # here means a typo'd mac or an unresolvable network costs nothing --
+        # no forced deprovision, no template build, no virt-install (#171 A3).
+        self.validate_direct_boot_config()
+
         # --- Pre-check: detect state that would block a clean provision ---
         # Block on either (a) live VMs from this project, or (b) a stale
         # cache entry with no live VMs. The second case used to slip

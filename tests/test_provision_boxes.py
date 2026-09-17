@@ -75,13 +75,19 @@ def discover_boxes():
     (The effective boot order is deliberately not asserted here: virt-install
     does not honour the requested ordering for --cdrom installs, which the
     per-box READMEs explain.)
+
+    ``proxmox-nested-ceph-cluster`` is excluded by name: it spans two physical
+    hosts joined by a VXLAN and boots a locally built Proxmox auto-install ISO,
+    none of which exists on a single CI host. Its config shape is pinned by
+    tests/test_proxmox_nested_box.py instead.
     """
     pattern = os.path.join(BOXES_DIR, "*/conf.yml")
     excluded_suffixes = ("-docker-runtime", "-iso-boot")
+    excluded_names = ("proxmox-nested-ceph-cluster",)
     return sorted(
         os.path.dirname(p) for p in glob.glob(pattern)
-        if not os.path.basename(
-            os.path.dirname(p)).endswith(excluded_suffixes)
+        if not os.path.basename(os.path.dirname(p)).endswith(excluded_suffixes)
+        and os.path.basename(os.path.dirname(p)) not in excluded_names
     )
 
 

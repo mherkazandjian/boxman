@@ -4,8 +4,8 @@ Both PXE network-boot VMs (:class:`~boxman.providers.libvirt.bare_vm.BareVM`)
 and ISO-install VMs (:class:`~boxman.providers.libvirt.iso_boot_vm.IsoBootVM`)
 create an empty boot disk and run ``virt-install`` to define the domain; they
 differ only in their install media and firmware boot order. The common logic
-lives here so a fix (path expansion, network namespacing, disk-size units, …)
-applies to both.
+lives here so a fix (path expansion, network namespacing, MAC pinning,
+disk-size units, …) applies to both.
 """
 
 import os
@@ -13,6 +13,7 @@ import shlex
 from typing import Any
 
 from boxman import log
+from boxman.exceptions import ProvisionError
 from boxman.utils.shell import run as _shell_run
 
 from .commands import VirshCommand, VirtInstallCommand
@@ -79,25 +80,61 @@ class DirectInstallVM:
         """
         return normalize_disk_size(self.info.get("disk_size"))
 
-    def _networks(self) -> list[str]:
-        """Fully-qualified libvirt network names to attach.
+    @staticmethod
+    def _network_spec(entry: Any) -> dict[str, Any] | None:
+        """Normalise one ``networks:`` / ``_resolved_networks`` entry.
 
-        Prefers ``_resolved_networks`` (namespaced by the manager); falls back
-        to the raw ``networks[].name`` (or ``default``) when unresolved.
+        Accepts a bare network name or a ``{name, mac}`` mapping and returns
+        ``{'name': str, 'mac': str | None}``; ``None`` for an unusable entry.
         """
-        resolved = self.info.get("_resolved_networks")
-        if resolved:
-            return list(resolved)
-        networks = self.info.get("networks") or []
-        names = [
-            n["name"] for n in networks
-            if isinstance(n, dict) and n.get("name")
-        ]
-        return names or ["default"]
+        if isinstance(entry, str):
+            return {"name": entry, "mac": None} if entry else None
+        if isinstance(entry, dict) and entry.get("name"):
+            mac = entry.get("mac")
+            return {"name": entry["name"], "mac": str(mac) if mac else None}
+        return None
+
+    def _network_specs(self) -> list[dict[str, Any]]:
+        """Networks to attach at ``virt-install`` time, as ``{name, mac}`` dicts.
+
+        Prefers ``_resolved_networks`` (namespaced by the manager, optionally
+        carrying a pinned ``mac``); falls back to the raw ``networks[]`` entries,
+        and to libvirt's ``default`` network when nothing is declared.
+        """
+        for source in (self.info.get("_resolved_networks"),
+                       self.info.get("networks")):
+            if not source:
+                # Nothing declared here. `_resolve_iso_config` writes
+                # `_resolved_networks: []` even when no `networks:` was given,
+                # so an empty list has to mean "ask the next source", not
+                # "declared and unresolvable".
+                continue
+            specs = [s for s in map(self._network_spec, source or []) if s]
+            if not specs:
+                # Declared, and nothing survived. Falling through to `default`
+                # here put a VM whose only entry was blank onto libvirt's
+                # shared default network with nothing reported -- the libvirt
+                # twin of #164 NET-C1. Refuse what can be proven wrong; never
+                # silently drop a reference (#171 A4).
+                raise ProvisionError(
+                    f"vm {self.vm_name}: 'networks:' was declared but no entry "
+                    f"names a network ({source!r}). Remove the key to use "
+                    f"libvirt's default network, or name one.")
+            return specs
+        return [{"name": "default", "mac": None}]
+
+    def _networks(self) -> list[str]:
+        """Fully-qualified libvirt network names to attach
+        (see :meth:`_network_specs`)."""
+        return [spec["name"] for spec in self._network_specs()]
 
     # ── creation ──────────────────────────────────────────────────────────
     def create(self) -> bool:
         """Create the VM (empty boot disk + ``virt-install`` define)."""
+        # Resolved first, and deliberately before qemu-img: an unusable
+        # `networks:` used to be discovered after the boot disk had already
+        # been written, leaving a stray image behind on a refusal (#171 A4).
+        network_specs = self._network_specs()
         disk_path = os.path.expanduser(
             os.path.join(self.workdir, f"{self.vm_name}.qcow2"))
         disk_size = self._boot_disk_size()
@@ -121,9 +158,12 @@ class DirectInstallVM:
         parts.append(f"--memory={memory}")
         parts.append(f"--vcpus={vcpus}")
         parts.append(
-            f"--disk=path={shlex.quote(disk_path)},format=qcow2,bus=virtio,discard=unmap")
-        for net in self._networks():
-            parts.append(f"--network=network={net},model=virtio")
+            f"--disk=path={shlex.quote(disk_path)},format=qcow2,driver.type=qcow2,bus=virtio,discard=unmap")
+        for spec in network_specs:
+            net_arg = f"--network=network={spec['name']},model=virtio"
+            if spec["mac"]:
+                net_arg += f",mac={spec['mac']}"
+            parts.append(net_arg)
         parts.extend(self._media_args())
         parts.append(f"--boot={self.boot_order}")
         parts.append("--os-variant=detect=on,require=off")

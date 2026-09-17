@@ -1,0 +1,405 @@
+"""
+Deterministic shape checks for boxes/proxmox-nested-ceph-cluster.
+
+The box spans two physical hosts joined by a VXLAN and boots a locally built
+Proxmox auto-install ISO, so the provisioning integration job excludes it.
+What makes it work is a contract between the two renders of one conf.yml:
+host1's libvirt NAT network must reserve the MAC of every node — including the
+two that live on host2 — and every node must pin exactly that MAC on its first
+NIC. Those are the things pinned here, without touching libvirt.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+
+import pytest
+import yaml
+
+from boxman.manager import BoxmanManager
+from boxman.utils.jinja_env import create_jinja_env
+
+pytestmark = pytest.mark.unit
+
+BOX = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "boxes", "proxmox-nested-ceph-cluster")
+
+
+def _render(monkeypatch, site: str) -> dict:
+    monkeypatch.setenv("BOXMAN_SITE", site)
+    monkeypatch.setenv("BOXMAN_CONF_DIR", BOX)
+    monkeypatch.delenv("PVE_LAB_DIR", raising=False)
+    env = create_jinja_env(BOX)
+    return yaml.safe_load(env.get_template("conf.yml").render())
+
+
+def _vms(cfg: dict) -> dict:
+    return cfg["clusters"]["pve"]["vms"]
+
+
+def _reservations(cfg_host1: dict) -> dict:
+    hosts = cfg_host1["clusters"]["pve"]["networks"]["pvenet"]["ip"]["dhcp"]["hosts"]
+    return {h["name"]: h for h in hosts}
+
+
+def test_host1_is_the_nat_side_and_reserves_every_node(monkeypatch):
+    cfg = _render(monkeypatch, "host1")
+    net = cfg["clusters"]["pve"]["networks"]["pvenet"]
+    assert net["mode"] == "nat"
+    assert net["bridge"]["name"] == "virbr-pve"
+    assert net["ip"]["address"] == "10.77.0.1"
+    assert "shared_networks" not in cfg
+    assert set(_vms(cfg)) == {"pve1", "pve2"}
+    res = _reservations(cfg)
+    assert set(res) == {"pve1", "pve2", "pve3", "pve4", "demo01"}
+    assert res["pve3"]["ip"] == "10.77.0.13"  # host2's node, reserved on host1
+
+
+def test_host2_is_the_bridge_side(monkeypatch):
+    cfg = _render(monkeypatch, "host2")
+    assert cfg["shared_networks"] == {
+        "pvelab": {"bridge": "br-pve", "stp": False, "mtu": 1450}}
+    assert cfg["clusters"]["pve"]["networks"]["pvenet"] == {
+        "mode": "bridge", "bridge": {"name": "br-pve"}}
+    assert set(_vms(cfg)) == {"pve3", "pve4"}
+
+
+def test_default_site_is_host1(monkeypatch):
+    monkeypatch.delenv("BOXMAN_SITE", raising=False)
+    monkeypatch.setenv("BOXMAN_CONF_DIR", BOX)
+    env = create_jinja_env(BOX)
+    cfg = yaml.safe_load(env.get_template("conf.yml").render())
+    assert set(_vms(cfg)) == {"pve1", "pve2"}
+
+
+@pytest.mark.parametrize("site", ["host1", "host2"])
+def test_every_node_pins_the_mac_host1_reserves(monkeypatch, site):
+    reservations = _reservations(_render(monkeypatch, "host1"))
+    cfg = _render(monkeypatch, site)
+    for name, vm in _vms(cfg).items():
+        nic = vm["networks"][0]
+        assert nic["name"] == "pvenet"
+        assert nic["mac"] == reservations[name]["mac"], name
+        assert vm["hostname"] == name == reservations[name]["name"]
+
+
+@pytest.mark.parametrize("site", ["host1", "host2"])
+def test_nodes_use_the_iso_boot_schema(monkeypatch, site):
+    cfg = _render(monkeypatch, site)
+    cluster = cfg["clusters"]["pve"]
+    assert cluster["admin_user"] == "root"
+    assert "admin_pass" not in cluster  # nothing to push keys into on the ISO path
+    assert os.path.isabs(cluster["admin_key_name"])
+    for name, vm in _vms(cfg).items():
+        assert vm["boot_order"][0] == "cdrom", name
+        assert isinstance(vm["vcpus"], int) and "cpus" not in vm, name
+        assert isinstance(vm["memory"], int), name
+        assert os.path.isabs(vm["cdroms"][0]["source"]), name
+        assert [d["target"] for d in vm["disks"]] == ["vdb", "vdc"], name
+        assert "--cpu host-passthrough" in vm["virt_install_extra_args"], name
+        assert any("guest_agent" in a for a in vm["virt_install_extra_args"]), name
+
+
+@pytest.mark.parametrize("site", ["host1", "host2"])
+def test_config_passes_boot_validation(monkeypatch, site):
+    mgr = BoxmanManager.__new__(BoxmanManager)
+    mgr.config = _render(monkeypatch, site)
+    mgr.app_config = {}
+    mgr.validate_base_images()  # cdroms present, MACs well-formed and unique
+
+
+def test_tasks_wrap_the_scripts(monkeypatch):
+    cfg = _render(monkeypatch, "host1")
+    expected = {"vxlan-up", "wait-installed", "wait-first-boot", "cluster",
+                "ceph", "demo-vm", "migrate", "mtu-check"}
+    assert expected <= set(cfg["tasks"])
+    for name in expected:
+        script = cfg["tasks"][name]["command"].split()[-1]
+        assert script.startswith(BOX + "/scripts/"), name
+        assert os.path.isfile(script), script
+
+
+#: A stand-in for scripts/lib.sh. The real pve-ceph.sh sources whatever lib.sh
+#: sits beside it, so copying the script next to this one exercises its actual
+#: control flow -- no reimplementation of the loop under test.
+#:
+#: Three facts are modelled *independently*, because ceph reports them
+#: separately and conflating them is what the script is being tested for:
+#:   MON_STORAGE     nodes with /var/lib/ceph/mon/ceph-<node>
+#:   MON_REGISTERED  nodes in the monmap
+#:   MON_QUORUM      nodes in quorum_names
+#: An earlier fixture derived all three from one list, which encoded the
+#: implementation's own mistake and so could not expose it.
+#:
+#: `set -euo pipefail` is here because the real lib.sh sets it; its absence is
+#: what let a broken bootstrap fix pass. Ordinary `log` events are recorded
+#: too: discarding them let a mutation that reports a monitor OK *before*
+#: checking its quorum pass every test.
+_CEPH_STUB_LIB = r"""
+set -euo pipefail
+NODES=(pve1 pve2 pve3 pve4)
+LOGS="$T/logs"; mkdir -p "$LOGS"
+LAB_NET=10.77.0.0/24
+CEPH_POOL=vmpool
+CALLS="$T/calls";  : > "$CALLS"
+MODE="${STUB_MODE:-normal}"
+
+_storage="${MON_STORAGE:-}"
+_registered="${MON_REGISTERED:-}"
+_quorum="${MON_QUORUM:-}"
+_has() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
+
+log() { echo "log $*" >> "$CALLS"; }
+die() { printf 'die %s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >> "$CALLS"; exit 9; }
+sleep() { :; }
+wait_ssh() { return 0; }
+
+_json_list() {   # _json_list <space separated>
+    local out="" n
+    for n in $1; do out="$out${out:+,}\"$n\""; done
+    echo "[$out]"
+}
+
+pssh() {
+    local node=$1; shift; local cmd="$*"
+    case "$cmd" in
+        *"/var/lib/ceph/mon/ceph-"*)
+            echo "mon_probe $node" >> "$CALLS"
+            [ "$MODE" = ssh_fail ]  && return 255
+            [ "$MODE" = odd_reply ] && { echo "maybe"; return 0; }
+            _has "$_storage" "$node" && echo yes || echo no
+            return 0 ;;
+        *"ceph mon dump"*)
+            echo "mon_dump" >> "$CALLS"
+            # A *complete, valid* monmap followed by a non-zero exit. An
+            # empty response would be stopped by the later shape validation,
+            # which masks whether the command's own status is checked at all.
+            if [ -n "${MONMAP_FAIL_AFTER_OUTPUT:-}" ]; then
+                echo "{\"mons\":[$(_json_list "$_registered" | sed 's/^\[//;s/\]$//' \
+                     | sed 's/"\([^"]*\)"/{"name":"\1"}/g')]}"
+                return "$MONMAP_FAIL_AFTER_OUTPUT"
+            fi
+            [ "$MODE" = dump_fail ] && return 1
+            case "${MONMAP_BODY:-}" in
+                null)    echo '{"mons":null}';    return 0 ;;
+                number)  echo '{"mons":42}';      return 0 ;;
+                nonames) echo '{"mons":[false]}'; return 0 ;;
+                noname)  echo '{"mons":[{"rank":0}]}'; return 0 ;;
+            esac
+            echo "{\"mons\":[$(_json_list "$_registered" | sed 's/^\[//;s/\]$//' \
+                 | sed 's/"\([^"]*\)"/{"name":"\1"}/g')]}"
+            return 0 ;;
+        *"pveceph mon create"*)
+            echo "mon_create $node" >> "$CALLS"
+            _storage="$_storage $node"; _registered="$_registered $node"
+            # a monitor can be created and still fail to join
+            [ "${MON_NEVER_JOINS:-}" = "$node" ] || _quorum="$_quorum $node"
+            return 0 ;;
+        *"ceph quorum_status"*)
+            echo "quorum_probe $node" >> "$CALLS"
+            [ -n "$_quorum" ] || return 1
+            echo "{\"quorum_names\":$(_json_list "$_quorum")}"
+            return 0 ;;
+        *"ceph --version"*) echo "ceph version 19.2.0"; return 0 ;;
+        *"ceph health"*)    echo "HEALTH_OK"; return 0 ;;
+        *) echo "cmd $cmd" >> "$CALLS"; return 0 ;;
+    esac
+}
+"""
+
+
+def _run_ceph_bootstrap(tmp_path, mode: str = "normal", storage: str = "",
+                        registered: str = "", quorum: str = "", tag: str = "",
+                        monmap_body: str = "", never_joins: str = "",
+                        fail_after: str = ""):
+    """Run the real pve-ceph.sh against the stub; return (rc, trace, full)."""
+    work = tmp_path / ("cephrun-" + (tag or mode))
+    work.mkdir(exist_ok=True)
+    shutil.copy(os.path.join(BOX, "scripts", "pve-ceph.sh"), work / "pve-ceph.sh")
+    (work / "lib.sh").write_text(_CEPH_STUB_LIB)
+    proc = subprocess.run(
+        ["bash", "./pve-ceph.sh"], cwd=work, timeout=120, capture_output=True,
+        text=True, env=dict(os.environ, T=str(work), STUB_MODE=mode,
+                            MON_STORAGE=storage, MON_REGISTERED=registered,
+                            MON_QUORUM=quorum, MONMAP_BODY=monmap_body,
+                            MON_NEVER_JOINS=never_joins,
+                            MONMAP_FAIL_AFTER_OUTPUT=fail_after))
+    calls = work / "calls"
+    full = calls.read_text().splitlines() if calls.exists() else []
+    trace = [ln for ln in full
+             if ln.startswith(("mon_create", "quorum_probe", "die"))]
+    return proc.returncode, trace, full
+
+
+def test_the_first_ceph_monitor_is_created_without_waiting_for_quorum(tmp_path):
+    """#171 B1. ``pveceph init`` writes configuration, not a monitor, so on
+    four fresh nodes nothing can be quorate until the first ``mon create``."""
+    rc, trace, _full = _run_ceph_bootstrap(tmp_path, tag="cold")
+
+    creates = [i for i, ln in enumerate(trace) if ln.startswith("mon_create")]
+    assert creates, f"no monitor was ever created; trace={trace}"
+    assert trace[creates[0]] == "mon_create pve1"
+    assert not any(ln.startswith("quorum_probe") for ln in trace[:creates[0]]), trace
+    assert rc == 0, f"bootstrap exited {rc}; trace={trace}"
+
+
+def test_every_monitor_after_the_first_still_waits_for_quorum(tmp_path):
+    _rc, trace, _full = _run_ceph_bootstrap(tmp_path, tag="order")
+    for node in ("pve2", "pve3"):
+        assert f"mon_create {node}" in trace, trace
+        idx = trace.index(f"mon_create {node}")
+        assert trace[idx - 1] == "quorum_probe pve1", trace
+
+
+def test_a_node_that_cannot_be_asked_is_reported_not_assumed_monitorless(tmp_path):
+    rc, trace, _full = _run_ceph_bootstrap(tmp_path, mode="ssh_fail", tag="sshfail")
+    assert rc != 0, trace
+    assert not [ln for ln in trace if ln.startswith("mon_create")], trace
+    assert any(ln.startswith("die") and "cannot ask" in ln for ln in trace), trace
+
+
+def test_an_unexpected_probe_reply_is_refused(tmp_path):
+    rc, trace, _full = _run_ceph_bootstrap(tmp_path, mode="odd_reply", tag="odd")
+    assert rc != 0, trace
+    assert not [ln for ln in trace if ln.startswith("mon_create")], trace
+
+
+def test_a_healthy_existing_cluster_is_left_alone(tmp_path):
+    """The positive control. Without it, a consistency guard that refuses
+    *any* registered monitor passes every other fixture, because they all
+    start from a cold cluster and never meet one."""
+    rc, _trace, full = _run_ceph_bootstrap(
+        tmp_path, storage="pve1 pve2 pve3", registered="pve1 pve2 pve3",
+        quorum="pve1 pve2 pve3", tag="healthy")
+
+    assert rc == 0, f"a healthy cluster was refused: {full[-6:]}"
+    assert not [ln for ln in full if ln.startswith("die")], full
+    assert not [ln for ln in full if ln.startswith("mon_create")], \
+        "an existing monitor was created again"
+
+
+def test_a_monitor_that_never_joined_the_quorum_is_not_reported_ok(tmp_path):
+    """"The cluster answered" is not "this monitor joined". pve3 has its store
+    and is registered, but is not in quorum_names."""
+    rc, trace, full = _run_ceph_bootstrap(
+        tmp_path, storage="pve1 pve2 pve3", registered="pve1 pve2 pve3",
+        quorum="pve1 pve2", tag="unjoined")
+
+    assert rc != 0, f"a monitor outside the quorum was reported ok; trace={trace}"
+    assert any(ln.startswith("die") and "pve3" in ln for ln in trace), trace
+    # It must not be announced OK either -- reporting first and checking after
+    # satisfies an exit-code assertion while still telling the operator the
+    # opposite of the truth.
+    assert not [ln for ln in full if ln == "log mon pve3 ok"], \
+        "pve3 was reported ok before its quorum membership was established"
+    # ...and nothing was done on the strength of it.
+    osd = [i for i, ln in enumerate(full) if "osd create" in ln or "ceph-volume" in ln]
+    died = [i for i, ln in enumerate(full) if ln.startswith("die")]
+    assert died, full
+    assert not [i for i in osd if i < died[0]], (
+        f"{len(osd)} osd command(s) ran before the bad monitor was refused")
+
+
+def test_a_registered_monitor_without_its_storage_is_diagnosed(tmp_path):
+    """#171 B1, consistency half. The realistic shape: pve3 is in the monmap
+    and *absent* from quorum_names, because its store is gone. A check that
+    reads quorum_names instead of the monmap answers the wrong question and
+    misses exactly this."""
+    rc, _trace, full = _run_ceph_bootstrap(
+        tmp_path, storage="pve1 pve2", registered="pve1 pve2 pve3",
+        quorum="pve1 pve2", tag="regnostore")
+
+    assert rc != 0, f"the mismatch was not reported: {full[-6:]}"
+    assert not [ln for ln in full if "mon_create pve3" in ln], \
+        "a monitor already in the monmap was created again"
+    advice = " ".join(ln for ln in full if ln.startswith("die"))
+    assert "ceph mon remove" in advice, f"no usable recovery was named: {advice}"
+    # If the obvious command is mentioned at all, it must be to say why it
+    # cannot be used: its own precondition is the directory that is missing.
+    if "pveceph mon destroy" in advice:
+        assert "cannot help" in advice or "requires that directory" in advice, (
+            "named a command whose precondition is the very thing that is gone, "
+            "without saying so")
+
+
+@pytest.mark.parametrize("body", ["null", "number", "nonames", "noname"])
+def test_an_unusable_monmap_is_not_read_as_absence(tmp_path, body):
+    """#171 B1. `has("mons")` proves only that the key is there: {"mons":null},
+    {"mons":42} and {"mons":[false]} all pass it and the extraction then fails
+    -- and its status, read inside the caller's `if`, becomes "not
+    registered". A monitor that *is* registered would be recreated."""
+    rc, _trace, full = _run_ceph_bootstrap(
+        tmp_path, storage="pve1 pve2", registered="pve1 pve2 pve3",
+        quorum="pve1 pve2", monmap_body=body, tag="body-" + body)
+
+    assert rc != 0, f"an unusable monmap was accepted: {full[-5:]}"
+    assert not [ln for ln in full if "mon_create pve3" in ln], \
+        "pve3 was recreated on the strength of an unreadable monmap"
+
+
+@pytest.mark.parametrize("code", ["1", "13", "255"])
+def test_a_monmap_query_that_fails_after_answering_stops_the_run(tmp_path, code):
+    """A command failure is not absence either.
+
+    The cluster here is otherwise healthy -- every store present, every
+    monitor registered and quorate -- and the dump returns a *complete, valid*
+    monmap and then exits non-zero. An empty response would be caught by the
+    shape validation instead, which masks whether the command's own status is
+    checked at all: removing that check passed the earlier fixture.
+    """
+    rc, _trace, full = _run_ceph_bootstrap(
+        tmp_path, storage="pve1 pve2 pve3", registered="pve1 pve2 pve3",
+        quorum="pve1 pve2 pve3", fail_after=code, tag="dumpfail-" + code)
+
+    assert rc != 0, f"exit {code} from the monmap query was ignored: {full[-5:]}"
+    assert any("monmap" in ln for ln in full if ln.startswith("die")), full
+    osd = [ln for ln in full if "osd create" in ln or "ceph-volume" in ln]
+    assert not osd, "OSD work proceeded after a failed monmap query"
+
+
+def test_a_newly_created_monitor_that_never_joins_is_refused(tmp_path):
+    """The cold-bootstrap path: pve3 is created here rather than pre-existing,
+    and never appears in quorum_names. Checking quorum only for monitors that
+    already existed reports it OK and runs eight OSD commands."""
+    rc, _trace, full = _run_ceph_bootstrap(
+        tmp_path, never_joins="pve3", tag="newnojoin")
+
+    assert rc != 0, f"a newly created monitor that never joined was accepted: {full[-5:]}"
+    assert not [ln for ln in full if ln == "log mon pve3 ok"], \
+        "pve3 was reported ok although it never joined"
+    osd = [i for i, ln in enumerate(full) if "osd create" in ln or "ceph-volume" in ln]
+    died = [i for i, ln in enumerate(full) if ln.startswith("die")]
+    assert died and not [i for i in osd if i < died[0]], full
+
+
+def test_the_recovery_names_every_step_the_recreate_needs(tmp_path):
+    """#171 B1. `ceph mon remove` alone leaves Proxmox's own records behind and
+    the recreate then refuses -- "address already in use" while mon_host still
+    lists it, "monitor already exists" while the ceph.conf section or the
+    enabled unit survives. Advice that stops at step one is unusable."""
+    rc, _trace, full = _run_ceph_bootstrap(
+        tmp_path, storage="pve1 pve2", registered="pve1 pve2 pve3",
+        quorum="pve1 pve2", tag="advice")
+
+    assert rc != 0
+    advice = " ".join(ln for ln in full if ln.startswith("die"))
+    # The operations and their targets, not merely the names of the objects.
+    # Naming the unit while telling the operator to *enable* it leaves pve3's
+    # service record in place and the upstream guard then refuses the recreate
+    # with "monitor 'pve3' already exists".
+    assert "ceph mon remove pve3" in advice, advice
+    assert "systemctl disable --now ceph-mon@pve3.service" in advice, (
+        f"the service is not disabled by the advice: {advice}")
+    assert "enable --now" not in advice, (
+        f"the advice re-enables the unit it needs removed: {advice}")
+    assert "delete the [mon.pve3] section" in advice, advice
+    # One operation, not two substrings that happen to both appear: `remove` is
+    # already supplied by `ceph mon remove pve3`, so checking it separately
+    # from `mon_host` would accept advice that says to *keep* the address
+    # there. The message wraps, so compare on normalised whitespace.
+    flat = " ".join(advice.split())
+    assert "remove pve3's address from mon_host" in flat, (
+        f"the advice does not say to remove pve3's address from mon_host: {flat}")

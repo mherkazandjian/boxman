@@ -1,0 +1,5 @@
+# generated locally by `make keys` / `make answer`; never commit
+keys/
+answer.toml
+*.iso
+conf.rendered.yml

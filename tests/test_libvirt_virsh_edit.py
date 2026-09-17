@@ -9,6 +9,7 @@ False instead of raising RuntimeError.
 
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -226,3 +227,90 @@ class TestMemballoonValidation:
                           return_value=_result(stdout=_domain_xml())):
             with pytest.raises(ConfigError):
                 ve.configure_memballoon("vm01", {"stats_period": True})
+
+
+class TestConfigureCpuMemoryEditsPersistentConfig:
+    """configure_cpu_memory must read the *inactive* (persistent) XML.
+
+    A direct-boot (ISO/PXE) VM is still running virt-install's transient
+    install XML (cdrom-first, on_reboot=destroy, install media inserted) when
+    the post-create configure step runs. Redefining from the live XML would
+    persist that and re-run the installer on every boot.
+
+    The two fixtures below deliberately differ. An earlier version of this
+    test returned one XML for both dumps and carried no boot order, reboot
+    policy or CD-ROM, so it could assert that ``--inactive`` was passed but not
+    that the definition came from it -- an implementation that redefined live
+    installer XML would have passed it unchanged (#171 C1).
+    """
+
+    #: what virt-install's transient install domain looks like
+    _LIVE = ("<domain type='kvm'><name>d</name>"
+             "<memory unit='KiB'>1048576</memory>"
+             "<currentMemory unit='KiB'>1048576</currentMemory>"
+             "<vcpu placement='static'>1</vcpu>"
+             "<os><type>hvm</type><boot dev='cdrom'/><boot dev='hd'/></os>"
+             "<on_reboot>destroy</on_reboot>"
+             "<devices><disk type='file' device='cdrom'>"
+             "<source file='/iso/install.iso'/><target dev='sda'/>"
+             "</disk></devices></domain>")
+
+    #: the real, persistent definition
+    _INACTIVE = ("<domain type='kvm'><name>d</name>"
+                 "<memory unit='KiB'>1048576</memory>"
+                 "<currentMemory unit='KiB'>1048576</currentMemory>"
+                 "<vcpu placement='static'>1</vcpu>"
+                 "<os><type>hvm</type><boot dev='hd'/></os>"
+                 "<on_reboot>restart</on_reboot>"
+                 "<devices/></domain>")
+
+    def _run(self, ve: VirshEdit):
+        """Drive configure_cpu_memory; return (calls, xml handed to define)."""
+        defined = {}
+
+        def _exe(*args, **kwargs):
+            if args and args[0] == "dumpxml":
+                inactive = "--inactive" in args
+                return _result(stdout=self._INACTIVE if inactive else self._LIVE)
+            if args and args[0] == "define":
+                defined["xml"] = open(args[1], encoding="utf-8").read()
+            return _result()
+
+        with patch.object(ve.virsh, "execute", side_effect=_exe) as exe:
+            ok = ve.configure_cpu_memory("d", None, 2048)
+        return ok, exe.call_args_list, defined.get("xml", "")
+
+    def test_reads_inactive_xml_then_defines(self, ve: VirshEdit):
+        ok, calls, _xml = self._run(ve)
+        assert ok is True
+        first = calls[0].args
+        assert first[0] == "dumpxml"
+        assert "d" in first and "--inactive" in first, first
+        assert any(c.args and c.args[0] == "define" for c in calls)
+
+    def test_the_definition_comes_from_the_persistent_xml(self, ve: VirshEdit):
+        """The assertions that matter: what was *defined*, not which flag was
+        passed to the dump.
+
+        Parsed, not string-matched: lxml re-serialises with double quotes, so
+        `"<boot dev='cdrom'/>" not in xml` is true however the domain is
+        configured -- an absence assertion that cannot match is no assertion.
+        """
+        _ok, _calls, xml = self._run(ve)
+        assert xml, "nothing was handed to `virsh define`"
+        root = ET.fromstring(xml)
+
+        boots = [b.get("dev") for b in root.findall("os/boot")]
+        assert boots == ["hd"], f"the installer's boot order was persisted: {boots}"
+        reboot = root.findtext("on_reboot")
+        assert reboot != "destroy", (
+            "on_reboot=destroy was persisted; the domain would vanish on reboot")
+        cdroms = [d for d in root.findall("devices/disk")
+                  if d.get("device") == "cdrom"]
+        assert not cdroms, "the install media was persisted"
+
+    def test_the_new_memory_actually_reaches_the_definition(self, ve: VirshEdit):
+        """Otherwise the test above could pass on an empty document."""
+        _ok, _calls, xml = self._run(ve)
+        root = ET.fromstring(xml)
+        assert root.findtext("memory") == "2097152", xml

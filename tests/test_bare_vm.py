@@ -120,3 +120,23 @@ class TestBareVMCreate:
         assert "--boot=network,hd" in second_call_cmd
         assert "--noautoconsole" in second_call_cmd
         assert "--wait=0" in second_call_cmd
+
+
+class TestNetworkMacPinning:
+    """PXE VMs inherit ``networks[].mac`` from DirectInstallVM, so a Cobbler
+    DHCP reservation can be matched deterministically."""
+
+    def test_mac_passthrough(self, tmp_path):
+        vm = _make_bare_vm(tmp_path, networks=[{'name': 'mgmt', 'mac': '52:54:00:0c:01:01'}])
+        assert vm._network_specs() == [{'name': 'mgmt', 'mac': '52:54:00:0c:01:01'}]
+        assert vm._networks() == ['mgmt']
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_mac_reaches_virt_install(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        vm = _make_bare_vm(
+            tmp_path,
+            _resolved_networks=[{'name': 'bprj__p__mgmt', 'mac': '52:54:00:0c:01:01'}])
+        vm.create()
+        cmd = mock_run.call_args_list[1][0][0]
+        assert "--network=network=bprj__p__mgmt,model=virtio,mac=52:54:00:0c:01:01" in cmd

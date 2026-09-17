@@ -211,6 +211,17 @@ Use it when several hypervisors should map one stable network name onto their
 own local bridge, which is what live migration wants. Use `shared_networks`
 instead when you want boxman to *create* the bridge on this host.
 
+The two combine: a `mode: bridge` network may name a bridge that a top-level
+`shared_networks:` entry in the same `conf.yml` creates, because
+`ensure_shared_bridges()` runs before `define_networks()` on every `provision`
+and `up`. That gives direct-boot (ISO/PXE) VMs — whose first NIC is a
+`networks: [{name: …}]` entry resolved as a libvirt network, not an adapter —
+a way onto a host bridge. `boxes/proxmox-nested-ceph-cluster/` uses it to
+stretch one L2 across two hypervisors: hpe1 runs a `mode: nat` network whose
+dnsmasq holds `dhcp.hosts` reservations for *every* node's pinned
+`networks[].mac`, hpe2 runs a `shared_networks` bridge + `mode: bridge`
+network, and a VXLAN enslaved to both bridges (outside boxman) joins them.
+
 > **Ownership warning.** Moving a network between `nat`/`route` and `bridge`
 > crosses bridge ownership: libvirt deletes a bridge it manages, and preserves
 > one it does not. Use different bridge names across that transition, or omit
