@@ -403,6 +403,15 @@ unprivileged `destroy` logged a successful cleanup having deleted nothing; a
 failed removal now fails, and the chains it could not read stay exactly where
 they were for the next, privileged, attempt.
 
+The launcher in front of `iptables` exits 1 too when *it* fails: `sudo` when it
+cannot authenticate or is not permitted, `docker exec` when the container is not
+running. Read naively, a refused `sudo` would answer "absent" to every probe. So
+an exit-1 answer is trusted only after one listing of a built-in chain
+(`iptables -S FORWARD`, which always exists) succeeded through the same
+privileged path in the same operation. A refused `sudo` therefore surfaces as
+`cannot reach the firewall … exited 1: sudo: a password is required`, never as
+a clean removal.
+
 ## Reconciliation: changing a network after it exists
 
 Edit a network in `conf.yml` and the next `boxman up` or `boxman update` picks
@@ -630,14 +639,25 @@ look identical from the error and need different fixes:
 `provider.libvirt.use_sudo` is unrelated to all three and will not fix any of
 them — see **Privileges** above.
 
-**`could not query the firewall — 'iptables -C …' exited 4: … Permission denied
-(you must be root)`.** An isolation probe ran unprivileged. boxman prefixes
-`sudo` itself on the local runtime, so this means `sudo` is unavailable or
-unauthorised for `iptables` — or `iptables` is listed in `sudo_skip_commands`.
-Fix the sudo rule; `use_sudo` will not help, for the same reason as above. The
-run is reported as failed rather than the rules being assumed absent, so nothing
-was deleted or left half-applied — see [what a failed query
-means](#privileges-and-what-a-failed-query-means).
+**`cannot reach the firewall — 'iptables -S FORWARD' exited N: …`** or
+**`could not query the firewall — 'iptables -C …' exited N: …`.** The isolation
+code could not get an answer from `iptables` and reports that instead of
+assuming the rules absent, so nothing was deleted or left half-applied — see
+[what a failed query means](#privileges-and-what-a-failed-query-means). The
+tail of the message says which launcher or backend refused:
+
+- `sudo: a password is required`, or `… is not in the sudoers file` (exit 1):
+  `sudo` refused before `iptables` ran. Give the invoking user a passwordless
+  rule for `iptables`; an unattended run cannot answer a prompt.
+- `Permission denied (you must be root)` (exit 4): `iptables` itself ran
+  unprivileged — `iptables` is listed in `sudo_skip_commands`, or the process
+  is root without `CAP_NET_ADMIN` (see the `ip link` entry above).
+- `container … is not running` (exit 1): the docker runtime's container is
+  down; `boxman up` starts it again.
+- `command not found` (exit 127): no `sudo` or no `iptables` where the command
+  executes.
+
+`use_sudo` will not fix any of these, for the same reason as above.
 
 **A network change appears to do nothing.** It is probably structural, and
 boxman reports the drift but applies nothing without `--recreate-networks`. Run

@@ -325,6 +325,12 @@ class TestPrivilegedShellCommands:
         assert self._issued({"force_sudo_commands": ["iptables"]},
                             euid=0) == "sudo iptables -S INPUT"
 
+    def test_force_beats_skip_when_both_name_the_command(self):
+        # the documented precedence: force is the stronger explicit instruction
+        assert self._issued({"sudo_skip_commands": ["iptables"],
+                             "force_sudo_commands": ["iptables"]},
+                            euid=1000) == "sudo iptables -S INPUT"
+
     def test_an_unprivileged_command_still_follows_use_sudo(self):
         # the contract for everything else is untouched
         v = VirshCommand(provider_config={"use_sudo": False})

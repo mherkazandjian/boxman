@@ -1257,6 +1257,11 @@ class Network:
                 f"{', '.join(owners)}; destroying an owner removes the Linux "
                 "bridge underneath this network")
 
+    #: Set once :meth:`_firewall_answers` has proven that ``iptables`` itself
+    #: is the process answering. A Network lives for one operation, so the
+    #: proof is per operation.
+    _firewall_reachable: bool = False
+
     def _firewall(self, command: str) -> Any:
         """
         Run one ``iptables`` command line with the privilege it needs.
@@ -1271,6 +1276,39 @@ class Network:
         """
         return self.virsh.execute_shell(command, warn=True, privileged=True)
 
+    def _firewall_answers(self) -> None:
+        """
+        Establish, once per operation, that ``iptables`` itself is the process
+        answering — not ``sudo`` refusing, ``docker exec`` failing, or a
+        missing binary.
+
+        ``-C`` and ``-S`` report a missing rule or chain with exit 1, but the
+        *launcher* in front of iptables uses 1 as well: ``sudo`` exits 1 when
+        it cannot authenticate or is not permitted, and ``docker exec`` exits 1
+        when the container is not running. Read naively, a refused sudo
+        answers "absent" to every probe, and a removal reports success having
+        deleted nothing — the failure #181 describes, one process up (found
+        by review of the first fix). So an exit-1 answer is trusted only after
+        one listing of a built-in chain succeeded through the same privileged
+        path: built-in chains always exist, so ``iptables -S FORWARD`` exits 0
+        exactly when the launcher worked and iptables could read the ruleset.
+
+        Raises:
+            NetworkError: When the listing fails, carrying its exit status and
+                stderr — ``sudo: a password is required``, ``Permission denied
+                (you must be root)``, the daemon's error, or ``command not
+                found``.
+        """
+        if self._firewall_reachable:
+            return
+        listed = self._firewall("iptables -S FORWARD")
+        if not listed.ok:
+            raise NetworkError(
+                f"network {self.name}: cannot reach the firewall — "
+                f"'iptables -S FORWARD' exited {listed.return_code}: "
+                f"{(listed.stderr or '').strip() or '(no stderr)'}")
+        self._firewall_reachable = True
+
     def _rule_is_present(self, check_cmd: str) -> bool:
         """
         Answer an ``iptables -C`` probe, refusing to guess when it failed.
@@ -1282,11 +1320,15 @@ class Network:
         be root)`` on both backends, 2 for a malformed rule — and says nothing
         about the rule. Reading it as "absent" is how a removal once reported
         success having queried nothing and deleted nothing (#181), so it is
-        an error rather than an answer.
+        an error rather than an answer. The 1 itself is trusted only once
+        :meth:`_firewall_answers` has shown that iptables, and not the
+        launcher in front of it, is what exited.
 
         Raises:
-            NetworkError: When the probe exited with a status other than 0 or 1.
+            NetworkError: When the firewall cannot be reached, or the probe
+                exited with a status other than 0 or 1.
         """
+        self._firewall_answers()
         probe = self._firewall(check_cmd)
         if probe.return_code == 0:
             return True
@@ -1468,12 +1510,14 @@ class Network:
         A missing chain exits 1 on both backends (``No chain/target/match by
         that name``; the nf_tables backend words it ``Incompatible with this
         kernel``). Any other failure is a failed query, not an empty answer —
-        the same distinction as :meth:`_rule_is_present`.
+        the same distinction as :meth:`_rule_is_present`, and the 1 is likewise
+        trusted only after :meth:`_firewall_answers`.
 
         Raises:
-            NetworkError: When the listing failed for a reason other than the
-                chain not existing.
+            NetworkError: When the firewall cannot be reached, or the listing
+                failed for a reason other than the chain not existing.
         """
+        self._firewall_answers()
         listed = self._firewall(f"iptables -S {chain}")
         if listed.return_code == 1:
             return None

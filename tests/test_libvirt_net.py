@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from invoke.runners import Result
 
 from boxman.exceptions import ConfigError, NetworkError
 from boxman.providers.libvirt.net import Network, NetworkInterface
@@ -1211,6 +1212,9 @@ class TestRouteIsolationChains:
 
         def shell(command, *_args, **_kwargs):
             calls.append(command)
+            if command == "iptables -S FORWARD":
+                # the reachability listing: a built-in chain always exists
+                return _result(stdout="-P FORWARD ACCEPT")
             if command.startswith("iptables -S "):
                 if chain_rules is None:
                     return _result(ok=False, return_code=1)
@@ -1466,6 +1470,8 @@ class TestFirewallQueriesAreNotGuessed:
         net.logger = MagicMock()
         return net
 
+    REACHABLE = "iptables -S FORWARD"   # the built-in listing, always issued first
+
     def _denied(self, net: Network) -> list[str]:
         """Every iptables command is refused for lack of privilege."""
         calls: list[str] = []
@@ -1478,15 +1484,58 @@ class TestFirewallQueriesAreNotGuessed:
         net.virsh.execute = MagicMock(return_value=_result(stdout=""))
         return calls
 
+    def _answering(self, net: Network, code: int, stderr: str = "") -> list[str]:
+        """iptables is reachable; every probe exits *code*."""
+        calls: list[str] = []
+
+        def shell(command, *_args, **_kwargs):
+            calls.append(command)
+            if command == self.REACHABLE:
+                return _result(stdout="-P FORWARD ACCEPT")
+            return _result(ok=code == 0, return_code=code, stderr=stderr)
+
+        net.virsh.execute_shell = MagicMock(side_effect=shell)
+        net.virsh.execute = MagicMock(return_value=_result(stdout=""))
+        return calls
+
+    def _scripted(self, net: Network, script: dict) -> list[str]:
+        """iptables is reachable; *script* maps a command to the exit codes
+        it answers in turn (the last one repeats); any other probe answers 1
+        (absent), any other listing succeeds, any other action succeeds."""
+        calls: list[str] = []
+        answers = {cmd: list(codes) for cmd, codes in script.items()}
+
+        def shell(command, *_args, **_kwargs):
+            calls.append(command)
+            if command == self.REACHABLE:
+                return _result(stdout="-P FORWARD ACCEPT")
+            if command in answers:
+                code = answers[command].pop(0) if len(answers[command]) > 1 \
+                    else answers[command][0]
+                return _result(ok=code == 0, return_code=code,
+                               stderr=self.DENIED if code == 4 else "")
+            if " -C " in f" {command} ":
+                return _result(ok=False, return_code=1)
+            if command.startswith("iptables -S "):
+                return _result(stdout=f"-A {command.split()[-1]} -j DROP")
+            return _result()
+
+        net.virsh.execute_shell = MagicMock(side_effect=shell)
+        net.virsh.execute = MagicMock(return_value=_result(stdout=""))
+        return calls
+
+    @staticmethod
+    def _mutations(calls: list[str]) -> list[str]:
+        """The commands that change the ruleset."""
+        return [c for c in calls if c.split()[1] in ("-I", "-A", "-N", "-D", "-F", "-X")]
+
     def test_a_probe_answers_present_absent_or_refuses(self):
         net = self._net()
         for code, expected in ((0, True), (1, False)):
-            net.virsh.execute_shell = MagicMock(
-                return_value=_result(ok=code == 0, return_code=code))
+            self._answering(net, code)
             assert net._rule_is_present("iptables -C INPUT -j DROP") is expected
         for code in (2, 3, 4):
-            net.virsh.execute_shell = MagicMock(return_value=_result(
-                ok=False, return_code=code, stderr=self.DENIED))
+            self._answering(net, code, stderr=self.DENIED)
             with pytest.raises(NetworkError, match="Permission denied"):
                 net._rule_is_present("iptables -C INPUT -j DROP")
 
@@ -1496,17 +1545,43 @@ class TestFirewallQueriesAreNotGuessed:
 
         assert net.remove_route_iptables_rule() is False
 
-        # it stopped at the first unanswerable probe: no delete, flush or
-        # chain drop was attempted against a state that was never read
-        assert calls and all(" -C " in f" {c} " for c in calls), calls
+        # it stopped at the reachability listing: no probe was trusted and no
+        # delete, flush or chain drop was attempted against an unread state
+        assert calls == [self.REACHABLE], calls
         logged = [str(c.args[0]) for c in net.logger.error.call_args_list]
         assert any("Permission denied" in m for m in logged), logged
+
+    HOOK = "iptables -C INPUT -i virbr9 -j BXM_ISO_I_virbr9"
+    UNHOOK = "iptables -D INPUT -i virbr9 -j BXM_ISO_I_virbr9"
+
+    @pytest.mark.parametrize("script, unhooks", [
+        ({HOOK: [4]}, 0),                            # the loop's first probe
+        ({HOOK: [0, 4]}, 1),                         # its re-probe after a -D
+        ({HOOK: [0, 1, 4]}, 1),                      # the confirmation after the loop
+        ({"iptables -S BXM_ISO_I_virbr9": [4]}, 0),  # the chain listing
+    ], ids=["first-probe", "re-probe", "confirmation", "listing"])
+    def test_a_refusal_anywhere_in_a_removal_fails_it_at_once(
+            self, script, unhooks):
+        # iptables was reachable and answered the probes before; then one is
+        # refused (a sudo timestamp expiring mid-run, say). That is not
+        # "absent": the removal fails right there, probes nothing further,
+        # and has changed nothing beyond the unhooks the earlier answers
+        # justified
+        net = self._net()
+        (refused, codes), = script.items()
+        calls = self._scripted(net, script)
+
+        assert net.remove_route_iptables_rule() is False
+
+        assert calls[-1] == refused, calls
+        assert calls.count(refused) == len(codes), calls
+        assert self._mutations(calls) == unhooks * [self.UNHOOK], calls
 
     def test_a_refused_apply_fails(self):
         net = self._net()
         calls = self._denied(net)
         assert net.apply_route_iptables_rule() is False
-        assert calls and all(" -C " in f" {c} " for c in calls), calls
+        assert calls == [self.REACHABLE], calls
 
     def test_reconcile_reports_failed_not_drift_when_the_probe_is_refused(self):
         net = self._net()
@@ -1520,13 +1595,11 @@ class TestFirewallQueriesAreNotGuessed:
 
     def test_a_missing_chain_lists_as_none_but_a_refused_listing_raises(self):
         net = self._net()
-        net.virsh.execute_shell = MagicMock(return_value=_result(
-            ok=False, return_code=1,
-            stderr="iptables: No chain/target/match by that name."))
+        self._answering(net, 1,
+                        stderr="iptables: No chain/target/match by that name.")
         assert net._chain_rules("BXM_ISO_I_virbr9") is None
 
-        net.virsh.execute_shell = MagicMock(return_value=_result(
-            ok=False, return_code=4, stderr=self.DENIED))
+        self._answering(net, 4, stderr=self.DENIED)
         with pytest.raises(NetworkError, match="Permission denied"):
             net._chain_rules("BXM_ISO_I_virbr9")
 
@@ -1536,6 +1609,98 @@ class TestFirewallQueriesAreNotGuessed:
         self._denied(net)
         with pytest.raises(NetworkError, match="Permission denied"):
             net._remove_legacy_isolation_rules("virbr9")
+
+
+class TestLaunchersAreNotIptables:
+    """The launcher in front of iptables exits 1 too when *it* fails: sudo
+    when it cannot authenticate or is not permitted, docker exec when the
+    container is not running. Read naively that is "absent" for every probe,
+    and a refused-sudo removal reported success having deleted nothing --
+    #181 one process up, found by review of the first fix. So an exit-1
+    answer is trusted only after one listing of a built-in chain succeeded
+    through the same privileged path. Real executor; only the shell runner is
+    replaced, with real invoke results.
+    """
+
+    REFUSED = "sudo: a password is required"
+    DEAD = ("Error response from daemon: container boxman-libvirt-p1 is not "
+            "running")
+
+    @staticmethod
+    def _net(**provider_config) -> Network:
+        net = Network(name="routed-net",
+                      info={"mode": "route", "bridge": {"name": "virbr9"}},
+                      assign_new_bridge=True, provider_config=provider_config)
+        net.logger = MagicMock()
+        net.virsh.execute = MagicMock(return_value=_result(stdout=""))
+        return net
+
+    @staticmethod
+    def _launcher_fails(prefix: str, stderr: str):
+        """A shell runner whose launcher fails before iptables runs -- exit 1,
+        as sudo and docker exec both do."""
+        issued: list[str] = []
+
+        def run(command, **_kwargs):
+            issued.append(command)
+            assert command.startswith(prefix), command
+            return Result(command=command, exited=1, stderr=stderr)
+
+        return issued, run
+
+    def test_a_refused_sudo_is_a_failure_not_an_answer(self):
+        net = self._net()   # use_sudo absent: the provider default
+        issued, run = self._launcher_fails("sudo iptables ", self.REFUSED)
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=run), \
+             patch("boxman.providers.libvirt.commands.os.geteuid",
+                   return_value=1000):
+            with pytest.raises(NetworkError, match="a password is required"):
+                net._rule_is_present("iptables -C INPUT -i virbr9 -j DROP")
+            with pytest.raises(NetworkError, match="a password is required"):
+                net._chain_rules("BXM_ISO_I_virbr9")
+            assert net.remove_route_iptables_rule() is False
+            assert net.reconcile_isolation(check_only=True) == 'failed'
+        # nothing but the reachability listing was ever issued
+        assert set(issued) == {"sudo iptables -S FORWARD"}, issued
+
+    def test_a_dead_container_is_a_failure_not_an_answer(self):
+        net = self._net(runtime="docker-compose",
+                        runtime_container="boxman-libvirt-p1")
+        issued, run = self._launcher_fails(
+            "docker exec --user root boxman-libvirt-p1 ", self.DEAD)
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=run):
+            assert net.remove_route_iptables_rule() is False
+            with pytest.raises(NetworkError, match="not running"):
+                net._rule_is_present("iptables -C INPUT -i virbr9 -j DROP")
+        assert issued and all(
+            c.endswith("bash -c 'iptables -S FORWARD'") for c in issued), issued
+
+    def test_once_iptables_answered_its_one_means_absent(self):
+        # the positive control: after a successful listing, exit 1 from a probe
+        # is iptables' own answer, and the listing is not repeated
+        net = self._net()
+        issued: list[str] = []
+
+        def run(command, **_kwargs):
+            issued.append(command)
+            if command == "sudo iptables -S FORWARD":
+                return Result(command=command, exited=0,
+                              stdout="-P FORWARD ACCEPT\n")
+            return Result(command=command, exited=1,
+                          stderr="iptables: Bad rule (does a matching rule "
+                                 "exist in that chain?).")
+
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=run), \
+             patch("boxman.providers.libvirt.commands.os.geteuid",
+                   return_value=1000):
+            assert net._rule_is_present(
+                "iptables -C INPUT -i virbr9 -j DROP") is False
+            assert net._chain_rules("BXM_ISO_I_virbr9") is None
+        assert issued[0] == "sudo iptables -S FORWARD"
+        assert issued.count("sudo iptables -S FORWARD") == 1
 
 
 class TestIsolationContentsAreChecked:
@@ -1660,8 +1825,13 @@ class TestRouteIsolationDrift:
 
     def test_not_intact_when_a_jump_is_missing(self):
         net = self._net()
-        net.virsh.execute_shell = MagicMock(
-            return_value=_result(ok=False, return_code=1))
+
+        def shell(command, *_a, **_k):
+            if command == "iptables -S FORWARD":     # iptables is reachable
+                return _result(stdout="-P FORWARD ACCEPT")
+            return _result(ok=False, return_code=1)  # every probe: absent
+
+        net.virsh.execute_shell = MagicMock(side_effect=shell)
         assert net._isolation_is_intact() is False
 
     def test_reconcile_reports_repaired_when_rules_had_vanished(self):
