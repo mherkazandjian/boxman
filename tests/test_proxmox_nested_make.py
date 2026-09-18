@@ -11,6 +11,7 @@ with stub executables on PATH, and asserts what actually happened.
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -1062,8 +1063,15 @@ done
 [ -e @MARKER@ ] && printf 'MARKER-PRESENT-AT %s\\n' "${mode:-apt}" >> @LOG@
 
 if [ "$mode" = update ]; then
-    cp -a @SOURCES@/. @SNAPSHOT@/ 2>/dev/null
-    printf 'SOURCES-SNAPSHOT\\n' >> @LOG@
+    # a fresh directory per update: one shared snapshot records only the last
+    # state apt saw, so an earlier update against a wrong configuration -- the
+    # enterprise repo still on, no no-subscription source yet -- would be
+    # overwritten by the correct later one and never noticed
+    n=$(( $(cat @SNAPSHOT@/.count 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "$n" > @SNAPSHOT@/.count
+    mkdir -p @SNAPSHOT@/update-$n
+    cp -a @SOURCES@/. @SNAPSHOT@/update-$n/ 2>/dev/null
+    printf 'SOURCES-SNAPSHOT %s\\n' "$n" >> @LOG@
 fi
 
 if [ "$mode" = dist-upgrade ]; then
@@ -1124,8 +1132,16 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
     (root / "etc/network/interfaces").write_text(
         "auto ens18\niface ens18 inet manual\n\n"
         "auto vmbr0\niface vmbr0 inet static\n        bridge-ports ens18\n")
+    # what the ISO actually ships, so "the enterprise repo is still on" is a
+    # state the assertions can see rather than an empty stanza that matches
+    # nothing whatever the hook does to it
     (root / "etc/apt/sources.list.d/pve-enterprise.sources").write_text(
-        "Types: deb\nEnabled: true\n")
+        "Types: deb\n"
+        "URIs: https://enterprise.proxmox.com/debian/pve\n"
+        "Suites: trixie\n"
+        "Components: pve-enterprise\n"
+        "Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n"
+        "Enabled: true\n")
 
     src = (box / "scripts" / "first-boot.sh").read_text()
     for absolute in ("/var/lib/pve-lab", "/var/log/pve-lab-first-boot.log",
@@ -1175,20 +1191,26 @@ def _dpkg_options_of(events: str) -> list[str]:
             if prev == "-o" and a.split("=", 1)[0].lower() == "dpkg::options::"]
 
 
+KNOWN_TYPES = {"deb", "deb-src"}
+#: values APT reads as false. Anything else -- including "off extra" -- leaves
+#: the entry enabled, so the whole field is compared, not its first word.
+FALSE_VALUES = {"no", "false", "0", "off"}
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
 def _deb822_stanzas(text: str) -> list[dict[str, list[str]]]:
     """
     Parse deb822 into stanzas of ``{field: [values]}``.
 
     A grep cannot do this job: sources.list(5) allows any spacing after the
     colon, values continued on indented lines, and whitespace-separated
-    multivalues -- and a field matched anywhere in the file says nothing about
-    which *stanza* it belongs to, which is the only thing that selects a
-    repository.
+    multivalues -- and a field matched anywhere in a file says nothing about
+    which *stanza* it belongs to, which is what selects a repository.
     """
     stanzas: list[dict[str, list[str]]] = []
     current: dict[str, list[str]] = {}
     last: str | None = None
-    for raw in text.splitlines():
+    for raw in text.replace("\r\n", "\n").splitlines():
         if not raw.strip():
             if current:
                 stanzas.append(current)
@@ -1208,37 +1230,114 @@ def _deb822_stanzas(text: str) -> list[dict[str, list[str]]]:
     return stanzas
 
 
+def _one_line_entries(text: str) -> list[dict[str, list[str]]]:
+    """
+    The `.list` one-line format, in the same shape.
+
+    APT reads both formats from the same directory, so a check that looks only
+    at `.sources` can miss an enterprise entry -- or refuse a perfectly good
+    no-subscription one -- purely because of the filename.
+    """
+    entries = []
+    for raw in text.replace("\r\n", "\n").splitlines():
+        line = re.sub(r"\[[^\]]*\]", " ", raw.strip())   # drop [options]
+        parts = line.split()
+        if len(parts) < 3 or parts[0].startswith("#"):
+            continue
+        if parts[0] not in KNOWN_TYPES:
+            continue
+        entries.append({"types": [parts[0]], "uris": [parts[1]],
+                        "suites": [parts[2]], "components": parts[3:]})
+    return entries
+
+
+def _apt_stanzas(directory) -> list[dict[str, list[str]]]:
+    """Every entry APT would read from *directory*, in either format."""
+    stanzas: list[dict[str, list[str]]] = []
+    for path in sorted(directory.iterdir()):
+        if path.suffix == ".sources":
+            stanzas.extend(_deb822_stanzas(path.read_text()))
+        elif path.suffix == ".list":
+            stanzas.extend(_one_line_entries(path.read_text()))
+    return stanzas
+
+
 def _is_enabled(stanza: dict[str, list[str]]) -> bool:
-    """`Enabled:` is per stanza, and its false spellings are not just 'false'."""
+    """`Enabled:` is per stanza, and only its exact false spellings count."""
     values = stanza.get("enabled")
     if not values:
         return True
-    return values[0].lower() not in ("no", "false", "0", "off")
+    return " ".join(values).strip().lower() not in FALSE_VALUES
 
 
-def _selects_pve_no_subscription(text: str) -> bool:
+def _configuration_loads(stanzas: list[dict[str, list[str]]]) -> bool:
     """
-    Whether *text* activates the repository `pveceph install` will use.
+    Whether APT could load this configuration at all.
+
+    An unknown type or a malformed `Signed-By` is not a stanza APT skips: it
+    refuses the file, and nothing in it is used. A selector that only looks for
+    the tokens it wants would call such a configuration good.
+    """
+    for stanza in stanzas:
+        if any(t not in KNOWN_TYPES for t in stanza.get("types", [])):
+            return False
+        signed_by = stanza.get("signed-by")
+        if signed_by:
+            joined = " ".join(signed_by)
+            fingerprint = re.fullmatch(r"[0-9A-Fa-f ]{40,}", joined)
+            if not joined.startswith("/") and not fingerprint:
+                return False
+    return True
+
+
+def _points_at(stanza: dict[str, list[str]], host: str, path: str) -> bool:
+    """
+    Whether any of the stanza's URIs is *host*/*path* over HTTP(S).
+
+    Compared on structure: the hostname folds case and the default port is the
+    same endpoint, while `file://` with the same spelling is a different
+    resource entirely.
+    """
+    for uri in stanza.get("uris", []):
+        parts = urlsplit(uri)
+        if parts.scheme not in DEFAULT_PORTS:
+            continue
+        if (parts.hostname or "").lower() != host:
+            continue
+        if parts.port is not None and parts.port != DEFAULT_PORTS[parts.scheme]:
+            continue
+        if posixpath.normpath(parts.path or "/").rstrip("/") == path:
+            return True
+    return False
+
+
+def _selects_pve_no_subscription(source: str | list) -> bool:
+    """
+    Whether these entries activate the repository `pveceph install` will use.
 
     Every field has to hold in the SAME active stanza: a Debian stanza and a
     PVE stanza that between them mention trixie and pve-no-subscription select
     neither.
     """
-    for stanza in _deb822_stanzas(text):
-        if not _is_enabled(stanza):
-            continue
-        if "deb" not in stanza.get("types", []):
-            continue
-        if "trixie" not in stanza.get("suites", []):
-            continue
-        if "pve-no-subscription" not in stanza.get("components", []):
-            continue
-        for uri in stanza.get("uris", []):
-            parts = urlsplit(uri)
-            if (parts.netloc == "download.proxmox.com"
-                    and parts.path.rstrip("/") == "/debian/pve"):
-                return True
-    return False
+    stanzas = _deb822_stanzas(source) if isinstance(source, str) else source
+    if not _configuration_loads(stanzas):
+        return False
+    return any(
+        _is_enabled(st)
+        and "deb" in st.get("types", [])
+        and "trixie" in st.get("suites", [])
+        and "pve-no-subscription" in st.get("components", [])
+        and _points_at(st, "download.proxmox.com", "/debian/pve")
+        for st in stanzas)
+
+
+def _enterprise_is_active(stanzas: list[dict[str, list[str]]]) -> bool:
+    """Any enabled entry pointing at the subscription-only repository."""
+    return any(
+        _is_enabled(st)
+        and (_points_at(st, "enterprise.proxmox.com", "/debian/pve")
+             or "pve-enterprise" in st.get("components", []))
+        for st in stanzas)
 
 
 def test_the_upgrade_runs_before_the_guest_agent(box, tmp_path):
@@ -1315,12 +1414,21 @@ def test_a_failed_mtu_probe_leaves_the_marker_unwritten(box, tmp_path):
     assert not marker.exists()
 
 
-def test_a_failed_reload_is_deliberately_not_fatal(box, tmp_path):
+def test_a_failed_reload_keeps_the_hook_s_existing_tolerance(box, tmp_path):
     """
-    The counterweight to the test above: `ifreload -a || true` is best-effort
-    on purpose -- ifupdown2 can refuse a reload on a node whose interfaces are
-    already right -- so this one must NOT abort the hook. Pinned so that
-    "propagate every failure" is not applied to it by mistake.
+    The counterweight to the test above, and narrower than it looks.
+
+    `ifreload -a || true` has been best-effort since the hook was written:
+    ifupdown2 can refuse a reload on a node whose interfaces are already right,
+    and making every non-zero reload fatal would change behaviour this PR is
+    not changing. That is all this pins.
+
+    It is **not** a claim that the MTU is correct when the marker appears. The
+    hook writes the interfaces file, prints `ip link show vmbr0` and never
+    reads the value back, so a reload that failed to apply 1450 to the running
+    device still publishes the marker and still releases the cluster build --
+    a pre-existing gap in the hook, filed separately, not something these tests
+    should quietly bless by asserting readiness here.
     """
     r, marker, *_ = _first_boot(box, tmp_path, "    :", ifreload="exit 1")
     assert r.returncode == 0, "a best-effort reload was made fatal"
@@ -1369,30 +1477,36 @@ def test_the_failure_reaches_the_log_wait_first_boot_names(box, tmp_path):
         f"the upgrade's own error never reached the advertised log:\n{text}"
 
 
-def test_the_upgrade_comes_from_the_no_subscription_repository(box, tmp_path):
+def test_every_apt_update_saw_only_the_intended_repository(box, tmp_path):
     """
     The upgrade is only in step with Ceph if it comes from the repository
-    `pveceph install` will use.
+    `pveceph install` will use -- and that has to hold at *every* update, not
+    just the last one. An extra early update against the stock configuration
+    would otherwise be hidden by the correct state captured afterwards.
 
-    Read from the sources as apt saw them at `update` time, and parsed as
-    deb822 rather than grepped: a file that exists, or one whose fields are
-    spread across two stanzas, is not a configured repository.
+    Read from the sources as apt saw them, across every file APT would read,
+    and parsed rather than grepped: a file that exists, one whose fields are
+    spread over two stanzas, or one APT would refuse to load, is not a
+    configured repository.
     """
     _r, _marker, events, _hooklog, snapshot = _first_boot(box, tmp_path, "    :")
-    assert "SOURCES-SNAPSHOT" in events, "apt never reached its update"
+    updates = sorted(d for d in snapshot.iterdir() if d.is_dir())
+    assert updates, f"apt never reached an update:\n{events}"
 
-    proxmox = (snapshot / "proxmox.sources").read_text()
-    assert _selects_pve_no_subscription(proxmox), \
-        f"no active pve-no-subscription stanza when apt updated:\n{proxmox}"
-
-    enterprise = (snapshot / "pve-enterprise.sources").read_text()
-    assert not any(_is_enabled(s) for s in _deb822_stanzas(enterprise)), \
-        f"the enterprise repository was still enabled:\n{enterprise}"
+    for update in updates:
+        stanzas = _apt_stanzas(update)
+        assert _configuration_loads(stanzas), \
+            f"APT could not have loaded the sources at {update.name}"
+        assert _selects_pve_no_subscription(stanzas), \
+            f"no active pve-no-subscription entry at {update.name}"
+        assert not _enterprise_is_active(stanzas), \
+            f"the enterprise repository was still active at {update.name}"
 
 
 #: Formats a working configuration can legitimately take, and selections that
-#: only look like one. The parser above decides the repository test's verdict,
-#: so it gets its own controls rather than being trusted.
+#: only look like one. The parser decides the repository test's verdict, so it
+#: gets its own controls rather than being trusted. The expectations are the
+#: ones real APT was observed to have.
 GOOD = """\
 Types: deb
 URIs: http://download.proxmox.com/debian/pve
@@ -1404,6 +1518,7 @@ SOURCE_VARIANTS = [
     ("plain", GOOD, True),
     ("tabs-after-colon", GOOD.replace(": ", ":\t"), True),
     ("no-space-after-colon", GOOD.replace(": ", ":"), True),
+    ("crlf-line-endings", GOOD.replace("\n", "\r\n"), True),
     ("continuation-lines",
      "Types: deb\nURIs:\n http://download.proxmox.com/debian/pve\n"
      "Suites:\n trixie\nComponents:\n pve-no-subscription\n", True),
@@ -1412,13 +1527,32 @@ SOURCE_VARIANTS = [
      GOOD.replace("URIs: http://download.proxmox.com/debian/pve",
                   "URIs: https://download.proxmox.com/debian/pve"
                   " http://download.proxmox.com/debian/pve"), True),
-    ("trailing-slash-uri",
-     GOOD.replace("/debian/pve", "/debian/pve/"), True),
+    ("trailing-slash-uri", GOOD.replace("/debian/pve", "/debian/pve/"), True),
+    ("uppercase-host",
+     GOOD.replace("download.proxmox.com", "DOWNLOAD.PROXMOX.COM"), True),
+    ("explicit-default-port",
+     GOOD.replace("download.proxmox.com", "download.proxmox.com:80"), True),
+    ("types-deb-and-deb-src", GOOD.replace("Types: deb", "Types: deb deb-src"),
+     True),
+    ("absolute-signed-by",
+     GOOD + "Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n",
+     True),
     ("plus-a-disabled-unrelated-stanza",
      GOOD + "\nTypes: deb\nURIs: http://example.invalid/x\nSuites: trixie\n"
             "Components: main\nEnabled: false\n", True),
+    # APT reads an unrecognised Enabled value as enabled, so neither does this
+    # count as disabled
+    ("enabled-is-not-exactly-false",
+     GOOD + "Enabled: false but not exactly false\n", True),
+    ("enabled-off-extra", GOOD + "Enabled: off extra\n", True),
     ("disabled-with-no", GOOD + "Enabled: no\n", False),
     ("disabled-with-false", GOOD + "Enabled: false\n", False),
+    ("unknown-type", GOOD.replace("Types: deb", "Types: deb invalid-type"),
+     False),
+    ("malformed-signed-by", GOOD + "Signed-By: not-a-key\n", False),
+    ("file-scheme", GOOD.replace("http://", "file://"), False),
+    ("non-default-port",
+     GOOD.replace("download.proxmox.com", "download.proxmox.com:8080"), False),
     ("fields-split-across-stanzas",
      "Types: deb\nURIs: http://deb.debian.org/debian\nSuites: trixie\n"
      "Components: main\n\nTypes: deb\n"
@@ -1427,6 +1561,7 @@ SOURCE_VARIANTS = [
     ("different-uri-path",
      GOOD.replace("/debian/pve", "/debian/pve-not-a-repository"), False),
     ("only-a-comment", "# No package repositories configured\n", False),
+    ("no-suites", GOOD.replace("Suites: trixie\n", ""), False),
 ]
 
 
@@ -1435,3 +1570,35 @@ SOURCE_VARIANTS = [
                          ids=[v[0] for v in SOURCE_VARIANTS])
 def test_the_source_parser_agrees_with_apt(source, selects):
     assert _selects_pve_no_subscription(source) is selects
+
+
+ONE_LINE_VARIANTS = [
+    ("no-subscription-in-a-list-file",
+     "deb http://download.proxmox.com/debian/pve trixie pve-no-subscription\n",
+     True, False),
+    ("with-options",
+     "deb [signed-by=/usr/share/keyrings/k.gpg] "
+     "http://download.proxmox.com/debian/pve trixie pve-no-subscription\n",
+     True, False),
+    ("enterprise-in-a-list-file",
+     "deb https://enterprise.proxmox.com/debian/pve trixie pve-enterprise\n",
+     False, True),
+    ("commented-out",
+     "# deb http://download.proxmox.com/debian/pve trixie pve-no-subscription\n",
+     False, False),
+    ("an-unrelated-debian-source",
+     "deb http://deb.debian.org/debian trixie main\n", False, False),
+]
+
+
+@pytest.mark.parametrize("text,selects,enterprise",
+                         [(v[1], v[2], v[3]) for v in ONE_LINE_VARIANTS],
+                         ids=[v[0] for v in ONE_LINE_VARIANTS])
+def test_one_line_sources_are_read_too(text, selects, enterprise):
+    """
+    APT reads `.list` and `.sources` from the same directory. An enterprise
+    entry in the format the test does not parse is still an enterprise entry.
+    """
+    entries = _one_line_entries(text)
+    assert _selects_pve_no_subscription(entries) is selects
+    assert _enterprise_is_active(entries) is enterprise

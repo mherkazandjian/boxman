@@ -48,11 +48,12 @@ file read as a guarantee it does not make.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import DEFAULT as MOCK_DEFAULT
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.exceptions import ConfigError
+from boxman.exceptions import ConfigError, NetworkError
 from boxman.manager import BoxmanManager
 
 pytestmark = pytest.mark.unit
@@ -99,6 +100,39 @@ RECREATE_AUTHORIZED = {
 }
 
 
+#: Provider methods the network lifecycle calls. Each is armed to fail *at the
+#: call* rather than leaving the evidence for a teardown check, so a wrong
+#: implementation names the line that did it.
+_PROVIDER_METHODS = (
+    'define_network', 'remove_network', 'start_network',
+    'apply_network_live_plan', 'plan_network', 'reconcile_network_isolation',
+    'reattach_domain_network',
+)
+
+
+def _trip_on_the_foreign_network(session):
+    """
+    Arm every provider method to refuse the host's network.
+
+    Returning ``DEFAULT`` leaves each mock's own ``return_value`` in charge, so
+    a test can still say what a call answers; a test that replaces a method's
+    ``side_effect`` outright disarms that one method, which is what the
+    autouse backstop above is for.
+    """
+    def _arm(name, mock):
+        def _check(*args, **kwargs):
+            named = [value for value in (*args, *kwargs.values())
+                     if repr(FOREIGN) in repr(value)]
+            if named:
+                raise AssertionError(
+                    f"{name} was called with the foreign network: {named}")
+            return MOCK_DEFAULT
+        mock.side_effect = _check
+
+    for name in _PROVIDER_METHODS:
+        _arm(name, getattr(session, name))
+
+
 def _manager(workdir, *, networks=DEFAULT, adapters=None, plan='none'):
     """
     A bare manager whose one cluster declares *networks* and attaches
@@ -124,6 +158,7 @@ def _manager(workdir, *, networks=DEFAULT, adapters=None, plan='none'):
     mgr._netlab = None
 
     session = MagicMock()
+    _trip_on_the_foreign_network(session)
     session.define_network.return_value = True
     session.remove_network.return_value = True
     session.start_network.return_value = True
@@ -143,11 +178,16 @@ def _manager(workdir, *, networks=DEFAULT, adapters=None, plan='none'):
         for label, target, args in tasks:
             try:
                 results[label] = target(*args)
+            except AssertionError:
+                # the tripwire firing inside a worker is this file talking, not
+                # a network that failed to come down: let it reach the test
+                raise
             except Exception as exc:                       # noqa: BLE001
                 failures[label] = str(exc)
         return results, failures
 
     mgr._run_parallel = _synchronous
+    _SESSIONS.append(session)
     return mgr, session
 
 
@@ -161,16 +201,41 @@ def _names_passed(mock_method):
     return [call.kwargs.get('name') for call in mock_method.call_args_list]
 
 
-def _mentions(session, needle):
+def _mentions(session, needle=FOREIGN):
     """
-    Every call on *session*, of any method, whose repr names *needle*.
+    Every call on *session*, of any method, that passes *needle* as a value.
 
-    Deliberately blunt: a method-specific assertion only rejects the wrong
-    implementation someone thought of. This one rejects any call that so much
-    as names the foreign network, positional arguments and nested dicts
-    included.
+    Deliberately blunt about *where*: a method-specific assertion only rejects
+    the wrong implementation someone thought of, so this looks at every call on
+    the session, positional arguments and nested dicts included. It is exact
+    about *what*, matching the value's repr, so the namespaced
+    ``...__clstr__infra_guest_net`` a cluster gets when it declares that same
+    name is not mistaken for the host's bare one.
     """
-    return [call for call in session.mock_calls if needle in str(call)]
+    return [call for call in session.mock_calls if repr(needle) in str(call)]
+
+
+#: every session handed out during one test, so the guard below sees them all
+_SESSIONS: list = []
+
+
+@pytest.fixture(autouse=True)
+def _never_names_the_foreign_network():
+    """
+    The guard, applied to every test in this file rather than to the ones
+    someone remembered to write it into.
+
+    Four rounds of review each found another reachable arm -- a refused
+    removal, a cache error, a confirmation declined, a saved XML -- where a
+    stray "clean up the other networks too" would have gone unnoticed because
+    no test asserted anything about that arm. Enumerating arms is losing;
+    making every test in the file carry the assertion is not.
+    """
+    _SESSIONS.clear()
+    yield
+    for session in _SESSIONS:
+        assert not _mentions(session), \
+            f"the foreign network was named: {_mentions(session)}"
 
 
 #: the three shapes "this cluster declares no networks" arrives in. A config
@@ -505,3 +570,67 @@ class TestTheExemptionIsDeclaration:
         adapter = dict(GLOBAL_ADAPTER)
         mgr.resolve_adapter_network(adapter, 'cluster_1')
         assert adapter['network_source'] == FOREIGN
+
+
+class TestTheArmsReachedOnlyByAwkwardInputs:
+    """
+    The rest of the reachable arms: a reserved replacement bridge, a
+    confirmation that is declined or never arrives, the direct define and
+    destroy workers that `provision` and `deprovision` use rather than the
+    reconcile path, and a teardown that finds a saved XML.
+
+    Each has its own control, because a test that only asserts "nothing
+    mentioned the foreign network" passes just as well when the arm was never
+    taken at all.
+    """
+
+    def test_a_reserved_replacement_bridge_is_used_for_the_declared_network(
+            self, tmp_path):
+        plan = dict(RECREATE_AUTHORIZED, replacement_bridge_name='virbr17')
+        mgr, session = _manager(tmp_path, plan=plan)
+
+        assert mgr.reconcile_networks(
+            allow_recreate=True, auto_accept=True) == {FULL_OWNED: 'recreated'}
+        defined = session.define_network.call_args.kwargs
+        assert defined['name'] == FULL_OWNED
+        assert defined['info']['bridge'] == {'name': 'virbr17'}
+
+    @pytest.mark.parametrize('answer', [EOFError('no stdin'), 'not the name'],
+                             ids=['confirmation-eof', 'confirmation-refused'])
+    def test_an_unconfirmed_recreate_removes_nothing(self, tmp_path, answer):
+        mgr, session = _manager(tmp_path, plan=RECREATE_AUTHORIZED)
+        prompt = (MagicMock(side_effect=answer)
+                  if isinstance(answer, Exception)
+                  else MagicMock(return_value=answer))
+
+        with patch('builtins.input', prompt):
+            results = mgr.reconcile_networks(allow_recreate=True)
+
+        assert results == {FULL_OWNED: 'skipped'}
+        session.remove_network.assert_not_called()
+
+    def test_a_refused_direct_definition_fails_the_run(self, tmp_path):
+        # `provision`, and a first `up`, go through define_networks, not the
+        # reconcile path the other definition tests exercise
+        mgr, session = _manager(tmp_path)
+        session.define_network.return_value = False
+        with pytest.raises(NetworkError, match=FULL_OWNED):
+            mgr.define_networks()
+
+    def test_a_refused_direct_removal_is_reported(self, tmp_path):
+        mgr, session = _manager(tmp_path)
+        session.remove_network.return_value = False
+        failures = mgr.destroy_networks()
+        assert list(failures) == ['cluster_1/lab_internal']
+
+    def test_a_teardown_removes_only_the_declared_network_s_xml(self, tmp_path):
+        owned_xml = tmp_path / f'{FULL_OWNED}_net_define.xml'
+        owned_xml.write_text('<network/>')
+        foreign_xml = tmp_path / f'{FOREIGN}_net_define.xml'
+        foreign_xml.write_text('<network/>')
+
+        mgr, _session = _manager(tmp_path)
+        assert mgr.destroy_networks() == {}
+
+        assert not owned_xml.exists(), "the declared network's XML was kept"
+        assert foreign_xml.exists(), "a foreign network's XML was deleted"
