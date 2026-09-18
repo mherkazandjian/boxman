@@ -1077,6 +1077,11 @@ if [ "$mode" = update ]; then
     cp -rL @SOURCES@/. @SNAPSHOT@/update-$n/parts/ 2>/dev/null
     [ -f @MAINLIST@ ] && cp -L @MAINLIST@ @SNAPSHOT@/update-$n/sources.list
     printf '%s\\n' "$*" > @SNAPSHOT@/update-$n/argv
+    # NUL-delimited, because `$*` cannot say whether `update -qq` was one
+    # argument or two, nor whether an empty one was passed -- and APT rejects
+    # both of those spellings outright
+    printf '%s\\0' "$@" > @SNAPSHOT@/update-$n/argv0
+    printf '%s' "${APT_CONFIG-}" > @SNAPSHOT@/update-$n/apt_config
     for f in @SOURCES@/*; do
         [ -L "$f" ] && printf 'SYMLINKED-SOURCE %s\\n' "$f" >> @LOG@
     done
@@ -1194,10 +1199,13 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
         _stub(fake / name,
               _fill(MARKER_WATCH, **{"@NAME@": name, "@BODY@": body}))
 
+    hook_env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}")
+    # cleared, so that an APT_CONFIG recorded below is one the hook set itself
+    hook_env.pop("APT_CONFIG", None)
     r = subprocess.run(
         ["bash", str(hook)], capture_output=True, text=True, timeout=60,
         stdin=subprocess.DEVNULL,       # as the service runs it: no answers
-        env=dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}"))
+        env=hook_env)
     return (r, marker, log.read_text() if log.exists() else "",
             root / "var/log/pve-lab-first-boot.log", snapshot)
 
@@ -1637,19 +1645,7 @@ def test_every_apt_update_saw_only_the_intended_repository(box, tmp_path):
     assert "SYMLINKED-SOURCE" not in events, \
         f"a source file was a symlink, so what apt read is not frozen:\n{events}"
     for update in updates:
-        argv = (update / "argv").read_text()
-        # APT's configuration keys fold case, so `dir::etc::sourceparts` sends
-        # it somewhere else just as effectively as the canonical spelling
-        assert "dir::etc" not in argv.lower(), \
-            f"apt was pointed at sources this test never captured: {argv}"
-        # ...and `Dir::Etc` is only one of the ways an option changes what gets
-        # selected: `-c`, `APT::Architecture`, a disabled Packages target. The
-        # replay below runs a plain `update`, so it stands for the hook's own
-        # only while the hook's own is plain too. Deliberately narrow: adding
-        # an option here should mean revisiting this test.
-        assert set(argv.split()) <= {"update", "-qq"}, \
-            f"unsupported options on apt-get update, which the replay does " \
-            f"not reproduce: {argv}"
+        _assert_update_is_the_replayed_one(update)
 
     for update in updates:
         stanzas = _apt_stanzas(update)
@@ -1659,6 +1655,67 @@ def test_every_apt_update_saw_only_the_intended_repository(box, tmp_path):
             f"no active pve-no-subscription entry at {update.name}"
         assert not _enterprise_is_active(stanzas), \
             f"the enterprise repository was still active at {update.name}"
+
+
+#: the index the node's upgrade needs, as a path rather than a spelling
+INTENDED_PATH = (f"/debian/pve/dists/trixie/pve-no-subscription"
+                 f"/binary-{NATIVE_ARCH}/Packages")
+
+
+def _served_by(url: str, host: str) -> bool:
+    """Whether *url*'s parsed hostname is *host*, whatever its case."""
+    return (urlsplit(url).hostname or "").lower() == host
+
+
+def _is_native_packages_url(url: str) -> bool:
+    """
+    Whether *url* is the intended repository's native Packages index.
+
+    Parsed, not prefix-matched. A literal prefix rejects `https`, an uppercase
+    hostname and an explicit `:80` -- all of which APT resolves to the same
+    endpoint and which are supported spellings for this hook -- while a pair of
+    substrings would accept the same path served by any other host.
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in DEFAULT_PORTS:
+        return False
+    if not _served_by(url, "download.proxmox.com"):
+        return False
+    if parts.port is not None and parts.port != DEFAULT_PORTS[parts.scheme]:
+        return False
+    if parts.query or parts.fragment:
+        return False
+    path = posixpath.normpath(parts.path or "/")
+    # bare, or with a compression suffix APT appends
+    return path == INTENDED_PATH or path.startswith(INTENDED_PATH + ".")
+
+
+def _assert_update_is_the_replayed_one(update_dir) -> None:
+    """
+    The replay runs a plain `apt-get update`, so it stands for the hook's own
+    invocation only while that is plain too.
+
+    Two ways it might not be, both of which leave the captured sources looking
+    right: an option the replay does not reproduce -- `-c`, `APT::Architecture`,
+    a disabled Packages target -- or an `APT_CONFIG` the hook exported, which
+    APT reads before anything on the command line. Argument boundaries are
+    compared, not text: `update update -qq`, `update -qq ""` and
+    `update "-qq -qq"` are all rejected by APT and all look the same once
+    flattened and split.
+
+    Deliberately narrow, and fail-closed: a legitimate new option on the hook's
+    update line fails here, which is the signal to revisit this fixture.
+    """
+    raw = (update_dir / "argv0").read_bytes().decode()
+    args = raw.split("\0")[:-1] if raw.endswith("\0") else raw.split("\0")
+    assert args == ["update", "-qq"], \
+        f"unsupported apt-get update invocation, which the replay does not " \
+        f"reproduce: {args!r}"
+    hook_config = (update_dir / "apt_config").read_text()
+    assert hook_config == "", \
+        f"the hook set APT_CONFIG={hook_config!r}; APT reads it before every " \
+        f"other source of configuration, so what it selected is not what " \
+        f"this snapshot describes"
 
 
 def _apt_enumerates(update_dir):
@@ -1729,29 +1786,15 @@ def test_apt_itself_selects_only_the_intended_repository(box, tmp_path):
     assert updates, f"apt never reached an update:\n{events}"
 
     for update in updates:
-        # the replay is a plain `update`, so it speaks for the hook's own only
-        # while the hook's own is plain: an option like `-c`, or
-        # `APT::Architecture`, or a disabled Packages target changes what APT
-        # selects without ever touching Dir::Etc
-        argv = (update / "argv").read_text()
-        assert set(argv.split()) <= {"update", "-qq"}, \
-            f"unsupported options on apt-get update, which this replay does " \
-            f"not reproduce: {argv}"
-
+        _assert_update_is_the_replayed_one(update)
         status, urls, errors = _apt_enumerates(update)
         assert status == 0, \
             f"APT could not load the sources at {update.name}: {errors}"
-        # the whole URL, not two substrings of it: a second stanza on another
-        # host can otherwise supply the architecture half of the match while
-        # the intended repository supplies the rest
-        wanted = [u for u in urls if u.startswith(
-            "http://download.proxmox.com/debian/pve"
-            f"/dists/trixie/pve-no-subscription/binary-{NATIVE_ARCH}/Packages")]
+        wanted = [u for u in urls if _is_native_packages_url(u)]
         assert wanted, \
             f"APT fetches no pve-no-subscription packages at {update.name}:\n" \
             + "\n".join(urls)
-        # APT prints the host as written, so the comparison folds case
-        enterprise = [u for u in urls if "enterprise.proxmox.com" in u.lower()]
+        enterprise = [u for u in urls if _served_by(u, "enterprise.proxmox.com")]
         assert not enterprise, \
             f"APT still fetches from the subscription host: {enterprise}"
 
