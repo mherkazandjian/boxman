@@ -1351,8 +1351,14 @@ def _configuration_loads(stanzas: list[dict[str, list[str]]]) -> bool:
         # the tokens is not the same as the stanza being loadable.
         if any("://" not in uri for uri in uris):
             return False
-        if (not stanza.get("components")
-                and not all(su.endswith("/") for su in stanza["suites"])):
+        # an exact-path suite takes no components, and a named suite requires
+        # them; APT refuses the file either way round, including when one bad
+        # exact-path member sits beside a valid suite
+        exact = [su for su in stanza["suites"] if su.endswith("/")]
+        named = [su for su in stanza["suites"] if not su.endswith("/")]
+        if exact and stanza.get("components"):
+            return False
+        if named and not stanza.get("components"):
             return False
         signed_by = stanza.get("signed-by")
         if signed_by:
@@ -1383,17 +1389,42 @@ def _points_at(stanza: dict[str, list[str]], host: str, path: str) -> bool:
             continue
         if parts.port is not None and parts.port != DEFAULT_PORTS[parts.scheme]:
             continue
+        # APT appends `/dists/<suite>/...` to the URI as given, so a query or
+        # fragment lands in the middle of the path it fetches: a different
+        # endpoint wearing the right host and path
+        if parts.query or parts.fragment:
+            continue
         if posixpath.normpath(parts.path or "/").rstrip("/") == path:
             return True
     return False
 
 
+#: the lab's nodes are amd64, so that is the architecture whose packages the
+#: upgrade needs; a stanza restricted away from it fetches nothing useful
+NATIVE_ARCH = "amd64"
+
+
 def _selects_binaries(stanza: dict[str, list[str]]) -> bool:
-    """`Targets: Sources` on a `deb` stanza fetches no binary packages."""
-    targets = stanza.get("targets")
-    if not targets:
-        return True
-    return any(t.lower() in ("packages", "deb", "binary") for t in targets)
+    """
+    Whether this stanza actually yields binary packages for the node.
+
+    `Targets: Sources` fetches no binaries; so does `Targets: deb`, because
+    `deb` is not one of APT's target identifiers -- `Packages` is. Removals and
+    architecture restrictions apply on top, and either can leave a stanza that
+    reads correctly selecting nothing the node can install.
+    """
+    targets = [t.lower() for t in stanza.get("targets", [])]
+    if targets and "packages" not in targets:
+        return False
+    if "packages" in [t.lower() for t in stanza.get("targets-remove", [])]:
+        return False
+    architectures = [a.lower() for a in stanza.get("architectures", [])]
+    if architectures and NATIVE_ARCH not in architectures:
+        return False
+    if NATIVE_ARCH in [a.lower()
+                       for a in stanza.get("architectures-remove", [])]:
+        return False
+    return True
 
 
 def _selects_pve_no_subscription(source: str | list) -> bool:
@@ -1619,6 +1650,75 @@ def test_every_apt_update_saw_only_the_intended_repository(box, tmp_path):
             f"no active pve-no-subscription entry at {update.name}"
         assert not _enterprise_is_active(stanzas), \
             f"the enterprise repository was still active at {update.name}"
+
+
+def _apt_enumerates(update_dir):
+    """
+    Ask APT itself which indexes it would fetch for one captured update.
+
+    Returns ``(exit_status, [url, ...])``, or ``None`` where APT is not
+    installed. `--print-uris` resolves and prints targets without downloading
+    anything, and every directory it touches is private to this call, so it
+    reads only what the hook produced and writes nothing outside tmp_path.
+
+    This is the oracle. The reader below approximates APT's selection rules for
+    machines without it, and successive reviews kept finding places where an
+    approximation of APT is not APT: an invalid suite/component pairing, a
+    query string that lands in the middle of the fetched path, `Targets: deb`
+    -- which is not a target identifier -- and architecture restrictions.
+    Asking the program settles all of them at once.
+    """
+    apt = shutil.which("apt-get")
+    if apt is None:
+        return None
+    private = update_dir / "apt-run"
+    for sub in ("state/lists/partial", "cache/archives/partial", "log"):
+        (private / sub).mkdir(parents=True, exist_ok=True)
+    main = update_dir / "sources.list"
+    out = subprocess.run(
+        [apt, "--print-uris", "update",
+         "-o", f"Dir::Etc::sourcelist={main if main.exists() else '/dev/null'}",
+         "-o", f"Dir::Etc::sourceparts={update_dir / 'parts'}",
+         "-o", f"Dir::State={private / 'state'}",
+         "-o", f"Dir::Cache={private / 'cache'}",
+         "-o", f"Dir::Log={private / 'log'}",
+         "-o", "Dir::Etc::trusted=/dev/null",
+         "-o", "Dir::Etc::trustedparts=/dev/null",
+         "-o", "Acquire::AllowInsecureRepositories=true"],
+        capture_output=True, text=True, timeout=120)
+    urls = re.findall(r"'([^']+)'", out.stdout)
+    return out.returncode, urls
+
+
+@pytest.mark.skipif(shutil.which("apt-get") is None,
+                    reason="needs APT to enumerate targets")
+def test_apt_itself_selects_only_the_intended_repository(box, tmp_path):
+    """
+    The same claim as the test above, answered by the program that decides it.
+
+    Every intercepted update is replayed through `apt-get --print-uris`, which
+    fails outright on a configuration APT will not load and otherwise names the
+    exact indexes it would fetch. A node's upgrade is in step with Ceph only if
+    those include a pve-no-subscription Packages index for its architecture and
+    none from the subscription host.
+    """
+    _r, _marker, events, _hooklog, snapshot = _first_boot(box, tmp_path, "    :")
+    updates = sorted(d for d in snapshot.iterdir() if d.is_dir())
+    assert updates, f"apt never reached an update:\n{events}"
+
+    for update in updates:
+        status, urls = _apt_enumerates(update)
+        assert status == 0, \
+            f"APT could not load the sources at {update.name}"
+        wanted = [u for u in urls
+                  if "/debian/pve/dists/trixie/pve-no-subscription/" in u
+                  and f"binary-{NATIVE_ARCH}/Packages" in u]
+        assert wanted, \
+            f"APT fetches no pve-no-subscription packages at {update.name}:\n" \
+            + "\n".join(urls)
+        enterprise = [u for u in urls if "enterprise.proxmox.com" in u]
+        assert not enterprise, \
+            f"APT still fetches from the subscription host: {enterprise}"
 
 
 #: Formats a working configuration can legitimately take, and selections that
