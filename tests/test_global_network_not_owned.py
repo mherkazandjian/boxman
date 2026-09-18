@@ -44,6 +44,13 @@ never selects a template's network -- but a foreign network that happens to
 share a name with a template's network, or that lives inside the container
 runtime, is not protected by what this file pins. Say so rather than let the
 file read as a guarantee it does not make.
+
+**What the guard is.** A provider-call invariant: the manager is driven for
+real, and every call it makes on its provider session is inspected. It is not
+an end-to-end libvirt boundary -- code that bypassed the session and ran
+``virsh`` itself would not be seen here, and nothing in the lifecycle does
+that today. The one non-call way to break the contract, rewriting the global
+adapter to a namespaced name, is checked separately after every test.
 """
 
 from __future__ import annotations
@@ -121,11 +128,10 @@ def _trip_on_the_foreign_network(session):
     """
     def _arm(name, mock):
         def _check(*args, **kwargs):
-            named = [value for value in (*args, *kwargs.values())
-                     if repr(FOREIGN) in repr(value)]
-            if named:
+            if _carries(FOREIGN, (args, kwargs)):
                 raise AssertionError(
-                    f"{name} was called with the foreign network: {named}")
+                    f"{name} was called with the foreign network: "
+                    f"args={args} kwargs={kwargs}")
             return MOCK_DEFAULT
         mock.side_effect = _check
 
@@ -188,6 +194,7 @@ def _manager(workdir, *, networks=DEFAULT, adapters=None, plan='none'):
 
     mgr._run_parallel = _synchronous
     _SESSIONS.append(session)
+    _MANAGERS.append(mgr)
     return mgr, session
 
 
@@ -201,22 +208,46 @@ def _names_passed(mock_method):
     return [call.kwargs.get('name') for call in mock_method.call_args_list]
 
 
+def _strings_in(value):
+    """Every string inside *value*, walking dicts, lists, tuples and sets."""
+    if isinstance(value, str):
+        yield str(value)                 # a str subclass compares as its text
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _strings_in(key)
+            yield from _strings_in(item)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            yield from _strings_in(item)
+
+
+def _carries(needle, value) -> bool:
+    """Whether *needle* appears as a string value anywhere in *value*."""
+    return any(text == needle for text in _strings_in(value))
+
+
 def _mentions(session, needle=FOREIGN):
     """
     Every call on *session*, of any method, that passes *needle* as a value.
 
     Deliberately blunt about *where*: a method-specific assertion only rejects
     the wrong implementation someone thought of, so this looks at every call on
-    the session, positional arguments and nested dicts included. It is exact
-    about *what*, matching the value's repr, so the namespaced
-    ``...__clstr__infra_guest_net`` a cluster gets when it declares that same
-    name is not mistaken for the host's bare one.
+    the session, positional arguments and nested structures included.
+
+    Compared as strings rather than by matching ``repr``. Two reasons: the
+    namespaced ``...__clstr__infra_guest_net`` a cluster gets when it declares
+    that same name must not be mistaken for the host's bare one, and a ``str``
+    subclass with its own ``__repr__`` is still that network's name to every
+    caller downstream while defeating any search of the call's text.
     """
-    return [call for call in session.mock_calls if repr(needle) in str(call)]
+    return [call for call in session.mock_calls
+            if _carries(needle, (call.args, call.kwargs))]
 
 
-#: every session handed out during one test, so the guard below sees them all
+#: every session and manager handed out during one test, so the guard below
+#: sees them all
 _SESSIONS: list = []
+_MANAGERS: list = []
 
 
 @pytest.fixture(autouse=True)
@@ -232,10 +263,22 @@ def _never_names_the_foreign_network():
     making every test in the file carry the assertion is not.
     """
     _SESSIONS.clear()
+    _MANAGERS.clear()
     yield
     for session in _SESSIONS:
         assert not _mentions(session), \
             f"the foreign network was named: {_mentions(session)}"
+    # ...and the adapter still names the host's network afterwards. Rewriting
+    # it to the namespaced form makes no provider call at all, so the guard
+    # above cannot see it -- and the guest would then be attached to a network
+    # that does not exist.
+    for mgr in _MANAGERS:
+        for cluster in mgr.config['clusters'].values():
+            for vm in (cluster.get('vms') or {}).values():
+                for adapter in vm.get('network_adapters') or []:
+                    if adapter.get('is_global'):
+                        assert adapter['network_source'] == FOREIGN, \
+                            f"a lifecycle call rewrote the global adapter: {adapter}"
 
 
 #: the three shapes "this cluster declares no networks" arrives in. A config
