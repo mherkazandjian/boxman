@@ -1063,14 +1063,23 @@ done
 [ -e @MARKER@ ] && printf 'MARKER-PRESENT-AT %s\\n' "${mode:-apt}" >> @LOG@
 
 if [ "$mode" = update ]; then
-    # a fresh directory per update: one shared snapshot records only the last
-    # state apt saw, so an earlier update against a wrong configuration -- the
-    # enterprise repo still on, no no-subscription source yet -- would be
-    # overwritten by the correct later one and never noticed
+    # A fresh directory per update, because one shared snapshot records only
+    # the last state apt saw: an earlier update against a wrong configuration
+    # -- enterprise still on, no no-subscription source yet -- would be
+    # overwritten by the correct later one and never noticed.
+    #
+    # -L, because `cp -a` would preserve a symlink and the bytes behind it
+    # could change before the assertions read them. What is stored has to be
+    # what apt read at the moment it ran.
     n=$(( $(cat @SNAPSHOT@/.count 2>/dev/null || echo 0) + 1 ))
     printf '%s' "$n" > @SNAPSHOT@/.count
-    mkdir -p @SNAPSHOT@/update-$n
-    cp -a @SOURCES@/. @SNAPSHOT@/update-$n/ 2>/dev/null
+    mkdir -p @SNAPSHOT@/update-$n/parts
+    cp -rL @SOURCES@/. @SNAPSHOT@/update-$n/parts/ 2>/dev/null
+    [ -f @MAINLIST@ ] && cp -L @MAINLIST@ @SNAPSHOT@/update-$n/sources.list
+    printf '%s\\n' "$*" > @SNAPSHOT@/update-$n/argv
+    for f in @SOURCES@/*; do
+        [ -L "$f" ] && printf 'SYMLINKED-SOURCE %s\\n' "$f" >> @LOG@
+    done
     printf 'SOURCES-SNAPSHOT %s\\n' "$n" >> @LOG@
 fi
 
@@ -1162,7 +1171,8 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
         body = (body.replace("@LOG@", str(log))
                     .replace("@MARKER@", str(marker))
                     .replace("@SOURCES@", str(root / "etc/apt/sources.list.d"))
-                    .replace("@SNAPSHOT@", str(snapshot)))
+                    .replace("@SNAPSHOT@", str(snapshot))
+                    .replace("@MAINLIST@", str(root / "etc/apt/sources.list")))
         for key, value in extra.items():
             body = body.replace(key, value)
         return body
@@ -1222,6 +1232,9 @@ def _deb822_stanzas(text: str) -> list[dict[str, list[str]]]:
             if last:
                 current[last].extend(raw.split())
             continue
+        if ":" not in raw:
+            current["__malformed__"] = ["1"]
+            continue
         field, _, value = raw.partition(":")
         last = field.strip().lower()
         current[last] = value.split()
@@ -1236,29 +1249,60 @@ def _one_line_entries(text: str) -> list[dict[str, list[str]]]:
 
     APT reads both formats from the same directory, so a check that looks only
     at `.sources` can miss an enterprise entry -- or refuse a perfectly good
-    no-subscription one -- purely because of the filename.
+    no-subscription one -- purely because of the filename. Options in brackets
+    are kept rather than discarded: a `[signed-by=...]` that APT rejects makes
+    the whole configuration unusable, so it has to reach the validation below.
     """
     entries = []
     for raw in text.replace("\r\n", "\n").splitlines():
-        line = re.sub(r"\[[^\]]*\]", " ", raw.strip())   # drop [options]
-        parts = line.split()
-        if len(parts) < 3 or parts[0].startswith("#"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
-        if parts[0] not in KNOWN_TYPES:
+        line = line.split(" #", 1)[0]                   # trailing comment
+        options = dict(
+            opt.split("=", 1)
+            for block in re.findall(r"\[([^\]]*)\]", line)
+            for opt in block.split() if "=" in opt)
+        parts = re.sub(r"\[[^\]]*\]", " ", line).split()
+        if len(parts) < 3:
+            entries.append({"__malformed__": ["1"]})
             continue
-        entries.append({"types": [parts[0]], "uris": [parts[1]],
-                        "suites": [parts[2]], "components": parts[3:]})
+        # the type is kept even when unknown: APT refuses the file rather than
+        # skipping the line, and the validator has to see that
+        entry = {"types": [parts[0]], "uris": [parts[1]],
+                 "suites": [parts[2]], "components": parts[3:]}
+        if "signed-by" in options:
+            entry["signed-by"] = options["signed-by"].split(",")
+        entries.append(entry)
     return entries
 
 
-def _apt_stanzas(directory) -> list[dict[str, list[str]]]:
-    """Every entry APT would read from *directory*, in either format."""
+#: APT ignores a file in sources.list.d whose name is not made of these
+#: characters, so `proxmox saved.sources` configures nothing at all.
+VALID_SOURCE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _apt_stanzas(update_dir) -> list[dict[str, list[str]]]:
+    """
+    Every entry APT would read for one intercepted `apt-get update`.
+
+    That is the main `sources.list` as well as the `sources.list.d` parts:
+    an enterprise entry added to the main list is not less active for being
+    outside the directory this fixture used to look at.
+    """
     stanzas: list[dict[str, list[str]]] = []
-    for path in sorted(directory.iterdir()):
-        if path.suffix == ".sources":
-            stanzas.extend(_deb822_stanzas(path.read_text()))
-        elif path.suffix == ".list":
-            stanzas.extend(_one_line_entries(path.read_text()))
+    main = update_dir / "sources.list"
+    if main.exists():
+        stanzas.extend(_one_line_entries(main.read_text()))
+    parts = update_dir / "parts"
+    if parts.is_dir():
+        for path in sorted(parts.iterdir()):
+            if not VALID_SOURCE_NAME.match(path.name):
+                continue
+            if path.suffix == ".sources":
+                stanzas.extend(_deb822_stanzas(path.read_text()))
+            elif path.suffix == ".list":
+                stanzas.extend(_one_line_entries(path.read_text()))
     return stanzas
 
 
@@ -1274,18 +1318,35 @@ def _configuration_loads(stanzas: list[dict[str, list[str]]]) -> bool:
     """
     Whether APT could load this configuration at all.
 
-    An unknown type or a malformed `Signed-By` is not a stanza APT skips: it
-    refuses the file, and nothing in it is used. A selector that only looks for
-    the tokens it wants would call such a configuration good.
+    An unknown type, a missing required field, a malformed line or a
+    `Signed-By` APT rejects is not an entry it skips: it refuses the file, and
+    nothing in it is used -- including the entry the hook wanted. A selector
+    that only looks for the tokens it wants calls such a configuration good.
+
+    This models the failures reachable from what this hook writes. It is not a
+    general APT validator; see the parser controls for the cases checked
+    against real APT.
     """
     for stanza in stanzas:
-        if any(t not in KNOWN_TYPES for t in stanza.get("types", [])):
+        if "__malformed__" in stanza:
+            return False
+        types = stanza.get("types", [])
+        if not types or any(t not in KNOWN_TYPES for t in types):
+            return False
+        if not stanza.get("uris") or not stanza.get("suites"):
+            return False
+        if (not stanza.get("components")
+                and not all(su.endswith("/") for su in stanza["suites"])):
             return False
         signed_by = stanza.get("signed-by")
         if signed_by:
-            joined = " ".join(signed_by)
-            fingerprint = re.fullmatch(r"[0-9A-Fa-f ]{40,}", joined)
-            if not joined.startswith("/") and not fingerprint:
+            tokens = [t for t in re.split(r"[,\s]+", " ".join(signed_by)) if t]
+            paths = tokens and all(t.startswith("/") for t in tokens)
+            # exactly 40 hex digits, optionally suffixed '!' -- 41 is not a
+            # fingerprint and APT says so
+            fingerprint = (len(tokens) == 1
+                           and re.fullmatch(r"[0-9A-Fa-f]{40}!?", tokens[0]))
+            if not (paths or fingerprint):
                 return False
     return True
 
@@ -1311,6 +1372,14 @@ def _points_at(stanza: dict[str, list[str]], host: str, path: str) -> bool:
     return False
 
 
+def _selects_binaries(stanza: dict[str, list[str]]) -> bool:
+    """`Targets: Sources` on a `deb` stanza fetches no binary packages."""
+    targets = stanza.get("targets")
+    if not targets:
+        return True
+    return any(t.lower() in ("packages", "deb", "binary") for t in targets)
+
+
 def _selects_pve_no_subscription(source: str | list) -> bool:
     """
     Whether these entries activate the repository `pveceph install` will use.
@@ -1325,6 +1394,7 @@ def _selects_pve_no_subscription(source: str | list) -> bool:
     return any(
         _is_enabled(st)
         and "deb" in st.get("types", [])
+        and _selects_binaries(st)
         and "trixie" in st.get("suites", [])
         and "pve-no-subscription" in st.get("components", [])
         and _points_at(st, "download.proxmox.com", "/debian/pve")
@@ -1493,6 +1563,18 @@ def test_every_apt_update_saw_only_the_intended_repository(box, tmp_path):
     updates = sorted(d for d in snapshot.iterdir() if d.is_dir())
     assert updates, f"apt never reached an update:\n{events}"
 
+    # The snapshot can only stand for what apt read if the hook does not move
+    # the goalposts: a symlinked source can be rewritten after the copy, and
+    # a `Dir::Etc` override sends apt to a directory nothing captured. Neither
+    # is something this hook does; asserted rather than assumed, because the
+    # capture silently certifies the wrong input otherwise.
+    assert "SYMLINKED-SOURCE" not in events, \
+        f"a source file was a symlink, so what apt read is not frozen:\n{events}"
+    for update in updates:
+        argv = (update / "argv").read_text()
+        assert "Dir::Etc" not in argv, \
+            f"apt was pointed at sources this test never captured: {argv}"
+
     for update in updates:
         stanzas = _apt_stanzas(update)
         assert _configuration_loads(stanzas), \
@@ -1562,13 +1644,38 @@ SOURCE_VARIANTS = [
      GOOD.replace("/debian/pve", "/debian/pve-not-a-repository"), False),
     ("only-a-comment", "# No package repositories configured\n", False),
     ("no-suites", GOOD.replace("Suites: trixie\n", ""), False),
+    ("no-uris", GOOD.replace("URIs: http://download.proxmox.com/debian/pve\n", ""),
+     False),
+    ("no-components", GOOD.replace("Components: pve-no-subscription\n", ""),
+     False),
+    ("colonless-line", GOOD + "this line has no colon\n", False),
+    ("fingerprint-signed-by",
+     GOOD + "Signed-By: " + "A" * 40 + "\n", True),
+    ("fingerprint-with-exclamation",
+     GOOD + "Signed-By: " + "A" * 40 + "!\n", True),
+    ("forty-one-hex-digits", GOOD + "Signed-By: " + "A" * 41 + "\n", False),
+    ("path-then-invalid-token",
+     GOOD + "Signed-By: /usr/share/keyrings/k.gpg not-a-key\n", False),
+    ("targets-sources-only", GOOD + "Targets: Sources\n", False),
+    ("targets-packages", GOOD + "Targets: Packages\n", True),
 ]
 
 
 @pytest.mark.parametrize("source,selects",
                          [(v[1], v[2]) for v in SOURCE_VARIANTS],
                          ids=[v[0] for v in SOURCE_VARIANTS])
-def test_the_source_parser_agrees_with_apt(source, selects):
+def test_the_source_reader_handles_what_this_hook_can_write(source, selects):
+    """
+    The scope of the model, stated rather than implied.
+
+    These expectations were each checked against real APT 2.7.14, and the
+    reader exists to answer one question about one hook: did this first boot
+    leave an active pve-no-subscription source and no active enterprise entry?
+    It is deliberately not a general APT validator -- it does not model
+    conflicting options, trust settings, or acquisition, and an earlier name
+    claiming it "agrees with APT" was an overclaim that successive reviews
+    kept falsifying.
+    """
     assert _selects_pve_no_subscription(source) is selects
 
 
@@ -1588,6 +1695,16 @@ ONE_LINE_VARIANTS = [
      False, False),
     ("an-unrelated-debian-source",
      "deb http://deb.debian.org/debian trixie main\n", False, False),
+    # the component is commented out, so it is not a component
+    ("component-after-a-comment",
+     "deb http://download.proxmox.com/debian/pve trixie main"
+     " # pve-no-subscription\n", False, False),
+    ("unknown-type-poisons-the-file",
+     "invalid-type http://download.proxmox.com/debian/pve trixie"
+     " pve-no-subscription\n", False, False),
+    ("bad-signed-by-option",
+     "deb [signed-by=not-a-key] http://download.proxmox.com/debian/pve"
+     " trixie pve-no-subscription\n", False, False),
 ]
 
 
