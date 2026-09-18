@@ -1082,6 +1082,14 @@ if [ "$mode" = update ]; then
     # both of those spellings outright
     printf '%s\\0' "$@" > @SNAPSHOT@/update-$n/argv0
     printf '%s' "${APT_CONFIG-}" > @SNAPSHOT@/update-$n/apt_config
+    # APT reads apt.conf and apt.conf.d/* on every run, so a hook can change
+    # what gets selected and delete the evidence afterwards. Recorded here,
+    # while it is still true.
+    mkdir -p @SNAPSHOT@/update-$n/aptconf
+    [ -f @APTETC@/apt.conf ] && \
+        cp -L @APTETC@/apt.conf @SNAPSHOT@/update-$n/aptconf/apt.conf
+    [ -d @APTETC@/apt.conf.d ] && \
+        cp -rL @APTETC@/apt.conf.d @SNAPSHOT@/update-$n/aptconf/ 2>/dev/null
     for f in @SOURCES@/*; do
         [ -L "$f" ] && printf 'SYMLINKED-SOURCE %s\\n' "$f" >> @LOG@
     done
@@ -1171,6 +1179,12 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
     for absolute in ("/var/lib/pve-lab", "/var/log/pve-lab-first-boot.log",
                      "/etc/apt/sources.list.d", "/etc/network/interfaces"):
         assert absolute in src, f"the hook no longer writes {absolute}"
+    # /etc/apt wholesale, not just sources.list.d: APT's default configuration
+    # lives beside it, and a hook that wrote apt.conf.d would otherwise reach
+    # the real one -- changing what APT selects without touching any input this
+    # fixture records
+    for absolute in ("/var/lib/pve-lab", "/var/log/pve-lab-first-boot.log",
+                     "/etc/apt", "/etc/network/interfaces"):
         src = src.replace(absolute, f"{root}{absolute}")
     hook = tmp_path / "first-boot.sh"
     hook.write_text(src)
@@ -1187,7 +1201,8 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
                     .replace("@MARKER@", str(marker))
                     .replace("@SOURCES@", str(root / "etc/apt/sources.list.d"))
                     .replace("@SNAPSHOT@", str(snapshot))
-                    .replace("@MAINLIST@", str(root / "etc/apt/sources.list")))
+                    .replace("@MAINLIST@", str(root / "etc/apt/sources.list"))
+                    .replace("@APTETC@", str(root / "etc/apt")))
         for key, value in extra.items():
             body = body.replace(key, value)
         return body
@@ -1291,6 +1306,12 @@ def _one_line_entries(text: str) -> list[dict[str, list[str]]]:
                  "suites": [parts[2]], "components": parts[3:]}
         if "signed-by" in options:
             entry["signed-by"] = options["signed-by"].split(",")
+        # `[arch=...]` is the one-line spelling of Architectures, and dropping
+        # it made an arm64-only entry look native
+        if "arch" in options:
+            entry["architectures"] = options["arch"].split(",")
+        if "arch-" in options:
+            entry["architectures-remove"] = options["arch-"].split(",")
         entries.append(entry)
     return entries
 
@@ -1393,7 +1414,7 @@ def _points_at(stanza: dict[str, list[str]], host: str, path: str) -> bool:
         parts = urlsplit(uri)
         if parts.scheme not in DEFAULT_PORTS:
             continue
-        if (parts.hostname or "").lower() != host:
+        if (parts.hostname or "").lower().rstrip(".") != host:
             continue
         if parts.port is not None and parts.port != DEFAULT_PORTS[parts.scheme]:
             continue
@@ -1463,7 +1484,7 @@ def _hosted_at(stanza: dict[str, list[str]], host: str) -> bool:
         parts = urlsplit(uri)
         if parts.scheme not in DEFAULT_PORTS:
             continue
-        if (parts.hostname or "").lower() == host:
+        if (parts.hostname or "").lower().rstrip(".") == host:
             return True
     return False
 
@@ -1657,14 +1678,23 @@ def test_every_apt_update_saw_only_the_intended_repository(box, tmp_path):
             f"the enterprise repository was still active at {update.name}"
 
 
+#: what APT may append to an index name
+COMPRESSION_SUFFIXES = (".xz", ".gz", ".bz2", ".lzma", ".lz4", ".zst")
+
 #: the index the node's upgrade needs, as a path rather than a spelling
 INTENDED_PATH = (f"/debian/pve/dists/trixie/pve-no-subscription"
                  f"/binary-{NATIVE_ARCH}/Packages")
 
 
 def _served_by(url: str, host: str) -> bool:
-    """Whether *url*'s parsed hostname is *host*, whatever its case."""
-    return (urlsplit(url).hostname or "").lower() == host
+    """
+    Whether *url*'s parsed hostname is *host*, whatever its case.
+
+    The trailing dot of a fully qualified name is stripped: `example.com.` and
+    `example.com` are the same host, and leaving it in let a subscription URL
+    past the very check that exists to refuse it.
+    """
+    return (urlsplit(url).hostname or "").lower().rstrip(".") == host
 
 
 def _is_native_packages_url(url: str) -> bool:
@@ -1686,8 +1716,10 @@ def _is_native_packages_url(url: str) -> bool:
     if parts.query or parts.fragment:
         return False
     path = posixpath.normpath(parts.path or "/")
-    # bare, or with a compression suffix APT appends
-    return path == INTENDED_PATH or path.startswith(INTENDED_PATH + ".")
+    # the file itself, bare or compressed -- not everything under a *directory*
+    # whose name happens to begin `Packages.`
+    return path in {INTENDED_PATH, *(INTENDED_PATH + suffix
+                                     for suffix in COMPRESSION_SUFFIXES)}
 
 
 def _assert_update_is_the_replayed_one(update_dir) -> None:
@@ -1716,6 +1748,11 @@ def _assert_update_is_the_replayed_one(update_dir) -> None:
         f"the hook set APT_CONFIG={hook_config!r}; APT reads it before every " \
         f"other source of configuration, so what it selected is not what " \
         f"this snapshot describes"
+    written = [path for path in (update_dir / "aptconf").rglob("*")
+               if path.is_file()]
+    assert not written, \
+        f"the hook wrote APT configuration that the replay does not " \
+        f"reproduce: {[f.name for f in written]}"
 
 
 def _apt_enumerates(update_dir):
@@ -1919,7 +1956,56 @@ ONE_LINE_VARIANTS = [
     ("bad-signed-by-option",
      "deb [signed-by=not-a-key] http://download.proxmox.com/debian/pve"
      " trixie pve-no-subscription\n", False, False),
+    # `[arch=...]` restricts the entry exactly as `Architectures:` does
+    ("arch-restricted-away-from-native",
+     "deb [arch=arm64] http://download.proxmox.com/debian/pve trixie"
+     " pve-no-subscription\n", False, False),
+    ("arch-includes-native",
+     "deb [arch=amd64] http://download.proxmox.com/debian/pve trixie"
+     " pve-no-subscription\n", True, False),
+    ("dotted-enterprise-host",
+     "deb http://enterprise.proxmox.com./debian/ceph-squid trixie"
+     " enterprise\n", False, True),
 ]
+
+
+#: What APT enumerates, and what only looks like it. The index is a file: a
+#: flat repository rooted at a *directory* called `Packages.backup` produces
+#: URLs that begin the same way and fetch something else entirely.
+_BASE = "http://download.proxmox.com/debian/pve/dists/trixie/pve-no-subscription"
+NATIVE_URL_CASES = [
+    ("bare", f"{_BASE}/binary-amd64/Packages", True),
+    ("compressed", f"{_BASE}/binary-amd64/Packages.xz", True),
+    ("https", "https://download.proxmox.com/debian/pve/dists/trixie"
+              "/pve-no-subscription/binary-amd64/Packages.gz", True),
+    ("uppercase-host", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "DOWNLOAD.PROXMOX.COM"), True),
+    ("default-port", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "download.proxmox.com:80"), True),
+    ("dotted-host", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "download.proxmox.com."), True),
+    ("backup-directory", f"{_BASE}/binary-amd64/Packages.backup/InRelease",
+     False),
+    ("compressed-directory", f"{_BASE}/binary-amd64/Packages.xz/Packages.xz",
+     False),
+    ("wrong-architecture", f"{_BASE}/binary-arm64/Packages", False),
+    ("wrong-component", f"{_BASE}/../pve-enterprise/binary-amd64/Packages",
+     False),
+    ("other-host", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "mirror.invalid"), False),
+    ("non-default-port", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "download.proxmox.com:8080"), False),
+    ("query", f"{_BASE}/binary-amd64/Packages?mirror=1", False),
+    ("fragment", f"{_BASE}/binary-amd64/Packages#packages", False),
+    ("translation-index", f"{_BASE}/i18n/Translation-en.xz", False),
+]
+
+
+@pytest.mark.parametrize("url,is_native",
+                         [(c[1], c[2]) for c in NATIVE_URL_CASES],
+                         ids=[c[0] for c in NATIVE_URL_CASES])
+def test_the_native_index_is_recognised_by_structure(url, is_native):
+    assert _is_native_packages_url(url) is is_native
 
 
 @pytest.mark.parametrize("text,selects,enterprise",
