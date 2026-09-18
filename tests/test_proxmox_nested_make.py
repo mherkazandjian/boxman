@@ -1086,10 +1086,22 @@ if [ "$mode" = update ]; then
     # what gets selected and delete the evidence afterwards. Recorded here,
     # while it is still true.
     mkdir -p @SNAPSHOT@/update-$n/aptconf
-    [ -f @APTETC@/apt.conf ] && \
-        cp -L @APTETC@/apt.conf @SNAPSHOT@/update-$n/aptconf/apt.conf
-    [ -d @APTETC@/apt.conf.d ] && \
-        cp -rL @APTETC@/apt.conf.d @SNAPSHOT@/update-$n/aptconf/ 2>/dev/null
+    present=@SNAPSHOT@/update-$n/aptconf-present
+    # presence is recorded by existence, not by managing to read it: a config
+    # this stub cannot copy is still a config APT loads -- it runs as root,
+    # where mode 000 is no obstacle -- and a silently empty capture would say
+    # the opposite
+    if [ -e @APTETC@/apt.conf ]; then
+        printf 'apt.conf\\n' >> "$present"
+        cp -L @APTETC@/apt.conf @SNAPSHOT@/update-$n/aptconf/apt.conf \
+            || printf 'apt.conf (unreadable)\\n' >> "$present"
+    fi
+    if [ -e @APTETC@/apt.conf.d ]; then
+        ls -A @APTETC@/apt.conf.d >> "$present" 2>/dev/null \
+            || printf 'apt.conf.d (unreadable)\\n' >> "$present"
+        cp -rL @APTETC@/apt.conf.d @SNAPSHOT@/update-$n/aptconf/ 2>/dev/null \
+            || printf 'apt.conf.d (uncopyable)\\n' >> "$present"
+    fi
     for f in @SOURCES@/*; do
         [ -L "$f" ] && printf 'SYMLINKED-SOURCE %s\\n' "$f" >> @LOG@
     done
@@ -1414,7 +1426,7 @@ def _points_at(stanza: dict[str, list[str]], host: str, path: str) -> bool:
         parts = urlsplit(uri)
         if parts.scheme not in DEFAULT_PORTS:
             continue
-        if (parts.hostname or "").lower().rstrip(".") != host:
+        if _canonical_host(parts.hostname) != host:
             continue
         if parts.port is not None and parts.port != DEFAULT_PORTS[parts.scheme]:
             continue
@@ -1484,7 +1496,7 @@ def _hosted_at(stanza: dict[str, list[str]], host: str) -> bool:
         parts = urlsplit(uri)
         if parts.scheme not in DEFAULT_PORTS:
             continue
-        if (parts.hostname or "").lower().rstrip(".") == host:
+        if _canonical_host(parts.hostname) == host:
             return True
     return False
 
@@ -1686,6 +1698,18 @@ INTENDED_PATH = (f"/debian/pve/dists/trixie/pve-no-subscription"
                  f"/binary-{NATIVE_ARCH}/Packages")
 
 
+def _canonical_host(host: str) -> str:
+    """
+    Fold case and drop the single terminal dot of a fully qualified name.
+
+    Exactly one: `example.com.` is `example.com`, while `example.com..` is
+    neither -- and treating it as the same host let a URL past the check that
+    exists to refuse it.
+    """
+    host = (host or "").lower()
+    return host[:-1] if host.endswith(".") else host
+
+
 def _served_by(url: str, host: str) -> bool:
     """
     Whether *url*'s parsed hostname is *host*, whatever its case.
@@ -1694,7 +1718,7 @@ def _served_by(url: str, host: str) -> bool:
     `example.com` are the same host, and leaving it in let a subscription URL
     past the very check that exists to refuse it.
     """
-    return (urlsplit(url).hostname or "").lower().rstrip(".") == host
+    return _canonical_host(urlsplit(url).hostname) == host
 
 
 def _is_native_packages_url(url: str) -> bool:
@@ -1748,11 +1772,13 @@ def _assert_update_is_the_replayed_one(update_dir) -> None:
         f"the hook set APT_CONFIG={hook_config!r}; APT reads it before every " \
         f"other source of configuration, so what it selected is not what " \
         f"this snapshot describes"
-    written = [path for path in (update_dir / "aptconf").rglob("*")
+    present = update_dir / "aptconf-present"
+    named = present.read_text().split() if present.exists() else []
+    written = [path.name for path in (update_dir / "aptconf").rglob("*")
                if path.is_file()]
-    assert not written, \
+    assert not named and not written, \
         f"the hook wrote APT configuration that the replay does not " \
-        f"reproduce: {[f.name for f in written]}"
+        f"reproduce: {sorted(set(named + written))}"
 
 
 def _apt_enumerates(update_dir):
@@ -1984,6 +2010,12 @@ NATIVE_URL_CASES = [
         "download.proxmox.com", "download.proxmox.com:80"), True),
     ("dotted-host", f"{_BASE}/binary-amd64/Packages".replace(
         "download.proxmox.com", "download.proxmox.com."), True),
+    # one terminal dot is the fully qualified spelling; two is a different,
+    # malformed name and not this repository
+    ("double-dotted-host", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "download.proxmox.com.."), False),
+    ("triple-dotted-host", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "download.proxmox.com..."), False),
     ("backup-directory", f"{_BASE}/binary-amd64/Packages.backup/InRelease",
      False),
     ("compressed-directory", f"{_BASE}/binary-amd64/Packages.xz/Packages.xz",
