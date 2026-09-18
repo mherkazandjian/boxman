@@ -1151,6 +1151,16 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
         "Components: pve-enterprise\n"
         "Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n"
         "Enabled: true\n")
+    # the hook's disabling loop names this one too, and it is a different
+    # repository with a different component -- seeded so that dropping it from
+    # that loop is something the assertions can see
+    (root / "etc/apt/sources.list.d/ceph.sources").write_text(
+        "Types: deb\n"
+        "URIs: https://enterprise.proxmox.com/debian/ceph-squid\n"
+        "Suites: trixie\n"
+        "Components: enterprise\n"
+        "Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n"
+        "Enabled: true\n")
 
     src = (box / "scripts" / "first-boot.sh").read_text()
     for absolute in ("/var/lib/pve-lab", "/var/log/pve-lab-first-boot.log",
@@ -1333,7 +1343,13 @@ def _configuration_loads(stanzas: list[dict[str, list[str]]]) -> bool:
         types = stanza.get("types", [])
         if not types or any(t not in KNOWN_TYPES for t in types):
             return False
-        if not stanza.get("uris") or not stanza.get("suites"):
+        uris = stanza.get("uris")
+        if not uris or not stanza.get("suites"):
+            return False
+        # An inline comment is not a comment in a deb822 field: it becomes more
+        # field content, and APT refuses the entry. Finding one good URI among
+        # the tokens is not the same as the stanza being loadable.
+        if any("://" not in uri for uri in uris):
             return False
         if (not stanza.get("components")
                 and not all(su.endswith("/") for su in stanza["suites"])):
@@ -1401,11 +1417,29 @@ def _selects_pve_no_subscription(source: str | list) -> bool:
         for st in stanzas)
 
 
+def _hosted_at(stanza: dict[str, list[str]], host: str) -> bool:
+    """Whether any of the stanza's HTTP(S) URIs is served by *host*."""
+    for uri in stanza.get("uris", []):
+        parts = urlsplit(uri)
+        if parts.scheme not in DEFAULT_PORTS:
+            continue
+        if (parts.hostname or "").lower() == host:
+            return True
+    return False
+
+
 def _enterprise_is_active(stanzas: list[dict[str, list[str]]]) -> bool:
-    """Any enabled entry pointing at the subscription-only repository."""
+    """
+    Any enabled entry on the subscription-only host.
+
+    Matched by host rather than by one path: the hook disables two of these,
+    and the Ceph one is a different repository (`/debian/ceph-squid`) with a
+    different component (`enterprise`) from PVE's. Keying on `/debian/pve` saw
+    only half of what the hook owns.
+    """
     return any(
         _is_enabled(st)
-        and (_points_at(st, "enterprise.proxmox.com", "/debian/pve")
+        and (_hosted_at(st, "enterprise.proxmox.com")
              or "pve-enterprise" in st.get("components", []))
         for st in stanzas)
 
@@ -1572,7 +1606,9 @@ def test_every_apt_update_saw_only_the_intended_repository(box, tmp_path):
         f"a source file was a symlink, so what apt read is not frozen:\n{events}"
     for update in updates:
         argv = (update / "argv").read_text()
-        assert "Dir::Etc" not in argv, \
+        # APT's configuration keys fold case, so `dir::etc::sourceparts` sends
+        # it somewhere else just as effectively as the canonical spelling
+        assert "dir::etc" not in argv.lower(), \
             f"apt was pointed at sources this test never captured: {argv}"
 
     for update in updates:
