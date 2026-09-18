@@ -1067,41 +1067,49 @@ if [ "$mode" = update ]; then
     # the last state apt saw: an earlier update against a wrong configuration
     # -- enterprise still on, no no-subscription source yet -- would be
     # overwritten by the correct later one and never noticed.
-    #
-    # -L, because `cp -a` would preserve a symlink and the bytes behind it
-    # could change before the assertions read them. What is stored has to be
-    # what apt read at the moment it ran.
     n=$(( $(cat @SNAPSHOT@/.count 2>/dev/null || echo 0) + 1 ))
     printf '%s' "$n" > @SNAPSHOT@/.count
-    mkdir -p @SNAPSHOT@/update-$n/parts
-    cp -rL @SOURCES@/. @SNAPSHOT@/update-$n/parts/ 2>/dev/null
-    [ -f @MAINLIST@ ] && cp -L @MAINLIST@ @SNAPSHOT@/update-$n/sources.list
-    printf '%s\\n' "$*" > @SNAPSHOT@/update-$n/argv
+    cap=@SNAPSHOT@/update-$n
+    mkdir -p "$cap/parts" "$cap/aptconf"
+    fail="$cap/capture-failed"
+    present="$cap/aptconf-present"
+
+    # One rule for every input APT reads: absent, captured, or recorded as a
+    # failure. Never silently missing -- an enterprise source this stub cannot
+    # read is still one APT loads, because the hook runs as root, and a
+    # snapshot that just omits it certifies the opposite of the truth.
+    #
+    # Presence is `-e` OR `-L`: `-e` follows symlinks and answers false when
+    # the target sits behind a directory this user cannot search, while root
+    # APT follows it perfectly well. Copies dereference (-L) so what is stored
+    # is bytes, not a link whose target can change afterwards.
+    if [ -e @SOURCES@ ] || [ -L @SOURCES@ ]; then
+        ls -A @SOURCES@ >/dev/null 2>&1 || printf 'sources.list.d\\n' >> "$fail"
+        cp -rL @SOURCES@/. "$cap/parts/" 2>/dev/null \
+            || printf 'sources.list.d\\n' >> "$fail"
+    fi
+    if [ -e @MAINLIST@ ] || [ -L @MAINLIST@ ]; then
+        cp -L @MAINLIST@ "$cap/sources.list" 2>/dev/null \
+            || printf 'sources.list\\n' >> "$fail"
+    fi
+    if [ -e @APTETC@/apt.conf ] || [ -L @APTETC@/apt.conf ]; then
+        printf 'apt.conf\\n' >> "$present"
+        cp -L @APTETC@/apt.conf "$cap/aptconf/apt.conf" 2>/dev/null \
+            || printf 'apt.conf\\n' >> "$fail"
+    fi
+    if [ -e @APTETC@/apt.conf.d ] || [ -L @APTETC@/apt.conf.d ]; then
+        ls -A @APTETC@/apt.conf.d >> "$present" 2>/dev/null \
+            || printf 'apt.conf.d\\n' >> "$fail"
+        cp -rL @APTETC@/apt.conf.d/. "$cap/aptconf/" 2>/dev/null \
+            || printf 'apt.conf.d\\n' >> "$fail"
+    fi
+
+    printf '%s\\n' "$*" > "$cap/argv"
     # NUL-delimited, because `$*` cannot say whether `update -qq` was one
     # argument or two, nor whether an empty one was passed -- and APT rejects
     # both of those spellings outright
-    printf '%s\\0' "$@" > @SNAPSHOT@/update-$n/argv0
-    printf '%s' "${APT_CONFIG-}" > @SNAPSHOT@/update-$n/apt_config
-    # APT reads apt.conf and apt.conf.d/* on every run, so a hook can change
-    # what gets selected and delete the evidence afterwards. Recorded here,
-    # while it is still true.
-    mkdir -p @SNAPSHOT@/update-$n/aptconf
-    present=@SNAPSHOT@/update-$n/aptconf-present
-    # presence is recorded by existence, not by managing to read it: a config
-    # this stub cannot copy is still a config APT loads -- it runs as root,
-    # where mode 000 is no obstacle -- and a silently empty capture would say
-    # the opposite
-    if [ -e @APTETC@/apt.conf ]; then
-        printf 'apt.conf\\n' >> "$present"
-        cp -L @APTETC@/apt.conf @SNAPSHOT@/update-$n/aptconf/apt.conf \
-            || printf 'apt.conf (unreadable)\\n' >> "$present"
-    fi
-    if [ -e @APTETC@/apt.conf.d ]; then
-        ls -A @APTETC@/apt.conf.d >> "$present" 2>/dev/null \
-            || printf 'apt.conf.d (unreadable)\\n' >> "$present"
-        cp -rL @APTETC@/apt.conf.d @SNAPSHOT@/update-$n/aptconf/ 2>/dev/null \
-            || printf 'apt.conf.d (uncopyable)\\n' >> "$present"
-    fi
+    printf '%s\\0' "$@" > "$cap/argv0"
+    printf '%s' "${APT_CONFIG-}" > "$cap/apt_config"
     for f in @SOURCES@/*; do
         [ -L "$f" ] && printf 'SYMLINKED-SOURCE %s\\n' "$f" >> @LOG@
     done
@@ -1772,6 +1780,10 @@ def _assert_update_is_the_replayed_one(update_dir) -> None:
         f"the hook set APT_CONFIG={hook_config!r}; APT reads it before every " \
         f"other source of configuration, so what it selected is not what " \
         f"this snapshot describes"
+    failed = update_dir / "capture-failed"
+    assert not failed.exists(), \
+        f"inputs APT read could not be captured, so this snapshot is not " \
+        f"what it saw: {sorted(set(failed.read_text().split()))}"
     present = update_dir / "aptconf-present"
     named = present.read_text().split() if present.exists() else []
     written = [path.name for path in (update_dir / "aptconf").rglob("*")
