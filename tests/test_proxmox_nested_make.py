@@ -1418,11 +1418,12 @@ def _selects_binaries(stanza: dict[str, list[str]]) -> bool:
         return False
     if "packages" in [t.lower() for t in stanza.get("targets-remove", [])]:
         return False
-    architectures = [a.lower() for a in stanza.get("architectures", [])]
+    # compared exactly: APT does not fold these, so `Architectures: AMD64`
+    # produces `binary-AMD64` targets and no amd64 packages at all
+    architectures = stanza.get("architectures", [])
     if architectures and NATIVE_ARCH not in architectures:
         return False
-    if NATIVE_ARCH in [a.lower()
-                       for a in stanza.get("architectures-remove", [])]:
+    if NATIVE_ARCH in stanza.get("architectures-remove", []):
         return False
     return True
 
@@ -1641,6 +1642,14 @@ def test_every_apt_update_saw_only_the_intended_repository(box, tmp_path):
         # it somewhere else just as effectively as the canonical spelling
         assert "dir::etc" not in argv.lower(), \
             f"apt was pointed at sources this test never captured: {argv}"
+        # ...and `Dir::Etc` is only one of the ways an option changes what gets
+        # selected: `-c`, `APT::Architecture`, a disabled Packages target. The
+        # replay below runs a plain `update`, so it stands for the hook's own
+        # only while the hook's own is plain too. Deliberately narrow: adding
+        # an option here should mean revisiting this test.
+        assert set(argv.split()) <= {"update", "-qq"}, \
+            f"unsupported options on apt-get update, which the replay does " \
+            f"not reproduce: {argv}"
 
     for update in updates:
         stanzas = _apt_stanzas(update)
@@ -1656,17 +1665,16 @@ def _apt_enumerates(update_dir):
     """
     Ask APT itself which indexes it would fetch for one captured update.
 
-    Returns ``(exit_status, [url, ...])``, or ``None`` where APT is not
-    installed. `--print-uris` resolves and prints targets without downloading
-    anything, and every directory it touches is private to this call, so it
-    reads only what the hook produced and writes nothing outside tmp_path.
+    Returns ``(exit_status, [url, ...], stderr)``, or ``None`` where APT is not
+    installed. ``--print-uris`` resolves targets without downloading anything.
 
-    This is the oracle. The reader below approximates APT's selection rules for
-    machines without it, and successive reviews kept finding places where an
-    approximation of APT is not APT: an invalid suite/component pairing, a
-    query string that lands in the middle of the fetched path, `Targets: deb`
-    -- which is not a target identifier -- and architecture restrictions.
-    Asking the program settles all of them at once.
+    The isolation is a private bootstrap handed over ``APT_CONFIG``, not a set
+    of late ``-o`` flags: APT reads that file *before* `/etc/apt/apt.conf` and
+    `/etc/apt/apt.conf.d/*`, so disabling those there is the only way to stop
+    the host's own settings deciding the answer. Without it this test depended
+    on the machine running it -- an ambient `APT::Architecture` or a
+    `DefaultEnabled "false"` silently changed which targets APT reported for
+    identical source bytes.
     """
     apt = shutil.which("apt-get")
     if apt is None:
@@ -1675,19 +1683,33 @@ def _apt_enumerates(update_dir):
     for sub in ("state/lists/partial", "cache/archives/partial", "log"):
         (private / sub).mkdir(parents=True, exist_ok=True)
     main = update_dir / "sources.list"
+    bootstrap = private / "bootstrap.conf"
+    bootstrap.write_text(f'''
+Dir::Etc::main "/dev/null";
+Dir::Etc::parts "/dev/null";
+Dir::Etc::sourcelist "{main if main.exists() else '/dev/null'}";
+Dir::Etc::sourceparts "{update_dir / 'parts'}";
+Dir::Etc::trusted "/dev/null";
+Dir::Etc::trustedparts "/dev/null";
+Dir::State "{private / 'state'}";
+Dir::Cache "{private / 'cache'}";
+Dir::Log "{private / 'log'}";
+APT::Architecture "{NATIVE_ARCH}";
+APT::Architectures {{ "{NATIVE_ARCH}"; }};
+Acquire::AllowInsecureRepositories "true";
+quiet "0";
+''')
+
     out = subprocess.run(
-        [apt, "--print-uris", "update",
-         "-o", f"Dir::Etc::sourcelist={main if main.exists() else '/dev/null'}",
-         "-o", f"Dir::Etc::sourceparts={update_dir / 'parts'}",
-         "-o", f"Dir::State={private / 'state'}",
-         "-o", f"Dir::Cache={private / 'cache'}",
-         "-o", f"Dir::Log={private / 'log'}",
-         "-o", "Dir::Etc::trusted=/dev/null",
-         "-o", "Dir::Etc::trustedparts=/dev/null",
-         "-o", "Acquire::AllowInsecureRepositories=true"],
-        capture_output=True, text=True, timeout=120)
-    urls = re.findall(r"'([^']+)'", out.stdout)
-    return out.returncode, urls
+        [apt, "--print-uris", "update"],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "APT_CONFIG": str(bootstrap), "LC_ALL": "C"})
+    # each record is `'<uri>' <filename> <size> <hash>`; a bare scan for quoted
+    # text tears a URI containing an apostrophe into pieces
+    urls = [m.group(1) for m in
+            (re.match(r"^'(.+)'\s+\S+\s+\d+\s", line)
+             for line in out.stdout.splitlines()) if m]
+    return out.returncode, urls, out.stderr
 
 
 @pytest.mark.skipif(shutil.which("apt-get") is None,
@@ -1707,16 +1729,29 @@ def test_apt_itself_selects_only_the_intended_repository(box, tmp_path):
     assert updates, f"apt never reached an update:\n{events}"
 
     for update in updates:
-        status, urls = _apt_enumerates(update)
+        # the replay is a plain `update`, so it speaks for the hook's own only
+        # while the hook's own is plain: an option like `-c`, or
+        # `APT::Architecture`, or a disabled Packages target changes what APT
+        # selects without ever touching Dir::Etc
+        argv = (update / "argv").read_text()
+        assert set(argv.split()) <= {"update", "-qq"}, \
+            f"unsupported options on apt-get update, which this replay does " \
+            f"not reproduce: {argv}"
+
+        status, urls, errors = _apt_enumerates(update)
         assert status == 0, \
-            f"APT could not load the sources at {update.name}"
-        wanted = [u for u in urls
-                  if "/debian/pve/dists/trixie/pve-no-subscription/" in u
-                  and f"binary-{NATIVE_ARCH}/Packages" in u]
+            f"APT could not load the sources at {update.name}: {errors}"
+        # the whole URL, not two substrings of it: a second stanza on another
+        # host can otherwise supply the architecture half of the match while
+        # the intended repository supplies the rest
+        wanted = [u for u in urls if u.startswith(
+            "http://download.proxmox.com/debian/pve"
+            f"/dists/trixie/pve-no-subscription/binary-{NATIVE_ARCH}/Packages")]
         assert wanted, \
             f"APT fetches no pve-no-subscription packages at {update.name}:\n" \
             + "\n".join(urls)
-        enterprise = [u for u in urls if "enterprise.proxmox.com" in u]
+        # APT prints the host as written, so the comparison folds case
+        enterprise = [u for u in urls if "enterprise.proxmox.com" in u.lower()]
         assert not enterprise, \
             f"APT still fetches from the subscription host: {enterprise}"
 
