@@ -89,6 +89,14 @@ and the nodes themselves have no `jq`), internet egress, ~100 GB free under
 `openssl`, `ssh-keygen`, and `jq` + `terraform` for the Terraform and HA
 targets.
 
+On the nodes there is nothing to install: the first-boot hook assumes
+**ifupdown2**, which Proxmox VE ships and uses by default, and which is the
+reason the hook is so particular about `/etc/network/interfaces` (see *What
+the hook accepts* below). A node converted to another network manager is
+outside what this box supports — the hook does not detect that, it fails at
+the live MTU check and withholds the readiness marker. ifupdown2 is not
+needed on the hosts or the workstation, and the test suite stubs it.
+
 Site-specific values live in one place, `scripts/lib.sh` (host IPs, the VLAN
 interface `bond0.1439`, node IPs/MACs, VXLAN id), and must match `conf.yml`
 (`tests/test_proxmox_nested_box.py` pins the MAC ↔ reservation contract).
