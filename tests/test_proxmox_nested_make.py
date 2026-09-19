@@ -1289,14 +1289,22 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
     snapshot.mkdir(exist_ok=True)
 
     def _fill(body, **extra):
+        # the injected bodies go in first, so a placeholder *inside* one --
+        # an upgrade that writes to @STATE@, a reload that empties @BRIF@ --
+        # is resolved by the pass below rather than surviving into the stub
+        for key, value in extra.items():
+            body = body.replace(key, value)
         body = (body.replace("@LOG@", str(log))
                     .replace("@MARKER@", str(marker))
                     .replace("@SOURCES@", str(root / "etc/apt/sources.list.d"))
                     .replace("@SNAPSHOT@", str(snapshot))
                     .replace("@MAINLIST@", str(root / "etc/apt/sources.list"))
-                    .replace("@APTETC@", str(root / "etc/apt")))
-        for key, value in extra.items():
-            body = body.replace(key, value)
+                    .replace("@APTETC@", str(root / "etc/apt"))
+                    # a place for one stub to leave something another reads:
+                    # what the upgrade does to the network, the `ip` stub has
+                    # to be able to report
+                    .replace("@STATE@", str(tmp_path))
+                    .replace("@BRIF@", str(root / "sys/class/net/vmbr0/brif")))
         return body
 
     _stub(fake / "apt-get",
@@ -1783,7 +1791,10 @@ def test_a_declared_port_that_is_not_attached_is_refused(box, tmp_path):
         box, tmp_path, "    :", bridge_ports=[])
     assert r.returncode != 0
     assert not marker.exists()
-    assert "not attached" in hooklog.read_text()
+    # named by its pass, like the other two: a port can be missing here, or
+    # leave during the reload, or leave during the upgrade, and the three
+    # mean different things
+    assert "to it before the reload" in hooklog.read_text()
 
 
 def test_a_member_no_stanza_declares_is_still_verified(box, tmp_path):
@@ -1809,6 +1820,68 @@ def test_an_undeclared_member_at_the_lab_mtu_is_fine(box, tmp_path):
         mtus={"vmbr0": 1450, "ens18": 1450, "ens19": 1450})
     assert r.returncode == 0, r.stderr
     assert marker.exists()
+
+
+#: an `ip` that answers from a file, so a stub running earlier in the hook can
+#: change what a later one sees -- an upgrade that moves an MTU, say
+IP_FROM_STATE = """
+iface=
+for a in "$@"; do
+    case "$a" in -*|link|show|dev) ;; *) iface=$a ;; esac
+done
+mtu=1450
+[ -f "@STATE@/mtu-$iface" ] && mtu=$(cat "@STATE@/mtu-$iface")
+echo "2: $iface: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu $mtu qdisc noqueue"
+"""
+
+
+def test_an_upgrade_that_moves_the_mtu_stops_the_marker(box, tmp_path):
+    """
+    The check used to run once, before a ten-minute dist-upgrade that replaces
+    packages and restarts services. Anything it moved afterwards was certified
+    by a marker written over the state the node had already left.
+    """
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    printf '1500\\n' > @STATE@/mtu-vmbr0",
+        ip=IP_FROM_STATE)
+    assert r.returncode != 0, "the upgrade moved the MTU unnoticed"
+    assert not marker.exists()
+    log = hooklog.read_text()
+    assert "vmbr0 has MTU 1500, expected 1450 after the upgrade" in log
+    # and the first pass did run, so this is the second one talking
+    assert "ok: vmbr0 mtu 1450 after the reload" in log
+
+
+def test_an_upgrade_that_detaches_the_uplink_stops_the_marker(box, tmp_path):
+    # a bridge with no uplink still answers `ip link` at the right MTU
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    rmdir @BRIF@/ens18")
+    assert r.returncode != 0, "the uplink left the bridge unnoticed"
+    assert not marker.exists()
+    assert "to it after the upgrade" in hooklog.read_text(), \
+        "the refusal did not say which pass lost the port"
+
+
+def test_a_reload_that_detaches_the_uplink_stops_the_marker(box, tmp_path):
+    # the same check, one pass earlier: attachment was verified before the
+    # reload and never again, so a port leaving during it went unseen
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", ifreload="rmdir @BRIF@/ens18")
+    assert r.returncode != 0, "the uplink left during the reload unnoticed"
+    assert not marker.exists()
+    assert "to it after the reload" in hooklog.read_text(), \
+        "the refusal did not say which pass lost the port"
+
+
+def test_an_ordinary_upgrade_still_publishes_the_marker(box, tmp_path):
+    # the control: verifying twice must not make a healthy node unready
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", ip=IP_FROM_STATE)
+    assert r.returncode == 0, r.stderr
+    assert marker.exists()
+    log = hooklog.read_text()
+    assert "ok: vmbr0 mtu 1450 after the reload" in log
+    assert "ok: vmbr0 mtu 1450 after the upgrade" in log
 
 
 def test_a_guest_tap_on_the_bridge_is_not_a_port(box, tmp_path):

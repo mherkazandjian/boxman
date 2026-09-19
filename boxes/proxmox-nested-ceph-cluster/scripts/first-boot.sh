@@ -279,13 +279,18 @@ fi
 # ...and each declared port is really attached to it. A port that is
 # configured but not enslaved leaves the bridge without an uplink, which looks
 # like a working node until the first packet has to leave it.
-for iface in $ports; do
-    if [ ! -e "/sys/class/net/vmbr0/brif/$iface" ]; then
-        echo "ERROR: $iface is declared as a port of vmbr0 but is not attached"
-        echo "       to it. Not writing the readiness marker."
-        exit 1
-    fi
-done
+check_attached() {           # <when> <iface>...: enslaved to vmbr0, or no marker
+    when=$1
+    shift
+    for iface in "$@"; do
+        if [ ! -e "/sys/class/net/vmbr0/brif/$iface" ]; then
+            echo "ERROR: $iface is declared as a port of vmbr0 but is not attached"
+            echo "       to it $when. Not writing the readiness marker."
+            exit 1
+        fi
+    done
+}
+check_attached "before the reload" $ports
 
 for iface in vmbr0 $ports; do
     if source_precedes "$iface"; then
@@ -318,8 +323,12 @@ done
 # the live MTU below is, and that is checked either way.
 ifreload -a || echo "note: ifreload exited non-zero; verifying the live MTU anyway"
 
-# The check that makes the marker mean what it says. Runs whether the reload
-# succeeded, failed, or was skipped because the file already said 1450.
+# The check that makes the marker mean what it says, and the reason it is a
+# function: it runs twice. Once here, so a node that is already wrong fails
+# before ten minutes of dist-upgrade, and once immediately before the marker,
+# because everything between the two -- the upgrade, the guest agent, the
+# services it starts -- can change what this verifies. A check that ran only
+# here would certify a state the node had already left.
 #
 # It covers every port the kernel actually has, not just the declared ones.
 # ifupdown2's effective port set is computed by its addons -- mstpctl-ports,
@@ -328,43 +337,57 @@ ifreload -a || echo "note: ifreload exited non-zero; verifying the live MTU anyw
 # game. After the reload the kernel knows, so it is asked. Declared ports are
 # still what gets *configured*: persisting an MTU needs a stanza to put it in.
 #
-# Every member, with nothing skipped by name. Guest taps were exempted here
-# at first, on the grounds that this hook runs once at first boot before any
-# guest exists -- but that premise is exactly what makes the exemption
-# pointless: on a node with no guests, an interface named like one is not a
-# guest's, and a name has never been proof of ownership anyway. So the whole
-# membership is checked, and a `tap...` at 1500 stops the marker like anything
-# else would.
-#
-# The listing has to succeed. Hiding its failure and carrying on would leave
-# the check covering only vmbr0 and the declared ports, which is the narrower
-# check this one replaced -- and the marker would still say otherwise.
-# -A, not plain -1: a member whose name begins with a dot is a member like
-# any other, and the default listing hides it while still succeeding.
-if ! attached=$(ls -1A -- /sys/class/net/vmbr0/brif); then
-    echo "ERROR: cannot list vmbr0's bridge members. Everything below is only"
-    echo "       as complete as that listing, so a marker written over a"
-    echo "       failed read would certify less than it says it does."
-    echo "       Not writing the readiness marker."
-    exit 1
-fi
-checked=
-for iface in vmbr0 $ports $attached; do
-    case " $checked " in *" $iface "*) continue ;; esac
-    checked="$checked $iface"
-    live=$( { ip -o link show "$iface" || true; } \
-            | awk '{ for (i = 1; i < NF; i++) if ($i == "mtu") print $(i + 1) }' )
-    if [ "$live" != "$LAB_MTU" ]; then
-        echo "ERROR: $iface has MTU ${live:-unknown}, expected $LAB_MTU."
-        echo "       The VXLAN carries $LAB_MTU-byte frames; a node left at 1500"
-        echo "       loses large packets silently, and Ceph on top of it fails in"
-        echo "       ways that look like anything but an MTU problem."
+# Nothing is skipped by name. Guest taps were exempted at first, on the
+# grounds that this hook runs once at first boot before any guest exists --
+# but that premise is exactly what makes the exemption pointless: on a node
+# with no guests, an interface named like one is not a guest's, and a name has
+# never been proof of ownership anyway.
+verify_lab_mtu() {           # <when>: the live state, read rather than assumed
+    # names out of a file or out of the kernel, never patterns: `bridge-ports
+    # e*0` is an attribute value no whitelist sees, and the kernel rejects
+    # only `/`, `:` and whitespace in a name
+    set -f
+
+    # The listing has to succeed. Hiding its failure and carrying on would
+    # leave this covering only vmbr0 and the declared ports -- the narrower
+    # check this one replaced -- and the marker would still say otherwise.
+    # -A, not plain -1: a member whose name begins with a dot is a member like
+    # any other, and the default listing hides it while still succeeding.
+    if ! attached=$(ls -1A -- /sys/class/net/vmbr0/brif); then
+        echo "ERROR: cannot list vmbr0's bridge members $1. Everything here is"
+        echo "       only as complete as that listing, so a marker written"
+        echo "       over a failed read would certify less than it says."
         echo "       Not writing the readiness marker."
         exit 1
     fi
-    echo "ok: $iface mtu $live"
-done
-set +f
+
+    # re-checked here and not only before the reload: a port can leave the
+    # bridge while the reload runs, or while the upgrade restarts whatever
+    # brought it up, and a bridge with no uplink still answers `ip link`
+    check_attached "$1" $ports
+
+    checked=
+    for iface in vmbr0 $ports $attached; do
+        case " $checked " in *" $iface "*) continue ;; esac
+        checked="$checked $iface"
+        live=$( { ip -o link show "$iface" || true; } \
+                | awk '{ for (i = 1; i < NF; i++) if ($i == "mtu") print $(i + 1) }' )
+        if [ "$live" != "$LAB_MTU" ]; then
+            echo "ERROR: $iface has MTU ${live:-unknown}, expected $LAB_MTU $1."
+            echo "       The VXLAN carries $LAB_MTU-byte frames; a node left at 1500"
+            echo "       loses large packets silently, and Ceph on top of it fails in"
+            echo "       ways that look like anything but an MTU problem."
+            echo "       Not writing the readiness marker."
+            exit 1
+        fi
+        echo "ok: $iface mtu $live $1"
+    done
+    set +f
+}
+
+# Runs whether the reload succeeded, failed, or was skipped because the file
+# already said 1450.
+verify_lab_mtu "after the reload"
 
 # 3. bring PVE in step with the repo before Ceph is installed from it.
 #
@@ -402,6 +425,12 @@ apt-get -y -qq \
 apt-get install -y -qq qemu-guest-agent
 systemctl enable --now qemu-guest-agent
 
-# 5. marker
+# 5. the same check again, then the marker
+#
+# The upgrade replaced packages, the guest agent started, services restarted.
+# The marker is what wait-first-boot.sh treats as permission to proceed, so it
+# is written against the state now rather than the state before all that.
+verify_lab_mtu "after the upgrade"
+
 date -Is > /var/lib/pve-lab/first-boot.done
 echo "== done $(date -Is)"
