@@ -11,10 +11,12 @@ with stub executables on PATH, and asserts what actually happened.
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import shutil
 import stat
 import subprocess
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -1002,3 +1004,1062 @@ def test_no_legacy_delete_on_a_cluster_that_never_had_them(box, tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not [c for c in calls if "prefer-hpe" in c], \
         f"touched rules that do not exist: {calls}"
+
+
+
+
+
+# ── first boot: the upgrade that keeps PVE and Ceph in step (#171, 2026-09-15) ─
+#
+# The nodes install from a frozen ISO while `pveceph install` takes whatever
+# Ceph is current, so an un-upgraded node runs ISO-era PVE against a newer
+# Ceph. On 2026-09-15 that pairing rejected the rbd keyring PVE had just
+# written and left every storage inactive on a HEALTH_OK cluster. The fix is a
+# `dist-upgrade` in the first-boot hook.
+#
+# The marker is what the whole lab waits on: wait-first-boot.sh polls it and
+# treats it as certifying repositories, MTU and the guest agent, so it must
+# appear only after every prerequisite has succeeded. *Every* stub the hook
+# calls -- apt, systemctl, ifreload, ip -- therefore reports whether the marker
+# already exists when it runs, and the tests demand that none of them saw it.
+#
+# The hook is run from a copy whose absolute paths are rebased under a temp
+# root. That is a rewrite for *reachability*, not a sandbox: it proves control
+# flow and ordering, and a hook that grew a new absolute path would write to
+# the real one. Containment is the disposable VM's job, not this fixture's.
+
+#: Reports the marker if it is already there, then does whatever the test needs.
+#: Every prerequisite the hook shells out to wears this.
+MARKER_WATCH = """
+printf '@NAME@ %s\\n' "$*" >> @LOG@
+[ -e @MARKER@ ] && printf 'MARKER-PRESENT-AT @NAME@\\n' >> @LOG@
+@BODY@
+exit 0
+"""
+
+#: apt-get stub. Records each invocation, parses the options apt would forward
+#: to dpkg, snapshots the sources as apt saw them, and acts on the mode.
+#:
+#: Parsing rather than substring-matching matters: counting arguments that
+#: merely contain `--force-confold` accepts `-o Dpkg::Option::=--force-confold`,
+#: a misspelt key apt puts in no list at all. Keys fold case, because apt's
+#: configuration keys are case-insensitive and `DPkg::Options::` is apt's own
+#: spelling.
+APT_STUB = """
+printf 'apt %s\\n' "$*" >> @LOG@
+mode=; prev=; dpkg_opts=
+for a in "$@"; do
+    case "$a" in
+        update|dist-upgrade|install) [ -n "$mode" ] || mode=$a ;;
+    esac
+    if [ "$prev" = "-o" ]; then
+        key=${a%%=*}; val=${a#*=}
+        lkey=$(printf '%s' "$key" | tr 'A-Z' 'a-z')
+        [ "$lkey" = "dpkg::options::" ] && dpkg_opts="$dpkg_opts $val"
+    fi
+    prev=$a
+done
+
+[ -e @MARKER@ ] && printf 'MARKER-PRESENT-AT %s\\n' "${mode:-apt}" >> @LOG@
+
+if [ "$mode" = update ]; then
+    # A fresh directory per update, because one shared snapshot records only
+    # the last state apt saw: an earlier update against a wrong configuration
+    # -- enterprise still on, no no-subscription source yet -- would be
+    # overwritten by the correct later one and never noticed.
+    n=$(( $(cat @SNAPSHOT@/.count 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "$n" > @SNAPSHOT@/.count
+    cap=@SNAPSHOT@/update-$n
+    mkdir -p "$cap/parts" "$cap/aptconf"
+    fail="$cap/capture-failed"
+    present="$cap/aptconf-present"
+
+    # One rule for every input APT reads: absent, captured, or recorded as a
+    # failure. Never silently missing -- an enterprise source this stub cannot
+    # read is still one APT loads, because the hook runs as root, and a
+    # snapshot that just omits it certifies the opposite of the truth.
+    #
+    # Presence is `-e` OR `-L`: `-e` follows symlinks and answers false when
+    # the target sits behind a directory this user cannot search, while root
+    # APT follows it perfectly well. Copies dereference (-L) so what is stored
+    # is bytes, not a link whose target can change afterwards.
+    if [ -e @SOURCES@ ] || [ -L @SOURCES@ ]; then
+        ls -A @SOURCES@ >/dev/null 2>&1 || printf 'sources.list.d\\n' >> "$fail"
+        cp -rL @SOURCES@/. "$cap/parts/" 2>/dev/null \
+            || printf 'sources.list.d\\n' >> "$fail"
+    fi
+    if [ -e @MAINLIST@ ] || [ -L @MAINLIST@ ]; then
+        cp -L @MAINLIST@ "$cap/sources.list" 2>/dev/null \
+            || printf 'sources.list\\n' >> "$fail"
+    fi
+    if [ -e @APTETC@/apt.conf ] || [ -L @APTETC@/apt.conf ]; then
+        printf 'apt.conf\\n' >> "$present"
+        cp -L @APTETC@/apt.conf "$cap/aptconf/apt.conf" 2>/dev/null \
+            || printf 'apt.conf\\n' >> "$fail"
+    fi
+    if [ -e @APTETC@/apt.conf.d ] || [ -L @APTETC@/apt.conf.d ]; then
+        ls -A @APTETC@/apt.conf.d >> "$present" 2>/dev/null \
+            || printf 'apt.conf.d\\n' >> "$fail"
+        cp -rL @APTETC@/apt.conf.d/. "$cap/aptconf/" 2>/dev/null \
+            || printf 'apt.conf.d\\n' >> "$fail"
+    fi
+
+    printf '%s\\n' "$*" > "$cap/argv"
+    # NUL-delimited, because `$*` cannot say whether `update -qq` was one
+    # argument or two, nor whether an empty one was passed -- and APT rejects
+    # both of those spellings outright
+    printf '%s\\0' "$@" > "$cap/argv0"
+    printf '%s' "${APT_CONFIG-}" > "$cap/apt_config"
+    for f in @SOURCES@/*; do
+        [ -L "$f" ] && printf 'SYMLINKED-SOURCE %s\\n' "$f" >> @LOG@
+    done
+    printf 'SOURCES-SNAPSHOT %s\\n' "$n" >> @LOG@
+fi
+
+if [ "$mode" = dist-upgrade ]; then
+@UPGRADE@
+fi
+if [ "$mode" = install ]; then
+@INSTALL@
+fi
+exit 0
+"""
+
+#: A dist-upgrade meeting a conffile edited locally *and* changed in the new
+#: package -- the conflict step 1 of the hook creates by editing
+#: pve-enterprise.sources. dpkg asks; with null stdin the answer is EOF and apt
+#: dies, and DEBIAN_FRONTEND does not help because dpkg reads that prompt
+#: itself.
+#:
+#: Any one of the three force options answers *this* conflict: dpkg's own
+#: default for it is keep-old, so `--force-confdef` returns that without
+#: reading stdin, and confold/confnew answer it outright. That the hook sends a
+#: pair is policy, asserted separately; a behavioural test cannot see one of
+#: them go missing, and modelling confdef as insufficient would fail a
+#: legitimate hook.
+CONFFILE_PROMPT = """
+    answered=0
+    for o in $dpkg_opts; do
+        case "$o" in
+            --force-confold|--force-confnew|--force-confdef) answered=1 ;;
+        esac
+    done
+    if [ "$answered" -eq 0 ]; then
+        echo "Configuration file '/etc/apt/sources.list.d/pve-enterprise.sources'" >&2
+        echo "EOF on stdin at conffile prompt" >&2
+        exit 1
+    fi
+"""
+
+#: A failing step that says something recognisable on stderr. Without a
+#: diagnostic, a log test can pass on the startup banner alone while the hook's
+#: `exec` has stopped capturing stderr at all -- the dead end the log exists to
+#: prevent.
+STEP_FAILS = """
+    echo "PVE_LAB_TEST_APT_BROKE: held broken packages" >&2
+    exit 100
+"""
+
+
+def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
+                systemctl: str = ":", ifreload: str = ":", ip: str = ":"):
+    """
+    Run the real hook with its absolute paths rebased under a temp root.
+
+    Returns ``(completed_process, marker, event_log, hook_log, sources_snapshot)``.
+    """
+    root = tmp_path / "root"
+    for d in ("var/lib", "var/log", "etc/apt/sources.list.d", "etc/network"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    (root / "etc/network/interfaces").write_text(
+        "auto ens18\niface ens18 inet manual\n\n"
+        "auto vmbr0\niface vmbr0 inet static\n        bridge-ports ens18\n")
+    # what the ISO actually ships, so "the enterprise repo is still on" is a
+    # state the assertions can see rather than an empty stanza that matches
+    # nothing whatever the hook does to it
+    (root / "etc/apt/sources.list.d/pve-enterprise.sources").write_text(
+        "Types: deb\n"
+        "URIs: https://enterprise.proxmox.com/debian/pve\n"
+        "Suites: trixie\n"
+        "Components: pve-enterprise\n"
+        "Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n"
+        "Enabled: true\n")
+    # the hook's disabling loop names this one too, and it is a different
+    # repository with a different component -- seeded so that dropping it from
+    # that loop is something the assertions can see
+    (root / "etc/apt/sources.list.d/ceph.sources").write_text(
+        "Types: deb\n"
+        "URIs: https://enterprise.proxmox.com/debian/ceph-squid\n"
+        "Suites: trixie\n"
+        "Components: enterprise\n"
+        "Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n"
+        "Enabled: true\n")
+
+    src = (box / "scripts" / "first-boot.sh").read_text()
+    for absolute in ("/var/lib/pve-lab", "/var/log/pve-lab-first-boot.log",
+                     "/etc/apt/sources.list.d", "/etc/network/interfaces"):
+        assert absolute in src, f"the hook no longer writes {absolute}"
+    # /etc/apt wholesale, not just sources.list.d: APT's default configuration
+    # lives beside it, and a hook that wrote apt.conf.d would otherwise reach
+    # the real one -- changing what APT selects without touching any input this
+    # fixture records
+    for absolute in ("/var/lib/pve-lab", "/var/log/pve-lab-first-boot.log",
+                     "/etc/apt", "/etc/network/interfaces"):
+        src = src.replace(absolute, f"{root}{absolute}")
+    hook = tmp_path / "first-boot.sh"
+    hook.write_text(src)
+
+    fake = tmp_path / "bin"
+    fake.mkdir(exist_ok=True)
+    log = tmp_path / "events.log"
+    marker = root / "var/lib/pve-lab/first-boot.done"
+    snapshot = tmp_path / "sources-as-apt-saw-them"
+    snapshot.mkdir(exist_ok=True)
+
+    def _fill(body, **extra):
+        body = (body.replace("@LOG@", str(log))
+                    .replace("@MARKER@", str(marker))
+                    .replace("@SOURCES@", str(root / "etc/apt/sources.list.d"))
+                    .replace("@SNAPSHOT@", str(snapshot))
+                    .replace("@MAINLIST@", str(root / "etc/apt/sources.list"))
+                    .replace("@APTETC@", str(root / "etc/apt")))
+        for key, value in extra.items():
+            body = body.replace(key, value)
+        return body
+
+    _stub(fake / "apt-get",
+          _fill(APT_STUB, **{"@UPGRADE@": upgrade, "@INSTALL@": install}))
+    for name, body in (("systemctl", systemctl), ("ifreload", ifreload),
+                       ("ip", ip)):
+        _stub(fake / name,
+              _fill(MARKER_WATCH, **{"@NAME@": name, "@BODY@": body}))
+
+    hook_env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}")
+    # cleared, so that an APT_CONFIG recorded below is one the hook set itself
+    hook_env.pop("APT_CONFIG", None)
+    r = subprocess.run(
+        ["bash", str(hook)], capture_output=True, text=True, timeout=60,
+        stdin=subprocess.DEVNULL,       # as the service runs it: no answers
+        env=hook_env)
+    return (r, marker, log.read_text() if log.exists() else "",
+            root / "var/log/pve-lab-first-boot.log", snapshot)
+
+
+def _dpkg_options_of(events: str) -> list[str]:
+    """The values the hook forwarded under apt's `DPkg::Options::` key."""
+    line = next(ln for ln in events.splitlines() if "dist-upgrade" in ln)
+    args = line.split()
+    return [a.split("=", 1)[1]
+            for prev, a in zip(args, args[1:], strict=False)   # pairwise
+            if prev == "-o" and a.split("=", 1)[0].lower() == "dpkg::options::"]
+
+
+KNOWN_TYPES = {"deb", "deb-src"}
+#: values APT reads as false. Anything else -- including "off extra" -- leaves
+#: the entry enabled, so the whole field is compared, not its first word.
+FALSE_VALUES = {"no", "false", "0", "off"}
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _deb822_stanzas(text: str) -> list[dict[str, list[str]]]:
+    """
+    Parse deb822 into stanzas of ``{field: [values]}``.
+
+    A grep cannot do this job: sources.list(5) allows any spacing after the
+    colon, values continued on indented lines, and whitespace-separated
+    multivalues -- and a field matched anywhere in a file says nothing about
+    which *stanza* it belongs to, which is what selects a repository.
+    """
+    stanzas: list[dict[str, list[str]]] = []
+    current: dict[str, list[str]] = {}
+    last: str | None = None
+    for raw in text.replace("\r\n", "\n").splitlines():
+        if not raw.strip():
+            if current:
+                stanzas.append(current)
+            current, last = {}, None
+            continue
+        if raw.lstrip().startswith("#"):
+            continue
+        if raw[0] in " \t":                       # continuation of the field
+            if last:
+                current[last].extend(raw.split())
+            continue
+        if ":" not in raw:
+            current["__malformed__"] = ["1"]
+            continue
+        field, _, value = raw.partition(":")
+        last = field.strip().lower()
+        current[last] = value.split()
+    if current:
+        stanzas.append(current)
+    return stanzas
+
+
+def _one_line_entries(text: str) -> list[dict[str, list[str]]]:
+    """
+    The `.list` one-line format, in the same shape.
+
+    APT reads both formats from the same directory, so a check that looks only
+    at `.sources` can miss an enterprise entry -- or refuse a perfectly good
+    no-subscription one -- purely because of the filename. Options in brackets
+    are kept rather than discarded: a `[signed-by=...]` that APT rejects makes
+    the whole configuration unusable, so it has to reach the validation below.
+    """
+    entries = []
+    for raw in text.replace("\r\n", "\n").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.split(" #", 1)[0]                   # trailing comment
+        options = dict(
+            opt.split("=", 1)
+            for block in re.findall(r"\[([^\]]*)\]", line)
+            for opt in block.split() if "=" in opt)
+        parts = re.sub(r"\[[^\]]*\]", " ", line).split()
+        if len(parts) < 3:
+            entries.append({"__malformed__": ["1"]})
+            continue
+        # the type is kept even when unknown: APT refuses the file rather than
+        # skipping the line, and the validator has to see that
+        entry = {"types": [parts[0]], "uris": [parts[1]],
+                 "suites": [parts[2]], "components": parts[3:]}
+        if "signed-by" in options:
+            entry["signed-by"] = options["signed-by"].split(",")
+        # `[arch=...]` is the one-line spelling of Architectures, and dropping
+        # it made an arm64-only entry look native
+        if "arch" in options:
+            entry["architectures"] = options["arch"].split(",")
+        if "arch-" in options:
+            entry["architectures-remove"] = options["arch-"].split(",")
+        entries.append(entry)
+    return entries
+
+
+#: APT ignores a file in sources.list.d whose name is not made of these
+#: characters, so `proxmox saved.sources` configures nothing at all.
+VALID_SOURCE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _apt_stanzas(update_dir) -> list[dict[str, list[str]]]:
+    """
+    Every entry APT would read for one intercepted `apt-get update`.
+
+    That is the main `sources.list` as well as the `sources.list.d` parts:
+    an enterprise entry added to the main list is not less active for being
+    outside the directory this fixture used to look at.
+    """
+    stanzas: list[dict[str, list[str]]] = []
+    main = update_dir / "sources.list"
+    if main.exists():
+        stanzas.extend(_one_line_entries(main.read_text()))
+    parts = update_dir / "parts"
+    if parts.is_dir():
+        for path in sorted(parts.iterdir()):
+            if not VALID_SOURCE_NAME.match(path.name):
+                continue
+            if path.suffix == ".sources":
+                stanzas.extend(_deb822_stanzas(path.read_text()))
+            elif path.suffix == ".list":
+                stanzas.extend(_one_line_entries(path.read_text()))
+    return stanzas
+
+
+def _is_enabled(stanza: dict[str, list[str]]) -> bool:
+    """`Enabled:` is per stanza, and only its exact false spellings count."""
+    values = stanza.get("enabled")
+    if not values:
+        return True
+    return " ".join(values).strip().lower() not in FALSE_VALUES
+
+
+def _configuration_loads(stanzas: list[dict[str, list[str]]]) -> bool:
+    """
+    Whether APT could load this configuration at all.
+
+    An unknown type, a missing required field, a malformed line or a
+    `Signed-By` APT rejects is not an entry it skips: it refuses the file, and
+    nothing in it is used -- including the entry the hook wanted. A selector
+    that only looks for the tokens it wants calls such a configuration good.
+
+    This models the failures reachable from what this hook writes. It is not a
+    general APT validator; see the parser controls for the cases checked
+    against real APT.
+    """
+    for stanza in stanzas:
+        if "__malformed__" in stanza:
+            return False
+        types = stanza.get("types", [])
+        if not types or any(t not in KNOWN_TYPES for t in types):
+            return False
+        uris = stanza.get("uris")
+        if not uris or not stanza.get("suites"):
+            return False
+        # An inline comment is not a comment in a deb822 field: it becomes more
+        # field content, and APT refuses the entry. Finding one good URI among
+        # the tokens is not the same as the stanza being loadable.
+        if any("://" not in uri for uri in uris):
+            return False
+        # an exact-path suite takes no components, and a named suite requires
+        # them; APT refuses the file either way round, including when one bad
+        # exact-path member sits beside a valid suite
+        exact = [su for su in stanza["suites"] if su.endswith("/")]
+        named = [su for su in stanza["suites"] if not su.endswith("/")]
+        if exact and stanza.get("components"):
+            return False
+        if named and not stanza.get("components"):
+            return False
+        signed_by = stanza.get("signed-by")
+        if signed_by:
+            tokens = [t for t in re.split(r"[,\s]+", " ".join(signed_by)) if t]
+            paths = tokens and all(t.startswith("/") for t in tokens)
+            # exactly 40 hex digits, optionally suffixed '!' -- 41 is not a
+            # fingerprint and APT says so
+            fingerprint = (len(tokens) == 1
+                           and re.fullmatch(r"[0-9A-Fa-f]{40}!?", tokens[0]))
+            if not (paths or fingerprint):
+                return False
+    return True
+
+
+def _points_at(stanza: dict[str, list[str]], host: str, path: str) -> bool:
+    """
+    Whether any of the stanza's URIs is *host*/*path* over HTTP(S).
+
+    Compared on structure: the hostname folds case and the default port is the
+    same endpoint, while `file://` with the same spelling is a different
+    resource entirely.
+    """
+    for uri in stanza.get("uris", []):
+        parts = urlsplit(uri)
+        if parts.scheme not in DEFAULT_PORTS:
+            continue
+        if _canonical_host(parts.hostname) != host:
+            continue
+        if parts.port is not None and parts.port != DEFAULT_PORTS[parts.scheme]:
+            continue
+        # APT appends `/dists/<suite>/...` to the URI as given, so a query or
+        # fragment lands in the middle of the path it fetches: a different
+        # endpoint wearing the right host and path
+        if parts.query or parts.fragment:
+            continue
+        if posixpath.normpath(parts.path or "/").rstrip("/") == path:
+            return True
+    return False
+
+
+#: the lab's nodes are amd64, so that is the architecture whose packages the
+#: upgrade needs; a stanza restricted away from it fetches nothing useful
+NATIVE_ARCH = "amd64"
+
+
+def _selects_binaries(stanza: dict[str, list[str]]) -> bool:
+    """
+    Whether this stanza actually yields binary packages for the node.
+
+    `Targets: Sources` fetches no binaries; so does `Targets: deb`, because
+    `deb` is not one of APT's target identifiers -- `Packages` is. Removals and
+    architecture restrictions apply on top, and either can leave a stanza that
+    reads correctly selecting nothing the node can install.
+    """
+    targets = [t.lower() for t in stanza.get("targets", [])]
+    if targets and "packages" not in targets:
+        return False
+    if "packages" in [t.lower() for t in stanza.get("targets-remove", [])]:
+        return False
+    # compared exactly: APT does not fold these, so `Architectures: AMD64`
+    # produces `binary-AMD64` targets and no amd64 packages at all
+    architectures = stanza.get("architectures", [])
+    if architectures and NATIVE_ARCH not in architectures:
+        return False
+    if NATIVE_ARCH in stanza.get("architectures-remove", []):
+        return False
+    return True
+
+
+def _selects_pve_no_subscription(source: str | list) -> bool:
+    """
+    Whether these entries activate the repository `pveceph install` will use.
+
+    Every field has to hold in the SAME active stanza: a Debian stanza and a
+    PVE stanza that between them mention trixie and pve-no-subscription select
+    neither.
+    """
+    stanzas = _deb822_stanzas(source) if isinstance(source, str) else source
+    if not _configuration_loads(stanzas):
+        return False
+    return any(
+        _is_enabled(st)
+        and "deb" in st.get("types", [])
+        and _selects_binaries(st)
+        and "trixie" in st.get("suites", [])
+        and "pve-no-subscription" in st.get("components", [])
+        and _points_at(st, "download.proxmox.com", "/debian/pve")
+        for st in stanzas)
+
+
+def _hosted_at(stanza: dict[str, list[str]], host: str) -> bool:
+    """Whether any of the stanza's HTTP(S) URIs is served by *host*."""
+    for uri in stanza.get("uris", []):
+        parts = urlsplit(uri)
+        if parts.scheme not in DEFAULT_PORTS:
+            continue
+        if _canonical_host(parts.hostname) == host:
+            return True
+    return False
+
+
+def _enterprise_is_active(stanzas: list[dict[str, list[str]]]) -> bool:
+    """
+    Any enabled entry on the subscription-only host.
+
+    Matched by host rather than by one path: the hook disables two of these,
+    and the Ceph one is a different repository (`/debian/ceph-squid`) with a
+    different component (`enterprise`) from PVE's. Keying on `/debian/pve` saw
+    only half of what the hook owns.
+    """
+    return any(
+        _is_enabled(st)
+        and (_hosted_at(st, "enterprise.proxmox.com")
+             or "pve-enterprise" in st.get("components", []))
+        for st in stanzas)
+
+
+def test_the_upgrade_runs_before_the_guest_agent(box, tmp_path):
+    r, marker, events, *_ = _first_boot(box, tmp_path, "    :")
+    assert r.returncode == 0, r.stderr
+    assert marker.exists(), "a completed hook must leave its marker"
+    calls = [ln for ln in events.splitlines() if ln.startswith("apt")]
+    upgrade_at = next(i for i, ln in enumerate(calls) if "dist-upgrade" in ln)
+    agent_at = next(i for i, ln in enumerate(calls) if "qemu-guest-agent" in ln)
+    assert upgrade_at < agent_at, calls
+
+
+def test_the_marker_is_published_only_after_every_prerequisite(box, tmp_path):
+    """
+    After all of them, not just after the upgrade.
+
+    wait-first-boot.sh polls this file and treats it as certifying
+    repositories, MTU and the guest agent. A hook that published it earlier --
+    after the upgrade but before the agent, or before the MTU block -- leaves
+    the same filesystem behind and the same call order, and releases the
+    cluster build over a node that is not ready. Every prerequisite the hook
+    shells out to reports the marker it can see, so this is checked where it
+    happens rather than inferred afterwards.
+    """
+    _r, marker, events, *_ = _first_boot(box, tmp_path, "    :")
+    early = [ln for ln in events.splitlines()
+             if ln.startswith("MARKER-PRESENT-AT")]
+    assert not early, f"the marker was already published during: {early}"
+    assert marker.exists()
+    # the control: those stubs really did run, so their silence means something
+    for step in ("ifreload", "ip", "systemctl"):
+        assert f"{step} " in events, f"{step} was never called:\n{events}"
+
+
+def test_a_failed_upgrade_leaves_the_marker_unwritten(box, tmp_path):
+    """
+    The whole point of refusing `|| true`.
+
+    An unwritten marker is what makes wait-first-boot.sh fail and name the
+    node's log; swallowed, the run would carry on to build a cluster on nodes
+    whose PVE does not match the Ceph about to be installed.
+    """
+    r, marker, *_ = _first_boot(box, tmp_path, STEP_FAILS)
+    assert r.returncode != 0, "a failed dist-upgrade reported success"
+    assert not marker.exists(), "the marker must not survive a failed upgrade"
+
+
+def test_a_failed_upgrade_stops_before_the_guest_agent(box, tmp_path):
+    # set -e must abort the hook there and then, not run on to the next step
+    _r, _marker, events, *_ = _first_boot(box, tmp_path, STEP_FAILS)
+    assert "qemu-guest-agent" not in events, events
+
+
+def test_a_failed_guest_agent_install_leaves_the_marker_unwritten(box, tmp_path):
+    # the marker certifies the agent too: boxman discovers a node's IP through it
+    r, marker, *_ = _first_boot(box, tmp_path, "    :", install=STEP_FAILS)
+    assert r.returncode != 0, "a failed guest-agent install reported success"
+    assert not marker.exists()
+
+
+def test_a_failed_service_enable_leaves_the_marker_unwritten(box, tmp_path):
+    r, marker, *_ = _first_boot(box, tmp_path, "    :", systemctl="exit 1")
+    assert r.returncode != 0, "a failed systemctl enable reported success"
+    assert not marker.exists()
+
+
+def test_a_failed_mtu_probe_leaves_the_marker_unwritten(box, tmp_path):
+    """
+    `ip link show vmbr0 | head -1` is the MTU stage's last word, and `pipefail`
+    makes its failure the pipeline's. The marker must not follow it.
+    """
+    r, marker, *_ = _first_boot(box, tmp_path, "    :", ip="exit 1")
+    assert r.returncode != 0, "a failed MTU probe reported success"
+    assert not marker.exists()
+
+
+def test_a_failed_reload_keeps_the_hook_s_existing_tolerance(box, tmp_path):
+    """
+    The counterweight to the test above, and narrower than it looks.
+
+    `ifreload -a || true` has been best-effort since the hook was written:
+    ifupdown2 can refuse a reload on a node whose interfaces are already right,
+    and making every non-zero reload fatal would change behaviour this PR is
+    not changing. That is all this pins.
+
+    It is **not** a claim that the MTU is correct when the marker appears. The
+    hook writes the interfaces file, prints `ip link show vmbr0` and never
+    reads the value back, so a reload that failed to apply 1450 to the running
+    device still publishes the marker and still releases the cluster build --
+    a pre-existing gap in the hook, filed separately, not something these tests
+    should quietly bless by asserting readiness here.
+    """
+    r, marker, *_ = _first_boot(box, tmp_path, "    :", ifreload="exit 1")
+    assert r.returncode == 0, "a best-effort reload was made fatal"
+    assert marker.exists()
+
+
+def test_the_upgrade_answers_the_conffile_prompt(box, tmp_path):
+    """
+    Counterfactual: the bare `apt-get dist-upgrade -y -qq` that actually ran on
+    the lab on 2026-09-15 fails this. Step 1 of the hook edits
+    pve-enterprise.sources, which IS a dpkg conffile, so an upgrade that also
+    changes it prompts, and with null stdin that prompt is EOF.
+    """
+    r, marker, events, hooklog, _ = _first_boot(box, tmp_path, CONFFILE_PROMPT)
+    assert r.returncode == 0, \
+        hooklog.read_text() if hooklog.exists() else r.stderr
+    assert marker.exists(), "the hook stalled on a conffile prompt"
+    assert "dist-upgrade" in events
+
+
+def test_the_upgrade_forwards_both_dpkg_options(box, tmp_path):
+    """
+    Policy, kept apart from the behaviour above.
+
+    Any one of the force options answers the ordinary conflict, so no
+    behavioural test can notice one of the documented pair going missing.
+    Assert the pair, parsed out of apt's own option list rather than matched as
+    a substring -- a misspelt key reaches no list at all.
+    """
+    _r, _marker, events, *_ = _first_boot(box, tmp_path, "    :")
+    assert sorted(_dpkg_options_of(events)) == \
+        ["--force-confdef", "--force-confold"]
+
+
+def test_the_failure_reaches_the_log_wait_first_boot_names(box, tmp_path):
+    """
+    wait-first-boot.sh sends the operator to this file. If the hook's `exec`
+    stopped redirecting stderr, the file would still hold the banner and the
+    operator would still have nothing to read.
+    """
+    _r, _marker, _events, hooklog, _ = _first_boot(box, tmp_path, STEP_FAILS)
+    assert hooklog.exists(), "the hook wrote no log at the advertised path"
+    text = hooklog.read_text()
+    assert "pve-lab first boot" in text
+    assert "PVE_LAB_TEST_APT_BROKE" in text, \
+        f"the upgrade's own error never reached the advertised log:\n{text}"
+
+
+def test_every_apt_update_saw_only_the_intended_repository(box, tmp_path):
+    """
+    The upgrade is only in step with Ceph if it comes from the repository
+    `pveceph install` will use -- and that has to hold at *every* update, not
+    just the last one. An extra early update against the stock configuration
+    would otherwise be hidden by the correct state captured afterwards.
+
+    Read from the sources as apt saw them, across every file APT would read,
+    and parsed rather than grepped: a file that exists, one whose fields are
+    spread over two stanzas, or one APT would refuse to load, is not a
+    configured repository.
+    """
+    _r, _marker, events, _hooklog, snapshot = _first_boot(box, tmp_path, "    :")
+    updates = sorted(d for d in snapshot.iterdir() if d.is_dir())
+    assert updates, f"apt never reached an update:\n{events}"
+
+    # The snapshot can only stand for what apt read if the hook does not move
+    # the goalposts: a symlinked source can be rewritten after the copy, and
+    # a `Dir::Etc` override sends apt to a directory nothing captured. Neither
+    # is something this hook does; asserted rather than assumed, because the
+    # capture silently certifies the wrong input otherwise.
+    assert "SYMLINKED-SOURCE" not in events, \
+        f"a source file was a symlink, so what apt read is not frozen:\n{events}"
+    for update in updates:
+        _assert_update_is_the_replayed_one(update)
+
+    for update in updates:
+        stanzas = _apt_stanzas(update)
+        assert _configuration_loads(stanzas), \
+            f"APT could not have loaded the sources at {update.name}"
+        assert _selects_pve_no_subscription(stanzas), \
+            f"no active pve-no-subscription entry at {update.name}"
+        assert not _enterprise_is_active(stanzas), \
+            f"the enterprise repository was still active at {update.name}"
+
+
+#: what APT may append to an index name
+COMPRESSION_SUFFIXES = (".xz", ".gz", ".bz2", ".lzma", ".lz4", ".zst")
+
+#: the index the node's upgrade needs, as a path rather than a spelling
+INTENDED_PATH = (f"/debian/pve/dists/trixie/pve-no-subscription"
+                 f"/binary-{NATIVE_ARCH}/Packages")
+
+
+def _canonical_host(host: str) -> str:
+    """
+    Fold case and drop the single terminal dot of a fully qualified name.
+
+    Exactly one: `example.com.` is `example.com`, while `example.com..` is
+    neither -- and treating it as the same host let a URL past the check that
+    exists to refuse it.
+    """
+    host = (host or "").lower()
+    return host[:-1] if host.endswith(".") else host
+
+
+def _served_by(url: str, host: str) -> bool:
+    """
+    Whether *url*'s parsed hostname is *host*, whatever its case.
+
+    The trailing dot of a fully qualified name is stripped: `example.com.` and
+    `example.com` are the same host, and leaving it in let a subscription URL
+    past the very check that exists to refuse it.
+    """
+    return _canonical_host(urlsplit(url).hostname) == host
+
+
+def _is_native_packages_url(url: str) -> bool:
+    """
+    Whether *url* is the intended repository's native Packages index.
+
+    Parsed, not prefix-matched. A literal prefix rejects `https`, an uppercase
+    hostname and an explicit `:80` -- all of which APT resolves to the same
+    endpoint and which are supported spellings for this hook -- while a pair of
+    substrings would accept the same path served by any other host.
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in DEFAULT_PORTS:
+        return False
+    if not _served_by(url, "download.proxmox.com"):
+        return False
+    if parts.port is not None and parts.port != DEFAULT_PORTS[parts.scheme]:
+        return False
+    if parts.query or parts.fragment:
+        return False
+    path = posixpath.normpath(parts.path or "/")
+    # the file itself, bare or compressed -- not everything under a *directory*
+    # whose name happens to begin `Packages.`
+    return path in {INTENDED_PATH, *(INTENDED_PATH + suffix
+                                     for suffix in COMPRESSION_SUFFIXES)}
+
+
+def _assert_update_is_the_replayed_one(update_dir) -> None:
+    """
+    The replay runs a plain `apt-get update`, so it stands for the hook's own
+    invocation only while that is plain too.
+
+    Two ways it might not be, both of which leave the captured sources looking
+    right: an option the replay does not reproduce -- `-c`, `APT::Architecture`,
+    a disabled Packages target -- or an `APT_CONFIG` the hook exported, which
+    APT reads before anything on the command line. Argument boundaries are
+    compared, not text: `update update -qq`, `update -qq ""` and
+    `update "-qq -qq"` are all rejected by APT and all look the same once
+    flattened and split.
+
+    Deliberately narrow, and fail-closed: a legitimate new option on the hook's
+    update line fails here, which is the signal to revisit this fixture.
+    """
+    raw = (update_dir / "argv0").read_bytes().decode()
+    args = raw.split("\0")[:-1] if raw.endswith("\0") else raw.split("\0")
+    assert args == ["update", "-qq"], \
+        f"unsupported apt-get update invocation, which the replay does not " \
+        f"reproduce: {args!r}"
+    hook_config = (update_dir / "apt_config").read_text()
+    assert hook_config == "", \
+        f"the hook set APT_CONFIG={hook_config!r}; APT reads it before every " \
+        f"other source of configuration, so what it selected is not what " \
+        f"this snapshot describes"
+    failed = update_dir / "capture-failed"
+    assert not failed.exists(), \
+        f"inputs APT read could not be captured, so this snapshot is not " \
+        f"what it saw: {sorted(set(failed.read_text().split()))}"
+    present = update_dir / "aptconf-present"
+    named = present.read_text().split() if present.exists() else []
+    written = [path.name for path in (update_dir / "aptconf").rglob("*")
+               if path.is_file()]
+    assert not named and not written, \
+        f"the hook wrote APT configuration that the replay does not " \
+        f"reproduce: {sorted(set(named + written))}"
+
+
+def _apt_enumerates(update_dir):
+    """
+    Ask APT itself which indexes it would fetch for one captured update.
+
+    Returns ``(exit_status, [url, ...], stderr)``, or ``None`` where APT is not
+    installed. ``--print-uris`` resolves targets without downloading anything.
+
+    The isolation is a private bootstrap handed over ``APT_CONFIG``, not a set
+    of late ``-o`` flags: APT reads that file *before* `/etc/apt/apt.conf` and
+    `/etc/apt/apt.conf.d/*`, so disabling those there is the only way to stop
+    the host's own settings deciding the answer. Without it this test depended
+    on the machine running it -- an ambient `APT::Architecture` or a
+    `DefaultEnabled "false"` silently changed which targets APT reported for
+    identical source bytes.
+    """
+    apt = shutil.which("apt-get")
+    if apt is None:
+        return None
+    private = update_dir / "apt-run"
+    for sub in ("state/lists/partial", "cache/archives/partial", "log"):
+        (private / sub).mkdir(parents=True, exist_ok=True)
+    main = update_dir / "sources.list"
+    bootstrap = private / "bootstrap.conf"
+    bootstrap.write_text(f'''
+Dir::Etc::main "/dev/null";
+Dir::Etc::parts "/dev/null";
+Dir::Etc::sourcelist "{main if main.exists() else '/dev/null'}";
+Dir::Etc::sourceparts "{update_dir / 'parts'}";
+Dir::Etc::trusted "/dev/null";
+Dir::Etc::trustedparts "/dev/null";
+Dir::State "{private / 'state'}";
+Dir::Cache "{private / 'cache'}";
+Dir::Log "{private / 'log'}";
+APT::Architecture "{NATIVE_ARCH}";
+APT::Architectures {{ "{NATIVE_ARCH}"; }};
+Acquire::AllowInsecureRepositories "true";
+quiet "0";
+''')
+
+    out = subprocess.run(
+        [apt, "--print-uris", "update"],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "APT_CONFIG": str(bootstrap), "LC_ALL": "C"})
+    # each record is `'<uri>' <filename> <size> <hash>`; a bare scan for quoted
+    # text tears a URI containing an apostrophe into pieces
+    urls = [m.group(1) for m in
+            (re.match(r"^'(.+)'\s+\S+\s+\d+\s", line)
+             for line in out.stdout.splitlines()) if m]
+    return out.returncode, urls, out.stderr
+
+
+@pytest.mark.skipif(shutil.which("apt-get") is None,
+                    reason="needs APT to enumerate targets")
+def test_apt_itself_selects_only_the_intended_repository(box, tmp_path):
+    """
+    The same claim as the test above, answered by the program that decides it.
+
+    Every intercepted update is replayed through `apt-get --print-uris`, which
+    fails outright on a configuration APT will not load and otherwise names the
+    exact indexes it would fetch. A node's upgrade is in step with Ceph only if
+    those include a pve-no-subscription Packages index for its architecture and
+    none from the subscription host.
+    """
+    _r, _marker, events, _hooklog, snapshot = _first_boot(box, tmp_path, "    :")
+    updates = sorted(d for d in snapshot.iterdir() if d.is_dir())
+    assert updates, f"apt never reached an update:\n{events}"
+
+    for update in updates:
+        _assert_update_is_the_replayed_one(update)
+        status, urls, errors = _apt_enumerates(update)
+        assert status == 0, \
+            f"APT could not load the sources at {update.name}: {errors}"
+        wanted = [u for u in urls if _is_native_packages_url(u)]
+        assert wanted, \
+            f"APT fetches no pve-no-subscription packages at {update.name}:\n" \
+            + "\n".join(urls)
+        enterprise = [u for u in urls if _served_by(u, "enterprise.proxmox.com")]
+        assert not enterprise, \
+            f"APT still fetches from the subscription host: {enterprise}"
+
+
+#: Formats a working configuration can legitimately take, and selections that
+#: only look like one. The parser decides the repository test's verdict, so it
+#: gets its own controls rather than being trusted. The expectations are the
+#: ones real APT was observed to have.
+GOOD = """\
+Types: deb
+URIs: http://download.proxmox.com/debian/pve
+Suites: trixie
+Components: pve-no-subscription
+"""
+
+SOURCE_VARIANTS = [
+    ("plain", GOOD, True),
+    ("tabs-after-colon", GOOD.replace(": ", ":\t"), True),
+    ("no-space-after-colon", GOOD.replace(": ", ":"), True),
+    ("crlf-line-endings", GOOD.replace("\n", "\r\n"), True),
+    ("continuation-lines",
+     "Types: deb\nURIs:\n http://download.proxmox.com/debian/pve\n"
+     "Suites:\n trixie\nComponents:\n pve-no-subscription\n", True),
+    ("extra-fields", GOOD + "Architectures: amd64\nX-Extra: something\n", True),
+    ("two-uris-one-line",
+     GOOD.replace("URIs: http://download.proxmox.com/debian/pve",
+                  "URIs: https://download.proxmox.com/debian/pve"
+                  " http://download.proxmox.com/debian/pve"), True),
+    ("trailing-slash-uri", GOOD.replace("/debian/pve", "/debian/pve/"), True),
+    ("uppercase-host",
+     GOOD.replace("download.proxmox.com", "DOWNLOAD.PROXMOX.COM"), True),
+    ("explicit-default-port",
+     GOOD.replace("download.proxmox.com", "download.proxmox.com:80"), True),
+    ("types-deb-and-deb-src", GOOD.replace("Types: deb", "Types: deb deb-src"),
+     True),
+    ("absolute-signed-by",
+     GOOD + "Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n",
+     True),
+    ("plus-a-disabled-unrelated-stanza",
+     GOOD + "\nTypes: deb\nURIs: http://example.invalid/x\nSuites: trixie\n"
+            "Components: main\nEnabled: false\n", True),
+    # APT reads an unrecognised Enabled value as enabled, so neither does this
+    # count as disabled
+    ("enabled-is-not-exactly-false",
+     GOOD + "Enabled: false but not exactly false\n", True),
+    ("enabled-off-extra", GOOD + "Enabled: off extra\n", True),
+    ("disabled-with-no", GOOD + "Enabled: no\n", False),
+    ("disabled-with-false", GOOD + "Enabled: false\n", False),
+    ("unknown-type", GOOD.replace("Types: deb", "Types: deb invalid-type"),
+     False),
+    ("malformed-signed-by", GOOD + "Signed-By: not-a-key\n", False),
+    ("file-scheme", GOOD.replace("http://", "file://"), False),
+    ("non-default-port",
+     GOOD.replace("download.proxmox.com", "download.proxmox.com:8080"), False),
+    ("fields-split-across-stanzas",
+     "Types: deb\nURIs: http://deb.debian.org/debian\nSuites: trixie\n"
+     "Components: main\n\nTypes: deb\n"
+     "URIs: http://download.proxmox.com/debian/pve\nSuites: bookworm\n"
+     "Components: pve-no-subscription\n", False),
+    ("different-uri-path",
+     GOOD.replace("/debian/pve", "/debian/pve-not-a-repository"), False),
+    ("only-a-comment", "# No package repositories configured\n", False),
+    ("no-suites", GOOD.replace("Suites: trixie\n", ""), False),
+    ("no-uris", GOOD.replace("URIs: http://download.proxmox.com/debian/pve\n", ""),
+     False),
+    ("no-components", GOOD.replace("Components: pve-no-subscription\n", ""),
+     False),
+    ("colonless-line", GOOD + "this line has no colon\n", False),
+    ("fingerprint-signed-by",
+     GOOD + "Signed-By: " + "A" * 40 + "\n", True),
+    ("fingerprint-with-exclamation",
+     GOOD + "Signed-By: " + "A" * 40 + "!\n", True),
+    ("forty-one-hex-digits", GOOD + "Signed-By: " + "A" * 41 + "\n", False),
+    ("path-then-invalid-token",
+     GOOD + "Signed-By: /usr/share/keyrings/k.gpg not-a-key\n", False),
+    ("targets-sources-only", GOOD + "Targets: Sources\n", False),
+    ("targets-packages", GOOD + "Targets: Packages\n", True),
+]
+
+
+@pytest.mark.parametrize("source,selects",
+                         [(v[1], v[2]) for v in SOURCE_VARIANTS],
+                         ids=[v[0] for v in SOURCE_VARIANTS])
+def test_the_source_reader_handles_what_this_hook_can_write(source, selects):
+    """
+    The scope of the model, stated rather than implied.
+
+    These expectations were each checked against real APT 2.7.14, and the
+    reader exists to answer one question about one hook: did this first boot
+    leave an active pve-no-subscription source and no active enterprise entry?
+    It is deliberately not a general APT validator -- it does not model
+    conflicting options, trust settings, or acquisition, and an earlier name
+    claiming it "agrees with APT" was an overclaim that successive reviews
+    kept falsifying.
+    """
+    assert _selects_pve_no_subscription(source) is selects
+
+
+ONE_LINE_VARIANTS = [
+    ("no-subscription-in-a-list-file",
+     "deb http://download.proxmox.com/debian/pve trixie pve-no-subscription\n",
+     True, False),
+    ("with-options",
+     "deb [signed-by=/usr/share/keyrings/k.gpg] "
+     "http://download.proxmox.com/debian/pve trixie pve-no-subscription\n",
+     True, False),
+    ("enterprise-in-a-list-file",
+     "deb https://enterprise.proxmox.com/debian/pve trixie pve-enterprise\n",
+     False, True),
+    ("commented-out",
+     "# deb http://download.proxmox.com/debian/pve trixie pve-no-subscription\n",
+     False, False),
+    ("an-unrelated-debian-source",
+     "deb http://deb.debian.org/debian trixie main\n", False, False),
+    # the component is commented out, so it is not a component
+    ("component-after-a-comment",
+     "deb http://download.proxmox.com/debian/pve trixie main"
+     " # pve-no-subscription\n", False, False),
+    ("unknown-type-poisons-the-file",
+     "invalid-type http://download.proxmox.com/debian/pve trixie"
+     " pve-no-subscription\n", False, False),
+    ("bad-signed-by-option",
+     "deb [signed-by=not-a-key] http://download.proxmox.com/debian/pve"
+     " trixie pve-no-subscription\n", False, False),
+    # `[arch=...]` restricts the entry exactly as `Architectures:` does
+    ("arch-restricted-away-from-native",
+     "deb [arch=arm64] http://download.proxmox.com/debian/pve trixie"
+     " pve-no-subscription\n", False, False),
+    ("arch-includes-native",
+     "deb [arch=amd64] http://download.proxmox.com/debian/pve trixie"
+     " pve-no-subscription\n", True, False),
+    ("dotted-enterprise-host",
+     "deb http://enterprise.proxmox.com./debian/ceph-squid trixie"
+     " enterprise\n", False, True),
+]
+
+
+#: What APT enumerates, and what only looks like it. The index is a file: a
+#: flat repository rooted at a *directory* called `Packages.backup` produces
+#: URLs that begin the same way and fetch something else entirely.
+_BASE = "http://download.proxmox.com/debian/pve/dists/trixie/pve-no-subscription"
+NATIVE_URL_CASES = [
+    ("bare", f"{_BASE}/binary-amd64/Packages", True),
+    ("compressed", f"{_BASE}/binary-amd64/Packages.xz", True),
+    ("https", "https://download.proxmox.com/debian/pve/dists/trixie"
+              "/pve-no-subscription/binary-amd64/Packages.gz", True),
+    ("uppercase-host", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "DOWNLOAD.PROXMOX.COM"), True),
+    ("default-port", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "download.proxmox.com:80"), True),
+    ("dotted-host", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "download.proxmox.com."), True),
+    # one terminal dot is the fully qualified spelling; two is a different,
+    # malformed name and not this repository
+    ("double-dotted-host", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "download.proxmox.com.."), False),
+    ("triple-dotted-host", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "download.proxmox.com..."), False),
+    ("backup-directory", f"{_BASE}/binary-amd64/Packages.backup/InRelease",
+     False),
+    ("compressed-directory", f"{_BASE}/binary-amd64/Packages.xz/Packages.xz",
+     False),
+    ("wrong-architecture", f"{_BASE}/binary-arm64/Packages", False),
+    ("wrong-component", f"{_BASE}/../pve-enterprise/binary-amd64/Packages",
+     False),
+    ("other-host", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "mirror.invalid"), False),
+    ("non-default-port", f"{_BASE}/binary-amd64/Packages".replace(
+        "download.proxmox.com", "download.proxmox.com:8080"), False),
+    ("query", f"{_BASE}/binary-amd64/Packages?mirror=1", False),
+    ("fragment", f"{_BASE}/binary-amd64/Packages#packages", False),
+    ("translation-index", f"{_BASE}/i18n/Translation-en.xz", False),
+]
+
+
+@pytest.mark.parametrize("url,is_native",
+                         [(c[1], c[2]) for c in NATIVE_URL_CASES],
+                         ids=[c[0] for c in NATIVE_URL_CASES])
+def test_the_native_index_is_recognised_by_structure(url, is_native):
+    assert _is_native_packages_url(url) is is_native
+
+
+@pytest.mark.parametrize("text,selects,enterprise",
+                         [(v[1], v[2], v[3]) for v in ONE_LINE_VARIANTS],
+                         ids=[v[0] for v in ONE_LINE_VARIANTS])
+def test_one_line_sources_are_read_too(text, selects, enterprise):
+    """
+    APT reads `.list` and `.sources` from the same directory. An enterprise
+    entry in the format the test does not parse is still an enterprise entry.
+    """
+    entries = _one_line_entries(text)
+    assert _selects_pve_no_subscription(entries) is selects
+    assert _enterprise_is_active(entries) is enterprise
