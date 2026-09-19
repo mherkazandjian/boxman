@@ -1225,7 +1225,7 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
     for name, body in (sourced or {}).items():
         target = root / "etc/network" / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(body)
+        target.write_text(body.replace("@ROOT@", str(root)))
     if bridge_ports is not None:
         brif = root / "sys/class/net/vmbr0/brif"
         brif.mkdir(parents=True, exist_ok=True)
@@ -2058,6 +2058,83 @@ def test_a_source_directory_is_expanded_too(box, tmp_path):
         sourced={"parts/second.cfg": "iface vmbr0 inet6 manual\n"
                                      "        bridge-ports ens19\n"})
     assert r.returncode != 0, "source-directory was not expanded"
+    assert not marker.exists()
+    assert "defines vmbr0 as well" in hooklog.read_text()
+
+
+#: main file plus one trailing include, the shape the installer writes
+def _with_include(path="@ROOT@/etc/network/extra.cfg"):
+    return DEFAULT_INTERFACES + f"\nsource {path}\n"
+
+
+INCLUDE_REFUSALS = [
+    ("nested-source",
+     {"extra.cfg": "source @ROOT@/etc/network/deeper.cfg\n",
+      "deeper.cfg": "iface vmbr0 inet6 manual\n        bridge-ports ens19\n"},
+     "sources further files"),
+    ("alias-of-the-bridge",
+     {"extra.cfg": "iface vmbr0:0 inet6 manual\n        bridge-ports ens19\n"},
+     "alias or range"),
+    ("range-covering-the-bridge",
+     {"extra.cfg": "iface vmbr[0-1] inet6 manual\n        bridge-ports ens19\n"},
+     "alias or range"),
+]
+
+
+@pytest.mark.parametrize("sourced,expected",
+                         [(v[1], v[2]) for v in INCLUDE_REFUSALS],
+                         ids=[v[0] for v in INCLUDE_REFUSALS])
+def test_an_include_that_could_hide_the_bridge_is_refused(box, tmp_path,
+                                                          sourced, expected):
+    """
+    ifupdown2 follows includes recursively and normalises alias and range
+    names before merging, so a second vmbr0 definition can arrive by any of
+    these routes -- and its bridge-ports are concatenated with the ones this
+    hook can see.
+    """
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=_with_include(), sourced=sourced,
+        bridge_ports=["ens18", "ens19"],
+        mtus={"vmbr0": 1450, "ens18": 1450, "ens19": 1500})
+    assert r.returncode != 0, "an include could still extend vmbr0"
+    assert not marker.exists()
+    assert expected in hooklog.read_text()
+
+
+def test_a_dotfile_in_a_source_directory_is_read(box, tmp_path):
+    # the parser lists the directory with os.listdir(), which includes
+    # dotfiles; a plain `*` glob would not
+    main = DEFAULT_INTERFACES + "\nsource-directory @ROOT@/etc/network/parts\n"
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=main,
+        sourced={"parts/.hidden.cfg": "iface vmbr0 inet6 manual\n"
+                                      "        bridge-ports ens19\n"})
+    assert r.returncode != 0, "a dotfile include was skipped"
+    assert not marker.exists()
+    assert "defines vmbr0 as well" in hooklog.read_text()
+
+
+def test_a_relative_include_is_resolved_against_the_interfaces_file(box, tmp_path):
+    # the parser resolves relative paths against the file that sourced them,
+    # not against the process's working directory
+    main = DEFAULT_INTERFACES + "\nsource extra.cfg\n"
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=main,
+        sourced={"extra.cfg": "iface vmbr0 inet6 manual\n"
+                              "        bridge-ports ens19\n"})
+    assert r.returncode != 0, "a relative include was not resolved"
+    assert not marker.exists()
+    assert "defines vmbr0 as well" in hooklog.read_text()
+
+
+def test_an_include_whose_name_has_a_space_is_read(box, tmp_path):
+    # the glob matches it; splitting the match again would skip it
+    main = DEFAULT_INTERFACES + "\nsource @ROOT@/etc/network/*.cfg\n"
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=main,
+        sourced={"second part.cfg": "iface vmbr0 inet6 manual\n"
+                                    "        bridge-ports ens19\n"})
+    assert r.returncode != 0, "an include with a space in its name was skipped"
     assert not marker.exists()
     assert "defines vmbr0 as well" in hooklog.read_text()
 

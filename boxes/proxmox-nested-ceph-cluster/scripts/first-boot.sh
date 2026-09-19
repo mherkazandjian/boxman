@@ -85,31 +85,67 @@ fi
 # configures and never verifies, while everything here passed. So the includes
 # are read just far enough to refuse that. (Reading the kernel's attachments
 # instead would pick up the tap devices of running guests.)
-includes=$(awk '
+check_include() {            # <path>: an include this hook can rule out
+    if ! LC_ALL=C awk '/\\/ || /[^\t -~]/ { bad = 1 } END { exit(bad) }' "$1"; then
+        echo "ERROR: the included file $1 uses a backslash or a non-ASCII"
+        echo "       character, so this hook cannot rule out a second vmbr0"
+        echo "       definition hiding in it."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+    if awk '$1 == "source" || $1 == "source-directory" { found = 1 }
+            END { exit(found ? 0 : 1) }' "$1"; then
+        echo "ERROR: $1 sources further files. ifupdown2 follows those"
+        echo "       recursively; this hook reads one level to rule out a"
+        echo "       second vmbr0 definition and will not chase a chain."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+    if awk '$1 == "iface" && $2 !~ /^[A-Za-z0-9_.@-]+$/ { found = 1 }
+            END { exit(found ? 0 : 1) }' "$1"; then
+        echo "ERROR: $1 uses an interface alias or range, which ifupdown2"
+        echo "       normalises -- so it can name vmbr0 without spelling it."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+    if awk '$1 == "iface" && $2 == "vmbr0" { found = 1 }
+            END { exit(found ? 0 : 1) }' "$1"; then
+        echo "ERROR: $1 defines vmbr0 as well, and ifupdown2 merges the"
+        echo "       bridge-ports of every definition -- so the port list"
+        echo "       configured and checked here would be a subset of the"
+        echo "       one the node actually brings up."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+}
+
+# A trailing `source` glob is what the installer writes, and harmless in
+# itself -- but an included file can carry a second `iface vmbr0` stanza, and
+# ifupdown2 concatenates the bridge-ports of every definition rather than
+# taking the first. That would add a port this hook never sees, never
+# configures and never verifies, while everything here passed. So each include
+# is read far enough to refuse that. (Reading the kernel's attachments instead
+# would pick up the tap devices of running guests.)
+#
+# The enumeration has to match the parser's: it resolves relative paths
+# against the file that sourced them, and lists a source-directory with
+# os.listdir(), which includes dotfiles. `dotglob` covers the second; reading
+# one pattern per line and globbing once covers a matched filename containing
+# a space.
+shopt -s nullglob dotglob
+while IFS= read -r pattern; do
+    case $pattern in
+        /*) ;;
+        *)  pattern="$(dirname "$IFACES_FILE")/$pattern" ;;
+    esac
+    for inc in $pattern; do
+        [ -f "$inc" ] && check_include "$inc"
+    done
+done < <(awk '
     $1 == "source"           { for (i = 2; i <= NF; i++) print $i }
     $1 == "source-directory" { for (i = 2; i <= NF; i++) print $i "/*" }
 ' "$IFACES_FILE")
-for pattern in $includes; do
-    for inc in $pattern; do          # the shell expands the glob
-        [ -f "$inc" ] || continue
-        if ! LC_ALL=C awk '/\\/ || /[^\t -~]/ { bad = 1 } END { exit(bad) }' "$inc"; then
-            echo "ERROR: the included file $inc uses a backslash or a"
-            echo "       non-ASCII character, so this hook cannot rule out a"
-            echo "       second vmbr0 definition hiding in it."
-            echo "       Not writing the readiness marker."
-            exit 1
-        fi
-        if awk '$1 == "iface" && $2 == "vmbr0" { found = 1 }
-                END { exit(found ? 0 : 1) }' "$inc"; then
-            echo "ERROR: $inc defines vmbr0 as well, and ifupdown2 merges the"
-            echo "       bridge-ports of every definition -- so the port list"
-            echo "       configured and checked here would be a subset of the"
-            echo "       one the node actually brings up."
-            echo "       Not writing the readiness marker."
-            exit 1
-        fi
-    done
-done
+shopt -u nullglob dotglob
 
 # With those refused, a stanza is plain lines: it opens at auto, iface, vlan,
 # source, source-directory or any allow-* keyword, names are compared as
