@@ -1161,8 +1161,50 @@ STEP_FAILS = """
 """
 
 
+#: `ip -o link show <iface>`, answering from a per-interface table. The hook
+#: reads the live MTU back before publishing its marker, so what this reports
+#: is the difference between a node that is ready and one that only looks it.
+IP_REPORTS_MTU = """
+iface=
+for a in "$@"; do
+    case "$a" in -*|link|show|dev) ;; *) iface=$a ;; esac
+done
+case "$iface" in
+@MTU_CASES@
+esac
+"""
+
+#: the stanzas a Proxmox install leaves behind, before this hook edits them
+DEFAULT_INTERFACES = """\
+auto lo
+iface lo inet loopback
+
+auto ens18
+iface ens18 inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+        address 10.77.0.11/24
+        gateway 10.77.0.1
+        bridge-ports ens18
+        bridge-stp off
+        bridge-fd 0
+"""
+
+
+def _ip_stub(mtus: dict[str, int]) -> str:
+    """An `ip` whose answers are the live MTUs *mtus* describes."""
+    arms = "\n".join(
+        f'    {iface}) echo "{n}: {iface}: <BROADCAST,MULTICAST,UP,LOWER_UP>'
+        f' mtu {mtu} qdisc noqueue state UP mode DEFAULT group default" ;;'
+        for n, (iface, mtu) in enumerate(mtus.items(), start=2))
+    return IP_REPORTS_MTU.replace("@MTU_CASES@", arms)
+
+
 def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
-                systemctl: str = ":", ifreload: str = ":", ip: str = ":"):
+                systemctl: str = ":", ifreload: str = ":", ip: str | None = None,
+                mtus: dict[str, int] | None = None,
+                interfaces: str | None = None):
     """
     Run the real hook with its absolute paths rebased under a temp root.
 
@@ -1172,8 +1214,10 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
     for d in ("var/lib", "var/log", "etc/apt/sources.list.d", "etc/network"):
         (root / d).mkdir(parents=True, exist_ok=True)
     (root / "etc/network/interfaces").write_text(
-        "auto ens18\niface ens18 inet manual\n\n"
-        "auto vmbr0\niface vmbr0 inet static\n        bridge-ports ens18\n")
+        DEFAULT_INTERFACES if interfaces is None else interfaces)
+    if ip is None:
+        ip = _ip_stub(mtus if mtus is not None
+                      else {"vmbr0": 1450, "ens18": 1450})
     # what the ISO actually ships, so "the enterprise repo is still on" is a
     # state the assertions can see rather than an empty stanza that matches
     # nothing whatever the hook does to it
@@ -1242,7 +1286,8 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
         stdin=subprocess.DEVNULL,       # as the service runs it: no answers
         env=hook_env)
     return (r, marker, log.read_text() if log.exists() else "",
-            root / "var/log/pve-lab-first-boot.log", snapshot)
+            root / "var/log/pve-lab-first-boot.log", snapshot,
+            root / "etc/network/interfaces")
 
 
 def _dpkg_options_of(events: str) -> list[str]:
@@ -1589,35 +1634,114 @@ def test_a_failed_service_enable_leaves_the_marker_unwritten(box, tmp_path):
     assert not marker.exists()
 
 
-def test_a_failed_mtu_probe_leaves_the_marker_unwritten(box, tmp_path):
+# The marker certifies the MTU, so the hook reads it back (#187). Every case
+# below ends with the node's real state, not with what a reload returned: a
+# tolerated failure, a success that applied nothing, and a configuration that
+# only looked complete all reach the same question -- is vmbr0, and its bridge
+# port, actually at 1450?
+
+def test_both_interfaces_at_the_lab_mtu_publish_the_marker(box, tmp_path):
+    r, marker, _events, _log, _snap, interfaces = _first_boot(
+        box, tmp_path, "    :", mtus={"vmbr0": 1450, "ens18": 1450})
+    assert r.returncode == 0, r.stderr
+    assert marker.exists()
+    # and the persistent configuration carries it per interface, so the next
+    # boot brings it back
+    text = interfaces.read_text()
+    for stanza in ("iface vmbr0 inet static", "iface ens18 inet manual"):
+        after = text.split(stanza, 1)[1].split("iface ", 1)[0]
+        assert "mtu 1450" in after, f"{stanza} did not get the MTU:\n{text}"
+
+
+def test_a_failed_reload_is_tolerated_when_the_live_mtu_is_right(box, tmp_path):
     """
-    `ip link show vmbr0 | head -1` is the MTU stage's last word, and `pipefail`
-    makes its failure the pipeline's. The marker must not follow it.
+    `ifreload -a` is best-effort on purpose: ifupdown2 refuses a reload on a
+    node whose interfaces already match, and that is not a failure. What makes
+    tolerating it safe is the check that follows, not optimism.
     """
-    r, marker, *_ = _first_boot(box, tmp_path, "    :", ip="exit 1")
-    assert r.returncode != 0, "a failed MTU probe reported success"
+    r, marker, _events, _log, _snap, _ifaces = _first_boot(
+        box, tmp_path, "    :", ifreload="exit 1",
+        mtus={"vmbr0": 1450, "ens18": 1450})
+    assert r.returncode == 0, "a best-effort reload was made fatal"
+    assert marker.exists()
+
+
+@pytest.mark.parametrize("reload_body,why", [
+    ("exit 1", "reload-failed"),
+    (":", "reload-succeeded-but-applied-nothing"),
+], ids=["reload-failed", "reload-succeeded"])
+def test_a_wrong_live_mtu_leaves_the_marker_unwritten(box, tmp_path,
+                                                      reload_body, why):
+    """
+    The heart of #187. Before this, both of these published the marker and
+    released the cluster build over a node whose vmbr0 was still at 1500 --
+    where Ceph then fails in ways that look like anything but an MTU problem.
+    """
+    r, marker, _events, hooklog, _snap, _ifaces = _first_boot(
+        box, tmp_path, "    :", ifreload=reload_body,
+        mtus={"vmbr0": 1500, "ens18": 1450})
+    assert r.returncode != 0, f"a node at MTU 1500 reported ready ({why})"
+    assert not marker.exists()
+    assert "expected 1450" in hooklog.read_text()
+
+
+def test_the_bridge_port_is_checked_too(box, tmp_path):
+    # the bridge can carry 1450 while the port underneath it drops the frames
+    r, marker, *_ = _first_boot(box, tmp_path, "    :",
+                                mtus={"vmbr0": 1450, "ens18": 1500})
+    assert r.returncode != 0, "only the bridge was checked"
     assert not marker.exists()
 
 
-def test_a_failed_reload_keeps_the_hook_s_existing_tolerance(box, tmp_path):
-    """
-    The counterweight to the test above, and narrower than it looks.
+def test_a_live_mtu_that_cannot_be_read_leaves_the_marker_unwritten(box, tmp_path):
+    # unknown is not the same as correct
+    r, marker, *_ = _first_boot(box, tmp_path, "    :", ip="exit 1")
+    assert r.returncode != 0, "an unanswerable probe reported ready"
+    assert not marker.exists()
 
-    `ifreload -a || true` has been best-effort since the hook was written:
-    ifupdown2 can refuse a reload on a node whose interfaces are already right,
-    and making every non-zero reload fatal would change behaviour this PR is
-    not changing. That is all this pins.
 
-    It is **not** a claim that the MTU is correct when the marker appears. The
-    hook writes the interfaces file, prints `ip link show vmbr0` and never
-    reads the value back, so a reload that failed to apply 1450 to the running
-    device still publishes the marker and still releases the cluster build --
-    a pre-existing gap in the hook, filed separately, not something these tests
-    should quietly bless by asserting readiness here.
+def test_a_commented_mtu_does_not_count_as_configured(box, tmp_path):
     """
-    r, marker, *_ = _first_boot(box, tmp_path, "    :", ifreload="exit 1")
-    assert r.returncode == 0, "a best-effort reload was made fatal"
-    assert marker.exists()
+    The old guard was `grep -q 'mtu 1450' /etc/network/interfaces`, which a
+    comment satisfies -- skipping the edit *and* the reload for both
+    interfaces while neither one actually had it.
+    """
+    commented = DEFAULT_INTERFACES.replace(
+        "auto ens18", "# mtu 1450 is set by the first-boot hook\nauto ens18")
+    r, marker, _events, _log, _snap, interfaces = _first_boot(
+        box, tmp_path, "    :", interfaces=commented,
+        mtus={"vmbr0": 1500, "ens18": 1500})
+    assert r.returncode != 0, "a comment was taken for configuration"
+    assert not marker.exists()
+    # it also has to have tried: the stanzas are edited regardless
+    assert interfaces.read_text().count("        mtu 1450") == 2
+
+
+def test_one_configured_interface_does_not_satisfy_the_other(box, tmp_path):
+    """
+    Same file-wide grep, the other way round: the port's stanza already says
+    1450, so the bridge's edit and the reload were both skipped.
+    """
+    half = DEFAULT_INTERFACES.replace(
+        "iface ens18 inet manual\n",
+        "iface ens18 inet manual\n        mtu 1450\n")
+    r, marker, _events, _log, _snap, interfaces = _first_boot(
+        box, tmp_path, "    :", interfaces=half,
+        mtus={"vmbr0": 1500, "ens18": 1450})
+    assert r.returncode != 0, "one interface's MTU stood in for both"
+    assert not marker.exists()
+    assert interfaces.read_text().count("        mtu 1450") == 2
+
+
+def test_a_bridge_with_no_port_is_refused(box, tmp_path):
+    # nothing to put the MTU on, and nothing to check: say so rather than
+    # substitute the literal string `__none__` for the port, as before
+    portless = DEFAULT_INTERFACES.replace("        bridge-ports ens18\n", "")
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=portless)
+    assert r.returncode != 0
+    assert not marker.exists()
+    assert "no bridge port" in hooklog.read_text()
 
 
 def test_the_upgrade_answers_the_conffile_prompt(box, tmp_path):
@@ -1627,7 +1751,8 @@ def test_the_upgrade_answers_the_conffile_prompt(box, tmp_path):
     pve-enterprise.sources, which IS a dpkg conffile, so an upgrade that also
     changes it prompts, and with null stdin that prompt is EOF.
     """
-    r, marker, events, hooklog, _ = _first_boot(box, tmp_path, CONFFILE_PROMPT)
+    r, marker, events, hooklog, *_ = _first_boot(
+        box, tmp_path, CONFFILE_PROMPT)
     assert r.returncode == 0, \
         hooklog.read_text() if hooklog.exists() else r.stderr
     assert marker.exists(), "the hook stalled on a conffile prompt"
@@ -1654,7 +1779,7 @@ def test_the_failure_reaches_the_log_wait_first_boot_names(box, tmp_path):
     stopped redirecting stderr, the file would still hold the banner and the
     operator would still have nothing to read.
     """
-    _r, _marker, _events, hooklog, _ = _first_boot(box, tmp_path, STEP_FAILS)
+    _r, _marker, _events, hooklog, *_ = _first_boot(box, tmp_path, STEP_FAILS)
     assert hooklog.exists(), "the hook wrote no log at the advertised path"
     text = hooklog.read_text()
     assert "pve-lab first boot" in text
@@ -1674,7 +1799,8 @@ def test_every_apt_update_saw_only_the_intended_repository(box, tmp_path):
     spread over two stanzas, or one APT would refuse to load, is not a
     configured repository.
     """
-    _r, _marker, events, _hooklog, snapshot = _first_boot(box, tmp_path, "    :")
+    _r, _marker, events, _hooklog, snapshot, _ = _first_boot(
+        box, tmp_path, "    :")
     updates = sorted(d for d in snapshot.iterdir() if d.is_dir())
     assert updates, f"apt never reached an update:\n{events}"
 
@@ -1856,7 +1982,8 @@ def test_apt_itself_selects_only_the_intended_repository(box, tmp_path):
     those include a pve-no-subscription Packages index for its architecture and
     none from the subscription host.
     """
-    _r, _marker, events, _hooklog, snapshot = _first_boot(box, tmp_path, "    :")
+    _r, _marker, events, _hooklog, snapshot, _ = _first_boot(
+        box, tmp_path, "    :")
     updates = sorted(d for d in snapshot.iterdir() if d.is_dir())
     assert updates, f"apt never reached an update:\n{events}"
 
