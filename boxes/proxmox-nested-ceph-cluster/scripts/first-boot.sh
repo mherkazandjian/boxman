@@ -36,6 +36,7 @@ EOF
 # README says certifies the MTU -- so the live value is read back here rather
 # than assumed from a reload that was tolerated, skipped, or simply believed.
 LAB_MTU=1450
+IFACES_FILE=/etc/network/interfaces
 
 if [ ! -d /sys/class/net/vmbr0/brif ]; then
     echo "ERROR: vmbr0 is not a bridge on this node. The lab's L2 rides a"
@@ -44,40 +45,87 @@ if [ ! -d /sys/class/net/vmbr0/brif ]; then
     exit 1
 fi
 
-# Reading and writing the interfaces file use the same stanza-aware
-# interpretation. ifupdown2 accepts any whitespace in a header and takes the
-# FIRST mtu in a stanza, so a wrong existing value has to be replaced rather
-# than followed by ours -- and interface names are compared as strings, never
-# interpolated into a regex, because `ens18.100` as one also matches
-# `ens18x100`, and this runs as root and reloads what it just wrote.
+# Reading and writing the interfaces file use one grammar, and it is
+# ifupdown2's rather than "lines in a file":
+#
+#   - a physical line ending in a backslash continues the next. Without that,
+#     `post-up /bin/echo \` followed by `mtu 1450` reads as an MTU directive
+#     that is not one, and `mtu \` + `1500` gets half-deleted -- turning a
+#     valid configuration invalid, as root, just before reloading it.
+#   - a stanza ends at auto, iface, vlan, source, source-directory or any
+#     allow-* keyword. `vlan` was missing, so a VLAN stanza's MTU was read as
+#     the bridge's and edited as the bridge's.
+#   - names are compared as strings: `ens18.100` as a regex matches ens18x100.
+#   - ifupdown2 takes the FIRST mtu in a stanza, so a wrong one is replaced
+#     rather than joined by ours.
+#
+# `raw` keeps the original physical text, so lines this does not change are
+# written back exactly as they were, continuations included.
 AWK_STANZA='
 function closes(word) {
-    return word == "auto" || word == "iface" || word == "source" ||
-           word == "source-directory" || word == "allow-hotplug" ||
-           word == "allow-auto"
+    return word == "auto" || word == "iface" || word == "vlan" ||
+           word == "source" || word == "source-directory" ||
+           word ~ /^allow-/
+}
+function next_logical(   line, nxt) {
+    if ((getline line) <= 0) return 0
+    raw = line
+    while (line ~ /\\[ \t]*$/) {
+        sub(/\\[ \t]*$/, "", line)
+        if ((getline nxt) <= 0) break
+        raw = raw "\n" nxt
+        line = line nxt
+    }
+    $0 = line
+    return 1
 }
 '
 
 stanza_mtu() {               # <iface> -> its effective mtu, or nothing
     awk -v want="$1" "$AWK_STANZA"'
-        $1 == "iface" && $2 == want { inside = 1; next }
-        inside && closes($1)        { inside = 0 }
-        inside && $1 == "mtu" && !found { print $2; found = 1 }
-    ' /etc/network/interfaces
+        BEGIN {
+            while (next_logical()) {
+                if ($1 == "iface" && $2 == want) { inside = 1; continue }
+                if (closes($1)) inside = 0
+                if (inside && $1 == "mtu" && !found) { print $2; found = 1 }
+            }
+        }
+    ' "$IFACES_FILE"
 }
 
 set_stanza_mtu() {           # <iface>: exactly one mtu, first in the stanza
-    tmp=$(mktemp /etc/network/interfaces.pve-lab.XXXXXX)
+    tmp=$(mktemp "$IFACES_FILE.pve-lab.XXXXXX")
     awk -v want="$1" -v mtu="$LAB_MTU" "$AWK_STANZA"'
-        $1 == "iface" && $2 == want {
-            print; print "        mtu " mtu; inside = 1; next
+        BEGIN {
+            while (next_logical()) {
+                if ($1 == "iface" && $2 == want) {
+                    print raw; print "        mtu " mtu; inside = 1; continue
+                }
+                if (closes($1)) inside = 0
+                if (inside && $1 == "mtu") continue
+                print raw
+            }
         }
-        inside && closes($1) { inside = 0 }
-        inside && $1 == "mtu" { next }
-        { print }
-    ' /etc/network/interfaces > "$tmp"
-    cat "$tmp" > /etc/network/interfaces
+    ' "$IFACES_FILE" > "$tmp"
+    cat "$tmp" > "$IFACES_FILE"
     rm -f "$tmp"
+}
+
+# A `source` ahead of an interface's own stanza can define it earlier, and the
+# earlier definition's MTU is the one that counts -- so editing the stanza we
+# can see would leave the node at 1500 with every check here passing. The
+# stock installer writes its stanzas first and a source glob last, which is
+# fine; anything else is refused rather than half-understood.
+source_precedes() {          # <iface>
+    awk -v want="$1" "$AWK_STANZA"'
+        BEGIN {
+            while (next_logical()) {
+                if ($1 == "source" || $1 == "source-directory") seen = 1
+                if ($1 == "iface" && $2 == want) { found = seen; break }
+            }
+            exit(found ? 0 : 1)
+        }
+    ' "$IFACES_FILE"
 }
 
 # vmbr0's ports come from vmbr0's own stanza, every token of it. A file-wide
@@ -92,7 +140,7 @@ ports=$(awk -v want=vmbr0 "$AWK_STANZA"'
     inside && $1 == "bridge-ports" {
         for (i = 2; i <= NF; i++) if ($i != "none") print $i
     }
-' /etc/network/interfaces)
+' "$IFACES_FILE")
 if [ -z "$ports" ]; then
     echo "ERROR: vmbr0 declares no bridge-ports; nothing carries the lab L2."
     echo "       Not writing the readiness marker."
@@ -111,6 +159,16 @@ for iface in $ports; do
 done
 
 for iface in vmbr0 $ports; do
+    if source_precedes "$iface"; then
+        echo "ERROR: $iface's stanza comes after a source directive, so an"
+        echo "       included file may define it first and win the MTU. This"
+        echo "       hook will not edit around that."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+done
+
+for iface in vmbr0 $ports; do
     [ "$(stanza_mtu "$iface")" = "$LAB_MTU" ] || set_stanza_mtu "$iface"
 done
 
@@ -119,7 +177,7 @@ done
 # at 1500 is exactly the outcome this step exists to prevent.
 for iface in vmbr0 $ports; do
     if [ "$(stanza_mtu "$iface")" != "$LAB_MTU" ]; then
-        echo "ERROR: $iface has no stanza in /etc/network/interfaces to carry"
+        echo "ERROR: $iface has no stanza in $IFACES_FILE to carry"
         echo "       mtu $LAB_MTU -- a sourced file, perhaps. The MTU would not"
         echo "       survive the next boot. Not writing the readiness marker."
         exit 1

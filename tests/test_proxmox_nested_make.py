@@ -1205,7 +1205,8 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
                 systemctl: str = ":", ifreload: str = ":", ip: str | None = None,
                 mtus: dict[str, int] | None = None,
                 interfaces: str | None = None,
-                bridge_ports: list[str] | None = ("ens18",)):
+                bridge_ports: list[str] | None = ("ens18",),
+                sourced: dict[str, str] | None = None):
     """
     Run the real hook with its absolute paths rebased under a temp root.
 
@@ -1219,6 +1220,8 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
     # the hook takes vmbr0's ports from the kernel rather than from the file,
     # so the fixture owns a sysfs shaped like a bridge: None means vmbr0 is
     # not a bridge at all, [] means it has no ports
+    for name, body in (sourced or {}).items():
+        (root / "etc/network" / name).write_text(body)
     if bridge_ports is not None:
         brif = root / "sys/class/net/vmbr0/brif"
         brif.mkdir(parents=True, exist_ok=True)
@@ -1828,8 +1831,10 @@ def test_the_ports_come_from_the_kernel_not_from_the_first_matching_line(
         "        bridge-ports ens18\n")
     r, marker, *_ = _first_boot(
         box, tmp_path, "    :", interfaces=other_bridge_first,
-        bridge_ports=["ens18"],
+        bridge_ports=["ens18", "ens19"],
         mtus={"vmbr0": 1450, "ens18": 1500, "ens19": 1450})
+    # ens19 is attached too, so selecting it would sail past the attachment
+    # guard and be caught -- or not -- by the MTU check itself
     assert r.returncode != 0, "another bridge's port stood in for vmbr0's"
     assert not marker.exists()
 
@@ -1903,6 +1908,156 @@ def test_a_port_with_no_stanza_here_is_refused(box, tmp_path):
     assert r.returncode != 0, "an unconfigurable interface was accepted"
     assert not marker.exists()
     assert "no stanza" in hooklog.read_text()
+
+
+# ifupdown2's grammar, not "lines in a file" (#188 review round 2). Each of
+# these parses cleanly for the real parser and used to be misread here.
+
+def test_a_continued_command_is_not_an_mtu_directive(box, tmp_path):
+    r"""
+    `post-up /bin/echo \` + `mtu 1450` is one command to ifupdown2. Read as two
+    lines it looks like the MTU is configured, so the edit is skipped and the
+    marker goes out over an interface that has no MTU directive at all.
+    """
+    continued = DEFAULT_INTERFACES.replace(
+        "        bridge-fd 0\n",
+        "        bridge-fd 0\n        post-up /bin/echo \\\n            mtu 1450\n")
+    _r, _marker, _events, _log, _snap, interfaces = _first_boot(
+        box, tmp_path, "    :", interfaces=continued)
+    text = interfaces.read_text()
+    stanza = text.split("iface vmbr0 inet static", 1)[1].split("\nauto ", 1)[0]
+    assert "\n        mtu 1450" in stanza, \
+        f"a continued command was mistaken for configuration:\n{text}"
+    # and the command itself survives intact
+    assert "post-up /bin/echo \\\n            mtu 1450" in text
+
+
+def test_a_continued_mtu_value_is_replaced_whole(box, tmp_path):
+    r"""
+    `mtu \` + `1500` is one directive. Deleting only its first physical line
+    leaves a bare `1500`, which ifupdown2 rejects -- a valid configuration
+    rewritten into an invalid one, as root, just before reloading it.
+    """
+    continued = DEFAULT_INTERFACES.replace(
+        "iface vmbr0 inet static\n",
+        "iface vmbr0 inet static\n        mtu \\\n            1500\n")
+    r, _marker, _events, _log, _snap, interfaces = _first_boot(
+        box, tmp_path, "    :", interfaces=continued)
+    assert r.returncode == 0, r.stderr
+    text = interfaces.read_text()
+    stanza = text.split("iface vmbr0 inet static", 1)[1].split("\nauto ", 1)[0]
+    assert "1500" not in stanza, f"an orphaned value was left behind:\n{text}"
+    assert stanza.count("mtu 1450") == 1, stanza
+
+
+def test_continued_bridge_ports_are_all_read(box, tmp_path):
+    ports = TWO_PORTS.replace("bridge-ports ens18 ens19",
+                              "bridge-ports ens18 \\\n            ens19")
+    r, marker, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=ports,
+        bridge_ports=["ens18", "ens19"],
+        mtus={"vmbr0": 1450, "ens18": 1450, "ens19": 1500})
+    assert r.returncode != 0, "a continued port list hid the second port"
+    assert not marker.exists()
+
+
+def test_a_vlan_stanza_is_not_part_of_the_bridge(box, tmp_path):
+    """
+    `vlan` opens a stanza. Without that, a VLAN's `mtu 1450` was read as the
+    bridge's -- and, with a different value, deleted as the bridge's.
+    """
+    with_vlan = DEFAULT_INTERFACES + "\nvlan 100\n        mtu 9000\n"
+    r, _marker, _events, _log, _snap, interfaces = _first_boot(
+        box, tmp_path, "    :", interfaces=with_vlan)
+    assert r.returncode == 0, r.stderr
+    text = interfaces.read_text()
+    assert "vlan 100\n        mtu 9000" in text, \
+        f"an unrelated VLAN stanza was edited:\n{text}"
+    stanza = text.split("iface vmbr0 inet static", 1)[1].split("\nauto ", 1)[0]
+    assert "mtu 1450" in stanza
+
+
+def test_any_allow_keyword_opens_a_stanza(box, tmp_path):
+    """
+    The family, not two names from it. `allow-hotplug` and `allow-auto` were
+    matched literally, so a site's own `allow-lab` left the previous stanza
+    open -- and its MTU was read, and deleted, as the bridge's.
+    """
+    with_allow = DEFAULT_INTERFACES.replace(
+        "        bridge-fd 0\n",
+        "        bridge-fd 0\nallow-lab ens20\n        mtu 9000\n")
+    r, _marker, _events, _log, _snap, interfaces = _first_boot(
+        box, tmp_path, "    :", interfaces=with_allow)
+    assert r.returncode == 0, r.stderr
+    text = interfaces.read_text()
+    assert "allow-lab ens20\n        mtu 9000" in text, \
+        f"an unrelated allow- stanza was edited:\n{text}"
+
+
+def test_a_stanza_defined_earlier_by_a_source_is_refused(box, tmp_path):
+    """
+    ifupdown2 merges definitions in order and keeps the first MTU, so a
+    sourced file defining ens18 before the main file's stanza wins. Editing
+    the one we can see would leave the node at 1500 with every check passing.
+    """
+    main = "source /etc/network/port.cfg\n\n" + DEFAULT_INTERFACES
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=main,
+        sourced={"port.cfg": "iface ens18 inet6 manual\n        mtu 1500\n"})
+    assert r.returncode != 0, "a split definition was edited around"
+    assert not marker.exists()
+    assert "source directive" in hooklog.read_text()
+
+
+def test_the_stock_trailing_source_glob_is_fine(box, tmp_path):
+    # what the Proxmox installer actually writes: stanzas first, glob last
+    stock = DEFAULT_INTERFACES + "\nsource /etc/network/interfaces.d/*\n"
+    r, marker, *_ = _first_boot(box, tmp_path, "    :", interfaces=stock)
+    assert r.returncode == 0, r.stderr
+    assert marker.exists()
+
+
+def test_a_configured_but_wrong_live_mtu_is_still_refused(box, tmp_path):
+    """
+    Both stanzas already say 1450, so nothing is edited -- and skipping the
+    live check in that case passed every other test here.
+    """
+    configured = DEFAULT_INTERFACES.replace(
+        "iface ens18 inet manual\n", "iface ens18 inet manual\n        mtu 1450\n"
+    ).replace(
+        "iface vmbr0 inet static\n", "iface vmbr0 inet static\n        mtu 1450\n")
+    r, marker, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=configured,
+        mtus={"vmbr0": 1500, "ens18": 1450})
+    assert r.returncode != 0, "an already-configured node skipped verification"
+    assert not marker.exists()
+
+
+def test_a_port_whose_live_mtu_is_unreadable_is_refused(box, tmp_path):
+    # the bridge answers, the port does not: unknown is not correct
+    r, marker, *_ = _first_boot(box, tmp_path, "    :",
+                                mtus={"vmbr0": 1450})
+    assert r.returncode != 0, "an unanswerable port probe reported ready"
+    assert not marker.exists()
+
+
+def test_a_healthy_node_with_another_bridge_declared_first(box, tmp_path):
+    # the positive twin of the wrong-port test: vmbr1 above vmbr0, everything
+    # correct, and both ports attached so nothing is rejected for the wrong
+    # reason
+    two_bridges = (
+        "auto lo\niface lo inet loopback\n\n"
+        "auto ens18\niface ens18 inet manual\n\n"
+        "auto ens19\niface ens19 inet manual\n\n"
+        "auto vmbr1\niface vmbr1 inet manual\n        bridge-ports ens19\n\n"
+        "auto vmbr0\niface vmbr0 inet static\n        address 10.77.0.11/24\n"
+        "        bridge-ports ens18\n")
+    r, marker, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=two_bridges,
+        bridge_ports=["ens18"],
+        mtus={"vmbr0": 1450, "ens18": 1450, "ens19": 1500})
+    assert r.returncode == 0, r.stderr
+    assert marker.exists(), "an unrelated bridge's port blocked a healthy node"
 
 
 def test_the_upgrade_answers_the_conffile_prompt(box, tmp_path):
