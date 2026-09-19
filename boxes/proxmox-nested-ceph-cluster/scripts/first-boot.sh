@@ -173,7 +173,21 @@ while IFS= read -r pattern; do
         *)  pattern="$(dirname "$IFACES_FILE")/$pattern" ;;
     esac
     for inc in $pattern; do
-        [ -f "$inc" ] && check_include "$inc"
+        if [ -f "$inc" ]; then
+            check_include "$inc"
+        elif [ -e "$inc" ] && [ ! -d "$inc" ]; then
+            # ifupdown2 open()s whatever the glob matched, so a FIFO or a
+            # device node named there supplies configuration exactly as a
+            # file does -- and this hook cannot inspect one without consuming
+            # it or blocking on it. A directory and a dangling symlink are
+            # both harmless: the parser's open() fails and it moves on.
+            echo "ERROR: the include $inc is not a regular file. ifupdown2"
+            echo "       reads whatever a source pattern matched, so a FIFO"
+            echo "       or a device node there can define vmbr0 -- and this"
+            echo "       hook cannot read one back to rule that out."
+            echo "       Not writing the readiness marker."
+            exit 1
+        fi
     done
 done < <(awk '
     $1 == "source"           { for (i = 2; i <= NF; i++) print $i }
@@ -197,7 +211,19 @@ stanza_mtu() {               # <iface> -> its effective mtu, or nothing
     awk -v want="$1" "$AWK_STANZA"'
         $1 == "iface" && $2 == want     { inside = 1; next }
         closes($1)                      { inside = 0 }
-        inside && $1 == "mtu" && !found { print $2; found = 1 }
+        inside && $1 == "mtu" && !found {
+            # ifupdown2 splits an attribute line once and keeps the whole
+            # remainder as the value, so `mtu 1450 9000` is "1450 9000" --
+            # which its address addon then fails to turn into an integer.
+            # Reporting the second field alone would call that stanza correct
+            # and leave the node with an MTU that never applies, so the value
+            # is compared whole and anything else is rewritten.
+            value = $0
+            sub(/^[ \t]*mtu[ \t]+/, "", value)
+            sub(/[ \t]+$/, "", value)
+            print value
+            found = 1
+        }
     ' "$IFACES_FILE"
 }
 

@@ -1206,7 +1206,8 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
                 mtus: dict[str, int] | None = None,
                 interfaces: str | None = None,
                 bridge_ports: list[str] | None = ("ens18",),
-                sourced: dict[str, str] | None = None):
+                sourced: dict[str, str] | None = None,
+                fifos: tuple[str, ...] = ()):
     """
     Run the real hook with its absolute paths rebased under a temp root.
 
@@ -1219,13 +1220,20 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
     (root / "etc/network/interfaces").write_text(
         (DEFAULT_INTERFACES if interfaces is None else interfaces)
         .replace("@ROOT@", str(root)))
-    # the hook takes vmbr0's ports from the kernel rather than from the file,
-    # so the fixture owns a sysfs shaped like a bridge: None means vmbr0 is
-    # not a bridge at all, [] means it has no ports
+    # the hook configures the ports vmbr0's own stanza declares and then
+    # verifies every member the kernel has, so the fixture owns a sysfs shaped
+    # like a bridge: None means vmbr0 is not a bridge at all, [] means it has
+    # no ports
     for name, body in (sourced or {}).items():
         target = root / "etc/network" / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body.replace("@ROOT@", str(root)))
+    # ifupdown2 open()s whatever a source pattern matched, so a test can put
+    # something that is not a regular file where an include would be
+    for name in fifos:
+        target = root / "etc/network" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(target)
     if bridge_ports is not None:
         brif = root / "sys/class/net/vmbr0/brif"
         brif.mkdir(parents=True, exist_ok=True)
@@ -1901,6 +1909,39 @@ def test_a_conflicting_mtu_is_replaced_rather_than_joined(box, tmp_path):
     assert stanza.count("mtu 1450") == 1, stanza
 
 
+def test_an_mtu_with_a_trailing_token_is_rewritten(box, tmp_path):
+    """
+    ifupdown2 splits an attribute line once and keeps the whole remainder, so
+    `mtu 1450 9000` is the value "1450 9000" -- which its address addon fails
+    to turn into an integer, leaving the interface at 1500. Reading the second
+    field alone called that stanza already correct and left it there.
+    """
+    multi = DEFAULT_INTERFACES.replace(
+        "iface vmbr0 inet static\n",
+        "iface vmbr0 inet static\n        mtu 1450 9000\n")
+    r, marker, _events, _log, _snap, interfaces = _first_boot(
+        box, tmp_path, "    :", interfaces=multi)
+    assert r.returncode == 0, "a repairable stanza was refused"
+    assert marker.exists()
+    stanza = interfaces.read_text().split("iface vmbr0 inet static", 1)[1]
+    stanza = stanza.split("\nauto ", 1)[0]
+    assert "1450 9000" not in stanza, f"the unusable value survived:\n{stanza}"
+    assert stanza.count("mtu 1450\n") == 1, stanza
+
+
+def test_an_mtu_with_extra_spacing_is_left_alone(box, tmp_path):
+    # the parser strips the line and collapses the separator, so this stanza
+    # is already correct and rewriting it would be churn
+    spaced = DEFAULT_INTERFACES.replace(
+        "iface vmbr0 inet static\n",
+        "iface vmbr0 inet static\n\tmtu   1450  \n")
+    r, marker, _events, _log, _snap, interfaces = _first_boot(
+        box, tmp_path, "    :", interfaces=spaced)
+    assert r.returncode == 0, r.stderr
+    assert marker.exists()
+    assert "\tmtu   1450  \n" in interfaces.read_text(), "a correct stanza was rewritten"
+
+
 def test_a_dotted_port_name_does_not_edit_its_neighbour(box, tmp_path):
     """
     The name went into an extended regular expression, where `.` matches any
@@ -2162,6 +2203,34 @@ def test_a_bracket_source_pattern_is_refused(box, tmp_path, pattern):
     # a phrase, not a word: the temp directory is named after this test,
     # so "bracket" appears in every path the log prints
     assert "different files in bash" in hooklog.read_text()
+
+
+def test_an_include_that_is_not_a_regular_file_is_refused(box, tmp_path):
+    """
+    ifupdown2 open()s whatever the glob matched, so a FIFO named where an
+    include would be supplies configuration exactly as a file does -- and the
+    scan, testing for a regular file, walked past it and reported ready.
+    Reading it here is not the answer either: awk would block on it forever.
+    """
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :",
+        interfaces=_with_include("@ROOT@/etc/network/parts/*"),
+        fifos=("parts/extra.cfg",))
+    assert r.returncode != 0, "a FIFO include was walked past"
+    assert not marker.exists()
+    assert "not a regular file" in hooklog.read_text()
+
+
+def test_a_directory_matched_by_a_source_glob_is_not_refused(box, tmp_path):
+    # the parser's open() on a directory fails and it moves on, so one caught
+    # by a trailing `*` is no reason to refuse the node
+    root = tmp_path / "root"
+    (root / "etc/network/parts/nested").mkdir(parents=True)
+    r, marker, *_ = _first_boot(
+        box, tmp_path, "    :",
+        interfaces=_with_include("@ROOT@/etc/network/parts/*"))
+    assert r.returncode == 0, r.stderr
+    assert marker.exists()
 
 
 def test_an_ordinary_glob_is_still_accepted(box, tmp_path):
