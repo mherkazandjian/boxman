@@ -188,6 +188,14 @@ done < <(awk '
 ' "$IFACES_FILE")
 shopt -u nullglob dotglob
 
+# Globbing stays off from here to the end of the MTU work. Every name below is
+# read out of a file or out of the kernel: `bridge-ports e*0` is an attribute
+# value, which the header whitelist never sees, and the kernel rejects only
+# `/`, `:` and whitespace in a name. Left expanding, either one is replaced by
+# whatever the working directory happens to contain -- and it is then that
+# name whose stanza gets rewritten and whose MTU gets checked.
+set -f
+
 # With those refused, a stanza is plain lines: it opens at auto, iface, vlan,
 # source, source-directory or any allow-* keyword, names are compared as
 # strings -- `ens18.100` as a regex also matches `ens18x100` -- and ifupdown2
@@ -340,12 +348,6 @@ if ! attached=$(ls -1A -- /sys/class/net/vmbr0/brif); then
     echo "       Not writing the readiness marker."
     exit 1
 fi
-#
-# Globbing off while these names are split: the kernel rejects only `/`, `:`
-# and whitespace in an interface name, so a member called `e*0` is legal --
-# and would otherwise be replaced here by whatever the working directory
-# happens to contain, checking those and never checking it.
-set -f
 checked=
 for iface in vmbr0 $ports $attached; do
     case " $checked " in *" $iface "*) continue ;; esac

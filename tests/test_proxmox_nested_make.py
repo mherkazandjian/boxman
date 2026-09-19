@@ -1194,8 +1194,10 @@ iface vmbr0 inet static
 
 def _ip_stub(mtus: dict[str, int]) -> str:
     """An `ip` whose answers are the live MTUs *mtus* describes."""
+    # quoted: an unquoted arm is a `case` *pattern*, so a name like `e*0`
+    # would answer for `evil0` too and a test could not tell them apart
     arms = "\n".join(
-        f'    {iface}) echo "{n}: {iface}: <BROADCAST,MULTICAST,UP,LOWER_UP>'
+        f'    "{iface}") echo "{n}: {iface}: <BROADCAST,MULTICAST,UP,LOWER_UP>'
         f' mtu {mtu} qdisc noqueue state UP mode DEFAULT group default" ;;'
         for n, (iface, mtu) in enumerate(mtus.items(), start=2))
     return IP_REPORTS_MTU.replace("@MTU_CASES@", arms)
@@ -1836,6 +1838,29 @@ def test_a_member_named_like_a_tap_is_still_checked(box, tmp_path):
     assert r.returncode != 0, "a member was waved through on its name"
     assert not marker.exists()
     assert "tap100i0 has MTU 1500" in hooklog.read_text()
+
+
+def test_a_declared_port_whose_name_globs_is_not_expanded(box, tmp_path):
+    """
+    A `bridge-ports` token is an attribute value, which the header whitelist
+    never sees -- so `e*0` reaches the loops that check attachment, edit the
+    stanza and validate what was persisted. Expanded there, it became whatever
+    the working directory matched: `evil0`'s stanza got the MTU, the check that
+    `e*0` has a stanza to carry one never ran, and the marker was written.
+    """
+    (tmp_path / "evil0").write_text("")        # what the glob would match
+    globbing = (DEFAULT_INTERFACES.replace("bridge-ports ens18",
+                                           "bridge-ports e*0")
+                + "\nauto evil0\niface evil0 inet manual\n")
+    r, marker, _events, hooklog, _snap, interfaces = _first_boot(
+        box, tmp_path, "    :", interfaces=globbing,
+        bridge_ports=["e*0", "evil0"],
+        mtus={"vmbr0": 1450, "e*0": 1450, "evil0": 1450})
+    assert r.returncode != 0, "a declared port's name was expanded"
+    assert not marker.exists()
+    assert "e*0 has no stanza" in hooklog.read_text()
+    assert "mtu" not in interfaces.read_text().split("iface evil0 inet manual")[1], \
+        "another interface's stanza was edited in its place"
 
 
 def test_a_member_whose_name_globs_is_not_expanded(box, tmp_path):
