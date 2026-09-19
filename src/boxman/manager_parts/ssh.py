@@ -470,7 +470,8 @@ class SSHMixin:
             # sshpass -e, not -p: an argv is world-readable in `ps` and
             # /proc for as long as the process lives, and this one runs up to
             # ten times per VM. -e takes the password from SSHPASS instead,
-            # which is readable only by this user (#164 CL-S2). Everything
+            # which narrows the audience to this process's own environment --
+            # root and the docker daemon still see it (#164 CL-S2). Everything
             # else is quoted: a password with a space used to break auth, and
             # one with `$(...)` in it used to run.
             cmd = (
@@ -487,8 +488,12 @@ class SSHMixin:
 
             # env= adds to the environment rather than replacing it, so the
             # rest of it (PATH, DOCKER_HOST, ...) still reaches the command.
+            # str(): an all-digit password in an unquoted Jinja value comes
+            # back from yaml.safe_load as an int, and resolve_reference keeps
+            # non-strings as they are. The f-string this replaced converted it
+            # on the way past; subprocess rejects it outright.
             result = run(cmd, hide=True, warn=True,
-                         env={'SSHPASS': admin_pass})
+                         env={'SSHPASS': str(admin_pass)})
 
             if result.ok:
                 # Log ssh-copy-id informational output

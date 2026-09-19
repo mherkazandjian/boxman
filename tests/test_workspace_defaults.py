@@ -271,7 +271,10 @@ class TestAnsibleCfgGeneration:
         _make_manager(config)
         cfg = config['workspace']['files']['ansible.cfg']
         assert '[defaults]' in cfg
-        assert 'host_key_checking = False' in cfg
+        # not here: it makes Ansible pass StrictHostKeyChecking=no for every
+        # target, including hosts that have nothing to do with boxman. The
+        # VM hosts carry it themselves (#164 CL-S1).
+        assert 'host_key_checking' not in cfg
         assert 'forks = 10' in cfg
         assert 'gathering = smart' in cfg
         assert 'fact_caching = jsonfile' in cfg
@@ -374,8 +377,8 @@ class TestWorkspaceInventoryGeneration:
         inv = config['workspace']['files']['inventory/01-hosts.yml']
         parsed = yaml.safe_load(inv)
         assert set(parsed['all']['hosts'].keys()) == {'c1_node01', 'c1_node02'}
-        assert parsed['all']['hosts']['c1_node01'] == {'boxman_alias': 'node0'}
-        assert parsed['all']['hosts']['c1_node02'] == {'boxman_alias': 'node1'}
+        assert parsed['all']['hosts']['c1_node01'] == {'boxman_alias': 'node0', 'ansible_ssh_common_args': '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'}
+        assert parsed['all']['hosts']['c1_node02'] == {'boxman_alias': 'node1', 'ansible_ssh_common_args': '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'}
         # cluster group
         assert 'c1' in parsed['all']['children']
         assert set(parsed['all']['children']['c1']['hosts'].keys()) == {'c1_node01', 'c1_node02'}
@@ -393,9 +396,9 @@ class TestWorkspaceInventoryGeneration:
         inv = config['workspace']['files']['inventory/01-hosts.yml']
         parsed = yaml.safe_load(inv)
         assert set(parsed['all']['hosts'].keys()) == {'web_web01', 'web_web02', 'db_db01'}
-        assert parsed['all']['hosts']['web_web01'] == {'boxman_alias': 'node0'}
-        assert parsed['all']['hosts']['web_web02'] == {'boxman_alias': 'node1'}
-        assert parsed['all']['hosts']['db_db01'] == {'boxman_alias': 'node2'}
+        assert parsed['all']['hosts']['web_web01'] == {'boxman_alias': 'node0', 'ansible_ssh_common_args': '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'}
+        assert parsed['all']['hosts']['web_web02'] == {'boxman_alias': 'node1', 'ansible_ssh_common_args': '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'}
+        assert parsed['all']['hosts']['db_db01'] == {'boxman_alias': 'node2', 'ansible_ssh_common_args': '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'}
         # cluster groups
         assert set(parsed['all']['children'].keys()) == {'web', 'db'}
         assert set(parsed['all']['children']['web']['hosts'].keys()) == {'web_web01', 'web_web02'}

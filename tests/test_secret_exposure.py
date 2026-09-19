@@ -17,9 +17,11 @@ import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 from boxman.manager import BoxmanManager
 from boxman.runtime.docker_compose import docker_exec_wrap
+from conftest import make_bare_manager
 
 pytestmark = pytest.mark.unit
 
@@ -131,6 +133,31 @@ class TestThePasswordStaysOffTheArgv:
         for call in self._capture(mgr, tmp_path):
             assert call.kwargs["env"]["SSHPASS"] == ADMIN_PASS
 
+    def test_a_numeric_password_survives_the_environment(self, tmp_path):
+        """
+        `admin_pass` comes from an unquoted Jinja value, so an all-digit one
+        is a YAML *int* by the time it gets here, and resolve_reference keeps
+        non-strings as they are. The f-string this replaced converted it on
+        the way past; subprocess calls os.fsencode on every environment value
+        and raises TypeError on an int -- before authentication is attempted.
+        """
+        mgr = _manager(tmp_path)
+        with patch("boxman.manager_parts.ssh.run") as fake_run:
+            fake_run.return_value = MagicMock(ok=False, stdout="", stderr="")
+            with patch.object(type(mgr), "_verify_ssh_connection",
+                              return_value=True, create=True), \
+                 patch("boxman.manager_parts.ssh.time.sleep"):
+                mgr._try_add_ssh_key(
+                    ip_address="192.168.11.91", hostname="vm1",
+                    admin_user="admin", admin_pass=12345678,
+                    pub_key_path=str(tmp_path / "id.pub"),
+                    ssh_conf_path=str(tmp_path / "ssh_config"))
+        for call in fake_run.call_args_list:
+            value = call.kwargs["env"]["SSHPASS"]
+            # the actual failure mode, not a proxy for it
+            os.fsencode(value)
+            assert value == "12345678"
+
     def test_the_remaining_arguments_are_quoted(self, tmp_path):
         # a path with a space used to split into two arguments
         mgr = _manager(tmp_path)
@@ -177,6 +204,41 @@ class TestTheRenderedConfigIsNotWorldReadable:
         assert "hunter2" in rendered.read_text(), "the secret is really in it"
         assert stat.S_IMODE(rendered.stat().st_mode) == 0o600
 
+    def test_a_failed_write_still_leaves_it_private(self, tmp_path):
+        """
+        The mode has to be right before the first byte, not after the last.
+        Tightening afterwards leaves freshly rendered credentials readable for
+        the length of the write -- and, if the write fails, for good.
+        """
+        stale = tmp_path / "conf.rendered.yml"
+        stale.write_text("old\n")
+        stale.chmod(0o644)
+
+        real_fdopen = os.fdopen
+
+        def exploding(fd, mode):
+            handle = real_fdopen(fd, mode)
+
+            class Exploding:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    handle.close()
+                    return False
+
+                def fileno(self):
+                    return handle.fileno()
+
+                def write(self, _):
+                    raise OSError(28, "No space left on device")
+
+            return Exploding()
+
+        with patch("boxman.manager_parts.config.os.fdopen", exploding):
+            rendered = self._render(tmp_path)
+        assert stat.S_IMODE(rendered.stat().st_mode) == 0o600
+
     def test_one_left_behind_by_an_older_boxman_is_tightened(self, tmp_path):
         # O_CREAT's mode applies only to a file being created, so an
         # existing 0644 would otherwise stay 0644 forever
@@ -184,3 +246,38 @@ class TestTheRenderedConfigIsNotWorldReadable:
         stale.write_text("old\n")
         stale.chmod(0o644)
         assert stat.S_IMODE(self._render(tmp_path).stat().st_mode) == 0o600
+
+
+class TestNoGeneratedFileRelaxesHostKeysGlobally:
+    """
+    CL-S1 again, one file over: `[defaults] host_key_checking = False` in the
+    generated ansible.cfg made Ansible pass `StrictHostKeyChecking=no` on the
+    command line for *every* target -- which overrides ssh_config, so scoping
+    the ssh_config stanzas did not constrain it. Any unrelated inventory run
+    with that config lost verification too.
+    """
+
+    @staticmethod
+    def _workspace(tmp_path):
+        config = {
+            "workspace": {"path": str(tmp_path)},
+            "clusters": {"c1": {"vms": {"vm1": {}}}},
+        }
+        mgr = make_bare_manager(config)
+        mgr.resolve_workspace_defaults()
+        return config["workspace"]["files"]
+
+    def test_the_generated_ansible_config_has_no_blanket_setting(self, tmp_path):
+        assert "host_key_checking" not in self._workspace(tmp_path)["ansible.cfg"]
+
+    def test_the_vm_host_carries_it_instead(self, tmp_path):
+        inv = yaml.safe_load(
+            self._workspace(tmp_path)["inventory/01-hosts.yml"])
+        args = inv["all"]["hosts"]["c1_vm1"]["ansible_ssh_common_args"]
+        assert "StrictHostKeyChecking=no" in args
+        assert "UserKnownHostsFile=/dev/null" in args
+
+    def test_the_gateway_is_still_a_vm(self, tmp_path):
+        # the VM rows used to be recognised by having *no* extra vars, so
+        # giving them these options emptied GATEWAYHOST and broke `boxman ssh`
+        assert "export GATEWAYHOST=c1_vm1" in self._workspace(tmp_path)["env.sh"]

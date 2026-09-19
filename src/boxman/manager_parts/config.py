@@ -122,8 +122,13 @@ class ConfigMixin:
             fd = os.open(rendered_path,
                          os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, 'w') as fobj:
+                # before the first byte, not after the last: O_CREAT's mode
+                # applies only to a file being created, so an existing 0644
+                # one -- written by an older boxman -- would otherwise hold
+                # freshly rendered credentials at 0644 for the length of the
+                # write, and keep them there entirely if the write failed
+                os.fchmod(fobj.fileno(), 0o600)
                 fobj.write(rendered_yaml)
-            os.chmod(rendered_path, 0o600)
         except OSError as exc:
             self.logger.warning(
                 f"could not write the rendered config to {rendered_path} "
