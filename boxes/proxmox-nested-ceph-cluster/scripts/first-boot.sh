@@ -279,16 +279,18 @@ fi
 # ...and each declared port is really attached to it. A port that is
 # configured but not enslaved leaves the bridge without an uplink, which looks
 # like a working node until the first packet has to leave it.
-check_attached() {           # <iface>...: enslaved to vmbr0, or no marker
+check_attached() {           # <when> <iface>...: enslaved to vmbr0, or no marker
+    when=$1
+    shift
     for iface in "$@"; do
         if [ ! -e "/sys/class/net/vmbr0/brif/$iface" ]; then
             echo "ERROR: $iface is declared as a port of vmbr0 but is not attached"
-            echo "       to it. Not writing the readiness marker."
+            echo "       to it $when. Not writing the readiness marker."
             exit 1
         fi
     done
 }
-check_attached $ports
+check_attached "before the reload" $ports
 
 for iface in vmbr0 $ports; do
     if source_precedes "$iface"; then
@@ -362,7 +364,7 @@ verify_lab_mtu() {           # <when>: the live state, read rather than assumed
     # re-checked here and not only before the reload: a port can leave the
     # bridge while the reload runs, or while the upgrade restarts whatever
     # brought it up, and a bridge with no uplink still answers `ip link`
-    check_attached $ports
+    check_attached "$1" $ports
 
     checked=
     for iface in vmbr0 $ports $attached; do

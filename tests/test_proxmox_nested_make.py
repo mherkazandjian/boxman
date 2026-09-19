@@ -1791,7 +1791,10 @@ def test_a_declared_port_that_is_not_attached_is_refused(box, tmp_path):
         box, tmp_path, "    :", bridge_ports=[])
     assert r.returncode != 0
     assert not marker.exists()
-    assert "not attached" in hooklog.read_text()
+    # named by its pass, like the other two: a port can be missing here, or
+    # leave during the reload, or leave during the upgrade, and the three
+    # mean different things
+    assert "to it before the reload" in hooklog.read_text()
 
 
 def test_a_member_no_stanza_declares_is_still_verified(box, tmp_path):
@@ -1855,8 +1858,8 @@ def test_an_upgrade_that_detaches_the_uplink_stops_the_marker(box, tmp_path):
         box, tmp_path, "    rmdir @BRIF@/ens18")
     assert r.returncode != 0, "the uplink left the bridge unnoticed"
     assert not marker.exists()
-    assert "ens18 is declared as a port of vmbr0 but is not attached" \
-        in hooklog.read_text()
+    assert "to it after the upgrade" in hooklog.read_text(), \
+        "the refusal did not say which pass lost the port"
 
 
 def test_a_reload_that_detaches_the_uplink_stops_the_marker(box, tmp_path):
@@ -1866,7 +1869,8 @@ def test_a_reload_that_detaches_the_uplink_stops_the_marker(box, tmp_path):
         box, tmp_path, "    :", ifreload="rmdir @BRIF@/ens18")
     assert r.returncode != 0, "the uplink left during the reload unnoticed"
     assert not marker.exists()
-    assert "not attached" in hooklog.read_text()
+    assert "to it after the reload" in hooklog.read_text(), \
+        "the refusal did not say which pass lost the port"
 
 
 def test_an_ordinary_upgrade_still_publishes_the_marker(box, tmp_path):
