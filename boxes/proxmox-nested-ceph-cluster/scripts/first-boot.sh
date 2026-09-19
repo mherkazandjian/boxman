@@ -37,28 +37,92 @@ EOF
 # than assumed from a reload that was tolerated, skipped, or simply believed.
 LAB_MTU=1450
 
-port=$(awk '/^[[:space:]]*bridge-ports/ {print $2; exit}' /etc/network/interfaces || true)
-if [ -z "$port" ] || [ "$port" = none ]; then
-    echo "ERROR: no bridge port found in /etc/network/interfaces; cannot set"
-    echo "       the lab MTU on vmbr0's port. Not writing the readiness marker."
+if [ ! -d /sys/class/net/vmbr0/brif ]; then
+    echo "ERROR: vmbr0 is not a bridge on this node. The lab's L2 rides a"
+    echo "       VXLAN and every node reaches it through vmbr0."
+    echo "       Not writing the readiness marker."
     exit 1
 fi
 
-# Per interface, and only within its own stanza. A file-wide `grep -q mtu 1450`
-# is satisfied by a comment, or by one interface already carrying it while the
-# other is untouched -- and then skips the edit AND the reload for both.
-stanza_has_mtu() {           # <iface>
-    awk -v want_iface="$1" -v want_mtu="$LAB_MTU" '
-        $1 == "iface" && $2 == want_iface { inside = 1; next }
-        $1 == "auto" || $1 == "iface" || $1 == "source" { inside = 0 }
-        inside && $1 == "mtu" && $2 == want_mtu { found = 1 }
-        END { exit(found ? 0 : 1) }
+# Reading and writing the interfaces file use the same stanza-aware
+# interpretation. ifupdown2 accepts any whitespace in a header and takes the
+# FIRST mtu in a stanza, so a wrong existing value has to be replaced rather
+# than followed by ours -- and interface names are compared as strings, never
+# interpolated into a regex, because `ens18.100` as one also matches
+# `ens18x100`, and this runs as root and reloads what it just wrote.
+AWK_STANZA='
+function closes(word) {
+    return word == "auto" || word == "iface" || word == "source" ||
+           word == "source-directory" || word == "allow-hotplug" ||
+           word == "allow-auto"
+}
+'
+
+stanza_mtu() {               # <iface> -> its effective mtu, or nothing
+    awk -v want="$1" "$AWK_STANZA"'
+        $1 == "iface" && $2 == want { inside = 1; next }
+        inside && closes($1)        { inside = 0 }
+        inside && $1 == "mtu" && !found { print $2; found = 1 }
     ' /etc/network/interfaces
 }
 
-for iface in vmbr0 "$port"; do
-    if ! stanza_has_mtu "$iface"; then
-        sed -i -E "/^iface $iface inet/a\\        mtu $LAB_MTU" /etc/network/interfaces
+set_stanza_mtu() {           # <iface>: exactly one mtu, first in the stanza
+    tmp=$(mktemp /etc/network/interfaces.pve-lab.XXXXXX)
+    awk -v want="$1" -v mtu="$LAB_MTU" "$AWK_STANZA"'
+        $1 == "iface" && $2 == want {
+            print; print "        mtu " mtu; inside = 1; next
+        }
+        inside && closes($1) { inside = 0 }
+        inside && $1 == "mtu" { next }
+        { print }
+    ' /etc/network/interfaces > "$tmp"
+    cat "$tmp" > /etc/network/interfaces
+    rm -f "$tmp"
+}
+
+# vmbr0's ports come from vmbr0's own stanza, every token of it. A file-wide
+# `grep bridge-ports` took the second token of whichever such line came first,
+# so another bridge declared above substituted its port and a two-port vmbr0
+# had only the first one looked at. Reading the kernel's bridge membership
+# instead would be worse: it also lists the tap devices of running guests,
+# which have no stanza and are nobody's uplink.
+ports=$(awk -v want=vmbr0 "$AWK_STANZA"'
+    $1 == "iface" && $2 == want { inside = 1; next }
+    inside && closes($1)        { inside = 0 }
+    inside && $1 == "bridge-ports" {
+        for (i = 2; i <= NF; i++) if ($i != "none") print $i
+    }
+' /etc/network/interfaces)
+if [ -z "$ports" ]; then
+    echo "ERROR: vmbr0 declares no bridge-ports; nothing carries the lab L2."
+    echo "       Not writing the readiness marker."
+    exit 1
+fi
+
+# ...and each declared port is really attached to it. A port that is
+# configured but not enslaved leaves the bridge without an uplink, which looks
+# like a working node until the first packet has to leave it.
+for iface in $ports; do
+    if [ ! -e "/sys/class/net/vmbr0/brif/$iface" ]; then
+        echo "ERROR: $iface is declared as a port of vmbr0 but is not attached"
+        echo "       to it. Not writing the readiness marker."
+        exit 1
+    fi
+done
+
+for iface in vmbr0 $ports; do
+    [ "$(stanza_mtu "$iface")" = "$LAB_MTU" ] || set_stanza_mtu "$iface"
+done
+
+# The persisted result, checked rather than assumed: an interface whose stanza
+# lives in a `source`d file is not in this one to edit, and silently leaving it
+# at 1500 is exactly the outcome this step exists to prevent.
+for iface in vmbr0 $ports; do
+    if [ "$(stanza_mtu "$iface")" != "$LAB_MTU" ]; then
+        echo "ERROR: $iface has no stanza in /etc/network/interfaces to carry"
+        echo "       mtu $LAB_MTU -- a sourced file, perhaps. The MTU would not"
+        echo "       survive the next boot. Not writing the readiness marker."
+        exit 1
     fi
 done
 
@@ -69,7 +133,7 @@ ifreload -a || echo "note: ifreload exited non-zero; verifying the live MTU anyw
 
 # The check that makes the marker mean what it says. Runs whether the reload
 # succeeded, failed, or was skipped because the file already said 1450.
-for iface in vmbr0 "$port"; do
+for iface in vmbr0 $ports; do
     live=$( { ip -o link show "$iface" || true; } \
             | awk '{ for (i = 1; i < NF; i++) if ($i == "mtu") print $(i + 1) }' )
     if [ "$live" != "$LAB_MTU" ]; then
