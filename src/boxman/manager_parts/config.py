@@ -412,7 +412,12 @@ class ConfigMixin:
         for host, alias in host_aliases:
             lines = [f'        {host}:', f'          boxman_alias: "{alias}"']
             for var, value in (host_extra_vars.get(host) or {}).items():
-                lines.append(f'          {var}: "{value}"')
+                # a bool unquoted: ansible coerces "False" for a typed option,
+                # but `ansible_host_key_checking` is read with `is False` once
+                # coerced, and an untyped consumer would see a truthy string
+                rendered = ('true' if value is True else 'false'
+                            if value is False else f'"{value}"')
+                lines.append(f'          {var}: {rendered}')
             host_blocks.append('\n'.join(lines))
         host_lines = '\n'.join(host_blocks)
         children_lines: list[str] = []

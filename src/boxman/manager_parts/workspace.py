@@ -100,13 +100,17 @@ class WorkspaceMixin:
                     # on the command line for *every* target, which overrides
                     # whatever ssh_config says, so an unrelated inventory run
                     # with this ansible.cfg lost verification too (#164 CL-S1).
-                    # A boxman VM still needs it -- its host key changes under
-                    # a reused IP -- and carrying it here keeps it with the
-                    # host, whether or not env.sh put `-F ssh_config` in play.
+                    # A boxman VM still needs the relaxation -- its host key
+                    # changes under a reused IP.
+                    #
+                    # The host-key-specific variable, not ansible_ssh_common_args:
+                    # that one owns *all* common ssh arguments and inventory vars
+                    # outrank the command line, so setting it here would discard
+                    # a user's own --ssh-common-args (a ProxyJump, say). This one
+                    # only makes the ssh plugin add -o StrictHostKeyChecking=no,
+                    # which is exactly what the blanket setting used to do.
                     all_hosts.append((cname, vm_name, f'{cname}_{vm_name}', {
-                        'ansible_ssh_common_args':
-                            '-o StrictHostKeyChecking=no '
-                            '-o UserKnownHostsFile=/dev/null',
+                        'ansible_host_key_checking': False,
                     }))
 
         pad_width = len(str(len(all_hosts) - 1)) if len(all_hosts) > 1 else 1

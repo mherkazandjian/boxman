@@ -273,9 +273,20 @@ class TestNoGeneratedFileRelaxesHostKeysGlobally:
     def test_the_vm_host_carries_it_instead(self, tmp_path):
         inv = yaml.safe_load(
             self._workspace(tmp_path)["inventory/01-hosts.yml"])
-        args = inv["all"]["hosts"]["c1_vm1"]["ansible_ssh_common_args"]
-        assert "StrictHostKeyChecking=no" in args
-        assert "UserKnownHostsFile=/dev/null" in args
+        host = inv["all"]["hosts"]["c1_vm1"]
+        # a real boolean: the ssh plugin reads this with `is False`
+        assert host["ansible_host_key_checking"] is False
+
+    def test_it_does_not_occupy_the_general_ssh_arguments(self, tmp_path):
+        """
+        `ansible_ssh_common_args` owns *every* common ssh argument, and an
+        inventory variable outranks the command line -- so setting it here
+        would silently discard a user's own `--ssh-common-args`, a ProxyJump
+        among them, and connect straight to the VM instead.
+        """
+        inv = yaml.safe_load(
+            self._workspace(tmp_path)["inventory/01-hosts.yml"])
+        assert "ansible_ssh_common_args" not in inv["all"]["hosts"]["c1_vm1"]
 
     def test_the_gateway_is_still_a_vm(self, tmp_path):
         # the VM rows used to be recognised by having *no* extra vars, so
