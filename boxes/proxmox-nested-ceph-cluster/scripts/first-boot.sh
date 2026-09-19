@@ -56,7 +56,14 @@ fi
 # before a byte is rewritten.
 unsupported=$(awk '
     /\r/            { print "CRLF line endings"; exit }
-    /\\[ \t]*$/     { print "line continuations"; exit }
+    # any backslash, not just one ending a line: ifupdown2 treats it as a
+    # separator wherever it appears, so `source\ PATH` is a source directive
+    # and `iface\ ens18` a header, both invisible to a reader splitting on
+    # whitespace
+    /\\/            { print "backslashes"; exit }
+    # form feed, vertical tab, a non-breaking space: ifupdown2 separates on
+    # them, awk does not, so they hide a header or a boundary in plain sight
+    /[^\t -~]/      { print "control or non-ASCII characters"; exit }
     $1 == "mapping" { print "a mapping stanza"; exit }
     $1 == "iface" && $2 !~ /^[A-Za-z0-9_.@-]+$/ {
         print "an interface alias or range (" $2 ")"; exit
@@ -127,7 +134,8 @@ source_precedes() {          # <iface>
 ports=$(awk -v want=vmbr0 "$AWK_STANZA"'
     $1 == "iface" && $2 == want { inside = 1; next }
     inside && closes($1)        { inside = 0 }
-    inside && $1 == "bridge-ports" {
+    # ifupdown2 normalises the underscore spelling to the hyphen one
+    inside && ($1 == "bridge-ports" || $1 == "bridge_ports") {
         for (i = 2; i <= NF; i++) if ($i != "none") print $i
     }
 ' "$IFACES_FILE")

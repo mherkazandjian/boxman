@@ -1921,17 +1921,39 @@ UNSUPPORTED_SHAPES = [
      DEFAULT_INTERFACES.replace(
          "        bridge-fd 0\n",
          "        bridge-fd 0\n        post-up /bin/echo \\\n            mtu 1450\n"),
-     "line continuations"),
+     "backslashes"),
     ("continued-mtu-value",
      DEFAULT_INTERFACES.replace(
          "iface vmbr0 inet static\n",
          "iface vmbr0 inet static\n        mtu \\\n            1500\n"),
-     "line continuations"),
+     "backslashes"),
     ("continued-bridge-ports",
      DEFAULT_INTERFACES.replace("bridge-ports ens18",
                                 "bridge-ports ens18 \\\n            ens19"),
-     "line continuations"),
+     "backslashes"),
+    # a backslash is a separator wherever it appears, not only at end of line:
+    # ifupdown2 reads these as a source directive and a header, while a reader
+    # splitting on whitespace sees neither
+    ("mid-line-backslash-source",
+     "source\\ /etc/network/port.cfg\n\n" + DEFAULT_INTERFACES, "backslashes"),
+    ("mid-line-backslash-header",
+     "iface\\ ens18 inet6 manual\n        mtu 1500\n\n" + DEFAULT_INTERFACES,
+     "backslashes"),
     ("crlf", DEFAULT_INTERFACES.replace("\n", "\r\n"), "CRLF"),
+    # ifupdown2 separates on these; awk does not, so they hide a header or a
+    # stanza boundary in plain sight
+    ("form-feed-separator",
+     DEFAULT_INTERFACES.replace("iface vmbr0 inet static",
+                                "iface\x0cvmbr0\x0cinet\x0cstatic"),
+     "control or non-ASCII"),
+    ("vertical-tab-separator",
+     DEFAULT_INTERFACES.replace("iface ens18 inet manual",
+                                "iface\x0bens18\x0binet\x0bmanual"),
+     "control or non-ASCII"),
+    ("non-breaking-space",
+     DEFAULT_INTERFACES.replace("bridge-ports ens18",
+                                "bridge-ports\u00a0ens18"),
+     "control or non-ASCII"),
     ("mapping-stanza",
      DEFAULT_INTERFACES + "\nmapping ens18\n        script /bin/true\n",
      "mapping stanza"),
@@ -1964,6 +1986,22 @@ def test_syntax_the_hook_cannot_round_trip_is_refused(box, tmp_path,
     # untouched file look rewritten
     assert written.read_bytes() == interfaces.encode(), \
         "the file was modified before the refusal"
+
+
+def test_the_underscore_spelling_of_bridge_ports_is_read(box, tmp_path):
+    """
+    ifupdown2 normalises `bridge_ports` to `bridge-ports`. Matching only the
+    hyphen spelling dropped a port from both the edit and the verification,
+    so a node published readiness with that port at 1500.
+    """
+    underscored = TWO_PORTS.replace("bridge-ports ens18 ens19",
+                                    "bridge_ports ens18 ens19")
+    r, marker, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=underscored,
+        bridge_ports=["ens18", "ens19"],
+        mtus={"vmbr0": 1450, "ens18": 1450, "ens19": 1500})
+    assert r.returncode != 0, "a port spelled with an underscore was ignored"
+    assert not marker.exists()
 
 
 def test_a_vlan_stanza_is_not_part_of_the_bridge(box, tmp_path):
