@@ -4,7 +4,8 @@
 # installed node, after the network and the PVE services are up.
 #
 #   1. repositories: disable the enterprise ones, enable pve-no-subscription
-#   2. MTU 1450 on the lab NIC + vmbr0 (the L2 rides a VXLAN over a 1500 VLAN)
+#   2. MTU 1450 on the lab NIC + vmbr0, verified live (the L2 rides a VXLAN
+#      over a 1500 VLAN)
 #   3. dist-upgrade, so the ISO's PVE matches the Ceph the repo will install
 #   4. qemu-guest-agent, so boxman can discover the node's IP via the agent
 #   5. a marker the orchestration scripts wait for before touching the node
@@ -29,12 +30,341 @@ Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
 EOF
 
 # 2. MTU 1450 on vmbr0 and its port (ifupdown2 re-applies it on every boot)
-port=$(awk '/^[[:space:]]*bridge-ports/ {print $2; exit}' /etc/network/interfaces || true)
-if ! grep -q 'mtu 1450' /etc/network/interfaces; then
-    sed -i -E "/^iface (vmbr0|${port:-__none__}) inet/a\\        mtu 1450" /etc/network/interfaces
-    ifreload -a || true
+#
+# The lab's L2 rides a VXLAN over a 1500-byte VLAN, so 1450 is what fits. The
+# marker this hook ends with is what wait-first-boot.sh waits for and what the
+# README says certifies the MTU -- so the live value is read back here rather
+# than assumed from a reload that was tolerated, skipped, or simply believed.
+LAB_MTU=1450
+IFACES_FILE=/etc/network/interfaces
+
+if [ ! -d /sys/class/net/vmbr0/brif ]; then
+    echo "ERROR: vmbr0 is not a bridge on this node. The lab's L2 rides a"
+    echo "       VXLAN and every node reaches it through vmbr0."
+    echo "       Not writing the readiness marker."
+    exit 1
 fi
-ip link show vmbr0 | head -1
+
+# What this hook understands is the plain stanza syntax the Proxmox installer
+# writes: one directive per line, stanzas opened by a keyword, literal
+# interface names. ifupdown2's full grammar is larger than that -- line
+# continuations that survive blank lines, CRLF, aliases like `ens18:0` and
+# ranges like `ens[18-19]` that name the same interface as a later stanza,
+# mapping stanzas -- and it belongs to a Python parser. Approximating enough
+# of it in awk produced a file that was misread a different way each round,
+# twice destructively. So anything outside the plain shapes is refused, here,
+# before a byte is rewritten.
+unsupported=$(awk '
+    /\r/            { print "CRLF line endings"; exit }
+    # any backslash, not just one ending a line: ifupdown2 treats it as a
+    # separator wherever it appears, so `source\ PATH` is a source directive
+    # and `iface\ ens18` a header, both invisible to a reader splitting on
+    # whitespace
+    /\\/            { print "backslashes"; exit }
+    # form feed, vertical tab, a non-breaking space: ifupdown2 separates on
+    # them, awk does not, so they hide a header or a boundary in plain sight
+    /[^\t -~]/      { print "control or non-ASCII characters"; exit }
+    $1 == "mapping" { print "a mapping stanza"; exit }
+    # ifupdown2 renders the file as a Mako template before parsing it, so a
+    # directive here can produce stanzas this hook never sees in the raw text
+    /\$\{|<%|^[ \t]*%/ { print "Mako template syntax"; exit }
+    # the MSTP addon contributes these to the bridge dependency list, so they
+    # add ports without a second vmbr0 stanza
+    $1 == "mstpctl-ports" || $1 == "mstpctl_ports" {
+        print "mstpctl port declarations"; exit
+    }
+    $1 == "iface" && $2 !~ /^[A-Za-z0-9_.@-]+$/ {
+        print "an interface alias or range (" $2 ")"; exit
+    }
+' "$IFACES_FILE")
+if [ -n "$unsupported" ]; then
+    echo "ERROR: $IFACES_FILE uses $unsupported, which this hook does not"
+    echo "       model. It sets mtu $LAB_MTU on vmbr0 and its ports, and it"
+    echo "       will not guess at syntax it cannot read back exactly."
+    echo "       Set the MTU by hand, or simplify the file, and re-run."
+    echo "       Not writing the readiness marker."
+    exit 1
+fi
+
+# A trailing `source` glob is what the installer writes, and harmless in
+# itself -- but an included file can carry a second `iface vmbr0` stanza, and
+# ifupdown2 concatenates the bridge-ports of every definition rather than
+# taking the first. That would add a port with no stanza of its own to carry
+# mtu 1450 into the next boot, so the includes are read just far enough to
+# refuse it. The live check at the end covers such a port for this boot; what
+# it cannot do is make the setting persist.
+check_include() {            # <path>: an include this hook can rule out
+    if ! LC_ALL=C awk '/\\/ || /[^\t -~]/ { bad = 1 } END { exit(bad) }' "$1"; then
+        echo "ERROR: the included file $1 uses a backslash or a non-ASCII"
+        echo "       character, so this hook cannot rule out a second vmbr0"
+        echo "       definition hiding in it."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+    if awk '$1 == "source" || $1 == "source-directory" { found = 1 }
+            END { exit(found ? 0 : 1) }' "$1"; then
+        echo "ERROR: $1 sources further files. ifupdown2 follows those"
+        echo "       recursively; this hook reads one level to rule out a"
+        echo "       second vmbr0 definition and will not chase a chain."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+    if awk '/\$\{|<%|^[ \t]*%/ { found = 1 }
+            $1 == "mstpctl-ports" || $1 == "mstpctl_ports" { found = 1 }
+            END { exit(found ? 0 : 1) }' "$1"; then
+        echo "ERROR: $1 uses Mako template syntax or mstpctl port"
+        echo "       declarations, either of which can add a bridge port"
+        echo "       with no stanza here to carry mtu $LAB_MTU into the next"
+        echo "       boot."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+    if awk '$1 == "iface" && $2 !~ /^[A-Za-z0-9_.@-]+$/ { found = 1 }
+            END { exit(found ? 0 : 1) }' "$1"; then
+        echo "ERROR: $1 uses an interface alias or range, which ifupdown2"
+        echo "       normalises -- so it can name vmbr0 without spelling it."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+    if awk '$1 == "iface" && $2 == "vmbr0" { found = 1 }
+            END { exit(found ? 0 : 1) }' "$1"; then
+        echo "ERROR: $1 defines vmbr0 as well, and ifupdown2 merges the"
+        echo "       bridge-ports of every definition -- so the port list"
+        echo "       configured and checked here would be a subset of the"
+        echo "       one the node actually brings up."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+}
+
+# The enumeration has to match the parser's: it resolves relative paths
+# against the file that sourced them, and lists a source-directory with
+# os.listdir(), which includes dotfiles. `dotglob` covers the second; reading
+# one pattern per line and globbing once covers a matched filename containing
+# a space.
+shopt -s nullglob dotglob
+while IFS= read -r pattern; do
+    # A bracket expression means different things to the two globbers: a
+    # leading caret negates the class in bash and is an ordinary member of it
+    # in Python, which is what the parser uses. A file it loads could then be
+    # absent from this scan -- and carry the vmbr0 stanza the scan exists to
+    # find. Literal paths and the installer's trailing `*` mean the same in
+    # both, so only brackets are refused.
+    case $pattern in
+        *'['*|*']'*|*'?'*)
+            echo "ERROR: the source pattern $pattern uses a bracket"
+            echo "       expression or a question mark, which select"
+            echo "       different files in bash and in the parser ifupdown2"
+            echo "       uses -- brackets by dialect, ? by locale -- so this hook"
+            echo "       cannot be sure it has seen every included file."
+            echo "       Not writing the readiness marker."
+            exit 1
+            ;;
+    esac
+    case $pattern in
+        /*) ;;
+        *)  pattern="$(dirname "$IFACES_FILE")/$pattern" ;;
+    esac
+    for inc in $pattern; do
+        if [ -f "$inc" ]; then
+            check_include "$inc"
+        elif [ -e "$inc" ] && [ ! -d "$inc" ]; then
+            # ifupdown2 open()s whatever the glob matched, so a FIFO or a
+            # device node named there supplies configuration exactly as a
+            # file does -- and this hook cannot inspect one without consuming
+            # it or blocking on it. A directory and a dangling symlink are
+            # both harmless: the parser's open() fails and it moves on.
+            echo "ERROR: the include $inc is not a regular file. ifupdown2"
+            echo "       reads whatever a source pattern matched, so a FIFO"
+            echo "       or a device node there can define vmbr0 -- and this"
+            echo "       hook cannot read one back to rule that out."
+            echo "       Not writing the readiness marker."
+            exit 1
+        fi
+    done
+done < <(awk '
+    $1 == "source"           { for (i = 2; i <= NF; i++) print $i }
+    $1 == "source-directory" { for (i = 2; i <= NF; i++) print $i "/*" }
+' "$IFACES_FILE")
+shopt -u nullglob dotglob
+
+# Globbing stays off from here to the end of the MTU work. Every name below is
+# read out of a file or out of the kernel: `bridge-ports e*0` is an attribute
+# value, which the header whitelist never sees, and the kernel rejects only
+# `/`, `:` and whitespace in a name. Left expanding, either one is replaced by
+# whatever the working directory happens to contain -- and it is then that
+# name whose stanza gets rewritten and whose MTU gets checked.
+set -f
+
+# With those refused, a stanza is plain lines: it opens at auto, iface, vlan,
+# source, source-directory or any allow-* keyword, names are compared as
+# strings -- `ens18.100` as a regex also matches `ens18x100` -- and ifupdown2
+# takes the FIRST mtu in a stanza, so a wrong one is replaced, not joined.
+AWK_STANZA='
+function closes(word) {
+    return word == "auto" || word == "iface" || word == "vlan" ||
+           word == "source" || word == "source-directory" ||
+           word ~ /^allow-/
+}
+'
+
+stanza_mtu() {               # <iface> -> its effective mtu, or nothing
+    awk -v want="$1" "$AWK_STANZA"'
+        $1 == "iface" && $2 == want     { inside = 1; next }
+        closes($1)                      { inside = 0 }
+        inside && $1 == "mtu" && !found {
+            # ifupdown2 splits an attribute line once and keeps the whole
+            # remainder as the value, so `mtu 1450 9000` is "1450 9000" --
+            # which its address addon then fails to turn into an integer.
+            # Reporting the second field alone would call that stanza correct
+            # and leave the node with an MTU that never applies, so the value
+            # is compared whole and anything else is rewritten.
+            value = $0
+            sub(/^[ \t]*mtu[ \t]+/, "", value)
+            sub(/[ \t]+$/, "", value)
+            print value
+            found = 1
+        }
+    ' "$IFACES_FILE"
+}
+
+set_stanza_mtu() {           # <iface>: exactly one mtu, first in the stanza
+    tmp=$(mktemp "$IFACES_FILE.pve-lab.XXXXXX")
+    awk -v want="$1" -v mtu="$LAB_MTU" "$AWK_STANZA"'
+        $1 == "iface" && $2 == want {
+            print; print "        mtu " mtu; inside = 1; next
+        }
+        closes($1)            { inside = 0 }
+        inside && $1 == "mtu" { next }
+        { print }
+    ' "$IFACES_FILE" > "$tmp"
+    cat "$tmp" > "$IFACES_FILE"
+    rm -f "$tmp"
+}
+
+# A `source` ahead of an interface's own stanza can define it earlier, and the
+# earlier definition's MTU is the one that counts -- so editing the stanza we
+# can see would leave the node at 1500 with every check here passing. The
+# stock installer writes its stanzas first and the glob last, which is fine;
+# anything else is refused rather than half-understood.
+source_precedes() {          # <iface>
+    awk -v want="$1" "$AWK_STANZA"'
+        $1 == "source" || $1 == "source-directory" { seen = 1 }
+        $1 == "iface" && $2 == want { if (seen) found = 1; exit }
+        END { exit(found ? 0 : 1) }
+    ' "$IFACES_FILE"
+}
+
+# vmbr0's ports come from vmbr0's own stanza, every token of it. A file-wide
+# `grep bridge-ports` took the second token of whichever such line came first,
+# so another bridge declared above substituted its port and a two-port vmbr0
+# had only the first one looked at. This list is what gets *configured* -- the
+# kernel's membership, read after the reload, is what gets verified. They
+# answer different questions: an interface needs a stanza to carry mtu 1450
+# into the next boot, and the kernel cannot supply one.
+ports=$(awk -v want=vmbr0 "$AWK_STANZA"'
+    $1 == "iface" && $2 == want { inside = 1; next }
+    inside && closes($1)        { inside = 0 }
+    # ifupdown2 normalises the underscore spelling to the hyphen one
+    inside && ($1 == "bridge-ports" || $1 == "bridge_ports") {
+        for (i = 2; i <= NF; i++) if ($i != "none") print $i
+    }
+' "$IFACES_FILE")
+if [ -z "$ports" ]; then
+    echo "ERROR: vmbr0 declares no bridge-ports; nothing carries the lab L2."
+    echo "       Not writing the readiness marker."
+    exit 1
+fi
+
+# ...and each declared port is really attached to it. A port that is
+# configured but not enslaved leaves the bridge without an uplink, which looks
+# like a working node until the first packet has to leave it.
+for iface in $ports; do
+    if [ ! -e "/sys/class/net/vmbr0/brif/$iface" ]; then
+        echo "ERROR: $iface is declared as a port of vmbr0 but is not attached"
+        echo "       to it. Not writing the readiness marker."
+        exit 1
+    fi
+done
+
+for iface in vmbr0 $ports; do
+    if source_precedes "$iface"; then
+        echo "ERROR: $iface's stanza comes after a source directive, so an"
+        echo "       included file may define it first and win the MTU. This"
+        echo "       hook will not edit around that."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+done
+
+for iface in vmbr0 $ports; do
+    [ "$(stanza_mtu "$iface")" = "$LAB_MTU" ] || set_stanza_mtu "$iface"
+done
+
+# The persisted result, checked rather than assumed: an interface whose stanza
+# lives in a `source`d file is not in this one to edit, and silently leaving it
+# at 1500 is exactly the outcome this step exists to prevent.
+for iface in vmbr0 $ports; do
+    if [ "$(stanza_mtu "$iface")" != "$LAB_MTU" ]; then
+        echo "ERROR: $iface has no stanza in $IFACES_FILE to carry"
+        echo "       mtu $LAB_MTU -- a sourced file, perhaps. The MTU would not"
+        echo "       survive the next boot. Not writing the readiness marker."
+        exit 1
+    fi
+done
+
+# Deliberately tolerated: ifupdown2 refuses a reload on a node whose interfaces
+# already match, and that is not a failure. Its status is not the question --
+# the live MTU below is, and that is checked either way.
+ifreload -a || echo "note: ifreload exited non-zero; verifying the live MTU anyway"
+
+# The check that makes the marker mean what it says. Runs whether the reload
+# succeeded, failed, or was skipped because the file already said 1450.
+#
+# It covers every port the kernel actually has, not just the declared ones.
+# ifupdown2's effective port set is computed by its addons -- mstpctl-ports,
+# vxlan-physdev, bridge-always-up and others each contribute members that no
+# `bridge-ports` line mentions -- and enumerating those statically is a losing
+# game. After the reload the kernel knows, so it is asked. Declared ports are
+# still what gets *configured*: persisting an MTU needs a stanza to put it in.
+#
+# Every member, with nothing skipped by name. Guest taps were exempted here
+# at first, on the grounds that this hook runs once at first boot before any
+# guest exists -- but that premise is exactly what makes the exemption
+# pointless: on a node with no guests, an interface named like one is not a
+# guest's, and a name has never been proof of ownership anyway. So the whole
+# membership is checked, and a `tap...` at 1500 stops the marker like anything
+# else would.
+#
+# The listing has to succeed. Hiding its failure and carrying on would leave
+# the check covering only vmbr0 and the declared ports, which is the narrower
+# check this one replaced -- and the marker would still say otherwise.
+# -A, not plain -1: a member whose name begins with a dot is a member like
+# any other, and the default listing hides it while still succeeding.
+if ! attached=$(ls -1A -- /sys/class/net/vmbr0/brif); then
+    echo "ERROR: cannot list vmbr0's bridge members. Everything below is only"
+    echo "       as complete as that listing, so a marker written over a"
+    echo "       failed read would certify less than it says it does."
+    echo "       Not writing the readiness marker."
+    exit 1
+fi
+checked=
+for iface in vmbr0 $ports $attached; do
+    case " $checked " in *" $iface "*) continue ;; esac
+    checked="$checked $iface"
+    live=$( { ip -o link show "$iface" || true; } \
+            | awk '{ for (i = 1; i < NF; i++) if ($i == "mtu") print $(i + 1) }' )
+    if [ "$live" != "$LAB_MTU" ]; then
+        echo "ERROR: $iface has MTU ${live:-unknown}, expected $LAB_MTU."
+        echo "       The VXLAN carries $LAB_MTU-byte frames; a node left at 1500"
+        echo "       loses large packets silently, and Ceph on top of it fails in"
+        echo "       ways that look like anything but an MTU problem."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
+    echo "ok: $iface mtu $live"
+done
+set +f
 
 # 3. bring PVE in step with the repo before Ceph is installed from it.
 #
