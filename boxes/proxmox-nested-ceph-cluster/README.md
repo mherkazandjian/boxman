@@ -143,9 +143,45 @@ unattended install the domain is simply `shut off`; `make wait-installed`
 watches for that, and `make boot` (`boxman up` again) starts the persistent
 definition from disk. The first-boot hook (`scripts/first-boot.sh`, baked into
 the ISO) then disables the enterprise repos, enables `pve-no-subscription`,
-sets MTU 1450 on `vmbr0`, runs a **`dist-upgrade`**, installs
-`qemu-guest-agent` and writes `/var/lib/pve-lab/first-boot.done`, which
+sets MTU 1450 on `vmbr0` **and its bridge port**, runs a **`dist-upgrade`**,
+installs `qemu-guest-agent` and writes `/var/lib/pve-lab/first-boot.done`, which
 `make wait-first-boot` polls before anything touches the node.
+
+The marker is the readiness signal for the whole build, so the hook verifies
+rather than assumes: after the reload it reads the live MTU back from `vmbr0`
+and from **every interface the kernel has enslaved to it**, and exits without
+writing the marker if any of them is not 1450, or cannot be read. It asks the
+kernel rather than the file because ifupdown2's effective port set is computed
+by its addons — `mstpctl-ports`, `vxlan-physdev`, `bridge-always-up` and others
+each contribute a member no `bridge-ports` line mentions. The declared ports
+are still what gets *configured*: persisting an MTU needs a stanza to put it
+in. A failed `ifreload` is tolerated — ifupdown2 refuses a reload on a node
+whose interfaces already match — but only because what follows it is a check
+and not an assumption. `make wait-first-boot` then fails naming
+`/var/log/pve-lab-first-boot.log` on the node, which says which interface was
+wrong.
+
+#### What the hook accepts, and what it does not promise
+
+The hook rewrites `/etc/network/interfaces`, so it reads only the shapes it
+can round-trip exactly — the plain stanza syntax the Proxmox installer writes,
+plus a trailing `source` glob. Anything else is **refused before a byte is
+rewritten**, with the reason in the log and no marker: CRLF, a backslash
+anywhere, control or non-ASCII characters, `mapping` stanzas, interface
+aliases (`ens18:0`) and ranges (`ens[18-19]`), Mako template syntax,
+`mstpctl-ports`, an include that sources further files or defines `vmbr0`
+itself, a source pattern using `[`, `]` or `?`, and an include that is not a
+regular file. ifupdown2's full grammar is larger than this and belongs to a
+Python parser; approximating it in shell produced a file that was misread a
+different way each review round, twice destructively.
+
+Interface **command hooks** (`pre-up`, `up`, `post-up`, and their `down`
+counterparts) are accepted, because refusing them would reject ordinary
+configurations and no static check can cover arbitrary commands. The guarantee
+around them is correspondingly bounded: the hook checks the live MTU of
+`vmbr0` and its members *after* `ifreload` returns, so a command that leaves
+one of them at the wrong MTU is caught — but one whose effect lands later, or
+which rewrites the persisted configuration afterwards, is not.
 
 ### Why the nodes are upgraded on first boot
 
@@ -321,6 +357,7 @@ the next `make up`.
 | Installer says the DHCP server must provide a host name | Either no DHCP offer arrived at all (`No DHCPOFFERS received` just above it on the console: see the next row) or the reservation's `name:` is missing / the node's MAC does not match it. `virsh net-dumpxml bprj__pvelab__bprj__clstr__pve__clstr__pvenet` on host1 shows the reservations; `virsh domiflist <domain>` the MAC. |
 | host2 guests get no DHCP although `ping 10.77.0.1` from host2's `br-pve` address works | firewalld. With `br_netfilter` loaded (docker loads it), *bridged* frames traverse firewalld's forward hook, and a bridge bound to no zone ends in the public zone's `reject with icmpx admin-prohibited` — host-originated packets use INPUT/OUTPUT and never see it (tunnel counters told the story: 29 sent, 3 received). boxman's physdev `ACCEPT` is in the iptables table and cannot override a later nftables reject. `vxlan-up.sh` binds `br-pve` to the `trusted` zone; verify with a netns + veth on `br-pve` pinging `10.77.0.1` (a plain ping from the host proves nothing). TX checksum offload on the VXLAN was tested and is *not* a factor. |
 | Installer aborts with `root disk '/dev/vda' too small (0 GB < 2 GB)` | The domain got `<driver type='raw'>` for the qcow2 boot disk, so the guest saw the 197 KiB file as a raw disk (`virsh domblkinfo <dom> vda` shows a tiny capacity). virt-install's `format=` only governs volume *creation*; for a file that already exists it takes the type from the libvirt pool's volume record, which was stale after a destroy plus a manual `rm` of images. boxman now passes `driver.type=qcow2` explicitly (fix shipped with this box). If you removed images by hand, `virsh pool-refresh vms` before the next `boxman up`. |
+| `wait-first-boot` times out and the node's log says `has MTU 1500, expected 1450` | The reload did not apply the lab MTU to that interface. `ip -o link show vmbr0` and its bridge port on the node; check `/etc/network/interfaces` has `mtu 1450` in *both* stanzas, then `ifreload -a`. The hook refuses to publish readiness over this because the VXLAN carries 1450-byte frames and Ceph on a 1500 node fails in ways that look like anything but an MTU problem. |
 | A node that was still *installing* is suddenly `shut off` | Do not `virsh reset`/`reboot` a node during the install: the transient install domain has `on_reboot=destroy`, which libvirt also applies to a reset, and the persistent definition has no install media. Re-provision the site (`boxman destroy -y`, `make sync`, `make up` order) instead. |
 | `virsh net-start` fails on host1: bridge in use | `virbr-pve` already existed (a leftover from `vxlan-up.sh` run too early). `sudo ip link del virbr-pve`, then `boxman up`, then `vxlan-up.sh`. |
 | Nodes on host2 lose connectivity after a host reboot / `boxman destroy` on host1 | The VXLAN is not persistent, and host1's bridge is recreated by libvirt. `make boot` (or `vxlan-up.sh` on both hosts) restores it. |
