@@ -1215,13 +1215,17 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
     root = tmp_path / "root"
     for d in ("var/lib", "var/log", "etc/apt/sources.list.d", "etc/network"):
         (root / d).mkdir(parents=True, exist_ok=True)
+    # `@ROOT@` lets a test write an include path that actually resolves
     (root / "etc/network/interfaces").write_text(
-        DEFAULT_INTERFACES if interfaces is None else interfaces)
+        (DEFAULT_INTERFACES if interfaces is None else interfaces)
+        .replace("@ROOT@", str(root)))
     # the hook takes vmbr0's ports from the kernel rather than from the file,
     # so the fixture owns a sysfs shaped like a bridge: None means vmbr0 is
     # not a bridge at all, [] means it has no ports
     for name, body in (sourced or {}).items():
-        (root / "etc/network" / name).write_text(body)
+        target = root / "etc/network" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body)
     if bridge_ports is not None:
         brif = root / "sys/class/net/vmbr0/brif"
         brif.mkdir(parents=True, exist_ok=True)
@@ -2002,6 +2006,60 @@ def test_the_underscore_spelling_of_bridge_ports_is_read(box, tmp_path):
         mtus={"vmbr0": 1450, "ens18": 1450, "ens19": 1500})
     assert r.returncode != 0, "a port spelled with an underscore was ignored"
     assert not marker.exists()
+
+
+def test_an_include_that_also_defines_the_bridge_is_refused(box, tmp_path):
+    """
+    ifupdown2 concatenates the `bridge-ports` of every definition rather than
+    taking the first, so a trailing include carrying a second `iface vmbr0`
+    stanza adds a port -- and the hook configured, attached-checked and
+    verified only the main file's, then reported ready with the other one live
+    at 1500.
+    """
+    main = DEFAULT_INTERFACES + "\nsource @ROOT@/etc/network/extra.cfg\n"
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=main,
+        sourced={"extra.cfg": "iface ens19 inet manual\n        mtu 1500\n"
+                              "iface vmbr0 inet6 manual\n"
+                              "        bridge-ports ens19\n"},
+        bridge_ports=["ens18", "ens19"],
+        mtus={"vmbr0": 1450, "ens18": 1450, "ens19": 1500})
+    assert r.returncode != 0, "an include extended vmbr0's port list unnoticed"
+    assert not marker.exists()
+    assert "defines vmbr0 as well" in hooklog.read_text()
+
+
+def test_an_include_about_other_interfaces_is_fine(box, tmp_path):
+    # the restriction is about vmbr0's definition, not about includes
+    main = DEFAULT_INTERFACES + "\nsource @ROOT@/etc/network/extra.cfg\n"
+    r, marker, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=main,
+        sourced={"extra.cfg": "iface ens30 inet manual\n        mtu 9000\n"})
+    assert r.returncode == 0, r.stderr
+    assert marker.exists()
+
+
+def test_an_include_the_hook_cannot_read_is_refused(box, tmp_path):
+    # a backslash there could hide the very stanza the check above looks for
+    main = DEFAULT_INTERFACES + "\nsource @ROOT@/etc/network/extra.cfg\n"
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=main,
+        sourced={"extra.cfg": "iface\\ vmbr0 inet6 manual\n"
+                              "        bridge-ports ens19\n"})
+    assert r.returncode != 0, "an unreadable include was waved through"
+    assert not marker.exists()
+    assert "backslash" in hooklog.read_text()
+
+
+def test_a_source_directory_is_expanded_too(box, tmp_path):
+    main = DEFAULT_INTERFACES + "\nsource-directory @ROOT@/etc/network/parts\n"
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=main,
+        sourced={"parts/second.cfg": "iface vmbr0 inet6 manual\n"
+                                     "        bridge-ports ens19\n"})
+    assert r.returncode != 0, "source-directory was not expanded"
+    assert not marker.exists()
+    assert "defines vmbr0 as well" in hooklog.read_text()
 
 
 def test_a_vlan_stanza_is_not_part_of_the_bridge(box, tmp_path):
