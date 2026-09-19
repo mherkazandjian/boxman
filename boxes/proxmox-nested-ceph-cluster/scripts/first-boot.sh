@@ -340,6 +340,12 @@ if ! attached=$(ls -1A -- /sys/class/net/vmbr0/brif); then
     echo "       Not writing the readiness marker."
     exit 1
 fi
+#
+# Globbing off while these names are split: the kernel rejects only `/`, `:`
+# and whitespace in an interface name, so a member called `e*0` is legal --
+# and would otherwise be replaced here by whatever the working directory
+# happens to contain, checking those and never checking it.
+set -f
 checked=
 for iface in vmbr0 $ports $attached; do
     case " $checked " in *" $iface "*) continue ;; esac
@@ -356,6 +362,7 @@ for iface in vmbr0 $ports $attached; do
     fi
     echo "ok: $iface mtu $live"
 done
+set +f
 
 # 3. bring PVE in step with the repo before Ceph is installed from it.
 #

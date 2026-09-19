@@ -179,10 +179,10 @@ the file, each with the reason in the log and no marker:
 | --- | --- |
 | CRLF; a backslash anywhere; control or non-ASCII characters | the same |
 | `mapping` stanzas | — (an include is scanned for stanzas, not parsed in order) |
-| an interface name outside `[A-Za-z0-9_.@-]+`, which is what aliases (`ens18:0`) and ranges (`ens[18-19]`) fall outside of | the same |
+| an `iface` header name outside `[A-Za-z0-9_.@-]+`, which is what aliases (`ens18:0`) and ranges (`ens[18-19]`) fall outside of | the same |
 | Mako template syntax; `mstpctl-ports` or `mstpctl_ports` | the same |
 | a `source` or `source-directory` pattern using `[`, `]` or `?` | a nested `source` or `source-directory`; an `iface vmbr0` of its own |
-| a `source` or `source-directory` ahead of the `vmbr0` or declared-port stanza it would define | — |
+| a `source` or `source-directory` ahead of the `vmbr0` or declared-port stanza — an ordering that *could* define it first, whatever the include turns out to hold | — |
 
 An include that is not a regular file is refused too — ifupdown2 `open()`s
 whatever a pattern matched, and a FIFO cannot be read back here without

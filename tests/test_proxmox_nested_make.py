@@ -1310,7 +1310,8 @@ def _first_boot(box, tmp_path, upgrade: str, *, install: str = "    :",
     r = subprocess.run(
         ["bash", str(hook)], capture_output=True, text=True, timeout=60,
         stdin=subprocess.DEVNULL,       # as the service runs it: no answers
-        env=hook_env)
+        cwd=tmp_path,                   # a directory the test owns, so what a
+        env=hook_env)                   # stray glob would match is knowable
     return (r, marker, log.read_text() if log.exists() else "",
             root / "var/log/pve-lab-first-boot.log", snapshot,
             root / "etc/network/interfaces")
@@ -1835,6 +1836,22 @@ def test_a_member_named_like_a_tap_is_still_checked(box, tmp_path):
     assert r.returncode != 0, "a member was waved through on its name"
     assert not marker.exists()
     assert "tap100i0 has MTU 1500" in hooklog.read_text()
+
+
+def test_a_member_whose_name_globs_is_not_expanded(box, tmp_path):
+    """
+    The kernel rejects only `/`, `:` and whitespace in an interface name, so
+    `e*0` is a legal member. Unquoted in the probe loop it was replaced by
+    whatever the working directory matched -- checking those names, at their
+    MTUs, and never checking the member itself.
+    """
+    (tmp_path / "evil0").write_text("")        # what the glob would match
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", bridge_ports=["ens18", "e*0"],
+        mtus={"vmbr0": 1450, "ens18": 1450, "e*0": 1500, "evil0": 1450})
+    assert r.returncode != 0, "a member's name was expanded into other names"
+    assert not marker.exists()
+    assert "e*0 has MTU 1500" in hooklog.read_text()
 
 
 def test_a_dot_prefixed_member_is_checked_too(box, tmp_path):
