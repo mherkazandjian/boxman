@@ -158,10 +158,11 @@ while IFS= read -r pattern; do
     # find. Literal paths and the installer's trailing `*` mean the same in
     # both, so only brackets are refused.
     case $pattern in
-        *'['*|*']'*)
+        *'['*|*']'*|*'?'*)
             echo "ERROR: the source pattern $pattern uses a bracket"
-            echo "       expression, which selects different files in bash"
-            echo "       and in the parser ifupdown2 uses, so this hook"
+            echo "       expression or a question mark, which select"
+            echo "       different files in bash and in the parser ifupdown2"
+            echo "       uses -- brackets by dialect, ? by locale -- so this hook"
             echo "       cannot be sure it has seen every included file."
             echo "       Not writing the readiness marker."
             exit 1
@@ -291,7 +292,22 @@ ifreload -a || echo "note: ifreload exited non-zero; verifying the live MTU anyw
 
 # The check that makes the marker mean what it says. Runs whether the reload
 # succeeded, failed, or was skipped because the file already said 1450.
-for iface in vmbr0 $ports; do
+#
+# It covers every port the kernel actually has, not just the declared ones.
+# ifupdown2's effective port set is computed by its addons -- mstpctl-ports,
+# vxlan-physdev, bridge-always-up and others each contribute members that no
+# `bridge-ports` line mentions -- and enumerating those statically is a losing
+# game. After the reload the kernel knows, so it is asked. Declared ports are
+# still what gets *configured*: persisting an MTU needs a stanza to put it in.
+#
+# Guest taps are not a concern here and are skipped anyway: this hook runs
+# once at first boot, before any guest exists, and a tap is not an uplink.
+attached=$(ls -1 /sys/class/net/vmbr0/brif 2>/dev/null \
+           | grep -vE '^(tap|veth|fwpr|fwln|fwbr)' || true)
+checked=
+for iface in vmbr0 $ports $attached; do
+    case " $checked " in *" $iface "*) continue ;; esac
+    checked="$checked $iface"
     live=$( { ip -o link show "$iface" || true; } \
             | awk '{ for (i = 1; i < NF; i++) if ($i == "mtu") print $(i + 1) }' )
     if [ "$live" != "$LAB_MTU" ]; then

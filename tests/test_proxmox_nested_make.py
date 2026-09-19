@@ -1775,6 +1775,31 @@ def test_a_declared_port_that_is_not_attached_is_refused(box, tmp_path):
     assert "not attached" in hooklog.read_text()
 
 
+def test_a_member_no_stanza_declares_is_still_verified(box, tmp_path):
+    """
+    ifupdown2 computes the effective port set with its addons --
+    `mstpctl-ports`, `vxlan-physdev`, `bridge-always-up` and others each
+    contribute members no `bridge-ports` line mentions. Enumerating those
+    statically is a losing game, and every round of this review found another
+    one. After the reload the kernel knows, so the live check asks it.
+    """
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", bridge_ports=["ens18", "ens19"],
+        mtus={"vmbr0": 1450, "ens18": 1450, "ens19": 1500})
+    assert r.returncode != 0, "an undeclared bridge member went unchecked"
+    assert not marker.exists()
+    assert "ens19 has MTU 1500" in hooklog.read_text()
+
+
+def test_an_undeclared_member_at_the_lab_mtu_is_fine(box, tmp_path):
+    # the control: an extra member is not itself a failure
+    r, marker, *_ = _first_boot(
+        box, tmp_path, "    :", bridge_ports=["ens18", "ens19"],
+        mtus={"vmbr0": 1450, "ens18": 1450, "ens19": 1450})
+    assert r.returncode == 0, r.stderr
+    assert marker.exists()
+
+
 def test_a_guest_tap_on_the_bridge_is_not_a_port(box, tmp_path):
     """
     Taking the port list from the kernel would include the tap devices of
@@ -2117,8 +2142,10 @@ def test_an_include_that_could_hide_the_bridge_is_refused(box, tmp_path,
 
 
 @pytest.mark.parametrize("pattern", ["@ROOT@/etc/network/[a-z]*.cfg",
-                                     "@ROOT@/etc/network/[^x]*.cfg"],
-                         ids=["ordinary-class", "negated-class"])
+                                     "@ROOT@/etc/network/[^x]*.cfg",
+                                     "@ROOT@/etc/network/extra.cf?"],
+                         ids=["ordinary-class", "negated-class",
+                              "question-mark"])
 def test_a_bracket_source_pattern_is_refused(box, tmp_path, pattern):
     """
     A leading caret negates the class in bash and is an ordinary member of it
@@ -2132,7 +2159,9 @@ def test_a_bracket_source_pattern_is_refused(box, tmp_path, pattern):
                               "        bridge-ports ens19\n"})
     assert r.returncode != 0
     assert not marker.exists()
-    assert "uses a bracket" in hooklog.read_text()
+    # a phrase, not a word: the temp directory is named after this test,
+    # so "bracket" appears in every path the log prints
+    assert "different files in bash" in hooklog.read_text()
 
 
 def test_an_ordinary_glob_is_still_accepted(box, tmp_path):
