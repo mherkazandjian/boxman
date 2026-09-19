@@ -65,6 +65,14 @@ unsupported=$(awk '
     # them, awk does not, so they hide a header or a boundary in plain sight
     /[^\t -~]/      { print "control or non-ASCII characters"; exit }
     $1 == "mapping" { print "a mapping stanza"; exit }
+    # ifupdown2 renders the file as a Mako template before parsing it, so a
+    # directive here can produce stanzas this hook never sees in the raw text
+    /\$\{|<%|^[ \t]*%/ { print "Mako template syntax"; exit }
+    # the MSTP addon contributes these to the bridge dependency list, so they
+    # add ports without a second vmbr0 stanza
+    $1 == "mstpctl-ports" || $1 == "mstpctl_ports" {
+        print "mstpctl port declarations"; exit
+    }
     $1 == "iface" && $2 !~ /^[A-Za-z0-9_.@-]+$/ {
         print "an interface alias or range (" $2 ")"; exit
     }
@@ -101,6 +109,15 @@ check_include() {            # <path>: an include this hook can rule out
         echo "       Not writing the readiness marker."
         exit 1
     fi
+    if awk '/\$\{|<%|^[ \t]*%/ { found = 1 }
+            $1 == "mstpctl-ports" || $1 == "mstpctl_ports" { found = 1 }
+            END { exit(found ? 0 : 1) }' "$1"; then
+        echo "ERROR: $1 uses Mako template syntax or mstpctl port"
+        echo "       declarations, either of which can add a bridge port"
+        echo "       this hook would never see."
+        echo "       Not writing the readiness marker."
+        exit 1
+    fi
     if awk '$1 == "iface" && $2 !~ /^[A-Za-z0-9_.@-]+$/ { found = 1 }
             END { exit(found ? 0 : 1) }' "$1"; then
         echo "ERROR: $1 uses an interface alias or range, which ifupdown2"
@@ -134,6 +151,22 @@ check_include() {            # <path>: an include this hook can rule out
 # a space.
 shopt -s nullglob dotglob
 while IFS= read -r pattern; do
+    # A bracket expression means different things to the two globbers: a
+    # leading caret negates the class in bash and is an ordinary member of it
+    # in Python, which is what the parser uses. A file it loads could then be
+    # absent from this scan -- and carry the vmbr0 stanza the scan exists to
+    # find. Literal paths and the installer's trailing `*` mean the same in
+    # both, so only brackets are refused.
+    case $pattern in
+        *'['*|*']'*)
+            echo "ERROR: the source pattern $pattern uses a bracket"
+            echo "       expression, which selects different files in bash"
+            echo "       and in the parser ifupdown2 uses, so this hook"
+            echo "       cannot be sure it has seen every included file."
+            echo "       Not writing the readiness marker."
+            exit 1
+            ;;
+    esac
     case $pattern in
         /*) ;;
         *)  pattern="$(dirname "$IFACES_FILE")/$pattern" ;;

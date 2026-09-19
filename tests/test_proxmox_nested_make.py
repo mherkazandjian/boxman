@@ -1967,6 +1967,21 @@ UNSUPPORTED_SHAPES = [
     ("range-definition",
      "iface ens[18-19] inet6 manual\n        mtu 1500\n\n" + DEFAULT_INTERFACES,
      "alias or range"),
+    # ifupdown2 renders the file as a Mako template before parsing, so a
+    # directive can produce stanzas that are not in the raw text
+    ("mako-expression",
+     DEFAULT_INTERFACES + "\n${context.get('extra', '')}\n", "Mako"),
+    ("mako-block", DEFAULT_INTERFACES + "\n<% x = 1 %>\n", "Mako"),
+    # the MSTP addon contributes these to the bridge's dependency list, so
+    # they add ports without a second vmbr0 stanza
+    ("mstpctl-ports",
+     DEFAULT_INTERFACES.replace("        bridge-fd 0\n",
+                                "        bridge-fd 0\n        mstpctl-ports ens19\n"),
+     "mstpctl"),
+    ("mstpctl-ports-underscored",
+     DEFAULT_INTERFACES.replace("        bridge-fd 0\n",
+                                "        bridge-fd 0\n        mstpctl_ports ens19\n"),
+     "mstpctl"),
 ]
 
 
@@ -2097,6 +2112,48 @@ def test_an_include_that_could_hide_the_bridge_is_refused(box, tmp_path,
         bridge_ports=["ens18", "ens19"],
         mtus={"vmbr0": 1450, "ens18": 1450, "ens19": 1500})
     assert r.returncode != 0, "an include could still extend vmbr0"
+    assert not marker.exists()
+    assert expected in hooklog.read_text()
+
+
+@pytest.mark.parametrize("pattern", ["@ROOT@/etc/network/[a-z]*.cfg",
+                                     "@ROOT@/etc/network/[^x]*.cfg"],
+                         ids=["ordinary-class", "negated-class"])
+def test_a_bracket_source_pattern_is_refused(box, tmp_path, pattern):
+    """
+    A leading caret negates the class in bash and is an ordinary member of it
+    in Python's glob, which is what ifupdown2 uses -- so a file the parser
+    loads can be absent from this scan, carrying the very vmbr0 stanza the
+    scan exists to find. Refused rather than matched by dialect.
+    """
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=_with_include(pattern),
+        sourced={"extra.cfg": "iface vmbr0 inet6 manual\n"
+                              "        bridge-ports ens19\n"})
+    assert r.returncode != 0
+    assert not marker.exists()
+    assert "uses a bracket" in hooklog.read_text()
+
+
+def test_an_ordinary_glob_is_still_accepted(box, tmp_path):
+    # the installer writes exactly this, and `*` means the same to both
+    r, marker, *_ = _first_boot(
+        box, tmp_path, "    :",
+        interfaces=_with_include("@ROOT@/etc/network/parts/*"))
+    assert r.returncode == 0, r.stderr
+    assert marker.exists()
+
+
+@pytest.mark.parametrize("body,expected", [
+    ("${context.get('x', '')}\n", "Mako"),
+    ("iface ens30 inet manual\n        mstpctl-ports ens19\n", "mstpctl"),
+], ids=["mako", "mstpctl"])
+def test_an_include_using_those_constructs_is_refused(box, tmp_path, body,
+                                                      expected):
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", interfaces=_with_include(),
+        sourced={"extra.cfg": body})
+    assert r.returncode != 0
     assert not marker.exists()
     assert expected in hooklog.read_text()
 
