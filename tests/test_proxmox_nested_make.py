@@ -1910,55 +1910,60 @@ def test_a_port_with_no_stanza_here_is_refused(box, tmp_path):
     assert "no stanza" in hooklog.read_text()
 
 
-# ifupdown2's grammar, not "lines in a file" (#188 review round 2). Each of
-# these parses cleanly for the real parser and used to be misread here.
+# What the hook models is the plain syntax the Proxmox installer writes.
+# ifupdown2 accepts more than that, and approximating the rest in awk misread
+# the file a new way every round -- twice destructively, once rewriting a
+# valid configuration into an invalid one. So the unmodelled shapes are
+# refused before anything is edited, and these pin that (#188 review).
 
-def test_a_continued_command_is_not_an_mtu_directive(box, tmp_path):
-    r"""
-    `post-up /bin/echo \` + `mtu 1450` is one command to ifupdown2. Read as two
-    lines it looks like the MTU is configured, so the edit is skipped and the
-    marker goes out over an interface that has no MTU directive at all.
+UNSUPPORTED_SHAPES = [
+    ("line-continuation",
+     DEFAULT_INTERFACES.replace(
+         "        bridge-fd 0\n",
+         "        bridge-fd 0\n        post-up /bin/echo \\\n            mtu 1450\n"),
+     "line continuations"),
+    ("continued-mtu-value",
+     DEFAULT_INTERFACES.replace(
+         "iface vmbr0 inet static\n",
+         "iface vmbr0 inet static\n        mtu \\\n            1500\n"),
+     "line continuations"),
+    ("continued-bridge-ports",
+     DEFAULT_INTERFACES.replace("bridge-ports ens18",
+                                "bridge-ports ens18 \\\n            ens19"),
+     "line continuations"),
+    ("crlf", DEFAULT_INTERFACES.replace("\n", "\r\n"), "CRLF"),
+    ("mapping-stanza",
+     DEFAULT_INTERFACES + "\nmapping ens18\n        script /bin/true\n",
+     "mapping stanza"),
+    ("alias-definition",
+     "iface ens18:0 inet6 manual\n        mtu 1500\n\n" + DEFAULT_INTERFACES,
+     "alias or range"),
+    ("range-definition",
+     "iface ens[18-19] inet6 manual\n        mtu 1500\n\n" + DEFAULT_INTERFACES,
+     "alias or range"),
+]
+
+
+@pytest.mark.parametrize("interfaces,expected",
+                         [(v[1], v[2]) for v in UNSUPPORTED_SHAPES],
+                         ids=[v[0] for v in UNSUPPORTED_SHAPES])
+def test_syntax_the_hook_cannot_round_trip_is_refused(box, tmp_path,
+                                                      interfaces, expected):
     """
-    continued = DEFAULT_INTERFACES.replace(
-        "        bridge-fd 0\n",
-        "        bridge-fd 0\n        post-up /bin/echo \\\n            mtu 1450\n")
-    _r, _marker, _events, _log, _snap, interfaces = _first_boot(
-        box, tmp_path, "    :", interfaces=continued)
-    text = interfaces.read_text()
-    stanza = text.split("iface vmbr0 inet static", 1)[1].split("\nauto ", 1)[0]
-    assert "\n        mtu 1450" in stanza, \
-        f"a continued command was mistaken for configuration:\n{text}"
-    # and the command itself survives intact
-    assert "post-up /bin/echo \\\n            mtu 1450" in text
-
-
-def test_a_continued_mtu_value_is_replaced_whole(box, tmp_path):
-    r"""
-    `mtu \` + `1500` is one directive. Deleting only its first physical line
-    leaves a bare `1500`, which ifupdown2 rejects -- a valid configuration
-    rewritten into an invalid one, as root, just before reloading it.
+    Each of these parses cleanly for ifupdown2 and was misread here: a
+    continued command read as an MTU directive, a continued value half-deleted
+    into invalid syntax, an alias or range defining the same interface earlier
+    and winning the first-MTU race. Refused, with the file left alone.
     """
-    continued = DEFAULT_INTERFACES.replace(
-        "iface vmbr0 inet static\n",
-        "iface vmbr0 inet static\n        mtu \\\n            1500\n")
-    r, _marker, _events, _log, _snap, interfaces = _first_boot(
-        box, tmp_path, "    :", interfaces=continued)
-    assert r.returncode == 0, r.stderr
-    text = interfaces.read_text()
-    stanza = text.split("iface vmbr0 inet static", 1)[1].split("\nauto ", 1)[0]
-    assert "1500" not in stanza, f"an orphaned value was left behind:\n{text}"
-    assert stanza.count("mtu 1450") == 1, stanza
-
-
-def test_continued_bridge_ports_are_all_read(box, tmp_path):
-    ports = TWO_PORTS.replace("bridge-ports ens18 ens19",
-                              "bridge-ports ens18 \\\n            ens19")
-    r, marker, *_ = _first_boot(
-        box, tmp_path, "    :", interfaces=ports,
-        bridge_ports=["ens18", "ens19"],
-        mtus={"vmbr0": 1450, "ens18": 1450, "ens19": 1500})
-    assert r.returncode != 0, "a continued port list hid the second port"
+    r, marker, _events, hooklog, _snap, written = _first_boot(
+        box, tmp_path, "    :", interfaces=interfaces)
+    assert r.returncode != 0, "unmodelled syntax was edited anyway"
     assert not marker.exists()
+    assert expected in hooklog.read_text()
+    # bytes, not text: reading CRLF as text would translate it and make an
+    # untouched file look rewritten
+    assert written.read_bytes() == interfaces.encode(), \
+        "the file was modified before the refusal"
 
 
 def test_a_vlan_stanza_is_not_part_of_the_bridge(box, tmp_path):

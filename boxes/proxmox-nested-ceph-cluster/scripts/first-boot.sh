@@ -45,67 +45,61 @@ if [ ! -d /sys/class/net/vmbr0/brif ]; then
     exit 1
 fi
 
-# Reading and writing the interfaces file use one grammar, and it is
-# ifupdown2's rather than "lines in a file":
-#
-#   - a physical line ending in a backslash continues the next. Without that,
-#     `post-up /bin/echo \` followed by `mtu 1450` reads as an MTU directive
-#     that is not one, and `mtu \` + `1500` gets half-deleted -- turning a
-#     valid configuration invalid, as root, just before reloading it.
-#   - a stanza ends at auto, iface, vlan, source, source-directory or any
-#     allow-* keyword. `vlan` was missing, so a VLAN stanza's MTU was read as
-#     the bridge's and edited as the bridge's.
-#   - names are compared as strings: `ens18.100` as a regex matches ens18x100.
-#   - ifupdown2 takes the FIRST mtu in a stanza, so a wrong one is replaced
-#     rather than joined by ours.
-#
-# `raw` keeps the original physical text, so lines this does not change are
-# written back exactly as they were, continuations included.
+# What this hook understands is the plain stanza syntax the Proxmox installer
+# writes: one directive per line, stanzas opened by a keyword, literal
+# interface names. ifupdown2's full grammar is larger than that -- line
+# continuations that survive blank lines, CRLF, aliases like `ens18:0` and
+# ranges like `ens[18-19]` that name the same interface as a later stanza,
+# mapping stanzas -- and it belongs to a Python parser. Approximating enough
+# of it in awk produced a file that was misread a different way each round,
+# twice destructively. So anything outside the plain shapes is refused, here,
+# before a byte is rewritten.
+unsupported=$(awk '
+    /\r/            { print "CRLF line endings"; exit }
+    /\\[ \t]*$/     { print "line continuations"; exit }
+    $1 == "mapping" { print "a mapping stanza"; exit }
+    $1 == "iface" && $2 !~ /^[A-Za-z0-9_.@-]+$/ {
+        print "an interface alias or range (" $2 ")"; exit
+    }
+' "$IFACES_FILE")
+if [ -n "$unsupported" ]; then
+    echo "ERROR: $IFACES_FILE uses $unsupported, which this hook does not"
+    echo "       model. It sets mtu $LAB_MTU on vmbr0 and its ports, and it"
+    echo "       will not guess at syntax it cannot read back exactly."
+    echo "       Set the MTU by hand, or simplify the file, and re-run."
+    echo "       Not writing the readiness marker."
+    exit 1
+fi
+
+# With those refused, a stanza is plain lines: it opens at auto, iface, vlan,
+# source, source-directory or any allow-* keyword, names are compared as
+# strings -- `ens18.100` as a regex also matches `ens18x100` -- and ifupdown2
+# takes the FIRST mtu in a stanza, so a wrong one is replaced, not joined.
 AWK_STANZA='
 function closes(word) {
     return word == "auto" || word == "iface" || word == "vlan" ||
            word == "source" || word == "source-directory" ||
            word ~ /^allow-/
 }
-function next_logical(   line, nxt) {
-    if ((getline line) <= 0) return 0
-    raw = line
-    while (line ~ /\\[ \t]*$/) {
-        sub(/\\[ \t]*$/, "", line)
-        if ((getline nxt) <= 0) break
-        raw = raw "\n" nxt
-        line = line nxt
-    }
-    $0 = line
-    return 1
-}
 '
 
 stanza_mtu() {               # <iface> -> its effective mtu, or nothing
     awk -v want="$1" "$AWK_STANZA"'
-        BEGIN {
-            while (next_logical()) {
-                if ($1 == "iface" && $2 == want) { inside = 1; continue }
-                if (closes($1)) inside = 0
-                if (inside && $1 == "mtu" && !found) { print $2; found = 1 }
-            }
-        }
+        $1 == "iface" && $2 == want     { inside = 1; next }
+        closes($1)                      { inside = 0 }
+        inside && $1 == "mtu" && !found { print $2; found = 1 }
     ' "$IFACES_FILE"
 }
 
 set_stanza_mtu() {           # <iface>: exactly one mtu, first in the stanza
     tmp=$(mktemp "$IFACES_FILE.pve-lab.XXXXXX")
     awk -v want="$1" -v mtu="$LAB_MTU" "$AWK_STANZA"'
-        BEGIN {
-            while (next_logical()) {
-                if ($1 == "iface" && $2 == want) {
-                    print raw; print "        mtu " mtu; inside = 1; continue
-                }
-                if (closes($1)) inside = 0
-                if (inside && $1 == "mtu") continue
-                print raw
-            }
+        $1 == "iface" && $2 == want {
+            print; print "        mtu " mtu; inside = 1; next
         }
+        closes($1)            { inside = 0 }
+        inside && $1 == "mtu" { next }
+        { print }
     ' "$IFACES_FILE" > "$tmp"
     cat "$tmp" > "$IFACES_FILE"
     rm -f "$tmp"
@@ -114,17 +108,13 @@ set_stanza_mtu() {           # <iface>: exactly one mtu, first in the stanza
 # A `source` ahead of an interface's own stanza can define it earlier, and the
 # earlier definition's MTU is the one that counts -- so editing the stanza we
 # can see would leave the node at 1500 with every check here passing. The
-# stock installer writes its stanzas first and a source glob last, which is
-# fine; anything else is refused rather than half-understood.
+# stock installer writes its stanzas first and the glob last, which is fine;
+# anything else is refused rather than half-understood.
 source_precedes() {          # <iface>
     awk -v want="$1" "$AWK_STANZA"'
-        BEGIN {
-            while (next_logical()) {
-                if ($1 == "source" || $1 == "source-directory") seen = 1
-                if ($1 == "iface" && $2 == want) { found = seen; break }
-            }
-            exit(found ? 0 : 1)
-        }
+        $1 == "source" || $1 == "source-directory" { seen = 1 }
+        $1 == "iface" && $2 == want { if (seen) found = 1; exit }
+        END { exit(found ? 0 : 1) }
     ' "$IFACES_FILE"
 }
 
