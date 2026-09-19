@@ -89,10 +89,10 @@ fi
 # A trailing `source` glob is what the installer writes, and harmless in
 # itself -- but an included file can carry a second `iface vmbr0` stanza, and
 # ifupdown2 concatenates the bridge-ports of every definition rather than
-# taking the first. That would add a port this hook never sees, never
-# configures and never verifies, while everything here passed. So the includes
-# are read just far enough to refuse that. (Reading the kernel's attachments
-# instead would pick up the tap devices of running guests.)
+# taking the first. That would add a port with no stanza of its own to carry
+# mtu 1450 into the next boot, so the includes are read just far enough to
+# refuse it. The live check at the end covers such a port for this boot; what
+# it cannot do is make the setting persist.
 check_include() {            # <path>: an include this hook can rule out
     if ! LC_ALL=C awk '/\\/ || /[^\t -~]/ { bad = 1 } END { exit(bad) }' "$1"; then
         echo "ERROR: the included file $1 uses a backslash or a non-ASCII"
@@ -136,14 +136,6 @@ check_include() {            # <path>: an include this hook can rule out
     fi
 }
 
-# A trailing `source` glob is what the installer writes, and harmless in
-# itself -- but an included file can carry a second `iface vmbr0` stanza, and
-# ifupdown2 concatenates the bridge-ports of every definition rather than
-# taking the first. That would add a port this hook never sees, never
-# configures and never verifies, while everything here passed. So each include
-# is read far enough to refuse that. (Reading the kernel's attachments instead
-# would pick up the tap devices of running guests.)
-#
 # The enumeration has to match the parser's: it resolves relative paths
 # against the file that sourced them, and lists a source-directory with
 # os.listdir(), which includes dotfiles. `dotglob` covers the second; reading
@@ -257,9 +249,10 @@ source_precedes() {          # <iface>
 # vmbr0's ports come from vmbr0's own stanza, every token of it. A file-wide
 # `grep bridge-ports` took the second token of whichever such line came first,
 # so another bridge declared above substituted its port and a two-port vmbr0
-# had only the first one looked at. Reading the kernel's bridge membership
-# instead would be worse: it also lists the tap devices of running guests,
-# which have no stanza and are nobody's uplink.
+# had only the first one looked at. This list is what gets *configured* -- the
+# kernel's membership, read after the reload, is what gets verified. They
+# answer different questions: an interface needs a stanza to carry mtu 1450
+# into the next boot, and the kernel cannot supply one.
 ports=$(awk -v want=vmbr0 "$AWK_STANZA"'
     $1 == "iface" && $2 == want { inside = 1; next }
     inside && closes($1)        { inside = 0 }
@@ -326,10 +319,24 @@ ifreload -a || echo "note: ifreload exited non-zero; verifying the live MTU anyw
 # game. After the reload the kernel knows, so it is asked. Declared ports are
 # still what gets *configured*: persisting an MTU needs a stanza to put it in.
 #
-# Guest taps are not a concern here and are skipped anyway: this hook runs
-# once at first boot, before any guest exists, and a tap is not an uplink.
-attached=$(ls -1 /sys/class/net/vmbr0/brif 2>/dev/null \
-           | grep -vE '^(tap|veth|fwpr|fwln|fwbr)' || true)
+# Every member, with nothing skipped by name. Guest taps were exempted here
+# at first, on the grounds that this hook runs once at first boot before any
+# guest exists -- but that premise is exactly what makes the exemption
+# pointless: on a node with no guests, an interface named like one is not a
+# guest's, and a name has never been proof of ownership anyway. So the whole
+# membership is checked, and a `tap...` at 1500 stops the marker like anything
+# else would.
+#
+# The listing has to succeed. Hiding its failure and carrying on would leave
+# the check covering only vmbr0 and the declared ports, which is the narrower
+# check this one replaced -- and the marker would still say otherwise.
+if ! attached=$(ls -1 /sys/class/net/vmbr0/brif); then
+    echo "ERROR: cannot list vmbr0's bridge members. Everything below is only"
+    echo "       as complete as that listing, so a marker written over a"
+    echo "       failed read would certify less than it says it does."
+    echo "       Not writing the readiness marker."
+    exit 1
+fi
 checked=
 for iface in vmbr0 $ports $attached; do
     case " $checked " in *" $iface "*) continue ;; esac

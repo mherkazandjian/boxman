@@ -1810,16 +1810,54 @@ def test_an_undeclared_member_at_the_lab_mtu_is_fine(box, tmp_path):
 
 def test_a_guest_tap_on_the_bridge_is_not_a_port(box, tmp_path):
     """
-    Taking the port list from the kernel would include the tap devices of
-    running guests -- seen on pve3 of the live lab, where `tap100i0` is
-    enslaved to vmbr0. They have no stanza and are nobody's uplink, so a hook
-    that treated them as ports would refuse every node running a VM.
+    A tap is a member, not a port: it has no stanza and is nobody's uplink, so
+    nothing is written for it. `tap100i0` is enslaved to vmbr0 on pve3 of the
+    live lab, which is where that distinction came from.
     """
-    r, marker, *_ = _first_boot(
+    r, marker, _events, _log, _snap, interfaces = _first_boot(
         box, tmp_path, "    :", bridge_ports=["ens18", "tap100i0"],
-        mtus={"vmbr0": 1450, "ens18": 1450})
+        mtus={"vmbr0": 1450, "ens18": 1450, "tap100i0": 1450})
     assert r.returncode == 0, r.stderr
     assert marker.exists()
+    assert "tap100i0" not in interfaces.read_text(), "a tap was configured"
+
+
+def test_a_member_named_like_a_tap_is_still_checked(box, tmp_path):
+    """
+    The exemption these names used to get rested on there being no guests at
+    first boot -- which is the same reason nothing here can be a guest's. A
+    name is not proof of ownership, and on a node with no guests an interface
+    named like one is exactly what is worth looking at.
+    """
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", bridge_ports=["ens18", "tap100i0"],
+        mtus={"vmbr0": 1450, "ens18": 1450, "tap100i0": 1500})
+    assert r.returncode != 0, "a member was waved through on its name"
+    assert not marker.exists()
+    assert "tap100i0 has MTU 1500" in hooklog.read_text()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads an unreadable dir")
+def test_a_membership_listing_that_fails_stops_the_marker(box, tmp_path):
+    """
+    The check is only as complete as that listing, and a swallowed failure
+    quietly returns it to covering vmbr0 and the declared ports alone -- the
+    narrower check this one replaced -- while the marker still says otherwise.
+    """
+    brif = tmp_path / "root/sys/class/net/vmbr0/brif"
+    brif.mkdir(parents=True)
+    (brif / "ens18").mkdir()
+    # searchable but not listable: the declared port's attachment check still
+    # resolves, so this stops at the listing and nowhere earlier
+    brif.chmod(0o111)
+    try:
+        r, marker, _events, hooklog, *_ = _first_boot(
+            box, tmp_path, "    :", bridge_ports=None)
+        assert r.returncode != 0, "a failed membership listing was ignored"
+        assert not marker.exists()
+        assert "cannot list vmbr0's bridge members" in hooklog.read_text()
+    finally:
+        brif.chmod(0o755)
 
 
 def test_something_that_is_not_a_bridge_is_refused(box, tmp_path):

@@ -150,12 +150,16 @@ installs `qemu-guest-agent` and writes `/var/lib/pve-lab/first-boot.done`, which
 The marker is the readiness signal for the whole build, so the hook verifies
 rather than assumes: after the reload it reads the live MTU back from `vmbr0`
 and from **every interface the kernel has enslaved to it**, and exits without
-writing the marker if any of them is not 1450, or cannot be read. It asks the
-kernel rather than the file because ifupdown2's effective port set is computed
-by its addons — `mstpctl-ports`, `vxlan-physdev`, `bridge-always-up` and others
-each contribute a member no `bridge-ports` line mentions. The declared ports
-are still what gets *configured*: persisting an MTU needs a stanza to put it
-in. A failed `ifreload` is tolerated — ifupdown2 refuses a reload on a node
+writing the marker if any of them is not 1450, cannot be read, or if the
+membership itself cannot be listed. Nothing is skipped by name: a `tap…` at
+1500 stops the marker like anything else, because on a node with no guests yet
+an interface named like a guest's is not one. It asks the kernel rather than
+the file because ifupdown2's effective port set is computed by its addons —
+`mstpctl-ports`, `vxlan-physdev`, `bridge-always-up` and others each
+contribute a member no `bridge-ports` line mentions. The declared ports are
+still what gets *configured*: persisting an MTU needs a stanza to put it in,
+and a member without one is checked for this boot but not carried into the
+next. A failed `ifreload` is tolerated — ifupdown2 refuses a reload on a node
 whose interfaces already match — but only because what follows it is a check
 and not an assumption. `make wait-first-boot` then fails naming
 `/var/log/pve-lab-first-boot.log` on the node, which says which interface was
@@ -165,23 +169,37 @@ wrong.
 
 The hook rewrites `/etc/network/interfaces`, so it reads only the shapes it
 can round-trip exactly — the plain stanza syntax the Proxmox installer writes,
-plus a trailing `source` glob. Anything else is **refused before a byte is
-rewritten**, with the reason in the log and no marker: CRLF, a backslash
-anywhere, control or non-ASCII characters, `mapping` stanzas, interface
-aliases (`ens18:0`) and ranges (`ens[18-19]`), Mako template syntax,
-`mstpctl-ports`, an include that sources further files or defines `vmbr0`
-itself, a source pattern using `[`, `]` or `?`, and an include that is not a
-regular file. ifupdown2's full grammar is larger than this and belongs to a
-Python parser; approximating it in shell produced a file that was misread a
-different way each review round, twice destructively.
+plus a trailing `source` glob or `source-directory`. This is not a validator:
+ordinary attributes it has no opinion about are passed over. What it does is
+**refuse, before a byte is rewritten**, the constructs that can make it misread
+the file, each with the reason in the log and no marker:
+
+| Refused in `/etc/network/interfaces` | Refused in an included file |
+| --- | --- |
+| CRLF; a backslash anywhere; control or non-ASCII characters | the same |
+| `mapping` stanzas | — (an include is scanned for stanzas, not parsed in order) |
+| interface aliases (`ens18:0`) and ranges (`ens[18-19]`) | the same |
+| Mako template syntax; `mstpctl-ports` | the same |
+| a source pattern using `[`, `]` or `?` | a nested `source`; an `iface vmbr0` of its own |
+
+An include that is not a regular file is refused too — ifupdown2 `open()`s
+whatever a pattern matched, and a FIFO cannot be read back here without
+blocking on it. A directory and a dangling symlink are not: the parser's
+`open()` fails on both and it moves on. A symlink to a regular file is read
+like the file it points at.
+
+ifupdown2's full grammar is larger than this and belongs to a Python parser;
+approximating it in shell produced a file that was misread a different way
+each review round, twice destructively.
 
 Interface **command hooks** (`pre-up`, `up`, `post-up`, and their `down`
 counterparts) are accepted, because refusing them would reject ordinary
 configurations and no static check can cover arbitrary commands. The guarantee
 around them is correspondingly bounded: the hook checks the live MTU of
 `vmbr0` and its members *after* `ifreload` returns, so a command that leaves
-one of them at the wrong MTU is caught — but one whose effect lands later, or
-which rewrites the persisted configuration afterwards, is not.
+one of them at the wrong MTU is caught — but one whose effect lands later is
+not. The persisted file is checked *before* the reload, so a command that
+rewrites it during or after the reload is outside that check as well.
 
 ### Why the nodes are upgraded on first boot
 
