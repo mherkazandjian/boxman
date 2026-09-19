@@ -3,6 +3,7 @@ Abstract base for runtime environments.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any
 
 
@@ -15,12 +16,19 @@ class RuntimeBase(ABC):
         self.config = config or {}
 
     @abstractmethod
-    def wrap_command(self, command: str) -> str:
+    def wrap_command(self, command: str,
+                     pass_env: Sequence[str] | None = None) -> str:
         """
         Wrap *command* for execution in this runtime.
 
         For a local runtime this is a no-op; for docker-compose it
         prefixes ``docker exec <container> bash -c '...'``.
+
+        *pass_env* names environment variables the command needs that must
+        survive the wrapping. A local command inherits the environment, so
+        the local runtime ignores it; a containerised one does not, so the
+        docker runtime forwards each name. It exists so a secret can be
+        handed over out of band rather than on the argv.
         """
 
     @property

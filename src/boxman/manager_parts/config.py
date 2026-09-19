@@ -114,8 +114,16 @@ class ConfigMixin:
         rendered_filename = f"{os.path.splitext(config_filename)[0]}.rendered.yml"
         rendered_path = os.path.join(config_dir, rendered_filename)
         try:
-            with open(rendered_path, 'w') as fobj:
+            # 0600 from the moment it exists: every env() is resolved in here,
+            # and the shipped boxes render `admin_pass: {{ env(...) }}` into
+            # it. O_CREAT's mode only applies to a file being created, so an
+            # already-existing one -- written 0644 by an older boxman -- is
+            # tightened explicitly rather than left as it was found.
+            fd = os.open(rendered_path,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as fobj:
                 fobj.write(rendered_yaml)
+            os.chmod(rendered_path, 0o600)
         except OSError as exc:
             self.logger.warning(
                 f"could not write the rendered config to {rendered_path} "

@@ -5,6 +5,7 @@
 
 
 import os
+import shlex
 import time
 
 from boxman.utils.references import resolve_reference
@@ -204,12 +205,6 @@ class SSHMixin:
             self.logger.info(f"writing ssh config to {ssh_config}")
 
             with open(ssh_config, 'w') as fobj:
-                # write global SSH options
-                fobj.write('Host *\n')
-                fobj.write('    StrictHostKeyChecking no\n')
-                fobj.write('    UserKnownHostsFile /dev/null\n')
-                fobj.write('\n\n')
-
                 # docker runtime: jump host stanza
                 if jump_stanza:
                     fobj.write(jump_stanza)
@@ -237,6 +232,16 @@ class SSHMixin:
                             fobj.write(f'    Hostname {first_ip}\n')
                             fobj.write(f'    User {cluster.get("admin_user", "admin")}\n')
                             fobj.write(f'    IdentityFile {admin_priv_key}\n')
+                            # per host, never under `Host *`: a boxman VM is
+                            # recreated often enough that its host key changes
+                            # under a reused IP, so checking it is noise here.
+                            # In a `Host *` stanza the same two lines disable
+                            # checking for every host the reader ever connects
+                            # to, because OpenSSH takes the first value it sees
+                            # for a keyword -- and this file is meant to be
+                            # Include-d (#164 CL-S1).
+                            fobj.write('    StrictHostKeyChecking no\n')
+                            fobj.write('    UserKnownHostsFile /dev/null\n')
                             if jump_stanza:
                                 fobj.write(
                                     f'    ProxyJump {self.SSH_JUMP_HOST_ALIAS}\n')
@@ -462,18 +467,28 @@ class SSHMixin:
             self.logger.info(
                 f"attempt {attempt}/{max_retries} to add ssh key (waiting {wait_time}s)")
 
-            # use sshpass to add the public key
+            # sshpass -e, not -p: an argv is world-readable in `ps` and
+            # /proc for as long as the process lives, and this one runs up to
+            # ten times per VM. -e takes the password from SSHPASS instead,
+            # which is readable only by this user (#164 CL-S2). Everything
+            # else is quoted: a password with a space used to break auth, and
+            # one with `$(...)` in it used to run.
             cmd = (
-                f'sshpass -p {admin_pass} ssh-copy-id -i {pub_key_path} '
+                f'sshpass -e ssh-copy-id -i {shlex.quote(pub_key_path)} '
                 f'-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null '
-                f'{admin_user}@{ip_address}'
+                f'{shlex.quote(f"{admin_user}@{ip_address}")}'
             )
 
             # When using a non-local runtime, the VM is only reachable from
-            # inside the container, so wrap the command with docker exec.
-            cmd = self.runtime_instance.wrap_command(cmd)
+            # inside the container, so wrap the command with docker exec --
+            # which also has to carry SSHPASS across, since a container does
+            # not inherit this process's environment.
+            cmd = self.runtime_instance.wrap_command(cmd, pass_env=('SSHPASS',))
 
-            result = run(cmd, hide=True, warn=True)
+            # env= adds to the environment rather than replacing it, so the
+            # rest of it (PATH, DOCKER_HOST, ...) still reaches the command.
+            result = run(cmd, hide=True, warn=True,
+                         env={'SSHPASS': admin_pass})
 
             if result.ok:
                 # Log ssh-copy-id informational output
