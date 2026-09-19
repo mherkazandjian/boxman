@@ -114,7 +114,8 @@ check_include() {            # <path>: an include this hook can rule out
             END { exit(found ? 0 : 1) }' "$1"; then
         echo "ERROR: $1 uses Mako template syntax or mstpctl port"
         echo "       declarations, either of which can add a bridge port"
-        echo "       this hook would never see."
+        echo "       with no stanza here to carry mtu $LAB_MTU into the next"
+        echo "       boot."
         echo "       Not writing the readiness marker."
         exit 1
     fi
@@ -330,7 +331,9 @@ ifreload -a || echo "note: ifreload exited non-zero; verifying the live MTU anyw
 # The listing has to succeed. Hiding its failure and carrying on would leave
 # the check covering only vmbr0 and the declared ports, which is the narrower
 # check this one replaced -- and the marker would still say otherwise.
-if ! attached=$(ls -1 /sys/class/net/vmbr0/brif); then
+# -A, not plain -1: a member whose name begins with a dot is a member like
+# any other, and the default listing hides it while still succeeding.
+if ! attached=$(ls -1A -- /sys/class/net/vmbr0/brif); then
     echo "ERROR: cannot list vmbr0's bridge members. Everything below is only"
     echo "       as complete as that listing, so a marker written over a"
     echo "       failed read would certify less than it says it does."

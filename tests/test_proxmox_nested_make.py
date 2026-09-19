@@ -1837,6 +1837,21 @@ def test_a_member_named_like_a_tap_is_still_checked(box, tmp_path):
     assert "tap100i0 has MTU 1500" in hooklog.read_text()
 
 
+def test_a_dot_prefixed_member_is_checked_too(box, tmp_path):
+    """
+    `ls -1` hides a name beginning with a dot and still exits 0, so a member
+    named that way was absent from a listing the hook had just certified as
+    complete. Nothing in the naming rules -- or in this hook's own accepted
+    interface names -- reserves a leading dot.
+    """
+    r, marker, _events, hooklog, *_ = _first_boot(
+        box, tmp_path, "    :", bridge_ports=["ens18", ".sneaky0"],
+        mtus={"vmbr0": 1450, "ens18": 1450, ".sneaky0": 1500})
+    assert r.returncode != 0, "a dot-prefixed member was not listed"
+    assert not marker.exists()
+    assert ".sneaky0 has MTU 1500" in hooklog.read_text()
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads an unreadable dir")
 def test_a_membership_listing_that_fails_stops_the_marker(box, tmp_path):
     """

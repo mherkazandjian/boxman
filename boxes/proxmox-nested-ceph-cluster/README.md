@@ -157,9 +157,10 @@ an interface named like a guest's is not one. It asks the kernel rather than
 the file because ifupdown2's effective port set is computed by its addons —
 `mstpctl-ports`, `vxlan-physdev`, `bridge-always-up` and others each
 contribute a member no `bridge-ports` line mentions. The declared ports are
-still what gets *configured*: persisting an MTU needs a stanza to put it in,
-and a member without one is checked for this boot but not carried into the
-next. A failed `ifreload` is tolerated — ifupdown2 refuses a reload on a node
+still what gets *configured*: only `vmbr0` and those ports have their MTU
+repaired and validated on disk, so any other member is checked for this boot
+and not persisted or validated by this hook — something else may well persist
+it, but nothing here certifies that. A failed `ifreload` is tolerated — ifupdown2 refuses a reload on a node
 whose interfaces already match — but only because what follows it is a check
 and not an assumption. `make wait-first-boot` then fails naming
 `/var/log/pve-lab-first-boot.log` on the node, which says which interface was
@@ -178,9 +179,10 @@ the file, each with the reason in the log and no marker:
 | --- | --- |
 | CRLF; a backslash anywhere; control or non-ASCII characters | the same |
 | `mapping` stanzas | — (an include is scanned for stanzas, not parsed in order) |
-| interface aliases (`ens18:0`) and ranges (`ens[18-19]`) | the same |
-| Mako template syntax; `mstpctl-ports` | the same |
-| a source pattern using `[`, `]` or `?` | a nested `source`; an `iface vmbr0` of its own |
+| an interface name outside `[A-Za-z0-9_.@-]+`, which is what aliases (`ens18:0`) and ranges (`ens[18-19]`) fall outside of | the same |
+| Mako template syntax; `mstpctl-ports` or `mstpctl_ports` | the same |
+| a `source` or `source-directory` pattern using `[`, `]` or `?` | a nested `source` or `source-directory`; an `iface vmbr0` of its own |
+| a `source` or `source-directory` ahead of the `vmbr0` or declared-port stanza it would define | — |
 
 An include that is not a regular file is refused too — ifupdown2 `open()`s
 whatever a pattern matched, and a FIFO cannot be read back here without
