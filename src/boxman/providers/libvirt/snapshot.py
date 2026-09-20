@@ -984,6 +984,11 @@ class SnapshotManager:
                 f"overlays without knowing whether the guest is writing "
                 f"to them")
 
+        # Splitting on newline is unambiguous *here*, unlike the snapshot
+        # list: libvirt refuses a newline in a domain name outright
+        # ("invalid char in name"), where it accepts one in a snapshot
+        # name. Spaces are allowed and are kept -- the names are compared
+        # exactly, not stripped.
         running = [n for n in listed.stdout.split('\n') if n]
         if vm_name not in running:
             # paused and pmsuspended domains are not listed either, and
