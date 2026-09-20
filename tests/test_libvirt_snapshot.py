@@ -69,22 +69,31 @@ def _inventory(sm: SnapshotManager, overlays: dict, order: list):
 
 def _shell_that_copies(calls: list | None = None,
                        ok: bool = True,
-                       stderr: str = ""):
-    """An ``execute_shell`` double that performs the ``cp`` it is given.
+                       stderr: str = "",
+                       strip_sudo: bool = False):
+    """An ``execute_shell`` double that really runs the command it is given.
 
-    The production code verifies its backups on the filesystem rather than
-    trusting ``cp``'s exit code, so a double that only records the command
-    string would fail every success-path test for the wrong reason.
+    The production code decides by looking at the filesystem -- inode,
+    size and mtime against the reservation it made -- rather than at exit
+    codes, so a double that only records command strings can neither
+    confirm nor refute what it concludes. Every path involved is under
+    tmp_path and shlex-quoted by the code under test.
+
+    With ``ok=False`` the command is not run and a failure is reported,
+    for the tests about what happens when the copy does not work.
+    ``strip_sudo`` records the command as built but runs it without the
+    prefixes, for the tests that are about which elements got one.
     """
     def run(cmd, *_a, **_kw):
         if calls is not None:
             calls.append(cmd)
-        if ok:
-            for part in cmd.split(" && "):
-                words = shlex.split(part)
-                if "cp" in words[:2]:
-                    Path(words[-1]).write_bytes(Path(words[-2]).read_bytes())
-        return _result(ok=ok, stderr=stderr)
+        if not ok:
+            return _result(ok=False, stderr=stderr)
+        runnable = cmd.replace("sudo ", "") if strip_sudo else cmd
+        proc = subprocess.run(runnable, shell=True,
+                              capture_output=True, text=True)
+        return _result(ok=proc.returncode == 0, stderr=proc.stderr,
+                       return_code=proc.returncode)
     return run
 
 
@@ -366,6 +375,9 @@ class TestPreserveSnapshotOverlays:
         assert "rsync" not in cmd
         assert str(overlay1) in cmd
         assert str(overlay2) in cmd
+        # each copy lands on a scratch name and is renamed over the
+        # reservation, so the reserved path is never a zero-length file
+        assert cmd.count("mv -fT ") == 2
         assert sorted(pair[0] for pair in preserved) == sorted(
             [str(overlay1), str(overlay2)]
         )
@@ -439,9 +451,11 @@ class TestPreserveSnapshotOverlays:
         calls: list[str] = []
         with _inventory(sm, {"s": [str(overlay)]}, ["s"]), \
              patch.object(sm.virsh, "execute_shell",
-                          side_effect=_shell_that_copies(calls)):
+                          side_effect=_shell_that_copies(calls,
+                                                         strip_sudo=True)):
             sm._preserve_snapshot_overlays("vm01", "s")
         assert calls[0].startswith("sudo cp ")
+        assert "sudo mv -fT " in calls[0]
 
 
 class TestStrictOverlayInventory:
@@ -717,6 +731,7 @@ class TestSnapshotMetadataIsComplete:
         ("wrong-root", "not a <domainsnapshot>"),
         ("name-mismatch", "got metadata naming"),
         ("duplicate-name", "more than once"),
+        ("blank-entry", "blank entry"),
     ])
     def test_incomplete_metadata_never_reaches_snapshot_revert(
         self, sm: SnapshotManager, tmp_path: Path, fault, expected
@@ -772,6 +787,8 @@ class TestSnapshotMetadataIsComplete:
         names = ["s1", "s2", "s3"]
         if fault == "duplicate-name":
             names = ["s1", "s2", "s2", "s3"]
+        if fault == "blank-entry":
+            names = ["s1", "", "s2", "s3"]
 
         seen: list[str] = []
         calls: list[str] = []
@@ -907,12 +924,12 @@ class TestBackupPathsAreReserved:
 
         with patch("boxman.providers.libvirt.snapshot.os.write",
                    side_effect=one_byte_at_a_time):
-            sm._reserve_backup_paths(
+            signatures = sm._reserve_backup_paths(
                 [(str(tmp_path / "o.qcow2"), str(backup))])
 
         assert backup.read_bytes() == sm._RESERVATION_MARKER
         # and the reservation still reads as "nothing copied here yet"
-        assert not sm._backup_was_written(str(backup))
+        assert not sm._backup_was_written(str(backup), signatures[str(backup)])
 
     def test_reserving_a_taken_path_fails_without_disturbing_it(
         self, sm: SnapshotManager, tmp_path: Path
@@ -989,6 +1006,106 @@ class TestBackupPathsAreReserved:
         assert unrecovered == [(str(overlay), str(backup))]
         assert backup.read_bytes() == b"the only copy"
         assert not (overlay / "o.qcow2.preserve").exists()
+
+
+class TestOwnershipSurvivesFailures:
+    """#193 round-6 findings 1 and 2.
+
+    Once a backup path is reserved it belongs to this call until it is
+    handed back or removed. A runner that raises rather than returning a
+    result used to walk out of the function leaving reservations behind,
+    and the check that a copy landed used to need a read permission the
+    copy itself does not.
+    """
+
+    def test_a_runner_that_cannot_start_the_copy_reaps_and_refuses(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """execute_shell turns a command that ran and failed into a
+        result, but a runner that cannot start one at all still raises."""
+        overlay = tmp_path / "o.qcow2"
+        overlay.write_bytes(b"x")
+        calls: list[str] = []
+
+        def explode(cmd, *_a, **_kw):
+            calls.append(cmd)
+            if cmd.startswith("rm -f"):
+                # really run the cleanup, so the assertion below is about
+                # the filesystem and not about the double
+                subprocess.run(cmd, shell=True, check=False)
+                return _result()
+            raise OSError(24, "Too many open files")
+
+        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+             patch.object(sm.virsh, "execute_shell", side_effect=explode):
+            with pytest.raises(SnapshotError,
+                               match="could not run the overlay backup"):
+                sm._preserve_snapshot_overlays("vm01", "s1")
+
+        assert any(c.startswith("rm -f") and "o.qcow2.preserve" in c
+                   for c in calls)
+        assert not (tmp_path / "o.qcow2.preserve").exists()
+
+    def test_a_failure_before_the_revert_does_not_strand_the_backups(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """The memory handling runs after preservation and before the
+        revert. A raise there used to leave the backups behind, and the
+        next restore refuses on them."""
+        backup = tmp_path / "o.qcow2.preserve"
+        calls: list[str] = []
+
+        def capture(cmd, *_a, **_kw):
+            calls.append(cmd)
+            return _result()
+
+        with patch.object(sm, "_preserve_snapshot_overlays",
+                          return_value=[(str(tmp_path / "o.qcow2"),
+                                         str(backup))]), \
+             patch.object(sm, "_memory_path_from_xml",
+                          side_effect=OSError(5, "I/O error")), \
+             patch.object(sm.virsh, "execute") as execute, \
+             patch.object(sm.virsh, "execute_shell", side_effect=capture):
+            with pytest.raises(SnapshotError, match="could not prepare"):
+                sm.snapshot_restore("vm01", "s1")
+
+        execute.assert_not_called()
+        assert any(c.startswith("rm -f") and str(backup) in c for c in calls)
+
+    def test_a_cleanup_that_cannot_run_still_names_what_it_left(
+        self, sm: SnapshotManager
+    ):
+        """This is the function that promises to name what it left behind,
+        so it must not be the one that dies quietly."""
+        def explode(*_a, **_kw):
+            raise OSError(24, "Too many open files")
+
+        with patch.object(sm.virsh, "execute_shell", side_effect=explode), \
+             patch.object(sm, "logger") as logger:
+            sm._reap_preserve_files(["/overlays/a.qcow2.preserve"])
+
+        assert any("/overlays/a.qcow2.preserve" in str(call)
+                   for call in logger.warning.call_args_list)
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root can read a 0000 file")
+    def test_verification_does_not_need_to_read_the_backup(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """A `sudo cp -p` of a root-owned 0600 overlay hands back a
+        root-owned 0600 backup. Reading it as the boxman user then fails,
+        and a check that reads would condemn a perfectly good copy."""
+        backup = tmp_path / "o.qcow2.preserve"
+        signatures = sm._reserve_backup_paths(
+            [(str(tmp_path / "o.qcow2"), str(backup))])
+
+        backup.write_bytes(b"a real overlay")      # the copy lands ...
+        os.chmod(backup, 0o000)                    # ... unreadable by us
+        try:
+            assert sm._backup_was_written(str(backup),
+                                          signatures[str(backup)])
+        finally:
+            os.chmod(backup, 0o600)
 
 
 class TestPendingRecoveryBlocksTheNextRestore:
@@ -1193,7 +1310,11 @@ class TestBackupIsAPrecondition:
                           side_effect=_shell_that_copies(calls)):
             sm._preserve_snapshot_overlays("vm01", "s1")
 
-        assert shlex.split(calls[0])[-2:] == [str(odd), f"{odd}.preserve"]
+        # the copy names the overlay; the rename that follows names the
+        # reservation it replaces
+        words = shlex.split(calls[0])
+        assert str(odd) in words
+        assert f"{odd}.preserve" == words[-1]
 
     def test_putting_the_overlays_back_is_a_rename_not_a_copy(
         self, sm: SnapshotManager, tmp_path: Path
@@ -1267,7 +1388,9 @@ class TestBackupIsAPrecondition:
         # and it says exactly what to run to finish the job
         message = str(excinfo.value)
         assert str(backup) in message
-        assert "mv -f" in message
+        # -T, or following the instruction moves the last copy *into* a
+        # directory sitting at the original path
+        assert "mv -fT" in message
 
 
 class TestBatchedCommandPrivilege:
@@ -1286,7 +1409,8 @@ class TestBatchedCommandPrivilege:
         other.write_bytes(b"y")
         with _inventory(sm, {"s": [str(overlay), str(other)]}, ["s"]), \
              patch.object(sm.virsh, "execute_shell",
-                          side_effect=_shell_that_copies(calls)):
+                          side_effect=_shell_that_copies(calls,
+                                                         strip_sudo=True)):
             sm._preserve_snapshot_overlays("vm01", "s")
         return calls[0]
 
@@ -1295,7 +1419,11 @@ class TestBatchedCommandPrivilege:
     ):
         sm = SnapshotManager({"use_sudo": True, "sudo_skip_commands": ["cp"]})
         cmd = self._preserve(sm, tmp_path, [])
-        assert "sudo " not in cmd
+        parts = cmd.split(" && ")
+        # the skip applies to cp, and only to cp: mv is a different
+        # executable and keeps the privilege use_sudo gives it
+        assert not any(part.startswith("sudo cp ") for part in parts)
+        assert any(part.startswith("sudo mv -fT ") for part in parts)
 
     def test_a_forced_copy_is_sudo_prefixed_on_every_element(
         self, tmp_path: Path
@@ -1303,10 +1431,13 @@ class TestBatchedCommandPrivilege:
         sm = SnapshotManager({"use_sudo": False,
                               "force_sudo_commands": ["cp"]})
         cmd = self._preserve(sm, tmp_path, [])
+        parts = cmd.split(" && ")
+        # every cp, not just the first: the ones after an && used to
+        # inherit nothing at all
         assert cmd.count("sudo cp ") == 2
-        # the command after the && used to inherit nothing at all
-        assert all(part.startswith("sudo cp ")
-                   for part in cmd.split(" && "))
+        assert not any(part.startswith("cp ") for part in parts)
+        # and the force names cp, so mv is left as use_sudo=False has it
+        assert any(part.startswith("mv -fT ") for part in parts)
 
     def test_a_skipped_rename_is_not_sudo_prefixed_either(self, tmp_path: Path):
         sm = SnapshotManager({"use_sudo": True, "sudo_skip_commands": ["mv"]})

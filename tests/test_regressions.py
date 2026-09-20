@@ -13,6 +13,7 @@ Part of Phase 1.4 of the review plan
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -93,15 +94,13 @@ class TestSnapshotOverlayPreservation057eb7d:
         calls: list[str] = []
 
         def copying(cmd, *_a, **_kw):
-            # the production code confirms its backups on the filesystem,
-            # so the double has to actually make them
+            # the production code confirms its backups on the filesystem
+            # -- inode, size and mtime against the reservation it made --
+            # so the double has to really run the command
             calls.append(cmd)
-            for part in cmd.split(" && "):
-                words = part.split()
-                if "cp" in words[:2]:
-                    Path(words[-1].strip("'")).write_bytes(
-                        Path(words[-2].strip("'")).read_bytes())
-            return _result()
+            proc = subprocess.run(cmd.replace("sudo ", ""), shell=True,
+                                  capture_output=True, text=True)
+            return _result(ok=proc.returncode == 0, stderr=proc.stderr)
 
         with patch.object(
             sm, "_strict_overlay_inventory",
