@@ -4,6 +4,7 @@ Snapshot module for libvirt provider.
 This module provides functionality to manage VM snapshots using command-line tools.
 """
 
+import binascii
 import os
 import shlex
 import stat
@@ -22,6 +23,12 @@ class SnapshotManager:
     """
     Class to manage snapshots of VMs in libvirt using virsh commands.
     """
+
+    #: bytes: written into a reserved backup path so the file is not empty.
+    #: libvirt refuses to create an external overlay over a file that
+    #: already exists *with content*, and silently adopts an empty one —
+    #: measured, not assumed — so the reservation has to carry something.
+    _RESERVATION_MARKER = b"boxman: reserved for a snapshot overlay backup\n"
 
     def __init__(self, provider_config: dict[str, Any] | None = None):
         """
@@ -1002,8 +1009,8 @@ class SnapshotManager:
         if result.ok:
             # cp exits 0 in cases that leave no usable backup at the
             # recorded path, so ask the filesystem rather than the exit code
-            unusable = [dst for src, dst in pairs
-                        if not self._backup_is_populated(src, dst)]
+            unusable = [dst for _src, dst in pairs
+                        if not self._backup_was_written(dst)]
             if not unusable:
                 for src, _dst in pairs:
                     self.logger.debug(f"preserved snapshot overlay: {src}")
@@ -1031,32 +1038,36 @@ class SnapshotManager:
             f"so without the backup every snapshot from '{snapshot_name}' "
             f"onwards would be gone.")
 
-    @staticmethod
-    def _backup_is_populated(src: str, dst: str) -> bool:
+    @classmethod
+    def _backup_was_written(cls, dst: str) -> bool:
         """
-        Whether *dst* holds a copy of *src* rather than an empty
-        reservation.
+        Whether the copy actually replaced this call's reservation.
 
-        ``cp`` can exit 0 having written nothing into the file reserved
-        for it, and an empty backup puts back an empty overlay. Sizes are
-        deliberately not compared for equality: a running guest writes to
-        its overlay while this runs, so only the cheap, non-flaky question
-        is asked — did a non-empty overlay produce an empty backup.
+        The reservation is deliberately non-empty, so neither "is it a
+        regular file" nor "is it larger than zero" tells a real backup
+        from an untouched placeholder — and ``cp`` can exit 0 having
+        written nothing. The marker is the question: if it is still the
+        first thing in the file, nothing was copied over it.
+
+        Sizes are deliberately not compared against the source: a running
+        guest writes to its overlay while this runs.
 
         Args:
-            src: the overlay that was copied.
-            dst: the backup it was copied to.
+            dst: the backup path to inspect.
 
         Returns:
-            bool: False for anything that is not a populated regular file,
-            including a path that cannot be stat'ed.
+            bool: False for anything that is not a regular file holding
+            something other than the marker, a path that cannot be read
+            included.
         """
         try:
             if not stat.S_ISREG(os.lstat(dst).st_mode):
                 return False
-            return os.lstat(src).st_size == 0 or os.lstat(dst).st_size > 0
+            with open(dst, 'rb') as fobj:
+                head = fobj.read(len(cls._RESERVATION_MARKER))
         except OSError:
             return False
+        return head != cls._RESERVATION_MARKER
 
     @staticmethod
     def _is_regular_file(path: str) -> bool:
@@ -1219,9 +1230,7 @@ class SnapshotManager:
         reserved: list[str] = []
         for _src, dst in pairs:
             try:
-                fd = os.open(
-                    dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
-                    0o600)
+                self._reserve_one_path(dst)
             except OSError as exc:
                 # only this call's own reservations, and only the ones it
                 # got as far as making
@@ -1230,8 +1239,41 @@ class SnapshotManager:
                     f"could not reserve the backup path {dst} "
                     f"({exc.strerror}); refusing to revert rather than copy "
                     f"to a path something else may already own") from exc
-            os.close(fd)
             reserved.append(dst)
+
+    def _reserve_one_path(self, dst: str) -> None:
+        """
+        Make *dst* appear, atomically, as a non-empty file nobody else owns.
+
+        Two properties are needed at once, and ``O_EXCL`` alone gives only
+        the first. The file has to appear in one step, so that two racers
+        cannot both believe they created it; and it has to be **non-empty**
+        the instant it appears, because libvirt adopts a zero-length file
+        at an overlay path as the overlay it was about to create, and
+        refuses only one that already has content. An ``O_EXCL`` create
+        followed by a write is empty for the moment in between, which is
+        exactly the state that invites the adoption.
+
+        So the marker is written to a private temporary file first, and
+        ``link()`` puts it at *dst* in a single step that fails if anything
+        is already there.
+
+        Args:
+            dst: the backup path to reserve.
+
+        Raises:
+            OSError: the path is taken, or could not be created.
+        """
+        tmp = f"{dst}.{os.getpid()}.{binascii.hexlify(os.urandom(6)).decode()}"
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, self._RESERVATION_MARKER)
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, dst)
+        finally:
+            os.unlink(tmp)
 
     def _reap_preserve_files(self, backups: list[str]) -> None:
         """

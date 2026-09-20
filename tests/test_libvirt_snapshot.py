@@ -857,6 +857,34 @@ class TestBackupPathsAreReserved:
         shell.assert_not_called()
         assert backup.read_bytes() == b"somebody else's overlay"
 
+    def test_the_reservation_is_a_non_empty_file(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """Measured against libvirt 10.0.0: an external snapshot whose
+        overlay path already holds an *empty* file silently adopts that
+        file as the overlay, and only a non-empty one is refused with
+        "already exists and is not a block device". An empty reservation
+        would therefore hand libvirt the very placeholder it is meant to
+        defend, and the copy would then overwrite a live overlay."""
+        backup = tmp_path / "o.qcow2.preserve"
+        sm._reserve_backup_paths([(str(tmp_path / "o.qcow2"), str(backup))])
+
+        assert backup.stat().st_size > 0
+        # and the temporary it was built through is not left lying about
+        assert [entry.name for entry in tmp_path.iterdir()] == [backup.name]
+
+    def test_reserving_a_taken_path_fails_without_disturbing_it(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"not ours")
+
+        with pytest.raises(SnapshotError, match="could not reserve"):
+            sm._reserve_backup_paths([(str(tmp_path / "o.qcow2"), str(backup))])
+
+        assert backup.read_bytes() == b"not ours"
+        assert [entry.name for entry in tmp_path.iterdir()] == [backup.name]
+
     def test_a_partial_reservation_removes_only_the_files_it_made(
         self, sm: SnapshotManager, tmp_path: Path
     ):
