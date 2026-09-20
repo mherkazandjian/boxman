@@ -114,7 +114,20 @@ class ConfigMixin:
         rendered_filename = f"{os.path.splitext(config_filename)[0]}.rendered.yml"
         rendered_path = os.path.join(config_dir, rendered_filename)
         try:
-            with open(rendered_path, 'w') as fobj:
+            # 0600 from the moment it exists: every env() is resolved in here,
+            # and the shipped boxes render `admin_pass: {{ env(...) }}` into
+            # it. O_CREAT's mode only applies to a file being created, so an
+            # already-existing one -- written 0644 by an older boxman -- is
+            # tightened explicitly rather than left as it was found.
+            fd = os.open(rendered_path,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as fobj:
+                # before the first byte, not after the last: O_CREAT's mode
+                # applies only to a file being created, so an existing 0644
+                # one -- written by an older boxman -- would otherwise hold
+                # freshly rendered credentials at 0644 for the length of the
+                # write, and keep them there entirely if the write failed
+                os.fchmod(fobj.fileno(), 0o600)
                 fobj.write(rendered_yaml)
         except OSError as exc:
             self.logger.warning(
@@ -399,7 +412,12 @@ class ConfigMixin:
         for host, alias in host_aliases:
             lines = [f'        {host}:', f'          boxman_alias: "{alias}"']
             for var, value in (host_extra_vars.get(host) or {}).items():
-                lines.append(f'          {var}: "{value}"')
+                # a bool unquoted: ansible coerces "False" for a typed option,
+                # but `ansible_host_key_checking` is read with `is False` once
+                # coerced, and an untyped consumer would see a truthy string
+                rendered = ('true' if value is True else 'false'
+                            if value is False else f'"{value}"')
+                lines.append(f'          {var}: {rendered}')
             host_blocks.append('\n'.join(lines))
         host_lines = '\n'.join(host_blocks)
         children_lines: list[str] = []

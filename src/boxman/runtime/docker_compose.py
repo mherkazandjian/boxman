@@ -16,6 +16,7 @@ import shutil
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import yaml as pyyaml
@@ -118,7 +119,8 @@ def _interpolate(value: str, values: dict[str, str]) -> str:
     return _COMPOSE_VAR.sub(_one, value)
 
 
-def docker_exec_wrap(command: str, container: str) -> str:
+def docker_exec_wrap(command: str, container: str,
+                     pass_env: Sequence[str] | None = None) -> str:
     """
     Wrap *command* in a ``docker exec --user root <container> bash -c '…'``
     invocation, escaping single quotes for the shell round-trip.
@@ -126,9 +128,15 @@ def docker_exec_wrap(command: str, container: str) -> str:
     This is the single shared implementation of the docker-exec wrapping —
     used by both :meth:`DockerComposeRuntime.wrap_command` and
     ``LibVirtCommandBase._wrap_for_runtime`` so the two paths cannot drift.
+
+    *pass_env* names variables to forward from this process's environment
+    into the container. ``-e NAME`` without a value is docker's own spelling
+    for "take it from my environment", which keeps the value off both argv
+    lists — this one's and the container's.
     """
     escaped = command.replace("'", "'\\''")
-    return f"docker exec --user root {container} bash -c '{escaped}'"
+    forwarded = "".join(f"-e {name} " for name in (pass_env or ()))
+    return f"docker exec --user root {forwarded}{container} bash -c '{escaped}'"
 
 
 class DockerComposeRuntime(RuntimeBase):
@@ -259,9 +267,10 @@ class DockerComposeRuntime(RuntimeBase):
     def name(self) -> str:
         return "docker-compose"
 
-    def wrap_command(self, command: str) -> str:
+    def wrap_command(self, command: str,
+                     pass_env: Sequence[str] | None = None) -> str:
         """Wrap *command* in a ``docker exec`` invocation."""
-        return docker_exec_wrap(command, self.container_name)
+        return docker_exec_wrap(command, self.container_name, pass_env)
 
     def inject_into_provider_config(
         self, provider_config: dict[str, Any]

@@ -1953,6 +1953,9 @@ class TestPhase6CliParity:
         assert web["ansible_connection"] == "community.docker.docker"
         assert web["ansible_host"] == "demo_services-web-1"
         assert "services" in inv["all"]["children"]
+        # the VM hosts carry ssh host-key options; a container is not reached
+        # over ssh at all, so handing it ssh arguments would be noise
+        assert "ansible_ssh_common_args" not in web
 
 
 # --------------------------------------------------------------------------

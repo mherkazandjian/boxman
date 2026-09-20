@@ -95,7 +95,23 @@ class WorkspaceMixin:
                     }))
             else:
                 for vm_name in (cluster.get('vms') or {}):
-                    all_hosts.append((cname, vm_name, f'{cname}_{vm_name}', {}))
+                    # per host, not `[defaults] host_key_checking = False`:
+                    # that setting makes Ansible pass StrictHostKeyChecking=no
+                    # on the command line for *every* target, which overrides
+                    # whatever ssh_config says, so an unrelated inventory run
+                    # with this ansible.cfg lost verification too (#164 CL-S1).
+                    # A boxman VM still needs the relaxation -- its host key
+                    # changes under a reused IP.
+                    #
+                    # The host-key-specific variable, not ansible_ssh_common_args:
+                    # that one owns *all* common ssh arguments and inventory vars
+                    # outrank the command line, so setting it here would discard
+                    # a user's own --ssh-common-args (a ProxyJump, say). This one
+                    # only makes the ssh plugin add -o StrictHostKeyChecking=no,
+                    # which is exactly what the blanket setting used to do.
+                    all_hosts.append((cname, vm_name, f'{cname}_{vm_name}', {
+                        'ansible_host_key_checking': False,
+                    }))
 
         pad_width = len(str(len(all_hosts) - 1)) if len(all_hosts) > 1 else 1
         alias_of = {
@@ -107,7 +123,12 @@ class WorkspaceMixin:
         # (the `boxman ssh` default target); a dc-only project leaves it empty
         # since containers are reached with `boxman exec`, not ssh.
         if all_hosts and env_sh_key not in ws_files:
-            first_vm = next((hk for (_c, _n, hk, ev) in all_hosts if not ev), '')
+            # a libvirt VM is one Ansible reaches over ssh -- an empty extra-vars
+            # dict used to be the tell, until VM rows started carrying their own
+            # host-key options, so the connection plugin is asked instead
+            first_vm = next(
+                (hk for (_c, _n, hk, ev) in all_hosts
+                 if not ev.get('ansible_connection')), '')
             inv_val = custom_inventory if custom_inventory else 'inventory'
             cfg_val = custom_ansible_config if custom_ansible_config else 'ansible.cfg'
             ws_files[env_sh_key] = (
@@ -193,7 +214,6 @@ class WorkspaceMixin:
         if ansible_cfg_key not in ws_files:
             ws_files[ansible_cfg_key] = (
                 "[defaults]\n"
-                "host_key_checking = False\n"
                 "poll_interval = 5\n"
                 "callbacks_enabled = timer\n"
                 "forks = 10\n"
