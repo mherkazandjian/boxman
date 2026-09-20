@@ -4,12 +4,10 @@ Snapshot module for libvirt provider.
 This module provides functionality to manage VM snapshots using command-line tools.
 """
 
-import fcntl
 import os
 import shlex
 import stat
 import time
-from contextlib import contextmanager
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -555,7 +553,8 @@ class SnapshotManager:
             return {}
 
         graph: dict[str, dict] = {}
-        for name in (n.strip() for n in list_result.stdout.splitlines()):
+        # exact names, newline-delimited: see _strict_overlay_inventory
+        for name in list_result.stdout.split('\n'):
             if not name:
                 continue
             xml_result = self.virsh.execute(
@@ -753,8 +752,15 @@ class SnapshotManager:
                 f"cannot list the snapshots of {vm_name} "
                 f"({(list_result.stderr or '').strip()}); {refusal}")
 
-        names = [n.strip() for n in list_result.stdout.splitlines()
-                 if n.strip()]
+        # split on newline alone, and keep the names exactly as libvirt
+        # gave them. `splitlines()` also breaks on U+2028 and friends,
+        # which libvirt accepts *inside* a snapshot name, and `.strip()`
+        # erases a name made of spaces -- either way the snapshot drops out
+        # of the inventory before the duplicate and topology checks can
+        # notice, and the revert deletes its overlay regardless. A name
+        # that really does contain a newline still splits, but then neither
+        # half names a snapshot and the dumpxml below refuses.
+        names = [n for n in list_result.stdout.split('\n') if n]
 
         # a repeated name collapses in the dictionaries below, so one
         # snapshot's overlays would silently replace the other's
@@ -856,8 +862,8 @@ class SnapshotManager:
                 f"<{root.tag}>, not a <domainsnapshot>; {refusal}")
 
         name_elem = root.find("name")
-        reported = (name_elem.text.strip()
-                    if name_elem is not None and name_elem.text else None)
+        # exactly, not stripped: ' s1 ' and 's1' are different snapshots
+        reported = name_elem.text if name_elem is not None else None
         if reported != name:
             raise SnapshotError(
                 f"asked libvirt for snapshot '{name}' of {vm_name} and got "
@@ -885,101 +891,30 @@ class SnapshotManager:
                 raise SnapshotError(
                     f"disk '{label}' of snapshot '{name}' on {vm_name} does "
                     f"not say whether it is an external snapshot; {refusal}")
+            # an empty or unknown mode is not a positively identified
+            # internal disk -- treating it as one drops a real overlay
+            if kind not in ('external', 'internal', 'no'):
+                raise SnapshotError(
+                    f"disk '{label}' of snapshot '{name}' on {vm_name} "
+                    f"reports the unrecognised snapshot mode '{kind}'; "
+                    f"{refusal}")
             if kind != "external":
                 continue
             source = disk.find("source")
             path = source.get("file") if source is not None else None
-            if not path:
+            if not path or not path.strip():
                 raise SnapshotError(
                     f"the external disk '{label}' of snapshot '{name}' on "
                     f"{vm_name} names no overlay file; {refusal}")
+            # a relative path resolves against whatever directory boxman
+            # happens to be run from, which is not where the overlay is
+            if not os.path.isabs(path):
+                raise SnapshotError(
+                    f"the external disk '{label}' of snapshot '{name}' on "
+                    f"{vm_name} names the relative overlay path '{path}', "
+                    f"which this cannot resolve to a file; {refusal}")
             files.append(path)
         return files
-
-    def _restore_lock_path(self, vm_name: str) -> str:
-        """
-        Where the restore lock for *vm_name* lives.
-
-        Beside the domain's first data disk: a location every boxman
-        process that could collide derives the same way. A temp directory
-        would not do — it follows each process's own ``TMPDIR``, so two
-        racing restores could take two different locks and both proceed.
-
-        Args:
-            vm_name: the domain about to be reverted.
-
-        Returns:
-            str: the lock file path.
-
-        Raises:
-            SnapshotError: the domain's disks could not be listed, or it
-                has none to anchor the lock to.
-        """
-        result = self.virsh.execute(
-            "domblklist", vm_name, "--details", warn=True)
-        if not result.ok:
-            raise SnapshotError(
-                f"cannot list the disks of {vm_name} "
-                f"({(result.stderr or '').strip()}); refusing to revert, "
-                f"because without them there is no shared place to take the "
-                f"lock that keeps two restores off each other")
-
-        for row in parse_domblklist(result.stdout):
-            if row.device == 'disk' and row.source and row.source != '-':
-                return os.path.join(
-                    os.path.dirname(row.source),
-                    f".boxman-restore.{vm_name}.lock")
-
-        raise SnapshotError(
-            f"{vm_name} has no data disk for a restore lock to sit beside; "
-            f"refusing to revert")
-
-    @contextmanager
-    def _restore_lock(self, vm_name: str):
-        """
-        Hold an exclusive lock for the whole destructive sequence — back
-        up, revert, put back.
-
-        Two restores of one domain could interleave: both confirmed their
-        backup paths were free, then one copied over the other's backup
-        while the loser's cleanup deleted a ``.preserve`` that had become
-        the only copy of an overlay. Checking that a path is free does not
-        reserve it; holding this does. It also covers ``snapshot-revert``
-        itself, which was never safe to run twice at once.
-
-        Non-blocking by design: a second restore is told one is already
-        running rather than queueing behind a revert of unknown length.
-
-        The lock binds boxman processes on this host. It says nothing
-        about another host reaching the same storage over NFS.
-
-        Args:
-            vm_name: the domain to lock.
-
-        Raises:
-            SnapshotError: the lock is held elsewhere, or cannot be taken.
-        """
-        path = self._restore_lock_path(vm_name)
-        fd = None
-        try:
-            try:
-                fd = os.open(
-                    path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o644)
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise SnapshotError(
-                    f"another restore of {vm_name} is already running "
-                    f"(lock: {path}); refusing to run a second one beside "
-                    f"it") from exc
-            except OSError as exc:
-                raise SnapshotError(
-                    f"cannot take the restore lock for {vm_name} at {path} "
-                    f"({exc.strerror}); refusing to revert without it"
-                ) from exc
-            yield
-        finally:
-            if fd is not None:
-                os.close(fd)
 
     def _preserve_snapshot_overlays(self,
                                     vm_name: str,
@@ -1047,6 +982,8 @@ class SnapshotManager:
         if not pairs:
             return []
 
+        self._reserve_backup_paths(pairs)
+
         # batch all copies into one command → one sudo prompt.
         # --reflink=auto shares the extents on a CoW filesystem instead of
         # writing a second full copy beside the original, which is the ENOSPC
@@ -1065,8 +1002,8 @@ class SnapshotManager:
         if result.ok:
             # cp exits 0 in cases that leave no usable backup at the
             # recorded path, so ask the filesystem rather than the exit code
-            unusable = [dst for _src, dst in pairs
-                        if not self._is_regular_file(dst)]
+            unusable = [dst for src, dst in pairs
+                        if not self._backup_is_populated(src, dst)]
             if not unusable:
                 for src, _dst in pairs:
                     self.logger.debug(f"preserved snapshot overlay: {src}")
@@ -1075,7 +1012,7 @@ class SnapshotManager:
             self._reap_preserve_files([dst for _, dst in pairs])
             raise SnapshotError(
                 f"the overlay backup of {vm_name} reported success, but "
-                f"{', '.join(unusable)} is not a regular file afterwards. "
+                f"{', '.join(unusable)} is not a usable copy afterwards. "
                 f"Refusing to revert: a backup that cannot be read back is "
                 f"not a backup.")
 
@@ -1093,6 +1030,33 @@ class SnapshotManager:
             f"Refusing to revert — snapshot-revert deletes those overlays, "
             f"so without the backup every snapshot from '{snapshot_name}' "
             f"onwards would be gone.")
+
+    @staticmethod
+    def _backup_is_populated(src: str, dst: str) -> bool:
+        """
+        Whether *dst* holds a copy of *src* rather than an empty
+        reservation.
+
+        ``cp`` can exit 0 having written nothing into the file reserved
+        for it, and an empty backup puts back an empty overlay. Sizes are
+        deliberately not compared for equality: a running guest writes to
+        its overlay while this runs, so only the cheap, non-flaky question
+        is asked — did a non-empty overlay produce an empty backup.
+
+        Args:
+            src: the overlay that was copied.
+            dst: the backup it was copied to.
+
+        Returns:
+            bool: False for anything that is not a populated regular file,
+            including a path that cannot be stat'ed.
+        """
+        try:
+            if not stat.S_ISREG(os.lstat(dst).st_mode):
+                return False
+            return os.lstat(src).st_size == 0 or os.lstat(dst).st_size > 0
+        except OSError:
+            return False
 
     @staticmethod
     def _is_regular_file(path: str) -> bool:
@@ -1223,6 +1187,52 @@ class SnapshotManager:
                 f"most likely left over from an interrupted restore — check "
                 f"it, then remove it.")
 
+    def _reserve_backup_paths(self, pairs: list[tuple]) -> None:
+        """
+        Create each backup path exclusively, so it is this call's file.
+
+        Checking that a path is free and then writing to it is not the same
+        as owning it. Between the two, another restore of the same domain
+        can take it, and so can a ``snapshot take``: a snapshot named
+        ``<other>.preserve`` makes libvirt create exactly the path this
+        backup wants. Either way the copy writes through somebody else's
+        file and the cleanup afterwards deletes it.
+
+        ``O_EXCL`` closes that. The file is created empty and the ``cp``
+        below fills it; whoever loses the race is told the path is taken
+        and refuses. It also means every path handed to
+        :meth:`_reap_preserve_files` was made here, which is what makes
+        reaping safe.
+
+        Creating a file needs write permission on the parent directory --
+        the same permission the cleanup ``rm`` already needs, and which it
+        already assumes (see
+        :meth:`VirshCommand._should_use_sudo_for_command`).
+
+        Args:
+            pairs: the ``(original, backup)`` pairs about to be copied.
+
+        Raises:
+            SnapshotError: a path could not be reserved. Reservations
+                already made in this call are removed first.
+        """
+        reserved: list[str] = []
+        for _src, dst in pairs:
+            try:
+                fd = os.open(
+                    dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                    0o600)
+            except OSError as exc:
+                # only this call's own reservations, and only the ones it
+                # got as far as making
+                self._reap_preserve_files(reserved)
+                raise SnapshotError(
+                    f"could not reserve the backup path {dst} "
+                    f"({exc.strerror}); refusing to revert rather than copy "
+                    f"to a path something else may already own") from exc
+            os.close(fd)
+            reserved.append(dst)
+
     def _reap_preserve_files(self, backups: list[str]) -> None:
         """
         Remove ``.preserve`` copies that this call created and no longer
@@ -1280,7 +1290,12 @@ class SnapshotManager:
             # That matters here of all places — the overlay is gone and its
             # backup is the only copy left, so a recovery that has to find
             # room for a second copy is one that fails when it is needed.
-            moves = [f"mv -f {shlex.quote(b)} {shlex.quote(o)}"
+            # -T: treat the destination as a plain name. Without it, a
+            # directory sitting at the original path swallows the backup --
+            # `mv` exits 0, the overlay is still missing, and the recovery
+            # instructions then point at a file that has been moved inside
+            # that directory.
+            moves = [f"mv -fT {shlex.quote(b)} {shlex.quote(o)}"
                      for o, b in to_restore]
             cmd = " && ".join(self.virsh.sudo_prefix(m) + m for m in moves)
             result = self.virsh.execute_shell(cmd, warn=True)
@@ -1371,13 +1386,11 @@ class SnapshotManager:
         target onwards, and the old code could not tell a failed backup
         apart from "there was nothing to back up" (#164 CL-D1).
 
-        The whole sequence is serialised per domain. Two restores of one VM
-        could each confirm their backup paths were free and then write over
-        one another, with the loser's cleanup deleting what had become an
-        overlay's only copy; and ``snapshot-revert`` was never safe to run
-        twice at once regardless. A second restore is refused outright
-        rather than queued. The lock binds boxman processes on this host,
-        and says nothing about another host reaching the same storage.
+        Each backup path is *reserved* rather than merely checked, so a
+        second restore -- or a ``snapshot take`` that happens to name its
+        overlay the same thing -- cannot land on a path this call is about
+        to write, and the cleanup only ever removes files this call
+        created.
 
         Compressed memory: if the snapshot's ``.raw`` memory file is missing
         but a ``.raw.zst`` sibling exists (created by ``snapshot take
@@ -1398,36 +1411,11 @@ class SnapshotManager:
             bool: True if successful, False otherwise
 
         Raises:
-            SnapshotError: the overlay backup could not be made, another
-                restore of this domain holds the lock, or the lock could
-                not be taken — in every case no revert was attempted.
+            SnapshotError: the overlay backup could not be made or
+                reserved, so no revert was attempted.
             SnapshotRecoveryError: the revert ran, but an overlay it deleted
                 could not be put back. Never retry this one — the retry
                 would revert a second time.
-        """
-        with self._restore_lock(vm_name):
-            return self._snapshot_restore_locked(vm_name, snapshot_name)
-
-    def _snapshot_restore_locked(self,
-                                 vm_name: str,
-                                 snapshot_name: str) -> bool:
-        """
-        The body of :meth:`snapshot_restore`, run while its lock is held.
-
-        Split out so the lock covers the whole sequence — back up, revert,
-        put back — rather than any one step of it.
-
-        Args:
-            vm_name: the domain to revert.
-            snapshot_name: the snapshot to revert to.
-
-        Returns:
-            bool: True if the revert succeeded.
-
-        Raises:
-            SnapshotError: the overlay backup could not be made.
-            SnapshotRecoveryError: the revert ran and an overlay it deleted
-                could not be put back.
         """
         preserved = self._preserve_snapshot_overlays(vm_name, snapshot_name)
 

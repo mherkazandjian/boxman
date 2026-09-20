@@ -11,9 +11,9 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
-import contextlib
 import os
 import shlex
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -57,17 +57,6 @@ SNAP_XML_NO_OVERLAY = """\
 """
 
 
-def _unlocked(sm: SnapshotManager):
-    """Neutralise the per-domain restore lock.
-
-    For tests that are not about the lock: taking it for real needs a
-    domblklist answer and a writable disk directory, which most of these
-    doubles do not provide. See TestRestoreLock for the lock itself.
-    """
-    return patch.object(sm, "_restore_lock",
-                        side_effect=lambda _vm: contextlib.nullcontext())
-
-
 def _inventory(sm: SnapshotManager, overlays: dict, order: list):
     """Patch the strict inventory with a complete, readable answer.
 
@@ -99,6 +88,24 @@ def _shell_that_copies(calls: list | None = None,
     return run
 
 
+def _shell_that_runs(calls: list | None = None):
+    """An ``execute_shell`` double that actually runs the command.
+
+    Real cp/mv/rm against tmp_path files. The production code decides by
+    looking at the filesystem rather than at exit codes, so a double that
+    only records command strings can neither confirm nor refute what it
+    concludes. Paths are shlex-quoted by the code under test and every one
+    of them is under tmp_path.
+    """
+    def run(cmd, *_a, **_kw):
+        if calls is not None:
+            calls.append(cmd)
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return _result(ok=proc.returncode == 0, stderr=proc.stderr,
+                       return_code=proc.returncode)
+    return run
+
+
 def _snap_xml(name: str, overlay: str, parent: str | None = None) -> str:
     parent_xml = f"<parent><name>{parent}</name></parent>" if parent else ""
     return (f"<domainsnapshot><name>{name}</name>{parent_xml}"
@@ -108,23 +115,14 @@ def _snap_xml(name: str, overlay: str, parent: str | None = None) -> str:
 
 def _virsh_snapshots(names, xml_for, list_ok: bool = True, seen=None,
                      disk=None):
-    """A ``virsh.execute`` double answering domblklist / snapshot-list /
-    snapshot-dumpxml.
+    """A ``virsh.execute`` double answering snapshot-list / snapshot-dumpxml.
 
     ``xml_for(name)`` returns the XML text, or None to fail that dumpxml.
-    ``disk`` is the domain's data disk; give one to let the real restore
-    lock be taken beside it, or leave it None to make domblklist fail.
+    ``disk`` is accepted and ignored — kept so callers read uniformly.
     """
     def execute(*args, **_kw):
         if seen is not None:
             seen.append(args[0])
-        if args[0] == "domblklist":
-            if disk is None:
-                return _result(ok=False, stderr="error: no such domain")
-            return _result(stdout=(
-                " Type   Device   Target   Source\n"
-                "------------------------------------\n"
-                f" file   disk     vda      {disk}\n"))
         if args[0] == "snapshot-list":
             if not list_ok:
                 return _result(ok=False, stderr="error: no such domain")
@@ -618,19 +616,29 @@ class TestBackupPathsAreClaimed:
                 sm._preserve_snapshot_overlays("vm01", "s1")
         shell.assert_not_called()
 
-    def test_a_copy_that_exits_zero_without_leaving_a_backup_is_refused(
+    def test_a_copy_that_exits_zero_without_writing_anything_is_refused(
         self, sm: SnapshotManager, tmp_path: Path
     ):
-        """cp exits 0 in cases that leave nothing usable at the recorded
-        path, so the backup is confirmed on the filesystem, not by exit
-        code."""
+        """cp can exit 0 having written nothing into the file reserved for
+        it, and an empty backup puts back an empty overlay. The backup is
+        confirmed on the filesystem, not by exit code."""
         overlay = tmp_path / "o.qcow2"
         overlay.write_bytes(b"x")
 
+        calls: list[str] = []
+
+        def capture(cmd, *_a, **_kw):
+            calls.append(cmd)
+            return _result()
+
         with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
-             patch.object(sm.virsh, "execute_shell", return_value=_result()):
-            with pytest.raises(SnapshotError, match="not a regular file"):
+             patch.object(sm.virsh, "execute_shell", side_effect=capture):
+            with pytest.raises(SnapshotError, match="not a usable copy"):
                 sm._preserve_snapshot_overlays("vm01", "s1")
+
+        # the empty reservation is reaped, not left to block the next run
+        assert any(c.startswith("rm -f") and "o.qcow2.preserve" in c
+                   for c in calls)
 
 
 class TestRestorePreservedOverlays:
@@ -647,7 +655,7 @@ class TestRestorePreservedOverlays:
         with patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
             sm._restore_preserved_overlays([(str(overlay), str(backup))])
         cmd = shell.call_args.args[0]
-        assert cmd.startswith("mv -f ")
+        assert cmd.startswith("mv -fT ")
         assert "rsync" not in cmd
         assert str(backup) in cmd
 
@@ -702,6 +710,10 @@ class TestSnapshotMetadataIsComplete:
         ("no-source", "names no overlay file"),
         ("empty-source", "names no overlay file"),
         ("unclassified-disk", "does not say whether"),
+        ("empty-mode", "unrecognised snapshot mode"),
+        ("unknown-mode", "unrecognised snapshot mode"),
+        ("whitespace-source", "names no overlay file"),
+        ("relative-source", "relative overlay path"),
         ("wrong-root", "not a <domainsnapshot>"),
         ("name-mismatch", "got metadata naming"),
         ("duplicate-name", "more than once"),
@@ -726,6 +738,20 @@ class TestSnapshotMetadataIsComplete:
             "unclassified-disk":
                 f"<disks><disk name='vda'>"
                 f"<source file='{overlays['s2']}'/></disk></disks>",
+            # an empty or unknown mode is not a positively identified
+            # internal disk, and must not be read as one
+            "empty-mode":
+                f"<disks><disk name='vda' snapshot=''>"
+                f"<source file='{overlays['s2']}'/></disk></disks>",
+            "unknown-mode":
+                f"<disks><disk name='vda' snapshot='externl'>"
+                f"<source file='{overlays['s2']}'/></disk></disks>",
+            "whitespace-source":
+                "<disks><disk name='vda' snapshot='external'>"
+                "<source file='   '/></disk></disks>",
+            "relative-source":
+                "<disks><disk name='vda' snapshot='external'>"
+                "<source file='disk.s2'/></disk></disks>",
         }
 
         def xml_for(name):
@@ -764,63 +790,136 @@ class TestSnapshotMetadataIsComplete:
             assert os.path.isfile(target)
 
 
-class TestRestoreLock:
-    """#193 round-2 finding 2.
+class TestSnapshotNamesSurviveTheParse:
+    """#193 round-3 finding 1.
 
-    Checking that a backup path is free does not reserve it. Two restores
-    of one domain could both pass that check and then write over each
-    other, with the loser's cleanup deleting what had become an overlay's
-    only copy — and ``snapshot-revert`` was never safe to run twice at once
-    regardless.
+    libvirt accepts a snapshot named three spaces, and one containing
+    U+2028. ``splitlines()`` breaks on the second and ``.strip()`` erases
+    the first — and a snapshot that never reaches the inventory is one
+    whose overlay nothing backs up, while the revert deletes it anyway.
     """
 
-    def _virsh(self, tmp_path: Path, seen=None, disk=True):
-        return _virsh_snapshots(
-            [], lambda _n: None, seen=seen,
-            disk=str(tmp_path / "disk.qcow2") if disk else None)
+    @pytest.mark.parametrize("leaf", ["   ", "a\u2028b"],
+                             ids=["three-spaces", "u2028"])
+    def test_an_oddly_named_leaf_is_enumerated_and_backed_up(
+        self, sm: SnapshotManager, tmp_path: Path, leaf
+    ):
+        overlays = {"s1": str(tmp_path / "s1.qcow2"),
+                    leaf: str(tmp_path / "leaf.qcow2")}
+        for target in overlays.values():
+            Path(target).write_bytes(b"x")
+        parents = {leaf: "s1"}
 
-    def test_a_second_restore_is_refused_while_one_is_running(
+        def xml_for(name):
+            return _snap_xml(name, overlays[name], parents.get(name))
+
+        with patch.object(sm.virsh, "execute", side_effect=_virsh_snapshots(
+                ["s1", leaf], xml_for)):
+            found, order = sm._strict_overlay_inventory("vm01")
+
+            assert order == ["s1", leaf]
+            assert found[leaf] == [overlays[leaf]]
+
+            # and reverting to s1 actually backs the leaf's overlay up
+            with patch.object(sm.virsh, "execute_shell",
+                              side_effect=_shell_that_runs()):
+                preserved = sm._preserve_snapshot_overlays("vm01", "s1")
+
+        assert sorted(o for o, _b in preserved) == sorted(overlays.values())
+
+
+class TestBackupPathsAreReserved:
+    """#193 round-3 findings 2 and 3.
+
+    Checking that a path is free is not the same as owning it. Another
+    restore, or a ``snapshot take`` whose overlay is named the same thing,
+    can take it in between — and then the copy writes through somebody
+    else's file and the cleanup deletes it.
+    """
+
+    def test_a_path_taken_after_the_check_is_refused_not_written_through(
         self, sm: SnapshotManager, tmp_path: Path
     ):
-        seen: list[str] = []
-        with patch.object(sm.virsh, "execute",
-                          side_effect=self._virsh(tmp_path, seen)):
-            with sm._restore_lock("vm01"):
-                with pytest.raises(SnapshotError, match="already running"):
-                    sm.snapshot_restore("vm01", "s1")
+        """Patching out the check models the race exactly: the path was
+        free when it was looked at, and taken by the time it was used —
+        which is what libvirt creating `<other>.preserve` does."""
+        overlay = tmp_path / "o.qcow2"
+        overlay.write_bytes(b"overlay")
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"somebody else's overlay")
 
-        assert "snapshot-revert" not in seen
+        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+             patch.object(sm, "_claim_backup_paths"), \
+             patch.object(sm.virsh, "execute_shell") as shell:
+            with pytest.raises(SnapshotError, match="could not reserve"):
+                sm._preserve_snapshot_overlays("vm01", "s1")
 
-    def test_the_lock_is_released_when_the_restore_finishes(
+        shell.assert_not_called()
+        assert backup.read_bytes() == b"somebody else's overlay"
+
+    def test_a_partial_reservation_removes_only_the_files_it_made(
         self, sm: SnapshotManager, tmp_path: Path
     ):
-        with patch.object(sm.virsh, "execute",
-                          side_effect=self._virsh(tmp_path)):
-            with sm._restore_lock("vm01"):
-                pass
-            # straight afterwards it has to be available again
-            with sm._restore_lock("vm01"):
-                pass
+        first = tmp_path / "a.qcow2"
+        first.write_bytes(b"a")
+        second = tmp_path / "b.qcow2"
+        second.write_bytes(b"b")
+        taken = tmp_path / "b.qcow2.preserve"
+        taken.write_bytes(b"not ours")
 
-    def test_a_domain_whose_disks_cannot_be_listed_is_refused(
+        with _inventory(sm, {"s": [str(first), str(second)]}, ["s"]), \
+             patch.object(sm, "_claim_backup_paths"), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            with pytest.raises(SnapshotError, match="could not reserve"):
+                sm._preserve_snapshot_overlays("vm01", "s")
+
+        # the reservation it did make is gone ...
+        assert not (tmp_path / "a.qcow2.preserve").exists()
+        # ... and the file it did not make is untouched
+        assert taken.read_bytes() == b"not ours"
+
+    def test_a_real_preserve_and_put_back_round_trips_the_bytes(
         self, sm: SnapshotManager, tmp_path: Path
     ):
-        with patch.object(sm.virsh, "execute",
-                          side_effect=self._virsh(tmp_path, disk=False)):
-            with pytest.raises(SnapshotError, match="cannot list the disks"):
-                with sm._restore_lock("vm01"):
-                    pass
+        """End to end with real cp, mv and rm — the commands as built,
+        against real files."""
+        overlay = tmp_path / "o.qcow2"
+        overlay.write_bytes(b"important")
 
-    def test_the_lock_sits_beside_the_domain_disk_not_in_a_temp_dir(
+        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            preserved = sm._preserve_snapshot_overlays("vm01", "s1")
+            backup = Path(preserved[0][1])
+            assert backup.read_bytes() == b"important"
+
+            overlay.unlink()                     # the revert deletes it
+            unrecovered = sm._restore_preserved_overlays(preserved)
+
+        assert unrecovered == []
+        assert overlay.read_bytes() == b"important"
+        assert not backup.exists()
+
+    def test_a_real_move_into_a_directory_leaves_the_backup_where_it_says(
         self, sm: SnapshotManager, tmp_path: Path
     ):
-        """Two racing restores have to derive the same path. A temp
-        directory follows each process's own TMPDIR, so it would hand them
-        two different locks and let both through."""
-        with patch.object(sm.virsh, "execute",
-                          side_effect=self._virsh(tmp_path)):
-            path = sm._restore_lock_path("vm01")
-        assert Path(path).parent == tmp_path
+        """`mv -f` puts the backup *inside* the directory and exits 0, so
+        the terminal error would name a path that no longer held anything.
+        `-T` refuses, and the recovery instructions stay true."""
+        overlay = tmp_path / "o.qcow2"
+        overlay.mkdir()                          # a directory, not the disk
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"the only copy")
+
+        with patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            unrecovered = sm._restore_preserved_overlays(
+                [(str(overlay), str(backup))])
+
+        assert unrecovered == [(str(overlay), str(backup))]
+        assert backup.read_bytes() == b"the only copy"
+        assert not (overlay / "o.qcow2.preserve").exists()
 
 
 class TestPendingRecoveryBlocksTheNextRestore:
@@ -946,8 +1045,7 @@ class TestBackupIsAPrecondition:
         was at risk" and "the copy failed", and the revert ran on either."""
         overlay = tmp_path / "s1.qcow2"
         overlay.write_bytes(b"x")
-        with _unlocked(sm), \
-             _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute_shell",
                           return_value=_result(ok=False, stderr="disk full")), \
@@ -1041,7 +1139,7 @@ class TestBackupIsAPrecondition:
             sm._restore_preserved_overlays([(str(overlay), str(backup))])
 
         cmd = shell.call_args.args[0]
-        assert cmd.startswith("mv -f ")
+        assert cmd.startswith("mv -fT ")
         assert "cp " not in cmd and "rsync" not in cmd
 
     def test_the_put_back_keeps_the_privilege_the_copy_had(self, tmp_path: Path):
@@ -1052,7 +1150,7 @@ class TestBackupIsAPrecondition:
         with patch.object(sm.virsh, "execute_shell",
                           return_value=_result()) as shell:
             sm._restore_preserved_overlays([(str(overlay), str(backup))])
-        assert shell.call_args.args[0].startswith("sudo mv -f ")
+        assert shell.call_args.args[0].startswith("sudo mv -fT ")
 
     def test_a_failed_put_back_keeps_the_only_copy_it_has_left(
         self, sm: SnapshotManager, tmp_path: Path
@@ -1088,8 +1186,7 @@ class TestBackupIsAPrecondition:
         backup = tmp_path / "o.qcow2.preserve"
         backup.write_bytes(b"x")
 
-        with _unlocked(sm), \
-             patch.object(sm, "_preserve_snapshot_overlays",
+        with patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=[(str(overlay), str(backup))]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", return_value=_result()), \
@@ -1150,7 +1247,7 @@ class TestBatchedCommandPrivilege:
         with patch.object(sm.virsh, "execute_shell",
                           return_value=_result()) as shell:
             sm._restore_preserved_overlays([(str(overlay), str(backup))])
-        assert shell.call_args.args[0].startswith("mv -f ")
+        assert shell.call_args.args[0].startswith("mv -fT ")
 
 
 class TestSnapshotRestore:
@@ -1160,8 +1257,7 @@ class TestSnapshotRestore:
         self, sm: SnapshotManager
     ):
         preserved_pairs = [("/overlays/a", "/overlays/a.preserve")]
-        with _unlocked(sm), \
-             patch.object(sm, "_preserve_snapshot_overlays",
+        with patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=preserved_pairs) as preserve, \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", return_value=_result()) as execute, \
@@ -1175,8 +1271,7 @@ class TestSnapshotRestore:
         restore.assert_called_once_with(preserved_pairs)
 
     def test_restore_called_even_when_revert_fails(self, sm: SnapshotManager):
-        with _unlocked(sm), \
-             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
                           return_value=_result(ok=False, stderr="boom")), \
@@ -1191,8 +1286,7 @@ class TestSnapshotRestore:
             _result(ok=False, stderr="unable to acquire write lock"),
             _result(ok=True),
         ]
-        with _unlocked(sm), \
-             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=results), \
              patch.object(sm, "_restore_preserved_overlays",
@@ -1201,8 +1295,7 @@ class TestSnapshotRestore:
             assert sm.snapshot_restore("vm01", "snap1") is True
 
     def test_does_not_retry_on_non_lock_error(self, sm: SnapshotManager):
-        with _unlocked(sm), \
-             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
                           return_value=_result(ok=False, stderr="bad name")) as execute, \
@@ -1213,8 +1306,7 @@ class TestSnapshotRestore:
         assert execute.call_count == 1  # no retries on non-lock errors
 
     def test_exception_still_calls_restore(self, sm: SnapshotManager):
-        with _unlocked(sm), \
-             patch.object(sm, "_preserve_snapshot_overlays", return_value=[("a", "b")]), \
+        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[("a", "b")]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=RuntimeError("x")), \
              patch.object(sm, "_restore_preserved_overlays",
@@ -1509,8 +1601,7 @@ class TestSnapshotRestoreCompressed:
         zst = tmp_path / "vm01_snapshot_s.raw.zst"
         zst.write_bytes(b"x")
         raw = str(tmp_path / "vm01_snapshot_s.raw")
-        with _unlocked(sm), \
-             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_restore_preserved_overlays",
                           return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=raw), \
@@ -1526,8 +1617,7 @@ class TestSnapshotRestoreCompressed:
                                                   tmp_path: Path):
         raw_path = tmp_path / "vm01_snapshot_s.raw"
         raw_path.write_bytes(b"x")
-        with _unlocked(sm), \
-             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_restore_preserved_overlays",
                           return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=str(raw_path)), \

@@ -482,14 +482,16 @@ class SnapshotsMixin:
                 self.logger.info(f"{len(failed)} VM(s) failed, retrying in 3s...")
                 time.sleep(3)
 
-        self._exit_if_dc_failed(dc_failed, 'restore')
-
-        # both groups go in one message. Raising on `pending` first would
-        # drop the terminal VMs -- the ones carrying the manual recovery
-        # commands, and the most urgent outstanding work -- from the last
-        # thing the operator sees.
-        if pending or unrecoverable:
+        # every group goes in one message. Raising on the containers, or
+        # on `pending`, before the rest would drop the terminal VMs -- the
+        # ones carrying the manual recovery commands, and the most urgent
+        # outstanding work -- from the last thing the operator reads.
+        if pending or unrecoverable or dc_failed:
             parts = []
+            if dc_failed:
+                parts.append(
+                    "failed for docker-compose cluster(s): "
+                    + ", ".join(dc_failed))
             if pending:
                 parts.append(
                     f"gave up after {max_rounds} rounds. still failing: "

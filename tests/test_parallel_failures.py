@@ -175,6 +175,28 @@ class TestRestoreRetryLoop:
         assert "node01" in message                       # the terminal one
         assert "mv -f" in message                        # and what to run
 
+    def test_a_container_failure_does_not_hide_the_recovery_instructions(
+        self, monkeypatch
+    ):
+        """A failed docker-compose cluster used to raise before either
+        libvirt group was reported, taking the manual recovery commands
+        with it (#193 round 3)."""
+        from boxman.exceptions import SnapshotError, SnapshotRecoveryError
+        monkeypatch.setattr("boxman.manager_parts.snapshots.time.sleep", lambda _s: None)
+        mgr = _manager()
+        mgr.provider.snapshot_restore.side_effect = SnapshotRecoveryError(
+            "could not put back the overlay; finish by hand: "
+            "mv -fT /disks/a.qcow2.preserve /disks/a.qcow2")
+        mgr.provider.validate_snapshot.return_value = (True, [])
+        mgr._restore_dc_plan = lambda _plan: ["compose_cluster"]
+        ns = types.SimpleNamespace(snapshot_name="s1", vms="all", cluster=None)
+        with pytest.raises(SnapshotError) as excinfo:
+            mgr.snapshot_restore(ns)
+
+        message = str(excinfo.value)
+        assert "compose_cluster" in message
+        assert "mv -fT" in message
+
 
 class TestUpdateParallelFailures:
 
