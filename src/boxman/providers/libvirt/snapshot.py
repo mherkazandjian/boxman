@@ -4,13 +4,16 @@ Snapshot module for libvirt provider.
 This module provides functionality to manage VM snapshots using command-line tools.
 """
 
+import binascii
 import os
 import shlex
+import stat
 import time
 from typing import Any
 from xml.etree import ElementTree as ET
 
 from boxman import log
+from boxman.exceptions import SnapshotError, SnapshotRecoveryError
 
 from .commands import VirshCommand
 from .virsh_parse import parse_domblklist
@@ -20,6 +23,12 @@ class SnapshotManager:
     """
     Class to manage snapshots of VMs in libvirt using virsh commands.
     """
+
+    #: bytes: written into a reserved backup path so the file is not empty.
+    #: libvirt refuses to create an external overlay over a file that
+    #: already exists *with content*, and silently adopts an empty one —
+    #: measured, not assumed — so the reservation has to carry something.
+    _RESERVATION_MARKER = b"boxman: reserved for a snapshot overlay backup\n"
 
     def __init__(self, provider_config: dict[str, Any] | None = None):
         """
@@ -551,7 +560,8 @@ class SnapshotManager:
             return {}
 
         graph: dict[str, dict] = {}
-        for name in (n.strip() for n in list_result.stdout.splitlines()):
+        # exact names, newline-delimited: see _strict_overlay_inventory
+        for name in list_result.stdout.split('\n'):
             if not name:
                 continue
             xml_result = self.virsh.execute(
@@ -710,6 +720,228 @@ class SnapshotManager:
                 continue
         return overlays
 
+    def _strict_overlay_inventory(
+            self, vm_name: str) -> tuple[dict[str, list[str]], list[str]]:
+        """
+        Enumerate every snapshot of *vm_name*, its external overlays and the
+        chain order — refusing on any gap rather than skipping it.
+
+        The permissive helpers behind the display verbs skip whatever they
+        cannot read: :meth:`_snapshot_graph` returns ``{}`` when the list
+        command fails and records ``xml=None`` for a dumpxml that failed,
+        and :meth:`_get_snapshot_overlay_files` and :meth:`_chain_order`
+        then ``continue`` past those entries and past XML that will not
+        parse. That is the right shape for drawing a table and the wrong one
+        for deciding what a revert is about to delete: a snapshot missing
+        from the inventory is a snapshot whose overlay nothing backs up, and
+        ``snapshot-revert`` deletes it all the same.
+
+        Args:
+            vm_name: the domain to enumerate.
+
+        Returns:
+            tuple: ``({snapshot: [overlay, ...]}, [snapshot, ...])`` — the
+            external overlays of every snapshot that has any, and every
+            snapshot name in chain order, oldest first.
+
+        Raises:
+            SnapshotError: the snapshot list failed, a dumpxml failed, an
+                XML did not parse, or the parent links do not reach every
+                snapshot.
+        """
+        refusal = ("refusing to revert: a snapshot this backup cannot "
+                   "account for is one whose overlay it cannot preserve")
+
+        list_result = self.virsh.execute(
+            "snapshot-list", vm_name, "--name", warn=True)
+        if not list_result.ok:
+            raise SnapshotError(
+                f"cannot list the snapshots of {vm_name} "
+                f"({(list_result.stderr or '').strip()}); {refusal}")
+
+        # split on newline alone, and keep the names exactly as libvirt
+        # gave them. `splitlines()` also breaks on U+2028 and friends,
+        # which libvirt accepts *inside* a snapshot name, and `.strip()`
+        # erases a name made of spaces -- either way the snapshot drops out
+        # of the inventory before the duplicate and topology checks can
+        # notice, and the revert deletes its overlay regardless.
+        names = list_result.stdout.split('\n')
+        # Exactly the terminators virsh adds, and no more: one from the
+        # newline after the last name, and one from the blank line vsh
+        # prints after a command. Popping *every* trailing empty instead
+        # erases the evidence the check below needs -- a list whose only
+        # snapshot is named LF is all empty fragments, and would come back
+        # as a domain with no snapshots at all.
+        if names and names[-1] == '':
+            names.pop()
+        if names and names[-1] == '':
+            names.pop()
+
+        # A name containing a newline splits into fragments that name no
+        # snapshot, and the dumpxml below refuses on those. A name made
+        # *only* of newlines leaves no fragment at all to refuse on -- it
+        # shows up here as a blank entry, indistinguishable from a blank
+        # line, so this is as far as the output format can be trusted.
+        if any(n == '' for n in names):
+            raise SnapshotError(
+                f"the snapshot list of {vm_name} has a blank entry, which "
+                f"cannot be told apart from a name made only of newlines; "
+                f"{refusal}")
+
+        # a repeated name collapses in the dictionaries below, so one
+        # snapshot's overlays would silently replace the other's
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        if duplicates:
+            raise SnapshotError(
+                f"{vm_name} lists the snapshot name(s) "
+                f"{', '.join(duplicates)} more than once; {refusal}")
+
+        overlays: dict[str, list[str]] = {}
+        parents: dict[str, str | None] = {}
+        for name in names:
+            xml_result = self.virsh.execute(
+                "snapshot-dumpxml", vm_name, name, warn=True)
+            if not xml_result.ok:
+                raise SnapshotError(
+                    f"cannot read the metadata of snapshot '{name}' on "
+                    f"{vm_name} ({(xml_result.stderr or '').strip()}); "
+                    f"{refusal}")
+            try:
+                root = ET.fromstring(xml_result.stdout)
+            except ET.ParseError as exc:
+                raise SnapshotError(
+                    f"the metadata of snapshot '{name}' on {vm_name} does "
+                    f"not parse ({exc}); {refusal}") from exc
+
+            files = self._overlays_from_snapshot_xml(
+                root, name, vm_name, refusal)
+            if files:
+                overlays[name] = files
+
+            parent_elem = root.find("parent/name")
+            parents[name] = (parent_elem.text
+                             if parent_elem is not None and parent_elem.text
+                             else None)
+
+        # the same walk as _chain_order, but its result has to account for
+        # every snapshot: one whose parent is missing is never reached from
+        # the root and drops out of the ordering without saying so, which
+        # then puts it outside the at-risk set the revert will delete from
+        children: dict[str | None, list[str]] = {}
+        for name, parent in parents.items():
+            children.setdefault(parent, []).append(name)
+
+        order: list[str] = []
+        queue: list[str | None] = [None]
+        while queue:
+            for child in children.get(queue.pop(0), []):
+                order.append(child)
+                queue.append(child)
+
+        unplaced = sorted(set(names) - set(order))
+        if unplaced:
+            raise SnapshotError(
+                f"the snapshot chain of {vm_name} does not place "
+                f"{', '.join(unplaced)} (a parent is missing from it); "
+                f"{refusal}")
+
+        return overlays, order
+
+    @staticmethod
+    def _overlays_from_snapshot_xml(root,
+                                    name: str,
+                                    vm_name: str,
+                                    refusal: str) -> list[str]:
+        """
+        The external overlay files a snapshot's metadata declares — or a
+        refusal, when the metadata cannot be read as a complete answer.
+
+        Well-formed XML is not the same as usable metadata. A document with
+        no ``<disks>``, an external disk with no ``<source>``, a disk that
+        does not say whether it is external: each of those yields an empty
+        or short file list that looks exactly like "this snapshot owns no
+        overlays", and the revert then deletes overlays nothing backed up.
+        So every disk has to classify itself, and every external one has to
+        name its file.
+
+        An empty ``<disks>`` is refused too. libvirt enumerates the
+        domain's disks there, so an empty list is truncated metadata rather
+        than a domain without disks — and a domain without disks has no
+        overlay to lose by refusing.
+
+        Args:
+            root: the parsed ``<domainsnapshot>`` element.
+            name: the snapshot name that was asked for.
+            vm_name: the domain, for the message.
+            refusal: the shared tail explaining why a gap refuses.
+
+        Returns:
+            list: the external overlay paths, possibly empty for a snapshot
+            whose disks are all internal.
+
+        Raises:
+            SnapshotError: the metadata does not answer the question.
+        """
+        if root.tag != 'domainsnapshot':
+            raise SnapshotError(
+                f"the metadata of snapshot '{name}' on {vm_name} is a "
+                f"<{root.tag}>, not a <domainsnapshot>; {refusal}")
+
+        name_elem = root.find("name")
+        # exactly, not stripped: ' s1 ' and 's1' are different snapshots
+        reported = name_elem.text if name_elem is not None else None
+        if reported != name:
+            raise SnapshotError(
+                f"asked libvirt for snapshot '{name}' of {vm_name} and got "
+                f"metadata naming '{reported}'; {refusal}")
+
+        disks = root.find("disks")
+        if disks is None:
+            raise SnapshotError(
+                f"the metadata of snapshot '{name}' on {vm_name} has no "
+                f"<disks> element, so there is no telling which disks it "
+                f"owns overlays for; {refusal}")
+
+        entries = disks.findall("disk")
+        if not entries:
+            raise SnapshotError(
+                f"the metadata of snapshot '{name}' on {vm_name} lists no "
+                f"disks at all, which is truncated metadata rather than a "
+                f"domain without disks; {refusal}")
+
+        files = []
+        for disk in entries:
+            label = disk.get("name") or "?"
+            kind = disk.get("snapshot")
+            if kind is None:
+                raise SnapshotError(
+                    f"disk '{label}' of snapshot '{name}' on {vm_name} does "
+                    f"not say whether it is an external snapshot; {refusal}")
+            # an empty or unknown mode is not a positively identified
+            # internal disk -- treating it as one drops a real overlay
+            if kind not in ('external', 'internal', 'no'):
+                raise SnapshotError(
+                    f"disk '{label}' of snapshot '{name}' on {vm_name} "
+                    f"reports the unrecognised snapshot mode '{kind}'; "
+                    f"{refusal}")
+            if kind != "external":
+                continue
+            source = disk.find("source")
+            path = source.get("file") if source is not None else None
+            if not path or not path.strip():
+                raise SnapshotError(
+                    f"the external disk '{label}' of snapshot '{name}' on "
+                    f"{vm_name} names no overlay file; {refusal}")
+            # a relative path resolves against whatever directory boxman
+            # happens to be run from, which is not where the overlay is
+            if not os.path.isabs(path):
+                raise SnapshotError(
+                    f"the external disk '{label}' of snapshot '{name}' on "
+                    f"{vm_name} names the relative overlay path '{path}', "
+                    f"which this cannot resolve to a file; {refusal}")
+            files.append(path)
+        return files
+
     def _preserve_snapshot_overlays(self,
                                     vm_name: str,
                                     snapshot_name: str) -> list[tuple]:
@@ -726,17 +958,31 @@ class SnapshotManager:
         chain on every restore (e.g. restoring the latest snapshot copies
         one overlay per disk instead of one per disk per snapshot).
 
-        If the target is not found in the chain order (orphaned/missing
-        metadata), fall back to preserving every overlay -- safe but slow.
+        The inventory it works from is the strict one, so "the target is
+        not in the chain" now means the target is not a snapshot of this
+        domain at all, rather than that its metadata could not be read.
+        Preserving everything remains the answer for that case -- safe,
+        slow, and about to fail at the revert anyway.
 
-        Returns a list of (original_path, backup_path) tuples.
+        Args:
+            vm_name: the domain whose overlays are at risk.
+            snapshot_name: the snapshot about to be reverted to.
+
+        Returns:
+            list: ``(original_path, backup_path)`` pairs. Empty means there
+            was nothing at risk, and nothing else — the caller reverts on
+            that answer, so a failed backup must not be able to produce it.
+
+        Raises:
+            SnapshotError: the backup could not be made, or could not be
+                shown to be complete. Either way the revert is refused
+                rather than run on a partial backup (#164 CL-D1).
         """
-        all_overlays = self._get_snapshot_overlay_files(vm_name)
+        all_overlays, order = self._strict_overlay_inventory(vm_name)
 
         # only overlays that revert can delete: the target and any newer
         # snapshots in the (oldest-first) chain.  Older snapshots are
         # backing files the target relies on and are left untouched.
-        order = self._chain_order(vm_name)
         if snapshot_name in order:
             at_risk = set(order[order.index(snapshot_name):])
         else:
@@ -748,58 +994,542 @@ class SnapshotManager:
             if snap in at_risk:
                 files_to_preserve.update(files)
 
-        pairs = [(f, f + '.preserve') for f in sorted(files_to_preserve)
-                 if os.path.isfile(f)]
+        # claim across *every* at-risk overlay before dropping the ones
+        # whose original is missing. A .preserve whose original is gone is
+        # the one that matters most -- it is what an interrupted restore
+        # leaves behind, and filtering first meant the next restore never
+        # looked at it, reverted again, and reported success.
+        candidates = sorted(files_to_preserve)
+        # The scratch each copy lands on before being renamed over its
+        # reservation is a real file in the overlay directory, so it is
+        # claimed and reserved exactly like the backup itself. A generated
+        # name would only be *probably* nobody's -- and cleanup removes
+        # these, so "probably" is not the standard. Deterministic, too:
+        # one left behind is detectable, and refuses the next restore
+        # rather than being silently reused.
+        self._claim_backup_paths(
+            [(f, f + '.preserve') for f in candidates]
+            + [(f, f + '.preserve.copy') for f in candidates],
+            all_overlays)
+
+        pairs = [(f, f + '.preserve') for f in candidates
+                 if self._overlay_is_present(f)]
         if not pairs:
             return []
 
-        # batch all copies into one command → one sudo prompt
-        sudo = "sudo " if self.use_sudo else ""
-        cmd = " && ".join(
-            f"{sudo}rsync -aW --sparse '{src}' '{dst}'"
-            for src, dst in pairs)
-        result = self.virsh.execute_shell(cmd, warn=True)
+        # the copy does not go straight to the reserved path. `cp` truncates
+        # its destination before filling it, and a zero-length file at an
+        # overlay path is one libvirt will adopt as the overlay it was about
+        # to create -- the very thing the reservation exists to prevent. So
+        # each copy lands on a scratch name and is renamed over the
+        # reservation, which is atomic within a directory: the reserved path
+        # is the marker one instant and the finished backup the next.
+        scratch = {dst: f"{dst}.copy" for _src, dst in pairs}
+        to_reserve = list(pairs) + [(src, scratch[dst]) for src, dst in pairs]
+        signatures = self._reserve_backup_paths(to_reserve)
+        owned = [path for _src, path in to_reserve]
+
+        # batch it all into one command → one sudo prompt.
+        # --reflink=auto shares the extents on a CoW filesystem instead of
+        # writing a second full copy beside the original, which is the ENOSPC
+        # this backup used to die of (#164 CL-R2). Elsewhere it falls back to
+        # the sparse copy `rsync -aW --sparse` was already making.
+        #
+        # Every command carries its own prefix: execute_shell prefixes the
+        # first word of the string it is handed, which in a chain reaches
+        # the first command only.
+        try:
+            steps = []
+            for src, dst in pairs:
+                steps.append(f"cp --reflink=auto --sparse=always -p "
+                             f"{shlex.quote(src)} {shlex.quote(scratch[dst])}")
+                steps.append(f"mv -fT {shlex.quote(scratch[dst])} "
+                             f"{shlex.quote(dst)}")
+            cmd = " && ".join(self.virsh.sudo_prefix(c) + c for c in steps)
+            result = self.virsh.execute_shell(cmd, warn=True)
+        except Exception as exc:
+            # execute_shell converts a command that *ran* and failed into a
+            # result, but a runner that cannot start the command at all
+            # still raises. Every path this call created is its own, and no
+            # revert has happened yet, so none of them is anybody's last
+            # copy of anything.
+            self._reap_preserve_files(owned)
+            raise SnapshotError(
+                f"could not run the overlay backup for {vm_name} "
+                f"({type(exc).__name__}: {exc}); refusing to revert without "
+                f"it") from exc
+
         if result.ok:
-            for src, _ in pairs:
-                self.logger.debug(f"preserved snapshot overlay: {src}")
-            return pairs
+            # cp and mv exit 0 in cases that leave no usable backup at the
+            # recorded path, so ask the filesystem rather than the exit code
+            unusable = [dst for _src, dst in pairs
+                        if not self._backup_was_written(dst, signatures[dst])]
+            if not unusable:
+                for src, _dst in pairs:
+                    self.logger.debug(f"preserved snapshot overlay: {src}")
+                return pairs
 
-        self.logger.warning(
-            f"failed to preserve overlays for {vm_name}: {result.stderr}")
-        return []
+            self._reap_preserve_files(owned)
+            raise SnapshotError(
+                f"the overlay backup of {vm_name} reported success, but "
+                f"{', '.join(unusable)} is not a usable copy afterwards. "
+                f"Refusing to revert: a backup that cannot be read back is "
+                f"not a backup.")
 
-    def _restore_preserved_overlays(self, preserved: list[tuple]) -> None:
+        # The steps are one && chain, so a failure part-way through leaves
+        # the earlier backups -- and one half-written one -- behind with
+        # nothing to reap them (#164 CL-D2). Every one of these paths was
+        # created by this call, which is what makes removing them safe.
+        self._reap_preserve_files(owned)
+
+        raise SnapshotError(
+            f"could not back up the snapshot overlays of {vm_name} before "
+            f"reverting to '{snapshot_name}': "
+            f"{(result.stderr or '').strip() or 'the copy failed'}. "
+            f"Refusing to revert — snapshot-revert deletes those overlays, "
+            f"so without the backup every snapshot from '{snapshot_name}' "
+            f"onwards would be gone.")
+
+    @staticmethod
+    def _backup_was_written(dst: str, reserved: tuple) -> bool:
         """
-        Restore overlay files that were deleted during revert and clean
-        up backup files that are no longer needed.
+        Whether the copy actually replaced this call's reservation.
+
+        The reservation is deliberately non-empty, so neither "is it a
+        regular file" nor "is it larger than zero" tells a real backup from
+        an untouched placeholder — and ``cp`` can exit 0 having written
+        nothing.
+
+        The question is asked of the inode rather than of the contents.
+        Reading the file would need permission the copy does not: a
+        ``sudo cp -p`` of a root-owned ``0600`` overlay hands back a
+        root-owned ``0600`` backup, and an unprivileged read of it fails —
+        which would condemn a perfectly good backup. ``lstat`` needs only
+        the directory, which this code already requires for the reservation
+        and the cleanup.
+
+        Args:
+            dst: the backup path to inspect.
+            reserved: the ``(inode, size, mtime_ns)`` the reservation had.
+
+        Returns:
+            bool: True when the file at *dst* is a regular file that is no
+            longer the reservation. A path that cannot be stat'ed counts as
+            not written.
+        """
+        try:
+            now = os.lstat(dst)
+        except OSError:
+            return False
+        if not stat.S_ISREG(now.st_mode):
+            return False
+        return (now.st_ino, now.st_size, now.st_mtime_ns) != reserved
+
+    @staticmethod
+    def _is_regular_file(path: str) -> bool:
+        """
+        Whether *path* is a regular file, with "cannot tell" counting as no.
+
+        Used to check a backup that has just been written, where the
+        cautious answer is that an unverifiable file is not a backup.
+
+        Args:
+            path: the path to classify.
+
+        Returns:
+            bool: True only for a regular file that could be stat'ed.
+        """
+        try:
+            return stat.S_ISREG(os.lstat(path).st_mode)
+        except OSError:
+            return False
+
+    def _overlay_is_present(self, path: str) -> bool:
+        """
+        Whether *path* is an overlay this can back up — or a refusal to
+        guess.
+
+        ``os.path.isfile`` folds three different answers into two. It says
+        False both for "it is not there" and for "I cannot tell" (an
+        unreadable parent directory, say): taking the second as the first
+        drops that overlay from the backup set, and the revert then deletes
+        a file nothing copied, which is CL-D1 one level down. And it says
+        True for a symlink to a regular file, which ``cp`` would follow --
+        copying the referent under the link's name, so that the put-back
+        afterwards replaces the link with a plain file.
+
+        ``lstat``, then, and only a regular file will do: a missing path is
+        genuinely absent, and anything else is refused rather than guessed.
+
+        Args:
+            path: an overlay file named by a snapshot's XML.
+
+        Returns:
+            True for a regular file; False when it genuinely is not there.
+
+        Raises:
+            SnapshotError: the path could not be classified, or is not a
+                regular file.
+        """
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise SnapshotError(
+                f"cannot tell whether the snapshot overlay {path} is there "
+                f"({exc.strerror}); refusing to revert, because an overlay "
+                f"left out of the backup is one the revert can delete for "
+                f"good") from exc
+
+        if stat.S_ISREG(mode):
+            return True
+        raise SnapshotError(
+            f"the snapshot overlay {path} is not a regular file; refusing "
+            f"to revert rather than copy something whose backup would not "
+            f"be the same kind of thing")
+
+    def _claim_backup_paths(self,
+                            pairs: list[tuple],
+                            all_overlays: dict[str, list[str]]) -> None:
+        """
+        Establish that every backup path is this call's to write, and
+        therefore its to reap.
+
+        ``.preserve`` is not a reserved namespace. Snapshot names are
+        free-form, so a snapshot may perfectly well be called
+        ``<other>.preserve``, and libvirt then names its overlay exactly
+        what this backup wants for its scratch copy: the copy overwrites a
+        live overlay, and the cleanup afterwards deletes it outright. The
+        same goes for anything else already sitting at that path — ``cp``
+        writes *through* an existing symlink or hard link, so the bytes land
+        in whatever it points at, and it drops the copy *inside* a directory
+        of that name while still exiting 0.
+
+        So nothing is guessed. A backup path must name the overlay of no
+        snapshot, and must not exist at all. What survives both checks is a
+        path this call creates, which is the only kind the failure path is
+        allowed to remove.
+
+        Between the check and the copy is a window, but not a shared one:
+        these paths are derived from overlay names and written by this
+        function alone.
+
+        Args:
+            pairs: the ``(original, backup)`` pairs about to be copied.
+            all_overlays: every snapshot's overlays, from the strict
+                inventory — complete by construction, which is what makes
+                the first check worth anything.
+
+        Raises:
+            SnapshotError: a backup path names a live overlay, already
+                exists, or cannot be classified.
+        """
+        declared = {f for files in all_overlays.values() for f in files}
+        collisions = sorted({dst for _src, dst in pairs} & declared)
+        if collisions:
+            raise SnapshotError(
+                f"the backup path(s) {', '.join(collisions)} are overlays of "
+                f"a snapshot of this domain — a snapshot named "
+                f"'<something>.preserve' collides with how backups are "
+                f"named here. Refusing to revert: writing there would "
+                f"overwrite a live overlay. Rename or delete that snapshot.")
+
+        for _src, dst in pairs:
+            try:
+                os.lstat(dst)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise SnapshotError(
+                    f"cannot tell what is at the backup path {dst} "
+                    f"({exc.strerror}); refusing to revert rather than write "
+                    f"over something unexamined") from exc
+
+            raise SnapshotError(
+                f"the backup path {dst} already exists. Refusing to revert: "
+                f"a copy there would be written through a symlink or a hard "
+                f"link, or land inside a directory, and the cleanup would "
+                f"then delete something this restore did not create. It is "
+                f"most likely left over from an interrupted restore — check "
+                f"it, then remove it.")
+
+    def _reserve_backup_paths(self, pairs: list[tuple]) -> dict[str, tuple]:
+        """
+        Create each backup path exclusively, so it is this call's file.
+
+        Checking that a path is free and then writing to it is not the same
+        as owning it. Between the two, another restore of the same domain
+        can take it, and so can a ``snapshot take``: a snapshot named
+        ``<other>.preserve`` makes libvirt create exactly the path this
+        backup wants. Either way the copy writes through somebody else's
+        file and the cleanup afterwards deletes it.
+
+        ``O_EXCL`` closes that. The file is created empty and the ``cp``
+        below fills it; whoever loses the race is told the path is taken
+        and refuses. It also means every path handed to
+        :meth:`_reap_preserve_files` was made here, which is what makes
+        reaping safe.
+
+        Creating a file needs write permission on the parent directory --
+        the same permission the cleanup ``rm`` already needs, and which it
+        already assumes (see
+        :meth:`VirshCommand._should_use_sudo_for_command`).
+
+        Args:
+            pairs: the ``(original, backup)`` pairs about to be copied.
+
+        Returns:
+            dict: ``{backup_path: signature}`` — what each reservation
+            looked like on disk, for :meth:`_backup_was_written` to
+            compare against afterwards.
+
+        Raises:
+            SnapshotError: a path could not be reserved. Reservations
+                already made in this call are removed first.
+        """
+        signatures: dict[str, tuple] = {}
+        for _src, dst in pairs:
+            try:
+                signatures[dst] = self._reserve_one_path(dst)
+            except OSError as exc:
+                # only this call's own reservations, and only the ones it
+                # got as far as making
+                self._reap_preserve_files(list(signatures))
+                raise SnapshotError(
+                    f"could not reserve the backup path {dst} "
+                    f"({exc.strerror}); refusing to revert rather than copy "
+                    f"to a path something else may already own") from exc
+        return signatures
+
+    def _reserve_one_path(self, dst: str) -> tuple:
+        """
+        Make *dst* appear, atomically, as a non-empty file nobody else owns.
+
+        Two properties are needed at once, and ``O_EXCL`` alone gives only
+        the first. The file has to appear in one step, so that two racers
+        cannot both believe they created it; and it has to be **non-empty**
+        the instant it appears, because libvirt adopts a zero-length file
+        at an overlay path as the overlay it was about to create, and
+        refuses only one that already has content. An ``O_EXCL`` create
+        followed by a write is empty for the moment in between, which is
+        exactly the state that invites the adoption.
+
+        So the marker is written to a private temporary file first, and
+        ``link()`` puts it at *dst* in a single step that fails if anything
+        is already there.
+
+        Args:
+            dst: the backup path to reserve.
+
+        Returns:
+            tuple: the reservation's ``(inode, size, mtime_ns)``, which is
+            what :meth:`_backup_was_written` later compares against.
+
+        Raises:
+            OSError: the path is taken, or could not be created.
+        """
+        tmp = f"{dst}.{os.getpid()}.{binascii.hexlify(os.urandom(6)).decode()}"
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            try:
+                # all of it, or the marker is truncated -- and a truncated
+                # marker is one _backup_was_written would not recognise,
+                # so an untouched reservation would pass for a backup
+                marker = self._RESERVATION_MARKER
+                written = 0
+                while written < len(marker):
+                    written += os.write(fd, marker[written:])
+            finally:
+                os.close(fd)
+            # stat the scaffold, not the published name: link() shares
+            # this inode, so the signature is the same either way, and
+            # taking it here keeps the path un-published until the caller
+            # is holding everything it needs to clean up
+            info = os.stat(tmp)
+            os.link(tmp, dst)
+        finally:
+            # scaffolding: gone whether the link landed, failed, or was
+            # never reached. Only the caller's own reservations are tracked
+            # for cleanup, and this name was never one of them.
+            try:
+                os.unlink(tmp)
+            except OSError as exc:
+                self.logger.warning(
+                    f"could not remove the reservation scaffold {tmp} "
+                    f"({exc.strerror}); remove it by hand")
+
+        return (info.st_ino, info.st_size, info.st_mtime_ns)
+
+    def _reap_preserve_files(self, backups: list[str]) -> None:
+        """
+        Remove ``.preserve`` copies that this call created and no longer
+        wants.
+
+        One ``rm -f`` taking every path rather than an ``&&`` chain: cleanup
+        must not stop at the first path that resists, and a path already
+        gone is not an error. The privilege is whatever the sudo policy
+        gives ``rm``, which by default is none — unlinking needs write
+        permission on the parent directory, not root (see
+        :meth:`VirshCommand._should_use_sudo_for_command`).
+
+        Best-effort: a failure names the paths, so that whatever is left
+        behind can be removed by hand.
+
+        Args:
+            backups: backup paths to unlink; an empty list is a no-op.
+        """
+        if not backups:
+            return
+        cmd = "rm -f " + " ".join(shlex.quote(b) for b in backups)
+        try:
+            result = self.virsh.execute_shell(cmd, warn=True)
+        except Exception as exc:
+            # this is the function that promises to name what it left
+            # behind, so it must not be the one that dies quietly
+            self.logger.warning(
+                f"could not run the overlay backup cleanup "
+                f"({type(exc).__name__}: {exc}); remove these by hand: "
+                f"{', '.join(backups)}")
+            return
+        if not result.ok:
+            self.logger.warning(
+                f"could not remove the overlay backups "
+                f"({(result.stderr or '').strip()}); remove them by hand: "
+                f"{', '.join(backups)}")
+
+    def _restore_preserved_overlays(
+            self, preserved: list[tuple]) -> list[tuple]:
+        """
+        Put back the overlay files the revert deleted, and reap the backups
+        that turned out not to be needed.
+
+        Args:
+            preserved: ``(original_path, backup_path)`` pairs as returned by
+                :meth:`_preserve_snapshot_overlays`.
+
+        Returns:
+            list: the pairs still waiting to be put back, empty when every
+            overlay is where it belongs. A non-empty list means the
+            snapshots that need them are unreachable until someone moves
+            them into place.
         """
         if not preserved:
-            return
-
-        sudo = "sudo " if self.use_sudo else ""
+            return []
 
         to_restore = [(o, b) for o, b in preserved
-                      if not os.path.isfile(o) and os.path.isfile(b)]
-        to_cleanup = [b for o, b in preserved
-                      if os.path.isfile(o) and os.path.isfile(b)]
+                      if not self._is_regular_file(o)
+                      and self._is_regular_file(b)]
 
         if to_restore:
-            cmd = " && ".join(
-                f"{sudo}rsync -aW --sparse --remove-source-files '{b}' '{o}'"
-                for o, b in to_restore)
-            result = self.virsh.execute_shell(cmd, warn=True)
-            if result.ok:
-                for o, _ in to_restore:
+            # a rename, not a copy: the backup sits beside the original, so
+            # this is the same directory by construction and moves no data.
+            # That matters here of all places — the overlay is gone and its
+            # backup is the only copy left, so a recovery that has to find
+            # room for a second copy is one that fails when it is needed.
+            # -T: treat the destination as a plain name. Without it, a
+            # directory sitting at the original path swallows the backup --
+            # `mv` exits 0, the overlay is still missing, and the recovery
+            # instructions then point at a file that has been moved inside
+            # that directory.
+            moves = [f"mv -fT {shlex.quote(b)} {shlex.quote(o)}"
+                     for o, b in to_restore]
+            cmd = " && ".join(self.virsh.sudo_prefix(m) + m for m in moves)
+            # a runner that cannot start the command raises rather than
+            # returning a failed result, and escaping here would skip the
+            # postcondition below -- so the caller would never learn that
+            # an overlay is still sitting in its backup
+            try:
+                result = self.virsh.execute_shell(cmd, warn=True)
+            except Exception as exc:
+                self.logger.warning(
+                    f"could not run the put-back "
+                    f"({type(exc).__name__}: {exc})")
+                result = None
+            if result is not None and result.ok:
+                for o, _b in to_restore:
                     self.logger.info(
                         f"restored overlay deleted by revert: {o}")
-            else:
+            elif result is not None:
                 self.logger.warning(
-                    f"failed to restore overlays: {result.stderr}")
+                    f"a move failed while putting the overlays back "
+                    f"({(result.stderr or '').strip()})")
 
-        if to_cleanup:
-            cmd = " && ".join(
-                f"rm -f '{b}'" for b in to_cleanup)
-            self.virsh.execute_shell(cmd, warn=True)
+        # The exit code is not the question. `mv -f` into a *directory* at
+        # the original path succeeds and leaves the backup sitting inside
+        # it; a pair whose original and backup have both gone never entered
+        # to_restore at all. Only where each overlay actually ended up says
+        # whether this worked, so every pair is judged on that -- and a
+        # retry then has just the stragglers to move.
+        unrecovered: list[tuple] = []
+        redundant: list[str] = []
+        for original, backup in preserved:
+            if self._is_regular_file(original):
+                # the overlay is where it belongs; its backup, if one is
+                # still lying about, is a spare copy and safe to drop
+                if self._is_regular_file(backup):
+                    redundant.append(backup)
+            else:
+                unrecovered.append((original, backup))
+
+        if unrecovered:
+            # deliberately no reap for these: their .preserve file may be
+            # the only copy of that overlay left in existence, and removing
+            # it is the loss this function exists to prevent
+            self.logger.error(
+                f"the overlays below are not back in place after the "
+                f"revert, and the snapshots that need them stay unreachable "
+                f"until they are moved there by hand: "
+                f"{', '.join(f'{b} -> {o}' for o, b in unrecovered)}")
+
+        self._reap_preserve_files(redundant)
+        return unrecovered
+
+    def _finish_restore(self,
+                        preserved: list[tuple],
+                        mem_path: str | None,
+                        decompressed_for_revert: bool) -> None:
+        """
+        Close out a revert: put the overlays back, re-compress the memory
+        file, and refuse to call the result a success if an overlay is
+        still sitting in its backup.
+
+        Args:
+            preserved: pairs from :meth:`_preserve_snapshot_overlays`.
+            mem_path: the snapshot's memory file, if it has one.
+            decompressed_for_revert: whether this call decompressed it.
+
+        Raises:
+            SnapshotRecoveryError: an overlay the revert deleted could not
+                be put back. Terminal by design — the revert has already
+                run, so retrying the restore would run it a second time.
+        """
+        unrecovered = self._restore_preserved_overlays(preserved)
+
+        # re-compressing the memory image is housekeeping. It runs after
+        # the overlays have been judged, and inside its own guard, so that
+        # it cannot throw away the one thing the caller has to be told.
+        try:
+            self._recompress_after_revert(mem_path, decompressed_for_revert)
+        except Exception as exc:
+            self.logger.warning(
+                f"could not re-compress the memory image of {mem_path} "
+                f"({type(exc).__name__}: {exc})")
+
+        if not unrecovered:
+            return
+
+        raise SnapshotRecoveryError(
+            f"reverted, but {len(unrecovered)} overlay(s) the revert deleted "
+            f"could not be put back, and the snapshots that need them are "
+            f"unreachable until they are. Finish by hand: "
+            # -T, like the automatic move: without it, following this
+            # instruction while a directory sits at the original path puts
+            # the last copy inside that directory and reports success
+            + "; ".join(f"mv -fT {shlex.quote(b)} {shlex.quote(o)}"
+                        for o, b in unrecovered)
+            + ". Clear whatever occupies the destination first if that "
+              "move refuses.")
 
     def snapshot_restore(self, vm_name: str, snapshot_name: str) -> bool:
         """
@@ -811,6 +1541,18 @@ class SnapshotManager:
         falls back to backing up every overlay if the target isn't found in
         the chain). After the revert any overlays libvirt deleted are
         restored so that every snapshot remains reachable.
+
+        That backup is a precondition, not a courtesy. If it cannot be made,
+        :meth:`_preserve_snapshot_overlays` raises and no revert is
+        attempted: reverting without it destroys every snapshot from the
+        target onwards, and the old code could not tell a failed backup
+        apart from "there was nothing to back up" (#164 CL-D1).
+
+        Each backup path is *reserved* rather than merely checked, so a
+        second restore -- or a ``snapshot take`` that happens to name its
+        overlay the same thing -- cannot land on a path this call is about
+        to write, and the cleanup only ever removes files this call
+        created.
 
         Compressed memory: if the snapshot's ``.raw`` memory file is missing
         but a ``.raw.zst`` sibling exists (created by ``snapshot take
@@ -829,22 +1571,41 @@ class SnapshotManager:
 
         Returns:
             bool: True if successful, False otherwise
+
+        Raises:
+            SnapshotError: the overlay backup could not be made or
+                reserved, so no revert was attempted.
+            SnapshotRecoveryError: the revert ran, but an overlay it deleted
+                could not be put back. Never retry this one — the retry
+                would revert a second time.
         """
         preserved = self._preserve_snapshot_overlays(vm_name, snapshot_name)
 
-        # Just-in-time decompress if the memory file was zstd'd.
-        mem_path = self._memory_path_from_xml(vm_name, snapshot_name)
-        decompressed_for_revert = False
-        if mem_path and not os.path.isfile(mem_path) and os.path.isfile(f"{mem_path}.zst"):
-            self.logger.info(
-                f"memory file is compressed; decompressing before revert: "
-                f"{mem_path}.zst")
-            if self.decompress_memory_file(mem_path, keep_zst=True):
-                decompressed_for_revert = True
-            else:
-                self.logger.error(
-                    f"could not decompress memory for {vm_name}/{snapshot_name}; "
-                    f"revert will likely fail")
+        # Everything from here to the revert still owns those backups: a
+        # raise in the memory handling would otherwise leave them behind,
+        # and the next restore refuses on them. Nothing has been reverted
+        # yet, so every original is still in place and the backups are
+        # redundant.
+        try:
+            # Just-in-time decompress if the memory file was zstd'd.
+            mem_path = self._memory_path_from_xml(vm_name, snapshot_name)
+            decompressed_for_revert = False
+            if mem_path and not os.path.isfile(mem_path) and os.path.isfile(f"{mem_path}.zst"):
+                self.logger.info(
+                    f"memory file is compressed; decompressing before revert: "
+                    f"{mem_path}.zst")
+                if self.decompress_memory_file(mem_path, keep_zst=True):
+                    decompressed_for_revert = True
+                else:
+                    self.logger.error(
+                        f"could not decompress memory for {vm_name}/{snapshot_name}; "
+                        f"revert will likely fail")
+        except Exception as exc:
+            self._reap_preserve_files([b for _o, b in preserved])
+            raise SnapshotError(
+                f"could not prepare {vm_name} for the revert to "
+                f"'{snapshot_name}' ({type(exc).__name__}: {exc}); refusing "
+                f"to revert") from exc
 
         max_retries = 3
         last_stderr = ''
@@ -873,12 +1634,11 @@ class SnapshotManager:
             except Exception as exc:
                 self.logger.error(
                     f"error reverting vm {vm_name} to snapshot '{snapshot_name}': {exc}")
-                self._restore_preserved_overlays(preserved)
-                self._recompress_after_revert(mem_path, decompressed_for_revert)
+                self._finish_restore(
+                    preserved, mem_path, decompressed_for_revert)
                 return False
 
-        self._restore_preserved_overlays(preserved)
-        self._recompress_after_revert(mem_path, decompressed_for_revert)
+        self._finish_restore(preserved, mem_path, decompressed_for_revert)
 
         if success:
             return True

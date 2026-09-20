@@ -13,6 +13,7 @@ Part of Phase 1.4 of the review plan
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -75,10 +76,11 @@ class TestSnapshotOverlayPreservation057eb7d:
 
         assert call_order == ["preserve", "revert", "restore"]
 
-    def test_preserve_uses_single_batched_rsync_command(self, tmp_path: Path):
+    def test_preserve_uses_a_single_batched_copy_command(self, tmp_path: Path):
         """Regression: a naive per-file loop would fire one sudo prompt
-        per overlay. The fix batches into a single `sudo rsync && sudo rsync ...`
-        chain to keep it to one auth prompt."""
+        per overlay. The fix batches into a single `sudo cp && sudo cp ...`
+        chain to keep it to one auth prompt. The copy tool changed with
+        #164 CL-R2 (rsync -> cp --reflink=auto); the batching did not."""
         sm = SnapshotManager({"use_sudo": True})
 
         a = tmp_path / "a.qcow2"
@@ -89,17 +91,28 @@ class TestSnapshotOverlayPreservation057eb7d:
         c.write_bytes(b"x")
 
         # revert to the oldest snapshot preserves it and both newer ones
+        calls: list[str] = []
+
+        def copying(cmd, *_a, **_kw):
+            # the production code confirms its backups on the filesystem
+            # -- inode, size and mtime against the reservation it made --
+            # so the double has to really run the command
+            calls.append(cmd)
+            proc = subprocess.run(cmd.replace("sudo ", ""), shell=True,
+                                  capture_output=True, text=True)
+            return _result(ok=proc.returncode == 0, stderr=proc.stderr)
+
         with patch.object(
-            sm, "_get_snapshot_overlay_files",
-            return_value={"s1": [str(a)], "s2": [str(b)], "s3": [str(c)]},
-        ), patch.object(sm, "_chain_order", return_value=["s1", "s2", "s3"]), \
-                patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
+            sm, "_strict_overlay_inventory",
+            return_value=({"s1": [str(a)], "s2": [str(b)], "s3": [str(c)]},
+                          ["s1", "s2", "s3"]),
+        ), patch.object(sm.virsh, "execute_shell", side_effect=copying):
             sm._preserve_snapshot_overlays("vm01", "s1")
 
-        assert shell.call_count == 1
-        cmd = shell.call_args.args[0]
-        # one sudo prefix per rsync, chained with &&, not ;
-        assert cmd.count("sudo rsync") == 3
+        assert len(calls) == 1
+        cmd = calls[0]
+        # one sudo prefix per copy, chained with &&, not ;
+        assert cmd.count("sudo cp ") == 3
         assert " && " in cmd
 
 

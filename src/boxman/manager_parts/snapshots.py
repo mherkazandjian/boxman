@@ -5,7 +5,7 @@ import os
 import time
 
 from boxman import log
-from boxman.exceptions import SnapshotError
+from boxman.exceptions import SnapshotError, SnapshotRecoveryError
 
 
 class SnapshotsMixin:
@@ -426,11 +426,31 @@ class SnapshotsMixin:
 
         # ── 3 & 4. Parallel restore with retry until all succeed ─────────────
         def _restore(full_vm_name, snapshot_name):
-            return bool(self.session_for_vm(full_vm_name).snapshot_restore(
-                full_vm_name, snapshot_name))
+            """``(ok, fatal_reason)`` — a reason means do not retry.
+
+            A revert that ran and then could not put the overlays back is
+            not a candidate for another round: the retry would run
+            ``snapshot-revert`` again, which is the destructive half. The
+            worker turns it into a value so the loop can tell it from an
+            ordinary failure without matching on message text.
+            """
+            try:
+                return (bool(self.session_for_vm(full_vm_name).snapshot_restore(
+                    full_vm_name, snapshot_name)), None)
+            except SnapshotRecoveryError as exc:
+                return (False, str(exc))
 
         pending = list(vm_targets)
         max_rounds = 20
+        # kept across rounds so the give-up message below can say *why* each
+        # VM is still failing. A restore that refuses because its overlay
+        # backup could not be made (#164 CL-D1) is retried like any other
+        # failure, and twenty rounds of retries would otherwise bury the one
+        # line that explains it.
+        last_failures: dict[str, str] = {}
+        # VMs whose revert ran but whose overlays could not be put back.
+        # These leave the retry loop immediately — see _restore above.
+        unrecoverable: dict[str, str] = {}
 
         for round_num in range(1, max_rounds + 1):
             self.logger.info(
@@ -441,29 +461,54 @@ class SnapshotsMixin:
             results, failures = self._run_parallel(
                 [(vm, _restore, (vm, snap)) for vm, snap in pending],
                 op_label='snapshot restore')
+            last_failures = failures
 
             failed = []
             for vm, snap in pending:
-                if vm not in failures and results.get(vm):
+                ok, fatal = results.get(vm) or (False, None)
+                if fatal:
+                    self.logger.error(f"unrecoverable: {vm}: {fatal}")
+                    unrecoverable[vm] = fatal
+                elif vm not in failures and ok:
                     self.logger.info(f"restored: {vm} to '{snap}'")
                 else:
                     self.logger.warning(f"failed: {vm} to '{snap}', will retry")
                     failed.append((vm, snap))
 
-            if not failed:
-                self.logger.info("all VMs restored successfully")
-                self._exit_if_dc_failed(dc_failed, 'restore')
-                return
-
             pending = failed
+            if not pending:
+                break
             if round_num < max_rounds:
                 self.logger.info(f"{len(failed)} VM(s) failed, retrying in 3s...")
                 time.sleep(3)
 
-        self._exit_if_dc_failed(dc_failed, 'restore')
-        raise SnapshotError(
-            f"restore gave up after {max_rounds} rounds. "
-            f"still failing: {[vm for vm, _ in pending]}")
+        # every group goes in one message. Raising on the containers, or
+        # on `pending`, before the rest would drop the terminal VMs -- the
+        # ones carrying the manual recovery commands, and the most urgent
+        # outstanding work -- from the last thing the operator reads.
+        if pending or unrecoverable or dc_failed:
+            parts = []
+            if dc_failed:
+                parts.append(
+                    "failed for docker-compose cluster(s): "
+                    + ", ".join(dc_failed))
+            if pending:
+                parts.append(
+                    f"gave up after {max_rounds} rounds. still failing: "
+                    + "; ".join(
+                        # a worker that returned False rather than raising
+                        # leaves no reason here — it logged its own above
+                        f"{vm} ({last_failures.get(vm, 'see the errors above')})"
+                        for vm, _ in pending))
+            if unrecoverable:
+                parts.append(
+                    "reverted these VMs but could not put back the overlays "
+                    "the revert deleted: "
+                    + "; ".join(f"{vm} ({why})"
+                                for vm, why in sorted(unrecoverable.items())))
+            raise SnapshotError("restore " + " Also: ".join(parts))
+
+        self.logger.info("all VMs restored successfully")
 
     def _refuse_managed_save_conflicts(self, vm_targets) -> None:
         """

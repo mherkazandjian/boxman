@@ -102,6 +102,101 @@ class TestRestoreRetryLoop:
         errors = [c.args[0] for c in mgr.logger.error.call_args_list if c.args]
         assert any("libvirt gone" in m for m in errors)
 
+    def test_the_give_up_message_says_why_each_vm_is_still_failing(self, monkeypatch):
+        """A restore that refuses because its overlay backup could not be
+        made (#164 CL-D1) is retried like any other failure. With only the
+        VM names on the final line, twenty rounds of retries bury the one
+        message that says what actually went wrong."""
+        from boxman.exceptions import SnapshotError
+        monkeypatch.setattr("boxman.manager_parts.snapshots.time.sleep", lambda _s: None)
+        mgr = _manager()
+        mgr.provider.snapshot_restore.side_effect = SnapshotError(
+            "could not back up the snapshot overlays of vm01: "
+            "No space left on device")
+        mgr.provider.validate_snapshot.return_value = (True, [])
+        ns = types.SimpleNamespace(snapshot_name="s1", vms="all", cluster=None)
+        with pytest.raises(SnapshotError) as excinfo:
+            mgr.snapshot_restore(ns)
+
+        message = str(excinfo.value)
+        assert "gave up after 20 rounds" in message
+        assert "No space left on device" in message
+
+    def test_a_failed_put_back_is_reported_without_being_retried(self, monkeypatch):
+        """The revert has already run. Another round would run it again --
+        the destructive half -- so a recovery failure leaves the loop at
+        once and is reported on its own terms (#193 review, finding 4)."""
+        from boxman.exceptions import SnapshotError, SnapshotRecoveryError
+        monkeypatch.setattr("boxman.manager_parts.snapshots.time.sleep", lambda _s: None)
+        mgr = _manager()
+        mgr.provider.snapshot_restore.side_effect = SnapshotRecoveryError(
+            "reverted, but 1 overlay(s) the revert deleted could not be put "
+            "back. Finish by hand: mv -f /disks/a.qcow2.preserve /disks/a.qcow2")
+        mgr.provider.validate_snapshot.return_value = (True, [])
+        ns = types.SimpleNamespace(snapshot_name="s1", vms="all", cluster=None)
+        with pytest.raises(SnapshotError) as excinfo:
+            mgr.snapshot_restore(ns)
+
+        message = str(excinfo.value)
+        assert "could not put back" in message
+        assert "mv -f" in message
+        assert "gave up after 20 rounds" not in message
+        # exactly one round: it never went back for another try
+        infos = [c.args[0] for c in mgr.logger.info.call_args_list if c.args]
+        assert sum(1 for m in infos if m.startswith("restore round")) == 1
+
+    def test_a_mixed_batch_reports_the_retries_and_the_recovery_together(
+        self, monkeypatch
+    ):
+        """Raising on the retry group first dropped the terminal VMs from
+        the final message -- the ones carrying the manual recovery
+        commands, and the most urgent outstanding work (#193 round 2)."""
+        from boxman.exceptions import SnapshotError, SnapshotRecoveryError
+        monkeypatch.setattr("boxman.manager_parts.snapshots.time.sleep", lambda _s: None)
+        mgr = _manager()
+        mgr.config["clusters"]["cluster_1"]["vms"] = {"node01": {}, "node02": {}}
+
+        def restore(full_vm_name, _snap):
+            if full_vm_name.endswith("node01"):
+                raise SnapshotRecoveryError(
+                    "could not put back the overlay; finish by hand: "
+                    "mv -f /disks/a.qcow2.preserve /disks/a.qcow2")
+            return False        # node02 just keeps failing, and is retried
+
+        mgr.provider.snapshot_restore.side_effect = restore
+        mgr.provider.validate_snapshot.return_value = (True, [])
+        ns = types.SimpleNamespace(snapshot_name="s1", vms="all", cluster=None)
+        with pytest.raises(SnapshotError) as excinfo:
+            mgr.snapshot_restore(ns)
+
+        message = str(excinfo.value)
+        assert "gave up after 20 rounds" in message      # node02's retries
+        assert "node02" in message
+        assert "node01" in message                       # the terminal one
+        assert "mv -f" in message                        # and what to run
+
+    def test_a_container_failure_does_not_hide_the_recovery_instructions(
+        self, monkeypatch
+    ):
+        """A failed docker-compose cluster used to raise before either
+        libvirt group was reported, taking the manual recovery commands
+        with it (#193 round 3)."""
+        from boxman.exceptions import SnapshotError, SnapshotRecoveryError
+        monkeypatch.setattr("boxman.manager_parts.snapshots.time.sleep", lambda _s: None)
+        mgr = _manager()
+        mgr.provider.snapshot_restore.side_effect = SnapshotRecoveryError(
+            "could not put back the overlay; finish by hand: "
+            "mv -fT /disks/a.qcow2.preserve /disks/a.qcow2")
+        mgr.provider.validate_snapshot.return_value = (True, [])
+        mgr._restore_dc_plan = lambda _plan: ["compose_cluster"]
+        ns = types.SimpleNamespace(snapshot_name="s1", vms="all", cluster=None)
+        with pytest.raises(SnapshotError) as excinfo:
+            mgr.snapshot_restore(ns)
+
+        message = str(excinfo.value)
+        assert "compose_cluster" in message
+        assert "mv -fT" in message
+
 
 class TestUpdateParallelFailures:
 
