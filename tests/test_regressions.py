@@ -13,6 +13,7 @@ Part of Phase 1.4 of the review plan
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -65,7 +66,9 @@ class TestSnapshotOverlayPreservation057eb7d:
         def record_restore(_pairs):
             call_order.append("restore")
 
-        with patch.object(sm, "_preserve_snapshot_overlays",
+        with patch.object(sm, "_restore_lock",
+                          side_effect=lambda _vm: contextlib.nullcontext()), \
+             patch.object(sm, "_preserve_snapshot_overlays",
                           side_effect=record_preserve), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=record_execute), \

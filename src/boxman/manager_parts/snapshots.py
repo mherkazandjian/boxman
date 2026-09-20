@@ -484,21 +484,27 @@ class SnapshotsMixin:
 
         self._exit_if_dc_failed(dc_failed, 'restore')
 
-        if pending:
-            raise SnapshotError(
-                f"restore gave up after {max_rounds} rounds. still failing: "
-                + "; ".join(
-                    # a worker that returned False rather than raising leaves
-                    # no reason here — it logged its own above
-                    f"{vm} ({last_failures.get(vm, 'see the errors above')})"
-                    for vm, _ in pending))
-
-        if unrecoverable:
-            raise SnapshotError(
-                "restore reverted these VMs but could not put back the "
-                "overlays the revert deleted: "
-                + "; ".join(f"{vm} ({why})"
-                            for vm, why in sorted(unrecoverable.items())))
+        # both groups go in one message. Raising on `pending` first would
+        # drop the terminal VMs -- the ones carrying the manual recovery
+        # commands, and the most urgent outstanding work -- from the last
+        # thing the operator sees.
+        if pending or unrecoverable:
+            parts = []
+            if pending:
+                parts.append(
+                    f"gave up after {max_rounds} rounds. still failing: "
+                    + "; ".join(
+                        # a worker that returned False rather than raising
+                        # leaves no reason here — it logged its own above
+                        f"{vm} ({last_failures.get(vm, 'see the errors above')})"
+                        for vm, _ in pending))
+            if unrecoverable:
+                parts.append(
+                    "reverted these VMs but could not put back the overlays "
+                    "the revert deleted: "
+                    + "; ".join(f"{vm} ({why})"
+                                for vm, why in sorted(unrecoverable.items())))
+            raise SnapshotError("restore " + " Also: ".join(parts))
 
         self.logger.info("all VMs restored successfully")
 

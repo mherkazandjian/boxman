@@ -4,10 +4,12 @@ Snapshot module for libvirt provider.
 This module provides functionality to manage VM snapshots using command-line tools.
 """
 
+import fcntl
 import os
 import shlex
 import stat
 import time
+from contextlib import contextmanager
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -754,6 +756,14 @@ class SnapshotManager:
         names = [n.strip() for n in list_result.stdout.splitlines()
                  if n.strip()]
 
+        # a repeated name collapses in the dictionaries below, so one
+        # snapshot's overlays would silently replace the other's
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        if duplicates:
+            raise SnapshotError(
+                f"{vm_name} lists the snapshot name(s) "
+                f"{', '.join(duplicates)} more than once; {refusal}")
+
         overlays: dict[str, list[str]] = {}
         parents: dict[str, str | None] = {}
         for name in names:
@@ -771,13 +781,8 @@ class SnapshotManager:
                     f"the metadata of snapshot '{name}' on {vm_name} does "
                     f"not parse ({exc}); {refusal}") from exc
 
-            files = []
-            for disk in root.findall(".//disks/disk"):
-                if disk.get("snapshot") != "external":
-                    continue
-                source = disk.find("source")
-                if source is not None and source.get("file"):
-                    files.append(source.get("file"))
+            files = self._overlays_from_snapshot_xml(
+                root, name, vm_name, refusal)
             if files:
                 overlays[name] = files
 
@@ -809,6 +814,172 @@ class SnapshotManager:
                 f"{refusal}")
 
         return overlays, order
+
+    @staticmethod
+    def _overlays_from_snapshot_xml(root,
+                                    name: str,
+                                    vm_name: str,
+                                    refusal: str) -> list[str]:
+        """
+        The external overlay files a snapshot's metadata declares — or a
+        refusal, when the metadata cannot be read as a complete answer.
+
+        Well-formed XML is not the same as usable metadata. A document with
+        no ``<disks>``, an external disk with no ``<source>``, a disk that
+        does not say whether it is external: each of those yields an empty
+        or short file list that looks exactly like "this snapshot owns no
+        overlays", and the revert then deletes overlays nothing backed up.
+        So every disk has to classify itself, and every external one has to
+        name its file.
+
+        An empty ``<disks>`` is refused too. libvirt enumerates the
+        domain's disks there, so an empty list is truncated metadata rather
+        than a domain without disks — and a domain without disks has no
+        overlay to lose by refusing.
+
+        Args:
+            root: the parsed ``<domainsnapshot>`` element.
+            name: the snapshot name that was asked for.
+            vm_name: the domain, for the message.
+            refusal: the shared tail explaining why a gap refuses.
+
+        Returns:
+            list: the external overlay paths, possibly empty for a snapshot
+            whose disks are all internal.
+
+        Raises:
+            SnapshotError: the metadata does not answer the question.
+        """
+        if root.tag != 'domainsnapshot':
+            raise SnapshotError(
+                f"the metadata of snapshot '{name}' on {vm_name} is a "
+                f"<{root.tag}>, not a <domainsnapshot>; {refusal}")
+
+        name_elem = root.find("name")
+        reported = (name_elem.text.strip()
+                    if name_elem is not None and name_elem.text else None)
+        if reported != name:
+            raise SnapshotError(
+                f"asked libvirt for snapshot '{name}' of {vm_name} and got "
+                f"metadata naming '{reported}'; {refusal}")
+
+        disks = root.find("disks")
+        if disks is None:
+            raise SnapshotError(
+                f"the metadata of snapshot '{name}' on {vm_name} has no "
+                f"<disks> element, so there is no telling which disks it "
+                f"owns overlays for; {refusal}")
+
+        entries = disks.findall("disk")
+        if not entries:
+            raise SnapshotError(
+                f"the metadata of snapshot '{name}' on {vm_name} lists no "
+                f"disks at all, which is truncated metadata rather than a "
+                f"domain without disks; {refusal}")
+
+        files = []
+        for disk in entries:
+            label = disk.get("name") or "?"
+            kind = disk.get("snapshot")
+            if kind is None:
+                raise SnapshotError(
+                    f"disk '{label}' of snapshot '{name}' on {vm_name} does "
+                    f"not say whether it is an external snapshot; {refusal}")
+            if kind != "external":
+                continue
+            source = disk.find("source")
+            path = source.get("file") if source is not None else None
+            if not path:
+                raise SnapshotError(
+                    f"the external disk '{label}' of snapshot '{name}' on "
+                    f"{vm_name} names no overlay file; {refusal}")
+            files.append(path)
+        return files
+
+    def _restore_lock_path(self, vm_name: str) -> str:
+        """
+        Where the restore lock for *vm_name* lives.
+
+        Beside the domain's first data disk: a location every boxman
+        process that could collide derives the same way. A temp directory
+        would not do — it follows each process's own ``TMPDIR``, so two
+        racing restores could take two different locks and both proceed.
+
+        Args:
+            vm_name: the domain about to be reverted.
+
+        Returns:
+            str: the lock file path.
+
+        Raises:
+            SnapshotError: the domain's disks could not be listed, or it
+                has none to anchor the lock to.
+        """
+        result = self.virsh.execute(
+            "domblklist", vm_name, "--details", warn=True)
+        if not result.ok:
+            raise SnapshotError(
+                f"cannot list the disks of {vm_name} "
+                f"({(result.stderr or '').strip()}); refusing to revert, "
+                f"because without them there is no shared place to take the "
+                f"lock that keeps two restores off each other")
+
+        for row in parse_domblklist(result.stdout):
+            if row.device == 'disk' and row.source and row.source != '-':
+                return os.path.join(
+                    os.path.dirname(row.source),
+                    f".boxman-restore.{vm_name}.lock")
+
+        raise SnapshotError(
+            f"{vm_name} has no data disk for a restore lock to sit beside; "
+            f"refusing to revert")
+
+    @contextmanager
+    def _restore_lock(self, vm_name: str):
+        """
+        Hold an exclusive lock for the whole destructive sequence — back
+        up, revert, put back.
+
+        Two restores of one domain could interleave: both confirmed their
+        backup paths were free, then one copied over the other's backup
+        while the loser's cleanup deleted a ``.preserve`` that had become
+        the only copy of an overlay. Checking that a path is free does not
+        reserve it; holding this does. It also covers ``snapshot-revert``
+        itself, which was never safe to run twice at once.
+
+        Non-blocking by design: a second restore is told one is already
+        running rather than queueing behind a revert of unknown length.
+
+        The lock binds boxman processes on this host. It says nothing
+        about another host reaching the same storage over NFS.
+
+        Args:
+            vm_name: the domain to lock.
+
+        Raises:
+            SnapshotError: the lock is held elsewhere, or cannot be taken.
+        """
+        path = self._restore_lock_path(vm_name)
+        fd = None
+        try:
+            try:
+                fd = os.open(
+                    path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o644)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise SnapshotError(
+                    f"another restore of {vm_name} is already running "
+                    f"(lock: {path}); refusing to run a second one beside "
+                    f"it") from exc
+            except OSError as exc:
+                raise SnapshotError(
+                    f"cannot take the restore lock for {vm_name} at {path} "
+                    f"({exc.strerror}); refusing to revert without it"
+                ) from exc
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def _preserve_snapshot_overlays(self,
                                     vm_name: str,
@@ -862,12 +1033,19 @@ class SnapshotManager:
             if snap in at_risk:
                 files_to_preserve.update(files)
 
-        pairs = [(f, f + '.preserve') for f in sorted(files_to_preserve)
+        # claim across *every* at-risk overlay before dropping the ones
+        # whose original is missing. A .preserve whose original is gone is
+        # the one that matters most -- it is what an interrupted restore
+        # leaves behind, and filtering first meant the next restore never
+        # looked at it, reverted again, and reported success.
+        candidates = sorted(files_to_preserve)
+        self._claim_backup_paths(
+            [(f, f + '.preserve') for f in candidates], all_overlays)
+
+        pairs = [(f, f + '.preserve') for f in candidates
                  if self._overlay_is_present(f)]
         if not pairs:
             return []
-
-        self._claim_backup_paths(pairs, all_overlays)
 
         # batch all copies into one command → one sudo prompt.
         # --reflink=auto shares the extents on a CoW filesystem instead of
@@ -1093,11 +1271,9 @@ class SnapshotManager:
             return []
 
         to_restore = [(o, b) for o, b in preserved
-                      if not os.path.isfile(o) and os.path.isfile(b)]
-        to_cleanup = [b for o, b in preserved
-                      if os.path.isfile(o) and os.path.isfile(b)]
+                      if not self._is_regular_file(o)
+                      and self._is_regular_file(b)]
 
-        unrecovered: list[tuple] = []
         if to_restore:
             # a rename, not a copy: the backup sits beside the original, so
             # this is the same directory by construction and moves no data.
@@ -1113,22 +1289,38 @@ class SnapshotManager:
                     self.logger.info(
                         f"restored overlay deleted by revert: {o}")
             else:
-                # the chain stops at the first move that failed, so ask the
-                # filesystem which ones actually landed instead of assuming
-                # none did -- a retry then has only the rest to do
-                unrecovered = [(o, b) for o, b in to_restore
-                               if not os.path.isfile(o)]
-                # deliberately no reap for these: their .preserve file is
-                # the only copy of that overlay left in existence, and
-                # removing it is the loss this function exists to prevent
-                self.logger.error(
-                    f"failed to put the overlays back after the revert "
-                    f"({(result.stderr or '').strip()}). The snapshots that "
-                    f"need them stay unreachable until these backups are "
-                    f"moved into place by hand: "
-                    f"{', '.join(f'{b} -> {o}' for o, b in unrecovered)}")
+                self.logger.warning(
+                    f"a move failed while putting the overlays back "
+                    f"({(result.stderr or '').strip()})")
 
-        self._reap_preserve_files(to_cleanup)
+        # The exit code is not the question. `mv -f` into a *directory* at
+        # the original path succeeds and leaves the backup sitting inside
+        # it; a pair whose original and backup have both gone never entered
+        # to_restore at all. Only where each overlay actually ended up says
+        # whether this worked, so every pair is judged on that -- and a
+        # retry then has just the stragglers to move.
+        unrecovered: list[tuple] = []
+        redundant: list[str] = []
+        for original, backup in preserved:
+            if self._is_regular_file(original):
+                # the overlay is where it belongs; its backup, if one is
+                # still lying about, is a spare copy and safe to drop
+                if self._is_regular_file(backup):
+                    redundant.append(backup)
+            else:
+                unrecovered.append((original, backup))
+
+        if unrecovered:
+            # deliberately no reap for these: their .preserve file may be
+            # the only copy of that overlay left in existence, and removing
+            # it is the loss this function exists to prevent
+            self.logger.error(
+                f"the overlays below are not back in place after the "
+                f"revert, and the snapshots that need them stay unreachable "
+                f"until they are moved there by hand: "
+                f"{', '.join(f'{b} -> {o}' for o, b in unrecovered)}")
+
+        self._reap_preserve_files(redundant)
         return unrecovered
 
     def _finish_restore(self,
@@ -1179,6 +1371,14 @@ class SnapshotManager:
         target onwards, and the old code could not tell a failed backup
         apart from "there was nothing to back up" (#164 CL-D1).
 
+        The whole sequence is serialised per domain. Two restores of one VM
+        could each confirm their backup paths were free and then write over
+        one another, with the loser's cleanup deleting what had become an
+        overlay's only copy; and ``snapshot-revert`` was never safe to run
+        twice at once regardless. A second restore is refused outright
+        rather than queued. The lock binds boxman processes on this host,
+        and says nothing about another host reaching the same storage.
+
         Compressed memory: if the snapshot's ``.raw`` memory file is missing
         but a ``.raw.zst`` sibling exists (created by ``snapshot take
         --compress-memory`` or ``storage compress-snapshots``), it is
@@ -1198,11 +1398,36 @@ class SnapshotManager:
             bool: True if successful, False otherwise
 
         Raises:
-            SnapshotError: the overlay backup could not be made, so the
-                revert was not attempted.
+            SnapshotError: the overlay backup could not be made, another
+                restore of this domain holds the lock, or the lock could
+                not be taken — in every case no revert was attempted.
             SnapshotRecoveryError: the revert ran, but an overlay it deleted
                 could not be put back. Never retry this one — the retry
                 would revert a second time.
+        """
+        with self._restore_lock(vm_name):
+            return self._snapshot_restore_locked(vm_name, snapshot_name)
+
+    def _snapshot_restore_locked(self,
+                                 vm_name: str,
+                                 snapshot_name: str) -> bool:
+        """
+        The body of :meth:`snapshot_restore`, run while its lock is held.
+
+        Split out so the lock covers the whole sequence — back up, revert,
+        put back — rather than any one step of it.
+
+        Args:
+            vm_name: the domain to revert.
+            snapshot_name: the snapshot to revert to.
+
+        Returns:
+            bool: True if the revert succeeded.
+
+        Raises:
+            SnapshotError: the overlay backup could not be made.
+            SnapshotRecoveryError: the revert ran and an overlay it deleted
+                could not be put back.
         """
         preserved = self._preserve_snapshot_overlays(vm_name, snapshot_name)
 

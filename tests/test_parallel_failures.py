@@ -145,6 +145,36 @@ class TestRestoreRetryLoop:
         infos = [c.args[0] for c in mgr.logger.info.call_args_list if c.args]
         assert sum(1 for m in infos if m.startswith("restore round")) == 1
 
+    def test_a_mixed_batch_reports_the_retries_and_the_recovery_together(
+        self, monkeypatch
+    ):
+        """Raising on the retry group first dropped the terminal VMs from
+        the final message -- the ones carrying the manual recovery
+        commands, and the most urgent outstanding work (#193 round 2)."""
+        from boxman.exceptions import SnapshotError, SnapshotRecoveryError
+        monkeypatch.setattr("boxman.manager_parts.snapshots.time.sleep", lambda _s: None)
+        mgr = _manager()
+        mgr.config["clusters"]["cluster_1"]["vms"] = {"node01": {}, "node02": {}}
+
+        def restore(full_vm_name, _snap):
+            if full_vm_name.endswith("node01"):
+                raise SnapshotRecoveryError(
+                    "could not put back the overlay; finish by hand: "
+                    "mv -f /disks/a.qcow2.preserve /disks/a.qcow2")
+            return False        # node02 just keeps failing, and is retried
+
+        mgr.provider.snapshot_restore.side_effect = restore
+        mgr.provider.validate_snapshot.return_value = (True, [])
+        ns = types.SimpleNamespace(snapshot_name="s1", vms="all", cluster=None)
+        with pytest.raises(SnapshotError) as excinfo:
+            mgr.snapshot_restore(ns)
+
+        message = str(excinfo.value)
+        assert "gave up after 20 rounds" in message      # node02's retries
+        assert "node02" in message
+        assert "node01" in message                       # the terminal one
+        assert "mv -f" in message                        # and what to run
+
 
 class TestUpdateParallelFailures:
 

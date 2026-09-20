@@ -11,6 +11,7 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
 from pathlib import Path
@@ -56,6 +57,17 @@ SNAP_XML_NO_OVERLAY = """\
 """
 
 
+def _unlocked(sm: SnapshotManager):
+    """Neutralise the per-domain restore lock.
+
+    For tests that are not about the lock: taking it for real needs a
+    domblklist answer and a writable disk directory, which most of these
+    doubles do not provide. See TestRestoreLock for the lock itself.
+    """
+    return patch.object(sm, "_restore_lock",
+                        side_effect=lambda _vm: contextlib.nullcontext())
+
+
 def _inventory(sm: SnapshotManager, overlays: dict, order: list):
     """Patch the strict inventory with a complete, readable answer.
 
@@ -94,14 +106,25 @@ def _snap_xml(name: str, overlay: str, parent: str | None = None) -> str:
             f"<source file='{overlay}'/></disk></disks></domainsnapshot>")
 
 
-def _virsh_snapshots(names, xml_for, list_ok: bool = True, seen=None):
-    """A ``virsh.execute`` double answering snapshot-list / -dumpxml.
+def _virsh_snapshots(names, xml_for, list_ok: bool = True, seen=None,
+                     disk=None):
+    """A ``virsh.execute`` double answering domblklist / snapshot-list /
+    snapshot-dumpxml.
 
     ``xml_for(name)`` returns the XML text, or None to fail that dumpxml.
+    ``disk`` is the domain's data disk; give one to let the real restore
+    lock be taken beside it, or leave it None to make domblklist fail.
     """
     def execute(*args, **_kw):
         if seen is not None:
             seen.append(args[0])
+        if args[0] == "domblklist":
+            if disk is None:
+                return _result(ok=False, stderr="error: no such domain")
+            return _result(stdout=(
+                " Type   Device   Target   Source\n"
+                "------------------------------------\n"
+                f" file   disk     vda      {disk}\n"))
         if args[0] == "snapshot-list":
             if not list_ok:
                 return _result(ok=False, stderr="error: no such domain")
@@ -480,17 +503,23 @@ class TestStrictOverlayInventory:
             parents["s2"] = "a-snapshot-that-is-not-listed"
 
         seen: list[str] = []
+        calls: list[str] = []
+        # a double that really performs the copy: with a guard removed the
+        # backup then *succeeds*, so the unsafe path is observable instead
+        # of being masked by the later "no backup on disk" refusal
         with patch.object(sm.virsh, "execute", side_effect=_virsh_snapshots(
                 ["s1", "s2", "s3"], xml_for,
-                list_ok=(fault != "no-list"), seen=seen)), \
+                list_ok=(fault != "no-list"), seen=seen,
+                disk=str(tmp_path / "disk.qcow2"))), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
-             patch.object(sm.virsh, "execute_shell") as shell:
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies(calls)):
             with pytest.raises(SnapshotError, match=expected):
                 sm.snapshot_restore("vm01", "s1")
 
         # the destructive command was never issued, and nothing was copied
         assert "snapshot-revert" not in seen
-        shell.assert_not_called()
+        assert calls == []
         # every overlay is still on disk
         for path in overlays.values():
             assert os.path.isfile(path)
@@ -539,13 +568,19 @@ class TestBackupPathsAreClaimed:
         sibling = tmp_path / "disk.s1.preserve"     # declared, absent
         assert not sibling.exists()
 
+        calls: list[str] = []
         with _inventory(sm,
                         {"s1": [str(overlay)], "s1.preserve": [str(sibling)]},
                         ["s1", "s1.preserve"]), \
-             patch.object(sm.virsh, "execute_shell") as shell:
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies(calls)):
             with pytest.raises(SnapshotError, match="overlays of"):
                 sm._preserve_snapshot_overlays("vm01", "s1")
-        shell.assert_not_called()
+
+        # nothing ran, and in particular nothing was written to the path
+        # that is the other snapshot's live overlay
+        assert calls == []
+        assert not sibling.exists()
 
     def test_a_backup_path_that_already_exists_is_refused_not_written_through(
         self, sm: SnapshotManager, tmp_path: Path
@@ -652,6 +687,227 @@ class TestRestorePreservedOverlays:
         assert "sudo " not in cmd
 
 
+class TestSnapshotMetadataIsComplete:
+    """#193 round-2 finding 1.
+
+    Well-formed XML is not the same as usable metadata. Each shape below
+    leaves the inventory short of a descendant's overlay while looking
+    exactly like "that snapshot owns none" — and the revert deletes it all
+    the same.
+    """
+
+    @pytest.mark.parametrize("fault,expected", [
+        ("no-disks", "has no <disks> element"),
+        ("empty-disks", "lists no disks at all"),
+        ("no-source", "names no overlay file"),
+        ("empty-source", "names no overlay file"),
+        ("unclassified-disk", "does not say whether"),
+        ("wrong-root", "not a <domainsnapshot>"),
+        ("name-mismatch", "got metadata naming"),
+        ("duplicate-name", "more than once"),
+    ])
+    def test_incomplete_metadata_never_reaches_snapshot_revert(
+        self, sm: SnapshotManager, tmp_path: Path, fault, expected
+    ):
+        overlays = {n: str(tmp_path / f"{n}.qcow2")
+                    for n in ("s1", "s2", "s3")}
+        for target in overlays.values():
+            Path(target).write_bytes(b"x")
+        parents = {"s2": "s1", "s3": "s2"}
+
+        bodies = {
+            "no-disks": "",
+            "empty-disks": "<disks></disks>",
+            "no-source":
+                "<disks><disk name='vda' snapshot='external'/></disks>",
+            "empty-source":
+                "<disks><disk name='vda' snapshot='external'>"
+                "<source file=''/></disk></disks>",
+            "unclassified-disk":
+                f"<disks><disk name='vda'>"
+                f"<source file='{overlays['s2']}'/></disk></disks>",
+        }
+
+        def xml_for(name):
+            if name != "s2":
+                return _snap_xml(name, overlays[name], parents.get(name))
+            if fault in bodies:
+                return (f"<domainsnapshot><name>s2</name>"
+                        f"<parent><name>s1</name></parent>"
+                        f"{bodies[fault]}</domainsnapshot>")
+            good = _snap_xml("s2", overlays["s2"], "s1")
+            if fault == "wrong-root":
+                return good.replace("domainsnapshot", "domain")
+            if fault == "name-mismatch":
+                return good.replace("<name>s2</name>",
+                                    "<name>s2-renamed</name>", 1)
+            return good
+
+        names = ["s1", "s2", "s3"]
+        if fault == "duplicate-name":
+            names = ["s1", "s2", "s2", "s3"]
+
+        seen: list[str] = []
+        calls: list[str] = []
+        with patch.object(sm.virsh, "execute", side_effect=_virsh_snapshots(
+                names, xml_for, seen=seen,
+                disk=str(tmp_path / "disk.qcow2"))), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies(calls)):
+            with pytest.raises(SnapshotError, match=expected):
+                sm.snapshot_restore("vm01", "s1")
+
+        assert "snapshot-revert" not in seen
+        assert calls == []
+        for target in overlays.values():
+            assert os.path.isfile(target)
+
+
+class TestRestoreLock:
+    """#193 round-2 finding 2.
+
+    Checking that a backup path is free does not reserve it. Two restores
+    of one domain could both pass that check and then write over each
+    other, with the loser's cleanup deleting what had become an overlay's
+    only copy — and ``snapshot-revert`` was never safe to run twice at once
+    regardless.
+    """
+
+    def _virsh(self, tmp_path: Path, seen=None, disk=True):
+        return _virsh_snapshots(
+            [], lambda _n: None, seen=seen,
+            disk=str(tmp_path / "disk.qcow2") if disk else None)
+
+    def test_a_second_restore_is_refused_while_one_is_running(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        seen: list[str] = []
+        with patch.object(sm.virsh, "execute",
+                          side_effect=self._virsh(tmp_path, seen)):
+            with sm._restore_lock("vm01"):
+                with pytest.raises(SnapshotError, match="already running"):
+                    sm.snapshot_restore("vm01", "s1")
+
+        assert "snapshot-revert" not in seen
+
+    def test_the_lock_is_released_when_the_restore_finishes(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        with patch.object(sm.virsh, "execute",
+                          side_effect=self._virsh(tmp_path)):
+            with sm._restore_lock("vm01"):
+                pass
+            # straight afterwards it has to be available again
+            with sm._restore_lock("vm01"):
+                pass
+
+    def test_a_domain_whose_disks_cannot_be_listed_is_refused(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        with patch.object(sm.virsh, "execute",
+                          side_effect=self._virsh(tmp_path, disk=False)):
+            with pytest.raises(SnapshotError, match="cannot list the disks"):
+                with sm._restore_lock("vm01"):
+                    pass
+
+    def test_the_lock_sits_beside_the_domain_disk_not_in_a_temp_dir(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """Two racing restores have to derive the same path. A temp
+        directory follows each process's own TMPDIR, so it would hand them
+        two different locks and let both through."""
+        with patch.object(sm.virsh, "execute",
+                          side_effect=self._virsh(tmp_path)):
+            path = sm._restore_lock_path("vm01")
+        assert Path(path).parent == tmp_path
+
+
+class TestPendingRecoveryBlocksTheNextRestore:
+    """#193 round-2 finding 3.
+
+    A ``.preserve`` whose original is *missing* is exactly what an
+    interrupted restore leaves behind. Dropping the missing original before
+    its backup was ever examined meant the next restore never saw it:
+    it reverted a second time and reported success.
+    """
+
+    def test_a_leftover_is_noticed_even_though_its_original_is_gone(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        present = tmp_path / "s1.qcow2"
+        present.write_bytes(b"x")
+        missing = tmp_path / "s2.qcow2"          # the interrupted restore
+        leftover = tmp_path / "s2.qcow2.preserve"
+        leftover.write_bytes(b"the only copy")
+        assert not missing.exists()
+
+        calls: list[str] = []
+        with _inventory(sm, {"s1": [str(present)], "s2": [str(missing)]},
+                        ["s1", "s2"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies(calls)):
+            with pytest.raises(SnapshotError, match="already exists"):
+                sm._preserve_snapshot_overlays("vm01", "s1")
+
+        assert calls == []
+        assert leftover.read_bytes() == b"the only copy"
+
+    def test_the_check_runs_even_when_every_original_is_missing(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """The early "nothing at risk" return used to skip the backup-path
+        check completely, which is the very state a failed put-back leaves
+        behind."""
+        missing = tmp_path / "s1.qcow2"
+        leftover = tmp_path / "s1.qcow2.preserve"
+        leftover.write_bytes(b"the only copy")
+
+        with _inventory(sm, {"s1": [str(missing)]}, ["s1"]), \
+             patch.object(sm.virsh, "execute_shell") as shell:
+            with pytest.raises(SnapshotError, match="already exists"):
+                sm._preserve_snapshot_overlays("vm01", "s1")
+        shell.assert_not_called()
+
+
+class TestPutBackPostcondition:
+    """#193 round-2 finding 2, second half.
+
+    Whether the overlays are back is a question about the filesystem, not
+    about what ``mv`` returned.
+    """
+
+    def test_a_pair_with_neither_original_nor_backup_is_unrecovered(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        overlay = tmp_path / "o.qcow2"           # deleted by the revert
+        backup = tmp_path / "o.qcow2.preserve"   # and never created
+        with patch.object(sm.virsh, "execute_shell",
+                          return_value=_result()) as shell:
+            unrecovered = sm._restore_preserved_overlays(
+                [(str(overlay), str(backup))])
+
+        # nothing to move and nothing to reap, so neither work list held it
+        # -- but the overlay is still missing, which is the whole question
+        assert unrecovered == [(str(overlay), str(backup))]
+        shell.assert_not_called()
+
+    def test_a_move_into_a_directory_at_the_original_path_is_unrecovered(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """`mv -f backup dir` succeeds by putting the backup *inside* the
+        directory, and exits 0 with the overlay still not there."""
+        overlay = tmp_path / "o.qcow2"
+        overlay.mkdir()                          # a directory, not the disk
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"x")
+
+        with patch.object(sm.virsh, "execute_shell", return_value=_result()):
+            unrecovered = sm._restore_preserved_overlays(
+                [(str(overlay), str(backup))])
+        assert unrecovered == [(str(overlay), str(backup))]
+
+
 class TestBackupIsAPrecondition:
     """#164 CL-D1 / CL-D2 / CL-R2.
 
@@ -690,7 +946,8 @@ class TestBackupIsAPrecondition:
         was at risk" and "the copy failed", and the revert ran on either."""
         overlay = tmp_path / "s1.qcow2"
         overlay.write_bytes(b"x")
-        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+        with _unlocked(sm), \
+             _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute_shell",
                           return_value=_result(ok=False, stderr="disk full")), \
@@ -831,7 +1088,8 @@ class TestBackupIsAPrecondition:
         backup = tmp_path / "o.qcow2.preserve"
         backup.write_bytes(b"x")
 
-        with patch.object(sm, "_preserve_snapshot_overlays",
+        with _unlocked(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=[(str(overlay), str(backup))]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", return_value=_result()), \
@@ -902,7 +1160,8 @@ class TestSnapshotRestore:
         self, sm: SnapshotManager
     ):
         preserved_pairs = [("/overlays/a", "/overlays/a.preserve")]
-        with patch.object(sm, "_preserve_snapshot_overlays",
+        with _unlocked(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=preserved_pairs) as preserve, \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", return_value=_result()) as execute, \
@@ -916,7 +1175,8 @@ class TestSnapshotRestore:
         restore.assert_called_once_with(preserved_pairs)
 
     def test_restore_called_even_when_revert_fails(self, sm: SnapshotManager):
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with _unlocked(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
                           return_value=_result(ok=False, stderr="boom")), \
@@ -931,7 +1191,8 @@ class TestSnapshotRestore:
             _result(ok=False, stderr="unable to acquire write lock"),
             _result(ok=True),
         ]
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with _unlocked(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=results), \
              patch.object(sm, "_restore_preserved_overlays",
@@ -940,7 +1201,8 @@ class TestSnapshotRestore:
             assert sm.snapshot_restore("vm01", "snap1") is True
 
     def test_does_not_retry_on_non_lock_error(self, sm: SnapshotManager):
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with _unlocked(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
                           return_value=_result(ok=False, stderr="bad name")) as execute, \
@@ -951,7 +1213,8 @@ class TestSnapshotRestore:
         assert execute.call_count == 1  # no retries on non-lock errors
 
     def test_exception_still_calls_restore(self, sm: SnapshotManager):
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[("a", "b")]), \
+        with _unlocked(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[("a", "b")]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=RuntimeError("x")), \
              patch.object(sm, "_restore_preserved_overlays",
@@ -1246,7 +1509,8 @@ class TestSnapshotRestoreCompressed:
         zst = tmp_path / "vm01_snapshot_s.raw.zst"
         zst.write_bytes(b"x")
         raw = str(tmp_path / "vm01_snapshot_s.raw")
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with _unlocked(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_restore_preserved_overlays",
                           return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=raw), \
@@ -1262,7 +1526,8 @@ class TestSnapshotRestoreCompressed:
                                                   tmp_path: Path):
         raw_path = tmp_path / "vm01_snapshot_s.raw"
         raw_path.write_bytes(b"x")
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with _unlocked(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_restore_preserved_overlays",
                           return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=str(raw_path)), \
