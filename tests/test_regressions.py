@@ -59,8 +59,13 @@ class TestSnapshotOverlayPreservation057eb7d:
             call_order.append("preserve")
             return [("/overlay.qcow2", "/overlay.qcow2.preserve")]
 
-        def record_execute(*_args, **_kwargs):
-            call_order.append("revert")
+        def record_execute(*args, **_kwargs):
+            # only the revert: the restore also probes domstate now, to
+            # pause a running guest before copying its overlays (#195)
+            if args and args[0] == "snapshot-revert":
+                call_order.append("revert")
+            if args and args[0] == "domstate":
+                return _result(ok=True, stdout="shut off\n")
             return _result(ok=True)
 
         def record_restore(_pairs):

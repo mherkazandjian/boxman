@@ -942,6 +942,131 @@ class SnapshotManager:
             files.append(path)
         return files
 
+    def _pause_for_backup(self, vm_name: str) -> bool:
+        """
+        Pause *vm_name* if it is running, so its overlays hold still while
+        they are copied.
+
+        The newest snapshot's overlay **is** the live disk — ``domblklist``
+        names it — and reverting to an older snapshot deletes it, which is
+        why it is in the backup set at all. Copying it while qemu writes
+        produces a mix of blocks from different instants; for qcow2 that
+        can be an inconsistent L1/L2 mapping rather than merely stale
+        data, and the put-back afterwards would install exactly that as
+        the newest snapshot's overlay.
+
+        The guest stays paused until the revert, which sets the domain
+        state itself from the snapshot's memory image. Every path that
+        gives up before the revert resumes it.
+
+        Args:
+            vm_name: the domain about to have its overlays copied.
+
+        Returns:
+            bool: True if this call paused the domain — and so is the one
+            that has to resume it. False if it was not running.
+
+        Raises:
+            SnapshotError: the domain is running and could not be paused.
+        """
+        # `domstate` prints a *translated* state name -- virsh runs it
+        # through gettext, and nothing here fixes the locale -- so
+        # comparing it against the English "running" reads a running guest
+        # as idle under any other locale, which is precisely the unpaused
+        # copy this exists to prevent. Domain names are not translated, so
+        # ask which domains are running and look for this one.
+        listed = self.virsh.execute(
+            "list", "--state-running", "--name", warn=True)
+        if not listed.ok:
+            raise SnapshotError(
+                f"cannot tell whether {vm_name} is running "
+                f"({(listed.stderr or '').strip()}); refusing to copy its "
+                f"overlays without knowing whether the guest is writing "
+                f"to them")
+
+        # Splitting on newline is unambiguous *here*, unlike the snapshot
+        # list: libvirt refuses a newline in a domain name outright
+        # ("invalid char in name"), where it accepts one in a snapshot
+        # name. Spaces are allowed and are kept -- the names are compared
+        # exactly, not stripped.
+        running = [n for n in listed.stdout.split('\n') if n]
+        if vm_name not in running:
+            # paused and pmsuspended domains are not listed either, and
+            # neither is writing -- which is the actual question
+            return False
+
+        result = self.virsh.execute("suspend", vm_name, warn=True)
+        if not result.ok:
+            raise SnapshotError(
+                f"could not pause {vm_name} before copying its overlays "
+                f"({(result.stderr or '').strip()}); refusing to copy the "
+                f"live disk while the guest writes to it")
+        self.logger.info(
+            f"paused {vm_name} while its overlays are copied")
+        return True
+
+    def _report_pause_after_failed_revert(self,
+                                          vm_name: str,
+                                          paused: bool) -> None:
+        """
+        Say that the guest may still be paused, instead of resuming it.
+
+        Once ``snapshot-revert`` has been attempted, the paused domain is
+        no longer necessarily the one this call paused. libvirt installs
+        the restored domain's running/paused state *before* writing the
+        snapshot metadata, and that write can fail — so a revert reported
+        as failed can already have put a legitimately paused snapshot in
+        place. Resuming on a failed result would silently start it.
+
+        A failed command result cannot tell those two apart, so this says
+        what it knows and leaves the decision where it belongs.
+
+        Args:
+            vm_name: the domain that was paused.
+            paused: whether this call paused it.
+        """
+        if not paused:
+            return
+        self.logger.error(
+            f"{vm_name} was paused before its overlays were copied, and the "
+            f"revert did not succeed. It is deliberately not resumed here: a "
+            f"revert can install the snapshot's own paused state before "
+            f"failing, and resuming would override that. Check with `virsh "
+            f"domstate {vm_name}`, and if that is still this restore's own "
+            f"pause: virsh resume {vm_name}")
+
+    def _resume_after_backup(self, vm_name: str, paused: bool) -> None:
+        """
+        Undo :meth:`_pause_for_backup` on a path that will not revert.
+
+        Best-effort, but loud: a guest left paused because a restore
+        refused is its own kind of failure, and the message says how to
+        put it right.
+
+        Args:
+            vm_name: the domain to resume.
+            paused: whether this call was the one that paused it.
+        """
+        if not paused:
+            return
+        try:
+            result = self.virsh.execute("resume", vm_name, warn=True)
+        except Exception as exc:
+            # this runs while another error is on its way up; raising here
+            # would replace it with this one
+            self.logger.error(
+                f"{vm_name} is still paused: the resume could not be run "
+                f"after the restore gave up ({type(exc).__name__}: {exc}). "
+                f"Resume it with: virsh resume {vm_name}")
+            return
+        if result.ok:
+            self.logger.info(f"resumed {vm_name}")
+            return
+        self.logger.error(
+            f"{vm_name} is still paused: it could not be resumed after the "
+            f"restore gave up ({(result.stderr or '').strip()}). Resume it "
+            f"with: virsh resume {vm_name}")
+
     def _preserve_snapshot_overlays(self,
                                     vm_name: str,
                                     snapshot_name: str) -> list[tuple]:
@@ -1579,7 +1704,15 @@ class SnapshotManager:
                 could not be put back. Never retry this one — the retry
                 would revert a second time.
         """
-        preserved = self._preserve_snapshot_overlays(vm_name, snapshot_name)
+        # the overlays have to hold still while they are copied, and the
+        # newest one is the disk the guest is writing to (#195)
+        paused = self._pause_for_backup(vm_name)
+        try:
+            preserved = self._preserve_snapshot_overlays(
+                vm_name, snapshot_name)
+        except Exception:
+            self._resume_after_backup(vm_name, paused)
+            raise
 
         # Everything from here to the revert still owns those backups: a
         # raise in the memory handling would otherwise leave them behind,
@@ -1602,6 +1735,7 @@ class SnapshotManager:
                         f"revert will likely fail")
         except Exception as exc:
             self._reap_preserve_files([b for _o, b in preserved])
+            self._resume_after_backup(vm_name, paused)
             raise SnapshotError(
                 f"could not prepare {vm_name} for the revert to "
                 f"'{snapshot_name}' ({type(exc).__name__}: {exc}); refusing "
@@ -1634,13 +1768,18 @@ class SnapshotManager:
             except Exception as exc:
                 self.logger.error(
                     f"error reverting vm {vm_name} to snapshot '{snapshot_name}': {exc}")
+                self._report_pause_after_failed_revert(vm_name, paused)
                 self._finish_restore(
                     preserved, mem_path, decompressed_for_revert)
                 return False
 
+        if not success:
+            self._report_pause_after_failed_revert(vm_name, paused)
         self._finish_restore(preserved, mem_path, decompressed_for_revert)
 
         if success:
+            # a successful revert sets the domain state itself, from the
+            # snapshot's memory image -- resuming here would fight it
             return True
 
         self.logger.error(
