@@ -57,6 +57,17 @@ SNAP_XML_NO_OVERLAY = """\
 """
 
 
+def _not_running(sm: SnapshotManager):
+    """Answer the pre-backup pause probe with "it is not running".
+
+    For tests that are not about pausing: the guest state is a `domstate`
+    call on the same mock these tests use for `snapshot-revert`, and it
+    would otherwise show up in their call counts. See
+    TestTheGuestHoldsStillWhileCopying for the pause itself.
+    """
+    return patch.object(sm, "_pause_for_backup", return_value=False)
+
+
 def _inventory(sm: SnapshotManager, overlays: dict, order: list):
     """Patch the strict inventory with a complete, readable answer.
 
@@ -1059,7 +1070,8 @@ class TestOwnershipSurvivesFailures:
             calls.append(cmd)
             return _result()
 
-        with patch.object(sm, "_preserve_snapshot_overlays",
+        with _not_running(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=[(str(tmp_path / "o.qcow2"),
                                          str(backup))]), \
              patch.object(sm, "_memory_path_from_xml",
@@ -1183,7 +1195,8 @@ class TestRoundSevenGaps:
         backup = tmp_path / "o.qcow2.preserve"
         backup.write_bytes(b"the only copy")
 
-        with patch.object(sm, "_preserve_snapshot_overlays",
+        with _not_running(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=[(str(overlay), str(backup))]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", return_value=_result()), \
@@ -1205,7 +1218,8 @@ class TestRoundSevenGaps:
         backup = tmp_path / "o.qcow2.preserve"
         backup.write_bytes(b"the only copy")
 
-        with patch.object(sm, "_preserve_snapshot_overlays",
+        with _not_running(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=[(str(overlay), str(backup))]), \
              patch.object(sm, "_memory_path_from_xml",
                           return_value=str(tmp_path / "mem.raw")), \
@@ -1218,6 +1232,137 @@ class TestRoundSevenGaps:
                 sm.snapshot_restore("vm01", "snap1")
 
         assert backup.read_bytes() == b"the only copy"
+
+
+class TestTheGuestHoldsStillWhileCopying:
+    """#195.
+
+    The newest snapshot's overlay *is* the live disk — `domblklist` names
+    it — and reverting to an older snapshot deletes it, which is why it is
+    in the backup set. Measured against libvirt 10.0.0: a memory snapshot
+    lets a running domain be reverted, and the revert removes that file.
+    Copying it while qemu writes gives a mix of blocks from different
+    instants, and the put-back would install that as the newest
+    snapshot's overlay.
+    """
+
+    def _virsh(self, states, calls):
+        """Answer domstate from *states*, record every verb in *calls*."""
+        def execute(*args, **_kw):
+            calls.append(args[0])
+            if args[0] == "domstate":
+                return _result(stdout=states.pop(0))
+            return _result()
+        return execute
+
+    def test_a_running_guest_is_paused_before_its_overlays_are_copied(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        calls: list[str] = []
+
+        def preserve(*_a, **_kw):
+            calls.append("the copy")
+            return []
+
+        with patch.object(sm, "_preserve_snapshot_overlays",
+                          side_effect=preserve), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
+             patch.object(sm, "_restore_preserved_overlays", return_value=[]), \
+             patch.object(sm.virsh, "execute",
+                          side_effect=self._virsh(["running\n"], calls)):
+            assert sm.snapshot_restore("vm01", "s1") is True
+
+        # before the copy, which is the whole point -- asserting only that
+        # it precedes the revert would allow pausing after the copy
+        assert calls.index("suspend") < calls.index("the copy")
+        assert calls.index("the copy") < calls.index("snapshot-revert")
+        # a successful revert sets the state itself, from the snapshot's
+        # memory image -- resuming here would fight it
+        assert "resume" not in calls
+
+    def test_a_guest_that_is_not_running_is_left_alone(
+        self, sm: SnapshotManager
+    ):
+        calls: list[str] = []
+        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
+             patch.object(sm, "_restore_preserved_overlays", return_value=[]), \
+             patch.object(sm.virsh, "execute",
+                          side_effect=self._virsh(["shut off\n"], calls)):
+            assert sm.snapshot_restore("vm01", "s1") is True
+
+        assert "suspend" not in calls
+        assert "resume" not in calls
+
+    def test_a_refused_backup_resumes_the_guest(
+        self, sm: SnapshotManager
+    ):
+        """Refusing to revert must not leave the VM paused: nothing was
+        changed, so nothing should look different afterwards."""
+        calls: list[str] = []
+        with patch.object(sm, "_preserve_snapshot_overlays",
+                          side_effect=SnapshotError("no space")), \
+             patch.object(sm.virsh, "execute",
+                          side_effect=self._virsh(["running\n"], calls)):
+            with pytest.raises(SnapshotError):
+                sm.snapshot_restore("vm01", "s1")
+
+        assert "suspend" in calls
+        assert "resume" in calls
+        assert "snapshot-revert" not in calls
+
+    def test_a_failed_revert_resumes_the_guest(self, sm: SnapshotManager):
+        calls: list[str] = []
+
+        def execute(*args, **_kw):
+            calls.append(args[0])
+            if args[0] == "domstate":
+                return _result(stdout="running\n")
+            if args[0] == "snapshot-revert":
+                return _result(ok=False, stderr="bad name")
+            return _result()
+
+        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
+             patch.object(sm, "_restore_preserved_overlays", return_value=[]), \
+             patch.object(sm.virsh, "execute", side_effect=execute):
+            assert sm.snapshot_restore("vm01", "s1") is False
+
+        assert calls.index("resume") > calls.index("snapshot-revert")
+
+    def test_a_guest_that_cannot_be_paused_refuses_the_restore(
+        self, sm: SnapshotManager
+    ):
+        """Copying the live disk anyway is the thing this exists to stop."""
+        calls: list[str] = []
+
+        def execute(*args, **_kw):
+            calls.append(args[0])
+            if args[0] == "domstate":
+                return _result(stdout="running\n")
+            if args[0] == "suspend":
+                return _result(ok=False, stderr="domain is not running")
+            return _result()
+
+        with patch.object(sm, "_preserve_snapshot_overlays") as preserve, \
+             patch.object(sm.virsh, "execute", side_effect=execute):
+            with pytest.raises(SnapshotError, match="could not pause"):
+                sm.snapshot_restore("vm01", "s1")
+
+        preserve.assert_not_called()
+        assert "snapshot-revert" not in calls
+
+    def test_an_unanswerable_guest_state_refuses_the_restore(
+        self, sm: SnapshotManager
+    ):
+        """Not knowing whether the guest is writing is not the same as
+        knowing it is not."""
+        with patch.object(sm, "_preserve_snapshot_overlays") as preserve, \
+             patch.object(sm.virsh, "execute",
+                          return_value=_result(ok=False, stderr="no domain")):
+            with pytest.raises(SnapshotError, match="cannot tell whether"):
+                sm.snapshot_restore("vm01", "s1")
+        preserve.assert_not_called()
 
 
 class TestPendingRecoveryBlocksTheNextRestore:
@@ -1343,7 +1488,8 @@ class TestBackupIsAPrecondition:
         was at risk" and "the copy failed", and the revert ran on either."""
         overlay = tmp_path / "s1.qcow2"
         overlay.write_bytes(b"x")
-        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+        with _not_running(sm), \
+             _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute_shell",
                           return_value=_result(ok=False, stderr="disk full")), \
@@ -1352,7 +1498,8 @@ class TestBackupIsAPrecondition:
             with pytest.raises(SnapshotError):
                 sm.snapshot_restore("vm01", "s1")
 
-        execute.assert_not_called()
+        assert not any(call.args and call.args[0] == "snapshot-revert"
+                       for call in execute.call_args_list)
 
     def test_a_failed_backup_reaps_every_copy_it_may_have_made(
         self, sm: SnapshotManager, tmp_path: Path
@@ -1488,7 +1635,8 @@ class TestBackupIsAPrecondition:
         backup = tmp_path / "o.qcow2.preserve"
         backup.write_bytes(b"x")
 
-        with patch.object(sm, "_preserve_snapshot_overlays",
+        with _not_running(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=[(str(overlay), str(backup))]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", return_value=_result()), \
@@ -1569,7 +1717,8 @@ class TestSnapshotRestore:
         self, sm: SnapshotManager
     ):
         preserved_pairs = [("/overlays/a", "/overlays/a.preserve")]
-        with patch.object(sm, "_preserve_snapshot_overlays",
+        with _not_running(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays",
                           return_value=preserved_pairs) as preserve, \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", return_value=_result()) as execute, \
@@ -1578,12 +1727,13 @@ class TestSnapshotRestore:
             assert sm.snapshot_restore("vm01", "snap1") is True
 
         preserve.assert_called_once_with("vm01", "snap1")
-        execute.assert_called_once()
-        assert execute.call_args.args[0] == "snapshot-revert"
+        assert [call.args[0] for call in execute.call_args_list
+                if call.args] == ["snapshot-revert"]
         restore.assert_called_once_with(preserved_pairs)
 
     def test_restore_called_even_when_revert_fails(self, sm: SnapshotManager):
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with _not_running(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
                           return_value=_result(ok=False, stderr="boom")), \
@@ -1598,7 +1748,8 @@ class TestSnapshotRestore:
             _result(ok=False, stderr="unable to acquire write lock"),
             _result(ok=True),
         ]
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with _not_running(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=results), \
              patch.object(sm, "_restore_preserved_overlays",
@@ -1607,7 +1758,8 @@ class TestSnapshotRestore:
             assert sm.snapshot_restore("vm01", "snap1") is True
 
     def test_does_not_retry_on_non_lock_error(self, sm: SnapshotManager):
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with _not_running(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
                           return_value=_result(ok=False, stderr="bad name")) as execute, \
@@ -1618,7 +1770,8 @@ class TestSnapshotRestore:
         assert execute.call_count == 1  # no retries on non-lock errors
 
     def test_exception_still_calls_restore(self, sm: SnapshotManager):
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[("a", "b")]), \
+        with _not_running(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[("a", "b")]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=RuntimeError("x")), \
              patch.object(sm, "_restore_preserved_overlays",
@@ -1913,7 +2066,8 @@ class TestSnapshotRestoreCompressed:
         zst = tmp_path / "vm01_snapshot_s.raw.zst"
         zst.write_bytes(b"x")
         raw = str(tmp_path / "vm01_snapshot_s.raw")
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with _not_running(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_restore_preserved_overlays",
                           return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=raw), \
@@ -1929,7 +2083,8 @@ class TestSnapshotRestoreCompressed:
                                                   tmp_path: Path):
         raw_path = tmp_path / "vm01_snapshot_s.raw"
         raw_path.write_bytes(b"x")
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
+        with _not_running(sm), \
+             patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_restore_preserved_overlays",
                           return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=str(raw_path)), \

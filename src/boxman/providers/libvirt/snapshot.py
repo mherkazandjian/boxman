@@ -942,6 +942,76 @@ class SnapshotManager:
             files.append(path)
         return files
 
+    def _pause_for_backup(self, vm_name: str) -> bool:
+        """
+        Pause *vm_name* if it is running, so its overlays hold still while
+        they are copied.
+
+        The newest snapshot's overlay **is** the live disk — ``domblklist``
+        names it — and reverting to an older snapshot deletes it, which is
+        why it is in the backup set at all. Copying it while qemu writes
+        produces a mix of blocks from different instants; for qcow2 that
+        can be an inconsistent L1/L2 mapping rather than merely stale
+        data, and the put-back afterwards would install exactly that as
+        the newest snapshot's overlay.
+
+        The guest stays paused until the revert, which sets the domain
+        state itself from the snapshot's memory image. Every path that
+        gives up before the revert resumes it.
+
+        Args:
+            vm_name: the domain about to have its overlays copied.
+
+        Returns:
+            bool: True if this call paused the domain — and so is the one
+            that has to resume it. False if it was not running.
+
+        Raises:
+            SnapshotError: the domain is running and could not be paused.
+        """
+        state = self.virsh.execute("domstate", vm_name, warn=True)
+        if not state.ok:
+            raise SnapshotError(
+                f"cannot tell whether {vm_name} is running "
+                f"({(state.stderr or '').strip()}); refusing to copy its "
+                f"overlays without knowing whether the guest is writing "
+                f"to them")
+        if state.stdout.strip() != 'running':
+            return False
+
+        result = self.virsh.execute("suspend", vm_name, warn=True)
+        if not result.ok:
+            raise SnapshotError(
+                f"could not pause {vm_name} before copying its overlays "
+                f"({(result.stderr or '').strip()}); refusing to copy the "
+                f"live disk while the guest writes to it")
+        self.logger.info(
+            f"paused {vm_name} while its overlays are copied")
+        return True
+
+    def _resume_after_backup(self, vm_name: str, paused: bool) -> None:
+        """
+        Undo :meth:`_pause_for_backup` on a path that will not revert.
+
+        Best-effort, but loud: a guest left paused because a restore
+        refused is its own kind of failure, and the message says how to
+        put it right.
+
+        Args:
+            vm_name: the domain to resume.
+            paused: whether this call was the one that paused it.
+        """
+        if not paused:
+            return
+        result = self.virsh.execute("resume", vm_name, warn=True)
+        if result.ok:
+            self.logger.info(f"resumed {vm_name}")
+            return
+        self.logger.error(
+            f"{vm_name} is still paused: it could not be resumed after the "
+            f"restore gave up ({(result.stderr or '').strip()}). Resume it "
+            f"with: virsh resume {vm_name}")
+
     def _preserve_snapshot_overlays(self,
                                     vm_name: str,
                                     snapshot_name: str) -> list[tuple]:
@@ -1579,7 +1649,15 @@ class SnapshotManager:
                 could not be put back. Never retry this one — the retry
                 would revert a second time.
         """
-        preserved = self._preserve_snapshot_overlays(vm_name, snapshot_name)
+        # the overlays have to hold still while they are copied, and the
+        # newest one is the disk the guest is writing to (#195)
+        paused = self._pause_for_backup(vm_name)
+        try:
+            preserved = self._preserve_snapshot_overlays(
+                vm_name, snapshot_name)
+        except Exception:
+            self._resume_after_backup(vm_name, paused)
+            raise
 
         # Everything from here to the revert still owns those backups: a
         # raise in the memory handling would otherwise leave them behind,
@@ -1602,6 +1680,7 @@ class SnapshotManager:
                         f"revert will likely fail")
         except Exception as exc:
             self._reap_preserve_files([b for _o, b in preserved])
+            self._resume_after_backup(vm_name, paused)
             raise SnapshotError(
                 f"could not prepare {vm_name} for the revert to "
                 f"'{snapshot_name}' ({type(exc).__name__}: {exc}); refusing "
@@ -1636,12 +1715,17 @@ class SnapshotManager:
                     f"error reverting vm {vm_name} to snapshot '{snapshot_name}': {exc}")
                 self._finish_restore(
                     preserved, mem_path, decompressed_for_revert)
+                self._resume_after_backup(vm_name, paused)
                 return False
 
         self._finish_restore(preserved, mem_path, decompressed_for_revert)
 
         if success:
+            # a successful revert sets the domain state itself, from the
+            # snapshot's memory image -- resuming here would fight it
             return True
+
+        self._resume_after_backup(vm_name, paused)
 
         self.logger.error(
             f"failed to revert vm {vm_name} to snapshot '{snapshot_name}': {last_stderr}")
