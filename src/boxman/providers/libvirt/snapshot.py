@@ -969,14 +969,25 @@ class SnapshotManager:
         Raises:
             SnapshotError: the domain is running and could not be paused.
         """
-        state = self.virsh.execute("domstate", vm_name, warn=True)
-        if not state.ok:
+        # `domstate` prints a *translated* state name -- virsh runs it
+        # through gettext, and nothing here fixes the locale -- so
+        # comparing it against the English "running" reads a running guest
+        # as idle under any other locale, which is precisely the unpaused
+        # copy this exists to prevent. Domain names are not translated, so
+        # ask which domains are running and look for this one.
+        listed = self.virsh.execute(
+            "list", "--state-running", "--name", warn=True)
+        if not listed.ok:
             raise SnapshotError(
                 f"cannot tell whether {vm_name} is running "
-                f"({(state.stderr or '').strip()}); refusing to copy its "
+                f"({(listed.stderr or '').strip()}); refusing to copy its "
                 f"overlays without knowing whether the guest is writing "
                 f"to them")
-        if state.stdout.strip() != 'running':
+
+        running = [n for n in listed.stdout.split('\n') if n]
+        if vm_name not in running:
+            # paused and pmsuspended domains are not listed either, and
+            # neither is writing -- which is the actual question
             return False
 
         result = self.virsh.execute("suspend", vm_name, warn=True)
@@ -988,6 +999,36 @@ class SnapshotManager:
         self.logger.info(
             f"paused {vm_name} while its overlays are copied")
         return True
+
+    def _report_pause_after_failed_revert(self,
+                                          vm_name: str,
+                                          paused: bool) -> None:
+        """
+        Say that the guest may still be paused, instead of resuming it.
+
+        Once ``snapshot-revert`` has been attempted, the paused domain is
+        no longer necessarily the one this call paused. libvirt installs
+        the restored domain's running/paused state *before* writing the
+        snapshot metadata, and that write can fail — so a revert reported
+        as failed can already have put a legitimately paused snapshot in
+        place. Resuming on a failed result would silently start it.
+
+        A failed command result cannot tell those two apart, so this says
+        what it knows and leaves the decision where it belongs.
+
+        Args:
+            vm_name: the domain that was paused.
+            paused: whether this call paused it.
+        """
+        if not paused:
+            return
+        self.logger.error(
+            f"{vm_name} was paused before its overlays were copied, and the "
+            f"revert did not succeed. It is deliberately not resumed here: a "
+            f"revert can install the snapshot's own paused state before "
+            f"failing, and resuming would override that. Check with `virsh "
+            f"domstate {vm_name}`, and if that is still this restore's own "
+            f"pause: virsh resume {vm_name}")
 
     def _resume_after_backup(self, vm_name: str, paused: bool) -> None:
         """
@@ -1003,7 +1044,16 @@ class SnapshotManager:
         """
         if not paused:
             return
-        result = self.virsh.execute("resume", vm_name, warn=True)
+        try:
+            result = self.virsh.execute("resume", vm_name, warn=True)
+        except Exception as exc:
+            # this runs while another error is on its way up; raising here
+            # would replace it with this one
+            self.logger.error(
+                f"{vm_name} is still paused: the resume could not be run "
+                f"after the restore gave up ({type(exc).__name__}: {exc}). "
+                f"Resume it with: virsh resume {vm_name}")
+            return
         if result.ok:
             self.logger.info(f"resumed {vm_name}")
             return
@@ -1713,19 +1763,19 @@ class SnapshotManager:
             except Exception as exc:
                 self.logger.error(
                     f"error reverting vm {vm_name} to snapshot '{snapshot_name}': {exc}")
+                self._report_pause_after_failed_revert(vm_name, paused)
                 self._finish_restore(
                     preserved, mem_path, decompressed_for_revert)
-                self._resume_after_backup(vm_name, paused)
                 return False
 
+        if not success:
+            self._report_pause_after_failed_revert(vm_name, paused)
         self._finish_restore(preserved, mem_path, decompressed_for_revert)
 
         if success:
             # a successful revert sets the domain state itself, from the
             # snapshot's memory image -- resuming here would fight it
             return True
-
-        self._resume_after_backup(vm_name, paused)
 
         self.logger.error(
             f"failed to revert vm {vm_name} to snapshot '{snapshot_name}': {last_stderr}")

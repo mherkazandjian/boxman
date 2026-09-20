@@ -1237,23 +1237,38 @@ class TestRoundSevenGaps:
 class TestTheGuestHoldsStillWhileCopying:
     """#195.
 
-    The newest snapshot's overlay *is* the live disk — `domblklist` names
-    it — and reverting to an older snapshot deletes it, which is why it is
-    in the backup set. Measured against libvirt 10.0.0: a memory snapshot
-    lets a running domain be reverted, and the revert removes that file.
-    Copying it while qemu writes gives a mix of blocks from different
-    instants, and the put-back would install that as the newest
-    snapshot's overlay.
+    The head overlay is the live disk — `domblklist` names it — and a
+    revert deletes it, which is why it is in the backup set. Measured
+    against libvirt 10.0.0: a memory snapshot lets a running domain be
+    reverted, and the revert removes that file. Copying it while qemu
+    writes gives a mix of blocks from different instants, and the
+    put-back would install that in its place.
     """
 
-    def _virsh(self, states, calls):
-        """Answer domstate from *states*, record every verb in *calls*."""
+    def _virsh(self, running, calls, suspend_ok=True, revert_ok=True):
+        """Answer the running-domain probe; record every verb in *calls*."""
         def execute(*args, **_kw):
             calls.append(args[0])
+            if args[0] == "list":
+                return _result(stdout="".join(f"{n}\n" for n in running))
             if args[0] == "domstate":
-                return _result(stdout=states.pop(0))
+                # nothing should consult this: its output is translated
+                return _result(stdout="en cours d'exécution\n")
+            if args[0] == "suspend" and not suspend_ok:
+                return _result(ok=False, stderr="domain is not running")
+            if args[0] == "snapshot-revert" and not revert_ok:
+                return _result(ok=False, stderr="bad name")
             return _result()
         return execute
+
+    def _restoring(self, sm, calls, **kw):
+        """The common patches for a restore whose backup is a no-op."""
+        return (
+            patch.object(sm, "_memory_path_from_xml", return_value=None),
+            patch.object(sm, "_restore_preserved_overlays", return_value=[]),
+            patch.object(sm.virsh, "execute",
+                         side_effect=self._virsh(calls=calls, **kw)),
+        )
 
     def test_a_running_guest_is_paused_before_its_overlays_are_copied(
         self, sm: SnapshotManager, tmp_path: Path
@@ -1264,12 +1279,9 @@ class TestTheGuestHoldsStillWhileCopying:
             calls.append("the copy")
             return []
 
+        mem, restore, execute = self._restoring(sm, calls, running=["vm01"])
         with patch.object(sm, "_preserve_snapshot_overlays",
-                          side_effect=preserve), \
-             patch.object(sm, "_memory_path_from_xml", return_value=None), \
-             patch.object(sm, "_restore_preserved_overlays", return_value=[]), \
-             patch.object(sm.virsh, "execute",
-                          side_effect=self._virsh(["running\n"], calls)):
+                          side_effect=preserve), mem, restore, execute:
             assert sm.snapshot_restore("vm01", "s1") is True
 
         # before the copy, which is the whole point -- asserting only that
@@ -1280,30 +1292,44 @@ class TestTheGuestHoldsStillWhileCopying:
         # memory image -- resuming here would fight it
         assert "resume" not in calls
 
+    def test_the_running_check_does_not_read_a_translated_state_name(
+        self, sm: SnapshotManager
+    ):
+        """`virsh domstate` prints its state through gettext. Comparing
+        that against the English "running" reads a running guest as idle
+        under any other locale -- exactly the unpaused copy this
+        prevents. Domain names are not translated."""
+        calls: list[str] = []
+        mem, restore, execute = self._restoring(sm, calls, running=["vm01"])
+        with patch.object(sm, "_preserve_snapshot_overlays",
+                          return_value=[]), mem, restore, execute:
+            assert sm.snapshot_restore("vm01", "s1") is True
+
+        # the double answers domstate in French; the guest is paused anyway
+        assert "suspend" in calls
+        assert "domstate" not in calls
+
     def test_a_guest_that_is_not_running_is_left_alone(
         self, sm: SnapshotManager
     ):
         calls: list[str] = []
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
-             patch.object(sm, "_memory_path_from_xml", return_value=None), \
-             patch.object(sm, "_restore_preserved_overlays", return_value=[]), \
-             patch.object(sm.virsh, "execute",
-                          side_effect=self._virsh(["shut off\n"], calls)):
+        mem, restore, execute = self._restoring(
+            sm, calls, running=["some-other-vm"])
+        with patch.object(sm, "_preserve_snapshot_overlays",
+                          return_value=[]), mem, restore, execute:
             assert sm.snapshot_restore("vm01", "s1") is True
 
         assert "suspend" not in calls
         assert "resume" not in calls
 
-    def test_a_refused_backup_resumes_the_guest(
-        self, sm: SnapshotManager
-    ):
+    def test_a_refused_backup_resumes_the_guest(self, sm: SnapshotManager):
         """Refusing to revert must not leave the VM paused: nothing was
         changed, so nothing should look different afterwards."""
         calls: list[str] = []
         with patch.object(sm, "_preserve_snapshot_overlays",
                           side_effect=SnapshotError("no space")), \
              patch.object(sm.virsh, "execute",
-                          side_effect=self._virsh(["running\n"], calls)):
+                          side_effect=self._virsh(["vm01"], calls)):
             with pytest.raises(SnapshotError):
                 sm.snapshot_restore("vm01", "s1")
 
@@ -1311,41 +1337,37 @@ class TestTheGuestHoldsStillWhileCopying:
         assert "resume" in calls
         assert "snapshot-revert" not in calls
 
-    def test_a_failed_revert_resumes_the_guest(self, sm: SnapshotManager):
+    def test_a_failed_revert_reports_the_pause_rather_than_undoing_it(
+        self, sm: SnapshotManager
+    ):
+        """libvirt installs the restored domain's paused state *before*
+        writing the snapshot metadata, and that write can fail — so a
+        revert reported as failed may already have put a legitimately
+        paused domain in place. Resuming on a failed result would start
+        it. A failed command result cannot tell the two apart."""
         calls: list[str] = []
-
-        def execute(*args, **_kw):
-            calls.append(args[0])
-            if args[0] == "domstate":
-                return _result(stdout="running\n")
-            if args[0] == "snapshot-revert":
-                return _result(ok=False, stderr="bad name")
-            return _result()
-
-        with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
-             patch.object(sm, "_memory_path_from_xml", return_value=None), \
-             patch.object(sm, "_restore_preserved_overlays", return_value=[]), \
-             patch.object(sm.virsh, "execute", side_effect=execute):
+        mem, restore, execute = self._restoring(
+            sm, calls, running=["vm01"], revert_ok=False)
+        with patch.object(sm, "_preserve_snapshot_overlays",
+                          return_value=[]), mem, restore, execute, \
+             patch.object(sm, "logger") as logger:
             assert sm.snapshot_restore("vm01", "s1") is False
 
-        assert calls.index("resume") > calls.index("snapshot-revert")
+        assert "suspend" in calls
+        assert "resume" not in calls
+        # but it says so, and says what to check
+        assert any("virsh resume vm01" in str(call)
+                   for call in logger.error.call_args_list)
 
     def test_a_guest_that_cannot_be_paused_refuses_the_restore(
         self, sm: SnapshotManager
     ):
         """Copying the live disk anyway is the thing this exists to stop."""
         calls: list[str] = []
-
-        def execute(*args, **_kw):
-            calls.append(args[0])
-            if args[0] == "domstate":
-                return _result(stdout="running\n")
-            if args[0] == "suspend":
-                return _result(ok=False, stderr="domain is not running")
-            return _result()
-
         with patch.object(sm, "_preserve_snapshot_overlays") as preserve, \
-             patch.object(sm.virsh, "execute", side_effect=execute):
+             patch.object(sm.virsh, "execute",
+                          side_effect=self._virsh(["vm01"], calls,
+                                                  suspend_ok=False)):
             with pytest.raises(SnapshotError, match="could not pause"):
                 sm.snapshot_restore("vm01", "s1")
 
@@ -1363,6 +1385,28 @@ class TestTheGuestHoldsStillWhileCopying:
             with pytest.raises(SnapshotError, match="cannot tell whether"):
                 sm.snapshot_restore("vm01", "s1")
         preserve.assert_not_called()
+
+    def test_a_resume_that_cannot_run_does_not_replace_the_real_error(
+        self, sm: SnapshotManager
+    ):
+        """The resume runs while another error is on its way up. Raising
+        here would swap the cause for the consequence."""
+        def execute(*args, **_kw):
+            if args[0] == "list":
+                return _result(stdout="vm01\n")
+            if args[0] == "resume":
+                raise OSError(24, "Too many open files")
+            return _result()
+
+        with patch.object(sm, "_preserve_snapshot_overlays",
+                          side_effect=SnapshotError("no space")), \
+             patch.object(sm.virsh, "execute", side_effect=execute), \
+             patch.object(sm, "logger") as logger:
+            with pytest.raises(SnapshotError, match="no space"):
+                sm.snapshot_restore("vm01", "s1")
+
+        assert any("virsh resume vm01" in str(call)
+                   for call in logger.error.call_args_list)
 
 
 class TestPendingRecoveryBlocksTheNextRestore:
