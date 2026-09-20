@@ -1108,6 +1108,118 @@ class TestOwnershipSurvivesFailures:
             os.chmod(backup, 0o600)
 
 
+class TestRoundSevenGaps:
+    """#193 round-7 findings.
+
+    Four ways the branch could still lose an overlay or mis-report one:
+    a scratch path nobody owned, a name the list parse swallowed, a
+    reservation published before the caller could clean it up, and a
+    recovery failure that escaped as the wrong kind of error.
+    """
+
+    def test_a_snapshot_whose_overlay_is_the_scratch_path_is_refused(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """The scratch a copy lands on before being renamed is a real file
+        in the overlay directory, and cleanup removes it — so like the
+        backup itself it has to be provably nobody else's."""
+        overlay = tmp_path / "disk.s1"
+        overlay.write_bytes(b"older")
+        sibling = tmp_path / "disk.s1.preserve.copy"      # a live overlay
+        sibling.write_bytes(b"newer")
+
+        calls: list[str] = []
+        with _inventory(sm,
+                        {"s1": [str(overlay)],
+                         "s1.preserve.copy": [str(sibling)]},
+                        ["s1", "s1.preserve.copy"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies(calls)):
+            with pytest.raises(SnapshotError, match="overlays of"):
+                sm._preserve_snapshot_overlays("vm01", "s1")
+
+        assert calls == []
+        assert sibling.read_bytes() == b"newer"
+
+    @pytest.mark.parametrize("names", [["\n"], ["s1", "\n"]],
+                             ids=["only-an-lf-name", "lf-named-tail-leaf"])
+    def test_a_name_made_of_newlines_is_refused_not_swallowed(
+        self, sm: SnapshotManager, tmp_path: Path, names
+    ):
+        """Such a name leaves no fragment to refuse on. Popping every
+        trailing empty fragment erased the evidence, and the snapshot
+        simply vanished from the inventory."""
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots(names, lambda _n: None)):
+            with pytest.raises(SnapshotError, match="blank entry"):
+                sm._strict_overlay_inventory("vm01")
+
+    def test_a_reservation_is_not_published_before_it_can_be_cleaned_up(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """The signature used to be read from the published name. A
+        failure there left the marker in place while the caller had no
+        idea the path existed — and every later restore refuses on it."""
+        backup = tmp_path / "o.qcow2.preserve"
+
+        def explode(*_a, **_kw):
+            raise OSError(5, "Input/output error")
+
+        with patch("boxman.providers.libvirt.snapshot.os.stat",
+                   side_effect=explode):
+            with pytest.raises(SnapshotError, match="could not reserve"):
+                sm._reserve_backup_paths(
+                    [(str(tmp_path / "o.qcow2"), str(backup))])
+
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_put_back_runner_that_raises_is_still_terminal(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """A raised runner error used to escape before the postcondition,
+        so the caller never learned an overlay was still in its backup —
+        and the manager retried it as an ordinary failure."""
+        overlay = tmp_path / "o.qcow2"          # deleted by the revert
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"the only copy")
+
+        with patch.object(sm, "_preserve_snapshot_overlays",
+                          return_value=[(str(overlay), str(backup))]), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
+             patch.object(sm.virsh, "execute", return_value=_result()), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=OSError(24, "Too many open files")):
+            with pytest.raises(SnapshotRecoveryError) as excinfo:
+                sm.snapshot_restore("vm01", "snap1")
+
+        assert "mv -fT" in str(excinfo.value)
+        assert backup.read_bytes() == b"the only copy"
+
+    def test_recompression_cannot_mask_the_terminal_overlay_error(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """Re-compressing the memory image is housekeeping. It used to run
+        before the terminal raise, so its own failure hid an overlay that
+        was already known not to be back."""
+        overlay = tmp_path / "o.qcow2"          # deleted by the revert
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"the only copy")
+
+        with patch.object(sm, "_preserve_snapshot_overlays",
+                          return_value=[(str(overlay), str(backup))]), \
+             patch.object(sm, "_memory_path_from_xml",
+                          return_value=str(tmp_path / "mem.raw")), \
+             patch.object(sm, "_recompress_after_revert",
+                          side_effect=OSError(5, "Input/output error")), \
+             patch.object(sm.virsh, "execute", return_value=_result()), \
+             patch.object(sm.virsh, "execute_shell",
+                          return_value=_result(ok=False, stderr="refused")):
+            with pytest.raises(SnapshotRecoveryError):
+                sm.snapshot_restore("vm01", "snap1")
+
+        assert backup.read_bytes() == b"the only copy"
+
+
 class TestPendingRecoveryBlocksTheNextRestore:
     """#193 round-2 finding 3.
 

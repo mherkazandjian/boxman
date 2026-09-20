@@ -766,8 +766,16 @@ class SnapshotManager:
         # of the inventory before the duplicate and topology checks can
         # notice, and the revert deletes its overlay regardless.
         names = list_result.stdout.split('\n')
-        while names and names[-1] == '':
-            names.pop()          # the trailing newline, and virsh's blank line
+        # Exactly the terminators virsh adds, and no more: one from the
+        # newline after the last name, and one from the blank line vsh
+        # prints after a command. Popping *every* trailing empty instead
+        # erases the evidence the check below needs -- a list whose only
+        # snapshot is named LF is all empty fragments, and would come back
+        # as a domain with no snapshots at all.
+        if names and names[-1] == '':
+            names.pop()
+        if names and names[-1] == '':
+            names.pop()
 
         # A name containing a newline splits into fragments that name no
         # snapshot, and the dumpxml below refuses on those. A name made
@@ -992,15 +1000,22 @@ class SnapshotManager:
         # leaves behind, and filtering first meant the next restore never
         # looked at it, reverted again, and reported success.
         candidates = sorted(files_to_preserve)
+        # The scratch each copy lands on before being renamed over its
+        # reservation is a real file in the overlay directory, so it is
+        # claimed and reserved exactly like the backup itself. A generated
+        # name would only be *probably* nobody's -- and cleanup removes
+        # these, so "probably" is not the standard. Deterministic, too:
+        # one left behind is detectable, and refuses the next restore
+        # rather than being silently reused.
         self._claim_backup_paths(
-            [(f, f + '.preserve') for f in candidates], all_overlays)
+            [(f, f + '.preserve') for f in candidates]
+            + [(f, f + '.preserve.copy') for f in candidates],
+            all_overlays)
 
         pairs = [(f, f + '.preserve') for f in candidates
                  if self._overlay_is_present(f)]
         if not pairs:
             return []
-
-        signatures = self._reserve_backup_paths(pairs)
 
         # the copy does not go straight to the reserved path. `cp` truncates
         # its destination before filling it, and a zero-length file at an
@@ -1009,10 +1024,10 @@ class SnapshotManager:
         # each copy lands on a scratch name and is renamed over the
         # reservation, which is atomic within a directory: the reserved path
         # is the marker one instant and the finished backup the next.
-        scratch = {dst: f"{dst}.{os.getpid()}."
-                        f"{binascii.hexlify(os.urandom(6)).decode()}.copy"
-                   for _src, dst in pairs}
-        owned = [dst for _src, dst in pairs] + list(scratch.values())
+        scratch = {dst: f"{dst}.copy" for _src, dst in pairs}
+        to_reserve = list(pairs) + [(src, scratch[dst]) for src, dst in pairs]
+        signatures = self._reserve_backup_paths(to_reserve)
+        owned = [path for _src, path in to_reserve]
 
         # batch it all into one command → one sudo prompt.
         # --reflink=auto shares the extents on a CoW filesystem instead of
@@ -1023,15 +1038,14 @@ class SnapshotManager:
         # Every command carries its own prefix: execute_shell prefixes the
         # first word of the string it is handed, which in a chain reaches
         # the first command only.
-        steps = []
-        for src, dst in pairs:
-            steps.append(f"cp --reflink=auto --sparse=always -p "
-                         f"{shlex.quote(src)} {shlex.quote(scratch[dst])}")
-            steps.append(f"mv -fT {shlex.quote(scratch[dst])} "
-                         f"{shlex.quote(dst)}")
-        cmd = " && ".join(self.virsh.sudo_prefix(c) + c for c in steps)
-
         try:
+            steps = []
+            for src, dst in pairs:
+                steps.append(f"cp --reflink=auto --sparse=always -p "
+                             f"{shlex.quote(src)} {shlex.quote(scratch[dst])}")
+                steps.append(f"mv -fT {shlex.quote(scratch[dst])} "
+                             f"{shlex.quote(dst)}")
+            cmd = " && ".join(self.virsh.sudo_prefix(c) + c for c in steps)
             result = self.virsh.execute_shell(cmd, warn=True)
         except Exception as exc:
             # execute_shell converts a command that *ran* and failed into a
@@ -1328,6 +1342,11 @@ class SnapshotManager:
                     written += os.write(fd, marker[written:])
             finally:
                 os.close(fd)
+            # stat the scaffold, not the published name: link() shares
+            # this inode, so the signature is the same either way, and
+            # taking it here keeps the path un-published until the caller
+            # is holding everything it needs to clean up
+            info = os.stat(tmp)
             os.link(tmp, dst)
         finally:
             # scaffolding: gone whether the link landed, failed, or was
@@ -1340,8 +1359,7 @@ class SnapshotManager:
                     f"could not remove the reservation scaffold {tmp} "
                     f"({exc.strerror}); remove it by hand")
 
-        reserved = os.lstat(dst)
-        return (reserved.st_ino, reserved.st_size, reserved.st_mtime_ns)
+        return (info.st_ino, info.st_size, info.st_mtime_ns)
 
     def _reap_preserve_files(self, backups: list[str]) -> None:
         """
@@ -1417,12 +1435,22 @@ class SnapshotManager:
             moves = [f"mv -fT {shlex.quote(b)} {shlex.quote(o)}"
                      for o, b in to_restore]
             cmd = " && ".join(self.virsh.sudo_prefix(m) + m for m in moves)
-            result = self.virsh.execute_shell(cmd, warn=True)
-            if result.ok:
+            # a runner that cannot start the command raises rather than
+            # returning a failed result, and escaping here would skip the
+            # postcondition below -- so the caller would never learn that
+            # an overlay is still sitting in its backup
+            try:
+                result = self.virsh.execute_shell(cmd, warn=True)
+            except Exception as exc:
+                self.logger.warning(
+                    f"could not run the put-back "
+                    f"({type(exc).__name__}: {exc})")
+                result = None
+            if result is not None and result.ok:
                 for o, _b in to_restore:
                     self.logger.info(
                         f"restored overlay deleted by revert: {o}")
-            else:
+            elif result is not None:
                 self.logger.warning(
                     f"a move failed while putting the overlays back "
                     f"({(result.stderr or '').strip()})")
@@ -1477,7 +1505,17 @@ class SnapshotManager:
                 run, so retrying the restore would run it a second time.
         """
         unrecovered = self._restore_preserved_overlays(preserved)
-        self._recompress_after_revert(mem_path, decompressed_for_revert)
+
+        # re-compressing the memory image is housekeeping. It runs after
+        # the overlays have been judged, and inside its own guard, so that
+        # it cannot throw away the one thing the caller has to be told.
+        try:
+            self._recompress_after_revert(mem_path, decompressed_for_revert)
+        except Exception as exc:
+            self.logger.warning(
+                f"could not re-compress the memory image of {mem_path} "
+                f"({type(exc).__name__}: {exc})")
+
         if not unrecovered:
             return
 
