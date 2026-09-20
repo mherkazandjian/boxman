@@ -90,15 +90,28 @@ class TestSnapshotOverlayPreservation057eb7d:
         c.write_bytes(b"x")
 
         # revert to the oldest snapshot preserves it and both newer ones
+        calls: list[str] = []
+
+        def copying(cmd, *_a, **_kw):
+            # the production code confirms its backups on the filesystem,
+            # so the double has to actually make them
+            calls.append(cmd)
+            for part in cmd.split(" && "):
+                words = part.split()
+                if "cp" in words[:2]:
+                    Path(words[-1].strip("'")).write_bytes(
+                        Path(words[-2].strip("'")).read_bytes())
+            return _result()
+
         with patch.object(
-            sm, "_get_snapshot_overlay_files",
-            return_value={"s1": [str(a)], "s2": [str(b)], "s3": [str(c)]},
-        ), patch.object(sm, "_chain_order", return_value=["s1", "s2", "s3"]), \
-                patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
+            sm, "_strict_overlay_inventory",
+            return_value=({"s1": [str(a)], "s2": [str(b)], "s3": [str(c)]},
+                          ["s1", "s2", "s3"]),
+        ), patch.object(sm.virsh, "execute_shell", side_effect=copying):
             sm._preserve_snapshot_overlays("vm01", "s1")
 
-        assert shell.call_count == 1
-        cmd = shell.call_args.args[0]
+        assert len(calls) == 1
+        cmd = calls[0]
         # one sudo prefix per copy, chained with &&, not ;
         assert cmd.count("sudo cp ") == 3
         assert " && " in cmd

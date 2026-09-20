@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.exceptions import SnapshotError
+from boxman.exceptions import SnapshotError, SnapshotRecoveryError
 from boxman.providers.libvirt.snapshot import SnapshotManager
 
 pytestmark = pytest.mark.unit
@@ -54,6 +54,65 @@ SNAP_XML_NO_OVERLAY = """\
   </disks>
 </domainsnapshot>
 """
+
+
+def _inventory(sm: SnapshotManager, overlays: dict, order: list):
+    """Patch the strict inventory with a complete, readable answer.
+
+    Tests about the strictness itself must NOT use this — they drive
+    ``virsh`` (see ``_virsh_snapshots``) so the enumeration really runs.
+    """
+    return patch.object(sm, "_strict_overlay_inventory",
+                        return_value=(overlays, order))
+
+
+def _shell_that_copies(calls: list | None = None,
+                       ok: bool = True,
+                       stderr: str = ""):
+    """An ``execute_shell`` double that performs the ``cp`` it is given.
+
+    The production code verifies its backups on the filesystem rather than
+    trusting ``cp``'s exit code, so a double that only records the command
+    string would fail every success-path test for the wrong reason.
+    """
+    def run(cmd, *_a, **_kw):
+        if calls is not None:
+            calls.append(cmd)
+        if ok:
+            for part in cmd.split(" && "):
+                words = shlex.split(part)
+                if "cp" in words[:2]:
+                    Path(words[-1]).write_bytes(Path(words[-2]).read_bytes())
+        return _result(ok=ok, stderr=stderr)
+    return run
+
+
+def _snap_xml(name: str, overlay: str, parent: str | None = None) -> str:
+    parent_xml = f"<parent><name>{parent}</name></parent>" if parent else ""
+    return (f"<domainsnapshot><name>{name}</name>{parent_xml}"
+            f"<disks><disk name='vda' snapshot='external'>"
+            f"<source file='{overlay}'/></disk></disks></domainsnapshot>")
+
+
+def _virsh_snapshots(names, xml_for, list_ok: bool = True, seen=None):
+    """A ``virsh.execute`` double answering snapshot-list / -dumpxml.
+
+    ``xml_for(name)`` returns the XML text, or None to fail that dumpxml.
+    """
+    def execute(*args, **_kw):
+        if seen is not None:
+            seen.append(args[0])
+        if args[0] == "snapshot-list":
+            if not list_ok:
+                return _result(ok=False, stderr="error: no such domain")
+            return _result(stdout="".join(f"{n}\n" for n in names))
+        if args[0] == "snapshot-dumpxml":
+            xml = xml_for(args[2])
+            if xml is None:
+                return _result(ok=False, stderr="error: cannot read metadata")
+            return _result(stdout=xml)
+        return _result()
+    return execute
 
 
 @pytest.fixture
@@ -257,29 +316,28 @@ class TestGetSnapshotOverlayFiles:
 class TestPreserveSnapshotOverlays:
 
     def test_no_overlays_returns_empty_list(self, sm: SnapshotManager):
-        with patch.object(sm, "_get_snapshot_overlay_files", return_value={}), \
-             patch.object(sm, "_chain_order", return_value=["s"]):
+        with _inventory(sm, {}, ["s"]):
             assert sm._preserve_snapshot_overlays("vm01", "s") == []
 
     def test_overlays_batched_into_single_copy_command(
         self, sm: SnapshotManager, tmp_path: Path
     ):
         overlay1 = tmp_path / "o1.qcow2"
-        overlay1.write_bytes(b"x")
+        overlay1.write_bytes(b"one")
         overlay2 = tmp_path / "o2.qcow2"
-        overlay2.write_bytes(b"x")
+        overlay2.write_bytes(b"two")
 
+        calls: list[str] = []
         # reverting to s1 (oldest) preserves s1 and the newer s2
-        with patch.object(
-            sm, "_get_snapshot_overlay_files",
-            return_value={"s1": [str(overlay1)], "s2": [str(overlay2)]},
-        ), patch.object(sm, "_chain_order", return_value=["s1", "s2"]), \
-                patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
+        with _inventory(sm, {"s1": [str(overlay1)], "s2": [str(overlay2)]},
+                        ["s1", "s2"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies(calls)):
             preserved = sm._preserve_snapshot_overlays("vm01", "s1")
 
         # one single command for BOTH overlays (regression: 057eb7d)
-        assert shell.call_count == 1
-        cmd = shell.call_args.args[0]
+        assert len(calls) == 1
+        cmd = calls[0]
         assert " && " in cmd
         # a reflink where the filesystem has them, a sparse copy where it
         # does not -- never a second full copy beside the original (CL-R2)
@@ -290,6 +348,9 @@ class TestPreserveSnapshotOverlays:
         assert sorted(pair[0] for pair in preserved) == sorted(
             [str(overlay1), str(overlay2)]
         )
+        # and the backups are really there, with the right bytes in them
+        assert (tmp_path / "o1.qcow2.preserve").read_bytes() == b"one"
+        assert (tmp_path / "o2.qcow2.preserve").read_bytes() == b"two"
 
     def test_preserves_only_target_and_newer(
         self, sm: SnapshotManager, tmp_path: Path
@@ -300,19 +361,25 @@ class TestPreserveSnapshotOverlays:
             f = tmp_path / f"{name}.qcow2"
             f.write_bytes(b"x")
             overlays[name] = [str(f)]
+        order = ["s1", "s2", "s3"]
 
         # restoring the latest snapshot backs up ONLY its own overlay
         # (the regression this narrowing fixes)
-        with patch.object(sm, "_get_snapshot_overlay_files", return_value=overlays), \
-                patch.object(sm, "_chain_order", return_value=["s1", "s2", "s3"]), \
-                patch.object(sm.virsh, "execute_shell", return_value=_result()):
+        with _inventory(sm, overlays, order), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies()):
             preserved = sm._preserve_snapshot_overlays("vm01", "s3")
         assert [p[0] for p in preserved] == overlays["s3"]
 
+        # a backup path has to be free, so clear the first run's scratch
+        # copy before the second (see TestBackupPathsAreClaimed)
+        for _o, b in preserved:
+            os.unlink(b)
+
         # restoring a middle snapshot backs up it + the newer one, not the older
-        with patch.object(sm, "_get_snapshot_overlay_files", return_value=overlays), \
-                patch.object(sm, "_chain_order", return_value=["s1", "s2", "s3"]), \
-                patch.object(sm.virsh, "execute_shell", return_value=_result()):
+        with _inventory(sm, overlays, order), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies()):
             preserved = sm._preserve_snapshot_overlays("vm01", "s2")
         backed_up = sorted(p[0] for p in preserved)
         assert backed_up == sorted(overlays["s2"] + overlays["s3"])
@@ -327,22 +394,19 @@ class TestPreserveSnapshotOverlays:
             f.write_bytes(b"x")
             overlays[name] = [str(f)]
 
-        # orphaned/missing metadata: target absent from chain order ->
+        # a target that is not a snapshot of this domain at all ->
         # preserve everything (safe but slow fallback)
-        with patch.object(sm, "_get_snapshot_overlay_files", return_value=overlays), \
-                patch.object(sm, "_chain_order", return_value=[]), \
-                patch.object(sm.virsh, "execute_shell", return_value=_result()):
+        with _inventory(sm, overlays, ["s1", "s2"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies()):
             preserved = sm._preserve_snapshot_overlays("vm01", "gone")
         assert sorted(p[0] for p in preserved) == sorted(
             overlays["s1"] + overlays["s2"]
         )
 
     def test_skips_missing_files(self, sm: SnapshotManager, tmp_path: Path):
-        with patch.object(
-            sm, "_get_snapshot_overlay_files",
-            return_value={"s": ["/does/not/exist.qcow2"]},
-        ), patch.object(sm, "_chain_order", return_value=["s"]), \
-                patch.object(sm.virsh, "execute_shell") as shell:
+        with _inventory(sm, {"s": ["/does/not/exist.qcow2"]}, ["s"]), \
+             patch.object(sm.virsh, "execute_shell") as shell:
             preserved = sm._preserve_snapshot_overlays("vm01", "s")
         assert preserved == []
         shell.assert_not_called()
@@ -351,12 +415,187 @@ class TestPreserveSnapshotOverlays:
         sm = SnapshotManager({"use_sudo": True})
         overlay = tmp_path / "o.qcow2"
         overlay.write_bytes(b"x")
-        with patch.object(
-            sm, "_get_snapshot_overlay_files", return_value={"s": [str(overlay)]}
-        ), patch.object(sm, "_chain_order", return_value=["s"]), \
-                patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
+        calls: list[str] = []
+        with _inventory(sm, {"s": [str(overlay)]}, ["s"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies(calls)):
             sm._preserve_snapshot_overlays("vm01", "s")
-        assert shell.call_args.args[0].startswith("sudo cp ")
+        assert calls[0].startswith("sudo cp ")
+
+
+class TestStrictOverlayInventory:
+    """#193 review finding 1.
+
+    The helpers behind the display verbs skip a snapshot they cannot read.
+    Preservation cannot: a snapshot missing from the inventory is one whose
+    overlay nothing backs up, and ``snapshot-revert`` deletes it anyway.
+    """
+
+    def _chain(self, tmp_path: Path):
+        overlays = {}
+        for name in ("s1", "s2", "s3"):
+            f = tmp_path / f"{name}.qcow2"
+            f.write_bytes(b"x")
+            overlays[name] = str(f)
+        return overlays
+
+    def _xml_for(self, overlays, parents):
+        def xml_for(name):
+            if overlays.get(name) is None:
+                return None
+            return _snap_xml(name, overlays[name], parents.get(name))
+        return xml_for
+
+    def test_a_readable_chain_is_enumerated_oldest_first(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        overlays = self._chain(tmp_path)
+        parents = {"s2": "s1", "s3": "s2"}
+        with patch.object(sm.virsh, "execute", side_effect=_virsh_snapshots(
+                ["s2", "s3", "s1"], self._xml_for(overlays, parents))):
+            found, order = sm._strict_overlay_inventory("vm01")
+        assert order == ["s1", "s2", "s3"]
+        assert found == {n: [overlays[n]] for n in ("s1", "s2", "s3")}
+
+    @pytest.mark.parametrize("fault,expected", [
+        ("unparseable", "does not parse"),
+        ("unreadable", "cannot read the metadata"),
+        ("no-list", "cannot list the snapshots"),
+        ("orphan", "does not place"),
+    ])
+    def test_a_gap_in_the_inventory_never_reaches_snapshot_revert(
+        self, sm: SnapshotManager, tmp_path: Path, fault, expected
+    ):
+        overlays = self._chain(tmp_path)
+        parents = {"s2": "s1", "s3": "s2"}
+
+        def xml_for(name):
+            if fault == "unreadable" and name == "s2":
+                return None
+            if fault == "unparseable" and name == "s2":
+                return "<domainsnapshot><disks>"          # truncated
+            return _snap_xml(name, overlays[name], parents.get(name))
+
+        if fault == "orphan":
+            parents["s2"] = "a-snapshot-that-is-not-listed"
+
+        seen: list[str] = []
+        with patch.object(sm.virsh, "execute", side_effect=_virsh_snapshots(
+                ["s1", "s2", "s3"], xml_for,
+                list_ok=(fault != "no-list"), seen=seen)), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
+             patch.object(sm.virsh, "execute_shell") as shell:
+            with pytest.raises(SnapshotError, match=expected):
+                sm.snapshot_restore("vm01", "s1")
+
+        # the destructive command was never issued, and nothing was copied
+        assert "snapshot-revert" not in seen
+        shell.assert_not_called()
+        # every overlay is still on disk
+        for path in overlays.values():
+            assert os.path.isfile(path)
+
+
+class TestBackupPathsAreClaimed:
+    """#193 review findings 2 and 3.
+
+    ``.preserve`` is not a reserved namespace and ``cp`` is happy to write
+    through whatever is already at the destination, so a backup path is
+    only usable once it has been shown to be nobody else's.
+    """
+
+    def test_a_snapshot_named_dot_preserve_refuses_rather_than_clobbering_it(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """Snapshot names are free-form: take `s1`, then take `s1.preserve`,
+        and libvirt names the second one's overlay exactly what the backup
+        of the first one's overlay wants to be called."""
+        overlay = tmp_path / "disk.s1"
+        overlay.write_bytes(b"older")
+        sibling = tmp_path / "disk.s1.preserve"     # a live overlay
+        sibling.write_bytes(b"newer")
+
+        with _inventory(sm,
+                        {"s1": [str(overlay)], "s1.preserve": [str(sibling)]},
+                        ["s1", "s1.preserve"]), \
+             patch.object(sm.virsh, "execute_shell") as shell:
+            with pytest.raises(SnapshotError) as excinfo:
+                sm._preserve_snapshot_overlays("vm01", "s1")
+
+        assert str(sibling) in str(excinfo.value)
+        shell.assert_not_called()
+        # the newer snapshot's only copy is neither overwritten nor reaped
+        assert sibling.read_bytes() == b"newer"
+
+    def test_the_collision_is_caught_by_name_not_by_the_path_being_occupied(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """The "must not already exist" check would also stop the case
+        above, which makes it a poor test of the name check. Here the
+        colliding overlay is declared but is not on disk, so only knowing
+        the name can refuse."""
+        overlay = tmp_path / "disk.s1"
+        overlay.write_bytes(b"older")
+        sibling = tmp_path / "disk.s1.preserve"     # declared, absent
+        assert not sibling.exists()
+
+        with _inventory(sm,
+                        {"s1": [str(overlay)], "s1.preserve": [str(sibling)]},
+                        ["s1", "s1.preserve"]), \
+             patch.object(sm.virsh, "execute_shell") as shell:
+            with pytest.raises(SnapshotError, match="overlays of"):
+                sm._preserve_snapshot_overlays("vm01", "s1")
+        shell.assert_not_called()
+
+    def test_a_backup_path_that_already_exists_is_refused_not_written_through(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """cp follows an existing destination symlink, so the bytes land in
+        whatever it points at — and the reap afterwards would remove it."""
+        overlay = tmp_path / "o.qcow2"
+        overlay.write_bytes(b"overlay")
+        victim = tmp_path / "somebody-elses-file"
+        victim.write_bytes(b"do not touch")
+        (tmp_path / "o.qcow2.preserve").symlink_to(victim)
+
+        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+             patch.object(sm.virsh, "execute_shell") as shell:
+            with pytest.raises(SnapshotError, match="already exists"):
+                sm._preserve_snapshot_overlays("vm01", "s1")
+
+        shell.assert_not_called()
+        assert victim.read_bytes() == b"do not touch"
+
+    def test_an_overlay_that_is_a_symlink_is_refused_not_dereferenced(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """os.path.isfile says True for a symlink to a regular file. cp would
+        copy the referent under the link's name, and the put-back would then
+        replace the link with a plain file."""
+        real = tmp_path / "elsewhere.qcow2"
+        real.write_bytes(b"x")
+        overlay = tmp_path / "o.qcow2"
+        overlay.symlink_to(real)
+
+        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+             patch.object(sm.virsh, "execute_shell") as shell:
+            with pytest.raises(SnapshotError, match="not a regular file"):
+                sm._preserve_snapshot_overlays("vm01", "s1")
+        shell.assert_not_called()
+
+    def test_a_copy_that_exits_zero_without_leaving_a_backup_is_refused(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """cp exits 0 in cases that leave nothing usable at the recorded
+        path, so the backup is confirmed on the filesystem, not by exit
+        code."""
+        overlay = tmp_path / "o.qcow2"
+        overlay.write_bytes(b"x")
+
+        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+             patch.object(sm.virsh, "execute_shell", return_value=_result()):
+            with pytest.raises(SnapshotError, match="not a regular file"):
+                sm._preserve_snapshot_overlays("vm01", "s1")
 
 
 class TestRestorePreservedOverlays:
@@ -429,9 +668,7 @@ class TestBackupIsAPrecondition:
     ):
         overlay = tmp_path / "s1.qcow2"
         overlay.write_bytes(b"x")
-        with patch.object(sm, "_get_snapshot_overlay_files",
-                          return_value={"s1": [str(overlay)]}), \
-             patch.object(sm, "_chain_order", return_value=["s1"]), \
+        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
              patch.object(
                  sm.virsh, "execute_shell",
                  return_value=_result(ok=False,
@@ -453,9 +690,7 @@ class TestBackupIsAPrecondition:
         was at risk" and "the copy failed", and the revert ran on either."""
         overlay = tmp_path / "s1.qcow2"
         overlay.write_bytes(b"x")
-        with patch.object(sm, "_get_snapshot_overlay_files",
-                          return_value={"s1": [str(overlay)]}), \
-             patch.object(sm, "_chain_order", return_value=["s1"]), \
+        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute_shell",
                           return_value=_result(ok=False, stderr="disk full")), \
@@ -482,9 +717,7 @@ class TestBackupIsAPrecondition:
             # the copy chain fails; the reap that follows it succeeds
             return _result(ok=cmd.startswith("rm "), stderr="disk full")
 
-        with patch.object(sm, "_get_snapshot_overlay_files",
-                          return_value=overlays), \
-             patch.object(sm, "_chain_order", return_value=["s1", "s2"]), \
+        with _inventory(sm, overlays, ["s1", "s2"]), \
              patch.object(sm.virsh, "execute_shell", side_effect=capture):
             with pytest.raises(SnapshotError):
                 sm._preserve_snapshot_overlays("vm01", "s1")
@@ -512,10 +745,8 @@ class TestBackupIsAPrecondition:
         def deny(*_a, **_kw):
             raise PermissionError(13, "Permission denied")
 
-        with patch.object(sm, "_get_snapshot_overlay_files",
-                          return_value={"s1": [str(overlay)]}), \
-             patch.object(sm, "_chain_order", return_value=["s1"]), \
-             patch("boxman.providers.libvirt.snapshot.os.stat",
+        with _inventory(sm, {"s1": [str(overlay)]}, ["s1"]), \
+             patch("boxman.providers.libvirt.snapshot.os.lstat",
                    side_effect=deny), \
              patch.object(sm.virsh, "execute_shell") as shell:
             with pytest.raises(SnapshotError) as excinfo:
@@ -532,15 +763,13 @@ class TestBackupIsAPrecondition:
         the path, handing the rest of the name to the shell as syntax."""
         odd = tmp_path / "it's a snapshot.qcow2"
         odd.write_bytes(b"x")
-        with patch.object(sm, "_get_snapshot_overlay_files",
-                          return_value={"s1": [str(odd)]}), \
-             patch.object(sm, "_chain_order", return_value=["s1"]), \
+        calls: list[str] = []
+        with _inventory(sm, {"s1": [str(odd)]}, ["s1"]), \
              patch.object(sm.virsh, "execute_shell",
-                          return_value=_result()) as shell:
+                          side_effect=_shell_that_copies(calls)):
             sm._preserve_snapshot_overlays("vm01", "s1")
 
-        cmd = shell.call_args.args[0]
-        assert shlex.split(cmd)[-2:] == [str(odd), f"{odd}.preserve"]
+        assert shlex.split(calls[0])[-2:] == [str(odd), f"{odd}.preserve"]
 
     def test_putting_the_overlays_back_is_a_rename_not_a_copy(
         self, sm: SnapshotManager, tmp_path: Path
@@ -582,12 +811,88 @@ class TestBackupIsAPrecondition:
             return _result(ok=False, stderr="read-only file system")
 
         with patch.object(sm.virsh, "execute_shell", side_effect=capture):
-            sm._restore_preserved_overlays([(str(overlay), str(backup))])
+            unrecovered = sm._restore_preserved_overlays(
+                [(str(overlay), str(backup))])
 
         # here the backup is the last copy of that overlay in existence;
-        # reaping it is precisely the loss the preservation exists to stop
-        assert not any(c.startswith("rm -f") for c in calls)
+        # reaping it is precisely the loss the preservation exists to stop.
+        # Match any rm naming it, prefixed or not -- `sudo rm -f` deletes
+        # just as thoroughly as `rm -f`.
+        assert not any("rm " in c and str(backup) in c for c in calls)
         assert backup.exists()
+        assert unrecovered == [(str(overlay), str(backup))]
+
+    def test_a_failed_put_back_is_terminal_not_a_successful_restore(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """The revert already ran. Reporting True here tells the caller the
+        chain is intact when an overlay is still sitting in its backup."""
+        overlay = tmp_path / "o.qcow2"          # deleted by the revert
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"x")
+
+        with patch.object(sm, "_preserve_snapshot_overlays",
+                          return_value=[(str(overlay), str(backup))]), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
+             patch.object(sm.virsh, "execute", return_value=_result()), \
+             patch.object(sm.virsh, "execute_shell",
+                          return_value=_result(ok=False, stderr="read-only")):
+            with pytest.raises(SnapshotRecoveryError) as excinfo:
+                sm.snapshot_restore("vm01", "snap1")
+
+        # and it says exactly what to run to finish the job
+        message = str(excinfo.value)
+        assert str(backup) in message
+        assert "mv -f" in message
+
+
+class TestBatchedCommandPrivilege:
+    """#193 review finding 5.
+
+    ``execute_shell`` prefixes the first word of the string it is handed,
+    which in an ``&&`` chain is the first command only — so a batch has to
+    decide privilege per command, and must not write ``sudo `` by hand,
+    which skips the policy altogether.
+    """
+
+    def _preserve(self, sm, tmp_path, calls):
+        overlay = tmp_path / "o.qcow2"
+        overlay.write_bytes(b"x")
+        other = tmp_path / "p.qcow2"
+        other.write_bytes(b"y")
+        with _inventory(sm, {"s": [str(overlay), str(other)]}, ["s"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_copies(calls)):
+            sm._preserve_snapshot_overlays("vm01", "s")
+        return calls[0]
+
+    def test_a_skipped_copy_is_not_sudo_prefixed_even_under_use_sudo(
+        self, tmp_path: Path
+    ):
+        sm = SnapshotManager({"use_sudo": True, "sudo_skip_commands": ["cp"]})
+        cmd = self._preserve(sm, tmp_path, [])
+        assert "sudo " not in cmd
+
+    def test_a_forced_copy_is_sudo_prefixed_on_every_element(
+        self, tmp_path: Path
+    ):
+        sm = SnapshotManager({"use_sudo": False,
+                              "force_sudo_commands": ["cp"]})
+        cmd = self._preserve(sm, tmp_path, [])
+        assert cmd.count("sudo cp ") == 2
+        # the command after the && used to inherit nothing at all
+        assert all(part.startswith("sudo cp ")
+                   for part in cmd.split(" && "))
+
+    def test_a_skipped_rename_is_not_sudo_prefixed_either(self, tmp_path: Path):
+        sm = SnapshotManager({"use_sudo": True, "sudo_skip_commands": ["mv"]})
+        overlay = tmp_path / "o.qcow2"          # deleted by the revert
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"x")
+        with patch.object(sm.virsh, "execute_shell",
+                          return_value=_result()) as shell:
+            sm._restore_preserved_overlays([(str(overlay), str(backup))])
+        assert shell.call_args.args[0].startswith("mv -f ")
 
 
 class TestSnapshotRestore:
@@ -601,7 +906,8 @@ class TestSnapshotRestore:
                           return_value=preserved_pairs) as preserve, \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", return_value=_result()) as execute, \
-             patch.object(sm, "_restore_preserved_overlays") as restore:
+             patch.object(sm, "_restore_preserved_overlays",
+                          return_value=[]) as restore:
             assert sm.snapshot_restore("vm01", "snap1") is True
 
         preserve.assert_called_once_with("vm01", "snap1")
@@ -614,7 +920,8 @@ class TestSnapshotRestore:
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
                           return_value=_result(ok=False, stderr="boom")), \
-             patch.object(sm, "_restore_preserved_overlays") as restore:
+             patch.object(sm, "_restore_preserved_overlays",
+                          return_value=[]) as restore:
             assert sm.snapshot_restore("vm01", "snap1") is False
         restore.assert_called_once()
 
@@ -627,7 +934,8 @@ class TestSnapshotRestore:
         with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=results), \
-             patch.object(sm, "_restore_preserved_overlays"), \
+             patch.object(sm, "_restore_preserved_overlays",
+                          return_value=[]), \
              patch("boxman.providers.libvirt.snapshot.time.sleep"):
             assert sm.snapshot_restore("vm01", "snap1") is True
 
@@ -636,7 +944,8 @@ class TestSnapshotRestore:
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute",
                           return_value=_result(ok=False, stderr="bad name")) as execute, \
-             patch.object(sm, "_restore_preserved_overlays"), \
+             patch.object(sm, "_restore_preserved_overlays",
+                          return_value=[]), \
              patch("boxman.providers.libvirt.snapshot.time.sleep"):
             assert sm.snapshot_restore("vm01", "snap1") is False
         assert execute.call_count == 1  # no retries on non-lock errors
@@ -645,7 +954,8 @@ class TestSnapshotRestore:
         with patch.object(sm, "_preserve_snapshot_overlays", return_value=[("a", "b")]), \
              patch.object(sm, "_memory_path_from_xml", return_value=None), \
              patch.object(sm.virsh, "execute", side_effect=RuntimeError("x")), \
-             patch.object(sm, "_restore_preserved_overlays") as restore:
+             patch.object(sm, "_restore_preserved_overlays",
+                          return_value=[]) as restore:
             assert sm.snapshot_restore("vm01", "snap1") is False
         restore.assert_called_once()
 
@@ -937,7 +1247,8 @@ class TestSnapshotRestoreCompressed:
         zst.write_bytes(b"x")
         raw = str(tmp_path / "vm01_snapshot_s.raw")
         with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
-             patch.object(sm, "_restore_preserved_overlays"), \
+             patch.object(sm, "_restore_preserved_overlays",
+                          return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=raw), \
              patch.object(sm, "decompress_memory_file",
                           return_value=True) as decomp, \
@@ -952,7 +1263,8 @@ class TestSnapshotRestoreCompressed:
         raw_path = tmp_path / "vm01_snapshot_s.raw"
         raw_path.write_bytes(b"x")
         with patch.object(sm, "_preserve_snapshot_overlays", return_value=[]), \
-             patch.object(sm, "_restore_preserved_overlays"), \
+             patch.object(sm, "_restore_preserved_overlays",
+                          return_value=[]), \
              patch.object(sm, "_memory_path_from_xml", return_value=str(raw_path)), \
              patch.object(sm, "decompress_memory_file") as decomp, \
              patch.object(sm.virsh, "execute", return_value=_result()):

@@ -175,6 +175,28 @@ class LibVirtCommandBase:
                 raise RuntimeError(error_message) from exc
             return exc.result
 
+    def sudo_prefix(self, command: str) -> str:
+        """
+        The prefix :meth:`execute_shell` would give *command* on its own.
+
+        A caller that batches several commands into one shell string has to
+        ask per command. ``execute_shell`` sees only the whole string and
+        prefixes at most its first word, so everything after an ``&&``
+        inherits whatever privilege the first command happened to need; and
+        a ``sudo `` written by hand skips the policy below entirely,
+        including ``sudo_skip_commands``. Both were live defects in the
+        overlay backup's copy/rename chains.
+
+        Args:
+            command: one command string, not a chain.
+
+        Returns:
+            str: ``"sudo "`` or ``""`` — concatenate it onto *command*.
+        """
+        if command.startswith("sudo "):
+            return ""
+        return "sudo " if self._should_use_sudo_for_command(command) else ""
+
     def _should_use_sudo_for_command(self, command: str) -> bool:
         """
         Decide whether *command* should be run with sudo.
@@ -275,12 +297,12 @@ class LibVirtCommandBase:
         # add sudo if needed (respects force_sudo_commands / sudo_skip_commands)
         if not command.startswith("sudo "):
             if privileged:
-                needs_sudo = self._privileged_needs_sudo(command)
-            else:
-                needs_sudo = ((force_sudo and self.use_sudo)
-                              or self._should_use_sudo_for_command(command))
-            if needs_sudo:
+                if self._privileged_needs_sudo(command):
+                    command = f"sudo {command}"
+            elif force_sudo and self.use_sudo:
                 command = f"sudo {command}"
+            else:
+                command = self.sudo_prefix(command) + command
 
         # wrap for runtime environment
         command = self._wrap_for_runtime(command)

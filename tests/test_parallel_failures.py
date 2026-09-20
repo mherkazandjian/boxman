@@ -122,6 +122,29 @@ class TestRestoreRetryLoop:
         assert "gave up after 20 rounds" in message
         assert "No space left on device" in message
 
+    def test_a_failed_put_back_is_reported_without_being_retried(self, monkeypatch):
+        """The revert has already run. Another round would run it again --
+        the destructive half -- so a recovery failure leaves the loop at
+        once and is reported on its own terms (#193 review, finding 4)."""
+        from boxman.exceptions import SnapshotError, SnapshotRecoveryError
+        monkeypatch.setattr("boxman.manager_parts.snapshots.time.sleep", lambda _s: None)
+        mgr = _manager()
+        mgr.provider.snapshot_restore.side_effect = SnapshotRecoveryError(
+            "reverted, but 1 overlay(s) the revert deleted could not be put "
+            "back. Finish by hand: mv -f /disks/a.qcow2.preserve /disks/a.qcow2")
+        mgr.provider.validate_snapshot.return_value = (True, [])
+        ns = types.SimpleNamespace(snapshot_name="s1", vms="all", cluster=None)
+        with pytest.raises(SnapshotError) as excinfo:
+            mgr.snapshot_restore(ns)
+
+        message = str(excinfo.value)
+        assert "could not put back" in message
+        assert "mv -f" in message
+        assert "gave up after 20 rounds" not in message
+        # exactly one round: it never went back for another try
+        infos = [c.args[0] for c in mgr.logger.info.call_args_list if c.args]
+        assert sum(1 for m in infos if m.startswith("restore round")) == 1
+
 
 class TestUpdateParallelFailures:
 

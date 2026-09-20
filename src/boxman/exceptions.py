@@ -87,6 +87,14 @@ class SnapshotError(BoxmanError):
     callers can decide whether to retry."""
 
 
+class SnapshotRecoveryError(SnapshotError):
+    """Raised when a revert has already happened and the overlays it
+    deleted could not be put back. Unlike its parent this must **not** be
+    retried: the retry would run ``snapshot-revert`` a second time, and
+    the backups that still need moving into place are named in the
+    message so the work can be finished by hand."""
+
+
 class RuntimeUnavailable(BoxmanError):  # noqa: N818 - public API name, renaming is a breaking change
     """Raised when the selected runtime (docker-compose, local libvirt)
     is not reachable — docker daemon down, libvirtd not responding, or
