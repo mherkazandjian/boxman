@@ -75,10 +75,11 @@ class TestSnapshotOverlayPreservation057eb7d:
 
         assert call_order == ["preserve", "revert", "restore"]
 
-    def test_preserve_uses_single_batched_rsync_command(self, tmp_path: Path):
+    def test_preserve_uses_a_single_batched_copy_command(self, tmp_path: Path):
         """Regression: a naive per-file loop would fire one sudo prompt
-        per overlay. The fix batches into a single `sudo rsync && sudo rsync ...`
-        chain to keep it to one auth prompt."""
+        per overlay. The fix batches into a single `sudo cp && sudo cp ...`
+        chain to keep it to one auth prompt. The copy tool changed with
+        #164 CL-R2 (rsync -> cp --reflink=auto); the batching did not."""
         sm = SnapshotManager({"use_sudo": True})
 
         a = tmp_path / "a.qcow2"
@@ -98,8 +99,8 @@ class TestSnapshotOverlayPreservation057eb7d:
 
         assert shell.call_count == 1
         cmd = shell.call_args.args[0]
-        # one sudo prefix per rsync, chained with &&, not ;
-        assert cmd.count("sudo rsync") == 3
+        # one sudo prefix per copy, chained with &&, not ;
+        assert cmd.count("sudo cp ") == 3
         assert " && " in cmd
 
 

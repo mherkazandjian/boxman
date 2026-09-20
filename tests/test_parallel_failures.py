@@ -102,6 +102,26 @@ class TestRestoreRetryLoop:
         errors = [c.args[0] for c in mgr.logger.error.call_args_list if c.args]
         assert any("libvirt gone" in m for m in errors)
 
+    def test_the_give_up_message_says_why_each_vm_is_still_failing(self, monkeypatch):
+        """A restore that refuses because its overlay backup could not be
+        made (#164 CL-D1) is retried like any other failure. With only the
+        VM names on the final line, twenty rounds of retries bury the one
+        message that says what actually went wrong."""
+        from boxman.exceptions import SnapshotError
+        monkeypatch.setattr("boxman.manager_parts.snapshots.time.sleep", lambda _s: None)
+        mgr = _manager()
+        mgr.provider.snapshot_restore.side_effect = SnapshotError(
+            "could not back up the snapshot overlays of vm01: "
+            "No space left on device")
+        mgr.provider.validate_snapshot.return_value = (True, [])
+        ns = types.SimpleNamespace(snapshot_name="s1", vms="all", cluster=None)
+        with pytest.raises(SnapshotError) as excinfo:
+            mgr.snapshot_restore(ns)
+
+        message = str(excinfo.value)
+        assert "gave up after 20 rounds" in message
+        assert "No space left on device" in message
+
 
 class TestUpdateParallelFailures:
 

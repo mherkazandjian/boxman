@@ -6,11 +6,13 @@ This module provides functionality to manage VM snapshots using command-line too
 
 import os
 import shlex
+import stat
 import time
 from typing import Any
 from xml.etree import ElementTree as ET
 
 from boxman import log
+from boxman.exceptions import SnapshotError
 
 from .commands import VirshCommand
 from .virsh_parse import parse_domblklist
@@ -729,7 +731,19 @@ class SnapshotManager:
         If the target is not found in the chain order (orphaned/missing
         metadata), fall back to preserving every overlay -- safe but slow.
 
-        Returns a list of (original_path, backup_path) tuples.
+        Args:
+            vm_name: the domain whose overlays are at risk.
+            snapshot_name: the snapshot about to be reverted to.
+
+        Returns:
+            list: ``(original_path, backup_path)`` pairs. Empty means there
+            was nothing at risk, and nothing else — the caller reverts on
+            that answer, so a failed backup must not be able to produce it.
+
+        Raises:
+            SnapshotError: the backup could not be made, or an overlay could
+                not be shown to be there. Either way the revert is refused
+                rather than run without a complete backup (#164 CL-D1).
         """
         all_overlays = self._get_snapshot_overlay_files(vm_name)
 
@@ -749,14 +763,19 @@ class SnapshotManager:
                 files_to_preserve.update(files)
 
         pairs = [(f, f + '.preserve') for f in sorted(files_to_preserve)
-                 if os.path.isfile(f)]
+                 if self._overlay_is_present(f)]
         if not pairs:
             return []
 
-        # batch all copies into one command → one sudo prompt
+        # batch all copies into one command → one sudo prompt.
+        # --reflink=auto shares the extents on a CoW filesystem instead of
+        # writing a second full copy beside the original, which is the ENOSPC
+        # this backup used to die of (#164 CL-R2). Elsewhere it falls back to
+        # the sparse copy `rsync -aW --sparse` was already making.
         sudo = "sudo " if self.use_sudo else ""
         cmd = " && ".join(
-            f"{sudo}rsync -aW --sparse '{src}' '{dst}'"
+            f"{sudo}cp --reflink=auto --sparse=always -p "
+            f"{shlex.quote(src)} {shlex.quote(dst)}"
             for src, dst in pairs)
         result = self.virsh.execute_shell(cmd, warn=True)
         if result.ok:
@@ -764,14 +783,84 @@ class SnapshotManager:
                 self.logger.debug(f"preserved snapshot overlay: {src}")
             return pairs
 
-        self.logger.warning(
-            f"failed to preserve overlays for {vm_name}: {result.stderr}")
-        return []
+        # The copies are one && chain, so a failure part-way through leaves
+        # the earlier backups -- and one half-written one -- behind with
+        # nothing to reap them (#164 CL-D2). Every original is still in
+        # place, a failed copy being what we are looking at, so the backups
+        # are redundant here and dropping them cannot lose anything.
+        self._reap_preserve_files([dst for _, dst in pairs])
+
+        raise SnapshotError(
+            f"could not back up the snapshot overlays of {vm_name} before "
+            f"reverting to '{snapshot_name}': "
+            f"{(result.stderr or '').strip() or 'the copy failed'}. "
+            f"Refusing to revert — snapshot-revert deletes those overlays, "
+            f"so without the backup every snapshot from '{snapshot_name}' "
+            f"onwards would be gone.")
+
+    def _overlay_is_present(self, path: str) -> bool:
+        """
+        Whether *path* is a regular file — or a refusal to guess.
+
+        ``os.path.isfile`` answers False both for "it is not there" and for
+        "I cannot tell" (an unreadable parent directory, say). Folding the
+        second into the first drops that overlay from the backup set, and
+        the revert then deletes a file nothing copied: CL-D1 one level down.
+
+        Args:
+            path: an overlay file named by a snapshot's XML.
+
+        Returns:
+            True for a regular file; False when it genuinely is not there.
+
+        Raises:
+            SnapshotError: the path could not be classified either way.
+        """
+        try:
+            return stat.S_ISREG(os.stat(path).st_mode)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise SnapshotError(
+                f"cannot tell whether the snapshot overlay {path} is there "
+                f"({exc.strerror}); refusing to revert, because an overlay "
+                f"left out of the backup is one the revert can delete for "
+                f"good") from exc
+
+    def _reap_preserve_files(self, backups: list[str]) -> None:
+        """
+        Remove ``.preserve`` copies that are no longer wanted.
+
+        One ``rm -f`` taking every path rather than an ``&&`` chain: cleanup
+        must not stop at the first path that resists, and a path that is
+        already gone is not an error. ``rm`` is never sudo-prefixed here —
+        unlinking needs write permission on the parent directory, not root
+        (see :meth:`VirshCommand._should_use_sudo_for_command`).
+
+        Best-effort: a failure names the paths so that whatever is left
+        behind can be removed by hand.
+
+        Args:
+            backups: backup paths to unlink; an empty list is a no-op.
+        """
+        if not backups:
+            return
+        cmd = "rm -f " + " ".join(shlex.quote(b) for b in backups)
+        result = self.virsh.execute_shell(cmd, warn=True)
+        if not result.ok:
+            self.logger.warning(
+                f"could not remove the overlay backups "
+                f"({(result.stderr or '').strip()}); remove them by hand: "
+                f"{', '.join(backups)}")
 
     def _restore_preserved_overlays(self, preserved: list[tuple]) -> None:
         """
-        Restore overlay files that were deleted during revert and clean
-        up backup files that are no longer needed.
+        Put back the overlay files the revert deleted, and reap the backups
+        that turned out not to be needed.
+
+        Args:
+            preserved: ``(original_path, backup_path)`` pairs as returned by
+                :meth:`_preserve_snapshot_overlays`.
         """
         if not preserved:
             return
@@ -784,8 +873,13 @@ class SnapshotManager:
                       if os.path.isfile(o) and os.path.isfile(b)]
 
         if to_restore:
+            # a rename, not a copy: the backup sits beside the original, so
+            # this is the same filesystem by construction and needs no free
+            # space. That matters here of all places — the overlay is gone
+            # and its backup is the only copy left, so a recovery that can
+            # fail on ENOSPC is one that fails exactly when it is needed.
             cmd = " && ".join(
-                f"{sudo}rsync -aW --sparse --remove-source-files '{b}' '{o}'"
+                f"{sudo}mv -f {shlex.quote(b)} {shlex.quote(o)}"
                 for o, b in to_restore)
             result = self.virsh.execute_shell(cmd, warn=True)
             if result.ok:
@@ -793,13 +887,17 @@ class SnapshotManager:
                     self.logger.info(
                         f"restored overlay deleted by revert: {o}")
             else:
-                self.logger.warning(
-                    f"failed to restore overlays: {result.stderr}")
+                # deliberately no reap on this path: here the .preserve file
+                # is the only copy of the overlay left, so removing it is
+                # the data loss this function exists to prevent.
+                self.logger.error(
+                    f"failed to put the overlays back after the revert "
+                    f"({(result.stderr or '').strip()}). The snapshots that "
+                    f"need them stay unreachable until these backups are "
+                    f"moved into place by hand: "
+                    f"{', '.join(f'{b} -> {o}' for o, b in to_restore)}")
 
-        if to_cleanup:
-            cmd = " && ".join(
-                f"rm -f '{b}'" for b in to_cleanup)
-            self.virsh.execute_shell(cmd, warn=True)
+        self._reap_preserve_files(to_cleanup)
 
     def snapshot_restore(self, vm_name: str, snapshot_name: str) -> bool:
         """
@@ -811,6 +909,12 @@ class SnapshotManager:
         falls back to backing up every overlay if the target isn't found in
         the chain). After the revert any overlays libvirt deleted are
         restored so that every snapshot remains reachable.
+
+        That backup is a precondition, not a courtesy. If it cannot be made,
+        :meth:`_preserve_snapshot_overlays` raises and no revert is
+        attempted: reverting without it destroys every snapshot from the
+        target onwards, and the old code could not tell a failed backup
+        apart from "there was nothing to back up" (#164 CL-D1).
 
         Compressed memory: if the snapshot's ``.raw`` memory file is missing
         but a ``.raw.zst`` sibling exists (created by ``snapshot take
@@ -829,6 +933,10 @@ class SnapshotManager:
 
         Returns:
             bool: True if successful, False otherwise
+
+        Raises:
+            SnapshotError: the overlay backup could not be made, so the
+                revert was not attempted.
         """
         preserved = self._preserve_snapshot_overlays(vm_name, snapshot_name)
 

@@ -431,6 +431,12 @@ class SnapshotsMixin:
 
         pending = list(vm_targets)
         max_rounds = 20
+        # kept across rounds so the give-up message below can say *why* each
+        # VM is still failing. A restore that refuses because its overlay
+        # backup could not be made (#164 CL-D1) is retried like any other
+        # failure, and twenty rounds of retries would otherwise bury the one
+        # line that explains it.
+        last_failures: dict[str, str] = {}
 
         for round_num in range(1, max_rounds + 1):
             self.logger.info(
@@ -441,6 +447,7 @@ class SnapshotsMixin:
             results, failures = self._run_parallel(
                 [(vm, _restore, (vm, snap)) for vm, snap in pending],
                 op_label='snapshot restore')
+            last_failures = failures
 
             failed = []
             for vm, snap in pending:
@@ -462,8 +469,12 @@ class SnapshotsMixin:
 
         self._exit_if_dc_failed(dc_failed, 'restore')
         raise SnapshotError(
-            f"restore gave up after {max_rounds} rounds. "
-            f"still failing: {[vm for vm, _ in pending]}")
+            f"restore gave up after {max_rounds} rounds. still failing: "
+            + "; ".join(
+                # a worker that returned False rather than raising leaves no
+                # reason here — it logged its own above
+                f"{vm} ({last_failures.get(vm, 'see the errors above')})"
+                for vm, _ in pending))
 
     def _refuse_managed_save_conflicts(self, vm_targets) -> None:
         """

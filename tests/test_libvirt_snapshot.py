@@ -12,11 +12,13 @@ Part of Phase 1.2 of the review plan
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import SnapshotError
 from boxman.providers.libvirt.snapshot import SnapshotManager
 
 pytestmark = pytest.mark.unit
@@ -259,7 +261,7 @@ class TestPreserveSnapshotOverlays:
              patch.object(sm, "_chain_order", return_value=["s"]):
             assert sm._preserve_snapshot_overlays("vm01", "s") == []
 
-    def test_overlays_batched_into_single_rsync_command(
+    def test_overlays_batched_into_single_copy_command(
         self, sm: SnapshotManager, tmp_path: Path
     ):
         overlay1 = tmp_path / "o1.qcow2"
@@ -279,7 +281,10 @@ class TestPreserveSnapshotOverlays:
         assert shell.call_count == 1
         cmd = shell.call_args.args[0]
         assert " && " in cmd
-        assert "rsync" in cmd
+        # a reflink where the filesystem has them, a sparse copy where it
+        # does not -- never a second full copy beside the original (CL-R2)
+        assert "cp --reflink=auto --sparse=always" in cmd
+        assert "rsync" not in cmd
         assert str(overlay1) in cmd
         assert str(overlay2) in cmd
         assert sorted(pair[0] for pair in preserved) == sorted(
@@ -351,7 +356,7 @@ class TestPreserveSnapshotOverlays:
         ), patch.object(sm, "_chain_order", return_value=["s"]), \
                 patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
             sm._preserve_snapshot_overlays("vm01", "s")
-        assert shell.call_args.args[0].startswith("sudo rsync")
+        assert shell.call_args.args[0].startswith("sudo cp ")
 
 
 class TestRestorePreservedOverlays:
@@ -368,8 +373,8 @@ class TestRestorePreservedOverlays:
         with patch.object(sm.virsh, "execute_shell", return_value=_result()) as shell:
             sm._restore_preserved_overlays([(str(overlay), str(backup))])
         cmd = shell.call_args.args[0]
-        assert "rsync" in cmd
-        assert "--remove-source-files" in cmd
+        assert cmd.startswith("mv -f ")
+        assert "rsync" not in cmd
         assert str(backup) in cmd
 
     def test_cleans_up_backup_when_original_still_present(
@@ -406,6 +411,183 @@ class TestRestorePreservedOverlays:
         cmd = shell.call_args.args[0]
         assert cmd.startswith("rm -f")
         assert "sudo " not in cmd
+
+
+class TestBackupIsAPrecondition:
+    """#164 CL-D1 / CL-D2 / CL-R2.
+
+    ``snapshot-revert`` deletes the overlays of the target snapshot and of
+    every snapshot newer than it. The backup taken beforehand is therefore
+    the only thing standing between a restore and the loss of the rest of
+    the chain -- so a backup that did not happen has to stop the revert,
+    clean up whatever half of it landed, and not have needed a second full
+    copy's worth of free space to attempt in the first place.
+    """
+
+    def test_a_failed_backup_refuses_instead_of_reporting_nothing_to_do(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        overlay = tmp_path / "s1.qcow2"
+        overlay.write_bytes(b"x")
+        with patch.object(sm, "_get_snapshot_overlay_files",
+                          return_value={"s1": [str(overlay)]}), \
+             patch.object(sm, "_chain_order", return_value=["s1"]), \
+             patch.object(
+                 sm.virsh, "execute_shell",
+                 return_value=_result(ok=False,
+                                      stderr="No space left on device")):
+            with pytest.raises(SnapshotError) as excinfo:
+                sm._preserve_snapshot_overlays("vm01", "s1")
+
+        # the operator has to be able to act on this: which vm, which
+        # snapshot, and what the copy itself said
+        message = str(excinfo.value)
+        assert "vm01" in message
+        assert "s1" in message
+        assert "No space left on device" in message
+
+    def test_a_failed_backup_never_reaches_snapshot_revert(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """The whole of CL-D1: an empty return used to mean both "nothing
+        was at risk" and "the copy failed", and the revert ran on either."""
+        overlay = tmp_path / "s1.qcow2"
+        overlay.write_bytes(b"x")
+        with patch.object(sm, "_get_snapshot_overlay_files",
+                          return_value={"s1": [str(overlay)]}), \
+             patch.object(sm, "_chain_order", return_value=["s1"]), \
+             patch.object(sm, "_memory_path_from_xml", return_value=None), \
+             patch.object(sm.virsh, "execute_shell",
+                          return_value=_result(ok=False, stderr="disk full")), \
+             patch.object(sm.virsh, "execute",
+                          return_value=_result()) as execute:
+            with pytest.raises(SnapshotError):
+                sm.snapshot_restore("vm01", "s1")
+
+        execute.assert_not_called()
+
+    def test_a_failed_backup_reaps_every_copy_it_may_have_made(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        overlays = {}
+        for name in ("s1", "s2"):
+            f = tmp_path / f"{name}.qcow2"
+            f.write_bytes(b"x")
+            overlays[name] = [str(f)]
+
+        calls: list[str] = []
+
+        def capture(cmd, *_a, **_kw):
+            calls.append(cmd)
+            # the copy chain fails; the reap that follows it succeeds
+            return _result(ok=cmd.startswith("rm "), stderr="disk full")
+
+        with patch.object(sm, "_get_snapshot_overlay_files",
+                          return_value=overlays), \
+             patch.object(sm, "_chain_order", return_value=["s1", "s2"]), \
+             patch.object(sm.virsh, "execute_shell", side_effect=capture):
+            with pytest.raises(SnapshotError):
+                sm._preserve_snapshot_overlays("vm01", "s1")
+
+        assert len(calls) == 2
+        reap = calls[1]
+        assert reap.startswith("rm -f ")
+        # every destination, not only the one the chain died on: the copies
+        # that already succeeded earlier in the && chain are what leaked
+        for name in ("s1", "s2"):
+            assert f"{overlays[name][0]}.preserve" in reap
+        # one rm taking both paths -- an && chain would stop at the first
+        # path that resisted and leave the rest behind, which is CL-D2 again
+        assert " && " not in reap
+
+    def test_an_overlay_that_cannot_be_stat_ed_refuses_rather_than_dropping_out(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """``os.path.isfile`` answers False for "unreadable" as flatly as
+        for "absent". Reading that as absent shrinks the backup set without
+        saying so, and the revert then deletes a file nothing copied."""
+        overlay = tmp_path / "s1.qcow2"
+        overlay.write_bytes(b"x")
+
+        def deny(*_a, **_kw):
+            raise PermissionError(13, "Permission denied")
+
+        with patch.object(sm, "_get_snapshot_overlay_files",
+                          return_value={"s1": [str(overlay)]}), \
+             patch.object(sm, "_chain_order", return_value=["s1"]), \
+             patch("boxman.providers.libvirt.snapshot.os.stat",
+                   side_effect=deny), \
+             patch.object(sm.virsh, "execute_shell") as shell:
+            with pytest.raises(SnapshotError) as excinfo:
+                sm._preserve_snapshot_overlays("vm01", "s1")
+
+        assert str(overlay) in str(excinfo.value)
+        assert "Permission denied" in str(excinfo.value)
+        shell.assert_not_called()
+
+    def test_overlay_paths_are_quoted_not_interpolated(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """The old f"'{src}'" ended its quoted string at an apostrophe in
+        the path, handing the rest of the name to the shell as syntax."""
+        odd = tmp_path / "it's a snapshot.qcow2"
+        odd.write_bytes(b"x")
+        with patch.object(sm, "_get_snapshot_overlay_files",
+                          return_value={"s1": [str(odd)]}), \
+             patch.object(sm, "_chain_order", return_value=["s1"]), \
+             patch.object(sm.virsh, "execute_shell",
+                          return_value=_result()) as shell:
+            sm._preserve_snapshot_overlays("vm01", "s1")
+
+        cmd = shell.call_args.args[0]
+        assert shlex.split(cmd)[-2:] == [str(odd), f"{odd}.preserve"]
+
+    def test_putting_the_overlays_back_is_a_rename_not_a_copy(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """This path runs after the overlay is already gone, so it must not
+        be the one that needs free space in order to succeed."""
+        overlay = tmp_path / "o.qcow2"          # deleted by the revert
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"x")
+        with patch.object(sm.virsh, "execute_shell",
+                          return_value=_result()) as shell:
+            sm._restore_preserved_overlays([(str(overlay), str(backup))])
+
+        cmd = shell.call_args.args[0]
+        assert cmd.startswith("mv -f ")
+        assert "cp " not in cmd and "rsync" not in cmd
+
+    def test_the_put_back_keeps_the_privilege_the_copy_had(self, tmp_path: Path):
+        sm = SnapshotManager({"use_sudo": True})
+        overlay = tmp_path / "o.qcow2"          # deleted by the revert
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"x")
+        with patch.object(sm.virsh, "execute_shell",
+                          return_value=_result()) as shell:
+            sm._restore_preserved_overlays([(str(overlay), str(backup))])
+        assert shell.call_args.args[0].startswith("sudo mv -f ")
+
+    def test_a_failed_put_back_keeps_the_only_copy_it_has_left(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        overlay = tmp_path / "o.qcow2"          # deleted by the revert
+        backup = tmp_path / "o.qcow2.preserve"
+        backup.write_bytes(b"x")
+
+        calls: list[str] = []
+
+        def capture(cmd, *_a, **_kw):
+            calls.append(cmd)
+            return _result(ok=False, stderr="read-only file system")
+
+        with patch.object(sm.virsh, "execute_shell", side_effect=capture):
+            sm._restore_preserved_overlays([(str(overlay), str(backup))])
+
+        # here the backup is the last copy of that overlay in existence;
+        # reaping it is precisely the loss the preservation exists to stop
+        assert not any(c.startswith("rm -f") for c in calls)
+        assert backup.exists()
 
 
 class TestSnapshotRestore:
