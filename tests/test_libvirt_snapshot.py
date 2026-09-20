@@ -873,6 +873,47 @@ class TestBackupPathsAreReserved:
         # and the temporary it was built through is not left lying about
         assert [entry.name for entry in tmp_path.iterdir()] == [backup.name]
 
+    def test_a_failed_marker_write_leaves_nothing_behind(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """The temporary is scaffolding. If writing the marker fails it is
+        never linked into place, so nothing tracks it for cleanup — it has
+        to remove itself."""
+        backup = tmp_path / "o.qcow2.preserve"
+
+        def explode(*_a, **_kw):
+            raise OSError(28, "No space left on device")
+
+        with patch("boxman.providers.libvirt.snapshot.os.write",
+                   side_effect=explode):
+            with pytest.raises(SnapshotError, match="could not reserve"):
+                sm._reserve_backup_paths(
+                    [(str(tmp_path / "o.qcow2"), str(backup))])
+
+        assert not backup.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_the_marker_is_written_whole_even_in_short_writes(
+        self, sm: SnapshotManager, tmp_path: Path
+    ):
+        """A short write would truncate the marker, and a truncated marker
+        is one _backup_was_written does not recognise — so an untouched
+        reservation would pass for a finished backup."""
+        backup = tmp_path / "o.qcow2.preserve"
+        real_write = os.write
+
+        def one_byte_at_a_time(fd, data):
+            return real_write(fd, data[:1])
+
+        with patch("boxman.providers.libvirt.snapshot.os.write",
+                   side_effect=one_byte_at_a_time):
+            sm._reserve_backup_paths(
+                [(str(tmp_path / "o.qcow2"), str(backup))])
+
+        assert backup.read_bytes() == sm._RESERVATION_MARKER
+        # and the reservation still reads as "nothing copied here yet"
+        assert not sm._backup_was_written(str(backup))
+
     def test_reserving_a_taken_path_fails_without_disturbing_it(
         self, sm: SnapshotManager, tmp_path: Path
     ):

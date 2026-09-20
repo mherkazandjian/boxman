@@ -1267,13 +1267,27 @@ class SnapshotManager:
         tmp = f"{dst}.{os.getpid()}.{binascii.hexlify(os.urandom(6)).decode()}"
         fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
-            os.write(fd, self._RESERVATION_MARKER)
-        finally:
-            os.close(fd)
-        try:
+            try:
+                # all of it, or the marker is truncated -- and a truncated
+                # marker is one _backup_was_written would not recognise,
+                # so an untouched reservation would pass for a backup
+                marker = self._RESERVATION_MARKER
+                written = 0
+                while written < len(marker):
+                    written += os.write(fd, marker[written:])
+            finally:
+                os.close(fd)
             os.link(tmp, dst)
         finally:
-            os.unlink(tmp)
+            # scaffolding: gone whether the link landed, failed, or was
+            # never reached. Only the caller's own reservations are tracked
+            # for cleanup, and this name was never one of them.
+            try:
+                os.unlink(tmp)
+            except OSError as exc:
+                self.logger.warning(
+                    f"could not remove the reservation scaffold {tmp} "
+                    f"({exc.strerror}); remove it by hand")
 
     def _reap_preserve_files(self, backups: list[str]) -> None:
         """
