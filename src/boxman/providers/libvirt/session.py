@@ -480,6 +480,53 @@ class LibVirtSession(SessionConfigMixin):
         status = network.destroy_network()
         return status
 
+    def network_attached_domains(self, name: str) -> list[str]:
+        """
+        The domains whose interfaces use the network *name*.
+
+        Asked before removing a network the config no longer declares: the
+        removal deletes the bridge, so a guest still attached to it is
+        left with a dead nic.
+
+        Args:
+            name: the fully qualified network name.
+
+        Returns:
+            list: domain names, empty when nothing is attached.
+        """
+        network = Network(
+            name=name,
+            info={},
+            provider_config=self.provider_config,
+            assign_new_bridge=False,
+            manager=self.manager,
+        )
+        return network.attached_domains()
+
+    def live_network_mode(self, name: str) -> str | None:
+        """
+        The forward mode of the *defined* network, from its live XML.
+
+        The cache records a network's address and bridge but not its mode,
+        and the mode decides whether removing it also has to tear down
+        iptables rules. Reading the definition avoids guessing.
+
+        Args:
+            name: the fully qualified network name.
+
+        Returns:
+            str: the forward mode, or None when the network is not defined
+            or its XML cannot be read.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        result = virsh.execute("net-dumpxml", name, hide=True, warn=True)
+        if not result.ok or not result.stdout:
+            return None
+        try:
+            return net_reconcile.parse_network_xml(result.stdout).get('mode')
+        except ET.ParseError:
+            return None
+
     def remove_network(self,
                        name: str = None,
                        info: dict[str, Any] | None = None) -> bool:

@@ -209,6 +209,17 @@ def parse_args():
         dest='recreate_networks'
     )
 
+    prune_networks_parent = argparse.ArgumentParser(add_help=False)
+    prune_networks_parent.add_argument(
+        '--prune-networks',
+        action='store_true',
+        default=False,
+        help=('remove networks this project provisioned but no longer '
+              'declares in conf.yml; without it they are only reported. '
+              'A network with guests still attached is never removed'),
+        dest='prune_networks'
+    )
+
     subparsers = parser.add_subparsers(help="sub-commands for boxman")
 
     #
@@ -374,7 +385,8 @@ def parse_args():
     # sub parser for the 'up' subcommand
     #
     parser_up = subparsers.add_parser(
-        'up', parents=[common, force_parent, rebuild_templates_parent, recreate_networks_parent],
+        'up', parents=[common, force_parent, rebuild_templates_parent,
+                       recreate_networks_parent, prune_networks_parent],
         help='bring up the infrastructure: provision if not created, start if powered off')
     parser_up.set_defaults(handler='up')
     parser_up.add_argument(
