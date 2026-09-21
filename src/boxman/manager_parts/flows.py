@@ -290,7 +290,8 @@ class FlowsMixin:
             self.ensure_shared_bridges()
             network_results = self.reconcile_networks(
                 allow_recreate=getattr(cli_args, 'recreate_networks', False),
-                auto_accept=getattr(cli_args, 'yes', False))
+                auto_accept=getattr(cli_args, 'yes', False),
+                prune=getattr(cli_args, 'prune_networks', False))
             self.report_network_results(network_results)
             self.raise_on_network_failures(network_results)
 
@@ -334,7 +335,8 @@ class FlowsMixin:
         # for a lease.
         network_results = self.reconcile_networks(
             allow_recreate=getattr(cli_args, 'recreate_networks', False),
-            auto_accept=getattr(cli_args, 'yes', False))
+            auto_accept=getattr(cli_args, 'yes', False),
+            prune=getattr(cli_args, 'prune_networks', False))
         self.report_network_results(network_results)
         self.raise_on_network_failures(network_results)
 
