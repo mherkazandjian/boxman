@@ -53,7 +53,11 @@ def join_names(names) -> str:
 
 @dataclass(frozen=True)
 class CloneDegradation:
-    """One clone that kept identity from its template under ``auto``.
+    """One clone that may have kept identity from its template under ``auto``.
+
+    "May": the pass is not atomic -- virt-sysprep can apply one change and then
+    fail on the next -- so the properties listed are the ones at risk, not
+    necessarily all ones that were kept.
 
     Crosses a process boundary: clones run in ``multiprocessing`` workers and
     these records travel back to the parent on ``_run_parallel``'s result
@@ -81,7 +85,7 @@ class CloneDegradation:
 
     def summary_line(self) -> str:
         """One line for the closing summary: vm, properties and cause."""
-        return (f"{self.vm}: kept its template's "
+        return (f"{self.vm}: may have kept its template's "
                 f"{join_names(self.properties)} -- {self.reason} "
                 f"({', '.join(self.policies)})")
 

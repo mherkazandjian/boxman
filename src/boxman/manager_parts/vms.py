@@ -194,7 +194,7 @@ class VMsMixin:
                     if isinstance(record, CloneDegradation))
 
     def report_clone_degradations(self) -> None:
-        """Close the run with one line per clone that kept template identity.
+        """Close the run with one line per clone that may have kept template identity.
 
         The per-clone warning is emitted where the clone happens, which on a
         project of any size is thousands of lines before the prompt comes
@@ -210,9 +210,11 @@ class VMsMixin:
             return
         self._clone_degradations = []
 
+        # "may have": the pass is not atomic, so a failure can land after some
+        # of a clone's properties were already reset
         self.logger.warning(
-            f"{len(records)} VM(s) kept identity from their template because "
-            f"the offline identity pass could not complete:")
+            f"{len(records)} VM(s) may have kept identity from their template; "
+            f"the offline identity pass did not complete:")
         for record in sorted(records, key=lambda item: item.vm):
             self.logger.warning(f"  {record.summary_line()}")
         self.logger.warning(
@@ -1204,6 +1206,18 @@ class VMsMixin:
             }))
 
     def update(self, cli_args):
+        """Apply config changes, then report every clone that degraded.
+
+        See :meth:`_update`. The report is in a ``finally`` for the same
+        reason as in ``provision``: a failure later in the run -- or in the
+        same clone batch -- must not swallow a degradation already collected.
+        """
+        try:
+            self._update(cli_args)
+        finally:
+            self.report_clone_degradations()
+
+    def _update(self, cli_args):
         """
         Apply config changes to already-provisioned VMs.
 
@@ -1459,8 +1473,6 @@ class VMsMixin:
                 self.wait_for_vm_ips(self._vms_worth_waiting_for())
             self.setup_ssh_access()
             self.connect_info()
-
-        self.report_clone_degradations()
 
         if update_failures:
             raise ProvisionError(

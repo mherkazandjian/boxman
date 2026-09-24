@@ -10,9 +10,12 @@ one-line-per-VM summary at the end of the run.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 from tests.conftest import make_bare_manager
 
+from boxman.exceptions import ProvisionError
 from boxman.providers.libvirt.clone_vm import (
     CloneDegradation,
 )
@@ -130,3 +133,72 @@ class TestReportCloneDegradations:
         first = len(_warnings(manager))
         manager.report_clone_degradations()
         assert len(_warnings(manager)) == first
+
+
+class TestReportedHoweverTheRunEnds:
+    """From the Copilot review of #204: the summary was skipped on failure."""
+
+    def test_provision_reports_even_when_it_raises(self):
+        manager = make_bare_manager({})
+        manager.collect_clone_degradations({"vm01": [_record("vm01")]})
+        with patch.object(manager, "_provision",
+                          side_effect=ProvisionError("vm02 never started")):
+            with pytest.raises(ProvisionError, match="never started"):
+                manager.provision(None)
+        assert any(line.strip().startswith("vm01:")
+                   for line in _warnings(manager))
+
+    def test_update_reports_even_when_it_raises(self):
+        manager = make_bare_manager({})
+        manager.collect_clone_degradations({"vm01": [_record("vm01")]})
+        with patch.object(manager, "_update",
+                          side_effect=ProvisionError("update finished with 1 failure")):
+            with pytest.raises(ProvisionError):
+                manager.update(None)
+        assert any(line.strip().startswith("vm01:")
+                   for line in _warnings(manager))
+
+    def test_a_failed_clone_does_not_swallow_a_degraded_one(self):
+        """The case the clone step's own comment promised: one clone fails,
+        another in the same batch degrades, and the batch raises."""
+        manager = make_bare_manager({"project": "p", "clusters": {"c1": {
+            "workdir": "/tmp/boxman-test-workdir",
+            "vms": {"vm01": {}, "vm02": {}}}}})
+        manager.provider = MagicMock()
+        degraded = "bprj__p__bprj_c1_vm01"
+        with patch.object(manager, "_ensure_libvirt_storage_pool"), \
+             patch.object(manager, "_resolve_iso_config"), \
+             patch.object(manager, "_run_parallel", return_value=(
+                 {degraded: [_record(degraded)]},
+                 {"bprj__p__bprj_c1_vm02": "CloneSanitizerError: boom"})), \
+             patch.object(manager, "_provision",
+                          side_effect=lambda _args: manager.clone_vms()):
+            with pytest.raises(ProvisionError, match="clone failed"):
+                manager.provision(None)
+        assert any(line.strip().startswith(f"{degraded}:")
+                   for line in _warnings(manager))
+
+    def test_a_successful_run_reports_once(self):
+        manager = make_bare_manager({})
+
+        def body(_args):
+            manager.collect_clone_degradations({"vm01": [_record("vm01")]})
+
+        with patch.object(manager, "_provision", side_effect=body):
+            manager.provision(None)
+        assert sum(line.strip().startswith("vm01:")
+                   for line in _warnings(manager)) == 1
+
+
+class TestTheSummaryDoesNotOverclaim:
+    """The pass is not atomic, so the summary must not say every property
+    was kept when some may already have been reset."""
+
+    def test_each_line_says_may_have_kept(self):
+        assert "may have kept" in _record("vm01").summary_line()
+
+    def test_the_header_says_may_have_kept(self):
+        manager = make_bare_manager({})
+        manager.collect_clone_degradations({"vm01": [_record("vm01")]})
+        manager.report_clone_degradations()
+        assert "may have kept" in _warnings(manager)[0]
