@@ -7,6 +7,11 @@ CPU, memory) match the declared configuration.
 
 Requires a working libvirt/KVM environment on the host.
 
+Before create-templates, each box's base-image URLs are probed with
+scripts/check_box_images.py; one the mirror has removed fails the box at
+once, naming the template and URL. ``make check-box-images`` runs the same
+check across every box without provisioning anything.
+
 Usage:
     make test-provision                                          # all boxes
     make test-provision pytest_args="-k tiny-libvirt-rocky-9"    # single box
@@ -14,6 +19,7 @@ Usage:
 """
 
 import glob
+import importlib.util
 import os
 import time
 
@@ -29,6 +35,18 @@ from boxman.utils.jinja_env import create_jinja_env
 
 BOXMAN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOXES_DIR = os.path.join(BOXMAN_DIR, "boxes")
+IMAGE_CHECKER = os.path.join(BOXMAN_DIR, "scripts", "check_box_images.py")
+
+
+def _load_image_checker():
+    """scripts/check_box_images.py is a dev script, not a package module."""
+    spec = importlib.util.spec_from_file_location("boxman_box_image_checker", IMAGE_CHECKER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+image_checker = _load_image_checker()
 
 # ---------------------------------------------------------------------------
 # OS variant → /etc/os-release ID mapping
@@ -202,13 +220,34 @@ def provisioned_box(request):
     config = parse_box_config(box_dir)
 
     # --- setup ---
+    # A pinned base image the mirror has since deleted (Rocky drops a point
+    # release's images once it is superseded) otherwise surfaces as a
+    # download failure deep inside create-templates. Probe the URLs first
+    # and name the dead one. Only "gone" (404/410) stops the box here: a
+    # probe that times out is weaker evidence than a failed download, so an
+    # unreachable mirror is left to create-templates, whose failure then
+    # carries what the probe saw.
+    image_checks = image_checker.check_refs(
+        image_checker.collect_image_refs(config, conf_path))
+    gone = [
+        image_checker.describe_dead(ref, status)
+        for ref, status in image_checks if status.state == image_checker.GONE
+    ]
+    if gone:
+        # still a failure, not a skip, for the reason given below
+        pytest.fail("\n".join(gone))
+    suspect = "".join(
+        f"\nbase-image pre-check: {image_checker.describe_dead(ref, status)}"
+        for ref, status in image_checks if status.state in image_checker.DEAD
+    )
+
     result = _run(f"boxman --conf {conf_path} create-templates --force", warn=True)
     if not result.ok:
         # deliberately a failure, not a skip: this job exists to catch exactly
         # this, and skipping leaves CI green after a box has stopped working
         pytest.fail(
             f"create-templates failed for {os.path.basename(box_dir)}: "
-            f"{result.stderr.strip()}"
+            f"{result.stderr.strip()}{suspect}"
         )
 
     result = _run(f"boxman --conf {conf_path} provision --force", warn=True)
