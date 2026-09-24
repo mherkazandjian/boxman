@@ -19,6 +19,7 @@ include = [
     { path = "containers/docker/Makefile", format = ["sdist", "wheel"] },
     { path = "containers/docker/supervisord.conf", format = ["sdist", "wheel"] },
     { path = "containers/docker/entrypoint.sh", format = ["sdist", "wheel"] },
+    { path = "containers/docker/seed-libvirt-state.sh", format = ["sdist", "wheel"] },
     { path = "containers/docker/README.md", format = ["sdist", "wheel"] },
     # Enumerate the file types boxes actually ship instead of `boxes/**/*`:
     # a blanket include would sweep in gitignored, generated `*.rendered.yml`

@@ -76,3 +76,24 @@ def test_docker_compose_extra_covers_the_docker_sdk(pyproject):
         "the docker-compose extra no longer provides the docker SDK; "
         "README and doc/docker-compose-provider/user-guide.md both tell users "
         "to install it this way")
+
+
+def test_every_file_the_dockerfile_copies_ships_in_the_package(pyproject):
+    """``include`` is an explicit per-file list, and the runtime builds the
+    image from the copy of ``containers/docker`` that shipped. A file the
+    Dockerfile COPYs but the list leaves out exists in a checkout and not in
+    a wheel install, where the image build then fails (#205 added
+    ``seed-libvirt-state.sh``)."""
+    docker_dir = os.path.join(os.path.dirname(PYPROJECT), "containers", "docker")
+    with open(os.path.join(docker_dir, "Dockerfile")) as fobj:
+        copied = [line.split()[1] for line in fobj
+                  if line.startswith("COPY ") and "--from" not in line]
+    assert copied, "found no COPY lines in the Dockerfile"
+
+    shipped = {entry["path"] if isinstance(entry, dict) else entry
+               for entry in pyproject["tool"]["poetry"].get("include", [])}
+    missing = [src for src in copied
+               if f"containers/docker/{src}" not in shipped]
+    assert not missing, (
+        f"the Dockerfile copies {missing}, which pyproject.toml does not "
+        f"include in the package")

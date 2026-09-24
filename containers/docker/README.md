@@ -306,8 +306,24 @@ anything that recreated the container — a workdir change, an unresponsive
 libvirtd, a compose-file edit — discarded every domain, network and
 snapshot (#164 FB-2).
 
-On a first run both are empty and `entrypoint.sh` seeds them from a
-pristine copy baked into the image, so libvirtd still starts configured.
+On every start `entrypoint.sh` restores whatever either directory lacks
+from a pristine copy baked into the image (`seed-libvirt-state.sh`): all of
+it on a first run, so libvirtd still starts configured, and only the
+missing paths when a directory is partly populated — one holding just the
+`nwfilter/` and `secrets/` libvirtd creates for itself, say (#205). A path
+the directory already holds is never overwritten, so local edits and
+libvirt's own changes survive an image upgrade. The flip side: a file the
+image ships comes back if you delete it.
+
+If something missing cannot be restored — a file where the image has a
+directory, for instance — the container logs a single `ERROR:` naming the
+host directory and idles rather than exiting, so it does not restart in a
+loop. Move that directory aside and restart to have it seeded afresh; the
+domains, networks and snapshots kept in it do not come back. A damaged
+`qemu/networks/default.xml` is reported the same way but the container
+keeps running without the default network: delete the file and restart to
+get the image's copy back.
+
 A container created before the mounts existed has its state copied out
 with `docker cp` and validated before anything stops it; the copy is only
 accepted once a `.libvirt-state-migrated` marker is written, so an
