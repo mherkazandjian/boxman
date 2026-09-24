@@ -68,7 +68,7 @@ contributes, and the customizations it contributes:
 |---|---|---|---|
 | machine id | `clone_machine_id` | `machine-id` | — |
 | hostname | `clone_hostname` | — | `--hostname`, `/etc/hosts` edit, cloud-init drop-in |
-| ssh host keys | `clone_ssh_host_keys` | `ssh-hostkeys` | `--upload` + `--chmod` per key file |
+| ssh host keys | `clone_ssh_host_keys` | `ssh-hostkeys` | `--tar-in` of one root-owned archive holding every key (§5.1) |
 
 Each key takes `auto | required | off`, default `auto`, with exactly the
 semantics `clone_machine_id` has today. Three sibling keys rather than one

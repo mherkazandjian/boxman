@@ -220,7 +220,8 @@ select what that pass covers:
 
 - `clone_machine_id` — give the clone its own `/etc/machine-id`;
 - `clone_ssh_host_keys` — delete the inherited `/etc/ssh/ssh_host_*` keys and
-  install a freshly generated set, owned `root:root` and mode `0600`.
+  install a freshly generated set, owned `root:root` — private keys mode
+  `0600`, public keys `0644`.
 
 Each takes the same three values, and defaults to `auto`:
 
