@@ -13,9 +13,12 @@ Usage:
     make test-provision verbose=1                                # verbose
 """
 
+import base64
 import glob
+import hashlib
 import os
 import time
+import warnings
 
 import invoke
 import pytest
@@ -199,24 +202,49 @@ def get_base_image(cluster_cfg, vm_cfg):
     return vm_cfg.get("base_image") or cluster_cfg.get("base_image")
 
 
+def ssh_pubkey_fingerprint(pubkey_line):
+    """``SHA256:...`` for an authorized-keys style line, as ssh-keygen -l prints it.
+
+    Computed here rather than by piping virt-cat into ``ssh-keygen -lf -``:
+    a pipeline reports the *last* command's exit status, so a failed virt-cat
+    would look like a success with empty output.
+    """
+    parts = pubkey_line.split()
+    if len(parts) < 2:
+        return None
+    try:
+        blob = base64.b64decode(parts[1], validate=True)
+    except Exception:
+        return None
+    digest = base64.b64encode(hashlib.sha256(blob).digest()).decode()
+    return "SHA256:" + digest.rstrip("=")
+
+
 def template_host_key_fingerprints(base_image):
     """Fingerprints of *base_image*'s own host keys, read offline.
 
-    Returns an empty dict when the template disk cannot be read — the
-    hypervisor may have no libguestfs tools, or no passwordless access to
-    them. The clone-vs-clone comparison still applies in that case; only the
-    clone-vs-template one is skipped.
+    Tries virt-cat unprivileged first, then under ``sudo -n``: libguestfs
+    talks to the session libvirt URI by default, which cannot see a
+    system-URI template domain.
+
+    Returns an empty dict when the template disk cannot be read at all — the
+    hypervisor may have no libguestfs tools, or no passwordless access. The
+    caller reports that rather than passing quietly, because an empty dict
+    makes the clone-vs-template comparison vacuous.
     """
-    fingerprints = {}
-    for key_type in SSH_HOST_KEY_TYPES:
-        pub = f"/etc/ssh/ssh_host_{key_type}_key.pub"
-        result = _run(
-            f"virt-cat -d {base_image} {pub} | ssh-keygen -lf -", warn=True)
-        if result.ok and result.stdout.strip():
-            parts = result.stdout.split()
-            if len(parts) > 1:
-                fingerprints[key_type] = parts[1]
-    return fingerprints
+    for prefix in ("", "sudo -n "):
+        fingerprints = {}
+        for key_type in SSH_HOST_KEY_TYPES:
+            pub = f"/etc/ssh/ssh_host_{key_type}_key.pub"
+            result = _run(f"{prefix}virt-cat -d {base_image} {pub}", warn=True)
+            if not result.ok or not result.stdout.strip():
+                continue
+            fingerprint = ssh_pubkey_fingerprint(result.stdout.strip())
+            if fingerprint:
+                fingerprints[key_type] = fingerprint
+        if fingerprints:
+            return fingerprints
+    return {}
 
 
 def get_expected_vcpus(vm_cfg):
@@ -316,6 +344,7 @@ class TestProvisionBox:
         seen = {}
         template_fingerprints = {}
         checked = 0
+        compared_to_template = 0
 
         for cluster_name, vm_name, vm_cfg in iter_vms(config):
             cluster_cfg = config["clusters"][cluster_name]
@@ -351,12 +380,22 @@ class TestProvisionBox:
                 seen[fingerprint] = (host, key_type)
 
                 template = template_fingerprints.get(base_image, {})
-                assert fingerprint != template.get(key_type), (
-                    f"{host}: its {key_type} host key is still the "
-                    f"template's ({fingerprint})")
+                if key_type in template:
+                    assert fingerprint != template[key_type], (
+                        f"{host}: its {key_type} host key is still the "
+                        f"template's ({fingerprint})")
+                    compared_to_template += 1
                 checked += 1
 
         assert checked, "no ssh host keys were checked on any vm"
+        if not compared_to_template:
+            # say so rather than pass quietly: without this the test rests
+            # entirely on clone-vs-clone, which proves nothing for a box
+            # that declares a single vm
+            warnings.warn(
+                "no template host keys could be read offline (virt-cat), so "
+                "the clone-vs-template comparison was skipped",
+                stacklevel=2)
 
     # -- OS release ---------------------------------------------------------
 
