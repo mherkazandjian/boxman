@@ -16,13 +16,16 @@ from boxman.exceptions import (
 )
 from boxman.loggers.logger import suppressed
 from boxman.manager_parts.images import ImagesMixin
-from boxman.providers.libvirt.clone_vm import CLONE_DEGRADATION_NOTICES_KEY
+from boxman.providers.libvirt.clone_vm import (
+    CLONE_DEGRADATIONS_KEY,
+    CloneDegradation,
+)
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.providers.libvirt.virsh_parse import parse_domblklist
 
 
 def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
-                      max_retries: int = 5) -> None:
+                      max_retries: int = 5) -> list:
     """
     Clone one VM, retrying transient (e.g. storage-pool-busy) failures.
 
@@ -30,12 +33,18 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
     ``multiprocessing.Process`` target. Shared by
     :meth:`BoxmanManager.clone_vms` and
     :meth:`BoxmanManager._clone_and_configure_new_vms`.
+
+    Returns the :class:`CloneDegradation` records for this clone, which
+    ``_run_parallel`` carries back to the parent on its result queue. Without
+    that return they would stay in the child process and the run could not
+    close with a summary — the warning emitted here scrolls away behind
+    everything provisioning does next.
     """
     for attempt in range(1, max_retries + 1):
         last_attempt = attempt == max_retries
-        degradation_notices: list[str] = []
+        degradations: list = []
         attempt_info = vm_info.copy()
-        attempt_info[CLONE_DEGRADATION_NOTICES_KEY] = degradation_notices
+        attempt_info[CLONE_DEGRADATIONS_KEY] = degradations
         # Suppress error-level logs on all retryable attempts so that
         # transient pool-busy failures don't appear as errors; only the
         # final attempt logs errors normally. suppressed() restores the
@@ -60,9 +69,9 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
             # unsuppressed retry. Re-emit only its degradation notice after
             # leaving the suppression context so duplicate identity is never
             # silent while transient attempt noise remains hidden.
-            for notice in degradation_notices:
-                log.warning(notice)
-            return
+            for degradation in degradations:
+                log.warning(degradation.message)
+            return degradations
         except (CloneSanitizerError, ConfigError):
             # Required sanitizer and invalid-policy failures are permanent.
             # Retrying would either repeat the same inspection or run into an
@@ -153,17 +162,63 @@ class VMsMixin:
         # particular looks like a hang. Goes through the shared helper so the
         # fan-out is bounded (one process per VM does not scale to a large
         # cluster) and killed workers are reported, not just non-zero exits.
-        _results, failures = self._run_parallel(
+        results, failures = self._run_parallel(
             [(new_vm_name, _clone_with_retry,
               (self.provider, cluster, vm_info, new_vm_name))
              for cluster, vm_info, new_vm_name in clone_tasks],
             op_label='clone vm')
+        # before the failure check: a batch where one clone failed and another
+        # merely degraded still has a degradation worth reporting
+        self.collect_clone_degradations(results)
         if failures:
             names = ', '.join(sorted(failures))
             raise ProvisionError(
                 f"clone failed for {len(failures)} VM(s) ({names}); aborting "
                 f"provision. See the preceding clone or guest-sanitizer log "
                 f"for the underlying cause and remediation.")
+
+    def collect_clone_degradations(self, results) -> None:
+        """Accumulate the degradation records clone workers returned.
+
+        *results* is ``_run_parallel``'s results dict: one entry per clone,
+        holding whatever :func:`_clone_with_retry` returned in that child.
+        """
+        collected = getattr(self, '_clone_degradations', None)
+        if collected is None:
+            collected = []
+            self._clone_degradations = collected
+        for payload in (results or {}).values():
+            if isinstance(payload, list):
+                collected.extend(
+                    record for record in payload
+                    if isinstance(record, CloneDegradation))
+
+    def report_clone_degradations(self) -> None:
+        """Close the run with one line per clone that kept template identity.
+
+        The per-clone warning is emitted where the clone happens, which on a
+        project of any size is thousands of lines before the prompt comes
+        back. A clone silently wearing its template's identity is exactly the
+        thing not to leave to a scrollback search, so it is repeated here,
+        once, at the end.
+
+        Accumulated records are cleared, so a long-lived manager reporting
+        twice does not print the same clone twice.
+        """
+        records = getattr(self, '_clone_degradations', None)
+        if not records:
+            return
+        self._clone_degradations = []
+
+        self.logger.warning(
+            f"{len(records)} VM(s) kept identity from their template because "
+            f"the offline identity pass could not complete:")
+        for record in sorted(records, key=lambda item: item.vm):
+            self.logger.warning(f"  {record.summary_line()}")
+        self.logger.warning(
+            "set the matching clone_* policy to 'required' to fail the clone "
+            "instead of inheriting, or install/repair virt-sysprep on the "
+            "hypervisor; the cause of each is logged beside its clone above.")
 
     ### end vms define / remove / destroy
     def _configure_and_start_vm(
@@ -661,11 +716,12 @@ class VMsMixin:
         # from running against VMs that were never defined. _run_parallel
         # reports raised/killed workers as failures, not just non-zero
         # exitcodes.
-        _results, failures = self._run_parallel(
+        results, failures = self._run_parallel(
             [(new_vm_name, _clone_with_retry,
               (self.provider, cluster, vm_info, new_vm_name))
              for cluster, vm_info, new_vm_name in clone_tasks],
             op_label='clone vm')
+        self.collect_clone_degradations(results)
         if failures:
             names = ', '.join(sorted(failures))
             raise ProvisionError(
@@ -1403,6 +1459,8 @@ class VMsMixin:
                 self.wait_for_vm_ips(self._vms_worth_waiting_for())
             self.setup_ssh_access()
             self.connect_info()
+
+        self.report_clone_degradations()
 
         if update_failures:
             raise ProvisionError(

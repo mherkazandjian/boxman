@@ -25,9 +25,10 @@ from boxman.exceptions import (
     ProvisionError,
 )
 from boxman.providers.libvirt.clone_vm import (
-    CLONE_DEGRADATION_NOTICES_KEY,
+    CLONE_DEGRADATIONS_KEY,
     SSH_HOST_KEY_ARCHIVE,
     SSH_HOST_KEY_TYPES,
+    CloneDegradation,
     CloneVM,
 )
 from boxman.providers.libvirt.session import LibVirtSession
@@ -519,8 +520,8 @@ class TestSysprepInvocation:
         self, clone: CloneVM
     ):
         """A boxman bug must not be reported as an uninspectable guest."""
-        notices: list[str] = []
-        clone.info[CLONE_DEGRADATION_NOTICES_KEY] = notices
+        notices: list = []
+        clone.info[CLONE_DEGRADATIONS_KEY] = notices
         with patch.object(
             clone, "build_sysprep_invocation",
             side_effect=ProvisionError("bad plan"),
@@ -651,18 +652,81 @@ class TestDegradationMessage:
             clone.build_identity_plan(), CloneSanitizerError("boom"))
         assert "may have kept" in message
 
-    def test_a_degraded_pass_records_one_notice_per_clone(
+    def test_a_degraded_pass_records_one_record_per_clone(
         self, clone: CloneVM
     ):
-        notices: list[str] = []
-        clone.info[CLONE_DEGRADATION_NOTICES_KEY] = notices
+        collected: list = []
+        clone.info[CLONE_DEGRADATIONS_KEY] = collected
         with patch.object(
             clone, "run_identity_pass",
             side_effect=CloneSanitizerError("no libguestfs"),
         ):
             clone.apply_identity_policies()
-        assert len(notices) == 1
-        assert "clone_ssh_host_keys=auto" in notices[0]
+        assert len(collected) == 1
+        record = collected[0]
+        assert isinstance(record, CloneDegradation)
+        assert record.vm == "vm01"
+        assert record.properties == ("machine id", "ssh host keys")
+        assert record.policies == (
+            "clone_machine_id=auto", "clone_ssh_host_keys=auto")
+        assert record.cause == "no libguestfs"
+        assert "clone_ssh_host_keys=auto" in record.message
+
+
+    def test_required_fails_closed_instead_of_recording(
+        self, tmp_path: Path
+    ):
+        """#202: a required policy must not turn into a summary line."""
+        vm = _vm(tmp_path, clone_ssh_host_keys="required")
+        collected: list = []
+        vm.info[CLONE_DEGRADATIONS_KEY] = collected
+        with patch.object(
+            vm, "run_identity_pass",
+            side_effect=CloneSanitizerError("no libguestfs"),
+        ), patch.object(vm, "discard_unsafe_clone") as discard:
+            with pytest.raises(CloneSanitizerError, match="no libguestfs"):
+                vm.apply_identity_policies()
+        assert collected == []
+        discard.assert_called_once()
+
+
+class TestDegradationRecord:
+    """The record the closing summary is built from (#202)."""
+
+    def test_summary_line_names_the_vm_properties_and_cause(
+        self, clone: CloneVM
+    ):
+        record = clone.degradation_record(
+            clone.build_identity_plan(),
+            CloneSanitizerError("no libguestfs"))
+        line = record.summary_line()
+        assert line.startswith("vm01: ")
+        assert "machine id and ssh host keys" in line
+        assert "the guest could not be inspected" in line
+        assert "clone_machine_id=auto" in line
+        # one line, so it cannot be lost in a scrollback of wrapped text
+        assert "\n" not in line
+
+    @pytest.mark.parametrize(
+        "error, expected",
+        [
+            (CloneSanitizerUnavailableError("virt-sysprep is not installed"),
+             "the offline sanitizer is unavailable"),
+            (CloneSanitizerError("virt-sysprep timed out after 300s"),
+             "the offline sanitizer timed out"),
+            (CloneSanitizerError("could not inspect vm"),
+             "the guest could not be inspected"),
+        ],
+    )
+    def test_cause_is_classified_for_the_summary(self, error, expected):
+        assert CloneVM.degradation_reason(error) == expected
+
+    def test_a_record_survives_pickling(self, clone: CloneVM):
+        """Clones run in multiprocessing workers; records cross that boundary."""
+        import pickle
+        record = clone.degradation_record(
+            clone.build_identity_plan(), CloneSanitizerError("boom"))
+        assert pickle.loads(pickle.dumps(record)) == record
 
 
 class TestDiscardUnsafeClone:

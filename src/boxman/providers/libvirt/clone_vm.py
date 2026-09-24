@@ -22,9 +22,11 @@ from .commands import VirshCommand, VirtCloneCommand, VirtSysprepCommand
 from .virsh_parse import parse_domiflist
 
 # Internal hand-off used by the retry wrapper. Clone attempts run under log
-# suppression so transient errors stay quiet; successful ``auto`` degradation
-# notices are collected here and re-emitted after that suppression ends.
-CLONE_DEGRADATION_NOTICES_KEY = '_boxman_clone_degradation_notices'
+# suppression so transient errors stay quiet; successful ``auto`` degradations
+# are collected here as :class:`CloneDegradation` records, re-emitted after
+# that suppression ends, and returned to the parent process so the run can
+# close with a summary of every clone that kept its template's identity.
+CLONE_DEGRADATIONS_KEY = '_boxman_clone_degradations'
 
 #: Every clone-identity property takes the same three policies with the same
 #: meaning: ``auto`` degrades to a notice and continues, ``required`` fails
@@ -39,6 +41,49 @@ SSH_HOST_KEY_TYPES = ('rsa', 'ecdsa', 'ed25519')
 #: Name of the staged archive that carries the clone's host keys into
 #: ``/etc/ssh`` with root ownership.
 SSH_HOST_KEY_ARCHIVE = 'ssh-host-keys.tar'
+
+
+def join_names(names) -> str:
+    """``a``, ``a and b``, ``a, b and c`` -- for messages, not for parsing."""
+    names = list(names)
+    if len(names) < 2:
+        return names[0] if names else 'nothing'
+    return ', '.join(names[:-1]) + f" and {names[-1]}"
+
+
+@dataclass(frozen=True)
+class CloneDegradation:
+    """One clone that kept identity from its template under ``auto``.
+
+    Crosses a process boundary: clones run in ``multiprocessing`` workers and
+    these records travel back to the parent on ``_run_parallel``'s result
+    queue, so every field is a plain picklable value.
+    """
+
+    #: str: the libvirt domain name of the clone
+    vm: str
+
+    #: tuple[str, ...]: readable names of the properties it may have kept
+    properties: tuple[str, ...]
+
+    #: tuple[str, ...]: the policies that allowed it, e.g.
+    #: ``('clone_machine_id=auto',)``
+    policies: tuple[str, ...]
+
+    #: str: short classification of why the pass did not complete
+    reason: str
+
+    #: str: the underlying error text, kept for the full warning
+    cause: str
+
+    #: str: the interleaved warning, emitted where the clone happened
+    message: str
+
+    def summary_line(self) -> str:
+        """One line for the closing summary: vm, properties and cause."""
+        return (f"{self.vm}: kept its template's "
+                f"{join_names(self.properties)} -- {self.reason} "
+                f"({', '.join(self.policies)})")
 
 
 @dataclass(frozen=True)
@@ -101,10 +146,7 @@ class IdentityPlan:
 
     def describe(self) -> str:
         """The affected properties, as a readable list."""
-        names = [prop.name for prop in self.properties]
-        if len(names) < 2:
-            return names[0] if names else 'nothing'
-        return ', '.join(names[:-1]) + f" and {names[-1]}"
+        return join_names(prop.name for prop in self.properties)
 
 
 class CloneVM:
@@ -419,14 +461,14 @@ class CloneVM:
             self.run_identity_pass(plan)
         except CloneSanitizerError as sanitizer_error:
             if plan.strictest_policy == 'auto':
-                message = self.degradation_message(plan, sanitizer_error)
-                notices = self.info.get(CLONE_DEGRADATION_NOTICES_KEY)
-                if isinstance(notices, list):
-                    notices.append(message)
+                degradation = self.degradation_record(plan, sanitizer_error)
+                collected = self.info.get(CLONE_DEGRADATIONS_KEY)
+                if isinstance(collected, list):
+                    collected.append(degradation)
                 else:
                     # Direct provider callers do not have a retry wrapper to
                     # re-emit the notice, so retain the normal warning path.
-                    self.logger.warning(message)
+                    self.logger.warning(degradation.message)
                 return
 
             # ``required`` is fail-closed. A cleanup failure is itself
@@ -434,6 +476,40 @@ class CloneVM:
             # exception chain, avoiding misleading clone retries.
             self.discard_unsafe_clone(sanitizer_error)
             raise
+
+    def degradation_record(
+            self, plan: IdentityPlan,
+            sanitizer_error: CloneSanitizerError) -> CloneDegradation:
+        """Describe an ``auto`` degradation as a record the run can summarise.
+
+        Structured rather than pre-formatted because the closing summary wants
+        one compact line per VM, while the warning emitted next to the clone
+        carries the full cause.
+        """
+        return CloneDegradation(
+            vm=self.new_vm_name,
+            properties=tuple(prop.name for prop in plan.properties),
+            policies=tuple(
+                f"{prop.config_key}={prop.policy}"
+                for prop in plan.properties),
+            reason=self.degradation_reason(sanitizer_error),
+            cause=str(sanitizer_error),
+            message=self.degradation_message(plan, sanitizer_error),
+        )
+
+    @staticmethod
+    def degradation_reason(
+            sanitizer_error: CloneSanitizerError) -> str:
+        """Short classification of a failed pass, for the closing summary.
+
+        The full cause goes in the warning beside the clone; a summary line
+        needs something that stays readable next to a domain name.
+        """
+        if isinstance(sanitizer_error, CloneSanitizerUnavailableError):
+            return 'the offline sanitizer is unavailable'
+        if 'timed out' in str(sanitizer_error):
+            return 'the offline sanitizer timed out'
+        return 'the guest could not be inspected'
 
     def degradation_message(self, plan: IdentityPlan,
                             sanitizer_error: CloneSanitizerError) -> str:

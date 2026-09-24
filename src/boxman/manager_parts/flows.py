@@ -184,6 +184,11 @@ class FlowsMixin:
         # render and deploy the containerlab topology (no-op if not configured)
         self.deploy_netlab()
 
+        # last, so it is the part still on screen when the prompt returns.
+        # `up` reaches every cloning path through provision(), so this covers
+        # it too; a run that aborts earlier has the per-clone warning inline.
+        self.report_clone_degradations()
+
         if undead:
             raise ProvisionError(
                 f"provision finished, but {len(undead)} VM(s) never started: "

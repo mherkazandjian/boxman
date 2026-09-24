@@ -236,6 +236,25 @@ a libguestfs appliance and cloning is already the slow step. A failure is
 judged against the strictest policy among the enabled properties: a single
 `required` property makes the whole pass fail closed and discards the clone.
 
+When the pass degrades under `auto`, boxman says so twice: once beside the
+clone, with the full cause, and once more as a summary at the **end** of
+`up` / `provision` / `update` — one line per VM, naming the properties it kept
+and why. The per-clone warning is emitted from a worker process in the middle
+of provisioning, thousands of lines before the prompt comes back, so the
+closing summary is the one worth reading:
+
+```
+WARNING: 2 VM(s) kept identity from their template because the offline
+         identity pass could not complete:
+  bprj__demo__bprj_cluster_1_node01: kept its template's machine id and ssh
+    host keys -- the offline sanitizer is unavailable
+    (clone_machine_id=auto, clone_ssh_host_keys=auto)
+  ...
+```
+
+`boxman doctor` names the same consequence up front when `virt-sysprep` is
+missing, which is the usual cause.
+
 The inspection is non-interactive and limited to 300 seconds by default. Set
 `provider.libvirt.virt_sysprep_timeout` in `boxman.yml` to another positive
 number for unusually slow hosts.
