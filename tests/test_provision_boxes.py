@@ -359,6 +359,13 @@ class TestProvisionBox:
             assert lines, (
                 f"no ssh host keys found on {host}; sshd cannot be running "
                 f"with a valid host key")
+            # the pass installs every type, so a missing one means it did not
+            # run -- checking only the keys that happen to exist would let a
+            # clone holding a single fresh key pass
+            present = sorted(line[1] for line in lines)
+            assert present == sorted(SSH_HOST_KEY_TYPES), (
+                f"{host}: host key types {present}, expected "
+                f"{sorted(SSH_HOST_KEY_TYPES)}")
 
             base_image = get_base_image(cluster_cfg, vm_cfg)
             if base_image and base_image not in template_fingerprints:
