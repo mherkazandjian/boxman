@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tarfile
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -25,6 +26,7 @@ from boxman.exceptions import (
 )
 from boxman.providers.libvirt.clone_vm import (
     CLONE_DEGRADATION_NOTICES_KEY,
+    SSH_HOST_KEY_ARCHIVE,
     SSH_HOST_KEY_TYPES,
     CloneVM,
 )
@@ -290,14 +292,11 @@ class TestRunIdentityPass:
 
         kwargs = execute.call_args.kwargs
         assert kwargs["operations"] == "machine-id,ssh-hostkeys,customize"
-        # the staged uploads are passed positionally, one flag per fragment
+        # the staged keys travel as one archive, passed positionally
         args = execute.call_args.args
-        for key_type in SSH_HOST_KEY_TYPES:
-            target = f"/etc/ssh/ssh_host_{key_type}_key"
-            assert f"0600:{target}" in args
-            assert f"0644:{target}.pub" in args
-        assert args.count("--upload") == 2 * len(SSH_HOST_KEY_TYPES)
-        assert args.count("--chown") == 2 * len(SSH_HOST_KEY_TYPES)
+        assert args[0] == "--tar-in"
+        assert args[1].endswith(f"/{SSH_HOST_KEY_ARCHIVE}:/etc/ssh")
+        assert len(args) == 2
 
     def test_nonzero_exit_is_a_typed_failure(self, clone: CloneVM):
         with patch.object(
@@ -534,40 +533,60 @@ class TestSysprepInvocation:
 
 class TestSshHostKeys:
 
-    def test_generates_every_key_type_with_upload_and_chmod(
-        self, clone: CloneVM
-    ):
+    def test_generates_a_real_key_of_every_type(self, clone: CloneVM):
         args, staging = clone.generate_ssh_host_keys()
         try:
+            assert args == [
+                "--tar-in",
+                f"{os.path.join(staging, SSH_HOST_KEY_ARCHIVE)}:/etc/ssh",
+            ]
             for key_type in SSH_HOST_KEY_TYPES:
                 private = os.path.join(staging, f"ssh_host_{key_type}_key")
-                target = f"/etc/ssh/ssh_host_{key_type}_key"
                 assert os.path.isfile(private)
                 assert os.path.isfile(f"{private}.pub")
                 assert "PRIVATE KEY" in Path(private).read_text()
-                assert f"{private}:{target}" in args
-                assert f"0600:{target}" in args
-                assert f"{private}.pub:{target}.pub" in args
-                assert f"0644:{target}.pub" in args
-                # --upload keeps the source file's uid, so the guest would
-                # otherwise own its host keys as the hypervisor's user
-                assert f"0:0:{target}" in args
-                assert f"0:0:{target}.pub" in args
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
-    def test_every_key_is_chowned_to_root_after_upload(
+    def test_archive_entries_are_root_owned_with_sshd_modes(
         self, clone: CloneVM
     ):
-        """libguestfs uploads keep the source uid; sshd needs root."""
-        args, staging = clone.generate_ssh_host_keys()
+        """Why an archive at all, rather than --upload.
+
+        libguestfs preserves the *source* file's ownership on upload, so the
+        guest would get its private host keys owned by whatever uid boxman
+        runs as, and ``--chown`` cannot fix that portably -- guestfs-tools
+        1.52.0 rejects every form of its own documented syntax. A tar entry
+        carries uid, gid and mode itself.
+        """
+        _args, staging = clone.generate_ssh_host_keys()
         try:
-            for key_type in SSH_HOST_KEY_TYPES:
-                target = f"/etc/ssh/ssh_host_{key_type}_key"
-                private = os.path.join(staging, f"ssh_host_{key_type}_key")
-                # the chown must follow the upload it corrects
-                assert args.index(f"0:0:{target}") > args.index(
-                    f"{private}:{target}")
+            archive = os.path.join(staging, SSH_HOST_KEY_ARCHIVE)
+            with tarfile.open(archive) as tar:
+                members = {member.name: member for member in tar.getmembers()}
+
+            expected = dict(CloneVM.ssh_host_key_files())
+            assert set(members) == set(expected)
+            for name, member in members.items():
+                assert member.uid == 0 and member.gid == 0, (
+                    f"{name} is owned by {member.uid}:{member.gid} in the "
+                    f"archive; sshd needs its host keys owned by root")
+                assert member.uname == "root" and member.gname == "root"
+                assert member.mode == expected[name], (
+                    f"{name} has mode {member.mode:o}, expected "
+                    f"{expected[name]:o}")
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def test_the_archive_carries_nothing_but_the_keys(self, clone: CloneVM):
+        """It unpacks into /etc/ssh, so a stray member would land there."""
+        _args, staging = clone.generate_ssh_host_keys()
+        try:
+            with tarfile.open(os.path.join(staging, SSH_HOST_KEY_ARCHIVE)) as tar:
+                names = tar.getnames()
+            assert SSH_HOST_KEY_ARCHIVE not in names
+            assert len(names) == 2 * len(SSH_HOST_KEY_TYPES)
+            assert all("/" not in name for name in names)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
@@ -581,7 +600,7 @@ class TestSshHostKeys:
                 name = f"ssh_host_{key_type}_key.pub"
                 assert (Path(first) / name).read_text() != (
                     Path(second) / name).read_text()
-            assert first_args != second_args
+            assert first_args != second_args  # distinct staging paths
         finally:
             shutil.rmtree(first, ignore_errors=True)
             shutil.rmtree(second, ignore_errors=True)

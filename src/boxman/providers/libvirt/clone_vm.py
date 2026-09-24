@@ -1,6 +1,7 @@
 import os
 import shlex
 import shutil
+import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,6 +35,10 @@ IDENTITY_POLICIES = frozenset({'auto', 'required', 'off'})
 #: produces on current OpenSSH. ``dsa`` is deliberately absent: upstream
 #: removed it, and a guest that still wanted one would not accept it anyway.
 SSH_HOST_KEY_TYPES = ('rsa', 'ecdsa', 'ed25519')
+
+#: Name of the staged archive that carries the clone's host keys into
+#: ``/etc/ssh`` with root ownership.
+SSH_HOST_KEY_ARCHIVE = 'ssh-host-keys.tar'
 
 
 @dataclass(frozen=True)
@@ -287,6 +292,17 @@ class CloneVM:
         keys at boot through ``sshd-keygen@``, but a Debian/Ubuntu guest
         without cloud-init would come up with no host keys and a failing sshd.
 
+        They are delivered as a tar archive rather than with ``--upload``
+        plus ``--chown``. libguestfs preserves the *source* file's ownership
+        on upload, so the keys would otherwise land owned by whatever uid
+        boxman runs as on the hypervisor, and ``--chown`` cannot be relied on
+        to correct that: guestfs-tools 1.52.0 documents ``--chown
+        UID:GID:PATH`` but its parser rejects every form of the argument
+        ("invalid format for '--chown' parameter"), while 1.52.2 accepts it.
+        A tar entry carries its own uid, gid and mode regardless of the file
+        on disk, which works on both -- and keeps the private keys off the
+        command line.
+
         The staging directory is an ordinary host temp directory: under the
         docker-compose runtime ``tempfile.gettempdir()`` is bind-mounted into
         the container at the same absolute path, the same mechanism the XML
@@ -298,13 +314,11 @@ class CloneVM:
         """
         staging_dir = tempfile.mkdtemp(
             prefix=f'boxman-hostkeys-{self.new_vm_name}-')
-        customizations: list[str] = []
 
         try:
             for key_type in SSH_HOST_KEY_TYPES:
                 private = os.path.join(
                     staging_dir, f'ssh_host_{key_type}_key')
-                target = f'/etc/ssh/ssh_host_{key_type}_key'
                 # -C '' keeps the hypervisor's user@host out of the guest's
                 # public keys. -N '' is not a shortcut: an sshd host key
                 # cannot be passphrase-protected.
@@ -320,24 +334,32 @@ class CloneVM:
                         f"could not generate a fresh {key_type} ssh host key "
                         f"for vm {self.new_vm_name}: {detail}")
 
-                # --upload preserves the *source* file's ownership, so
-                # without an explicit --chown the guest ends up with its
-                # private host keys owned by whatever uid boxman happens to
-                # run as on the hypervisor. --chown comes before --chmod:
-                # these are applied in command-line order.
-                customizations.extend([
-                    '--upload', f'{private}:{target}',
-                    '--chown', f'0:0:{target}',
-                    '--chmod', f'0600:{target}',
-                    '--upload', f'{private}.pub:{target}.pub',
-                    '--chown', f'0:0:{target}.pub',
-                    '--chmod', f'0644:{target}.pub',
-                ])
+            archive = os.path.join(staging_dir, SSH_HOST_KEY_ARCHIVE)
+            with tarfile.open(archive, 'w') as tar:
+                for name, mode in self.ssh_host_key_files():
+                    source = os.path.join(staging_dir, name)
+                    entry = tar.gettarinfo(source, arcname=name)
+                    # the whole point of the archive: sshd must find its
+                    # host keys owned by root, whoever generated them
+                    entry.uid = entry.gid = 0
+                    entry.uname = entry.gname = 'root'
+                    entry.mode = mode
+                    with open(source, 'rb') as handle:
+                        tar.addfile(entry, handle)
         except Exception:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
 
-        return customizations, staging_dir
+        return ['--tar-in', f'{archive}:/etc/ssh'], staging_dir
+
+    @staticmethod
+    def ssh_host_key_files() -> list[tuple[str, int]]:
+        """Each host key file the clone gets, with the mode sshd expects."""
+        files = []
+        for key_type in SSH_HOST_KEY_TYPES:
+            files.append((f'ssh_host_{key_type}_key', 0o600))
+            files.append((f'ssh_host_{key_type}_key.pub', 0o644))
+        return files
 
     @staticmethod
     def assert_customize_invariant(operations: list[str],

@@ -47,7 +47,9 @@ and one failure mode is silent.
 | F7 | **No flag suppresses** customize's machine-id or random-seed write. | The §4 interaction cannot be engineered away. |
 | F8 | SELinux relabelling is automatic in 1.52; `--selinux-relabel` is documented as "Compatibility option doing nothing", and `--no-selinux-relabel` disables it. | Production invocations must **not** pass `--no-selinux-relabel`, or uploaded host keys get wrong labels on EL guests. |
 | F9 | Customizations available: `--upload`, `--write`, `--edit`, `--append-line`, `--delete`, `--chmod`, `--chown`, `--mkdir`, `--touch`, `--copy-in`, `--link`, `--move`, `--run`, `--run-command`, `--firstboot*`. | Enough to do all of #200 and #201 offline in one pass. |
-| F10 | `--upload` **preserves the source file's ownership**. An uploaded host key landed in the guest owned by uid 10000 — the hypervisor user's uid — not root. | Every upload needs an explicit `--chown 0:0:<path>` after it. Measured on the finished implementation, and the reason `--chown` is in the invocation. |
+| F10 | `--upload` **preserves the source file's ownership**. An uploaded host key landed in the guest owned by uid 10000 — the hypervisor user's uid — not root. | Ownership has to be set explicitly; uploading alone is not enough. |
+| F11 | **`--chown` is broken in guestfs-tools 1.52.0** — the version on the test-runner VM. It documents `--chown UID:GID:PATH`, but its parser rejects *every* form, including its own documented one: `invalid format for '--chown' parameter`. 1.52.2 accepts the identical argument. | `--chown` cannot be relied on. Ownership is carried by a tar archive instead (F12), which also keeps private keys off the command line. |
+| F12 | `--tar-in <archive>:<dir>` honours the **uid, gid and mode recorded in the tar entries**, not the source files' — verified on 1.52.0 with source files owned by uid 1001 landing as `uid 0 / gid 0`, modes `0600` / `0644`, with SELinux relabelling still applied. | The portable way to install root-owned files, on both versions. |
 
 Reproduction scripts are not checked in; they build a throwaway disk in a
 scratch directory and run the matrix above. The integration tier re-verifies
@@ -166,11 +168,14 @@ left alone.
 
 - **Delete**: the `ssh-hostkeys` operation, which removes `/etc/ssh/ssh_host_*`.
 - **Replace**: generate the keys **on the host** with `ssh-keygen -q -t <type>
-  -N '' -f <tmp>` into a per-clone temporary directory, then `--upload` each
-  private and public key and `--chmod 0600` / `0644` them. F3 guarantees these
-  land after the deletion.
-- Follow every upload with `--chown 0:0:<path>` (F10) and then `--chmod`;
-  the customizations are applied in command-line order.
+  -N '' -C '' -f <tmp>` into a per-clone temporary directory, pack them into a
+  tar archive whose entries carry `uid 0`, `gid 0` and modes `0600` / `0644`,
+  and install it with a single `--tar-in <archive>:/etc/ssh`. F3 guarantees it
+  lands after the deletion.
+- The archive, rather than `--upload` + `--chown` + `--chmod`, because of F10
+  and F11: uploads keep the source file's uid, and `--chown` is unusable on
+  1.52.0. It also collapses 18 arguments into 2 and keeps the private key
+  paths off the command line.
 - Do not pass `--no-selinux-relabel` (F8), so EL guests get correct labels.
 - Delete the temporary directory even on failure.
 
@@ -277,11 +282,20 @@ pass architecture, `doc/tutorial/README.md`'s clone-policy section including the
 **Settled during PR 1**, by running the implementation's own invocation
 against a disk carrying template host keys:
 
-- *Ownership of uploaded host-key files.* Resolved, and it was a real bug:
+- *Ownership of uploaded host-key files.* Resolved, and it took two attempts.
   `--upload` preserves the source uid (F10), so the first implementation left
-  the guest's private host keys owned by the hypervisor user. Fixed with an
-  explicit `--chown 0:0:` per file; verified as `uid 0 / gid 0`, mode `0600`
-  for private keys and `0644` for public ones.
+  the guest's private host keys owned by the hypervisor user. The obvious fix,
+  `--chown 0:0:<path>`, worked on 1.52.2 and then failed on the test-runner
+  VM's 1.52.0, which rejects every form of its own documented syntax (F11).
+  Settled with a tar archive carrying uid, gid and mode (F12), verified on
+  1.52.0 as `uid 0 / gid 0`, mode `0600` for private keys and `0644` for
+  public ones.
+- *Whether a degraded `auto` pass is noticeable.* It is not, which is #202's
+  whole point: the first integration run showed two clones sharing an rsa host
+  key, and the cause — `invalid format for '--chown' parameter` — was only
+  visible in boxman's own output, which the test fixture hides. The failure
+  was caught by asserting on the guests, not by the provisioning step, which
+  reported success.
 - *Whether the staged temp directory is reachable under the docker-compose
   runtime.* Confirmed: it is bind-mounted at the same absolute path, which is
   what made the uploads resolve in the container.
