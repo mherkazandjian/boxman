@@ -7,6 +7,9 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -18,8 +21,13 @@ from boxman.exceptions import (
     CloneSanitizerError,
     CloneSanitizerUnavailableError,
     ConfigError,
+    ProvisionError,
 )
-from boxman.providers.libvirt.clone_vm import CloneVM
+from boxman.providers.libvirt.clone_vm import (
+    CLONE_DEGRADATION_NOTICES_KEY,
+    SSH_HOST_KEY_TYPES,
+    CloneVM,
+)
 from boxman.providers.libvirt.session import LibVirtSession
 
 pytestmark = pytest.mark.unit
@@ -44,6 +52,29 @@ def clone(tmp_path: Path) -> CloneVM:
         workdir=str(tmp_path),
         provider_config={"use_sudo": False},
     )
+
+
+def _machine_id_only(clone: CloneVM):
+    """A plan covering only the machine id.
+
+    Deliberately narrow: it contributes no customizations, so it needs no
+    staging and the error-classification tests below stay about
+    virt-sysprep's exit status rather than about key generation.
+    """
+    clone.ssh_host_keys_policy = "off"
+    return clone.build_identity_plan()
+
+
+def _staging_leftovers(vm_name: str) -> list[Path]:
+    """Staging directories this vm left behind in the temp dir."""
+    return list(
+        Path(tempfile.gettempdir()).glob(f"boxman-hostkeys-{vm_name}-*"))
+
+
+def _vm(tmp_path: Path, **info) -> CloneVM:
+    return CloneVM(
+        src_vm_name="base", new_vm_name="vm-new", info=info,
+        workdir=str(tmp_path))
 
 
 class TestConstruction:
@@ -102,7 +133,7 @@ class TestCreateClone:
 
     def test_success_path_calls_virt_clone_with_correct_args(self, clone: CloneVM):
         with patch.object(clone.virt_clone, "execute") as virt_clone_exec, \
-             patch.object(clone, "reset_machine_identity", return_value=True), \
+             patch.object(clone, "run_identity_pass", return_value=True), \
              patch.object(clone, "remove_network_interfaces", return_value=True):
             virt_clone_exec.return_value = _result()
             assert clone.create_clone() is True
@@ -122,7 +153,7 @@ class TestCreateClone:
             provider_config=None,
         )
         with patch.object(c.virt_clone, "execute", return_value=_result()) as virt_clone, \
-             patch.object(c, "reset_machine_identity", return_value=True), \
+             patch.object(c, "run_identity_pass", return_value=True), \
              patch.object(c, "remove_network_interfaces") as remove_ifaces:
             assert c.create_clone() is True
             virt_clone.assert_called_once()
@@ -136,7 +167,7 @@ class TestCreateClone:
         self, clone: CloneVM, captured_logs
     ):
         with patch.object(clone.virt_clone, "execute", return_value=_result()), \
-             patch.object(clone, "reset_machine_identity", return_value=True), \
+             patch.object(clone, "run_identity_pass", return_value=True), \
              patch.object(clone, "remove_network_interfaces", return_value=False):
             assert clone.create_clone() is True
         assert any(
@@ -150,8 +181,8 @@ class TestCreateClone:
             clone.virt_clone, "execute",
             side_effect=lambda *args, **kwargs: order.append("clone"),
         ), patch.object(
-            clone, "reset_machine_identity",
-            side_effect=lambda: (order.append("sysprep"), True)[1],
+            clone, "run_identity_pass",
+            side_effect=lambda plan: (order.append("sysprep"), True)[1],
         ), patch.object(
             clone, "remove_network_interfaces",
             side_effect=lambda: (order.append("interfaces"), True)[1],
@@ -164,7 +195,7 @@ class TestCreateClone:
     ):
         error = CloneSanitizerError("unsupported guest")
         with patch.object(clone.virt_clone, "execute", return_value=_result()), \
-             patch.object(clone, "reset_machine_identity", side_effect=error), \
+             patch.object(clone, "run_identity_pass", side_effect=error), \
              patch.object(clone, "discard_unsafe_clone") as discard, \
              patch.object(
                  clone, "remove_network_interfaces", return_value=True
@@ -185,7 +216,7 @@ class TestCreateClone:
         with patch.object(clone.virt_clone, "execute", return_value=_result()), \
              patch.object(
                  clone,
-                 "reset_machine_identity",
+                 "run_identity_pass",
                  side_effect=error,
              ), \
              patch.object(clone, "discard_unsafe_clone") as discard, \
@@ -202,7 +233,7 @@ class TestCreateClone:
         sanitizer = CloneSanitizerError("unsupported encrypted guest")
         with patch.object(clone.virt_clone, "execute", return_value=_result()), \
              patch.object(
-                 clone, "reset_machine_identity", side_effect=sanitizer
+                 clone, "run_identity_pass", side_effect=sanitizer
              ), \
              patch.object(
                  clone.virsh, "execute",
@@ -217,25 +248,56 @@ class TestCreateClone:
         assert caught.value.__cause__ is sanitizer
         remove_ifaces.assert_not_called()
 
-    def test_off_skips_sanitizer(self, clone: CloneVM):
+    def test_every_policy_off_skips_the_pass(self, clone: CloneVM):
         clone.machine_id_policy = "off"
+        clone.ssh_host_keys_policy = "off"
         with patch.object(clone.virt_clone, "execute", return_value=_result()), \
-             patch.object(clone, "reset_machine_identity") as reset, \
+             patch.object(clone, "run_identity_pass") as reset, \
              patch.object(clone, "remove_network_interfaces", return_value=True):
             assert clone.create_clone() is True
         reset.assert_not_called()
 
+    def test_machine_id_off_alone_still_runs_the_pass(self, clone: CloneVM):
+        """``off`` on one property must not disable the others."""
+        clone.machine_id_policy = "off"
+        with patch.object(clone.virt_clone, "execute", return_value=_result()), \
+             patch.object(clone, "run_identity_pass") as reset, \
+             patch.object(clone, "remove_network_interfaces", return_value=True):
+            assert clone.create_clone() is True
+        reset.assert_called_once()
 
-class TestResetMachineIdentity:
 
-    def test_runs_only_machine_id_operation_on_the_clone(self, clone: CloneVM):
+class TestRunIdentityPass:
+
+    def test_machine_id_only_plan_runs_exactly_that_operation(
+        self, clone: CloneVM
+    ):
         with patch.object(
             clone.virt_sysprep, "execute", return_value=_result()
         ) as execute:
-            assert clone.reset_machine_identity() is None
+            assert clone.run_identity_pass(_machine_id_only(clone)) is None
         execute.assert_called_once_with(
             domain="vm01", operations="machine-id", keys_from_stdin=True,
             warn=True, execution_timeout=300, timeout=315)
+
+    def test_default_plan_carries_host_keys_and_customize(
+        self, clone: CloneVM
+    ):
+        with patch.object(
+            clone.virt_sysprep, "execute", return_value=_result()
+        ) as execute:
+            clone.run_identity_pass(clone.build_identity_plan())
+
+        kwargs = execute.call_args.kwargs
+        assert kwargs["operations"] == "machine-id,ssh-hostkeys,customize"
+        # the staged uploads are passed positionally, one flag per fragment
+        args = execute.call_args.args
+        for key_type in SSH_HOST_KEY_TYPES:
+            target = f"/etc/ssh/ssh_host_{key_type}_key"
+            assert f"0600:{target}" in args
+            assert f"0644:{target}.pub" in args
+        assert args.count("--upload") == 2 * len(SSH_HOST_KEY_TYPES)
+        assert args.count("--chown") == 2 * len(SSH_HOST_KEY_TYPES)
 
     def test_nonzero_exit_is_a_typed_failure(self, clone: CloneVM):
         with patch.object(
@@ -245,7 +307,7 @@ class TestResetMachineIdentity:
                 ok=False, stderr="inspection failed", return_code=1),
         ):
             with pytest.raises(CloneSanitizerError, match="inspection failed"):
-                clone.reset_machine_identity()
+                clone.run_identity_pass(_machine_id_only(clone))
 
     def test_missing_tool_has_actionable_package_guidance(self, clone: CloneVM):
         with patch.object(
@@ -258,7 +320,7 @@ class TestResetMachineIdentity:
             ),
         ):
             with pytest.raises(CloneSanitizerUnavailableError) as caught:
-                clone.reset_machine_identity()
+                clone.run_identity_pass(_machine_id_only(clone))
         assert "virt-sysprep" in str(caught.value)
         assert "guestfs-tools" in str(caught.value)
 
@@ -275,7 +337,7 @@ class TestResetMachineIdentity:
             ),
         ):
             with pytest.raises(CloneSanitizerError) as caught:
-                clone.reset_machine_identity()
+                clone.run_identity_pass(_machine_id_only(clone))
         assert not isinstance(caught.value, CloneSanitizerUnavailableError)
         assert "domain 'vm01' not found" in str(caught.value)
 
@@ -295,7 +357,7 @@ class TestResetMachineIdentity:
                 CloneSanitizerUnavailableError,
                 match="not installed",
             ):
-                clone.reset_machine_identity()
+                clone.run_identity_pass(_machine_id_only(clone))
 
     def test_noninteractive_sudo_denial_is_a_permanent_prerequisite_failure(
         self, clone: CloneVM
@@ -313,7 +375,7 @@ class TestResetMachineIdentity:
             ),
         ):
             with pytest.raises(CloneSanitizerUnavailableError) as caught:
-                clone.reset_machine_identity()
+                clone.run_identity_pass(_machine_id_only(clone))
         assert "passwordless sudo" in str(caught.value)
         assert "use_sudo" in str(caught.value)
 
@@ -326,7 +388,7 @@ class TestResetMachineIdentity:
             clone.virt_sysprep, "execute", side_effect=timed_out
         ) as execute:
             with pytest.raises(CloneSanitizerError, match="timed out after 300s"):
-                clone.reset_machine_identity()
+                clone.run_identity_pass(_machine_id_only(clone))
         assert execute.call_args.kwargs["execution_timeout"] == 300
         assert execute.call_args.kwargs["timeout"] == 315
 
@@ -340,7 +402,248 @@ class TestResetMachineIdentity:
             return_value=_result(ok=False, return_code=return_code),
         ):
             with pytest.raises(CloneSanitizerError, match="timed out after 300s"):
-                clone.reset_machine_identity()
+                clone.run_identity_pass(_machine_id_only(clone))
+
+
+class TestIdentityPlan:
+    """The pure planning half: what the pass will ask virt-sysprep to do."""
+
+    def test_default_policies_cover_both_properties(self, clone: CloneVM):
+        plan = clone.build_identity_plan()
+        assert [prop.config_key for prop in plan.properties] == [
+            "clone_machine_id", "clone_ssh_host_keys"]
+        assert plan.operations == ["machine-id", "ssh-hostkeys"]
+        assert plan.needs_customize is True
+        assert plan.fresh_ssh_host_keys is True
+        assert plan.strictest_policy == "auto"
+
+    def test_host_keys_off_leaves_a_machine_id_only_plan(self, tmp_path: Path):
+        plan = _vm(tmp_path, clone_ssh_host_keys="off").build_identity_plan()
+        assert plan.operations == ["machine-id"]
+        assert plan.needs_customize is False
+        assert plan.fresh_ssh_host_keys is False
+
+    def test_machine_id_off_leaves_a_host_keys_only_plan(self, tmp_path: Path):
+        plan = _vm(tmp_path, clone_machine_id="off").build_identity_plan()
+        assert plan.operations == ["ssh-hostkeys"]
+        assert plan.needs_customize is True
+
+    def test_every_policy_off_yields_an_empty_plan(self, tmp_path: Path):
+        plan = _vm(
+            tmp_path, clone_machine_id="off", clone_ssh_host_keys="off",
+        ).build_identity_plan()
+        assert plan.properties == []
+        assert plan.operations == []
+
+    def test_a_single_required_property_makes_the_pass_fail_closed(
+        self, tmp_path: Path
+    ):
+        """The strictest policy among the enabled properties wins."""
+        plan = _vm(
+            tmp_path, clone_machine_id="auto", clone_ssh_host_keys="required",
+        ).build_identity_plan()
+        assert plan.strictest_policy == "required"
+
+    def test_machine_id_off_with_another_property_on_warns(
+        self, tmp_path: Path, captured_logs
+    ):
+        """``customize`` always rewrites /etc/machine-id; say so."""
+        _vm(tmp_path, clone_machine_id="off").build_identity_plan()
+        assert any(
+            "clone_machine_id=off cannot be honoured" in rec.message
+            and "customize" in rec.message
+            for rec in captured_logs.records)
+
+    def test_machine_id_off_alone_does_not_warn(
+        self, tmp_path: Path, captured_logs
+    ):
+        _vm(
+            tmp_path, clone_machine_id="off", clone_ssh_host_keys="off",
+        ).build_identity_plan()
+        assert not any(
+            "cannot be honoured" in rec.message
+            for rec in captured_logs.records)
+
+    def test_describe_reads_as_a_list_of_properties(self, clone: CloneVM):
+        assert clone.build_identity_plan().describe() == (
+            "machine id and ssh host keys")
+        assert _machine_id_only(clone).describe() == "machine id"
+
+    @pytest.mark.parametrize("policy", ["auto", "required", "off"])
+    def test_accepts_host_key_policies(self, tmp_path: Path, policy: str):
+        assert _vm(
+            tmp_path, clone_ssh_host_keys=policy).ssh_host_keys_policy == policy
+
+    @pytest.mark.parametrize("policy", ["strict", True, None, ["auto"]])
+    def test_rejects_invalid_host_key_policy(self, tmp_path: Path, policy):
+        with pytest.raises(ConfigError, match="clone_ssh_host_keys"):
+            _vm(tmp_path, clone_ssh_host_keys=policy)
+
+
+class TestSysprepInvocation:
+
+    def test_customize_is_enabled_whenever_customizations_exist(
+        self, clone: CloneVM
+    ):
+        plan = _machine_id_only(clone)
+        plan.customizations = ["--upload", "/tmp/k:/etc/ssh/k"]
+        args, kwargs = clone.build_sysprep_invocation(plan)
+        assert kwargs["operations"].split(",") == ["machine-id", "customize"]
+        assert args == ["--upload", "/tmp/k:/etc/ssh/k"]
+
+    def test_customize_is_absent_without_customizations(self, clone: CloneVM):
+        _args, kwargs = clone.build_sysprep_invocation(
+            _machine_id_only(clone))
+        assert "customize" not in kwargs["operations"]
+
+    def test_invariant_rejects_customizations_without_customize(self):
+        """The silent-no-op guard: virt-sysprep would exit 0 doing nothing."""
+        with pytest.raises(ProvisionError, match="silently ignore"):
+            CloneVM.assert_customize_invariant(
+                ["machine-id"], ["--hostname", "node01"])
+
+    def test_invariant_accepts_customizations_with_customize(self):
+        CloneVM.assert_customize_invariant(
+            ["machine-id", "customize"], ["--hostname", "node01"])
+
+    def test_invariant_accepts_operations_without_customizations(self):
+        CloneVM.assert_customize_invariant(["machine-id"], [])
+
+    def test_selinux_relabelling_is_never_suppressed(self, clone: CloneVM):
+        """An unlabelled uploaded host key is one sshd refuses to read."""
+        args, kwargs = clone.build_sysprep_invocation(
+            clone.build_identity_plan())
+        assert "--no-selinux-relabel" not in args
+        assert "no_selinux_relabel" not in kwargs
+
+    def test_an_invariant_violation_is_not_degraded_to_a_notice(
+        self, clone: CloneVM
+    ):
+        """A boxman bug must not be reported as an uninspectable guest."""
+        notices: list[str] = []
+        clone.info[CLONE_DEGRADATION_NOTICES_KEY] = notices
+        with patch.object(
+            clone, "build_sysprep_invocation",
+            side_effect=ProvisionError("bad plan"),
+        ), patch.object(clone, "discard_unsafe_clone") as discard:
+            with pytest.raises(ProvisionError, match="bad plan"):
+                clone.apply_identity_policies()
+        assert notices == []
+        discard.assert_not_called()
+
+
+class TestSshHostKeys:
+
+    def test_generates_every_key_type_with_upload_and_chmod(
+        self, clone: CloneVM
+    ):
+        args, staging = clone.generate_ssh_host_keys()
+        try:
+            for key_type in SSH_HOST_KEY_TYPES:
+                private = os.path.join(staging, f"ssh_host_{key_type}_key")
+                target = f"/etc/ssh/ssh_host_{key_type}_key"
+                assert os.path.isfile(private)
+                assert os.path.isfile(f"{private}.pub")
+                assert "PRIVATE KEY" in Path(private).read_text()
+                assert f"{private}:{target}" in args
+                assert f"0600:{target}" in args
+                assert f"{private}.pub:{target}.pub" in args
+                assert f"0644:{target}.pub" in args
+                # --upload keeps the source file's uid, so the guest would
+                # otherwise own its host keys as the hypervisor's user
+                assert f"0:0:{target}" in args
+                assert f"0:0:{target}.pub" in args
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def test_every_key_is_chowned_to_root_after_upload(
+        self, clone: CloneVM
+    ):
+        """libguestfs uploads keep the source uid; sshd needs root."""
+        args, staging = clone.generate_ssh_host_keys()
+        try:
+            for key_type in SSH_HOST_KEY_TYPES:
+                target = f"/etc/ssh/ssh_host_{key_type}_key"
+                private = os.path.join(staging, f"ssh_host_{key_type}_key")
+                # the chown must follow the upload it corrects
+                assert args.index(f"0:0:{target}") > args.index(
+                    f"{private}:{target}")
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def test_two_clones_never_share_a_host_key(self, tmp_path: Path):
+        """#201: clones of one template must not present the same keys."""
+        first_args, first = _vm(tmp_path).generate_ssh_host_keys()
+        second_args, second = _vm(tmp_path).generate_ssh_host_keys()
+        try:
+            assert first != second
+            for key_type in SSH_HOST_KEY_TYPES:
+                name = f"ssh_host_{key_type}_key.pub"
+                assert (Path(first) / name).read_text() != (
+                    Path(second) / name).read_text()
+            assert first_args != second_args
+        finally:
+            shutil.rmtree(first, ignore_errors=True)
+            shutil.rmtree(second, ignore_errors=True)
+
+    def test_keygen_failure_is_typed_and_leaves_nothing_behind(
+        self, clone: CloneVM
+    ):
+        with patch(
+            "boxman.providers.libvirt.clone_vm._shell_run",
+            return_value=_result(ok=False, stderr="disk full"),
+        ):
+            with pytest.raises(CloneSanitizerError, match="ssh host key"):
+                clone.generate_ssh_host_keys()
+        assert _staging_leftovers(clone.new_vm_name) == []
+
+    def test_staging_is_removed_after_a_successful_pass(self, clone: CloneVM):
+        with patch.object(
+            clone.virt_sysprep, "execute", return_value=_result()
+        ):
+            clone.run_identity_pass(clone.build_identity_plan())
+        assert _staging_leftovers(clone.new_vm_name) == []
+
+    def test_staging_is_removed_after_a_failed_pass(self, clone: CloneVM):
+        with patch.object(
+            clone.virt_sysprep, "execute",
+            return_value=_result(ok=False, stderr="inspection failed",
+                                 return_code=1),
+        ):
+            with pytest.raises(CloneSanitizerError):
+                clone.run_identity_pass(clone.build_identity_plan())
+        assert _staging_leftovers(clone.new_vm_name) == []
+
+
+class TestDegradationMessage:
+
+    def test_names_every_property_and_its_policy(self, clone: CloneVM):
+        message = clone.degradation_message(
+            clone.build_identity_plan(),
+            CloneSanitizerError("no libguestfs"))
+        assert "clone_machine_id=auto" in message
+        assert "clone_ssh_host_keys=auto" in message
+        assert "machine id and ssh host keys" in message
+        assert "no libguestfs" in message
+
+    def test_says_the_guest_may_have_kept_its_identity(self, clone: CloneVM):
+        """The pass is not atomic, so the notice must not overclaim."""
+        message = clone.degradation_message(
+            clone.build_identity_plan(), CloneSanitizerError("boom"))
+        assert "may have kept" in message
+
+    def test_a_degraded_pass_records_one_notice_per_clone(
+        self, clone: CloneVM
+    ):
+        notices: list[str] = []
+        clone.info[CLONE_DEGRADATION_NOTICES_KEY] = notices
+        with patch.object(
+            clone, "run_identity_pass",
+            side_effect=CloneSanitizerError("no libguestfs"),
+        ):
+            clone.apply_identity_policies()
+        assert len(notices) == 1
+        assert "clone_ssh_host_keys=auto" in notices[0]
 
 
 class TestDiscardUnsafeClone:
@@ -542,7 +845,7 @@ class TestCloneVmIsoBootDispatch:
             )
 
 
-class TestCloneVmMachineIdentityFailureChain:
+class TestCloneVmIdentityFailureChain:
 
     def test_session_propagates_real_clone_sanitizer_failure(self, tmp_path):
         session = LibVirtSession.__new__(LibVirtSession)
@@ -574,8 +877,16 @@ class TestCloneVmMachineIdentityFailureChain:
                 )
 
         virt_clone.assert_called_once()
-        virt_sysprep.assert_called_once_with(
-            domain="vm01", operations="machine-id", keys_from_stdin=True,
-            warn=True, execution_timeout=300, timeout=315)
+        virt_sysprep.assert_called_once()
+        # the positional arguments are the staged uploads, whose paths carry
+        # a random temp component; the operation list is the contract here
+        assert virt_sysprep.call_args.kwargs == {
+            "domain": "vm01",
+            "operations": "machine-id,ssh-hostkeys,customize",
+            "keys_from_stdin": True,
+            "warn": True,
+            "execution_timeout": 300,
+            "timeout": 315,
+        }
         virsh.assert_called_once_with(
             "undefine", "vm01", "--remove-all-storage", warn=True)
