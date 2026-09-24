@@ -24,6 +24,7 @@ import pytest
 import yaml
 
 from boxman.providers.libvirt.clone_vm import SSH_HOST_KEY_TYPES
+from boxman.utils.hostnames import hostname_problem
 from boxman.utils.jinja_env import create_jinja_env
 
 # ---------------------------------------------------------------------------
@@ -244,6 +245,87 @@ def template_host_key_fingerprints(base_image):
         if fingerprints:
             return fingerprints
     return {}
+
+
+def is_direct_boot(vm_cfg):
+    """ISO/PXE VMs are installed, not cloned: no clone identity applies."""
+    boot_order = vm_cfg.get("boot_order") or ["hd"]
+    return boot_order[0] in ("cdrom", "network")
+
+
+def expected_guest_hostname(vm_name, vm_cfg):
+    """The name a clone's guest should carry, mirroring boxman's resolver.
+
+    ``hostname:`` when declared, else the VM key when that is a valid
+    hostname; None when ``clone_hostname: off`` leaves the template's name.
+    """
+    if vm_cfg.get("clone_hostname", "auto") == "off":
+        return None
+    declared = vm_cfg.get("hostname")
+    if declared is not None:
+        return str(declared)
+    return vm_name if hostname_problem(vm_name) is None else None
+
+
+def template_names(config, base_image):
+    """Every name the template went by: its domain name, and the hostname
+    and fqdn its own cloud-init declared -- which is what the template's
+    guest actually called itself, and what a stale /etc/hosts line carries.
+    """
+    names = {base_image} if base_image else set()
+    for tmpl in (config.get("templates") or {}).values():
+        if tmpl.get("name") != base_image:
+            continue
+        userdata = tmpl.get("cloudinit")
+        if not isinstance(userdata, str):
+            continue
+        try:
+            data = yaml.safe_load(userdata) or {}
+        except yaml.YAMLError:
+            continue
+        for key in ("hostname", "fqdn"):
+            if isinstance(data.get(key), str):
+                names.add(data[key])
+    return names
+
+
+#: The guest's static hostname; /etc/hostname where there is no hostnamectl.
+GUEST_NAME_PROBE = "'hostnamectl --static 2>/dev/null || cat /etc/hostname'"
+
+#: Changes on every boot, so a reboot that silently did not happen is caught.
+BOOT_ID_PROBE = "cat /proc/sys/kernel/random/boot_id"
+
+
+def assert_guest_names(config):
+    """Every cloned VM carries its own name and no longer resolves its
+    template's to itself (#200). Returns how many VMs were checked."""
+    checked = 0
+    for cluster_name, vm_name, vm_cfg in iter_vms(config):
+        if is_direct_boot(vm_cfg):
+            continue
+        expected = expected_guest_hostname(vm_name, vm_cfg)
+        if expected is None:
+            continue
+        cluster_cfg = config["clusters"][cluster_name]
+        ssh_config = get_ssh_config_path(config, cluster_name)
+        host = get_ssh_host(cluster_name, vm_name, vm_cfg)
+
+        actual = ssh_cmd(ssh_config, host, GUEST_NAME_PROBE).stdout.strip()
+        assert actual == expected, (
+            f"{host}: static hostname is {actual!r}, expected {expected!r}")
+
+        for old in template_names(config, get_base_image(cluster_cfg, vm_cfg)):
+            if old.lower() == expected.lower():
+                continue
+            found = ssh_cmd(
+                ssh_config, host, f"'getent hosts {old} || true'").stdout
+            for line in found.splitlines():
+                address = line.split()[0]
+                assert not (address.startswith("127.") or address == "::1"), (
+                    f"{host}: still resolves its template's name {old!r} to "
+                    f"itself ({line.strip()})")
+        checked += 1
+    return checked
 
 
 def get_expected_vcpus(vm_cfg):
@@ -532,3 +614,42 @@ class TestProvisionBox:
                 f"Expected ~{expected_mb} MB RAM on {host}, "
                 f"got {actual_mb} MB (< {lower:.0f} MB tolerance floor)"
             )
+
+    # -- Clone identity: hostname (#200) ------------------------------------
+
+    def test_guest_hostname_is_the_declared_one(self, provisioned_box):
+        """A clone boots under its hostname: (or VM key), not its template's."""
+        assert assert_guest_names(provisioned_box) or not any(
+            expected_guest_hostname(name, cfg) and not is_direct_boot(cfg)
+            for _cluster, name, cfg in iter_vms(provisioned_box))
+
+    def test_guest_hostname_survives_a_reboot(self, provisioned_box):
+        """Kept last in the class: it reboots every cloned VM.
+
+        On an unsealed template cloud-init runs again at boot; without the
+        clone's drop-in and hosts template it would restore the template's
+        name. A sealed template never runs it, so both kinds must pass.
+        """
+        config = provisioned_box
+        before = {}
+        for cluster_name, vm_name, vm_cfg in iter_vms(config):
+            if is_direct_boot(vm_cfg):
+                continue
+            ssh_config = get_ssh_config_path(config, cluster_name)
+            host = get_ssh_host(cluster_name, vm_name, vm_cfg)
+            before[host] = (ssh_config, ssh_cmd(
+                ssh_config, host, BOOT_ID_PROBE).stdout.strip())
+            # the connection drops as the guest goes down; its status means
+            # nothing, which is why the boot id is compared afterwards
+            _run(f"ssh -F {ssh_config} -o StrictHostKeyChecking=no "
+                 f"-o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "
+                 f"{host} 'sudo -n systemctl reboot'", warn=True)
+        if not before:
+            pytest.skip("no cloned VMs in this box")
+
+        time.sleep(15)  # let the guests actually go down before polling
+        for host, (ssh_config, boot_id) in before.items():
+            after = ssh_cmd(ssh_config, host, BOOT_ID_PROBE).stdout.strip()
+            assert after != boot_id, f"{host} did not reboot"
+
+        assert_guest_names(config)

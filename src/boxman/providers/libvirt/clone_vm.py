@@ -16,6 +16,7 @@ from boxman.exceptions import (
     ConfigError,
     ProvisionError,
 )
+from boxman.utils.hostnames import hostname_problem
 from boxman.utils.shell import run as _shell_run
 
 from .commands import VirshCommand, VirtCloneCommand, VirtSysprepCommand
@@ -33,6 +34,13 @@ CLONE_DEGRADATIONS_KEY = '_boxman_clone_degradations'
 # that suppression and never seen.
 CLONE_WARNINGS_KEY = '_boxman_clone_warnings'
 
+# Internal hand-off from the manager: the name this clone's guest should carry
+# -- its ``hostname:``, or its VM key when that is absent, the same fallback
+# the ssh alias uses. Resolved there because the provider only ever sees the
+# full libvirt domain name, never the key. ``None`` means there is no usable
+# name, and the hostname property is left out of the pass.
+CLONE_GUEST_HOSTNAME_KEY = '_boxman_guest_hostname'
+
 #: Every clone-identity property takes the same three policies with the same
 #: meaning: ``auto`` degrades to a notice and continues, ``required`` fails
 #: closed and discards the clone, ``off`` leaves the property alone.
@@ -46,6 +54,147 @@ SSH_HOST_KEY_TYPES = ('rsa', 'ecdsa', 'ed25519')
 #: Name of the staged archive that carries the clone's host keys into
 #: ``/etc/ssh`` with root ownership.
 SSH_HOST_KEY_ARCHIVE = 'ssh-host-keys.tar'
+
+#: Name of the staged script that renames the clone in /etc/hosts and in
+#: cloud-init's config, run inside the guest before ``--hostname``.
+HOSTNAME_SCRIPT = 'boxman-clone-hostname.sh'
+
+#: The cloud-init drop-in that script writes.
+CLOUD_INIT_HOSTNAME_DROPIN = '/etc/cloud/cloud.cfg.d/99-boxman-hostname.cfg'
+
+# Runs inside the guest (``virt-sysprep --run``), chrooted into its root. It
+# is a guest-side script rather than ``--edit`` because ``--edit`` evaluates
+# Perl on the *host* running virt-sysprep -- the bundled docker runtime has no
+# perl -- and aborts the whole pass when the file it edits is missing, which
+# every guest without cloud-init would trip. The only placeholders are the two
+# names, which are validated hostnames: letters, digits, dots and hyphens.
+#
+# BOXMAN_GUEST_ROOT exists so the script can be exercised against a directory
+# in the unit tests; inside the guest it is unset.
+_HOSTNAME_SCRIPT = r'''#!/bin/sh
+# Written by boxman when this VM was cloned from its template: give the clone
+# its own name in /etc/hosts, and keep cloud-init from restoring the
+# template's. Runs once, offline, before virt-sysprep sets the hostname.
+root="${BOXMAN_GUEST_ROOT:-}"
+new_fqdn='@NEW_FQDN@'
+new_short='@NEW_SHORT@'
+
+# the template's name, read before --hostname replaces it
+old=$(head -n 1 "$root/etc/hostname" 2>/dev/null | tr -d ' \t\r')
+old_short=${old%%.*}
+
+# /etc/hosts: a loopback line that names the template -- or is 127.0.1.1,
+# which Debian reserves for the machine's own name -- is a self-line, and
+# every non-localhost name on it is the template's. cloud-init composes such
+# a line from unrelated sources (its fqdn from the metadata's local-hostname,
+# its short name from user-data), so they cannot be matched by name alone.
+# Those names become the clone's; every other line is left exactly as it
+# was. If no loopback line names the clone afterwards, one is added.
+if [ -f "$root/etc/hosts" ]; then
+    awk -v old="$old" -v olds="$old_short" -v nf="$new_fqdn" -v ns="$new_short" '
+        function lc(s) { return tolower(s) }
+        function is_local(n,    l) {
+            l = lc(n)
+            return l ~ /^localhost/ || l ~ /^ip6-/
+        }
+        function is_old(n,    l) {
+            if (skip) return 0
+            l = lc(n)
+            return l == lold || l == lolds || index(l, lolds ".") == 1
+        }
+        function add(n,    l) {
+            l = lc(n)
+            if (l in seen) return
+            seen[l] = 1
+            out = out " " n
+        }
+        BEGIN {
+            lold = lc(old); lolds = lc(olds)
+            # never rewrite localhost, whatever the template called itself
+            skip = (lolds == "" || lolds ~ /^localhost/)
+            have_new = 0
+        }
+        {
+            if ($0 ~ /^[ \t]*(#|$)/ || ($1 !~ /^127\./ && $1 != "::1")) {
+                print; next
+            }
+            n = 0; comment = ""
+            split("", names)
+            for (i = 2; i <= NF; i++) {
+                if (substr($i, 1, 1) == "#") {
+                    comment = substr($0, index($0, "#")); break
+                }
+                names[++n] = $i
+            }
+            self = ($1 == "127.0.1.1")
+            for (k = 1; k <= n; k++) if (is_old(names[k])) self = 1
+            if (!self) {
+                for (k = 1; k <= n; k++) if (lc(names[k]) == lc(ns)) have_new = 1
+                print; next
+            }
+            out = $1; placed = 0
+            split("", seen)
+            for (k = 1; k <= n; k++) {
+                if (is_local(names[k])) add(names[k])
+                else if (!placed) { add(nf); add(ns); placed = 1 }
+            }
+            if (!placed) { add(nf); add(ns) }
+            print out (comment == "" ? "" : " " comment)
+            have_new = 1
+        }
+        END {
+            if (!have_new) print "127.0.1.1 " (nf == ns ? ns : nf " " ns)
+        }
+    ' "$root/etc/hosts" > "$root/etc/hosts.boxman" &&
+        cat "$root/etc/hosts.boxman" > "$root/etc/hosts"
+    rm -f "$root/etc/hosts.boxman"
+fi
+
+# cloud-init, when the guest has it (sealed or not: harmless when disabled).
+if [ -d "$root/etc/cloud" ]; then
+    mkdir -p "$root/etc/cloud/cloud.cfg.d"
+    cat > "$root@DROPIN@" <<EOF
+# Written by boxman when this VM was cloned: its name is $new_short, not its
+# template's. preserve_hostname stops cloud-init setting the name back from
+# the template's metadata on a later boot.
+preserve_hostname: true
+hostname: $new_short
+fqdn: $new_fqdn
+EOF
+    # A template whose own user-data sets hostname: with manage_etc_hosts:
+    # true would still have cloud-init write the template's name into
+    # /etc/hosts on every boot -- user-data outranks any drop-in above. The
+    # hosts template is the one place it cannot override, and the file's own
+    # header names it as where a persistent change belongs.
+    for tpl in "$root"/etc/cloud/templates/hosts.*.tmpl; do
+        [ -f "$tpl" ] || continue
+        if [ "$new_fqdn" = "$new_short" ]; then
+            # an undotted name is both; do not list it twice on one line
+            sed -i -e "s/{{ *fqdn *}}[ \t]*{{ *hostname *}}/$new_short/g" "$tpl"
+        fi
+        sed -i -e "s/{{ *fqdn *}}/$new_fqdn/g" \
+               -e "s/{{ *hostname *}}/$new_short/g" "$tpl"
+    done
+fi
+exit 0
+'''
+
+
+def render_hostname_script(hostname: str) -> str:
+    """The guest-side rename script for *hostname*, a validated name.
+
+    A dotted *hostname* is the fully qualified name and its first label the
+    short one; an undotted one is both.
+    """
+    problem = hostname_problem(hostname)
+    if problem is not None:
+        # the placeholders go into shell, awk and sed unquoted-in-effect; a
+        # value that was never validated must not reach them
+        raise ConfigError(f"refusing to write hostname {hostname!r}: {problem}")
+    return (_HOSTNAME_SCRIPT
+            .replace('@NEW_FQDN@', hostname)
+            .replace('@NEW_SHORT@', hostname.split('.', 1)[0])
+            .replace('@DROPIN@', CLOUD_INIT_HOSTNAME_DROPIN))
 
 
 def join_names(names) -> str:
@@ -141,6 +290,9 @@ class IdentityPlan:
     #: bool: whether fresh ssh host keys must be generated before the pass
     fresh_ssh_host_keys: bool = False
 
+    #: str | None: the name to give the guest, when the pass sets one
+    hostname: str | None = None
+
     @property
     def strictest_policy(self) -> str:
         """The policy a failure of this pass is judged against.
@@ -205,6 +357,12 @@ class CloneVM:
         #: handled
         self.ssh_host_keys_policy = self._resolve_policy(
             'clone_ssh_host_keys')
+
+        #: str: how a failure to give the guest its own hostname is handled
+        self.hostname_policy = self._resolve_policy('clone_hostname')
+
+        #: str | None: the name the guest should carry, validated
+        self.guest_hostname = self._resolve_guest_hostname()
 
         #: int: bounded libguestfs inspection time; avoids a wedged appliance
         #: blocking the parent process forever while it joins clone workers.
@@ -278,6 +436,29 @@ class CloneVM:
                 f"{choices}, got {policy!r}")
         return policy
 
+    def _resolve_guest_hostname(self) -> str | None:
+        """The validated name for this clone's guest, or None for none.
+
+        The manager passes the resolved name under
+        :data:`CLONE_GUEST_HOSTNAME_KEY`. A direct provider caller has no VM
+        key to fall back on, so only an explicit ``hostname:`` counts there.
+        """
+        if CLONE_GUEST_HOSTNAME_KEY in self.info:
+            hostname = self.info[CLONE_GUEST_HOSTNAME_KEY]
+        else:
+            hostname = self.info.get('hostname')
+        if hostname is None:
+            if self.hostname_policy == 'required':
+                raise ConfigError(
+                    f"clone_hostname=required for vm '{self.new_vm_name}', "
+                    f"but it has no usable hostname; declare hostname:")
+            return None
+        problem = hostname_problem(hostname)
+        if problem is not None:
+            raise ConfigError(
+                f"hostname for vm '{self.new_vm_name}' {problem}")
+        return hostname
+
     def build_identity_plan(self) -> IdentityPlan:
         """Assemble the offline pass from the enabled identity policies.
 
@@ -303,6 +484,15 @@ class CloneVM:
             # clone holds the private host keys of all of them.
             plan.operations.append('ssh-hostkeys')
             plan.fresh_ssh_host_keys = True
+            plan.needs_customize = True
+
+        if self.hostname_policy != 'off' and self.guest_hostname:
+            plan.properties.append(IdentityProperty(
+                'hostname', 'clone_hostname', self.hostname_policy))
+            # virt-clone copies /etc/hostname verbatim, so every clone booted
+            # under its template's name: indistinguishable in logs, prompts
+            # and monitoring, and wrong for anything keyed on the hostname.
+            plan.hostname = self.guest_hostname
             plan.needs_customize = True
 
         if plan.needs_customize and self.machine_id_policy == 'off':
@@ -337,6 +527,31 @@ class CloneVM:
             customizations, staging_dir = self.generate_ssh_host_keys()
             plan.customizations.extend(customizations)
             plan.staging_dirs.append(staging_dir)
+        if plan.hostname:
+            customizations, staging_dir = self.stage_hostname(plan.hostname)
+            plan.customizations.extend(customizations)
+            plan.staging_dirs.append(staging_dir)
+
+    def stage_hostname(self, hostname: str) -> tuple[list[str], str]:
+        """Stage the rename script and return the customizations that apply it.
+
+        ``--run`` comes first on purpose: customizations apply in command-line
+        order, and the script has to read the template's name out of
+        /etc/hostname before ``--hostname`` overwrites it. ``--hostname`` then
+        handles the distro-specific files (/etc/hostname everywhere, plus the
+        likes of /etc/sysconfig/network) and writes a dotted name as given.
+        """
+        staging_dir = tempfile.mkdtemp(
+            prefix=f'boxman-hostname-{self.new_vm_name}-')
+        try:
+            script = os.path.join(staging_dir, HOSTNAME_SCRIPT)
+            with open(script, 'w') as handle:
+                handle.write(render_hostname_script(hostname))
+            os.chmod(script, 0o755)
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+        return ['--run', script, '--hostname', hostname], staging_dir
 
     def generate_ssh_host_keys(self) -> tuple[list[str], str]:
         """Generate a fresh set of ssh host keys for the clone, on the host.

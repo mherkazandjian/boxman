@@ -18,11 +18,14 @@ from boxman.loggers.logger import suppressed
 from boxman.manager_parts.images import ImagesMixin
 from boxman.providers.libvirt.clone_vm import (
     CLONE_DEGRADATIONS_KEY,
+    CLONE_GUEST_HOSTNAME_KEY,
     CLONE_WARNINGS_KEY,
+    IDENTITY_POLICIES,
     CloneDegradation,
 )
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.providers.libvirt.virsh_parse import parse_domblklist
+from boxman.utils.hostnames import hostname_problem
 
 
 def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
@@ -140,6 +143,8 @@ class VMsMixin:
             for cluster_name, cluster in self._vm_clusters.items():
                 for vm_name, vm_info in cluster['vms'].items():
                     vm_info = vm_info.copy()
+                    vm_info[CLONE_GUEST_HOSTNAME_KEY] = self.guest_hostname(
+                        vm_name, vm_info)
                     new_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
                     yield cluster, vm_info, new_vm_name
 
@@ -183,6 +188,86 @@ class VMsMixin:
                 f"clone failed for {len(failures)} VM(s) ({names}); aborting "
                 f"provision. See the preceding clone or guest-sanitizer log "
                 f"for the underlying cause and remediation.")
+
+    @staticmethod
+    def declared_hostname(vm_info: dict[str, Any]):
+        """The VM's ``hostname:``, with an explicit null read as absent."""
+        return vm_info.get('hostname')
+
+    def guest_hostname(self, vm_name: str,
+                       vm_info: dict[str, Any]) -> str | None:
+        """The name a clone's guest should carry, or None when there is none.
+
+        ``hostname:`` when declared, otherwise the VM key -- the same fallback
+        the ssh alias uses, so the alias and the guest's own name agree. A key
+        that is not a valid hostname (``my_vm``) yields None: it makes a fine
+        ssh alias but not a guest name, and :meth:`validate_clone_identity_config`
+        has already warned or refused according to the policy. A declared
+        value is returned as-is; validation refused a bad one before this runs.
+        """
+        declared = self.declared_hostname(vm_info)
+        if declared is not None:
+            return declared
+        return vm_name if hostname_problem(vm_name) is None else None
+
+    def validate_clone_identity_config(self) -> None:
+        """Refuse bad clone-identity settings before anything is created.
+
+        Checks the ``clone_*`` policy values and the guest hostname of every
+        cloned VM. Both would otherwise surface only inside a clone worker,
+        after networks and templates exist -- and a bad hostname would reach
+        the guest's /etc/hosts. Direct-boot (ISO/PXE) VMs are skipped: they
+        are installed, not cloned, so none of this applies to them.
+
+        A VM *key* that is not a valid hostname is only an error under
+        ``clone_hostname: required``. Under ``auto`` it is a warning and the
+        guest keeps its template's name, so a config that works today does
+        not start failing because its keys use underscores.
+
+        Raises:
+            ConfigError: naming every offending VM at once.
+        """
+        bad = []
+        choices = ', '.join(sorted(IDENTITY_POLICIES))
+        for cluster_name, cluster in (self.config.get('clusters') or {}).items():
+            for vm_name, vm_info in ((cluster or {}).get('vms') or {}).items():
+                vm_info = vm_info or {}
+                boot_order = vm_info.get('boot_order') or ['hd']
+                if boot_order[0] in ('cdrom', 'network'):
+                    continue
+                loc = f"{cluster_name}.vms.{vm_name}"
+
+                for key in ('clone_machine_id', 'clone_ssh_host_keys',
+                            'clone_hostname'):
+                    policy = vm_info.get(key, 'auto')
+                    if (not isinstance(policy, str)
+                            or policy not in IDENTITY_POLICIES):
+                        bad.append(
+                            f"{loc}.{key} must be one of {choices}, "
+                            f"got {policy!r}")
+
+                policy = vm_info.get('clone_hostname', 'auto')
+                declared = self.declared_hostname(vm_info)
+                if declared is not None:
+                    problem = hostname_problem(declared)
+                    if problem is not None:
+                        bad.append(f"{loc}.hostname {problem}")
+                elif policy != 'off':
+                    problem = hostname_problem(vm_name)
+                    if problem is None:
+                        continue
+                    if policy == 'required':
+                        bad.append(
+                            f"{loc} has no hostname:, and its key {problem}; "
+                            f"clone_hostname=required needs a valid name")
+                    else:
+                        self.logger.warning(
+                            f"{loc} has no hostname:, and its key {problem}, "
+                            f"so the guest keeps its template's name; declare "
+                            f"hostname: to name it")
+        if bad:
+            raise ConfigError(
+                "invalid clone identity configuration: " + "; ".join(bad))
 
     def collect_clone_degradations(self, results) -> None:
         """Accumulate the degradation records clone workers returned.
@@ -722,6 +807,11 @@ class VMsMixin:
             for vm_name, vm_info in cluster['vms'].items():
                 full = f"{prj_name}_{cluster_name}_{vm_name}"
                 if full in new_vm_names:
+                    vm_info = {
+                        **vm_info,
+                        CLONE_GUEST_HOSTNAME_KEY: self.guest_hostname(
+                            vm_name, vm_info),
+                    }
                     clone_tasks.append((cluster, vm_info, full))
 
         # Abort the update if any clone worker fails — same guard as
@@ -1250,6 +1340,7 @@ class VMsMixin:
         # so a bad mac was reported only after the networks had changed
         # (#171 A3).
         self.validate_direct_boot_config()
+        self.validate_clone_identity_config()
         dry_run = getattr(cli_args, 'dry_run', False)
         auto_accept = getattr(cli_args, 'yes', False)
         # Deliberately not `auto_accept or ...`: --yes answers the VM-removal
