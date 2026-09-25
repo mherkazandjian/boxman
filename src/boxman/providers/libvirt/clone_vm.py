@@ -325,8 +325,17 @@ class CloneVM:
             The customization arguments that install the keys, and the
             staging directory the caller is responsible for removing.
         """
-        staging_dir = tempfile.mkdtemp(
-            prefix=f'boxman-hostkeys-{self.new_vm_name}-')
+        # Only the host's disk and the command runner fail operationally
+        # here; those are typed as a sanitizer error so they reach the clone
+        # policy. Anything else raised while staging is a boxman bug and
+        # propagates as itself -- never as an ``auto`` notice.
+        try:
+            staging_dir = tempfile.mkdtemp(
+                prefix=f'boxman-hostkeys-{self.new_vm_name}-')
+        except OSError as exc:
+            raise CloneSanitizerError(
+                f"could not create a staging directory for vm "
+                f"{self.new_vm_name}'s ssh host keys: {exc}") from exc
 
         try:
             for key_type in SSH_HOST_KEY_TYPES:
@@ -335,10 +344,15 @@ class CloneVM:
                 # -C '' keeps the hypervisor's user@host out of the guest's
                 # public keys. -N '' is not a shortcut: an sshd host key
                 # cannot be passphrase-protected.
-                result = _shell_run(
-                    f"ssh-keygen -q -t {key_type} -N '' -C '' "
-                    f"-f {shlex.quote(private)}",
-                    hide=True, warn=True)
+                try:
+                    result = _shell_run(
+                        f"ssh-keygen -q -t {key_type} -N '' -C '' "
+                        f"-f {shlex.quote(private)}",
+                        hide=True, warn=True)
+                except Exception as exc:
+                    raise CloneSanitizerError(
+                        f"could not run ssh-keygen for vm "
+                        f"{self.new_vm_name}: {exc}") from exc
                 if not result.ok or not os.path.isfile(private):
                     detail = (
                         result.stderr or result.stdout or 'unknown error'
@@ -356,17 +370,22 @@ class CloneVM:
                         f"for vm {self.new_vm_name}: {detail}")
 
             archive = os.path.join(staging_dir, SSH_HOST_KEY_ARCHIVE)
-            with tarfile.open(archive, 'w') as tar:
-                for name, mode in self.ssh_host_key_files():
-                    source = os.path.join(staging_dir, name)
-                    entry = tar.gettarinfo(source, arcname=name)
-                    # the whole point of the archive: sshd must find its
-                    # host keys owned by root, whoever generated them
-                    entry.uid = entry.gid = 0
-                    entry.uname = entry.gname = 'root'
-                    entry.mode = mode
-                    with open(source, 'rb') as handle:
-                        tar.addfile(entry, handle)
+            try:
+                with tarfile.open(archive, 'w') as tar:
+                    for name, mode in self.ssh_host_key_files():
+                        source = os.path.join(staging_dir, name)
+                        entry = tar.gettarinfo(source, arcname=name)
+                        # the whole point of the archive: sshd must find its
+                        # host keys owned by root, whoever generated them
+                        entry.uid = entry.gid = 0
+                        entry.uname = entry.gname = 'root'
+                        entry.mode = mode
+                        with open(source, 'rb') as handle:
+                            tar.addfile(entry, handle)
+            except (OSError, tarfile.TarError) as exc:
+                raise CloneSanitizerError(
+                    f"could not write vm {self.new_vm_name}'s ssh host key "
+                    f"archive: {exc}") from exc
         except Exception:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
@@ -488,19 +507,12 @@ class CloneVM:
         clone policy.
         """
         try:
-            # Staging writes keys and an archive to the host's disk: an
-            # OSError there (disk full) is an operational failure of the pass
-            # and must reach the clone policy -- otherwise ``required`` never
-            # discards the unsanitized clone and the retry wrapper retries it.
-            # ConfigError and CloneSanitizerError already say what they mean.
-            try:
-                self.stage_identity_plan(plan)
-            except (CloneSanitizerError, ConfigError):
-                raise
-            except Exception as exc:
-                raise CloneSanitizerError(
-                    f"could not prepare the offline identity pass for vm "
-                    f"{self.new_vm_name}: {exc}") from exc
+            # Staging types its own operational failures -- the host's disk,
+            # the command runner -- as CloneSanitizerError, so they reach the
+            # clone policy: ``required`` discards the unsanitized clone
+            # instead of the retry wrapper retrying it. Anything else it
+            # raises is a boxman bug, and is not caught here.
+            self.stage_identity_plan(plan)
 
             # Built outside the sanitizer try/except below on purpose: an
             # invariant violation is a boxman bug, not a guest that cannot be

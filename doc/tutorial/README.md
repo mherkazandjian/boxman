@@ -260,8 +260,10 @@ and proceeds. Set every `clone_*` identity policy to `off` to skip the pass
 entirely. First-boot behaviour is unaffected for ordinary templates: systemd
 counts a boot as the first only when `/etc/machine-id` is missing or reads
 `uninitialized`, not when it is empty, so the old truncation never triggered
-`ConditionFirstBoot` either. Only a template shipped with no
-`/etc/machine-id` at all loses its first-boot semantics.
+`ConditionFirstBoot` either. Only two kinds of template lose their first-boot
+semantics: one shipped with no `/etc/machine-id` at all, and, under
+`clone_machine_id: off` with another property enabled, one whose file reads
+`uninitialized`.
 
 ### How the pieces fit together
 

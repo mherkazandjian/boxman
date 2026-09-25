@@ -683,6 +683,32 @@ class TestStagingFailures:
             with pytest.raises(ProvisionError, match="bad plan"):
                 clone.run_identity_pass(clone.build_identity_plan())
 
+    def test_a_failed_staging_directory_is_typed(self, clone: CloneVM):
+        import errno
+        with patch("boxman.providers.libvirt.clone_vm.tempfile.mkdtemp",
+                   side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            with pytest.raises(CloneSanitizerError, match="No space left") as caught:
+                clone.run_identity_pass(clone.build_identity_plan())
+        assert isinstance(caught.value.__cause__, OSError)
+
+    @pytest.mark.parametrize("bug", [
+        AssertionError("staging bug"),
+        AttributeError("staging bug"),
+        ProvisionError("staging bug"),
+    ], ids=lambda exc: type(exc).__name__)
+    def test_a_bug_inside_staging_is_not_degraded(self, clone: CloneVM, bug):
+        """From round 2 of the review: only the host's disk and the command
+        runner fail operationally. A boxman bug inside staging must surface
+        as itself, not become an ``auto`` notice on an unsanitized clone."""
+        notices: list = []
+        clone.info[CLONE_DEGRADATION_NOTICES_KEY] = notices
+        with patch.object(clone, "stage_identity_plan", side_effect=bug), \
+             patch.object(clone.virt_sysprep, "execute") as execute:
+            with pytest.raises(type(bug), match="staging bug"):
+                clone.apply_identity_policies()
+        assert notices == []
+        execute.assert_not_called()
+
 
 class TestHostPrerequisitesAreTyped:
     """A missing tool on the hypervisor or a sudo rule that does not cover
@@ -987,3 +1013,70 @@ class TestCloneVmIdentityFailureChain:
         }
         virsh.assert_called_once_with(
             "undefine", "vm01", "--remove-all-storage", warn=True)
+
+
+
+# ---------------------------------------------------------------------------
+# the integration tier's host-key check must not pass vacuously
+# ---------------------------------------------------------------------------
+
+_TYPES = ("ecdsa", "ed25519", "rsa")
+
+
+def _keys(prefix: str) -> dict[str, str]:
+    return {key_type: f"SHA256:{prefix}-{key_type}" for key_type in _TYPES}
+
+
+class TestHostKeyFreshnessCheck:
+    """From round 2 of the review: a sibling clone with fresh keys proves the
+    two differ, not that either differs from the template. Freshness needs
+    every key type compared against the template; without that the check
+    skips rather than passes."""
+
+    CONFIG = {
+        "workspace": {"path": "/workspace"},
+        "clusters": {"c1": {"base_image": "tmpl",
+                            "vms": {"vm1": {}, "vm2": {}}}},
+    }
+
+    def _check(self, guests: dict[str, dict[str, str]],
+               template: dict[str, str], config=None) -> None:
+        from types import SimpleNamespace
+
+        from tests import test_provision_boxes as boxes
+
+        def ssh(ssh_config, host, command):
+            keys = guests[host.split("_", 1)[1]]
+            return SimpleNamespace(stdout="".join(
+                f"KEY {t} root:600 {fp}\n" for t, fp in keys.items()))
+
+        with patch.object(boxes, "ssh_cmd", side_effect=ssh), \
+             patch.object(boxes, "template_host_key_fingerprints",
+                          return_value=template):
+            boxes.TestProvisionBox().test_ssh_host_keys_are_fresh_and_unique(
+                config or self.CONFIG)
+
+    def test_fresh_keys_against_a_readable_template_pass(self):
+        self._check({"vm1": _keys("a"), "vm2": _keys("b")}, _keys("t"))
+
+    def test_an_inherited_key_against_a_readable_template_fails(self):
+        with pytest.raises(AssertionError, match="still the template's"):
+            self._check({"vm1": _keys("t"), "vm2": _keys("b")}, _keys("t"))
+
+    def test_an_inherited_key_beside_a_fresh_sibling_is_not_a_pass(self):
+        """vm1 kept every template key, vm2 got fresh ones, and the template
+        cannot be read: the keys differ, but nothing shows vm1's are new."""
+        with pytest.raises(pytest.skip.Exception, match="vm1"):
+            self._check({"vm1": _keys("t"), "vm2": _keys("b")}, {})
+
+    def test_a_lone_vm_with_an_unreadable_template_skips(self):
+        config = {"workspace": {"path": "/workspace"},
+                  "clusters": {"c1": {"base_image": "tmpl",
+                                      "vms": {"vm1": {}}}}}
+        with pytest.raises(pytest.skip.Exception):
+            self._check({"vm1": _keys("a")}, {}, config)
+
+    def test_a_partly_readable_template_skips(self):
+        partial = {"rsa": "SHA256:t-rsa"}
+        with pytest.raises(pytest.skip.Exception):
+            self._check({"vm1": _keys("a"), "vm2": _keys("b")}, partial)
