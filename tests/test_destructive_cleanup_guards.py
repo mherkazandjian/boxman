@@ -156,7 +156,7 @@ class _TeardownGate:
         mgr = BoxmanManager.__new__(BoxmanManager)
         mgr.config = {"project": "demo"}
         mgr.logger = MagicMock()
-        self.inventory = SimpleNamespace(saved_at=None)
+        self.inventory = SimpleNamespace(saved_at=None, locator_at=None)
         mgr._capture_vm_storage = MagicMock(return_value=self.inventory)
         return mgr
 
@@ -382,8 +382,25 @@ class TestDestroyTeardownGate:
         assert [c[0] for c in order.mock_calls] == [
             "deprovision_files", "force_rmtree", "unregister"]
 
+    def test_stale_teardown_locators_go_once_the_workspace_has(
+            self, tmp_path):
+        """A kept file's inventory goes with the workspace; its locator is
+        retired after that, before the project is forgotten (#208)."""
+        mgr, workspace = self._manager(tmp_path)
+        mgr._retire_stale_teardown_locators = MagicMock()
+        order = MagicMock()
+        order.attach_mock(mgr._force_rmtree, "force_rmtree")
+        order.attach_mock(mgr._retire_stale_teardown_locators, "retire")
+        order.attach_mock(mgr.unregister_from_cache, "unregister")
+
+        mgr.destroy(ARGS)
+
+        assert [c[0] for c in order.mock_calls] == [
+            "force_rmtree", "retire", "unregister"]
+
     def test_a_failed_deprovision_preserves_everything(self, tmp_path):
         mgr, _workspace = self._manager(tmp_path)
+        mgr._retire_stale_teardown_locators = MagicMock()
         mgr.deprovision.side_effect = ProvisionError(
             "deprovision did not complete — VMs are still defined: node01")
 
@@ -393,6 +410,7 @@ class TestDestroyTeardownGate:
         mgr._force_rmtree.assert_not_called()
         mgr.deprovision_files.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
+        mgr._retire_stale_teardown_locators.assert_not_called()
 
     def test_a_failed_compose_destroy_preserves_everything(self, tmp_path):
         """``destroy_compose_clusters`` (down --volumes) is a different

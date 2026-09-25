@@ -40,6 +40,35 @@ from .virsh_parse import (
     parse_domiflist,
 )
 
+#: what :func:`_absence_probe` prints once it has established that a path
+#: has no directory entry at all
+_ABSENT = "boxman-source-absent"
+
+
+def _absence_probe(path: str) -> str:
+    """
+    The shell probe behind :meth:`LibVirtSession._source_absent`, for an
+    absolute, normalised *path*: it prints :data:`_ABSENT` only when *path*
+    has no directory entry (``-e`` follows a symlink, so ``-L`` catches a
+    dangling one) and the nearest ancestor that does exist is a directory
+    the probe can search. That directory shows the same entries to
+    everyone; one it cannot search, or one on the way that is not a
+    directory, proves nothing and prints nothing.
+    """
+    def exists(p: str) -> str:
+        return f"[ -e {shlex.quote(p)} ] || [ -L {shlex.quote(p)} ]"
+
+    steps = [f"if {exists(path)}; then exit 0; fi"]
+    ancestor = path
+    while (parent := os.path.dirname(ancestor)) != ancestor:
+        ancestor = parent
+        quoted = shlex.quote(ancestor)
+        steps.append(
+            f"if {exists(ancestor)}; then "
+            f"if [ -d {quoted} ] && [ -x {quoted} ]; then echo {_ABSENT}; "
+            f"fi; exit 0; fi")
+    return "; ".join(steps)
+
 
 class LibVirtSession(SessionConfigMixin):
     """
@@ -816,7 +845,9 @@ class LibVirtSession(SessionConfigMixin):
         is still in use. An explicitly empty slot (``-``) is not a source,
         and neither is a ``network`` row: it names no file on this host. A
         ``volume`` row is read at the local path its volume resolves to
-        (:meth:`vm_storage_devices`).
+        (:meth:`vm_storage_devices`). A source confirmed absent (see
+        :meth:`_source_absent`) — a deleted seed ISO still attached — uses
+        nothing: there is no file there, nor anything below it.
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         listing = virsh.execute("list", "--all", "--name", warn=True)
@@ -836,6 +867,8 @@ class LibVirtSession(SessionConfigMixin):
             for source in sorted(sources):
                 chain = self._backing_chain_files(cmd, source)
                 if chain is None:
+                    if self._source_absent(source):
+                        continue
                     return None
                 for path in chain:
                     in_use.setdefault(path, domain)
@@ -936,14 +969,25 @@ class LibVirtSession(SessionConfigMixin):
         named it, not resolved: a layer that is a symlink must stay
         recognisable as one (callers compare resolved paths themselves).
 
+        A source confirmed absent (see :meth:`_source_absent`) has no chain
+        and nothing below it to protect — a seed ISO still attached after
+        it was deleted, which boxman tolerates elsewhere — and is left out.
+        Any other source whose chain cannot be read makes the whole answer
+        ``None``: an existing image that cannot be read may depend on
+        anything.
+
         Returns:
-            ``{source: chain}``, or ``None`` when any chain cannot be read.
+            ``{source: chain}`` for every source that is there, or ``None``
+            when the chain of one that is not confirmed absent cannot be
+            read.
         """
         cmd = LibVirtCommandBase(provider_config=self.provider_config)
         chains: dict[str, list[str]] = {}
         for source in sources:
             images = self._read_backing_chain(cmd, source)
             if images is None:
+                if self._source_absent(source):
+                    continue
                 return None
             chain: list[str] = []
             seen: set[str] = set()
@@ -954,6 +998,31 @@ class LibVirtSession(SessionConfigMixin):
                     chain.append(image['filename'])
             chains[source] = chain
         return chains
+
+    def _source_absent(self, path: str) -> bool:
+        """
+        Whether *path* positively does not exist where ``qemu-img`` reads it.
+
+        Asked through the same command wrapper ``qemu-img`` runs through,
+        so under the docker-compose runtime it is answered inside the
+        runtime container, whose mounts are not this host's — and never
+        inferred from ``qemu-img``'s error text. Only a path with no
+        directory entry at all, under a directory the probe can search,
+        is absent (:func:`_absence_probe`); anything else — the path is
+        there, a directory on the way cannot be searched, the probe itself
+        fails — is not. The probe never adds ``sudo``, so it can never
+        prompt for a password: whoever it runs as, a directory it can
+        search holds the same entries for everyone, and one it cannot
+        search proves nothing. Only an absolute, normalised path is
+        probed, so the directories checked are the ones it resolves
+        through.
+        """
+        if not os.path.isabs(path) or os.path.normpath(path) != path:
+            return False
+        probe = LibVirtCommandBase(override_config_use_sudo=False,
+                                   provider_config=self.provider_config)
+        result = probe.execute_shell(_absence_probe(path), warn=True)
+        return bool(result.ok) and (result.stdout or "").strip() == _ABSENT
 
     @staticmethod
     def _read_backing_chain(cmd, source: str) -> list[dict] | None:

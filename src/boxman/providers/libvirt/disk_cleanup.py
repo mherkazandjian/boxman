@@ -200,8 +200,10 @@ class StorageInventory:
     #: one of :data:`RECORDS_PRESENT`, :data:`RECORDS_NONE`,
     #: :data:`RECORDS_UNREADABLE`, :data:`RECORDS_UNKNOWN`
     records_state: str
-    #: the backing chain of each disk source, as ``qemu-img`` names the
-    #: layers (the disk first, the bottom image last); ``None`` when one
+    #: the backing chain of each disk and media source, as ``qemu-img``
+    #: names the layers (the source first, the bottom image last); a
+    #: source confirmed absent has none, and on a retry a disk source
+    #: removed since maps to what is left of its chain. ``None`` when one
     #: could not be read
     chains: dict[str, list[str]] | None
     #: files under its exclusive names in its disk directories
@@ -217,16 +219,42 @@ class StorageInventory:
     #: where it was saved before undefining (see
     #: :func:`save_teardown_inventory`); not saved itself
     saved_at: str | None = None
+    #: the locator that leads a retry to :attr:`saved_at` (see
+    #: :func:`save_teardown_locator`); not saved itself
+    locator_at: str | None = None
 
 
 #: version of the saved teardown inventory's layout
 TEARDOWN_INVENTORY_VERSION = 1
+#: version of a teardown locator's layout
+TEARDOWN_LOCATOR_VERSION = 1
+
+
+def _inventory_name(vm_name: str) -> str:
+    return f".boxman-teardown-{vm_name}.json"
 
 
 def teardown_inventory_path(directory: str, vm_name: str) -> str:
     """Where a VM's teardown inventory is saved, beside its boot disk."""
     return os.path.join(os.path.expanduser(directory),
-                        f".boxman-teardown-{vm_name}.json")
+                        _inventory_name(vm_name))
+
+
+def _write_json_atomically(path: str, data: object) -> None:
+    """Write *data* to *path* as JSON: into a staging file beside it,
+    flushed and synced, then renamed over it."""
+    fd, staging = tempfile.mkstemp(prefix=".boxman-teardown-",
+                                   suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(staging, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(staging)
+        raise
 
 
 def save_teardown_inventory(inventory: StorageInventory,
@@ -239,8 +267,10 @@ def save_teardown_inventory(inventory: StorageInventory,
     teardown interrupted after the undefine would otherwise be retried
     blind: a CD-ROM file under the VM's own names, protected by the first
     attempt, would be taken for a boot-disk file and deleted by the second.
-    Saved first, the retry decides with exactly what the first attempt
-    saw; identity checks still guard every unlink.
+    Saved first, the retry decides with what the first attempt saw — its
+    provenance; what the files depend on is read again (the caller's
+    part) — and identity checks still guard every unlink. A retry finds it
+    through its locator (:func:`save_teardown_locator`).
 
     Raises:
         OSError: If the file cannot be written.
@@ -261,56 +291,157 @@ def save_teardown_inventory(inventory: StorageInventory,
                        in inventory.identities.items()},
         "targets": inventory.targets,
     }
-    fd, staging = tempfile.mkstemp(prefix=".boxman-teardown-",
-                                   suffix=".tmp", dir=os.path.dirname(path))
-    try:
-        with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(staging, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(staging)
-        raise
+    _write_json_atomically(path, data)
     return path
+
+
+def _is_int(value: object) -> bool:
+    # a JSON true would pass isinstance(value, int)
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_paths(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _is_map(value: object, valid: Callable[[object], bool]) -> bool:
+    # JSON object keys are always strings
+    return isinstance(value, dict) and all(valid(v) for v in value.values())
+
+
+_RECORD_FIELDS = frozenset(f.name for f in dataclasses.fields(DiskRecord))
+
+
+def _is_records(value: object) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(record, dict) and set(record) == _RECORD_FIELDS
+        and all(isinstance(v, str) for v in record.values())
+        for record in value)
+
+
+def _is_identity(value: object) -> bool:
+    return (isinstance(value, list) and len(value) == 2
+            and all(_is_int(v) for v in value))
+
+
+def _field(data: dict, key: str, valid: Callable[[object], bool]) -> object:
+    if key not in data or not valid(data[key]):
+        raise ValueError(f"its {key!r} is missing or malformed")
+    return data[key]
+
+
+def _json_object(path: str) -> dict:
+    with open(path) as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"it holds a JSON {type(data).__name__}, not an "
+                         f"object")
+    return data
+
+
+def _version(data: dict, expected: int) -> None:
+    version = data.get("version")
+    if not _is_int(version) or version != expected:
+        raise ValueError(f"unknown layout {version!r}")
 
 
 def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
     """
     Read back what :func:`save_teardown_inventory` saved for *vm_name*.
 
+    Its whole layout is checked before any of it is used — every field
+    present and of its type, the records complete — so a truncated,
+    hand-edited or foreign file is refused as unreadable, never half-read.
+
     Raises:
-        OSError, ValueError, KeyError, TypeError: If it cannot be read, is
-            not a saved inventory of this layout, or names another VM.
+        OSError, ValueError: If it cannot be read, is not a saved inventory
+            of this layout, or names another VM.
     """
-    with open(path) as fh:
-        data = json.load(fh)
-    if data.get("version") != TEARDOWN_INVENTORY_VERSION:
-        raise ValueError(f"unknown layout {data.get('version')!r}")
-    if data["vm_name"] != vm_name:
-        raise ValueError(f"it is the inventory of {data['vm_name']!r}")
-    state = data["records_state"]
+    data = _json_object(path)
+    _version(data, TEARDOWN_INVENTORY_VERSION)
+    name = _field(data, "vm_name", lambda v: isinstance(v, str))
+    if name != vm_name:
+        raise ValueError(f"it is the inventory of {name!r}")
+    state = data.get("records_state")
     if state not in (RECORDS_PRESENT, RECORDS_NONE, RECORDS_UNREADABLE):
         raise ValueError(f"unknown records state {state!r}")
-    records = data["records"]
+    # records are read exactly when the domain carried them
+    records = _field(data, "records", (
+        _is_records if state == RECORDS_PRESENT else (lambda v: v is None)))
+    chains = _field(data, "chains",
+                    lambda v: v is None or _is_map(v, _is_paths))
+    legacy = _field(data, "legacy_disks", lambda v: v is None or _is_paths(v))
+    identities = _field(data, "identities",
+                        lambda v: _is_map(v, _is_identity))
     return StorageInventory(
         vm_name=vm_name,
-        disk_sources=list(data["disk_sources"]),
-        media_sources=list(data["media_sources"]),
+        disk_sources=list(_field(data, "disk_sources", _is_paths)),
+        media_sources=list(_field(data, "media_sources", _is_paths)),
         records=(None if records is None
                  else [DiskRecord(**record) for record in records]),
         records_state=state,
-        chains=(None if data["chains"] is None
-                else {k: list(v) for k, v in data["chains"].items()}),
-        boot_family=list(data["boot_family"]),
-        legacy_disks=(None if data["legacy_disks"] is None
-                      else list(data["legacy_disks"])),
-        identities={k: (int(v[0]), int(v[1]))
-                    for k, v in data["identities"].items()},
-        targets=dict(data["targets"]),
+        chains=(None if chains is None
+                else {k: list(v) for k, v in chains.items()}),
+        boot_family=list(_field(data, "boot_family", _is_paths)),
+        legacy_disks=None if legacy is None else list(legacy),
+        identities={k: (v[0], v[1]) for k, v in identities.items()},
+        targets=dict(_field(data, "targets",
+                            lambda v: _is_map(v, lambda t: isinstance(t, str)))),
         saved_at=path,
     )
+
+
+def teardown_locator_path(locator_dir: str, vm_name: str) -> str:
+    """Where the locator of *vm_name*'s saved teardown inventory is kept:
+    in *locator_dir* (under boxman's per-user state dir), keyed by the full
+    vm name alone."""
+    return os.path.join(os.path.expanduser(locator_dir), f"{vm_name}.json")
+
+
+def save_teardown_locator(locator: str, vm_name: str,
+                          inventory_path: str) -> None:
+    """
+    Record at *locator*, atomically, that *vm_name*'s teardown inventory is
+    saved at *inventory_path*.
+
+    The inventory stays beside the VM's disks, which it describes, and that
+    can be any directory the boot disk was in. The locator is what a retry
+    looks up — by the vm name alone — so it finds the inventory wherever
+    that was, whatever directories the retry itself would search.
+
+    Raises:
+        OSError: If it cannot be written.
+    """
+    os.makedirs(os.path.dirname(locator), exist_ok=True)
+    _write_json_atomically(locator, {
+        "version": TEARDOWN_LOCATOR_VERSION,
+        "vm_name": vm_name,
+        "inventory": os.path.abspath(inventory_path),
+    })
+
+
+def read_teardown_locator(locator: str, vm_name: str) -> str:
+    """
+    The inventory path *locator* records for *vm_name*.
+
+    Only an absolute path to a file named as *vm_name*'s teardown inventory
+    is accepted: what a locator names is read, and removed once it has
+    done its job.
+
+    Raises:
+        OSError, ValueError: If it cannot be read or is malformed.
+    """
+    data = _json_object(locator)
+    _version(data, TEARDOWN_LOCATOR_VERSION)
+    name = _field(data, "vm_name", lambda v: isinstance(v, str))
+    if name != vm_name:
+        raise ValueError(f"it is the locator of {name!r}")
+    inventory = _field(data, "inventory", lambda v: isinstance(v, str))
+    if (not os.path.isabs(inventory)
+            or os.path.basename(inventory) != _inventory_name(vm_name)):
+        raise ValueError(f"it does not name a teardown inventory of "
+                         f"{vm_name}: {inventory!r}")
+    return inventory
 
 
 @dataclass

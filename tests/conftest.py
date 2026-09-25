@@ -17,6 +17,7 @@ Helpers (plain importable functions, not fixtures):
 
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import Any
 from unittest.mock import MagicMock
@@ -48,6 +49,31 @@ def captured_logs(caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
         yield caplog
     finally:
         boxman_logger.propagate = previous_propagate
+
+
+# ---------------------------------------------------------------------------
+# boxman's per-user cache dir — never the real one
+# ---------------------------------------------------------------------------
+
+_cache_dirs = itertools.count()
+
+
+@pytest.fixture(autouse=True)
+def _private_boxman_cache_dir(tmp_path_factory: pytest.TempPathFactory,
+                              monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Point boxman's per-user cache dir (``~/.config/boxman/cache``) at a
+    directory of this test's own, not created until something writes there.
+
+    A VM teardown records there where it saved its inventory (#208), and a
+    registered project lands there too; neither may reach the real one, nor
+    leak from one test into the next. Tests that patch
+    ``DEFAULT_CACHE_DIR`` themselves still win.
+    """
+    monkeypatch.setattr(
+        "boxman.config_cache.DEFAULT_CACHE_DIR",
+        str(tmp_path_factory.getbasetemp() / "boxman-cache"
+            / str(next(_cache_dirs))))
 
 
 # ---------------------------------------------------------------------------

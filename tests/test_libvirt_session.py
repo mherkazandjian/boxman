@@ -19,6 +19,10 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
+import os
+import shlex
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -26,7 +30,7 @@ import pytest
 
 from boxman.exceptions import ConfigError
 from boxman.providers.libvirt.net import Network
-from boxman.providers.libvirt.session import LibVirtSession
+from boxman.providers.libvirt.session import _ABSENT, LibVirtSession
 
 pytestmark = pytest.mark.unit
 
@@ -804,10 +808,14 @@ class TestBackingChains:
     undefining: head first, the bottom image last (#212 review round 3,
     R3-2; #208)."""
 
-    def _run(self, sources):
+    def _run(self, sources, absent=()):
+        """*absent* lists the paths the absence probe confirms absent."""
         chains = TestDiskPathsInUse.CHAIN
 
         def shell(command, **kwargs):
+            if _ABSENT in command:
+                probed = shlex.split(command)[3]
+                return _result(stdout=_ABSENT if probed in absent else "")
             source = command.rsplit(" ", 1)[1].strip("'")
             if source not in chains:
                 return _result(ok=False, stderr="Could not open")
@@ -824,7 +832,139 @@ class TestBackingChains:
         }
 
     def test_none_when_any_chain_cannot_be_read(self):
+        """... and its source is not confirmed absent."""
         assert self._run(["/ws/a.qcow2", "/ws/missing.qcow2"]) is None
+
+    def test_a_source_confirmed_absent_is_left_out(self):
+        assert self._run(["/ws/a.qcow2", "/ws/missing.qcow2"],
+                         absent={"/ws/missing.qcow2"}) == {
+            "/ws/a.qcow2": ["/ws/a.qcow2"]}
 
     def test_no_sources_is_an_empty_answer(self):
         assert self._run([]) == {}
+
+
+class TestAbsenceProbe:
+    """How a source is confirmed absent (#208 review round 3, 4): through
+    the command wrapper qemu-img runs through, never with sudo, and only on
+    the probe's own positive answer."""
+
+    def _commands(self, provider, probe_says=_ABSENT, probe_ok=True):
+        seen = []
+
+        def run(command, **kwargs):
+            seen.append(command)
+            if _ABSENT in command:
+                return _result(stdout=probe_says, ok=probe_ok)
+            return _result(ok=False, stderr="Could not open")
+
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=run):
+            chains = _session(provider).backing_chains(["/ws/seed.iso"])
+        return chains, seen
+
+    def test_it_never_adds_sudo_even_where_qemu_img_gets_it(self):
+        chains, (qemu_img, probe) = self._commands({"use_sudo": True})
+        assert chains == {}
+        assert qemu_img.startswith("sudo qemu-img ")
+        assert not probe.startswith("sudo")
+
+    def test_it_runs_where_qemu_img_runs(self):
+        chains, (qemu_img, probe) = self._commands({
+            "runtime": "docker-compose", "runtime_container": "rt"})
+        assert chains == {}
+        for command in (qemu_img, probe):
+            assert command.startswith("docker exec --user root rt bash -c ")
+
+    @pytest.mark.parametrize("says, ok", [("", True), (_ABSENT, False),
+                                          ("something else", True)])
+    def test_anything_but_its_answer_is_not_absence(self, says, ok):
+        chains, _ = self._commands({}, probe_says=says, probe_ok=ok)
+        assert chains is None
+
+
+@pytest.mark.skipif(shutil.which("qemu-img") is None, reason="needs qemu-img")
+class TestSourcesGoneFromTheHost:
+    """A source that does not exist has no backing chain -- nothing below
+    it to protect -- while an existing image that cannot be read still
+    fails closed (#208 review round 3, 4). Real qemu-img, real files, the
+    local runtime."""
+
+    @staticmethod
+    def _image(path):
+        subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", str(path),
+                        "1M"], check=True)
+        return str(path)
+
+    @staticmethod
+    def _unless_root():
+        if os.geteuid() == 0:
+            pytest.skip("root reads past mode 000")
+
+    def test_a_missing_source_is_left_out(self, tmp_path):
+        disk = self._image(tmp_path / "a.qcow2")
+        gone = str(tmp_path / "seed.iso")
+        assert _session({}).backing_chains([disk, gone]) == {disk: [disk]}
+
+    def test_a_source_whose_directory_is_gone_too_is_left_out(self, tmp_path):
+        gone = str(tmp_path / "gone" / "deeper" / "seed.iso")
+        assert _session({}).backing_chains([gone]) == {}
+
+    def test_an_existing_image_that_cannot_be_read_fails_closed(self, tmp_path):
+        self._unless_root()
+        disk = self._image(tmp_path / "a.qcow2")
+        os.chmod(disk, 0)
+        assert _session({}).backing_chains([disk]) is None
+
+    def test_a_dangling_symlink_is_not_taken_for_absent(self, tmp_path):
+        link = tmp_path / "seed.iso"
+        link.symlink_to(tmp_path / "nowhere.iso")
+        assert _session({}).backing_chains([str(link)]) is None
+
+    def test_a_directory_that_cannot_be_searched_proves_nothing(self, tmp_path):
+        self._unless_root()
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        locked.chmod(0)
+        try:
+            assert _session({}).backing_chains([str(locked / "seed.iso")]) is None
+        finally:
+            locked.chmod(0o700)
+
+    @pytest.mark.parametrize("path", ["seed.iso", "{tmp}/x/../seed.iso"])
+    def test_a_path_not_absolute_and_normal_proves_nothing(self, tmp_path, path):
+        assert _session({}).backing_chains(
+            [path.format(tmp=tmp_path)]) is None
+
+    def test_a_domain_whose_cdrom_is_gone_is_still_scanned(self, tmp_path):
+        disk = self._image(tmp_path / "b.qcow2")
+        gone = str(tmp_path / "seed.iso")
+        blk = (TestDiskPathsInUse.HEADER
+               + f" file   disk     vda      {disk}\n"
+               + f" file   cdrom    sda      {gone}\n")
+
+        def virsh_execute(*args, **kwargs):
+            if args[0] == "list":
+                return _result(stdout="vm-b\n")
+            return _result(stdout=blk)
+
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:
+            virsh.return_value.execute.side_effect = virsh_execute
+            in_use = _session({}).disk_paths_in_use()
+
+        assert in_use == {os.path.realpath(disk): "vm-b"}
+
+    def test_a_domain_whose_disk_cannot_be_read_fails_the_scan(self, tmp_path):
+        self._unless_root()
+        disk = self._image(tmp_path / "b.qcow2")
+        os.chmod(disk, 0)
+        blk = TestDiskPathsInUse.HEADER + f" file   disk     vda      {disk}\n"
+
+        def virsh_execute(*args, **kwargs):
+            if args[0] == "list":
+                return _result(stdout="vm-b\n")
+            return _result(stdout=blk)
+
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:
+            virsh.return_value.execute.side_effect = virsh_execute
+            assert _session({}).disk_paths_in_use() is None

@@ -849,15 +849,22 @@ Details worth knowing:
   not at all, overlays first, so no kept disk loses its backing file. A VM
   that predates the ownership record has its declared disks removed by name.
   Before undefining, the teardown saves what it saw beside the boot disk
-  (`.boxman-teardown-<vm>.json`), so a teardown interrupted after the
-  undefine and run again decides exactly as the first attempt would; the
-  file is removed once nothing it protects is left. With the VM already gone
-  and nothing saved, only boxman's own qcow2 images and memory files under
-  the VM's names are removed, and its extra disks are kept. An extra disk
-  moved to an overlay by a snapshot
-  goes with its whole chain when every layer is provably its own (the disk at
-  its recorded target, the recorded base at the bottom, each layer named for
-  it in the same directory); otherwise the chain is kept whole. Every file
+  (`.boxman-teardown-<vm>.json`) and records where in
+  `~/.config/boxman/cache/teardown/<vm>.json`, so a teardown interrupted
+  after the undefine and run again — wherever the boot disk was — decides
+  with the first attempt's records, while reading again what each file
+  still there depends on (a kept image may have been rebased since); both
+  files are removed once nothing they protect is left (`destroy`, which
+  removes the workspace, also drops a locator whose inventory went with
+  it), and one that cannot be read stops the retry with nothing removed.
+  With the VM already gone and nothing saved, only boxman's own qcow2
+  images and memory files under the VM's names are removed, and its extra
+  disks are kept. A CD-ROM or disk whose file no longer exists — a deleted
+  seed ISO still attached — protects nothing and holds nothing back. An
+  extra disk moved to an overlay by a snapshot goes with its whole chain
+  when every layer is provably its own (the disk at its recorded target,
+  the recorded base at the bottom, each layer named for it in the same
+  directory); otherwise the chain is kept whole. Every file
   kept is named in a warning; keeping it does not fail the command. (`virsh
   undefine --remove-all-storage` used to wipe and delete every
   storage-pool-listed file the VM referenced, ISOs included — #208.)

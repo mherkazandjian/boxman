@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman import config_cache
 from boxman.exceptions import ProvisionError
 from boxman.providers.libvirt import disk_cleanup
 from boxman.providers.libvirt.disk_ownership import (
@@ -42,8 +45,54 @@ def _record(name, path, role=ROLE_DATA, target='vdb'):
     return DiskRecord(name=name, target=target, role=role, source=str(path))
 
 
-#: default for ``_Teardown(chains=...)``: every disk a standalone image
+#: default for ``_Teardown(chains=...)``: every disk that exists a
+#: standalone image; one that does not is left out, as the host's answer
+#: leaves out a source confirmed absent
 STANDALONE = object()
+
+
+def _live(table):
+    """``backing_chains`` as the host would answer it now: each requested
+    source that exists, with its chain from *table* (standalone when not
+    listed); a source that does not exist is left out (confirmed absent),
+    and a chain with a missing layer cannot be read."""
+    table = {str(k): [str(layer) for layer in v] for k, v in table.items()}
+
+    def chains(sources):
+        answer = {}
+        for source in map(str, sources):
+            if not os.path.lexists(source):
+                continue
+            layers = table.get(source, [source])
+            if not all(os.path.lexists(layer) for layer in layers):
+                return None
+            answer[source] = layers
+        return answer
+    return chains
+
+
+needs_qemu_img = pytest.mark.skipif(shutil.which('qemu-img') is None,
+                                    reason='needs qemu-img')
+
+
+def _image(path, backing=None):
+    """A real qcow2 image, built on *backing* when given."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    command = ['qemu-img', 'create', '-q', '-f', 'qcow2']
+    if backing is not None:
+        command += ['-b', str(backing), '-F', 'qcow2', str(path)]
+    else:
+        command += [str(path), '1M']
+    subprocess.run(command, check=True)
+    return path
+
+
+def _production_chains(t):
+    """Have *t*'s session read backing chains the way production does:
+    ``LibVirtSession.backing_chains`` running the real ``qemu-img`` (and
+    whatever else it runs) on this host, local runtime, no sudo."""
+    t.session.backing_chains.side_effect = LibVirtSession(
+        config={'provider': {'libvirt': {}}}).backing_chains
 
 
 class _Teardown:
@@ -66,8 +115,7 @@ class _Teardown:
                for i, p in enumerate(media)])
         session.confirm_vm_absent.return_value = True
         if chains is STANDALONE:
-            session.backing_chains.side_effect = (
-                lambda sources: {str(s): [str(s)] for s in sources})
+            session.backing_chains.side_effect = _live({})
         else:
             session.backing_chains.return_value = chains
         session.disk_paths_in_use.return_value = (
@@ -765,6 +813,141 @@ class TestRetriedTeardown:
 
         assert boot.exists()
 
+    # -- #208 review round 3 -----------------------------------------------
+
+    @pytest.mark.parametrize("path", ["deprovision", "update_remove"])
+    def test_a_retry_finds_an_inventory_saved_beside_a_boot_disk_elsewhere(
+            self, tmp_path, path):
+        """The boot disk lives outside the configured workdir, so the first
+        pass saves the inventory beside it, there; the retry must still
+        decide with it and keep the qcow2 CD-ROM under the VM's names in
+        the workdir, which the no-inventory fallback would take for one of
+        boxman's images (round 3, 1)."""
+        workdir = tmp_path / 'work'
+        elsewhere = tmp_path / 'elsewhere'
+        boot = _qcow2(elsewhere / f'{VM}.qcow2')
+        cdrom = _qcow2(workdir / f'{VM}.cd.qcow2')
+        t = _Teardown(workdir, disks=[boot], media=[cdrom], records=[])
+
+        getattr(t, path)()
+        assert boot.exists() and cdrom.exists()
+        assert _saved(elsewhere).exists() and not _saved(workdir).exists()
+
+        t.session.vm_storage_devices.return_value = None
+        t.mgr.logger.reset_mock()
+
+        getattr(t, path)()
+
+        assert cdrom.exists()
+        if path == "deprovision":
+            # searched by name in the workdir, and kept as the media it is
+            # (update searches only where the attached disks were)
+            assert (f'left {cdrom} in place because it is a CD-ROM'
+                    in t.warnings)
+        assert _saved(elsewhere).exists()
+
+    def test_a_retry_finishes_a_chain_whose_head_was_removed(self, tmp_path):
+        """Heads go first; a teardown interrupted after removing the head
+        of the boot chain, retried, removes the rest (round 3, 2)."""
+        base = _qcow2(tmp_path / f'{VM}.qcow2')
+        head = _qcow2(tmp_path / f'{VM}.s1')
+        t = _Teardown(tmp_path, disks=[head], records=[])
+        t.session.backing_chains.side_effect = _live({head: [head, base]})
+
+        self._interrupt_at(t, base)
+        assert not head.exists() and base.exists()
+        assert _saved(tmp_path).exists()
+
+        t.session.vm_storage_devices.return_value = None
+        t.mgr.logger.reset_mock()
+        t.deprovision()
+
+        assert not base.exists()
+        assert not _saved(tmp_path).exists()
+        assert t.warnings == ''
+
+    def test_a_retry_finishes_a_data_disk_chain_whose_head_was_removed(
+            self, tmp_path):
+        """The same for a recorded data disk an external snapshot moved
+        behind an overlay: the saved record and chain still prove the base
+        the VM's own once its overlay is gone (round 3, 2)."""
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        base = _qcow2(tmp_path / f'{VM}_disk01.qcow2')
+        head = _qcow2(tmp_path / f'{VM}_disk01.s1')
+        t = _Teardown(tmp_path, disks=[boot, head],
+                      records=[_record('disk01', base)])
+        t.session.backing_chains.side_effect = _live({head: [head, base]})
+
+        self._interrupt_at(t, base, config_disks=[{'name': 'disk01'}])
+        assert not (boot.exists() or head.exists()) and base.exists()
+
+        t.session.vm_storage_devices.return_value = None
+        t.mgr.logger.reset_mock()
+        t.deprovision([{'name': 'disk01'}])
+
+        assert not base.exists()
+        assert not _saved(tmp_path).exists()
+        assert t.warnings == ''
+
+    def test_what_is_left_of_a_chain_that_cannot_be_read_is_kept(
+            self, tmp_path):
+        """The rest of an interrupted chain is read again too, and failing
+        to read it keeps everything."""
+        base = _qcow2(tmp_path / f'{VM}.qcow2')
+        head = _qcow2(tmp_path / f'{VM}.s1')
+        t = _Teardown(tmp_path, disks=[head], records=[])
+        t.session.backing_chains.side_effect = _live({head: [head, base]})
+        self._interrupt_at(t, base)
+
+        t.session.vm_storage_devices.return_value = None
+        t.session.backing_chains.side_effect = _live(
+            {base: [base, tmp_path / 'gone.qcow2']})
+        t.deprovision()
+
+        assert base.exists()
+        assert _saved(tmp_path).exists()
+        assert 'backing chains of the vm' in t.warnings
+
+    def test_a_layer_replaced_since_still_keeps_what_is_below_it(
+            self, tmp_path):
+        """What survives of an interrupted chain keeps its identity
+        checks: a middle layer replaced since keeps itself and the base."""
+        base = _qcow2(tmp_path / f'{VM}.qcow2')
+        middle = _qcow2(tmp_path / f'{VM}.s1')
+        head = _qcow2(tmp_path / f'{VM}.s2')
+        t = _Teardown(tmp_path, disks=[head], records=[])
+        t.session.backing_chains.side_effect = _live(
+            {head: [head, middle, base], middle: [middle, base]})
+
+        self._interrupt_at(t, middle)
+        assert not head.exists()
+        fresh = tmp_path / 'fresh'
+        fresh.write_bytes(b'QFI\xfb someone else')
+        fresh.replace(middle)
+
+        t.session.vm_storage_devices.return_value = None
+        t.deprovision()
+
+        assert middle.read_bytes() == b'QFI\xfb someone else'
+        assert base.exists()
+        assert _saved(tmp_path).exists()
+
+    @staticmethod
+    def _interrupt_at(t, stop, config_disks=()):
+        """Run *t*'s deprovision with the removal of *stop* failing, as an
+        interruption would leave it."""
+        remove = disk_cleanup.remove_if_unchanged
+
+        def interrupted(path, identity):
+            if path == str(stop):
+                raise OSError(5, 'Input/output error')
+            return remove(path, identity)
+
+        with patch.object(disk_cleanup, 'remove_if_unchanged',
+                          side_effect=interrupted), \
+                pytest.raises(OSError, match='Input/output error'):
+            t.deprovision(list(config_disks))
+
 
 class TestSavedInventoryLifecycle:
 
@@ -813,6 +996,29 @@ class TestSavedInventoryLifecycle:
             t.deprovision()
 
         assert boot.exists()
+
+    @pytest.mark.parametrize("layout", [
+        "a list", "a string", "version true", "present records missing",
+        "a record of numbers", "a record short of a field",
+        "disk sources a string", "a chain a string",
+        "identities of booleans", "an identity of three",
+        "targets of lists", "boot family of numbers",
+    ])
+    def test_a_malformed_saved_inventory_keeps_everything(self, tmp_path,
+                                                          layout):
+        """Well-formed JSON of the wrong shape is as unreadable as a
+        truncated file (round 3, 5)."""
+        data = _malformed(tmp_path, layout)
+        _saved(tmp_path).write_text(json.dumps(data))
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, records=[])
+        t.session.vm_storage_devices.return_value = None
+
+        with pytest.raises(ProvisionError, match='could not be read'):
+            t.deprovision()
+
+        assert boot.exists()
+        t.session.destroy_vm.assert_not_called()
 
     def test_an_inventory_saved_for_another_vm_is_refused(self, tmp_path):
         path = disk_cleanup.save_teardown_inventory(disk_cleanup.StorageInventory(
@@ -869,3 +1075,364 @@ class TestMediaChains:
         # the media source's chain was asked for, not just the disks'
         asked = t.session.backing_chains.call_args.args[0]
         assert str(media) in asked
+
+    # -- #208 review round 3, 4 ----------------------------------------------
+
+    @needs_qemu_img
+    @pytest.mark.parametrize("missing", ["cdrom", "disk"])
+    def test_a_source_gone_from_the_host_does_not_keep_the_boot_disk(
+            self, tmp_path, missing):
+        """A seed ISO still attached after it was deleted -- tolerated
+        everywhere else -- has no chain, so nothing to protect: the boot
+        disk is reclaimed. So is a recorded extra disk deleted by hand."""
+        boot = _image(tmp_path / f'{VM}.qcow2')
+        if missing == "cdrom":
+            gone = tmp_path / 'seed.iso'
+            t = _Teardown(tmp_path, disks=[boot], media=[gone], records=[])
+        else:
+            gone = tmp_path / f'{VM}_disk01.qcow2'
+            t = _Teardown(tmp_path, disks=[boot, gone],
+                          records=[_record('disk01', gone)])
+        _production_chains(t)
+
+        t.deprovision()
+
+        assert not boot.exists()
+        assert not _saved(tmp_path).exists()
+        assert t.warnings == ''
+
+    @needs_qemu_img
+    def test_an_existing_media_image_that_cannot_be_read_keeps_it(
+            self, tmp_path):
+        """Absence is not a read error: an existing image qemu-img cannot
+        read still keeps everything."""
+        if os.geteuid() == 0:
+            pytest.skip('root reads a mode-000 file')
+        boot = _image(tmp_path / f'{VM}.qcow2')
+        media = _image(tmp_path / 'isos' / 'media.qcow2')
+        media.chmod(0)
+        t = _Teardown(tmp_path, disks=[boot], media=[media], records=[])
+        _production_chains(t)
+
+        t.deprovision()
+
+        assert boot.exists()
+        assert 'backing chains of the vm' in t.warnings
+
+
+@needs_qemu_img
+class TestStaleSavedDependencies:
+    """A saved inventory keeps the provenance a retry can no longer read
+    -- records, roles, targets, identities -- not the dependencies: a file
+    it left in place can be rebased since, in place, on the same inode
+    (#208 review round 3, 3)."""
+
+    @pytest.mark.parametrize("kept", ["media", "adopted disk"])
+    def test_a_kept_image_rebased_onto_a_kept_data_disk_keeps_it(
+            self, tmp_path, kept):
+        boot = _image(tmp_path / f'{VM}.qcow2')
+        data = _image(tmp_path / f'{VM}_disk01.qcow2')
+        records = [_record('disk01', data)]
+        if kept == "media":
+            head = _image(tmp_path / 'isos' / 'media.qcow2')
+            t = _Teardown(tmp_path, disks=[boot, data], media=[head],
+                          records=records, in_use={str(data): OTHER})
+        else:
+            head = _image(tmp_path / 'shared' / 'adopted.qcow2')
+            records.append(_record('shared', head, role=ROLE_ADOPTED,
+                                   target='vdc'))
+            t = _Teardown(tmp_path, disks=[boot, data, head],
+                          records=records, in_use={str(data): OTHER})
+        _production_chains(t)
+
+        t.deprovision([{'name': 'disk01'}])
+        assert data.exists() and head.exists() and not boot.exists()
+
+        before = disk_cleanup.file_identities([str(head), str(data)])
+        subprocess.run(['qemu-img', 'rebase', '-u', '-F', 'qcow2', '-b',
+                        str(data), str(head)], check=True)
+        assert disk_cleanup.file_identities([str(head), str(data)]) == before
+
+        # the other domain lets go; the retry must see what the kept image
+        # depends on now, not what it depended on when it was saved
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.mgr.logger.reset_mock()
+        t.deprovision([{'name': 'disk01'}])
+
+        assert data.exists()
+        assert str(data) in t.warnings
+        chain = subprocess.run(
+            ['qemu-img', 'info', '--backing-chain', '--output=json', '-U',
+             str(head)], check=True, capture_output=True, text=True)
+        assert [image['filename'] for image in json.loads(chain.stdout)] == [
+            str(head), str(data)]
+
+    def test_a_chain_that_cannot_be_read_now_keeps_everything(
+            self, tmp_path):
+        """The re-read fails closed: a kept image whose chain cannot be
+        read any more keeps every candidate."""
+        if os.geteuid() == 0:
+            pytest.skip('root reads a mode-000 file')
+        boot = _image(tmp_path / f'{VM}.qcow2')
+        data = _image(tmp_path / f'{VM}_disk01.qcow2')
+        media = _image(tmp_path / 'isos' / 'media.qcow2')
+        t = _Teardown(tmp_path, disks=[boot, data], media=[media],
+                      records=[_record('disk01', data)],
+                      in_use={str(data): OTHER})
+        _production_chains(t)
+        t.deprovision([{'name': 'disk01'}])
+
+        media.chmod(0)
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.deprovision([{'name': 'disk01'}])
+
+        assert data.exists()
+
+
+def _locator():
+    return disk_cleanup.teardown_locator_path(
+        config_cache.teardown_locator_dir(), VM)
+
+
+class TestTeardownLocator:
+    """Where the inventory was saved is recorded under boxman's per-user
+    state dir, keyed by the full vm name, so a retry finds it wherever the
+    boot disk was; a locator that leads nowhere readable fails the retry
+    closed, never falling back (#208 review round 3, 1)."""
+
+    def test_it_lives_under_the_per_user_cache_dir(self, tmp_path,
+                                                   monkeypatch):
+        monkeypatch.setattr(config_cache, 'DEFAULT_CACHE_DIR',
+                            str(tmp_path / 'cache'))
+        assert _locator() == str(tmp_path / 'cache' / 'teardown'
+                                 / f'{VM}.json')
+
+    def test_written_before_the_undefine_and_removed_with_the_inventory(
+            self, tmp_path):
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        seen = []
+        t.session.destroy_vm.side_effect = (
+            lambda *a, **k: seen.append(json.loads(open(_locator()).read())))
+
+        t.deprovision()
+
+        assert seen and seen[0] == {'version': 1, 'vm_name': VM,
+                                    'inventory': str(_saved(tmp_path))}
+        assert not os.path.lexists(_locator())
+        assert not _saved(tmp_path).exists() and not boot.exists()
+
+    def _first_pass_keeps_media(self, tmp_path):
+        """A deprovision that keeps a qcow2 CD-ROM under the VM's names --
+        what the no-inventory fallback would take for a boot image --
+        leaving the inventory and its locator behind; then the domain is
+        gone."""
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        cdrom = _qcow2(tmp_path / f'{VM}.cd.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], media=[cdrom], records=[])
+        t.deprovision()
+        assert cdrom.exists() and not boot.exists()
+        assert json.loads(open(_locator()).read())['inventory'] == str(
+            _saved(tmp_path))
+        t.session.vm_storage_devices.return_value = None
+        t.session.destroy_vm.reset_mock()
+        return t, cdrom
+
+    def test_kept_with_the_inventory_while_it_protects_a_kept_file(
+            self, tmp_path):
+        t, cdrom = self._first_pass_keeps_media(tmp_path)
+
+        t.deprovision()
+
+        assert cdrom.exists()
+        assert os.path.lexists(_locator()) and _saved(tmp_path).exists()
+
+    def test_an_inventory_it_names_that_is_missing_fails_closed(
+            self, tmp_path):
+        t, cdrom = self._first_pass_keeps_media(tmp_path)
+        _saved(tmp_path).unlink()
+
+        with pytest.raises(ProvisionError, match='which is missing') as exc:
+            t.deprovision()
+
+        assert _locator() in str(exc.value)
+        assert str(_saved(tmp_path)) in str(exc.value)
+        assert cdrom.exists()
+        t.session.destroy_vm.assert_not_called()
+
+    def test_an_inventory_it_names_that_cannot_be_read_fails_closed(
+            self, tmp_path):
+        t, cdrom = self._first_pass_keeps_media(tmp_path)
+        _saved(tmp_path).write_text('[]')
+
+        with pytest.raises(ProvisionError, match='could not be read') as exc:
+            t.deprovision()
+
+        assert _locator() in str(exc.value)
+        assert str(_saved(tmp_path)) in str(exc.value)
+        assert cdrom.exists()
+        t.session.destroy_vm.assert_not_called()
+
+    @pytest.mark.parametrize("content", [
+        '[]', '{"version": 1, "vm_na',
+        # each of these is refused on one count alone; '@saved@' is the
+        # real inventory, which it would otherwise lead to
+        json.dumps({'version': 2, 'vm_name': VM, 'inventory': '@saved@'}),
+        json.dumps({'version': True, 'vm_name': VM, 'inventory': '@saved@'}),
+        json.dumps({'version': 1, 'vm_name': OTHER, 'inventory': '@saved@'}),
+        json.dumps({'version': 1, 'vm_name': VM,
+                    'inventory': f'.boxman-teardown-{VM}.json'}),
+        json.dumps({'version': 1, 'vm_name': VM, 'inventory': '/etc/passwd'}),
+    ])
+    def test_a_locator_that_cannot_be_read_fails_closed(self, tmp_path,
+                                                        content):
+        t, cdrom = self._first_pass_keeps_media(tmp_path)
+        with open(_locator(), 'w') as fh:
+            fh.write(content.replace('@saved@', str(_saved(tmp_path))))
+
+        with pytest.raises(ProvisionError, match='could not be read') as exc:
+            t.deprovision()
+
+        assert _locator() in str(exc.value)
+        assert cdrom.exists()
+        t.session.destroy_vm.assert_not_called()
+
+    def test_it_is_consulted_before_the_workdir(self, tmp_path):
+        """With a locator, a file at the inventory's name in the searched
+        directories is never read in its place."""
+        workdir = tmp_path / 'work'
+        elsewhere = tmp_path / 'elsewhere'
+        boot = _qcow2(elsewhere / f'{VM}.qcow2')
+        cdrom = _qcow2(workdir / f'{VM}.cd.qcow2')
+        t = _Teardown(workdir, disks=[boot], media=[cdrom], records=[])
+        t.deprovision()
+        _saved(workdir).write_text('not an inventory')
+        t.session.vm_storage_devices.return_value = None
+
+        t.deprovision()
+
+        assert cdrom.exists()
+
+    def test_without_it_the_inventory_beside_the_boot_disk_still_counts(
+            self, tmp_path):
+        """boxman's state dir cleared: the retry still finds the inventory
+        in the directories it searches, and keeps the media."""
+        t, cdrom = self._first_pass_keeps_media(tmp_path)
+        os.remove(_locator())
+
+        t.deprovision()
+
+        assert cdrom.exists()
+        assert _saved(tmp_path).exists()
+
+    def test_a_locator_naming_another_file_never_gets_it_removed(
+            self, tmp_path):
+        """What a locator names is removed once superseded — so only a file
+        named as the vm's teardown inventory is ever taken from one."""
+        victim = _file(tmp_path / 'elsewhere' / 'precious.json', b'{}')
+        os.makedirs(os.path.dirname(_locator()))
+        with open(_locator(), 'w') as fh:
+            json.dump({'version': 1, 'vm_name': VM,
+                       'inventory': str(victim)}, fh)
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+
+        t.deprovision()
+
+        assert victim.read_bytes() == b'{}'
+        assert not boot.exists()
+        assert not os.path.lexists(_locator())
+
+    def test_destroy_retires_only_the_locators_whose_inventory_is_gone(
+            self, tmp_path):
+        """``destroy`` removes the workspace a kept inventory was saved in;
+        its locator would then fail every later teardown of the VM closed.
+        A locator whose inventory survives (saved outside the workspace)
+        still protects, and stays."""
+        mgr = make_bare_manager(
+            {'project': 'demo',
+             'clusters': {'cluster_1': {'workdir': str(tmp_path / 'w'),
+                                        'vms': {'web': {}, 'db': {}}}}})
+        gone = tmp_path / 'w' / f'.boxman-teardown-{VM}.json'
+        kept = _file(tmp_path / 'outside' / f'.boxman-teardown-{OTHER}.json',
+                     b'{}')
+        other = disk_cleanup.teardown_locator_path(
+            config_cache.teardown_locator_dir(), OTHER)
+        disk_cleanup.save_teardown_locator(_locator(), VM, str(gone))
+        disk_cleanup.save_teardown_locator(other, OTHER, str(kept))
+
+        mgr._retire_stale_teardown_locators()
+
+        assert not os.path.lexists(_locator())
+        assert os.path.lexists(other) and kept.exists()
+
+    def test_one_that_cannot_be_written_leaves_the_domain_defined(
+            self, tmp_path, monkeypatch):
+        def refuse(*_args, **_kwargs):
+            raise PermissionError(13, 'Permission denied')
+
+        monkeypatch.setattr(
+            'boxman.manager_parts.vms.save_teardown_locator', refuse)
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+
+        with pytest.raises(ProvisionError, match='could not save') as exc:
+            t.deprovision()
+
+        assert _locator() in str(exc.value)
+        t.session.destroy_vm.assert_not_called()
+        assert boot.exists()
+
+    def test_an_inventory_of_an_earlier_definition_is_retired(
+            self, tmp_path):
+        """A locator left by an earlier definition of the vm names an
+        inventory elsewhere; a capture of the domain as it is now replaces
+        both, and the superseded inventory goes."""
+        earlier = tmp_path / 'earlier'
+        earlier.mkdir()
+        stale = _saved(earlier)
+        stale.write_text('{}')
+        disk_cleanup.save_teardown_locator(_locator(), VM, str(stale))
+        workdir = tmp_path / 'work'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        iso = _file(workdir / f'{VM}.install.iso', b'iso')
+        t = _Teardown(workdir, disks=[boot], media=[iso], records=[])
+
+        t.deprovision()
+
+        assert not stale.exists()
+        assert json.loads(open(_locator()).read())['inventory'] == str(
+            _saved(workdir))
+
+
+def _malformed(tmp_path, layout):
+    """A saved inventory for VM, well-formed JSON, bent into *layout*."""
+    base = disk_cleanup.StorageInventory(
+        vm_name=VM, disk_sources=['/w/a'], media_sources=[],
+        records=[_record('disk01', '/w/a')], records_state='present',
+        chains={'/w/a': ['/w/a']}, boot_family=['/w/a'], legacy_disks=None,
+        identities={'/w/a': (1, 2)}, targets={'/w/a': 'vdb'})
+    scratch = tmp_path / 'scratch'
+    scratch.mkdir()
+    data = json.loads(open(disk_cleanup.save_teardown_inventory(
+        base, str(scratch))).read())
+    record = data['records'][0]
+    return {
+        "a list": [],
+        "a string": "inventory",
+        "version true": {**data, "version": True},
+        "present records missing": {**data, "records": None},
+        "a record of numbers": {**data, "records": [{**record, "name": 1}]},
+        "a record short of a field": {
+            **data, "records": [{k: v for k, v in record.items()
+                                 if k != "role"}]},
+        "disk sources a string": {**data, "disk_sources": "/w/a"},
+        "a chain a string": {**data, "chains": {"/w/a": "/w/a"}},
+        "identities of booleans": {**data,
+                                   "identities": {"/w/a": [True, False]}},
+        "an identity of three": {**data, "identities": {"/w/a": [1, 2, 3]}},
+        "targets of lists": {**data, "targets": {"/w/a": ["vdb"]}},
+        "boot family of numbers": {**data, "boot_family": [1]},
+    }[layout]

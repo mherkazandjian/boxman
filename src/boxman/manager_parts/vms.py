@@ -1,6 +1,7 @@
 """VM lifecycle and update flows for BoxmanManager."""
 
 import contextlib
+import dataclasses
 import logging
 import os
 import time
@@ -8,6 +9,7 @@ from multiprocessing import Queue
 from typing import Any
 
 from boxman import log
+from boxman.config_cache import teardown_locator_dir
 from boxman.exceptions import (
     BoxmanError,
     CloneSanitizerError,
@@ -28,9 +30,12 @@ from boxman.providers.libvirt.disk_cleanup import (
     boot_family_files,
     file_identities,
     load_teardown_inventory,
+    read_teardown_locator,
     remove_vm_storage,
     save_teardown_inventory,
+    save_teardown_locator,
     teardown_inventory_path,
+    teardown_locator_path,
 )
 from boxman.providers.libvirt.disk_ownership import (
     DiskRecord,
@@ -426,16 +431,22 @@ class VMsMixin:
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")
-        # The saved inventory stays while it still protects a kept file, so
-        # a retry keeps it too; with nothing kept it has done its job. It is
-        # removed before the pools are refreshed, which would otherwise list
-        # it (a directory pool lists hidden files too).
+        # The saved inventory and its locator stay while the inventory still
+        # protects a kept file, so a retry keeps it too; with nothing kept
+        # they have done their job. The inventory goes first (a locator left
+        # without it fails a retry closed), and before the pools are
+        # refreshed, which would otherwise list it (a directory pool lists
+        # hidden files too).
         removed = list(outcome.removed)
-        if inventory.saved_at and not outcome.kept:
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(inventory.saved_at)
-                if removed:
-                    removed.append(inventory.saved_at)
+        if not outcome.kept:
+            if inventory.saved_at:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(inventory.saved_at)
+                    if removed:
+                        removed.append(inventory.saved_at)
+            if inventory.locator_at:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(inventory.locator_at)
         if removed:
             session.refresh_pools_holding(removed)
 
@@ -471,13 +482,14 @@ class VMsMixin:
                     f"rather than removing storage blind")
             # already undefined (a teardown that was interrupted): decide
             # with what the interrupted attempt saved before it undefined
-            # the domain, or — if nothing was saved — by name, keeping all
-            # but boxman's own artifact types (remove_vm_storage)
+            # the domain — its chains read again, now — or, if nothing was
+            # saved, by name, keeping all but boxman's own artifact types
+            # (remove_vm_storage)
             if disk_dirs is None:
                 disk_dirs = self._vm_disk_dirs(full_vm_name, [])
             saved = self._load_saved_inventory(full_vm_name, disk_dirs)
             if saved is not None:
-                return saved
+                return self._with_current_chains(session, saved)
             rows, exists = [], False
 
         disk_sources, media_sources = [], []
@@ -536,51 +548,183 @@ class VMsMixin:
         if exists:
             # saved before the undefine, which drops what it was read from;
             # a retry after an interruption decides with it. Beside the boot
-            # disk, where a retry's disk directories find it again.
+            # disk, with a locator that leads a retry to it wherever that is.
             save_dir = next(
                 (os.path.dirname(path) for path in disk_sources
                  if os.path.basename(path).startswith(f"{full_vm_name}.")),
                 disk_dirs[0] if disk_dirs else None)
             if save_dir is not None:
-                try:
-                    inventory.saved_at = save_teardown_inventory(
-                        inventory, save_dir)
-                except OSError as exc:
-                    raise ProvisionError(
-                        f"{full_vm_name}: could not save its teardown "
-                        f"inventory in {save_dir} ({exc}); leaving it "
-                        f"defined, since a teardown interrupted after the "
-                        f"undefine could not be retried safely") from exc
+                self._save_teardown_inventory(inventory, save_dir)
         return inventory
+
+    def _save_teardown_inventory(self, inventory: StorageInventory,
+                                 save_dir: str) -> None:
+        """
+        Save *inventory* in *save_dir*, beside the vm's boot disk, and its
+        locator under boxman's per-user state dir, keyed by the full vm
+        name, both before the undefine: through the locator a retry finds
+        the inventory even when the boot disk was outside every directory
+        the retry itself would search. An inventory that an earlier locator
+        named elsewhere described an earlier definition of the vm; it is
+        superseded, and removed.
+
+        Raises:
+            ProvisionError: If either cannot be written. The domain stays
+                defined: a teardown interrupted after the undefine could not
+                be retried safely.
+        """
+        vm = inventory.vm_name
+        locator = teardown_locator_path(teardown_locator_dir(), vm)
+        superseded = None
+        with contextlib.suppress(OSError, ValueError, RecursionError):
+            superseded = read_teardown_locator(locator, vm)
+        try:
+            saved_at = save_teardown_inventory(inventory, save_dir)
+            save_teardown_locator(locator, vm, saved_at)
+        except OSError as exc:
+            raise ProvisionError(
+                f"{vm}: could not save its teardown inventory in {save_dir} "
+                f"and record where it is at {locator} ({exc}); leaving it "
+                f"defined, since a teardown interrupted after the undefine "
+                f"could not be retried safely") from exc
+        inventory.saved_at, inventory.locator_at = saved_at, locator
+        if (superseded is not None and os.path.realpath(superseded)
+                != os.path.realpath(saved_at)):
+            try:
+                os.remove(superseded)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self.logger.warning(
+                    f"{vm}: could not remove {superseded}, the teardown "
+                    f"inventory of an earlier definition of it ({exc})")
 
     def _load_saved_inventory(self, full_vm_name: str,
                               disk_dirs: list[str]) -> StorageInventory | None:
         """
         The teardown inventory an earlier, interrupted teardown of
-        *full_vm_name* saved in one of *disk_dirs*, or ``None`` if none did.
+        *full_vm_name* saved, or ``None`` if it saved none.
+
+        Found through its locator, which records where it was saved beside
+        the boot disk, wherever that was — never passed over for another.
+        With no locator at all (boxman's state dir was cleared), one in
+        *disk_dirs* is used.
 
         Raises:
-            ProvisionError: If one is there but cannot be read. Its
-                protections cannot be honoured blind, so nothing is removed;
-                check what should stay, then remove the file.
+            ProvisionError: If the locator, or the inventory it or
+                *disk_dirs* lead to, cannot be read — a locator whose
+                inventory is missing included. The inventory's protections
+                cannot be honoured blind, so nothing is removed; check what
+                should stay, then remove the files named.
         """
+        locator = teardown_locator_path(teardown_locator_dir(), full_vm_name)
+        if os.path.lexists(locator):
+            try:
+                path = read_teardown_locator(locator, full_vm_name)
+            except (OSError, ValueError, RecursionError) as exc:
+                raise ProvisionError(
+                    f"{full_vm_name}: the teardown locator at {locator} "
+                    f"could not be read ({exc}); leaving its storage in "
+                    f"place — check what should stay, then remove that "
+                    f"file") from exc
+            if not os.path.lexists(path):
+                raise ProvisionError(
+                    f"{full_vm_name}: the teardown locator at {locator} "
+                    f"names an inventory at {path}, which is missing; "
+                    f"leaving its storage in place — check what should "
+                    f"stay, then remove {locator}")
+            inventory = self._read_saved_inventory(full_vm_name, path,
+                                                   locator)
+            inventory.locator_at = locator
+            return inventory
         for directory in disk_dirs:
             path = teardown_inventory_path(directory, full_vm_name)
-            if not os.path.lexists(path):
-                continue
-            try:
-                inventory = load_teardown_inventory(path, full_vm_name)
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                raise ProvisionError(
-                    f"{full_vm_name}: the teardown inventory an earlier "
-                    f"attempt saved at {path} could not be read ({exc}); "
-                    f"leaving its storage in place — check what should "
-                    f"stay, then remove that file") from exc
-            self.logger.info(
-                f"{full_vm_name}: already undefined; deciding its storage "
-                f"with the inventory saved at {path}")
-            return inventory
+            if os.path.lexists(path):
+                return self._read_saved_inventory(full_vm_name, path, None)
         return None
+
+    def _read_saved_inventory(self, full_vm_name: str, path: str,
+                              locator: str | None) -> StorageInventory:
+        """:func:`load_teardown_inventory` of *path*, which *locator* (if
+        any) led to; a file that cannot be read raises ProvisionError."""
+        try:
+            inventory = load_teardown_inventory(path, full_vm_name)
+        except (OSError, ValueError, KeyError, TypeError,
+                RecursionError) as exc:
+            named = f" (named by the locator {locator})" if locator else ""
+            remove = f"remove it and {locator}" if locator else (
+                "remove that file")
+            raise ProvisionError(
+                f"{full_vm_name}: the teardown inventory an earlier attempt "
+                f"saved at {path}{named} could not be read ({exc}); leaving "
+                f"its storage in place — check what should stay, then "
+                f"{remove}") from exc
+        self.logger.info(
+            f"{full_vm_name}: already undefined; deciding its storage with "
+            f"the inventory saved at {path}")
+        return inventory
+
+    def _retire_stale_teardown_locators(self) -> None:
+        """
+        Remove the teardown locators of this project's VMs whose inventory
+        no longer exists: ``destroy`` has just removed the workspace a VM
+        teardown that kept a file saved it in. Such a locator protects
+        nothing any more, yet would fail every later teardown of the same
+        VMs closed. One whose inventory is still there — saved beside a boot
+        disk outside the workspace — still protects what that teardown kept,
+        and stays.
+        """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        for cluster_name, cluster in self._vm_clusters.items():
+            for vm_name in cluster.get('vms') or {}:
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                locator = teardown_locator_path(teardown_locator_dir(),
+                                                full_vm_name)
+                try:
+                    inventory = read_teardown_locator(locator, full_vm_name)
+                except (OSError, ValueError, RecursionError):
+                    continue
+                if not os.path.lexists(inventory):
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(locator)
+                        self.logger.info(
+                            f"{full_vm_name}: removed the teardown locator "
+                            f"of {inventory}, which went with the workspace")
+
+    def _with_current_chains(self, session,
+                             saved: StorageInventory) -> StorageInventory:
+        """
+        *saved*, with the backing chains of what is left of its sources read
+        again, now.
+
+        A saved inventory carries what a retry can no longer read once the
+        domain is gone — its devices, its ownership records and their state,
+        the targets, the legacy decision, the identity of every file — but
+        not what those files depend on: an image the first attempt kept may
+        have been rebased since, in place, on the same inode, and a chain it
+        was removing head first may have lost its top. So every saved source
+        still there has its chain read again. A disk source removed since
+        stands for the topmost layer of its saved chain that is still there,
+        whose chain is read in its place: what is left of the disk keeps its
+        target, its record and its dependencies. A media source gone since
+        has no chain — boxman never removes one, and nothing depends on an
+        image that is not there. A chain that cannot be read makes them all
+        unknown (``None``), which keeps everything.
+        """
+        sources = [*saved.disk_sources, *saved.media_sources]
+        chains = session.backing_chains(sources) if sources else {}
+        for source in saved.disk_sources:
+            if chains is None:
+                break
+            if source in chains:
+                continue
+            for layer in (saved.chains or {}).get(source, [])[1:]:
+                below = session.backing_chains([layer])
+                if below is None or layer in below:
+                    chains = (None if below is None
+                              else {**chains, source: below[layer]})
+                    break
+        return dataclasses.replace(saved, chains=chains)
 
     def _vm_disk_dirs(self,
                       full_vm_name: str,

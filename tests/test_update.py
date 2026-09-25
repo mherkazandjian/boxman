@@ -806,6 +806,8 @@ class TestDestroyRemovedVm:
         """The sample paths are the host's own; never write beside them."""
         monkeypatch.setattr("boxman.manager_parts.vms.save_teardown_inventory",
                             MagicMock(return_value=None))
+        monkeypatch.setattr("boxman.manager_parts.vms.save_teardown_locator",
+                            MagicMock(return_value=None))
 
     def _make_manager(self):
         """Bare BoxmanManager instance with a mocked provider."""
