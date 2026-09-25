@@ -249,7 +249,7 @@ closing summary is the one worth reading:
 WARNING: 2 VM(s) may have kept identity from their template; the offline
          identity pass did not complete:
   bprj__demo__bprj_cluster_1_node01: may have kept its template's machine id and ssh
-    host keys -- the offline sanitizer is unavailable
+    host keys -- a required host tool is missing or not permitted
     (clone_machine_id=auto, clone_ssh_host_keys=auto)
   ...
 ```

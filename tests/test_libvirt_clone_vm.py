@@ -780,7 +780,7 @@ class TestDegradationRecord:
         line = record.summary_line()
         assert line.startswith("vm01: ")
         assert "machine id and ssh host keys" in line
-        assert "the guest could not be inspected" in line
+        assert "the offline identity pass failed" in line
         assert "clone_machine_id=auto" in line
         # one line, so it cannot be lost in a scrollback of wrapped text
         assert "\n" not in line
@@ -789,15 +789,47 @@ class TestDegradationRecord:
         "error, expected",
         [
             (CloneSanitizerUnavailableError("virt-sysprep is not installed"),
-             "the offline sanitizer is unavailable"),
+             "a required host tool is missing or not permitted"),
             (CloneSanitizerError("virt-sysprep timed out after 300s"),
-             "the offline sanitizer timed out"),
-            (CloneSanitizerError("could not inspect vm"),
+             "the offline identity pass timed out"),
+            (CloneSanitizerError("virt-sysprep identity pass failed for vm "
+                                 "vm01: virt-sysprep: error: no operating "
+                                 "systems were found in the guest image"),
              "the guest could not be inspected"),
+            (CloneSanitizerError("could not inspect vm"),
+             "the offline identity pass failed"),
         ],
     )
     def test_cause_is_classified_for_the_summary(self, error, expected):
         assert CloneVM.degradation_reason(error) == expected
+
+    def test_a_missing_ssh_keygen_does_not_blame_the_guest(self, clone: CloneVM):
+        """From Codex's review of #204: the real error path, end to end."""
+        collected: list = []
+        clone.info[CLONE_DEGRADATIONS_KEY] = collected
+        with patch("boxman.providers.libvirt.clone_vm._shell_run",
+                   return_value=_result(ok=False, return_code=127,
+                                        stderr="sh: ssh-keygen: not found")):
+            clone.apply_identity_policies()
+        assert collected[0].reason == (
+            "a required host tool is missing or not permitted")
+
+    def test_a_sudo_rule_without_virt_sysprep_does_not_blame_the_guest(
+        self, clone: CloneVM
+    ):
+        collected: list = []
+        clone.info[CLONE_DEGRADATIONS_KEY] = collected
+        clone.ssh_host_keys_policy = "off"
+        with patch.object(
+            clone.virt_sysprep, "execute",
+            return_value=_result(
+                ok=False, return_code=1,
+                stderr="Sorry, user mher is not allowed to execute "
+                       "'/usr/bin/virt-sysprep' as root on host."),
+        ):
+            clone.apply_identity_policies()
+        assert collected[0].reason == (
+            "a required host tool is missing or not permitted")
 
     def test_a_record_survives_pickling(self, clone: CloneVM):
         """Clones run in multiprocessing workers; records cross that boundary."""

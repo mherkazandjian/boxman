@@ -23,7 +23,7 @@ from boxman.providers.libvirt.clone_vm import (
 pytestmark = pytest.mark.unit
 
 
-def _record(vm: str, properties=("machine id",), reason="the guest could not be inspected",
+def _record(vm: str, properties=("machine id",), reason="the offline identity pass failed",
             policies=("clone_machine_id=auto",)) -> CloneDegradation:
     return CloneDegradation(
         vm=vm,
@@ -106,7 +106,7 @@ class TestReportCloneDegradations:
         manager.collect_clone_degradations({
             "vm01": [_record(
                 "vm01", properties=("machine id", "ssh host keys"),
-                reason="the offline sanitizer is unavailable",
+                reason="a required host tool is missing or not permitted",
                 policies=("clone_machine_id=auto", "clone_ssh_host_keys=auto"))],
         })
         manager.report_clone_degradations()
@@ -115,7 +115,7 @@ class TestReportCloneDegradations:
             line for line in _warnings(manager)
             if line.strip().startswith("vm01:"))
         assert "machine id and ssh host keys" in line
-        assert "the offline sanitizer is unavailable" in line
+        assert "a required host tool is missing or not permitted" in line
         assert "clone_machine_id=auto" in line
 
     def test_the_summary_says_how_to_fail_closed_instead(self):
@@ -133,6 +133,17 @@ class TestReportCloneDegradations:
         first = len(_warnings(manager))
         manager.report_clone_degradations()
         assert len(_warnings(manager)) == first
+
+
+def _batch(results, failures):
+    """A stand-in for ``_run_parallel`` that honours its ``on_result`` contract:
+    each success is handed over as it arrives, then the dicts are returned."""
+    def run(tasks, op_label="", max_workers=None, on_result=None):
+        for label, payload in results.items():
+            if on_result is not None:
+                on_result(label, payload)
+        return results, failures
+    return run
 
 
 class TestReportedHoweverTheRunEnds:
@@ -168,12 +179,34 @@ class TestReportedHoweverTheRunEnds:
         degraded = "bprj__p__bprj_c1_vm01"
         with patch.object(manager, "_ensure_libvirt_storage_pool"), \
              patch.object(manager, "_resolve_iso_config"), \
-             patch.object(manager, "_run_parallel", return_value=(
+             patch.object(manager, "_run_parallel", side_effect=_batch(
                  {degraded: [_record(degraded)]},
                  {"bprj__p__bprj_c1_vm02": "CloneSanitizerError: boom"})), \
              patch.object(manager, "_provision",
                           side_effect=lambda _args: manager.clone_vms()):
             with pytest.raises(ProvisionError, match="clone failed"):
+                manager.provision(None)
+        assert any(line.strip().startswith(f"{degraded}:")
+                   for line in _warnings(manager))
+
+    def test_an_interrupted_clone_batch_still_reports_what_came_back(self):
+        """Ctrl-C while vm02 is still cloning must not lose vm01's record."""
+        manager = make_bare_manager({"project": "p", "clusters": {"c1": {
+            "workdir": "/tmp/boxman-test-workdir",
+            "vms": {"vm01": {}, "vm02": {}}}}})
+        manager.provider = MagicMock()
+        degraded = "bprj__p__bprj_c1_vm01"
+
+        def interrupted(tasks, op_label="", max_workers=None, on_result=None):
+            on_result(degraded, [_record(degraded)])
+            raise KeyboardInterrupt
+
+        with patch.object(manager, "_ensure_libvirt_storage_pool"), \
+             patch.object(manager, "_resolve_iso_config"), \
+             patch.object(manager, "_run_parallel", side_effect=interrupted), \
+             patch.object(manager, "_provision",
+                          side_effect=lambda _args: manager.clone_vms()):
+            with pytest.raises(KeyboardInterrupt):
                 manager.provision(None)
         assert any(line.strip().startswith(f"{degraded}:")
                    for line in _warnings(manager))

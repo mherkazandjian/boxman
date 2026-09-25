@@ -403,7 +403,8 @@ class BoxmanManager(
             return max(1, n_tasks)
         return max(1, min(requested, n_tasks))
 
-    def _run_parallel(self, tasks, op_label='parallel task', max_workers=None):
+    def _run_parallel(self, tasks, op_label='parallel task', max_workers=None,
+                      on_result=None):
         """
         Run workers in child processes and report per-task failures.
 
@@ -420,6 +421,12 @@ class BoxmanManager(
             op_label: verb phrase used in the per-failure error messages.
             max_workers: cap on concurrently live children; ``None`` resolves
                 via :meth:`_parallel_worker_limit`, <= 0 means unbounded.
+            on_result: optional ``callable(label, payload)``, called in the
+                parent for each task that succeeded, as soon as its result is
+                drained -- before this method returns. A caller that must not
+                lose completed work to an interruption (a Ctrl-C while other
+                workers are still running) collects here rather than from the
+                returned dict.
 
         Returns:
             ``(results, failures)`` dicts keyed by task label. A task lands in
@@ -447,6 +454,11 @@ class BoxmanManager(
         running: dict[str, Process] = {}
         pending = iter(tasks)
 
+        def _record(label, ok, payload) -> None:
+            reported[label] = (ok, payload)
+            if ok and on_result is not None:
+                on_result(label, payload)
+
         def _drain() -> None:
             """Move everything already queued into *reported*."""
             while True:
@@ -454,7 +466,7 @@ class BoxmanManager(
                     label, ok, payload = result_queue.get_nowait()
                 except Empty:
                     return
-                reported[label] = (ok, payload)
+                _record(label, ok, payload)
 
         while True:
             while len(running) < limit:
@@ -492,7 +504,7 @@ class BoxmanManager(
                 # A child exited without reporting (killed, or the queue
                 # broke) — the per-task loop below marks it as failed.
                 break
-            reported[label] = (ok, payload)
+            _record(label, ok, payload)
 
         results: dict[str, Any] = {}
         failures: dict[str, str] = {}

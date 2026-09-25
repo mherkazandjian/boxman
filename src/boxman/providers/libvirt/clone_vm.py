@@ -528,13 +528,19 @@ class CloneVM:
         """Short classification of a failed pass, for the closing summary.
 
         The full cause goes in the warning beside the clone; a summary line
-        needs something that stays readable next to a domain name.
+        needs something that stays readable next to a domain name. It blames
+        the guest only when libguestfs said the guest was the problem: a
+        missing tool or a sudo rule on the hypervisor is not, and a reader
+        sent to inspect the guest for it would look in the wrong place.
         """
         if isinstance(sanitizer_error, CloneSanitizerUnavailableError):
-            return 'the offline sanitizer is unavailable'
-        if 'timed out' in str(sanitizer_error):
-            return 'the offline sanitizer timed out'
-        return 'the guest could not be inspected'
+            return 'a required host tool is missing or not permitted'
+        text = str(sanitizer_error).lower()
+        if 'timed out' in text:
+            return 'the offline identity pass timed out'
+        if 'no operating systems were found' in text:
+            return 'the guest could not be inspected'
+        return 'the offline identity pass failed'
 
     def degradation_message(self, plan: IdentityPlan,
                             sanitizer_error: CloneSanitizerError) -> str:

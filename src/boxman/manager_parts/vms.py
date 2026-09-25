@@ -167,14 +167,16 @@ class VMsMixin:
         # particular looks like a hang. Goes through the shared helper so the
         # fan-out is bounded (one process per VM does not scale to a large
         # cluster) and killed workers are reported, not just non-zero exits.
-        results, failures = self._run_parallel(
+        # Collected as each clone's result is drained rather than from the
+        # returned dict: a batch where one clone failed and another degraded,
+        # or one interrupted while other clones are still running, still has
+        # the degradations that came back in hand when provision() reports.
+        _results, failures = self._run_parallel(
             [(new_vm_name, _clone_with_retry,
               (self.provider, cluster, vm_info, new_vm_name))
              for cluster, vm_info, new_vm_name in clone_tasks],
-            op_label='clone vm')
-        # before the failure check: a batch where one clone failed and another
-        # merely degraded still has a degradation worth reporting
-        self.collect_clone_degradations(results)
+            op_label='clone vm',
+            on_result=self._collect_clone_result)
         if failures:
             names = ', '.join(sorted(failures))
             raise ProvisionError(
@@ -197,6 +199,10 @@ class VMsMixin:
                 collected.extend(
                     record for record in payload
                     if isinstance(record, CloneDegradation))
+
+    def _collect_clone_result(self, label: str, payload) -> None:
+        """``_run_parallel`` callback: collect one clone's records on arrival."""
+        self.collect_clone_degradations({label: payload})
 
     def report_clone_degradations(self) -> None:
         """Close the run with one line per clone that may have kept template identity.
@@ -723,12 +729,12 @@ class VMsMixin:
         # from running against VMs that were never defined. _run_parallel
         # reports raised/killed workers as failures, not just non-zero
         # exitcodes.
-        results, failures = self._run_parallel(
+        _results, failures = self._run_parallel(
             [(new_vm_name, _clone_with_retry,
               (self.provider, cluster, vm_info, new_vm_name))
              for cluster, vm_info, new_vm_name in clone_tasks],
-            op_label='clone vm')
-        self.collect_clone_degradations(results)
+            op_label='clone vm',
+            on_result=self._collect_clone_result)
         if failures:
             names = ', '.join(sorted(failures))
             raise ProvisionError(

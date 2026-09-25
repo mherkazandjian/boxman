@@ -6,7 +6,7 @@ a failure (and must never deadlock the parent on a blocking queue.get).
 
 import os
 import types
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -42,6 +42,12 @@ def _ok_worker(value):
 
 def _raising_worker():
     raise RuntimeError("boom")
+
+
+def _sleeping_worker(seconds):
+    import time
+    time.sleep(seconds)
+    return "late"
 
 
 def _dying_worker():
@@ -81,6 +87,39 @@ class TestRunParallel:
     def test_empty_task_list(self):
         mgr = _manager()
         assert mgr._run_parallel([]) == ({}, {})
+
+
+class TestOnResult:
+    """``on_result`` hands each success to the caller as it is drained, so an
+    interruption cannot discard work that has already come back (from Codex's
+    review of #204)."""
+
+    def test_called_for_each_success_and_not_for_failures(self):
+        got = []
+        _results, failures = _manager()._run_parallel(
+            [("a", _ok_worker, (1,)), ("b", _raising_worker, ())],
+            on_result=lambda label, payload: got.append((label, payload)))
+        assert got == [("a", 1)]
+        assert set(failures) == {"b"}
+
+    def test_a_result_drained_before_an_interrupt_is_not_lost(self):
+        import multiprocessing.connection as mpc
+        real_wait = mpc.wait
+        got = []
+
+        def wait(objects, timeout=None):
+            if got:  # the fast worker's result is already in hand
+                raise KeyboardInterrupt
+            return real_wait(objects, timeout)
+
+        with patch.object(mpc, "wait", side_effect=wait):
+            with pytest.raises(KeyboardInterrupt):
+                _manager()._run_parallel(
+                    [("fast", _ok_worker, ("record",)),
+                     ("slow", _sleeping_worker, (1.5,))],
+                    max_workers=2,
+                    on_result=lambda label, payload: got.append((label, payload)))
+        assert got == [("fast", "record")]
 
 
 class TestRestoreRetryLoop:
