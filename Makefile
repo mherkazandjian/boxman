@@ -3,7 +3,7 @@ include common.mk
 .PHONY: clean dev-clean uninstall build install cleaninstall full-reinstall \
 	devipython devshell test test-integration test-provision test-dc-e2e \
 	test-vm-up test-vm-sync test-vm-test test-vm-destroy loc loc-detailed \
-	boxes-deprovision boxes-clean help
+	check-box-images boxes-deprovision boxes-clean help
 
 ################
 #@group: \033[0;32mbuild\033[0m
@@ -145,6 +145,11 @@ loc-detailed:
 
 ################
 #@group: \033[0;32mboxes\033[0m
+#@help: check every box's base-image and ISO URLs still exist upstream (needs network;
+#@help: boxes="boxes/<box> ..." to narrow it). Exits non-zero if any is dead
+check-box-images:
+	@PYTHONPATH=src:$(PYTHONPATH) python scripts/check_box_images.py $(boxes)
+
 #@help: deprovision all boxes that have a conf.yml (also cleans .boxman dirs)
 boxes-deprovision:
 	@for conf in boxes/*/conf.yml; do \
