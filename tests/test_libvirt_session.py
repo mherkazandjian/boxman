@@ -844,6 +844,74 @@ class TestBackingChains:
         assert self._run([]) == {}
 
 
+class TestInUseWithAMissingSource:
+    """A source confirmed absent uses nothing only in a domain positively
+    shut off: an active one -- running, paused, suspended, crashed -- can
+    hold the unlinked image open together with the images below it, whose
+    files still exist (#208 review round 4, 2)."""
+
+    BLK = (TestDiskPathsInUse.HEADER
+           + " file   disk     vda      /ws/b.qcow2\n"
+           + " file   disk     vdb      /ws/gone.qcow2\n")
+
+    def _run(self, state, state_ok=True, absent=("/ws/gone.qcow2",)):
+        calls = []
+
+        def virsh_execute(*args, **kwargs):
+            calls.append(args[0])
+            if args[0] == "list":
+                return _result(stdout="vm-b\n")
+            if args[0] == "domstate":
+                assert args[1] == "vm-b"
+                return _result(stdout=f"{state}\n", ok=state_ok)
+            return _result(stdout=self.BLK)
+
+        def shell(command, **kwargs):
+            if _ABSENT in command:
+                probed = shlex.split(command)[3]
+                calls.append(f"probe {probed}")
+                return _result(stdout=_ABSENT if probed in absent else "")
+            source = command.rsplit(" ", 1)[1].strip("'")
+            calls.append(f"qemu-img {source}")
+            if source == "/ws/b.qcow2":
+                return _result(stdout='{"filename": "/ws/b.qcow2"}')
+            return _result(ok=False, stderr="Could not open")
+
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh, \
+             patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
+            virsh.return_value.execute.side_effect = virsh_execute
+            cmd.return_value.execute_shell.side_effect = shell
+            return _session({}).disk_paths_in_use(), calls
+
+    @pytest.mark.parametrize("state", [
+        "running", "paused", "pmsuspended", "in shutdown", "crashed", "idle"])
+    def test_an_active_domain_fails_the_scan_and_says_why(
+            self, state, captured_logs):
+        in_use, _ = self._run(state)
+        assert in_use is None
+        assert "vm-b" in captured_logs.text
+        assert "/ws/gone.qcow2" in captured_logs.text
+
+    def test_a_shut_off_domain_is_scanned_without_it(self):
+        in_use, _ = self._run("shut off")
+        assert in_use == {"/ws/b.qcow2": "vm-b"}
+
+    def test_a_state_that_cannot_be_read_fails_the_scan(self, captured_logs):
+        in_use, _ = self._run("shut off", state_ok=False)
+        assert in_use is None
+        assert "vm-b" in captured_logs.text
+
+    def test_the_state_is_asked_only_once_the_absence_is_confirmed(self):
+        _, calls = self._run("shut off")
+        assert calls.count("domstate") == 1
+        assert calls.index("domstate") > calls.index("probe /ws/gone.qcow2")
+
+    def test_no_state_is_asked_while_absence_is_not_confirmed(self):
+        in_use, calls = self._run("shut off", absent=())
+        assert in_use is None
+        assert "domstate" not in calls
+
+
 class TestAbsenceProbe:
     """How a source is confirmed absent (#208 review round 3, 4): through
     the command wrapper qemu-img runs through, never with sudo, and only on
@@ -936,7 +1004,11 @@ class TestSourcesGoneFromTheHost:
         assert _session({}).backing_chains(
             [path.format(tmp=tmp_path)]) is None
 
-    def test_a_domain_whose_cdrom_is_gone_is_still_scanned(self, tmp_path):
+    @pytest.mark.parametrize("state, scanned", [("shut off", True),
+                                                ("running", False)])
+    def test_a_domain_whose_cdrom_is_gone(self, tmp_path, state, scanned):
+        """... is scanned without it once it is shut off (#208 review
+        round 4, 2: a running one may still hold the deleted file open)."""
         disk = self._image(tmp_path / "b.qcow2")
         gone = str(tmp_path / "seed.iso")
         blk = (TestDiskPathsInUse.HEADER
@@ -946,13 +1018,16 @@ class TestSourcesGoneFromTheHost:
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
                 return _result(stdout="vm-b\n")
+            if args[0] == "domstate":
+                return _result(stdout=f"{state}\n")
             return _result(stdout=blk)
 
         with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:
             virsh.return_value.execute.side_effect = virsh_execute
             in_use = _session({}).disk_paths_in_use()
 
-        assert in_use == {os.path.realpath(disk): "vm-b"}
+        assert in_use == ({os.path.realpath(disk): "vm-b"} if scanned
+                          else None)
 
     def test_a_domain_whose_disk_cannot_be_read_fails_the_scan(self, tmp_path):
         self._unless_root()

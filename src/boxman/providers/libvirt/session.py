@@ -847,7 +847,10 @@ class LibVirtSession(SessionConfigMixin):
         ``volume`` row is read at the local path its volume resolves to
         (:meth:`vm_storage_devices`). A source confirmed absent (see
         :meth:`_source_absent`) — a deleted seed ISO still attached — uses
-        nothing: there is no file there, nor anything below it.
+        nothing only in a domain positively shut off (:meth:`_shut_off`):
+        a running one can hold the unlinked image open in QEMU together
+        with the images below it, whose files still exist, so any other
+        state fails the scan.
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         listing = virsh.execute("list", "--all", "--name", warn=True)
@@ -867,7 +870,8 @@ class LibVirtSession(SessionConfigMixin):
             for source in sorted(sources):
                 chain = self._backing_chain_files(cmd, source)
                 if chain is None:
-                    if self._source_absent(source):
+                    if (self._source_absent(source)
+                            and self._shut_off(virsh, domain, source)):
                         continue
                     return None
                 for path in chain:
@@ -998,6 +1002,34 @@ class LibVirtSession(SessionConfigMixin):
                     chain.append(image['filename'])
             chains[source] = chain
         return chains
+
+    def _shut_off(self, virsh, domain: str, missing: str) -> bool:
+        """
+        Whether *domain*, whose source *missing* is confirmed absent, is
+        positively shut off — so it holds nothing open.
+
+        A domain that runs (or is paused, suspended, crashed, shutting
+        down, ...) can keep an unlinked image open in QEMU together with
+        its whole backing chain, and the files below it still exist: a
+        missing pathname says nothing about what it uses. Asked only once
+        the absence is confirmed, which makes the answer safe to act on: a
+        domain that starts after this cannot open a path that no longer
+        exists, and one that stopped before it has released its files. Any
+        state but ``shut off``, or none at all, is named in a warning.
+        """
+        result = virsh.execute("domstate", domain, warn=True)
+        state = (result.stdout or "").strip() if result.ok else ""
+        if state == "shut off":
+            return True
+        self.logger.warning(
+            f"domain {domain} "
+            + (f"is {state}" if state else "could not be asked for its state")
+            + f" with {missing} attached, which no longer exists: while it "
+            f"runs it can still hold that file open, with the images below "
+            f"it, so no teardown can tell which files it uses and each keeps "
+            f"them all — detach {missing} from {domain}, or shut that VM "
+            f"down")
+        return False
 
     def _source_absent(self, path: str) -> bool:
         """

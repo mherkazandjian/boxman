@@ -444,6 +444,37 @@ def read_teardown_locator(locator: str, vm_name: str) -> str:
     return inventory
 
 
+def entry_exists(path: str) -> bool:
+    """
+    Whether *path* has a directory entry (a dangling symlink counts).
+
+    Only ``FileNotFoundError`` is absence. ``os.path.lexists`` answers
+    ``False`` for an entry that cannot be looked up at all — a directory on
+    the way that cannot be searched, a component that is not a directory, a
+    symlink loop — and a retried teardown that took an unsearchable locator
+    directory for "no locator" fell back to deleting by name what the
+    inventory protected (#208).
+
+    Raises:
+        OSError: If it cannot be looked up for any other reason, for the
+            caller to fail closed on.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _may_exist(path: str) -> bool:
+    """``False`` only when *path* is confirmed absent (:func:`entry_exists`):
+    one that cannot be looked up may still be there, so it is kept."""
+    try:
+        return entry_exists(path)
+    except OSError:
+        return True
+
+
 @dataclass
 class StorageOutcome:
     """What :func:`remove_vm_storage` removed and what it kept, and why."""
@@ -686,7 +717,7 @@ def remove_vm_storage(
         records = inventory.records or []
         for record in records:
             if (record.source in inventory.disk_sources
-                    or not os.path.lexists(record.source)):
+                    or not _may_exist(record.source)):
                 continue
             chain, reason = _owned_snapshot_chain(
                 inventory, record, real_workdirs)
@@ -701,7 +732,7 @@ def remove_vm_storage(
                     admission.admit(layer)
         by_source = {record.source: record for record in records}
         for path in attached_extras:
-            if not os.path.lexists(path) or admission.is_admitted(path):
+            if not _may_exist(path) or admission.is_admitted(path):
                 continue
             reason = (media_refusal(path)
                       or _leftover_refusal(vm, path, by_source.get(path),
@@ -712,7 +743,7 @@ def remove_vm_storage(
                 admission.admit(path)
     elif state == RECORDS_NONE and inventory.legacy_disks is not None:
         for path in legacy:
-            if not os.path.lexists(path):
+            if not _may_exist(path):
                 continue
             reason = static_refusal(path)
             if reason:
@@ -721,11 +752,11 @@ def remove_vm_storage(
                 admission.admit(path)
         declared = {real(path) for path in legacy}
         for path in attached_extras:
-            if os.path.lexists(path) and real(path) not in declared:
+            if _may_exist(path) and real(path) not in declared:
                 admission.refuse(path, _WHY_NO_RECORD[RECORDS_NONE])
     else:
         for path in unique([*attached_extras, *legacy]):
-            if os.path.lexists(path):
+            if _may_exist(path):
                 admission.refuse(path, _WHY_NO_RECORD[state])
 
     # -- dependencies across the whole inventory ---------------------------
@@ -781,9 +812,11 @@ def remove_vm_storage(
                                 "a layer above it in its backing chain was "
                                 "replaced after the vm was inspected")
 
+    # the kept list decides whether the saved inventory and its locator go
+    # (_teardown_vm), so only a file confirmed gone leaves it
     outcome.kept = [(path, reason)
                     for path, reason in admission.refused.values()
-                    if os.path.lexists(path)]
+                    if _may_exist(path)]
     return outcome
 
 

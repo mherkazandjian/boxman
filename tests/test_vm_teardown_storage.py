@@ -74,6 +74,16 @@ def _live(table):
 needs_qemu_img = pytest.mark.skipif(shutil.which('qemu-img') is None,
                                     reason='needs qemu-img')
 
+#: a directory mode 000 stops only a non-root lookup
+unless_root = pytest.mark.skipif(os.geteuid() == 0,
+                                 reason='root searches a mode-000 directory')
+
+
+def _virsh_result(stdout='', ok=True):
+    result = MagicMock(name='invoke.Result')
+    result.stdout, result.stderr, result.ok = stdout, '', ok
+    return result
+
 
 def _image(path, backing=None):
     """A real qcow2 image, built on *backing* when given."""
@@ -1368,6 +1378,137 @@ class TestTeardownLocator:
         assert not os.path.lexists(_locator())
         assert os.path.lexists(other) and kept.exists()
 
+    # -- #208 review round 4, 1: only "not there" is absence ---------------
+
+    @unless_root
+    def test_a_locator_that_cannot_be_looked_up_fails_the_retry_closed(
+            self, tmp_path):
+        """Codex's reproduction: the locator's directory cannot be searched,
+        which is not "no locator" -- falling back deleted the VM-named
+        qcow2 CD-ROM the inventory protects."""
+        workdir, elsewhere = tmp_path / 'work', tmp_path / 'elsewhere'
+        boot = _qcow2(elsewhere / f'{VM}.qcow2')
+        cdrom = _qcow2(workdir / f'{VM}.cd.qcow2')
+        t = _Teardown(workdir, disks=[boot], media=[cdrom], records=[])
+        t.deprovision()
+        t.session.vm_storage_devices.return_value = None
+        t.session.destroy_vm.reset_mock()
+        locators = os.path.dirname(_locator())
+        os.chmod(locators, 0)
+        try:
+            with pytest.raises(ProvisionError,
+                               match='could not be looked up') as exc:
+                t.deprovision()
+        finally:
+            os.chmod(locators, 0o700)
+
+        assert _locator() in str(exc.value)
+        assert cdrom.exists() and boot.exists()
+        assert _saved(elsewhere).exists() and os.path.lexists(_locator())
+        t.session.destroy_vm.assert_not_called()
+
+    @unless_root
+    def test_an_inventory_it_names_that_cannot_be_looked_up_fails_closed(
+            self, tmp_path):
+        workdir, elsewhere = tmp_path / 'work', tmp_path / 'elsewhere'
+        boot = _qcow2(elsewhere / f'{VM}.qcow2')
+        cdrom = _qcow2(workdir / f'{VM}.cd.qcow2')
+        t = _Teardown(workdir, disks=[boot], media=[cdrom], records=[])
+        t.deprovision()
+        t.session.vm_storage_devices.return_value = None
+        elsewhere.chmod(0)
+        try:
+            with pytest.raises(ProvisionError,
+                               match='could not be looked up') as exc:
+                t.deprovision()
+        finally:
+            elsewhere.chmod(0o700)
+
+        assert _locator() in str(exc.value)
+        assert str(_saved(elsewhere)) in str(exc.value)
+        assert cdrom.exists() and _saved(elsewhere).exists()
+
+    @unless_root
+    def test_a_searched_directory_that_cannot_be_looked_up_fails_closed(
+            self, tmp_path):
+        """No locator (state dir cleared): an inventory beside the boot disk
+        that cannot be looked up is not skipped for the fallback."""
+        workdir = tmp_path / 'w'
+        t, cdrom = self._first_pass_keeps_media(workdir)
+        os.remove(_locator())
+        workdir.chmod(0)
+        try:
+            with pytest.raises(ProvisionError,
+                               match='could not be looked up') as exc:
+                t.deprovision()
+        finally:
+            workdir.chmod(0o700)
+
+        assert str(_saved(workdir)) in str(exc.value)
+        assert cdrom.exists() and _saved(workdir).exists()
+
+    @unless_root
+    def test_destroy_keeps_a_locator_whose_inventory_cannot_be_looked_up(
+            self, tmp_path):
+        mgr = make_bare_manager(
+            {'project': 'demo',
+             'clusters': {'cluster_1': {'workdir': str(tmp_path / 'w'),
+                                        'vms': {'web': {}}}}})
+        hidden = tmp_path / 'hidden'
+        inventory = _file(hidden / f'.boxman-teardown-{VM}.json', b'{}')
+        disk_cleanup.save_teardown_locator(_locator(), VM, str(inventory))
+        hidden.chmod(0)
+        try:
+            mgr._retire_stale_teardown_locators()
+        finally:
+            hidden.chmod(0o700)
+
+        assert os.path.lexists(_locator()) and inventory.exists()
+        warned = ' '.join(str(c.args[0])
+                          for c in mgr.logger.warning.call_args_list)
+        assert _locator() in warned and str(inventory) in warned
+
+    @unless_root
+    def test_destroy_carries_on_past_a_locator_it_cannot_read(self, tmp_path):
+        mgr = make_bare_manager(
+            {'project': 'demo',
+             'clusters': {'cluster_1': {'workdir': str(tmp_path / 'w'),
+                                        'vms': {'web': {}, 'db': {}}}}})
+        disk_cleanup.save_teardown_locator(
+            _locator(), VM, str(tmp_path / 'gone' / f'.boxman-teardown-{VM}.json'))
+        locators = os.path.dirname(_locator())
+        os.chmod(locators, 0)
+        try:
+            mgr._retire_stale_teardown_locators()
+        finally:
+            os.chmod(locators, 0o700)
+
+        assert os.path.lexists(_locator())
+        warned = ' '.join(str(c.args[0])
+                          for c in mgr.logger.warning.call_args_list)
+        assert _locator() in warned
+
+    @unless_root
+    def test_destroy_carries_on_past_a_locator_it_cannot_remove(
+            self, tmp_path):
+        mgr = make_bare_manager(
+            {'project': 'demo',
+             'clusters': {'cluster_1': {'workdir': str(tmp_path / 'w'),
+                                        'vms': {'web': {}}}}})
+        disk_cleanup.save_teardown_locator(
+            _locator(), VM, str(tmp_path / 'gone' / f'.boxman-teardown-{VM}.json'))
+        locators = os.path.dirname(_locator())
+        os.chmod(locators, 0o500)
+        try:
+            mgr._retire_stale_teardown_locators()
+        finally:
+            os.chmod(locators, 0o700)
+
+        assert os.path.lexists(_locator())
+        warned = ' '.join(str(c.args[0])
+                          for c in mgr.logger.warning.call_args_list)
+        assert _locator() in warned
+
     def test_one_that_cannot_be_written_leaves_the_domain_defined(
             self, tmp_path, monkeypatch):
         def refuse(*_args, **_kwargs):
@@ -1405,6 +1546,132 @@ class TestTeardownLocator:
         assert not stale.exists()
         assert json.loads(open(_locator()).read())['inventory'] == str(
             _saved(workdir))
+
+
+def _inventory(**fields):
+    """A StorageInventory for VM, empty but for *fields*."""
+    base = dict(vm_name=VM, disk_sources=[], media_sources=[], records=None,
+                records_state=disk_cleanup.RECORDS_NONE, chains={},
+                boot_family=[], legacy_disks=None)
+    base.update(fields)
+    return disk_cleanup.StorageInventory(**base)
+
+
+class TestUnsearchableDirectories:
+    """A file whose directory cannot be searched is not known to be gone,
+    so it is kept -- and so are the saved inventory and the locator that
+    protect it, which a teardown removes once nothing is kept (#208 review
+    round 4, 1)."""
+
+    @unless_root
+    @pytest.mark.parametrize("site", [
+        "recorded, moved by a snapshot", "recorded and attached",
+        "declared by a legacy domain", "attached to a legacy domain",
+        "attached, records unknown", "attached, records unreadable",
+    ])
+    def test_a_file_that_cannot_be_looked_up_is_kept(self, tmp_path, site):
+        other = tmp_path / 'other'
+        path = _qcow2(other / f'{VM}_disk01.qcow2')
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        sources = [str(boot)]
+        chains = {str(boot): [str(boot)]}
+        fields = {}
+        if site == "recorded, moved by a snapshot":
+            fields = dict(records=[_record('disk01', path)],
+                          records_state=disk_cleanup.RECORDS_PRESENT)
+        elif site == "declared by a legacy domain":
+            fields = dict(legacy_disks=[str(path)])
+        else:
+            sources.append(str(path))
+            chains[str(path)] = [str(path)]
+            fields = {
+                "recorded and attached": dict(
+                    records=[_record('disk01', path, role=ROLE_ADOPTED)],
+                    records_state=disk_cleanup.RECORDS_PRESENT),
+                "attached to a legacy domain": dict(legacy_disks=[]),
+                "attached, records unknown": dict(
+                    records_state=disk_cleanup.RECORDS_UNKNOWN),
+                "attached, records unreadable": dict(
+                    records_state=disk_cleanup.RECORDS_UNREADABLE),
+            }[site]
+        inventory = _inventory(
+            disk_sources=sources, chains=chains, boot_family=[str(boot)],
+            identities=disk_cleanup.file_identities([str(boot), str(path)]),
+            **fields)
+        other.chmod(0)
+        try:
+            outcome = disk_cleanup.remove_vm_storage(
+                inventory, [str(tmp_path), str(other)], lambda: {})
+        finally:
+            other.chmod(0o700)
+
+        assert str(path) in [kept for kept, _ in outcome.kept]
+        assert path.exists()
+
+    @unless_root
+    def test_a_kept_file_that_turns_unsearchable_keeps_the_inventory(
+            self, tmp_path):
+        """The kept list decides whether the inventory and its locator go:
+        a kept file that cannot be looked up by then is still kept."""
+        other = tmp_path / 'other'
+        adopted = _qcow2(other / 'adopted.qcow2')
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, disks=[boot, adopted],
+                      records=[_record('shared', adopted, role=ROLE_ADOPTED,
+                                       target='vdb')])
+
+        def scan():
+            # after every decision, before the kept list is drawn up
+            other.chmod(0)
+            return {}
+
+        t.session.disk_paths_in_use.side_effect = scan
+        try:
+            t.deprovision()
+        finally:
+            other.chmod(0o700)
+
+        assert adopted.exists() and not boot.exists()
+        assert _saved(tmp_path).exists() and os.path.lexists(_locator())
+        assert str(adopted) in t.warnings
+
+
+class TestRunningDomainWithAMissingSource:
+    """Another domain still running with a deleted image attached can hold
+    it open in QEMU together with the images below it: a base of it that
+    still exists must not read as unused (#208 review round 4, 2)."""
+
+    @needs_qemu_img
+    def test_the_base_of_an_unlinked_head_it_may_hold_is_kept(
+            self, tmp_path, captured_logs):
+        boot = _image(tmp_path / f'{VM}.qcow2')
+        head = _image(tmp_path / 'other' / 'head.qcow2', backing=boot)
+        head.unlink()
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        blk = (" Type   Device   Target   Source\n"
+               "------------------------------------\n"
+               f" file   disk     vda      {head}\n")
+
+        def virsh_execute(*args, **kwargs):
+            if args[0] == 'list':
+                return _virsh_result('vm-other\n')
+            if args[0] == 'domstate':
+                return _virsh_result('running\n')
+            return _virsh_result(blk)
+
+        # the real in-use scan: real qemu-img and absence probe, a mocked
+        # virsh that knows one other, running, domain
+        real = LibVirtSession(config={'provider': {'libvirt': {}}})
+        t.session.disk_paths_in_use.side_effect = real.disk_paths_in_use
+        with patch('boxman.providers.libvirt.session.VirshCommand') as virsh:
+            virsh.return_value.execute.side_effect = virsh_execute
+            t.deprovision()
+
+        assert boot.exists()
+        assert (f'left {boot} in place because could not check whether '
+                f'another domain uses it') in t.warnings
+        assert 'vm-other' in captured_logs.text
+        assert str(head) in captured_logs.text
 
 
 def _malformed(tmp_path, layout):

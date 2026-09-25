@@ -856,14 +856,20 @@ Details worth knowing:
   still there depends on (a kept image may have been rebased since); both
   files are removed once nothing they protect is left (`destroy`, which
   removes the workspace, also drops a locator whose inventory went with
-  it), and one that cannot be read stops the retry with nothing removed.
-  With the VM already gone and nothing saved, only boxman's own qcow2
-  images and memory files under the VM's names are removed, and its extra
-  disks are kept. A CD-ROM or disk whose file no longer exists — a deleted
-  seed ISO still attached — protects nothing and holds nothing back. An
-  extra disk moved to an overlay by a snapshot goes with its whole chain
-  when every layer is provably its own (the disk at its recorded target,
-  the recorded base at the bottom, each layer named for it in the same
+  it), and one that cannot be read or even looked up (a directory that
+  cannot be searched) stops the retry with nothing removed. With the VM
+  already gone and nothing saved, only boxman's own qcow2 images and
+  memory files under the VM's names are removed, and its extra disks are
+  kept. A file is taken for gone only when it is not there; one that
+  cannot be looked up is kept. A CD-ROM or disk whose file no longer
+  exists — a deleted seed ISO still attached — protects nothing and holds
+  nothing back, for the VM being torn down and for VMs that are shut off.
+  A *running* VM with a deleted file still attached can hold it open,
+  with the images below it, so every teardown keeps everything, named in
+  a warning, until that file is detached or that VM stops. An extra disk
+  moved to an overlay by a snapshot goes with its whole chain when every
+  layer is provably its own (the disk at its recorded target, the
+  recorded base at the bottom, each layer named for it in the same
   directory); otherwise the chain is kept whole. Every file
   kept is named in a warning; keeping it does not fail the command. (`virsh
   undefine --remove-all-storage` used to wipe and delete every

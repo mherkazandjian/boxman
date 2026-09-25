@@ -28,6 +28,7 @@ from boxman.providers.libvirt.disk_cleanup import (
     RECORDS_UNREADABLE,
     StorageInventory,
     boot_family_files,
+    entry_exists,
     file_identities,
     load_teardown_inventory,
     read_teardown_locator,
@@ -608,17 +609,27 @@ class VMsMixin:
         Found through its locator, which records where it was saved beside
         the boot disk, wherever that was — never passed over for another.
         With no locator at all (boxman's state dir was cleared), one in
-        *disk_dirs* is used.
+        *disk_dirs* is used. Only a file confirmed not there is absent
+        (:func:`entry_exists`): one that cannot be looked up is never taken
+        for "none saved".
 
         Raises:
             ProvisionError: If the locator, or the inventory it or
-                *disk_dirs* lead to, cannot be read — a locator whose
-                inventory is missing included. The inventory's protections
-                cannot be honoured blind, so nothing is removed; check what
-                should stay, then remove the files named.
+                *disk_dirs* lead to, cannot be looked up or read — a locator
+                whose inventory is missing included. The inventory's
+                protections cannot be honoured blind, so nothing is removed;
+                check what should stay, then remove the files named.
         """
         locator = teardown_locator_path(teardown_locator_dir(), full_vm_name)
-        if os.path.lexists(locator):
+        try:
+            located = entry_exists(locator)
+        except OSError as exc:
+            raise ProvisionError(
+                f"{full_vm_name}: the teardown locator at {locator} could "
+                f"not be looked up ({exc}); leaving its storage in place — "
+                f"make it readable again, or check what should stay and "
+                f"remove that file") from exc
+        if located:
             try:
                 path = read_teardown_locator(locator, full_vm_name)
             except (OSError, ValueError, RecursionError) as exc:
@@ -627,7 +638,16 @@ class VMsMixin:
                     f"could not be read ({exc}); leaving its storage in "
                     f"place — check what should stay, then remove that "
                     f"file") from exc
-            if not os.path.lexists(path):
+            try:
+                present = entry_exists(path)
+            except OSError as exc:
+                raise ProvisionError(
+                    f"{full_vm_name}: the teardown locator at {locator} "
+                    f"names an inventory at {path}, which could not be "
+                    f"looked up ({exc}); leaving its storage in place — make "
+                    f"it readable again, or check what should stay and "
+                    f"remove both files") from exc
+            if not present:
                 raise ProvisionError(
                     f"{full_vm_name}: the teardown locator at {locator} "
                     f"names an inventory at {path}, which is missing; "
@@ -639,7 +659,15 @@ class VMsMixin:
             return inventory
         for directory in disk_dirs:
             path = teardown_inventory_path(directory, full_vm_name)
-            if os.path.lexists(path):
+            try:
+                present = entry_exists(path)
+            except OSError as exc:
+                raise ProvisionError(
+                    f"{full_vm_name}: {path}, where an earlier attempt would "
+                    f"have saved its teardown inventory, could not be looked "
+                    f"up ({exc}); leaving its storage in place — make it "
+                    f"readable again and retry") from exc
+            if present:
                 return self._read_saved_inventory(full_vm_name, path, None)
         return None
 
@@ -672,7 +700,9 @@ class VMsMixin:
         nothing any more, yet would fail every later teardown of the same
         VMs closed. One whose inventory is still there — saved beside a boot
         disk outside the workspace — still protects what that teardown kept,
-        and stays.
+        and stays; so does one that cannot be read, or whose inventory cannot
+        be confirmed gone (:func:`entry_exists`), named in a warning. Nothing
+        here fails ``destroy``.
         """
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self._vm_clusters.items():
@@ -682,14 +712,35 @@ class VMsMixin:
                                                 full_vm_name)
                 try:
                     inventory = read_teardown_locator(locator, full_vm_name)
-                except (OSError, ValueError, RecursionError):
+                except FileNotFoundError:
                     continue
-                if not os.path.lexists(inventory):
-                    with contextlib.suppress(FileNotFoundError):
-                        os.remove(locator)
-                        self.logger.info(
-                            f"{full_vm_name}: removed the teardown locator "
-                            f"of {inventory}, which went with the workspace")
+                except (OSError, ValueError, RecursionError) as exc:
+                    self.logger.warning(
+                        f"{full_vm_name}: left the teardown locator {locator} "
+                        f"in place: it could not be read ({exc})")
+                    continue
+                try:
+                    gone = not entry_exists(inventory)
+                except OSError as exc:
+                    self.logger.warning(
+                        f"{full_vm_name}: left the teardown locator {locator} "
+                        f"in place: whether the inventory it names, "
+                        f"{inventory}, is gone could not be told ({exc})")
+                    continue
+                if not gone:
+                    continue
+                try:
+                    os.remove(locator)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    self.logger.warning(
+                        f"{full_vm_name}: could not remove the teardown "
+                        f"locator {locator} ({exc})")
+                    continue
+                self.logger.info(
+                    f"{full_vm_name}: removed the teardown locator of "
+                    f"{inventory}, which went with the workspace")
 
     def _with_current_chains(self, session,
                              saved: StorageInventory) -> StorageInventory:

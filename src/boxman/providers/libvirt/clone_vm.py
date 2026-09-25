@@ -12,7 +12,7 @@ from boxman.exceptions import (
 )
 
 from .commands import VirshCommand, VirtCloneCommand, VirtSysprepCommand
-from .disk_cleanup import file_identities, remove_if_unchanged
+from .disk_cleanup import entry_exists, file_identities, remove_if_unchanged
 from .storage_pools import refresh_pools_holding
 from .virsh_parse import parse_domiflist
 
@@ -314,9 +314,11 @@ class CloneVM:
                 sanitizer_error,
                 f"could not confirm the clone was undefined, so its disk "
                 f"{path} was left in place")
-        if not os.path.lexists(path):
-            return
         try:
+            # only a disk confirmed gone is nothing left to do; one that
+            # cannot be looked up is a disk left behind
+            if not entry_exists(path):
+                return
             outcome, where = remove_if_unchanged(path, identity)
         except OSError as exc:
             self._raise_disk_left(

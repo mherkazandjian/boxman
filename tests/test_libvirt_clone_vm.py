@@ -7,6 +7,7 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -420,6 +421,32 @@ class TestDiscardUnsafeClone:
             with pytest.raises(CloneCleanupError, match="replaced"):
                 clone.discard_unsafe_clone()
         assert disk.read_bytes() == b"someone else"
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root searches a mode-000 directory")
+    def test_a_disk_that_cannot_be_looked_up_is_reported_not_skipped(
+        self, tmp_path: Path
+    ):
+        """#208 review round 4, 1: only "not there" lets the discard return
+        quietly; a disk it cannot look up is a disk left behind."""
+        workdir = tmp_path / "clones"
+        workdir.mkdir()
+        disk = workdir / "vm01.qcow2"
+        disk.write_bytes(b"clone")
+        clone = CloneVM(
+            src_vm_name="template-base", new_vm_name="vm01",
+            info={"network_adapters": [{"network": "default"}]},
+            workdir=str(workdir), provider_config={"use_sudo": False})
+        try:
+            with patch.object(clone.virsh, "execute",
+                              side_effect=self._fake_virsh(
+                                  workdir,
+                                  on_undefine=lambda: workdir.chmod(0))):
+                with pytest.raises(CloneCleanupError, match="vm01.qcow2"):
+                    clone.discard_unsafe_clone()
+        finally:
+            workdir.chmod(0o700)
+        assert disk.read_bytes() == b"clone"
 
     def test_cleanup_failure_is_terminal_and_preserves_sanitizer_cause(
         self, clone: CloneVM
