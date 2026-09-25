@@ -841,10 +841,19 @@ class TestDestroyRemovedVm:
 
         assert mgr._vm_disk_dirs('test-vm', []) == ['/fallback']
 
-    def test_storage_is_inventoried_before_undefining(self):
+    def test_storage_is_inventoried_before_undefining(self, tmp_path):
         """domblklist, the ownership records and the chains describe the
-        domain only while it exists (ordering regression guard)."""
+        domain only while it exists (ordering regression guard). Its disks
+        are under tmp_path: the host's own directories (a root-owned 0711
+        /var/lib/libvirt/images, say) are never listed."""
         mgr = self._make_manager()
+        disks = [str(tmp_path / 'images' / 'test-vm.qcow2'),
+                 str(tmp_path / 'data' / 'test-vm_disk01.qcow2')]
+        seed = str(tmp_path / 'data' / 'seed.iso')
+        mgr.provider.vm_storage_devices.return_value = [
+            DomblkRow('file', 'disk', 'vda', disks[0]),
+            DomblkRow('file', 'disk', 'vdb', disks[1]),
+            DomblkRow('file', 'cdrom', 'hda', seed)]
         mgr.provider.confirm_vm_absent.side_effect = [False, True]
         parent = MagicMock()
         parent.attach_mock(mgr.provider.vm_storage_devices, 'devices')
@@ -862,9 +871,7 @@ class TestDestroyRemovedVm:
             call('test-vm'), call('test-vm', force=True)]
         # every disk's chain is read, the boot disk's too, and the cdrom's:
         # a qcow2 CD-ROM can be built on one of the disks (#208 review r2)
-        mgr.provider.backing_chains.assert_called_once_with(
-            ['/var/lib/libvirt/images/test-vm.qcow2',
-             '/data/test-vm_disk01.qcow2', '/data/seed.iso'])
+        mgr.provider.backing_chains.assert_called_once_with([*disks, seed])
 
     def test_a_domain_whose_devices_cannot_be_read_stays_defined(self):
         mgr = self._make_manager()

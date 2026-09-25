@@ -121,6 +121,55 @@ def boot_family_files(workdir: str, vm_name: str) -> list[str]:
     return sorted(found)
 
 
+def boot_family_candidates(workdir: str, vm_name: str) -> list[str]:
+    """
+    :func:`boot_family_files`, for a teardown to decide with — which may not
+    take "cannot tell" for "nothing there".
+
+    ``glob`` and the ``isfile``/``islink`` filter both swallow errors, so a
+    directory that exists but cannot be listed, or can be listed but not
+    searched (every entry's lookup then fails), read as holding none: a
+    VM-named qcow2 CD-ROM there was never a candidate, never refused and
+    never kept, and the saved inventory that protected it was dropped (#208).
+    Here only a directory that does not exist holds none, and an entry
+    under the VM's names that cannot be looked up stays a candidate (the
+    refusals, which look up every candidate, then keep it).
+
+    The VM's names are matched literally, as every other name rule of the
+    teardown is (``<vm>.``, ``<vm>_snapshot_``, ``<vm>_<name>.``): a glob
+    took ``node[1]`` for a pattern, listed ``node1.qcow2`` — another VM's
+    disk — and missed ``node[1].qcow2``. *workdir* is taken as the path it
+    is, never as a pattern, too. A directory that lists fine gives exactly
+    what :func:`boot_family_files` gives, for a vm name and a *workdir*
+    without glob metacharacters.
+
+    Raises:
+        OSError: If *workdir* exists but cannot be listed.
+    """
+    workdir = os.path.expanduser(workdir)
+    try:
+        names = os.listdir(workdir)
+    except FileNotFoundError:
+        return []
+    found = []
+    for name in names:
+        if not (name.startswith(f'{vm_name}.')
+                or name.startswith(f'{vm_name}_snapshot_')):
+            continue
+        path = os.path.join(workdir, name)
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue        # gone since it was listed
+        except OSError:
+            found.append(path)
+            continue
+        # what boot_family_files keeps: a symlink, or a regular file
+        if stat.S_ISLNK(st.st_mode) or stat.S_ISREG(st.st_mode):
+            found.append(path)
+    return sorted(found)
+
+
 def file_identities(paths: Iterable[str]) -> dict[str, tuple[int, int]]:
     """
     ``(st_dev, st_ino)`` of each path that exists, without following a
@@ -207,7 +256,7 @@ class StorageInventory:
     #: could not be read
     chains: dict[str, list[str]] | None
     #: files under its exclusive names in its disk directories
-    #: (:func:`boot_family_files`)
+    #: (:func:`boot_family_candidates`)
     boot_family: list[str]
     #: config-declared extra disks by name (``<vm>_<name>.<ext>``) when the
     #: config is known, ``None`` when it is not (a VM gone from conf.yml)
@@ -616,7 +665,7 @@ def remove_vm_storage(
     undefining; anything a rule does not admit is kept:
 
     1. **The boot-disk family** — files under the VM's exclusive names in
-       its disk directories (:func:`boot_family_files`): its boot disk,
+       its disk directories (:func:`boot_family_candidates`): its boot disk,
        its overlays and its memory-snapshot files. Extra-disk files
        (attached, recorded, config-declared, or a layer under one) are
        never decided by name.

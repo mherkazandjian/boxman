@@ -1636,6 +1636,327 @@ class TestUnsearchableDirectories:
         assert str(adopted) in t.warnings
 
 
+class TestUnlistableDirectories:
+    """The files under the VM's own names are listed from its directories,
+    and a teardown decides with that listing -- at capture, and in the
+    fallback for a VM undefined with nothing saved. A directory counts as
+    holding none only when it does not exist; one that cannot be listed
+    stops the teardown, and an entry that cannot be looked up is still a
+    candidate, kept by the refusals (#208 review round 4, residual)."""
+
+    @unless_root
+    def test_an_unlistable_workdir_at_capture_leaves_the_domain_defined(
+            self, tmp_path):
+        """(a) Nothing undefined, nothing removed, nothing saved."""
+        workdir, elsewhere = tmp_path / 'work', tmp_path / 'elsewhere'
+        boot = _qcow2(elsewhere / f'{VM}.qcow2')
+        cdrom = _qcow2(workdir / f'{VM}.cd.qcow2')
+        t = _Teardown(workdir, disks=[boot], media=[cdrom], records=[])
+        workdir.chmod(0)
+        try:
+            with pytest.raises(ProvisionError, match='could not list') as exc:
+                t.deprovision()
+        finally:
+            workdir.chmod(0o700)
+
+        assert f'could not list {workdir} (' in str(exc.value)
+        assert 'leaving it defined' in str(exc.value)
+        assert 'make that directory readable' in str(exc.value)
+        t.session.destroy_vm.assert_not_called()
+        assert boot.exists() and cdrom.exists()
+        assert not _saved(elsewhere).exists()
+        assert not os.path.lexists(_locator())
+
+    @unless_root
+    def test_a_listable_unsearchable_workdir_keeps_what_is_under_the_names(
+            self, tmp_path):
+        """(b) Every entry there fails to be looked up; the VM-named qcow2
+        CD-ROM is still a candidate, so it is kept, and so are the saved
+        inventory and the locator."""
+        workdir, elsewhere = tmp_path / 'work', tmp_path / 'elsewhere'
+        boot = _qcow2(elsewhere / f'{VM}.qcow2')
+        cdrom = _qcow2(workdir / f'{VM}.cd.qcow2')
+        t = _Teardown(workdir, disks=[boot], media=[cdrom], records=[])
+        workdir.chmod(0o400)
+        try:
+            t.deprovision()
+        finally:
+            workdir.chmod(0o700)
+
+        assert cdrom.exists()
+        assert f'left {cdrom} in place' in t.warnings
+        assert _saved(elsewhere).exists() and os.path.lexists(_locator())
+
+    @unless_root
+    def test_the_fallback_with_an_unlistable_workdir_removes_nothing(
+            self, tmp_path):
+        """(c) Undefined, nothing saved: a workdir that can be searched but
+        not listed stops the name-based fallback."""
+        workdir = tmp_path / 'w'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        t = _Teardown(workdir, records=[])
+        t.session.vm_storage_devices.return_value = None
+        workdir.chmod(0o100)
+        try:
+            with pytest.raises(ProvisionError, match='could not list') as exc:
+                t.deprovision()
+        finally:
+            workdir.chmod(0o700)
+
+        assert f'could not list {workdir} (' in str(exc.value)
+        assert boot.exists()
+
+    # -- only the cluster workdirs are listed strictly -----------------------
+
+    @unless_root
+    @pytest.mark.parametrize("mode", [0o111, 0o000])
+    def test_update_removes_a_vm_whose_adopted_disk_sits_unlistable(
+            self, tmp_path, mode):
+        """An adopted disk in a directory the user cannot list -- Ubuntu's
+        /var/lib/libvirt/images is root's, 0711, so searchable but not
+        listable to a user, as 0111 is to its owner -- is outside every
+        cluster workdir, where nothing is removed: listing it strictly only
+        made update unable to remove the VM."""
+        workdir, outside = tmp_path / 'work', tmp_path / 'outside'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        adopted = _qcow2(outside / 'adopted.qcow2')
+        t = _Teardown(workdir, disks=[boot, adopted],
+                      records=[_record('shared', adopted, role=ROLE_ADOPTED,
+                                       target='vdb')])
+        outside.chmod(mode)
+        try:
+            t.update_remove()
+        finally:
+            outside.chmod(0o700)
+
+        t.session.destroy_vm.assert_called()
+        assert not boot.exists()
+        assert adopted.exists()
+        assert (f"left {adopted} in place because boxman attached it but did "
+                f"not create it (role 'adopted')") in t.warnings
+
+    @unless_root
+    def test_update_with_an_unlistable_workdir_leaves_the_domain_defined(
+            self, tmp_path):
+        """The update path lists the directories of the attached disks; the
+        cluster workdir among them is still listed strictly."""
+        workdir = tmp_path / 'work'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        t = _Teardown(workdir, disks=[boot], records=[])
+        workdir.chmod(0)
+        try:
+            with pytest.raises(ProvisionError, match='could not list') as exc:
+                t.update_remove()
+        finally:
+            workdir.chmod(0o700)
+
+        assert f'could not list {workdir} (' in str(exc.value)
+        t.session.destroy_vm.assert_not_called()
+        assert boot.exists()
+
+    @unless_root
+    def test_a_workdir_reached_through_a_symlink_is_listed_strictly(
+            self, tmp_path):
+        """A cluster workdir is recognised by its resolved path, whichever
+        way the config or libvirt spells it."""
+        real = tmp_path / 'real'
+        boot = _qcow2(real / f'{VM}.qcow2')
+        link = tmp_path / 'link'
+        link.symlink_to(real)
+        t = _Teardown(link, disks=[boot], records=[])
+        real.chmod(0)
+        try:
+            with pytest.raises(ProvisionError, match='could not list'):
+                t.update_remove()
+        finally:
+            real.chmod(0o700)
+
+        t.session.destroy_vm.assert_not_called()
+        assert boot.exists()
+
+    # -- #208 review round 5: a directory is skipped only once it is proved
+    # -- to be none of the cluster workdirs, by identity ---------------------
+
+    @unless_root
+    def test_an_unresolvable_workdir_alias_stops_the_teardown(self, tmp_path):
+        """Codex's case: the workdir is configured as ``hidden/work ->
+        real``, libvirt names the sources under ``real``, ``hidden`` is 000
+        and ``real`` 0300 (writable and searchable, not listable). A path
+        comparison could not resolve the alias, took ``real`` for an
+        outside directory and skipped it: the CD-ROM was never a
+        candidate, the inventory and locator were dropped, and a later
+        retry deleted it."""
+        hidden, real = tmp_path / 'hidden', tmp_path / 'real'
+        hidden.mkdir()
+        boot = _qcow2(real / f'{VM}.qcow2')
+        cdrom = _qcow2(real / f'{VM}.cd.qcow2')
+        (hidden / 'work').symlink_to(real)
+        t = _Teardown(hidden / 'work', disks=[boot], media=[cdrom],
+                      records=[])
+        hidden.chmod(0)
+        real.chmod(0o300)
+        try:
+            with pytest.raises(ProvisionError,
+                               match='could not resolve') as exc:
+                t.update_remove()
+        finally:
+            hidden.chmod(0o700)
+            real.chmod(0o700)
+
+        assert str(hidden / 'work') in str(exc.value)
+        assert 'make it accessible' in str(exc.value)
+        t.session.destroy_vm.assert_not_called()
+        assert boot.exists() and cdrom.exists()
+        assert not _saved(real).exists()
+        assert not os.path.lexists(_locator())
+
+        # the modes restored, the VM is still defined and a retry keeps it
+        t.update_remove()
+
+        assert cdrom.exists() and not boot.exists()
+        assert f'left {cdrom} in place because it is a CD-ROM' in t.warnings
+
+    @unless_root
+    def test_an_outside_directory_whose_identity_cannot_be_read_stops_it(
+            self, tmp_path):
+        """An unlistable directory under a parent that cannot be searched
+        cannot be proved to be none of the cluster workdirs."""
+        workdir, parent = tmp_path / 'work', tmp_path / 'parent'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        adopted = _qcow2(parent / 'outside' / 'adopted.qcow2')
+        t = _Teardown(workdir, disks=[boot, adopted],
+                      records=[_record('shared', adopted, role=ROLE_ADOPTED,
+                                       target='vdb')])
+        parent.chmod(0)
+        try:
+            with pytest.raises(ProvisionError,
+                               match='could not resolve') as exc:
+                t.update_remove()
+        finally:
+            parent.chmod(0o700)
+
+        assert str(parent / 'outside') in str(exc.value)
+        t.session.destroy_vm.assert_not_called()
+        assert boot.exists() and adopted.exists()
+
+    @unless_root
+    def test_a_configured_workdir_that_does_not_exist_is_ignored(
+            self, tmp_path):
+        """A workdir that is not there cannot be the unlistable directory."""
+        workdir, outside = tmp_path / 'work', tmp_path / 'outside'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        adopted = _qcow2(outside / 'adopted.qcow2')
+        t = _Teardown(workdir, disks=[boot, adopted],
+                      records=[_record('shared', adopted, role=ROLE_ADOPTED,
+                                       target='vdb')])
+        t.mgr.config['clusters']['cluster_2'] = {
+            'workdir': str(tmp_path / 'never-created')}
+        outside.chmod(0o111)
+        try:
+            t.update_remove()
+        finally:
+            outside.chmod(0o700)
+
+        t.session.destroy_vm.assert_called()
+        assert not boot.exists() and adopted.exists()
+
+    def test_a_directory_gone_since_it_failed_to_list_holds_nothing(
+            self, tmp_path, monkeypatch):
+        """Listing failed, then the directory vanished: nothing is in it."""
+        workdir, gone = tmp_path / 'work', tmp_path / 'gone'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        adopted = gone / 'adopted.qcow2'
+        t = _Teardown(workdir, disks=[boot, adopted],
+                      records=[_record('shared', adopted, role=ROLE_ADOPTED,
+                                       target='vdb')])
+        real_listing = disk_cleanup.boot_family_candidates
+
+        def listing(directory, vm_name):
+            if directory == str(gone):
+                raise PermissionError(13, 'Permission denied', directory)
+            return real_listing(directory, vm_name)
+
+        monkeypatch.setattr('boxman.manager_parts.vms.boot_family_candidates',
+                            listing)
+
+        t.update_remove()
+
+        t.session.destroy_vm.assert_called()
+        assert not boot.exists()
+
+    def test_a_directory_that_lists_fine_gives_what_it_always_did(
+            self, tmp_path):
+        for name in (f'{VM}.qcow2', f'{VM}.s1', f'{VM}.', f'{VM}.iso',
+                     f'{VM}_snapshot_s1.raw', f'{VM}_disk01.qcow2',
+                     f'{VM}2.qcow2', 'other.qcow2'):
+            _file(tmp_path / name)
+        (tmp_path / f'{VM}.d').mkdir()
+        (tmp_path / f'{VM}_snapshot_d').mkdir()
+        (tmp_path / f'{VM}.link').symlink_to(tmp_path / f'{VM}.qcow2')
+        (tmp_path / f'{VM}.dir-link').symlink_to(tmp_path / f'{VM}.d')
+        (tmp_path / f'{VM}.dangling').symlink_to(tmp_path / 'nowhere')
+
+        listed = disk_cleanup.boot_family_candidates(str(tmp_path), VM)
+
+        assert listed == disk_cleanup.boot_family_files(str(tmp_path), VM)
+        assert len(listed) == 8
+        assert disk_cleanup.boot_family_candidates(
+            str(tmp_path / 'missing'), VM) == []
+
+    @unless_root
+    @pytest.mark.parametrize("mode, listed", [(0o000, None), (0o100, None),
+                                              (0o400, 2)])
+    def test_what_a_directory_that_cannot_be_read_gives(self, tmp_path,
+                                                        mode, listed):
+        workdir = tmp_path / 'w'
+        _qcow2(workdir / f'{VM}.qcow2')
+        _file(workdir / f'{VM}_snapshot_s1.raw')
+        _file(workdir / 'other.qcow2')
+        workdir.chmod(mode)
+        try:
+            if listed is None:
+                with pytest.raises(PermissionError):
+                    disk_cleanup.boot_family_candidates(str(workdir), VM)
+            else:
+                assert disk_cleanup.boot_family_candidates(
+                    str(workdir), VM) == [str(workdir / f'{VM}.qcow2'),
+                                          str(workdir / f'{VM}_snapshot_s1.raw')]
+        finally:
+            workdir.chmod(0o700)
+
+
+class TestLiteralVmNames:
+    """The VM's names are matched literally, as every other name rule of
+    the teardown is: a VM whose name holds a glob metacharacter lists only
+    the files under its own names, never another VM's (#208 review round
+    4, residual)."""
+
+    @pytest.mark.parametrize("vm", ["node[1]", "node*", "node?"])
+    def test_only_files_under_its_literal_names_are_listed(self, tmp_path,
+                                                            vm):
+        own = [_file(tmp_path / f'{vm}.qcow2'),
+               _file(tmp_path / f'{vm}_snapshot_s1.raw')]
+        for name in ('node1.qcow2', 'nodeX.qcow2', 'node1_snapshot_x'):
+            _file(tmp_path / name)
+
+        assert disk_cleanup.boot_family_candidates(str(tmp_path), vm) == (
+            sorted(str(path) for path in own))
+
+    def test_removing_node_1_leaves_an_undefined_node1_alone(self, tmp_path):
+        prefix = 'bprj__demo__bprj_cluster_1_'
+        mine = _qcow2(tmp_path / f'{prefix}node[1].qcow2')
+        # the boot disk of a VM node1 that is not defined any more, so no
+        # in-use scan can speak for it
+        other = _qcow2(tmp_path / f'{prefix}node1.qcow2')
+        t = _Teardown(tmp_path, disks=[mine], records=[])
+
+        t.mgr._destroy_vm_and_disks('cluster_1', {'workdir': str(tmp_path)},
+                                    'node[1]', {'disks': []})
+
+        assert not mine.exists()
+        assert other.exists()
+
+
 class TestRunningDomainWithAMissingSource:
     """Another domain still running with a deleted image attached can hold
     it open in QEMU together with the images below it: a base of it that

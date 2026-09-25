@@ -27,7 +27,7 @@ from boxman.providers.libvirt.disk_cleanup import (
     RECORDS_UNKNOWN,
     RECORDS_UNREADABLE,
     StorageInventory,
-    boot_family_files,
+    boot_family_candidates,
     entry_exists,
     file_identities,
     load_teardown_inventory,
@@ -527,9 +527,32 @@ class VMsMixin:
         sources = [*disk_sources, *media_sources]
         chains = session.backing_chains(sources) if sources else {}
 
-        boot_family = sorted({path for workdir in disk_dirs
-                              for path in boot_family_files(workdir,
-                                                            full_vm_name)})
+        # decided with at capture and, for a domain undefined with nothing
+        # saved, by the name-based fallback: a cluster workdir that cannot
+        # be listed stops the teardown — before the undefine, at capture.
+        # Any other directory (an adopted disk's, a root-owned 0711
+        # /var/lib/libvirt/images) holds nothing that could be removed —
+        # every file outside the cluster workdirs is refused — so one that
+        # cannot be listed, once proved none of them, holds no candidates.
+        found: set[str] = set()
+        for workdir in disk_dirs:
+            try:
+                found.update(boot_family_candidates(workdir, full_vm_name))
+            except OSError as exc:
+                if self._none_of_the_cluster_workdirs(full_vm_name, workdir,
+                                                      exists):
+                    self.logger.debug(
+                        f"{full_vm_name}: could not list {workdir} ({exc}); "
+                        f"it is outside every cluster workdir, where nothing "
+                        f"is removed")
+                    continue
+                raise ProvisionError(
+                    f"{full_vm_name}: could not list {workdir} ({exc}), "
+                    f"which holds its boot disk, overlays and memory files; "
+                    + ("leaving it defined and its storage in place"
+                       if exists else "leaving its storage in place")
+                    + " — make that directory readable, then retry") from exc
+        boot_family = sorted(found)
         files = [*disk_sources, *boot_family, *(legacy_disks or ()),
                  *(record.source for record in records or ()),
                  *(layer for chain in (chains or {}).values()
@@ -557,6 +580,53 @@ class VMsMixin:
             if save_dir is not None:
                 self._save_teardown_inventory(inventory, save_dir)
         return inventory
+
+    def _none_of_the_cluster_workdirs(self, full_vm_name: str,
+                                      directory: str, exists: bool) -> bool:
+        """
+        Whether *directory*, which could not be listed, is proved to be none
+        of the cluster workdirs.
+
+        Told by identity — device and inode, symlinks followed — which sees
+        through an alias or a bind mount where a path comparison cannot, and
+        never guessed: ``os.path.realpath`` answers with the unresolved path
+        when a lookup fails, and a workdir configured as ``hidden/work ->
+        real`` under an unsearchable ``hidden`` read as another directory
+        than ``real``, which was then skipped. Only "not there" is an
+        answer: a workdir that does not exist cannot be *directory*, and a
+        *directory* gone since it failed to list holds nothing.
+
+        Raises:
+            ProvisionError: If *directory* or a cluster workdir cannot be
+                resolved — never taken for "none of them".
+        """
+        leaving = ("leaving it defined and its storage in place" if exists
+                   else "leaving its storage in place")
+
+        def identity(path: str, question: str) -> tuple[int, int] | None:
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise ProvisionError(
+                    f"{full_vm_name}: could not resolve {path} ({exc}) to "
+                    f"tell {question}; {leaving} — make it accessible, then "
+                    f"retry") from exc
+            return (st.st_dev, st.st_ino)
+
+        target = identity(
+            os.path.expanduser(directory),
+            "whether this directory, which could not be listed either, is "
+            "a cluster workdir")
+        if target is None:
+            return True
+        for workdir in self._cluster_workdirs():
+            if identity(os.path.expanduser(workdir),
+                        f"whether this cluster workdir is {directory}, which "
+                        f"could not be listed") == target:
+                return False
+        return True
 
     def _save_teardown_inventory(self, inventory: StorageInventory,
                                  save_dir: str) -> None:
