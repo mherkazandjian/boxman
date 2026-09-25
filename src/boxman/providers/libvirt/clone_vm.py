@@ -85,16 +85,22 @@ _HOSTNAME_SCRIPT = r'''#!/bin/sh
 root="${BOXMAN_GUEST_ROOT:-}"
 new_fqdn='@NEW_FQDN@'
 new_short='@NEW_SHORT@'
+dropin='@DROPIN@'
 
 fail() { echo "boxman hostname: $*" >&2; exit 1; }
 
 # Replace FILE with what the command after it prints when given FILE: via a
 # scratch copy in the target's own directory (metadata copied first, so mode
-# and owner survive) and an atomic rename. A symlink is followed, not replaced.
+# and owner survive) and an atomic rename. A symlink is followed, not replaced;
+# one that cannot be resolved fails, since renaming over it would replace the
+# link and leave its real target stale.
 replace() {
     file=$1; shift
-    target=$(readlink -f "$file" 2>/dev/null) || target=$file
-    [ -n "$target" ] || target=$file
+    target=$file
+    if [ -L "$file" ]; then
+        target=$(readlink -f "$file") && [ -n "$target" ] ||
+            fail "cannot resolve the symlink $file"
+    fi
     tmp=$(mktemp "${target%/*}/.boxman-rewrite.XXXXXX") ||
         fail "cannot create a scratch file beside $target"
     if cp -p "$target" "$tmp" && "$@" "$target" > "$tmp" &&
@@ -105,8 +111,15 @@ replace() {
     fail "could not rewrite $target"
 }
 
-# the template's name, read before --hostname replaces it
-old=$(head -n 1 "$root/etc/hostname" 2>/dev/null | tr -d ' \t\r')
+# the template's name, read before --hostname replaces it. A missing file
+# means no name to replace; one that is there but cannot be read fails, or
+# its name would silently survive on every line matched by name.
+old=
+if [ -e "$root/etc/hostname" ] || [ -L "$root/etc/hostname" ]; then
+    first=$(head -n 1 "$root/etc/hostname") ||
+        fail "cannot read $root/etc/hostname"
+    old=$(printf '%s' "$first" | tr -d ' \t\r')
+fi
 old_short=${old%%.*}
 
 # /etc/hosts: a loopback line that names the template -- or is 127.0.1.1,
@@ -119,8 +132,11 @@ old_short=${old%%.*}
 # one is added.
 HOSTS_AWK='
     function lc(s) { return tolower(s) }
-    # 127/8, and every spelling of the IPv6 loopback (::1, 0:0:0:0:0:0:0:1)
-    function is_loopback(a) { return a ~ /^127\./ || a ~ /^[0:]*:0*1$/ }
+    # 127/8, and every spelling of the IPv6 loopback: ::1, 0:0:0:0:0:0:0:1,
+    # and with a dotted tail, ::0.0.0.1
+    function is_loopback(a) {
+        return a ~ /^127\./ || a ~ /^[0:]*:0*1$/ || a ~ /^[0:]*:(0+\.)(0+\.)(0+\.)0*1$/
+    }
     function is_local(n,    l) {
         l = lc(n)
         return l ~ /^localhost/ || l ~ /^ip6-/
@@ -174,15 +190,76 @@ HOSTS_AWK='
         if (!have_new) print "127.0.1.1 " (nf == ns ? ns : nf " " ns)
     }'
 
-# cloud-init's module lists: comment update_etc_hosts out, in whichever form
-# it is listed (plain, dashed, [name, frequency], quoted)
-MODULES_AWK='
-    /^[ \t]*-[ \t]*\[?[ \t]*"?update[-_]etc[-_]hosts"?[ \t]*(,|\]|$)/ {
-        sub(/-/, "# -")
-        print $0 "  # boxman: /etc/hosts is set when the vm is cloned"
-        next
-    }
-    { print }'
+# cloud-init's module lists, minus update_etc_hosts, for the drop-in. Run by
+# cloud-init's own interpreter, so PyYAML is there. The lists are resolved the
+# way cloud-init does (util.read_conf_with_confd): the cloud.cfg.d files,
+# highest-sorting name first, then cloud.cfg; the first file to set a key
+# wins, and a list is taken whole. Only lists that name the module are
+# written; a file that outranks the drop-in and names it is an error.
+MODULES_PY='
+import os
+import sys
+
+import yaml
+
+root, own = sys.argv[1], sys.argv[2]
+etc = root + "/etc/cloud"
+confd = etc + "/cloud.cfg.d"
+KEYS = ("cloud_init_modules", "cloud_config_modules", "cloud_final_modules")
+
+
+def load(path):
+    with open(path) as handle:
+        data = yaml.safe_load(handle)
+    return data if isinstance(data, dict) else {}
+
+
+def module(entry):
+    """The canonical name of a list entry, as cloud-init forms it."""
+    if isinstance(entry, dict):
+        entry = entry.get("name")
+    elif isinstance(entry, list):
+        entry = entry[0] if entry else None
+    if not isinstance(entry, str):
+        return None
+    name = entry.replace("-", "_")
+    if name.lower().endswith(".py"):
+        name = name[:-3]
+    name = name.strip()
+    return name[3:] if name.startswith("cc_") else name
+
+
+names = []
+if os.path.isdir(confd):
+    names = sorted((n for n in os.listdir(confd) if n.endswith(".cfg")
+                    and os.path.isfile(os.path.join(confd, n))), reverse=True)
+sources = [(n, os.path.join(confd, n)) for n in names if n != own]
+if os.path.isfile(etc + "/cloud.cfg"):
+    sources.append((None, etc + "/cloud.cfg"))
+configs = [(n, load(path)) for n, path in sources]
+
+lists = {}
+for key in KEYS:
+    for name, cfg in configs:
+        if key in cfg:
+            break
+    else:
+        continue
+    entries = cfg[key]
+    if not isinstance(entries, list):
+        continue
+    kept = [e for e in entries if module(e) != "update_etc_hosts"]
+    if len(kept) == len(entries):
+        continue
+    if name is not None and name > own:
+        sys.exit("%s/%s sets %s after %s, so update_etc_hosts cannot be "
+                 "dropped from it" % (confd, name, key, own))
+    lists[key] = kept
+if lists:
+    print("# the module lists of cloud-init, without update_etc_hosts")
+    print(yaml.safe_dump(lists, default_flow_style=False, sort_keys=False),
+          end="")
+'
 
 if [ -f "$root/etc/hosts" ]; then
     replace "$root/etc/hosts" awk -v old="$old" -v olds="$old_short" \
@@ -205,9 +282,31 @@ if [ -d "$root/etc/cloud" ]; then
     # Every manage_etc_hosts mode -- true, template, localhost -- writes
     # /etc/hosts through update_etc_hosts, taking the name from the
     # template's user-data, which outranks any drop-in. So the module leaves
-    # this clone's list; its /etc/hosts was set above.
-    if [ -f "$root/etc/cloud/cloud.cfg" ]; then
-        replace "$root/etc/cloud/cloud.cfg" awk "$MODULES_AWK"
+    # this clone's module lists; its /etc/hosts was set above. The lists go
+    # in the drop-in, not cloud.cfg: that is a distro conffile, and editing
+    # YAML by line is not safe. Without cloud-init installed there is nothing
+    # to stop.
+    ci=
+    for candidate in "$root/usr/bin/cloud-init" "$root/bin/cloud-init" \
+            "$root/usr/local/bin/cloud-init"; do
+        if [ -f "$candidate" ]; then ci=$candidate; break; fi
+    done
+    if [ -n "$ci" ]; then
+        IFS= read -r shebang < "$ci" || fail "cannot read $ci"
+        case $shebang in
+            '#!'*) ;;
+            *) fail "cannot tell which interpreter runs $ci" ;;
+        esac
+        set -f
+        # shellcheck disable=SC2086  # split into interpreter and its options
+        set -- ${shebang#??}
+        set +f
+        [ $# -gt 0 ] && [ -x "$root$1" ] ||
+            fail "cloud-init's interpreter ${1:-?} is missing"
+        interpreter="$root$1"; shift
+        "$interpreter" "$@" -c "$MODULES_PY" "$root" "${dropin##*/}" \
+            >> "$root@DROPIN@" ||
+            fail "cannot drop update_etc_hosts from cloud-init's module lists"
     fi
 fi
 exit 0
@@ -575,15 +674,29 @@ class CloneVM:
         handles the distro-specific files (/etc/hostname everywhere, plus the
         likes of /etc/sysconfig/network) and writes a dotted name as given.
         """
-        staging_dir = tempfile.mkdtemp(
-            prefix=f'boxman-hostname-{self.new_vm_name}-')
+        # rendered first: a ConfigError is not an operational failure, and
+        # nothing is staged yet to clean up after it
+        content = render_hostname_script(hostname)
+        # only the host's disk fails operationally here; typed, it reaches
+        # the clone policy (see generate_ssh_host_keys)
+        try:
+            staging_dir = tempfile.mkdtemp(
+                prefix=f'boxman-hostname-{self.new_vm_name}-')
+        except OSError as exc:
+            raise CloneSanitizerError(
+                f"could not create a staging directory for vm "
+                f"{self.new_vm_name}'s rename script: {exc}") from exc
         try:
             script = os.path.join(staging_dir, HOSTNAME_SCRIPT)
             with open(script, 'w') as handle:
-                handle.write(render_hostname_script(hostname))
+                handle.write(content)
             os.chmod(script, 0o755)
-        except Exception:
+        except BaseException as exc:
             shutil.rmtree(staging_dir, ignore_errors=True)
+            if isinstance(exc, OSError):
+                raise CloneSanitizerError(
+                    f"could not write vm {self.new_vm_name}'s rename "
+                    f"script: {exc}") from exc
             raise
         return ['--run', script, '--hostname', hostname], staging_dir
 

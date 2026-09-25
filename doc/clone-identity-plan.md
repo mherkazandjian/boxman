@@ -228,13 +228,22 @@ F13, F14 and F16 are why.
     `localhost`;
   - when `/etc/cloud` exists, writes `cloud.cfg.d/99-boxman-hostname.cfg` with
     `preserve_hostname: true` plus `hostname` and `fqdn` (quoted, so `no` or
-    `123` stay strings), and comments `update_etc_hosts` out of `cloud.cfg`'s
-    module list, in whichever form it is listed;
-  - rewrites each file through a temporary copy beside its real target that
+    `123` stay strings); when cloud-init is installed, it also re-declares
+    there every module list that names `update_etc_hosts`, without it. The
+    lists are resolved as cloud-init resolves them (`util.read_conf_with_confd`:
+    the `cloud.cfg.d` files, highest-sorting name first, then `cloud.cfg`; the
+    first file to set a key wins, and a list is taken whole), by cloud-init's
+    own interpreter, found from the shebang of `cloud-init`, so its PyYAML is
+    there. `cloud.cfg` itself, a distro conffile, is not touched. A drop-in
+    that sorts after boxman's and names the module would outrank it, so it
+    fails the pass;
+  - rewrites `/etc/hosts` through a temporary copy beside its real target that
     keeps the original's owner and mode, renamed into place only once written
-    in full; any failure exits non-zero, which `virt-sysprep --run` reports,
-    so a failed rename is an identity-pass failure under the policy rather than
-    a silent success with a truncated `/etc/hosts`.
+    in full; a symlinked target that cannot be resolved, or an `/etc/hostname`
+    that is there but cannot be read, fails before anything is written. Any
+    failure exits non-zero, which `virt-sysprep --run` reports, so a failed
+    rename is an identity-pass failure under the policy rather than a silent
+    success with a truncated `/etc/hosts`.
 - **Why disable `update_etc_hosts`**: every `manage_etc_hosts` mode — `true`,
   `template` and `localhost` — writes `/etc/hosts` through that one module, on
   *every* boot, taking the name from the template's user-data, which outranks
@@ -242,20 +251,31 @@ F13, F14 and F16 are why.
   `manage_etc_hosts: true`. The file was set when the clone was made, so the
   module has nothing left to do. The first build instead gave cloud-init's
   `hosts.*.tmpl` the literal name; the Codex review found that `localhost` mode
-  bypasses those templates and wrote the template's name back. Rejected
-  alternatives: that template edit; a fresh NoCloud seed per clone (a new
-  instance-id re-runs every per-instance module of the template's user-data on
-  every clone, and does nothing for a sealed template).
+  bypasses those templates and wrote the template's name back. Its second
+  review found the next implementation -- commenting the entry out of
+  `cloud.cfg` with awk -- missed valid YAML forms (flow lists, quoted or
+  commented entries, block pairs), broke a multi-line entry into invalid YAML,
+  and could rewrite look-alike text elsewhere in the file; hence the drop-in,
+  written with a YAML library. Rejected alternatives: the template edit and the
+  line edit; a fresh NoCloud seed per clone (a new instance-id re-runs every
+  per-instance module of the template's user-data on every clone, and does
+  nothing for a sealed template). Not covered: a template whose *user-data*
+  sets the module lists itself, since user-data outranks every drop-in.
 - **When it matters, and verified**: on a clone of a template built by the
   current code cloud-init does not run at all: the template's NoCloud seed is
   ejected at build time, so ds-identify finds no datasource and disables it.
   It runs when a clone has one: a template built before that eject, whose
   clones share its `seed.iso`, or a seed attached by hand. Checked on an
-  Ubuntu 24.04 clone with a NoCloud seed inserted, in `true` mode under the
-  template's instance-id and in `localhost` mode under a fresh one: with the
-  module commented out `/etc/hosts` was untouched and the name stayed the
-  clone's; re-enabling the module brought `127.0.1.1 alpha hello-cloudinit`
-  back in both modes.
+  Ubuntu 24.04 clone (cloud-init 24.1) with a NoCloud seed inserted, in `true`
+  mode under the template's instance-id and in `localhost` mode under a fresh
+  one: with the drop-in's module lists, `update_etc_hosts` did not run,
+  `/etc/hosts` was untouched and the name stayed the clone's; removing those
+  lists brought `127.0.1.1 alpha hello-cloudinit` back in both modes.
+  cloud-init's own loader (`read_conf_with_confd`) reports the module gone
+  from all three lists on that clone and on a sealed Rocky 9.8 clone
+  (cloud-init 24.4), where the interpreter came from the same shebang;
+  `dpkg -V` reports `cloud.cfg` unmodified, and the Rocky clone's file is
+  byte-for-byte its template's.
 - **Validation**: `hostname_problem()` in `src/boxman/utils/hostnames.py` — RFC
   1123 labels, 253 characters in total, a dotted value written as given,
   booleans and numbers refused. It runs at config time in a new

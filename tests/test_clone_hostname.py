@@ -223,7 +223,7 @@ class TestIntegrationNameCheck:
         def ssh(ssh_config, host, command):
             if command == boxes.GUEST_NAME_PROBE:
                 return SimpleNamespace(stdout="vm1\n")
-            assert "getent hosts tmpl" in command
+            assert "getent hosts -- tmpl" in command
             return SimpleNamespace(stdout=resolver_output)
 
         with patch.object(boxes, "ssh_cmd", side_effect=ssh):
@@ -250,6 +250,22 @@ class TestIntegrationNameCheck:
     def test_no_status_at_all_fails(self):
         with pytest.raises(AssertionError, match="could not check"):
             self._check("")
+
+    @pytest.mark.parametrize("bare", ["0\n", "2\n"])
+    def test_a_bare_status_without_the_marker_fails(self, bare):
+        """Round 2's F3: an unmarked number is not proof getent ran."""
+        with pytest.raises(AssertionError, match="could not check"):
+            self._check(bare)
+
+    @pytest.mark.skipif(shutil.which("getent") is None, reason="needs getent")
+    def test_an_option_like_name_is_looked_up_not_obeyed(self):
+        """Round 2's F6: `getent hosts --help` printed its usage and exited
+        0, which read as a completed lookup."""
+        import shlex
+        inner = shlex.split(boxes.resolve_probe("--help"))[0]
+        result = subprocess.run(["sh", "-c", inner], capture_output=True,
+                                text=True, check=False)
+        assert result.stdout.splitlines() == ["getent-status=2"]
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +351,36 @@ class TestHostnameInvocation:
         assert not Path(staged).exists()
 
 
+class TestHostnameStagingFailures:
+    """Writing the rename script to the host's disk can fail operationally;
+    that must reach the clone policy typed, with nothing left behind."""
+
+    @pytest.mark.parametrize("target", [
+        "boxman.providers.libvirt.clone_vm.tempfile.mkdtemp",
+        "boxman.providers.libvirt.clone_vm.os.chmod",
+    ])
+    def test_a_disk_failure_is_typed(self, tmp_path, target):
+        import errno
+        import glob
+        import tempfile
+        vm = _only_hostname(tmp_path)
+        with patch(target, side_effect=OSError(errno.ENOSPC, "No space left")):
+            with pytest.raises(CloneSanitizerError, match="No space left") as caught:
+                vm.stage_hostname("node01")
+        assert isinstance(caught.value.__cause__, OSError)
+        assert glob.glob(os.path.join(
+            tempfile.gettempdir(), f"boxman-hostname-{vm.new_vm_name}-*")) == []
+
+    def test_an_invalid_name_is_a_config_error_and_stages_nothing(self, tmp_path):
+        import glob
+        import tempfile
+        vm = _only_hostname(tmp_path)
+        with pytest.raises(ConfigError):
+            vm.stage_hostname("-bad")
+        assert glob.glob(os.path.join(
+            tempfile.gettempdir(), f"boxman-hostname-{vm.new_vm_name}-*")) == []
+
+
 class TestHostnamePolicy:
 
     def test_auto_records_a_degradation_naming_the_hostname(self, tmp_path):
@@ -379,10 +425,54 @@ def _guest(tmp_path: Path, hostname: str, hosts: str | None,
         (root / "etc/hosts").write_text(hosts)
     if cloud or hosts_template is not None:
         (root / "etc/cloud").mkdir()
+        _install_cloud_init(root)
     if hosts_template is not None:
         (root / "etc/cloud/templates").mkdir()
         (root / "etc/cloud/templates/hosts.debian.tmpl").write_text(hosts_template)
     return root
+
+
+def _install_cloud_init(root: Path, shebang: str = "#!/usr/bin/python3 -s") -> None:
+    """A stand-in for the guest's cloud-init: only its shebang is read, to
+    find the interpreter (with PyYAML) that cloud-init itself runs on."""
+    import sys
+    (root / "usr/bin").mkdir(parents=True, exist_ok=True)
+    python = root / "usr/bin/python3"
+    if not python.exists():
+        python.symlink_to(sys.executable)
+    (root / "usr/bin/cloud-init").write_text(shebang + "\n")
+
+
+def _effective_modules(root: Path) -> dict:
+    """The module lists cloud-init would use: the cloud.cfg.d files, the
+    highest-sorting name first, then cloud.cfg; the first to set a key wins
+    (util.read_conf_with_confd, checked against cloud-init 25.1)."""
+    import yaml
+    confd = root / "etc/cloud/cloud.cfg.d"
+    files = sorted((f for f in confd.glob("*.cfg")), key=lambda f: f.name,
+                   reverse=True) if confd.is_dir() else []
+    cfg = root / "etc/cloud/cloud.cfg"
+    if cfg.is_file():
+        files.append(cfg)
+    lists: dict = {}
+    for path in files:
+        data = yaml.safe_load(path.read_text()) or {}
+        for key in ("cloud_init_modules", "cloud_config_modules",
+                    "cloud_final_modules"):
+            if key in data and key not in lists:
+                lists[key] = data[key]
+    return lists
+
+
+def _module_names(entries) -> list:
+    out = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            entry = entry["name"]
+        elif isinstance(entry, list):
+            entry = entry[0]
+        out.append(entry.strip())
+    return out
 
 
 def _run(root: Path, name: str) -> None:
@@ -579,34 +669,178 @@ class TestRenameScript:
         assert (root / "etc/hosts").read_bytes() == (
             b"::1 node01\r\n127.0.0.1 localhost\r\n")
 
-    @pytest.mark.parametrize("address", ["0:0:0:0:0:0:0:1", "::0001", "0::1"])
+    @pytest.mark.parametrize("address", [
+        "0:0:0:0:0:0:0:1", "::0001", "0::1",
+        "::0.0.0.1", "0:0:0:0:0:0:0.0.0.1",
+    ])
     def test_expanded_ipv6_loopback_spellings_are_loopback(self, tmp_path, address):
-        """R4: only the abbreviated ::1 was recognised."""
+        """R4, and round 2's F5: only the abbreviated ::1 was recognised,
+        then no spelling with a dotted tail."""
         root = _guest(tmp_path, "oldbox", f"{address} oldbox\n")
         _run(root, "node01")
         assert _hosts(root) == [f"{address} node01"]
 
-    @pytest.mark.parametrize("entry", [
-        " - update_etc_hosts",
-        "  - update-etc-hosts",
-        " - [update_etc_hosts, always]",
-        " - [ update_etc_hosts ]",
-        ' - "update_etc_hosts"',
-    ])
-    def test_cloud_init_stops_managing_etc_hosts(self, tmp_path, entry):
-        """R7: every manage_etc_hosts mode goes through update_etc_hosts, and
-        user-data outranks any drop-in -- so the clone's module list drops it.
-        The file must stay valid YAML, with every other module untouched."""
+    @pytest.mark.parametrize("address", ["::1.0.0.1", "::ffff:0.0.0.1", "::11"])
+    def test_other_ipv6_addresses_are_not_loopback(self, tmp_path, address):
+        root = _guest(tmp_path, "oldbox", f"{address} oldbox\n")
+        _run(root, "node01")
+        assert _hosts(root) == [f"{address} oldbox", "127.0.1.1 node01"]
+
+    def test_an_unresolvable_symlink_fails_and_touches_nothing(self, tmp_path):
+        """Round 2's F2: without readlink the link was renamed over, turning
+        it into a plain file and leaving its real target stale."""
+        import shutil as sh
+        root = _guest(tmp_path, "oldbox", None)
+        (root / "etc/hosts.real").write_text("127.0.1.1 oldbox\n")
+        (root / "etc/hosts").symlink_to("hosts.real")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        for tool in ("head", "tr", "mktemp", "cp", "mv", "rm", "awk", "mkdir"):
+            (bin_dir / tool).symlink_to(sh.which(tool))
+        script = root.parent / HOSTNAME_SCRIPT
+        script.write_text(render_hostname_script("node01"))
+        script.chmod(0o755)
+        result = subprocess.run(
+            [str(script)], capture_output=True, text=True, check=False,
+            env={"PATH": str(bin_dir), "BOXMAN_GUEST_ROOT": str(root)})
+        assert result.returncode != 0
+        assert (root / "etc/hosts").is_symlink()
+        assert (root / "etc/hosts.real").read_text() == "127.0.1.1 oldbox\n"
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+    def test_an_unreadable_hostname_file_fails_before_any_write(self, tmp_path):
+        """Round 2's F4: the read error was swallowed by the pipeline, the
+        template's name read as empty, and the edits ran anyway."""
+        root = _guest(tmp_path, "oldbox", "::1 oldbox\n", cloud=True)
+        (root / "etc/hostname").chmod(0o000)
+        try:
+            result = _run_raw(root, "node01")
+        finally:
+            (root / "etc/hostname").chmod(0o644)
+        assert result.returncode != 0
+        assert (root / "etc/hosts").read_text() == "::1 oldbox\n"
+        assert not (root / CLOUD_INIT_HOSTNAME_DROPIN.lstrip("/")).exists()
+
+    @pytest.mark.parametrize("modules, kept", [
+        ("cloud_init_modules:\n - seed_random\n - update_etc_hosts\n - ca_certs\n",
+         ["seed_random", "ca_certs"]),
+        ("cloud_init_modules:\n  - update-etc-hosts\n  - ca_certs\n", ["ca_certs"]),
+        ("cloud_init_modules:\n - [update_etc_hosts, always]\n - ca_certs\n",
+         ["ca_certs"]),
+        ("cloud_init_modules:\n - 'update_etc_hosts'\n - ca_certs\n", ["ca_certs"]),
+        ("cloud_init_modules:\n - update_etc_hosts # keep hosts current\n"
+         " - ca_certs\n", ["ca_certs"]),
+        ("cloud_init_modules:\n - - update_etc_hosts\n   - always\n - ca_certs\n",
+         ["ca_certs"]),
+        ("cloud_init_modules: [seed_random, update_etc_hosts, ca_certs]\n",
+         ["seed_random", "ca_certs"]),
+        ("cloud_init_modules:\n - [update_etc_hosts,\n    always]\n - ca_certs\n",
+         ["ca_certs"]),
+        ("cloud_init_modules:\n - {name: update_etc_hosts, frequency: always}\n"
+         " - ca_certs\n", ["ca_certs"]),
+        ("cloud_init_modules:\n - cc_update_etc_hosts\n - update_etc_hosts.py\n"
+         " - ca_certs\n", ["ca_certs"]),
+    ], ids=["plain", "dashed", "pair", "quoted", "comment", "block-pair",
+            "flow-list", "multiline-flow", "dict", "prefixed"])
+    def test_cloud_init_stops_managing_etc_hosts(self, tmp_path, modules, kept):
+        """R7, and round 2's F1: every manage_etc_hosts mode goes through
+        update_etc_hosts, and user-data outranks any drop-in -- so the module
+        leaves the lists cloud-init will use, in any valid YAML form. The
+        lists are re-declared in the drop-in; cloud.cfg is not touched."""
         import yaml
-        cfg = ("cloud_init_modules:\n - seed_random\n" + entry +
-               "\n - ca_certs\ncloud_config_modules:\n - runcmd\n")
+        cfg = modules + "cloud_config_modules:\n - runcmd\n"
         root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
         (root / "etc/cloud/cloud.cfg").write_text(cfg)
         _run(root, "node01")
-        data = yaml.safe_load((root / "etc/cloud/cloud.cfg").read_text())
-        flat = [m if isinstance(m, str) else m[0] for m in data["cloud_init_modules"]]
-        assert flat == ["seed_random", "ca_certs"]
-        assert data["cloud_config_modules"] == ["runcmd"]
+        assert (root / "etc/cloud/cloud.cfg").read_text() == cfg
+        yaml.safe_load(
+            (root / CLOUD_INIT_HOSTNAME_DROPIN.lstrip("/")).read_text())
+        lists = _effective_modules(root)
+        assert _module_names(lists["cloud_init_modules"]) == kept
+        assert lists["cloud_config_modules"] == ["runcmd"]
+
+    def test_unrelated_yaml_is_never_edited(self, tmp_path):
+        """F1: a write_files payload that looks like a module entry."""
+        cfg = ("cloud_init_modules:\n - update_etc_hosts\n"
+               "write_files:\n - path: /etc/motd\n   content: |\n"
+               "     - update_etc_hosts\n")
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "etc/cloud/cloud.cfg").write_text(cfg)
+        _run(root, "node01")
+        assert (root / "etc/cloud/cloud.cfg").read_text() == cfg
+        assert _effective_modules(root)["cloud_init_modules"] == []
+
+    def test_a_lower_drop_in_list_is_the_one_filtered(self, tmp_path):
+        """A drop-in sorting before boxman's already replaced cloud.cfg's
+        list; that is the list cloud-init uses, so that is the one kept."""
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "etc/cloud/cloud.cfg").write_text(
+            "cloud_init_modules:\n - seed_random\n")
+        confd = root / "etc/cloud/cloud.cfg.d"
+        confd.mkdir()
+        (confd / "50-site.cfg").write_text(
+            "cloud_init_modules:\n - update_etc_hosts\n - ca_certs\n")
+        _run(root, "node01")
+        assert _effective_modules(root)["cloud_init_modules"] == ["ca_certs"]
+
+    def test_a_higher_drop_in_naming_the_module_fails(self, tmp_path):
+        """It would outrank boxman's lists, so the module would stay on."""
+        root = _guest(tmp_path, "oldbox", "127.0.1.1 oldbox\n", cloud=True)
+        confd = root / "etc/cloud/cloud.cfg.d"
+        confd.mkdir()
+        (confd / "99_zz-site.cfg").write_text(
+            "cloud_init_modules:\n - update_etc_hosts\n")
+        result = _run_raw(root, "node01")
+        assert result.returncode != 0
+        assert "99_zz-site.cfg" in result.stderr
+
+    def test_a_higher_drop_in_without_the_module_is_fine(self, tmp_path):
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "etc/cloud/cloud.cfg").write_text(
+            "cloud_init_modules:\n - update_etc_hosts\n")
+        confd = root / "etc/cloud/cloud.cfg.d"
+        confd.mkdir()
+        (confd / "99_zz-site.cfg").write_text("cloud_init_modules:\n - ca_certs\n")
+        _run(root, "node01")
+        assert _effective_modules(root)["cloud_init_modules"] == ["ca_certs"]
+
+    def test_lists_without_the_module_are_not_redeclared(self, tmp_path):
+        import yaml
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "etc/cloud/cloud.cfg").write_text(
+            "cloud_init_modules:\n - seed_random\n")
+        _run(root, "node01")
+        data = yaml.safe_load(
+            (root / CLOUD_INIT_HOSTNAME_DROPIN.lstrip("/")).read_text())
+        assert "cloud_init_modules" not in data
+
+    def test_without_cloud_init_installed_no_lists_are_written(self, tmp_path):
+        """A leftover /etc/cloud with no cloud-init: nothing can rewrite
+        /etc/hosts, so there is nothing to stop."""
+        import yaml
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "usr/bin/cloud-init").unlink()
+        (root / "etc/cloud/cloud.cfg").write_text(
+            "cloud_init_modules:\n - update_etc_hosts\n")
+        _run(root, "node01")
+        data = yaml.safe_load(
+            (root / CLOUD_INIT_HOSTNAME_DROPIN.lstrip("/")).read_text())
+        assert "cloud_init_modules" not in data
+
+    def test_a_missing_interpreter_fails(self, tmp_path):
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "usr/bin/cloud-init").write_text("#!/usr/libexec/platform-python\n")
+        (root / "etc/cloud/cloud.cfg").write_text(
+            "cloud_init_modules:\n - update_etc_hosts\n")
+        result = _run_raw(root, "node01")
+        assert result.returncode != 0
+        assert "platform-python" in result.stderr
+
+    def test_an_unreadable_config_fails(self, tmp_path):
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "etc/cloud/cloud.cfg").write_text(
+            "cloud_init_modules: [update_etc_hosts\n")
+        assert _run_raw(root, "node01").returncode != 0
 
     def test_hosts_templates_are_no_longer_edited(self, tmp_path):
         """R7 replaces the template edit: with the module off, it is moot."""

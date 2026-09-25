@@ -17,6 +17,7 @@ import base64
 import glob
 import hashlib
 import os
+import shlex
 import time
 
 import invoke
@@ -295,19 +296,22 @@ GUEST_NAME_PROBE = "'hostnamectl --static 2>/dev/null || cat /etc/hostname'"
 #: Changes on every boot, so a reboot that silently did not happen is caught.
 BOOT_ID_PROBE = "cat /proc/sys/kernel/random/boot_id"
 
-#: getent's exit statuses that mean the lookup ran: found, and not found.
-GETENT_ANSWERED = ("0", "2")
+#: The probe's last line when getent answered: found, and not found.
+GETENT_ANSWERED = ("getent-status=0", "getent-status=2")
 
 
 def resolve_probe(name):
     """A guest command that looks *name* up and prints getent's exit status.
 
     The status is printed, not returned: ssh_cmd retries any non-zero exit,
-    and a name that does not resolve is the answer hoped for here.
+    and a name that does not resolve is the answer hoped for here. ``--``
+    ends getent's options, so a name such as ``--help`` is looked up rather
+    than obeyed; the whole command is quoted once more for the remote shell.
     """
-    return ("'if command -v getent >/dev/null; then "
-            f"getent hosts {name}; echo getent-status=$?; "
-            "else echo getent-status=missing; fi'")
+    inner = ("if command -v getent >/dev/null; then "
+             f"getent hosts -- {shlex.quote(name)}; echo getent-status=$?; "
+             "else echo getent-status=missing; fi")
+    return shlex.quote(inner)
 
 
 def resolved_lines(output, host, name):
@@ -318,7 +322,7 @@ def resolved_lines(output, host, name):
     """
     lines = output.splitlines()
     status = lines.pop().strip() if lines else ""
-    assert status.removeprefix("getent-status=") in GETENT_ANSWERED, (
+    assert status in GETENT_ANSWERED, (
         f"{host}: could not check whether {name!r} still resolves: "
         f"{status or 'the probe printed nothing'}")
     return [line for line in lines if line.strip()]
