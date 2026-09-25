@@ -52,10 +52,10 @@ workspace:
 
 templates:
   template1:
-    name: rocky-9.7-minimal-base-template-cloudinit
+    name: rocky-9.8-minimal-base-template-cloudinit
     image:
-      uri: https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base-9.7-20251123.2.x86_64.qcow2
-      checksum: sha256:15d81d3434b298142b2fdd8fb54aef2662684db5c082cc191c3c79762ed6360c
+      uri: https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base-9.8-20260525.0.x86_64.qcow2
+      checksum: sha256:92c206cc6f790c61583247eefe87890f8828420662c17cacf247cec78ab4eec8
     disk_size: 20G
     os_variant: rocky9
     memory: 2048
@@ -126,7 +126,7 @@ templates:
 
 clusters:
   cluster_1:
-    base_image: rocky-9.7-minimal-base-template-cloudinit
+    base_image: rocky-9.8-minimal-base-template-cloudinit
     proxy_host: localhost
     admin_user: admin
     admin_pass: {{ env("BOXMAN_ADMIN_PASS", default="boxman") }}

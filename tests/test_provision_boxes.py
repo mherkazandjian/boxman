@@ -13,7 +13,9 @@ Usage:
     make test-provision verbose=1                                # verbose
 """
 
+import base64
 import glob
+import hashlib
 import os
 import time
 
@@ -21,6 +23,7 @@ import invoke
 import pytest
 import yaml
 
+from boxman.providers.libvirt.clone_vm import SSH_HOST_KEY_TYPES
 from boxman.utils.jinja_env import create_jinja_env
 
 # ---------------------------------------------------------------------------
@@ -179,6 +182,70 @@ def get_os_id_for_vm(config, cluster_cfg, vm_cfg):
     return get_os_id(config)
 
 
+#: Printed by the guest, one line per host key that exists:
+#: ``KEY <type> <owner>:<mode> <fingerprint>``. Single-quoted as a whole so
+#: the local shell leaves the ``$(...)`` for the guest to expand, and free of
+#: inner single quotes for the same reason.
+HOST_KEY_PROBE = (
+    "'for t in " + " ".join(SSH_HOST_KEY_TYPES) + "; do "
+    "f=/etc/ssh/ssh_host_${t}_key; "
+    "if [ -f $f ]; then "
+    "echo KEY $t $(stat -c %U:%a $f) "
+    "$(ssh-keygen -lf $f.pub | cut -d\" \" -f2); "
+    "fi; done'"
+)
+
+
+def get_base_image(cluster_cfg, vm_cfg):
+    """The template a VM is cloned from (VM-level overrides cluster-level)."""
+    return vm_cfg.get("base_image") or cluster_cfg.get("base_image")
+
+
+def ssh_pubkey_fingerprint(pubkey_line):
+    """``SHA256:...`` for an authorized-keys style line, as ssh-keygen -l prints it.
+
+    Computed here rather than by piping virt-cat into ``ssh-keygen -lf -``:
+    a pipeline reports the *last* command's exit status, so a failed virt-cat
+    would look like a success with empty output.
+    """
+    parts = pubkey_line.split()
+    if len(parts) < 2:
+        return None
+    try:
+        blob = base64.b64decode(parts[1], validate=True)
+    except Exception:
+        return None
+    digest = base64.b64encode(hashlib.sha256(blob).digest()).decode()
+    return "SHA256:" + digest.rstrip("=")
+
+
+def template_host_key_fingerprints(base_image):
+    """Fingerprints of *base_image*'s own host keys, read offline.
+
+    Tries virt-cat unprivileged first, then under ``sudo -n``: libguestfs
+    talks to the session libvirt URI by default, which cannot see a
+    system-URI template domain.
+
+    Returns an empty dict when the template disk cannot be read at all — the
+    hypervisor may have no libguestfs tools, or no passwordless access. The
+    caller reports that rather than passing quietly, because an empty dict
+    makes the clone-vs-template comparison vacuous.
+    """
+    for prefix in ("", "sudo -n "):
+        fingerprints = {}
+        for key_type in SSH_HOST_KEY_TYPES:
+            pub = f"/etc/ssh/ssh_host_{key_type}_key.pub"
+            result = _run(f"{prefix}virt-cat -d {base_image} {pub}", warn=True)
+            if not result.ok or not result.stdout.strip():
+                continue
+            fingerprint = ssh_pubkey_fingerprint(result.stdout.strip())
+            if fingerprint:
+                fingerprints[key_type] = fingerprint
+        if fingerprints:
+            return fingerprints
+    return {}
+
+
 def get_expected_vcpus(vm_cfg):
     """Compute expected vCPU count from sockets × cores × threads."""
     cpus = vm_cfg.get("cpus", {})
@@ -252,6 +319,96 @@ class TestProvisionBox:
             assert "ok" in result.stdout, (
                 f"SSH echo failed on {host}: {result.stdout}"
             )
+
+    # -- Clone identity: ssh host keys (#201) -------------------------------
+
+    def test_ssh_host_keys_are_fresh_and_unique(self, provisioned_box):
+        """No clone may present its template's ssh host keys.
+
+        virt-clone copies /etc/ssh/ssh_host_* verbatim, so before
+        ``clone_ssh_host_keys`` every clone of one template shared its host
+        keys: two clones were indistinguishable by key, and root on either
+        held the private keys of both. Three things are checked per VM, on the
+        running guest rather than on its disk, so a key that sshd would refuse
+        still fails the test:
+
+        * every host key is owned by root with mode 0600 -- libguestfs
+          uploads preserve the *source* file's ownership, so this is what
+          catches a missing ``--chown``;
+        * no fingerprint repeats across the VMs of one box;
+        * no fingerprint matches the template's, where the template disk can
+          be read offline.
+        """
+        config = provisioned_box
+        seen = {}
+        template_fingerprints = {}
+        checked = 0
+        # Freshness needs evidence per vm: every key type compared against
+        # its template. A sibling clone is not evidence -- two clones whose
+        # keys differ show they differ, not that either is new: one can keep
+        # every template key beside a sibling that got fresh ones. Without
+        # the comparison the checks below pass for inherited keys too.
+        unproven = []
+
+        for cluster_name, vm_name, vm_cfg in iter_vms(config):
+            cluster_cfg = config["clusters"][cluster_name]
+            ssh_config = get_ssh_config_path(config, cluster_name)
+            host = get_ssh_host(cluster_name, vm_name, vm_cfg)
+
+            result = ssh_cmd(ssh_config, host, HOST_KEY_PROBE)
+            lines = [
+                line.split() for line in result.stdout.splitlines()
+                if line.startswith("KEY ")
+            ]
+            assert lines, (
+                f"no ssh host keys found on {host}; sshd cannot be running "
+                f"with a valid host key")
+            # the pass installs every type, so a missing one means it did not
+            # run -- checking only the keys that happen to exist would let a
+            # clone holding a single fresh key pass
+            present = sorted(line[1] for line in lines)
+            assert present == sorted(SSH_HOST_KEY_TYPES), (
+                f"{host}: host key types {present}, expected "
+                f"{sorted(SSH_HOST_KEY_TYPES)}")
+
+            base_image = get_base_image(cluster_cfg, vm_cfg)
+            if base_image and base_image not in template_fingerprints:
+                template_fingerprints[base_image] = (
+                    template_host_key_fingerprints(base_image))
+
+            for _marker, key_type, ownership, fingerprint in lines:
+                assert ownership == "root:600", (
+                    f"{host}: /etc/ssh/ssh_host_{key_type}_key is "
+                    f"{ownership}, expected root:600 -- sshd refuses a host "
+                    f"key it does not own privately")
+
+                if fingerprint in seen:
+                    other_host, other_type = seen[fingerprint]
+                    pytest.fail(
+                        f"{host} and {other_host} share their {key_type}/"
+                        f"{other_type} host key ({fingerprint}): the clones "
+                        f"kept their template's keys")
+                seen[fingerprint] = (host, key_type)
+
+                template = template_fingerprints.get(base_image, {})
+                if key_type in template:
+                    assert fingerprint != template[key_type], (
+                        f"{host}: its {key_type} host key is still the "
+                        f"template's ({fingerprint})")
+                checked += 1
+
+            template = template_fingerprints.get(base_image, {})
+            if not all(line[1] in template for line in lines):
+                unproven.append(host)
+
+        assert checked, "no ssh host keys were checked on any vm"
+        if unproven:
+            # every assertion above held, but none of them could tell a fresh
+            # key from an inherited one on these vms: report that, not a pass
+            pytest.skip(
+                f"no freshness evidence for {', '.join(unproven)}: the "
+                f"template's host keys could not all be read offline "
+                f"(virt-cat); uniqueness across the box was checked")
 
     # -- OS release ---------------------------------------------------------
 
