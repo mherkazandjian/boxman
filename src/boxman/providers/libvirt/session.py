@@ -1,4 +1,6 @@
+import json
 import os
+import shlex
 import tempfile
 import time
 from multiprocessing import Process, Queue
@@ -16,7 +18,7 @@ from ..session_base import SessionConfigMixin
 from . import net_reconcile
 from .cdrom import CDROMManager
 from .clone_vm import CloneVM
-from .commands import VirshCommand
+from .commands import LibVirtCommandBase, VirshCommand
 from .destroy_vm import DestroyVM, shutdown_and_wait
 from .disk import DiskManager
 from .disk_cleanup import remove_vm_disks
@@ -781,6 +783,67 @@ class LibVirtSession(SessionConfigMixin):
         """
         destroyer = DestroyVM(name=name, provider_config=self.provider_config)
         return destroyer.confirm_absent()
+
+    def disk_paths_in_use(self) -> dict[str, str] | None:
+        """
+        Map every image file a defined domain uses to that domain's name.
+
+        Covers each domain's disk and CD-ROM sources and every layer of
+        their backing chains, as resolved paths, so a caller can tell
+        whether a file it is about to delete is still some domain's disk or
+        the base of one.
+
+        Fails closed: ``None`` when the domain list, any domain's block
+        devices or any backing chain cannot be read — a partial answer
+        would let a caller delete a file that is still in use.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        listing = virsh.execute("list", "--all", "--name", warn=True)
+        if not listing.ok:
+            return None
+        cmd = LibVirtCommandBase(provider_config=self.provider_config)
+        in_use: dict[str, str] = {}
+        for domain in (line.strip() for line in listing.stdout.splitlines()):
+            if not domain:
+                continue
+            blklist = virsh.execute(
+                "domblklist", domain, "--details", warn=True)
+            if not blklist.ok:
+                return None
+            for row in parse_domblklist(blklist.stdout):
+                if row.source in (None, '-'):
+                    continue
+                chain = self._backing_chain_files(cmd, row.source)
+                if chain is None:
+                    return None
+                for path in chain:
+                    in_use.setdefault(path, domain)
+        return in_use
+
+    @staticmethod
+    def _backing_chain_files(cmd, source: str) -> list[str] | None:
+        """
+        Resolved paths of *source* and every image below it, or ``None``
+        when ``qemu-img`` cannot read the chain. ``-U`` reads images a
+        running guest holds locked.
+        """
+        result = cmd.execute_shell(
+            f"qemu-img info --backing-chain --output=json -U "
+            f"{shlex.quote(source)}", warn=True)
+        if not result.ok:
+            return None
+        try:
+            chain = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(chain, dict):
+            chain = [chain]
+        paths = {os.path.realpath(source)}
+        for image in chain:
+            for key in ('filename', 'full-backing-filename'):
+                if image.get(key):
+                    paths.add(os.path.realpath(image[key]))
+        return sorted(paths)
 
     def start_vm(self, vm_name: str) -> bool:
         """

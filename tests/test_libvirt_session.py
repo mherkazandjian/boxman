@@ -493,3 +493,81 @@ class TestTemplateDisksPresent:
             virsh_cls.return_value.execute.return_value = _result(
                 stdout="not xml at all")
             assert s.template_disks_present("x") is True
+
+
+class TestDiskPathsInUse:
+    """What every defined domain uses, backing chains included -- the check
+    that keeps a removed VM's cleanup off another domain's disk (#207
+    review, finding 1). It fails closed: any unanswered query is None."""
+
+    BLK_A = (" Type   Device   Target   Source\n"
+             "------------------------------------\n"
+             " file   disk     vda      /ws/a.qcow2\n"
+             " file   cdrom    sda      -\n")
+    BLK_B = (" Type   Device   Target   Source\n"
+             "------------------------------------\n"
+             " file   disk     vda      /ws/b.top\n"
+             " file   cdrom    sdb      /iso/install.iso\n")
+    CHAIN = {
+        "/ws/a.qcow2": '{"filename": "/ws/a.qcow2"}',
+        "/ws/b.top": ('[{"filename": "/ws/b.top", '
+                      '"full-backing-filename": "/tpl/base.qcow2"}, '
+                      '{"filename": "/tpl/base.qcow2"}]'),
+        "/iso/install.iso": '{"filename": "/iso/install.iso"}',
+    }
+
+    def _run(self, virsh_results=None, chains=None):
+        virsh_results = virsh_results or {}
+        chains = self.CHAIN if chains is None else chains
+
+        def virsh_execute(*args, **kwargs):
+            if args[:2] in virsh_results:
+                return virsh_results[args[:2]]
+            if args[0] == "list":
+                return _result(stdout="vm-a\nvm-b\n")
+            return _result(stdout={"vm-a": self.BLK_A,
+                                   "vm-b": self.BLK_B}[args[1]])
+
+        def shell(command, **kwargs):
+            source = command.rsplit(" ", 1)[1].strip("'")
+            if source not in chains:
+                return _result(ok=False, stderr="Could not open")
+            return _result(stdout=chains[source])
+
+        s = _session({})
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh, \
+             patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
+            virsh.return_value.execute.side_effect = virsh_execute
+            cmd.return_value.execute_shell.side_effect = shell
+            return s.disk_paths_in_use(), cmd
+
+    def test_maps_sources_and_backing_files_to_their_domain(self):
+        in_use, cmd = self._run()
+        assert in_use == {
+            "/ws/a.qcow2": "vm-a",
+            "/ws/b.top": "vm-b",
+            "/tpl/base.qcow2": "vm-b",
+            "/iso/install.iso": "vm-b",
+        }
+        # a running guest holds its image locked: -U reads it anyway
+        assert all(" -U " in c.args[0]
+                   for c in cmd.return_value.execute_shell.call_args_list)
+
+    def test_none_when_the_domain_list_fails(self):
+        in_use, _ = self._run({("list", "--all"): _result(ok=False)})
+        assert in_use is None
+
+    def test_none_when_a_domain_cannot_be_inspected(self):
+        in_use, _ = self._run({("domblklist", "vm-b"): _result(ok=False)})
+        assert in_use is None
+
+    def test_none_when_a_chain_cannot_be_read(self):
+        chains = dict(self.CHAIN)
+        del chains["/ws/b.top"]
+        in_use, _ = self._run(chains=chains)
+        assert in_use is None
+
+    def test_none_when_qemu_img_output_is_not_json(self):
+        chains = dict(self.CHAIN, **{"/ws/a.qcow2": "garbage"})
+        in_use, _ = self._run(chains=chains)
+        assert in_use is None
