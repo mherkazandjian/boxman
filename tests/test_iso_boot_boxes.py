@@ -125,9 +125,11 @@ def _load_image_checker():
                          ids=[os.path.basename(d) for d in ISO_BOXES])
 def test_pinned_iso_urls_are_still_reachable(box_dir):
     """
-    The pinned URLs still resolve, probed without a download.
+    The pinned URLs still resolve to a non-empty image, probed without a download.
 
-    Uses the same probe as ``make check-box-images``. An operator-supplied
+    Uses the same probe as ``make check-box-images``, which reports a
+    response confirmed empty (204/205, ``Content-Length: 0``, no body) as an
+    error, but accepts one that simply omits the length. An operator-supplied
     placeholder is skipped there: ``talos-iso-boot`` boots an ISO Omni
     generates per instance, so it ships a marker (an all-zero checksum and
     ``placeholder`` in the uri) with nothing to reach.

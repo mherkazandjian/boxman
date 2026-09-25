@@ -11,15 +11,17 @@ boxman's Jinja2 helpers, collects each template ``image.uri`` and each
 ``isos:`` ``uri``, and probes every http(s) one without downloading it.
 
 A probe is a HEAD request that follows redirects. When the server answers
-HEAD with an error status, a one-byte ranged GET decides instead: some
-servers reject HEAD outright, and a wrong "dead" verdict costs someone a red
-CI run for nothing.
+HEAD with an error status, or advertises an empty image (204/205 or
+``Content-Length: 0``), a one-byte ranged GET decides instead: some servers
+reject HEAD outright or answer it inaccurately, and a wrong "dead" verdict
+costs someone a red CI run for nothing.
 
 Verdicts:
   ok           the image is there
   gone         404/410 -- the mirror removed it; update the uri and checksum
   unreachable  DNS failure, timeout, refused connection, TLS failure
-  error        any other error status (403, 5xx, ...) or a malformed url
+  error        any other error status (403, 5xx, ...), a malformed url, or
+               an image the ranged GET confirmed empty
   skipped      not http(s) (``oci://``, local paths), or an operator-supplied
                placeholder (an all-zero checksum, or "placeholder" in the uri)
 
@@ -72,6 +74,8 @@ UNREACHABLE = "unreachable"
 ERROR = "error"
 SKIPPED = "skipped"
 DEAD = (GONE, UNREACHABLE, ERROR)
+# the detail prefix of an ERROR for an image that exists but has no bytes
+EMPTY_IMAGE = "empty image"
 
 # what a probe can raise short of an HTTP status: URLError (DNS, refused,
 # TLS) and a bare TimeoutError are OSErrors; a mangled response is an
@@ -235,46 +239,90 @@ def collect_image_refs(config: dict, conf_path: str) -> list[ImageRef]:
 # ---------------------------------------------------------------------------
 
 
-class _RedirectKeepingHead(urllib.request.HTTPRedirectHandler):
+class _ProbeRedirectHandler(urllib.request.HTTPRedirectHandler):
     """
-    Follow redirects without turning a HEAD into a GET.
+    Follow redirects without turning a HEAD into a GET or leaking proxy credentials.
 
     urllib re-issues a redirected request as a plain GET, so a HEAD that hits
     a redirecting mirror would start streaming a multi-gigabyte image. Keep
     the method; the other headers (``Range`` included) are carried over by
     urllib already.
+
+    That carry-over includes ``Proxy-Authorization``, which urllib's
+    ProxyHandler adds as an ordinary header and keeps off the wire only when
+    tunnelling. A redirect from a proxied http mirror to a host reached
+    directly (an https CDN with no https proxy set, or a ``no_proxy`` host)
+    would hand that host the proxy password. Drop it from every redirected
+    request; the proxy handler adds it back when the destination is proxied.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and req.get_method() == "HEAD":
+        if new is None:
+            return None
+        if req.get_method() == "HEAD":
             new.method = "HEAD"
+        for hdrs in (new.headers, new.unredirected_hdrs):
+            for key in [k for k in hdrs if k.lower() == "proxy-authorization"]:
+                del hdrs[key]
         return new
 
 
 def build_opener(*handlers) -> urllib.request.OpenerDirector:
     """
-    An opener that follows redirects and keeps a HEAD a HEAD.
+    An opener that follows redirects, keeps a HEAD a HEAD, and does not
+    carry proxy credentials across a redirect.
 
     Extra *handlers* join the chain; the unit tests put a fake transport in
     front of the network that way.
     """
-    return urllib.request.build_opener(_RedirectKeepingHead, *handlers)
+    return urllib.request.build_opener(_ProbeRedirectHandler, *handlers)
 
 
 def is_http(uri: str) -> bool:
     return urllib.parse.urlsplit(str(uri)).scheme.lower() in ("http", "https")
 
 
+def _content_length(headers) -> int | None:
+    try:
+        return int(headers.get("Content-Length", ""))
+    except (TypeError, ValueError):
+        return None
+
+
 def _probe(opener, url: str, method: str, timeout: float, headers=None):
+    """
+    Send one request. Return its status, its url after redirects, and why the
+    response shows the image to be empty, or None when it does not.
+
+    A missing ``Content-Length`` proves nothing either way: valid responses
+    may omit it. A HEAD can only advertise emptiness; a GET settles it, and
+    one byte of body is enough to show the image is not empty.
+    """
     request = urllib.request.Request(
         url, method=method, headers={"User-Agent": USER_AGENT, **(headers or {})})
     with opener.open(request, timeout=timeout) as response:
-        return response.status, response.geturl()
+        status = response.status
+        if status in (204, 205):
+            empty = f"{status} {response.msg}".strip()
+        elif _content_length(response.headers) == 0:
+            empty = f"{status}, Content-Length: 0"
+        elif method == "GET" and not response.read(1):
+            empty = f"{status} with no body"
+        else:
+            empty = None
+        return status, response.geturl(), empty
 
 
 def _from_http_error(exc: urllib.error.HTTPError) -> UrlStatus:
     final_url = getattr(exc, "url", None) or exc.filename
+    if exc.code == 416:
+        # an unsatisfiable range is answered with `bytes */<length>`: the
+        # first byte being out of range means the image has no bytes at all
+        content_range = (exc.headers.get("Content-Range") or "") if exc.headers else ""
+        if content_range.rsplit("/", 1)[-1].strip() == "0":
+            return UrlStatus(ERROR, f"{EMPTY_IMAGE} (416, Content-Range: {content_range})",
+                             exc.code, final_url)
     detail = f"{exc.code} {exc.reason}".strip()
     state = GONE if exc.code in (404, 410) else ERROR
     return UrlStatus(state, detail, exc.code, final_url)
@@ -296,10 +344,12 @@ def check_url(url: str, timeout: float = DEFAULT_TIMEOUT, opener=None) -> UrlSta
         return UrlStatus(SKIPPED, "not an http(s) source")
     opener = opener or build_opener()
     try:
-        status, final_url = _probe(opener, url, "HEAD", timeout)
-        return UrlStatus(OK, str(status), status, final_url)
+        status, final_url, empty = _probe(opener, url, "HEAD", timeout)
+        if not empty:
+            return UrlStatus(OK, str(status), status, final_url)
+        head_said = f"HEAD answered {empty}"
     except urllib.error.HTTPError as exc:
-        head_code = exc.code
+        head_said = f"HEAD answered {exc.code}"
         exc.close()
     except _NETWORK_ERRORS as exc:
         # unreachable is unreachable; a GET would only wait out a second timeout
@@ -307,16 +357,19 @@ def check_url(url: str, timeout: float = DEFAULT_TIMEOUT, opener=None) -> UrlSta
     except ValueError as exc:
         return UrlStatus(ERROR, f"invalid url: {exc}")
 
-    # HEAD answered with an error status. Let a one-byte ranged GET decide:
-    # some servers reject HEAD (405, 501, 403) while serving GET fine.
+    # HEAD answered with an error status or advertised an empty image. Let a
+    # one-byte ranged GET decide: some servers reject HEAD (405, 501, 403)
+    # while serving GET fine, and some answer HEAD inaccurately.
     try:
-        status, final_url = _probe(opener, url, "GET", timeout, {"Range": "bytes=0-0"})
-        return UrlStatus(OK, f"{status} (HEAD answered {head_code})", status, final_url)
+        status, final_url, empty = _probe(opener, url, "GET", timeout, {"Range": "bytes=0-0"})
     except urllib.error.HTTPError as exc:
         exc.close()
         return _from_http_error(exc)
     except _NETWORK_ERRORS as exc:
         return _unreachable(exc, timeout)
+    if empty:
+        return UrlStatus(ERROR, f"{EMPTY_IMAGE} ({empty})", status, final_url)
+    return UrlStatus(OK, f"{status} ({head_said})", status, final_url)
 
 
 def check_refs(refs: list[ImageRef], timeout: float = DEFAULT_TIMEOUT,
@@ -357,6 +410,8 @@ def describe_dead(ref: ImageRef, status: UrlStatus) -> str:
                 f"update {fields}: {ref.uri}")
     if status.state == UNREACHABLE:
         return f"{where} is unreachable ({status.detail}): {ref.uri}"
+    if status.detail.startswith(EMPTY_IMAGE):
+        return f"{where} serves an {status.detail}{moved}: {ref.uri}"
     return f"{where} answers {status.detail}{moved}: {ref.uri}"
 
 
