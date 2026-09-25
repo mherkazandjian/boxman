@@ -16,7 +16,10 @@ from boxman.exceptions import (
 )
 from boxman.loggers.logger import suppressed
 from boxman.manager_parts.images import ImagesMixin
-from boxman.providers.libvirt.clone_vm import CLONE_DEGRADATION_NOTICES_KEY
+from boxman.providers.libvirt.clone_vm import (
+    CLONE_DEGRADATION_NOTICES_KEY,
+    CLONE_WARNINGS_KEY,
+)
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.providers.libvirt.virsh_parse import parse_domblklist
 
@@ -34,8 +37,10 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
     for attempt in range(1, max_retries + 1):
         last_attempt = attempt == max_retries
         degradation_notices: list[str] = []
+        warnings: list[str] = []
         attempt_info = vm_info.copy()
         attempt_info[CLONE_DEGRADATION_NOTICES_KEY] = degradation_notices
+        attempt_info[CLONE_WARNINGS_KEY] = warnings
         # Suppress error-level logs on all retryable attempts so that
         # transient pool-busy failures don't appear as errors; only the
         # final attempt logs errors normally. suppressed() restores the
@@ -60,8 +65,8 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
             # unsuppressed retry. Re-emit only its degradation notice after
             # leaving the suppression context so duplicate identity is never
             # silent while transient attempt noise remains hidden.
-            for notice in degradation_notices:
-                log.warning(notice)
+            for message in warnings + degradation_notices:
+                log.warning(message)
             return
         except (CloneSanitizerError, ConfigError):
             # Required sanitizer and invalid-policy failures are permanent.

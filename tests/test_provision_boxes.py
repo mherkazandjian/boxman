@@ -18,7 +18,6 @@ import glob
 import hashlib
 import os
 import time
-import warnings
 
 import invoke
 import pytest
@@ -344,7 +343,14 @@ class TestProvisionBox:
         seen = {}
         template_fingerprints = {}
         checked = 0
-        compared_to_template = 0
+        # freshness needs evidence per vm: every key type compared against
+        # its template, or a sibling clone of the same template to differ
+        # from. Without either, the checks below pass for inherited keys too.
+        clones_per_template = {}
+        for cluster_name, _vm_name, vm_cfg in iter_vms(config):
+            base = get_base_image(config["clusters"][cluster_name], vm_cfg)
+            clones_per_template[base] = clones_per_template.get(base, 0) + 1
+        unproven = []
 
         for cluster_name, vm_name, vm_cfg in iter_vms(config):
             cluster_cfg = config["clusters"][cluster_name]
@@ -391,18 +397,21 @@ class TestProvisionBox:
                     assert fingerprint != template[key_type], (
                         f"{host}: its {key_type} host key is still the "
                         f"template's ({fingerprint})")
-                    compared_to_template += 1
                 checked += 1
 
+            template = template_fingerprints.get(base_image, {})
+            compared_all = all(line[1] in template for line in lines)
+            if not compared_all and clones_per_template.get(base_image, 0) < 2:
+                unproven.append(host)
+
         assert checked, "no ssh host keys were checked on any vm"
-        if not compared_to_template:
-            # say so rather than pass quietly: without this the test rests
-            # entirely on clone-vs-clone, which proves nothing for a box
-            # that declares a single vm
-            warnings.warn(
-                "no template host keys could be read offline (virt-cat), so "
-                "the clone-vs-template comparison was skipped",
-                stacklevel=2)
+        if unproven:
+            # every assertion above held, but none of them could tell a fresh
+            # key from an inherited one on these vms: report that, not a pass
+            pytest.skip(
+                f"no freshness evidence for {', '.join(unproven)}: the "
+                f"template's host keys could not be read offline (virt-cat) "
+                f"and there is no sibling clone of the same template")
 
     # -- OS release ---------------------------------------------------------
 

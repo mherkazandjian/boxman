@@ -138,11 +138,15 @@ it and document it**, because it is strictly better for the property's purpose:
   clones of one template have **different** machine IDs, rather than merely
   empty ones.
 
-The cost: an empty `/etc/machine-id` is what makes systemd treat a boot as
-first boot (`ConditionFirstBoot=yes`). A populated one suppresses that. For
-boxman's model — clone a prepared template, configure over ssh — this is
-fine, but it must be stated in the release notes, and the integration tier
-should run once against a template that has not been sealed.
+The cost is smaller than first written here. systemd's first-boot rule
+(`machine-id(5)`, "First Boot Semantics") treats a **missing**
+`/etc/machine-id`, or one containing `uninitialized`, as a first boot — but an
+existing **empty** file as *not* one. The old truncation to empty therefore
+never produced a first boot either, and writing a populated id changes
+`ConditionFirstBoot` only for a template that ships with no `/etc/machine-id`
+at all. (Corrected after Codex's review of PR #203; the earlier text claimed
+an empty file triggered first boot.) No consumer of `ConditionFirstBoot` or of
+an empty machine id exists in boxman or its shipped templates.
 
 ### The `clone_machine_id: off` interaction
 
@@ -301,6 +305,14 @@ against a disk carrying template host keys:
   what made the uploads resolve in the container.
 
 **Still open, for the integration tier:**
+
+- The host-key integration test inspects the *booted* guest. It skips, rather
+  than passes, when it has no freshness evidence (no readable template keys and
+  no sibling clone), but it still cannot prove the offline `--tar-in` itself: a
+  guest whose pass deleted the keys and failed to install new ones, and that
+  regenerates missing keys at boot, would also pass. A pre-boot inspection of
+  the shut-off clone against the staged fingerprints was proposed in review and
+  not built.
 
 - Whether `sshd` accepts the uploaded keys and starts on first boot, on an EL
   and on a Debian/Ubuntu guest. A synthetic root cannot answer this.

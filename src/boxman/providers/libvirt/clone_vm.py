@@ -26,6 +26,11 @@ from .virsh_parse import parse_domiflist
 # notices are collected here and re-emitted after that suppression ends.
 CLONE_DEGRADATION_NOTICES_KEY = '_boxman_clone_degradation_notices'
 
+# The same hand-off for a plain warning a *successful* pass produces -- an
+# overridden clone_machine_id=off -- which would otherwise be logged inside
+# that suppression and never seen.
+CLONE_WARNINGS_KEY = '_boxman_clone_warnings'
+
 #: Every clone-identity property takes the same three policies with the same
 #: meaning: ``auto`` degrades to a notice and continues, ``required`` fails
 #: closed and discards the clone, ``off`` leaves the property alone.
@@ -261,7 +266,7 @@ class CloneVM:
             # therefore overrides clone_machine_id=off. Warn rather than
             # raise: raising would break every existing config that sets
             # ``off`` the moment another property defaults to ``auto``.
-            self.logger.warning(
+            self._warn(
                 f"vm {self.new_vm_name}: clone_machine_id=off cannot be "
                 f"honoured while another clone identity property is enabled. "
                 f"The offline pass they need runs virt-sysprep's 'customize' "
@@ -271,6 +276,14 @@ class CloneVM:
                 f"entirely.")
 
         return plan
+
+    def _warn(self, message: str) -> None:
+        """Warn through the retry wrapper's hand-off when there is one."""
+        collected = self.info.get(CLONE_WARNINGS_KEY)
+        if isinstance(collected, list):
+            collected.append(message)
+        else:
+            self.logger.warning(message)
 
     def stage_identity_plan(self, plan: IdentityPlan) -> None:
         """Produce the host-side inputs the pass uploads into the guest."""
@@ -330,6 +343,14 @@ class CloneVM:
                     detail = (
                         result.stderr or result.stdout or 'unknown error'
                     ).strip()
+                    if result.return_code == 127:
+                        # a host prerequisite, not something wrong with the
+                        # guest: say so, so the summary does not blame it
+                        raise CloneSanitizerUnavailableError(
+                            "ssh-keygen is not installed on the hypervisor, "
+                            "where boxman generates a clone's host keys; "
+                            "install the OpenSSH client, or set "
+                            "clone_ssh_host_keys: off. Cause: " + detail)
                     raise CloneSanitizerError(
                         f"could not generate a fresh {key_type} ssh host key "
                         f"for vm {self.new_vm_name}: {detail}")
@@ -466,8 +487,21 @@ class CloneVM:
         encrypted and unsupported appliances are handled by the configured
         clone policy.
         """
-        self.stage_identity_plan(plan)
         try:
+            # Staging writes keys and an archive to the host's disk: an
+            # OSError there (disk full) is an operational failure of the pass
+            # and must reach the clone policy -- otherwise ``required`` never
+            # discards the unsanitized clone and the retry wrapper retries it.
+            # ConfigError and CloneSanitizerError already say what they mean.
+            try:
+                self.stage_identity_plan(plan)
+            except (CloneSanitizerError, ConfigError):
+                raise
+            except Exception as exc:
+                raise CloneSanitizerError(
+                    f"could not prepare the offline identity pass for vm "
+                    f"{self.new_vm_name}: {exc}") from exc
+
             # Built outside the sanitizer try/except below on purpose: an
             # invariant violation is a boxman bug, not a guest that cannot be
             # inspected, and must not be degraded into an ``auto`` notice.
@@ -536,6 +570,10 @@ class CloneVM:
                 or "terminal is required" in detail_lower
                 or "askpass" in detail_lower
             )
+        ) or (
+            # a sudoers rule that does not cover virt-sysprep at all
+            "is not allowed to execute" in detail_lower
+            or "is not in the sudoers" in detail_lower
         )
         if sudo_denied:
             message = (
