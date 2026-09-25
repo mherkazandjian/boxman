@@ -842,6 +842,76 @@ class TestRenameScript:
             "cloud_init_modules: [update_etc_hosts\n")
         assert _run_raw(root, "node01").returncode != 0
 
+    @pytest.mark.parametrize("cfg, dropin, reason", [
+        ('conf_d: ""\ncloud_init_modules: [update_etc_hosts, ca_certs]\n',
+         None, "conf_d"),
+        ('merge_how: "dict(recurse_list)+list(append)"\n'
+         "cloud_init_modules: [update_etc_hosts, ca_certs]\n", None, "merge_how"),
+        ("cloud_init_modules: [seed_random]\n",
+         "## template: jinja\ncloud_init_modules:\n"
+         " - \"{{ 'update_etc_hosts' }}\"\n - ca_certs\n", "jinja"),
+    ], ids=["conf_d-disabled", "merge_how-base", "jinja-dropin"])
+    def test_configs_the_drop_in_cannot_win_against_fail(
+            self, tmp_path, cfg, dropin, reason):
+        """Round 3's F1: cloud-init's loader honours conf_d, merge
+        directives and templates, and each kept the module on while the
+        script reported success (confirmed against cloud-init 25.1)."""
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "etc/cloud/cloud.cfg").write_text(cfg)
+        if dropin is not None:
+            confd = root / "etc/cloud/cloud.cfg.d"
+            confd.mkdir()
+            (confd / "99_zz-site.cfg").write_text(dropin)
+        result = _run_raw(root, "node01")
+        assert result.returncode != 0
+        assert reason in result.stderr
+
+    @pytest.mark.parametrize("cfg, dropin", [
+        # the guest's own path, written under the stand-in root: where the
+        # test python can import cloudinit, its real loader follows it
+        ("conf_d: {root}/etc/cloud/cloud.cfg.d\n"
+         "cloud_init_modules: [update_etc_hosts, ca_certs]\n", None),
+        ('merge_how: "dict(recurse_list)+list(append)"\n'
+         "cloud_init_modules: [ca_certs]\n", None),
+        ("cloud_init_modules: [update_etc_hosts]\n",
+         "## template: jinja\nhostname: '{{ v1.local_hostname }}'\n"),
+    ], ids=["default-conf_d", "merge_how-without-the-module", "jinja-without-lists"])
+    def test_what_cannot_bring_the_module_back_is_accepted(
+            self, tmp_path, cfg, dropin):
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "etc/cloud/cloud.cfg").write_text(cfg.replace("{root}", str(root)))
+        if dropin is not None:
+            confd = root / "etc/cloud/cloud.cfg.d"
+            confd.mkdir()
+            (confd / "50-site.cfg").write_text(dropin)
+        _run(root, "node01")
+        assert "update_etc_hosts" not in _module_names(
+            _effective_modules(root).get("cloud_init_modules", []))
+
+    @pytest.mark.parametrize("effective, ok", [
+        ({"cloud_init_modules": ["ca_certs"]}, True),
+        ({"cloud_init_modules": [["update_etc_hosts", "always"]]}, False),
+    ], ids=["loader-agrees", "loader-disagrees"])
+    def test_cloud_inits_own_loader_has_the_last_word(
+            self, tmp_path, monkeypatch, effective, ok):
+        """Where cloud-init's interpreter can import it -- in a guest, always
+        -- its own read_conf_with_confd must agree the module is off."""
+        import json
+        fake = tmp_path / "fake-cloudinit"
+        (fake / "cloudinit").mkdir(parents=True)
+        (fake / "cloudinit/__init__.py").write_text("")
+        (fake / "cloudinit/util.py").write_text(
+            "import json, os\n"
+            "def read_conf_with_confd(path):\n"
+            "    return json.loads(os.environ['FAKE_CLOUD_INIT_CONFIG'])\n")
+        monkeypatch.setenv("PYTHONPATH", str(fake))
+        monkeypatch.setenv("FAKE_CLOUD_INIT_CONFIG", json.dumps(effective))
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "etc/cloud/cloud.cfg").write_text(
+            "cloud_init_modules: [update_etc_hosts, ca_certs]\n")
+        result = _run_raw(root, "node01")
+        assert (result.returncode == 0) is ok, result.stderr
+
     def test_hosts_templates_are_no_longer_edited(self, tmp_path):
         """R7 replaces the template edit: with the module off, it is moot."""
         template = "## template:jinja\n127.0.1.1 {{fqdn}} {{hostname}}\n"

@@ -234,9 +234,16 @@ F13, F14 and F16 are why.
     the `cloud.cfg.d` files, highest-sorting name first, then `cloud.cfg`; the
     first file to set a key wins, and a list is taken whole), by cloud-init's
     own interpreter, found from the shebang of `cloud-init`, so its PyYAML is
-    there. `cloud.cfg` itself, a distro conffile, is not touched. A drop-in
-    that sorts after boxman's and names the module would outrank it, so it
-    fails the pass;
+    there. `cloud.cfg` itself, a distro conffile, is not touched. Whatever
+    could keep the drop-in from winning fails the pass rather than being
+    guessed at: a drop-in that sorts after boxman's and names the module; when
+    any file names it, a `conf_d` that moves the drop-in directory or a
+    `merge_how`/`merge_type` directive that could append it back; and always,
+    a jinja template that sets a module list, which cannot be read before it
+    renders. Finally, where cloud-init's interpreter can import it (in a
+    guest, always), cloud-init's own `read_conf_with_confd` re-reads the
+    lists with the drop-in in place, and a module still enabled fails the
+    pass;
   - rewrites `/etc/hosts` through a temporary copy beside its real target that
     keeps the original's owner and mode, renamed into place only once written
     in full; a symlinked target that cannot be resolved, or an `/etc/hostname`

@@ -195,9 +195,14 @@ HOSTS_AWK='
 # way cloud-init does (util.read_conf_with_confd): the cloud.cfg.d files,
 # highest-sorting name first, then cloud.cfg; the first file to set a key
 # wins, and a list is taken whole. Only lists that name the module are
-# written; a file that outranks the drop-in and names it is an error.
+# written. When some file names it, whatever could keep the drop-in from
+# winning is an error rather than a guess: a file that outranks it and names
+# the module, a conf_d that moves the drop-in directory, a merge directive
+# (merge_how / merge_type) that could append the module back, and a jinja
+# template that sets a module list, which cannot be read before it renders.
 MODULES_PY='
 import os
+import re
 import sys
 
 import yaml
@@ -208,10 +213,22 @@ confd = etc + "/cloud.cfg.d"
 KEYS = ("cloud_init_modules", "cloud_config_modules", "cloud_final_modules")
 
 
+TEMPLATE = re.compile(r"##\s*template\s*:\s*jinja", re.IGNORECASE)
+
+
 def load(path):
+    """The file as a dict, and whether it is a jinja template."""
     with open(path) as handle:
-        data = yaml.safe_load(handle)
-    return data if isinstance(data, dict) else {}
+        text = handle.read()
+    templated = bool(TEMPLATE.match(text.split("\n", 1)[0]))
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        if templated:
+            sys.exit("%s is a jinja template that cannot be read before it "
+                     "renders" % path)
+        raise
+    return (data if isinstance(data, dict) else {}), templated
 
 
 def module(entry):
@@ -236,11 +253,38 @@ if os.path.isdir(confd):
 sources = [(n, os.path.join(confd, n)) for n in names if n != own]
 if os.path.isfile(etc + "/cloud.cfg"):
     sources.append((None, etc + "/cloud.cfg"))
-configs = [(n, load(path)) for n, path in sources]
+configs = []
+for n, path in sources:
+    cfg, templated = load(path)
+    configs.append((n, path, cfg, templated))
+
+
+def names_module(cfg):
+    return any(isinstance(cfg.get(key), list)
+               and any(module(e) == "update_etc_hosts" for e in cfg[key])
+               for key in KEYS)
+
+
+# a template can name the module in an expression, so it cannot be ruled out
+for _n, path, cfg, templated in configs:
+    if templated and any(key in cfg for key in KEYS):
+        sys.exit("%s is a jinja template that sets a module list" % path)
+
+if any(names_module(cfg) for _n, _p, cfg, _t in configs):
+    for n, path, cfg, _t in configs:
+        # a path in the guest is relative to its root
+        if n is None and "conf_d" in cfg and os.path.normpath(
+                str(cfg["conf_d"] or "").strip() or ".") != os.path.normpath(confd):
+            sys.exit("%s sets conf_d to %r, so the drop-in would not be read"
+                     % (path, cfg["conf_d"]))
+        for directive in ("merge_how", "merge_type"):
+            if directive in cfg:
+                sys.exit("%s sets %s, which could append update_etc_hosts "
+                         "back" % (path, directive))
 
 lists = {}
 for key in KEYS:
-    for name, cfg in configs:
+    for name, _path, cfg, _templated in configs:
         if key in cfg:
             break
     else:
@@ -259,6 +303,27 @@ if lists:
     print("# the module lists of cloud-init, without update_etc_hosts")
     print(yaml.safe_dump(lists, default_flow_style=False, sort_keys=False),
           end="")
+'
+
+# Then the same question put to cloud-init itself, where its interpreter can
+# import it (in a guest it always can): the effective module lists, read by
+# its own loader with the drop-in in place, must not name the module.
+VERIFY_PY='
+import sys
+
+try:
+    from cloudinit import util
+except ImportError:
+    sys.exit(0)  # this interpreter cannot run cloud-init, nor rewrite /etc/hosts
+cfg = util.read_conf_with_confd(sys.argv[1] + "/etc/cloud/cloud.cfg")
+for key in ("cloud_init_modules", "cloud_config_modules", "cloud_final_modules"):
+    for entry in cfg.get(key) or []:
+        if isinstance(entry, dict):
+            entry = entry.get("name")
+        elif isinstance(entry, list):
+            entry = entry[0] if entry else None
+        if isinstance(entry, str) and "update_etc_hosts" in entry.replace("-", "_"):
+            sys.exit("cloud-init still runs update_etc_hosts (%s)" % key)
 '
 
 if [ -f "$root/etc/hosts" ]; then
@@ -307,6 +372,8 @@ if [ -d "$root/etc/cloud" ]; then
         "$interpreter" "$@" -c "$MODULES_PY" "$root" "${dropin##*/}" \
             >> "$root@DROPIN@" ||
             fail "cannot drop update_etc_hosts from cloud-init's module lists"
+        "$interpreter" "$@" -c "$VERIFY_PY" "$root" ||
+            fail "cloud-init would still rewrite /etc/hosts"
     fi
 fi
 exit 0
