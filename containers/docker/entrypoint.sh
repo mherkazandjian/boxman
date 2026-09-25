@@ -1,35 +1,78 @@
 #!/bin/bash
 set -e
 
+# Report a problem this script cannot repair, then idle instead of exiting.
+#
+# `restart: unless-stopped` restarts the container whatever the exit status,
+# so exiting turns one failure into an endless loop: the same error scrolls
+# past every few seconds, `docker exec` is refused because the container is
+# always "restarting", and whatever depends on the container fails in ways
+# that point elsewhere (#205). Idling leaves the explanation at the end of
+# `docker logs` and the container open for inspection. Nothing else is
+# started, so libvirtd never runs against state known to be broken.
+#
+# The diagnosis also goes to $STARTUP_FAILURE, where boxman's readiness
+# check finds it: without it boxman could only time out waiting for a
+# libvirtd that is never coming, and then recreate a container that stops
+# at the same problem.
+STARTUP_FAILURE=/run/boxman/startup-failure
+rm -f "$STARTUP_FAILURE"
+
+fail_without_restarting() {
+    mkdir -p "${STARTUP_FAILURE%/*}"
+    printf '%s\n' "$1" > "$STARTUP_FAILURE"
+    {
+        echo "ERROR: $1"
+        echo "The container is idling instead of exiting, so that it does" \
+             "not restart in a loop. Fix the problem above, then restart it."
+    } >&2
+    trap 'exit 1' TERM INT
+    while :; do
+        sleep 3600 &
+        wait $!
+    done
+}
+
 # Ensure required directories exist
 mkdir -p /var/run/libvirt /var/lib/libvirt/images /etc/boxman/ssh
 
 # ---------------------------------------------------------------------------
-# Seed the persisted libvirt state directories (#164 FB-2).
+# Seed the persisted libvirt state directories (#164 FB-2, #205).
 #
 # /etc/libvirt and /var/lib/libvirt/qemu are bind-mounted from the host so
-# domains, networks, snapshot metadata and NVRAM outlive the container. On a
-# first run those host directories are empty, and the mount hides the
-# configuration baked into the image, so copy the image's pristine stash in.
+# domains, networks, snapshot metadata and NVRAM outlive the container, and
+# the mount hides the configuration baked into the image. Every start
+# restores whatever the image's pristine stash holds that the host directory
+# lacks: the lot on a first run, the odd file on a damaged one.
 #
-# Emptiness is the only trigger: once a directory holds anything at all it is
-# the authority and is never overwritten, so an upgrade cannot clobber a live
-# installation with image defaults.
+# This used to happen only when a directory was empty. One holding just the
+# nwfilter/ and secrets/ that libvirtd creates for itself then counted as
+# seeded, and the missing default network wedged the container in a restart
+# loop. Paths already present are never overwritten, so an upgrade still
+# cannot clobber a live installation with image defaults.
 # ---------------------------------------------------------------------------
-seed_from_pristine() {
-    target="$1"
-    stash="$2"
-    [ -d "$stash" ] || return 0
-    mkdir -p "$target"
-    if [ -n "$(ls -A "$target" 2>/dev/null || true)" ]; then
+seed_state_dir() {
+    container_path="$1"
+    subdir="$2"
+    # What was restored goes to the log as it happens; what could not be
+    # is kept as well, for the diagnosis.
+    if { problems=$(/opt/boxman/seed-libvirt-state.sh \
+            "$container_path" "/opt/boxman/pristine/$subdir" 2>&1 1>&3); } 3>&1
+    then
         return 0
     fi
-    cp -a "$stash/." "$target/"
-    echo "Seeded $target from the image's pristine copy"
+    fail_without_restarting \
+"$container_path is incomplete or damaged and could not be repaired from
+the image.
+$problems
+It is the host directory ${BOXMAN_DATA_DIR:-./data}/$subdir. To reset it,
+stop the container and move that directory aside: it is seeded afresh on
+the next start, but the libvirt state kept in it (domain and network
+definitions, snapshot metadata, NVRAM) does not come back with it."
 }
 
-seed_from_pristine /etc/libvirt /opt/boxman/pristine/etc-libvirt
-seed_from_pristine /var/lib/libvirt/qemu /opt/boxman/pristine/var-lib-libvirt-qemu
+seed_state_dir /etc/libvirt etc-libvirt
+seed_state_dir /var/lib/libvirt/qemu var-lib-libvirt-qemu
 
 # Hand the state trees to the host user where libvirt permits it.
 #
@@ -186,16 +229,30 @@ if [ ! -S /var/run/libvirt/libvirt-sock ]; then
     cat /var/log/supervisor/libvirtd.stderr.log 2>/dev/null || true
 fi
 
-# Start the default network if not already active
+# Start the default network if not already active.
+#
+# A failure here is reported, not fatal. Exiting under `set -e` turned any
+# problem with the network definition into a restart loop (#205), and
+# libvirtd and sshd are worth keeping up while it is fixed.
+default_network_ok=1
 if virsh net-info default 2>/dev/null | grep -q "Active.*no"; then
     echo "Starting default network..."
-    virsh net-start default
+    virsh net-start default || default_network_ok=
 elif ! virsh net-info default &>/dev/null; then
     echo "Defining and starting default network..."
-    virsh net-define /etc/libvirt/qemu/networks/default.xml
-    virsh net-start default
+    { virsh net-define /etc/libvirt/qemu/networks/default.xml &&
+        virsh net-start default; } || default_network_ok=
 fi
 
-echo "libvirt is ready."
+if [ -n "$default_network_ok" ]; then
+    echo "libvirt is ready."
+else
+    echo "ERROR: libvirt's default network could not be defined or started" \
+         "(see the virsh error above); the container stays up without" \
+         "it. Its definition is" \
+         "${BOXMAN_DATA_DIR:-./data}/etc-libvirt/qemu/networks/default.xml" \
+         "on the host: if that file is damaged, remove it and restart the" \
+         "container to restore the image's copy." >&2
+fi
 
 wait $SUPERVISOR_PID

@@ -306,8 +306,40 @@ anything that recreated the container — a workdir change, an unresponsive
 libvirtd, a compose-file edit — discarded every domain, network and
 snapshot (#164 FB-2).
 
-On a first run both are empty and `entrypoint.sh` seeds them from a
-pristine copy baked into the image, so libvirtd still starts configured.
+On every start `entrypoint.sh` restores whatever either directory lacks
+from a pristine copy baked into the image (`seed-libvirt-state.sh`): all of
+it on a first run, so libvirtd still starts configured, and only the
+missing paths when a directory is partly populated — one holding just the
+`nwfilter/` and `secrets/` libvirtd creates for itself, say (#205). A path
+the directory already holds is never overwritten, so local edits and
+libvirt's own changes survive an image upgrade. The flip side: a file the
+image ships comes back if you delete it.
+
+Each file is copied beside its destination first and only then linked into
+place, so a copy cut short by a full disk or a stopped container is never
+taken for the real thing; the next start simply tries again. A container
+stopped mid-copy can leave a `.boxman-seed.XXXXXX` staging directory
+behind, which the next start removes — but only if it holds the
+`.boxman-seed-staging` marker the entrypoint puts in each one and nothing
+but the staged file, so a directory of yours with a similar name is never
+touched. Even then only the marker and that file are deleted, and the
+directory only if it is then empty, so nothing that lands in it meanwhile
+is lost. Existing paths
+are checked too: a directory must be a directory and a file a file (a
+symlink counts as what it points at, so a dangling one satisfies neither).
+
+If something cannot be restored, or is there as the wrong kind of thing —
+a file where the image has a directory, for instance — the container logs a
+single `ERROR:` naming each path and the host directory, and idles rather
+than exiting, so it does not restart in a loop. boxman reports the same
+diagnosis straight away instead of timing out, and leaves the idle
+container alone rather than recreating it. Fix the path, or move the whole
+directory aside to have it seeded afresh (the domains, networks and
+snapshots kept in it do not come back), then `docker restart` the
+container. A damaged `qemu/networks/default.xml` is reported but the
+container keeps running without the default network: delete the file and
+restart to get the image's copy back.
+
 A container created before the mounts existed has its state copied out
 with `docker cp` and validated before anything stops it; the copy is only
 accepted once a `.libvirt-state-migrated` marker is written, so an

@@ -17,8 +17,11 @@ export BOXMAN_PROJECT_DIR
 SSH_LINK_DIR := $(HOME)/.ssh/config.d/boxman
 SSH_LINK := $(SSH_LINK_DIR)/boxman-$(BOXMAN_INSTANCE_NAME).conf
 
-up: ## Start the container and link ssh config
-	docker compose up -d
+# --build, as boxman's runtime does: without it an image built from an older
+# checkout is reused, and its entrypoint runs against this compose file's
+# mounts (#205). The build cache makes it cheap when nothing changed.
+up: ## Start the container (rebuilding the image if its sources changed) and link ssh config
+	docker compose up -d --build
 	@$(MAKE) link-ssh
 
 build: ## Build the docker image
