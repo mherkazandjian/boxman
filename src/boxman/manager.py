@@ -1,4 +1,5 @@
 import os
+import signal
 from multiprocessing import Process, Queue
 from typing import Any, Optional
 
@@ -31,6 +32,8 @@ _PARALLEL_RESULT_TIMEOUT = 5
 _PARALLEL_POLL_INTERVAL = 0.2
 # how long an abandoned worker gets to exit after SIGTERM before SIGKILL
 _PARALLEL_STOP_TIMEOUT = 5
+# _abandon_parallel could not change SIGINT (not on the main thread)
+_NOT_IGNORED = object()
 
 
 def _parallel_worker(result_queue, label, target, args):
@@ -40,11 +43,21 @@ def _parallel_worker(result_queue, label, target, args):
     Always reports the outcome on *result_queue* — even when *target*
     raises — so the parent can never mistake a crashed worker for a
     success (or block forever waiting for a message that never comes).
+
+    Once *target* has returned, the parent owns cancellation: SIGINT is
+    ignored while the result is written and flushed. A terminal's Ctrl-C
+    reaches every process in its group, and one landing mid-write would
+    leave half a message in the pipe, which the parent's drain would then
+    wait on forever. *target* itself runs with the default handler, so the
+    commands it starts still stop on Ctrl-C (an ignored signal would be
+    inherited by them).
     """
     try:
-        result_queue.put((label, True, target(*args)))
+        outcome = (label, True, target(*args))
     except Exception as exc:
-        result_queue.put((label, False, f"{type(exc).__name__}: {exc}"))
+        outcome = (label, False, f"{type(exc).__name__}: {exc}")
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    result_queue.put(outcome)
 
 
 class BoxmanManager(
@@ -554,9 +567,25 @@ class BoxmanManager(
         Drains what finished workers already queued, so an ``on_result``
         caller keeps it, then stops and reaps every worker still running,
         so none outlives the batch. Nothing here raises, not even a second
-        Ctrl-C: the caller is already propagating the exception that got it
-        here, and the workers must be stopped either way.
+        Ctrl-C: SIGINT is ignored until the cleanup is done, then the
+        caller's handler is back. The caller is already propagating the
+        exception that got it here, and the workers must be stopped either
+        way.
         """
+        try:
+            previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except ValueError:
+            # not the main thread, which is where SIGINT is handled anyway
+            previous = _NOT_IGNORED
+        try:
+            self._stop_parallel(op_label, running, drain)
+        finally:
+            if previous is not _NOT_IGNORED:
+                signal.signal(signal.SIGINT,
+                              signal.SIG_DFL if previous is None else previous)
+
+    def _stop_parallel(self, op_label, running, drain) -> None:
+        """The body of :meth:`_abandon_parallel`, with SIGINT ignored."""
         try:
             drain()
         except BaseException as exc:

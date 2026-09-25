@@ -191,6 +191,105 @@ class TestOnResult:
         assert multiprocessing.active_children() == []
 
 
+
+def _run_scenario(code: str, timeout: float = 30):
+    """Run *code* in a child python leading its own process group, so a
+    real SIGINT can reach every process in it -- as a terminal's Ctrl-C
+    does -- without interrupting pytest. A hang is a failure, not a stall."""
+    import signal
+    import subprocess
+    import sys
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code], stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, start_new_session=True,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, err = proc.communicate()
+        pytest.fail(f"the interrupted batch hung\n{out}\n{err[-3000:]}")
+    return out
+
+
+class TestARealCtrlC:
+    """From round 3 of the review: interrupts delivered as real signals,
+    not raised from a patched function."""
+
+    def test_a_group_ctrl_c_during_publication_does_not_hang(self):
+        """A terminal Ctrl-C also reaches the workers. One interrupted while
+        its result was half written left the rest of the message missing,
+        and the parent's cleanup drain waited for it forever."""
+        out = _run_scenario("""
+import multiprocessing, os, signal, time
+import multiprocessing.connection as mpc
+from unittest.mock import patch
+from tests.test_parallel_failures import _big_payload_worker, _manager, _ok_worker
+
+real_wait = mpc.wait
+fired = []
+
+def wait(objects, timeout=None):
+    ready = real_wait(objects, timeout)
+    if ready and not fired:  # the fast worker exited, undrained
+        fired.append(True)
+        time.sleep(0.2)      # the big result is now half through the pipe
+        os.killpg(os.getpgrp(), signal.SIGINT)
+        time.sleep(5)
+    return ready
+
+got = []
+with patch.object(mpc, "wait", side_effect=wait):
+    try:
+        _manager()._run_parallel(
+            [("fast", _ok_worker, ("record",)),
+             ("big", _big_payload_worker, (1 << 20,))],
+            max_workers=2, on_result=lambda label, payload: got.append(label))
+    except KeyboardInterrupt:
+        print("interrupted")
+print("got", ",".join(got))
+print("active", len(multiprocessing.active_children()))
+""")
+        assert "interrupted" in out
+        assert "got fast" in out
+        assert "active 0" in out
+
+    def test_a_second_ctrl_c_during_cleanup_changes_nothing(self):
+        """It escaped the cleanup, replaced the error that started it, and
+        left the workers it had not yet stopped running."""
+        out = _run_scenario("""
+import multiprocessing, signal
+import multiprocessing.process as mpp
+from unittest.mock import patch
+from tests.test_parallel_failures import _manager, _ok_worker, _sleeping_worker
+
+real_terminate = mpp.BaseProcess.terminate
+fired = []
+
+def terminate(self):
+    if not fired:
+        fired.append(True)
+        signal.raise_signal(signal.SIGINT)
+    return real_terminate(self)
+
+def boom(label, payload):
+    raise RuntimeError("callback probe")
+
+with patch.object(mpp.BaseProcess, "terminate", terminate):
+    try:
+        _manager()._run_parallel(
+            [("fast", _ok_worker, (1,)), ("slow", _sleeping_worker, (30,))],
+            max_workers=2, on_result=boom)
+    except BaseException as exc:
+        print("raised", type(exc).__name__, exc)
+print("active", len(multiprocessing.active_children()))
+print("sigint handler restored", signal.getsignal(signal.SIGINT) is signal.default_int_handler)
+""")
+        assert "raised RuntimeError callback probe" in out
+        assert "active 0" in out
+        assert "sigint handler restored True" in out
+
+
 class TestRestoreRetryLoop:
 
     def test_raising_restore_worker_never_reports_success(self, monkeypatch):
