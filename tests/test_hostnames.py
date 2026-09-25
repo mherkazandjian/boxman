@@ -99,6 +99,14 @@ class TestHostnameProblem:
         problem = hostname_problem(value)
         assert problem is not None and fragment in problem
 
+    @pytest.mark.parametrize("value", [
+        "node01\n", "node01\r\n", "node\n01", "node01\n.example.com", "node01 ",
+    ])
+    def test_refuses_line_breaks_and_trailing_space(self, value):
+        """From Codex's review: Python's $ matches before a final newline, so
+        a YAML block scalar's trailing newline passed validation."""
+        assert hostname_problem(value) is not None
+
     def test_the_length_limit_counts_the_dots(self):
         assert len("a." * 126 + "a") == 253
         assert hostname_problem("a." * 126 + "a") is None

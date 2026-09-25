@@ -8,6 +8,7 @@ import os
 import shlex
 import time
 
+from boxman.utils.hostnames import hostname_or_key
 from boxman.utils.references import resolve_reference
 from boxman.utils.shell import run
 
@@ -65,7 +66,7 @@ class SSHMixin:
 
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                hostname = vm_info.get('hostname', vm_name)
+                hostname = hostname_or_key(vm_name, vm_info)
 
                 self.logger.status(f"vm: {vm_name} (hostname: {hostname})")
 
@@ -217,7 +218,7 @@ class SSHMixin:
 
                     for vm_name, vm_info in cluster['vms'].items():
                         full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                        hostname = vm_info.get('hostname', vm_name)
+                        hostname = hostname_or_key(vm_name, vm_info)
                         prefixed_host = f"{cluster_name}_{hostname}"
                         padded_alias = f"node{str(vm_counter).zfill(pad_width)}"
                         vm_counter += 1
@@ -419,7 +420,7 @@ class SSHMixin:
                 self.logger.info(f"adding ssh key to vm {vm_name} ({ip_address})...")
 
                 # try to add the key with exponential backoff
-                hostname = vm_info.get('hostname', vm_name)
+                hostname = hostname_or_key(vm_name, vm_info)
                 prefixed_host = f"{cluster_name}_{hostname}"
                 success = self._try_add_ssh_key(
                     ip_address=ip_address,

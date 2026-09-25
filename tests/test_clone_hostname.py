@@ -14,9 +14,11 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
+from tests import test_provision_boxes as boxes
 from tests.conftest import make_bare_manager
 
 from boxman.exceptions import CloneSanitizerError, ConfigError
@@ -67,6 +69,12 @@ class TestValidateCloneIdentityConfig:
     def test_refuses_the_issues_invalid_values(self, hostname):
         manager = make_bare_manager(_config({"vm1": {"hostname": hostname}}))
         with pytest.raises(ConfigError, match=r"cluster_1\.vms\.vm1\.hostname"):
+            manager.validate_clone_identity_config()
+
+    def test_refuses_a_block_scalar_newline(self):
+        """R2: `hostname: |` leaves a trailing newline in the value."""
+        manager = make_bare_manager(_config({"vm1": {"hostname": "node01\n"}}))
+        with pytest.raises(ConfigError, match=r"vm1\.hostname"):
             manager.validate_clone_identity_config()
 
     def test_names_every_offending_vm_at_once(self):
@@ -140,6 +148,108 @@ class TestGuestHostname:
     def test_a_key_that_is_not_a_hostname_yields_none(self):
         manager = make_bare_manager({})
         assert manager.guest_hostname("my_vm", {}) is None
+
+
+class TestSshAliasOfANullHostname:
+    """An explicit ``hostname: null`` names the ssh alias after the VM key.
+
+    ``vm_info.get('hostname', vm_name)`` returns None for a present-but-null
+    key, so two such VMs in one cluster both got the alias ``cluster_1_None``
+    -- one alias for two hosts, while their guests were named vm1 and vm2.
+    Each site that builds an alias is driven here, not just the shared rule.
+    """
+
+    @staticmethod
+    def _manager(tmp_path: Path):
+        manager = make_bare_manager({
+            "project": "p",
+            "workspace": {"path": str(tmp_path)},
+            "clusters": {"cluster_1": {
+                "vms": {"vm1": {"hostname": None}, "vm2": {"hostname": None}},
+                "admin_pass": "secret",
+                "ssh_config": "ssh_config",
+            }},
+        })
+        session = MagicMock()
+        session.get_vm_ip_addresses.side_effect = (
+            lambda name: {"eth0": f"192.168.10.{name[-1]}"})
+        manager.session_for_cluster = lambda cluster_name: session
+        manager._docker_ssh_jump_stanza = lambda: None
+        return manager
+
+    def test_the_written_ssh_config(self, tmp_path):
+        self._manager(tmp_path).write_ssh_config()
+
+        hosts = [line.split()[1]
+                 for line in (tmp_path / "ssh_config").read_text().splitlines()
+                 if line.startswith("Host ")]
+        assert hosts == ["cluster_1_vm1", "cluster_1_vm2"]
+
+    def test_the_key_push(self, tmp_path):
+        (tmp_path / "id_ed25519_boxman.pub").write_text("ssh-ed25519 AAAA\n")
+        manager = self._manager(tmp_path)
+        manager._try_add_ssh_key = MagicMock(return_value=True)
+
+        assert manager.add_ssh_keys_to_vms() is True
+
+        pushed = [c.kwargs["hostname"]
+                  for c in manager._try_add_ssh_key.call_args_list]
+        assert pushed == ["cluster_1_vm1", "cluster_1_vm2"]
+
+    def test_the_connection_info(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager.connect_info()
+
+        lines = [c.args[0] for c in manager.logger.status.call_args_list]
+        assert "vm: vm1 (hostname: vm1)" in lines
+        assert "vm: vm2 (hostname: vm2)" in lines
+
+
+class TestIntegrationNameCheck:
+    """The integration tier's stale-name check must not pass vacuously.
+
+    It asks the guest's resolver whether the template's name still points
+    at the guest. A guest without getent, or a lookup that fails for any
+    reason other than "not found", used to read as "not found" -- a green
+    result claiming a check that never ran.
+    """
+
+    CONFIG = {
+        "workspace": {"path": "/workspace"},
+        "clusters": {"c1": {"base_image": "tmpl", "vms": {"vm1": {}}}},
+    }
+
+    def _check(self, resolver_output: str) -> int:
+        def ssh(ssh_config, host, command):
+            if command == boxes.GUEST_NAME_PROBE:
+                return SimpleNamespace(stdout="vm1\n")
+            assert "getent hosts tmpl" in command
+            return SimpleNamespace(stdout=resolver_output)
+
+        with patch.object(boxes, "ssh_cmd", side_effect=ssh):
+            return boxes.assert_guest_names(self.CONFIG)
+
+    def test_a_name_that_no_longer_resolves_passes(self):
+        assert self._check("getent-status=2\n") == 1
+
+    def test_a_name_resolving_elsewhere_passes(self):
+        assert self._check("192.168.10.9    tmpl\ngetent-status=0\n") == 1
+
+    def test_a_name_resolving_to_the_guest_itself_fails(self):
+        with pytest.raises(AssertionError, match="still resolves"):
+            self._check("127.0.1.1       tmpl\ngetent-status=0\n")
+
+    def test_a_guest_without_getent_fails(self):
+        with pytest.raises(AssertionError, match="could not check"):
+            self._check("getent-status=missing\n")
+
+    def test_a_failed_lookup_fails(self):
+        with pytest.raises(AssertionError, match="could not check"):
+            self._check("getent-status=1\n")
+
+    def test_no_status_at_all_fails(self):
+        with pytest.raises(AssertionError, match="could not check"):
+            self._check("")
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +395,15 @@ def _run(root: Path, name: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
+def _run_raw(root: Path, name: str):
+    script = root.parent / HOSTNAME_SCRIPT
+    script.write_text(render_hostname_script(name))
+    script.chmod(0o755)
+    return subprocess.run(
+        [str(script)], env={**os.environ, "BOXMAN_GUEST_ROOT": str(root)},
+        capture_output=True, text=True, check=False)
+
+
 def _hosts(root: Path) -> list[str]:
     return (root / "etc/hosts").read_text().splitlines()
 
@@ -395,27 +514,111 @@ class TestRenameScript:
         _run(root, "ctrl.example.com")
         dropin = (root / CLOUD_INIT_HOSTNAME_DROPIN.lstrip("/")).read_text()
         assert "preserve_hostname: true" in dropin
-        assert "hostname: ctrl" in dropin
-        assert "fqdn: ctrl.example.com" in dropin
+        assert "hostname: 'ctrl'" in dropin
+        assert "fqdn: 'ctrl.example.com'" in dropin
 
-    def test_cloud_inits_hosts_template_is_given_the_literal_name(self, tmp_path):
-        """User-data outranks any drop-in; the hosts template is what it cannot."""
-        template = ("## template:jinja\n"
-                    "127.0.1.1 {{fqdn}} {{hostname}}\n"
-                    "::1 {{ fqdn }} {{ hostname }}\n")
-        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", template)
-        _run(root, "ctrl.example.com")
-        rendered = (root / "etc/cloud/templates/hosts.debian.tmpl").read_text()
-        assert rendered == ("## template:jinja\n"
-                            "127.0.1.1 ctrl.example.com ctrl\n"
-                            "::1 ctrl.example.com ctrl\n")
+    def test_a_failed_hosts_rewrite_fails_the_script(self, tmp_path):
+        """R1: a write failure must reach the clone policy, not report 0."""
+        root = _guest(tmp_path, "oldbox", "127.0.1.1 oldbox\n")
+        (root / "etc").chmod(0o555)          # no scratch file can be created
+        try:
+            result = _run_raw(root, "node01")
+        finally:
+            (root / "etc").chmod(0o755)
+        assert result.returncode != 0
+        assert (root / "etc/hosts").read_text() == "127.0.1.1 oldbox\n"
 
-    def test_a_short_name_is_not_listed_twice_in_the_template(self, tmp_path):
+    def test_a_symlinked_hosts_file_is_rewritten_through_the_link(self, tmp_path):
+        """R1: the link stays a link, its target gets the new names, and no
+        fixed scratch name can alias the source."""
+        root = _guest(tmp_path, "oldbox", None)
+        (root / "etc/hosts.boxman").write_text("127.0.1.1 oldbox\n")
+        (root / "etc/hosts").symlink_to("hosts.boxman")
+        _run(root, "node01")
+        assert (root / "etc/hosts").is_symlink()
+        assert (root / "etc/hosts.boxman").read_text() == "127.0.1.1 node01\n"
+
+    def test_hosts_keeps_its_mode(self, tmp_path):
+        root = _guest(tmp_path, "oldbox", "127.0.1.1 oldbox\n")
+        (root / "etc/hosts").chmod(0o640)
+        _run(root, "node01")
+        assert (root / "etc/hosts").stat().st_mode & 0o777 == 0o640
+
+    def test_no_scratch_file_is_left_behind(self, tmp_path):
+        root = _guest(tmp_path, "oldbox", "127.0.1.1 oldbox\n", cloud=True)
+        (root / "etc/cloud/cloud.cfg").write_text(
+            "cloud_init_modules:\n - update_etc_hosts\n")
+        _run(root, "node01")
+        leftovers = [p.name for p in (root / "etc").rglob("*")
+                     if "boxman" in p.name and p.name != "99-boxman-hostname.cfg"]
+        assert leftovers == []
+
+    def test_a_failed_drop_in_write_fails_the_script(self, tmp_path):
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "etc/cloud/cloud.cfg.d").write_text("not a directory")
+        assert _run_raw(root, "node01").returncode != 0
+
+    @pytest.mark.parametrize("name", ["no", "123", "null", "1.2", "on"])
+    def test_the_drop_in_values_are_strings(self, tmp_path, name):
+        """R3: an unquoted `hostname: no` is YAML false, and cloud-init would
+        call .split('.') on it."""
+        import yaml
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        _run(root, name)
+        data = yaml.safe_load(
+            (root / CLOUD_INIT_HOSTNAME_DROPIN.lstrip("/")).read_text())
+        assert data["hostname"] == name.split(".")[0]
+        assert data["fqdn"] == name
+        assert data["preserve_hostname"] is True
+
+    def test_crlf_self_lines_are_renamed_and_keep_their_endings(self, tmp_path):
+        """R4: a CR left on the last name hid the template's name."""
+        root = _guest(tmp_path, "oldbox", None)
+        (root / "etc/hosts").write_bytes(b"::1 oldbox\r\n127.0.0.1 localhost\r\n")
+        _run(root, "node01")
+        assert (root / "etc/hosts").read_bytes() == (
+            b"::1 node01\r\n127.0.0.1 localhost\r\n")
+
+    @pytest.mark.parametrize("address", ["0:0:0:0:0:0:0:1", "::0001", "0::1"])
+    def test_expanded_ipv6_loopback_spellings_are_loopback(self, tmp_path, address):
+        """R4: only the abbreviated ::1 was recognised."""
+        root = _guest(tmp_path, "oldbox", f"{address} oldbox\n")
+        _run(root, "node01")
+        assert _hosts(root) == [f"{address} node01"]
+
+    @pytest.mark.parametrize("entry", [
+        " - update_etc_hosts",
+        "  - update-etc-hosts",
+        " - [update_etc_hosts, always]",
+        " - [ update_etc_hosts ]",
+        ' - "update_etc_hosts"',
+    ])
+    def test_cloud_init_stops_managing_etc_hosts(self, tmp_path, entry):
+        """R7: every manage_etc_hosts mode goes through update_etc_hosts, and
+        user-data outranks any drop-in -- so the clone's module list drops it.
+        The file must stay valid YAML, with every other module untouched."""
+        import yaml
+        cfg = ("cloud_init_modules:\n - seed_random\n" + entry +
+               "\n - ca_certs\ncloud_config_modules:\n - runcmd\n")
+        root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", cloud=True)
+        (root / "etc/cloud/cloud.cfg").write_text(cfg)
+        _run(root, "node01")
+        data = yaml.safe_load((root / "etc/cloud/cloud.cfg").read_text())
+        flat = [m if isinstance(m, str) else m[0] for m in data["cloud_init_modules"]]
+        assert flat == ["seed_random", "ca_certs"]
+        assert data["cloud_config_modules"] == ["runcmd"]
+
+    def test_hosts_templates_are_no_longer_edited(self, tmp_path):
+        """R7 replaces the template edit: with the module off, it is moot."""
         template = "## template:jinja\n127.0.1.1 {{fqdn}} {{hostname}}\n"
         root = _guest(tmp_path, "oldbox", "127.0.0.1 localhost\n", template)
         _run(root, "node01")
-        assert (root / "etc/cloud/templates/hosts.debian.tmpl").read_text() == (
-            "## template:jinja\n127.0.1.1 node01\n")
+        assert (root / "etc/cloud/templates/hosts.debian.tmpl").read_text() == template
+
+    def test_a_trailing_newline_never_reaches_the_script(self):
+        """R2, at the provider boundary."""
+        with pytest.raises(ConfigError):
+            render_hostname_script("node01\n")
 
     def test_refuses_to_render_an_unvalidated_name(self):
         with pytest.raises(ConfigError, match="refusing"):

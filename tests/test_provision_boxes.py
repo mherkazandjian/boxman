@@ -24,7 +24,7 @@ import pytest
 import yaml
 
 from boxman.providers.libvirt.clone_vm import SSH_HOST_KEY_TYPES
-from boxman.utils.hostnames import hostname_problem
+from boxman.utils.hostnames import hostname_or_key, hostname_problem
 from boxman.utils.jinja_env import create_jinja_env
 
 # ---------------------------------------------------------------------------
@@ -150,7 +150,7 @@ def get_ssh_config_path(config, cluster_name):
 
 def get_ssh_host(cluster_name, vm_name, vm_cfg):
     """Return the SSH host alias that boxman generates: <cluster>_<hostname>."""
-    hostname = vm_cfg.get("hostname", vm_name)
+    hostname = hostname_or_key(vm_name, vm_cfg)
     return f"{cluster_name}_{hostname}"
 
 
@@ -295,6 +295,34 @@ GUEST_NAME_PROBE = "'hostnamectl --static 2>/dev/null || cat /etc/hostname'"
 #: Changes on every boot, so a reboot that silently did not happen is caught.
 BOOT_ID_PROBE = "cat /proc/sys/kernel/random/boot_id"
 
+#: getent's exit statuses that mean the lookup ran: found, and not found.
+GETENT_ANSWERED = ("0", "2")
+
+
+def resolve_probe(name):
+    """A guest command that looks *name* up and prints getent's exit status.
+
+    The status is printed, not returned: ssh_cmd retries any non-zero exit,
+    and a name that does not resolve is the answer hoped for here.
+    """
+    return ("'if command -v getent >/dev/null; then "
+            f"getent hosts {name}; echo getent-status=$?; "
+            "else echo getent-status=missing; fi'")
+
+
+def resolved_lines(output, host, name):
+    """The ``getent hosts`` lines in a :func:`resolve_probe` output.
+
+    Fails unless getent actually answered: a guest without it, or a lookup
+    that failed for another reason, would otherwise read as "not found".
+    """
+    lines = output.splitlines()
+    status = lines.pop().strip() if lines else ""
+    assert status.removeprefix("getent-status=") in GETENT_ANSWERED, (
+        f"{host}: could not check whether {name!r} still resolves: "
+        f"{status or 'the probe printed nothing'}")
+    return [line for line in lines if line.strip()]
+
 
 def assert_guest_names(config):
     """Every cloned VM carries its own name and no longer resolves its
@@ -317,9 +345,9 @@ def assert_guest_names(config):
         for old in template_names(config, get_base_image(cluster_cfg, vm_cfg)):
             if old.lower() == expected.lower():
                 continue
-            found = ssh_cmd(
-                ssh_config, host, f"'getent hosts {old} || true'").stdout
-            for line in found.splitlines():
+            found = resolved_lines(
+                ssh_cmd(ssh_config, host, resolve_probe(old)).stdout, host, old)
+            for line in found:
                 address = line.split()[0]
                 assert not (address.startswith("127.") or address == "::1"), (
                     f"{host}: still resolves its template's name {old!r} to "

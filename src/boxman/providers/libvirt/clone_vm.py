@@ -69,6 +69,13 @@ CLOUD_INIT_HOSTNAME_DROPIN = '/etc/cloud/cloud.cfg.d/99-boxman-hostname.cfg'
 # every guest without cloud-init would trip. The only placeholders are the two
 # names, which are validated hostnames: letters, digits, dots and hyphens.
 #
+# Every step that can fail makes the script exit non-zero, which fails the
+# pass and lets the clone policy act -- ``required`` discards the clone,
+# ``auto`` reports it -- instead of claiming a name it did not set. Files are
+# rewritten through a scratch copy beside the real target (a symlinked
+# /etc/hosts stays a link) and renamed into place, so a failure leaves the
+# original intact rather than truncated.
+#
 # BOXMAN_GUEST_ROOT exists so the script can be exercised against a directory
 # in the unit tests; inside the guest it is unset.
 _HOSTNAME_SCRIPT = r'''#!/bin/sh
@@ -78,6 +85,25 @@ _HOSTNAME_SCRIPT = r'''#!/bin/sh
 root="${BOXMAN_GUEST_ROOT:-}"
 new_fqdn='@NEW_FQDN@'
 new_short='@NEW_SHORT@'
+
+fail() { echo "boxman hostname: $*" >&2; exit 1; }
+
+# Replace FILE with what the command after it prints when given FILE: via a
+# scratch copy in the target's own directory (metadata copied first, so mode
+# and owner survive) and an atomic rename. A symlink is followed, not replaced.
+replace() {
+    file=$1; shift
+    target=$(readlink -f "$file" 2>/dev/null) || target=$file
+    [ -n "$target" ] || target=$file
+    tmp=$(mktemp "${target%/*}/.boxman-rewrite.XXXXXX") ||
+        fail "cannot create a scratch file beside $target"
+    if cp -p "$target" "$tmp" && "$@" "$target" > "$tmp" &&
+            mv -f "$tmp" "$target"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    fail "could not rewrite $target"
+}
 
 # the template's name, read before --hostname replaces it
 old=$(head -n 1 "$root/etc/hostname" 2>/dev/null | tr -d ' \t\r')
@@ -89,92 +115,100 @@ old_short=${old%%.*}
 # a line from unrelated sources (its fqdn from the metadata's local-hostname,
 # its short name from user-data), so they cannot be matched by name alone.
 # Those names become the clone's; every other line is left exactly as it
-# was. If no loopback line names the clone afterwards, one is added.
+# was, line ending included. If no loopback line names the clone afterwards,
+# one is added.
+HOSTS_AWK='
+    function lc(s) { return tolower(s) }
+    # 127/8, and every spelling of the IPv6 loopback (::1, 0:0:0:0:0:0:0:1)
+    function is_loopback(a) { return a ~ /^127\./ || a ~ /^[0:]*:0*1$/ }
+    function is_local(n,    l) {
+        l = lc(n)
+        return l ~ /^localhost/ || l ~ /^ip6-/
+    }
+    function is_old(n,    l) {
+        if (skip) return 0
+        l = lc(n)
+        return l == lold || l == lolds || index(l, lolds ".") == 1
+    }
+    function add(n,    l) {
+        l = lc(n)
+        if (l in seen) return
+        seen[l] = 1
+        out = out " " n
+    }
+    BEGIN {
+        lold = lc(old); lolds = lc(olds)
+        # never rewrite localhost, whatever the template called itself
+        skip = (lolds == "" || lolds ~ /^localhost/)
+        have_new = 0
+    }
+    {
+        orig = $0
+        cr = sub(/\r$/, "")
+        if ($0 ~ /^[ \t]*(#|$)/ || !is_loopback($1)) { print orig; next }
+        n = 0; comment = ""
+        split("", names)
+        for (i = 2; i <= NF; i++) {
+            if (substr($i, 1, 1) == "#") {
+                comment = substr($0, index($0, "#")); break
+            }
+            names[++n] = $i
+        }
+        self = ($1 == "127.0.1.1")
+        for (k = 1; k <= n; k++) if (is_old(names[k])) self = 1
+        if (!self) {
+            for (k = 1; k <= n; k++) if (lc(names[k]) == lc(ns)) have_new = 1
+            print orig; next
+        }
+        out = $1; placed = 0
+        split("", seen)
+        for (k = 1; k <= n; k++) {
+            if (is_local(names[k])) add(names[k])
+            else if (!placed) { add(nf); add(ns); placed = 1 }
+        }
+        if (!placed) { add(nf); add(ns) }
+        print out (comment == "" ? "" : " " comment) (cr ? "\r" : "")
+        have_new = 1
+    }
+    END {
+        if (!have_new) print "127.0.1.1 " (nf == ns ? ns : nf " " ns)
+    }'
+
+# cloud-init's module lists: comment update_etc_hosts out, in whichever form
+# it is listed (plain, dashed, [name, frequency], quoted)
+MODULES_AWK='
+    /^[ \t]*-[ \t]*\[?[ \t]*"?update[-_]etc[-_]hosts"?[ \t]*(,|\]|$)/ {
+        sub(/-/, "# -")
+        print $0 "  # boxman: /etc/hosts is set when the vm is cloned"
+        next
+    }
+    { print }'
+
 if [ -f "$root/etc/hosts" ]; then
-    awk -v old="$old" -v olds="$old_short" -v nf="$new_fqdn" -v ns="$new_short" '
-        function lc(s) { return tolower(s) }
-        function is_local(n,    l) {
-            l = lc(n)
-            return l ~ /^localhost/ || l ~ /^ip6-/
-        }
-        function is_old(n,    l) {
-            if (skip) return 0
-            l = lc(n)
-            return l == lold || l == lolds || index(l, lolds ".") == 1
-        }
-        function add(n,    l) {
-            l = lc(n)
-            if (l in seen) return
-            seen[l] = 1
-            out = out " " n
-        }
-        BEGIN {
-            lold = lc(old); lolds = lc(olds)
-            # never rewrite localhost, whatever the template called itself
-            skip = (lolds == "" || lolds ~ /^localhost/)
-            have_new = 0
-        }
-        {
-            if ($0 ~ /^[ \t]*(#|$)/ || ($1 !~ /^127\./ && $1 != "::1")) {
-                print; next
-            }
-            n = 0; comment = ""
-            split("", names)
-            for (i = 2; i <= NF; i++) {
-                if (substr($i, 1, 1) == "#") {
-                    comment = substr($0, index($0, "#")); break
-                }
-                names[++n] = $i
-            }
-            self = ($1 == "127.0.1.1")
-            for (k = 1; k <= n; k++) if (is_old(names[k])) self = 1
-            if (!self) {
-                for (k = 1; k <= n; k++) if (lc(names[k]) == lc(ns)) have_new = 1
-                print; next
-            }
-            out = $1; placed = 0
-            split("", seen)
-            for (k = 1; k <= n; k++) {
-                if (is_local(names[k])) add(names[k])
-                else if (!placed) { add(nf); add(ns); placed = 1 }
-            }
-            if (!placed) { add(nf); add(ns) }
-            print out (comment == "" ? "" : " " comment)
-            have_new = 1
-        }
-        END {
-            if (!have_new) print "127.0.1.1 " (nf == ns ? ns : nf " " ns)
-        }
-    ' "$root/etc/hosts" > "$root/etc/hosts.boxman" &&
-        cat "$root/etc/hosts.boxman" > "$root/etc/hosts"
-    rm -f "$root/etc/hosts.boxman"
+    replace "$root/etc/hosts" awk -v old="$old" -v olds="$old_short" \
+        -v nf="$new_fqdn" -v ns="$new_short" "$HOSTS_AWK"
 fi
 
 # cloud-init, when the guest has it (sealed or not: harmless when disabled).
 if [ -d "$root/etc/cloud" ]; then
-    mkdir -p "$root/etc/cloud/cloud.cfg.d"
-    cat > "$root@DROPIN@" <<EOF
-# Written by boxman when this VM was cloned: its name is $new_short, not its
-# template's. preserve_hostname stops cloud-init setting the name back from
-# the template's metadata on a later boot.
-preserve_hostname: true
-hostname: $new_short
-fqdn: $new_fqdn
-EOF
-    # A template whose own user-data sets hostname: with manage_etc_hosts:
-    # true would still have cloud-init write the template's name into
-    # /etc/hosts on every boot -- user-data outranks any drop-in above. The
-    # hosts template is the one place it cannot override, and the file's own
-    # header names it as where a persistent change belongs.
-    for tpl in "$root"/etc/cloud/templates/hosts.*.tmpl; do
-        [ -f "$tpl" ] || continue
-        if [ "$new_fqdn" = "$new_short" ]; then
-            # an undotted name is both; do not list it twice on one line
-            sed -i -e "s/{{ *fqdn *}}[ \t]*{{ *hostname *}}/$new_short/g" "$tpl"
-        fi
-        sed -i -e "s/{{ *fqdn *}}/$new_fqdn/g" \
-               -e "s/{{ *hostname *}}/$new_short/g" "$tpl"
-    done
+    mkdir -p "$root/etc/cloud/cloud.cfg.d" ||
+        fail "cannot create $root/etc/cloud/cloud.cfg.d"
+    # values quoted: an unquoted `hostname: no` is YAML false, `123` an int
+    {
+        echo "# Written by boxman when this VM was cloned: its name is"
+        echo "# $new_short, not its template's. preserve_hostname stops"
+        echo "# cloud-init setting the name back from the template's data."
+        echo "preserve_hostname: true"
+        echo "hostname: '$new_short'"
+        echo "fqdn: '$new_fqdn'"
+    } > "$root@DROPIN@" || fail "cannot write $root@DROPIN@"
+    # Every manage_etc_hosts mode -- true, template, localhost -- writes
+    # /etc/hosts through update_etc_hosts, taking the name from the
+    # template's user-data, which outranks any drop-in. So the module leaves
+    # this clone's list; its /etc/hosts was set above.
+    if [ -f "$root/etc/cloud/cloud.cfg" ]; then
+        replace "$root/etc/cloud/cloud.cfg" awk "$MODULES_AWK"
+    fi
 fi
 exit 0
 '''

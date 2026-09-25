@@ -28,6 +28,22 @@ def expand_name_range(name_range: str):
 
 
 
+def hostname_or_key(vm_name: str, vm_info: dict):
+    """
+    The name a VM's ssh alias is built from: its ``hostname:``, else its key.
+
+    An explicit ``hostname: null`` counts as absent. ``vm_info.get('hostname',
+    vm_name)`` would return None for it, and two such VMs in one cluster
+    would then share the alias ``<cluster>_None``.
+
+    :param vm_name: the VM's key under ``vms:``
+    :param vm_info: the VM's config block
+    :return: the declared hostname as-is, or *vm_name*
+    """
+    declared = vm_info.get('hostname')
+    return vm_name if declared is None else declared
+
+
 #: One DNS label per RFC 1123: letters, digits and inner hyphens, 1-63 long.
 _HOSTNAME_LABEL = re.compile(r'^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$')
 
@@ -64,7 +80,9 @@ def hostname_problem(value) -> str | None:
         if len(label) > 63:
             return (f"{value!r} has a {len(label)}-character label; each "
                     f"dot-separated label is at most 63")
-        if not _HOSTNAME_LABEL.match(label):
+        # fullmatch, not match: the pattern's $ also matches just before a
+        # trailing newline, which a YAML block scalar leaves in the value
+        if not _HOSTNAME_LABEL.fullmatch(label):
             return (f"{value!r} has the label {label!r}; labels use letters, "
                     f"digits and inner hyphens only")
     return None

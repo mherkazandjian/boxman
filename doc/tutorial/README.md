@@ -273,13 +273,13 @@ or not the template seals cloud-init: `/etc/hostname` takes the value as
 given (a dotted value is an FQDN), and loopback lines in `/etc/hosts` that
 named the template now name the clone. When the guest has cloud-init, a
 `cloud.cfg.d` drop-in sets `preserve_hostname: true`, and cloud-init's
-`hosts.*.tmpl` templates are given the literal name — a template whose own
-user-data sets `hostname:` with `manage_etc_hosts: true` would otherwise have
-cloud-init write the template's name back into `/etc/hosts` on every boot,
-and user-data outranks any drop-in. A hostname that is not a valid RFC 1123
-name is refused before anything is created; a VM *key* that is not (`my_vm`)
-only warns under `auto` and leaves the template's name in place — declare
-`hostname:` to name it.
+`update_etc_hosts` module is commented out of the clone's `cloud.cfg` — a
+template whose own user-data sets `hostname:` with `manage_etc_hosts` would
+otherwise have cloud-init write the template's name back into `/etc/hosts` on
+every boot, and user-data outranks any drop-in. A hostname that is not a
+valid RFC 1123 name is refused before anything is created; a VM *key* that is
+not (`my_vm`) only warns under `auto` and leaves the template's name in place
+— declare `hostname:` to name it.
 
 Why the ssh host keys matter: without `clone_ssh_host_keys`, every clone of
 one template presents the template's host keys. Clients cannot tell two

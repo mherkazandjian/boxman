@@ -205,8 +205,8 @@ The plan below replaced an earlier one built on `--edit` and a drop-in alone;
 F13, F14 and F16 are why.
 
 - **Resolve**: `hostname:` if declared, otherwise the VM key — the same
-  fallback `manager_parts/ssh.py` uses for the ssh alias, so the alias and the
-  guest's name agree. The manager resolves it, because the provider only ever
+  fallback the ssh alias uses (`hostname_or_key()`, where an explicit `null`
+  counts as absent), so the alias and the guest's name agree. The manager resolves it, because the provider only ever
   sees the full libvirt domain name, and hands it to the clone under a private
   key in the VM's info, the way the degradation list travels.
 - **Set**: `--hostname <resolved>`, for `/etc/hostname` and the distro files.
@@ -215,25 +215,44 @@ F13, F14 and F16 are why.
   It runs inside the guest, so it needs no host perl (F13), and it tests for
   every file before touching it (F14). Its only requirement, guest arch matching
   the host's, always holds under KVM. It:
-  - treats a loopback line as a self-line when it names the template or is
-    `127.0.1.1` (Debian's address for the machine's own name), and replaces
-    every non-localhost name on it with the clone's (F16); every other line is
-    left byte-for-byte alone, and a self-line is added if none names the clone;
-  - never rewrites a `localhost*` name, even for a template called `localhost`;
+  - treats a loopback line (`127.0.0.0/8` or `::1`, in any of its spellings)
+    as a self-line when it names the template or is `127.0.1.1` (Debian's
+    address for the machine's own name), and replaces every non-localhost
+    name on it with the clone's (F16); every other line is left byte-for-byte
+    alone, CRLF endings included, and a self-line is added if none names the
+    clone;
+  - never rewrites a `localhost*` or `ip6-*` name, even for a template called
+    `localhost`;
   - when `/etc/cloud` exists, writes `cloud.cfg.d/99-boxman-hostname.cfg` with
-    `preserve_hostname: true` plus `hostname` and `fqdn`, and replaces
-    `{{fqdn}}` / `{{hostname}}` in cloud-init's `hosts.*.tmpl` with the literal
-    names.
-- **Why the hosts template**: a template whose own user-data sets `hostname:`
-  with `manage_etc_hosts: true` — every shipped cloud-init box does — has
-  cloud-init re-render `/etc/hosts` on *every* boot from its hosts template,
-  taking the name from user-data, which outranks any `cloud.cfg.d` drop-in. The
-  template file is the one input user-data cannot override, and its own header
-  names it as where a persistent change belongs. Rejected alternatives: removing
-  `update_etc_hosts` from `cloud.cfg`'s module list (editing a distro conffile,
-  and impossible with `--edit` on a guest without cloud-init); a fresh NoCloud
-  seed per clone (a new instance-id re-runs every per-instance module of the
-  template's user-data on every clone, and does nothing for a sealed template).
+    `preserve_hostname: true` plus `hostname` and `fqdn` (quoted, so `no` or
+    `123` stay strings), and comments `update_etc_hosts` out of `cloud.cfg`'s
+    module list, in whichever form it is listed;
+  - rewrites each file through a temporary copy beside its real target that
+    keeps the original's owner and mode, renamed into place only once written
+    in full; any failure exits non-zero, which `virt-sysprep --run` reports,
+    so a failed rename is an identity-pass failure under the policy rather than
+    a silent success with a truncated `/etc/hosts`.
+- **Why disable `update_etc_hosts`**: every `manage_etc_hosts` mode — `true`,
+  `template` and `localhost` — writes `/etc/hosts` through that one module, on
+  *every* boot, taking the name from the template's user-data, which outranks
+  any `cloud.cfg.d` drop-in. Every shipped cloud-init box sets
+  `manage_etc_hosts: true`. The file was set when the clone was made, so the
+  module has nothing left to do. The first build instead gave cloud-init's
+  `hosts.*.tmpl` the literal name; the Codex review found that `localhost` mode
+  bypasses those templates and wrote the template's name back. Rejected
+  alternatives: that template edit; a fresh NoCloud seed per clone (a new
+  instance-id re-runs every per-instance module of the template's user-data on
+  every clone, and does nothing for a sealed template).
+- **When it matters, and verified**: on a clone of a template built by the
+  current code cloud-init does not run at all: the template's NoCloud seed is
+  ejected at build time, so ds-identify finds no datasource and disables it.
+  It runs when a clone has one: a template built before that eject, whose
+  clones share its `seed.iso`, or a seed attached by hand. Checked on an
+  Ubuntu 24.04 clone with a NoCloud seed inserted, in `true` mode under the
+  template's instance-id and in `localhost` mode under a fresh one: with the
+  module commented out `/etc/hosts` was untouched and the name stayed the
+  clone's; re-enabling the module brought `127.0.1.1 alpha hello-cloudinit`
+  back in both modes.
 - **Validation**: `hostname_problem()` in `src/boxman/utils/hostnames.py` — RFC
   1123 labels, 253 characters in total, a dotted value written as given,
   booleans and numbers refused. It runs at config time in a new
