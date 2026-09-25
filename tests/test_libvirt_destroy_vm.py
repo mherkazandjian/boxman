@@ -199,9 +199,21 @@ class TestForceUndefine:
                     if c.args[0] == "undefine"][0]
         assert undefine.args[1] == "vm01"
         for flag in ("--remove-all-storage", "--wipe-storage",
-                     "--delete-storage-volume-snapshots",
                      "--snapshots-metadata"):
             assert flag in undefine.args
+
+    def test_storage_undefine_omits_the_rbd_only_snapshot_flag(
+            self, dv: DestroyVM):
+        """Regression for issue #207: --delete-storage-volume-snapshots is
+        VIR_STORAGE_VOL_DELETE_WITH_SNAPSHOTS (0x2), which only RBD pools
+        implement. The directory pools holding boxman's disks reject it, so
+        every volume removal failed after the domain was already undefined."""
+        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
+             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
+             patch.object(dv.virsh, "execute", return_value=_result()) as execute:
+            assert dv.force_undefine_vm() is True
+        for c in execute.call_args_list:
+            assert "--delete-storage-volume-snapshots" not in c.args
 
     def test_falls_back_to_plain_undefine_on_failure(self, dv: DestroyVM):
         """Regression for issue #85 item 25: when the rich undefine
@@ -341,8 +353,80 @@ class TestManagedSaveBlocksUndefine:
              patch.object(
                  dv.virsh, "execute",
                  side_effect=[_result(ok=False, stderr="storage gone"),
-                              _result(ok=False, stderr="still refusing")]):
+                              _result(ok=False, stderr="still refusing"),
+                              # the listing still shows the domain
+                              _result(stdout="vm01\n")]):
             assert dv.force_undefine_vm() is False
+
+
+class TestRetryAfterAStorageOnlyFailure:
+    """Issue #207: virsh undefines the domain *before* it removes the
+    volumes, so a failed storage-removing undefine can leave nothing for the
+    plain retry to find. A clean deprovision logged an ERROR per VM for it.
+
+    The stderr below is what libvirt 10.0 printed on the test-runner VM."""
+
+    STORAGE_ERROR = (
+        "error: Failed to remove storage volume 'vda'(/ws/c1/vm01.qcow2)\n"
+        "error: unsupported flags (0x2) in function "
+        "virStorageBackendVolDeleteLocal")
+    NOT_FOUND = "error: failed to get domain 'vm01'"
+
+    def _run(self, dv: DestroyVM, fallback, listing, defined_after):
+        def fake_execute(*args, **kwargs):
+            if args[0] == "undefine" and "--remove-all-storage" in args:
+                return _result(ok=False, stderr=self.STORAGE_ERROR,
+                               return_code=1)
+            if args[0] == "undefine":
+                return fallback
+            if args[0] == "list":
+                return listing
+            raise AssertionError(f"unexpected virsh call {args}")
+
+        with patch.object(dv, "logger") as logger, \
+             patch.object(dv, "is_vm_defined",
+                          side_effect=[True, defined_after]), \
+             patch.object(dv, "_confirm_shut_off_or_absent",
+                          return_value=True), \
+             patch.object(dv.virsh, "execute", side_effect=fake_execute):
+            ok = dv.force_undefine_vm()
+        return ok, logger
+
+    def test_a_domain_the_first_attempt_removed_is_success(self, dv: DestroyVM):
+        ok, logger = self._run(
+            dv,
+            fallback=_result(ok=False, stderr=self.NOT_FOUND, return_code=1),
+            listing=_result(stdout="other-vm\n"),
+            defined_after=False)
+        assert ok is True
+        logger.error.assert_not_called()
+        debug = " ".join(str(c.args[0]) for c in logger.debug.call_args_list)
+        assert "already removed" in debug
+
+    def test_any_other_retry_failure_is_still_an_error(self, dv: DestroyVM):
+        ok, logger = self._run(
+            dv,
+            fallback=_result(
+                ok=False, return_code=1,
+                stderr="error: Refusing to undefine while domain managed "
+                       "save image exists"),
+            listing=_result(stdout="vm01\nother-vm\n"),
+            defined_after=True)
+        assert ok is False
+        errors = [str(c.args[0]) for c in logger.error.call_args_list]
+        assert any("plain undefine also failed" in e for e in errors)
+
+    def test_a_not_found_message_alone_is_not_trusted(self, dv: DestroyVM):
+        """The retry's error text is not proof: only a successful listing
+        classifies the failure as harmless (see confirm_absent)."""
+        _ok, logger = self._run(
+            dv,
+            fallback=_result(ok=False, stderr=self.NOT_FOUND, return_code=1),
+            listing=_result(ok=False, stderr="error: failed to connect",
+                            return_code=1),
+            defined_after=False)
+        errors = [str(c.args[0]) for c in logger.error.call_args_list]
+        assert any("plain undefine also failed" in e for e in errors)
 
 
 class TestConfirmAbsent:

@@ -1,6 +1,7 @@
 """VM lifecycle and update flows for BoxmanManager."""
 
 import contextlib
+import glob
 import logging
 import os
 import time
@@ -18,6 +19,14 @@ from boxman.loggers.logger import suppressed
 from boxman.manager_parts.images import ImagesMixin
 from boxman.providers.libvirt.clone_vm import CLONE_DEGRADATION_NOTICES_KEY
 from boxman.providers.libvirt.commands import VirshCommand
+from boxman.providers.libvirt.disk_cleanup import (
+    file_identities,
+    remove_recorded_leftovers,
+)
+from boxman.providers.libvirt.disk_ownership import (
+    DiskRecord,
+    read_disk_records,
+)
 from boxman.providers.libvirt.virsh_parse import parse_domblklist
 
 
@@ -345,7 +354,28 @@ class VMsMixin:
             disks=vm_info.get('disks', [])
         )
 
-    def _vm_disk_dirs(self, full_vm_name: str) -> list[str]:
+    def _vm_disk_files(self, full_vm_name: str) -> list[str]:
+        """
+        Return the paths of *full_vm_name*'s disk files (CD-ROMs left out),
+        read from libvirt itself (``virsh domblklist``).
+
+        Must run before the domain is undefined. Empty when the domain
+        cannot be queried (e.g. already undefined).
+        """
+        virsh = VirshCommand(
+            provider_config=self.provider.provider_config)
+        result = virsh.execute(
+            "domblklist", full_vm_name, "--details", warn=True)
+        if not result.ok:
+            return []
+        return [
+            row.source for row in parse_domblklist(result.stdout)
+            if row.device == 'disk' and row.source not in (None, '-')
+        ]
+
+    def _vm_disk_dirs(self,
+                      full_vm_name: str,
+                      disk_files: list[str] | None = None) -> list[str]:
         """
         Return the directories that hold *full_vm_name*'s disk files,
         discovered from libvirt itself (``virsh domblklist``).
@@ -356,16 +386,15 @@ class VMsMixin:
         cannot be queried (e.g. already undefined) — the destroy_disks
         glob is anchored at the VM name, so sweeping extra directories
         is harmless.
+
+        Args:
+            full_vm_name: Full name of the VM.
+            disk_files: The VM's disk files when the caller already read
+                them with :meth:`_vm_disk_files`; queried here otherwise.
         """
-        virsh = VirshCommand(
-            provider_config=self.provider.provider_config)
-        result = virsh.execute(
-            "domblklist", full_vm_name, "--details", warn=True)
-        dirs = set()
-        if result.ok:
-            for row in parse_domblklist(result.stdout):
-                if row.device == 'disk' and row.source not in (None, '-'):
-                    dirs.add(os.path.dirname(row.source))
+        if disk_files is None:
+            disk_files = self._vm_disk_files(full_vm_name)
+        dirs = {os.path.dirname(path) for path in disk_files}
         if not dirs:
             self.logger.warning(
                 f"could not query disk paths for {full_vm_name} from "
@@ -378,19 +407,28 @@ class VMsMixin:
         Destroy a VM that has been removed from the config.
 
         Uses destroy_vm + destroy_disks with an empty disk list since we
-        no longer have the disk config for this VM. The disk directories
-        are read from libvirt before the domain is undefined (see
-        ``_vm_disk_dirs``); the glob-based cleanup in destroy_disks
-        catches all {vm_name}* artifacts.
+        no longer have the disk config for this VM. The disk files,
+        directories and ownership records are read from libvirt before the
+        domain is undefined (see ``_vm_disk_files``); the glob-based cleanup
+        in destroy_disks catches the boot disk and snapshot artifacts, and
+        ``_remove_leftover_disk_files`` the recorded extra disks it cannot
+        name.
         """
         self.logger.info(f"removing VM {full_vm_name} (no longer in config)")
         # Phase 1 (#49): stays on the default session — the VM is gone
         # from the config, so its cluster (and provider) can no longer be
         # resolved. Revisited in Phase 3 (#51).
         #
-        # The disk directories come from libvirt, so they must be discovered
-        # *before* the domain is undefined.
-        disk_dirs = self._vm_disk_dirs(full_vm_name)
+        # The disk files, directories and ownership records come from
+        # libvirt, so they must be read *before* the domain is undefined —
+        # and the files' identities with them, so a file replaced in the
+        # meantime is never taken for the one that was attached.
+        disk_files = self._vm_disk_files(full_vm_name)
+        disk_dirs = self._vm_disk_dirs(full_vm_name, disk_files)
+        records = self._vm_disk_records(full_vm_name)
+        identities = file_identities(disk_files)
+        protected = self._sweep_protection(
+            full_vm_name, disk_files, records, disk_dirs)
         self.provider.destroy_vm(full_vm_name)
         if not self.provider.confirm_vm_absent(full_vm_name):
             self.provider.destroy_vm(full_vm_name, force=True)
@@ -409,8 +447,108 @@ class VMsMixin:
             self.provider.destroy_disks(
                 workdir,
                 vm_name=full_vm_name,
-                disks=[]
+                disks=[],
+                protected=protected,
             )
+        self._remove_leftover_disk_files(
+            full_vm_name, disk_files, records, identities)
+
+    def _sweep_protection(self,
+                          full_vm_name: str,
+                          disk_files: list[str],
+                          records: list[DiskRecord] | None,
+                          disk_dirs: list[str]) -> list[str]:
+        """
+        The files the name sweep must leave to the ownership decision.
+        Read before the domain is undefined.
+
+        Every extra disk is decided on recorded ownership alone, so the
+        sweep must not reach one first: its ``<vm>_snapshot_*`` pattern
+        also matches the files of an extra disk whose logical name starts
+        with ``snapshot_``. That covers every attached extra disk, every
+        layer beneath one (an external snapshot leaves the recorded base
+        and older overlays unattached but still in the chain), and every
+        recorded source, whatever its role. The boot disk and its overlays
+        (``<vm>.*``) stay with the sweep; extra disks are always named
+        ``<vm>_<name>.<ext>``.
+
+        When a chain cannot be read, a layer of a kept disk cannot be told
+        apart from a memory-snapshot file, so every ``<vm>_snapshot_*``
+        file is protected instead.
+        """
+        extra_disk_files = [
+            path for path in disk_files
+            if not os.path.basename(path).startswith(f"{full_vm_name}.")
+        ]
+        protected = set(extra_disk_files)
+        protected.update(record.source for record in records or ())
+        chains = (self.provider.backing_chain_files(extra_disk_files)
+                  if extra_disk_files else [])
+        if chains is None:
+            self.logger.warning(
+                f"{full_vm_name}: could not read the backing chain of its "
+                f"extra disks, so its {full_vm_name}_snapshot_* files are "
+                f"left in place")
+            # the same pattern the sweep uses, so it covers exactly what
+            # the sweep would take
+            for workdir in disk_dirs:
+                protected.update(glob.glob(os.path.join(
+                    os.path.expanduser(workdir),
+                    f"{full_vm_name}_snapshot_*")))
+        else:
+            protected.update(chains)
+        return sorted(protected)
+
+    def _vm_disk_records(self, full_vm_name: str) -> list[DiskRecord] | None:
+        """
+        Return boxman's disk ownership records for *full_vm_name* (see
+        ``disk_ownership``). Must run before the domain is undefined.
+
+        ``None`` when the domain carries none or they cannot be read:
+        either way boxman does not know what it attached there, which is
+        never grounds for deleting a file.
+        """
+        virsh = VirshCommand(
+            provider_config=self.provider.provider_config)
+        try:
+            return read_disk_records(virsh, full_vm_name)
+        except ProvisionError as exc:
+            self.logger.warning(
+                f"{full_vm_name}: {exc}; none of its extra disks will be "
+                f"removed")
+            return None
+
+    def _cluster_workdirs(self) -> list[str]:
+        """The workdirs of every cluster in the project config."""
+        return [
+            cluster['workdir']
+            for cluster in (self.config.get('clusters') or {}).values()
+            if isinstance(cluster, dict) and cluster.get('workdir')
+        ]
+
+    def _remove_leftover_disk_files(
+            self,
+            full_vm_name: str,
+            disk_files: list[str],
+            records: list[DiskRecord] | None,
+            identities: dict[str, tuple[int, int]]) -> None:
+        """
+        Remove the recorded extra disks an undefined VM left behind, and
+        name every leftover file that is kept.
+
+        ``undefine --remove-all-storage`` skips a disk its storage pool
+        does not list, and ``destroy_disks`` cannot name a removed VM's
+        extra disks. The decision is made on recorded ownership, never on
+        the file name — see
+        :func:`~boxman.providers.libvirt.disk_cleanup.remove_recorded_leftovers`
+        for the rules.
+        """
+        kept = remove_recorded_leftovers(
+            full_vm_name, disk_files, records, self._cluster_workdirs(),
+            identities, self.provider.disk_paths_in_use)
+        for path, reason in kept:
+            self.logger.warning(
+                f"{full_vm_name}: left disk {path} in place because {reason}")
 
     def configure_and_start_vms(self) -> None:
         """
