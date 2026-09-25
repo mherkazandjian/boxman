@@ -29,6 +29,8 @@ from boxman.utils.jinja_env import create_jinja_env
 #: feeder-thread flush latency — or a child that died before queue.put).
 _PARALLEL_RESULT_TIMEOUT = 5
 _PARALLEL_POLL_INTERVAL = 0.2
+# how long an abandoned worker gets to exit after SIGTERM before SIGKILL
+_PARALLEL_STOP_TIMEOUT = 5
 
 
 def _parallel_worker(result_queue, label, target, args):
@@ -422,11 +424,20 @@ class BoxmanManager(
             max_workers: cap on concurrently live children; ``None`` resolves
                 via :meth:`_parallel_worker_limit`, <= 0 means unbounded.
             on_result: optional ``callable(label, payload)``, called in the
-                parent for each task that succeeded, as soon as its result is
-                drained -- before this method returns. A caller that must not
-                lose completed work to an interruption (a Ctrl-C while other
-                workers are still running) collects here rather than from the
-                returned dict.
+                parent for each success a task *reports*, as soon as its
+                result is drained -- before this method returns. A caller that
+                must not lose completed work to an interruption (a Ctrl-C
+                while other workers are still running) collects here rather
+                than from the returned dict. It is not the batch's final word:
+                a worker that reported a result and then exited non-zero still
+                lands in ``failures``. If it raises, the batch stops as on an
+                interruption and it is not called again.
+
+        On any exception -- a Ctrl-C, or *on_result* raising -- the results
+        already queued are drained first, the workers still running are
+        stopped and reaped, and the exception is re-raised. The queue is not
+        read again after that: a worker killed mid-write can leave it
+        corrupted.
 
         Returns:
             ``(results, failures)`` dicts keyed by task label. A task lands in
@@ -454,10 +465,17 @@ class BoxmanManager(
         running: dict[str, Process] = {}
         pending = iter(tasks)
 
+        callback_failed = False
+
         def _record(label, ok, payload) -> None:
+            nonlocal callback_failed
             reported[label] = (ok, payload)
-            if ok and on_result is not None:
-                on_result(label, payload)
+            if ok and on_result is not None and not callback_failed:
+                try:
+                    on_result(label, payload)
+                except Exception:
+                    callback_failed = True
+                    raise
 
         def _drain() -> None:
             """Move everything already queued into *reported*."""
@@ -468,43 +486,47 @@ class BoxmanManager(
                     return
                 _record(label, ok, payload)
 
-        while True:
-            while len(running) < limit:
-                try:
-                    label, target, args = next(pending)
-                except StopIteration:
+        try:
+            while True:
+                while len(running) < limit:
+                    try:
+                        label, target, args = next(pending)
+                    except StopIteration:
+                        break
+                    proc = Process(
+                        target=_parallel_worker,
+                        args=(result_queue, label, target, args))
+                    proc.start()
+                    running[label] = proc
+
+                if not running:
                     break
-                proc = Process(
-                    target=_parallel_worker,
-                    args=(result_queue, label, target, args))
-                proc.start()
-                running[label] = proc
 
-            if not running:
-                break
+                # Wake on the first child to exit, but time out so the queue
+                # is drained regularly even while every child is working.
+                wait([proc.sentinel for proc in running.values()],
+                     timeout=_PARALLEL_POLL_INTERVAL)
+                _drain()
+                for label in [lbl for lbl, proc in running.items()
+                              if not proc.is_alive()]:
+                    proc = running.pop(label)
+                    proc.join()
+                    exitcodes[label] = proc.exitcode
 
-            # Wake on the first child to exit, but time out so the queue is
-            # drained regularly even while every child is still working.
-            wait([proc.sentinel for proc in running.values()],
-                 timeout=_PARALLEL_POLL_INTERVAL)
-            _drain()
-            for label in [lbl for lbl, proc in running.items()
-                          if not proc.is_alive()]:
-                proc = running.pop(label)
-                proc.join()
-                exitcodes[label] = proc.exitcode
-
-        # Every child has exited; collect results its feeder thread flushed
-        # on the way out.
-        while len(reported) < len(tasks):
-            try:
-                label, ok, payload = result_queue.get(
-                    timeout=_PARALLEL_RESULT_TIMEOUT)
-            except Empty:
-                # A child exited without reporting (killed, or the queue
-                # broke) — the per-task loop below marks it as failed.
-                break
-            _record(label, ok, payload)
+            # Every child has exited; collect results its feeder thread
+            # flushed on the way out.
+            while len(reported) < len(tasks):
+                try:
+                    label, ok, payload = result_queue.get(
+                        timeout=_PARALLEL_RESULT_TIMEOUT)
+                except Empty:
+                    # A child exited without reporting (killed, or the queue
+                    # broke) — the per-task loop below marks it as failed.
+                    break
+                _record(label, ok, payload)
+        except BaseException:
+            self._abandon_parallel(op_label, running, _drain)
+            raise
 
         results: dict[str, Any] = {}
         failures: dict[str, str] = {}
@@ -524,6 +546,37 @@ class BoxmanManager(
         for label, reason in failures.items():
             self.logger.error(f"{op_label} failed for {label}: {reason}")
         return results, failures
+
+    def _abandon_parallel(self, op_label, running, drain) -> None:
+        """
+        Clean up after :meth:`_run_parallel` was interrupted.
+
+        Drains what finished workers already queued, so an ``on_result``
+        caller keeps it, then stops and reaps every worker still running,
+        so none outlives the batch. Nothing here raises, not even a second
+        Ctrl-C: the caller is already propagating the exception that got it
+        here, and the workers must be stopped either way.
+        """
+        try:
+            drain()
+        except BaseException as exc:
+            self.logger.debug(
+                f"{op_label}: could not collect queued results while "
+                f"stopping: {exc!r}")
+        alive = [proc for proc in running.values() if proc.is_alive()]
+        if alive:
+            self.logger.warning(
+                f"{op_label}: stopping {len(alive)} worker(s) still running")
+        for proc in alive:
+            proc.terminate()
+        for proc in running.values():
+            try:
+                proc.join(timeout=_PARALLEL_STOP_TIMEOUT)
+            except BaseException:
+                pass
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
 
     def _vm_cluster_map(self) -> dict[str, str]:
         """

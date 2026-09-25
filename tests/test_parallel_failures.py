@@ -5,6 +5,7 @@ a failure (and must never deadlock the parent on a blocking queue.get).
 """
 
 import os
+import time
 import types
 from unittest.mock import MagicMock, patch
 
@@ -120,6 +121,74 @@ class TestOnResult:
                     max_workers=2,
                     on_result=lambda label, payload: got.append((label, payload)))
         assert got == [("fast", "record")]
+
+    def test_a_result_queued_but_not_yet_drained_is_not_lost(self):
+        """From round 2 of the review: the interrupt lands after the fast
+        worker exited -- its result already flushed to the queue -- but
+        before the parent drained it."""
+        import multiprocessing.connection as mpc
+        real_wait = mpc.wait
+        got = []
+        interrupted = []
+
+        # multiprocessing polls its queue and joins through this same
+        # function, so interrupt once, as a real Ctrl-C does
+        def wait(objects, timeout=None):
+            ready = real_wait(objects, timeout)
+            if ready and not interrupted:  # a worker exited, undrained
+                interrupted.append(True)
+                raise KeyboardInterrupt
+            return ready
+
+        with patch.object(mpc, "wait", side_effect=wait):
+            with pytest.raises(KeyboardInterrupt):
+                _manager()._run_parallel(
+                    [("fast", _ok_worker, ("record",)),
+                     ("slow", _sleeping_worker, (30,))],
+                    max_workers=2,
+                    on_result=lambda label, payload: got.append((label, payload)))
+        assert got == [("fast", "record")]
+
+    def test_an_interrupt_stops_the_workers_still_running(self):
+        import multiprocessing
+        import multiprocessing.connection as mpc
+        real_wait = mpc.wait
+        interrupted = []
+
+        def wait(objects, timeout=None):
+            if not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt
+            return real_wait(objects, timeout)
+
+        started = time.monotonic()
+        with patch.object(mpc, "wait", side_effect=wait):
+            with pytest.raises(KeyboardInterrupt):
+                _manager()._run_parallel(
+                    [("slow", _sleeping_worker, (30,)),
+                     ("slower", _sleeping_worker, (30,))],
+                    max_workers=2)
+        assert multiprocessing.active_children() == []
+        assert time.monotonic() - started < 15
+
+    def test_a_failing_callback_stops_the_batch_and_is_not_called_again(self):
+        import multiprocessing
+        calls = []
+
+        def boom(label, payload):
+            calls.append(label)
+            time.sleep(0.5)  # the other fast result is queued meanwhile
+            raise RuntimeError("callback probe")
+
+        with pytest.raises(RuntimeError, match="callback probe"):
+            _manager()._run_parallel(
+                [("fast", _ok_worker, (1,)),
+                 ("also-fast", _ok_worker, (2,)),
+                 ("slow", _sleeping_worker, (30,)),
+                 ("pending", _ok_worker, (3,))],
+                max_workers=3, on_result=boom)
+        assert len(calls) == 1
+        assert multiprocessing.active_children() == []
 
 
 class TestRestoreRetryLoop:
