@@ -838,6 +838,17 @@ Details worth knowing:
   query that fails is not proof of absence, so an unreachable libvirtd leaves
   the disks alone instead of unlinking them under a guest that may still be
   running.
+- **Only the storage the VM owns is removed, by boxman — never by libvirt.**
+  Its boot disk, snapshot overlays and memory files (the files under the VM's
+  own `<vm>.*` / `<vm>_snapshot_*` names) and the extra disks boxman recorded
+  creating for it. Never: a CD-ROM or ISO it has attached, an `attach_only`
+  (adopted) disk, an extra disk outside the cluster workdir, or anything
+  another VM uses directly or as a backing file. A VM that predates the
+  ownership record has its declared disks removed by name. An extra disk
+  moved to an overlay by a snapshot is kept whole. Every file kept is named in
+  a warning; keeping it does not fail the command. (`virsh undefine
+  --remove-all-storage` used to wipe and delete every storage-pool-listed file
+  the VM referenced, ISOs included — #208.)
 - **`destroy` validates its delete targets up front**, before any teardown
   starts. It refuses a path that is empty, relative, a symlink, your home
   directory, a filesystem root or mount point, a top-level path, or a
@@ -856,7 +867,9 @@ Edit `conf.yml` and run `boxman update` to reconcile the live state with the con
 - **Add VMs**: add new VM entries to a cluster's `vms:` section — they will be
   cloned from the base template, configured, and started
 - **Remove VMs**: remove VM entries from the config — running VMs will be
-  shut down, undefined, and their disks cleaned up
+  shut down, undefined, and the storage they own removed (see
+  [Teardown safety](#teardown-safety)); with the config gone, the extra disks
+  of a VM that predates the ownership record are kept
 - **CPU and memory**: change `cpus` or `memory` on existing VMs — applied live
   (hot-plug) when possible, otherwise a restart is flagged
 - **Add disks**: add new disk entries to a VM's `disks:` section — they will be

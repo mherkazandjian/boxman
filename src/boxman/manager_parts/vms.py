@@ -1,7 +1,6 @@
 """VM lifecycle and update flows for BoxmanManager."""
 
 import contextlib
-import glob
 import logging
 import os
 import time
@@ -19,15 +18,19 @@ from boxman.loggers.logger import suppressed
 from boxman.manager_parts.images import ImagesMixin
 from boxman.providers.libvirt.clone_vm import CLONE_DEGRADATION_NOTICES_KEY
 from boxman.providers.libvirt.commands import VirshCommand
+from boxman.providers.libvirt.disk import disk_path_for
 from boxman.providers.libvirt.disk_cleanup import (
+    StorageInventory,
+    boot_family_files,
     file_identities,
-    remove_recorded_leftovers,
+    remove_vm_storage,
 )
 from boxman.providers.libvirt.disk_ownership import (
     DiskRecord,
+    disk_logical_name,
     read_disk_records,
 )
-from boxman.providers.libvirt.virsh_parse import parse_domblklist
+from boxman.providers.libvirt.virsh_parse import LOCAL_SOURCE_TYPES
 
 
 def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
@@ -319,23 +322,88 @@ class VMsMixin:
         self, cluster_name: str, cluster: dict[str, Any], vm_name: str, vm_info: dict[str, Any]
     ) -> None:
         """
-        Fully destroy a single VM: stop/undefine, remove disks, force-cleanup.
+        Fully destroy a single VM: stop/undefine it and remove the storage
+        it owns (see :meth:`_teardown_vm`).
 
         Designed to be called in a separate process per VM during deprovision.
         """
         prj_name = f'bprj__{self.config["project"]}__bprj'
         full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-        vm_info = vm_info.copy()
+        workdir = cluster['workdir']
 
         self.logger.info(f"destroying vm {full_vm_name}")
-        session = self.session_for_cluster(cluster_name)
+        # The config is known here, so a domain without any ownership record
+        # (one that predates it) still has its declared disks removed by
+        # name, as before the records existed.
+        legacy_disks = [
+            disk_path_for(workdir, disk_logical_name(disk),
+                          driver_type=(disk.get('driver') or {}).get(
+                              'type', 'qcow2'),
+                          disk_prefix=full_vm_name)
+            for disk in (vm_info.get('disks') or [])
+            if isinstance(disk, dict)
+        ]
+        self._teardown_vm(self.session_for_cluster(cluster_name),
+                          full_vm_name, disk_dirs=[workdir],
+                          legacy_disks=legacy_disks)
+
+    def _destroy_removed_vm(self, full_vm_name: str) -> None:
+        """
+        Destroy a VM that has been removed from the config, and the storage
+        it owns (see :meth:`_teardown_vm`).
+
+        Its disk directories come from libvirt, since the config no longer
+        says where it lived, and a domain without ownership records keeps its
+        extra disks: with the config gone there is nothing to name them by.
+        """
+        self.logger.info(f"removing VM {full_vm_name} (no longer in config)")
+        # Phase 1 (#49): stays on the default session — the VM is gone
+        # from the config, so its cluster (and provider) can no longer be
+        # resolved. Revisited in Phase 3 (#51).
+        self._teardown_vm(self.provider, full_vm_name,
+                          disk_dirs=None, legacy_disks=None)
+
+    def _teardown_vm(self,
+                     session,
+                     full_vm_name: str,
+                     disk_dirs: list[str] | None,
+                     legacy_disks: list[str] | None) -> None:
+        """
+        Undefine *full_vm_name* and remove the storage it owns — the one
+        storage-removal routine of every VM teardown.
+
+        libvirt deletes nothing (see ``DestroyVM.force_undefine_vm``): the
+        storage is inventoried while the domain still exists, and only once
+        it is positively confirmed gone does
+        :func:`~boxman.providers.libvirt.disk_cleanup.remove_vm_storage`
+        remove what that inventory says the VM owns. Every file kept is
+        named in a warning, and the storage pools that held a removed file
+        are refreshed.
+
+        Args:
+            session: The libvirt session the VM lives on.
+            full_vm_name: Full name of the VM.
+            disk_dirs: Where its boot disk family lives; ``None`` to take the
+                directories of its attached disks from libvirt.
+            legacy_disks: Its config-declared extra disks by name, removed
+                only when the domain carries no ownership record at all;
+                ``None`` when the config is not known.
+
+        Raises:
+            ProvisionError: If the domain's storage cannot be inventoried
+                while it still exists, or it cannot be confirmed gone. Its
+                storage is left in place either way.
+        """
+        inventory = self._capture_vm_storage(
+            session, full_vm_name, disk_dirs, legacy_disks)
+
         session.destroy_vm(full_vm_name)
         if not session.confirm_vm_absent(full_vm_name):
             session.destroy_vm(full_vm_name, force=True)
 
-        # Unlinking the disk files is gated on a *positive* confirmation that
-        # the domain is gone. destroy_vm()'s return value cannot carry that:
-        # it reports success when the libvirt query itself could not be
+        # Removing storage is gated on a *positive* confirmation that the
+        # domain is gone. destroy_vm()'s return value cannot carry that: it
+        # reports success when the libvirt query itself could not be
         # answered, so an outage looked like a finished teardown and the
         # qcow2 files were removed out from under a still-running guest.
         if not session.confirm_vm_absent(full_vm_name):
@@ -344,56 +412,107 @@ class VMsMixin:
                 f"undefined; leaving its disks in place rather than removing "
                 f"storage under a possibly-live guest")
 
-        # No bool check here on purpose: remove_vm_disks() returns True or
-        # raises (its os.remove calls are uncaught), so a filesystem error
-        # already reaches _run_parallel's failure handling. Testing the
-        # return value would be dead code.
-        session.destroy_disks(
-            cluster['workdir'],
+        # remove_vm_storage() raises on a filesystem error, which reaches
+        # _run_parallel's failure handling
+        outcome = remove_vm_storage(
+            inventory, self._cluster_workdirs(), session.disk_paths_in_use)
+        for path, reason in outcome.kept:
+            self.logger.warning(
+                f"{full_vm_name}: left {path} in place because {reason}")
+        if outcome.removed:
+            session.refresh_pools_holding(outcome.removed)
+
+    def _capture_vm_storage(self,
+                            session,
+                            full_vm_name: str,
+                            disk_dirs: list[str] | None,
+                            legacy_disks: list[str] | None,
+                            ) -> StorageInventory:
+        """
+        Inventory *full_vm_name*'s storage before it is undefined: its block
+        devices in both definitions, its ownership records, the backing
+        chains of its extra disks, its boot-disk family, and the identity of
+        every one of those files.
+
+        Raises:
+            ProvisionError: If the domain exists but its block devices cannot
+                be read — tearing it down blind could remove a CD-ROM or a
+                disk that is not its own.
+        """
+        rows = session.vm_storage_devices(full_vm_name)
+        exists = True
+        if rows is None:
+            if not session.confirm_vm_absent(full_vm_name):
+                raise ProvisionError(
+                    f"{full_vm_name}: could not read its block devices from "
+                    f"libvirt; leaving it defined and its storage in place "
+                    f"rather than removing storage blind")
+            # already undefined (a teardown that was interrupted): nothing
+            # is attached, and its boot disk family is found by name
+            rows, exists = [], False
+
+        disk_sources, media_sources = [], []
+        for row in rows:
+            if row.type not in LOCAL_SOURCE_TYPES or row.source == '-':
+                continue
+            bucket = disk_sources if row.device == 'disk' else media_sources
+            if row.source not in bucket:
+                bucket.append(row.source)
+
+        if disk_dirs is None:
+            disk_dirs = self._vm_disk_dirs(full_vm_name, disk_sources)
+
+        records, records_unreadable = None, False
+        if exists:
+            try:
+                records = self._vm_disk_records(full_vm_name)
+            except ProvisionError as exc:
+                self.logger.warning(
+                    f"{full_vm_name}: {exc}; none of its extra disks will be "
+                    f"removed")
+                records_unreadable = True
+
+        extra_disks = [path for path in disk_sources
+                       if not os.path.basename(path).startswith(
+                           f"{full_vm_name}.")]
+        chain_layers = (session.backing_chain_files(extra_disks)
+                        if extra_disks else [])
+
+        boot_family = sorted({path for workdir in disk_dirs
+                              for path in boot_family_files(workdir,
+                                                            full_vm_name)})
+        files = [*disk_sources, *boot_family, *(legacy_disks or ()),
+                 *(record.source for record in records or ())]
+        return StorageInventory(
             vm_name=full_vm_name,
-            disks=vm_info.get('disks', [])
+            disk_sources=disk_sources,
+            media_sources=media_sources,
+            records=records,
+            records_unreadable=records_unreadable,
+            chain_layers=chain_layers,
+            boot_family=boot_family,
+            legacy_disks=legacy_disks,
+            identities=file_identities(files),
         )
-
-    def _vm_disk_files(self, full_vm_name: str) -> list[str]:
-        """
-        Return the paths of *full_vm_name*'s disk files (CD-ROMs left out),
-        read from libvirt itself (``virsh domblklist``).
-
-        Must run before the domain is undefined. Empty when the domain
-        cannot be queried (e.g. already undefined).
-        """
-        virsh = VirshCommand(
-            provider_config=self.provider.provider_config)
-        result = virsh.execute(
-            "domblklist", full_vm_name, "--details", warn=True)
-        if not result.ok:
-            return []
-        return [
-            row.source for row in parse_domblklist(result.stdout)
-            if row.device == 'disk' and row.source not in (None, '-')
-        ]
 
     def _vm_disk_dirs(self,
                       full_vm_name: str,
-                      disk_files: list[str] | None = None) -> list[str]:
+                      disk_files: list[str]) -> list[str]:
         """
-        Return the directories that hold *full_vm_name*'s disk files,
-        discovered from libvirt itself (``virsh domblklist``).
+        Return the directories that hold *full_vm_name*'s disk files, as
+        libvirt reported them (``virsh domblklist``).
 
         Used for VMs that no longer appear in conf.yml, whose workdir
         can therefore not be resolved from the config. Falls back to
         every workdir known to the project config when the domain
-        cannot be queried (e.g. already undefined) — the destroy_disks
-        glob is anchored at the VM name, so sweeping extra directories
-        is harmless.
+        cannot be queried (e.g. already undefined) — the boot-disk family
+        is found by names anchored at the VM name, so looking in extra
+        directories is harmless.
 
         Args:
             full_vm_name: Full name of the VM.
-            disk_files: The VM's disk files when the caller already read
-                them with :meth:`_vm_disk_files`; queried here otherwise.
+            disk_files: The sources of its disk devices.
         """
-        if disk_files is None:
-            disk_files = self._vm_disk_files(full_vm_name)
         dirs = {os.path.dirname(path) for path in disk_files}
         if not dirs:
             self.logger.warning(
@@ -402,121 +521,21 @@ class VMsMixin:
             dirs.update(self.collect_workdirs())
         return sorted(dirs)
 
-    def _destroy_removed_vm(self, full_vm_name: str) -> None:
-        """
-        Destroy a VM that has been removed from the config.
-
-        Uses destroy_vm + destroy_disks with an empty disk list since we
-        no longer have the disk config for this VM. The disk files,
-        directories and ownership records are read from libvirt before the
-        domain is undefined (see ``_vm_disk_files``); the glob-based cleanup
-        in destroy_disks catches the boot disk and snapshot artifacts, and
-        ``_remove_leftover_disk_files`` the recorded extra disks it cannot
-        name.
-        """
-        self.logger.info(f"removing VM {full_vm_name} (no longer in config)")
-        # Phase 1 (#49): stays on the default session — the VM is gone
-        # from the config, so its cluster (and provider) can no longer be
-        # resolved. Revisited in Phase 3 (#51).
-        #
-        # The disk files, directories and ownership records come from
-        # libvirt, so they must be read *before* the domain is undefined —
-        # and the files' identities with them, so a file replaced in the
-        # meantime is never taken for the one that was attached.
-        disk_files = self._vm_disk_files(full_vm_name)
-        disk_dirs = self._vm_disk_dirs(full_vm_name, disk_files)
-        records = self._vm_disk_records(full_vm_name)
-        identities = file_identities(disk_files)
-        protected = self._sweep_protection(
-            full_vm_name, disk_files, records, disk_dirs)
-        self.provider.destroy_vm(full_vm_name)
-        if not self.provider.confirm_vm_absent(full_vm_name):
-            self.provider.destroy_vm(full_vm_name, force=True)
-
-        # Same gate as _destroy_vm_and_disks: only a positive confirmation
-        # that the domain is gone authorises unlinking its disks.
-        if not self.provider.confirm_vm_absent(full_vm_name):
-            raise ProvisionError(
-                f"{full_vm_name}: could not confirm the domain was "
-                f"undefined; leaving its disks in place rather than removing "
-                f"storage under a possibly-live guest")
-
-        for workdir in disk_dirs:
-            # see _destroy_vm_and_disks: remove_vm_disks() raises rather
-            # than returning False
-            self.provider.destroy_disks(
-                workdir,
-                vm_name=full_vm_name,
-                disks=[],
-                protected=protected,
-            )
-        self._remove_leftover_disk_files(
-            full_vm_name, disk_files, records, identities)
-
-    def _sweep_protection(self,
-                          full_vm_name: str,
-                          disk_files: list[str],
-                          records: list[DiskRecord] | None,
-                          disk_dirs: list[str]) -> list[str]:
-        """
-        The files the name sweep must leave to the ownership decision.
-        Read before the domain is undefined.
-
-        Every extra disk is decided on recorded ownership alone, so the
-        sweep must not reach one first: its ``<vm>_snapshot_*`` pattern
-        also matches the files of an extra disk whose logical name starts
-        with ``snapshot_``. That covers every attached extra disk, every
-        layer beneath one (an external snapshot leaves the recorded base
-        and older overlays unattached but still in the chain), and every
-        recorded source, whatever its role. The boot disk and its overlays
-        (``<vm>.*``) stay with the sweep; extra disks are always named
-        ``<vm>_<name>.<ext>``.
-
-        When a chain cannot be read, a layer of a kept disk cannot be told
-        apart from a memory-snapshot file, so every ``<vm>_snapshot_*``
-        file is protected instead.
-        """
-        extra_disk_files = [
-            path for path in disk_files
-            if not os.path.basename(path).startswith(f"{full_vm_name}.")
-        ]
-        protected = set(extra_disk_files)
-        protected.update(record.source for record in records or ())
-        chains = (self.provider.backing_chain_files(extra_disk_files)
-                  if extra_disk_files else [])
-        if chains is None:
-            self.logger.warning(
-                f"{full_vm_name}: could not read the backing chain of its "
-                f"extra disks, so its {full_vm_name}_snapshot_* files are "
-                f"left in place")
-            # the same pattern the sweep uses, so it covers exactly what
-            # the sweep would take
-            for workdir in disk_dirs:
-                protected.update(glob.glob(os.path.join(
-                    os.path.expanduser(workdir),
-                    f"{full_vm_name}_snapshot_*")))
-        else:
-            protected.update(chains)
-        return sorted(protected)
-
     def _vm_disk_records(self, full_vm_name: str) -> list[DiskRecord] | None:
         """
         Return boxman's disk ownership records for *full_vm_name* (see
-        ``disk_ownership``). Must run before the domain is undefined.
+        ``disk_ownership``), or ``None`` when the domain carries none. Must
+        run before the domain is undefined.
 
-        ``None`` when the domain carries none or they cannot be read:
-        either way boxman does not know what it attached there, which is
-        never grounds for deleting a file.
+        Raises:
+            ProvisionError: If the records are present but cannot be read.
+                That is never grounds for removing a disk, and must not be
+                mistaken for "no records", which lets a deprovision fall
+                back to removing declared disks by name.
         """
         virsh = VirshCommand(
             provider_config=self.provider.provider_config)
-        try:
-            return read_disk_records(virsh, full_vm_name)
-        except ProvisionError as exc:
-            self.logger.warning(
-                f"{full_vm_name}: {exc}; none of its extra disks will be "
-                f"removed")
-            return None
+        return read_disk_records(virsh, full_vm_name)
 
     def _cluster_workdirs(self) -> list[str]:
         """The workdirs of every cluster in the project config."""
@@ -525,30 +544,6 @@ class VMsMixin:
             for cluster in (self.config.get('clusters') or {}).values()
             if isinstance(cluster, dict) and cluster.get('workdir')
         ]
-
-    def _remove_leftover_disk_files(
-            self,
-            full_vm_name: str,
-            disk_files: list[str],
-            records: list[DiskRecord] | None,
-            identities: dict[str, tuple[int, int]]) -> None:
-        """
-        Remove the recorded extra disks an undefined VM left behind, and
-        name every leftover file that is kept.
-
-        ``undefine --remove-all-storage`` skips a disk its storage pool
-        does not list, and ``destroy_disks`` cannot name a removed VM's
-        extra disks. The decision is made on recorded ownership, never on
-        the file name — see
-        :func:`~boxman.providers.libvirt.disk_cleanup.remove_recorded_leftovers`
-        for the rules.
-        """
-        kept = remove_recorded_leftovers(
-            full_vm_name, disk_files, records, self._cluster_workdirs(),
-            identities, self.provider.disk_paths_in_use)
-        for path, reason in kept:
-            self.logger.warning(
-                f"{full_vm_name}: left disk {path} in place because {reason}")
 
     def configure_and_start_vms(self) -> None:
         """

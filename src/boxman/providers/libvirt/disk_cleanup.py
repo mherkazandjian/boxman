@@ -1,16 +1,17 @@
 """
-Filesystem-only helpers for removing a VM's disks and leftover artifacts.
+Filesystem-side helpers for removing a VM's storage.
 
-Extracted from :meth:`LibVirtSession.destroy_disks` in Phase 2.6 of the
-engineering review plan so that the pure filesystem
-logic lives outside the libvirt session class — both for clarity and so
-it can be exercised without constructing a session.
+:func:`remove_vm_storage` is the one routine every VM teardown removes
+storage through (#208): it decides, from a :class:`StorageInventory` taken
+before the domain was undefined, which files the VM owns, and unlinks only
+those, each through :func:`remove_if_unchanged`. libvirt itself deletes
+nothing.
 
-The logic matches the contract pinned by
-``tests/test_libvirt_session.py::TestDestroyDisks``: remove the boot
-disk, any extra named disks, and any snapshot artifacts prefixed with
-the VM name (overlay files with timestamp/hash suffixes,
-``<vm>_snapshot_*.raw`` memory files).
+:func:`remove_vm_disks` is the older name-based sweep behind
+:meth:`LibVirtSession.destroy_disks`, pinned by
+``tests/test_libvirt_session.py::TestDestroyDisks``: the boot disk, the
+named extra disks and the snapshot artifacts prefixed with the VM name. No
+teardown uses it any more.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import os
 import stat
 import tempfile
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 
 from boxman import log
 
@@ -86,23 +88,35 @@ def remove_vm_disks(
         if removable(disk_path):
             os.remove(disk_path)
 
-    # Snapshot artifacts: overlay files named ``<vm>.<suffix>`` (the
-    # literal dot separates the VM name from the timestamp/hash suffix)
-    # and memory snapshot files ``<vm>_snapshot_*``. A plain
-    # ``<vm>*`` prefix glob would also match disks of other VMs whose
-    # name starts with this VM's name (e.g. destroying ``web`` would
-    # delete ``web2.qcow2``), so both patterns require a separator.
-    patterns = (
-        os.path.join(workdir, f'{vm_name}.*'),
-        os.path.join(workdir, f'{vm_name}_snapshot_*'),
-    )
-    for pattern in patterns:
-        for leftover in _glob.glob(pattern):
-            if removable(leftover):
-                log.info(f"removing snapshot artifact: {leftover}")
-                os.remove(leftover)
+    for leftover in boot_family_files(workdir, vm_name):
+        if removable(leftover):
+            log.info(f"removing snapshot artifact: {leftover}")
+            os.remove(leftover)
 
     return True
+
+
+def boot_family_files(workdir: str, vm_name: str) -> list[str]:
+    """
+    The files under boxman's exclusive names for *vm_name* in *workdir*:
+    its boot disk and overlays ``<vm>.<suffix>`` (``<vm>.qcow2``,
+    ``<vm>.2026-04-21T08:00:00``, ``<vm>.1772465824`` — the literal dot
+    separates the VM name from the suffix) and its memory-snapshot files
+    ``<vm>_snapshot_*``.
+
+    A plain ``<vm>*`` prefix glob would also match the disks of another VM
+    whose name starts with this one's (destroying ``web`` would delete
+    ``web2.qcow2``), so both patterns require a separator. The second one
+    also matches every file of an extra disk whose logical name starts with
+    ``snapshot_``; callers that know the VM's extra disks must keep those
+    out (see :func:`remove_vm_storage`).
+    """
+    workdir = os.path.expanduser(workdir)
+    found = []
+    for pattern in (f'{vm_name}.*', f'{vm_name}_snapshot_*'):
+        found.extend(path for path in _glob.glob(os.path.join(workdir, pattern))
+                     if os.path.isfile(path) or os.path.islink(path))
+    return sorted(found)
 
 
 def file_identities(paths: Iterable[str]) -> dict[str, tuple[int, int]]:
@@ -148,110 +162,224 @@ def _leftover_refusal(vm_name: str,
     return None
 
 
-def remove_recorded_leftovers(
-    vm_name: str,
-    attached: list[str],
-    records: list[DiskRecord] | None,
-    workdirs: Iterable[str],
-    identities: dict[str, tuple[int, int]],
-    paths_in_use: Callable[[], dict[str, str] | None],
-) -> list[tuple[str, str]]:
+@dataclass
+class StorageInventory:
     """
-    Remove the data disks an undefined VM's teardown left behind — on
-    recorded ownership only, never on the file name.
+    What a VM's teardown knows about its storage, read before undefining.
 
-    ``undefine --remove-all-storage`` removes only the volumes a storage
-    pool lists, so an extra disk boxman created with ``qemu-img`` survives
-    it as "not managed by libvirt". Being attached and named ``<vm>_...``
-    proves neither that boxman created a file nor that nothing else uses
-    it: another VM's disk can carry that prefix (``web`` and ``web_2``), an
-    ``attach_only`` disk was adopted rather than created, and a file can be
-    another domain's backing image. A leftover is removed only when all of
-    these hold:
+    Undefining drops the domain's XML, its ownership record and its
+    snapshot metadata, and nothing the teardown decides afterwards may rest
+    on a file's name alone, so everything is captured here first.
+    """
 
-    1. the domain's ownership record, read before undefining, lists it
-       with role ``data`` at exactly this source path;
-    2. its name is ``<vm>_<recorded name>.<ext>``, as the attach path
-       creates it;
-    3. it is a regular file, not a symlink, directly in one of the
-       project's cluster *workdirs* once symlinks are resolved;
-    4. it is the same file (device and inode) that was attached — checked
-       on the entry after it has been moved aside, so the only thing ever
-       unlinked is that entry (see :func:`_remove_if_unchanged`);
-    5. no defined domain uses it, directly or as a backing file —
-       *paths_in_use* is asked once, and a ``None`` answer keeps them all.
+    #: full name of the VM
+    vm_name: str
+    #: sources of its ``disk`` devices, live and persistent definition
+    disk_sources: list[str]
+    #: sources of every other device (CD-ROM, floppy, ...), live and
+    #: persistent definition: never deleted
+    media_sources: list[str]
+    #: its ownership records; ``None`` when it carried none
+    records: list[DiskRecord] | None
+    #: whether the records could not be read (then ``records`` is None and
+    #: nothing recorded-or-not is removed as an extra disk)
+    records_unreadable: bool
+    #: resolved paths of every layer under its attached extra disks;
+    #: ``None`` when a chain could not be read
+    chain_layers: list[str] | None
+    #: files under its exclusive names in its disk directories
+    #: (:func:`boot_family_files`)
+    boot_family: list[str]
+    #: config-declared extra disks by name (``<vm>_<name>.<ext>``) when the
+    #: config is known, ``None`` when it is not (a VM gone from conf.yml)
+    legacy_disks: list[str] | None
+    #: :func:`file_identities` of every file above
+    identities: dict[str, tuple[int, int]] = field(default_factory=dict)
 
-    A recorded disk that is no longer attached where it was recorded (an
-    external snapshot moved it to an overlay) is kept whole: nothing
-    recorded names the overlays, and removing half a chain is worse than
-    leaving it.
 
-    Args:
-        vm_name: Full name of the (already undefined) VM.
-        attached: Its disk files, read before undefining.
-        records: Its ownership records, read before undefining; ``None``
-            when it had none, which keeps every file.
-        workdirs: The project's cluster workdirs.
-        identities: :func:`file_identities` of *attached*, taken before
-            undefining.
-        paths_in_use: Returns resolved path -> name of the domain using
-            it, or ``None`` when that cannot be determined.
+@dataclass
+class StorageOutcome:
+    """What :func:`remove_vm_storage` removed and what it kept, and why."""
+
+    removed: list[str] = field(default_factory=list)
+    kept: list[tuple[str, str]] = field(default_factory=list)
+
+
+def _regular_file_refusal(path: str) -> str | None:
+    """Why *path* is not a regular file that may be unlinked, if it is not."""
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        return f"it could not be inspected ({exc})"
+    if not stat.S_ISREG(st.st_mode):
+        return "it is a symlink or not a regular file"
+    return None
+
+
+def remove_vm_storage(
+    inventory: StorageInventory,
+    workdirs: Iterable[str],
+    paths_in_use: Callable[[], dict[str, str] | None],
+) -> StorageOutcome:
+    """
+    Remove the storage an undefined VM owns — and nothing else.
+
+    The one storage-removal routine of every VM teardown (``deprovision``,
+    ``destroy``, ``provision --force``, ``up --force`` and ``update``
+    removing a VM). libvirt deletes nothing: ``undefine
+    --remove-all-storage`` zero-filled and deleted every pool-listed source
+    of the domain, CD-ROM media and adopted disks included (#208).
+
+    Candidates, from the *inventory* taken before undefining:
+
+    1. **The boot-disk family** — files under the VM's exclusive names in
+       its disk directories (:func:`boot_family_files`): its boot disk, its
+       overlays and its memory-snapshot files. Any of them that is a
+       source of one of its CD-ROMs, or an extra disk of it, a layer of
+       one or a recorded source, is left to the rules below. When an extra
+       disk's chain cannot be read, a ``<vm>_snapshot_*`` file cannot be
+       told from a layer of one, so all of them are kept.
+    2. **Extra disks recorded with role ``data``** at exactly their
+       attached source, by the rules of :func:`_leftover_refusal`. A
+       recorded disk no longer attached where it was recorded (an external
+       snapshot moved it to an overlay) is kept whole.
+    3. **A legacy domain** — one with no ownership record at all: when the
+       config is known (*legacy_disks*), its config-declared disks
+       ``<vm>_<name>.<ext>``, by name as before records existed; otherwise
+       (a VM gone from conf.yml) its extra disks are kept.
+
+    Never removed: a CD-ROM (or other media) source, an adopted or other
+    non-``data`` recorded disk, an extra disk outside every cluster
+    *workdir*, a symlink, or anything another domain uses directly or as a
+    backing file. *paths_in_use* is asked once; if it cannot answer
+    (``None``), every candidate is kept. Each unlink goes through
+    :func:`remove_if_unchanged` against the identity taken before
+    undefining.
 
     Returns:
-        ``(path, reason)`` for every leftover file that was kept.
+        The files removed, and ``(path, reason)`` for every file kept.
     """
-    kept: list[tuple[str, str]] = []
-    present = [path for path in attached if os.path.lexists(path)]
+    vm = inventory.vm_name
+    outcome = StorageOutcome()
+    kept = outcome.kept
 
-    if records is None:
-        return [(path, "the domain carries no record of which disks "
-                       "boxman created") for path in present]
+    def real(path: str) -> str:
+        return os.path.realpath(path)
 
-    for record in records:
-        if record.source not in attached and os.path.lexists(record.source):
-            kept.append((record.source, (
-                "boxman created it, but it was no longer attached where "
-                "it was recorded (an external snapshot moves a disk to an "
-                "overlay); remove it and its overlays by hand")))
+    media = {real(path) for path in inventory.media_sources}
+    real_workdirs = {real(os.path.expanduser(w)) for w in workdirs}
+    attached_extras = []
+    for path in inventory.disk_sources:
+        if (not os.path.basename(path).startswith(f"{vm}.")
+                and path not in attached_extras):
+            attached_extras.append(path)
+    records = inventory.records
+    legacy = (inventory.legacy_disks
+              if records is None and not inventory.records_unreadable
+              else None)
 
-    real_workdirs = {os.path.realpath(os.path.expanduser(workdir))
-                     for workdir in workdirs}
-    by_source = {record.source: record for record in records}
-    candidates = []
-    for path in present:
-        reason = _leftover_refusal(vm_name, path, by_source.get(path),
-                                   real_workdirs)
+    # everything decided as an extra disk, not as the boot family
+    extra_related = {real(path) for path in attached_extras}
+    extra_related.update(real(r.source) for r in records or ())
+    extra_related.update(real(path) for path in legacy or ())
+    extra_related.update(real(path) for path in inventory.chain_layers or ())
+
+    candidates: list[str] = []
+
+    # -- 1. the boot-disk family --------------------------------------------
+    for path in inventory.boot_family:
+        if real(path) in media:
+            kept.append((path, "it is a CD-ROM or other media source of "
+                               "the vm"))
+            continue
+        if real(path) in extra_related:
+            continue
+        if (inventory.chain_layers is None
+                and os.path.basename(path).startswith(f"{vm}_snapshot_")):
+            kept.append((path, (
+                "the backing chain of the vm's extra disks could not be "
+                "read, so a layer of one cannot be told apart from a "
+                "memory-snapshot file")))
+            continue
+        reason = _regular_file_refusal(path)
         if reason:
             kept.append((path, reason))
         else:
             candidates.append(path)
-    if not candidates:
-        return kept
 
+    # -- 2./3. extra disks ----------------------------------------------------
+    present_extras = [p for p in attached_extras if os.path.lexists(p)]
+    if records is None:
+        if legacy is not None:
+            for path in legacy:
+                if not os.path.lexists(path) or path in candidates:
+                    continue
+                reason = ("it is a CD-ROM or other media source of the vm"
+                          if real(path) in media
+                          else _regular_file_refusal(path))
+                if (reason is None and real(os.path.dirname(path))
+                        not in real_workdirs):
+                    reason = "it is outside every cluster workdir of the project"
+                if reason:
+                    kept.append((path, reason))
+                else:
+                    candidates.append(path)
+            legacy_real = {real(path) for path in legacy}
+            present_extras = [p for p in present_extras
+                              if real(p) not in legacy_real]
+        why = ("its disk ownership record could not be read"
+               if inventory.records_unreadable
+               else "the domain carries no record of which disks boxman "
+                    "created")
+        kept.extend((path, why) for path in present_extras)
+    else:
+        for record in records:
+            if (record.source not in inventory.disk_sources
+                    and os.path.lexists(record.source)):
+                kept.append((record.source, (
+                    "boxman created it, but it was no longer attached "
+                    "where it was recorded (an external snapshot moves a "
+                    "disk to an overlay); remove it and its overlays by "
+                    "hand")))
+        by_source = {record.source: record for record in records}
+        for path in present_extras:
+            reason = _leftover_refusal(vm, path, by_source.get(path),
+                                       real_workdirs)
+            if reason:
+                kept.append((path, reason))
+            else:
+                candidates.append(path)
+
+    if not candidates:
+        return outcome
+
+    # -- in use by another domain, then the identity-checked unlink ----------
     in_use = paths_in_use()
     for path in candidates:
         if in_use is None:
             kept.append((path, "could not check whether another domain "
                                "uses it"))
             continue
-        user = in_use.get(os.path.realpath(path))
+        user = in_use.get(real(path))
         if user:
             kept.append((path, f"domain {user} uses it"))
             continue
-        outcome, where = _remove_if_unchanged(path, identities.get(path))
-        if outcome == "removed":
-            log.info(f"removed leftover disk of {vm_name}: {path}")
-        elif outcome == "restored":
+        result, where = remove_if_unchanged(
+            path, inventory.identities.get(path))
+        if result == "removed":
+            log.info(f"removed {path} (vm {vm})")
+            outcome.removed.append(path)
+        elif result == "restored":
             kept.append((path, "it was replaced after the vm was inspected"))
-        elif outcome == "stranded":
+        elif result == "stranded":
             kept.append((path, (
                 f"it was replaced after the vm was inspected, and the name "
                 f"was taken again before the replacement could be put "
                 f"back; the replacement is at {where}")))
-    return kept
+    return outcome
 
 
-def _remove_if_unchanged(path: str,
+def remove_if_unchanged(path: str,
                          identity: tuple[int, int] | None,
                          ) -> tuple[str, str | None]:
     """

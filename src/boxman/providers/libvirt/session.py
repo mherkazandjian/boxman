@@ -29,8 +29,11 @@ from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
 from .storage import StorageManager
+from .storage_pools import refresh_pools_holding
 from .virsh_edit import VirshEdit
 from .virsh_parse import (
+    LOCAL_SOURCE_TYPES,
+    DomblkRow,
     parse_domblklist,
     parse_domblklist_strict,
     parse_domiflist,
@@ -757,7 +760,8 @@ class LibVirtSession(SessionConfigMixin):
 
     def destroy_vm(self, name: str, force: bool = False) -> bool:
         """
-        Destroy (remove) a vm.
+        Destroy (remove) a vm: stop and undefine it. Its storage is left in
+        place for the caller (see :meth:`DestroyVM.force_undefine_vm`).
 
         Args:
             name: Name of the vm to destroy
@@ -808,7 +812,10 @@ class LibVirtSession(SessionConfigMixin):
         Fails closed: ``None`` when the domain list, either inventory of
         any domain, or any backing chain cannot be read, or reads as
         incomplete — a partial answer would let a caller delete a file that
-        is still in use. An explicitly empty slot (``-``) is not a source.
+        is still in use. An explicitly empty slot (``-``) is not a source,
+        and neither is a row that is not a local file or block device
+        (``network``, ``volume``, ...): it names no path on this host, so
+        failing the whole scan on it would keep every candidate for nothing.
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         listing = virsh.execute("list", "--all", "--name", warn=True)
@@ -819,17 +826,11 @@ class LibVirtSession(SessionConfigMixin):
         for domain in (line.strip() for line in listing.stdout.splitlines()):
             if not domain:
                 continue
-            sources: set[str] = set()
-            for inactive in ((), ("--inactive",)):
-                blklist = virsh.execute(
-                    "domblklist", domain, "--details", *inactive, warn=True)
-                if not blklist.ok:
-                    return None
-                rows = parse_domblklist_strict(blklist.stdout)
-                if rows is None:
-                    return None
-                sources.update(row.source for row in rows
-                               if row.source != '-')
+            rows = self.vm_storage_devices(domain)
+            if rows is None:
+                return None
+            sources = {row.source for row in rows
+                       if row.type in LOCAL_SOURCE_TYPES and row.source != '-'}
             for source in sorted(sources):
                 chain = self._backing_chain_files(cmd, source)
                 if chain is None:
@@ -837,6 +838,40 @@ class LibVirtSession(SessionConfigMixin):
                 for path in chain:
                     in_use.setdefault(path, domain)
         return in_use
+
+    def vm_storage_devices(self, vm_name: str) -> list[DomblkRow] | None:
+        """
+        Every block device of *vm_name* in its live and its persistent
+        definition, as ``domblklist --details`` rows (type, device, target,
+        source), de-duplicated.
+
+        Plain ``domblklist`` of a running domain reports only the live
+        definition; the persistent one — what it uses on its next start —
+        can name other media or disks. For a transient domain
+        ``--inactive`` reports its one definition (libvirt 10.0).
+
+        Returns:
+            The rows, or ``None`` when either inventory cannot be read or
+            reads as incomplete (see :func:`parse_domblklist_strict`).
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        rows: list[DomblkRow] = []
+        for inactive in ((), ("--inactive",)):
+            blklist = virsh.execute(
+                "domblklist", vm_name, "--details", *inactive, warn=True)
+            if not blklist.ok:
+                return None
+            parsed = parse_domblklist_strict(blklist.stdout)
+            if parsed is None:
+                return None
+            rows.extend(row for row in parsed if row not in rows)
+        return rows
+
+    def refresh_pools_holding(self, paths: list[str]) -> list[str]:
+        """Refresh the active pools whose directory held one of *paths*
+        (see :func:`storage_pools.refresh_pools_holding`)."""
+        return refresh_pools_holding(
+            VirshCommand(provider_config=self.provider_config), paths)
 
     def backing_chain_files(self, sources: list[str]) -> list[str] | None:
         """

@@ -11,6 +11,11 @@ a genuinely missing column comes back as ``None``).
 
 from typing import NamedTuple
 
+#: ``domblklist --details`` Type values whose Source is a path on this host.
+#: The others (``network``, ``volume``, ``nvme``, ...) name a remote image, a
+#: pool volume or a device address, never a file boxman could delete.
+LOCAL_SOURCE_TYPES = frozenset({'file', 'block'})
+
 
 class DomblkRow(NamedTuple):
     """One row of ``virsh domblklist --details`` output."""

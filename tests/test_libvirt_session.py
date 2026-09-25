@@ -634,6 +634,61 @@ class TestDiskPathsInUse:
         in_use, _ = self._run(chains=chains)
         assert in_use is None
 
+    # -- #208: a source that is not a local file does not fail the scan ----
+
+    def test_a_network_or_volume_source_is_skipped_not_fatal(self):
+        """An RBD/iSCSI disk or a pool volume names no path on this host;
+        failing the scan on it kept every teardown candidate for nothing.
+        qemu-img is never asked about it."""
+        remote = self.HEADER + (
+            " file      disk   vda   /ws/b.top\n"
+            " network   disk   vdb   rbd-pool/image\n"
+            " volume    disk   vdc   default/data.qcow2\n")
+        in_use, cmd = self._run(inventories={("vm-b", False): remote,
+                                             ("vm-b", True): remote})
+        assert in_use is not None
+        assert in_use["/ws/b.top"] == "vm-b"
+        asked = " ".join(c.args[0]
+                         for c in cmd.return_value.execute_shell.call_args_list)
+        assert "rbd-pool/image" not in asked
+        assert "default/data.qcow2" not in asked
+
+
+class TestVmStorageDevices:
+    """The torn-down domain's own inventory: both definitions, so a CD-ROM
+    or disk only in the persistent XML is known before undefining (#208)."""
+
+    LIVE = (TestDiskPathsInUse.HEADER
+            + " file   disk    vda   /ws/vm.qcow2\n"
+            + " file   cdrom   sda   /iso/live.iso\n")
+    PERSISTENT = (TestDiskPathsInUse.HEADER
+                  + " file   disk    vda   /ws/vm.qcow2\n"
+                  + " file   cdrom   sda   /iso/next-boot.iso\n")
+
+    def _run(self, live, persistent):
+        def execute(*args, **kwargs):
+            out = persistent if "--inactive" in args else live
+            return out if not isinstance(out, str) else _result(stdout=out)
+
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:
+            virsh.return_value.execute.side_effect = execute
+            return _session({}).vm_storage_devices("vm")
+
+    def test_both_definitions_de_duplicated(self):
+        rows = self._run(self.LIVE, self.PERSISTENT)
+        assert [(r.device, r.source) for r in rows] == [
+            ("disk", "/ws/vm.qcow2"),
+            ("cdrom", "/iso/live.iso"),
+            ("cdrom", "/iso/next-boot.iso"),
+        ]
+
+    def test_none_when_either_definition_cannot_be_read(self):
+        assert self._run(self.LIVE, _result(ok=False)) is None
+        assert self._run(_result(ok=False), self.PERSISTENT) is None
+
+    def test_none_when_a_definition_reads_as_incomplete(self):
+        assert self._run(self.LIVE, self.PERSISTENT + " garbled\n") is None
+
 
 class TestBackingChainFiles:
     """Every layer under a removed VM's extra disks, read before undefining

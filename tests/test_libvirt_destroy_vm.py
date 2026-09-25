@@ -175,10 +175,7 @@ class TestForceUndefine:
              patch.object(dv.virsh, "execute", return_value=_result()) as execute:
             assert dv.force_undefine_vm() is True
         calls = [c.args[0] for c in execute.call_args_list]
-        assert "destroy" in calls  # force-kill first
-        rich = [c for c in execute.call_args_list
-                if c.args[0] == "undefine" and "--remove-all-storage" in c.args]
-        assert rich, "expected the full storage-removal undefine"
+        assert calls.index("destroy") < calls.index("undefine")
 
     def test_skips_kill_when_already_shut_off(self, dv: DestroyVM):
         with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
@@ -188,67 +185,36 @@ class TestForceUndefine:
         calls = [c.args[0] for c in execute.call_args_list]
         assert "destroy" not in calls
 
-    def test_flags_passed_as_separate_args(self, dv: DestroyVM):
-        """Regression for issue #85 item 25: flags must be separate
-        args, not one re-split string."""
+    def test_undefine_passes_no_storage_flags(self, dv: DestroyVM):
+        """#208: --remove-all-storage (and --wipe-storage) zero-filled and
+        deleted every pool-listed source of the domain -- CD-ROM media,
+        adopted disks, a template's shared seed.iso. The caller removes the
+        storage the VM owns; libvirt removes none. Flags stay separate args
+        (#85 item 25)."""
         with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
              patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
              patch.object(dv.virsh, "execute", return_value=_result()) as execute:
             assert dv.force_undefine_vm() is True
-        undefine = [c for c in execute.call_args_list
-                    if c.args[0] == "undefine"][0]
-        assert undefine.args[1] == "vm01"
-        for flag in ("--remove-all-storage", "--wipe-storage",
-                     "--snapshots-metadata"):
-            assert flag in undefine.args
-
-    def test_storage_undefine_omits_the_rbd_only_snapshot_flag(
-            self, dv: DestroyVM):
-        """Regression for issue #207: --delete-storage-volume-snapshots is
-        VIR_STORAGE_VOL_DELETE_WITH_SNAPSHOTS (0x2), which only RBD pools
-        implement. The directory pools holding boxman's disks reject it, so
-        every volume removal failed after the domain was already undefined."""
-        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
-             patch.object(dv.virsh, "execute", return_value=_result()) as execute:
-            assert dv.force_undefine_vm() is True
+        undefines = [c for c in execute.call_args_list
+                     if c.args[0] == "undefine"]
+        assert len(undefines) == 1
+        assert undefines[0].args == (
+            "undefine", "vm01", "--snapshots-metadata", "--managed-save")
+        assert undefines[0].kwargs.get("warn") is True
         for c in execute.call_args_list:
-            assert "--delete-storage-volume-snapshots" not in c.args
+            for flag in ("--remove-all-storage", "--wipe-storage",
+                         "--delete-storage-volume-snapshots", "--storage"):
+                assert flag not in c.args
 
-    def test_falls_back_to_plain_undefine_on_failure(self, dv: DestroyVM):
-        """Regression for issue #85 item 25: when the rich undefine
-        fails (old libvirt, storage already gone), retry with plain
-        undefine --snapshots-metadata so the domain stays removable."""
-        calls = []
-
-        def fake_execute(*args, **kwargs):
-            calls.append((args, kwargs))
-            if args[0] == "undefine" and "--remove-all-storage" in args:
-                return _result(ok=False, stderr="unsupported flag")
-            return _result()
-
-        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
+    def test_a_failed_undefine_is_not_retried(self, dv: DestroyVM):
+        """The storage-removing form needed a plain fallback; the plain
+        form is all there is now."""
+        with patch.object(dv, "is_vm_defined", return_value=True), \
              patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
-             patch.object(dv.virsh, "execute", side_effect=fake_execute):
-            assert dv.force_undefine_vm() is True
-        undefines = [args for args, _ in calls if args[0] == "undefine"]
-        assert len(undefines) == 2
-        # --managed-save rides along on the fallback too: libvirt refuses to
-        # undefine a domain that has a managed save image, which is exactly
-        # the state a suspended or memory-snapshotted VM is left in
-        assert undefines[1] == ("undefine", "vm01", "--snapshots-metadata",
-                                "--managed-save")
-        # rich form ran with warn=True so its failure could be handled
-        rich_kwargs = [kw for args, kw in calls
-                       if args[0] == "undefine"
-                       and "--remove-all-storage" in args][0]
-        assert rich_kwargs.get("warn") is True
-
-    def test_no_fallback_when_rich_undefine_succeeds(self, dv: DestroyVM):
-        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
-             patch.object(dv.virsh, "execute", return_value=_result()) as execute:
-            assert dv.force_undefine_vm() is True
+             patch.object(dv.virsh, "execute",
+                          side_effect=[_result(ok=False, stderr="busy"),
+                                       _result(stdout="vm01\n")]) as execute:
+            assert dv.force_undefine_vm() is False
         undefines = [c for c in execute.call_args_list
                      if c.args[0] == "undefine"]
         assert len(undefines) == 1
@@ -333,52 +299,31 @@ class TestManagedSaveBlocksUndefine:
             assert dv.undefine_vm() is True
         assert "--managed-save" in execute.call_args_list[0].args
 
-    def test_fallback_also_clears_the_managed_save(self, dv: DestroyVM):
-        # the storage-removal form is not idempotent, so the fallback is the
-        # path a real destroy usually takes -- it needs the flag too
-        with patch.object(dv, "is_vm_defined", side_effect=[True, False]), \
-             patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
-             patch.object(
-                 dv.virsh, "execute",
-                 side_effect=[_result(ok=False, stderr="not managed by libvirt"),
-                              _result()]) as execute:
-            assert dv.force_undefine_vm() is True
-        assert "--managed-save" in execute.call_args_list[1].args
-
-    def test_a_failing_fallback_is_reported_not_swallowed(self, dv: DestroyVM):
+    def test_a_failing_undefine_is_reported_not_swallowed(self, dv: DestroyVM):
         # destroy used to exit 0 while leaving the domain defined; the whole
         # point is that this surfaces
         with patch.object(dv, "is_vm_defined", return_value=True), \
              patch.object(dv, "_confirm_shut_off_or_absent", return_value=True), \
              patch.object(
                  dv.virsh, "execute",
-                 side_effect=[_result(ok=False, stderr="storage gone"),
-                              _result(ok=False, stderr="still refusing"),
+                 side_effect=[_result(ok=False, stderr="still refusing"),
                               # the listing still shows the domain
                               _result(stdout="vm01\n")]):
             assert dv.force_undefine_vm() is False
 
 
-class TestRetryAfterAStorageOnlyFailure:
-    """Issue #207: virsh undefines the domain *before* it removes the
-    volumes, so a failed storage-removing undefine can leave nothing for the
-    plain retry to find. A clean deprovision logged an ERROR per VM for it.
+class TestAFailedUndefineIsClassifiedByAbsence:
+    """Issue #207: a clean teardown logged an ERROR per VM because a
+    failed undefine was reported without checking whether the domain was
+    in fact gone. The check is a successful listing, never the error text
+    (see confirm_absent)."""
 
-    The stderr below is what libvirt 10.0 printed on the test-runner VM."""
-
-    STORAGE_ERROR = (
-        "error: Failed to remove storage volume 'vda'(/ws/c1/vm01.qcow2)\n"
-        "error: unsupported flags (0x2) in function "
-        "virStorageBackendVolDeleteLocal")
     NOT_FOUND = "error: failed to get domain 'vm01'"
 
-    def _run(self, dv: DestroyVM, fallback, listing, defined_after):
+    def _run(self, dv: DestroyVM, undefine, listing, defined_after):
         def fake_execute(*args, **kwargs):
-            if args[0] == "undefine" and "--remove-all-storage" in args:
-                return _result(ok=False, stderr=self.STORAGE_ERROR,
-                               return_code=1)
             if args[0] == "undefine":
-                return fallback
+                return undefine
             if args[0] == "list":
                 return listing
             raise AssertionError(f"unexpected virsh call {args}")
@@ -392,21 +337,21 @@ class TestRetryAfterAStorageOnlyFailure:
             ok = dv.force_undefine_vm()
         return ok, logger
 
-    def test_a_domain_the_first_attempt_removed_is_success(self, dv: DestroyVM):
+    def test_a_domain_that_is_gone_is_success(self, dv: DestroyVM):
         ok, logger = self._run(
             dv,
-            fallback=_result(ok=False, stderr=self.NOT_FOUND, return_code=1),
+            undefine=_result(ok=False, stderr=self.NOT_FOUND, return_code=1),
             listing=_result(stdout="other-vm\n"),
             defined_after=False)
         assert ok is True
         logger.error.assert_not_called()
         debug = " ".join(str(c.args[0]) for c in logger.debug.call_args_list)
-        assert "already removed" in debug
+        assert "is gone" in debug
 
-    def test_any_other_retry_failure_is_still_an_error(self, dv: DestroyVM):
+    def test_any_other_failure_is_still_an_error(self, dv: DestroyVM):
         ok, logger = self._run(
             dv,
-            fallback=_result(
+            undefine=_result(
                 ok=False, return_code=1,
                 stderr="error: Refusing to undefine while domain managed "
                        "save image exists"),
@@ -414,19 +359,17 @@ class TestRetryAfterAStorageOnlyFailure:
             defined_after=True)
         assert ok is False
         errors = [str(c.args[0]) for c in logger.error.call_args_list]
-        assert any("plain undefine also failed" in e for e in errors)
+        assert any("undefine failed" in e for e in errors)
 
     def test_a_not_found_message_alone_is_not_trusted(self, dv: DestroyVM):
-        """The retry's error text is not proof: only a successful listing
-        classifies the failure as harmless (see confirm_absent)."""
         _ok, logger = self._run(
             dv,
-            fallback=_result(ok=False, stderr=self.NOT_FOUND, return_code=1),
+            undefine=_result(ok=False, stderr=self.NOT_FOUND, return_code=1),
             listing=_result(ok=False, stderr="error: failed to connect",
                             return_code=1),
             defined_after=False)
         errors = [str(c.args[0]) for c in logger.error.call_args_list]
-        assert any("plain undefine also failed" in e for e in errors)
+        assert any("undefine failed" in e for e in errors)
 
 
 class TestConfirmAbsent:
@@ -493,14 +436,16 @@ class TestConfirmShutOffOrAbsent:
             assert dv._confirm_shut_off_or_absent() is False
 
 
-class TestStorageRemovalRequiresConfirmedShutdown:
-    """FB-4: ``--remove-all-storage`` may only run once the domain has been
-    positively observed to be stopped or gone — on the already-stopped path
-    as well as after a forced kill."""
+class TestUndefineRequiresConfirmedShutdown:
+    """FB-4: the undefine may only run once the domain has been positively
+    observed to be stopped or gone — on the already-stopped path as well as
+    after a forced kill. Undefining a running domain does not stop it: it
+    only makes it transient, still running on the disks its teardown then
+    removes."""
 
-    def test_a_failed_state_query_never_removes_storage(self, dv: DestroyVM):
+    def test_a_failed_state_query_never_undefines(self, dv: DestroyVM):
         """The libvirt-outage case: every query fails, so shut-off can never
-        be confirmed and the storage-removing undefine must not be issued."""
+        be confirmed and the undefine must not be issued."""
         with patch.object(dv, "is_vm_defined", return_value=True), \
              patch.object(
                  dv.virsh, "execute",
@@ -509,9 +454,8 @@ class TestStorageRemovalRequiresConfirmedShutdown:
             assert dv.force_undefine_vm() is False
 
         assert not any(
-            call.args[0] == "undefine" and "--remove-all-storage" in call.args
-            for call in execute.call_args_list
-        ), "storage was removed without confirming the domain was stopped"
+            call.args[0] == "undefine" for call in execute.call_args_list
+        ), "undefined without confirming the domain was stopped"
 
     def test_a_shutdown_confirmed_after_the_kill_may_proceed(self, dv: DestroyVM):
         """Unconfirmed at first, confirmed after the forced kill: correct to
@@ -524,8 +468,7 @@ class TestStorageRemovalRequiresConfirmedShutdown:
             assert dv.force_undefine_vm() is True
 
         assert any(
-            call.args[0] == "undefine" and "--remove-all-storage" in call.args
-            for call in execute.call_args_list
+            call.args[0] == "undefine" for call in execute.call_args_list
         )
 
     def test_unexpected_domstate_output_is_not_confirmation(self, dv: DestroyVM):
