@@ -852,9 +852,11 @@ class TestDestroyRemovedVm:
         # absence
         assert mgr.provider.destroy_vm.call_args_list == [
             call('test-vm'), call('test-vm', force=True)]
-        # only the extra disk's chain is read; the cdrom is not a disk
+        # every disk's chain is read, the boot disk's too; the cdrom is
+        # not a disk
         mgr.provider.backing_chains.assert_called_once_with(
-            ['/data/test-vm_disk01.qcow2'])
+            ['/var/lib/libvirt/images/test-vm.qcow2',
+             '/data/test-vm_disk01.qcow2'])
 
     def test_a_domain_whose_devices_cannot_be_read_stays_defined(self):
         mgr = self._make_manager()
@@ -873,6 +875,7 @@ class TestDestroyRemovedVm:
         mgr.provider.vm_storage_devices.return_value = None
         mgr.provider.confirm_vm_absent.return_value = True
         mgr.collect_workdirs = MagicMock(return_value=[str(tmp_path)])
+        mgr.config['clusters'] = {'c1': {'workdir': str(tmp_path)}}
         boot = tmp_path / 'test-vm.qcow2'
         boot.write_bytes(b'x')
 

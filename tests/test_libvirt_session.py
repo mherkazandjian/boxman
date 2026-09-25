@@ -634,24 +634,93 @@ class TestDiskPathsInUse:
         in_use, _ = self._run(chains=chains)
         assert in_use is None
 
-    # -- #208: a source that is not a local file does not fail the scan ----
+    # -- #208: pool volumes are local files; only network is remote --------
 
-    def test_a_network_or_volume_source_is_skipped_not_fatal(self):
-        """An RBD/iSCSI disk or a pool volume names no path on this host;
-        failing the scan on it kept every teardown candidate for nothing.
-        qemu-img is never asked about it."""
-        remote = self.HEADER + (
-            " file      disk   vda   /ws/b.top\n"
-            " network   disk   vdb   rbd-pool/image\n"
-            " volume    disk   vdc   default/data.qcow2\n")
-        in_use, cmd = self._run(inventories={("vm-b", False): remote,
-                                             ("vm-b", True): remote})
+    VOLUME_XML = (
+        "<domain><devices>"
+        "<disk type='volume' device='disk'>"
+        "<source pool='p1' volume='top.qcow2'/><target dev='vdb'/></disk>"
+        "<disk type='volume' device='cdrom'>"
+        "<source pool='p1' volume='install.iso'/><target dev='sdc'/></disk>"
+        "</devices></domain>")
+    VOLUME_ROWS = (" volume    disk    vdb   top.qcow2\n"
+                   " volume    cdrom   sdc   install.iso\n"
+                   " network   disk    vdd   rbd-pool/image\n")
+    VOLUME_PATHS = {"top.qcow2": "/pool/top.qcow2",
+                    "install.iso": "/pool/install.iso"}
+
+    def _run_volumes(self, dumpxml=None, vol_paths=None, extra_rows=""):
+        rows = self.HEADER + self.VOLUME_ROWS + extra_rows
+        dumpxml = self.VOLUME_XML if dumpxml is None else dumpxml
+        vol_paths = self.VOLUME_PATHS if vol_paths is None else vol_paths
+        chains = dict(self.CHAIN, **{
+            "/pool/top.qcow2": ('[{"filename": "/pool/top.qcow2", '
+                                '"full-backing-filename": "/ws/removed.qcow2"}, '
+                                '{"filename": "/ws/removed.qcow2"}]'),
+            "/pool/install.iso": '{"filename": "/pool/install.iso"}',
+            # readable, so only the type check can refuse the dir row below
+            "/srv/share": '{"filename": "/srv/share"}'})
+
+        def virsh_execute(*args, **kwargs):
+            if args[0] == "list":
+                return _result(stdout="vm-a\nvm-b\n")
+            if args[0] == "dumpxml":
+                return _result(stdout=dumpxml)
+            if args[0] == "vol-path":
+                path = vol_paths.get(args[1])
+                return (_result(stdout=path + "\n") if path
+                        else _result(ok=False, stderr="no storage vol"))
+            if args[1] == "vm-b":
+                return _result(stdout=rows)
+            return _result(stdout=self.BLK_A)
+
+        def shell(command, **kwargs):
+            source = command.rsplit(" ", 1)[1].strip("'")
+            if source not in chains:
+                return _result(ok=False, stderr="Could not open")
+            return _result(stdout=chains[source])
+
+        s = _session({})
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh, \
+             patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
+            virsh.return_value.execute.side_effect = virsh_execute
+            cmd.return_value.execute_shell.side_effect = shell
+            return s.disk_paths_in_use(), cmd, virsh.return_value.execute
+
+    def test_local_pool_volumes_are_resolved_and_mapped(self):
+        """A volume-type disk and CD-ROM are local files of a directory
+        pool: mapped by their resolved paths, the disk's backing file too.
+        Observed on libvirt 10.0: domblklist shows only the volume name."""
+        in_use, _cmd, execute = self._run_volumes()
+        assert in_use["/pool/top.qcow2"] == "vm-b"
+        assert in_use["/ws/removed.qcow2"] == "vm-b"
+        assert in_use["/pool/install.iso"] == "vm-b"
+        paths = [c.args for c in execute.call_args_list
+                 if c.args[0] == "vol-path"]
+        assert ("vol-path", "top.qcow2") in paths
+        assert all(c.kwargs.get("pool") == "p1"
+                   for c in execute.call_args_list if c.args[0] == "vol-path")
+
+    def test_a_network_source_is_skipped_not_fatal(self):
+        in_use, cmd, _ = self._run_volumes()
         assert in_use is not None
-        assert in_use["/ws/b.top"] == "vm-b"
         asked = " ".join(c.args[0]
                          for c in cmd.return_value.execute_shell.call_args_list)
         assert "rbd-pool/image" not in asked
-        assert "default/data.qcow2" not in asked
+
+    def test_none_when_a_volume_cannot_be_resolved(self):
+        in_use, _, _ = self._run_volumes(
+            vol_paths={"install.iso": "/pool/install.iso"})
+        assert in_use is None
+
+    def test_none_when_the_volume_xml_names_no_pool(self):
+        in_use, _, _ = self._run_volumes(dumpxml="<domain><devices/></domain>")
+        assert in_use is None
+
+    def test_none_for_a_source_type_neither_local_nor_remote(self):
+        in_use, _, _ = self._run_volumes(
+            extra_rows=" dir   disk   vde   /srv/share\n")
+        assert in_use is None
 
 
 class TestVmStorageDevices:
@@ -688,6 +757,46 @@ class TestVmStorageDevices:
 
     def test_none_when_a_definition_reads_as_incomplete(self):
         assert self._run(self.LIVE, self.PERSISTENT + " garbled\n") is None
+
+    def _run_volume(self, vol_path):
+        rows = (TestDiskPathsInUse.HEADER
+                + " file     disk    vda   /ws/vm.qcow2\n"
+                + " volume   cdrom   sda   install.iso\n"
+                + " network  disk    vdb   rbd-pool/image\n")
+        xml = ("<domain><devices><disk type='volume' device='cdrom'>"
+               "<source pool='isos' volume='install.iso'/>"
+               "<target dev='sda'/></disk></devices></domain>")
+
+        def execute(*args, **kwargs):
+            if args[0] == "dumpxml":
+                return _result(stdout=xml)
+            if args[0] == "vol-path":
+                return (_result(stdout=vol_path + "\n") if vol_path
+                        else _result(ok=False, stderr="no storage vol"))
+            return _result(stdout=rows)
+
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:
+            virsh.return_value.execute.side_effect = execute
+            return _session({}).vm_storage_devices("vm")
+
+    def test_a_volume_cdrom_is_resolved_to_its_path(self):
+        """So the teardown's media exclusion sees the file it names
+        (#212+#208 review, 3)."""
+        rows = self._run_volume("/pool/isos/install.iso")
+        assert ("volume", "cdrom", "/pool/isos/install.iso") in [
+            (r.type, r.device, r.source) for r in rows]
+        # a remote source is kept as reported; consumers skip it
+        assert ("network", "rbd-pool/image") in [(r.type, r.source)
+                                                  for r in rows]
+
+    def test_none_when_a_volume_cannot_be_resolved(self):
+        assert self._run_volume(None) is None
+
+    def test_none_for_a_source_type_neither_local_nor_remote(self):
+        rows = (TestDiskPathsInUse.HEADER
+                + " file   disk   vda   /ws/vm.qcow2\n"
+                + " dir    disk   vdb   /srv/share\n")
+        assert self._run(rows, rows) is None
 
 
 class TestBackingChains:

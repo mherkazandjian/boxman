@@ -11,10 +11,14 @@ a genuinely missing column comes back as ``None``).
 
 from typing import NamedTuple
 
-#: ``domblklist --details`` Type values whose Source is a path on this host.
-#: The others (``network``, ``volume``, ``nvme``, ...) name a remote image, a
-#: pool volume or a device address, never a file boxman could delete.
-LOCAL_SOURCE_TYPES = frozenset({'file', 'block'})
+#: ``domblklist --details`` Type values whose Source is a path on this
+#: host — for ``volume``, once :meth:`LibVirtSession.vm_storage_devices`
+#: has resolved the pool volume it names to its path.
+LOCAL_SOURCE_TYPES = frozenset({'file', 'block', 'volume'})
+
+#: Type values whose Source names a remote image (RBD, iSCSI, NBD, ...),
+#: never a file on this host. Any type in neither set fails closed.
+REMOTE_SOURCE_TYPES = frozenset({'network'})
 
 
 class DomblkRow(NamedTuple):

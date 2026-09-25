@@ -840,18 +840,22 @@ Details worth knowing:
   running.
 - **Only the storage the VM owns is removed, by boxman — never by libvirt.**
   Its boot disk, snapshot overlays and memory files (the files under the VM's
-  own `<vm>.*` / `<vm>_snapshot_*` names) and the extra disks boxman recorded
-  creating for it. Never: a CD-ROM or ISO it has attached, an `attach_only`
-  (adopted) disk, an extra disk outside the cluster workdir, or anything
-  another VM uses directly or as a backing file. A VM that predates the
-  ownership record has its declared disks removed by name. An extra disk
-  moved to an overlay by a snapshot goes with its whole snapshot chain when
-  every layer is provably its own (the disk at its recorded target, the
-  recorded base at the bottom, each layer named for it in the same
-  directory); otherwise the chain is kept whole. Every file kept is named in
-  a warning; keeping it does not fail the command. (`virsh undefine
-  --remove-all-storage` used to wipe and delete every storage-pool-listed file
-  the VM referenced, ISOs included — #208.)
+  own `<vm>.*` / `<vm>_snapshot_*` names in a cluster workdir) and the extra
+  disks boxman recorded creating for it. Never: a CD-ROM or ISO it has
+  attached (in either its live or its persistent definition), an
+  `attach_only` (adopted) disk, anything outside the cluster workdirs, a
+  symlink, or anything another VM uses directly or as a backing file —
+  storage-pool volumes included. A disk's backing chain goes as a whole or
+  not at all, overlays first, so no kept disk loses its backing file. A VM
+  that predates the ownership record has its declared disks removed by name;
+  a retried teardown of a VM already undefined keeps its extra disks, since
+  its record went with it. An extra disk moved to an overlay by a snapshot
+  goes with its whole chain when every layer is provably its own (the disk at
+  its recorded target, the recorded base at the bottom, each layer named for
+  it in the same directory); otherwise the chain is kept whole. Every file
+  kept is named in a warning; keeping it does not fail the command. (`virsh
+  undefine --remove-all-storage` used to wipe and delete every
+  storage-pool-listed file the VM referenced, ISOs included — #208.)
 - **`destroy` validates its delete targets up front**, before any teardown
   starts. It refuses a path that is empty, relative, a symlink, your home
   directory, a filesystem root or mount point, a top-level path, or a

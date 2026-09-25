@@ -20,6 +20,10 @@ from boxman.providers.libvirt.clone_vm import CLONE_DEGRADATION_NOTICES_KEY
 from boxman.providers.libvirt.commands import VirshCommand
 from boxman.providers.libvirt.disk import disk_path_for
 from boxman.providers.libvirt.disk_cleanup import (
+    RECORDS_NONE,
+    RECORDS_PRESENT,
+    RECORDS_UNKNOWN,
+    RECORDS_UNREADABLE,
     StorageInventory,
     boot_family_files,
     file_identities,
@@ -431,8 +435,13 @@ class VMsMixin:
         """
         Inventory *full_vm_name*'s storage before it is undefined: its block
         devices in both definitions, its ownership records, the backing
-        chains of its extra disks, its boot-disk family, and the identity of
-        every one of those files.
+        chain of each of its disks, its boot-disk family, and the identity
+        of every one of those files.
+
+        A domain already gone (an interrupted teardown being retried) is
+        inventoried by name only, and its ownership state is *unknown*, not
+        "none": whatever record it carried went with it, so its disks are
+        never taken for a legacy domain's.
 
         Raises:
             ProvisionError: If the domain exists but its block devices cannot
@@ -465,7 +474,7 @@ class VMsMixin:
         if disk_dirs is None:
             disk_dirs = self._vm_disk_dirs(full_vm_name, disk_sources)
 
-        records, records_unreadable = None, False
+        records, records_state = None, RECORDS_UNKNOWN
         if exists:
             try:
                 records = self._vm_disk_records(full_vm_name)
@@ -473,12 +482,14 @@ class VMsMixin:
                 self.logger.warning(
                     f"{full_vm_name}: {exc}; none of its extra disks will be "
                     f"removed")
-                records_unreadable = True
+                records_state = RECORDS_UNREADABLE
+            else:
+                records_state = (RECORDS_NONE if records is None
+                                 else RECORDS_PRESENT)
 
-        extra_disks = [path for path in disk_sources
-                       if not os.path.basename(path).startswith(
-                           f"{full_vm_name}.")]
-        chains = session.backing_chains(extra_disks) if extra_disks else {}
+        # every disk's chain, the boot disk's included: what may be removed
+        # is decided across all of them (remove_vm_storage)
+        chains = session.backing_chains(disk_sources) if disk_sources else {}
 
         boot_family = sorted({path for workdir in disk_dirs
                               for path in boot_family_files(workdir,
@@ -492,7 +503,7 @@ class VMsMixin:
             disk_sources=disk_sources,
             media_sources=media_sources,
             records=records,
-            records_unreadable=records_unreadable,
+            records_state=records_state,
             chains=chains,
             boot_family=boot_family,
             legacy_disks=legacy_disks,

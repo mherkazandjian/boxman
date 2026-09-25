@@ -9,8 +9,9 @@ the routine with real files in a temporary workdir and a mocked session.
 
 from __future__ import annotations
 
+import json
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -21,6 +22,7 @@ from boxman.providers.libvirt.disk_ownership import (
     ROLE_DATA,
     DiskRecord,
 )
+from boxman.providers.libvirt.session import LibVirtSession
 from boxman.providers.libvirt.virsh_parse import DomblkRow
 from conftest import make_bare_manager
 
@@ -40,26 +42,32 @@ def _record(name, path, role=ROLE_DATA, target='vdb'):
     return DiskRecord(name=name, target=target, role=role, source=str(path))
 
 
-class _Teardown:
-    """A bare manager whose session reports *disks* and *media* for VM."""
+#: default for ``_Teardown(chains=...)``: every disk a standalone image
+STANDALONE = object()
 
-    def __init__(self, workdir, *, disks=(), media=(), records=None,
-                 records_error=None, in_use=None, chains=None):
+
+class _Teardown:
+    """A bare manager whose session reports *disks* and *media* for VM (or
+    exactly *rows*, e.g. a live and a persistent definition that differ).
+    ``chains=None`` makes the backing chains unreadable."""
+
+    def __init__(self, workdir, *, disks=(), media=(), rows=None,
+                 records=None, records_error=None, in_use=None,
+                 chains=STANDALONE):
         self.workdir = workdir
         self.mgr = make_bare_manager(
             {'project': 'demo',
              'clusters': {'cluster_1': {'workdir': str(workdir)}}})
         session = self.session = MagicMock()
-        session.vm_storage_devices.return_value = (
+        session.vm_storage_devices.return_value = rows if rows is not None else (
             [DomblkRow('file', 'disk', f'vd{chr(97 + i)}', str(p))
              for i, p in enumerate(disks)]
             + [DomblkRow('file', 'cdrom', f'sd{chr(97 + i)}', str(p))
                for i, p in enumerate(media)])
         session.confirm_vm_absent.return_value = True
-        if chains is None:
+        if chains is STANDALONE:
             session.backing_chains.side_effect = (
-                lambda sources: {str(s): [os.path.realpath(s)]
-                                 for s in sources})
+                lambda sources: {str(s): [str(s)] for s in sources})
         else:
             session.backing_chains.return_value = chains
         session.disk_paths_in_use.return_value = (
@@ -285,12 +293,115 @@ class TestOwnedSnapshotChains:
         self._assert_kept_whole(t, chain)
 
     def test_an_unreadable_chain_keeps_it(self, tmp_path):
+        """``chains=None``: the session could not read them (review, 7)."""
         chain = self._chain(tmp_path, 'qcow2', 's1')
         t = self._teardown(tmp_path, chain, chains=None)
+        assert t.session.backing_chains([]) is None
 
         t.deprovision()
 
         self._assert_kept_whole(t, chain)
+
+    @pytest.mark.parametrize("layer", [0, -1])
+    def test_a_chain_with_a_media_layer_is_kept_whole(self, tmp_path, layer):
+        """The head or the base is also a CD-ROM source in one definition
+        (review, 2)."""
+        chain = self._chain(tmp_path, 'qcow2', 's1')
+        t = self._teardown(tmp_path, chain, media=[chain[layer]])
+
+        t.deprovision()
+
+        for kept in chain:
+            assert kept.exists()
+
+    def test_a_base_attached_in_the_other_definition_is_kept_under_its_head(
+            self, tmp_path):
+        """The live definition holds the overlay at vdb, the persistent one
+        the recorded base itself: the base must not go while its head is
+        kept (review, 6)."""
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        base = _file(tmp_path / f'{VM}_disk01.qcow2')
+        head = _file(tmp_path / f'{VM}_disk01.s1')
+        t = _Teardown(tmp_path, rows=[
+            DomblkRow('file', 'disk', 'vda', str(boot)),
+            DomblkRow('file', 'disk', 'vdb', str(head)),
+            DomblkRow('file', 'disk', 'vdb', str(base))],
+            records=[_record('disk01', base)],
+            chains={str(boot): [str(boot)],
+                    str(head): [str(head), str(base)],
+                    str(base): [str(base)]})
+
+        t.deprovision([{'name': 'disk01'}])
+
+        assert head.exists() and base.exists()
+        assert str(base) in t.warnings
+        assert not boot.exists()
+
+    def test_nothing_left_to_remove_asks_no_host_wide_scan(self, tmp_path):
+        """Chain dependencies are settled before the scan of every domain's
+        disks, so a teardown whose candidates they all keep never runs it."""
+        base = _file(tmp_path / f'{VM}_disk01.qcow2')
+        head = _file(tmp_path / f'{VM}_disk01.s1')
+        t = _Teardown(tmp_path, rows=[
+            DomblkRow('file', 'disk', 'vdb', str(head)),
+            DomblkRow('file', 'disk', 'vdb', str(base))],
+            records=[_record('disk01', base)],
+            chains={str(head): [str(head), str(base)],
+                    str(base): [str(base)]})
+
+        t.deprovision([{'name': 'disk01'}])
+
+        t.session.disk_paths_in_use.assert_not_called()
+        assert head.exists() and base.exists()
+
+    def test_a_shared_base_at_a_separate_target_is_kept(self, tmp_path):
+        """The recorded base at vdb, an unrecorded overlay of it at vdc."""
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        base = _file(tmp_path / f'{VM}_disk01.qcow2')
+        head = _file(tmp_path / f'{VM}_disk01.other')
+        t = _Teardown(tmp_path, rows=[
+            DomblkRow('file', 'disk', 'vda', str(boot)),
+            DomblkRow('file', 'disk', 'vdb', str(base)),
+            DomblkRow('file', 'disk', 'vdc', str(head))],
+            records=[_record('disk01', base)],
+            chains={str(boot): [str(boot)],
+                    str(base): [str(base)],
+                    str(head): [str(head), str(base)]})
+
+        t.deprovision([{'name': 'disk01'}])
+
+        assert head.exists() and base.exists()
+        assert not boot.exists()
+
+    def test_a_symlinked_layer_found_by_qemu_img_keeps_the_chain(
+            self, tmp_path):
+        """Through the real ``backing_chains`` normalisation: a symlink
+        head must stay recognisable as one, not become its target
+        (review, 5)."""
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        base = _file(tmp_path / f'{VM}_disk01.qcow2')
+        target = _file(tmp_path / f'{VM}_disk01.real')
+        alias = tmp_path / f'{VM}_disk01.s1'
+        alias.symlink_to(target)
+        answer = json.dumps([
+            {"filename": str(alias), "full-backing-filename": str(base)},
+            {"filename": str(base)}])
+        session = LibVirtSession(config={"provider": {"libvirt": {}}})
+        with patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
+            cmd.return_value.execute_shell.side_effect = (
+                lambda command, **kw: MagicMock(
+                    ok=True,
+                    stdout=answer if str(alias) in command
+                    else json.dumps({"filename": str(boot)})))
+            chains = session.backing_chains([str(boot), str(alias)])
+        t = _Teardown(tmp_path, disks=[boot, alias],
+                      records=[_record('disk01', base)], chains=chains)
+
+        t.deprovision([{'name': 'disk01'}])
+
+        assert alias.is_symlink()
+        assert target.exists() and base.exists()
+        assert str(base) in t.warnings
 
     def test_a_replaced_layer_keeps_it_and_everything_below(self, tmp_path):
         """Removal runs head first, so what is left is never an overlay
@@ -370,6 +481,58 @@ class TestNeverRemoved:
         assert not memory.exists()
         assert OTHER in t.warnings
 
+    def test_a_boot_named_file_outside_every_cluster_workdir_is_kept(
+            self, tmp_path):
+        """update takes the VM's disk directories from libvirt, which can
+        name one outside every cluster workdir (#212+#208 review, 1)."""
+        workdir = tmp_path / 'cluster'
+        workdir.mkdir()
+        outside = _file(tmp_path / 'external' / f'{VM}.qcow2')
+        t = _Teardown(workdir, disks=[outside], records=[])
+
+        t.update_remove()
+
+        assert outside.exists()
+        assert str(outside) in t.warnings
+
+    def test_a_recorded_data_disk_that_is_also_media_is_kept(self, tmp_path):
+        """One definition attaches it as a disk, the other as a CD-ROM: the
+        media exclusion holds on every removal route (review, 2)."""
+        data = _file(tmp_path / f'{VM}_disk01.qcow2')
+        t = _Teardown(tmp_path, rows=[
+            DomblkRow('file', 'disk', 'vdb', str(data)),
+            DomblkRow('file', 'cdrom', 'sda', str(data))],
+            records=[_record('disk01', data)])
+
+        t.deprovision([{'name': 'disk01'}])
+
+        assert data.exists()
+        assert str(data) in t.warnings
+
+    def test_a_retried_deprovision_keeps_an_adopted_disk(self, tmp_path):
+        """The first pass keeps it and undefines the domain; the retry finds
+        the domain gone -- and its record with it. Gone is not "no record":
+        the legacy by-name rule must not take it (review, 4)."""
+        adopted = _file(tmp_path / f'{VM}_disk01.qcow2')
+        t = _Teardown(tmp_path, disks=[adopted],
+                      records=[_record('disk01', adopted, ROLE_ADOPTED)])
+
+        t.deprovision([{'name': 'disk01'}])
+        assert adopted.exists()
+
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        t.session.vm_storage_devices.return_value = None
+        t.session.confirm_vm_absent.return_value = True
+        t.mgr.logger.reset_mock()
+
+        t.deprovision([{'name': 'disk01'}])
+
+        assert adopted.exists()
+        assert str(adopted) in t.warnings
+        # the boot family, under the VM's exclusive names, still goes
+        assert not boot.exists()
+        t.mgr._vm_disk_records.assert_called_once()
+
     def test_a_symlink_under_the_vms_names_is_kept(self, tmp_path):
         """boxman never creates one; unlinking it would report a disk as
         removed while its data lives on elsewhere."""
@@ -382,6 +545,37 @@ class TestNeverRemoved:
 
         assert link.is_symlink() and target.exists()
         assert str(link) in t.warnings
+
+    def test_a_boot_base_another_domain_uses_keeps_its_overlay_too(
+            self, tmp_path):
+        """A chain goes as a whole or not at all: the overlay stays on its
+        kept base rather than going on its own."""
+        base = _file(tmp_path / f'{VM}.qcow2')
+        head = _file(tmp_path / f'{VM}.s1')
+        t = _Teardown(tmp_path, disks=[head], records=[],
+                      chains={str(head): [str(head), str(base)]},
+                      in_use={str(base): OTHER})
+
+        t.deprovision()
+
+        assert base.exists() and head.exists()
+        assert OTHER in t.warnings
+
+    def test_a_chain_that_goes_through_a_symlink_is_kept(self, tmp_path):
+        """qemu-img names the backing layer by a symlink to the boot base:
+        resolved, every layer looks removable, so the check runs on the
+        name qemu-img gave (#212+#208 review, 5)."""
+        base = _file(tmp_path / f'{VM}.qcow2')
+        head = _file(tmp_path / f'{VM}.s1')
+        link = tmp_path / 'base-link.qcow2'
+        link.symlink_to(base)
+        t = _Teardown(tmp_path, disks=[head], records=[],
+                      chains={str(head): [str(head), str(link)]})
+
+        t.deprovision()
+
+        assert head.exists() and base.exists() and link.is_symlink()
+        assert 'symlink' in t.warnings
 
     def test_a_failed_scan_keeps_every_candidate_and_names_each(
             self, tmp_path):

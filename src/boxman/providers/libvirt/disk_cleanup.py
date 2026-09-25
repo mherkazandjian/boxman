@@ -162,6 +162,18 @@ def _leftover_refusal(vm_name: str,
     return None
 
 
+#: the domain carried ownership records, read into ``records``
+RECORDS_PRESENT = "present"
+#: the domain existed, was inventoried, and carried no ownership record —
+#: one that predates them
+RECORDS_NONE = "none"
+#: the domain carried a record that could not be read
+RECORDS_UNREADABLE = "unreadable"
+#: the domain was already undefined when it was inventoried (an interrupted
+#: teardown being retried): whatever record it carried went with it
+RECORDS_UNKNOWN = "unknown"
+
+
 @dataclass
 class StorageInventory:
     """
@@ -169,7 +181,8 @@ class StorageInventory:
 
     Undefining drops the domain's XML, its ownership record and its
     snapshot metadata, and nothing the teardown decides afterwards may rest
-    on a file's name alone, so everything is captured here first.
+    on a file's name alone, so everything is captured here first. Paths are
+    kept as they were reported (lexical); decisions compare them resolved.
     """
 
     #: full name of the VM
@@ -179,14 +192,15 @@ class StorageInventory:
     #: sources of every other device (CD-ROM, floppy, ...), live and
     #: persistent definition: never deleted
     media_sources: list[str]
-    #: its ownership records; ``None`` when it carried none
+    #: its ownership records, when :attr:`records_state` is
+    #: :data:`RECORDS_PRESENT`
     records: list[DiskRecord] | None
-    #: whether the records could not be read (then ``records`` is None and
-    #: nothing recorded-or-not is removed as an extra disk)
-    records_unreadable: bool
-    #: the backing chain of each attached extra disk (resolved paths, the
-    #: disk first, the bottom image last); ``None`` when one could not be
-    #: read
+    #: one of :data:`RECORDS_PRESENT`, :data:`RECORDS_NONE`,
+    #: :data:`RECORDS_UNREADABLE`, :data:`RECORDS_UNKNOWN`
+    records_state: str
+    #: the backing chain of each disk source, as ``qemu-img`` names the
+    #: layers (the disk first, the bottom image last); ``None`` when one
+    #: could not be read
     chains: dict[str, list[str]] | None
     #: files under its exclusive names in its disk directories
     #: (:func:`boot_family_files`)
@@ -198,14 +212,6 @@ class StorageInventory:
     identities: dict[str, tuple[int, int]] = field(default_factory=dict)
     #: the target (``vdb``, ...) each disk source is attached at
     targets: dict[str, str] = field(default_factory=dict)
-
-    @property
-    def chain_layers(self) -> list[str] | None:
-        """Every layer of every chain in :attr:`chains`, or ``None``."""
-        if self.chains is None:
-            return None
-        return sorted({layer for chain in self.chains.values()
-                       for layer in chain})
 
 
 @dataclass
@@ -227,6 +233,82 @@ def _regular_file_refusal(path: str) -> str | None:
     return None
 
 
+_MEDIA = "it is a CD-ROM or other media source of the vm"
+_OUTSIDE = "it is outside every cluster workdir of the project"
+
+_WHY_NO_RECORD = {
+    RECORDS_NONE: "the domain carries no record of which disks boxman "
+                  "created",
+    RECORDS_UNREADABLE: "its disk ownership record could not be read",
+    RECORDS_UNKNOWN: "the vm was already undefined when this teardown "
+                     "inventoried it, so whether boxman created it can no "
+                     "longer be told",
+}
+
+
+class _Admission:
+    """Which referenced files may be removed, and why each other one is
+    kept. Keyed by resolved path; a refusal always wins over an
+    admission."""
+
+    def __init__(self) -> None:
+        #: resolved path -> the path to unlink it by
+        self.admitted: dict[str, str] = {}
+        #: resolved path -> (path, why it is kept)
+        self.refused: dict[str, tuple[str, str]] = {}
+
+    def admit(self, path: str) -> None:
+        resolved = os.path.realpath(path)
+        if resolved not in self.refused:
+            self.admitted.setdefault(resolved, path)
+
+    def refuse(self, path: str, reason: str) -> None:
+        resolved = os.path.realpath(path)
+        self.admitted.pop(resolved, None)
+        self.refused.setdefault(resolved, (path, reason))
+
+    def is_admitted(self, path: str) -> bool:
+        return os.path.realpath(path) in self.admitted
+
+
+def _refuse_incomplete_chains(chains: dict[str, list[str]],
+                              admission: _Admission) -> None:
+    """
+    Keep every layer of every chain that is not removable as a whole.
+
+    A chain is removed only when each of its layers is admitted and none is
+    a symlink — checked on the path ``qemu-img`` named, before resolving
+    it, since a symlinked layer resolves to a file that looks removable.
+    Otherwise every layer of it is kept: removing a layer that a kept disk
+    above it (or a kept image beside it in the same chain) still needs would
+    leave that disk broken. Repeated until stable, as chains share layers
+    and a live and a persistent definition can each hold a different head
+    over the same base.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for head, layers in chains.items():
+            problem = None
+            for layer in layers:
+                if os.path.islink(layer):
+                    problem = f"its backing chain goes through the symlink {layer}"
+                    break
+                if not admission.is_admitted(layer):
+                    problem = (
+                        f"it is in the backing chain of {head}, which is kept"
+                        if layer == head else
+                        f"it is in the backing chain of {head}, and {layer} "
+                        f"in that chain is kept")
+                    break
+            if problem is None:
+                continue
+            for layer in layers:
+                if admission.is_admitted(layer):
+                    admission.refuse(layer, problem)
+                    changed = True
+
+
 def remove_vm_storage(
     inventory: StorageInventory,
     workdirs: Iterable[str],
@@ -241,112 +323,93 @@ def remove_vm_storage(
     --remove-all-storage`` zero-filled and deleted every pool-listed source
     of the domain, CD-ROM media and adopted disks included (#208).
 
-    Candidates, from the *inventory* taken before undefining:
+    Files are first admitted one by one, from the *inventory* taken before
+    undefining; anything a rule does not admit is kept:
 
     1. **The boot-disk family** — files under the VM's exclusive names in
-       its disk directories (:func:`boot_family_files`): its boot disk, its
-       overlays and its memory-snapshot files. Any of them that is a
-       source of one of its CD-ROMs, or an extra disk of it, a layer of
-       one or a recorded source, is left to the rules below. When an extra
-       disk's chain cannot be read, a ``<vm>_snapshot_*`` file cannot be
-       told from a layer of one, so all of them are kept.
+       its disk directories (:func:`boot_family_files`): its boot disk,
+       its overlays and its memory-snapshot files. Extra-disk files
+       (attached, recorded, config-declared, or a layer under one) are
+       never decided by name.
     2. **Extra disks recorded with role ``data``** at exactly their
-       attached source, by the rules of :func:`_leftover_refusal`. A
-       recorded disk no longer attached where it was recorded (an external
-       snapshot moved it to an overlay) goes with its whole snapshot chain,
-       head first, when the chain is provably the VM's own
-       (:func:`_owned_snapshot_chain`); otherwise the chain is kept whole.
-    3. **A legacy domain** — one with no ownership record at all: when the
-       config is known (*legacy_disks*), its config-declared disks
-       ``<vm>_<name>.<ext>``, by name as before records existed; otherwise
-       (a VM gone from conf.yml) its extra disks are kept.
+       attached source, by the rules of :func:`_leftover_refusal`; and a
+       recorded disk an external snapshot moved behind overlays, together
+       with its whole chain, when :func:`_owned_snapshot_chain` proves the
+       chain the VM's own.
+    3. **A legacy domain** — one inventoried with no ownership record at
+       all: when the config is known (*legacy_disks*), its config-declared
+       disks, by name. A VM gone from conf.yml keeps them, and so does a
+       domain already undefined when inventoried (a retried teardown):
+       its record, if it had one, is gone.
 
-    Never removed: a CD-ROM (or other media) source, an adopted or other
-    non-``data`` recorded disk, an extra disk outside every cluster
-    *workdir*, a symlink, or anything another domain uses directly or as a
-    backing file. *paths_in_use* is asked once; if it cannot answer
-    (``None``), every candidate is kept. Each unlink goes through
+    Every admitted file must be a regular file, not a symlink, inside one
+    of the cluster *workdirs* once symlinks are resolved, and not a CD-ROM
+    (or other media) source of either definition.
+
+    Then, across the whole inventory: a backing chain is removed only as a
+    whole (:func:`_refuse_incomplete_chains`), and an unreadable chain
+    keeps everything; nothing another domain uses directly or as a backing
+    file is removed (*paths_in_use* is asked once, and ``None`` keeps
+    everything). What remains is removed heads first, each through
     :func:`remove_if_unchanged` against the identity taken before
-    undefining.
+    undefining; a layer replaced since keeps everything below it.
 
     Returns:
         The files removed, and ``(path, reason)`` for every file kept.
     """
     vm = inventory.vm_name
     outcome = StorageOutcome()
-    kept = outcome.kept
-
-    def real(path: str) -> str:
-        return os.path.realpath(path)
-
-    media = {real(path) for path in inventory.media_sources}
+    admission = _Admission()
+    real = os.path.realpath
     real_workdirs = {real(os.path.expanduser(w)) for w in workdirs}
-    attached_extras = []
-    for path in inventory.disk_sources:
-        if (not os.path.basename(path).startswith(f"{vm}.")
-                and path not in attached_extras):
-            attached_extras.append(path)
-    records = inventory.records
-    legacy = (inventory.legacy_disks
-              if records is None and not inventory.records_unreadable
-              else None)
+    media = {real(path) for path in inventory.media_sources}
+    chains = inventory.chains
+    legacy = list(inventory.legacy_disks or ())
 
-    # everything decided as an extra disk, not as the boot family
-    extra_related = {real(path) for path in attached_extras}
-    extra_related.update(real(r.source) for r in records or ())
-    extra_related.update(real(path) for path in legacy or ())
-    extra_related.update(real(path) for path in inventory.chain_layers or ())
+    def unique(paths):
+        seen, out = set(), []
+        for path in paths:
+            if real(path) not in seen:
+                seen.add(real(path))
+                out.append(path)
+        return out
 
-    candidates: list[str] = []
-    chains: list[list[str]] = []
-
-    # -- 1. the boot-disk family --------------------------------------------
-    for path in inventory.boot_family:
+    def static_refusal(path: str) -> str | None:
         if real(path) in media:
-            kept.append((path, "it is a CD-ROM or other media source of "
-                               "the vm"))
-            continue
-        if real(path) in extra_related:
-            continue
-        if (inventory.chain_layers is None
-                and os.path.basename(path).startswith(f"{vm}_snapshot_")):
-            kept.append((path, (
-                "the backing chain of the vm's extra disks could not be "
-                "read, so a layer of one cannot be told apart from a "
-                "memory-snapshot file")))
-            continue
+            return _MEDIA
         reason = _regular_file_refusal(path)
         if reason:
-            kept.append((path, reason))
-        else:
-            candidates.append(path)
+            return reason
+        if real(os.path.dirname(path)) not in real_workdirs:
+            return _OUTSIDE
+        return None
 
-    # -- 2./3. extra disks ----------------------------------------------------
-    present_extras = [p for p in attached_extras if os.path.lexists(p)]
-    if records is None:
-        if legacy is not None:
-            for path in legacy:
-                if not os.path.lexists(path) or path in candidates:
-                    continue
-                reason = ("it is a CD-ROM or other media source of the vm"
-                          if real(path) in media
-                          else _regular_file_refusal(path))
-                if (reason is None and real(os.path.dirname(path))
-                        not in real_workdirs):
-                    reason = "it is outside every cluster workdir of the project"
-                if reason:
-                    kept.append((path, reason))
-                else:
-                    candidates.append(path)
-            legacy_real = {real(path) for path in legacy}
-            present_extras = [p for p in present_extras
-                              if real(p) not in legacy_real]
-        why = ("its disk ownership record could not be read"
-               if inventory.records_unreadable
-               else "the domain carries no record of which disks boxman "
-                    "created")
-        kept.extend((path, why) for path in present_extras)
-    else:
+    attached_extras = unique(
+        path for path in inventory.disk_sources
+        if not os.path.basename(path).startswith(f"{vm}."))
+
+    # extra-disk files are never decided by name
+    extra_related = {real(path) for path in attached_extras}
+    extra_related.update(real(r.source) for r in inventory.records or ())
+    extra_related.update(real(path) for path in legacy)
+    for source, layers in (chains or {}).items():
+        if not os.path.basename(source).startswith(f"{vm}."):
+            extra_related.update(real(layer) for layer in layers)
+
+    # -- 1. the boot-disk family ------------------------------------------
+    for path in inventory.boot_family:
+        if real(path) in extra_related:
+            continue
+        reason = static_refusal(path)
+        if reason:
+            admission.refuse(path, reason)
+        else:
+            admission.admit(path)
+
+    # -- 2./3. extra disks -------------------------------------------------
+    state = inventory.records_state
+    if state == RECORDS_PRESENT:
+        records = inventory.records or []
         for record in records:
             if (record.source in inventory.disk_sources
                     or not os.path.lexists(record.source)):
@@ -354,51 +417,99 @@ def remove_vm_storage(
             chain, reason = _owned_snapshot_chain(
                 inventory, record, real_workdirs)
             if chain is None:
-                kept.append((record.source, (
+                admission.refuse(record.source, (
                     f"boxman created it, but it was no longer attached "
                     f"where it was recorded (an external snapshot moves a "
                     f"disk to an overlay) and {reason}; remove it and its "
-                    f"overlays by hand")))
+                    f"overlays by hand"))
             else:
-                chains.append(chain)
-        in_chains = {layer for chain in chains for layer in chain}
+                for layer in chain:
+                    admission.admit(layer)
         by_source = {record.source: record for record in records}
-        for path in present_extras:
-            if real(path) in in_chains:
+        for path in attached_extras:
+            if not os.path.lexists(path) or admission.is_admitted(path):
                 continue
-            reason = _leftover_refusal(vm, path, by_source.get(path),
-                                       real_workdirs)
+            reason = (_MEDIA if real(path) in media
+                      else _leftover_refusal(vm, path, by_source.get(path),
+                                             real_workdirs))
             if reason:
-                kept.append((path, reason))
+                admission.refuse(path, reason)
             else:
-                candidates.append(path)
+                admission.admit(path)
+    elif state == RECORDS_NONE and inventory.legacy_disks is not None:
+        for path in legacy:
+            if not os.path.lexists(path):
+                continue
+            reason = static_refusal(path)
+            if reason:
+                admission.refuse(path, reason)
+            else:
+                admission.admit(path)
+        declared = {real(path) for path in legacy}
+        for path in attached_extras:
+            if os.path.lexists(path) and real(path) not in declared:
+                admission.refuse(path, _WHY_NO_RECORD[RECORDS_NONE])
+    else:
+        for path in unique([*attached_extras, *legacy]):
+            if os.path.lexists(path):
+                admission.refuse(path, _WHY_NO_RECORD[state])
 
-    if not candidates and not chains:
-        return outcome
+    # -- dependencies across the whole inventory ---------------------------
+    if chains is None:
+        for path in list(admission.admitted.values()):
+            admission.refuse(path, (
+                "the backing chains of the vm's disks could not be read, so "
+                "what depends on it cannot be told"))
+    else:
+        _refuse_incomplete_chains(chains, admission)
 
-    # -- in use by another domain, then the identity-checked unlink ----------
-    in_use = paths_in_use()
-    for path in candidates:
-        if in_use is None:
-            kept.append((path, "could not check whether another domain "
-                               "uses it"))
-            continue
-        user = in_use.get(real(path))
-        if user:
-            kept.append((path, f"domain {user} uses it"))
-            continue
+    # -- in use by another domain ------------------------------------------
+    if admission.admitted:
+        in_use = paths_in_use()
+        for resolved, path in list(admission.admitted.items()):
+            if in_use is None:
+                admission.refuse(path, "could not check whether another "
+                                       "domain uses it")
+            elif in_use.get(resolved):
+                admission.refuse(path, f"domain {in_use[resolved]} uses it")
+        if chains:
+            _refuse_incomplete_chains(chains, admission)
+
+    # -- removal, heads first ------------------------------------------------
+    resolved_chains = [[real(layer) for layer in layers]
+                       for layers in (chains or {}).values()]
+    depth: dict[str, int] = {}
+    for layers in resolved_chains:
+        for index, layer in enumerate(layers):
+            depth[layer] = max(depth.get(layer, 0), index)
+    for resolved in sorted(admission.admitted, key=lambda r: depth.get(r, 0)):
+        path = admission.admitted.get(resolved)
+        if path is None:
+            continue     # kept meanwhile: a layer above it was replaced
         result, where = remove_if_unchanged(
             path, inventory.identities.get(path))
         if result == "removed":
             log.info(f"removed {path} (vm {vm})")
             outcome.removed.append(path)
-        elif result == "restored":
-            kept.append((path, "it was replaced after the vm was inspected"))
-        elif result == "stranded":
-            kept.append((path, _stranded(where)))
+            del admission.admitted[resolved]
+        elif result == "gone":
+            del admission.admitted[resolved]
+        else:
+            admission.refuse(path,
+                             "it was replaced after the vm was inspected"
+                             if result == "restored" else _stranded(where))
+            for layers in resolved_chains:
+                if resolved in layers:
+                    for below in layers[layers.index(resolved) + 1:]:
+                        if below in admission.admitted:
+                            admission.refuse(
+                                admission.admitted[below],
+                                "a layer above it in its backing chain was "
+                                "replaced after the vm was inspected")
 
-    for chain in chains:
-        _remove_chain(chain, vm, inventory, in_use, outcome)
+    outcome.kept = [(path, reason)
+                    for path, reason in admission.refused.values()
+                    if os.path.lexists(path)]
     return outcome
 
 
@@ -427,24 +538,27 @@ def _owned_snapshot_chain(inventory: StorageInventory,
     - exactly one attached disk has the base at the *bottom* of its
       backing chain (nothing below it: boxman creates data disks
       standalone), and that disk is attached at the record's target;
-    - every layer is a regular file in the base's directory named
-      ``<vm>_<name>.<suffix>``.
+    - every layer, as ``qemu-img`` named it, is a regular file and not a
+      symlink, in the base's directory, named ``<vm>_<name>.<suffix>``,
+      and not a CD-ROM or other media source of the vm.
 
-    Whether another domain uses a layer is checked at removal time.
+    Whether it may go as a whole, and whether another domain uses a layer,
+    is decided by :func:`remove_vm_storage` across the whole inventory.
 
     Returns:
         ``(chain, None)`` — head first, base last — or ``(None, reason)``.
     """
     vm = inventory.vm_name
+    real = os.path.realpath
     if record.role != ROLE_DATA:
         return None, (f"boxman attached it but did not create it (role "
                       f"{record.role!r})")
     if inventory.chains is None:
-        return None, ("the backing chains of the vm's extra disks could not "
-                      "be read")
-    base = os.path.realpath(record.source)
+        return None, ("the backing chains of the vm's disks could not be "
+                      "read")
+    base = real(record.source)
     heads = [source for source, chain in inventory.chains.items()
-             if chain and chain[-1] == base]
+             if chain and real(chain[-1]) == base]
     if len(heads) != 1:
         return None, ("no single attached disk has it at the bottom of its "
                       "backing chain")
@@ -453,60 +567,26 @@ def _owned_snapshot_chain(inventory: StorageInventory,
         return None, (f"the disk built on it is attached at "
                       f"{inventory.targets.get(head)}, not at "
                       f"{record.target} where it was recorded")
-    directory = os.path.dirname(base)
+    directory = real(os.path.dirname(record.source))
     if directory not in workdirs:
-        return None, "it is outside every cluster workdir of the project"
+        return None, _OUTSIDE
+    media = {real(path) for path in inventory.media_sources}
     stem = f"{vm}_{record.name}."
     chain = inventory.chains[head]
     for layer in chain:
+        if os.path.islink(layer):
+            return None, f"{layer} in its chain is a symlink"
         if not os.path.basename(layer).startswith(stem):
             return None, (f"{layer} in its chain is not named for disk "
                           f"{record.name!r}")
-        if os.path.dirname(layer) != directory:
+        if real(os.path.dirname(layer)) != directory:
             return None, f"{layer} in its chain is in another directory"
+        if real(layer) in media:
+            return None, f"{layer} in its chain is a media source of the vm"
         reason = _regular_file_refusal(layer)
         if reason:
             return None, f"{layer} in its chain: {reason}"
     return chain, None
-
-
-def _remove_chain(chain: list[str], vm: str, inventory: StorageInventory,
-                  in_use: dict[str, str] | None,
-                  outcome: StorageOutcome) -> None:
-    """
-    Remove an owned snapshot chain from the head down to the base, so a
-    failure part-way never leaves an overlay whose backing file is gone.
-    Any layer another domain uses — or an unanswered scan — keeps the whole
-    chain; a layer replaced since the inspection keeps it and everything
-    below it.
-    """
-    kept = outcome.kept
-    if in_use is None:
-        kept.extend((layer, "could not check whether another domain uses "
-                            "it") for layer in chain)
-        return
-    users = {in_use[layer] for layer in chain if in_use.get(layer)}
-    if users:
-        kept.extend((layer, (f"its snapshot chain is used by domain "
-                             f"{', '.join(sorted(users))}"))
-                    for layer in chain)
-        return
-    for position, layer in enumerate(chain):
-        result, where = remove_if_unchanged(
-            layer, inventory.identities.get(layer))
-        if result == "removed":
-            log.info(f"removed {layer} (vm {vm})")
-            outcome.removed.append(layer)
-        elif result == "gone":
-            continue
-        else:
-            kept.append((layer,
-                         "it was replaced after the vm was inspected"
-                         if result == "restored" else _stranded(where)))
-            kept.extend((below, ("a layer above it in its snapshot chain "
-                                 "was replaced after the vm was inspected"))
-                        for below in chain[position + 1:])
-            return
 
 
 def remove_if_unchanged(path: str,

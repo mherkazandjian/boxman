@@ -33,6 +33,7 @@ from .storage_pools import refresh_pools_holding
 from .virsh_edit import VirshEdit
 from .virsh_parse import (
     LOCAL_SOURCE_TYPES,
+    REMOTE_SOURCE_TYPES,
     DomblkRow,
     parse_domblklist,
     parse_domblklist_strict,
@@ -813,9 +814,9 @@ class LibVirtSession(SessionConfigMixin):
         any domain, or any backing chain cannot be read, or reads as
         incomplete — a partial answer would let a caller delete a file that
         is still in use. An explicitly empty slot (``-``) is not a source,
-        and neither is a row that is not a local file or block device
-        (``network``, ``volume``, ...): it names no path on this host, so
-        failing the whole scan on it would keep every candidate for nothing.
+        and neither is a ``network`` row: it names no file on this host. A
+        ``volume`` row is read at the local path its volume resolves to
+        (:meth:`vm_storage_devices`).
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         listing = virsh.execute("list", "--all", "--name", warn=True)
@@ -830,7 +831,8 @@ class LibVirtSession(SessionConfigMixin):
             if rows is None:
                 return None
             sources = {row.source for row in rows
-                       if row.type in LOCAL_SOURCE_TYPES and row.source != '-'}
+                       if row.type not in REMOTE_SOURCE_TYPES
+                       and row.source != '-'}
             for source in sorted(sources):
                 chain = self._backing_chain_files(cmd, source)
                 if chain is None:
@@ -850,9 +852,16 @@ class LibVirtSession(SessionConfigMixin):
         can name other media or disks. For a transient domain
         ``--inactive`` reports its one definition (libvirt 10.0).
 
+        A ``volume`` row names a storage-pool volume, not a path, yet a
+        volume of a directory pool is a local file; its Source is resolved
+        to that path (see :meth:`_resolve_volume_rows`). A ``network`` row
+        (RBD, iSCSI, NBD, ...) is kept as reported: it names no local file.
+
         Returns:
-            The rows, or ``None`` when either inventory cannot be read or
-            reads as incomplete (see :func:`parse_domblklist_strict`).
+            The rows, or ``None`` when either inventory cannot be read,
+            reads as incomplete (see :func:`parse_domblklist_strict`), holds
+            a volume that cannot be resolved, or a source type that is
+            neither a local path nor remote — anything unknown fails closed.
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         rows: list[DomblkRow] = []
@@ -864,8 +873,54 @@ class LibVirtSession(SessionConfigMixin):
             parsed = parse_domblklist_strict(blklist.stdout)
             if parsed is None:
                 return None
+            filled = [row for row in parsed if row.source != '-']
+            if any(row.type not in LOCAL_SOURCE_TYPES | REMOTE_SOURCE_TYPES
+                   for row in filled):
+                return None
+            if any(row.type == 'volume' for row in filled):
+                parsed = self._resolve_volume_rows(
+                    virsh, vm_name, inactive, parsed)
+                if parsed is None:
+                    return None
             rows.extend(row for row in parsed if row not in rows)
         return rows
+
+    @staticmethod
+    def _resolve_volume_rows(virsh, vm_name: str, inactive: tuple,
+                             rows: list[DomblkRow]) -> list[DomblkRow] | None:
+        """
+        *rows* with each ``volume`` row's Source replaced by the volume's
+        local path: its pool and volume come from the same definition's XML
+        (``domblklist`` shows only the volume), its path from ``virsh
+        vol-path``. ``None`` when any of it cannot be read.
+        """
+        dumped = virsh.execute("dumpxml", vm_name, *inactive, warn=True)
+        if not dumped.ok:
+            return None
+        try:
+            root = ET.fromstring(dumped.stdout)
+        except ET.ParseError:
+            return None
+        volumes = {}
+        for disk in root.findall("./devices/disk[@type='volume']"):
+            target = disk.find("target")
+            source = disk.find("source")
+            if target is None or source is None:
+                continue
+            volumes[target.get("dev")] = (source.get("pool"),
+                                          source.get("volume"))
+        resolved = []
+        for row in rows:
+            if row.type == 'volume' and row.source != '-':
+                pool, volume = volumes.get(row.target, (None, None))
+                if not pool or not volume:
+                    return None
+                path = virsh.execute("vol-path", volume, pool=pool, warn=True)
+                if not path.ok or not (path.stdout or '').strip():
+                    return None
+                row = row._replace(source=path.stdout.strip())
+            resolved.append(row)
+        return resolved
 
     def refresh_pools_holding(self, paths: list[str]) -> list[str]:
         """Refresh the active pools whose directory held one of *paths*
@@ -876,8 +931,10 @@ class LibVirtSession(SessionConfigMixin):
     def backing_chains(self,
                        sources: list[str]) -> dict[str, list[str]] | None:
         """
-        The backing chain of each of *sources*: resolved paths, the source
-        first and the image at the bottom of the chain last.
+        The backing chain of each of *sources*, the source first and the
+        image at the bottom of the chain last — each layer as ``qemu-img``
+        named it, not resolved: a layer that is a symlink must stay
+        recognisable as one (callers compare resolved paths themselves).
 
         Returns:
             ``{source: chain}``, or ``None`` when any chain cannot be read.
@@ -889,10 +946,12 @@ class LibVirtSession(SessionConfigMixin):
             if images is None:
                 return None
             chain: list[str] = []
+            seen: set[str] = set()
             for image in images:
-                path = os.path.realpath(image['filename'])
-                if path not in chain:
-                    chain.append(path)
+                resolved = os.path.realpath(image['filename'])
+                if resolved not in seen:
+                    seen.add(resolved)
+                    chain.append(image['filename'])
             chains[source] = chain
         return chains
 
