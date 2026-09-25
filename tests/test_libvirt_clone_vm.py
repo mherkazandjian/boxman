@@ -25,9 +25,10 @@ from boxman.exceptions import (
     ProvisionError,
 )
 from boxman.providers.libvirt.clone_vm import (
-    CLONE_DEGRADATION_NOTICES_KEY,
+    CLONE_DEGRADATIONS_KEY,
     SSH_HOST_KEY_ARCHIVE,
     SSH_HOST_KEY_TYPES,
+    CloneDegradation,
     CloneVM,
 )
 from boxman.providers.libvirt.session import LibVirtSession
@@ -519,8 +520,8 @@ class TestSysprepInvocation:
         self, clone: CloneVM
     ):
         """A boxman bug must not be reported as an uninspectable guest."""
-        notices: list[str] = []
-        clone.info[CLONE_DEGRADATION_NOTICES_KEY] = notices
+        notices: list = []
+        clone.info[CLONE_DEGRADATIONS_KEY] = notices
         with patch.object(
             clone, "build_sysprep_invocation",
             side_effect=ProvisionError("bad plan"),
@@ -646,13 +647,13 @@ class TestStagingFailures:
 
     def test_auto_degrades_to_a_notice(self, clone: CloneVM):
         notices: list = []
-        clone.info[CLONE_DEGRADATION_NOTICES_KEY] = notices
+        clone.info[CLONE_DEGRADATIONS_KEY] = notices
         with self._failing_tar(), \
              patch.object(clone.virt_sysprep, "execute") as execute, \
              patch.object(clone, "discard_unsafe_clone") as discard:
             clone.apply_identity_policies()
         assert len(notices) == 1
-        assert "No space left" in notices[0]
+        assert "No space left" in notices[0].cause
         execute.assert_not_called()
         discard.assert_not_called()
         assert _staging_leftovers(clone.new_vm_name) == []
@@ -701,7 +702,7 @@ class TestStagingFailures:
         runner fail operationally. A boxman bug inside staging must surface
         as itself, not become an ``auto`` notice on an unsanitized clone."""
         notices: list = []
-        clone.info[CLONE_DEGRADATION_NOTICES_KEY] = notices
+        clone.info[CLONE_DEGRADATIONS_KEY] = notices
         with patch.object(clone, "stage_identity_plan", side_effect=bug), \
              patch.object(clone.virt_sysprep, "execute") as execute:
             with pytest.raises(type(bug), match="staging bug"):
@@ -755,18 +756,113 @@ class TestDegradationMessage:
             clone.build_identity_plan(), CloneSanitizerError("boom"))
         assert "may have kept" in message
 
-    def test_a_degraded_pass_records_one_notice_per_clone(
+    def test_a_degraded_pass_records_one_record_per_clone(
         self, clone: CloneVM
     ):
-        notices: list[str] = []
-        clone.info[CLONE_DEGRADATION_NOTICES_KEY] = notices
+        collected: list = []
+        clone.info[CLONE_DEGRADATIONS_KEY] = collected
         with patch.object(
             clone, "run_identity_pass",
             side_effect=CloneSanitizerError("no libguestfs"),
         ):
             clone.apply_identity_policies()
-        assert len(notices) == 1
-        assert "clone_ssh_host_keys=auto" in notices[0]
+        assert len(collected) == 1
+        record = collected[0]
+        assert isinstance(record, CloneDegradation)
+        assert record.vm == "vm01"
+        assert record.properties == ("machine id", "ssh host keys")
+        assert record.policies == (
+            "clone_machine_id=auto", "clone_ssh_host_keys=auto")
+        assert record.cause == "no libguestfs"
+        assert "clone_ssh_host_keys=auto" in record.message
+
+
+    def test_required_fails_closed_instead_of_recording(
+        self, tmp_path: Path
+    ):
+        """#202: a required policy must not turn into a summary line."""
+        vm = _vm(tmp_path, clone_ssh_host_keys="required")
+        collected: list = []
+        vm.info[CLONE_DEGRADATIONS_KEY] = collected
+        with patch.object(
+            vm, "run_identity_pass",
+            side_effect=CloneSanitizerError("no libguestfs"),
+        ), patch.object(vm, "discard_unsafe_clone") as discard:
+            with pytest.raises(CloneSanitizerError, match="no libguestfs"):
+                vm.apply_identity_policies()
+        assert collected == []
+        discard.assert_called_once()
+
+
+class TestDegradationRecord:
+    """The record the closing summary is built from (#202)."""
+
+    def test_summary_line_names_the_vm_properties_and_cause(
+        self, clone: CloneVM
+    ):
+        record = clone.degradation_record(
+            clone.build_identity_plan(),
+            CloneSanitizerError("no libguestfs"))
+        line = record.summary_line()
+        assert line.startswith("vm01: ")
+        assert "machine id and ssh host keys" in line
+        assert "the offline identity pass failed" in line
+        assert "clone_machine_id=auto" in line
+        # one line, so it cannot be lost in a scrollback of wrapped text
+        assert "\n" not in line
+
+    @pytest.mark.parametrize(
+        "error, expected",
+        [
+            (CloneSanitizerUnavailableError("virt-sysprep is not installed"),
+             "a required host tool is missing or not permitted"),
+            (CloneSanitizerError("virt-sysprep timed out after 300s"),
+             "the offline identity pass timed out"),
+            (CloneSanitizerError("virt-sysprep identity pass failed for vm "
+                                 "vm01: virt-sysprep: error: no operating "
+                                 "systems were found in the guest image"),
+             "the guest could not be inspected"),
+            (CloneSanitizerError("could not inspect vm"),
+             "the offline identity pass failed"),
+        ],
+    )
+    def test_cause_is_classified_for_the_summary(self, error, expected):
+        assert CloneVM.degradation_reason(error) == expected
+
+    def test_a_missing_ssh_keygen_does_not_blame_the_guest(self, clone: CloneVM):
+        """From Codex's review of #204: the real error path, end to end."""
+        collected: list = []
+        clone.info[CLONE_DEGRADATIONS_KEY] = collected
+        with patch("boxman.providers.libvirt.clone_vm._shell_run",
+                   return_value=_result(ok=False, return_code=127,
+                                        stderr="sh: ssh-keygen: not found")):
+            clone.apply_identity_policies()
+        assert collected[0].reason == (
+            "a required host tool is missing or not permitted")
+
+    def test_a_sudo_rule_without_virt_sysprep_does_not_blame_the_guest(
+        self, clone: CloneVM
+    ):
+        collected: list = []
+        clone.info[CLONE_DEGRADATIONS_KEY] = collected
+        clone.ssh_host_keys_policy = "off"
+        with patch.object(
+            clone.virt_sysprep, "execute",
+            return_value=_result(
+                ok=False, return_code=1,
+                stderr="Sorry, user mher is not allowed to execute "
+                       "'/usr/bin/virt-sysprep' as root on host."),
+        ):
+            clone.apply_identity_policies()
+        assert collected[0].reason == (
+            "a required host tool is missing or not permitted")
+
+    def test_a_record_survives_pickling(self, clone: CloneVM):
+        """Clones run in multiprocessing workers; records cross that boundary."""
+        import pickle
+        record = clone.degradation_record(
+            clone.build_identity_plan(), CloneSanitizerError("boom"))
+        assert pickle.loads(pickle.dumps(record)) == record
 
 
 class TestDiscardUnsafeClone:

@@ -91,7 +91,8 @@ imperatively via `nix profile install nixpkgs#<pkg>` / `guix install <pkg>`.
 - **Virtualization hardware** — CPU VT-x/AMD-V, `/dev/kvm` presence and access,
   and nested virt when running inside a VM.
 - **Local runtime** — the `virsh`/`virt-install`/`virt-clone`/`qemu-img`/QEMU
-  tools, optional `virt-sysprep` (`clone_machine_id: required` needs it),
+  tools, optional `virt-sysprep` (the clone identity pass needs it; any
+  `clone_*: required` policy fails closed without it),
   `libvirtd` running, `virsh -c qemu:///system` connectivity, `libvirt`
   and `kvm` group membership, the `default` NAT network, a cloud-init seed-ISO
   tool, `sshpass`, `rsync`, the OpenSSH client, and your **sudo rights**
