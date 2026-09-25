@@ -10,7 +10,17 @@ set -e
 # that point elsewhere (#205). Idling leaves the explanation at the end of
 # `docker logs` and the container open for inspection. Nothing else is
 # started, so libvirtd never runs against state known to be broken.
+#
+# The diagnosis also goes to $STARTUP_FAILURE, where boxman's readiness
+# check finds it: without it boxman could only time out waiting for a
+# libvirtd that is never coming, and then recreate a container that stops
+# at the same problem.
+STARTUP_FAILURE=/run/boxman/startup-failure
+rm -f "$STARTUP_FAILURE"
+
 fail_without_restarting() {
+    mkdir -p "${STARTUP_FAILURE%/*}"
+    printf '%s\n' "$1" > "$STARTUP_FAILURE"
     {
         echo "ERROR: $1"
         echo "The container is idling instead of exiting, so that it does" \
@@ -44,15 +54,21 @@ mkdir -p /var/run/libvirt /var/lib/libvirt/images /etc/boxman/ssh
 seed_state_dir() {
     container_path="$1"
     subdir="$2"
-    if ! /opt/boxman/seed-libvirt-state.sh \
-            "$container_path" "/opt/boxman/pristine/$subdir"; then
-        fail_without_restarting \
-"$container_path is incomplete and could not be repaired from the image.
+    # What was restored goes to the log as it happens; what could not be
+    # is kept as well, for the diagnosis.
+    if { problems=$(/opt/boxman/seed-libvirt-state.sh \
+            "$container_path" "/opt/boxman/pristine/$subdir" 2>&1 1>&3); } 3>&1
+    then
+        return 0
+    fi
+    fail_without_restarting \
+"$container_path is incomplete or damaged and could not be repaired from
+the image.
+$problems
 It is the host directory ${BOXMAN_DATA_DIR:-./data}/$subdir. To reset it,
 stop the container and move that directory aside: it is seeded afresh on
 the next start, but the libvirt state kept in it (domain and network
 definitions, snapshot metadata, NVRAM) does not come back with it."
-    fi
 }
 
 seed_state_dir /etc/libvirt etc-libvirt

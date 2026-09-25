@@ -11,15 +11,24 @@ killed the entrypoint and the container restart-looped for good.
 The script is plain bash over two directory arguments, so it runs here
 against temp trees; the docker-level behaviour is covered by
 ``tests/test_docker_compose.py`` in the integration tier.
+
+The review of the first fix added the rest: a copy cut short must never be
+published, an existing path of the wrong kind must be reported rather than
+accepted, a path appearing mid-restore must not be overwritten, and when
+the entrypoint gives up, boxman's readiness wait must say why at once.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import resource
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -32,16 +41,24 @@ if shutil.which("bash") is None:  # pragma: no cover - every CI host has it
     pytest.skip("the seeding script needs bash", allow_module_level=True)
 
 
+#: mtime given to every pristine file, so a copy that drops it shows
+PRISTINE_MTIME = 1_577_836_800  # 2020-01-01
+
+
 def _make_pristine(root: Path) -> Path:
     """A small stand-in for the image's /etc/libvirt, with the shapes that
     matter: nested files, an empty 0700 directory, and the absolute
-    autostart symlink the Dockerfile creates (dangling outside the image)."""
+    autostart symlink the Dockerfile creates (dangling outside the image).
+    The root is 0750 and the files carry an old mtime, so metadata that
+    does not survive seeding shows up."""
     pristine = root / "pristine" / "etc-libvirt"
     (pristine / "nwfilter").mkdir(parents=True)
+    pristine.chmod(0o750)
     (pristine / "secrets").mkdir()
     (pristine / "secrets").chmod(0o700)
     (pristine / "qemu" / "networks" / "autostart").mkdir(parents=True)
     (pristine / "libvirtd.conf").write_text('auth_unix_rw = "none"\n')
+    (pristine / "libvirtd.conf").chmod(0o600)
     (pristine / "qemu.conf").write_text('user = "root"\n')
     (pristine / "nwfilter" / "clean-traffic.xml").write_text(
         "<filter name='clean-traffic'/>\n")
@@ -49,6 +66,9 @@ def _make_pristine(root: Path) -> Path:
         "<network><name>default</name></network>\n")
     os.symlink("/etc/libvirt/qemu/networks/default.xml",
                pristine / "qemu" / "networks" / "autostart" / "default.xml")
+    for path in pristine.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            os.utime(path, (PRISTINE_MTIME, PRISTINE_MTIME))
     return pristine
 
 
@@ -82,10 +102,38 @@ def _stamps(root: Path) -> dict[str, tuple]:
     return stamps
 
 
-def _seed(target: Path, pristine: Path) -> subprocess.CompletedProcess:
+def _seed(target: Path, pristine: Path, *, env: dict | None = None,
+          fsize_limit: int | None = None) -> subprocess.CompletedProcess:
+    """Run the script. *fsize_limit* caps the size of any file it or its
+    children write (RLIMIT_FSIZE), which cuts a copy short the way a full
+    disk does."""
+    def _limit():  # runs in the child, before exec
+        resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_limit, fsize_limit))
+
     return subprocess.run(
         ["bash", str(SEED_SCRIPT), str(target), str(pristine)],
-        capture_output=True, text=True, timeout=30)
+        capture_output=True, text=True, timeout=30, env=env,
+        preexec_fn=_limit if fsize_limit is not None else None)
+
+
+def _staging_left_in(root: Path) -> list[str]:
+    """Anything the script stages under, left behind."""
+    return sorted(str(p.relative_to(root))
+                  for p in root.rglob(".boxman-seed.*"))
+
+
+def _shim(tmp_path: Path, name: str, body: str) -> dict:
+    """An environment whose PATH puts a wrapper around *name* first.
+
+    The wrapper runs *body* and then execs the real *name*, so a test can
+    make something happen at the exact moment the script calls it."""
+    real = shutil.which(name)
+    bindir = tmp_path / "shim-bin"
+    bindir.mkdir(exist_ok=True)
+    shim = bindir / name
+    shim.write_text(f"#!/bin/bash\n{body}\nexec {real} \"$@\"\n")
+    shim.chmod(0o755)
+    return {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
 
 
 class TestSeedLibvirtState:
@@ -130,8 +178,15 @@ class TestSeedLibvirtState:
         assert _tree(target) == _tree(pristine)
         assert result.stdout.strip() == (
             f"Seeded {target} from the image's pristine copy")
+        # file metadata survives staging and publication, not just modes
+        for path in target.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                assert path.stat().st_mtime == PRISTINE_MTIME, path
+        assert _staging_left_in(target) == []
 
     def test_a_missing_directory_is_created_and_seeded(self, tmp_path):
+        """Including the root itself, which gets the pristine root's mode
+        rather than whatever the umask gives."""
         pristine = _make_pristine(tmp_path)
         target = tmp_path / "does" / "not" / "exist"
 
@@ -139,6 +194,7 @@ class TestSeedLibvirtState:
 
         assert result.returncode == 0, result.stderr
         assert _tree(target) == _tree(pristine)
+        assert target.stat().st_mode & 0o7777 == 0o750
 
     def test_a_complete_directory_is_left_alone(self, tmp_path):
         """Every path present, several with local changes: nothing is
@@ -185,27 +241,11 @@ class TestSeedLibvirtState:
         assert link.is_symlink()
         assert os.readlink(link) == "/etc/libvirt/qemu/networks/default.xml"
 
-    def test_a_dangling_symlink_counts_as_present(self, tmp_path):
-        """``-e`` alone calls a dangling link missing; ``cp`` then refuses to
-        write through it, and a link the volume deliberately holds would be
-        reported as damage the container cannot start with."""
-        pristine = _make_pristine(tmp_path)
-        target = tmp_path / "etc-libvirt"
-        (target / "qemu" / "networks").mkdir(parents=True)
-        elsewhere = tmp_path / "elsewhere.xml"
-        os.symlink(elsewhere, target / "qemu" / "networks" / "default.xml")
-
-        result = _seed(target, pristine)
-
-        assert result.returncode == 0, result.stderr
-        assert os.readlink(target / "qemu" / "networks" / "default.xml") == (
-            str(elsewhere))
-        assert not elsewhere.exists()
-
-    def test_what_cannot_be_restored_fails_naming_each_path(self, tmp_path):
-        """A file where the image has a directory blocks everything below it.
-        That is reported, per path, with a non-zero exit — and everything
-        else is still restored."""
+    def test_a_blocked_directory_is_reported_once_and_the_rest_restored(
+            self, tmp_path):
+        """A file where the image has a populated directory blocks everything
+        below it. It is kept, reported once — not once per entry it blocks —
+        with a non-zero exit, and everything else is still restored."""
         pristine = _make_pristine(tmp_path)
         target = tmp_path / "etc-libvirt"
         (target / "qemu").mkdir(parents=True)
@@ -217,11 +257,11 @@ class TestSeedLibvirtState:
         assert (target / "qemu" / "networks").read_text() == (
             "not a directory\n")
         assert (target / "libvirtd.conf").is_file()
-        assert "Could not restore 2 path(s)" in result.stderr
-        assert "qemu/networks/default.xml:" in result.stderr
-        assert "qemu/networks/autostart:" in result.stderr
-        # the directory that failed is reported once, not once per entry
-        assert "autostart/default.xml" not in result.stderr
+        assert (target / "secrets").is_dir()
+        assert ("qemu/networks: a regular file where the image has a "
+                "directory") in result.stderr
+        assert "default.xml" not in result.stderr
+        assert "autostart" not in result.stderr
 
     def test_a_missing_pristine_copy_fails_and_says_to_rebuild(self, tmp_path):
         target = tmp_path / "etc-libvirt"
@@ -239,6 +279,320 @@ class TestSeedLibvirtState:
             capture_output=True, text=True, timeout=30)
         assert result.returncode == 2
         assert "usage:" in result.stderr
+
+
+class TestAFailedCopyIsNeverAccepted:
+    """Review finding 1: a copy written straight to its final path and cut
+    short — a full disk, a container stopped mid-copy — left a truncated file
+    that every later start took for the real thing."""
+
+    @pytest.mark.parametrize("rel", [
+        "libvirtd.conf",               # a file in a directory that exists
+        "qemu/networks/default.xml",   # one inside a directory still missing
+    ])
+    def test_a_cut_short_copy_publishes_nothing_and_a_retry_restores_it(
+            self, tmp_path, rel):
+        pristine = _make_pristine(tmp_path)
+        content = "x" * 8191 + "\n"
+        (pristine / rel).write_text(content)
+        target = tmp_path / "etc-libvirt"
+        target.mkdir()
+
+        first = _seed(target, pristine, fsize_limit=1024)
+
+        assert first.returncode == 1
+        assert rel in first.stderr
+        assert not (target / rel).exists(), (
+            "a partial copy was published at the final path")
+        assert _staging_left_in(target) == []
+        # everything that did fit is in place
+        assert (target / "qemu.conf").is_file()
+
+        second = _seed(target, pristine)
+
+        assert second.returncode == 0, second.stderr
+        assert (target / rel).read_text() == content
+        assert _tree(target) == _tree(pristine)
+        assert _staging_left_in(target) == []
+
+    def test_staging_left_by_a_killed_run_is_removed(self, tmp_path):
+        """SIGKILL gives the script no chance to clean up, so the next run
+        does — removing its own staging directories and nothing else."""
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        shutil.copytree(pristine, target, symlinks=True)
+        (target / "qemu.conf").unlink()
+        stale = target / "nwfilter" / ".boxman-seed.Ab12Cd"
+        stale.mkdir()
+        (stale / "entry").write_text("<filter name='clean-tr")
+        # look-alikes the script did not create
+        (target / ".boxman-seed.abcdef").write_text("a file, not staging\n")
+        (target / ".boxman-seed.notes").mkdir()
+
+        result = _seed(target, pristine)
+
+        assert result.returncode == 0, result.stderr
+        assert not stale.exists()
+        assert (target / ".boxman-seed.abcdef").read_text() == (
+            "a file, not staging\n")
+        assert (target / ".boxman-seed.notes").is_dir()
+        assert (target / "qemu.conf").read_text() == 'user = "root"\n'
+
+
+class TestIncompatibleExistingPaths:
+    """Review finding 2: an existing path is kept whatever it is, but one
+    that cannot serve as what the image has there is reported, not
+    silently accepted."""
+
+    def test_a_file_where_the_image_has_an_empty_directory(self, tmp_path):
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        target.mkdir()
+        (target / "secrets").write_text("not a directory\n")
+
+        result = _seed(target, pristine)
+
+        assert result.returncode == 1
+        assert ("secrets: a regular file where the image has a directory"
+                in result.stderr)
+        assert (target / "secrets").read_text() == "not a directory\n"
+        assert (target / "libvirtd.conf").is_file()   # the rest still came
+
+    def test_a_directory_where_the_image_has_a_config_file(self, tmp_path):
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        (target / "libvirtd.conf").mkdir(parents=True)
+
+        result = _seed(target, pristine)
+
+        assert result.returncode == 1
+        assert ("libvirtd.conf: a directory where the image has a regular "
+                "file" in result.stderr)
+        assert (target / "libvirtd.conf").is_dir()
+
+    def test_a_dangling_symlink_where_the_image_has_a_file(self, tmp_path):
+        """Kept — the script never removes what the volume holds — but it
+        does not make the required file usable, so it is reported."""
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        (target / "qemu" / "networks").mkdir(parents=True)
+        elsewhere = tmp_path / "elsewhere.xml"
+        os.symlink(elsewhere, target / "qemu" / "networks" / "default.xml")
+
+        result = _seed(target, pristine)
+
+        assert result.returncode == 1
+        assert ("qemu/networks/default.xml: a dangling symlink where the "
+                "image has a regular file") in result.stderr
+        assert os.readlink(target / "qemu" / "networks" / "default.xml") == (
+            str(elsewhere))
+        assert not elsewhere.exists()
+
+    def test_symlinks_are_judged_by_what_they_point_at(self, tmp_path):
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        target.mkdir()
+        real_conf = tmp_path / "site-libvirtd.conf"
+        real_conf.write_text("# managed elsewhere\n")
+        os.symlink(real_conf, target / "libvirtd.conf")
+        real_secrets = tmp_path / "site-secrets"
+        real_secrets.mkdir()
+        os.symlink(real_secrets, target / "secrets")
+
+        result = _seed(target, pristine)
+
+        assert result.returncode == 0, result.stderr
+        assert real_conf.read_text() == "# managed elsewhere\n"
+        assert os.readlink(target / "secrets") == str(real_secrets)
+
+    def test_where_the_image_has_a_symlink_any_non_directory_will_do(
+            self, tmp_path):
+        """The image's autostart link points into the container's own
+        /etc/libvirt; what the volume holds there is libvirt's business,
+        dangling or not — only a directory cannot stand in for a link."""
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        shutil.copytree(pristine, target, symlinks=True)
+        link = target / "qemu" / "networks" / "autostart" / "default.xml"
+        link.unlink()
+        os.symlink(tmp_path / "gone.xml", link)
+
+        assert _seed(target, pristine).returncode == 0
+
+        link.unlink()
+        link.mkdir()
+        result = _seed(target, pristine)
+        assert result.returncode == 1
+        assert ("qemu/networks/autostart/default.xml: a directory where the "
+                "image has a symlink") in result.stderr
+
+
+class TestConcurrentWriters:
+    """Review finding 3: a path that appears after the script found it
+    missing must not be overwritten. Ordinary startup has no concurrent
+    writer, so a shim around cp/mkdir makes one appear at the worst moment:
+    after the check, before the script publishes."""
+
+    def test_a_file_appearing_during_the_copy_is_not_overwritten(
+            self, tmp_path):
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        target.mkdir()
+        dst = target / "libvirtd.conf"
+        env = _shim(tmp_path, "cp", (
+            f'if [ "${{@: -2:1}}" = "{pristine / "libvirtd.conf"}" ]; then\n'
+            f'    echo "# written by someone else" > "{dst}"\n'
+            f'    touch "{tmp_path / "shim-ran"}"\n'
+            f'fi'))
+
+        result = _seed(target, pristine, env=env)
+
+        assert (tmp_path / "shim-ran").exists()
+        assert result.returncode == 0, result.stderr
+        assert dst.read_text() == "# written by someone else\n"
+        assert _staging_left_in(target) == []
+        assert (target / "qemu.conf").is_file()
+
+    def test_a_directory_appearing_before_mkdir_is_kept(self, tmp_path):
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        target.mkdir()
+        dst = target / "nwfilter"
+        env = _shim(tmp_path, "mkdir", (
+            f'if [ "${{@: -1}}" = "{dst}" ]; then\n'
+            f'    echo "not a directory" > "{dst}"\n'
+            f'    touch "{tmp_path / "shim-ran"}"\n'
+            f'fi'))
+
+        result = _seed(target, pristine, env=env)
+
+        assert (tmp_path / "shim-ran").exists()
+        assert result.returncode == 1
+        assert dst.read_text() == "not a directory\n"
+        assert ("nwfilter: a regular file where the image has a directory"
+                in result.stderr)
+
+
+def _entrypoint_function(name: str) -> str:
+    """The text of one shell function from entrypoint.sh, to run on its own."""
+    text = (DOCKER_DIR / "entrypoint.sh").read_text()
+    match = re.search(rf"^{name}\(\) {{\n.*?^}}\n", text, re.M | re.S)
+    assert match, f"{name}() not found in entrypoint.sh"
+    return match.group(0)
+
+
+class TestTheRuntimeSurfacesAStartupFailure:
+    """Review nit: when the entrypoint gives up it idles, and boxman used to
+    wait out its readiness timeout for a libvirtd that was never coming,
+    report nothing specific, and recreate the container on the next run —
+    which then stopped at the same problem."""
+
+    DIAGNOSIS = ("/etc/libvirt is incomplete or damaged and could not be "
+                 "repaired from the image.\n    secrets: a regular file where "
+                 "the image has a directory")
+
+    @staticmethod
+    def _runtime(tmp_path):
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+        return DockerComposeRuntime(config={"project_dir": str(tmp_path)})
+
+    @staticmethod
+    def _docker(marker_text):
+        """A stand-in for the shell: libvirtd never answers, and the marker
+        file holds *marker_text* (None: there is no marker)."""
+        def run(cmd, **_kwargs):
+            if "/run/boxman/startup-failure" in cmd and marker_text:
+                return MagicMock(ok=True, stdout=marker_text + "\n")
+            return MagicMock(ok=False, stdout="")
+        return run
+
+    def test_the_wait_ends_at_once_with_the_diagnosis(self, tmp_path):
+        from boxman.exceptions import RuntimeUnavailable
+        rt = self._runtime(tmp_path)
+        rt.ready_timeout = 60
+        clock = iter(range(1000))
+        with patch("boxman.runtime.docker_compose._shell_run",
+                   side_effect=self._docker(self.DIAGNOSIS)), \
+                patch("time.sleep") as sleep, \
+                patch("time.monotonic", side_effect=lambda: next(clock)):
+            with pytest.raises(RuntimeUnavailable) as err:
+                rt._wait_for_libvirtd()
+
+        assert sleep.call_count == 0
+        message = str(err.value)
+        assert self.DIAGNOSIS in message
+        assert rt.container_name in message
+        assert "docker restart" in message
+
+    def test_without_a_marker_the_wait_times_out_as_before(self, tmp_path):
+        rt = self._runtime(tmp_path)
+        rt.ready_timeout = 1
+        clock = iter(x * 0.3 for x in range(100))
+        with patch("boxman.runtime.docker_compose._shell_run",
+                   side_effect=self._docker(None)), \
+                patch("time.sleep"), \
+                patch("time.monotonic", side_effect=lambda: next(clock)):
+            with pytest.raises(RuntimeError, match="did not become responsive"):
+                rt._wait_for_libvirtd()
+
+    def test_ensure_ready_does_not_recreate_a_container_that_gave_up(
+            self, tmp_path):
+        """Recreating is the answer to a wedged libvirtd, not to a state
+        directory only the user can fix."""
+        from boxman.exceptions import RuntimeUnavailable
+        rt = self._runtime(tmp_path)
+        with patch.object(rt, "_container_is_running", return_value=True), \
+                patch.object(rt, "_container_mounts", return_value=None), \
+                patch.object(rt, "_project_dir_accessible", return_value=True), \
+                patch.object(rt, "_ensure_state_persisted"), \
+                patch.object(rt, "_log_compose_file"), \
+                patch.object(rt, "_wait_for_libvirtd",
+                             side_effect=RuntimeUnavailable(self.DIAGNOSIS)), \
+                patch.object(rt, "_recreate_container") as recreate:
+            with pytest.raises(RuntimeUnavailable):
+                rt.ensure_ready()
+        recreate.assert_not_called()
+
+    def test_the_entrypoint_writes_where_the_runtime_looks(self, tmp_path):
+        """Runs the entrypoint's own fail_without_restarting, pointed at a
+        temp marker: it writes the diagnosis, idles, and exits on TERM."""
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+        entrypoint = (DOCKER_DIR / "entrypoint.sh").read_text()
+        assert (f"STARTUP_FAILURE={DockerComposeRuntime._STARTUP_FAILURE_MARKER}\n"
+                in entrypoint)
+        # the container's writable layer survives `docker restart`, so a
+        # marker from a failed start has to go before the next one begins
+        assert entrypoint.index('rm -f "$STARTUP_FAILURE"') < entrypoint.index(
+            "seed_state_dir /etc/libvirt")
+
+        marker = tmp_path / "run" / "boxman" / "startup-failure"
+        proc = subprocess.Popen(
+            ["bash", "-c",
+             f"set -e\nSTARTUP_FAILURE={marker}\n"
+             f"{_entrypoint_function('fail_without_restarting')}"
+             f'fail_without_restarting "$1"', "_", self.DIAGNOSIS],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert marker.read_text() == self.DIAGNOSIS + "\n"
+            time.sleep(0.2)
+            assert proc.poll() is None, "it exited instead of idling"
+            # like `docker stop`: TERM to the entrypoint alone
+            proc.terminate()
+            proc.wait(timeout=10)
+        finally:
+            # its sleep outlives it here, as it cannot in a container whose
+            # PID 1 has exited, and holds the pipes open
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        _, stderr = proc.communicate(timeout=10)
+        assert proc.returncode == 1
+        assert stderr.count("ERROR:") == 1
 
 
 class TestSeedingIsWiredIntoTheImage:

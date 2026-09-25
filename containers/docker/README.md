@@ -315,14 +315,23 @@ the directory already holds is never overwritten, so local edits and
 libvirt's own changes survive an image upgrade. The flip side: a file the
 image ships comes back if you delete it.
 
-If something missing cannot be restored — a file where the image has a
-directory, for instance — the container logs a single `ERROR:` naming the
-host directory and idles rather than exiting, so it does not restart in a
-loop. Move that directory aside and restart to have it seeded afresh; the
-domains, networks and snapshots kept in it do not come back. A damaged
-`qemu/networks/default.xml` is reported the same way but the container
-keeps running without the default network: delete the file and restart to
-get the image's copy back.
+Each file is copied beside its destination first and only then linked into
+place, so a copy cut short by a full disk or a stopped container is never
+taken for the real thing; the next start simply tries again. Existing paths
+are checked too: a directory must be a directory and a file a file (a
+symlink counts as what it points at, so a dangling one satisfies neither).
+
+If something cannot be restored, or is there as the wrong kind of thing —
+a file where the image has a directory, for instance — the container logs a
+single `ERROR:` naming each path and the host directory, and idles rather
+than exiting, so it does not restart in a loop. boxman reports the same
+diagnosis straight away instead of timing out, and leaves the idle
+container alone rather than recreating it. Fix the path, or move the whole
+directory aside to have it seeded afresh (the domains, networks and
+snapshots kept in it do not come back), then `docker restart` the
+container. A damaged `qemu/networks/default.xml` is reported but the
+container keeps running without the default network: delete the file and
+restart to get the image's copy back.
 
 A container created before the mounts existed has its state copied out
 with `docker cp` and validated before anything stops it; the copy is only
