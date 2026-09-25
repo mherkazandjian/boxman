@@ -343,13 +343,11 @@ class TestProvisionBox:
         seen = {}
         template_fingerprints = {}
         checked = 0
-        # freshness needs evidence per vm: every key type compared against
-        # its template, or a sibling clone of the same template to differ
-        # from. Without either, the checks below pass for inherited keys too.
-        clones_per_template = {}
-        for cluster_name, _vm_name, vm_cfg in iter_vms(config):
-            base = get_base_image(config["clusters"][cluster_name], vm_cfg)
-            clones_per_template[base] = clones_per_template.get(base, 0) + 1
+        # Freshness needs evidence per vm: every key type compared against
+        # its template. A sibling clone is not evidence -- two clones whose
+        # keys differ show they differ, not that either is new: one can keep
+        # every template key beside a sibling that got fresh ones. Without
+        # the comparison the checks below pass for inherited keys too.
         unproven = []
 
         for cluster_name, vm_name, vm_cfg in iter_vms(config):
@@ -400,8 +398,7 @@ class TestProvisionBox:
                 checked += 1
 
             template = template_fingerprints.get(base_image, {})
-            compared_all = all(line[1] in template for line in lines)
-            if not compared_all and clones_per_template.get(base_image, 0) < 2:
+            if not all(line[1] in template for line in lines):
                 unproven.append(host)
 
         assert checked, "no ssh host keys were checked on any vm"
@@ -410,8 +407,8 @@ class TestProvisionBox:
             # key from an inherited one on these vms: report that, not a pass
             pytest.skip(
                 f"no freshness evidence for {', '.join(unproven)}: the "
-                f"template's host keys could not be read offline (virt-cat) "
-                f"and there is no sibling clone of the same template")
+                f"template's host keys could not all be read offline "
+                f"(virt-cat); uniqueness across the box was checked")
 
     # -- OS release ---------------------------------------------------------
 

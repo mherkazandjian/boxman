@@ -142,10 +142,13 @@ The cost is smaller than first written here. systemd's first-boot rule
 (`machine-id(5)`, "First Boot Semantics") treats a **missing**
 `/etc/machine-id`, or one containing `uninitialized`, as a first boot — but an
 existing **empty** file as *not* one. The old truncation to empty therefore
-never produced a first boot either, and writing a populated id changes
-`ConditionFirstBoot` only for a template that ships with no `/etc/machine-id`
-at all. (Corrected after Codex's review of PR #203; the earlier text claimed
-an empty file triggered first boot.) No consumer of `ConditionFirstBoot` or of
+never produced a first boot either. Writing a populated id changes
+`ConditionFirstBoot` in two cases only: a template that ships with no
+`/etc/machine-id` (the old pass left a missing file missing), and, under
+`clone_machine_id: off` with another property enabled, a template whose file
+reads `uninitialized` (`off` used to leave it untouched). (Corrected after
+Codex's reviews of PR #203; the earlier text claimed an empty file triggered
+first boot, then named only the missing-file case.) No consumer of `ConditionFirstBoot` or of
 an empty machine id exists in boxman or its shipped templates.
 
 ### The `clone_machine_id: off` interaction
