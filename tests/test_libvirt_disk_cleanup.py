@@ -11,11 +11,17 @@ refactor accidentally changing which files are swept.
 
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
 
 import pytest
 
-from boxman.providers.libvirt.disk_cleanup import remove_vm_disks
+from boxman.providers.libvirt.disk_cleanup import (
+    _remove_if_unchanged,
+    file_identities,
+    remove_vm_disks,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -148,3 +154,40 @@ class TestRemoveVmDisks:
         kept.write_bytes(b"x")
         remove_vm_disks(str(alias), "vm01", [], protected=[str(kept)])
         assert kept.exists()
+
+
+class TestRemoveIfUnchanged:
+    """The claim rename can fail; its still-empty private directory must
+    not be left behind in the workdir (#212 review round 3, R3-1)."""
+
+    @pytest.mark.parametrize("err", [errno.EACCES, errno.EXDEV])
+    def test_a_failed_claim_keeps_the_file_and_leaves_no_debris(
+            self, tmp_path: Path, monkeypatch, err):
+        disk = tmp_path / "vm01_disk01.qcow2"
+        disk.write_bytes(b"data")
+        identity = file_identities([str(disk)])[str(disk)]
+
+        def refuse(src, dst, *args, **kwargs):
+            raise OSError(err, os.strerror(err))
+
+        monkeypatch.setattr(os, "rename", refuse)
+
+        with pytest.raises(OSError) as raised:
+            _remove_if_unchanged(str(disk), identity)
+
+        # the original error, not one from the cleanup
+        assert raised.value.errno == err
+        assert disk.read_bytes() == b"data"
+        assert sorted(p.name for p in tmp_path.iterdir()) == [disk.name]
+
+    def test_a_file_already_gone_leaves_no_debris(
+            self, tmp_path: Path, monkeypatch):
+        disk = tmp_path / "vm01_disk01.qcow2"
+
+        def gone(src, dst, *args, **kwargs):
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT))
+
+        monkeypatch.setattr(os, "rename", gone)
+
+        assert _remove_if_unchanged(str(disk), (1, 2)) == ("gone", None)
+        assert list(tmp_path.iterdir()) == []

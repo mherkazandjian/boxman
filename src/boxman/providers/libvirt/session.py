@@ -838,6 +838,21 @@ class LibVirtSession(SessionConfigMixin):
                     in_use.setdefault(path, domain)
         return in_use
 
+    def backing_chain_files(self, sources: list[str]) -> list[str] | None:
+        """
+        Resolved paths of every image in the backing chains of *sources*,
+        the sources included, or ``None`` when any chain cannot be read.
+        ``-U`` reads images a running guest holds locked.
+        """
+        cmd = LibVirtCommandBase(provider_config=self.provider_config)
+        paths: set[str] = set()
+        for source in sources:
+            chain = self._backing_chain_files(cmd, source)
+            if chain is None:
+                return None
+            paths.update(chain)
+        return sorted(paths)
+
     @staticmethod
     def _backing_chain_files(cmd, source: str) -> list[str] | None:
         """

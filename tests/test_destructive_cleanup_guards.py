@@ -196,6 +196,8 @@ class TestDestroyRemovedVmGate:
             return_value=["/ws/c1/bprj__demo__bprj_cluster_1_old01_d1.qcow2"])
         mgr._vm_disk_dirs = MagicMock(return_value=["/ws/c1"])
         mgr._vm_disk_records = MagicMock(return_value=None)
+        mgr.provider.backing_chain_files.return_value = [
+            "/ws/c1/bprj__demo__bprj_cluster_1_old01_d1.qcow2"]
         mgr._remove_leftover_disk_files = MagicMock()
         return mgr
 
@@ -216,10 +218,12 @@ class TestDestroyRemovedVmGate:
         parent.attach_mock(mgr._vm_disk_files, "disk_files")
         parent.attach_mock(mgr._vm_disk_dirs, "disk_dirs")
         parent.attach_mock(mgr._vm_disk_records, "disk_records")
+        parent.attach_mock(mgr.provider.backing_chain_files, "chains")
         parent.attach_mock(mgr.provider.destroy_vm, "destroy_vm")
         mgr._destroy_removed_vm("bprj__demo__bprj_cluster_1_old01")
-        assert [c[0] for c in parent.mock_calls][:4] == [
-            "disk_files", "disk_dirs", "disk_records", "destroy_vm"]
+        assert [c[0] for c in parent.mock_calls][:5] == [
+            "disk_files", "disk_dirs", "disk_records", "chains",
+            "destroy_vm"]
 
 
 # --------------------------------------------------------------------------

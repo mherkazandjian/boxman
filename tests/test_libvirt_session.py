@@ -633,3 +633,32 @@ class TestDiskPathsInUse:
         chains = dict(self.CHAIN, **{"/ws/a.qcow2": '"a.qcow2"'})
         in_use, _ = self._run(chains=chains)
         assert in_use is None
+
+
+class TestBackingChainFiles:
+    """Every layer under a removed VM's extra disks, read before undefining
+    so the name sweep leaves them to the ownership decision (#212 review
+    round 3, R3-2)."""
+
+    def _run(self, sources):
+        chains = TestDiskPathsInUse.CHAIN
+
+        def shell(command, **kwargs):
+            source = command.rsplit(" ", 1)[1].strip("'")
+            if source not in chains:
+                return _result(ok=False, stderr="Could not open")
+            return _result(stdout=chains[source])
+
+        with patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
+            cmd.return_value.execute_shell.side_effect = shell
+            return _session({}).backing_chain_files(sources)
+
+    def test_unions_every_layer_of_every_source(self):
+        assert self._run(["/ws/a.qcow2", "/ws/b.top"]) == [
+            "/tpl/base.qcow2", "/ws/a.qcow2", "/ws/b.top"]
+
+    def test_none_when_any_chain_cannot_be_read(self):
+        assert self._run(["/ws/a.qcow2", "/ws/missing.qcow2"]) is None
+
+    def test_no_sources_is_an_empty_answer(self):
+        assert self._run([]) == []

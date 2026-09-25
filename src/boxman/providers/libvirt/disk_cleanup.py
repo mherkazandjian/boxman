@@ -15,6 +15,7 @@ the VM name (overlay files with timestamp/hash suffixes,
 
 from __future__ import annotations
 
+import contextlib
 import glob as _glob
 import os
 import stat
@@ -277,9 +278,15 @@ def _remove_if_unchanged(path: str,
     moved = os.path.join(private, name)
     try:
         os.rename(path, moved)
-    except FileNotFoundError:
-        os.rmdir(private)
-        return "gone", None
+    except OSError as exc:
+        # Nothing was moved, so the private directory is still empty: a
+        # plain rmdir (never a recursive delete) removes it, and a failure
+        # there must not hide why the rename failed.
+        with contextlib.suppress(OSError):
+            os.rmdir(private)
+        if isinstance(exc, FileNotFoundError):
+            return "gone", None
+        raise
     st = os.lstat(moved)
     if (st.st_dev, st.st_ino) == identity:
         os.unlink(moved)

@@ -1,6 +1,7 @@
 """VM lifecycle and update flows for BoxmanManager."""
 
 import contextlib
+import glob
 import logging
 import os
 import time
@@ -426,6 +427,8 @@ class VMsMixin:
         disk_dirs = self._vm_disk_dirs(full_vm_name, disk_files)
         records = self._vm_disk_records(full_vm_name)
         identities = file_identities(disk_files)
+        protected = self._sweep_protection(
+            full_vm_name, disk_files, records, disk_dirs)
         self.provider.destroy_vm(full_vm_name)
         if not self.provider.confirm_vm_absent(full_vm_name):
             self.provider.destroy_vm(full_vm_name, force=True)
@@ -438,15 +441,6 @@ class VMsMixin:
                 f"undefined; leaving its disks in place rather than removing "
                 f"storage under a possibly-live guest")
 
-        # Every attached extra disk is decided on recorded ownership alone,
-        # so the name sweep must not reach one first: its <vm>_snapshot_*
-        # pattern also matches an extra disk whose logical name starts with
-        # "snapshot_". The boot disk and its overlays (<vm>.*) stay with
-        # the sweep; extra disks are always named <vm>_<name>.<ext>.
-        extra_disk_files = [
-            path for path in disk_files
-            if not os.path.basename(path).startswith(f"{full_vm_name}.")
-        ]
         for workdir in disk_dirs:
             # see _destroy_vm_and_disks: remove_vm_disks() raises rather
             # than returning False
@@ -454,10 +448,56 @@ class VMsMixin:
                 workdir,
                 vm_name=full_vm_name,
                 disks=[],
-                protected=extra_disk_files,
+                protected=protected,
             )
         self._remove_leftover_disk_files(
             full_vm_name, disk_files, records, identities)
+
+    def _sweep_protection(self,
+                          full_vm_name: str,
+                          disk_files: list[str],
+                          records: list[DiskRecord] | None,
+                          disk_dirs: list[str]) -> list[str]:
+        """
+        The files the name sweep must leave to the ownership decision.
+        Read before the domain is undefined.
+
+        Every extra disk is decided on recorded ownership alone, so the
+        sweep must not reach one first: its ``<vm>_snapshot_*`` pattern
+        also matches the files of an extra disk whose logical name starts
+        with ``snapshot_``. That covers every attached extra disk, every
+        layer beneath one (an external snapshot leaves the recorded base
+        and older overlays unattached but still in the chain), and every
+        recorded source, whatever its role. The boot disk and its overlays
+        (``<vm>.*``) stay with the sweep; extra disks are always named
+        ``<vm>_<name>.<ext>``.
+
+        When a chain cannot be read, a layer of a kept disk cannot be told
+        apart from a memory-snapshot file, so every ``<vm>_snapshot_*``
+        file is protected instead.
+        """
+        extra_disk_files = [
+            path for path in disk_files
+            if not os.path.basename(path).startswith(f"{full_vm_name}.")
+        ]
+        protected = set(extra_disk_files)
+        protected.update(record.source for record in records or ())
+        chains = (self.provider.backing_chain_files(extra_disk_files)
+                  if extra_disk_files else [])
+        if chains is None:
+            self.logger.warning(
+                f"{full_vm_name}: could not read the backing chain of its "
+                f"extra disks, so its {full_vm_name}_snapshot_* files are "
+                f"left in place")
+            # the same pattern the sweep uses, so it covers exactly what
+            # the sweep would take
+            for workdir in disk_dirs:
+                protected.update(glob.glob(os.path.join(
+                    os.path.expanduser(workdir),
+                    f"{full_vm_name}_snapshot_*")))
+        else:
+            protected.update(chains)
+        return sorted(protected)
 
     def _vm_disk_records(self, full_vm_name: str) -> list[DiskRecord] | None:
         """

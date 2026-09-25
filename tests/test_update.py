@@ -828,6 +828,8 @@ class TestDestroyRemovedVm:
         # the disks may only be removed once absence is confirmed.
         mgr.provider.confirm_vm_absent.side_effect = [False, True]
         mgr._vm_disk_records = MagicMock(return_value=None)
+        mgr.provider.backing_chain_files.return_value = [
+            '/data/test-vm_disk01.qcow2']
         # the sample paths are absolute; never let a unit test unlink them
         mgr._remove_leftover_disk_files = MagicMock()
 
@@ -841,6 +843,9 @@ class TestDestroyRemovedVm:
             # boot disk (<vm>.qcow2) is not
             assert c.kwargs == {'vm_name': 'test-vm', 'disks': [],
                                 'protected': ['/data/test-vm_disk01.qcow2']}
+        # only the extra disk's chain is read, the boot disk's is not
+        mgr.provider.backing_chain_files.assert_called_once_with(
+            ['/data/test-vm_disk01.qcow2'])
         # the domain's own disk list and ownership records, read before
         # undefining, are handed on
         mgr._remove_leftover_disk_files.assert_called_once()
@@ -1002,6 +1007,9 @@ class TestRemovedVmLeftoverDisks:
         mgr.provider.destroy_disks.side_effect = (
             lambda workdir, vm_name, disks, **kwargs:
                 remove_vm_disks(workdir, vm_name, disks, **kwargs))
+        # standalone images by default: each chain is just the file itself
+        mgr.provider.backing_chain_files.side_effect = (
+            lambda sources: sorted(str(s) for s in sources))
         return mgr
 
     @staticmethod
@@ -1312,6 +1320,64 @@ class TestRemovedVmLeftoverDisks:
         warnings = self._warnings(mgr)
         assert str(base) in warnings
         assert str(head) in warnings
+
+    def test_a_snapshot_moved_disk_named_snapshot_is_kept_whole(
+            self, tmp_path):
+        """The same, for logical name ``snapshot_disk01``: the recorded
+        base is no longer attached, and ``<vm>_snapshot_disk01.qcow2``
+        matches the memory-snapshot sweep, which deleted it before the
+        ownership decision could keep the chain (#212 review round 3,
+        R3-2)."""
+        base = self._file(tmp_path / f'{self.VM}_snapshot_disk01.qcow2')
+        head = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap1')
+        mgr = self._manager(tmp_path, [head],
+                            [self._record('snapshot_disk01', base)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert base.exists()
+        assert head.exists()
+        warnings = self._warnings(mgr)
+        assert str(base) in warnings
+        assert str(head) in warnings
+
+    def test_every_layer_under_a_kept_disk_survives_the_sweep(
+            self, tmp_path):
+        """Two snapshots: the middle layer is neither attached nor recorded,
+        but it is in the attached head's backing chain, read before
+        undefining."""
+        base = self._file(tmp_path / f'{self.VM}_snapshot_disk01.qcow2')
+        middle = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap1')
+        head = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap2')
+        memory = self._file(tmp_path / f'{self.VM}_snapshot_snap1.raw')
+        mgr = self._manager(tmp_path, [head],
+                            [self._record('snapshot_disk01', base)])
+        mgr.provider.backing_chain_files.side_effect = None
+        mgr.provider.backing_chain_files.return_value = [
+            str(head), str(middle), str(base)]
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert head.exists() and middle.exists() and base.exists()
+        # a memory-snapshot file is not part of any chain: still swept
+        assert not memory.exists()
+
+    def test_an_unreadable_chain_keeps_every_snapshot_named_file(
+            self, tmp_path):
+        """Without the chain, which ``<vm>_snapshot_*`` files are layers of
+        a kept disk cannot be told apart from memory-snapshot files, so the
+        sweep leaves all of them."""
+        middle = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap1')
+        head = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap2')
+        memory = self._file(tmp_path / f'{self.VM}_snapshot_snap1.raw')
+        mgr = self._manager(tmp_path, [head], [])
+        mgr.provider.backing_chain_files.side_effect = None
+        mgr.provider.backing_chain_files.return_value = None
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert middle.exists() and head.exists() and memory.exists()
+        assert 'backing chain' in self._warnings(mgr)
 
     def test_unconfirmed_absence_leaves_every_disk(self, tmp_path):
         extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
