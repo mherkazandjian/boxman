@@ -845,7 +845,10 @@ Details worth knowing:
   (adopted) disk, an extra disk outside the cluster workdir, or anything
   another VM uses directly or as a backing file. A VM that predates the
   ownership record has its declared disks removed by name. An extra disk
-  moved to an overlay by a snapshot is kept whole. Every file kept is named in
+  moved to an overlay by a snapshot goes with its whole snapshot chain when
+  every layer is provably its own (the disk at its recorded target, the
+  recorded base at the bottom, each layer named for it in the same
+  directory); otherwise the chain is kept whole. Every file kept is named in
   a warning; keeping it does not fail the command. (`virsh undefine
   --remove-all-storage` used to wipe and delete every storage-pool-listed file
   the VM referenced, ISOs included — #208.)

@@ -873,28 +873,36 @@ class LibVirtSession(SessionConfigMixin):
         return refresh_pools_holding(
             VirshCommand(provider_config=self.provider_config), paths)
 
-    def backing_chain_files(self, sources: list[str]) -> list[str] | None:
+    def backing_chains(self,
+                       sources: list[str]) -> dict[str, list[str]] | None:
         """
-        Resolved paths of every image in the backing chains of *sources*,
-        the sources included, or ``None`` when any chain cannot be read.
-        ``-U`` reads images a running guest holds locked.
+        The backing chain of each of *sources*: resolved paths, the source
+        first and the image at the bottom of the chain last.
+
+        Returns:
+            ``{source: chain}``, or ``None`` when any chain cannot be read.
         """
         cmd = LibVirtCommandBase(provider_config=self.provider_config)
-        paths: set[str] = set()
+        chains: dict[str, list[str]] = {}
         for source in sources:
-            chain = self._backing_chain_files(cmd, source)
-            if chain is None:
+            images = self._read_backing_chain(cmd, source)
+            if images is None:
                 return None
-            paths.update(chain)
-        return sorted(paths)
+            chain: list[str] = []
+            for image in images:
+                path = os.path.realpath(image['filename'])
+                if path not in chain:
+                    chain.append(path)
+            chains[source] = chain
+        return chains
 
     @staticmethod
-    def _backing_chain_files(cmd, source: str) -> list[str] | None:
+    def _read_backing_chain(cmd, source: str) -> list[dict] | None:
         """
-        Resolved paths of *source* and every image below it, or ``None``
-        when ``qemu-img`` cannot read the chain or its answer is not a
-        non-empty list of images that each name their file. ``-U`` reads
-        images a running guest holds locked.
+        ``qemu-img info --backing-chain`` of *source*, head first, or
+        ``None`` when it cannot be read or its answer is not a non-empty
+        list of images that each name their file. ``-U`` reads images a
+        running guest holds locked.
         """
         result = cmd.execute_shell(
             f"qemu-img info --backing-chain --output=json -U "
@@ -909,14 +917,27 @@ class LibVirtSession(SessionConfigMixin):
             chain = [chain]
         if not isinstance(chain, list) or not chain:
             return None
-        paths = {os.path.realpath(source)}
         for image in chain:
             if not isinstance(image, dict):
                 return None
             filename = image.get('filename')
             if not isinstance(filename, str) or not filename:
                 return None
-            paths.add(os.path.realpath(filename))
+        return chain
+
+    @classmethod
+    def _backing_chain_files(cls, cmd, source: str) -> list[str] | None:
+        """
+        Resolved paths of *source* and every image below it — the images
+        and the backing files they name — or ``None`` when the chain cannot
+        be read (see :meth:`_read_backing_chain`).
+        """
+        images = cls._read_backing_chain(cmd, source)
+        if images is None:
+            return None
+        paths = {os.path.realpath(source)}
+        for image in images:
+            paths.add(os.path.realpath(image['filename']))
             backing = image.get('full-backing-filename')
             if isinstance(backing, str) and backing:
                 paths.add(os.path.realpath(backing))

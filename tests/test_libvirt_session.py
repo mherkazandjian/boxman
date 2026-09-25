@@ -690,10 +690,10 @@ class TestVmStorageDevices:
         assert self._run(self.LIVE, self.PERSISTENT + " garbled\n") is None
 
 
-class TestBackingChainFiles:
-    """Every layer under a removed VM's extra disks, read before undefining
-    so the name sweep leaves them to the ownership decision (#212 review
-    round 3, R3-2)."""
+class TestBackingChains:
+    """The chain of each extra disk of a VM being torn down, read before
+    undefining: head first, the bottom image last (#212 review round 3,
+    R3-2; #208)."""
 
     def _run(self, sources):
         chains = TestDiskPathsInUse.CHAIN
@@ -706,14 +706,16 @@ class TestBackingChainFiles:
 
         with patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
             cmd.return_value.execute_shell.side_effect = shell
-            return _session({}).backing_chain_files(sources)
+            return _session({}).backing_chains(sources)
 
-    def test_unions_every_layer_of_every_source(self):
-        assert self._run(["/ws/a.qcow2", "/ws/b.top"]) == [
-            "/tpl/base.qcow2", "/ws/a.qcow2", "/ws/b.top"]
+    def test_each_source_maps_to_its_chain_head_first(self):
+        assert self._run(["/ws/a.qcow2", "/ws/b.top"]) == {
+            "/ws/a.qcow2": ["/ws/a.qcow2"],
+            "/ws/b.top": ["/ws/b.top", "/tpl/base.qcow2"],
+        }
 
     def test_none_when_any_chain_cannot_be_read(self):
         assert self._run(["/ws/a.qcow2", "/ws/missing.qcow2"]) is None
 
     def test_no_sources_is_an_empty_answer(self):
-        assert self._run([]) == []
+        assert self._run([]) == {}

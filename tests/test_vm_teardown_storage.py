@@ -9,11 +9,13 @@ the routine with real files in a temporary workdir and a mocked session.
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock
 
 import pytest
 
 from boxman.exceptions import ProvisionError
+from boxman.providers.libvirt import disk_cleanup
 from boxman.providers.libvirt.disk_ownership import (
     ROLE_ADOPTED,
     ROLE_DATA,
@@ -55,10 +57,11 @@ class _Teardown:
                for i, p in enumerate(media)])
         session.confirm_vm_absent.return_value = True
         if chains is None:
-            session.backing_chain_files.side_effect = (
-                lambda sources: sorted(str(s) for s in sources))
+            session.backing_chains.side_effect = (
+                lambda sources: {str(s): [os.path.realpath(s)]
+                                 for s in sources})
         else:
-            session.backing_chain_files.return_value = chains
+            session.backing_chains.return_value = chains
         session.disk_paths_in_use.return_value = (
             {} if in_use is None else in_use)
         self.mgr.session_for_cluster = MagicMock(return_value=session)
@@ -113,21 +116,201 @@ class TestOrdinaryTeardown:
 
         t.session.refresh_pools_holding.assert_not_called()
 
-    def test_a_data_disk_moved_by_a_snapshot_is_kept_whole(self, tmp_path):
-        """Deferred, as #212 left it: the record names only the base, and
-        nothing recorded names the overlays, so the chain is kept whole and
-        named rather than half removed."""
-        _file(tmp_path / f'{VM}.qcow2')
+    def test_a_data_disk_moved_by_a_snapshot_goes_with_its_chain(
+            self, tmp_path):
+        """provision -> snapshot take -> deprovision leaves nothing: the
+        data disk's snapshot chain is proven the VM's own (see
+        TestOwnedSnapshotChains)."""
+        boot_base = _file(tmp_path / f'{VM}.qcow2')
+        boot_head = _file(tmp_path / f'{VM}.s1')
+        memory = _file(tmp_path / f'{VM}_snapshot_s1.raw')
         data_base = _file(tmp_path / f'{VM}_disk01.qcow2')
         data_head = _file(tmp_path / f'{VM}_disk01.s1')
-        t = _Teardown(tmp_path, disks=[data_head],
-                      records=[_record('disk01', data_base)])
+        t = _Teardown(tmp_path, disks=[boot_head, data_head],
+                      records=[_record('disk01', data_base)],
+                      chains={str(data_head): [str(data_head),
+                                               str(data_base)]})
 
         t.deprovision([{'name': 'disk01'}])
 
-        assert data_base.exists() and data_head.exists()
-        assert not (tmp_path / f'{VM}.qcow2').exists()
-        assert str(data_base) in t.warnings and str(data_head) in t.warnings
+        assert list(tmp_path.iterdir()) == []
+        assert not (boot_base.exists() or memory.exists())
+        assert t.warnings == ''
+
+
+class TestOwnedSnapshotChains:
+    """A ``data`` disk whose recorded source a snapshot moved behind
+    overlays is removed whole — head first — only when the chain is provably
+    the VM's own; otherwise it is kept whole and named, as before."""
+
+    def _chain(self, tmp_path, *names):
+        """Files ``<vm>_disk01.<name>``, base first; returns them head
+        first, the way qemu-img lists a chain."""
+        layers = [_file(tmp_path / f'{VM}_disk01.{name}') for name in names]
+        return list(reversed(layers))
+
+    def _teardown(self, tmp_path, chain, *, target='vdb', role=ROLE_DATA,
+                  **kwargs):
+        head, base = chain[0], chain[-1]
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        return _Teardown(
+            tmp_path, disks=[boot, head],
+            records=[_record('disk01', base, role=role, target=target)],
+            chains=kwargs.pop('chains', {str(head): [str(p) for p in chain]}),
+            **kwargs)
+
+    @pytest.mark.parametrize("path", ["deprovision", "update_remove"])
+    def test_a_proven_chain_is_removed_head_first(self, tmp_path,
+                                                   monkeypatch, path):
+        chain = self._chain(tmp_path, 'qcow2', 's1', 's2')
+        order = []
+        real = disk_cleanup.remove_if_unchanged
+
+        def recording(p, identity):
+            order.append(os.path.basename(p))
+            return real(p, identity)
+
+        monkeypatch.setattr(disk_cleanup, 'remove_if_unchanged', recording)
+        t = self._teardown(tmp_path, chain)
+
+        getattr(t, path)()
+
+        assert not any(layer.exists() for layer in chain)
+        chain_order = [o for o in order if o.startswith(f'{VM}_disk01.')]
+        assert chain_order == [f'{VM}_disk01.s2', f'{VM}_disk01.s1',
+                               f'{VM}_disk01.qcow2']
+        assert t.warnings == ''
+
+    def _assert_kept_whole(self, t, chain):
+        for layer in chain:
+            assert layer.exists(), layer
+        assert str(chain[-1]) in t.warnings
+
+    def test_a_head_attached_elsewhere_than_recorded_keeps_it(self, tmp_path):
+        chain = self._chain(tmp_path, 'qcow2', 's1')
+        t = self._teardown(tmp_path, chain, target='vdc')
+
+        t.deprovision()
+
+        self._assert_kept_whole(t, chain)
+
+    def test_an_image_below_the_recorded_base_keeps_it(self, tmp_path):
+        """boxman creates data disks standalone: a base that itself has a
+        backing file is not what boxman made -- even one named like the
+        disk, in the same directory."""
+        chain = self._chain(tmp_path, 'qcow2', 's1')
+        below = _file(tmp_path / f'{VM}_disk01.orig')
+        t = self._teardown(
+            tmp_path, chain,
+            chains={str(chain[0]): [str(p) for p in chain] + [str(below)]})
+
+        t.deprovision()
+
+        self._assert_kept_whole(t, chain)
+        assert below.exists()
+
+    def test_a_layer_not_named_for_the_disk_keeps_it(self, tmp_path):
+        base = _file(tmp_path / f'{VM}_disk01.qcow2')
+        foreign = _file(tmp_path / 'somebody.qcow2')
+        head = _file(tmp_path / f'{VM}_disk01.s2')
+        chain = [head, foreign, base]
+        t = self._teardown(tmp_path, chain)
+
+        t.deprovision()
+
+        self._assert_kept_whole(t, chain)
+
+    def test_a_layer_in_another_directory_keeps_it(self, tmp_path):
+        base = _file(tmp_path / f'{VM}_disk01.qcow2')
+        away = _file(tmp_path / 'elsewhere' / f'{VM}_disk01.s1')
+        head = _file(tmp_path / f'{VM}_disk01.s2')
+        chain = [head, away, base]
+        t = self._teardown(tmp_path, chain)
+
+        t.deprovision()
+
+        self._assert_kept_whole(t, chain)
+
+    def test_a_layer_another_domain_uses_keeps_the_whole_chain(
+            self, tmp_path):
+        chain = self._chain(tmp_path, 'qcow2', 's1', 's2')
+        t = self._teardown(tmp_path, chain,
+                           in_use={os.path.realpath(chain[1]): OTHER})
+
+        t.deprovision()
+
+        for layer in chain:
+            assert layer.exists()
+        assert OTHER in t.warnings
+
+    def test_a_chain_outside_every_cluster_workdir_keeps_it(self, tmp_path):
+        away = tmp_path / 'elsewhere'
+        chain = self._chain(away, 'qcow2', 's1')
+        t = self._teardown(tmp_path, chain)
+
+        t.deprovision()
+
+        self._assert_kept_whole(t, chain)
+
+    def test_a_layer_that_is_not_a_regular_file_keeps_it(self, tmp_path):
+        base = _file(tmp_path / f'{VM}_disk01.qcow2')
+        fifo = tmp_path / f'{VM}_disk01.s1'
+        os.mkfifo(fifo)
+        head = _file(tmp_path / f'{VM}_disk01.s2')
+        chain = [head, fifo, base]
+        t = self._teardown(tmp_path, chain)
+
+        t.deprovision()
+
+        assert head.exists() and base.exists() and fifo.exists()
+        assert str(base) in t.warnings
+
+    def test_a_failed_scan_keeps_the_whole_chain(self, tmp_path):
+        chain = self._chain(tmp_path, 'qcow2', 's1')
+        t = self._teardown(tmp_path, chain)
+        t.session.disk_paths_in_use.return_value = None
+
+        t.deprovision()
+
+        for layer in chain:
+            assert layer.exists()
+            assert str(layer) in t.warnings
+
+    def test_an_adopted_disk_moved_by_a_snapshot_keeps_it(self, tmp_path):
+        chain = self._chain(tmp_path, 'qcow2', 's1')
+        t = self._teardown(tmp_path, chain, role=ROLE_ADOPTED)
+
+        t.deprovision()
+
+        self._assert_kept_whole(t, chain)
+
+    def test_an_unreadable_chain_keeps_it(self, tmp_path):
+        chain = self._chain(tmp_path, 'qcow2', 's1')
+        t = self._teardown(tmp_path, chain, chains=None)
+
+        t.deprovision()
+
+        self._assert_kept_whole(t, chain)
+
+    def test_a_replaced_layer_keeps_it_and_everything_below(self, tmp_path):
+        """Removal runs head first, so what is left is never an overlay
+        whose backing file is gone."""
+        chain = self._chain(tmp_path, 'qcow2', 's1', 's2')
+        t = self._teardown(tmp_path, chain)
+
+        def replace_middle(*_args, **_kwargs):
+            fresh = tmp_path / 'fresh'
+            fresh.write_bytes(b'someone else')
+            fresh.replace(chain[1])
+
+        t.session.destroy_vm.side_effect = replace_middle
+
+        t.deprovision()
+
+        assert not chain[0].exists()
+        assert chain[1].read_bytes() == b'someone else'
+        assert chain[2].exists()
+        assert str(chain[2]) in t.warnings
 
 
 class TestNeverRemoved:

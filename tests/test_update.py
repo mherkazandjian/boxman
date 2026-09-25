@@ -807,8 +807,8 @@ class TestDestroyRemovedVm:
         mgr.provider = MagicMock()
         mgr.provider.provider_config = {'uri': 'qemu:///system'}
         mgr.provider.vm_storage_devices.return_value = self.SAMPLE_ROWS
-        mgr.provider.backing_chain_files.side_effect = (
-            lambda sources: sorted(sources))
+        mgr.provider.backing_chains.side_effect = (
+            lambda sources: {s: [s] for s in sources})
         mgr.provider.disk_paths_in_use.return_value = {}
         mgr._vm_disk_records = MagicMock(return_value=None)
         return mgr
@@ -841,7 +841,7 @@ class TestDestroyRemovedVm:
         parent = MagicMock()
         parent.attach_mock(mgr.provider.vm_storage_devices, 'devices')
         parent.attach_mock(mgr._vm_disk_records, 'disk_records')
-        parent.attach_mock(mgr.provider.backing_chain_files, 'chains')
+        parent.attach_mock(mgr.provider.backing_chains, 'chains')
         parent.attach_mock(mgr.provider.destroy_vm, 'destroy_vm')
 
         mgr._destroy_removed_vm('test-vm')
@@ -853,7 +853,7 @@ class TestDestroyRemovedVm:
         assert mgr.provider.destroy_vm.call_args_list == [
             call('test-vm'), call('test-vm', force=True)]
         # only the extra disk's chain is read; the cdrom is not a disk
-        mgr.provider.backing_chain_files.assert_called_once_with(
+        mgr.provider.backing_chains.assert_called_once_with(
             ['/data/test-vm_disk01.qcow2'])
 
     def test_a_domain_whose_devices_cannot_be_read_stays_defined(self):
@@ -951,8 +951,8 @@ class TestRemovedVmLeftoverDisks:
             attached, media)
         mgr._vm_disk_records = MagicMock(return_value=records)
         # standalone images by default: each chain is just the file itself
-        mgr.provider.backing_chain_files.side_effect = (
-            lambda sources: sorted(str(s) for s in sources))
+        mgr.provider.backing_chains.side_effect = (
+            lambda sources: {str(s): [os.path.realpath(s)] for s in sources})
         return mgr
 
     @staticmethod
@@ -1288,16 +1288,18 @@ class TestRemovedVmLeftoverDisks:
             self, tmp_path):
         """Two snapshots: the middle layer is neither attached nor recorded,
         but it is in the attached head's backing chain, read before
-        undefining."""
+        undefining. The head is attached elsewhere than the record says, so
+        the chain is not proven the VM's own and every layer is kept."""
         base = self._file(tmp_path / f'{self.VM}_snapshot_disk01.qcow2')
         middle = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap1')
         head = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap2')
         memory = self._file(tmp_path / f'{self.VM}_snapshot_snap1.raw')
         mgr = self._manager(tmp_path, [head],
-                            [self._record('snapshot_disk01', base)])
-        mgr.provider.backing_chain_files.side_effect = None
-        mgr.provider.backing_chain_files.return_value = [
-            str(head), str(middle), str(base)]
+                            [self._record('snapshot_disk01', base,
+                                          target='vdz')])
+        mgr.provider.backing_chains.side_effect = None
+        mgr.provider.backing_chains.return_value = {
+            str(head): [str(head), str(middle), str(base)]}
 
         mgr._destroy_removed_vm(self.VM)
 
@@ -1314,8 +1316,8 @@ class TestRemovedVmLeftoverDisks:
         head = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap2')
         memory = self._file(tmp_path / f'{self.VM}_snapshot_snap1.raw')
         mgr = self._manager(tmp_path, [head], [])
-        mgr.provider.backing_chain_files.side_effect = None
-        mgr.provider.backing_chain_files.return_value = None
+        mgr.provider.backing_chains.side_effect = None
+        mgr.provider.backing_chains.return_value = None
 
         mgr._destroy_removed_vm(self.VM)
 

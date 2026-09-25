@@ -184,9 +184,10 @@ class StorageInventory:
     #: whether the records could not be read (then ``records`` is None and
     #: nothing recorded-or-not is removed as an extra disk)
     records_unreadable: bool
-    #: resolved paths of every layer under its attached extra disks;
-    #: ``None`` when a chain could not be read
-    chain_layers: list[str] | None
+    #: the backing chain of each attached extra disk (resolved paths, the
+    #: disk first, the bottom image last); ``None`` when one could not be
+    #: read
+    chains: dict[str, list[str]] | None
     #: files under its exclusive names in its disk directories
     #: (:func:`boot_family_files`)
     boot_family: list[str]
@@ -195,6 +196,16 @@ class StorageInventory:
     legacy_disks: list[str] | None
     #: :func:`file_identities` of every file above
     identities: dict[str, tuple[int, int]] = field(default_factory=dict)
+    #: the target (``vdb``, ...) each disk source is attached at
+    targets: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def chain_layers(self) -> list[str] | None:
+        """Every layer of every chain in :attr:`chains`, or ``None``."""
+        if self.chains is None:
+            return None
+        return sorted({layer for chain in self.chains.values()
+                       for layer in chain})
 
 
 @dataclass
@@ -242,7 +253,9 @@ def remove_vm_storage(
     2. **Extra disks recorded with role ``data``** at exactly their
        attached source, by the rules of :func:`_leftover_refusal`. A
        recorded disk no longer attached where it was recorded (an external
-       snapshot moved it to an overlay) is kept whole.
+       snapshot moved it to an overlay) goes with its whole snapshot chain,
+       head first, when the chain is provably the VM's own
+       (:func:`_owned_snapshot_chain`); otherwise the chain is kept whole.
     3. **A legacy domain** — one with no ownership record at all: when the
        config is known (*legacy_disks*), its config-declared disks
        ``<vm>_<name>.<ext>``, by name as before records existed; otherwise
@@ -285,6 +298,7 @@ def remove_vm_storage(
     extra_related.update(real(path) for path in inventory.chain_layers or ())
 
     candidates: list[str] = []
+    chains: list[list[str]] = []
 
     # -- 1. the boot-disk family --------------------------------------------
     for path in inventory.boot_family:
@@ -334,15 +348,24 @@ def remove_vm_storage(
         kept.extend((path, why) for path in present_extras)
     else:
         for record in records:
-            if (record.source not in inventory.disk_sources
-                    and os.path.lexists(record.source)):
+            if (record.source in inventory.disk_sources
+                    or not os.path.lexists(record.source)):
+                continue
+            chain, reason = _owned_snapshot_chain(
+                inventory, record, real_workdirs)
+            if chain is None:
                 kept.append((record.source, (
-                    "boxman created it, but it was no longer attached "
-                    "where it was recorded (an external snapshot moves a "
-                    "disk to an overlay); remove it and its overlays by "
-                    "hand")))
+                    f"boxman created it, but it was no longer attached "
+                    f"where it was recorded (an external snapshot moves a "
+                    f"disk to an overlay) and {reason}; remove it and its "
+                    f"overlays by hand")))
+            else:
+                chains.append(chain)
+        in_chains = {layer for chain in chains for layer in chain}
         by_source = {record.source: record for record in records}
         for path in present_extras:
+            if real(path) in in_chains:
+                continue
             reason = _leftover_refusal(vm, path, by_source.get(path),
                                        real_workdirs)
             if reason:
@@ -350,7 +373,7 @@ def remove_vm_storage(
             else:
                 candidates.append(path)
 
-    if not candidates:
+    if not candidates and not chains:
         return outcome
 
     # -- in use by another domain, then the identity-checked unlink ----------
@@ -372,16 +395,123 @@ def remove_vm_storage(
         elif result == "restored":
             kept.append((path, "it was replaced after the vm was inspected"))
         elif result == "stranded":
-            kept.append((path, (
-                f"it was replaced after the vm was inspected, and the name "
-                f"was taken again before the replacement could be put "
-                f"back; the replacement is at {where}")))
+            kept.append((path, _stranded(where)))
+
+    for chain in chains:
+        _remove_chain(chain, vm, inventory, in_use, outcome)
     return outcome
 
 
+def _stranded(where: str | None) -> str:
+    return (f"it was replaced after the vm was inspected, and the name was "
+            f"taken again before the replacement could be put back; the "
+            f"replacement is at {where}")
+
+
+def _owned_snapshot_chain(inventory: StorageInventory,
+                          record: DiskRecord,
+                          workdirs: set[str],
+                          ) -> tuple[list[str] | None, str | None]:
+    """
+    The snapshot chain of a ``data`` disk whose recorded source an external
+    snapshot moved behind overlays — when it is provably this VM's own.
+
+    The record names only the base; libvirt names each overlay after the
+    source it was taken of (``<vm>_<name>.qcow2`` gives
+    ``<vm>_<name>.<snapshot>``), and the snapshot metadata that listed the
+    overlays goes with the domain. The chain is taken as the VM's own only
+    when all of these hold, each checked against the inventory read before
+    undefining:
+
+    - the record's role is ``data`` and its base is in a cluster workdir;
+    - exactly one attached disk has the base at the *bottom* of its
+      backing chain (nothing below it: boxman creates data disks
+      standalone), and that disk is attached at the record's target;
+    - every layer is a regular file in the base's directory named
+      ``<vm>_<name>.<suffix>``.
+
+    Whether another domain uses a layer is checked at removal time.
+
+    Returns:
+        ``(chain, None)`` — head first, base last — or ``(None, reason)``.
+    """
+    vm = inventory.vm_name
+    if record.role != ROLE_DATA:
+        return None, (f"boxman attached it but did not create it (role "
+                      f"{record.role!r})")
+    if inventory.chains is None:
+        return None, ("the backing chains of the vm's extra disks could not "
+                      "be read")
+    base = os.path.realpath(record.source)
+    heads = [source for source, chain in inventory.chains.items()
+             if chain and chain[-1] == base]
+    if len(heads) != 1:
+        return None, ("no single attached disk has it at the bottom of its "
+                      "backing chain")
+    head = heads[0]
+    if inventory.targets.get(head) != record.target:
+        return None, (f"the disk built on it is attached at "
+                      f"{inventory.targets.get(head)}, not at "
+                      f"{record.target} where it was recorded")
+    directory = os.path.dirname(base)
+    if directory not in workdirs:
+        return None, "it is outside every cluster workdir of the project"
+    stem = f"{vm}_{record.name}."
+    chain = inventory.chains[head]
+    for layer in chain:
+        if not os.path.basename(layer).startswith(stem):
+            return None, (f"{layer} in its chain is not named for disk "
+                          f"{record.name!r}")
+        if os.path.dirname(layer) != directory:
+            return None, f"{layer} in its chain is in another directory"
+        reason = _regular_file_refusal(layer)
+        if reason:
+            return None, f"{layer} in its chain: {reason}"
+    return chain, None
+
+
+def _remove_chain(chain: list[str], vm: str, inventory: StorageInventory,
+                  in_use: dict[str, str] | None,
+                  outcome: StorageOutcome) -> None:
+    """
+    Remove an owned snapshot chain from the head down to the base, so a
+    failure part-way never leaves an overlay whose backing file is gone.
+    Any layer another domain uses — or an unanswered scan — keeps the whole
+    chain; a layer replaced since the inspection keeps it and everything
+    below it.
+    """
+    kept = outcome.kept
+    if in_use is None:
+        kept.extend((layer, "could not check whether another domain uses "
+                            "it") for layer in chain)
+        return
+    users = {in_use[layer] for layer in chain if in_use.get(layer)}
+    if users:
+        kept.extend((layer, (f"its snapshot chain is used by domain "
+                             f"{', '.join(sorted(users))}"))
+                    for layer in chain)
+        return
+    for position, layer in enumerate(chain):
+        result, where = remove_if_unchanged(
+            layer, inventory.identities.get(layer))
+        if result == "removed":
+            log.info(f"removed {layer} (vm {vm})")
+            outcome.removed.append(layer)
+        elif result == "gone":
+            continue
+        else:
+            kept.append((layer,
+                         "it was replaced after the vm was inspected"
+                         if result == "restored" else _stranded(where)))
+            kept.extend((below, ("a layer above it in its snapshot chain "
+                                 "was replaced after the vm was inspected"))
+                        for below in chain[position + 1:])
+            return
+
+
 def remove_if_unchanged(path: str,
-                         identity: tuple[int, int] | None,
-                         ) -> tuple[str, str | None]:
+                        identity: tuple[int, int] | None,
+                        ) -> tuple[str, str | None]:
     """
     Unlink *path* only if it is still the file *identity* names.
 

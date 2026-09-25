@@ -452,12 +452,15 @@ class VMsMixin:
             rows, exists = [], False
 
         disk_sources, media_sources = [], []
+        targets: dict[str, str] = {}
         for row in rows:
             if row.type not in LOCAL_SOURCE_TYPES or row.source == '-':
                 continue
             bucket = disk_sources if row.device == 'disk' else media_sources
             if row.source not in bucket:
                 bucket.append(row.source)
+            if row.device == 'disk':
+                targets.setdefault(row.source, row.target)
 
         if disk_dirs is None:
             disk_dirs = self._vm_disk_dirs(full_vm_name, disk_sources)
@@ -475,24 +478,26 @@ class VMsMixin:
         extra_disks = [path for path in disk_sources
                        if not os.path.basename(path).startswith(
                            f"{full_vm_name}.")]
-        chain_layers = (session.backing_chain_files(extra_disks)
-                        if extra_disks else [])
+        chains = session.backing_chains(extra_disks) if extra_disks else {}
 
         boot_family = sorted({path for workdir in disk_dirs
                               for path in boot_family_files(workdir,
                                                             full_vm_name)})
         files = [*disk_sources, *boot_family, *(legacy_disks or ()),
-                 *(record.source for record in records or ())]
+                 *(record.source for record in records or ()),
+                 *(layer for chain in (chains or {}).values()
+                   for layer in chain)]
         return StorageInventory(
             vm_name=full_vm_name,
             disk_sources=disk_sources,
             media_sources=media_sources,
             records=records,
             records_unreadable=records_unreadable,
-            chain_layers=chain_layers,
+            chains=chains,
             boot_family=boot_family,
             legacy_disks=legacy_disks,
             identities=file_identities(files),
+            targets=targets,
         )
 
     def _vm_disk_dirs(self,
