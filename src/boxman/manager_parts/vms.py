@@ -18,6 +18,7 @@ from boxman.loggers.logger import suppressed
 from boxman.manager_parts.images import ImagesMixin
 from boxman.providers.libvirt.clone_vm import (
     CLONE_DEGRADATIONS_KEY,
+    CLONE_WARNINGS_KEY,
     CloneDegradation,
 )
 from boxman.providers.libvirt.commands import VirshCommand
@@ -43,8 +44,10 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
     for attempt in range(1, max_retries + 1):
         last_attempt = attempt == max_retries
         degradations: list = []
+        warnings: list[str] = []
         attempt_info = vm_info.copy()
         attempt_info[CLONE_DEGRADATIONS_KEY] = degradations
+        attempt_info[CLONE_WARNINGS_KEY] = warnings
         # Suppress error-level logs on all retryable attempts so that
         # transient pool-busy failures don't appear as errors; only the
         # final attempt logs errors normally. suppressed() restores the
@@ -69,6 +72,8 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
             # unsuppressed retry. Re-emit only its degradation notice after
             # leaving the suppression context so duplicate identity is never
             # silent while transient attempt noise remains hidden.
+            for message in warnings:
+                log.warning(message)
             for degradation in degradations:
                 log.warning(degradation.message)
             return degradations

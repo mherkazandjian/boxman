@@ -277,8 +277,11 @@ on the guest regenerating one at boot, and the reason to prefer `off` for
 guests that do not do so has gone away. It does mean `clone_machine_id: off`
 cannot be honoured while another identity property is enabled: boxman warns
 and proceeds. Set every `clone_*` identity policy to `off` to skip the pass
-entirely. A populated machine ID also stops systemd treating the guest's
-first boot as a first boot (`ConditionFirstBoot`).
+entirely. First-boot behaviour is unaffected for ordinary templates: systemd
+counts a boot as the first only when `/etc/machine-id` is missing or reads
+`uninitialized`, not when it is empty, so the old truncation never triggered
+`ConditionFirstBoot` either. Only a template shipped with no
+`/etc/machine-id` at all loses its first-boot semantics.
 
 ### How the pieces fit together
 

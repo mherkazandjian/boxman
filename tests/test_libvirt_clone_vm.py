@@ -635,6 +635,84 @@ class TestSshHostKeys:
         assert _staging_leftovers(clone.new_vm_name) == []
 
 
+class TestStagingFailures:
+    """From Codex's review of #203: an OSError while staging (disk full,
+    archive write) escaped the policy -- ``auto`` recorded nothing and
+    ``required`` never discarded the unsanitized clone."""
+
+    def _failing_tar(self):
+        import errno
+        return patch("boxman.providers.libvirt.clone_vm.tarfile.open",
+                     side_effect=OSError(errno.ENOSPC, "No space left on device"))
+
+    def test_auto_degrades_to_a_notice(self, clone: CloneVM):
+        notices: list = []
+        clone.info[CLONE_DEGRADATIONS_KEY] = notices
+        with self._failing_tar(), \
+             patch.object(clone.virt_sysprep, "execute") as execute, \
+             patch.object(clone, "discard_unsafe_clone") as discard:
+            clone.apply_identity_policies()
+        assert len(notices) == 1
+        assert "No space left" in notices[0].cause
+        execute.assert_not_called()
+        discard.assert_not_called()
+        assert _staging_leftovers(clone.new_vm_name) == []
+
+    def test_required_discards_and_raises_a_typed_error(self, tmp_path: Path):
+        vm = _vm(tmp_path, clone_ssh_host_keys="required")
+        with self._failing_tar(), \
+             patch.object(vm.virt_sysprep, "execute") as execute, \
+             patch.object(vm, "discard_unsafe_clone") as discard:
+            with pytest.raises(CloneSanitizerError) as caught:
+                vm.apply_identity_policies()
+        assert isinstance(caught.value.__cause__, OSError)
+        execute.assert_not_called()
+        discard.assert_called_once()
+        assert _staging_leftovers(vm.new_vm_name) == []
+
+    def test_a_runner_exception_during_keygen_is_typed(self, clone: CloneVM):
+        with patch("boxman.providers.libvirt.clone_vm._shell_run",
+                   side_effect=RuntimeError("runner exploded")):
+            with pytest.raises(CloneSanitizerError, match="runner exploded"):
+                clone.run_identity_pass(clone.build_identity_plan())
+        assert _staging_leftovers(clone.new_vm_name) == []
+
+    def test_an_invariant_violation_is_still_not_degraded(self, clone: CloneVM):
+        """Converting staging errors must not swallow a boxman bug."""
+        with patch.object(clone, "build_sysprep_invocation",
+                          side_effect=ProvisionError("bad plan")):
+            with pytest.raises(ProvisionError, match="bad plan"):
+                clone.run_identity_pass(clone.build_identity_plan())
+
+
+class TestHostPrerequisitesAreTyped:
+    """A missing tool on the hypervisor or a sudo rule that does not cover
+    virt-sysprep is a host prerequisite, not a guest problem."""
+
+    def test_missing_ssh_keygen_is_unavailable(self, clone: CloneVM):
+        with patch("boxman.providers.libvirt.clone_vm._shell_run",
+                   return_value=_result(ok=False, return_code=127,
+                                        stderr="sh: ssh-keygen: not found")):
+            with pytest.raises(CloneSanitizerUnavailableError,
+                               match="ssh-keygen is not installed"):
+                clone.generate_ssh_host_keys()
+        assert _staging_leftovers(clone.new_vm_name) == []
+
+    @pytest.mark.parametrize("stderr", [
+        "Sorry, user mher is not allowed to execute '/usr/bin/virt-sysprep' "
+        "as root on host.",
+        "mher is not in the sudoers file.  This incident will be reported.",
+    ])
+    def test_a_sudo_rule_without_virt_sysprep_is_unavailable(
+        self, clone: CloneVM, stderr
+    ):
+        with patch.object(clone.virt_sysprep, "execute",
+                          return_value=_result(ok=False, return_code=1,
+                                               stderr=stderr)):
+            with pytest.raises(CloneSanitizerUnavailableError, match="sudo"):
+                clone.run_identity_pass(_machine_id_only(clone))
+
+
 class TestDegradationMessage:
 
     def test_names_every_property_and_its_policy(self, clone: CloneVM):

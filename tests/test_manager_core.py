@@ -460,6 +460,39 @@ class TestCloneVmsExitCodeGuard:
         assert len(notices) == 1
         assert "virt-sysprep unavailable" in notices[0]
 
+    def test_machine_id_override_warning_survives_real_retry_wrapper(
+        self, tmp_path: Path, captured_logs
+    ):
+        """From Codex's review of #203: the clone_machine_id=off override
+        warning was logged inside the retry wrapper's suppression, so a normal
+        first-attempt success showed nothing."""
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
+
+        from boxman.manager_parts.vms import _clone_with_retry
+        from boxman.providers.libvirt.session import LibVirtSession
+
+        provider = LibVirtSession(config={
+            "provider": {"libvirt": {"use_sudo": False}},
+        })
+        cluster = {"base_image": "tpl", "workdir": str(tmp_path)}
+
+        with _patch(
+            "boxman.providers.libvirt.clone_vm.VirtCloneCommand.execute",
+            return_value=object(),
+        ), _patch(
+            "boxman.providers.libvirt.clone_vm.VirtSysprepCommand.execute",
+            return_value=MagicMock(ok=True),
+        ):
+            _clone_with_retry(
+                provider, cluster, {"clone_machine_id": "off"}, "vm01")
+
+        warnings = [
+            record.message for record in captured_logs.records
+            if "cannot be honoured" in record.message
+        ]
+        assert len(warnings) == 1
+
     def test_failed_unsafe_clone_cleanup_is_not_retried(self, tmp_path: Path):
         from unittest.mock import MagicMock
         from unittest.mock import patch as _patch
