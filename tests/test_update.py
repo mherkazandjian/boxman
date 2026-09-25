@@ -801,6 +801,12 @@ class TestDestroyRemovedVm:
 
     SAMPLE_ROWS = parse_domblklist(SAMPLE_DOMBLKLIST_OUTPUT)
 
+    @pytest.fixture(autouse=True)
+    def _no_saved_inventory(self, monkeypatch):
+        """The sample paths are the host's own; never write beside them."""
+        monkeypatch.setattr("boxman.manager_parts.vms.save_teardown_inventory",
+                            MagicMock(return_value=None))
+
     def _make_manager(self):
         """Bare BoxmanManager instance with a mocked provider."""
         mgr = make_bare_manager({'project': 'demo', 'clusters': {}})
@@ -852,11 +858,11 @@ class TestDestroyRemovedVm:
         # absence
         assert mgr.provider.destroy_vm.call_args_list == [
             call('test-vm'), call('test-vm', force=True)]
-        # every disk's chain is read, the boot disk's too; the cdrom is
-        # not a disk
+        # every disk's chain is read, the boot disk's too, and the cdrom's:
+        # a qcow2 CD-ROM can be built on one of the disks (#208 review r2)
         mgr.provider.backing_chains.assert_called_once_with(
             ['/var/lib/libvirt/images/test-vm.qcow2',
-             '/data/test-vm_disk01.qcow2'])
+             '/data/test-vm_disk01.qcow2', '/data/seed.iso'])
 
     def test_a_domain_whose_devices_cannot_be_read_stays_defined(self):
         mgr = self._make_manager()
@@ -869,15 +875,16 @@ class TestDestroyRemovedVm:
         mgr.provider.destroy_vm.assert_not_called()
 
     def test_a_domain_already_gone_is_torn_down_by_name(self, tmp_path):
-        """An interrupted teardown: nothing is attached any more, and the
-        boot disk family is still found by name in the workdirs."""
+        """An interrupted teardown with nothing saved: nothing is attached
+        any more, and boxman's own qcow2 images under the VM's names are
+        still found by name in the workdirs."""
         mgr = self._make_manager()
         mgr.provider.vm_storage_devices.return_value = None
         mgr.provider.confirm_vm_absent.return_value = True
         mgr.collect_workdirs = MagicMock(return_value=[str(tmp_path)])
         mgr.config['clusters'] = {'c1': {'workdir': str(tmp_path)}}
         boot = tmp_path / 'test-vm.qcow2'
-        boot.write_bytes(b'x')
+        boot.write_bytes(b'QFI\xfb' + b'\0' * 60)
 
         mgr._destroy_removed_vm('test-vm')
 
@@ -1131,7 +1138,9 @@ class TestRemovedVmLeftoverDisks:
 
         assert extra.read_bytes() == b'someone else'
         # the replacement went back under its name; nothing is left over
-        assert sorted(p.name for p in tmp_path.iterdir()) == [extra.name]
+        # but the saved inventory, which stays while it protects a file
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            f'.boxman-teardown-{self.VM}.json', extra.name]
 
     def test_an_adopted_disk_named_like_a_memory_snapshot_is_kept(
             self, tmp_path):

@@ -847,9 +847,14 @@ Details worth knowing:
   symlink, or anything another VM uses directly or as a backing file —
   storage-pool volumes included. A disk's backing chain goes as a whole or
   not at all, overlays first, so no kept disk loses its backing file. A VM
-  that predates the ownership record has its declared disks removed by name;
-  a retried teardown of a VM already undefined keeps its extra disks, since
-  its record went with it. An extra disk moved to an overlay by a snapshot
+  that predates the ownership record has its declared disks removed by name.
+  Before undefining, the teardown saves what it saw beside the boot disk
+  (`.boxman-teardown-<vm>.json`), so a teardown interrupted after the
+  undefine and run again decides exactly as the first attempt would; the
+  file is removed once nothing it protects is left. With the VM already gone
+  and nothing saved, only boxman's own qcow2 images and memory files under
+  the VM's names are removed, and its extra disks are kept. An extra disk
+  moved to an overlay by a snapshot
   goes with its whole chain when every layer is provably its own (the disk at
   its recorded target, the recorded base at the bottom, each layer named for
   it in the same directory); otherwise the chain is kept whole. Every file

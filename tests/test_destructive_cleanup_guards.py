@@ -152,12 +152,12 @@ class _TeardownGate:
         monkeypatch.setattr("boxman.manager_parts.vms.remove_vm_storage",
                             self.remove)
 
-    @staticmethod
-    def _base_manager():
+    def _base_manager(self):
         mgr = BoxmanManager.__new__(BoxmanManager)
         mgr.config = {"project": "demo"}
         mgr.logger = MagicMock()
-        mgr._capture_vm_storage = MagicMock(return_value="inventory")
+        self.inventory = SimpleNamespace(saved_at=None)
+        mgr._capture_vm_storage = MagicMock(return_value=self.inventory)
         return mgr
 
 
@@ -180,7 +180,7 @@ class TestDestroyVmAndDisksGate(_TeardownGate):
         session.confirm_vm_absent.return_value = True
         self._run(mgr)
         self.remove.assert_called_once()
-        assert self.remove.call_args.args[0] == "inventory"
+        assert self.remove.call_args.args[0] is self.inventory
 
     def test_a_forced_undefine_is_tried_before_giving_up(self):
         mgr, session = self._manager()

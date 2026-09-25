@@ -17,7 +17,9 @@ teardown uses it any more.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import glob as _glob
+import json
 import os
 import stat
 import tempfile
@@ -212,6 +214,103 @@ class StorageInventory:
     identities: dict[str, tuple[int, int]] = field(default_factory=dict)
     #: the target (``vdb``, ...) each disk source is attached at
     targets: dict[str, str] = field(default_factory=dict)
+    #: where it was saved before undefining (see
+    #: :func:`save_teardown_inventory`); not saved itself
+    saved_at: str | None = None
+
+
+#: version of the saved teardown inventory's layout
+TEARDOWN_INVENTORY_VERSION = 1
+
+
+def teardown_inventory_path(directory: str, vm_name: str) -> str:
+    """Where a VM's teardown inventory is saved, beside its boot disk."""
+    return os.path.join(os.path.expanduser(directory),
+                        f".boxman-teardown-{vm_name}.json")
+
+
+def save_teardown_inventory(inventory: StorageInventory,
+                            directory: str) -> str:
+    """
+    Save *inventory* beside the VM's disks, atomically, and return the path.
+
+    Undefining drops everything the inventory was read from — the
+    domain's devices, its ownership record, its chains' context — so a
+    teardown interrupted after the undefine would otherwise be retried
+    blind: a CD-ROM file under the VM's own names, protected by the first
+    attempt, would be taken for a boot-disk file and deleted by the second.
+    Saved first, the retry decides with exactly what the first attempt
+    saw; identity checks still guard every unlink.
+
+    Raises:
+        OSError: If the file cannot be written.
+    """
+    path = teardown_inventory_path(directory, inventory.vm_name)
+    data = {
+        "version": TEARDOWN_INVENTORY_VERSION,
+        "vm_name": inventory.vm_name,
+        "disk_sources": inventory.disk_sources,
+        "media_sources": inventory.media_sources,
+        "records": (None if inventory.records is None
+                    else [dataclasses.asdict(r) for r in inventory.records]),
+        "records_state": inventory.records_state,
+        "chains": inventory.chains,
+        "boot_family": inventory.boot_family,
+        "legacy_disks": inventory.legacy_disks,
+        "identities": {path_: list(identity) for path_, identity
+                       in inventory.identities.items()},
+        "targets": inventory.targets,
+    }
+    fd, staging = tempfile.mkstemp(prefix=".boxman-teardown-",
+                                   suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(staging, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(staging)
+        raise
+    return path
+
+
+def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
+    """
+    Read back what :func:`save_teardown_inventory` saved for *vm_name*.
+
+    Raises:
+        OSError, ValueError, KeyError, TypeError: If it cannot be read, is
+            not a saved inventory of this layout, or names another VM.
+    """
+    with open(path) as fh:
+        data = json.load(fh)
+    if data.get("version") != TEARDOWN_INVENTORY_VERSION:
+        raise ValueError(f"unknown layout {data.get('version')!r}")
+    if data["vm_name"] != vm_name:
+        raise ValueError(f"it is the inventory of {data['vm_name']!r}")
+    state = data["records_state"]
+    if state not in (RECORDS_PRESENT, RECORDS_NONE, RECORDS_UNREADABLE):
+        raise ValueError(f"unknown records state {state!r}")
+    records = data["records"]
+    return StorageInventory(
+        vm_name=vm_name,
+        disk_sources=list(data["disk_sources"]),
+        media_sources=list(data["media_sources"]),
+        records=(None if records is None
+                 else [DiskRecord(**record) for record in records]),
+        records_state=state,
+        chains=(None if data["chains"] is None
+                else {k: list(v) for k, v in data["chains"].items()}),
+        boot_family=list(data["boot_family"]),
+        legacy_disks=(None if data["legacy_disks"] is None
+                      else list(data["legacy_disks"])),
+        identities={k: (int(v[0]), int(v[1]))
+                    for k, v in data["identities"].items()},
+        targets=dict(data["targets"]),
+        saved_at=path,
+    )
 
 
 @dataclass
@@ -234,7 +333,35 @@ def _regular_file_refusal(path: str) -> str | None:
 
 
 _MEDIA = "it is a CD-ROM or other media source of the vm"
+_UNDER_MEDIA = "it backs a CD-ROM or other media source of the vm"
 _OUTSIDE = "it is outside every cluster workdir of the project"
+_NOT_AN_ARTIFACT = (
+    "the vm was already undefined and no saved teardown inventory was "
+    "found, so only boxman's own qcow2 images and memory files are removed "
+    "by name")
+
+#: the first bytes of every qcow2 image
+_QCOW2_MAGIC = b"QFI\xfb"
+
+
+def _boxman_artifact_refusal(vm_name: str, path: str) -> str | None:
+    """
+    Why *path* is not one of the artifact types boxman writes under the VM's
+    names — a qcow2 image ``<vm>.*`` (told by its magic, not its name) or a
+    memory file ``<vm>_snapshot_*.raw`` / ``.raw.zst`` — if it is not.
+    The rule for a domain undefined without a saved inventory: nothing is
+    left to say what else a file under those names might be.
+    """
+    name = os.path.basename(path)
+    if name.startswith(f"{vm_name}_snapshot_"):
+        return None if name.endswith((".raw", ".raw.zst")) else _NOT_AN_ARTIFACT
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(len(_QCOW2_MAGIC))
+    except OSError as exc:
+        return (f"it could not be read to tell whether it is a qcow2 image "
+                f"({exc})")
+    return None if magic == _QCOW2_MAGIC else _NOT_AN_ARTIFACT
 
 _WHY_NO_RECORD = {
     RECORDS_NONE: "the domain carries no record of which disks boxman "
@@ -362,9 +489,21 @@ def remove_vm_storage(
     admission = _Admission()
     real = os.path.realpath
     real_workdirs = {real(os.path.expanduser(w)) for w in workdirs}
-    media = {real(path) for path in inventory.media_sources}
     chains = inventory.chains
     legacy = list(inventory.legacy_disks or ())
+    # a media source and every image under it: a qcow2 CD-ROM can be built
+    # on a file the vm also attaches as a disk. Protected before anything is
+    # admitted, on every route.
+    media = {real(path) for path in inventory.media_sources}
+    under_media = {real(layer) for source in inventory.media_sources
+                   for layer in (chains or {}).get(source, ())} - media
+
+    def media_refusal(path: str) -> str | None:
+        if real(path) in media:
+            return _MEDIA
+        if real(path) in under_media:
+            return _UNDER_MEDIA
+        return None
 
     def unique(paths):
         seen, out = set(), []
@@ -375,8 +514,9 @@ def remove_vm_storage(
         return out
 
     def static_refusal(path: str) -> str | None:
-        if real(path) in media:
-            return _MEDIA
+        reason = media_refusal(path)
+        if reason:
+            return reason
         reason = _regular_file_refusal(path)
         if reason:
             return reason
@@ -393,14 +533,17 @@ def remove_vm_storage(
     extra_related.update(real(r.source) for r in inventory.records or ())
     extra_related.update(real(path) for path in legacy)
     for source, layers in (chains or {}).items():
-        if not os.path.basename(source).startswith(f"{vm}."):
+        if (source not in inventory.media_sources
+                and not os.path.basename(source).startswith(f"{vm}.")):
             extra_related.update(real(layer) for layer in layers)
 
     # -- 1. the boot-disk family ------------------------------------------
     for path in inventory.boot_family:
-        if real(path) in extra_related:
+        if real(path) in extra_related and media_refusal(path) is None:
             continue
         reason = static_refusal(path)
+        if reason is None and inventory.records_state == RECORDS_UNKNOWN:
+            reason = _boxman_artifact_refusal(vm, path)
         if reason:
             admission.refuse(path, reason)
         else:
@@ -429,9 +572,9 @@ def remove_vm_storage(
         for path in attached_extras:
             if not os.path.lexists(path) or admission.is_admitted(path):
                 continue
-            reason = (_MEDIA if real(path) in media
-                      else _leftover_refusal(vm, path, by_source.get(path),
-                                             real_workdirs))
+            reason = (media_refusal(path)
+                      or _leftover_refusal(vm, path, by_source.get(path),
+                                           real_workdirs))
             if reason:
                 admission.refuse(path, reason)
             else:

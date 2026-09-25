@@ -27,7 +27,10 @@ from boxman.providers.libvirt.disk_cleanup import (
     StorageInventory,
     boot_family_files,
     file_identities,
+    load_teardown_inventory,
     remove_vm_storage,
+    save_teardown_inventory,
+    teardown_inventory_path,
 )
 from boxman.providers.libvirt.disk_ownership import (
     DiskRecord,
@@ -423,8 +426,18 @@ class VMsMixin:
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")
-        if outcome.removed:
-            session.refresh_pools_holding(outcome.removed)
+        # The saved inventory stays while it still protects a kept file, so
+        # a retry keeps it too; with nothing kept it has done its job. It is
+        # removed before the pools are refreshed, which would otherwise list
+        # it (a directory pool lists hidden files too).
+        removed = list(outcome.removed)
+        if inventory.saved_at and not outcome.kept:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(inventory.saved_at)
+                if removed:
+                    removed.append(inventory.saved_at)
+        if removed:
+            session.refresh_pools_holding(removed)
 
     def _capture_vm_storage(self,
                             session,
@@ -456,8 +469,15 @@ class VMsMixin:
                     f"{full_vm_name}: could not read its block devices from "
                     f"libvirt; leaving it defined and its storage in place "
                     f"rather than removing storage blind")
-            # already undefined (a teardown that was interrupted): nothing
-            # is attached, and its boot disk family is found by name
+            # already undefined (a teardown that was interrupted): decide
+            # with what the interrupted attempt saved before it undefined
+            # the domain, or — if nothing was saved — by name, keeping all
+            # but boxman's own artifact types (remove_vm_storage)
+            if disk_dirs is None:
+                disk_dirs = self._vm_disk_dirs(full_vm_name, [])
+            saved = self._load_saved_inventory(full_vm_name, disk_dirs)
+            if saved is not None:
+                return saved
             rows, exists = [], False
 
         disk_sources, media_sources = [], []
@@ -487,9 +507,12 @@ class VMsMixin:
                 records_state = (RECORDS_NONE if records is None
                                  else RECORDS_PRESENT)
 
-        # every disk's chain, the boot disk's included: what may be removed
-        # is decided across all of them (remove_vm_storage)
-        chains = session.backing_chains(disk_sources) if disk_sources else {}
+        # every disk's chain, the boot disk's included, and every media
+        # source's: a qcow2 CD-ROM can be built on a file the vm also
+        # attaches as a disk. What may be removed is decided across all of
+        # them (remove_vm_storage).
+        sources = [*disk_sources, *media_sources]
+        chains = session.backing_chains(sources) if sources else {}
 
         boot_family = sorted({path for workdir in disk_dirs
                               for path in boot_family_files(workdir,
@@ -498,7 +521,7 @@ class VMsMixin:
                  *(record.source for record in records or ()),
                  *(layer for chain in (chains or {}).values()
                    for layer in chain)]
-        return StorageInventory(
+        inventory = StorageInventory(
             vm_name=full_vm_name,
             disk_sources=disk_sources,
             media_sources=media_sources,
@@ -510,6 +533,54 @@ class VMsMixin:
             identities=file_identities(files),
             targets=targets,
         )
+        if exists:
+            # saved before the undefine, which drops what it was read from;
+            # a retry after an interruption decides with it. Beside the boot
+            # disk, where a retry's disk directories find it again.
+            save_dir = next(
+                (os.path.dirname(path) for path in disk_sources
+                 if os.path.basename(path).startswith(f"{full_vm_name}.")),
+                disk_dirs[0] if disk_dirs else None)
+            if save_dir is not None:
+                try:
+                    inventory.saved_at = save_teardown_inventory(
+                        inventory, save_dir)
+                except OSError as exc:
+                    raise ProvisionError(
+                        f"{full_vm_name}: could not save its teardown "
+                        f"inventory in {save_dir} ({exc}); leaving it "
+                        f"defined, since a teardown interrupted after the "
+                        f"undefine could not be retried safely") from exc
+        return inventory
+
+    def _load_saved_inventory(self, full_vm_name: str,
+                              disk_dirs: list[str]) -> StorageInventory | None:
+        """
+        The teardown inventory an earlier, interrupted teardown of
+        *full_vm_name* saved in one of *disk_dirs*, or ``None`` if none did.
+
+        Raises:
+            ProvisionError: If one is there but cannot be read. Its
+                protections cannot be honoured blind, so nothing is removed;
+                check what should stay, then remove the file.
+        """
+        for directory in disk_dirs:
+            path = teardown_inventory_path(directory, full_vm_name)
+            if not os.path.lexists(path):
+                continue
+            try:
+                inventory = load_teardown_inventory(path, full_vm_name)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise ProvisionError(
+                    f"{full_vm_name}: the teardown inventory an earlier "
+                    f"attempt saved at {path} could not be read ({exc}); "
+                    f"leaving its storage in place — check what should "
+                    f"stay, then remove that file") from exc
+            self.logger.info(
+                f"{full_vm_name}: already undefined; deciding its storage "
+                f"with the inventory saved at {path}")
+            return inventory
+        return None
 
     def _vm_disk_dirs(self,
                       full_vm_name: str,
