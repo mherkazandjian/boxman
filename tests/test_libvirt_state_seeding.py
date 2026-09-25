@@ -44,6 +44,10 @@ if shutil.which("bash") is None:  # pragma: no cover - every CI host has it
 #: mtime given to every pristine file, so a copy that drops it shows
 PRISTINE_MTIME = 1_577_836_800  # 2020-01-01
 
+#: File the script puts in each staging directory it makes, and without
+#: which it never removes one
+STAGING_MARKER = ".boxman-seed-staging"
+
 
 def _make_pristine(root: Path) -> Path:
     """A small stand-in for the image's /etc/libvirt, with the shapes that
@@ -315,28 +319,95 @@ class TestAFailedCopyIsNeverAccepted:
         assert _tree(target) == _tree(pristine)
         assert _staging_left_in(target) == []
 
-    def test_staging_left_by_a_killed_run_is_removed(self, tmp_path):
-        """SIGKILL gives the script no chance to clean up, so the next run
-        does — removing its own staging directories and nothing else."""
+    def test_what_a_killed_run_leaves_behind_is_reclaimed(self, tmp_path):
+        """SIGKILL gives the script no chance to clean up. Kill it for real,
+        mid-copy, and the next run must recognise the leftover as its own,
+        remove it, and restore the file whole."""
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        target.mkdir()
+        env = _shim(tmp_path, "cp", (
+            f'if [ "${{@: -2:1}}" = "{pristine / "libvirtd.conf"}" ]; then\n'
+            f'    printf "auth_unix" > "${{@: -1}}"\n'
+            f'    kill -KILL 0\n'
+            f'fi'))
+
+        killed = subprocess.run(
+            ["bash", str(SEED_SCRIPT), str(target), str(pristine)],
+            capture_output=True, text=True, timeout=30, env=env,
+            start_new_session=True)   # so `kill 0` stops at the script
+
+        assert killed.returncode == -9
+        assert not (target / "libvirtd.conf").exists()
+        leftover = _staging_left_in(target)
+        assert len(leftover) == 1
+        assert sorted(p.name for p in (target / leftover[0]).iterdir()) == [
+            STAGING_MARKER, "entry"]
+
+        result = _seed(target, pristine)
+
+        assert result.returncode == 0, result.stderr
+        assert f"Removed {target / leftover[0]}" in result.stdout
+        assert _staging_left_in(target) == []
+        assert (target / "libvirtd.conf").read_text() == (
+            'auth_unix_rw = "none"\n')
+
+    @pytest.mark.parametrize("contents", [
+        {STAGING_MARKER: "x"},                        # killed before copying
+        {STAGING_MARKER: "x", "entry": "<filter"},    # killed mid-copy
+    ])
+    def test_staging_holding_its_marker_is_removed(self, tmp_path, contents):
         pristine = _make_pristine(tmp_path)
         target = tmp_path / "etc-libvirt"
         shutil.copytree(pristine, target, symlinks=True)
-        (target / "qemu.conf").unlink()
         stale = target / "nwfilter" / ".boxman-seed.Ab12Cd"
         stale.mkdir()
-        (stale / "entry").write_text("<filter name='clean-tr")
-        # look-alikes the script did not create
-        (target / ".boxman-seed.abcdef").write_text("a file, not staging\n")
-        (target / ".boxman-seed.notes").mkdir()
+        for name, text in contents.items():
+            (stale / name).write_text(text)
 
         result = _seed(target, pristine)
 
         assert result.returncode == 0, result.stderr
         assert not stale.exists()
-        assert (target / ".boxman-seed.abcdef").read_text() == (
-            "a file, not staging\n")
-        assert (target / ".boxman-seed.notes").is_dir()
-        assert (target / "qemu.conf").read_text() == 'user = "root"\n'
+        assert f"Removed {stale}" in result.stdout
+
+    @pytest.mark.parametrize("name, build", [
+        # a user's directory with a six-character suffix, as the glob matches
+        (".boxman-seed.backup",
+         lambda d: (d.mkdir(), (d / "guest.xml").write_text("<domain/>"))),
+        # the marker is there, but so is something staging never holds
+        (".boxman-seed.Qx12ab",
+         lambda d: (d.mkdir(), (d / STAGING_MARKER).write_text("x"),
+                    (d / "entry").write_text("x"),
+                    (d / "notes.txt").write_text("mine"))),
+        # staging only ever holds a file or link as its entry
+        (".boxman-seed.Rz34cd",
+         lambda d: (d.mkdir(), (d / STAGING_MARKER).write_text("x"),
+                    (d / "entry").mkdir(),
+                    (d / "entry" / "guest.xml").write_text("<domain/>"))),
+        # a marker that is not a regular file
+        (".boxman-seed.Mk56ef",
+         lambda d: (d.mkdir(), (d / STAGING_MARKER).mkdir())),
+        (".boxman-seed.abcdef",
+         lambda d: d.write_text("a file, not a directory\n")),
+        (".boxman-seed.notes", lambda d: d.mkdir()),
+    ])
+    def test_a_look_alike_the_script_did_not_make_is_kept(
+            self, tmp_path, name, build):
+        """Nothing is removed on the strength of its name alone: only a
+        directory holding the script's marker and at most its entry."""
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        shutil.copytree(pristine, target, symlinks=True)
+        look_alike = target / "nwfilter" / name
+        build(look_alike)
+        before = _tree(target / "nwfilter")
+
+        result = _seed(target, pristine)
+
+        assert result.returncode == 0, result.stderr
+        assert _tree(target / "nwfilter") == before
+        assert "Removed" not in result.stdout
 
 
 class TestIncompatibleExistingPaths:

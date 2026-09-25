@@ -33,10 +33,15 @@
 # staging directory beside its destination and then hard-linked into place.
 # The link is atomic and fails if the destination exists, so a copy cut
 # short — a full disk, a container stopped mid-copy — is never published,
-# and a path that appears while the copy runs is never overwritten. Staging
-# directories are named .boxman-seed.XXXXXX; one left by a killed run is
-# removed by the next. Hard links need the host directory on a filesystem
-# that has them, as every native Linux one does.
+# and a path that appears while the copy runs is never overwritten. Hard
+# links need the host directory on a filesystem that has them, as every
+# native Linux one does.
+#
+# Staging directories are named .boxman-seed.XXXXXX, and the script puts a
+# .boxman-seed-staging marker file in each before copying anything into it.
+# A run that is killed leaves one behind, and the next run removes it — but
+# only a directory holding that marker and at most the staged entry, never
+# one that merely has a matching name. Anything else is left as it is.
 #
 # The flip side of restoring whatever is missing: a file the image ships
 # comes back on the next start if it is deleted from TARGET — including
@@ -65,6 +70,7 @@ fi
 # The staging directory in use, removed however the script ends. SIGKILL
 # is the exception, and the next run's remove_stale_staging covers it.
 staging=
+STAGING_MARKER=.boxman-seed-staging
 trap 'if [ -n "$staging" ]; then rm -rf -- "$staging"; fi' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -123,7 +129,11 @@ publish() {
         staging=
         return 1
     fi
-    err=$(cp -a -- "$1" "$staging/entry" 2>&1) &&
+    # the marker goes in first, so that whatever a killed run leaves here
+    # can be told apart from a directory that merely has a similar name
+    err=$( { echo "staging directory of seed-libvirt-state.sh (#205)" \
+                > "$staging/$STAGING_MARKER"; } 2>&1) &&
+        err=$(cp -a -- "$1" "$staging/entry" 2>&1) &&
         err=$(ln -P -T -- "$staging/entry" "$2" 2>&1)
     rc=$?
     rm -rf -- "$staging"
@@ -136,9 +146,28 @@ publish() {
     return "$rc"
 }
 
+# Whether $1 is staging this script made and nothing else has touched: a
+# directory holding its marker, a regular file, and at most the entry it was
+# copying, which is never a directory. The name alone proves nothing — a
+# user's .boxman-seed.backup matches it too.
+is_own_staging() {
+    is_real_dir "$1" || return 1
+    [ -f "$1/$STAGING_MARKER" ] && [ ! -L "$1/$STAGING_MARKER" ] || return 1
+    for item in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+        exists "$item" || continue    # a pattern that matched nothing
+        case "${item##*/}" in
+            "$STAGING_MARKER") ;;
+            entry) if is_real_dir "$item"; then return 1; fi ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+# Remove staging a killed run left in directory $1. Anything else with a
+# similar name is left exactly as it is, and not mentioned.
 remove_stale_staging() {
     for stale in "$1"/.boxman-seed.??????; do
-        if is_real_dir "$stale" && rm -rf -- "$stale"; then
+        if is_own_staging "$stale" && rm -rf -- "$stale"; then
             echo "Removed $stale, left behind by an interrupted run"
         fi
     done

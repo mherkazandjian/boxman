@@ -317,7 +317,12 @@ image ships comes back if you delete it.
 
 Each file is copied beside its destination first and only then linked into
 place, so a copy cut short by a full disk or a stopped container is never
-taken for the real thing; the next start simply tries again. Existing paths
+taken for the real thing; the next start simply tries again. A container
+stopped mid-copy can leave a `.boxman-seed.XXXXXX` staging directory
+behind, which the next start removes — but only if it holds the
+`.boxman-seed-staging` marker the entrypoint puts in each one and nothing
+but the staged file, so a directory of yours with a similar name is never
+touched. Existing paths
 are checked too: a directory must be a directory and a file a file (a
 symlink counts as what it points at, so a dangling one satisfies neither).
 
