@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from boxman.utils.hostnames import expand_name_range
+from boxman.utils.hostnames import expand_name_range, hostname_problem
 
 pytestmark = pytest.mark.unit
 
@@ -57,3 +57,56 @@ class TestExpandNameRange:
     def test_non_integer_range_raises(self):
         with pytest.raises(ValueError):
             expand_name_range("node[a:b]")
+
+
+class TestHostnameProblem:
+    """Validation of a guest hostname before it reaches a guest (#200)."""
+
+    @pytest.mark.parametrize("value", [
+        "node01",
+        "a",
+        "ctrl.example.com",
+        "Node-01",
+        "a" * 63,
+        ".".join(["a" * 63] * 3) + ".abcdefghijklmnopqrstuvwxyz0123456789ab",
+    ])
+    def test_accepts_valid_names(self, value):
+        assert hostname_problem(value) is None
+
+    @pytest.mark.parametrize("value, fragment", [
+        ("-bad", "inner hyphens"),
+        ("bad-", "inner hyphens"),
+        ("a" * 64, "at most 63"),
+        ("a." * 126 + "ab", "at most 253"),
+        ("my_vm", "inner hyphens"),
+        ("x..y", "empty label"),
+        ("trailing.", "empty label"),
+        ("", "must not be empty"),
+        ("sp ace", "inner hyphens"),
+    ])
+    def test_refuses_invalid_names(self, value, fragment):
+        problem = hostname_problem(value)
+        assert problem is not None and fragment in problem
+
+    @pytest.mark.parametrize("value, fragment", [
+        (True, "boolean"),
+        (False, "boolean"),
+        (42, "int"),
+        (1.5, "float"),
+    ])
+    def test_refuses_what_yaml_turned_into_a_non_string(self, value, fragment):
+        """``hostname: 101`` / ``hostname: no`` are not what the author meant."""
+        problem = hostname_problem(value)
+        assert problem is not None and fragment in problem
+
+    @pytest.mark.parametrize("value", [
+        "node01\n", "node01\r\n", "node\n01", "node01\n.example.com", "node01 ",
+    ])
+    def test_refuses_line_breaks_and_trailing_space(self, value):
+        """From Codex's review: Python's $ matches before a final newline, so
+        a YAML block scalar's trailing newline passed validation."""
+        assert hostname_problem(value) is not None
+
+    def test_the_length_limit_counts_the_dots(self):
+        assert len("a." * 126 + "a") == 253
+        assert hostname_problem("a." * 126 + "a") is None

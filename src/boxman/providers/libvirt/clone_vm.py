@@ -16,6 +16,7 @@ from boxman.exceptions import (
     ConfigError,
     ProvisionError,
 )
+from boxman.utils.hostnames import hostname_problem
 from boxman.utils.shell import run as _shell_run
 
 from .commands import VirshCommand, VirtCloneCommand, VirtSysprepCommand
@@ -33,6 +34,13 @@ CLONE_DEGRADATIONS_KEY = '_boxman_clone_degradations'
 # that suppression and never seen.
 CLONE_WARNINGS_KEY = '_boxman_clone_warnings'
 
+# Internal hand-off from the manager: the name this clone's guest should carry
+# -- its ``hostname:``, or its VM key when that is absent, the same fallback
+# the ssh alias uses. Resolved there because the provider only ever sees the
+# full libvirt domain name, never the key. ``None`` means there is no usable
+# name, and the hostname property is left out of the pass.
+CLONE_GUEST_HOSTNAME_KEY = '_boxman_guest_hostname'
+
 #: Every clone-identity property takes the same three policies with the same
 #: meaning: ``auto`` degrades to a notice and continues, ``required`` fails
 #: closed and discards the clone, ``off`` leaves the property alone.
@@ -46,6 +54,347 @@ SSH_HOST_KEY_TYPES = ('rsa', 'ecdsa', 'ed25519')
 #: Name of the staged archive that carries the clone's host keys into
 #: ``/etc/ssh`` with root ownership.
 SSH_HOST_KEY_ARCHIVE = 'ssh-host-keys.tar'
+
+#: Name of the staged script that renames the clone in /etc/hosts and in
+#: cloud-init's config, run inside the guest before ``--hostname``.
+HOSTNAME_SCRIPT = 'boxman-clone-hostname.sh'
+
+#: The cloud-init drop-in that script writes.
+CLOUD_INIT_HOSTNAME_DROPIN = '/etc/cloud/cloud.cfg.d/99-boxman-hostname.cfg'
+
+# Runs inside the guest (``virt-sysprep --run``), chrooted into its root. It
+# is a guest-side script rather than ``--edit`` because ``--edit`` evaluates
+# Perl on the *host* running virt-sysprep -- the bundled docker runtime has no
+# perl -- and aborts the whole pass when the file it edits is missing, which
+# every guest without cloud-init would trip. The only placeholders are the two
+# names, which are validated hostnames: letters, digits, dots and hyphens.
+#
+# Every step that can fail makes the script exit non-zero, which fails the
+# pass and lets the clone policy act -- ``required`` discards the clone,
+# ``auto`` reports it -- instead of claiming a name it did not set. Files are
+# rewritten through a scratch copy beside the real target (a symlinked
+# /etc/hosts stays a link) and renamed into place, so a failure leaves the
+# original intact rather than truncated.
+#
+# BOXMAN_GUEST_ROOT exists so the script can be exercised against a directory
+# in the unit tests; inside the guest it is unset.
+_HOSTNAME_SCRIPT = r'''#!/bin/sh
+# Written by boxman when this VM was cloned from its template: give the clone
+# its own name in /etc/hosts, and keep cloud-init from restoring the
+# template's. Runs once, offline, before virt-sysprep sets the hostname.
+root="${BOXMAN_GUEST_ROOT:-}"
+new_fqdn='@NEW_FQDN@'
+new_short='@NEW_SHORT@'
+dropin='@DROPIN@'
+
+fail() { echo "boxman hostname: $*" >&2; exit 1; }
+
+# Replace FILE with what the command after it prints when given FILE: via a
+# scratch copy in the target's own directory (metadata copied first, so mode
+# and owner survive) and an atomic rename. A symlink is followed, not replaced;
+# one that cannot be resolved fails, since renaming over it would replace the
+# link and leave its real target stale.
+replace() {
+    file=$1; shift
+    target=$file
+    if [ -L "$file" ]; then
+        target=$(readlink -f "$file") && [ -n "$target" ] ||
+            fail "cannot resolve the symlink $file"
+    fi
+    tmp=$(mktemp "${target%/*}/.boxman-rewrite.XXXXXX") ||
+        fail "cannot create a scratch file beside $target"
+    if cp -p "$target" "$tmp" && "$@" "$target" > "$tmp" &&
+            mv -f "$tmp" "$target"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    fail "could not rewrite $target"
+}
+
+# the template's name, read before --hostname replaces it. A missing file
+# means no name to replace; one that is there but cannot be read fails, or
+# its name would silently survive on every line matched by name.
+old=
+if [ -e "$root/etc/hostname" ] || [ -L "$root/etc/hostname" ]; then
+    first=$(head -n 1 "$root/etc/hostname") ||
+        fail "cannot read $root/etc/hostname"
+    old=$(printf '%s' "$first" | tr -d ' \t\r')
+fi
+old_short=${old%%.*}
+
+# /etc/hosts: a loopback line that names the template -- or is 127.0.1.1,
+# which Debian reserves for the machine's own name -- is a self-line, and
+# every non-localhost name on it is the template's. cloud-init composes such
+# a line from unrelated sources (its fqdn from the metadata's local-hostname,
+# its short name from user-data), so they cannot be matched by name alone.
+# Those names become the clone's; every other line is left exactly as it
+# was, line ending included. If no loopback line names the clone afterwards,
+# one is added.
+HOSTS_AWK='
+    function lc(s) { return tolower(s) }
+    # 127/8, and every spelling of the IPv6 loopback: ::1, 0:0:0:0:0:0:0:1,
+    # and with a dotted tail, ::0.0.0.1
+    function is_loopback(a) {
+        return a ~ /^127\./ || a ~ /^[0:]*:0*1$/ || a ~ /^[0:]*:(0+\.)(0+\.)(0+\.)0*1$/
+    }
+    function is_local(n,    l) {
+        l = lc(n)
+        return l ~ /^localhost/ || l ~ /^ip6-/
+    }
+    function is_old(n,    l) {
+        if (skip) return 0
+        l = lc(n)
+        return l == lold || l == lolds || index(l, lolds ".") == 1
+    }
+    function add(n,    l) {
+        l = lc(n)
+        if (l in seen) return
+        seen[l] = 1
+        out = out " " n
+    }
+    BEGIN {
+        lold = lc(old); lolds = lc(olds)
+        # never rewrite localhost, whatever the template called itself
+        skip = (lolds == "" || lolds ~ /^localhost/)
+        have_new = 0
+    }
+    {
+        orig = $0
+        cr = sub(/\r$/, "")
+        if ($0 ~ /^[ \t]*(#|$)/ || !is_loopback($1)) { print orig; next }
+        n = 0; comment = ""
+        split("", names)
+        for (i = 2; i <= NF; i++) {
+            if (substr($i, 1, 1) == "#") {
+                comment = substr($0, index($0, "#")); break
+            }
+            names[++n] = $i
+        }
+        self = ($1 == "127.0.1.1")
+        for (k = 1; k <= n; k++) if (is_old(names[k])) self = 1
+        if (!self) {
+            for (k = 1; k <= n; k++) if (lc(names[k]) == lc(ns)) have_new = 1
+            print orig; next
+        }
+        out = $1; placed = 0
+        split("", seen)
+        for (k = 1; k <= n; k++) {
+            if (is_local(names[k])) add(names[k])
+            else if (!placed) { add(nf); add(ns); placed = 1 }
+        }
+        if (!placed) { add(nf); add(ns) }
+        print out (comment == "" ? "" : " " comment) (cr ? "\r" : "")
+        have_new = 1
+    }
+    END {
+        if (!have_new) print "127.0.1.1 " (nf == ns ? ns : nf " " ns)
+    }'
+
+# cloud-init's module lists, minus update_etc_hosts, for the drop-in. Run by
+# cloud-init's own interpreter, so PyYAML is there. The lists are resolved the
+# way cloud-init does (util.read_conf_with_confd): the cloud.cfg.d files,
+# highest-sorting name first, then cloud.cfg; the first file to set a key
+# wins, and a list is taken whole. Only lists that name the module are
+# written. When some file names it, whatever could keep the drop-in from
+# winning is an error rather than a guess: a file that outranks it and names
+# the module, a conf_d that moves the drop-in directory, a merge directive
+# (merge_how / merge_type) that could append the module back, and a jinja
+# template that sets a module list, which cannot be read before it renders.
+MODULES_PY='
+import os
+import re
+import sys
+
+import yaml
+
+root, own = sys.argv[1], sys.argv[2]
+etc = root + "/etc/cloud"
+confd = etc + "/cloud.cfg.d"
+KEYS = ("cloud_init_modules", "cloud_config_modules", "cloud_final_modules")
+
+
+TEMPLATE = re.compile(r"##\s*template\s*:\s*jinja", re.IGNORECASE)
+
+
+def load(path):
+    """The file as a dict, and whether it is a jinja template."""
+    with open(path) as handle:
+        text = handle.read()
+    templated = bool(TEMPLATE.match(text.split("\n", 1)[0]))
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        if templated:
+            sys.exit("%s is a jinja template that cannot be read before it "
+                     "renders" % path)
+        raise
+    return (data if isinstance(data, dict) else {}), templated
+
+
+def module(entry):
+    """The canonical name of a list entry, as cloud-init forms it."""
+    if isinstance(entry, dict):
+        entry = entry.get("name")
+    elif isinstance(entry, list):
+        entry = entry[0] if entry else None
+    if not isinstance(entry, str):
+        return None
+    name = entry.replace("-", "_")
+    if name.lower().endswith(".py"):
+        name = name[:-3]
+    name = name.strip()
+    return name[3:] if name.startswith("cc_") else name
+
+
+names = []
+if os.path.isdir(confd):
+    names = sorted((n for n in os.listdir(confd) if n.endswith(".cfg")
+                    and os.path.isfile(os.path.join(confd, n))), reverse=True)
+sources = [(n, os.path.join(confd, n)) for n in names if n != own]
+if os.path.isfile(etc + "/cloud.cfg"):
+    sources.append((None, etc + "/cloud.cfg"))
+configs = []
+for n, path in sources:
+    cfg, templated = load(path)
+    configs.append((n, path, cfg, templated))
+
+
+def names_module(cfg):
+    return any(isinstance(cfg.get(key), list)
+               and any(module(e) == "update_etc_hosts" for e in cfg[key])
+               for key in KEYS)
+
+
+# a template can name the module in an expression, so it cannot be ruled out
+for _n, path, cfg, templated in configs:
+    if templated and any(key in cfg for key in KEYS):
+        sys.exit("%s is a jinja template that sets a module list" % path)
+
+if any(names_module(cfg) for _n, _p, cfg, _t in configs):
+    for n, path, cfg, _t in configs:
+        # a path in the guest is relative to its root
+        if n is None and "conf_d" in cfg and os.path.normpath(
+                str(cfg["conf_d"] or "").strip() or ".") != os.path.normpath(confd):
+            sys.exit("%s sets conf_d to %r, so the drop-in would not be read"
+                     % (path, cfg["conf_d"]))
+        for directive in ("merge_how", "merge_type"):
+            if directive in cfg:
+                sys.exit("%s sets %s, which could append update_etc_hosts "
+                         "back" % (path, directive))
+
+lists = {}
+for key in KEYS:
+    for name, _path, cfg, _templated in configs:
+        if key in cfg:
+            break
+    else:
+        continue
+    entries = cfg[key]
+    if not isinstance(entries, list):
+        continue
+    kept = [e for e in entries if module(e) != "update_etc_hosts"]
+    if len(kept) == len(entries):
+        continue
+    if name is not None and name > own:
+        sys.exit("%s/%s sets %s after %s, so update_etc_hosts cannot be "
+                 "dropped from it" % (confd, name, key, own))
+    lists[key] = kept
+if lists:
+    print("# the module lists of cloud-init, without update_etc_hosts")
+    print(yaml.safe_dump(lists, default_flow_style=False, sort_keys=False),
+          end="")
+'
+
+# Then the same question put to cloud-init itself, where its interpreter can
+# import it (in a guest it always can): the effective module lists, read by
+# its own loader with the drop-in in place, must not name the module.
+VERIFY_PY='
+import sys
+
+try:
+    from cloudinit import util
+except ImportError:
+    sys.exit(0)  # this interpreter cannot run cloud-init, nor rewrite /etc/hosts
+cfg = util.read_conf_with_confd(sys.argv[1] + "/etc/cloud/cloud.cfg")
+for key in ("cloud_init_modules", "cloud_config_modules", "cloud_final_modules"):
+    for entry in cfg.get(key) or []:
+        if isinstance(entry, dict):
+            entry = entry.get("name")
+        elif isinstance(entry, list):
+            entry = entry[0] if entry else None
+        if isinstance(entry, str) and "update_etc_hosts" in entry.replace("-", "_"):
+            sys.exit("cloud-init still runs update_etc_hosts (%s)" % key)
+'
+
+if [ -f "$root/etc/hosts" ]; then
+    replace "$root/etc/hosts" awk -v old="$old" -v olds="$old_short" \
+        -v nf="$new_fqdn" -v ns="$new_short" "$HOSTS_AWK"
+fi
+
+# cloud-init, when the guest has it (sealed or not: harmless when disabled).
+if [ -d "$root/etc/cloud" ]; then
+    mkdir -p "$root/etc/cloud/cloud.cfg.d" ||
+        fail "cannot create $root/etc/cloud/cloud.cfg.d"
+    # values quoted: an unquoted `hostname: no` is YAML false, `123` an int
+    {
+        echo "# Written by boxman when this VM was cloned: its name is"
+        echo "# $new_short, not its template's. preserve_hostname stops"
+        echo "# cloud-init setting the name back from the template's data."
+        echo "preserve_hostname: true"
+        echo "hostname: '$new_short'"
+        echo "fqdn: '$new_fqdn'"
+    } > "$root@DROPIN@" || fail "cannot write $root@DROPIN@"
+    # Every manage_etc_hosts mode -- true, template, localhost -- writes
+    # /etc/hosts through update_etc_hosts, taking the name from the
+    # template's user-data, which outranks any drop-in. So the module leaves
+    # this clone's module lists; its /etc/hosts was set above. The lists go
+    # in the drop-in, not cloud.cfg: that is a distro conffile, and editing
+    # YAML by line is not safe. Without cloud-init installed there is nothing
+    # to stop.
+    ci=
+    for candidate in "$root/usr/bin/cloud-init" "$root/bin/cloud-init" \
+            "$root/usr/local/bin/cloud-init"; do
+        if [ -f "$candidate" ]; then ci=$candidate; break; fi
+    done
+    if [ -n "$ci" ]; then
+        IFS= read -r shebang < "$ci" || fail "cannot read $ci"
+        case $shebang in
+            '#!'*) ;;
+            *) fail "cannot tell which interpreter runs $ci" ;;
+        esac
+        set -f
+        # shellcheck disable=SC2086  # split into interpreter and its options
+        set -- ${shebang#??}
+        set +f
+        [ $# -gt 0 ] && [ -x "$root$1" ] ||
+            fail "cloud-init's interpreter ${1:-?} is missing"
+        interpreter="$root$1"; shift
+        "$interpreter" "$@" -c "$MODULES_PY" "$root" "${dropin##*/}" \
+            >> "$root@DROPIN@" ||
+            fail "cannot drop update_etc_hosts from cloud-init's module lists"
+        "$interpreter" "$@" -c "$VERIFY_PY" "$root" ||
+            fail "cloud-init would still rewrite /etc/hosts"
+    fi
+fi
+exit 0
+'''
+
+
+def render_hostname_script(hostname: str) -> str:
+    """The guest-side rename script for *hostname*, a validated name.
+
+    A dotted *hostname* is the fully qualified name and its first label the
+    short one; an undotted one is both.
+    """
+    problem = hostname_problem(hostname)
+    if problem is not None:
+        # the placeholders go into shell, awk and sed unquoted-in-effect; a
+        # value that was never validated must not reach them
+        raise ConfigError(f"refusing to write hostname {hostname!r}: {problem}")
+    return (_HOSTNAME_SCRIPT
+            .replace('@NEW_FQDN@', hostname)
+            .replace('@NEW_SHORT@', hostname.split('.', 1)[0])
+            .replace('@DROPIN@', CLOUD_INIT_HOSTNAME_DROPIN))
 
 
 def join_names(names) -> str:
@@ -141,6 +490,9 @@ class IdentityPlan:
     #: bool: whether fresh ssh host keys must be generated before the pass
     fresh_ssh_host_keys: bool = False
 
+    #: str | None: the name to give the guest, when the pass sets one
+    hostname: str | None = None
+
     @property
     def strictest_policy(self) -> str:
         """The policy a failure of this pass is judged against.
@@ -205,6 +557,12 @@ class CloneVM:
         #: handled
         self.ssh_host_keys_policy = self._resolve_policy(
             'clone_ssh_host_keys')
+
+        #: str: how a failure to give the guest its own hostname is handled
+        self.hostname_policy = self._resolve_policy('clone_hostname')
+
+        #: str | None: the name the guest should carry, validated
+        self.guest_hostname = self._resolve_guest_hostname()
 
         #: int: bounded libguestfs inspection time; avoids a wedged appliance
         #: blocking the parent process forever while it joins clone workers.
@@ -278,6 +636,29 @@ class CloneVM:
                 f"{choices}, got {policy!r}")
         return policy
 
+    def _resolve_guest_hostname(self) -> str | None:
+        """The validated name for this clone's guest, or None for none.
+
+        The manager passes the resolved name under
+        :data:`CLONE_GUEST_HOSTNAME_KEY`. A direct provider caller has no VM
+        key to fall back on, so only an explicit ``hostname:`` counts there.
+        """
+        if CLONE_GUEST_HOSTNAME_KEY in self.info:
+            hostname = self.info[CLONE_GUEST_HOSTNAME_KEY]
+        else:
+            hostname = self.info.get('hostname')
+        if hostname is None:
+            if self.hostname_policy == 'required':
+                raise ConfigError(
+                    f"clone_hostname=required for vm '{self.new_vm_name}', "
+                    f"but it has no usable hostname; declare hostname:")
+            return None
+        problem = hostname_problem(hostname)
+        if problem is not None:
+            raise ConfigError(
+                f"hostname for vm '{self.new_vm_name}' {problem}")
+        return hostname
+
     def build_identity_plan(self) -> IdentityPlan:
         """Assemble the offline pass from the enabled identity policies.
 
@@ -303,6 +684,15 @@ class CloneVM:
             # clone holds the private host keys of all of them.
             plan.operations.append('ssh-hostkeys')
             plan.fresh_ssh_host_keys = True
+            plan.needs_customize = True
+
+        if self.hostname_policy != 'off' and self.guest_hostname:
+            plan.properties.append(IdentityProperty(
+                'hostname', 'clone_hostname', self.hostname_policy))
+            # virt-clone copies /etc/hostname verbatim, so every clone booted
+            # under its template's name: indistinguishable in logs, prompts
+            # and monitoring, and wrong for anything keyed on the hostname.
+            plan.hostname = self.guest_hostname
             plan.needs_customize = True
 
         if plan.needs_customize and self.machine_id_policy == 'off':
@@ -337,6 +727,45 @@ class CloneVM:
             customizations, staging_dir = self.generate_ssh_host_keys()
             plan.customizations.extend(customizations)
             plan.staging_dirs.append(staging_dir)
+        if plan.hostname:
+            customizations, staging_dir = self.stage_hostname(plan.hostname)
+            plan.customizations.extend(customizations)
+            plan.staging_dirs.append(staging_dir)
+
+    def stage_hostname(self, hostname: str) -> tuple[list[str], str]:
+        """Stage the rename script and return the customizations that apply it.
+
+        ``--run`` comes first on purpose: customizations apply in command-line
+        order, and the script has to read the template's name out of
+        /etc/hostname before ``--hostname`` overwrites it. ``--hostname`` then
+        handles the distro-specific files (/etc/hostname everywhere, plus the
+        likes of /etc/sysconfig/network) and writes a dotted name as given.
+        """
+        # rendered first: a ConfigError is not an operational failure, and
+        # nothing is staged yet to clean up after it
+        content = render_hostname_script(hostname)
+        # only the host's disk fails operationally here; typed, it reaches
+        # the clone policy (see generate_ssh_host_keys)
+        try:
+            staging_dir = tempfile.mkdtemp(
+                prefix=f'boxman-hostname-{self.new_vm_name}-')
+        except OSError as exc:
+            raise CloneSanitizerError(
+                f"could not create a staging directory for vm "
+                f"{self.new_vm_name}'s rename script: {exc}") from exc
+        try:
+            script = os.path.join(staging_dir, HOSTNAME_SCRIPT)
+            with open(script, 'w') as handle:
+                handle.write(content)
+            os.chmod(script, 0o755)
+        except BaseException as exc:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            if isinstance(exc, OSError):
+                raise CloneSanitizerError(
+                    f"could not write vm {self.new_vm_name}'s rename "
+                    f"script: {exc}") from exc
+            raise
+        return ['--run', script, '--hostname', hostname], staging_dir
 
     def generate_ssh_host_keys(self) -> tuple[list[str], str]:
         """Generate a fresh set of ssh host keys for the clone, on the host.

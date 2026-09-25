@@ -199,6 +199,7 @@ clusters:
         hostname: node01
         clone_machine_id: auto  # auto (default), required, or off; see below
         clone_ssh_host_keys: auto  # same three values; fresh ssh host keys
+        clone_hostname: auto       # same three values; the guest is named node01
         cpus: { sockets: 1, cores: 2, threads: 2 }
         memory: 2048
         max_vcpus: 16       # ceiling for live hot-scaling later
@@ -213,15 +214,18 @@ clusters:
 ```
 
 `virt-clone` assigns a new libvirt UUID and NIC MAC but copies the guest
-filesystem verbatim — Linux's machine ID and the ssh host keys included.
-Boxman therefore runs a single offline `virt-sysprep` pass against the
-shut-off clone, before changing interfaces or starting it. Two per-VM keys
-select what that pass covers:
+filesystem verbatim — Linux's machine ID, the ssh host keys and the hostname
+included. Boxman therefore runs a single offline `virt-sysprep` pass against
+the shut-off clone, before changing interfaces or starting it. Three per-VM
+keys select what that pass covers:
 
 - `clone_machine_id` — give the clone its own `/etc/machine-id`;
 - `clone_ssh_host_keys` — delete the inherited `/etc/ssh/ssh_host_*` keys and
   install a freshly generated set, owned `root:root` — private keys mode
-  `0600`, public keys `0644`.
+  `0600`, public keys `0644`;
+- `clone_hostname` — name the guest after its `hostname:`, or after its VM key
+  when there is none (the same fallback the ssh alias uses, so the alias and
+  the guest's own name agree), instead of after its template.
 
 Each takes the same three values, and defaults to `auto`:
 
@@ -260,6 +264,23 @@ missing, which is the usual cause.
 The inspection is non-interactive and limited to 300 seconds by default. Set
 `provider.libvirt.virt_sysprep_timeout` in `boxman.yml` to another positive
 number for unusually slow hosts.
+
+Why the hostname matters: without `clone_hostname`, every clone booted under
+its template's name — indistinguishable in logs, prompts and monitoring, and
+wrong for anything keyed on the hostname, such as a slurm `NodeName` or a TLS
+SAN. The name is written offline, so it is in place before first boot whether
+or not the template seals cloud-init: `/etc/hostname` takes the value as
+given (a dotted value is an FQDN), and loopback lines in `/etc/hosts` that
+named the template now name the clone. When the guest has cloud-init, a
+`cloud.cfg.d` drop-in sets `preserve_hostname: true` and drops cloud-init's
+`update_etc_hosts` module from the clone's module lists (re-declared in the
+drop-in; `cloud.cfg` itself is not edited) — a template whose own user-data
+sets `hostname:` with `manage_etc_hosts` would otherwise have cloud-init write
+the template's name back into `/etc/hosts` on every boot, and user-data
+outranks any drop-in. A hostname that is not a
+valid RFC 1123 name is refused before anything is created; a VM *key* that is
+not (`my_vm`) only warns under `auto` and leaves the template's name in place
+— declare `hostname:` to name it.
 
 Why the ssh host keys matter: without `clone_ssh_host_keys`, every clone of
 one template presents the template's host keys. Clients cannot tell two

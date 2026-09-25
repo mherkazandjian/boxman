@@ -42,13 +42,17 @@ and one failure mode is silent.
 | F2 | `--hostname` is a **customization option**, applied by the `customize` *operation*. `--operations` **replaces** the default set, and boxman passes `--operations machine-id`, so `customize` is not enabled. `virt-sysprep -a disk --operations machine-id --hostname X` **exits 0, prints nothing unusual, and does not set the hostname.** | The central trap. Any customization added without also enabling `customize` is a silent no-op, and a unit test that only asserts the built command string would pass. |
 | F3 | Operation order is fixed and `customize` runs **last**. Observed `ssh-hostkeys` → `customize`, and `machine-id` → `customize`; both are the reverse of alphabetical, so this is deliberate ordering, not luck. A `--write` to a path that `ssh-hostkeys` had just deleted survived. | Delete-then-replace is safe **in a single pass**: `ssh-hostkeys` removes the inherited keys, then `customize` uploads fresh ones. |
 | F4 | The `customize` operation **always writes a populated random `/etc/machine-id`** — even with no customization flags at all ("Setting a random seed", "Setting the machine ID in /etc/machine-id"). `--operations machine-id` alone **truncates** it to empty. | Enabling `customize` changes today's machine-id behaviour. See §4. |
-| F5 | `--hostname` writes `/etc/hostname` (and distro files) but **does not touch `/etc/hosts`**. A template's `127.0.1.1 <template fqdn> <template name>` line survives untouched. | #200 §3 needs a separate explicit edit. Confirms the issue's expectation. |
+| F5 | *Revised during #200.* `--hostname` writes `/etc/hostname` as given (an FQDN included) and the distro files, and its `/etc/hosts` handling is **distro-specific**: on a RedHat root it leaves `/etc/hosts` alone; on a Debian root it replaces the old *short* name with the new value and leaves the old FQDN behind (`127.0.1.1 hello-cloudinit.localdomain node01.example.com`). The original measurement used a Fedora-shaped root, which hid the Debian behaviour. | #200 §3 needs its own `/etc/hosts` handling on every distro, and it must run *before* `--hostname`, which erases the old name it would otherwise have to find. |
 | F6 | `--run-command` requires host/guest arch compatibility and refuses otherwise: *"host cpu (x86_64) and guest arch (unknown) are not compatible … Use --firstboot scripts instead."* | #201's suggested in-appliance `ssh-keygen -A` is not portable. See §5.1. |
 | F7 | **No flag suppresses** customize's machine-id or random-seed write. | The §4 interaction cannot be engineered away. |
 | F8 | SELinux relabelling is automatic in 1.52; `--selinux-relabel` is documented as "Compatibility option doing nothing", and `--no-selinux-relabel` disables it. | Production invocations must **not** pass `--no-selinux-relabel`, or uploaded host keys get wrong labels on EL guests. |
 | F9 | Customizations available: `--upload`, `--write`, `--edit`, `--append-line`, `--delete`, `--chmod`, `--chown`, `--mkdir`, `--touch`, `--copy-in`, `--link`, `--move`, `--run`, `--run-command`, `--firstboot*`. | Enough to do all of #200 and #201 offline in one pass. |
 | F10 | `--upload` **preserves the source file's ownership**. An uploaded host key landed in the guest owned by uid 10000 — the hypervisor user's uid — not root. | Ownership has to be set explicitly; uploading alone is not enough. |
 | F11 | **`--chown` is broken in guestfs-tools 1.52.0** — the version on the test-runner VM. It documents `--chown UID:GID:PATH`, but its parser rejects *every* form, including its own documented one: `invalid format for '--chown' parameter`. 1.52.2 accepts the identical argument. | `--chown` cannot be relied on. Ownership is carried by a tar archive instead (F12), which also keeps private keys off the command line. |
+| F13 | `--edit` evaluates its Perl expression with **`perl` on the host running virt-sysprep**, not in the guest. The bundled docker-runtime image has no perl: `sh: line 1: perl: command not found`. | `--edit` is unusable under the docker runtime. |
+| F14 | `--edit` on a file the guest does not have **aborts the whole pass**: `virt-sysprep: error: /etc/cloud/cloud.cfg does not exist in the guest`. | Nothing can be edited conditionally with `--edit` — every guest without cloud-init would fail the pass. |
+| F15 | `--mkdir` creates intermediate directories (`mkdir -p`), and a multi-line `--write` value lands intact. Same on 1.52.0 and 1.52.2. A customize run on a root with no `/etc/machine-id` exits 0. | Closes the §9 `--mkdir` question, and #201 is unaffected by guests without a machine id. |
+| F16 | *Found on a real guest.* cloud-init's `manage_etc_hosts: true` composes the self-line from **unrelated sources**: its fqdn from the metadata's `local-hostname` (boxman's template name), its short name from user-data (`hello-cloudinit`) — `127.0.1.1 ubuntu-24.04-minimal-base-template-cloudinit hello-cloudinit`. Only one of them matches `/etc/hostname`. | A name-matching rewrite leaves the template's name behind; the whole self-line has to be treated as the template's. |
 | F12 | `--tar-in <archive>:<dir>` honours the **uid, gid and mode recorded in the tar entries**, not the source files' — verified on 1.52.0 with source files owned by uid 1001 landing as `uid 0 / gid 0`, modes `0600` / `0644`, with SELinux relabelling still applied. | The portable way to install root-owned files, on both versions. |
 
 Reproduction scripts are not checked in; they build a throwaway disk in a
@@ -198,31 +202,99 @@ To verify in the integration tier: uploaded files' ownership (sshd refuses a
 host key not owned by root) and that `sshd` starts on first boot on both an EL
 and a Debian/Ubuntu guest.
 
-### 5.2 #200 — hostname (PR 2)
+### 5.2 #200 — hostname (as built)
 
-- **Set**: `--hostname <resolved>`, where resolved is `hostname:` if declared,
-  otherwise the VM key — the same fallback `manager_parts/ssh.py` already uses
-  for the ssh alias, so the alias and the guest's name agree.
-- **`/etc/hosts`** (F5): rewrite the `127.0.1.1` line to the new name rather
-  than deleting it, via `--edit`. Leave the `127.0.0.1 localhost` line alone.
-  Idempotent, and it does not strand a clone with no self-resolution. The limit
-  to document: a template that wrote its loopback entry on some other address
-  is not rewritten.
-- **Survives reboots**: `--mkdir /etc/cloud/cloud.cfg.d` plus `--write` of a
-  `99-boxman-hostname.cfg` drop-in setting `preserve_hostname: true`, so
-  cloud-init's `update_hostname` module does not restore the template's name on
-  a later boot. Harmless on a sealed template and on a guest without cloud-init.
-  Chosen over minting a fresh NoCloud seed for the clone, which is more work and
-  does nothing for a sealed template.
-- **Validation** (#200 §5): a new `validate_hostname()` in
-  `src/boxman/utils/hostnames.py` (the module exists but today holds only
-  `expand_name_range`). RFC 1123 labels — letters, digits, inner hyphens, 1–63
-  characters each, 253 total; a dotted value is an FQDN and is written as given;
-  booleans and numbers are refused with a clear message, as `net.py` already
-  does for DHCP reservation names.
-  It runs at **config** time, in `normalize_v2_config()`
-  (`manager_parts/config.py`), not at clone time where `clone_machine_id` is
-  validated — #200 requires invalid values refused before any clone exists.
+The plan below replaced an earlier one built on `--edit` and a drop-in alone;
+F13, F14 and F16 are why.
+
+- **Resolve**: `hostname:` if declared, otherwise the VM key — the same
+  fallback the ssh alias uses (`hostname_or_key()`, where an explicit `null`
+  counts as absent), so the alias and the guest's name agree. The manager resolves it, because the provider only ever
+  sees the full libvirt domain name, and hands it to the clone under a private
+  key in the VM's info, the way the degradation list travels.
+- **Set**: `--hostname <resolved>`, for `/etc/hostname` and the distro files.
+- **`/etc/hosts` and cloud-init**: a small generated POSIX `sh` script run with
+  `--run`, *before* `--hostname` so it can still read the template's name.
+  It runs inside the guest, so it needs no host perl (F13), and it tests for
+  every file before touching it (F14). Its only requirement, guest arch matching
+  the host's, always holds under KVM. It:
+  - treats a loopback line (`127.0.0.0/8` or `::1`, in any of its spellings)
+    as a self-line when it names the template or is `127.0.1.1` (Debian's
+    address for the machine's own name), and replaces every non-localhost
+    name on it with the clone's (F16); every other line is left byte-for-byte
+    alone, CRLF endings included, and a self-line is added if none names the
+    clone;
+  - never rewrites a `localhost*` or `ip6-*` name, even for a template called
+    `localhost`;
+  - when `/etc/cloud` exists, writes `cloud.cfg.d/99-boxman-hostname.cfg` with
+    `preserve_hostname: true` plus `hostname` and `fqdn` (quoted, so `no` or
+    `123` stay strings); when cloud-init is installed, it also re-declares
+    there every module list that names `update_etc_hosts`, without it. The
+    lists are resolved as cloud-init resolves them (`util.read_conf_with_confd`:
+    the `cloud.cfg.d` files, highest-sorting name first, then `cloud.cfg`; the
+    first file to set a key wins, and a list is taken whole), by cloud-init's
+    own interpreter, found from the shebang of `cloud-init`, so its PyYAML is
+    there. `cloud.cfg` itself, a distro conffile, is not touched. Whatever
+    could keep the drop-in from winning fails the pass rather than being
+    guessed at: a drop-in that sorts after boxman's and names the module; when
+    any file names it, a `conf_d` that moves the drop-in directory or a
+    `merge_how`/`merge_type` directive that could append it back; and always,
+    a jinja template that sets a module list, which cannot be read before it
+    renders. Finally, where cloud-init's interpreter can import it (in a
+    guest, always), cloud-init's own `read_conf_with_confd` re-reads the
+    lists with the drop-in in place, and a module still enabled fails the
+    pass;
+  - rewrites `/etc/hosts` through a temporary copy beside its real target that
+    keeps the original's owner and mode, renamed into place only once written
+    in full; a symlinked target that cannot be resolved, or an `/etc/hostname`
+    that is there but cannot be read, fails before anything is written. Any
+    failure exits non-zero, which `virt-sysprep --run` reports, so a failed
+    rename is an identity-pass failure under the policy rather than a silent
+    success with a truncated `/etc/hosts`.
+- **Why disable `update_etc_hosts`**: every `manage_etc_hosts` mode — `true`,
+  `template` and `localhost` — writes `/etc/hosts` through that one module, on
+  *every* boot, taking the name from the template's user-data, which outranks
+  any `cloud.cfg.d` drop-in. Every shipped cloud-init box sets
+  `manage_etc_hosts: true`. The file was set when the clone was made, so the
+  module has nothing left to do. The first build instead gave cloud-init's
+  `hosts.*.tmpl` the literal name; the Codex review found that `localhost` mode
+  bypasses those templates and wrote the template's name back. Its second
+  review found the next implementation -- commenting the entry out of
+  `cloud.cfg` with awk -- missed valid YAML forms (flow lists, quoted or
+  commented entries, block pairs), broke a multi-line entry into invalid YAML,
+  and could rewrite look-alike text elsewhere in the file; hence the drop-in,
+  written with a YAML library. Rejected alternatives: the template edit and the
+  line edit; a fresh NoCloud seed per clone (a new instance-id re-runs every
+  per-instance module of the template's user-data on every clone, and does
+  nothing for a sealed template). Not covered: a template whose *user-data*
+  sets the module lists itself, since user-data outranks every drop-in.
+- **When it matters, and verified**: on a clone of a template built by the
+  current code cloud-init does not run at all: the template's NoCloud seed is
+  ejected at build time, so ds-identify finds no datasource and disables it.
+  It runs when a clone has one: a template built before that eject, whose
+  clones share its `seed.iso`, or a seed attached by hand. Checked on an
+  Ubuntu 24.04 clone (cloud-init 24.1) with a NoCloud seed inserted, in `true`
+  mode under the template's instance-id and in `localhost` mode under a fresh
+  one: with the drop-in's module lists, `update_etc_hosts` did not run,
+  `/etc/hosts` was untouched and the name stayed the clone's; removing those
+  lists brought `127.0.1.1 alpha hello-cloudinit` back in both modes.
+  cloud-init's own loader (`read_conf_with_confd`) reports the module gone
+  from all three lists on that clone and on a sealed Rocky 9.8 clone
+  (cloud-init 24.4), where the interpreter came from the same shebang;
+  `dpkg -V` reports `cloud.cfg` unmodified, and the Rocky clone's file is
+  byte-for-byte its template's.
+- **Validation**: `hostname_problem()` in `src/boxman/utils/hostnames.py` — RFC
+  1123 labels, 253 characters in total, a dotted value written as given,
+  booleans and numbers refused. It runs at config time in a new
+  `validate_clone_identity_config()`, called beside
+  `validate_direct_boot_config()` at the top of `provision` and `update`, before
+  anything is created. Not `normalize_v2_config()` as first planned: that only
+  runs for `version: '2.0'` configs. The same validator now also refuses a bad
+  `clone_*` policy value there, instead of first inside a clone worker.
+- **An invalid VM key** (`my_vm`) is a fine ssh alias but not a hostname. Under
+  `auto` it warns and the guest keeps its template's name; under `required` it
+  is a `ConfigError`. So a config that works today does not break. None of the
+  45 VMs in the shipped boxes is affected.
 
 ### 5.3 #202 — surfacing (PR 3)
 
@@ -307,7 +379,16 @@ against a disk carrying template host keys:
   runtime.* Confirmed: it is bind-mounted at the same absolute path, which is
   what made the uploads resolve in the container.
 
-**Still open, for the integration tier:**
+**Settled since:**
+
+- `sshd` accepts the installed keys and starts on first boot, on the EL and
+  Ubuntu boxes (PR 1's integration run).
+- `--mkdir` is `mkdir -p` (F15) — moot now, since the #200 script creates the
+  drop-in directory itself.
+- The distro hostname files: `--hostname` handles them, and every shipped
+  template is a systemd distro where `/etc/hostname` is authoritative.
+
+**Still open:**
 
 - The host-key integration test inspects the *booted* guest. It skips, rather
   than passes, when it has no freshness evidence (no readable template keys and
@@ -316,13 +397,6 @@ against a disk carrying template host keys:
   regenerates missing keys at boot, would also pass. A pre-boot inspection of
   the shut-off clone against the staged fingerprints was proposed in review and
   not built.
-
-- Whether `sshd` accepts the uploaded keys and starts on first boot, on an EL
-  and on a Debian/Ubuntu guest. A synthetic root cannot answer this.
-- Whether `--mkdir` creates intermediate directories (`mkdir -p`) on a guest
-  with no `/etc/cloud` (#200).
-- Whether the distro hostname files beyond `/etc/hostname` matter for any
-  template boxman ships (#200).
 
 ## 10. A note on `agents/`
 
