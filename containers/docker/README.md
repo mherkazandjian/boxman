@@ -322,7 +322,9 @@ stopped mid-copy can leave a `.boxman-seed.XXXXXX` staging directory
 behind, which the next start removes — but only if it holds the
 `.boxman-seed-staging` marker the entrypoint puts in each one and nothing
 but the staged file, so a directory of yours with a similar name is never
-touched. Existing paths
+touched. Even then only the marker and that file are deleted, and the
+directory only if it is then empty, so nothing that lands in it meanwhile
+is lost. Existing paths
 are checked too: a directory must be a directory and a file a file (a
 symlink counts as what it points at, so a dangling one satisfies neither).
 

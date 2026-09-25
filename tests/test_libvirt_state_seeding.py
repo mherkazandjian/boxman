@@ -132,7 +132,7 @@ def _shim(tmp_path: Path, name: str, body: str) -> dict:
     The wrapper runs *body* and then execs the real *name*, so a test can
     make something happen at the exact moment the script calls it."""
     real = shutil.which(name)
-    bindir = tmp_path / "shim-bin"
+    bindir = tmp_path / f"shim-{name}"   # one per command, so shims never mix
     bindir.mkdir(exist_ok=True)
     shim = bindir / name
     shim.write_text(f"#!/bin/bash\n{body}\nexec {real} \"$@\"\n")
@@ -319,13 +319,10 @@ class TestAFailedCopyIsNeverAccepted:
         assert _tree(target) == _tree(pristine)
         assert _staging_left_in(target) == []
 
-    def test_what_a_killed_run_leaves_behind_is_reclaimed(self, tmp_path):
-        """SIGKILL gives the script no chance to clean up. Kill it for real,
-        mid-copy, and the next run must recognise the leftover as its own,
-        remove it, and restore the file whole."""
-        pristine = _make_pristine(tmp_path)
-        target = tmp_path / "etc-libvirt"
-        target.mkdir()
+    @staticmethod
+    def _kill_mid_copy(tmp_path, pristine, target):
+        """Run the script and SIGKILL it inside the copy of libvirtd.conf,
+        as a container stopped mid-seed would; return the staging left."""
         env = _shim(tmp_path, "cp", (
             f'if [ "${{@: -2:1}}" = "{pristine / "libvirtd.conf"}" ]; then\n'
             f'    printf "auth_unix" > "${{@: -1}}"\n'
@@ -341,16 +338,61 @@ class TestAFailedCopyIsNeverAccepted:
         assert not (target / "libvirtd.conf").exists()
         leftover = _staging_left_in(target)
         assert len(leftover) == 1
-        assert sorted(p.name for p in (target / leftover[0]).iterdir()) == [
+        stale = target / leftover[0]
+        assert sorted(p.name for p in stale.iterdir()) == [
             STAGING_MARKER, "entry"]
+        return stale
+
+    def test_what_a_killed_run_leaves_behind_is_reclaimed(self, tmp_path):
+        """SIGKILL gives the script no chance to clean up. Kill it for real,
+        mid-copy, and the next run must recognise the leftover as its own,
+        remove it, and restore the file whole."""
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        target.mkdir()
+        stale = self._kill_mid_copy(tmp_path, pristine, target)
 
         result = _seed(target, pristine)
 
         assert result.returncode == 0, result.stderr
-        assert f"Removed {target / leftover[0]}" in result.stdout
+        assert f"Removed {stale}" in result.stdout
         assert _staging_left_in(target) == []
         assert (target / "libvirtd.conf").read_text() == (
             'auth_unix_rw = "none"\n')
+
+    def test_a_file_arriving_during_the_removal_is_kept(self, tmp_path):
+        """Checking that a leftover is the script's own and removing it are
+        two steps. A file written into it between them is not the script's
+        to delete: it survives, and nothing claims the directory went."""
+        pristine = _make_pristine(tmp_path)
+        target = tmp_path / "etc-libvirt"
+        target.mkdir()
+        stale = self._kill_mid_copy(tmp_path, pristine, target)
+        ran = tmp_path / "shim-ran"
+        env = _shim(tmp_path, "rm", (
+            f'for arg in "$@"; do\n'
+            f'    case "$arg" in "{stale}"|"{stale}"/*)\n'
+            f'        if [ ! -e "{ran}" ]; then\n'
+            f'            echo "<domain/>" > "{stale / "guest.xml"}"\n'
+            f'            touch "{ran}"\n'
+            f'        fi ;;\n'
+            f'    esac\n'
+            f'done'))
+
+        result = _seed(target, pristine, env=env)
+
+        assert ran.exists()
+        assert result.returncode == 0, result.stderr
+        assert (stale / "guest.xml").read_text() == "<domain/>\n"
+        assert "Removed" not in result.stdout
+        assert (target / "libvirtd.conf").read_text() == (
+            'auth_unix_rw = "none"\n')
+
+        # no longer staging at all, so later runs leave it alone too
+        again = _seed(target, pristine)
+        assert again.returncode == 0, again.stderr
+        assert (stale / "guest.xml").read_text() == "<domain/>\n"
+        assert "Removed" not in again.stdout
 
     @pytest.mark.parametrize("contents", [
         {STAGING_MARKER: "x"},                        # killed before copying
@@ -388,6 +430,13 @@ class TestAFailedCopyIsNeverAccepted:
         # a marker that is not a regular file
         (".boxman-seed.Mk56ef",
          lambda d: (d.mkdir(), (d / STAGING_MARKER).mkdir())),
+        # nor a link to one, which the removal would otherwise take for its
+        # own marker and delete along with the directory
+        (".boxman-seed.Ln78gh",
+         lambda d: (d.mkdir(),
+                    os.symlink(d.parent / "clean-traffic.xml",
+                               d / STAGING_MARKER),
+                    (d / "entry").write_text("x"))),
         (".boxman-seed.abcdef",
          lambda d: d.write_text("a file, not a directory\n")),
         (".boxman-seed.notes", lambda d: d.mkdir()),

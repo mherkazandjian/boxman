@@ -41,7 +41,9 @@
 # .boxman-seed-staging marker file in each before copying anything into it.
 # A run that is killed leaves one behind, and the next run removes it — but
 # only a directory holding that marker and at most the staged entry, never
-# one that merely has a matching name. Anything else is left as it is.
+# one that merely has a matching name, and never recursively: the marker
+# and entry go by name and the directory by rmdir, so anything else in it,
+# even something that arrived after the check, is left as it is.
 #
 # The flip side of restoring whatever is missing: a file the image ships
 # comes back on the next start if it is deleted from TARGET — including
@@ -165,9 +167,17 @@ is_own_staging() {
 
 # Remove staging a killed run left in directory $1. Anything else with a
 # similar name is left exactly as it is, and not mentioned.
+#
+# Never recursively: checking ownership and removing are two steps, and
+# something written into the directory between them is not the script's to
+# delete. Only the marker and the entry are removed by name — the entry is
+# never a directory, so no recursion is needed — and then rmdir, which
+# fails on anything that arrived meanwhile and so leaves it in place.
 remove_stale_staging() {
     for stale in "$1"/.boxman-seed.??????; do
-        if is_own_staging "$stale" && rm -rf -- "$stale"; then
+        is_own_staging "$stale" || continue
+        rm -f -- "$stale/$STAGING_MARKER" "$stale/entry" 2>/dev/null
+        if rmdir -- "$stale" 2>/dev/null; then
             echo "Removed $stale, left behind by an interrupted run"
         fi
     done
