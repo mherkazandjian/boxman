@@ -18,6 +18,7 @@ from __future__ import annotations
 import glob as _glob
 import os
 import stat
+import tempfile
 from collections.abc import Callable, Iterable
 
 from boxman import log
@@ -30,6 +31,7 @@ def remove_vm_disks(
     workdir: str,
     vm_name: str,
     extra_disks: Iterable[dict[str, str]] = (),
+    protected: Iterable[str] = (),
 ) -> bool:
     """
     Delete the files on disk belonging to *vm_name* under *workdir*.
@@ -55,6 +57,10 @@ def remove_vm_disks(
         vm_name: Full VM name (typically ``bprj__<project>__bprj_<cluster>_<vm>``).
         extra_disks: Iterable of extra-disk config dicts; each dict is
             expected to have a ``name`` key used to build the filename.
+        protected: Paths the sweep must leave alone whatever their name,
+            because the caller decides them on recorded ownership. The
+            ``<vm>_snapshot_*`` pattern also matches an extra disk whose
+            logical name starts with ``snapshot_``.
 
     Returns:
         ``True`` once the sweep completes (even if there was nothing to
@@ -63,14 +69,20 @@ def remove_vm_disks(
         to exceptions.
     """
     workdir = os.path.expanduser(workdir)
+    # compared resolved, so a workdir reached through a symlink still
+    # matches the paths libvirt reports
+    kept = {os.path.realpath(os.path.expanduser(path)) for path in protected}
+
+    def removable(path: str) -> bool:
+        return os.path.isfile(path) and os.path.realpath(path) not in kept
 
     boot_disk = disk_path_for(workdir, vm_name)
-    if os.path.isfile(boot_disk):
+    if removable(boot_disk):
         os.remove(boot_disk)
 
     for disk in extra_disks:
         disk_path = disk_path_for(workdir, disk["name"], disk_prefix=vm_name)
-        if os.path.isfile(disk_path):
+        if removable(disk_path):
             os.remove(disk_path)
 
     # Snapshot artifacts: overlay files named ``<vm>.<suffix>`` (the
@@ -85,7 +97,7 @@ def remove_vm_disks(
     )
     for pattern in patterns:
         for leftover in _glob.glob(pattern):
-            if os.path.isfile(leftover):
+            if removable(leftover):
                 log.info(f"removing snapshot artifact: {leftover}")
                 os.remove(leftover)
 
@@ -162,7 +174,9 @@ def remove_recorded_leftovers(
        creates it;
     3. it is a regular file, not a symlink, directly in one of the
        project's cluster *workdirs* once symlinks are resolved;
-    4. it is the same file (device and inode) that was attached;
+    4. it is the same file (device and inode) that was attached — checked
+       on the entry after it has been moved aside, so the only thing ever
+       unlinked is that entry (see :func:`_remove_if_unchanged`);
     5. no defined domain uses it, directly or as a backing file —
        *paths_in_use* is asked once, and a ``None`` answer keeps them all.
 
@@ -223,11 +237,58 @@ def remove_recorded_leftovers(
         if user:
             kept.append((path, f"domain {user} uses it"))
             continue
-        # checked last, right before unlinking: the file must still be the
-        # one (device and inode) that was attached before undefining
-        if file_identities([path]).get(path) != identities.get(path):
+        outcome, where = _remove_if_unchanged(path, identities.get(path))
+        if outcome == "removed":
+            log.info(f"removed leftover disk of {vm_name}: {path}")
+        elif outcome == "restored":
             kept.append((path, "it was replaced after the vm was inspected"))
-            continue
-        log.info(f"removing leftover disk of {vm_name}: {path}")
-        os.remove(path)
+        elif outcome == "stranded":
+            kept.append((path, (
+                f"it was replaced after the vm was inspected, and the name "
+                f"was taken again before the replacement could be put "
+                f"back; the replacement is at {where}")))
     return kept
+
+
+def _remove_if_unchanged(path: str,
+                         identity: tuple[int, int] | None,
+                         ) -> tuple[str, str | None]:
+    """
+    Unlink *path* only if it is still the file *identity* names.
+
+    Comparing a stat of the pathname and then unlinking the pathname
+    deletes whatever replaced the file in between. Instead the entry is
+    moved into a private directory beside it — the same filesystem, so the
+    rename is atomic — and only that moved entry is checked and unlinked; a
+    writer that recreates the name meanwhile is never touched. A moved
+    entry that is not the attached file goes back under its name with a
+    link, which fails rather than replaces, so a name taken again in the
+    meantime is never overwritten.
+
+    Returns:
+        ``(outcome, where)``: ``"removed"``; ``"restored"`` (it was not the
+        attached file and is back under its name); ``"stranded"`` (it was
+        not the attached file and the name was taken again, so it stays at
+        *where*, inside the private directory); or ``"gone"`` (someone
+        removed it first).
+    """
+    directory, name = os.path.split(path)
+    private = tempfile.mkdtemp(prefix=".boxman-removing-", dir=directory)
+    moved = os.path.join(private, name)
+    try:
+        os.rename(path, moved)
+    except FileNotFoundError:
+        os.rmdir(private)
+        return "gone", None
+    st = os.lstat(moved)
+    if (st.st_dev, st.st_ino) == identity:
+        os.unlink(moved)
+        os.rmdir(private)
+        return "removed", None
+    try:
+        os.link(moved, path, follow_symlinks=False)
+    except OSError:
+        return "stranded", moved
+    os.unlink(moved)
+    os.rmdir(private)
+    return "restored", None

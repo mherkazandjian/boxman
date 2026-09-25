@@ -516,17 +516,24 @@ class TestDiskPathsInUse:
         "/iso/install.iso": '{"filename": "/iso/install.iso"}',
     }
 
-    def _run(self, virsh_results=None, chains=None):
-        virsh_results = virsh_results or {}
+    HEADER = (" Type   Device   Target   Source\n"
+              "------------------------------------\n")
+
+    def _run(self, inventories=None, failures=(), chains=None,
+             list_ok=True):
+        """*inventories* maps ``(domain, inactive)`` to domblklist output;
+        *failures* lists the ``(domain, inactive)`` queries that fail."""
+        inventories = inventories or {}
         chains = self.CHAIN if chains is None else chains
 
         def virsh_execute(*args, **kwargs):
-            if args[:2] in virsh_results:
-                return virsh_results[args[:2]]
             if args[0] == "list":
-                return _result(stdout="vm-a\nvm-b\n")
-            return _result(stdout={"vm-a": self.BLK_A,
-                                   "vm-b": self.BLK_B}[args[1]])
+                return _result(stdout="vm-a\nvm-b\n", ok=list_ok)
+            key = (args[1], "--inactive" in args)
+            if key in failures:
+                return _result(ok=False, stderr="error: failed")
+            default = {"vm-a": self.BLK_A, "vm-b": self.BLK_B}[args[1]]
+            return _result(stdout=inventories.get(key, default))
 
         def shell(command, **kwargs):
             source = command.rsplit(" ", 1)[1].strip("'")
@@ -554,11 +561,11 @@ class TestDiskPathsInUse:
                    for c in cmd.return_value.execute_shell.call_args_list)
 
     def test_none_when_the_domain_list_fails(self):
-        in_use, _ = self._run({("list", "--all"): _result(ok=False)})
+        in_use, _ = self._run(list_ok=False)
         assert in_use is None
 
     def test_none_when_a_domain_cannot_be_inspected(self):
-        in_use, _ = self._run({("domblklist", "vm-b"): _result(ok=False)})
+        in_use, _ = self._run(failures=[("vm-b", False)])
         assert in_use is None
 
     def test_none_when_a_chain_cannot_be_read(self):
@@ -569,5 +576,60 @@ class TestDiskPathsInUse:
 
     def test_none_when_qemu_img_output_is_not_json(self):
         chains = dict(self.CHAIN, **{"/ws/a.qcow2": "garbage"})
+        in_use, _ = self._run(chains=chains)
+        assert in_use is None
+
+    # -- #212 review round 2, R2-2: a running domain's persistent disks ----
+
+    def test_a_running_domains_persistent_disks_count_too(self):
+        """Live XML says b.top, the persistent XML (next start) says an
+        overlay backed by another file -- both chains are in use. Observed
+        on libvirt 10.0: plain domblklist of a running domain reports only
+        the live source."""
+        persistent = self.HEADER + " file   disk     vda      /ws/b.next\n"
+        chains = dict(self.CHAIN, **{
+            "/ws/b.next": ('[{"filename": "/ws/b.next", '
+                           '"full-backing-filename": "/ws/removed.qcow2"}, '
+                           '{"filename": "/ws/removed.qcow2"}]')})
+        in_use, _ = self._run(inventories={("vm-b", True): persistent},
+                              chains=chains)
+        assert in_use["/ws/b.top"] == "vm-b"
+        assert in_use["/ws/b.next"] == "vm-b"
+        assert in_use["/ws/removed.qcow2"] == "vm-b"
+
+    def test_none_when_a_persistent_inventory_cannot_be_read(self):
+        in_use, _ = self._run(failures=[("vm-b", True)])
+        assert in_use is None
+
+    def test_a_source_in_both_inventories_is_read_once(self):
+        _in_use, cmd = self._run()
+        sources = [c.args[0].rsplit(" ", 1)[1].strip("'")
+                   for c in cmd.return_value.execute_shell.call_args_list]
+        assert sorted(sources) == sorted(set(sources))
+
+    # -- R2-3: an incomplete answer is "cannot tell" -----------------------
+
+    def test_none_when_a_row_has_no_source(self):
+        in_use, _ = self._run(inventories={
+            ("vm-b", False): self.HEADER + " file   disk     vda\n"})
+        assert in_use is None
+
+    def test_none_when_a_row_cannot_be_parsed(self):
+        in_use, _ = self._run(inventories={
+            ("vm-b", False): self.BLK_B + " garbled\n"})
+        assert in_use is None
+
+    def test_none_when_the_chain_is_empty(self):
+        chains = dict(self.CHAIN, **{"/ws/a.qcow2": "[]"})
+        in_use, _ = self._run(chains=chains)
+        assert in_use is None
+
+    def test_none_when_a_chain_entry_has_no_filename(self):
+        chains = dict(self.CHAIN, **{"/ws/a.qcow2": '[{"format": "qcow2"}]'})
+        in_use, _ = self._run(chains=chains)
+        assert in_use is None
+
+    def test_none_when_the_chain_is_not_a_list_of_images(self):
+        chains = dict(self.CHAIN, **{"/ws/a.qcow2": '"a.qcow2"'})
         in_use, _ = self._run(chains=chains)
         assert in_use is None

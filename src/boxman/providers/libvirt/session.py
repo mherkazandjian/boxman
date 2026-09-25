@@ -30,7 +30,11 @@ from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
 from .storage import StorageManager
 from .virsh_edit import VirshEdit
-from .virsh_parse import parse_domblklist, parse_domiflist
+from .virsh_parse import (
+    parse_domblklist,
+    parse_domblklist_strict,
+    parse_domiflist,
+)
 
 
 class LibVirtSession(SessionConfigMixin):
@@ -625,6 +629,7 @@ class LibVirtSession(SessionConfigMixin):
                       workdir : str,
                       vm_name: str,
                       disks: list[dict[str, str]],
+                      protected: list[str] | tuple = (),
                       ) -> bool:
         """
         Destroy disks associated with the VM.
@@ -640,12 +645,14 @@ class LibVirtSession(SessionConfigMixin):
             workdir: Directory where disk images are stored
             vm_name: Full name of the VM
             disks: Extra disk configurations from the cluster config
+            protected: Paths to leave alone whatever their name (see
+                :func:`remove_vm_disks`)
 
         Returns:
             True if successful, False otherwise
         """
         # Delegates to the pure-filesystem helper extracted in Phase 2.6.
-        return remove_vm_disks(workdir, vm_name, disks)
+        return remove_vm_disks(workdir, vm_name, disks, protected=protected)
 
     def set_boot_order(self, vm_name: str, order: list[str]) -> bool:
         """
@@ -788,14 +795,20 @@ class LibVirtSession(SessionConfigMixin):
         """
         Map every image file a defined domain uses to that domain's name.
 
-        Covers each domain's disk and CD-ROM sources and every layer of
-        their backing chains, as resolved paths, so a caller can tell
-        whether a file it is about to delete is still some domain's disk or
-        the base of one.
+        Covers each domain's disk and CD-ROM sources in both its live and
+        its persistent definition, and every layer of their backing chains,
+        as resolved paths, so a caller can tell whether a file it is about
+        to delete is still some domain's disk or the base of one. Plain
+        ``domblklist`` of a running domain reports only the live
+        definition, while the persistent one — what the domain uses on its
+        next start — can name a different disk, or an overlay backed by one.
+        For a transient domain ``--inactive`` reports its one definition
+        (libvirt 10.0), so the same two queries cover it.
 
-        Fails closed: ``None`` when the domain list, any domain's block
-        devices or any backing chain cannot be read — a partial answer
-        would let a caller delete a file that is still in use.
+        Fails closed: ``None`` when the domain list, either inventory of
+        any domain, or any backing chain cannot be read, or reads as
+        incomplete — a partial answer would let a caller delete a file that
+        is still in use. An explicitly empty slot (``-``) is not a source.
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         listing = virsh.execute("list", "--all", "--name", warn=True)
@@ -806,14 +819,19 @@ class LibVirtSession(SessionConfigMixin):
         for domain in (line.strip() for line in listing.stdout.splitlines()):
             if not domain:
                 continue
-            blklist = virsh.execute(
-                "domblklist", domain, "--details", warn=True)
-            if not blklist.ok:
-                return None
-            for row in parse_domblklist(blklist.stdout):
-                if row.source in (None, '-'):
-                    continue
-                chain = self._backing_chain_files(cmd, row.source)
+            sources: set[str] = set()
+            for inactive in ((), ("--inactive",)):
+                blklist = virsh.execute(
+                    "domblklist", domain, "--details", *inactive, warn=True)
+                if not blklist.ok:
+                    return None
+                rows = parse_domblklist_strict(blklist.stdout)
+                if rows is None:
+                    return None
+                sources.update(row.source for row in rows
+                               if row.source != '-')
+            for source in sorted(sources):
+                chain = self._backing_chain_files(cmd, source)
                 if chain is None:
                     return None
                 for path in chain:
@@ -824,8 +842,9 @@ class LibVirtSession(SessionConfigMixin):
     def _backing_chain_files(cmd, source: str) -> list[str] | None:
         """
         Resolved paths of *source* and every image below it, or ``None``
-        when ``qemu-img`` cannot read the chain. ``-U`` reads images a
-        running guest holds locked.
+        when ``qemu-img`` cannot read the chain or its answer is not a
+        non-empty list of images that each name their file. ``-U`` reads
+        images a running guest holds locked.
         """
         result = cmd.execute_shell(
             f"qemu-img info --backing-chain --output=json -U "
@@ -838,11 +857,19 @@ class LibVirtSession(SessionConfigMixin):
             return None
         if isinstance(chain, dict):
             chain = [chain]
+        if not isinstance(chain, list) or not chain:
+            return None
         paths = {os.path.realpath(source)}
         for image in chain:
-            for key in ('filename', 'full-backing-filename'):
-                if image.get(key):
-                    paths.add(os.path.realpath(image[key]))
+            if not isinstance(image, dict):
+                return None
+            filename = image.get('filename')
+            if not isinstance(filename, str) or not filename:
+                return None
+            paths.add(os.path.realpath(filename))
+            backing = image.get('full-backing-filename')
+            if isinstance(backing, str) and backing:
+                paths.add(os.path.realpath(backing))
         return sorted(paths)
 
     def start_vm(self, vm_name: str) -> bool:

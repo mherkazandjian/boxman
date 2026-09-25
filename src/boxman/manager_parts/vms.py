@@ -438,13 +438,23 @@ class VMsMixin:
                 f"undefined; leaving its disks in place rather than removing "
                 f"storage under a possibly-live guest")
 
+        # Every attached extra disk is decided on recorded ownership alone,
+        # so the name sweep must not reach one first: its <vm>_snapshot_*
+        # pattern also matches an extra disk whose logical name starts with
+        # "snapshot_". The boot disk and its overlays (<vm>.*) stay with
+        # the sweep; extra disks are always named <vm>_<name>.<ext>.
+        extra_disk_files = [
+            path for path in disk_files
+            if not os.path.basename(path).startswith(f"{full_vm_name}.")
+        ]
         for workdir in disk_dirs:
             # see _destroy_vm_and_disks: remove_vm_disks() raises rather
             # than returning False
             self.provider.destroy_disks(
                 workdir,
                 vm_name=full_vm_name,
-                disks=[]
+                disks=[],
+                protected=extra_disk_files,
             )
         self._remove_leftover_disk_files(
             full_vm_name, disk_files, records, identities)

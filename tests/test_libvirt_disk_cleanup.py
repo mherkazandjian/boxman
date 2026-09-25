@@ -122,3 +122,29 @@ class TestRemoveVmDisks:
         # Call without the third positional to confirm default works
         assert remove_vm_disks(str(tmp_path), "vm01") is True
         assert not (tmp_path / "vm01.qcow2").exists()
+
+    def test_protected_paths_survive_every_pattern(self, tmp_path: Path):
+        """An extra disk whose logical name starts with ``snapshot_``
+        matches the memory-snapshot pattern; a protected path is left for
+        the caller to decide (#212 review round 2, R2-1)."""
+        snapshot_named = tmp_path / "vm01_snapshot_data.qcow2"
+        memory = tmp_path / "vm01_snapshot_s1.raw"
+        extra = tmp_path / "vm01_disk01.qcow2"
+        for path in (snapshot_named, memory, extra):
+            path.write_bytes(b"x")
+        remove_vm_disks(str(tmp_path), "vm01", [{"name": "disk01"}],
+                        protected=[str(snapshot_named), str(extra)])
+        assert snapshot_named.exists()
+        assert extra.exists()
+        assert not memory.exists()
+
+    def test_protection_matches_through_a_symlinked_workdir(
+            self, tmp_path: Path):
+        real = tmp_path / "real"
+        real.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+        kept = real / "vm01_snapshot_data.qcow2"
+        kept.write_bytes(b"x")
+        remove_vm_disks(str(alias), "vm01", [], protected=[str(kept)])
+        assert kept.exists()

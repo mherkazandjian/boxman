@@ -12,6 +12,7 @@ import pytest
 from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.disk import DiskManager
+from boxman.providers.libvirt.disk_cleanup import remove_vm_disks
 from boxman.providers.libvirt.disk_ownership import (
     ROLE_ADOPTED,
     ROLE_DATA,
@@ -836,7 +837,10 @@ class TestDestroyRemovedVm:
             c.args[0] for c in mgr.provider.destroy_disks.call_args_list)
         assert swept == ['/data', '/var/lib/libvirt/images']
         for c in mgr.provider.destroy_disks.call_args_list:
-            assert c.kwargs == {'vm_name': 'test-vm', 'disks': []}
+            # the attached extra disk is kept out of the name sweep; the
+            # boot disk (<vm>.qcow2) is not
+            assert c.kwargs == {'vm_name': 'test-vm', 'disks': [],
+                                'protected': ['/data/test-vm_disk01.qcow2']}
         # the domain's own disk list and ownership records, read before
         # undefining, are handed on
         mgr._remove_leftover_disk_files.assert_called_once()
@@ -993,6 +997,11 @@ class TestRemovedVmLeftoverDisks:
         mgr._vm_disk_files = MagicMock(
             return_value=[str(p) for p in attached])
         mgr._vm_disk_records = MagicMock(return_value=records)
+        # the real name sweep, so that its ordering against the ownership
+        # decision is exercised too (#212 review round 2, R2-1)
+        mgr.provider.destroy_disks.side_effect = (
+            lambda workdir, vm_name, disks, **kwargs:
+                remove_vm_disks(workdir, vm_name, disks, **kwargs))
         return mgr
 
     @staticmethod
@@ -1167,6 +1176,125 @@ class TestRemovedVmLeftoverDisks:
         mgr._destroy_removed_vm(self.VM)
 
         assert extra.read_bytes() == b'someone else'
+        # the replacement went back under its name; nothing is left over
+        assert sorted(p.name for p in tmp_path.iterdir()) == [extra.name]
+
+    def test_an_adopted_disk_named_like_a_memory_snapshot_is_kept(
+            self, tmp_path):
+        """Logical name ``snapshot_data`` gives ``<vm>_snapshot_data.qcow2``,
+        which the name sweep's ``<vm>_snapshot_*`` pattern took for a
+        memory-snapshot file and unlinked before the ownership decision ran
+        (#212 review round 2, R2-1)."""
+        adopted = self._file(tmp_path / f'{self.VM}_snapshot_data.qcow2')
+        mgr = self._manager(
+            tmp_path, [adopted],
+            [self._record('snapshot_data', adopted, ROLE_ADOPTED)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert adopted.exists()
+        assert str(adopted) in self._warnings(mgr)
+
+    def test_a_snapshot_named_disk_another_domain_uses_is_kept(
+            self, tmp_path):
+        extra = self._file(tmp_path / f'{self.VM}_snapshot_data.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('snapshot_data', extra)],
+                            in_use={str(extra): self.OTHER})
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.exists()
+        assert self.OTHER in self._warnings(mgr)
+
+    def test_the_sweep_still_removes_the_boot_disk_and_memory_files(
+            self, tmp_path):
+        boot = self._file(tmp_path / f'{self.VM}.qcow2')
+        memory = self._file(tmp_path / f'{self.VM}_snapshot_s1.raw')
+        mgr = self._manager(tmp_path, [boot], [])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert not boot.exists()
+        assert not memory.exists()
+
+    def test_a_file_replaced_right_before_the_unlink_is_kept(
+            self, tmp_path, monkeypatch):
+        """The replacement lands after the identity check and before the
+        unlink: the review's probe runs it from the log call that sat
+        between the two (#212 review round 2, R2-4)."""
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('disk01', extra)])
+
+        replaced = []
+
+        def replace(*_args, **_kwargs):
+            if not replaced:
+                replaced.append(True)
+                fresh = tmp_path / 'fresh'
+                fresh.write_bytes(b'someone else')
+                os.replace(fresh, extra)
+
+        monkeypatch.setattr(
+            'boxman.providers.libvirt.disk_cleanup.log.info', replace)
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.read_bytes() == b'someone else'
+
+    def test_a_file_recreated_after_it_was_claimed_is_kept(
+            self, tmp_path, monkeypatch):
+        """Only the entry moved into the private directory is ever
+        unlinked: a writer recreating the name right after the move keeps
+        its file."""
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('disk01', extra)])
+        real_rename = os.rename
+
+        def rename_then_recreate(src, dst, *args, **kwargs):
+            real_rename(src, dst, *args, **kwargs)
+            if str(src) == str(extra):
+                extra.write_bytes(b'someone else')
+
+        monkeypatch.setattr(os, 'rename', rename_then_recreate)
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.read_bytes() == b'someone else'
+        assert sorted(p.name for p in tmp_path.iterdir()) == [extra.name]
+
+    def test_a_replacement_that_cannot_be_put_back_is_named(
+            self, tmp_path, monkeypatch):
+        """The file moved aside turns out not to be the attached one, and
+        the name has been taken again meanwhile: it stays in the private
+        directory, which the warning names."""
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('disk01', extra)])
+
+        def replace_during_undefine(*_args, **_kwargs):
+            fresh = tmp_path / 'fresh'
+            fresh.write_bytes(b'someone else')
+            os.replace(fresh, extra)
+
+        mgr.provider.destroy_vm.side_effect = replace_during_undefine
+        real_link = os.link
+
+        def name_taken_again(src, dst, *args, **kwargs):
+            if str(dst) == str(extra):
+                extra.write_bytes(b'a third writer')
+            return real_link(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, 'link', name_taken_again)
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.read_bytes() == b'a third writer'
+        stranded = [p for p in tmp_path.rglob(extra.name) if p != extra]
+        assert [p.read_bytes() for p in stranded] == [b'someone else']
+        assert str(stranded[0]) in self._warnings(mgr)
 
     def test_a_snapshot_moved_disk_is_kept_whole_and_named(self, tmp_path):
         """An external snapshot moved the head to an overlay. The record
