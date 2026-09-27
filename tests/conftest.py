@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import uuid
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -95,3 +96,29 @@ def make_bare_manager(config: dict[str, Any] | None = None) -> BoxmanManager:
     mgr.logger = MagicMock()
     mgr._netlab = None
     return mgr
+
+
+# ---------------------------------------------------------------------------
+# What `virsh list` prints — for mocked virsh calls
+# ---------------------------------------------------------------------------
+
+def domain_uuid(name: str) -> str:
+    """A stable UUID for the test domain *name*."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"libvirt-domain:{name}"))
+
+
+def domain_listing(args: tuple, *domains: str | tuple[str, str]) -> str:
+    """
+    What ``virsh list`` prints for *domains* when called with *args*: a
+    ``<uuid> <name>`` line each when they ask for ``--uuid`` (with
+    ``--name``), one name per line otherwise. A domain is its name, whose
+    UUID is :func:`domain_uuid`'s, or a ``(uuid, name)`` pair — a domain
+    listed under a name that is not its first, or a new domain under an
+    old name.
+    """
+    lines = []
+    for domain in domains:
+        uid, name = (domain if isinstance(domain, tuple)
+                     else (domain_uuid(domain), domain))
+        lines.append(f"{uid} {name}" if "--uuid" in args else name)
+    return "".join(f"{line}\n" for line in lines)

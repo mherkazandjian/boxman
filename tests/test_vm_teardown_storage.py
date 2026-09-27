@@ -27,7 +27,7 @@ from boxman.providers.libvirt.disk_ownership import (
 )
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.providers.libvirt.virsh_parse import DomblkRow
-from conftest import make_bare_manager
+from conftest import domain_listing, domain_uuid, make_bare_manager
 
 pytestmark = pytest.mark.unit
 
@@ -2055,7 +2055,8 @@ class TestTheSameFileUnderAnotherName:
         def virsh_execute(*args, **kwargs):
             if args[0] == 'list':
                 # defined, not running
-                return _virsh_result('vm-other\n' if '--all' in args else '')
+                return _virsh_result(domain_listing(args, 'vm-other')
+                                     if '--all' in args else '')
             return _virsh_result(blk)
 
         real = LibVirtSession(config={'provider': {'libvirt': {}}})
@@ -2285,7 +2286,7 @@ class TestRunningDomainWithABlockJob:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == 'list':
-                return _virsh_result('vm-other\n')
+                return _virsh_result(domain_listing(args, 'vm-other'))
             if args[0] == 'dumpxml':
                 return _virsh_result(live)
             return _virsh_result(blk)
@@ -2312,12 +2313,12 @@ class TestASiblingGoneMidScan:
             self, tmp_path):
         boot = _file(tmp_path / f'{VM}.qcow2')
         t = _Teardown(tmp_path, disks=[boot], records=[])
-        listings = iter(['vm-sibling\n', ''])
+        listings = iter([('vm-sibling',), ()])
 
         def virsh_execute(*args, **kwargs):
             if args[0] == 'list':
-                return _virsh_result(next(listings) if '--all' in args
-                                     else '')
+                return _virsh_result(domain_listing(args, *next(listings))
+                                     if '--all' in args else '')
             # undefined by its own teardown since the listing
             return _virsh_result('', ok=False)
 
@@ -2329,6 +2330,78 @@ class TestASiblingGoneMidScan:
 
         assert not boot.exists()
         assert 'another domain' not in t.warnings
+
+    def test_one_whose_source_is_spelled_with_dotdot_keeps_nothing_either(
+            self, tmp_path):
+        """libvirt keeps a source's spelling -- heads/../sibling.qcow2 --
+        and the absence probe reads only normalised paths: a sibling
+        undefined mid-scan, whose teardown then moved that file into its
+        removal directory, is gone all the same (review round 8, 2)."""
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        listings = iter([('vm-sibling',), ()])
+        (tmp_path / 'heads').mkdir()
+        sibling = _file(tmp_path / 'sibling.qcow2')
+        removing = tmp_path / '.boxman-removing-sibling'
+        removing.mkdir()
+        blk = (" Type   Device   Target   Source\n"
+               "------------------------------------\n"
+               f" file   disk     vda      {tmp_path}/heads/../sibling.qcow2\n")
+
+        def virsh_execute(*args, **kwargs):
+            if args[0] == 'list':
+                return _virsh_result(domain_listing(args, *next(listings))
+                                     if '--all' in args else '')
+            if args[0] == 'domblklist':
+                if '--inactive' in args:
+                    # undefined since; its teardown moves the file away
+                    sibling.rename(removing / sibling.name)
+                return _virsh_result(blk)
+            return _virsh_result('', ok=False)
+
+        real = LibVirtSession(config={'provider': {'libvirt': {}}})
+        t.session.disk_paths_in_use.side_effect = real.disk_paths_in_use
+        with patch('boxman.providers.libvirt.session.VirshCommand') as virsh:
+            virsh.return_value.execute.side_effect = virsh_execute
+            t.deprovision()
+
+        assert not boot.exists()
+        assert 'another domain' not in t.warnings
+
+    def test_a_sibling_renamed_mid_scan_keeps_what_it_uses(
+            self, tmp_path, captured_logs):
+        """virsh domrename between the listing and the sibling's query: the
+        old name no longer answers, and a fresh listing names its UUID under
+        the new one -- the same domain, with the same disks, one of them
+        this VM's boot disk. The scan fails, and the disk is kept (review
+        round 8, 1)."""
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        listings = iter([('vm-sibling',),
+                         ((domain_uuid('vm-sibling'), 'vm-renamed'),)])
+        blk = (" Type   Device   Target   Source\n"
+               "------------------------------------\n"
+               f" file   disk     vda      {boot}\n")
+
+        def virsh_execute(*args, **kwargs):
+            if args[0] == 'list':
+                return _virsh_result(domain_listing(args, *next(listings))
+                                     if '--all' in args else '')
+            if args[0] == 'domblklist' and args[1] == 'vm-renamed':
+                return _virsh_result(blk)
+            # the old name no longer answers
+            return _virsh_result('', ok=False)
+
+        real = LibVirtSession(config={'provider': {'libvirt': {}}})
+        t.session.disk_paths_in_use.side_effect = real.disk_paths_in_use
+        with patch('boxman.providers.libvirt.session.VirshCommand') as virsh:
+            virsh.return_value.execute.side_effect = virsh_execute
+            t.deprovision()
+
+        assert boot.exists()
+        assert (f'left {boot} in place because could not check whether '
+                f'another domain uses it') in t.warnings
+        assert 'domain vm-sibling was renamed vm-renamed' in captured_logs.text
 
 
 class TestRunningDomainWithAMissingSource:
@@ -2368,7 +2441,7 @@ class TestRunningDomainWithAMissingSource:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == 'list':
-                return _virsh_result('vm-other\n')
+                return _virsh_result(domain_listing(args, 'vm-other'))
             if args[0] == 'domstate':
                 return _virsh_result('running\n')
             if args[0] == 'dumpxml':
@@ -2406,7 +2479,7 @@ class TestRunningDomainWithAMissingSource:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == 'list':
-                return _virsh_result('vm-other\n')
+                return _virsh_result(domain_listing(args, 'vm-other'))
             if args[0] == 'domstate':
                 return _virsh_result('running\n')
             if args[0] == 'dumpxml':

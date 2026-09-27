@@ -874,8 +874,9 @@ Details worth knowing:
   block job running) does every teardown keep everything, named in a
   warning, until that file is detached or that VM stops. A VM that a
   parallel teardown undefines while this one checks — `deprovision` tears
-  VMs down in parallel — holds nothing once libvirt no longer lists it.
-  An extra disk
+  VMs down in parallel — holds nothing once libvirt lists neither its name
+  nor its UUID; one merely renamed (`virsh domrename`) still uses its
+  disks, so that check keeps everything. An extra disk
   moved to an overlay by a snapshot goes with its whole chain when every
   layer is provably its own (the disk at its recorded target, the
   recorded base at the bottom, each layer named for it in the same

@@ -31,6 +31,7 @@ import pytest
 from boxman.exceptions import ConfigError
 from boxman.providers.libvirt.net import Network
 from boxman.providers.libvirt.session import _ABSENT, LibVirtSession
+from conftest import domain_listing, domain_uuid
 
 pytestmark = pytest.mark.unit
 
@@ -533,8 +534,8 @@ class TestDiskPathsInUse:
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
                 # every domain; none of them running
-                return _result(stdout="vm-a\nvm-b\n" if "--all" in args
-                               else "", ok=list_ok)
+                return _result(stdout=domain_listing(args, "vm-a", "vm-b")
+                               if "--all" in args else "", ok=list_ok)
             key = (args[1], "--inactive" in args)
             if key in failures:
                 return _result(ok=False, stderr="error: failed")
@@ -669,8 +670,8 @@ class TestDiskPathsInUse:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
-                return _result(stdout="vm-a\nvm-b\n" if "--all" in args
-                               else "")
+                return _result(stdout=domain_listing(args, "vm-a", "vm-b")
+                               if "--all" in args else "")
             if args[0] == "dumpxml":
                 return _result(stdout=dumpxml)
             if args[0] == "vol-path":
@@ -866,8 +867,9 @@ class TestInUseWithAMissingSource:
             calls.append(args[0])
             if args[0] == "list":
                 # the running domains are the ones not shut off
-                return _result(stdout="vm-b\n" if "--all" in args
-                               or state != "shut off" else "")
+                return _result(stdout=domain_listing(args, "vm-b")
+                               if "--all" in args or state != "shut off"
+                               else "")
             if args[0] == "domstate":
                 assert args[1] == "vm-b"
                 return _result(stdout=f"{state}\n", ok=state_ok)
@@ -1086,10 +1088,11 @@ class TestInUseWithAMissingSource:
         """A pool volume's chain is not read from the live definition."""
         virsh = MagicMock()
         virsh.execute.side_effect = lambda *args, **kwargs: _result(
-            stdout="vm-b\n" if args[0] == "list" else "running\n")
+            stdout=domain_listing(args, "vm-b") if args[0] == "list"
+            else "running\n")
 
-        held = _session({})._held_below(virsh, "vm-b", "/pool/gone.qcow2",
-                                        True, {})
+        held = _session({})._held_below(virsh, "vm-b", domain_uuid("vm-b"),
+                                        "/pool/gone.qcow2", True, {})
 
         assert held is None
         assert "volume" in captured_logs.text
@@ -1108,7 +1111,8 @@ class TestInUseByIdentity:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
-                return _result(stdout="vm-b\n" if "--all" in args else "")
+                return _result(stdout=domain_listing(args, "vm-b")
+                               if "--all" in args else "")
             return _result(stdout=blk)
 
         def shell(command, **kwargs):
@@ -1207,7 +1211,7 @@ class TestInUseWithABlockJob:
             calls.append(args)
             if args[0] == "list":
                 if "--all" in args:
-                    return _result(stdout="vm-a\nvm-b\n")
+                    return _result(stdout=domain_listing(args, "vm-a", "vm-b"))
                 if not active_ok:
                     return _result(ok=False, stderr="error: failed")
                 return _result(stdout=active)
@@ -1380,9 +1384,10 @@ class TestInUseWithABlockJob:
 class TestInUseWhileDomainsGoAway:
     """deprovision tears VMs down in parallel, so a domain listed when the
     scan starts can be undefined by its own teardown before the scan reads
-    it. Once a query of it fails and a fresh, successful listing no longer
-    names it, it holds nothing and is skipped, with whatever was read of
-    it; still listed, or a listing that fails, fails the scan as before
+    it. Once what it uses cannot be told and a fresh, successful listing
+    names neither it nor its UUID, it holds nothing and is skipped, with
+    whatever was read of it; still listed, renamed (its UUID under another
+    name), or a listing that fails or cannot be read, fails the scan
     (#213)."""
 
     CHAINS = {"/ws/a.qcow2": '{"filename": "/ws/a.qcow2"}',
@@ -1393,6 +1398,8 @@ class TestInUseWhileDomainsGoAway:
     FAILURES = {
         # its inventory
         "inventory": dict(failing={("domblklist", "vm-b")}),
+        # the chain of a source spelled so that its absence is not probed
+        "unprobed source": dict(unprobed=True),
         # its state, asked for a source of it that no longer exists
         "state": dict(failing={("domstate", "vm-b")}, missing=True),
         # its live definition, read for its block jobs while it runs
@@ -1405,18 +1412,26 @@ class TestInUseWhileDomainsGoAway:
         "destination": dict(active={"vm-b"}, mirror=(
             "<mirror type='file' file='/w/copy.qcow2' job='copy'/>")),
     }
+    #: vm-b under another name, virsh domrename's doing: the same UUID
+    RENAMED = (domain_uuid("vm-b"), "vm-renamed")
+    #: a new domain defined under vm-b's name: another UUID
+    REPLACED = (domain_uuid("vm-b, again"), "vm-b")
 
     def _run(self, relists, failing=frozenset(), active=frozenset(),
-             missing=False, mirror=""):
-        """vm-a, then vm-b, each read as listed first; the *failing*
-        ``(query, domain)`` pairs fail. Each listing after the first
-        answers the next of *relists*: its output, or ``None`` for one that
-        fails. vm-b's disk carries *mirror*, and it has a CD-ROM that no
-        longer exists when *missing*."""
+             missing=False, unprobed=False, mirror="", first=None):
+        """vm-a, then vm-b, each read as listed first (or as *first* says,
+        raw); the *failing* ``(query, domain)`` pairs fail. Each listing
+        after the first answers the next of *relists*: the domains it
+        lists, its raw output, or ``None`` for one that fails. vm-b's disk
+        carries *mirror*; it has a CD-ROM that no longer exists when
+        *missing*, and a second disk, spelled with ``..``, whose chain
+        cannot be read when *unprobed*."""
         calls = []
         relists = iter(relists)
         blk_b = (TestDiskPathsInUse.HEADER
                  + " file   disk     vda      /ws/b.qcow2\n"
+                 + (" file   disk     vdb      /ws/heads/../b2.qcow2\n"
+                    if unprobed else "")
                  + (" file   cdrom    sda      /ws/gone.iso\n"
                     if missing else ""))
         live = ("<domain><devices><disk type='file' device='disk'>"
@@ -1429,12 +1444,14 @@ class TestInUseWhileDomainsGoAway:
                 if "--all" not in args:
                     return _result(stdout="".join(f"{d}\n" for d in active))
                 if sum(c[:2] == ("list", "--all") for c in calls) == 1:
-                    return _result(stdout="vm-a\nvm-b\n")
+                    return _result(stdout=first if first is not None
+                                   else domain_listing(args, "vm-a", "vm-b"))
                 answer = next(relists)
                 if answer is None:
                     return _result(ok=False, stderr="error: failed to "
                                    "connect to the hypervisor")
-                return _result(stdout=answer)
+                return _result(stdout=answer if isinstance(answer, str)
+                               else domain_listing(args, *answer))
             if (args[0], args[1]) in failing:
                 return _result(ok=False, stderr=f"error: failed to get "
                                f"domain '{args[1]}'")
@@ -1464,35 +1481,67 @@ class TestInUseWhileDomainsGoAway:
             return _session({}).disk_paths_in_use(), calls
 
     @pytest.mark.parametrize("failure", FAILURES)
-    def test_a_domain_gone_since_is_skipped(self, captured_logs, failure):
-        """... with what was read of it before (its disk), and no warning:
-        a teardown that removes nothing of it has nothing to report."""
-        in_use, _ = self._run(["vm-a\n"], **self.FAILURES[failure])
+    def test_a_domain_gone_since_is_skipped(self, captured_logs, tmp_path,
+                                            failure):
+        """... with what was read of it before -- its disk, and the image
+        below it, by identity too -- and no warning: a teardown that removes
+        nothing of it has nothing to report."""
+        base = tmp_path / "b-base.qcow2"
+        base.write_bytes(b"")
+        self.CHAINS = dict(self.CHAINS, **{"/ws/b.qcow2": (
+            f'[{{"filename": "/ws/b.qcow2", "full-backing-filename": '
+            f'"{base}"}}, {{"filename": "{base}"}}]')})
+
+        in_use, _ = self._run([("vm-a",)], **self.FAILURES[failure])
 
         assert in_use == self.A_ONLY
+        assert in_use.identities == {}
         assert not [r for r in captured_logs.records if r.levelno >= 30]
 
     @pytest.mark.parametrize("failure", FAILURES)
-    def test_a_domain_still_listed_fails_the_scan(self, failure):
+    @pytest.mark.parametrize("listed", [("vm-a", "vm-b"), ("vm-a", REPLACED)],
+                             ids=["still there", "replaced"])
+    def test_a_domain_still_listed_fails_the_scan(self, failure, listed):
         """... whether it never went -- a running domain undefined
-        meanwhile stays listed, transient -- or was defined again under the
-        same name: whatever the failed query's error says."""
-        in_use, _ = self._run(["vm-a\nvm-b\n"], **self.FAILURES[failure])
+        meanwhile stays listed, transient -- or a new one was defined under
+        its name: whatever the failed query's error says."""
+        in_use, _ = self._run([listed], **self.FAILURES[failure])
 
         assert in_use is None
 
     @pytest.mark.parametrize("failure", FAILURES)
-    def test_a_listing_that_fails_fails_the_scan(self, failure):
-        in_use, _ = self._run([None], **self.FAILURES[failure])
+    def test_a_domain_renamed_since_fails_the_scan(self, captured_logs,
+                                                   failure):
+        """virsh domrename keeps a domain and its disks under a name the
+        scan never read: its UUID tells it from a deleted one, and the scan
+        fails, naming both names (review round 8, 1)."""
+        in_use, _ = self._run([("vm-a", self.RENAMED)],
+                              **self.FAILURES[failure])
 
         assert in_use is None
+        assert "domain vm-b was renamed vm-renamed" in captured_logs.text
+
+    @pytest.mark.parametrize("failure", FAILURES)
+    @pytest.mark.parametrize("relist", [None, "vm-a\n"],
+                             ids=["fails", "names without UUIDs"])
+    def test_a_listing_that_cannot_tell_fails_the_scan(self, failure, relist):
+        in_use, _ = self._run([relist], **self.FAILURES[failure])
+
+        assert in_use is None
+
+    def test_a_domain_list_without_uuids_fails_the_scan(self, captured_logs):
+        """The UUIDs are what tell a renamed domain from a deleted one."""
+        in_use, _ = self._run([], first="vm-a\nvm-b\n")
+
+        assert in_use is None
+        assert "could not read the domain list" in captured_logs.text
 
     def test_each_failure_lists_anew(self):
         """vm-b is still listed when vm-a is found gone, and goes away
         before its own query: a listing older than a failure cannot tell."""
         in_use, calls = self._run(
-            ["vm-b\n", ""], failing={("domblklist", "vm-a"),
-                                     ("domblklist", "vm-b")})
+            [("vm-b",), ()], failing={("domblklist", "vm-a"),
+                                      ("domblklist", "vm-b")})
 
         assert in_use == {}
         assert sum(c[:2] == ("list", "--all") for c in calls) == 3
@@ -1520,6 +1569,49 @@ class TestInUseWhileDomainsGoAway:
         st = os.stat(base)
         assert in_use[os.path.realpath(base)] == "vm-a"
         assert in_use.identities[(st.st_dev, st.st_ino)] == "vm-a"
+
+
+class TestListedDomains:
+    """virsh list --all --uuid --name as the in-use scan reads it: a
+    '<uuid> <name>' line each, and a blank line to end, as libvirt 10
+    prints it; blanks around a name, as a padded column would add, are not
+    part of it (#213 review round 8, 1)."""
+
+    U1 = "f31f8d03-3f19-4853-ab40-477fd927d42f"
+    U2 = "54c8095d-b626-4cbf-a728-157b24f16c94"
+
+    @staticmethod
+    def _read(output):
+        from boxman.providers.libvirt.session import _listed_domains
+        return _listed_domains(output)
+
+    def test_each_name_and_uuid_in_the_order_listed(self):
+        output = (f"{self.U1} vm-a{' ' * 26}\n"
+                  f"{self.U2} a-name-longer-than-thirty-columns\n"
+                  "\n")
+
+        assert self._read(output) == [
+            ("vm-a", self.U1), ("a-name-longer-than-thirty-columns", self.U2)]
+
+    def test_a_name_with_a_space_is_one_name(self):
+        assert self._read(f"{self.U1} my vm{' ' * 25}\n") == [
+            ("my vm", self.U1)]
+
+    def test_a_wider_gap_before_the_name_is_not_part_of_it(self):
+        assert self._read(f"{self.U1}   vm-a\n") == [("vm-a", self.U1)]
+
+    def test_a_uuid_is_read_in_lower_case(self):
+        assert self._read(f"{self.U1.upper()} vm-a\n") == [("vm-a", self.U1)]
+
+    def test_no_domains(self):
+        assert self._read("\n") == []
+
+    @pytest.mark.parametrize("line", [
+        "vm-a", "vm a", U1, f"{U1[:-1]} vm-a", f"{U1}x vm-a"],
+        ids=["a name", "a name with a space", "a uuid", "a short uuid",
+             "a long uuid"])
+    def test_a_line_that_is_not_a_uuid_and_a_name(self, line):
+        assert self._read(f"{self.U2} vm-b\n{line}\n") is None
 
 
 class TestAbsenceProbe:
@@ -1635,8 +1727,9 @@ class TestSourcesGoneFromTheHost:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
-                return _result(stdout="vm-b\n" if "--all" in args
-                               or state != "shut off" else "")
+                return _result(stdout=domain_listing(args, "vm-b")
+                               if "--all" in args or state != "shut off"
+                               else "")
             if args[0] == "domstate":
                 return _result(stdout=f"{state}\n")
             if args[0] == "dumpxml":
@@ -1658,7 +1751,8 @@ class TestSourcesGoneFromTheHost:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
-                return _result(stdout="vm-b\n" if "--all" in args else "")
+                return _result(stdout=domain_listing(args, "vm-b")
+                               if "--all" in args else "")
             return _result(stdout=blk)
 
         with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:

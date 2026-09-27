@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shlex
 import tempfile
 import time
@@ -45,10 +46,45 @@ from .virsh_parse import (
 _ABSENT = "boxman-source-absent"
 
 
+#: a domain's UUID, as ``virsh list --uuid`` prints it
+_UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+                   re.IGNORECASE)
+
+
+def _listed_domains(output: str) -> list[tuple[str, str]] | None:
+    """
+    The ``(name, uuid)`` of every domain ``virsh list --uuid --name``
+    printed in *output* — one ``<uuid> <name>`` line each, and a blank
+    line to end them on libvirt 10; blanks around a name are not part of
+    it — in the order listed, the UUID in lower case; ``None`` when a line
+    is not one.
+    """
+    listed = []
+    for line in output.splitlines():
+        uid, _, name = line.strip().partition(" ")
+        if not uid:
+            continue
+        name = name.strip()
+        if not _UUID.fullmatch(uid) or not name:
+            return None
+        listed.append((name, uid.lower()))
+    return listed
+
+
 class _DomainGoneError(Exception):
     """A domain went away during the in-use scan: what it uses could not
-    be told, and a listing taken since no longer names it
+    be told, and a listing taken since names neither it nor its UUID
     (:meth:`LibVirtSession._raise_if_gone`)."""
+
+
+class _DomainRenamedError(Exception):
+    """A domain was renamed during the in-use scan: what it uses could not
+    be told, and a listing taken since names its UUID under another name,
+    :attr:`name` (:meth:`LibVirtSession._raise_if_gone`)."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.name = name
 
 
 def _live_disks(domain: ET.Element, source: str) -> list[ET.Element]:
@@ -891,7 +927,8 @@ class LibVirtSession(SessionConfigMixin):
         For a transient domain ``--inactive`` reports its one definition
         (libvirt 10.0), so the same two queries cover it.
 
-        Fails closed: ``None`` when the domain list, either inventory of
+        Fails closed: ``None`` when the domain list (``virsh list --all
+        --uuid --name``: each domain's name and UUID), either inventory of
         any domain, or any backing chain cannot be read, or reads as
         incomplete — a partial answer would let a caller delete a file that
         is still in use. An explicitly empty slot (``-``) is not a source,
@@ -916,13 +953,16 @@ class LibVirtSession(SessionConfigMixin):
         A domain can go away while the scan runs: ``deprovision`` tears
         VMs down in parallel, and a sibling's teardown undefines it after
         the listing. Once what a domain uses cannot be told — its
-        inventory, its state or its live definition cannot be read, or what
-        that definition names cannot be followed — and a fresh, successful
-        listing taken since no longer names it, it holds nothing and is
-        skipped, with whatever was read of it (:meth:`_raise_if_gone`).
-        One still listed — a running domain undefined meanwhile stays
-        listed, transient, until it stops — or a listing that fails still
-        fails the scan.
+        inventory, its state or its live definition cannot be read, or the
+        chain of a source, or what that definition names, cannot be
+        followed — and a fresh, successful listing taken since names
+        neither it nor its UUID, it holds nothing and is skipped, with
+        whatever was read of it (:meth:`_raise_if_gone`). One still listed
+        — a running domain undefined meanwhile stays listed, transient,
+        until it stops — or a listing that fails still fails the scan, and
+        so does one renamed meanwhile (``virsh domrename``: its UUID listed
+        under another name), which keeps its disks under a name the scan
+        never read.
 
         Every file is recorded by its identity too, ``(st_dev, st_ino)``
         read host-side (:attr:`FilesInUse.identities`), so a teardown
@@ -932,8 +972,17 @@ class LibVirtSession(SessionConfigMixin):
         scan: it could be any file.
         """
         virsh = VirshCommand(provider_config=self.provider_config)
-        listing = virsh.execute("list", "--all", "--name", warn=True)
+        listing = virsh.execute("list", "--all", "--uuid", "--name",
+                                warn=True)
         if not listing.ok:
+            return None
+        domains = _listed_domains(listing.stdout)
+        if domains is None:
+            self.logger.warning(
+                "could not read the domain list: virsh list --all --uuid "
+                "--name printed a line that is not a UUID and a name, so no "
+                "teardown can tell which files other domains use, and each "
+                "keeps them all")
             return None
         running = virsh.execute("list", "--name", warn=True)
         if not running.ok:
@@ -946,17 +995,22 @@ class LibVirtSession(SessionConfigMixin):
         active = {line.strip() for line in running.stdout.splitlines()}
         cmd = LibVirtCommandBase(provider_config=self.provider_config)
         in_use = FilesInUse()
-        for domain in (line.strip() for line in listing.stdout.splitlines()):
-            if not domain:
-                continue
+        for domain, uuid in domains:
             try:
-                used = self._files_used_by(virsh, cmd, domain,
+                used = self._files_used_by(virsh, cmd, domain, uuid,
                                            domain in active)
             except _DomainGoneError:
                 self.logger.debug(
                     f"domain {domain} went away during the in-use scan, so "
                     f"it holds nothing")
                 continue
+            except _DomainRenamedError as renamed:
+                self.logger.warning(
+                    f"domain {domain} was renamed {renamed.name} while the "
+                    f"in-use scan read it, so what it uses was not read: no "
+                    f"teardown can tell which files other domains use, and "
+                    f"each keeps them all — retry")
+                return None
             if used is None:
                 return None
             for path, owner in used.items():
@@ -965,22 +1019,24 @@ class LibVirtSession(SessionConfigMixin):
                 in_use.identities.setdefault(identity, owner)
         return in_use
 
-    def _files_used_by(self, virsh, cmd, domain: str,
+    def _files_used_by(self, virsh, cmd, domain: str, uuid: str,
                        active: bool) -> FilesInUse | None:
         """
-        What *domain* uses, as :meth:`disk_paths_in_use` maps it; its block
-        jobs too when it is *active*.
+        What *domain*, whose UUID is *uuid*, uses, as
+        :meth:`disk_paths_in_use` maps it; its block jobs too when it is
+        *active*.
 
         Returns:
             The map, or ``None`` when it cannot be told.
 
         Raises:
-            _DomainGoneError: What it uses could not be told, and a listing
-                taken since no longer names it (:meth:`_raise_if_gone`).
+            _DomainGoneError, _DomainRenamedError: What it uses could not be
+                told, and *domain* went away or was renamed since
+                (:meth:`_raise_if_gone`).
         """
         rows = self.vm_storage_devices(domain)
         if rows is None:
-            self._raise_if_gone(virsh, domain)
+            self._raise_if_gone(virsh, domain, uuid)
             return None
         sources = {row.source for row in rows
                    if row.type not in REMOTE_SOURCE_TYPES
@@ -992,8 +1048,11 @@ class LibVirtSession(SessionConfigMixin):
             chain = self._backing_chain_files(cmd, source)
             if chain is None:
                 if not self._source_absent(source):
+                    # not proved absent — which a source spelled otherwise
+                    # than normalised never is — so possibly there
+                    self._raise_if_gone(virsh, domain, uuid)
                     return None
-                held = self._held_below(virsh, domain, source,
+                held = self._held_below(virsh, domain, uuid, source,
                                         source in volumes, live)
                 if held is None:
                     return None
@@ -1017,34 +1076,44 @@ class LibVirtSession(SessionConfigMixin):
             if not self._record_in_use(used, domain, chain):
                 return None
         if active:
-            jobs = self._block_job_files(virsh, cmd, domain, live)
+            jobs = self._block_job_files(virsh, cmd, domain, uuid, live)
             if jobs is None:
                 return None
             if not self._record_in_use(used, domain, jobs):
                 return None
         return used
 
-    def _raise_if_gone(self, virsh, domain: str) -> None:
+    def _raise_if_gone(self, virsh, domain: str, uuid: str) -> None:
         """
         Raise :class:`_DomainGoneError` when a fresh, successful ``virsh list
-        --all --name`` no longer names *domain*.
+        --all --uuid --name`` names neither *domain* nor its *uuid*, and
+        :class:`_DomainRenamedError` when it names that UUID under another
+        name.
 
         Asked once something about *domain* could not be read, so the
-        listing is newer than that failure: a domain it does not name has
-        neither a definition nor a process — one undefined while it runs
-        becomes transient and stays listed until it stops — and holds
-        nothing. One still named, or a listing that fails, proves nothing,
-        and the caller fails closed. Every failure lists anew, never
-        reusing an answer: an earlier listing could miss a domain defined
-        again under the same name since, which must count as there. That a
-        domain is gone is never read from an error's text.
+        listing is newer than that failure: a domain it does not name, by
+        name or UUID, has neither a definition nor a process — one
+        undefined while it runs becomes transient and stays listed until
+        it stops — and holds nothing. Renamed (``virsh domrename``), it is
+        the same domain with the same disks under a name the scan never
+        read. One still named — or a new domain defined under that name —
+        or a listing that fails or cannot be read, proves nothing, and the
+        caller fails closed. Every failure lists anew, never reusing an
+        answer: an earlier listing could miss a domain defined again under
+        the same name since, which must count as there. That a domain is
+        gone is never read from an error's text.
         """
-        listing = virsh.execute("list", "--all", "--name", warn=True)
+        listing = virsh.execute("list", "--all", "--uuid", "--name",
+                                warn=True)
         if not listing.ok:
             return
-        if domain not in {line.strip()
-                          for line in listing.stdout.splitlines()}:
-            raise _DomainGoneError(domain)
+        listed = _listed_domains(listing.stdout)
+        if listed is None or domain in {name for name, _ in listed}:
+            return
+        renamed = [name for name, uid in listed if uid == uuid]
+        if renamed:
+            raise _DomainRenamedError(renamed[0])
+        raise _DomainGoneError(domain)
 
     def _record_in_use(self, in_use: FilesInUse, domain: str,
                        paths: list[str]) -> bool:
@@ -1070,10 +1139,11 @@ class LibVirtSession(SessionConfigMixin):
             in_use.identities.setdefault((st.st_dev, st.st_ino), domain)
         return True
 
-    def _block_job_files(self, virsh, cmd, domain: str,
+    def _block_job_files(self, virsh, cmd, domain: str, uuid: str,
                          live: dict[str, ET.Element | None]) -> list[str] | None:
         """
-        The files the block jobs of *domain*, an active domain, hold.
+        The files the block jobs of *domain*, an active domain whose UUID
+        is *uuid*, hold.
 
         A block job can write into a destination no inventory lists (a
         block copy's target): the ``<mirror>`` of its disk in the live
@@ -1088,12 +1158,12 @@ class LibVirtSession(SessionConfigMixin):
             mirror names no file, or a destination's chain cannot be read.
 
         Raises:
-            _DomainGoneError: They cannot be told, and *domain* went away
-                (:meth:`_raise_if_gone`).
+            _DomainGoneError, _DomainRenamedError: They cannot be told, and
+                *domain* went away or was renamed (:meth:`_raise_if_gone`).
         """
         definition = self._live_definition(virsh, domain, live)
         if definition is None:
-            self._raise_if_gone(virsh, domain)
+            self._raise_if_gone(virsh, domain, uuid)
             self.logger.warning(
                 f"could not read the live definition of domain {domain}, "
                 f"which names the files a block job on it holds: no teardown "
@@ -1111,7 +1181,7 @@ class LibVirtSession(SessionConfigMixin):
             destination = mirror.get("file") or (
                 None if own is None else own.get("file") or own.get("dev"))
             if not destination:
-                self._raise_if_gone(virsh, domain)
+                self._raise_if_gone(virsh, domain, uuid)
                 self.logger.warning(
                     f"a block job on domain {domain} (disk {dev}) holds a "
                     f"destination its live definition names no file for: no "
@@ -1121,7 +1191,7 @@ class LibVirtSession(SessionConfigMixin):
                 return None
             chain = self._backing_chain_files(cmd, destination)
             if chain is None:
-                self._raise_if_gone(virsh, domain)
+                self._raise_if_gone(virsh, domain, uuid)
                 self.logger.warning(
                     f"a block job on domain {domain} holds {destination} "
                     f"(disk {dev}), whose backing chain could not be read: no "
@@ -1271,11 +1341,12 @@ class LibVirtSession(SessionConfigMixin):
             chains[source] = chain
         return chains
 
-    def _held_below(self, virsh, domain: str, missing: str, volume: bool,
+    def _held_below(self, virsh, domain: str, uuid: str, missing: str,
+                    volume: bool,
                     live: dict[str, ET.Element | None]) -> list[str] | None:
         """
-        The files *domain* holds open below *missing*, one of its sources
-        confirmed absent.
+        The files *domain*, whose UUID is *uuid*, holds open below
+        *missing*, one of its sources confirmed absent.
 
         None, if it is positively shut off. Otherwise QEMU can hold the
         unlinked image open together with the images below it: exactly the
@@ -1295,8 +1366,8 @@ class LibVirtSession(SessionConfigMixin):
             volume (*volume*), or its recorded chain cannot be followed.
 
         Raises:
-            _DomainGoneError: They cannot be told, and *domain* went away
-                (:meth:`_raise_if_gone`).
+            _DomainGoneError, _DomainRenamedError: They cannot be told, and
+                *domain* went away or was renamed (:meth:`_raise_if_gone`).
         """
         result = virsh.execute("domstate", domain, warn=True)
         state = (result.stdout or "").strip() if result.ok else ""
@@ -1319,7 +1390,7 @@ class LibVirtSession(SessionConfigMixin):
                     held.extend(f for f in files if f not in held)
                 else:
                     return held
-        self._raise_if_gone(virsh, domain)
+        self._raise_if_gone(virsh, domain, uuid)
         self.logger.warning(
             f"domain {domain} is {state or 'in an unknown state'} with "
             f"{missing} attached, which no longer exists, and {why}: QEMU "
