@@ -689,11 +689,13 @@ class _Admission:
                 and self._refused_ids.isdisjoint(self._identities.of(path))):
             self.admitted.setdefault(resolved, path)
 
-    def refuse(self, path: str, reason: str) -> None:
-        for key in self._same_file(path):
-            del self.admitted[key]
+    def refuse(self, path: str, reason: str) -> list[str]:
+        """Keep the file *path* names, under every name it was admitted by;
+        returns those names (withdrawn from the admitted)."""
+        withdrawn = [self.admitted.pop(key) for key in self._same_file(path)]
         self._refused_ids.update(self._identities.of(path))
         self.refused.setdefault(os.path.realpath(path), (path, reason))
+        return withdrawn
 
     def is_admitted(self, path: str) -> bool:
         """Admitted under this resolved path. A chain counts as whole only
@@ -954,38 +956,63 @@ def remove_vm_storage(
             _refuse_incomplete_chains(chains, admission)
 
     # -- removal, heads first ------------------------------------------------
-    # (by resolved path: a layer named otherwise than the file admitted is
-    # never admitted, so the chain-whole rule kept that chain already)
+    # (ordered by resolved path: a layer named otherwise than the file
+    # admitted is never admitted, so the chain-whole rule kept that chain)
     resolved_chains = [[real(layer) for layer in layers]
                        for layers in (chains or {}).values()]
     depth: dict[str, int] = {}
     for layers in resolved_chains:
         for index, layer in enumerate(layers):
             depth[layer] = max(depth.get(layer, 0), index)
+    unlinked: set[str] = set()
+
+    def keep_below(kept: list[str]) -> None:
+        """
+        A kept layer keeps everything below it, under every name — applied
+        before anything else is unlinked. For each chain holding a file
+        just kept (by resolved path or identity; never a layer already
+        unlinked, which holds nothing up), every admitted layer below it is
+        refused; each refusal withdraws the names that file was admitted
+        by, which are followed in turn.
+        """
+        work, seen = list(kept), set()
+        while work:
+            path = work.pop()
+            if path in seen:
+                continue
+            seen.add(path)
+            resolved, ids = real(path), identities.of(path)
+            for layers in (chains or {}).values():
+                for index, layer in enumerate(layers):
+                    if real(layer) in unlinked or not (
+                            real(layer) == resolved
+                            or not ids.isdisjoint(identities.of(layer))):
+                        continue
+                    for below in layers[index + 1:]:
+                        if admission.is_admitted_as(below):
+                            work.extend(admission.refuse(
+                                below, "a layer above it in its backing "
+                                       "chain is kept"))
+
     for resolved in sorted(admission.admitted, key=lambda r: depth.get(r, 0)):
         path = admission.admitted.get(resolved)
         if path is None:
-            continue     # kept meanwhile: a layer above it was replaced
+            continue     # kept meanwhile, with a layer above it
         result, where = remove_if_unchanged(
             path, inventory.identities.get(path))
         if result == "removed":
             log.info(f"removed {path} (vm {vm})")
             outcome.removed.append(path)
             del admission.admitted[resolved]
+            unlinked.add(resolved)
         elif result == "gone":
             del admission.admitted[resolved]
+            unlinked.add(resolved)
         else:
-            admission.refuse(path,
-                             "it was replaced after the vm was inspected"
-                             if result == "restored" else _stranded(where))
-            for layers in resolved_chains:
-                if resolved in layers:
-                    for below in layers[layers.index(resolved) + 1:]:
-                        if below in admission.admitted:
-                            admission.refuse(
-                                admission.admitted[below],
-                                "a layer above it in its backing chain was "
-                                "replaced after the vm was inspected")
+            withdrawn = admission.refuse(
+                path, "it was replaced after the vm was inspected"
+                if result == "restored" else _stranded(where))
+            keep_below([path, *withdrawn])
 
     # the kept list decides whether the saved inventory and its locator go
     # (_teardown_vm), so only a file confirmed gone leaves it

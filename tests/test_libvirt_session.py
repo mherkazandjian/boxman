@@ -1017,6 +1017,41 @@ class TestInUseWithAMissingSource:
         assert why in captured_logs.text
         assert "/ws/gone.qcow2" in captured_logs.text
 
+    def test_every_live_disk_with_the_source_is_examined(
+            self, captured_logs):
+        """#208 review round 6, 2: the same missing source on two live
+        disks, a block copy on the second."""
+        disks = ("<devices><disk type='file' device='disk'>"
+                 "<source file='/ws/gone.qcow2' index='1'/><backingStore/>"
+                 "<target dev='vdb'/></disk>"
+                 "<disk type='file' device='disk'>"
+                 "<source file='/ws/gone.qcow2' index='3'/><backingStore/>"
+                 "<mirror type='file' job='copy'><source file='/ws/c.qcow2'/>"
+                 "</mirror><target dev='vdc'/></disk></devices>")
+
+        in_use, _ = self._run("running", live=f"<domain>{disks}</domain>")
+
+        assert in_use is None
+        assert "block job" in captured_logs.text
+
+    def test_the_files_every_such_disk_holds_are_all_mapped(self, tmp_path):
+        one, two = tmp_path / "one.qcow2", tmp_path / "two.qcow2"
+        one.write_bytes(b"one")
+        two.write_bytes(b"two")
+        live = ("<domain><devices><disk type='file' device='disk'>"
+                "<source file='/ws/gone.qcow2' index='1'/>"
+                + self._level(one) + "<target dev='vdb'/></disk>"
+                "<disk type='file' device='disk'>"
+                "<source file='/ws/gone.qcow2' index='3'/>"
+                + self._level(two) + "<target dev='vdc'/></disk>"
+                "</devices></domain>")
+
+        in_use, _ = self._run("running", live=live)
+
+        assert in_use == {"/ws/b.qcow2": "vm-b",
+                          os.path.realpath(one): "vm-b",
+                          os.path.realpath(two): "vm-b"}
+
     def test_a_live_definition_that_cannot_be_dumped_fails_the_scan(
             self, captured_logs):
         in_use, _ = self._run("running", dump_ok=False)

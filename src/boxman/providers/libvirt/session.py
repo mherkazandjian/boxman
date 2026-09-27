@@ -45,14 +45,13 @@ from .virsh_parse import (
 _ABSENT = "boxman-source-absent"
 
 
-def _live_disk(domain: ET.Element, source: str) -> ET.Element | None:
-    """The ``<disk>`` of a domain definition whose own ``<source>`` names
-    *source* (its ``file`` or ``dev``)."""
-    for disk in domain.findall("./devices/disk"):
-        own = disk.find("source")
-        if own is not None and source in (own.get("file"), own.get("dev")):
-            return disk
-    return None
+def _live_disks(domain: ET.Element, source: str) -> list[ET.Element]:
+    """Every ``<disk>`` of a domain definition whose own ``<source>``
+    names *source* (its ``file`` or ``dev``): libvirt lets two read-only
+    disks share one, and a block job run on either."""
+    return [disk for disk in domain.findall("./devices/disk")
+            if (own := disk.find("source")) is not None
+            and source in (own.get("file"), own.get("dev"))]
 
 
 def _backing_store_files(disk: ET.Element) -> tuple[list[str] | None, str]:
@@ -1102,11 +1101,11 @@ class LibVirtSession(SessionConfigMixin):
 
         None, if it is positively shut off. Otherwise QEMU can hold the
         unlinked image open together with the images below it: exactly the
-        backing chain libvirt records for that disk in the domain's live
-        definition (:func:`_backing_store_files`; ``virsh dumpxml``, read
-        once per domain into *live*), or nothing when the live definition
-        does not have that source at all — only the persistent one, which
-        QEMU does not hold. The state is asked only once the absence is
+        backing chains libvirt records in the domain's live definition for
+        every disk with that source (:func:`_backing_store_files`; ``virsh
+        dumpxml``, read once per domain into *live*), all of them — or
+        nothing when no live disk has that source, only the persistent
+        definition, which QEMU does not hold. The state is asked only once the absence is
         confirmed, which makes it safe to act on: a domain that starts
         after this cannot open a path that no longer exists, and one that
         stopped before has released its files.
@@ -1136,11 +1135,13 @@ class LibVirtSession(SessionConfigMixin):
             if live[domain] is None:
                 why = "its live definition could not be read"
             else:
-                disk = _live_disk(live[domain], missing)
-                if disk is None:
-                    return []
-                held, why = _backing_store_files(disk)
-                if held is not None:
+                held: list[str] = []
+                for disk in _live_disks(live[domain], missing):
+                    files, why = _backing_store_files(disk)
+                    if files is None:
+                        break
+                    held.extend(f for f in files if f not in held)
+                else:
                     return held
         self.logger.warning(
             f"domain {domain} is {state or 'in an unknown state'} with "

@@ -2096,6 +2096,89 @@ class TestTheSameFileUnderAnotherName:
 
         assert base.exists() and head.exists()
 
+    @needs_qemu_img
+    def test_a_head_kept_by_another_names_refusal_keeps_its_own_base(
+            self, tmp_path):
+        """Codex's case (#208 review round 6, 1): one head, hard-linked
+        into two workdirs, whose relative backing name resolves to a
+        different base in each. Replacing it under one name keeps it under
+        both -- and each name's own base with it."""
+        a, b = tmp_path / 'a', tmp_path / 'b'
+        base_a = _image(a / f'{VM}.qcow2')
+        base_b = _image(b / f'{VM}.qcow2')
+        head_a = a / f'{VM}.s1'
+        subprocess.run(['qemu-img', 'create', '-q', '-f', 'qcow2', '-b',
+                        f'{VM}.qcow2', '-F', 'qcow2', str(head_a)],
+                       check=True)
+        head_b = _link(head_a, b / f'{VM}.s1')
+        t = _Teardown(a, disks=[head_a, head_b], records=[])
+        t.mgr.config['clusters']['cluster_2'] = {'workdir': str(b)}
+        _production_chains(t)
+
+        def replace(*_args, **_kwargs):
+            fresh = a / 'fresh'
+            fresh.write_bytes(b'someone else')
+            fresh.replace(head_a)
+
+        t.session.destroy_vm.side_effect = replace
+
+        t.update_remove()
+
+        assert head_a.read_bytes() == b'someone else'
+        assert base_a.exists() and head_b.exists() and base_b.exists()
+        chain = subprocess.run(['qemu-img', 'info', '--backing-chain', '-U',
+                                str(head_b)], capture_output=True)
+        assert chain.returncode == 0, chain.stderr
+
+    def test_a_name_already_unlinked_holds_nothing_up(self, tmp_path):
+        """The head's first name is unlinked before its second is found
+        replaced: the first name's base no longer holds anything up, and
+        goes; the second keeps its own."""
+        a, b = tmp_path / 'a', tmp_path / 'b'
+        base_a, base_b = _qcow2(a / f'{VM}.qcow2'), _qcow2(b / f'{VM}.qcow2')
+        head_a = _qcow2(a / f'{VM}.s1')
+        head_b = _link(head_a, b / f'{VM}.s1')
+        t = _Teardown(a, disks=[head_a, head_b], records=[])
+        t.mgr.config['clusters']['cluster_2'] = {'workdir': str(b)}
+        t.session.backing_chains.side_effect = _live(
+            {head_a: [head_a, base_a], head_b: [head_b, base_b]})
+
+        def replace(*_args, **_kwargs):
+            fresh = b / 'fresh'
+            fresh.write_bytes(b'QFI\xfb someone else')
+            fresh.replace(head_b)
+
+        t.session.destroy_vm.side_effect = replace
+
+        t.update_remove()
+
+        assert not head_a.exists() and not base_a.exists()
+        assert head_b.read_bytes() == b'QFI\xfb someone else'
+        assert base_b.exists()
+
+    def test_a_layer_kept_by_withdrawal_keeps_what_is_below_it_too(
+            self, tmp_path):
+        """Transitively: a kept head keeps its middle layer, whose other
+        name heads another chain -- which keeps its own base."""
+        a1, a2 = _qcow2(tmp_path / f'{VM}.a1'), _qcow2(tmp_path / f'{VM}.a2')
+        b1 = _link(a2, tmp_path / f'{VM}.b1')
+        b2 = _qcow2(tmp_path / f'{VM}.b2')
+        t = _Teardown(tmp_path, disks=[a1, b1], records=[])
+        t.session.backing_chains.side_effect = _live({a1: [a1, a2],
+                                                      b1: [b1, b2]})
+
+        def replace(*_args, **_kwargs):
+            fresh = tmp_path / 'fresh'
+            fresh.write_bytes(b'QFI\xfb someone else')
+            fresh.replace(a1)
+
+        t.session.destroy_vm.side_effect = replace
+
+        t.deprovision()
+
+        assert a1.read_bytes() == b'QFI\xfb someone else'
+        assert a2.exists() and b1.exists() and b2.exists()
+
     def test_a_data_disks_file_is_never_decided_by_another_name(
             self, tmp_path):
         """Extra-disk files are never decided by name -- nor under another
@@ -2181,6 +2264,55 @@ class TestRunningDomainWithAMissingSource:
     """Another domain still running with a deleted image attached can hold
     it open in QEMU together with the images below it: a base of it that
     still exists must not read as unused (#208 review round 4, 2)."""
+
+    @needs_qemu_img
+    def test_a_mirror_on_a_second_disk_with_the_same_source_keeps_all(
+            self, tmp_path):
+        """#208 review round 6, 2: the same deleted head on two live disks,
+        a block copy running on the second into a file under this VM's
+        names. The scan cannot tell what that domain holds, so it fails,
+        and the copy's destination is kept."""
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        destination = _qcow2(tmp_path / f'{VM}.copy.qcow2')
+        base = _image(tmp_path / 'other' / 'base.qcow2')
+        head = _image(tmp_path / 'other' / 'head.qcow2', backing=base)
+        head.unlink()
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        blk = (" Type   Device   Target   Source\n"
+               "------------------------------------\n"
+               f" file   disk     vda      {head}\n"
+               f" file   disk     vdb      {head}\n")
+        chain = ("<backingStore type='file' index='2'><format type='qcow2'/>"
+                 f"<source file='{base}'/><backingStore/></backingStore>")
+        live = ("<domain><devices>"
+                "<disk type='file' device='disk'>"
+                f"<source file='{head}' index='1'/>{chain}"
+                "<target dev='vda'/><readonly/></disk>"
+                "<disk type='file' device='disk'>"
+                f"<source file='{head}' index='3'/>{chain}"
+                "<mirror type='file' job='copy' ready='yes'>"
+                f"<format type='qcow2'/><source file='{destination}'/>"
+                "</mirror><target dev='vdb'/><readonly/></disk>"
+                "</devices></domain>")
+
+        def virsh_execute(*args, **kwargs):
+            if args[0] == 'list':
+                return _virsh_result('vm-other\n')
+            if args[0] == 'domstate':
+                return _virsh_result('running\n')
+            if args[0] == 'dumpxml':
+                return _virsh_result(live)
+            return _virsh_result(blk)
+
+        real = LibVirtSession(config={'provider': {'libvirt': {}}})
+        t.session.disk_paths_in_use.side_effect = real.disk_paths_in_use
+        with patch('boxman.providers.libvirt.session.VirshCommand') as virsh:
+            virsh.return_value.execute.side_effect = virsh_execute
+            t.deprovision()
+
+        assert destination.exists() and boot.exists()
+        assert (f'left {destination} in place because could not check '
+                f'whether another domain uses it') in t.warnings
 
     @needs_qemu_img
     def test_the_base_of_an_unlinked_head_it_holds_is_kept(self, tmp_path):
