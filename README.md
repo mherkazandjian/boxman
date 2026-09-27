@@ -872,7 +872,10 @@ Details worth knowing:
   with the images below it: it protects exactly the backing chain libvirt
   says it holds, and only when libvirt cannot say (no chain recorded, a
   block job running) does every teardown keep everything, named in a
-  warning, until that file is detached or that VM stops. An extra disk
+  warning, until that file is detached or that VM stops. A VM that a
+  parallel teardown undefines while this one checks — `deprovision` tears
+  VMs down in parallel — holds nothing once libvirt no longer lists it.
+  An extra disk
   moved to an overlay by a snapshot goes with its whole chain when every
   layer is provably its own (the disk at its recorded target, the
   recorded base at the bottom, each layer named for it in the same

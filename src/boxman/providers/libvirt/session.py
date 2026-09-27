@@ -45,6 +45,12 @@ from .virsh_parse import (
 _ABSENT = "boxman-source-absent"
 
 
+class _DomainGoneError(Exception):
+    """A domain went away during the in-use scan: what it uses could not
+    be told, and a listing taken since no longer names it
+    (:meth:`LibVirtSession._raise_if_gone`)."""
+
+
 def _live_disks(domain: ET.Element, source: str) -> list[ET.Element]:
     """Every ``<disk>`` of a domain definition whose own ``<source>``
     names *source* (its ``file`` or ``dev``): libvirt lets two read-only
@@ -907,6 +913,17 @@ class LibVirtSession(SessionConfigMixin):
         (:meth:`_block_job_files`); when that list, a live definition or a
         destination's chain cannot be read, the scan fails.
 
+        A domain can go away while the scan runs: ``deprovision`` tears
+        VMs down in parallel, and a sibling's teardown undefines it after
+        the listing. Once what a domain uses cannot be told — its
+        inventory, its state or its live definition cannot be read, or what
+        that definition names cannot be followed — and a fresh, successful
+        listing taken since no longer names it, it holds nothing and is
+        skipped, with whatever was read of it (:meth:`_raise_if_gone`).
+        One still listed — a running domain undefined meanwhile stays
+        listed, transient, until it stops — or a listing that fails still
+        fails the scan.
+
         Every file is recorded by its identity too, ``(st_dev, st_ino)``
         read host-side (:attr:`FilesInUse.identities`), so a teardown
         recognises it under a name no resolved path unifies with its own —
@@ -932,50 +949,102 @@ class LibVirtSession(SessionConfigMixin):
         for domain in (line.strip() for line in listing.stdout.splitlines()):
             if not domain:
                 continue
-            rows = self.vm_storage_devices(domain)
-            if rows is None:
+            try:
+                used = self._files_used_by(virsh, cmd, domain,
+                                           domain in active)
+            except _DomainGoneError:
+                self.logger.debug(
+                    f"domain {domain} went away during the in-use scan, so "
+                    f"it holds nothing")
+                continue
+            if used is None:
                 return None
-            sources = {row.source for row in rows
-                       if row.type not in REMOTE_SOURCE_TYPES
-                       and row.source != '-'}
-            volumes = {row.source for row in rows if row.type == 'volume'}
-            live: dict[str, ET.Element | None] = {}
-            for source in sorted(sources):
-                chain = self._backing_chain_files(cmd, source)
-                if chain is None:
-                    if not self._source_absent(source):
-                        return None
-                    held = self._held_below(virsh, domain, source,
-                                            source in volumes, live)
-                    if held is None:
-                        return None
-                    for path in held:
-                        resolved = os.path.realpath(path)
-                        try:
-                            st = os.stat(resolved)
-                        except FileNotFoundError:
-                            continue      # deleted too: nothing to protect
-                        except OSError as exc:
-                            self.logger.warning(
-                                f"could not read the identity of {path}, "
-                                f"which domain {domain} holds ({exc}): "
-                                f"whether a file a teardown would remove is "
-                                f"that one cannot be told, so each keeps "
-                                f"everything — make it accessible")
-                            return None
-                        in_use.setdefault(resolved, domain)
-                        in_use.identities.setdefault(
-                            (st.st_dev, st.st_ino), domain)
-                    continue
-                if not self._record_in_use(in_use, domain, chain):
-                    return None
-            if domain in active:
-                jobs = self._block_job_files(virsh, cmd, domain, live)
-                if jobs is None:
-                    return None
-                if not self._record_in_use(in_use, domain, jobs):
-                    return None
+            for path, owner in used.items():
+                in_use.setdefault(path, owner)
+            for identity, owner in used.identities.items():
+                in_use.identities.setdefault(identity, owner)
         return in_use
+
+    def _files_used_by(self, virsh, cmd, domain: str,
+                       active: bool) -> FilesInUse | None:
+        """
+        What *domain* uses, as :meth:`disk_paths_in_use` maps it; its block
+        jobs too when it is *active*.
+
+        Returns:
+            The map, or ``None`` when it cannot be told.
+
+        Raises:
+            _DomainGoneError: What it uses could not be told, and a listing
+                taken since no longer names it (:meth:`_raise_if_gone`).
+        """
+        rows = self.vm_storage_devices(domain)
+        if rows is None:
+            self._raise_if_gone(virsh, domain)
+            return None
+        sources = {row.source for row in rows
+                   if row.type not in REMOTE_SOURCE_TYPES
+                   and row.source != '-'}
+        volumes = {row.source for row in rows if row.type == 'volume'}
+        live: dict[str, ET.Element | None] = {}
+        used = FilesInUse()
+        for source in sorted(sources):
+            chain = self._backing_chain_files(cmd, source)
+            if chain is None:
+                if not self._source_absent(source):
+                    return None
+                held = self._held_below(virsh, domain, source,
+                                        source in volumes, live)
+                if held is None:
+                    return None
+                for path in held:
+                    resolved = os.path.realpath(path)
+                    try:
+                        st = os.stat(resolved)
+                    except FileNotFoundError:
+                        continue      # deleted too: nothing to protect
+                    except OSError as exc:
+                        self.logger.warning(
+                            f"could not read the identity of {path}, which "
+                            f"domain {domain} holds ({exc}): whether a file "
+                            f"a teardown would remove is that one cannot be "
+                            f"told, so each keeps everything — make it "
+                            f"accessible")
+                        return None
+                    used.setdefault(resolved, domain)
+                    used.identities.setdefault((st.st_dev, st.st_ino), domain)
+                continue
+            if not self._record_in_use(used, domain, chain):
+                return None
+        if active:
+            jobs = self._block_job_files(virsh, cmd, domain, live)
+            if jobs is None:
+                return None
+            if not self._record_in_use(used, domain, jobs):
+                return None
+        return used
+
+    def _raise_if_gone(self, virsh, domain: str) -> None:
+        """
+        Raise :class:`_DomainGoneError` when a fresh, successful ``virsh list
+        --all --name`` no longer names *domain*.
+
+        Asked once something about *domain* could not be read, so the
+        listing is newer than that failure: a domain it does not name has
+        neither a definition nor a process — one undefined while it runs
+        becomes transient and stays listed until it stops — and holds
+        nothing. One still named, or a listing that fails, proves nothing,
+        and the caller fails closed. Every failure lists anew, never
+        reusing an answer: an earlier listing could miss a domain defined
+        again under the same name since, which must count as there. That a
+        domain is gone is never read from an error's text.
+        """
+        listing = virsh.execute("list", "--all", "--name", warn=True)
+        if not listing.ok:
+            return
+        if domain not in {line.strip()
+                          for line in listing.stdout.splitlines()}:
+            raise _DomainGoneError(domain)
 
     def _record_in_use(self, in_use: FilesInUse, domain: str,
                        paths: list[str]) -> bool:
@@ -1017,9 +1086,14 @@ class LibVirtSession(SessionConfigMixin):
             Their resolved paths, or ``None``, with a warning saying why,
             when they cannot be told: the live definition cannot be read, a
             mirror names no file, or a destination's chain cannot be read.
+
+        Raises:
+            _DomainGoneError: They cannot be told, and *domain* went away
+                (:meth:`_raise_if_gone`).
         """
         definition = self._live_definition(virsh, domain, live)
         if definition is None:
+            self._raise_if_gone(virsh, domain)
             self.logger.warning(
                 f"could not read the live definition of domain {domain}, "
                 f"which names the files a block job on it holds: no teardown "
@@ -1037,6 +1111,7 @@ class LibVirtSession(SessionConfigMixin):
             destination = mirror.get("file") or (
                 None if own is None else own.get("file") or own.get("dev"))
             if not destination:
+                self._raise_if_gone(virsh, domain)
                 self.logger.warning(
                     f"a block job on domain {domain} (disk {dev}) holds a "
                     f"destination its live definition names no file for: no "
@@ -1046,6 +1121,7 @@ class LibVirtSession(SessionConfigMixin):
                 return None
             chain = self._backing_chain_files(cmd, destination)
             if chain is None:
+                self._raise_if_gone(virsh, domain)
                 self.logger.warning(
                     f"a block job on domain {domain} holds {destination} "
                     f"(disk {dev}), whose backing chain could not be read: no "
@@ -1217,6 +1293,10 @@ class LibVirtSession(SessionConfigMixin):
             with a warning saying why, when they cannot be told: the state
             or the live definition cannot be read, *missing* is a pool
             volume (*volume*), or its recorded chain cannot be followed.
+
+        Raises:
+            _DomainGoneError: They cannot be told, and *domain* went away
+                (:meth:`_raise_if_gone`).
         """
         result = virsh.execute("domstate", domain, warn=True)
         state = (result.stdout or "").strip() if result.ok else ""
@@ -1239,6 +1319,7 @@ class LibVirtSession(SessionConfigMixin):
                     held.extend(f for f in files if f not in held)
                 else:
                     return held
+        self._raise_if_gone(virsh, domain)
         self.logger.warning(
             f"domain {domain} is {state or 'in an unknown state'} with "
             f"{missing} attached, which no longer exists, and {why}: QEMU "

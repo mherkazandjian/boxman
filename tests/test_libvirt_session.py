@@ -1085,7 +1085,8 @@ class TestInUseWithAMissingSource:
     def test_a_missing_volume_source_fails_the_scan(self, captured_logs):
         """A pool volume's chain is not read from the live definition."""
         virsh = MagicMock()
-        virsh.execute.return_value = _result(stdout="running\n")
+        virsh.execute.side_effect = lambda *args, **kwargs: _result(
+            stdout="vm-b\n" if args[0] == "list" else "running\n")
 
         held = _session({})._held_below(virsh, "vm-b", "/pool/gone.qcow2",
                                         True, {})
@@ -1374,6 +1375,151 @@ class TestInUseWithABlockJob:
 
         assert in_use == self.PLAIN
         assert [c for c in calls if c[0] == "dumpxml"] == [("dumpxml", "vm-b")]
+
+
+class TestInUseWhileDomainsGoAway:
+    """deprovision tears VMs down in parallel, so a domain listed when the
+    scan starts can be undefined by its own teardown before the scan reads
+    it. Once a query of it fails and a fresh, successful listing no longer
+    names it, it holds nothing and is skipped, with whatever was read of
+    it; still listed, or a listing that fails, fails the scan as before
+    (#213)."""
+
+    CHAINS = {"/ws/a.qcow2": '{"filename": "/ws/a.qcow2"}',
+              "/ws/b.qcow2": '{"filename": "/ws/b.qcow2"}'}
+    A_ONLY = {"/ws/a.qcow2": "vm-a"}
+
+    # how vm-b fails: the query of it that fails, and what reaches it
+    FAILURES = {
+        # its inventory
+        "inventory": dict(failing={("domblklist", "vm-b")}),
+        # its state, asked for a source of it that no longer exists
+        "state": dict(failing={("domstate", "vm-b")}, missing=True),
+        # its live definition, read for its block jobs while it runs
+        "live definition": dict(failing={("dumpxml", "vm-b")},
+                                active={"vm-b"}),
+        # what that definition names: a block job's destination...
+        "mirror": dict(active={"vm-b"},
+                       mirror="<mirror type='file' job='copy'/>"),
+        # ... or its chain
+        "destination": dict(active={"vm-b"}, mirror=(
+            "<mirror type='file' file='/w/copy.qcow2' job='copy'/>")),
+    }
+
+    def _run(self, relists, failing=frozenset(), active=frozenset(),
+             missing=False, mirror=""):
+        """vm-a, then vm-b, each read as listed first; the *failing*
+        ``(query, domain)`` pairs fail. Each listing after the first
+        answers the next of *relists*: its output, or ``None`` for one that
+        fails. vm-b's disk carries *mirror*, and it has a CD-ROM that no
+        longer exists when *missing*."""
+        calls = []
+        relists = iter(relists)
+        blk_b = (TestDiskPathsInUse.HEADER
+                 + " file   disk     vda      /ws/b.qcow2\n"
+                 + (" file   cdrom    sda      /ws/gone.iso\n"
+                    if missing else ""))
+        live = ("<domain><devices><disk type='file' device='disk'>"
+                f"<source file='/ws/b.qcow2'/>{mirror}<target dev='vda'/>"
+                "</disk></devices></domain>")
+
+        def virsh_execute(*args, **kwargs):
+            calls.append(args)
+            if args[0] == "list":
+                if "--all" not in args:
+                    return _result(stdout="".join(f"{d}\n" for d in active))
+                if sum(c[:2] == ("list", "--all") for c in calls) == 1:
+                    return _result(stdout="vm-a\nvm-b\n")
+                answer = next(relists)
+                if answer is None:
+                    return _result(ok=False, stderr="error: failed to "
+                                   "connect to the hypervisor")
+                return _result(stdout=answer)
+            if (args[0], args[1]) in failing:
+                return _result(ok=False, stderr=f"error: failed to get "
+                               f"domain '{args[1]}'")
+            if args[0] == "domblklist":
+                return _result(stdout=TestDiskPathsInUse.BLK_A
+                               if args[1] == "vm-a" else blk_b)
+            if args[0] == "domstate":
+                return _result(stdout="running\n")
+            if args[0] == "dumpxml":
+                return _result(stdout=live)
+            raise AssertionError(f"unexpected virsh {args}")
+
+        def shell(command, **kwargs):
+            if _ABSENT in command:
+                probed = shlex.split(command)[3]
+                return _result(stdout=_ABSENT if probed == "/ws/gone.iso"
+                               else "")
+            source = command.rsplit(" ", 1)[1].strip("'")
+            if source not in self.CHAINS:
+                return _result(ok=False, stderr="Could not open")
+            return _result(stdout=self.CHAINS[source])
+
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh, \
+             patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
+            virsh.return_value.execute.side_effect = virsh_execute
+            cmd.return_value.execute_shell.side_effect = shell
+            return _session({}).disk_paths_in_use(), calls
+
+    @pytest.mark.parametrize("failure", FAILURES)
+    def test_a_domain_gone_since_is_skipped(self, captured_logs, failure):
+        """... with what was read of it before (its disk), and no warning:
+        a teardown that removes nothing of it has nothing to report."""
+        in_use, _ = self._run(["vm-a\n"], **self.FAILURES[failure])
+
+        assert in_use == self.A_ONLY
+        assert not [r for r in captured_logs.records if r.levelno >= 30]
+
+    @pytest.mark.parametrize("failure", FAILURES)
+    def test_a_domain_still_listed_fails_the_scan(self, failure):
+        """... whether it never went -- a running domain undefined
+        meanwhile stays listed, transient -- or was defined again under the
+        same name: whatever the failed query's error says."""
+        in_use, _ = self._run(["vm-a\nvm-b\n"], **self.FAILURES[failure])
+
+        assert in_use is None
+
+    @pytest.mark.parametrize("failure", FAILURES)
+    def test_a_listing_that_fails_fails_the_scan(self, failure):
+        in_use, _ = self._run([None], **self.FAILURES[failure])
+
+        assert in_use is None
+
+    def test_each_failure_lists_anew(self):
+        """vm-b is still listed when vm-a is found gone, and goes away
+        before its own query: a listing older than a failure cannot tell."""
+        in_use, calls = self._run(
+            ["vm-b\n", ""], failing={("domblklist", "vm-a"),
+                                     ("domblklist", "vm-b")})
+
+        assert in_use == {}
+        assert sum(c[:2] == ("list", "--all") for c in calls) == 3
+
+    def test_a_domain_read_whole_is_kept_as_it_was(self):
+        """No listing is taken when nothing fails."""
+        in_use, calls = self._run([])
+
+        assert in_use == dict(self.A_ONLY, **{"/ws/b.qcow2": "vm-b"})
+        assert sum(c[:2] == ("list", "--all") for c in calls) == 1
+
+    def test_a_file_two_domains_use_is_named_for_the_first(self, tmp_path):
+        """What each domain uses is gathered on its own, then added to what
+        the domains before it use: a file both use keeps the first one's
+        name, by path and by identity alike."""
+        base = tmp_path / "base.qcow2"
+        base.write_bytes(b"")
+        self.CHAINS = {source: (f'[{{"filename": "{source}", '
+                                f'"full-backing-filename": "{base}"}}, '
+                                f'{{"filename": "{base}"}}]')
+                       for source in ("/ws/a.qcow2", "/ws/b.qcow2")}
+
+        in_use, _ = self._run([])
+
+        st = os.stat(base)
+        assert in_use[os.path.realpath(base)] == "vm-a"
+        assert in_use.identities[(st.st_dev, st.st_ino)] == "vm-a"
 
 
 class TestAbsenceProbe:

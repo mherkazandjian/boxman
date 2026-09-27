@@ -2302,6 +2302,35 @@ class TestRunningDomainWithABlockJob:
         assert not boot.exists()
 
 
+class TestASiblingGoneMidScan:
+    """deprovision tears VMs down in parallel: a sibling listed when this
+    VM's in-use scan starts can be undefined by its own teardown before the
+    scan reads it. Gone from a fresh listing, it holds nothing, and this VM
+    keeps nothing because of it (#213)."""
+
+    def test_a_sibling_undefined_mid_scan_keeps_nothing_of_ours(
+            self, tmp_path):
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        listings = iter(['vm-sibling\n', ''])
+
+        def virsh_execute(*args, **kwargs):
+            if args[0] == 'list':
+                return _virsh_result(next(listings) if '--all' in args
+                                     else '')
+            # undefined by its own teardown since the listing
+            return _virsh_result('', ok=False)
+
+        real = LibVirtSession(config={'provider': {'libvirt': {}}})
+        t.session.disk_paths_in_use.side_effect = real.disk_paths_in_use
+        with patch('boxman.providers.libvirt.session.VirshCommand') as virsh:
+            virsh.return_value.execute.side_effect = virsh_execute
+            t.deprovision()
+
+        assert not boot.exists()
+        assert 'another domain' not in t.warnings
+
+
 class TestRunningDomainWithAMissingSource:
     """Another domain still running with a deleted image attached can hold
     it open in QEMU together with the images below it: a base of it that
