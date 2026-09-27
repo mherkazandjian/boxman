@@ -374,14 +374,13 @@ class DestroyVM:
             self.logger.info(f"vm {self.name} is not defined, nothing to undefine")
             return True
 
-        # --remove-all-storage requires the domain to be fully stopped, and
-        # "fully stopped" has to be *positively observed*. is_vm_shut_off()
-        # answers True when the query itself failed, so an unreachable
-        # libvirtd used to read as a stopped domain and storage removal went
-        # ahead regardless. Require positive evidence both on the
-        # already-stopped path and again after a forced kill — otherwise a
-        # domain whose qemu process has not actually released its disks can
-        # have them removed underneath it.
+        # The domain has to be *positively observed* shut off first.
+        # is_vm_shut_off() answers True when the query itself failed, so an
+        # unreachable libvirtd used to read as a stopped domain. Undefining a
+        # running domain does not stop it — it only makes it transient, still
+        # running on disks the caller is about to remove. Require positive
+        # evidence both on the already-stopped path and again after a
+        # forced kill.
         if not self._confirm_shut_off_or_absent():
             self.logger.warning(
                 f"vm {self.name} is not shut off, force-killing before undefine")
@@ -389,40 +388,41 @@ class DestroyVM:
             if not self._confirm_shut_off_or_absent():
                 self.logger.error(
                     f"vm {self.name}: could not confirm it is shut off; "
-                    f"refusing to undefine with --remove-all-storage, which "
-                    f"would remove its disks under a possibly-live guest")
+                    f"refusing to undefine it, which would leave a "
+                    f"possibly-live guest running on disks its teardown "
+                    f"removes")
                 return False
 
         try:
             self.logger.info(f"**force** un-defining vm {self.name}")
 
-            # Try the full storage-removal form first. It is not
-            # idempotent (--remove-all-storage errors when the files are
-            # already gone) and --delete-storage-volume-snapshots
-            # requires a recent libvirt, so on failure fall back to a
-            # plain undefine that only drops snapshot metadata — the
-            # domain must always be removable.
+            # No storage flags. --remove-all-storage (with --wipe-storage)
+            # zero-filled and deleted every source in the domain's XML that
+            # a libvirt storage pool lists — CD-ROM media, adopted disks, a
+            # template's shared seed.iso — whoever owned it (#208). The
+            # caller removes storage itself, from boxman's own inventory.
             # --managed-save is not optional: libvirt refuses with "Refusing to
             # undefine while domain managed save image exists" for any domain
             # that was suspended or snapshotted with memory state, which
             # boxman itself creates. Without it destroy leaves the VM defined.
             result = self.virsh.execute(
                 "undefine", self.name,
-                "--remove-all-storage", "--wipe-storage",
-                "--delete-storage-volume-snapshots", "--snapshots-metadata",
-                "--managed-save",
+                "--snapshots-metadata", "--managed-save",
                 warn=True)
             if not result.ok:
-                self.logger.warning(
-                    f"undefine with storage removal failed for {self.name} "
-                    f"({result.stderr.strip()}) — retrying plain undefine")
-                fallback = self.virsh.execute(
-                    "undefine", self.name, "--snapshots-metadata",
-                    "--managed-save", warn=True)
-                if not fallback.ok:
+                # Classified by a successful listing, not by the error text:
+                # a failed lookup is not proof of absence (see
+                # confirm_absent), and a domain that is gone is what was
+                # asked for.
+                if self.confirm_absent():
+                    self.logger.debug(
+                        f"undefine reported a failure, but domain "
+                        f"{self.name} is gone "
+                        f"({(result.stderr or '').strip()})")
+                else:
                     self.logger.error(
-                        f"plain undefine also failed for {self.name}: "
-                        f"{fallback.stderr.strip()}")
+                        f"undefine failed for {self.name}: "
+                        f"{(result.stderr or '').strip()}")
 
             # verify that the vm is no longer defined
             if not self.is_vm_defined():
@@ -438,7 +438,8 @@ class DestroyVM:
     def remove(self, force: bool | None = None) -> bool:
         """
         Completely remove the VM: stop it, then undefine it together with its
-        storage and snapshot metadata.
+        snapshot metadata. Its storage is left in place: the caller removes
+        only what boxman's own inventory says the VM owns (#208).
 
         Snapshot metadata is cleared in a single atomic
         ``undefine --snapshots-metadata`` inside :meth:`force_undefine_vm`.

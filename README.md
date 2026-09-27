@@ -838,6 +838,52 @@ Details worth knowing:
   query that fails is not proof of absence, so an unreachable libvirtd leaves
   the disks alone instead of unlinking them under a guest that may still be
   running.
+- **Only the storage the VM owns is removed, by boxman — never by libvirt.**
+  Its boot disk, snapshot overlays and memory files (the files under the VM's
+  own `<vm>.*` / `<vm>_snapshot_*` names in a cluster workdir) and the extra
+  disks boxman recorded creating for it. Never: a CD-ROM or ISO it has
+  attached (in either its live or its persistent definition), an
+  `attach_only` (adopted) disk, anything outside the cluster workdirs, a
+  symlink, or anything another VM uses directly, as a backing file or as
+  the destination of a block job it runs (a block copy) — storage-pool
+  volumes included. A protected file is recognised by its
+  identity as well as its path, so under a bind mount or a hard link too;
+  one boxman cannot look up keeps everything. A disk's backing chain goes
+  as a whole or not at all, overlays first, so no kept disk loses its
+  backing file. A VM that predates the ownership record has its declared
+  disks removed by name.
+  Before undefining, the teardown saves what it saw beside the boot disk
+  (`.boxman-teardown-<vm>.json`) and records where in
+  `~/.config/boxman/cache/teardown/<vm>.json`, so a teardown interrupted
+  after the undefine and run again — wherever the boot disk was — decides
+  with the first attempt's records, while reading again what each file
+  still there depends on (a kept image may have been rebased since); both
+  files are removed once nothing they protect is left (`destroy`, which
+  removes the workspace, also drops a locator whose inventory went with
+  it), and one that cannot be read or even looked up (a directory that
+  cannot be searched) stops the retry with nothing removed. With the VM
+  already gone and nothing saved, only boxman's own qcow2 images and
+  memory files under the VM's names are removed, and its extra disks are
+  kept. A file is taken for gone only when it is not there; one that
+  cannot be looked up is kept. A CD-ROM or disk whose file no longer
+  exists — a deleted seed ISO still attached — protects nothing and holds
+  nothing back, for the VM being torn down and for VMs that are shut off.
+  A *running* VM with a deleted file still attached can hold it open,
+  with the images below it: it protects exactly the backing chain libvirt
+  says it holds, and only when libvirt cannot say (no chain recorded, a
+  block job running) does every teardown keep everything, named in a
+  warning, until that file is detached or that VM stops. A VM that a
+  parallel teardown undefines while this one checks — `deprovision` tears
+  VMs down in parallel — holds nothing once libvirt lists neither its name
+  nor its UUID; one merely renamed (`virsh domrename`) still uses its
+  disks, so that check keeps everything. An extra disk
+  moved to an overlay by a snapshot goes with its whole chain when every
+  layer is provably its own (the disk at its recorded target, the
+  recorded base at the bottom, each layer named for it in the same
+  directory); otherwise the chain is kept whole. Every file
+  kept is named in a warning; keeping it does not fail the command. (`virsh
+  undefine --remove-all-storage` used to wipe and delete every
+  storage-pool-listed file the VM referenced, ISOs included — #208.)
 - **`destroy` validates its delete targets up front**, before any teardown
   starts. It refuses a path that is empty, relative, a symlink, your home
   directory, a filesystem root or mount point, a top-level path, or a
@@ -856,7 +902,9 @@ Edit `conf.yml` and run `boxman update` to reconcile the live state with the con
 - **Add VMs**: add new VM entries to a cluster's `vms:` section — they will be
   cloned from the base template, configured, and started
 - **Remove VMs**: remove VM entries from the config — running VMs will be
-  shut down, undefined, and their disks cleaned up
+  shut down, undefined, and the storage they own removed (see
+  [Teardown safety](#teardown-safety)); with the config gone, the extra disks
+  of a VM that predates the ownership record are kept
 - **CPU and memory**: change `cpus` or `memory` on existing VMs — applied live
   (hot-plug) when possible, otherwise a restart is flagged
 - **Add disks**: add new disk entries to a VM's `disks:` section — they will be

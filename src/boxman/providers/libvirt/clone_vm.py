@@ -4,7 +4,7 @@ import shutil
 import tarfile
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NoReturn
 
 import invoke
 
@@ -20,6 +20,8 @@ from boxman.utils.hostnames import hostname_problem
 from boxman.utils.shell import run as _shell_run
 
 from .commands import VirshCommand, VirtCloneCommand, VirtSysprepCommand
+from .disk_cleanup import entry_exists, file_identities, remove_if_unchanged
+from .storage_pools import refresh_pools_holding
 from .virsh_parse import parse_domiflist
 
 # Internal hand-off used by the retry wrapper. Clone attempts run under log
@@ -1120,16 +1122,22 @@ class CloneVM:
             self, sanitizer_error: CloneSanitizerError | None = None) -> None:
         """Remove the newly-created clone after identity sanitization fails.
 
-        If libvirt cannot remove it, raise a terminal error containing both
-        failure causes. A plain-undefine fallback is intentionally avoided:
-        it would leave the known clone disk behind, while deleting individual
-        domain disks risks shared or inherited media.
+        The domain is undefined without storage flags and, only once it is
+        confirmed gone, its own boot disk — the file ``virt-clone`` wrote at
+        :attr:`new_image_path` — is removed. Nothing else it references is
+        touched: a clone shares its template's CD-ROM media, and
+        ``--remove-all-storage`` deleted a template's cloud-init
+        ``seed.iso`` along with it (#208).
+
+        If the clone cannot be removed, raise a terminal error containing
+        both failure causes.
         """
+        identity = file_identities([self.new_image_path]).get(
+            self.new_image_path)
         try:
             result = self.virsh.execute(
                 "undefine",
                 self.new_vm_name,
-                "--remove-all-storage",
                 warn=True,
             )
         except Exception as cleanup_error:
@@ -1164,6 +1172,58 @@ class CloneVM:
             if sanitizer_error is not None:
                 raise error from sanitizer_error
             raise error
+
+        path = self.new_image_path
+        if not self._confirm_clone_absent():
+            self._raise_disk_left(
+                sanitizer_error,
+                f"could not confirm the clone was undefined, so its disk "
+                f"{path} was left in place")
+        try:
+            # only a disk confirmed gone is nothing left to do; one that
+            # cannot be looked up is a disk left behind
+            if not entry_exists(path):
+                return
+            outcome, where = remove_if_unchanged(path, identity)
+        except OSError as exc:
+            self._raise_disk_left(
+                sanitizer_error, f"could not remove its disk {path}: {exc}")
+        if outcome in ("restored", "stranded"):
+            self._raise_disk_left(
+                sanitizer_error,
+                f"{path} was replaced after the clone was created and was "
+                f"left in place" + (f" (it is at {where})" if where else ""))
+        if outcome == "removed":
+            refresh_pools_holding(self.virsh, [path])
+
+    def _confirm_clone_absent(self) -> bool:
+        """True only when a successful listing no longer shows the clone —
+        a failed query is never read as "gone" (see
+        ``DestroyVM.confirm_absent``)."""
+        try:
+            listing = self.virsh.execute("list", "--all", "--name", warn=True)
+        except Exception:
+            return False
+        names = {line.strip() for line in (listing.stdout or "").splitlines()}
+        return listing.ok and self.new_vm_name not in names
+
+    def _raise_disk_left(self,
+                         sanitizer_error: CloneSanitizerError | None,
+                         cleanup_detail: str) -> NoReturn:
+        """Raise the terminal error for a clone whose disk stayed behind."""
+        sanitizer_detail = (
+            str(sanitizer_error) if sanitizer_error is not None
+            else 'machine identity reset failed')
+        error = CloneCleanupError(
+            f"{sanitizer_detail}; additionally failed to discard unsafe "
+            f"clone {self.new_vm_name}: {cleanup_detail}. It requires "
+            f"manual cleanup.",
+            sanitizer_error=sanitizer_error,
+            cleanup_error=cleanup_detail,
+        )
+        if sanitizer_error is not None:
+            raise error from sanitizer_error
+        raise error
 
     def clone(self) -> bool:
         """

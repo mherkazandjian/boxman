@@ -105,8 +105,9 @@ RUN ln -sf /etc/libvirt/qemu/networks/default.xml /etc/libvirt/qemu/networks/aut
 # mounts they live in the writable layer and every recreate discards them.
 # A bind mount over an empty host directory would, however, hide everything
 # configured above and leave libvirtd with no libvirtd.conf, no qemu.conf and
-# no default network. entrypoint.sh seeds a mount it finds empty from this
-# stash, so a first run behaves exactly like the unmounted image did.
+# no default network. On every start entrypoint.sh restores whatever a mount
+# lacks from this stash (seed-libvirt-state.sh), so a first run behaves
+# exactly like the unmounted image did and a partial one is repaired.
 #
 # Keep this as the last step that touches either directory: anything added to
 # /etc/libvirt after this line would never reach a seeded instance.
@@ -114,8 +115,9 @@ RUN mkdir -p /var/lib/libvirt/qemu /opt/boxman/pristine && \
     cp -a /etc/libvirt /opt/boxman/pristine/etc-libvirt && \
     cp -a /var/lib/libvirt/qemu /opt/boxman/pristine/var-lib-libvirt-qemu
 
+COPY seed-libvirt-state.sh /opt/boxman/seed-libvirt-state.sh
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh /opt/boxman/seed-libvirt-state.sh
 
 # clean up stale sockets before starting supervisor
 CMD ["/entrypoint.sh"]

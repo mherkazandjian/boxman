@@ -102,6 +102,9 @@ class VirtualBoxSession(SessionConfigMixin):
                       disks: list[dict[str, str]]) -> bool:
         raise _phase('destroy_disks', 2)
 
+    def vm_storage_devices(self, vm_name: str) -> list[Any] | None:
+        raise _phase('vm_storage_devices', 2)
+
     def start_vm(self, vm_name: str) -> bool:
         raise _phase('start_vm', 2)
 

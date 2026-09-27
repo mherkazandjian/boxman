@@ -17,7 +17,9 @@ Helpers (plain importable functions, not fixtures):
 
 from __future__ import annotations
 
+import itertools
 import logging
+import uuid
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -51,6 +53,31 @@ def captured_logs(caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
 
 
 # ---------------------------------------------------------------------------
+# boxman's per-user cache dir — never the real one
+# ---------------------------------------------------------------------------
+
+_cache_dirs = itertools.count()
+
+
+@pytest.fixture(autouse=True)
+def _private_boxman_cache_dir(tmp_path_factory: pytest.TempPathFactory,
+                              monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Point boxman's per-user cache dir (``~/.config/boxman/cache``) at a
+    directory of this test's own, not created until something writes there.
+
+    A VM teardown records there where it saved its inventory (#208), and a
+    registered project lands there too; neither may reach the real one, nor
+    leak from one test into the next. Tests that patch
+    ``DEFAULT_CACHE_DIR`` themselves still win.
+    """
+    monkeypatch.setattr(
+        "boxman.config_cache.DEFAULT_CACHE_DIR",
+        str(tmp_path_factory.getbasetemp() / "boxman-cache"
+            / str(next(_cache_dirs))))
+
+
+# ---------------------------------------------------------------------------
 # Bare manager — the BoxmanManager.__new__ bypass shared by unit tests
 # ---------------------------------------------------------------------------
 
@@ -69,3 +96,29 @@ def make_bare_manager(config: dict[str, Any] | None = None) -> BoxmanManager:
     mgr.logger = MagicMock()
     mgr._netlab = None
     return mgr
+
+
+# ---------------------------------------------------------------------------
+# What `virsh list` prints — for mocked virsh calls
+# ---------------------------------------------------------------------------
+
+def domain_uuid(name: str) -> str:
+    """A stable UUID for the test domain *name*."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"libvirt-domain:{name}"))
+
+
+def domain_listing(args: tuple, *domains: str | tuple[str, str]) -> str:
+    """
+    What ``virsh list`` prints for *domains* when called with *args*: a
+    ``<uuid> <name>`` line each when they ask for ``--uuid`` (with
+    ``--name``), one name per line otherwise. A domain is its name, whose
+    UUID is :func:`domain_uuid`'s, or a ``(uuid, name)`` pair — a domain
+    listed under a name that is not its first, or a new domain under an
+    old name.
+    """
+    lines = []
+    for domain in domains:
+        uid, name = (domain if isinstance(domain, tuple)
+                     else (domain_uuid(domain), domain))
+        lines.append(f"{uid} {name}" if "--uuid" in args else name)
+    return "".join(f"{line}\n" for line in lines)

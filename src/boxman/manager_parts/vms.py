@@ -1,6 +1,7 @@
 """VM lifecycle and update flows for BoxmanManager."""
 
 import contextlib
+import dataclasses
 import logging
 import os
 import time
@@ -8,6 +9,7 @@ from multiprocessing import Queue
 from typing import Any
 
 from boxman import log
+from boxman.config_cache import teardown_locator_dir
 from boxman.exceptions import (
     BoxmanError,
     CloneSanitizerError,
@@ -24,7 +26,30 @@ from boxman.providers.libvirt.clone_vm import (
     CloneDegradation,
 )
 from boxman.providers.libvirt.commands import VirshCommand
-from boxman.providers.libvirt.virsh_parse import parse_domblklist
+from boxman.providers.libvirt.disk import disk_path_for
+from boxman.providers.libvirt.disk_cleanup import (
+    RECORDS_NONE,
+    RECORDS_PRESENT,
+    RECORDS_UNKNOWN,
+    RECORDS_UNREADABLE,
+    StorageInventory,
+    boot_family_candidates,
+    entry_exists,
+    file_identities,
+    load_teardown_inventory,
+    read_teardown_locator,
+    remove_vm_storage,
+    save_teardown_inventory,
+    save_teardown_locator,
+    teardown_inventory_path,
+    teardown_locator_path,
+)
+from boxman.providers.libvirt.disk_ownership import (
+    DiskRecord,
+    disk_logical_name,
+    read_disk_records,
+)
+from boxman.providers.libvirt.virsh_parse import LOCAL_SOURCE_TYPES
 from boxman.utils.hostnames import hostname_problem
 
 
@@ -463,23 +488,88 @@ class VMsMixin:
         self, cluster_name: str, cluster: dict[str, Any], vm_name: str, vm_info: dict[str, Any]
     ) -> None:
         """
-        Fully destroy a single VM: stop/undefine, remove disks, force-cleanup.
+        Fully destroy a single VM: stop/undefine it and remove the storage
+        it owns (see :meth:`_teardown_vm`).
 
         Designed to be called in a separate process per VM during deprovision.
         """
         prj_name = f'bprj__{self.config["project"]}__bprj'
         full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-        vm_info = vm_info.copy()
+        workdir = cluster['workdir']
 
         self.logger.info(f"destroying vm {full_vm_name}")
-        session = self.session_for_cluster(cluster_name)
+        # The config is known here, so a domain without any ownership record
+        # (one that predates it) still has its declared disks removed by
+        # name, as before the records existed.
+        legacy_disks = [
+            disk_path_for(workdir, disk_logical_name(disk),
+                          driver_type=(disk.get('driver') or {}).get(
+                              'type', 'qcow2'),
+                          disk_prefix=full_vm_name)
+            for disk in (vm_info.get('disks') or [])
+            if isinstance(disk, dict)
+        ]
+        self._teardown_vm(self.session_for_cluster(cluster_name),
+                          full_vm_name, disk_dirs=[workdir],
+                          legacy_disks=legacy_disks)
+
+    def _destroy_removed_vm(self, full_vm_name: str) -> None:
+        """
+        Destroy a VM that has been removed from the config, and the storage
+        it owns (see :meth:`_teardown_vm`).
+
+        Its disk directories come from libvirt, since the config no longer
+        says where it lived, and a domain without ownership records keeps its
+        extra disks: with the config gone there is nothing to name them by.
+        """
+        self.logger.info(f"removing VM {full_vm_name} (no longer in config)")
+        # Phase 1 (#49): stays on the default session — the VM is gone
+        # from the config, so its cluster (and provider) can no longer be
+        # resolved. Revisited in Phase 3 (#51).
+        self._teardown_vm(self.provider, full_vm_name,
+                          disk_dirs=None, legacy_disks=None)
+
+    def _teardown_vm(self,
+                     session,
+                     full_vm_name: str,
+                     disk_dirs: list[str] | None,
+                     legacy_disks: list[str] | None) -> None:
+        """
+        Undefine *full_vm_name* and remove the storage it owns — the one
+        storage-removal routine of every VM teardown.
+
+        libvirt deletes nothing (see ``DestroyVM.force_undefine_vm``): the
+        storage is inventoried while the domain still exists, and only once
+        it is positively confirmed gone does
+        :func:`~boxman.providers.libvirt.disk_cleanup.remove_vm_storage`
+        remove what that inventory says the VM owns. Every file kept is
+        named in a warning, and the storage pools that held a removed file
+        are refreshed.
+
+        Args:
+            session: The libvirt session the VM lives on.
+            full_vm_name: Full name of the VM.
+            disk_dirs: Where its boot disk family lives; ``None`` to take the
+                directories of its attached disks from libvirt.
+            legacy_disks: Its config-declared extra disks by name, removed
+                only when the domain carries no ownership record at all;
+                ``None`` when the config is not known.
+
+        Raises:
+            ProvisionError: If the domain's storage cannot be inventoried
+                while it still exists, or it cannot be confirmed gone. Its
+                storage is left in place either way.
+        """
+        inventory = self._capture_vm_storage(
+            session, full_vm_name, disk_dirs, legacy_disks)
+
         session.destroy_vm(full_vm_name)
         if not session.confirm_vm_absent(full_vm_name):
             session.destroy_vm(full_vm_name, force=True)
 
-        # Unlinking the disk files is gated on a *positive* confirmation that
-        # the domain is gone. destroy_vm()'s return value cannot carry that:
-        # it reports success when the libvirt query itself could not be
+        # Removing storage is gated on a *positive* confirmation that the
+        # domain is gone. destroy_vm()'s return value cannot carry that: it
+        # reports success when the libvirt query itself could not be
         # answered, so an outage looked like a finished teardown and the
         # qcow2 files were removed out from under a still-running guest.
         if not session.confirm_vm_absent(full_vm_name):
@@ -488,37 +578,447 @@ class VMsMixin:
                 f"undefined; leaving its disks in place rather than removing "
                 f"storage under a possibly-live guest")
 
-        # No bool check here on purpose: remove_vm_disks() returns True or
-        # raises (its os.remove calls are uncaught), so a filesystem error
-        # already reaches _run_parallel's failure handling. Testing the
-        # return value would be dead code.
-        session.destroy_disks(
-            cluster['workdir'],
-            vm_name=full_vm_name,
-            disks=vm_info.get('disks', [])
-        )
+        # remove_vm_storage() raises on a filesystem error, which reaches
+        # _run_parallel's failure handling
+        outcome = remove_vm_storage(
+            inventory, self._cluster_workdirs(), session.disk_paths_in_use)
+        for path, reason in outcome.kept:
+            self.logger.warning(
+                f"{full_vm_name}: left {path} in place because {reason}")
+        # The saved inventory and its locator stay while the inventory still
+        # protects a kept file, so a retry keeps it too; with nothing kept
+        # they have done their job. The inventory goes first (a locator left
+        # without it fails a retry closed), and before the pools are
+        # refreshed, which would otherwise list it (a directory pool lists
+        # hidden files too).
+        removed = list(outcome.removed)
+        if not outcome.kept:
+            if inventory.saved_at:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(inventory.saved_at)
+                    if removed:
+                        removed.append(inventory.saved_at)
+            if inventory.locator_at:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(inventory.locator_at)
+        if removed:
+            session.refresh_pools_holding(removed)
 
-    def _vm_disk_dirs(self, full_vm_name: str) -> list[str]:
+    def _capture_vm_storage(self,
+                            session,
+                            full_vm_name: str,
+                            disk_dirs: list[str] | None,
+                            legacy_disks: list[str] | None,
+                            ) -> StorageInventory:
         """
-        Return the directories that hold *full_vm_name*'s disk files,
-        discovered from libvirt itself (``virsh domblklist``).
+        Inventory *full_vm_name*'s storage before it is undefined: its block
+        devices in both definitions, its ownership records, the backing
+        chain of each of its disks, its boot-disk family, and the identity
+        of every one of those files.
+
+        A domain already gone (an interrupted teardown being retried) is
+        inventoried by name only, and its ownership state is *unknown*, not
+        "none": whatever record it carried went with it, so its disks are
+        never taken for a legacy domain's.
+
+        Raises:
+            ProvisionError: If the domain exists but its block devices cannot
+                be read — tearing it down blind could remove a CD-ROM or a
+                disk that is not its own.
+        """
+        rows = session.vm_storage_devices(full_vm_name)
+        exists = True
+        if rows is None:
+            if not session.confirm_vm_absent(full_vm_name):
+                raise ProvisionError(
+                    f"{full_vm_name}: could not read its block devices from "
+                    f"libvirt; leaving it defined and its storage in place "
+                    f"rather than removing storage blind")
+            # already undefined (a teardown that was interrupted): decide
+            # with what the interrupted attempt saved before it undefined
+            # the domain — its chains read again, now — or, if nothing was
+            # saved, by name, keeping all but boxman's own artifact types
+            # (remove_vm_storage)
+            if disk_dirs is None:
+                disk_dirs = self._vm_disk_dirs(full_vm_name, [])
+            saved = self._load_saved_inventory(full_vm_name, disk_dirs)
+            if saved is not None:
+                return self._with_current_chains(session, saved)
+            rows, exists = [], False
+
+        disk_sources, media_sources = [], []
+        targets: dict[str, str] = {}
+        for row in rows:
+            if row.type not in LOCAL_SOURCE_TYPES or row.source == '-':
+                continue
+            bucket = disk_sources if row.device == 'disk' else media_sources
+            if row.source not in bucket:
+                bucket.append(row.source)
+            if row.device == 'disk':
+                targets.setdefault(row.source, row.target)
+
+        if disk_dirs is None:
+            disk_dirs = self._vm_disk_dirs(full_vm_name, disk_sources)
+
+        records, records_state = None, RECORDS_UNKNOWN
+        if exists:
+            try:
+                records = self._vm_disk_records(full_vm_name)
+            except ProvisionError as exc:
+                self.logger.warning(
+                    f"{full_vm_name}: {exc}; none of its extra disks will be "
+                    f"removed")
+                records_state = RECORDS_UNREADABLE
+            else:
+                records_state = (RECORDS_NONE if records is None
+                                 else RECORDS_PRESENT)
+
+        # every disk's chain, the boot disk's included, and every media
+        # source's: a qcow2 CD-ROM can be built on a file the vm also
+        # attaches as a disk. What may be removed is decided across all of
+        # them (remove_vm_storage).
+        sources = [*disk_sources, *media_sources]
+        chains = session.backing_chains(sources) if sources else {}
+
+        # decided with at capture and, for a domain undefined with nothing
+        # saved, by the name-based fallback: a cluster workdir that cannot
+        # be listed stops the teardown — before the undefine, at capture.
+        # Any other directory (an adopted disk's, a root-owned 0711
+        # /var/lib/libvirt/images) holds nothing that could be removed —
+        # every file outside the cluster workdirs is refused — so one that
+        # cannot be listed, once proved none of them, holds no candidates.
+        found: set[str] = set()
+        for workdir in disk_dirs:
+            try:
+                found.update(boot_family_candidates(workdir, full_vm_name))
+            except OSError as exc:
+                if self._none_of_the_cluster_workdirs(full_vm_name, workdir,
+                                                      exists):
+                    self.logger.debug(
+                        f"{full_vm_name}: could not list {workdir} ({exc}); "
+                        f"it is outside every cluster workdir, where nothing "
+                        f"is removed")
+                    continue
+                raise ProvisionError(
+                    f"{full_vm_name}: could not list {workdir} ({exc}), "
+                    f"which holds its boot disk, overlays and memory files; "
+                    + ("leaving it defined and its storage in place"
+                       if exists else "leaving its storage in place")
+                    + " — make that directory readable, then retry") from exc
+        boot_family = sorted(found)
+        files = [*disk_sources, *boot_family, *(legacy_disks or ()),
+                 *(record.source for record in records or ()),
+                 *(layer for chain in (chains or {}).values()
+                   for layer in chain)]
+        inventory = StorageInventory(
+            vm_name=full_vm_name,
+            disk_sources=disk_sources,
+            media_sources=media_sources,
+            records=records,
+            records_state=records_state,
+            chains=chains,
+            boot_family=boot_family,
+            legacy_disks=legacy_disks,
+            identities=file_identities(files),
+            targets=targets,
+        )
+        if exists:
+            # saved before the undefine, which drops what it was read from;
+            # a retry after an interruption decides with it. Beside the boot
+            # disk, with a locator that leads a retry to it wherever that is.
+            save_dir = next(
+                (os.path.dirname(path) for path in disk_sources
+                 if os.path.basename(path).startswith(f"{full_vm_name}.")),
+                disk_dirs[0] if disk_dirs else None)
+            if save_dir is not None:
+                self._save_teardown_inventory(inventory, save_dir)
+        return inventory
+
+    def _none_of_the_cluster_workdirs(self, full_vm_name: str,
+                                      directory: str, exists: bool) -> bool:
+        """
+        Whether *directory*, which could not be listed, is proved to be none
+        of the cluster workdirs.
+
+        Told by identity — device and inode, symlinks followed — which sees
+        through an alias or a bind mount where a path comparison cannot, and
+        never guessed: ``os.path.realpath`` answers with the unresolved path
+        when a lookup fails, and a workdir configured as ``hidden/work ->
+        real`` under an unsearchable ``hidden`` read as another directory
+        than ``real``, which was then skipped. Only "not there" is an
+        answer: a workdir that does not exist cannot be *directory*, and a
+        *directory* gone since it failed to list holds nothing.
+
+        Raises:
+            ProvisionError: If *directory* or a cluster workdir cannot be
+                resolved — never taken for "none of them".
+        """
+        leaving = ("leaving it defined and its storage in place" if exists
+                   else "leaving its storage in place")
+
+        def identity(path: str, question: str) -> tuple[int, int] | None:
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise ProvisionError(
+                    f"{full_vm_name}: could not resolve {path} ({exc}) to "
+                    f"tell {question}; {leaving} — make it accessible, then "
+                    f"retry") from exc
+            return (st.st_dev, st.st_ino)
+
+        target = identity(
+            os.path.expanduser(directory),
+            "whether this directory, which could not be listed either, is "
+            "a cluster workdir")
+        if target is None:
+            return True
+        for workdir in self._cluster_workdirs():
+            if identity(os.path.expanduser(workdir),
+                        f"whether this cluster workdir is {directory}, which "
+                        f"could not be listed") == target:
+                return False
+        return True
+
+    def _save_teardown_inventory(self, inventory: StorageInventory,
+                                 save_dir: str) -> None:
+        """
+        Save *inventory* in *save_dir*, beside the vm's boot disk, and its
+        locator under boxman's per-user state dir, keyed by the full vm
+        name, both before the undefine: through the locator a retry finds
+        the inventory even when the boot disk was outside every directory
+        the retry itself would search. An inventory that an earlier locator
+        named elsewhere described an earlier definition of the vm; it is
+        superseded, and removed.
+
+        Raises:
+            ProvisionError: If either cannot be written. The domain stays
+                defined: a teardown interrupted after the undefine could not
+                be retried safely.
+        """
+        vm = inventory.vm_name
+        locator = teardown_locator_path(teardown_locator_dir(), vm)
+        superseded = None
+        with contextlib.suppress(OSError, ValueError, RecursionError):
+            superseded = read_teardown_locator(locator, vm)
+        try:
+            saved_at = save_teardown_inventory(inventory, save_dir)
+            save_teardown_locator(locator, vm, saved_at)
+        except OSError as exc:
+            raise ProvisionError(
+                f"{vm}: could not save its teardown inventory in {save_dir} "
+                f"and record where it is at {locator} ({exc}); leaving it "
+                f"defined, since a teardown interrupted after the undefine "
+                f"could not be retried safely") from exc
+        inventory.saved_at, inventory.locator_at = saved_at, locator
+        if (superseded is not None and os.path.realpath(superseded)
+                != os.path.realpath(saved_at)):
+            try:
+                os.remove(superseded)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self.logger.warning(
+                    f"{vm}: could not remove {superseded}, the teardown "
+                    f"inventory of an earlier definition of it ({exc})")
+
+    def _load_saved_inventory(self, full_vm_name: str,
+                              disk_dirs: list[str]) -> StorageInventory | None:
+        """
+        The teardown inventory an earlier, interrupted teardown of
+        *full_vm_name* saved, or ``None`` if it saved none.
+
+        Found through its locator, which records where it was saved beside
+        the boot disk, wherever that was — never passed over for another.
+        With no locator at all (boxman's state dir was cleared), one in
+        *disk_dirs* is used. Only a file confirmed not there is absent
+        (:func:`entry_exists`): one that cannot be looked up is never taken
+        for "none saved".
+
+        Raises:
+            ProvisionError: If the locator, or the inventory it or
+                *disk_dirs* lead to, cannot be looked up or read — a locator
+                whose inventory is missing included. The inventory's
+                protections cannot be honoured blind, so nothing is removed;
+                check what should stay, then remove the files named.
+        """
+        locator = teardown_locator_path(teardown_locator_dir(), full_vm_name)
+        try:
+            located = entry_exists(locator)
+        except OSError as exc:
+            raise ProvisionError(
+                f"{full_vm_name}: the teardown locator at {locator} could "
+                f"not be looked up ({exc}); leaving its storage in place — "
+                f"make it readable again, or check what should stay and "
+                f"remove that file") from exc
+        if located:
+            try:
+                path = read_teardown_locator(locator, full_vm_name)
+            except (OSError, ValueError, RecursionError) as exc:
+                raise ProvisionError(
+                    f"{full_vm_name}: the teardown locator at {locator} "
+                    f"could not be read ({exc}); leaving its storage in "
+                    f"place — check what should stay, then remove that "
+                    f"file") from exc
+            try:
+                present = entry_exists(path)
+            except OSError as exc:
+                raise ProvisionError(
+                    f"{full_vm_name}: the teardown locator at {locator} "
+                    f"names an inventory at {path}, which could not be "
+                    f"looked up ({exc}); leaving its storage in place — make "
+                    f"it readable again, or check what should stay and "
+                    f"remove both files") from exc
+            if not present:
+                raise ProvisionError(
+                    f"{full_vm_name}: the teardown locator at {locator} "
+                    f"names an inventory at {path}, which is missing; "
+                    f"leaving its storage in place — check what should "
+                    f"stay, then remove {locator}")
+            inventory = self._read_saved_inventory(full_vm_name, path,
+                                                   locator)
+            inventory.locator_at = locator
+            return inventory
+        for directory in disk_dirs:
+            path = teardown_inventory_path(directory, full_vm_name)
+            try:
+                present = entry_exists(path)
+            except OSError as exc:
+                raise ProvisionError(
+                    f"{full_vm_name}: {path}, where an earlier attempt would "
+                    f"have saved its teardown inventory, could not be looked "
+                    f"up ({exc}); leaving its storage in place — make it "
+                    f"readable again and retry") from exc
+            if present:
+                return self._read_saved_inventory(full_vm_name, path, None)
+        return None
+
+    def _read_saved_inventory(self, full_vm_name: str, path: str,
+                              locator: str | None) -> StorageInventory:
+        """:func:`load_teardown_inventory` of *path*, which *locator* (if
+        any) led to; a file that cannot be read raises ProvisionError."""
+        try:
+            inventory = load_teardown_inventory(path, full_vm_name)
+        except (OSError, ValueError, KeyError, TypeError,
+                RecursionError) as exc:
+            named = f" (named by the locator {locator})" if locator else ""
+            remove = f"remove it and {locator}" if locator else (
+                "remove that file")
+            raise ProvisionError(
+                f"{full_vm_name}: the teardown inventory an earlier attempt "
+                f"saved at {path}{named} could not be read ({exc}); leaving "
+                f"its storage in place — check what should stay, then "
+                f"{remove}") from exc
+        self.logger.info(
+            f"{full_vm_name}: already undefined; deciding its storage with "
+            f"the inventory saved at {path}")
+        return inventory
+
+    def _retire_stale_teardown_locators(self) -> None:
+        """
+        Remove the teardown locators of this project's VMs whose inventory
+        no longer exists: ``destroy`` has just removed the workspace a VM
+        teardown that kept a file saved it in. Such a locator protects
+        nothing any more, yet would fail every later teardown of the same
+        VMs closed. One whose inventory is still there — saved beside a boot
+        disk outside the workspace — still protects what that teardown kept,
+        and stays; so does one that cannot be read, or whose inventory cannot
+        be confirmed gone (:func:`entry_exists`), named in a warning. Nothing
+        here fails ``destroy``.
+        """
+        prj_name = f'bprj__{self.config["project"]}__bprj'
+        for cluster_name, cluster in self._vm_clusters.items():
+            for vm_name in cluster.get('vms') or {}:
+                full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                locator = teardown_locator_path(teardown_locator_dir(),
+                                                full_vm_name)
+                try:
+                    inventory = read_teardown_locator(locator, full_vm_name)
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError, RecursionError) as exc:
+                    self.logger.warning(
+                        f"{full_vm_name}: left the teardown locator {locator} "
+                        f"in place: it could not be read ({exc})")
+                    continue
+                try:
+                    gone = not entry_exists(inventory)
+                except OSError as exc:
+                    self.logger.warning(
+                        f"{full_vm_name}: left the teardown locator {locator} "
+                        f"in place: whether the inventory it names, "
+                        f"{inventory}, is gone could not be told ({exc})")
+                    continue
+                if not gone:
+                    continue
+                try:
+                    os.remove(locator)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    self.logger.warning(
+                        f"{full_vm_name}: could not remove the teardown "
+                        f"locator {locator} ({exc})")
+                    continue
+                self.logger.info(
+                    f"{full_vm_name}: removed the teardown locator of "
+                    f"{inventory}, which went with the workspace")
+
+    def _with_current_chains(self, session,
+                             saved: StorageInventory) -> StorageInventory:
+        """
+        *saved*, with the backing chains of what is left of its sources read
+        again, now.
+
+        A saved inventory carries what a retry can no longer read once the
+        domain is gone — its devices, its ownership records and their state,
+        the targets, the legacy decision, the identity of every file — but
+        not what those files depend on: an image the first attempt kept may
+        have been rebased since, in place, on the same inode, and a chain it
+        was removing head first may have lost its top. So every saved source
+        still there has its chain read again. A disk source removed since
+        stands for the topmost layer of its saved chain that is still there,
+        whose chain is read in its place: what is left of the disk keeps its
+        target, its record and its dependencies. A media source gone since
+        has no chain — boxman never removes one, and nothing depends on an
+        image that is not there. A chain that cannot be read makes them all
+        unknown (``None``), which keeps everything.
+        """
+        sources = [*saved.disk_sources, *saved.media_sources]
+        chains = session.backing_chains(sources) if sources else {}
+        for source in saved.disk_sources:
+            if chains is None:
+                break
+            if source in chains:
+                continue
+            for layer in (saved.chains or {}).get(source, [])[1:]:
+                below = session.backing_chains([layer])
+                if below is None or layer in below:
+                    chains = (None if below is None
+                              else {**chains, source: below[layer]})
+                    break
+        return dataclasses.replace(saved, chains=chains)
+
+    def _vm_disk_dirs(self,
+                      full_vm_name: str,
+                      disk_files: list[str]) -> list[str]:
+        """
+        Return the directories that hold *full_vm_name*'s disk files, as
+        libvirt reported them (``virsh domblklist``).
 
         Used for VMs that no longer appear in conf.yml, whose workdir
         can therefore not be resolved from the config. Falls back to
         every workdir known to the project config when the domain
-        cannot be queried (e.g. already undefined) — the destroy_disks
-        glob is anchored at the VM name, so sweeping extra directories
-        is harmless.
+        cannot be queried (e.g. already undefined) — the boot-disk family
+        is found by names anchored at the VM name, so looking in extra
+        directories is harmless.
+
+        Args:
+            full_vm_name: Full name of the VM.
+            disk_files: The sources of its disk devices.
         """
-        virsh = VirshCommand(
-            provider_config=self.provider.provider_config)
-        result = virsh.execute(
-            "domblklist", full_vm_name, "--details", warn=True)
-        dirs = set()
-        if result.ok:
-            for row in parse_domblklist(result.stdout):
-                if row.device == 'disk' and row.source not in (None, '-'):
-                    dirs.add(os.path.dirname(row.source))
+        dirs = {os.path.dirname(path) for path in disk_files}
         if not dirs:
             self.logger.warning(
                 f"could not query disk paths for {full_vm_name} from "
@@ -526,44 +1026,29 @@ class VMsMixin:
             dirs.update(self.collect_workdirs())
         return sorted(dirs)
 
-    def _destroy_removed_vm(self, full_vm_name: str) -> None:
+    def _vm_disk_records(self, full_vm_name: str) -> list[DiskRecord] | None:
         """
-        Destroy a VM that has been removed from the config.
+        Return boxman's disk ownership records for *full_vm_name* (see
+        ``disk_ownership``), or ``None`` when the domain carries none. Must
+        run before the domain is undefined.
 
-        Uses destroy_vm + destroy_disks with an empty disk list since we
-        no longer have the disk config for this VM. The disk directories
-        are read from libvirt before the domain is undefined (see
-        ``_vm_disk_dirs``); the glob-based cleanup in destroy_disks
-        catches all {vm_name}* artifacts.
+        Raises:
+            ProvisionError: If the records are present but cannot be read.
+                That is never grounds for removing a disk, and must not be
+                mistaken for "no records", which lets a deprovision fall
+                back to removing declared disks by name.
         """
-        self.logger.info(f"removing VM {full_vm_name} (no longer in config)")
-        # Phase 1 (#49): stays on the default session — the VM is gone
-        # from the config, so its cluster (and provider) can no longer be
-        # resolved. Revisited in Phase 3 (#51).
-        #
-        # The disk directories come from libvirt, so they must be discovered
-        # *before* the domain is undefined.
-        disk_dirs = self._vm_disk_dirs(full_vm_name)
-        self.provider.destroy_vm(full_vm_name)
-        if not self.provider.confirm_vm_absent(full_vm_name):
-            self.provider.destroy_vm(full_vm_name, force=True)
+        virsh = VirshCommand(
+            provider_config=self.provider.provider_config)
+        return read_disk_records(virsh, full_vm_name)
 
-        # Same gate as _destroy_vm_and_disks: only a positive confirmation
-        # that the domain is gone authorises unlinking its disks.
-        if not self.provider.confirm_vm_absent(full_vm_name):
-            raise ProvisionError(
-                f"{full_vm_name}: could not confirm the domain was "
-                f"undefined; leaving its disks in place rather than removing "
-                f"storage under a possibly-live guest")
-
-        for workdir in disk_dirs:
-            # see _destroy_vm_and_disks: remove_vm_disks() raises rather
-            # than returning False
-            self.provider.destroy_disks(
-                workdir,
-                vm_name=full_vm_name,
-                disks=[]
-            )
+    def _cluster_workdirs(self) -> list[str]:
+        """The workdirs of every cluster in the project config."""
+        return [
+            cluster['workdir']
+            for cluster in (self.config.get('clusters') or {}).values()
+            if isinstance(cluster, dict) and cluster.get('workdir')
+        ]
 
     def configure_and_start_vms(self) -> None:
         """

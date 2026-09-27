@@ -1122,6 +1122,12 @@ class FlowsMixin:
         for tpl_dir in template_dirs:
             self._force_rmtree(tpl_dir)
 
+        # 6b. a VM teardown that kept a file left its saved inventory, and a
+        #     locator to it under boxman's state dir; the inventory went with
+        #     the workspace, and the locator would fail every later teardown
+        #     of the same VMs closed (#208)
+        self._retire_stale_teardown_locators()
+
         # 7. unregister the project LAST. Every removal above raises on
         #    failure, so reaching this point means there is nothing left to
         #    stay visible for — and if one of them did fail, the project is
