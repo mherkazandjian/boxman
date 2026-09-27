@@ -1,4 +1,7 @@
+import json
 import os
+import re
+import shlex
 import tempfile
 import time
 from multiprocessing import Process, Queue
@@ -16,10 +19,10 @@ from ..session_base import SessionConfigMixin
 from . import net_reconcile
 from .cdrom import CDROMManager
 from .clone_vm import CloneVM
-from .commands import VirshCommand
+from .commands import LibVirtCommandBase, VirshCommand
 from .destroy_vm import DestroyVM, shutdown_and_wait
 from .disk import DiskManager
-from .disk_cleanup import remove_vm_disks
+from .disk_cleanup import FilesInUse, remove_vm_disks
 from .disk_ownership import detach_disk, forget_disk
 from .import_image import ImageImporter
 from .iso_boot_vm import IsoBootVM
@@ -27,8 +30,132 @@ from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
 from .storage import StorageManager
+from .storage_pools import refresh_pools_holding
 from .virsh_edit import VirshEdit
-from .virsh_parse import parse_domblklist, parse_domiflist
+from .virsh_parse import (
+    LOCAL_SOURCE_TYPES,
+    REMOTE_SOURCE_TYPES,
+    DomblkRow,
+    parse_domblklist,
+    parse_domblklist_strict,
+    parse_domiflist,
+)
+
+#: what :func:`_absence_probe` prints once it has established that a path
+#: has no directory entry at all
+_ABSENT = "boxman-source-absent"
+
+
+#: a domain's UUID, as ``virsh list --uuid`` prints it
+_UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+                   re.IGNORECASE)
+
+
+def _listed_domains(output: str) -> list[tuple[str, str]] | None:
+    """
+    The ``(name, uuid)`` of every domain ``virsh list --uuid --name``
+    printed in *output* — one ``<uuid> <name>`` line each, and a blank
+    line to end them on libvirt 10; blanks around a name are not part of
+    it — in the order listed, the UUID in lower case; ``None`` when a line
+    is not one.
+    """
+    listed = []
+    for line in output.splitlines():
+        uid, _, name = line.strip().partition(" ")
+        if not uid:
+            continue
+        name = name.strip()
+        if not _UUID.fullmatch(uid) or not name:
+            return None
+        listed.append((name, uid.lower()))
+    return listed
+
+
+class _DomainGoneError(Exception):
+    """A domain went away during the in-use scan: what it uses could not
+    be told, and a listing taken since names neither it nor its UUID
+    (:meth:`LibVirtSession._raise_if_gone`)."""
+
+
+class _DomainRenamedError(Exception):
+    """A domain was renamed during the in-use scan: what it uses could not
+    be told, and a listing taken since names its UUID under another name,
+    :attr:`name` (:meth:`LibVirtSession._raise_if_gone`)."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.name = name
+
+
+def _live_disks(domain: ET.Element, source: str) -> list[ET.Element]:
+    """Every ``<disk>`` of a domain definition whose own ``<source>``
+    names *source* (its ``file`` or ``dev``): libvirt lets two read-only
+    disks share one, and a block job run on either."""
+    return [disk for disk in domain.findall("./devices/disk")
+            if (own := disk.find("source")) is not None
+            and source in (own.get("file"), own.get("dev"))]
+
+
+def _backing_store_files(disk: ET.Element) -> tuple[list[str] | None, str]:
+    """
+    The local files below *disk*'s own image, as libvirt records its
+    backing chain in a live definition: nested ``<backingStore>`` levels,
+    ended by an empty ``<backingStore/>``. A ``file`` or ``block`` level
+    names a file; a ``network`` one names nothing local.
+
+    Returns:
+        ``(paths, "")``, or ``(None, why)`` when the files cannot be told:
+        no ``<backingStore>`` at all (libvirt recorded no chain), a chain
+        recorded only in part, a level of another type, or a ``<mirror>``
+        (a block job holds more files than the chain shows).
+    """
+    if disk.find("mirror") is not None:
+        return None, "a block job runs on it, holding more than its chain"
+    level = disk.find("backingStore")
+    if level is None:
+        return None, "libvirt records no backing chain for it"
+    files: list[str] = []
+    while level.attrib or len(level):
+        kind = level.get("type")
+        if kind in ("file", "block"):
+            source = level.find("source")
+            path = (None if source is None
+                    else source.get("file" if kind == "file" else "dev"))
+            if not path:
+                return None, f"a {kind} level of its chain names no file"
+            files.append(path)
+        elif kind != "network":
+            return None, f"its chain holds a {kind or 'typeless'} level"
+        nested = level.find("backingStore")
+        if nested is None:
+            return None, "libvirt records its backing chain only in part"
+        level = nested
+    return files, ""
+
+
+def _absence_probe(path: str) -> str:
+    """
+    The shell probe behind :meth:`LibVirtSession._source_absent`, for an
+    absolute, normalised *path*: it prints :data:`_ABSENT` only when *path*
+    has no directory entry (``-e`` follows a symlink, so ``-L`` catches a
+    dangling one) and the nearest ancestor that does exist is a directory
+    the probe can search. That directory shows the same entries to
+    everyone; one it cannot search, or one on the way that is not a
+    directory, proves nothing and prints nothing.
+    """
+    def exists(p: str) -> str:
+        return f"[ -e {shlex.quote(p)} ] || [ -L {shlex.quote(p)} ]"
+
+    steps = [f"if {exists(path)}; then exit 0; fi"]
+    ancestor = path
+    while (parent := os.path.dirname(ancestor)) != ancestor:
+        ancestor = parent
+        quoted = shlex.quote(ancestor)
+        steps.append(
+            f"if {exists(ancestor)}; then "
+            f"if [ -d {quoted} ] && [ -x {quoted} ]; then echo {_ABSENT}; "
+            f"fi; exit 0; fi")
+    return "; ".join(steps)
 
 
 class LibVirtSession(SessionConfigMixin):
@@ -623,6 +750,7 @@ class LibVirtSession(SessionConfigMixin):
                       workdir : str,
                       vm_name: str,
                       disks: list[dict[str, str]],
+                      protected: list[str] | tuple = (),
                       ) -> bool:
         """
         Destroy disks associated with the VM.
@@ -638,12 +766,14 @@ class LibVirtSession(SessionConfigMixin):
             workdir: Directory where disk images are stored
             vm_name: Full name of the VM
             disks: Extra disk configurations from the cluster config
+            protected: Paths to leave alone whatever their name (see
+                :func:`remove_vm_disks`)
 
         Returns:
             True if successful, False otherwise
         """
         # Delegates to the pure-filesystem helper extracted in Phase 2.6.
-        return remove_vm_disks(workdir, vm_name, disks)
+        return remove_vm_disks(workdir, vm_name, disks, protected=protected)
 
     def set_boot_order(self, vm_name: str, order: list[str]) -> bool:
         """
@@ -748,7 +878,8 @@ class LibVirtSession(SessionConfigMixin):
 
     def destroy_vm(self, name: str, force: bool = False) -> bool:
         """
-        Destroy (remove) a vm.
+        Destroy (remove) a vm: stop and undefine it. Its storage is left in
+        place for the caller (see :meth:`DestroyVM.force_undefine_vm`).
 
         Args:
             name: Name of the vm to destroy
@@ -781,6 +912,564 @@ class LibVirtSession(SessionConfigMixin):
         """
         destroyer = DestroyVM(name=name, provider_config=self.provider_config)
         return destroyer.confirm_absent()
+
+    def disk_paths_in_use(self) -> FilesInUse | None:
+        """
+        Map every image file a defined domain uses to that domain's name.
+
+        Covers each domain's disk and CD-ROM sources in both its live and
+        its persistent definition, and every layer of their backing chains,
+        as resolved paths, so a caller can tell whether a file it is about
+        to delete is still some domain's disk or the base of one. Plain
+        ``domblklist`` of a running domain reports only the live
+        definition, while the persistent one — what the domain uses on its
+        next start — can name a different disk, or an overlay backed by one.
+        For a transient domain ``--inactive`` reports its one definition
+        (libvirt 10.0), so the same two queries cover it.
+
+        Fails closed: ``None`` when the domain list (``virsh list --all
+        --uuid --name``: each domain's name and UUID), either inventory of
+        any domain, or any backing chain cannot be read, or reads as
+        incomplete — a partial answer would let a caller delete a file that
+        is still in use. An explicitly empty slot (``-``) is not a source,
+        and neither is a ``network`` row: it names no file on this host. A
+        ``volume`` row is read at the local path its volume resolves to
+        (:meth:`vm_storage_devices`). A source confirmed absent (see
+        :meth:`_source_absent`) — a deleted seed ISO still attached — uses
+        nothing in a domain positively shut off; in one that runs, QEMU can
+        hold the unlinked image open together with the images below it,
+        whose files may still exist, so exactly the chain libvirt records
+        for it in the live definition is taken as held (:meth:`_held_below`)
+        — and when that cannot be told, the scan fails.
+
+        A block job — a block copy, say — can write into a destination no
+        inventory lists, and the domain running it holds that file and
+        every image below it until the job ends. Only an active domain runs
+        one, so the live definition of each domain ``virsh list`` reports
+        active is read for them, once, shared with :meth:`_held_below`
+        (:meth:`_block_job_files`); when that list, a live definition or a
+        destination's chain cannot be read, the scan fails.
+
+        A domain can go away while the scan runs: ``deprovision`` tears
+        VMs down in parallel, and a sibling's teardown undefines it after
+        the listing. Once what a domain uses cannot be told — its
+        inventory, its state or its live definition cannot be read, or the
+        chain of a source, or what that definition names, cannot be
+        followed — and a fresh, successful listing taken since names
+        neither it nor its UUID, it holds nothing and is skipped, with
+        whatever was read of it (:meth:`_raise_if_gone`). One still listed
+        — a running domain undefined meanwhile stays listed, transient,
+        until it stops — or a listing that fails still fails the scan, and
+        so does one renamed meanwhile (``virsh domrename``: its UUID listed
+        under another name), which keeps its disks under a name the scan
+        never read.
+
+        Every file is recorded by its identity too, ``(st_dev, st_ino)``
+        read host-side (:attr:`FilesInUse.identities`), so a teardown
+        recognises it under a name no resolved path unifies with its own —
+        a bind mount, a hard link, a path only root resolves. A file whose
+        identity cannot be read, other than for naming no file, fails the
+        scan: it could be any file.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        listing = virsh.execute("list", "--all", "--uuid", "--name",
+                                warn=True)
+        if not listing.ok:
+            return None
+        domains = _listed_domains(listing.stdout)
+        if domains is None:
+            self.logger.warning(
+                "could not read the domain list: virsh list --all --uuid "
+                "--name printed a line that is not a UUID and a name, so no "
+                "teardown can tell which files other domains use, and each "
+                "keeps them all")
+            return None
+        running = virsh.execute("list", "--name", warn=True)
+        if not running.ok:
+            self.logger.warning(
+                f"could not list the running domains "
+                f"({(running.stderr or '').strip()}), so which files their "
+                f"block jobs hold cannot be told: no teardown can tell which "
+                f"files other domains use, and each keeps them all")
+            return None
+        active = {line.strip() for line in running.stdout.splitlines()}
+        cmd = LibVirtCommandBase(provider_config=self.provider_config)
+        in_use = FilesInUse()
+        for domain, uuid in domains:
+            try:
+                used = self._files_used_by(virsh, cmd, domain, uuid,
+                                           domain in active)
+            except _DomainGoneError:
+                self.logger.debug(
+                    f"domain {domain} went away during the in-use scan, so "
+                    f"it holds nothing")
+                continue
+            except _DomainRenamedError as renamed:
+                self.logger.warning(
+                    f"domain {domain} was renamed {renamed.name} while the "
+                    f"in-use scan read it, so what it uses was not read: no "
+                    f"teardown can tell which files other domains use, and "
+                    f"each keeps them all — retry")
+                return None
+            if used is None:
+                return None
+            for path, owner in used.items():
+                in_use.setdefault(path, owner)
+            for identity, owner in used.identities.items():
+                in_use.identities.setdefault(identity, owner)
+        return in_use
+
+    def _files_used_by(self, virsh, cmd, domain: str, uuid: str,
+                       active: bool) -> FilesInUse | None:
+        """
+        What *domain*, whose UUID is *uuid*, uses, as
+        :meth:`disk_paths_in_use` maps it; its block jobs too when it is
+        *active*.
+
+        Returns:
+            The map, or ``None`` when it cannot be told.
+
+        Raises:
+            _DomainGoneError, _DomainRenamedError: What it uses could not be
+                told, and *domain* went away or was renamed since
+                (:meth:`_raise_if_gone`).
+        """
+        rows = self.vm_storage_devices(domain)
+        if rows is None:
+            self._raise_if_gone(virsh, domain, uuid)
+            return None
+        sources = {row.source for row in rows
+                   if row.type not in REMOTE_SOURCE_TYPES
+                   and row.source != '-'}
+        volumes = {row.source for row in rows if row.type == 'volume'}
+        live: dict[str, ET.Element | None] = {}
+        used = FilesInUse()
+        for source in sorted(sources):
+            chain = self._backing_chain_files(cmd, source)
+            if chain is None:
+                if not self._source_absent(source):
+                    # not proved absent — which a source spelled otherwise
+                    # than normalised never is — so possibly there
+                    self._raise_if_gone(virsh, domain, uuid)
+                    return None
+                held = self._held_below(virsh, domain, uuid, source,
+                                        source in volumes, live)
+                if held is None:
+                    return None
+                for path in held:
+                    resolved = os.path.realpath(path)
+                    try:
+                        st = os.stat(resolved)
+                    except FileNotFoundError:
+                        continue      # deleted too: nothing to protect
+                    except OSError as exc:
+                        self.logger.warning(
+                            f"could not read the identity of {path}, which "
+                            f"domain {domain} holds ({exc}): whether a file "
+                            f"a teardown would remove is that one cannot be "
+                            f"told, so each keeps everything — make it "
+                            f"accessible")
+                        return None
+                    used.setdefault(resolved, domain)
+                    used.identities.setdefault((st.st_dev, st.st_ino), domain)
+                continue
+            if not self._record_in_use(used, domain, chain):
+                return None
+        if active:
+            jobs = self._block_job_files(virsh, cmd, domain, uuid, live)
+            if jobs is None:
+                return None
+            if not self._record_in_use(used, domain, jobs):
+                return None
+        return used
+
+    def _raise_if_gone(self, virsh, domain: str, uuid: str) -> None:
+        """
+        Raise :class:`_DomainGoneError` when a fresh, successful ``virsh list
+        --all --uuid --name`` names neither *domain* nor its *uuid*, and
+        :class:`_DomainRenamedError` when it names that UUID under another
+        name.
+
+        Asked once something about *domain* could not be read, so the
+        listing is newer than that failure: a domain it does not name, by
+        name or UUID, has neither a definition nor a process — one
+        undefined while it runs becomes transient and stays listed until
+        it stops — and holds nothing. Renamed (``virsh domrename``), it is
+        the same domain with the same disks under a name the scan never
+        read. One still named — or a new domain defined under that name —
+        or a listing that fails or cannot be read, proves nothing, and the
+        caller fails closed. Every failure lists anew, never reusing an
+        answer: an earlier listing could miss a domain defined again under
+        the same name since, which must count as there. That a domain is
+        gone is never read from an error's text.
+        """
+        listing = virsh.execute("list", "--all", "--uuid", "--name",
+                                warn=True)
+        if not listing.ok:
+            return
+        listed = _listed_domains(listing.stdout)
+        if listed is None or domain in {name for name, _ in listed}:
+            return
+        renamed = [name for name, uid in listed if uid == uuid]
+        if renamed:
+            raise _DomainRenamedError(renamed[0])
+        raise _DomainGoneError(domain)
+
+    def _record_in_use(self, in_use: FilesInUse, domain: str,
+                       paths: list[str]) -> bool:
+        """
+        Record *paths*, resolved, as used by *domain*: each by its path,
+        and by its identity when it names a file. False, with a warning,
+        when an identity cannot be read other than for naming no file — it
+        could be any file.
+        """
+        for path in paths:
+            in_use.setdefault(path, domain)
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                self.logger.warning(
+                    f"could not read the identity of {path}, which domain "
+                    f"{domain} uses ({exc}): whether a file a teardown would "
+                    f"remove is that one cannot be told, so each keeps "
+                    f"everything — make it accessible")
+                return False
+            in_use.identities.setdefault((st.st_dev, st.st_ino), domain)
+        return True
+
+    def _block_job_files(self, virsh, cmd, domain: str, uuid: str,
+                         live: dict[str, ET.Element | None]) -> list[str] | None:
+        """
+        The files the block jobs of *domain*, an active domain whose UUID
+        is *uuid*, hold.
+
+        A block job can write into a destination no inventory lists (a
+        block copy's target): the ``<mirror>`` of its disk in the live
+        definition names it, by its ``file`` attribute or its ``<source>``
+        (``file`` or ``dev``). Each destination is read like a source of
+        *domain*, with every image below it (:meth:`_backing_chain_files`).
+        A ``network`` one names nothing on this host.
+
+        Returns:
+            Their resolved paths, or ``None``, with a warning saying why,
+            when they cannot be told: the live definition cannot be read, a
+            mirror names no file, or a destination's chain cannot be read.
+
+        Raises:
+            _DomainGoneError, _DomainRenamedError: They cannot be told, and
+                *domain* went away or was renamed (:meth:`_raise_if_gone`).
+        """
+        definition = self._live_definition(virsh, domain, live)
+        if definition is None:
+            self._raise_if_gone(virsh, domain, uuid)
+            self.logger.warning(
+                f"could not read the live definition of domain {domain}, "
+                f"which names the files a block job on it holds: no teardown "
+                f"can tell which files that domain uses, so each keeps them "
+                f"all")
+            return None
+        held: list[str] = []
+        for disk in definition.findall("./devices/disk"):
+            mirror = disk.find("mirror")
+            if mirror is None or mirror.get("type") in REMOTE_SOURCE_TYPES:
+                continue
+            target = disk.find("target")
+            dev = "?" if target is None else target.get("dev", "?")
+            own = mirror.find("source")
+            destination = mirror.get("file") or (
+                None if own is None else own.get("file") or own.get("dev"))
+            if not destination:
+                self._raise_if_gone(virsh, domain, uuid)
+                self.logger.warning(
+                    f"a block job on domain {domain} (disk {dev}) holds a "
+                    f"destination its live definition names no file for: no "
+                    f"teardown can tell which files that job uses, so each "
+                    f"keeps them all — retry once the job has ended (virsh "
+                    f"blockjob {domain} {dev})")
+                return None
+            chain = self._backing_chain_files(cmd, destination)
+            if chain is None:
+                self._raise_if_gone(virsh, domain, uuid)
+                self.logger.warning(
+                    f"a block job on domain {domain} holds {destination} "
+                    f"(disk {dev}), whose backing chain could not be read: no "
+                    f"teardown can tell which files that job uses, so each "
+                    f"keeps them all — make {destination} readable, or retry "
+                    f"once the job has ended (virsh blockjob {domain} {dev})")
+                return None
+            held.extend(path for path in chain if path not in held)
+        return held
+
+    @staticmethod
+    def _live_definition(virsh, domain: str,
+                         live: dict[str, ET.Element | None]) -> ET.Element | None:
+        """*domain*'s live definition (``virsh dumpxml``), read once per
+        domain into *live*; ``None`` when it cannot be read or parsed."""
+        if domain not in live:
+            dumped = virsh.execute("dumpxml", domain, warn=True)
+            try:
+                live[domain] = (ET.fromstring(dumped.stdout)
+                                if dumped.ok else None)
+            except ET.ParseError:
+                live[domain] = None
+        return live[domain]
+
+    def vm_storage_devices(self, vm_name: str) -> list[DomblkRow] | None:
+        """
+        Every block device of *vm_name* in its live and its persistent
+        definition, as ``domblklist --details`` rows (type, device, target,
+        source), de-duplicated.
+
+        Plain ``domblklist`` of a running domain reports only the live
+        definition; the persistent one — what it uses on its next start —
+        can name other media or disks. For a transient domain
+        ``--inactive`` reports its one definition (libvirt 10.0).
+
+        A ``volume`` row names a storage-pool volume, not a path, yet a
+        volume of a directory pool is a local file; its Source is resolved
+        to that path (see :meth:`_resolve_volume_rows`). A ``network`` row
+        (RBD, iSCSI, NBD, ...) is kept as reported: it names no local file.
+
+        Returns:
+            The rows, or ``None`` when either inventory cannot be read,
+            reads as incomplete (see :func:`parse_domblklist_strict`), holds
+            a volume that cannot be resolved, or a source type that is
+            neither a local path nor remote — anything unknown fails closed.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        rows: list[DomblkRow] = []
+        for inactive in ((), ("--inactive",)):
+            blklist = virsh.execute(
+                "domblklist", vm_name, "--details", *inactive, warn=True)
+            if not blklist.ok:
+                return None
+            parsed = parse_domblklist_strict(blklist.stdout)
+            if parsed is None:
+                return None
+            filled = [row for row in parsed if row.source != '-']
+            if any(row.type not in LOCAL_SOURCE_TYPES | REMOTE_SOURCE_TYPES
+                   for row in filled):
+                return None
+            if any(row.type == 'volume' for row in filled):
+                parsed = self._resolve_volume_rows(
+                    virsh, vm_name, inactive, parsed)
+                if parsed is None:
+                    return None
+            rows.extend(row for row in parsed if row not in rows)
+        return rows
+
+    @staticmethod
+    def _resolve_volume_rows(virsh, vm_name: str, inactive: tuple,
+                             rows: list[DomblkRow]) -> list[DomblkRow] | None:
+        """
+        *rows* with each ``volume`` row's Source replaced by the volume's
+        local path: its pool and volume come from the same definition's XML
+        (``domblklist`` shows only the volume), its path from ``virsh
+        vol-path``. ``None`` when any of it cannot be read.
+        """
+        dumped = virsh.execute("dumpxml", vm_name, *inactive, warn=True)
+        if not dumped.ok:
+            return None
+        try:
+            root = ET.fromstring(dumped.stdout)
+        except ET.ParseError:
+            return None
+        volumes = {}
+        for disk in root.findall("./devices/disk[@type='volume']"):
+            target = disk.find("target")
+            source = disk.find("source")
+            if target is None or source is None:
+                continue
+            volumes[target.get("dev")] = (source.get("pool"),
+                                          source.get("volume"))
+        resolved = []
+        for row in rows:
+            if row.type == 'volume' and row.source != '-':
+                pool, volume = volumes.get(row.target, (None, None))
+                if not pool or not volume:
+                    return None
+                path = virsh.execute("vol-path", volume, pool=pool, warn=True)
+                if not path.ok or not (path.stdout or '').strip():
+                    return None
+                row = row._replace(source=path.stdout.strip())
+            resolved.append(row)
+        return resolved
+
+    def refresh_pools_holding(self, paths: list[str]) -> list[str]:
+        """Refresh the active pools whose directory held one of *paths*
+        (see :func:`storage_pools.refresh_pools_holding`)."""
+        return refresh_pools_holding(
+            VirshCommand(provider_config=self.provider_config), paths)
+
+    def backing_chains(self,
+                       sources: list[str]) -> dict[str, list[str]] | None:
+        """
+        The backing chain of each of *sources*, the source first and the
+        image at the bottom of the chain last — each layer as ``qemu-img``
+        named it, not resolved: a layer that is a symlink must stay
+        recognisable as one (callers compare resolved paths themselves).
+
+        A source confirmed absent (see :meth:`_source_absent`) has no chain
+        and nothing below it to protect — a seed ISO still attached after
+        it was deleted, which boxman tolerates elsewhere — and is left out.
+        Any other source whose chain cannot be read makes the whole answer
+        ``None``: an existing image that cannot be read may depend on
+        anything.
+
+        Returns:
+            ``{source: chain}`` for every source that is there, or ``None``
+            when the chain of one that is not confirmed absent cannot be
+            read.
+        """
+        cmd = LibVirtCommandBase(provider_config=self.provider_config)
+        chains: dict[str, list[str]] = {}
+        for source in sources:
+            images = self._read_backing_chain(cmd, source)
+            if images is None:
+                if self._source_absent(source):
+                    continue
+                return None
+            chain: list[str] = []
+            seen: set[str] = set()
+            for image in images:
+                resolved = os.path.realpath(image['filename'])
+                if resolved not in seen:
+                    seen.add(resolved)
+                    chain.append(image['filename'])
+            chains[source] = chain
+        return chains
+
+    def _held_below(self, virsh, domain: str, uuid: str, missing: str,
+                    volume: bool,
+                    live: dict[str, ET.Element | None]) -> list[str] | None:
+        """
+        The files *domain*, whose UUID is *uuid*, holds open below
+        *missing*, one of its sources confirmed absent.
+
+        None, if it is positively shut off. Otherwise QEMU can hold the
+        unlinked image open together with the images below it: exactly the
+        backing chains libvirt records in the domain's live definition for
+        every disk with that source (:func:`_backing_store_files`; ``virsh
+        dumpxml``, read once per domain into *live*), all of them — or
+        nothing when no live disk has that source, only the persistent
+        definition, which QEMU does not hold. The state is asked only once the absence is
+        confirmed, which makes it safe to act on: a domain that starts
+        after this cannot open a path that no longer exists, and one that
+        stopped before has released its files.
+
+        Returns:
+            The held files' paths — some may be gone as well — or ``None``,
+            with a warning saying why, when they cannot be told: the state
+            or the live definition cannot be read, *missing* is a pool
+            volume (*volume*), or its recorded chain cannot be followed.
+
+        Raises:
+            _DomainGoneError, _DomainRenamedError: They cannot be told, and
+                *domain* went away or was renamed (:meth:`_raise_if_gone`).
+        """
+        result = virsh.execute("domstate", domain, warn=True)
+        state = (result.stdout or "").strip() if result.ok else ""
+        if state == "shut off":
+            return []
+        if not state:
+            why = "its state could not be read"
+        elif volume:
+            why = "it is a storage-pool volume, whose chain is not followed"
+        else:
+            definition = self._live_definition(virsh, domain, live)
+            if definition is None:
+                why = "its live definition could not be read"
+            else:
+                held: list[str] = []
+                for disk in _live_disks(definition, missing):
+                    files, why = _backing_store_files(disk)
+                    if files is None:
+                        break
+                    held.extend(f for f in files if f not in held)
+                else:
+                    return held
+        self._raise_if_gone(virsh, domain, uuid)
+        self.logger.warning(
+            f"domain {domain} is {state or 'in an unknown state'} with "
+            f"{missing} attached, which no longer exists, and {why}: QEMU "
+            f"can hold that file open with the images below it, so no "
+            f"teardown can tell which files it uses and each keeps them all "
+            f"— detach {missing} from {domain}, or shut that VM down")
+        return None
+
+    def _source_absent(self, path: str) -> bool:
+        """
+        Whether *path* positively does not exist where ``qemu-img`` reads it.
+
+        Asked through the same command wrapper ``qemu-img`` runs through,
+        so under the docker-compose runtime it is answered inside the
+        runtime container, whose mounts are not this host's — and never
+        inferred from ``qemu-img``'s error text. Only a path with no
+        directory entry at all, under a directory the probe can search,
+        is absent (:func:`_absence_probe`); anything else — the path is
+        there, a directory on the way cannot be searched, the probe itself
+        fails — is not. The probe never adds ``sudo``, so it can never
+        prompt for a password: whoever it runs as, a directory it can
+        search holds the same entries for everyone, and one it cannot
+        search proves nothing. Only an absolute, normalised path is
+        probed, so the directories checked are the ones it resolves
+        through.
+        """
+        if not os.path.isabs(path) or os.path.normpath(path) != path:
+            return False
+        probe = LibVirtCommandBase(override_config_use_sudo=False,
+                                   provider_config=self.provider_config)
+        result = probe.execute_shell(_absence_probe(path), warn=True)
+        return bool(result.ok) and (result.stdout or "").strip() == _ABSENT
+
+    @staticmethod
+    def _read_backing_chain(cmd, source: str) -> list[dict] | None:
+        """
+        ``qemu-img info --backing-chain`` of *source*, head first, or
+        ``None`` when it cannot be read or its answer is not a non-empty
+        list of images that each name their file. ``-U`` reads images a
+        running guest holds locked.
+        """
+        result = cmd.execute_shell(
+            f"qemu-img info --backing-chain --output=json -U "
+            f"{shlex.quote(source)}", warn=True)
+        if not result.ok:
+            return None
+        try:
+            chain = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(chain, dict):
+            chain = [chain]
+        if not isinstance(chain, list) or not chain:
+            return None
+        for image in chain:
+            if not isinstance(image, dict):
+                return None
+            filename = image.get('filename')
+            if not isinstance(filename, str) or not filename:
+                return None
+        return chain
+
+    @classmethod
+    def _backing_chain_files(cls, cmd, source: str) -> list[str] | None:
+        """
+        Resolved paths of *source* and every image below it — the images
+        and the backing files they name — or ``None`` when the chain cannot
+        be read (see :meth:`_read_backing_chain`).
+        """
+        images = cls._read_backing_chain(cmd, source)
+        if images is None:
+            return None
+        paths = {os.path.realpath(source)}
+        for image in images:
+            paths.add(os.path.realpath(image['filename']))
+            backing = image.get('full-backing-filename')
+            if isinstance(backing, str) and backing:
+                paths.add(os.path.realpath(backing))
+        return sorted(paths)
 
     def start_vm(self, vm_name: str) -> bool:
         """

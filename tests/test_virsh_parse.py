@@ -15,6 +15,7 @@ from boxman.providers.libvirt.virsh_parse import (
     DomblkRow,
     DomifRow,
     parse_domblklist,
+    parse_domblklist_strict,
     parse_domiflist,
 )
 
@@ -91,6 +92,30 @@ class TestParseDomblklist:
     def test_short_line_skipped(self):
         rows = parse_domblklist("garbage\nfile   disk   vda   /x.qcow2\n")
         assert rows == [DomblkRow('file', 'disk', 'vda', '/x.qcow2')]
+
+
+class TestParseDomblklistStrict:
+    """For callers that need every source, where a skipped line or a
+    missing Source column would read as "no such device" (#212 review
+    round 2, R2-3)."""
+
+    def test_complete_table_parses_like_the_lenient_parser(self):
+        assert (parse_domblklist_strict(DOMBLKLIST_GOLDEN)
+                == parse_domblklist(DOMBLKLIST_GOLDEN))
+
+    def test_an_explicitly_empty_slot_is_a_complete_answer(self):
+        rows = parse_domblklist_strict(DOMBLKLIST_GOLDEN)
+        assert DomblkRow('file', 'cdrom', 'hdb', '-') in rows
+
+    def test_empty_device_list_is_complete(self):
+        assert parse_domblklist_strict(DOMBLKLIST_EMPTY) == []
+
+    def test_none_when_a_line_cannot_be_read(self):
+        assert parse_domblklist_strict(
+            "garbage\nfile   disk   vda   /x.qcow2\n") is None
+
+    def test_none_when_a_source_column_is_missing(self):
+        assert parse_domblklist_strict("file   cdrom   hdc\n") is None
 
 
 class TestParseDomiflist:

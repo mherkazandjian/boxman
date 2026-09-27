@@ -11,6 +11,15 @@ a genuinely missing column comes back as ``None``).
 
 from typing import NamedTuple
 
+#: ``domblklist --details`` Type values whose Source is a path on this
+#: host — for ``volume``, once :meth:`LibVirtSession.vm_storage_devices`
+#: has resolved the pool volume it names to its path.
+LOCAL_SOURCE_TYPES = frozenset({'file', 'block', 'volume'})
+
+#: Type values whose Source names a remote image (RBD, iSCSI, NBD, ...),
+#: never a file on this host. Any type in neither set fails closed.
+REMOTE_SOURCE_TYPES = frozenset({'network'})
+
 
 class DomblkRow(NamedTuple):
     """One row of ``virsh domblklist --details`` output."""
@@ -53,6 +62,28 @@ def parse_domblklist(output: str) -> list[DomblkRow]:
             target=parts[2],
             source=parts[3] if len(parts) >= 4 else None,
         ))
+    return rows
+
+
+def parse_domblklist_strict(output: str) -> list[DomblkRow] | None:
+    """
+    Like :func:`parse_domblklist`, but ``None`` when any data line cannot
+    be read as a row with a Source column.
+
+    :func:`parse_domblklist` skips a short line and reports a missing
+    Source as ``None``, which is right for callers that look for one
+    device. A caller that needs the *complete* set of sources cannot tell
+    an absent device from an unreadable line, so it gets ``None`` instead.
+    An explicitly empty slot (virsh prints ``-``) is a complete answer and
+    is kept as ``-``.
+    """
+    rows = parse_domblklist(output)
+    data_lines = [line for line in output.splitlines()
+                  if not _is_header_or_separator(line)]
+    if len(rows) != len(data_lines):
+        return None
+    if any(row.source is None for row in rows):
+        return None
     return rows
 
 

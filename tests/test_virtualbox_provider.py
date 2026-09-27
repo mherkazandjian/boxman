@@ -288,6 +288,7 @@ class TestStubbedOperations:
             lambda s: s.save_vm("vm", "/tmp"),
             lambda s: s.restore_vm("vm", "/tmp"),
             lambda s: s.destroy_disks("/tmp", "vm", []),
+            lambda s: s.vm_storage_devices("vm"),
             lambda s: s.set_boot_order("vm", ["hd"]),
             lambda s: s.import_image("file://m", "vm", "/tmp"),
             lambda s: s.snapshot_take(vm_name="vm"),
