@@ -198,6 +198,7 @@ clusters:
       node01:
         hostname: node01
         clone_machine_id: auto  # auto (default), required, or off; see below
+        clone_ssh_host_keys: auto  # same three values; fresh ssh host keys
         cpus: { sockets: 1, cores: 2, threads: 2 }
         memory: 2048
         max_vcpus: 16       # ceiling for live hot-scaling later
@@ -212,22 +213,57 @@ clusters:
 ```
 
 `virt-clone` assigns a new libvirt UUID and NIC MAC but copies the guest
-filesystem, including Linux's machine ID. Boxman therefore runs the offline
-`virt-sysprep --operations machine-id` reset before changing interfaces or
-starting a normal disk clone. `clone_machine_id` controls failure handling:
+filesystem verbatim — Linux's machine ID and the ssh host keys included.
+Boxman therefore runs a single offline `virt-sysprep` pass against the
+shut-off clone, before changing interfaces or starting it. Two per-VM keys
+select what that pass covers:
 
-- `auto` (default) attempts the reset, but warns and continues if libguestfs
+- `clone_machine_id` — give the clone its own `/etc/machine-id`;
+- `clone_ssh_host_keys` — delete the inherited `/etc/ssh/ssh_host_*` keys and
+  install a freshly generated set, owned `root:root` — private keys mode
+  `0600`, public keys `0644`.
+
+Each takes the same three values, and defaults to `auto`:
+
+- `auto` (default) attempts the pass, but warns and continues if libguestfs
   cannot inspect an opaque, encrypted, or unsupported appliance;
-- `required` fails closed and removes the new clone if the reset cannot be
+- `required` fails closed and removes the new clone if the pass cannot be
   completed; use this for supported Linux templates that must never boot with
   the source identity;
-- `off` skips the reset and retains the legacy clone behavior.
+- `off` leaves that property alone.
+
+Both properties are handled in the *same* pass, because each invocation boots
+a libguestfs appliance and cloning is already the slow step. A failure is
+judged against the strictest policy among the enabled properties: a single
+`required` property makes the whole pass fail closed and discards the clone.
 
 The inspection is non-interactive and limited to 300 seconds by default. Set
 `provider.libvirt.virt_sysprep_timeout` in `boxman.yml` to another positive
-number for unusually slow hosts. Guests that do not regenerate empty machine-ID
-files during boot should use `off` unless the template supplies its own
-first-boot identity mechanism.
+number for unusually slow hosts.
+
+Why the ssh host keys matter: without `clone_ssh_host_keys`, every clone of
+one template presents the template's host keys. Clients cannot tell two
+clones apart by key, and root on any single clone holds the private host keys
+of all of them. The keys are generated on the hypervisor and uploaded into
+the guest rather than generated inside it, so this also works for a template
+that seals cloud-init, for a guest that ships no `ssh-keygen`, and for a
+guest whose architecture differs from the hypervisor's.
+
+One consequence worth knowing: replacing host keys needs virt-sysprep's
+`customize` operation, which *always* writes a fresh random `/etc/machine-id`
+and cannot be told not to. A clone therefore gets a populated machine ID
+rather than an empty one — a stronger guarantee, since it no longer depends
+on the guest regenerating one at boot, and the reason to prefer `off` for
+guests that do not do so has gone away. It does mean `clone_machine_id: off`
+cannot be honoured while another identity property is enabled: boxman warns
+and proceeds. Set every `clone_*` identity policy to `off` to skip the pass
+entirely. First-boot behaviour is unaffected for ordinary templates: systemd
+counts a boot as the first only when `/etc/machine-id` is missing or reads
+`uninitialized`, not when it is empty, so the old truncation never triggered
+`ConditionFirstBoot` either. Only two kinds of template lose their first-boot
+semantics: one shipped with no `/etc/machine-id` at all, and, under
+`clone_machine_id: off` with another property enabled, one whose file reads
+`uninitialized`.
 
 ### How the pieces fit together
 

@@ -75,7 +75,7 @@ providers:
     virt_install_cmd: virt-install
     # path to virt-clone command
     virt_clone_cmd: virt-clone
-    # path to virt-sysprep (used by clone_machine_id: auto|required)
+    # path to virt-sysprep (used by the clone_* identity policies)
     virt_sysprep_cmd: virt-sysprep
     # maximum offline guest inspection time in seconds
     virt_sysprep_timeout: 300
