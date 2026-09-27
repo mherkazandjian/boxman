@@ -350,8 +350,9 @@ def test_missing_clone_sanitizer_is_optional_warning(monkeypatch):
     # policies, not merely that a tool is missing
     assert "clone_machine_id=auto" in result.detail
     assert "clone_ssh_host_keys=auto" in result.detail
-    assert "clone_machine_id=required" in result.detail
-    assert "machine id and ssh host keys" in result.detail
+    assert "clone_hostname=auto" in result.detail
+    assert "clone_*=required" in result.detail
+    assert "machine id, ssh host keys and hostname" in result.detail
     assert "guestfs-tools" in result.fix.commands[0]
 
 

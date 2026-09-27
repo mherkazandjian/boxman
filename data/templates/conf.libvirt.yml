@@ -73,6 +73,7 @@ clusters:
         # compatibility. Both run in one offline virt-sysprep pass.
         # clone_machine_id: auto        # its own /etc/machine-id
         # clone_ssh_host_keys: auto     # freshly generated ssh host keys
+        # clone_hostname: auto          # the guest is named hostname: (or the vm key)
         # boot_order: [network, hd]   # PXE boot: boot from network first, then disk
         disks:
           - name: disk01

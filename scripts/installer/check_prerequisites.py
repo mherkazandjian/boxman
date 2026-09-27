@@ -1019,12 +1019,12 @@ class Doctor:
                 self.family, "guestfs-tools")
             return WARN, (
                 "virt-sysprep missing; the offline clone identity pass cannot "
-                "run. Under clone_machine_id=auto and "
-                "clone_ssh_host_keys=auto (the defaults) every clone keeps "
-                "its template's machine id and ssh host keys, and boxman "
-                "reports it once at the end of the run; under "
-                "clone_machine_id=required or clone_ssh_host_keys=required "
-                "the clone fails closed and is discarded"
+                "run. Under clone_machine_id=auto, clone_ssh_host_keys=auto "
+                "and clone_hostname=auto (the defaults) every clone keeps "
+                "its template's machine id, ssh host keys and hostname, and "
+                "boxman reports it once at the end of the run; under any "
+                "clone_*=required policy the clone fails closed and is "
+                "discarded"
             ), self._install_fix(
                 "install virt-sysprep so clones get their own identity",
                 package)

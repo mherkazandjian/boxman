@@ -39,6 +39,7 @@ class FlowsMixin:
         # here means a typo'd mac or an unresolvable network costs nothing --
         # no forced deprovision, no template build, no virt-install (#171 A3).
         self.validate_direct_boot_config()
+        self.validate_clone_identity_config()
 
         # --- Pre-check: detect state that would block a clean provision ---
         # Block on either (a) live VMs from this project, or (b) a stale
