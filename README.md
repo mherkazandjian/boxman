@@ -844,8 +844,9 @@ Details worth knowing:
   disks boxman recorded creating for it. Never: a CD-ROM or ISO it has
   attached (in either its live or its persistent definition), an
   `attach_only` (adopted) disk, anything outside the cluster workdirs, a
-  symlink, or anything another VM uses directly or as a backing file —
-  storage-pool volumes included. A protected file is recognised by its
+  symlink, or anything another VM uses directly, as a backing file or as
+  the destination of a block job it runs (a block copy) — storage-pool
+  volumes included. A protected file is recognised by its
   identity as well as its path, so under a bind mount or a hard link too;
   one boxman cannot look up keeps everything. A disk's backing chain goes
   as a whole or not at all, overlays first, so no kept disk loses its

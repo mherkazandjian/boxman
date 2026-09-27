@@ -899,6 +899,14 @@ class LibVirtSession(SessionConfigMixin):
         for it in the live definition is taken as held (:meth:`_held_below`)
         — and when that cannot be told, the scan fails.
 
+        A block job — a block copy, say — can write into a destination no
+        inventory lists, and the domain running it holds that file and
+        every image below it until the job ends. Only an active domain runs
+        one, so the live definition of each domain ``virsh list`` reports
+        active is read for them, once, shared with :meth:`_held_below`
+        (:meth:`_block_job_files`); when that list, a live definition or a
+        destination's chain cannot be read, the scan fails.
+
         Every file is recorded by its identity too, ``(st_dev, st_ino)``
         read host-side (:attr:`FilesInUse.identities`), so a teardown
         recognises it under a name no resolved path unifies with its own —
@@ -910,6 +918,15 @@ class LibVirtSession(SessionConfigMixin):
         listing = virsh.execute("list", "--all", "--name", warn=True)
         if not listing.ok:
             return None
+        running = virsh.execute("list", "--name", warn=True)
+        if not running.ok:
+            self.logger.warning(
+                f"could not list the running domains "
+                f"({(running.stderr or '').strip()}), so which files their "
+                f"block jobs hold cannot be told: no teardown can tell which "
+                f"files other domains use, and each keeps them all")
+            return None
+        active = {line.strip() for line in running.stdout.splitlines()}
         cmd = LibVirtCommandBase(provider_config=self.provider_config)
         in_use = FilesInUse()
         for domain in (line.strip() for line in listing.stdout.splitlines()):
@@ -950,23 +967,108 @@ class LibVirtSession(SessionConfigMixin):
                         in_use.identities.setdefault(
                             (st.st_dev, st.st_ino), domain)
                     continue
-                for path in chain:
-                    in_use.setdefault(path, domain)
-                    try:
-                        st = os.stat(path)
-                    except FileNotFoundError:
-                        continue
-                    except OSError as exc:
-                        self.logger.warning(
-                            f"could not read the identity of {path}, which "
-                            f"domain {domain} uses ({exc}): whether a file a "
-                            f"teardown would remove is that one cannot be "
-                            f"told, so each keeps everything — make it "
-                            f"accessible")
-                        return None
-                    in_use.identities.setdefault(
-                        (st.st_dev, st.st_ino), domain)
+                if not self._record_in_use(in_use, domain, chain):
+                    return None
+            if domain in active:
+                jobs = self._block_job_files(virsh, cmd, domain, live)
+                if jobs is None:
+                    return None
+                if not self._record_in_use(in_use, domain, jobs):
+                    return None
         return in_use
+
+    def _record_in_use(self, in_use: FilesInUse, domain: str,
+                       paths: list[str]) -> bool:
+        """
+        Record *paths*, resolved, as used by *domain*: each by its path,
+        and by its identity when it names a file. False, with a warning,
+        when an identity cannot be read other than for naming no file — it
+        could be any file.
+        """
+        for path in paths:
+            in_use.setdefault(path, domain)
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                self.logger.warning(
+                    f"could not read the identity of {path}, which domain "
+                    f"{domain} uses ({exc}): whether a file a teardown would "
+                    f"remove is that one cannot be told, so each keeps "
+                    f"everything — make it accessible")
+                return False
+            in_use.identities.setdefault((st.st_dev, st.st_ino), domain)
+        return True
+
+    def _block_job_files(self, virsh, cmd, domain: str,
+                         live: dict[str, ET.Element | None]) -> list[str] | None:
+        """
+        The files the block jobs of *domain*, an active domain, hold.
+
+        A block job can write into a destination no inventory lists (a
+        block copy's target): the ``<mirror>`` of its disk in the live
+        definition names it, by its ``file`` attribute or its ``<source>``
+        (``file`` or ``dev``). Each destination is read like a source of
+        *domain*, with every image below it (:meth:`_backing_chain_files`).
+        A ``network`` one names nothing on this host.
+
+        Returns:
+            Their resolved paths, or ``None``, with a warning saying why,
+            when they cannot be told: the live definition cannot be read, a
+            mirror names no file, or a destination's chain cannot be read.
+        """
+        definition = self._live_definition(virsh, domain, live)
+        if definition is None:
+            self.logger.warning(
+                f"could not read the live definition of domain {domain}, "
+                f"which names the files a block job on it holds: no teardown "
+                f"can tell which files that domain uses, so each keeps them "
+                f"all")
+            return None
+        held: list[str] = []
+        for disk in definition.findall("./devices/disk"):
+            mirror = disk.find("mirror")
+            if mirror is None or mirror.get("type") in REMOTE_SOURCE_TYPES:
+                continue
+            target = disk.find("target")
+            dev = "?" if target is None else target.get("dev", "?")
+            own = mirror.find("source")
+            destination = mirror.get("file") or (
+                None if own is None else own.get("file") or own.get("dev"))
+            if not destination:
+                self.logger.warning(
+                    f"a block job on domain {domain} (disk {dev}) holds a "
+                    f"destination its live definition names no file for: no "
+                    f"teardown can tell which files that job uses, so each "
+                    f"keeps them all — retry once the job has ended (virsh "
+                    f"blockjob {domain} {dev})")
+                return None
+            chain = self._backing_chain_files(cmd, destination)
+            if chain is None:
+                self.logger.warning(
+                    f"a block job on domain {domain} holds {destination} "
+                    f"(disk {dev}), whose backing chain could not be read: no "
+                    f"teardown can tell which files that job uses, so each "
+                    f"keeps them all — make {destination} readable, or retry "
+                    f"once the job has ended (virsh blockjob {domain} {dev})")
+                return None
+            held.extend(path for path in chain if path not in held)
+        return held
+
+    @staticmethod
+    def _live_definition(virsh, domain: str,
+                         live: dict[str, ET.Element | None]) -> ET.Element | None:
+        """*domain*'s live definition (``virsh dumpxml``), read once per
+        domain into *live*; ``None`` when it cannot be read or parsed."""
+        if domain not in live:
+            dumped = virsh.execute("dumpxml", domain, warn=True)
+            try:
+                live[domain] = (ET.fromstring(dumped.stdout)
+                                if dumped.ok else None)
+            except ET.ParseError:
+                live[domain] = None
+        return live[domain]
 
     def vm_storage_devices(self, vm_name: str) -> list[DomblkRow] | None:
         """
@@ -1125,18 +1227,12 @@ class LibVirtSession(SessionConfigMixin):
         elif volume:
             why = "it is a storage-pool volume, whose chain is not followed"
         else:
-            if domain not in live:
-                dumped = virsh.execute("dumpxml", domain, warn=True)
-                try:
-                    live[domain] = (ET.fromstring(dumped.stdout)
-                                    if dumped.ok else None)
-                except ET.ParseError:
-                    live[domain] = None
-            if live[domain] is None:
+            definition = self._live_definition(virsh, domain, live)
+            if definition is None:
                 why = "its live definition could not be read"
             else:
                 held: list[str] = []
-                for disk in _live_disks(live[domain], missing):
+                for disk in _live_disks(definition, missing):
                     files, why = _backing_store_files(disk)
                     if files is None:
                         break

@@ -2054,7 +2054,8 @@ class TestTheSameFileUnderAnotherName:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == 'list':
-                return _virsh_result('vm-other\n')
+                # defined, not running
+                return _virsh_result('vm-other\n' if '--all' in args else '')
             return _virsh_result(blk)
 
         real = LibVirtSession(config={'provider': {'libvirt': {}}})
@@ -2258,6 +2259,47 @@ class TestTheSameFileUnderAnotherName:
         assert str(cdrom) in t.warnings
         assert 'make it accessible' in t.warnings
         assert _saved(workdir).exists()
+
+
+class TestRunningDomainWithABlockJob:
+    """Another running domain's block copy writes into its destination:
+    a file under this VM's names that is one is kept (#208, the mirror
+    analysis)."""
+
+    @needs_qemu_img
+    def test_a_block_copy_into_a_file_under_the_vms_names_keeps_it(
+            self, tmp_path):
+        boot = _image(tmp_path / f'{VM}.qcow2')
+        destination = _image(tmp_path / f'{VM}.copy.qcow2')
+        source = _image(tmp_path / 'other' / 'disk.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        blk = (" Type   Device   Target   Source\n"
+               "------------------------------------\n"
+               f" file   disk     vda      {source}\n")
+        live = ("<domain><devices><disk type='file' device='disk'>"
+                f"<source file='{source}' index='1'/><backingStore/>"
+                f"<mirror type='file' file='{destination}' format='qcow2' "
+                "job='copy'><format type='qcow2'/>"
+                f"<source file='{destination}' index='2'/><backingStore/>"
+                "</mirror><target dev='vda'/></disk></devices></domain>")
+
+        def virsh_execute(*args, **kwargs):
+            if args[0] == 'list':
+                return _virsh_result('vm-other\n')
+            if args[0] == 'dumpxml':
+                return _virsh_result(live)
+            return _virsh_result(blk)
+
+        real = LibVirtSession(config={'provider': {'libvirt': {}}})
+        t.session.disk_paths_in_use.side_effect = real.disk_paths_in_use
+        with patch('boxman.providers.libvirt.session.VirshCommand') as virsh:
+            virsh.return_value.execute.side_effect = virsh_execute
+            t.deprovision()
+
+        assert destination.exists()
+        assert (f'left {destination} in place because domain vm-other uses '
+                f'it') in t.warnings
+        assert not boot.exists()
 
 
 class TestRunningDomainWithAMissingSource:

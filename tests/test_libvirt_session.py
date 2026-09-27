@@ -532,7 +532,9 @@ class TestDiskPathsInUse:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
-                return _result(stdout="vm-a\nvm-b\n", ok=list_ok)
+                # every domain; none of them running
+                return _result(stdout="vm-a\nvm-b\n" if "--all" in args
+                               else "", ok=list_ok)
             key = (args[1], "--inactive" in args)
             if key in failures:
                 return _result(ok=False, stderr="error: failed")
@@ -667,7 +669,8 @@ class TestDiskPathsInUse:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
-                return _result(stdout="vm-a\nvm-b\n")
+                return _result(stdout="vm-a\nvm-b\n" if "--all" in args
+                               else "")
             if args[0] == "dumpxml":
                 return _result(stdout=dumpxml)
             if args[0] == "vol-path":
@@ -862,7 +865,9 @@ class TestInUseWithAMissingSource:
         def virsh_execute(*args, **kwargs):
             calls.append(args[0])
             if args[0] == "list":
-                return _result(stdout="vm-b\n")
+                # the running domains are the ones not shut off
+                return _result(stdout="vm-b\n" if "--all" in args
+                               or state != "shut off" else "")
             if args[0] == "domstate":
                 assert args[1] == "vm-b"
                 return _result(stdout=f"{state}\n", ok=state_ok)
@@ -1102,7 +1107,7 @@ class TestInUseByIdentity:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
-                return _result(stdout="vm-b\n")
+                return _result(stdout="vm-b\n" if "--all" in args else "")
             return _result(stdout=blk)
 
         def shell(command, **kwargs):
@@ -1173,6 +1178,202 @@ class TestInUseByIdentity:
 
         assert in_use is not None
         assert len(in_use.identities) == 2
+
+
+class TestInUseWithABlockJob:
+    """A block job's destination -- a block copy's target, written while
+    the job runs -- is in use by the domain running it, together with
+    everything below it. Only an active domain runs one, and its live
+    definition names it (#208, the mirror analysis)."""
+
+    BLK = TestDiskPathsInUse.HEADER + " file   disk     vda      /ws/b.qcow2\n"
+    PLAIN = {"/ws/a.qcow2": "vm-a", "/ws/b.qcow2": "vm-b"}
+    COPY = ("<mirror type='file' file='/w/web.copy.qcow2' format='qcow2' "
+            "job='copy'><format type='qcow2'/>"
+            "<source file='/w/web.copy.qcow2' index='2'/><backingStore/>"
+            "</mirror>")
+
+    def _run(self, live="", active="vm-b\n", active_ok=True, dump_ok=True,
+             chains=None):
+        """vm-a is shut off; vm-b is active unless *active* says otherwise,
+        and *live* is its live definition."""
+        calls = []
+        chains = dict(TestDiskPathsInUse.CHAIN,
+                      **{"/ws/b.qcow2": '{"filename": "/ws/b.qcow2"}'},
+                      **(chains or {}))
+
+        def virsh_execute(*args, **kwargs):
+            calls.append(args)
+            if args[0] == "list":
+                if "--all" in args:
+                    return _result(stdout="vm-a\nvm-b\n")
+                if not active_ok:
+                    return _result(ok=False, stderr="error: failed")
+                return _result(stdout=active)
+            if args[0] == "dumpxml":
+                return _result(stdout=live, ok=dump_ok)
+            if args[1] == "vm-a":
+                return _result(stdout=TestDiskPathsInUse.BLK_A)
+            return _result(stdout=self.BLK)
+
+        def shell(command, **kwargs):
+            if _ABSENT in command:
+                return _result(stdout="")
+            source = command.rsplit(" ", 1)[1].strip("'")
+            if source not in chains:
+                return _result(ok=False, stderr="Could not open")
+            return _result(stdout=chains[source])
+
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh, \
+             patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
+            virsh.return_value.execute.side_effect = virsh_execute
+            cmd.return_value.execute_shell.side_effect = shell
+            return _session({}).disk_paths_in_use(), calls
+
+    @staticmethod
+    def _live(mirror):
+        return ("<domain><devices><disk type='file' device='disk'>"
+                "<source file='/ws/b.qcow2' index='1'/><backingStore/>"
+                f"{mirror}<target dev='vda'/></disk></devices></domain>")
+
+    def test_a_block_copy_destination_is_in_use(self):
+        in_use, _ = self._run(live=self._live(self.COPY), chains={
+            "/w/web.copy.qcow2": '{"filename": "/w/web.copy.qcow2"}'})
+
+        assert in_use == dict(self.PLAIN, **{"/w/web.copy.qcow2": "vm-b"})
+
+    def test_everything_below_the_destination_is_in_use_too(self):
+        in_use, _ = self._run(live=self._live(self.COPY), chains={
+            "/w/web.copy.qcow2": (
+                '[{"filename": "/w/web.copy.qcow2", '
+                '"full-backing-filename": "/w/base.qcow2"}, '
+                '{"filename": "/w/base.qcow2"}]')})
+
+        assert in_use["/w/web.copy.qcow2"] == "vm-b"
+        assert in_use["/w/base.qcow2"] == "vm-b"
+
+    @pytest.mark.parametrize("mirror, destination", [
+        ("<mirror type='file' file='/w/copy.qcow2' format='qcow2' "
+         "job='copy'/>", "/w/copy.qcow2"),
+        ("<mirror type='file' job='copy'><format type='qcow2'/>"
+         "<source file='/w/copy.qcow2'/></mirror>", "/w/copy.qcow2"),
+        ("<mirror type='block' job='copy'><format type='raw'/>"
+         "<source dev='/dev/vg/copy'/></mirror>", "/dev/vg/copy"),
+    ], ids=["file attribute", "source file", "source dev"])
+    def test_the_destination_is_named_either_way(self, mirror, destination):
+        in_use, _ = self._run(live=self._live(mirror), chains={
+            destination: f'{{"filename": "{destination}"}}'})
+
+        assert in_use[destination] == "vm-b"
+
+    def test_the_destination_and_what_backs_it_are_known_by_identity(
+            self, tmp_path):
+        copy, base = tmp_path / "web.copy.qcow2", tmp_path / "base.qcow2"
+        copy.write_bytes(b"")
+        base.write_bytes(b"")
+        mirror = (f"<mirror type='file' file='{copy}' job='copy'>"
+                  f"<source file='{copy}'/></mirror>")
+        in_use, _ = self._run(live=self._live(mirror), chains={
+            str(copy): (f'[{{"filename": "{copy}", "full-backing-filename": '
+                        f'"{base}"}}, {{"filename": "{base}"}}]')})
+
+        for path in (copy, base):
+            st = os.stat(path)
+            assert in_use.identities[(st.st_dev, st.st_ino)] == "vm-b"
+
+    def test_a_destination_whose_identity_cannot_be_read_fails_the_scan(
+            self, tmp_path, captured_logs):
+        if os.geteuid() == 0:
+            pytest.skip("root reads past mode 000")
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        copy = locked / "web.copy.qcow2"
+        copy.write_bytes(b"")
+        mirror = f"<mirror type='file' file='{copy}' job='copy'/>"
+        locked.chmod(0o600)
+        try:
+            in_use, _ = self._run(live=self._live(mirror), chains={
+                str(copy): f'{{"filename": "{copy}"}}'})
+        finally:
+            locked.chmod(0o700)
+
+        assert in_use is None
+        assert f"could not read the identity of {copy}" in captured_logs.text
+
+    def test_a_destination_whose_chain_cannot_be_read_fails_the_scan(
+            self, captured_logs):
+        in_use, _ = self._run(live=self._live(self.COPY))
+
+        assert in_use is None
+        assert ("a block job on domain vm-b holds /w/web.copy.qcow2"
+                in captured_logs.text)
+        assert "vda" in captured_logs.text
+
+    @pytest.mark.parametrize("live, dump_ok", [
+        ("", False), ("not xml", True)], ids=["not dumped", "not xml"])
+    def test_a_live_definition_that_cannot_be_read_fails_the_scan(
+            self, captured_logs, live, dump_ok):
+        in_use, _ = self._run(live=live, dump_ok=dump_ok)
+
+        assert in_use is None
+        assert "live definition of domain vm-b" in captured_logs.text
+
+    @pytest.mark.parametrize("mirror", [
+        "<mirror type='file' job='copy'><format type='qcow2'/></mirror>",
+        "<mirror type='volume' job='copy'><source pool='p' volume='v'/>"
+        "</mirror>",
+    ], ids=["no source", "a volume"])
+    def test_a_mirror_that_names_no_file_fails_the_scan(
+            self, captured_logs, mirror):
+        in_use, _ = self._run(live=self._live(mirror))
+
+        assert in_use is None
+        assert "a block job on domain vm-b" in captured_logs.text
+
+    def test_every_disks_block_job_is_examined(self):
+        live = ("<domain><devices>"
+                "<disk type='file' device='disk'>"
+                "<source file='/ws/b.qcow2'/><target dev='vda'/></disk>"
+                "<disk type='file' device='disk'>"
+                "<source file='/ws/c.qcow2'/><mirror type='file' "
+                "file='/w/c.copy.qcow2' job='copy'/><target dev='vdb'/></disk>"
+                "<disk type='file' device='disk'>"
+                "<source file='/ws/d.qcow2'/><mirror type='file' "
+                "file='/w/d.copy.qcow2' job='copy'/><target dev='vdc'/></disk>"
+                "</devices></domain>")
+        in_use, _ = self._run(live=live, chains={
+            "/w/c.copy.qcow2": '{"filename": "/w/c.copy.qcow2"}',
+            "/w/d.copy.qcow2": '{"filename": "/w/d.copy.qcow2"}'})
+
+        assert in_use["/w/c.copy.qcow2"] == "vm-b"
+        assert in_use["/w/d.copy.qcow2"] == "vm-b"
+
+    def test_the_running_domains_that_cannot_be_listed_fail_the_scan(
+            self, captured_logs):
+        in_use, _ = self._run(live=self._live(""), active_ok=False)
+
+        assert in_use is None
+        assert "could not list the running domains" in captured_logs.text
+
+    def test_a_network_mirror_names_nothing_local(self):
+        in_use, _ = self._run(live=self._live(
+            "<mirror type='network' job='copy'><format type='raw'/>"
+            "<source protocol='nbd' name='copy'>"
+            "<host name='example' port='10809'/></source></mirror>"))
+
+        assert in_use == self.PLAIN
+
+    def test_a_shut_off_domain_is_not_read(self):
+        in_use, calls = self._run(active="")
+
+        assert in_use == self.PLAIN
+        assert not [c for c in calls if c[0] == "dumpxml"]
+
+    def test_an_active_domain_without_a_block_job_changes_nothing(self):
+        in_use, calls = self._run(live=self._live(""))
+
+        assert in_use == self.PLAIN
+        assert [c for c in calls if c[0] == "dumpxml"] == [("dumpxml", "vm-b")]
 
 
 class TestAbsenceProbe:
@@ -1288,7 +1489,8 @@ class TestSourcesGoneFromTheHost:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
-                return _result(stdout="vm-b\n")
+                return _result(stdout="vm-b\n" if "--all" in args
+                               or state != "shut off" else "")
             if args[0] == "domstate":
                 return _result(stdout=f"{state}\n")
             if args[0] == "dumpxml":
@@ -1310,7 +1512,7 @@ class TestSourcesGoneFromTheHost:
 
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
-                return _result(stdout="vm-b\n")
+                return _result(stdout="vm-b\n" if "--all" in args else "")
             return _result(stdout=blk)
 
         with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:
