@@ -79,6 +79,14 @@ unless_root = pytest.mark.skipif(os.geteuid() == 0,
                                  reason='root searches a mode-000 directory')
 
 
+def _link(target, path):
+    """*path* made another name of the file *target* (a hard link): the
+    same file, which no resolved path can tell is the same."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.link(target, path)
+    return path
+
+
 def _virsh_result(stdout='', ok=True):
     result = MagicMock(name='invoke.Result')
     result.stdout, result.stderr, result.ok = stdout, '', ok
@@ -1709,9 +1717,8 @@ class TestUnlistableDirectories:
     # -- only the cluster workdirs are listed strictly -----------------------
 
     @unless_root
-    @pytest.mark.parametrize("mode", [0o111, 0o000])
     def test_update_removes_a_vm_whose_adopted_disk_sits_unlistable(
-            self, tmp_path, mode):
+            self, tmp_path):
         """An adopted disk in a directory the user cannot list -- Ubuntu's
         /var/lib/libvirt/images is root's, 0711, so searchable but not
         listable to a user, as 0111 is to its owner -- is outside every
@@ -1723,7 +1730,7 @@ class TestUnlistableDirectories:
         t = _Teardown(workdir, disks=[boot, adopted],
                       records=[_record('shared', adopted, role=ROLE_ADOPTED,
                                        target='vdb')])
-        outside.chmod(mode)
+        outside.chmod(0o111)
         try:
             t.update_remove()
         finally:
@@ -1734,6 +1741,32 @@ class TestUnlistableDirectories:
         assert adopted.exists()
         assert (f"left {adopted} in place because boxman attached it but did "
                 f"not create it (role 'adopted')") in t.warnings
+
+    @unless_root
+    def test_an_adopted_disk_that_cannot_be_looked_up_keeps_everything(
+            self, tmp_path):
+        """Its directory cannot even be searched (000): whether the adopted
+        disk is another name of a file under the VM's names cannot be told,
+        so nothing is removed -- the VM is undefined, and the warning says
+        what to make accessible."""
+        workdir, outside = tmp_path / 'work', tmp_path / 'outside'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        adopted = _qcow2(outside / 'adopted.qcow2')
+        t = _Teardown(workdir, disks=[boot, adopted],
+                      records=[_record('shared', adopted, role=ROLE_ADOPTED,
+                                       target='vdb')])
+        outside.chmod(0)
+        try:
+            t.update_remove()
+        finally:
+            outside.chmod(0o700)
+
+        t.session.destroy_vm.assert_called()
+        assert boot.exists() and adopted.exists()
+        assert (f'the identity of {adopted} could not be read'
+                in t.warnings)
+        assert 'make it accessible' in t.warnings
+        assert _saved(workdir).exists() and os.path.lexists(_locator())
 
     @unless_root
     def test_update_with_an_unlistable_workdir_leaves_the_domain_defined(
@@ -1955,6 +1988,193 @@ class TestLiteralVmNames:
 
         assert not mine.exists()
         assert other.exists()
+
+
+class TestTheSameFileUnderAnotherName:
+    """A protected file is recognised by its identity too, not only by its
+    resolved path: under a bind mount, a hard link or a path boxman cannot
+    resolve, the same file has another name that no resolved path
+    unifies. A hard link models that here (#208, the alias review)."""
+
+    def test_a_cdrom_also_named_for_the_vm_is_kept(self, tmp_path):
+        """Scenario 1: the CD-ROM is attached by one name, and the same file
+        sits under the VM's names in its workdir."""
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        iso = _file(tmp_path / 'isos' / 'install.iso', b'iso')
+        named = _link(iso, tmp_path / f'{VM}.install.iso')
+        t = _Teardown(tmp_path, disks=[boot], media=[iso], records=[])
+
+        t.deprovision()
+
+        assert named.exists() and not boot.exists()
+        assert f'left {named} in place because it is a CD-ROM' in t.warnings
+
+    def test_a_cdrom_given_through_a_symlink_to_another_name_is_kept(
+            self, tmp_path):
+        """The CD-ROM's path is a symlink to another name of the file: only
+        its identity read now, links followed, is the file's."""
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        named = _file(tmp_path / f'{VM}.install.iso', b'iso')
+        other = _link(named, tmp_path / 'isos' / 'install.iso')
+        cdrom = tmp_path / 'isos' / 'current.iso'
+        cdrom.symlink_to(other)
+        t = _Teardown(tmp_path, disks=[boot], media=[cdrom], records=[])
+
+        t.deprovision()
+
+        assert named.exists() and not boot.exists()
+        assert f'left {named} in place because it is a CD-ROM' in t.warnings
+
+    def test_an_image_under_a_qcow2_cdrom_by_another_name_is_kept(
+            self, tmp_path):
+        """Scenario 2: a qcow2 CD-ROM is built on the boot disk, named by
+        another path."""
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        base = _link(boot, tmp_path / 'isos' / 'base.qcow2')
+        cdrom = _qcow2(tmp_path / 'isos' / 'cd.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], media=[cdrom], records=[])
+        t.session.backing_chains.side_effect = _live({cdrom: [cdrom, base]})
+
+        t.deprovision()
+
+        assert boot.exists()
+        assert f'left {boot} in place because it backs a CD-ROM' in t.warnings
+
+    @needs_qemu_img
+    def test_a_file_another_domain_uses_by_another_name_is_kept(
+            self, tmp_path):
+        """Scenario 3, through the real in-use scan (real qemu-img, a
+        mocked virsh that knows one other domain)."""
+        boot = _image(tmp_path / f'{VM}.qcow2')
+        alias = _link(boot, tmp_path / 'other' / 'disk.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+        blk = (" Type   Device   Target   Source\n"
+               "------------------------------------\n"
+               f" file   disk     vda      {alias}\n")
+
+        def virsh_execute(*args, **kwargs):
+            if args[0] == 'list':
+                return _virsh_result('vm-other\n')
+            return _virsh_result(blk)
+
+        real = LibVirtSession(config={'provider': {'libvirt': {}}})
+        t.session.disk_paths_in_use.side_effect = real.disk_paths_in_use
+        with patch('boxman.providers.libvirt.session.VirshCommand') as virsh:
+            virsh.return_value.execute.side_effect = virsh_execute
+            t.deprovision()
+
+        assert boot.exists()
+        assert f'left {boot} in place because domain vm-other uses it' in (
+            t.warnings)
+
+    def test_an_adopted_disk_also_named_for_the_vm_is_kept(self, tmp_path):
+        """Scenario 4: an adopted disk is attached by one name, and the same
+        file sits under the VM's names in its workdir."""
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        adopted = _qcow2(tmp_path / 'shared' / 'data.qcow2')
+        named = _link(adopted, tmp_path / f'{VM}.data.qcow2')
+        t = _Teardown(tmp_path, disks=[boot, adopted],
+                      records=[_record('shared', adopted, role=ROLE_ADOPTED,
+                                       target='vdb')])
+
+        t.deprovision()
+
+        assert named.exists() and adopted.exists()
+        assert not boot.exists()
+
+    def test_a_chain_kept_by_another_name_keeps_its_layer(self, tmp_path):
+        """The chain-whole rule: a boot overlay is kept because its base,
+        named by another path, is not the VM's -- the same file under the
+        VM's names is kept too."""
+        base = _qcow2(tmp_path / f'{VM}.qcow2')
+        alias = _link(base, tmp_path / 'shared' / 'base.qcow2')
+        head = _qcow2(tmp_path / f'{VM}.s1')
+        t = _Teardown(tmp_path, disks=[head], records=[])
+        t.session.backing_chains.side_effect = _live({head: [head, alias]})
+
+        t.deprovision()
+
+        assert base.exists() and head.exists()
+
+    def test_a_data_disks_file_is_never_decided_by_another_name(
+            self, tmp_path):
+        """Extra-disk files are never decided by name -- nor under another
+        name of the same file among the VM's names."""
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        data = _qcow2(tmp_path / f'{VM}_disk01.qcow2')
+        other = _link(data, tmp_path / f'{VM}.disk01-copy')
+        t = _Teardown(tmp_path, disks=[boot, data],
+                      records=[_record('disk01', data)])
+
+        t.deprovision([{'name': 'disk01'}])
+
+        assert not boot.exists() and not data.exists()
+        assert other.exists()
+
+    def test_a_snapshot_chain_holding_a_cdrom_by_another_name_is_kept(
+            self, tmp_path):
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        base = _qcow2(tmp_path / f'{VM}_disk01.qcow2')
+        head = _qcow2(tmp_path / f'{VM}_disk01.s1')
+        cdrom = _link(head, tmp_path / 'isos' / 'cd.iso')
+        t = _Teardown(tmp_path, disks=[boot, head], media=[cdrom],
+                      records=[_record('disk01', base)])
+        t.session.backing_chains.side_effect = _live({head: [head, base]})
+
+        t.deprovision([{'name': 'disk01'}])
+
+        assert head.exists() and base.exists()
+        assert f'{head} in its chain is a media source of the vm' in (
+            t.warnings)
+
+    def test_a_refusal_under_one_name_blocks_admitting_the_other(
+            self, tmp_path):
+        one = _file(tmp_path / 'one')
+        other = _link(one, tmp_path / 'other')
+        admission = disk_cleanup._Admission(disk_cleanup._Identities(
+            disk_cleanup.file_identities([str(one), str(other)]), ()))
+
+        admission.refuse(str(one), 'kept')
+        admission.admit(str(other))
+
+        assert admission.admitted == {}
+
+    def test_a_refusal_under_one_name_withdraws_the_others_admission(
+            self, tmp_path):
+        one = _file(tmp_path / 'one')
+        other = _link(one, tmp_path / 'other')
+        admission = disk_cleanup._Admission(disk_cleanup._Identities(
+            disk_cleanup.file_identities([str(one), str(other)]), ()))
+
+        admission.admit(str(other))
+        admission.refuse(str(one), 'kept')
+
+        assert admission.admitted == {}
+        assert not admission.is_admitted_as(str(other))
+
+    @unless_root
+    def test_a_protected_path_that_cannot_be_resolved_keeps_everything(
+            self, tmp_path):
+        """The CD-ROM is named through a directory boxman cannot search, so
+        whether it is one of the files under the VM's names cannot be told:
+        everything is kept, and the warning names it."""
+        workdir, hidden = tmp_path / 'w', tmp_path / 'hidden'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        named = _file(workdir / f'{VM}.install.iso', b'iso')
+        hidden.mkdir()
+        (hidden / 'link').symlink_to(workdir)
+        cdrom = hidden / 'link' / f'{VM}.install.iso'
+        t = _Teardown(workdir, disks=[boot], media=[cdrom], records=[])
+        hidden.chmod(0)
+        try:
+            t.deprovision()
+        finally:
+            hidden.chmod(0o700)
+
+        assert boot.exists() and named.exists()
+        assert str(cdrom) in t.warnings
+        assert 'make it accessible' in t.warnings
+        assert _saved(workdir).exists()
 
 
 class TestRunningDomainWithAMissingSource:

@@ -845,9 +845,12 @@ Details worth knowing:
   attached (in either its live or its persistent definition), an
   `attach_only` (adopted) disk, anything outside the cluster workdirs, a
   symlink, or anything another VM uses directly or as a backing file —
-  storage-pool volumes included. A disk's backing chain goes as a whole or
-  not at all, overlays first, so no kept disk loses its backing file. A VM
-  that predates the ownership record has its declared disks removed by name.
+  storage-pool volumes included. A protected file is recognised by its
+  identity as well as its path, so under a bind mount or a hard link too;
+  one boxman cannot look up keeps everything. A disk's backing chain goes
+  as a whole or not at all, overlays first, so no kept disk loses its
+  backing file. A VM that predates the ownership record has its declared
+  disks removed by name.
   Before undefining, the teardown saves what it saw beside the boot disk
   (`.boxman-teardown-<vm>.json`) and records where in
   `~/.config/boxman/cache/teardown/<vm>.json`, so a teardown interrupted

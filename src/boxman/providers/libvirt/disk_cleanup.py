@@ -584,29 +584,125 @@ _WHY_NO_RECORD = {
 }
 
 
+class FilesInUse(dict):
+    """
+    What other domains use (``LibVirtSession.disk_paths_in_use``): the
+    mapping itself is resolved path -> domain, and :attr:`identities` maps
+    each of those files' identity, ``(st_dev, st_ino)``, to its domain — so
+    a file used under a name no resolved path unifies with the teardown's
+    (a bind mount, a hard link, a path boxman cannot resolve) is still
+    recognised.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        #: (st_dev, st_ino) -> the domain that uses that file
+        self.identities: dict[tuple[int, int], str] = {}
+
+
+class _Identities:
+    """
+    Which file each path names, as ``(st_dev, st_ino)``: one file under two
+    names a resolved path cannot unify — a bind mount, a hard link, a
+    symlink boxman cannot resolve — is still one file (#208).
+
+    A candidate's identity is the one captured before undefining
+    (``StorageInventory.identities``, lstat: candidates are regular files,
+    and a symlink is refused anyway) — the identity its removal checks. A
+    protected path is read now, host-side, with ``os.stat`` (links
+    followed): one that names no file matches nothing by identity, and one
+    that cannot be read at all is kept in :attr:`unreadable`, which keeps
+    every candidate (:func:`remove_vm_storage`).
+    """
+
+    def __init__(self, captured: dict[str, tuple[int, int]],
+                 protected: Iterable[str]) -> None:
+        self._captured = captured
+        self._current: dict[str, tuple[int, int]] = {}
+        #: protected path -> why its identity could not be read
+        self.unreadable: dict[str, OSError] = {}
+        seen: set[str] = set()
+        for path in protected:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                self.unreadable[path] = exc
+                continue
+            self._current[path] = (st.st_dev, st.st_ino)
+
+    def of(self, path: str) -> set[tuple[int, int]]:
+        """Every identity known for *path*: captured, read now, or both."""
+        return {identity for identity in (self._captured.get(path),
+                                          self._current.get(path))
+                if identity is not None}
+
+
+class _FileSet:
+    """Files, matched by resolved path or by identity
+    (:class:`_Identities`)."""
+
+    def __init__(self, identities: _Identities, paths: Iterable[str]) -> None:
+        self._identities = identities
+        self._resolved: set[str] = set()
+        self._ids: set[tuple[int, int]] = set()
+        for path in paths:
+            self._resolved.add(os.path.realpath(path))
+            self._ids.update(identities.of(path))
+
+    def __contains__(self, path: object) -> bool:
+        return (os.path.realpath(path) in self._resolved
+                or not self._ids.isdisjoint(self._identities.of(path)))
+
+
 class _Admission:
     """Which referenced files may be removed, and why each other one is
-    kept. Keyed by resolved path; a refusal always wins over an
-    admission."""
+    kept. Keyed by resolved path, and matched by identity too
+    (:class:`_Identities`): the refusal of a file under one name blocks,
+    and withdraws, its admission under another. A refusal always wins over
+    an admission, and identity only ever adds refusals."""
 
-    def __init__(self) -> None:
+    def __init__(self, identities: _Identities | None = None) -> None:
+        self._identities = identities or _Identities({}, ())
         #: resolved path -> the path to unlink it by
         self.admitted: dict[str, str] = {}
         #: resolved path -> (path, why it is kept)
         self.refused: dict[str, tuple[str, str]] = {}
+        self._refused_ids: set[tuple[int, int]] = set()
+
+    def _same_file(self, path: str) -> list[str]:
+        """The admitted entries (resolved keys) that are the file *path*
+        names, by resolved path or identity."""
+        resolved = os.path.realpath(path)
+        ids = self._identities.of(path)
+        return [key for key, admitted in self.admitted.items()
+                if key == resolved
+                or not ids.isdisjoint(self._identities.of(admitted))]
 
     def admit(self, path: str) -> None:
         resolved = os.path.realpath(path)
-        if resolved not in self.refused:
+        if (resolved not in self.refused
+                and self._refused_ids.isdisjoint(self._identities.of(path))):
             self.admitted.setdefault(resolved, path)
 
     def refuse(self, path: str, reason: str) -> None:
-        resolved = os.path.realpath(path)
-        self.admitted.pop(resolved, None)
-        self.refused.setdefault(resolved, (path, reason))
+        for key in self._same_file(path):
+            del self.admitted[key]
+        self._refused_ids.update(self._identities.of(path))
+        self.refused.setdefault(os.path.realpath(path), (path, reason))
 
     def is_admitted(self, path: str) -> bool:
+        """Admitted under this resolved path. A chain counts as whole only
+        by the names ``qemu-img`` gave its layers, as before identities."""
         return os.path.realpath(path) in self.admitted
+
+    def is_admitted_as(self, path: str) -> bool:
+        """Admitted under this name, or under another name of its file."""
+        return bool(self._same_file(path))
 
 
 def _refuse_incomplete_chains(chains: dict[str, list[str]],
@@ -642,7 +738,8 @@ def _refuse_incomplete_chains(chains: dict[str, list[str]],
             if problem is None:
                 continue
             for layer in layers:
-                if admission.is_admitted(layer):
+                # the layer's file under any name
+                if admission.is_admitted_as(layer):
                     admission.refuse(layer, problem)
                     changed = True
 
@@ -684,6 +781,13 @@ def remove_vm_storage(
     of the cluster *workdirs* once symlinks are resolved, and not a CD-ROM
     (or other media) source of either definition.
 
+    Every protection that compares files matches them by resolved path and
+    by identity (:class:`_Identities`): the media and what they are built
+    on, the extra disks and their chains, the chain-whole rule, what other
+    domains use (:class:`FilesInUse`), and a refusal under one name against
+    an admission under another. A protected path whose identity cannot be
+    read, other than for naming no file, keeps every candidate.
+
     Then, across the whole inventory: a backing chain is removed only as a
     whole (:func:`_refuse_incomplete_chains`), and an unreadable chain
     keeps everything; nothing another domain uses directly or as a backing
@@ -697,22 +801,29 @@ def remove_vm_storage(
     """
     vm = inventory.vm_name
     outcome = StorageOutcome()
-    admission = _Admission()
     real = os.path.realpath
     real_workdirs = {real(os.path.expanduser(w)) for w in workdirs}
     chains = inventory.chains
     legacy = list(inventory.legacy_disks or ())
+    records = inventory.records or []
+    # every path a protection compares candidates with, read now
+    identities = _Identities(inventory.identities, [
+        *inventory.media_sources, *inventory.disk_sources,
+        *(record.source for record in records), *legacy,
+        *(layer for layers in (chains or {}).values() for layer in layers)])
+    admission = _Admission(identities)
     # a media source and every image under it: a qcow2 CD-ROM can be built
     # on a file the vm also attaches as a disk. Protected before anything is
     # admitted, on every route.
-    media = {real(path) for path in inventory.media_sources}
-    under_media = {real(layer) for source in inventory.media_sources
-                   for layer in (chains or {}).get(source, ())} - media
+    media = _FileSet(identities, inventory.media_sources)
+    under_media = _FileSet(identities, [
+        layer for source in inventory.media_sources
+        for layer in (chains or {}).get(source, ())])
 
     def media_refusal(path: str) -> str | None:
-        if real(path) in media:
+        if path in media:
             return _MEDIA
-        if real(path) in under_media:
+        if path in under_media:
             return _UNDER_MEDIA
         return None
 
@@ -740,17 +851,16 @@ def remove_vm_storage(
         if not os.path.basename(path).startswith(f"{vm}."))
 
     # extra-disk files are never decided by name
-    extra_related = {real(path) for path in attached_extras}
-    extra_related.update(real(r.source) for r in inventory.records or ())
-    extra_related.update(real(path) for path in legacy)
-    for source, layers in (chains or {}).items():
-        if (source not in inventory.media_sources
-                and not os.path.basename(source).startswith(f"{vm}.")):
-            extra_related.update(real(layer) for layer in layers)
+    extra_related = _FileSet(identities, [
+        *attached_extras, *(record.source for record in records), *legacy,
+        *(layer for source, layers in (chains or {}).items()
+          if source not in inventory.media_sources
+          and not os.path.basename(source).startswith(f"{vm}.")
+          for layer in layers)])
 
     # -- 1. the boot-disk family ------------------------------------------
     for path in inventory.boot_family:
-        if real(path) in extra_related and media_refusal(path) is None:
+        if path in extra_related and media_refusal(path) is None:
             continue
         reason = static_refusal(path)
         if reason is None and inventory.records_state == RECORDS_UNKNOWN:
@@ -763,13 +873,12 @@ def remove_vm_storage(
     # -- 2./3. extra disks -------------------------------------------------
     state = inventory.records_state
     if state == RECORDS_PRESENT:
-        records = inventory.records or []
         for record in records:
             if (record.source in inventory.disk_sources
                     or not _may_exist(record.source)):
                 continue
             chain, reason = _owned_snapshot_chain(
-                inventory, record, real_workdirs)
+                inventory, record, real_workdirs, media)
             if chain is None:
                 admission.refuse(record.source, (
                     f"boxman created it, but it was no longer attached "
@@ -816,20 +925,37 @@ def remove_vm_storage(
                 "what depends on it cannot be told"))
     else:
         _refuse_incomplete_chains(chains, admission)
+    if identities.unreadable:
+        unreadable, exc = min(identities.unreadable.items())
+        for path in list(admission.admitted.values()):
+            admission.refuse(path, (
+                f"the identity of {unreadable} could not be read ({exc}), so "
+                f"whether that is this file cannot be told — make it "
+                f"accessible"))
 
     # -- in use by another domain ------------------------------------------
     if admission.admitted:
         in_use = paths_in_use()
+        used_ids = getattr(in_use, "identities", {})
         for resolved, path in list(admission.admitted.items()):
+            if resolved not in admission.admitted:
+                continue     # withdrawn meanwhile, under another name
             if in_use is None:
                 admission.refuse(path, "could not check whether another "
                                        "domain uses it")
-            elif in_use.get(resolved):
-                admission.refuse(path, f"domain {in_use[resolved]} uses it")
+                continue
+            domain = in_use.get(resolved) or next(
+                (used_ids[identity]
+                 for identity in sorted(identities.of(path))
+                 if identity in used_ids), None)
+            if domain:
+                admission.refuse(path, f"domain {domain} uses it")
         if chains:
             _refuse_incomplete_chains(chains, admission)
 
     # -- removal, heads first ------------------------------------------------
+    # (by resolved path: a layer named otherwise than the file admitted is
+    # never admitted, so the chain-whole rule kept that chain already)
     resolved_chains = [[real(layer) for layer in layers]
                        for layers in (chains or {}).values()]
     depth: dict[str, int] = {}
@@ -878,6 +1004,7 @@ def _stranded(where: str | None) -> str:
 def _owned_snapshot_chain(inventory: StorageInventory,
                           record: DiskRecord,
                           workdirs: set[str],
+                          media: _FileSet | None = None,
                           ) -> tuple[list[str] | None, str | None]:
     """
     The snapshot chain of a ``data`` disk whose recorded source an external
@@ -926,7 +1053,8 @@ def _owned_snapshot_chain(inventory: StorageInventory,
     directory = real(os.path.dirname(record.source))
     if directory not in workdirs:
         return None, _OUTSIDE
-    media = {real(path) for path in inventory.media_sources}
+    if media is None:
+        media = _FileSet(_Identities({}, ()), inventory.media_sources)
     stem = f"{vm}_{record.name}."
     chain = inventory.chains[head]
     for layer in chain:
@@ -937,7 +1065,7 @@ def _owned_snapshot_chain(inventory: StorageInventory,
                           f"{record.name!r}")
         if real(os.path.dirname(layer)) != directory:
             return None, f"{layer} in its chain is in another directory"
-        if real(layer) in media:
+        if layer in media:
             return None, f"{layer} in its chain is a media source of the vm"
         reason = _regular_file_refusal(layer)
         if reason:

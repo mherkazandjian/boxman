@@ -912,6 +912,92 @@ class TestInUseWithAMissingSource:
         assert "domstate" not in calls
 
 
+class TestInUseByIdentity:
+    """Every file another domain uses is recorded by its identity too, read
+    host-side, so a teardown recognises it under any other name; a file
+    whose identity cannot be read fails the scan (#208, the alias
+    review)."""
+
+    @staticmethod
+    def _scan(tmp_path, source, chain_json):
+        blk = (TestDiskPathsInUse.HEADER
+               + f" file   disk     vda      {source}\n")
+
+        def virsh_execute(*args, **kwargs):
+            if args[0] == "list":
+                return _result(stdout="vm-b\n")
+            return _result(stdout=blk)
+
+        def shell(command, **kwargs):
+            if _ABSENT in command:
+                return _result(stdout="")
+            asked = command.rsplit(" ", 1)[1].strip("'")
+            if asked != str(source):
+                return _result(ok=False, stderr="Could not open")
+            return _result(stdout=chain_json)
+
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh, \
+             patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
+            virsh.return_value.execute.side_effect = virsh_execute
+            cmd.return_value.execute_shell.side_effect = shell
+            return _session({}).disk_paths_in_use()
+
+    @staticmethod
+    def _chain(top, base):
+        return (f'[{{"filename": "{top}", "full-backing-filename": '
+                f'"{base}"}}, {{"filename": "{base}"}}]')
+
+    def test_every_file_is_recorded_by_identity_too(self, tmp_path):
+        top, base = tmp_path / "b.top", tmp_path / "base.qcow2"
+        top.write_bytes(b"top")
+        base.write_bytes(b"base")
+
+        in_use = self._scan(tmp_path, top, self._chain(top, base))
+
+        assert in_use == {os.path.realpath(top): "vm-b",
+                          os.path.realpath(base): "vm-b"}
+        for path in (top, base):
+            st = os.stat(path)
+            assert in_use.identities[(st.st_dev, st.st_ino)] == "vm-b"
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_a_file_whose_identity_cannot_be_read_fails_the_scan(
+            self, tmp_path, captured_logs):
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        top, base = hidden / "b.top", hidden / "base.qcow2"
+        top.write_bytes(b"top")
+        base.write_bytes(b"base")
+        hidden.chmod(0)
+        try:
+            in_use = self._scan(tmp_path, top, self._chain(top, base))
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is None
+        assert str(top) in captured_logs.text
+        assert "make it accessible" in captured_logs.text
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_a_directory_that_can_be_searched_but_not_listed_is_read(
+            self, tmp_path):
+        """Ordinary use: /var/lib/libvirt/images is root's, 0711 -- its
+        files still stat fine for a user, as 0111 is to its owner."""
+        images = tmp_path / "images"
+        images.mkdir()
+        top, base = images / "b.top", images / "base.qcow2"
+        top.write_bytes(b"top")
+        base.write_bytes(b"base")
+        images.chmod(0o111)
+        try:
+            in_use = self._scan(tmp_path, top, self._chain(top, base))
+        finally:
+            images.chmod(0o700)
+
+        assert in_use is not None
+        assert len(in_use.identities) == 2
+
+
 class TestAbsenceProbe:
     """How a source is confirmed absent (#208 review round 3, 4): through
     the command wrapper qemu-img runs through, never with sudo, and only on

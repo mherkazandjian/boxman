@@ -21,7 +21,7 @@ from .clone_vm import CloneVM
 from .commands import LibVirtCommandBase, VirshCommand
 from .destroy_vm import DestroyVM, shutdown_and_wait
 from .disk import DiskManager
-from .disk_cleanup import remove_vm_disks
+from .disk_cleanup import FilesInUse, remove_vm_disks
 from .disk_ownership import detach_disk, forget_disk
 from .import_image import ImageImporter
 from .iso_boot_vm import IsoBootVM
@@ -825,7 +825,7 @@ class LibVirtSession(SessionConfigMixin):
         destroyer = DestroyVM(name=name, provider_config=self.provider_config)
         return destroyer.confirm_absent()
 
-    def disk_paths_in_use(self) -> dict[str, str] | None:
+    def disk_paths_in_use(self) -> FilesInUse | None:
         """
         Map every image file a defined domain uses to that domain's name.
 
@@ -851,13 +851,20 @@ class LibVirtSession(SessionConfigMixin):
         a running one can hold the unlinked image open in QEMU together
         with the images below it, whose files still exist, so any other
         state fails the scan.
+
+        Every file is recorded by its identity too, ``(st_dev, st_ino)``
+        read host-side (:attr:`FilesInUse.identities`), so a teardown
+        recognises it under a name no resolved path unifies with its own —
+        a bind mount, a hard link, a path only root resolves. A file whose
+        identity cannot be read, other than for naming no file, fails the
+        scan: it could be any file.
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         listing = virsh.execute("list", "--all", "--name", warn=True)
         if not listing.ok:
             return None
         cmd = LibVirtCommandBase(provider_config=self.provider_config)
-        in_use: dict[str, str] = {}
+        in_use = FilesInUse()
         for domain in (line.strip() for line in listing.stdout.splitlines()):
             if not domain:
                 continue
@@ -876,6 +883,20 @@ class LibVirtSession(SessionConfigMixin):
                     return None
                 for path in chain:
                     in_use.setdefault(path, domain)
+                    try:
+                        st = os.stat(path)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        self.logger.warning(
+                            f"could not read the identity of {path}, which "
+                            f"domain {domain} uses ({exc}): whether a file a "
+                            f"teardown would remove is that one cannot be "
+                            f"told, so each keeps everything — make it "
+                            f"accessible")
+                        return None
+                    in_use.identities.setdefault(
+                        (st.st_dev, st.st_ino), domain)
         return in_use
 
     def vm_storage_devices(self, vm_name: str) -> list[DomblkRow] | None:
