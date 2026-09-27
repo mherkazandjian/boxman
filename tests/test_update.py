@@ -3,6 +3,7 @@ Tests for the boxman update feature: VMStateDiffer, hot/cold CPU/memory,
 disk resize, and update orchestration logic.
 """
 
+import os
 import types
 from unittest.mock import MagicMock, call, patch
 
@@ -11,6 +12,12 @@ import pytest
 from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.disk import DiskManager
+from boxman.providers.libvirt.disk_cleanup import remove_vm_disks
+from boxman.providers.libvirt.disk_ownership import (
+    ROLE_ADOPTED,
+    ROLE_DATA,
+    DiskRecord,
+)
 from boxman.providers.libvirt.virsh_edit import VirshEdit
 from boxman.providers.libvirt.vm_differ import VMStateDiffer
 from conftest import make_bare_manager
@@ -820,6 +827,11 @@ class TestDestroyRemovedVm:
         # Not gone after the graceful undefine, gone after the forced one:
         # the disks may only be removed once absence is confirmed.
         mgr.provider.confirm_vm_absent.side_effect = [False, True]
+        mgr._vm_disk_records = MagicMock(return_value=None)
+        mgr.provider.backing_chain_files.return_value = [
+            '/data/test-vm_disk01.qcow2']
+        # the sample paths are absolute; never let a unit test unlink them
+        mgr._remove_leftover_disk_files = MagicMock()
 
         mgr._destroy_removed_vm('test-vm')
 
@@ -827,7 +839,21 @@ class TestDestroyRemovedVm:
             c.args[0] for c in mgr.provider.destroy_disks.call_args_list)
         assert swept == ['/data', '/var/lib/libvirt/images']
         for c in mgr.provider.destroy_disks.call_args_list:
-            assert c.kwargs == {'vm_name': 'test-vm', 'disks': []}
+            # the attached extra disk is kept out of the name sweep; the
+            # boot disk (<vm>.qcow2) is not
+            assert c.kwargs == {'vm_name': 'test-vm', 'disks': [],
+                                'protected': ['/data/test-vm_disk01.qcow2']}
+        # only the extra disk's chain is read, the boot disk's is not
+        mgr.provider.backing_chain_files.assert_called_once_with(
+            ['/data/test-vm_disk01.qcow2'])
+        # the domain's own disk list and ownership records, read before
+        # undefining, are handed on
+        mgr._remove_leftover_disk_files.assert_called_once()
+        assert mgr._remove_leftover_disk_files.call_args.args[:3] == (
+            'test-vm',
+            ['/var/lib/libvirt/images/test-vm.qcow2',
+             '/data/test-vm_disk01.qcow2'],
+            None)
         # domain undefined both gracefully and with force
         assert mgr.provider.destroy_vm.call_args_list == [
             call('test-vm'),
@@ -874,19 +900,495 @@ class TestDestroyRemovedVm:
         virsh.execute.return_value = MagicMock(
             ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
         mgr.provider.confirm_vm_absent.side_effect = [False, True]
+        mgr._vm_disk_records = MagicMock(return_value=None)
+        mgr._remove_leftover_disk_files = MagicMock()
 
         parent = MagicMock()
         parent.attach_mock(virsh.execute, 'virsh_execute')
+        parent.attach_mock(mgr._vm_disk_records, 'disk_records')
         parent.attach_mock(mgr.provider.destroy_vm, 'destroy_vm')
 
         mgr._destroy_removed_vm('test-vm')
 
         ordered = [c[0] for c in parent.mock_calls]
         assert ordered == [
-            'virsh_execute', 'destroy_vm', 'destroy_vm']
+            'virsh_execute', 'disk_records', 'destroy_vm', 'destroy_vm']
         # first destroy_vm is the graceful one, second is force=True
-        assert parent.mock_calls[1] == call.destroy_vm('test-vm')
-        assert parent.mock_calls[2] == call.destroy_vm('test-vm', force=True)
+        assert parent.mock_calls[2] == call.destroy_vm('test-vm')
+        assert parent.mock_calls[3] == call.destroy_vm('test-vm', force=True)
+
+    @patch("boxman.manager_parts.vms.VirshCommand")
+    def test_vm_disk_files_from_domblklist(self, mock_virsh_cls):
+        """Disk files come from libvirt, cdrom sources are left out."""
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(
+            ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
+
+        assert mgr._vm_disk_files('test-vm') == [
+            '/var/lib/libvirt/images/test-vm.qcow2',
+            '/data/test-vm_disk01.qcow2']
+
+    @patch("boxman.manager_parts.vms.VirshCommand")
+    def test_vm_disk_files_empty_when_query_fails(self, mock_virsh_cls):
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(ok=False)
+
+        assert mgr._vm_disk_files('test-vm') == []
+
+    @patch("boxman.manager_parts.vms.VirshCommand")
+    def test_vm_disk_records_read_from_the_domain_metadata(
+            self, mock_virsh_cls):
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(
+            ok=True, stderr='',
+            stdout=('<disks><disk name="disk01" target="vdb" role="data" '
+                    'source="/ws/test-vm_disk01.qcow2"/></disks>'))
+
+        assert mgr._vm_disk_records('test-vm') == [DiskRecord(
+            name='disk01', target='vdb', role=ROLE_DATA,
+            source='/ws/test-vm_disk01.qcow2')]
+
+    @patch("boxman.manager_parts.vms.VirshCommand")
+    def test_vm_disk_records_none_when_the_domain_has_none(
+            self, mock_virsh_cls):
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(
+            ok=False, stdout='',
+            stderr='error: metadata not found: Requested metadata element '
+                   'is not present')
+
+        assert mgr._vm_disk_records('test-vm') is None
+
+    @patch("boxman.manager_parts.vms.VirshCommand")
+    def test_unreadable_vm_disk_records_are_none_and_reported(
+            self, mock_virsh_cls):
+        """Unreadable must not read as "boxman attached nothing"; None
+        keeps every file."""
+        mgr = self._make_manager()
+        mock_virsh_cls.return_value.execute.return_value = MagicMock(
+            ok=True, stderr='', stdout='<disks><disk name="x"')
+
+        assert mgr._vm_disk_records('test-vm') is None
+        mgr.logger.warning.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Extra disks libvirt left behind (issue #207)
+# ---------------------------------------------------------------------------
+class TestRemovedVmLeftoverDisks:
+    """``update`` removing a VM left its extra disk behind and still exited
+    0 (#207). ``undefine --remove-all-storage`` skips a disk its storage
+    pool does not list ("not managed by libvirt") -- boxman creates extra
+    disks with qemu-img, outside the pool -- and the name glob in
+    destroy_disks cannot name them for a VM that is gone from conf.yml.
+    Observed on the test-runner VM with
+    ``boxes/tiny-libvirt-ubuntu-24.04-cloudinit``.
+
+    What libvirt left is removed on recorded ownership, never on the file
+    name: being attached and named ``<vm>_...`` proves neither that boxman
+    created a file nor that nothing else uses it (#207 review, findings 1
+    and 3)."""
+
+    VM = 'bprj__demo__bprj_cluster_1_web'
+    OTHER = 'bprj__demo__bprj_cluster_1_db'
+
+    def _manager(self, workdir, attached, records, in_use=None):
+        mgr = make_bare_manager(
+            {'project': 'demo',
+             'clusters': {'cluster_1': {'workdir': str(workdir)}}})
+        mgr.provider = MagicMock()
+        mgr.provider.confirm_vm_absent.return_value = True
+        mgr.provider.disk_paths_in_use.return_value = in_use or {}
+        mgr._vm_disk_files = MagicMock(
+            return_value=[str(p) for p in attached])
+        mgr._vm_disk_records = MagicMock(return_value=records)
+        # the real name sweep, so that its ordering against the ownership
+        # decision is exercised too (#212 review round 2, R2-1)
+        mgr.provider.destroy_disks.side_effect = (
+            lambda workdir, vm_name, disks, **kwargs:
+                remove_vm_disks(workdir, vm_name, disks, **kwargs))
+        # standalone images by default: each chain is just the file itself
+        mgr.provider.backing_chain_files.side_effect = (
+            lambda sources: sorted(str(s) for s in sources))
+        return mgr
+
+    @staticmethod
+    def _record(name, path, role=ROLE_DATA, target='vdb'):
+        return DiskRecord(name=name, target=target, role=role,
+                          source=str(path))
+
+    @staticmethod
+    def _file(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'qcow2')
+        return path
+
+    @staticmethod
+    def _warnings(mgr):
+        return ' '.join(str(c.args[0])
+                        for c in mgr.logger.warning.call_args_list)
+
+    def test_a_recorded_data_disk_is_removed(self, tmp_path):
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path,
+                            [tmp_path / f'{self.VM}.qcow2', extra],
+                            [self._record('disk01', extra)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert not extra.exists()
+
+    def test_an_attached_neighbour_named_like_an_extra_disk_is_kept(
+            self, tmp_path):
+        """VM ``web_2``'s boot disk, attached to ``web``, matches ``web_*``
+        (the probe from the #207 review)."""
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        neighbour = self._file(tmp_path / f'{self.VM}_2.qcow2')
+        mgr = self._manager(tmp_path, [extra, neighbour],
+                            [self._record('disk01', extra)],
+                            in_use={str(neighbour): f'{self.VM}_2'})
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert not extra.exists()
+        assert neighbour.exists()
+        assert str(neighbour) in self._warnings(mgr)
+
+    def test_an_adopted_disk_is_kept(self, tmp_path):
+        """attach_only: the image existed already, so boxman did not make
+        it (disk_ownership.ROLE_ADOPTED)."""
+        adopted = self._file(tmp_path / f'{self.VM}_data.qcow2')
+        mgr = self._manager(tmp_path, [adopted],
+                            [self._record('data', adopted, ROLE_ADOPTED)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert adopted.exists()
+        assert str(adopted) in self._warnings(mgr)
+
+    def test_a_domain_without_ownership_records_keeps_its_disks(
+            self, tmp_path):
+        """No metadata (a domain predating it): boxman does not know what
+        it attached, which is never grounds for deleting anything."""
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path, [extra], records=None)
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.exists()
+        assert str(extra) in self._warnings(mgr)
+
+    def test_a_disk_another_domain_uses_is_kept(self, tmp_path):
+        """Directly or as a backing file: disk_paths_in_use covers both."""
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('disk01', extra)],
+                            in_use={str(extra): self.OTHER})
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.exists()
+        assert self.OTHER in self._warnings(mgr)
+
+    def test_nothing_is_removed_when_other_domains_cannot_be_checked(
+            self, tmp_path):
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('disk01', extra)])
+        mgr.provider.disk_paths_in_use.return_value = None
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.exists()
+        assert str(extra) in self._warnings(mgr)
+
+    def test_a_disk_outside_every_cluster_workdir_is_kept(self, tmp_path):
+        workdir = tmp_path / 'ws'
+        workdir.mkdir()
+        elsewhere = self._file(
+            tmp_path / 'elsewhere' / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(workdir, [elsewhere],
+                            [self._record('disk01', elsewhere)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert elsewhere.exists()
+
+    def test_a_symlinked_directory_cannot_lead_outside_the_workdir(
+            self, tmp_path):
+        workdir = tmp_path / 'ws'
+        workdir.mkdir()
+        outside = tmp_path / 'outside'
+        target = self._file(outside / f'{self.VM}_disk01.qcow2')
+        (workdir / 'sub').symlink_to(outside, target_is_directory=True)
+        via_link = workdir / 'sub' / f'{self.VM}_disk01.qcow2'
+        mgr = self._manager(workdir, [via_link],
+                            [self._record('disk01', via_link)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert target.exists()
+
+    def test_a_symlinked_disk_file_is_kept(self, tmp_path):
+        """boxman never creates one; unlinking it would report a disk as
+        removed while its data lives on elsewhere."""
+        target = self._file(tmp_path / 'outside' / 'data.qcow2')
+        link = tmp_path / f'{self.VM}_disk01.qcow2'
+        link.symlink_to(target)
+        mgr = self._manager(tmp_path, [link], [self._record('disk01', link)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert link.is_symlink()
+        assert target.exists()
+
+    def test_a_workdir_reached_through_a_symlink_is_still_its_own(
+            self, tmp_path):
+        real = tmp_path / 'real'
+        real.mkdir()
+        alias = tmp_path / 'alias'
+        alias.symlink_to(real, target_is_directory=True)
+        extra = self._file(alias / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(alias, [extra], [self._record('disk01', extra)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert not (real / f'{self.VM}_disk01.qcow2').exists()
+
+    def test_a_record_not_named_for_its_disk_is_not_trusted(self, tmp_path):
+        """boxman names a data disk ``<vm>_<name>.<type>``; a record whose
+        source says otherwise was not written by the attach path."""
+        other = self._file(tmp_path / 'shared-data.qcow2')
+        mgr = self._manager(tmp_path, [other],
+                            [self._record('disk01', other)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert other.exists()
+        assert str(other) in self._warnings(mgr)
+
+    def test_a_file_replaced_after_the_capture_is_kept(self, tmp_path):
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('disk01', extra)])
+
+        def replace_during_undefine(*_args, **_kwargs):
+            # a new inode at the same path, allocated while the old one
+            # still exists so the number cannot be reused
+            fresh = tmp_path / 'fresh'
+            fresh.write_bytes(b'someone else')
+            os.replace(fresh, extra)
+
+        mgr.provider.destroy_vm.side_effect = replace_during_undefine
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.read_bytes() == b'someone else'
+        # the replacement went back under its name; nothing is left over
+        assert sorted(p.name for p in tmp_path.iterdir()) == [extra.name]
+
+    def test_an_adopted_disk_named_like_a_memory_snapshot_is_kept(
+            self, tmp_path):
+        """Logical name ``snapshot_data`` gives ``<vm>_snapshot_data.qcow2``,
+        which the name sweep's ``<vm>_snapshot_*`` pattern took for a
+        memory-snapshot file and unlinked before the ownership decision ran
+        (#212 review round 2, R2-1)."""
+        adopted = self._file(tmp_path / f'{self.VM}_snapshot_data.qcow2')
+        mgr = self._manager(
+            tmp_path, [adopted],
+            [self._record('snapshot_data', adopted, ROLE_ADOPTED)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert adopted.exists()
+        assert str(adopted) in self._warnings(mgr)
+
+    def test_a_snapshot_named_disk_another_domain_uses_is_kept(
+            self, tmp_path):
+        extra = self._file(tmp_path / f'{self.VM}_snapshot_data.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('snapshot_data', extra)],
+                            in_use={str(extra): self.OTHER})
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.exists()
+        assert self.OTHER in self._warnings(mgr)
+
+    def test_the_sweep_still_removes_the_boot_disk_and_memory_files(
+            self, tmp_path):
+        boot = self._file(tmp_path / f'{self.VM}.qcow2')
+        memory = self._file(tmp_path / f'{self.VM}_snapshot_s1.raw')
+        mgr = self._manager(tmp_path, [boot], [])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert not boot.exists()
+        assert not memory.exists()
+
+    def test_a_file_replaced_right_before_the_unlink_is_kept(
+            self, tmp_path, monkeypatch):
+        """The replacement lands after the identity check and before the
+        unlink: the review's probe runs it from the log call that sat
+        between the two (#212 review round 2, R2-4)."""
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('disk01', extra)])
+
+        replaced = []
+
+        def replace(*_args, **_kwargs):
+            if not replaced:
+                replaced.append(True)
+                fresh = tmp_path / 'fresh'
+                fresh.write_bytes(b'someone else')
+                os.replace(fresh, extra)
+
+        monkeypatch.setattr(
+            'boxman.providers.libvirt.disk_cleanup.log.info', replace)
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.read_bytes() == b'someone else'
+
+    def test_a_file_recreated_after_it_was_claimed_is_kept(
+            self, tmp_path, monkeypatch):
+        """Only the entry moved into the private directory is ever
+        unlinked: a writer recreating the name right after the move keeps
+        its file."""
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('disk01', extra)])
+        real_rename = os.rename
+
+        def rename_then_recreate(src, dst, *args, **kwargs):
+            real_rename(src, dst, *args, **kwargs)
+            if str(src) == str(extra):
+                extra.write_bytes(b'someone else')
+
+        monkeypatch.setattr(os, 'rename', rename_then_recreate)
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.read_bytes() == b'someone else'
+        assert sorted(p.name for p in tmp_path.iterdir()) == [extra.name]
+
+    def test_a_replacement_that_cannot_be_put_back_is_named(
+            self, tmp_path, monkeypatch):
+        """The file moved aside turns out not to be the attached one, and
+        the name has been taken again meanwhile: it stays in the private
+        directory, which the warning names."""
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('disk01', extra)])
+
+        def replace_during_undefine(*_args, **_kwargs):
+            fresh = tmp_path / 'fresh'
+            fresh.write_bytes(b'someone else')
+            os.replace(fresh, extra)
+
+        mgr.provider.destroy_vm.side_effect = replace_during_undefine
+        real_link = os.link
+
+        def name_taken_again(src, dst, *args, **kwargs):
+            if str(dst) == str(extra):
+                extra.write_bytes(b'a third writer')
+            return real_link(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, 'link', name_taken_again)
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert extra.read_bytes() == b'a third writer'
+        stranded = [p for p in tmp_path.rglob(extra.name) if p != extra]
+        assert [p.read_bytes() for p in stranded] == [b'someone else']
+        assert str(stranded[0]) in self._warnings(mgr)
+
+    def test_a_snapshot_moved_disk_is_kept_whole_and_named(self, tmp_path):
+        """An external snapshot moved the head to an overlay. The record
+        names only the base; nothing recorded names the overlays, so boxman
+        removes neither rather than half a chain (#207 review, finding 3)."""
+        base = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        head = self._file(tmp_path / f'{self.VM}_disk01.snap1')
+        mgr = self._manager(tmp_path, [head],
+                            [self._record('disk01', base)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert base.exists()
+        assert head.exists()
+        warnings = self._warnings(mgr)
+        assert str(base) in warnings
+        assert str(head) in warnings
+
+    def test_a_snapshot_moved_disk_named_snapshot_is_kept_whole(
+            self, tmp_path):
+        """The same, for logical name ``snapshot_disk01``: the recorded
+        base is no longer attached, and ``<vm>_snapshot_disk01.qcow2``
+        matches the memory-snapshot sweep, which deleted it before the
+        ownership decision could keep the chain (#212 review round 3,
+        R3-2)."""
+        base = self._file(tmp_path / f'{self.VM}_snapshot_disk01.qcow2')
+        head = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap1')
+        mgr = self._manager(tmp_path, [head],
+                            [self._record('snapshot_disk01', base)])
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert base.exists()
+        assert head.exists()
+        warnings = self._warnings(mgr)
+        assert str(base) in warnings
+        assert str(head) in warnings
+
+    def test_every_layer_under_a_kept_disk_survives_the_sweep(
+            self, tmp_path):
+        """Two snapshots: the middle layer is neither attached nor recorded,
+        but it is in the attached head's backing chain, read before
+        undefining."""
+        base = self._file(tmp_path / f'{self.VM}_snapshot_disk01.qcow2')
+        middle = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap1')
+        head = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap2')
+        memory = self._file(tmp_path / f'{self.VM}_snapshot_snap1.raw')
+        mgr = self._manager(tmp_path, [head],
+                            [self._record('snapshot_disk01', base)])
+        mgr.provider.backing_chain_files.side_effect = None
+        mgr.provider.backing_chain_files.return_value = [
+            str(head), str(middle), str(base)]
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert head.exists() and middle.exists() and base.exists()
+        # a memory-snapshot file is not part of any chain: still swept
+        assert not memory.exists()
+
+    def test_an_unreadable_chain_keeps_every_snapshot_named_file(
+            self, tmp_path):
+        """Without the chain, which ``<vm>_snapshot_*`` files are layers of
+        a kept disk cannot be told apart from memory-snapshot files, so the
+        sweep leaves all of them."""
+        middle = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap1')
+        head = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap2')
+        memory = self._file(tmp_path / f'{self.VM}_snapshot_snap1.raw')
+        mgr = self._manager(tmp_path, [head], [])
+        mgr.provider.backing_chain_files.side_effect = None
+        mgr.provider.backing_chain_files.return_value = None
+
+        mgr._destroy_removed_vm(self.VM)
+
+        assert middle.exists() and head.exists() and memory.exists()
+        assert 'backing chain' in self._warnings(mgr)
+
+    def test_unconfirmed_absence_leaves_every_disk(self, tmp_path):
+        extra = self._file(tmp_path / f'{self.VM}_disk01.qcow2')
+        mgr = self._manager(tmp_path, [extra],
+                            [self._record('disk01', extra)])
+        mgr.provider.confirm_vm_absent.return_value = False
+
+        with pytest.raises(ProvisionError, match='could not confirm'):
+            mgr._destroy_removed_vm(self.VM)
+
+        assert extra.exists()
 
 
 # ---------------------------------------------------------------------------

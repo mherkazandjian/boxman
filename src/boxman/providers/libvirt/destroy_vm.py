@@ -396,12 +396,20 @@ class DestroyVM:
         try:
             self.logger.info(f"**force** un-defining vm {self.name}")
 
-            # Try the full storage-removal form first. It is not
-            # idempotent (--remove-all-storage errors when the files are
-            # already gone) and --delete-storage-volume-snapshots
-            # requires a recent libvirt, so on failure fall back to a
+            # Try the full storage-removal form first. virsh undefines the
+            # domain *before* it touches the volumes, so a failure here can
+            # mean the domain is already gone and only a volume could not
+            # be removed — e.g. a file deleted behind the storage pool's
+            # back, which the pool still lists. On failure fall back to a
             # plain undefine that only drops snapshot metadata — the
-            # domain must always be removable.
+            # domain must always be removable. The disk files are removed
+            # by the caller's disk cleanup either way.
+            # --delete-storage-volume-snapshots is deliberately absent: it
+            # is VIR_STORAGE_VOL_DELETE_WITH_SNAPSHOTS (0x2), which only
+            # RBD pools implement. The directory pools virt-clone creates
+            # for boxman's workdirs reject it with "unsupported flags
+            # (0x2) in function virStorageBackendVolDeleteLocal", so every
+            # volume removal failed after the domain was already undefined.
             # --managed-save is not optional: libvirt refuses with "Refusing to
             # undefine while domain managed save image exists" for any domain
             # that was suspended or snapshotted with memory state, which
@@ -409,8 +417,7 @@ class DestroyVM:
             result = self.virsh.execute(
                 "undefine", self.name,
                 "--remove-all-storage", "--wipe-storage",
-                "--delete-storage-volume-snapshots", "--snapshots-metadata",
-                "--managed-save",
+                "--snapshots-metadata", "--managed-save",
                 warn=True)
             if not result.ok:
                 self.logger.warning(
@@ -420,9 +427,20 @@ class DestroyVM:
                     "undefine", self.name, "--snapshots-metadata",
                     "--managed-save", warn=True)
                 if not fallback.ok:
-                    self.logger.error(
-                        f"plain undefine also failed for {self.name}: "
-                        f"{fallback.stderr.strip()}")
+                    # "failed to get domain" here is the expected outcome
+                    # when the first attempt undefined the domain and only
+                    # its storage removal failed. Classify it by a
+                    # successful listing, not by the error text: a failed
+                    # lookup is not proof of absence (see confirm_absent).
+                    if self.confirm_absent():
+                        self.logger.debug(
+                            f"plain undefine found no domain {self.name}: "
+                            f"the storage-removing undefine had already "
+                            f"removed it ({fallback.stderr.strip()})")
+                    else:
+                        self.logger.error(
+                            f"plain undefine also failed for {self.name}: "
+                            f"{fallback.stderr.strip()}")
 
             # verify that the vm is no longer defined
             if not self.is_vm_defined():

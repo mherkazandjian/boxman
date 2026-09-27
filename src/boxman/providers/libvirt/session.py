@@ -1,4 +1,6 @@
+import json
 import os
+import shlex
 import tempfile
 import time
 from multiprocessing import Process, Queue
@@ -16,7 +18,7 @@ from ..session_base import SessionConfigMixin
 from . import net_reconcile
 from .cdrom import CDROMManager
 from .clone_vm import CloneVM
-from .commands import VirshCommand
+from .commands import LibVirtCommandBase, VirshCommand
 from .destroy_vm import DestroyVM, shutdown_and_wait
 from .disk import DiskManager
 from .disk_cleanup import remove_vm_disks
@@ -28,7 +30,11 @@ from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
 from .storage import StorageManager
 from .virsh_edit import VirshEdit
-from .virsh_parse import parse_domblklist, parse_domiflist
+from .virsh_parse import (
+    parse_domblklist,
+    parse_domblklist_strict,
+    parse_domiflist,
+)
 
 
 class LibVirtSession(SessionConfigMixin):
@@ -623,6 +629,7 @@ class LibVirtSession(SessionConfigMixin):
                       workdir : str,
                       vm_name: str,
                       disks: list[dict[str, str]],
+                      protected: list[str] | tuple = (),
                       ) -> bool:
         """
         Destroy disks associated with the VM.
@@ -638,12 +645,14 @@ class LibVirtSession(SessionConfigMixin):
             workdir: Directory where disk images are stored
             vm_name: Full name of the VM
             disks: Extra disk configurations from the cluster config
+            protected: Paths to leave alone whatever their name (see
+                :func:`remove_vm_disks`)
 
         Returns:
             True if successful, False otherwise
         """
         # Delegates to the pure-filesystem helper extracted in Phase 2.6.
-        return remove_vm_disks(workdir, vm_name, disks)
+        return remove_vm_disks(workdir, vm_name, disks, protected=protected)
 
     def set_boot_order(self, vm_name: str, order: list[str]) -> bool:
         """
@@ -781,6 +790,102 @@ class LibVirtSession(SessionConfigMixin):
         """
         destroyer = DestroyVM(name=name, provider_config=self.provider_config)
         return destroyer.confirm_absent()
+
+    def disk_paths_in_use(self) -> dict[str, str] | None:
+        """
+        Map every image file a defined domain uses to that domain's name.
+
+        Covers each domain's disk and CD-ROM sources in both its live and
+        its persistent definition, and every layer of their backing chains,
+        as resolved paths, so a caller can tell whether a file it is about
+        to delete is still some domain's disk or the base of one. Plain
+        ``domblklist`` of a running domain reports only the live
+        definition, while the persistent one — what the domain uses on its
+        next start — can name a different disk, or an overlay backed by one.
+        For a transient domain ``--inactive`` reports its one definition
+        (libvirt 10.0), so the same two queries cover it.
+
+        Fails closed: ``None`` when the domain list, either inventory of
+        any domain, or any backing chain cannot be read, or reads as
+        incomplete — a partial answer would let a caller delete a file that
+        is still in use. An explicitly empty slot (``-``) is not a source.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        listing = virsh.execute("list", "--all", "--name", warn=True)
+        if not listing.ok:
+            return None
+        cmd = LibVirtCommandBase(provider_config=self.provider_config)
+        in_use: dict[str, str] = {}
+        for domain in (line.strip() for line in listing.stdout.splitlines()):
+            if not domain:
+                continue
+            sources: set[str] = set()
+            for inactive in ((), ("--inactive",)):
+                blklist = virsh.execute(
+                    "domblklist", domain, "--details", *inactive, warn=True)
+                if not blklist.ok:
+                    return None
+                rows = parse_domblklist_strict(blklist.stdout)
+                if rows is None:
+                    return None
+                sources.update(row.source for row in rows
+                               if row.source != '-')
+            for source in sorted(sources):
+                chain = self._backing_chain_files(cmd, source)
+                if chain is None:
+                    return None
+                for path in chain:
+                    in_use.setdefault(path, domain)
+        return in_use
+
+    def backing_chain_files(self, sources: list[str]) -> list[str] | None:
+        """
+        Resolved paths of every image in the backing chains of *sources*,
+        the sources included, or ``None`` when any chain cannot be read.
+        ``-U`` reads images a running guest holds locked.
+        """
+        cmd = LibVirtCommandBase(provider_config=self.provider_config)
+        paths: set[str] = set()
+        for source in sources:
+            chain = self._backing_chain_files(cmd, source)
+            if chain is None:
+                return None
+            paths.update(chain)
+        return sorted(paths)
+
+    @staticmethod
+    def _backing_chain_files(cmd, source: str) -> list[str] | None:
+        """
+        Resolved paths of *source* and every image below it, or ``None``
+        when ``qemu-img`` cannot read the chain or its answer is not a
+        non-empty list of images that each name their file. ``-U`` reads
+        images a running guest holds locked.
+        """
+        result = cmd.execute_shell(
+            f"qemu-img info --backing-chain --output=json -U "
+            f"{shlex.quote(source)}", warn=True)
+        if not result.ok:
+            return None
+        try:
+            chain = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(chain, dict):
+            chain = [chain]
+        if not isinstance(chain, list) or not chain:
+            return None
+        paths = {os.path.realpath(source)}
+        for image in chain:
+            if not isinstance(image, dict):
+                return None
+            filename = image.get('filename')
+            if not isinstance(filename, str) or not filename:
+                return None
+            paths.add(os.path.realpath(filename))
+            backing = image.get('full-backing-filename')
+            if isinstance(backing, str) and backing:
+                paths.add(os.path.realpath(backing))
+        return sorted(paths)
 
     def start_vm(self, vm_name: str) -> bool:
         """

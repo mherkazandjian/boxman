@@ -56,6 +56,28 @@ def parse_domblklist(output: str) -> list[DomblkRow]:
     return rows
 
 
+def parse_domblklist_strict(output: str) -> list[DomblkRow] | None:
+    """
+    Like :func:`parse_domblklist`, but ``None`` when any data line cannot
+    be read as a row with a Source column.
+
+    :func:`parse_domblklist` skips a short line and reports a missing
+    Source as ``None``, which is right for callers that look for one
+    device. A caller that needs the *complete* set of sources cannot tell
+    an absent device from an unreadable line, so it gets ``None`` instead.
+    An explicitly empty slot (virsh prints ``-``) is a complete answer and
+    is kept as ``-``.
+    """
+    rows = parse_domblklist(output)
+    data_lines = [line for line in output.splitlines()
+                  if not _is_header_or_separator(line)]
+    if len(rows) != len(data_lines):
+        return None
+    if any(row.source is None for row in rows):
+        return None
+    return rows
+
+
 def parse_domiflist(output: str) -> list[DomifRow]:
     """
     Parse ``virsh domiflist`` output into rows.

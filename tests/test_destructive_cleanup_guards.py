@@ -192,7 +192,13 @@ class TestDestroyRemovedVmGate:
         mgr.config = {"project": "demo"}
         mgr.logger = MagicMock()
         mgr.provider = MagicMock()
+        mgr._vm_disk_files = MagicMock(
+            return_value=["/ws/c1/bprj__demo__bprj_cluster_1_old01_d1.qcow2"])
         mgr._vm_disk_dirs = MagicMock(return_value=["/ws/c1"])
+        mgr._vm_disk_records = MagicMock(return_value=None)
+        mgr.provider.backing_chain_files.return_value = [
+            "/ws/c1/bprj__demo__bprj_cluster_1_old01_d1.qcow2"]
+        mgr._remove_leftover_disk_files = MagicMock()
         return mgr
 
     def test_unconfirmed_absence_preserves_the_disks(self):
@@ -202,17 +208,22 @@ class TestDestroyRemovedVmGate:
         with pytest.raises(ProvisionError, match="could not confirm"):
             mgr._destroy_removed_vm("bprj__demo__bprj_cluster_1_old01")
         mgr.provider.destroy_disks.assert_not_called()
+        mgr._remove_leftover_disk_files.assert_not_called()
 
     def test_disk_dirs_are_read_before_the_domain_is_undefined(self):
         """``domblklist`` returns nothing once the domain is gone."""
         mgr = self._manager()
         mgr.provider.confirm_vm_absent.return_value = True
         parent = MagicMock()
+        parent.attach_mock(mgr._vm_disk_files, "disk_files")
         parent.attach_mock(mgr._vm_disk_dirs, "disk_dirs")
+        parent.attach_mock(mgr._vm_disk_records, "disk_records")
+        parent.attach_mock(mgr.provider.backing_chain_files, "chains")
         parent.attach_mock(mgr.provider.destroy_vm, "destroy_vm")
         mgr._destroy_removed_vm("bprj__demo__bprj_cluster_1_old01")
-        assert [c[0] for c in parent.mock_calls][:2] == [
-            "disk_dirs", "destroy_vm"]
+        assert [c[0] for c in parent.mock_calls][:5] == [
+            "disk_files", "disk_dirs", "disk_records", "chains",
+            "destroy_vm"]
 
 
 # --------------------------------------------------------------------------
