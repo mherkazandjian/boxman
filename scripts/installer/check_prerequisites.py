@@ -1003,20 +1003,33 @@ class Doctor:
         self.check("Nested virtualization", nested)
 
     def _check_clone_sanitizer(self):
-        """Report virt-sysprep as recommended, not a core runtime gate."""
+        """Report virt-sysprep as recommended, not a core runtime gate.
+
+        Still only a warning -- boxman clones fine without it -- but the
+        warning names what is lost, because the default policy is ``auto``
+        and a clone that quietly wears its template's identity is easy to
+        miss for weeks (#202).
+        """
         def clone_sanitizer():
             if have("virt-sysprep"):
-                return OK, "virt-sysprep present for clone machine-ID reset", None
+                return OK, (
+                    "virt-sysprep present for the offline clone identity pass"
+                ), None
             package = _TOOL_PKG["virt-sysprep"].get(
                 self.family, "guestfs-tools")
             return WARN, (
-                "virt-sysprep missing; clone_machine_id=auto will warn and "
-                "continue, while clone_machine_id=required will fail closed"
+                "virt-sysprep missing; the offline clone identity pass cannot "
+                "run. Under clone_machine_id=auto and "
+                "clone_ssh_host_keys=auto (the defaults) every clone keeps "
+                "its template's machine id and ssh host keys, and boxman "
+                "reports it once at the end of the run; under "
+                "clone_machine_id=required or clone_ssh_host_keys=required "
+                "the clone fails closed and is discarded"
             ), self._install_fix(
-                "install virt-sysprep for automatic clone machine-ID resets",
+                "install virt-sysprep so clones get their own identity",
                 package)
 
-        return self.check("Clone machine-ID sanitizer", clone_sanitizer)
+        return self.check("Clone identity sanitizer", clone_sanitizer)
 
     # -- LOCAL runtime ----------------------------------------------------- #
     def check_local_runtime(self):
@@ -1208,7 +1221,8 @@ class Doctor:
                 gaps.append("iptables/ip (NAT & isolated networks, netlab bridges)")
             if not sysprep_ok:
                 gaps.append(
-                    "virt-sysprep (clone_machine_id=required needs NOPASSWD)")
+                    "virt-sysprep (the clone identity pass needs NOPASSWD; "
+                    "clone_*=required fails closed without it)")
             if not (qemu_ok and rm_ok):
                 gaps.append("qemu-img/rm (destroy/cleanup silently no-ops without these)")
             if not gaps:

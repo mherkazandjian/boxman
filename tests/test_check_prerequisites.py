@@ -346,8 +346,12 @@ def test_missing_clone_sanitizer_is_optional_warning(monkeypatch):
     result = doctor._check_clone_sanitizer()
 
     assert result.status == checker.WARN
+    # the point of #202: the warning has to say what is lost, for both
+    # policies, not merely that a tool is missing
     assert "clone_machine_id=auto" in result.detail
+    assert "clone_ssh_host_keys=auto" in result.detail
     assert "clone_machine_id=required" in result.detail
+    assert "machine id and ssh host keys" in result.detail
     assert "guestfs-tools" in result.fix.commands[0]
 
 

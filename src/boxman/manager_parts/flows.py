@@ -14,6 +14,19 @@ from boxman.exceptions import BoxmanError, ConfigError, ProvisionError
 class FlowsMixin:
 
     def provision(self, cli_args):
+        """Provision the project, then report every clone that degraded.
+
+        The report sits in a ``finally`` because it matters most when the run
+        does not finish cleanly: a batch where one clone failed and another
+        merely kept its template's identity raises out of the clone step, and
+        the degraded clone would otherwise never reach the closing summary.
+        """
+        try:
+            self._provision(cli_args)
+        finally:
+            self.report_clone_degradations()
+
+    def _provision(self, cli_args):
 
         config = self.config
 
