@@ -252,21 +252,14 @@ cd ~/fresh-hybrid
 boxman destroy          # prompts [y/N]; type y   (or use -y to skip)
 ```
 
-> ### Expect a red libvirt error here — it is benign
+> ### No libvirt storage errors any more
 >
-> On libvirt **10.0.0** (what stage01 runs) you will see:
->
-> ```
-> error: unsupported flags (0x2) in function virStorageBackendVolDeleteLocal
-> error: Failed to remove storage volume 'vda'(....qcow2)
-> ```
->
-> The teardown still completes — note the `Wiping volume 'vda' ... Done.` just
-> above it, and boxman removes the workdir itself afterwards. libvirt 10 rejects
-> the flag *combination* boxman passes to `virsh undefine`. Rehearsed: VM
-> undefined, containers removed, disk directory gone. If it appears, say
-> *"libvirt rejects one flag combination on this version; the volume is wiped
-> and boxman cleans the directory — let's verify"* and run the proof below.
+> Older boxman printed `error: unsupported flags (0x2) in function
+> virStorageBackendVolDeleteLocal` here on libvirt 10.0.0 (#207): it asked
+> `virsh undefine` to wipe and delete the VM's storage itself. boxman now
+> undefines the VM without storage flags and removes only the files the VM
+> owns (#208), so the teardown prints no storage errors. Anything it keeps —
+> an ISO, a disk another VM uses — is named in a warning.
 
 Prove it, don't assert it (took 13s in rehearsal):
 

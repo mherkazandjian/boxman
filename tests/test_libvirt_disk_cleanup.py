@@ -18,8 +18,8 @@ from pathlib import Path
 import pytest
 
 from boxman.providers.libvirt.disk_cleanup import (
-    _remove_if_unchanged,
     file_identities,
+    remove_if_unchanged,
     remove_vm_disks,
 )
 
@@ -173,7 +173,7 @@ class TestRemoveIfUnchanged:
         monkeypatch.setattr(os, "rename", refuse)
 
         with pytest.raises(OSError) as raised:
-            _remove_if_unchanged(str(disk), identity)
+            remove_if_unchanged(str(disk), identity)
 
         # the original error, not one from the cleanup
         assert raised.value.errno == err
@@ -189,5 +189,5 @@ class TestRemoveIfUnchanged:
 
         monkeypatch.setattr(os, "rename", gone)
 
-        assert _remove_if_unchanged(str(disk), (1, 2)) == ("gone", None)
+        assert remove_if_unchanged(str(disk), (1, 2)) == ("gone", None)
         assert list(tmp_path.iterdir()) == []

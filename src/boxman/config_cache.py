@@ -6,6 +6,16 @@ from boxman import log
 
 DEFAULT_CACHE_DIR = '~/.config/boxman/cache'
 
+
+def teardown_locator_dir() -> str:
+    """
+    Where a VM teardown keeps, per full vm name, the locator of the
+    inventory it saved beside the VM's disks before undefining it — so a
+    retried teardown finds that inventory wherever the disks were (#208).
+    Under this per-user cache dir, read when called.
+    """
+    return os.path.join(os.path.expanduser(DEFAULT_CACHE_DIR), 'teardown')
+
 class BoxmanCache:
     """
     The boxman cache manager

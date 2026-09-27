@@ -7,6 +7,7 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -345,11 +346,107 @@ class TestResetMachineIdentity:
 
 class TestDiscardUnsafeClone:
 
-    def test_undefines_only_the_failed_clone_and_its_storage(self, clone: CloneVM):
-        with patch.object(clone.virsh, "execute", return_value=_result()) as execute:
+    @staticmethod
+    def _fake_virsh(tmp_path: Path, *, listing: str = "", on_undefine=None):
+        """undefine / list / pool-* answers; the clone's directory is the
+        active pool ``clones``."""
+        def execute(*args, **kwargs):
+            if args[0] == "undefine":
+                if on_undefine is not None:
+                    on_undefine()
+                return _result()
+            if args[0] == "list":
+                return _result(stdout=listing)
+            if args[0] == "pool-list":
+                return _result(stdout="clones\n")
+            if args[0] == "pool-dumpxml":
+                return _result(stdout=f"<pool><target><path>{tmp_path}"
+                                      f"</path></target></pool>")
+            if args[0] == "pool-refresh":
+                return _result()
+            raise AssertionError(f"unexpected virsh call {args}")
+        return execute
+
+    def test_undefines_without_storage_flags_then_removes_only_its_disk(
+        self, clone: CloneVM, tmp_path: Path
+    ):
+        """#208: ``--remove-all-storage`` also deleted the template's
+        cloud-init seed.iso, which a clone of a template built before
+        86f5a98 still references as its CD-ROM."""
+        disk = tmp_path / "vm01.qcow2"
+        disk.write_bytes(b"clone")
+        seed = tmp_path / "tpl" / "seed.iso"
+        seed.parent.mkdir()
+        seed.write_bytes(b"seed")
+        with patch.object(clone.virsh, "execute",
+                          side_effect=self._fake_virsh(tmp_path)) as execute:
             clone.discard_unsafe_clone()
-        execute.assert_called_once_with(
-            "undefine", "vm01", "--remove-all-storage", warn=True)
+        undefine = [c for c in execute.call_args_list
+                    if c.args[0] == "undefine"]
+        assert [c.args for c in undefine] == [("undefine", "vm01")]
+        assert undefine[0].kwargs == {"warn": True}
+        assert not disk.exists()
+        assert seed.read_bytes() == b"seed"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["tpl"]
+        # the pool that listed the disk no longer does
+        assert ("pool-refresh", "clones") in [
+            c.args for c in execute.call_args_list]
+
+    def test_the_disk_stays_while_the_clone_is_not_confirmed_gone(
+        self, clone: CloneVM, tmp_path: Path
+    ):
+        disk = tmp_path / "vm01.qcow2"
+        disk.write_bytes(b"clone")
+        with patch.object(clone.virsh, "execute",
+                          side_effect=self._fake_virsh(
+                              tmp_path, listing="vm01\n")):
+            with pytest.raises(CloneCleanupError, match="left in place"):
+                clone.discard_unsafe_clone()
+        assert disk.read_bytes() == b"clone"
+
+    def test_a_disk_replaced_meanwhile_is_left_and_reported(
+        self, clone: CloneVM, tmp_path: Path
+    ):
+        disk = tmp_path / "vm01.qcow2"
+        disk.write_bytes(b"clone")
+
+        def replace():
+            fresh = tmp_path / "fresh"
+            fresh.write_bytes(b"someone else")
+            fresh.replace(disk)
+
+        with patch.object(clone.virsh, "execute",
+                          side_effect=self._fake_virsh(
+                              tmp_path, on_undefine=replace)):
+            with pytest.raises(CloneCleanupError, match="replaced"):
+                clone.discard_unsafe_clone()
+        assert disk.read_bytes() == b"someone else"
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root searches a mode-000 directory")
+    def test_a_disk_that_cannot_be_looked_up_is_reported_not_skipped(
+        self, tmp_path: Path
+    ):
+        """#208 review round 4, 1: only "not there" lets the discard return
+        quietly; a disk it cannot look up is a disk left behind."""
+        workdir = tmp_path / "clones"
+        workdir.mkdir()
+        disk = workdir / "vm01.qcow2"
+        disk.write_bytes(b"clone")
+        clone = CloneVM(
+            src_vm_name="template-base", new_vm_name="vm01",
+            info={"network_adapters": [{"network": "default"}]},
+            workdir=str(workdir), provider_config={"use_sudo": False})
+        try:
+            with patch.object(clone.virsh, "execute",
+                              side_effect=self._fake_virsh(
+                                  workdir,
+                                  on_undefine=lambda: workdir.chmod(0))):
+                with pytest.raises(CloneCleanupError, match="vm01.qcow2"):
+                    clone.discard_unsafe_clone()
+        finally:
+            workdir.chmod(0o700)
+        assert disk.read_bytes() == b"clone"
 
     def test_cleanup_failure_is_terminal_and_preserves_sanitizer_cause(
         self, clone: CloneVM
@@ -577,5 +674,9 @@ class TestCloneVmMachineIdentityFailureChain:
         virt_sysprep.assert_called_once_with(
             domain="vm01", operations="machine-id", keys_from_stdin=True,
             warn=True, execution_timeout=300, timeout=315)
-        virsh.assert_called_once_with(
-            "undefine", "vm01", "--remove-all-storage", warn=True)
+        # undefined without storage flags; its disk (never written here,
+        # virt-clone is mocked) is removed by boxman, not by libvirt
+        assert [c.args for c in virsh.call_args_list
+                if c.args[0] == "undefine"] == [("undefine", "vm01")]
+        for c in virsh.call_args_list:
+            assert "--remove-all-storage" not in c.args

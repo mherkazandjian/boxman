@@ -12,13 +12,13 @@ import pytest
 from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.disk import DiskManager
-from boxman.providers.libvirt.disk_cleanup import remove_vm_disks
 from boxman.providers.libvirt.disk_ownership import (
     ROLE_ADOPTED,
     ROLE_DATA,
     DiskRecord,
 )
 from boxman.providers.libvirt.virsh_edit import VirshEdit
+from boxman.providers.libvirt.virsh_parse import DomblkRow, parse_domblklist
 from boxman.providers.libvirt.vm_differ import VMStateDiffer
 from conftest import make_bare_manager
 
@@ -783,162 +783,128 @@ class TestVMStateDifferDiskParsing:
         assert differ.get_actual_disks('test-vm') == []
 
 
+def device_rows(disks, media=()):
+    """``vm_storage_devices`` rows: *disks* as disk devices, *media* as
+    CD-ROMs."""
+    return (
+        [DomblkRow('file', 'disk', f'vd{chr(97 + i)}', str(path))
+         for i, path in enumerate(disks)]
+        + [DomblkRow('file', 'cdrom', f'sd{chr(97 + i)}', str(path))
+           for i, path in enumerate(media)])
+
+
 # ---------------------------------------------------------------------------
 # Removed-VM destruction (update() path) — regression tests for the
 # undefined-`workdir` NameError (issue #81)
 # ---------------------------------------------------------------------------
 class TestDestroyRemovedVm:
 
+    SAMPLE_ROWS = parse_domblklist(SAMPLE_DOMBLKLIST_OUTPUT)
+
+    @pytest.fixture(autouse=True)
+    def _no_saved_inventory(self, monkeypatch):
+        """The sample paths are the host's own; never write beside them."""
+        monkeypatch.setattr("boxman.manager_parts.vms.save_teardown_inventory",
+                            MagicMock(return_value=None))
+        monkeypatch.setattr("boxman.manager_parts.vms.save_teardown_locator",
+                            MagicMock(return_value=None))
+
     def _make_manager(self):
         """Bare BoxmanManager instance with a mocked provider."""
-        mgr = make_bare_manager()
+        mgr = make_bare_manager({'project': 'demo', 'clusters': {}})
         mgr.provider = MagicMock()
         mgr.provider.provider_config = {'uri': 'qemu:///system'}
+        mgr.provider.vm_storage_devices.return_value = self.SAMPLE_ROWS
+        mgr.provider.backing_chains.side_effect = (
+            lambda sources: {s: [s] for s in sources})
+        mgr.provider.disk_paths_in_use.return_value = {}
+        mgr._vm_disk_records = MagicMock(return_value=None)
         return mgr
 
-    @patch("boxman.manager_parts.vms.VirshCommand")
-    def test_vm_disk_dirs_from_domblklist(self, mock_virsh_cls):
-        """Disk directories come from libvirt, cdrom sources are ignored."""
+    def test_vm_disk_dirs_from_the_attached_disks(self):
         mgr = self._make_manager()
-        mock_virsh_cls.return_value.execute.return_value = MagicMock(
-            ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
+        assert mgr._vm_disk_dirs('test-vm', [
+            '/var/lib/libvirt/images/test-vm.qcow2',
+            '/data/test-vm_disk01.qcow2']) == [
+                '/data', '/var/lib/libvirt/images']
 
-        dirs = mgr._vm_disk_dirs('test-vm')
-
-        assert dirs == ['/data', '/var/lib/libvirt/images']
-
-    @patch("boxman.manager_parts.vms.VirshCommand")
-    def test_vm_disk_dirs_fallback_when_query_fails(self, mock_virsh_cls):
-        """If domblklist fails, fall back to the configured workdirs."""
+    def test_vm_disk_dirs_handles_paths_with_spaces(self):
         mgr = self._make_manager()
-        mock_virsh_cls.return_value.execute.return_value = MagicMock(ok=False)
+        assert mgr._vm_disk_dirs(
+            'test-vm', ['/vm images/test-vm.qcow2']) == ['/vm images']
+
+    def test_vm_disk_dirs_fallback_when_nothing_is_attached(self):
+        """A diskless or already-undefined domain: fall back to the
+        configured workdirs."""
+        mgr = self._make_manager()
         mgr.collect_workdirs = MagicMock(return_value=['/fallback'])
 
-        dirs = mgr._vm_disk_dirs('test-vm')
+        assert mgr._vm_disk_dirs('test-vm', []) == ['/fallback']
 
-        assert dirs == ['/fallback']
-
-    @patch("boxman.manager_parts.vms.VirshCommand")
-    def test_destroy_removed_vm_sweeps_libvirt_disk_dirs(self, mock_virsh_cls):
-        """destroy_disks runs once per libvirt-reported disk directory."""
+    def test_storage_is_inventoried_before_undefining(self, tmp_path):
+        """domblklist, the ownership records and the chains describe the
+        domain only while it exists (ordering regression guard). Its disks
+        are under tmp_path: the host's own directories (a root-owned 0711
+        /var/lib/libvirt/images, say) are never listed."""
         mgr = self._make_manager()
-        mock_virsh_cls.return_value.execute.return_value = MagicMock(
-            ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
-        # Not gone after the graceful undefine, gone after the forced one:
-        # the disks may only be removed once absence is confirmed.
+        disks = [str(tmp_path / 'images' / 'test-vm.qcow2'),
+                 str(tmp_path / 'data' / 'test-vm_disk01.qcow2')]
+        seed = str(tmp_path / 'data' / 'seed.iso')
+        mgr.provider.vm_storage_devices.return_value = [
+            DomblkRow('file', 'disk', 'vda', disks[0]),
+            DomblkRow('file', 'disk', 'vdb', disks[1]),
+            DomblkRow('file', 'cdrom', 'hda', seed)]
         mgr.provider.confirm_vm_absent.side_effect = [False, True]
-        mgr._vm_disk_records = MagicMock(return_value=None)
-        mgr.provider.backing_chain_files.return_value = [
-            '/data/test-vm_disk01.qcow2']
-        # the sample paths are absolute; never let a unit test unlink them
-        mgr._remove_leftover_disk_files = MagicMock()
-
-        mgr._destroy_removed_vm('test-vm')
-
-        swept = sorted(
-            c.args[0] for c in mgr.provider.destroy_disks.call_args_list)
-        assert swept == ['/data', '/var/lib/libvirt/images']
-        for c in mgr.provider.destroy_disks.call_args_list:
-            # the attached extra disk is kept out of the name sweep; the
-            # boot disk (<vm>.qcow2) is not
-            assert c.kwargs == {'vm_name': 'test-vm', 'disks': [],
-                                'protected': ['/data/test-vm_disk01.qcow2']}
-        # only the extra disk's chain is read, the boot disk's is not
-        mgr.provider.backing_chain_files.assert_called_once_with(
-            ['/data/test-vm_disk01.qcow2'])
-        # the domain's own disk list and ownership records, read before
-        # undefining, are handed on
-        mgr._remove_leftover_disk_files.assert_called_once()
-        assert mgr._remove_leftover_disk_files.call_args.args[:3] == (
-            'test-vm',
-            ['/var/lib/libvirt/images/test-vm.qcow2',
-             '/data/test-vm_disk01.qcow2'],
-            None)
-        # domain undefined both gracefully and with force
-        assert mgr.provider.destroy_vm.call_args_list == [
-            call('test-vm'),
-            call('test-vm', force=True),
-        ]
-
-    @patch("boxman.manager_parts.vms.VirshCommand")
-    def test_vm_disk_dirs_handles_paths_with_spaces(self, mock_virsh_cls):
-        """A disk path containing spaces must survive domblklist parsing."""
-        mgr = self._make_manager()
-        mock_virsh_cls.return_value.execute.return_value = MagicMock(
-            ok=True,
-            stdout=(
-                " Type   Device   Target   Source\n"
-                "-------------------------------------------\n"
-                " file   disk     vda      /vm images/test-vm.qcow2\n"
-            )
-        )
-
-        dirs = mgr._vm_disk_dirs('test-vm')
-
-        assert dirs == ['/vm images']
-
-    @patch("boxman.manager_parts.vms.VirshCommand")
-    def test_vm_disk_dirs_fallback_when_no_disks(self, mock_virsh_cls):
-        """ok=True with zero disk rows (e.g. diskless VM) also falls back
-        to the configured workdirs."""
-        mgr = self._make_manager()
-        mock_virsh_cls.return_value.execute.return_value = MagicMock(
-            ok=True, stdout=" Type   Device   Target   Source\n---\n")
-        mgr.collect_workdirs = MagicMock(return_value=['/fallback'])
-
-        dirs = mgr._vm_disk_dirs('test-vm')
-
-        assert dirs == ['/fallback']
-
-    @patch("boxman.manager_parts.vms.VirshCommand")
-    def test_destroy_removed_vm_queries_disks_before_undefining(
-            self, mock_virsh_cls):
-        """domblklist must run before destroy_vm — after the domain is
-        undefined the query returns nothing (ordering regression guard)."""
-        mgr = self._make_manager()
-        virsh = mock_virsh_cls.return_value
-        virsh.execute.return_value = MagicMock(
-            ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
-        mgr.provider.confirm_vm_absent.side_effect = [False, True]
-        mgr._vm_disk_records = MagicMock(return_value=None)
-        mgr._remove_leftover_disk_files = MagicMock()
-
         parent = MagicMock()
-        parent.attach_mock(virsh.execute, 'virsh_execute')
+        parent.attach_mock(mgr.provider.vm_storage_devices, 'devices')
         parent.attach_mock(mgr._vm_disk_records, 'disk_records')
+        parent.attach_mock(mgr.provider.backing_chains, 'chains')
         parent.attach_mock(mgr.provider.destroy_vm, 'destroy_vm')
 
         mgr._destroy_removed_vm('test-vm')
 
-        ordered = [c[0] for c in parent.mock_calls]
-        assert ordered == [
-            'virsh_execute', 'disk_records', 'destroy_vm', 'destroy_vm']
-        # first destroy_vm is the graceful one, second is force=True
-        assert parent.mock_calls[2] == call.destroy_vm('test-vm')
-        assert parent.mock_calls[3] == call.destroy_vm('test-vm', force=True)
+        assert [c[0] for c in parent.mock_calls] == [
+            'devices', 'disk_records', 'chains', 'destroy_vm', 'destroy_vm']
+        # graceful first, then forced: the storage waits for confirmed
+        # absence
+        assert mgr.provider.destroy_vm.call_args_list == [
+            call('test-vm'), call('test-vm', force=True)]
+        # every disk's chain is read, the boot disk's too, and the cdrom's:
+        # a qcow2 CD-ROM can be built on one of the disks (#208 review r2)
+        mgr.provider.backing_chains.assert_called_once_with([*disks, seed])
 
-    @patch("boxman.manager_parts.vms.VirshCommand")
-    def test_vm_disk_files_from_domblklist(self, mock_virsh_cls):
-        """Disk files come from libvirt, cdrom sources are left out."""
+    def test_a_domain_whose_devices_cannot_be_read_stays_defined(self):
         mgr = self._make_manager()
-        mock_virsh_cls.return_value.execute.return_value = MagicMock(
-            ok=True, stdout=SAMPLE_DOMBLKLIST_OUTPUT)
+        mgr.provider.vm_storage_devices.return_value = None
+        mgr.provider.confirm_vm_absent.return_value = False
 
-        assert mgr._vm_disk_files('test-vm') == [
-            '/var/lib/libvirt/images/test-vm.qcow2',
-            '/data/test-vm_disk01.qcow2']
+        with pytest.raises(ProvisionError, match='could not read its block'):
+            mgr._destroy_removed_vm('test-vm')
 
-    @patch("boxman.manager_parts.vms.VirshCommand")
-    def test_vm_disk_files_empty_when_query_fails(self, mock_virsh_cls):
+        mgr.provider.destroy_vm.assert_not_called()
+
+    def test_a_domain_already_gone_is_torn_down_by_name(self, tmp_path):
+        """An interrupted teardown with nothing saved: nothing is attached
+        any more, and boxman's own qcow2 images under the VM's names are
+        still found by name in the workdirs."""
         mgr = self._make_manager()
-        mock_virsh_cls.return_value.execute.return_value = MagicMock(ok=False)
+        mgr.provider.vm_storage_devices.return_value = None
+        mgr.provider.confirm_vm_absent.return_value = True
+        mgr.collect_workdirs = MagicMock(return_value=[str(tmp_path)])
+        mgr.config['clusters'] = {'c1': {'workdir': str(tmp_path)}}
+        boot = tmp_path / 'test-vm.qcow2'
+        boot.write_bytes(b'QFI\xfb' + b'\0' * 60)
 
-        assert mgr._vm_disk_files('test-vm') == []
+        mgr._destroy_removed_vm('test-vm')
+
+        assert not boot.exists()
+        mgr._vm_disk_records.assert_not_called()
 
     @patch("boxman.manager_parts.vms.VirshCommand")
     def test_vm_disk_records_read_from_the_domain_metadata(
             self, mock_virsh_cls):
         mgr = self._make_manager()
+        del mgr._vm_disk_records
         mock_virsh_cls.return_value.execute.return_value = MagicMock(
             ok=True, stderr='',
             stdout=('<disks><disk name="disk01" target="vdb" role="data" '
@@ -952,6 +918,7 @@ class TestDestroyRemovedVm:
     def test_vm_disk_records_none_when_the_domain_has_none(
             self, mock_virsh_cls):
         mgr = self._make_manager()
+        del mgr._vm_disk_records
         mock_virsh_cls.return_value.execute.return_value = MagicMock(
             ok=False, stdout='',
             stderr='error: metadata not found: Requested metadata element '
@@ -960,16 +927,16 @@ class TestDestroyRemovedVm:
         assert mgr._vm_disk_records('test-vm') is None
 
     @patch("boxman.manager_parts.vms.VirshCommand")
-    def test_unreadable_vm_disk_records_are_none_and_reported(
-            self, mock_virsh_cls):
-        """Unreadable must not read as "boxman attached nothing"; None
-        keeps every file."""
+    def test_unreadable_vm_disk_records_raise(self, mock_virsh_cls):
+        """Unreadable must not read as "no records": that would let a
+        deprovision fall back to removing declared disks by name."""
         mgr = self._make_manager()
+        del mgr._vm_disk_records
         mock_virsh_cls.return_value.execute.return_value = MagicMock(
             ok=True, stderr='', stdout='<disks><disk name="x"')
 
-        assert mgr._vm_disk_records('test-vm') is None
-        mgr.logger.warning.assert_called_once()
+        with pytest.raises(ProvisionError):
+            mgr._vm_disk_records('test-vm')
 
 
 # ---------------------------------------------------------------------------
@@ -992,24 +959,19 @@ class TestRemovedVmLeftoverDisks:
     VM = 'bprj__demo__bprj_cluster_1_web'
     OTHER = 'bprj__demo__bprj_cluster_1_db'
 
-    def _manager(self, workdir, attached, records, in_use=None):
+    def _manager(self, workdir, attached, records, in_use=None, media=()):
         mgr = make_bare_manager(
             {'project': 'demo',
              'clusters': {'cluster_1': {'workdir': str(workdir)}}})
         mgr.provider = MagicMock()
         mgr.provider.confirm_vm_absent.return_value = True
         mgr.provider.disk_paths_in_use.return_value = in_use or {}
-        mgr._vm_disk_files = MagicMock(
-            return_value=[str(p) for p in attached])
+        mgr.provider.vm_storage_devices.return_value = device_rows(
+            attached, media)
         mgr._vm_disk_records = MagicMock(return_value=records)
-        # the real name sweep, so that its ordering against the ownership
-        # decision is exercised too (#212 review round 2, R2-1)
-        mgr.provider.destroy_disks.side_effect = (
-            lambda workdir, vm_name, disks, **kwargs:
-                remove_vm_disks(workdir, vm_name, disks, **kwargs))
         # standalone images by default: each chain is just the file itself
-        mgr.provider.backing_chain_files.side_effect = (
-            lambda sources: sorted(str(s) for s in sources))
+        mgr.provider.backing_chains.side_effect = (
+            lambda sources: {str(s): [os.path.realpath(s)] for s in sources})
         return mgr
 
     @staticmethod
@@ -1185,7 +1147,9 @@ class TestRemovedVmLeftoverDisks:
 
         assert extra.read_bytes() == b'someone else'
         # the replacement went back under its name; nothing is left over
-        assert sorted(p.name for p in tmp_path.iterdir()) == [extra.name]
+        # but the saved inventory, which stays while it protects a file
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            f'.boxman-teardown-{self.VM}.json', extra.name]
 
     def test_an_adopted_disk_named_like_a_memory_snapshot_is_kept(
             self, tmp_path):
@@ -1345,16 +1309,18 @@ class TestRemovedVmLeftoverDisks:
             self, tmp_path):
         """Two snapshots: the middle layer is neither attached nor recorded,
         but it is in the attached head's backing chain, read before
-        undefining."""
+        undefining. The head is attached elsewhere than the record says, so
+        the chain is not proven the VM's own and every layer is kept."""
         base = self._file(tmp_path / f'{self.VM}_snapshot_disk01.qcow2')
         middle = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap1')
         head = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap2')
         memory = self._file(tmp_path / f'{self.VM}_snapshot_snap1.raw')
         mgr = self._manager(tmp_path, [head],
-                            [self._record('snapshot_disk01', base)])
-        mgr.provider.backing_chain_files.side_effect = None
-        mgr.provider.backing_chain_files.return_value = [
-            str(head), str(middle), str(base)]
+                            [self._record('snapshot_disk01', base,
+                                          target='vdz')])
+        mgr.provider.backing_chains.side_effect = None
+        mgr.provider.backing_chains.return_value = {
+            str(head): [str(head), str(middle), str(base)]}
 
         mgr._destroy_removed_vm(self.VM)
 
@@ -1371,8 +1337,8 @@ class TestRemovedVmLeftoverDisks:
         head = self._file(tmp_path / f'{self.VM}_snapshot_disk01.snap2')
         memory = self._file(tmp_path / f'{self.VM}_snapshot_snap1.raw')
         mgr = self._manager(tmp_path, [head], [])
-        mgr.provider.backing_chain_files.side_effect = None
-        mgr.provider.backing_chain_files.return_value = None
+        mgr.provider.backing_chains.side_effect = None
+        mgr.provider.backing_chains.return_value = None
 
         mgr._destroy_removed_vm(self.VM)
 
