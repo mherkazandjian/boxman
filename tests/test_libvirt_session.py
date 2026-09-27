@@ -854,7 +854,9 @@ class TestInUseWithAMissingSource:
            + " file   disk     vda      /ws/b.qcow2\n"
            + " file   disk     vdb      /ws/gone.qcow2\n")
 
-    def _run(self, state, state_ok=True, absent=("/ws/gone.qcow2",)):
+    def _run(self, state, state_ok=True, absent=("/ws/gone.qcow2",),
+             live="", dump_ok=True):
+        """*live* is what ``virsh dumpxml`` (the live definition) says."""
         calls = []
 
         def virsh_execute(*args, **kwargs):
@@ -864,6 +866,9 @@ class TestInUseWithAMissingSource:
             if args[0] == "domstate":
                 assert args[1] == "vm-b"
                 return _result(stdout=f"{state}\n", ok=state_ok)
+            if args[0] == "dumpxml":
+                assert "--inactive" not in args
+                return _result(stdout=live, ok=dump_ok)
             return _result(stdout=self.BLK)
 
         def shell(command, **kwargs):
@@ -885,21 +890,29 @@ class TestInUseWithAMissingSource:
 
     @pytest.mark.parametrize("state", [
         "running", "paused", "pmsuspended", "in shutdown", "crashed", "idle"])
-    def test_an_active_domain_fails_the_scan_and_says_why(
+    def test_an_active_domain_whose_live_definition_cannot_be_read(
             self, state, captured_logs):
-        in_use, _ = self._run(state)
+        """... fails the scan, and says why."""
+        in_use, _ = self._run(state, live="not xml")
         assert in_use is None
         assert "vm-b" in captured_logs.text
         assert "/ws/gone.qcow2" in captured_logs.text
+        assert "live definition could not be read" in captured_logs.text
 
     def test_a_shut_off_domain_is_scanned_without_it(self):
         in_use, _ = self._run("shut off")
         assert in_use == {"/ws/b.qcow2": "vm-b"}
 
     def test_a_state_that_cannot_be_read_fails_the_scan(self, captured_logs):
-        in_use, _ = self._run("shut off", state_ok=False)
+        """... even when the live definition would say it holds nothing."""
+        live = ("<domain><devices><disk type='file' device='disk'>"
+                "<source file='/ws/gone.qcow2' index='1'/><backingStore/>"
+                "<target dev='vdb'/></disk></devices></domain>")
+        in_use, calls = self._run("shut off", state_ok=False, live=live)
         assert in_use is None
         assert "vm-b" in captured_logs.text
+        assert "state could not be read" in captured_logs.text
+        assert "dumpxml" not in calls
 
     def test_the_state_is_asked_only_once_the_absence_is_confirmed(self):
         _, calls = self._run("shut off")
@@ -910,6 +923,135 @@ class TestInUseWithAMissingSource:
         in_use, calls = self._run("shut off", absent=())
         assert in_use is None
         assert "domstate" not in calls
+
+    # -- the live backing chain of a running domain's missing source --------
+
+    @staticmethod
+    def _live(disk_inner, device="disk", target="vdb"):
+        return (f"<domain><devices><disk type='file' device='{device}'>"
+                f"{disk_inner}<target dev='{target}'/></disk>"
+                f"</devices></domain>")
+
+    @staticmethod
+    def _level(path, inner="<backingStore/>", kind="file", attr="file"):
+        return (f"<backingStore type='{kind}' index='2'>"
+                f"<format type='qcow2'/><source {attr}='{path}'/>{inner}"
+                f"</backingStore>")
+
+    def test_a_running_domain_maps_what_its_live_chain_holds(self, tmp_path):
+        base = tmp_path / "base.qcow2"
+        base.write_bytes(b"base")
+        live = self._live("<source file='/ws/gone.qcow2' index='1'/>"
+                          + self._level(base))
+
+        in_use, calls = self._run("running", live=live)
+
+        assert in_use == {"/ws/b.qcow2": "vm-b",
+                          os.path.realpath(base): "vm-b"}
+        st = os.stat(base)
+        assert in_use.identities[(st.st_dev, st.st_ino)] == "vm-b"
+        assert calls.count("dumpxml") == 1
+
+    def test_a_running_domain_whose_whole_chain_is_gone_holds_nothing(
+            self, tmp_path):
+        """The b2p2-lab case: head and base both deleted -- nothing on
+        disk to protect, and the scan completes."""
+        live = self._live("<source file='/ws/gone.qcow2' index='1'/>"
+                          + self._level(tmp_path / "gone-base.qcow2"))
+
+        in_use, _ = self._run("running", live=live)
+
+        assert in_use == {"/ws/b.qcow2": "vm-b"}
+
+    def test_a_deleted_seed_with_an_empty_chain_holds_nothing(self):
+        live = self._live("<source file='/ws/gone.qcow2' index='3'/>"
+                          "<backingStore/>", device="cdrom")
+
+        in_use, _ = self._run("running", live=live)
+
+        assert in_use == {"/ws/b.qcow2": "vm-b"}
+
+    def test_a_source_only_in_the_persistent_definition_is_skipped(self):
+        """The live definition does not hold it, so QEMU does not."""
+        live = self._live("<source file='/ws/b.qcow2' index='1'/>"
+                          "<backingStore/>", target="vda")
+
+        in_use, _ = self._run("running", live=live)
+
+        assert in_use == {"/ws/b.qcow2": "vm-b"}
+
+    def test_a_network_level_names_nothing_local(self, tmp_path):
+        base = tmp_path / "base.qcow2"
+        base.write_bytes(b"base")
+        network = ("<backingStore type='network' index='2'>"
+                   "<source protocol='rbd' name='pool/img'/>"
+                   + self._level(base) + "</backingStore>")
+        live = self._live("<source file='/ws/gone.qcow2' index='1'/>"
+                          + network)
+
+        in_use, _ = self._run("running", live=live)
+
+        assert in_use == {"/ws/b.qcow2": "vm-b",
+                          os.path.realpath(base): "vm-b"}
+
+    @pytest.mark.parametrize("disk_inner, why", [
+        ("<source file='/ws/gone.qcow2' index='1'/>",
+         "records no backing chain"),
+        ("<source file='/ws/gone.qcow2' index='1'/><backingStore/>"
+         "<mirror type='file' job='copy'><source file='/ws/m.qcow2'/>"
+         "</mirror>", "block job"),
+        ("<source file='/ws/gone.qcow2' index='1'/>"
+         "<backingStore type='volume' index='2'>"
+         "<source pool='p' volume='v'/><backingStore/></backingStore>",
+         "volume level"),
+        ("<source file='/ws/gone.qcow2' index='1'/>"
+         "<backingStore type='file' index='2'>"
+         "<source file='/ws/base.qcow2'/></backingStore>",
+         "only in part"),
+    ], ids=["no backingStore", "mirror", "volume level", "open-ended"])
+    def test_a_chain_that_cannot_be_told_fails_the_scan(
+            self, disk_inner, why, captured_logs):
+        in_use, _ = self._run("running", live=self._live(disk_inner))
+
+        assert in_use is None
+        assert why in captured_logs.text
+        assert "/ws/gone.qcow2" in captured_logs.text
+
+    def test_a_live_definition_that_cannot_be_dumped_fails_the_scan(
+            self, captured_logs):
+        in_use, _ = self._run("running", dump_ok=False)
+
+        assert in_use is None
+        assert "live definition could not be read" in captured_logs.text
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_a_held_file_whose_identity_cannot_be_read_fails_the_scan(
+            self, tmp_path, captured_logs):
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        base = hidden / "base.qcow2"
+        base.write_bytes(b"base")
+        live = self._live("<source file='/ws/gone.qcow2' index='1'/>"
+                          + self._level(base))
+        hidden.chmod(0)
+        try:
+            in_use, _ = self._run("running", live=live)
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is None
+        assert str(base) in captured_logs.text
+
+    def test_a_missing_volume_source_fails_the_scan(self, captured_logs):
+        """A pool volume's chain is not read from the live definition."""
+        virsh = MagicMock()
+        virsh.execute.return_value = _result(stdout="running\n")
+
+        held = _session({})._held_below(virsh, "vm-b", "/pool/gone.qcow2",
+                                        True, {})
+
+        assert held is None
+        assert "volume" in captured_logs.text
 
 
 class TestInUseByIdentity:
@@ -1090,11 +1232,19 @@ class TestSourcesGoneFromTheHost:
         assert _session({}).backing_chains(
             [path.format(tmp=tmp_path)]) is None
 
-    @pytest.mark.parametrize("state, scanned", [("shut off", True),
-                                                ("running", False)])
-    def test_a_domain_whose_cdrom_is_gone(self, tmp_path, state, scanned):
-        """... is scanned without it once it is shut off (#208 review
-        round 4, 2: a running one may still hold the deleted file open)."""
+    @pytest.mark.parametrize("state, live, scanned", [
+        ("shut off", "", True),
+        ("running", "<domain><devices><disk type='file' device='cdrom'>"
+                    "<source file='{gone}' index='3'/><backingStore/>"
+                    "<target dev='sda'/></disk></devices></domain>", True),
+        ("running", "<domain><devices><disk type='file' device='cdrom'>"
+                    "<source file='{gone}' index='3'/>"
+                    "<target dev='sda'/></disk></devices></domain>", False),
+    ], ids=["shut off", "running, empty chain", "running, no chain"])
+    def test_a_domain_whose_cdrom_is_gone(self, tmp_path, state, live,
+                                          scanned):
+        """... is scanned without it once it is shut off, or while it runs
+        with a live chain that holds nothing (#208 review round 4, 2)."""
         disk = self._image(tmp_path / "b.qcow2")
         gone = str(tmp_path / "seed.iso")
         blk = (TestDiskPathsInUse.HEADER
@@ -1106,6 +1256,8 @@ class TestSourcesGoneFromTheHost:
                 return _result(stdout="vm-b\n")
             if args[0] == "domstate":
                 return _result(stdout=f"{state}\n")
+            if args[0] == "dumpxml":
+                return _result(stdout=live.format(gone=gone))
             return _result(stdout=blk)
 
         with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:

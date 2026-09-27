@@ -868,8 +868,10 @@ Details worth knowing:
   exists — a deleted seed ISO still attached — protects nothing and holds
   nothing back, for the VM being torn down and for VMs that are shut off.
   A *running* VM with a deleted file still attached can hold it open,
-  with the images below it, so every teardown keeps everything, named in
-  a warning, until that file is detached or that VM stops. An extra disk
+  with the images below it: it protects exactly the backing chain libvirt
+  says it holds, and only when libvirt cannot say (no chain recorded, a
+  block job running) does every teardown keep everything, named in a
+  warning, until that file is detached or that VM stops. An extra disk
   moved to an overlay by a snapshot goes with its whole chain when every
   layer is provably its own (the disk at its recorded target, the
   recorded base at the bottom, each layer named for it in the same

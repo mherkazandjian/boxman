@@ -45,6 +45,53 @@ from .virsh_parse import (
 _ABSENT = "boxman-source-absent"
 
 
+def _live_disk(domain: ET.Element, source: str) -> ET.Element | None:
+    """The ``<disk>`` of a domain definition whose own ``<source>`` names
+    *source* (its ``file`` or ``dev``)."""
+    for disk in domain.findall("./devices/disk"):
+        own = disk.find("source")
+        if own is not None and source in (own.get("file"), own.get("dev")):
+            return disk
+    return None
+
+
+def _backing_store_files(disk: ET.Element) -> tuple[list[str] | None, str]:
+    """
+    The local files below *disk*'s own image, as libvirt records its
+    backing chain in a live definition: nested ``<backingStore>`` levels,
+    ended by an empty ``<backingStore/>``. A ``file`` or ``block`` level
+    names a file; a ``network`` one names nothing local.
+
+    Returns:
+        ``(paths, "")``, or ``(None, why)`` when the files cannot be told:
+        no ``<backingStore>`` at all (libvirt recorded no chain), a chain
+        recorded only in part, a level of another type, or a ``<mirror>``
+        (a block job holds more files than the chain shows).
+    """
+    if disk.find("mirror") is not None:
+        return None, "a block job runs on it, holding more than its chain"
+    level = disk.find("backingStore")
+    if level is None:
+        return None, "libvirt records no backing chain for it"
+    files: list[str] = []
+    while level.attrib or len(level):
+        kind = level.get("type")
+        if kind in ("file", "block"):
+            source = level.find("source")
+            path = (None if source is None
+                    else source.get("file" if kind == "file" else "dev"))
+            if not path:
+                return None, f"a {kind} level of its chain names no file"
+            files.append(path)
+        elif kind != "network":
+            return None, f"its chain holds a {kind or 'typeless'} level"
+        nested = level.find("backingStore")
+        if nested is None:
+            return None, "libvirt records its backing chain only in part"
+        level = nested
+    return files, ""
+
+
 def _absence_probe(path: str) -> str:
     """
     The shell probe behind :meth:`LibVirtSession._source_absent`, for an
@@ -847,10 +894,11 @@ class LibVirtSession(SessionConfigMixin):
         ``volume`` row is read at the local path its volume resolves to
         (:meth:`vm_storage_devices`). A source confirmed absent (see
         :meth:`_source_absent`) — a deleted seed ISO still attached — uses
-        nothing only in a domain positively shut off (:meth:`_shut_off`):
-        a running one can hold the unlinked image open in QEMU together
-        with the images below it, whose files still exist, so any other
-        state fails the scan.
+        nothing in a domain positively shut off; in one that runs, QEMU can
+        hold the unlinked image open together with the images below it,
+        whose files may still exist, so exactly the chain libvirt records
+        for it in the live definition is taken as held (:meth:`_held_below`)
+        — and when that cannot be told, the scan fails.
 
         Every file is recorded by its identity too, ``(st_dev, st_ino)``
         read host-side (:attr:`FilesInUse.identities`), so a teardown
@@ -874,13 +922,35 @@ class LibVirtSession(SessionConfigMixin):
             sources = {row.source for row in rows
                        if row.type not in REMOTE_SOURCE_TYPES
                        and row.source != '-'}
+            volumes = {row.source for row in rows if row.type == 'volume'}
+            live: dict[str, ET.Element | None] = {}
             for source in sorted(sources):
                 chain = self._backing_chain_files(cmd, source)
                 if chain is None:
-                    if (self._source_absent(source)
-                            and self._shut_off(virsh, domain, source)):
-                        continue
-                    return None
+                    if not self._source_absent(source):
+                        return None
+                    held = self._held_below(virsh, domain, source,
+                                            source in volumes, live)
+                    if held is None:
+                        return None
+                    for path in held:
+                        resolved = os.path.realpath(path)
+                        try:
+                            st = os.stat(resolved)
+                        except FileNotFoundError:
+                            continue      # deleted too: nothing to protect
+                        except OSError as exc:
+                            self.logger.warning(
+                                f"could not read the identity of {path}, "
+                                f"which domain {domain} holds ({exc}): "
+                                f"whether a file a teardown would remove is "
+                                f"that one cannot be told, so each keeps "
+                                f"everything — make it accessible")
+                            return None
+                        in_use.setdefault(resolved, domain)
+                        in_use.identities.setdefault(
+                            (st.st_dev, st.st_ino), domain)
+                    continue
                 for path in chain:
                     in_use.setdefault(path, domain)
                     try:
@@ -1024,33 +1094,61 @@ class LibVirtSession(SessionConfigMixin):
             chains[source] = chain
         return chains
 
-    def _shut_off(self, virsh, domain: str, missing: str) -> bool:
+    def _held_below(self, virsh, domain: str, missing: str, volume: bool,
+                    live: dict[str, ET.Element | None]) -> list[str] | None:
         """
-        Whether *domain*, whose source *missing* is confirmed absent, is
-        positively shut off — so it holds nothing open.
+        The files *domain* holds open below *missing*, one of its sources
+        confirmed absent.
 
-        A domain that runs (or is paused, suspended, crashed, shutting
-        down, ...) can keep an unlinked image open in QEMU together with
-        its whole backing chain, and the files below it still exist: a
-        missing pathname says nothing about what it uses. Asked only once
-        the absence is confirmed, which makes the answer safe to act on: a
-        domain that starts after this cannot open a path that no longer
-        exists, and one that stopped before it has released its files. Any
-        state but ``shut off``, or none at all, is named in a warning.
+        None, if it is positively shut off. Otherwise QEMU can hold the
+        unlinked image open together with the images below it: exactly the
+        backing chain libvirt records for that disk in the domain's live
+        definition (:func:`_backing_store_files`; ``virsh dumpxml``, read
+        once per domain into *live*), or nothing when the live definition
+        does not have that source at all — only the persistent one, which
+        QEMU does not hold. The state is asked only once the absence is
+        confirmed, which makes it safe to act on: a domain that starts
+        after this cannot open a path that no longer exists, and one that
+        stopped before has released its files.
+
+        Returns:
+            The held files' paths — some may be gone as well — or ``None``,
+            with a warning saying why, when they cannot be told: the state
+            or the live definition cannot be read, *missing* is a pool
+            volume (*volume*), or its recorded chain cannot be followed.
         """
         result = virsh.execute("domstate", domain, warn=True)
         state = (result.stdout or "").strip() if result.ok else ""
         if state == "shut off":
-            return True
+            return []
+        if not state:
+            why = "its state could not be read"
+        elif volume:
+            why = "it is a storage-pool volume, whose chain is not followed"
+        else:
+            if domain not in live:
+                dumped = virsh.execute("dumpxml", domain, warn=True)
+                try:
+                    live[domain] = (ET.fromstring(dumped.stdout)
+                                    if dumped.ok else None)
+                except ET.ParseError:
+                    live[domain] = None
+            if live[domain] is None:
+                why = "its live definition could not be read"
+            else:
+                disk = _live_disk(live[domain], missing)
+                if disk is None:
+                    return []
+                held, why = _backing_store_files(disk)
+                if held is not None:
+                    return held
         self.logger.warning(
-            f"domain {domain} "
-            + (f"is {state}" if state else "could not be asked for its state")
-            + f" with {missing} attached, which no longer exists: while it "
-            f"runs it can still hold that file open, with the images below "
-            f"it, so no teardown can tell which files it uses and each keeps "
-            f"them all — detach {missing} from {domain}, or shut that VM "
-            f"down")
-        return False
+            f"domain {domain} is {state or 'in an unknown state'} with "
+            f"{missing} attached, which no longer exists, and {why}: QEMU "
+            f"can hold that file open with the images below it, so no "
+            f"teardown can tell which files it uses and each keeps them all "
+            f"— detach {missing} from {domain}, or shut that VM down")
+        return None
 
     def _source_absent(self, path: str) -> bool:
         """

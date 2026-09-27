@@ -2183,21 +2183,31 @@ class TestRunningDomainWithAMissingSource:
     still exists must not read as unused (#208 review round 4, 2)."""
 
     @needs_qemu_img
-    def test_the_base_of_an_unlinked_head_it_may_hold_is_kept(
-            self, tmp_path, captured_logs):
+    def test_the_base_of_an_unlinked_head_it_holds_is_kept(self, tmp_path):
+        """The running domain holds exactly the chain libvirt records in
+        its live definition: the base is kept as used by it, and an
+        unrelated file of the VM is removed as usual."""
         boot = _image(tmp_path / f'{VM}.qcow2')
+        memory = _file(tmp_path / f'{VM}_snapshot_s1.raw')
         head = _image(tmp_path / 'other' / 'head.qcow2', backing=boot)
         head.unlink()
         t = _Teardown(tmp_path, disks=[boot], records=[])
         blk = (" Type   Device   Target   Source\n"
                "------------------------------------\n"
                f" file   disk     vda      {head}\n")
+        live = ("<domain><devices><disk type='file' device='disk'>"
+                f"<source file='{head}' index='1'/>"
+                "<backingStore type='file' index='2'><format type='qcow2'/>"
+                f"<source file='{boot}'/><backingStore/></backingStore>"
+                "<target dev='vda'/></disk></devices></domain>")
 
         def virsh_execute(*args, **kwargs):
             if args[0] == 'list':
                 return _virsh_result('vm-other\n')
             if args[0] == 'domstate':
                 return _virsh_result('running\n')
+            if args[0] == 'dumpxml':
+                return _virsh_result(live)
             return _virsh_result(blk)
 
         # the real in-use scan: real qemu-img and absence probe, a mocked
@@ -2209,10 +2219,9 @@ class TestRunningDomainWithAMissingSource:
             t.deprovision()
 
         assert boot.exists()
-        assert (f'left {boot} in place because could not check whether '
-                f'another domain uses it') in t.warnings
-        assert 'vm-other' in captured_logs.text
-        assert str(head) in captured_logs.text
+        assert (f'left {boot} in place because domain vm-other uses it'
+                in t.warnings)
+        assert not memory.exists()
 
 
 def _malformed(tmp_path, layout):
