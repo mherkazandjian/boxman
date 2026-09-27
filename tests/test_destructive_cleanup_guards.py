@@ -25,6 +25,7 @@ import pytest
 
 from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
+from boxman.providers.libvirt.disk_cleanup import StorageOutcome
 
 pytestmark = pytest.mark.unit
 
@@ -141,14 +142,31 @@ class TestForceRmtree:
 # --------------------------------------------------------------------------
 # FB-4 — disks are removed only on a confirmed undefine
 # --------------------------------------------------------------------------
-class TestDestroyVmAndDisksGate:
+class _TeardownGate:
+    """Shared set-up: the storage inventory and the removal are mocked, so
+    only the gate between them is under test."""
+
+    @pytest.fixture(autouse=True)
+    def _removal(self, monkeypatch):
+        self.remove = MagicMock(return_value=StorageOutcome())
+        monkeypatch.setattr("boxman.manager_parts.vms.remove_vm_storage",
+                            self.remove)
+
+    def _base_manager(self):
+        mgr = BoxmanManager.__new__(BoxmanManager)
+        mgr.config = {"project": "demo"}
+        mgr.logger = MagicMock()
+        self.inventory = SimpleNamespace(saved_at=None, locator_at=None)
+        mgr._capture_vm_storage = MagicMock(return_value=self.inventory)
+        return mgr
+
+
+class TestDestroyVmAndDisksGate(_TeardownGate):
 
     FULL_NAME = "bprj__demo__bprj_cluster_1_node01"
 
     def _manager(self):
-        mgr = BoxmanManager.__new__(BoxmanManager)
-        mgr.config = {"project": "demo"}
-        mgr.logger = MagicMock()
+        mgr = self._base_manager()
         session = MagicMock()
         mgr.session_for_cluster = MagicMock(return_value=session)
         return mgr, session
@@ -161,7 +179,8 @@ class TestDestroyVmAndDisksGate:
         mgr, session = self._manager()
         session.confirm_vm_absent.return_value = True
         self._run(mgr)
-        session.destroy_disks.assert_called_once()
+        self.remove.assert_called_once()
+        assert self.remove.call_args.args[0] is self.inventory
 
     def test_a_forced_undefine_is_tried_before_giving_up(self):
         mgr, session = self._manager()
@@ -171,7 +190,7 @@ class TestDestroyVmAndDisksGate:
             call(self.FULL_NAME),
             call(self.FULL_NAME, force=True),
         ]
-        session.destroy_disks.assert_called_once()
+        self.remove.assert_called_once()
 
     def test_unconfirmed_absence_preserves_the_disks(self):
         """The libvirt-outage case. ``destroy_vm`` reports success because
@@ -182,17 +201,24 @@ class TestDestroyVmAndDisksGate:
         session.confirm_vm_absent.return_value = False
         with pytest.raises(ProvisionError, match="could not confirm"):
             self._run(mgr)
-        session.destroy_disks.assert_not_called()
+        self.remove.assert_not_called()
+
+    def test_storage_is_inventoried_before_the_undefine(self):
+        mgr, session = self._manager()
+        session.confirm_vm_absent.return_value = True
+        parent = MagicMock()
+        parent.attach_mock(mgr._capture_vm_storage, "capture")
+        parent.attach_mock(session.destroy_vm, "destroy_vm")
+        self._run(mgr)
+        assert [c[0] for c in parent.mock_calls][:2] == [
+            "capture", "destroy_vm"]
 
 
-class TestDestroyRemovedVmGate:
+class TestDestroyRemovedVmGate(_TeardownGate):
 
     def _manager(self):
-        mgr = BoxmanManager.__new__(BoxmanManager)
-        mgr.config = {"project": "demo"}
-        mgr.logger = MagicMock()
+        mgr = self._base_manager()
         mgr.provider = MagicMock()
-        mgr._vm_disk_dirs = MagicMock(return_value=["/ws/c1"])
         return mgr
 
     def test_unconfirmed_absence_preserves_the_disks(self):
@@ -201,18 +227,20 @@ class TestDestroyRemovedVmGate:
         mgr.provider.confirm_vm_absent.return_value = False
         with pytest.raises(ProvisionError, match="could not confirm"):
             mgr._destroy_removed_vm("bprj__demo__bprj_cluster_1_old01")
-        mgr.provider.destroy_disks.assert_not_called()
+        self.remove.assert_not_called()
 
-    def test_disk_dirs_are_read_before_the_domain_is_undefined(self):
-        """``domblklist`` returns nothing once the domain is gone."""
+    def test_storage_is_inventoried_before_the_undefine(self):
+        """``domblklist`` and the ownership record are gone with the
+        domain."""
         mgr = self._manager()
         mgr.provider.confirm_vm_absent.return_value = True
         parent = MagicMock()
-        parent.attach_mock(mgr._vm_disk_dirs, "disk_dirs")
+        parent.attach_mock(mgr._capture_vm_storage, "capture")
         parent.attach_mock(mgr.provider.destroy_vm, "destroy_vm")
         mgr._destroy_removed_vm("bprj__demo__bprj_cluster_1_old01")
         assert [c[0] for c in parent.mock_calls][:2] == [
-            "disk_dirs", "destroy_vm"]
+            "capture", "destroy_vm"]
+        self.remove.assert_called_once()
 
 
 # --------------------------------------------------------------------------
@@ -354,8 +382,25 @@ class TestDestroyTeardownGate:
         assert [c[0] for c in order.mock_calls] == [
             "deprovision_files", "force_rmtree", "unregister"]
 
+    def test_stale_teardown_locators_go_once_the_workspace_has(
+            self, tmp_path):
+        """A kept file's inventory goes with the workspace; its locator is
+        retired after that, before the project is forgotten (#208)."""
+        mgr, workspace = self._manager(tmp_path)
+        mgr._retire_stale_teardown_locators = MagicMock()
+        order = MagicMock()
+        order.attach_mock(mgr._force_rmtree, "force_rmtree")
+        order.attach_mock(mgr._retire_stale_teardown_locators, "retire")
+        order.attach_mock(mgr.unregister_from_cache, "unregister")
+
+        mgr.destroy(ARGS)
+
+        assert [c[0] for c in order.mock_calls] == [
+            "force_rmtree", "retire", "unregister"]
+
     def test_a_failed_deprovision_preserves_everything(self, tmp_path):
         mgr, _workspace = self._manager(tmp_path)
+        mgr._retire_stale_teardown_locators = MagicMock()
         mgr.deprovision.side_effect = ProvisionError(
             "deprovision did not complete — VMs are still defined: node01")
 
@@ -365,6 +410,7 @@ class TestDestroyTeardownGate:
         mgr._force_rmtree.assert_not_called()
         mgr.deprovision_files.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
+        mgr._retire_stale_teardown_locators.assert_not_called()
 
     def test_a_failed_compose_destroy_preserves_everything(self, tmp_path):
         """``destroy_compose_clusters`` (down --volumes) is a different

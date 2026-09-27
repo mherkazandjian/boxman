@@ -22,7 +22,7 @@ from typing import Any
 import yaml as pyyaml
 
 from boxman import log
-from boxman.exceptions import ProvisionError
+from boxman.exceptions import ProvisionError, RuntimeUnavailable
 from boxman.runtime.base import RuntimeBase
 from boxman.runtime.tar_stream import ArchiveError, extract_archive
 from boxman.utils.compose_names import sanitize_project_name
@@ -608,6 +608,12 @@ class DockerComposeRuntime(RuntimeBase):
     #: ``paused``, ``restarting``, ``removing``, or a state docker adds
     #: later — is treated as "may have guests", which refuses.
     _STATES_WITHOUT_GUESTS = frozenset({"created", "exited", "dead"})
+
+    #: Where entrypoint.sh writes its diagnosis when it finds a problem it
+    #: cannot repair — a libvirt state directory it cannot complete — and
+    #: idles instead of exiting (#205). Without it the readiness wait could
+    #: only time out on a libvirtd that is never coming.
+    _STARTUP_FAILURE_MARKER = "/run/boxman/startup-failure"
 
     #: Marker the in-container probe prints. A count is trusted only when
     #: this line is present: ``docker exec`` overloads exit status 1 for
@@ -1515,7 +1521,10 @@ class DockerComposeRuntime(RuntimeBase):
                 # `make boxes-clean`). In that state `virsh` inside the
                 # container sees an empty /run/libvirt and hangs. Detect
                 # the condition with a bounded wait and fall through to
-                # stop+recreate instead of propagating the timeout.
+                # stop+recreate instead of propagating the timeout. An
+                # entrypoint that gave up (RuntimeUnavailable, deliberately
+                # not caught) is left alone: a new container would stop at
+                # the same problem (#205).
                 try:
                     self._wait_for_libvirtd()
                     return
@@ -1678,8 +1687,25 @@ class DockerComposeRuntime(RuntimeBase):
             f"{self.ready_timeout}s"
         )
 
+    def _startup_failure(self) -> str | None:
+        """The diagnosis the entrypoint left when it gave up, or None."""
+        result = _shell_run(
+            self.wrap_command(f"cat {self._STARTUP_FAILURE_MARKER}"),
+            hide=True, warn=True)
+        diagnosis = result.stdout.strip() if result.ok else ""
+        return diagnosis or None
+
     def _wait_for_libvirtd(self) -> None:
-        """Block until ``virsh version`` succeeds inside the container."""
+        """
+        Block until ``virsh version`` succeeds inside the container.
+
+        Raises:
+            RuntimeUnavailable: at once, when the entrypoint has given up on
+                a problem only the user can fix. That is not retried and the
+                container is not recreated for it: a new one would stop at
+                the same problem, and the idle one is where it can be seen.
+            RuntimeError: when libvirtd has not answered in time.
+        """
         deadline = time.monotonic() + self.ready_timeout
         interval = 3
         while time.monotonic() < deadline:
@@ -1688,6 +1714,15 @@ class DockerComposeRuntime(RuntimeBase):
             if result.ok:
                 self.logger.info("libvirtd is responsive inside the container")
                 return
+            diagnosis = self._startup_failure()
+            if diagnosis:
+                raise RuntimeUnavailable(
+                    f"the runtime container '{self.container_name}' stopped "
+                    f"before starting libvirtd:\n{diagnosis}\n"
+                    f"It is left running, idle, so the problem can be "
+                    f"inspected ('docker logs {self.container_name}'). "
+                    f"Once it is fixed, run 'docker restart "
+                    f"{self.container_name}' and try again.")
             self.logger.info(
                 "waiting for libvirtd to become responsive...")
             time.sleep(interval)

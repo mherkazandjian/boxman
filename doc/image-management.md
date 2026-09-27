@@ -54,6 +54,14 @@ using cloud-init. See the README "Cloud-init template creation" section
 for a worked example. The image cache above is engaged automatically
 whenever the template's `image:` field is a URL.
 
+Pin a point-release image by URL and checksum, not a `latest` alias: an
+alias is republished in place and silently invalidates the checksum. The
+cost is that mirrors delete a point release's images once it is superseded,
+so a pinned URL eventually returns 404. For the boxes shipped under
+`boxes/`, `make check-box-images` probes every template `image.uri` and
+`isos:` `uri` and names the dead ones; refresh a dead entry's `uri` and
+`checksum` together.
+
 ---
 
 ## `boxman import-image`

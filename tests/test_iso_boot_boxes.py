@@ -15,6 +15,7 @@ that needs the network.
 from __future__ import annotations
 
 import glob
+import importlib.util
 import os
 import re
 
@@ -110,42 +111,39 @@ class TestIsoBoxConfig:
         assert "boxman ssh" in text and "not" in text
 
 
-def _is_placeholder_iso(spec: dict) -> bool:
-    """
-    Whether an ``isos:`` entry is a stand-in the operator has to replace.
-
-    Not every ISO can be pinned to a public URL. ``talos-iso-boot`` boots an
-    image generated per-instance by Omni (``omnictl download iso``), so the
-    box ships a marker instead of a real artifact and its README/comments say
-    to substitute one. Such an entry has nothing to reach, and asserting that
-    it resolves fails for a box that is behaving exactly as documented.
-
-    Recognised markers, both of which that box carries: an all-zero checksum
-    (no real artifact is pinned) and ``placeholder`` in the URI.
-    """
-    checksum = str(spec.get("checksum", ""))
-    digest = checksum.split(":", 1)[-1]
-    if digest and set(digest) == {"0"}:
-        return True
-    return "placeholder" in str(spec.get("uri", "")).lower()
+def _load_image_checker():
+    """scripts/check_box_images.py is a dev script, not a package module."""
+    path = os.path.join(os.path.dirname(BOXES_DIR), "scripts", "check_box_images.py")
+    spec = importlib.util.spec_from_file_location("boxman_box_image_checker", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("box_dir", ISO_BOXES,
                          ids=[os.path.basename(d) for d in ISO_BOXES])
 def test_pinned_iso_urls_are_still_reachable(box_dir):
-    """The pinned URLs still resolve (a HEAD request, no download)."""
-    import urllib.request
-    checked = 0
-    for name, spec in (_config(box_dir).get("isos") or {}).items():
-        if _is_placeholder_iso(spec):
-            continue
-        request = urllib.request.Request(spec["uri"], method="HEAD")
-        with urllib.request.urlopen(request, timeout=30) as response:
-            assert response.status == 200, f"{name}: {spec['uri']}"
-            assert int(response.headers.get("Content-Length", 0)) > 0
-        checked += 1
-    if not checked:
+    """
+    The pinned URLs still resolve to a non-empty image, probed without a download.
+
+    Uses the same probe as ``make check-box-images``, which reports a
+    response confirmed empty (204/205, ``Content-Length: 0``, no body) as an
+    error, but accepts one that simply omits the length. An operator-supplied
+    placeholder is skipped there: ``talos-iso-boot`` boots an ISO Omni
+    generates per instance, so it ships a marker (an all-zero checksum and
+    ``placeholder`` in the uri) with nothing to reach.
+    """
+    checker = _load_image_checker()
+    conf_path = os.path.join(box_dir, "conf.yml")
+    refs = [ref for ref in checker.collect_image_refs(_config(box_dir), conf_path)
+            if ref.kind == "iso"]
+    probed = [(ref, status) for ref, status in checker.check_refs(refs, timeout=30)
+              if status.state != checker.SKIPPED]
+    if not probed:
         pytest.skip(
             "every ISO in this box is an operator-supplied placeholder "
             "(see its conf.yml) — there is no pinned URL to reach")
+    dead = [checker.describe_dead(ref, status)
+            for ref, status in probed if status.state != checker.OK]
+    assert not dead, "\n".join(dead)
