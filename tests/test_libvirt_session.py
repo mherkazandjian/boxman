@@ -1688,7 +1688,7 @@ class TestSourcesGoneFromTheHost:
     def test_an_existing_image_that_cannot_be_read_fails_closed(self, tmp_path):
         """The real probe, in a real shell, finds that the user may not
         read it, so libvirt is asked (#221) -- which lists no volume at
-        that path, as for any file in no storage pool."""
+        that path, nor any pool, here."""
         self._unless_root()
         disk = self._image(tmp_path / "a.qcow2")
         os.chmod(disk, 0)
@@ -1697,7 +1697,7 @@ class TestSourcesGoneFromTheHost:
                 ok=False, stderr="error: Storage volume not found")
             assert _session({}).backing_chains([disk]) is None
         assert [c.args for c in virsh.return_value.execute.call_args_list] == [
-            ("vol-pool", disk)]
+            ("vol-pool", disk), ("pool-list", "--name")]
 
     def test_a_readable_image_qemu_img_cannot_open_is_not_taken_to_libvirt(
             self, tmp_path):
@@ -1783,8 +1783,8 @@ class TestSourcesGoneFromTheHost:
             if args[0] == "list":
                 return _result(stdout=domain_listing(args, "vm-b")
                                if "--all" in args else "")
-            if args[0] == "vol-pool":
-                # what libvirt answers for a file in no storage pool (#221)
+            if args[0] in ("vol-pool", "pool-list"):
+                # a file in no storage pool, on a host with none (#221)
                 return _result(ok=False, stderr="error: Storage volume not "
                                                 "found")
             return _result(stdout=blk)
@@ -1946,12 +1946,16 @@ class TestChainReadThroughLibvirt:
     READ = [("vol-pool", (TOP,)), ("pool-refresh", ("cluster_1",)),
             ("vol-dumpxml", (TOP,)), ("vol-pool", (BASE,)),
             ("vol-dumpxml", (BASE,))]
+    #: ... when libvirt lists no volume at TOP, even once the pool on its
+    #: directory is refreshed
+    UNLISTED = [("vol-pool", (TOP,)), ("pool-refresh", ("cluster_1",)),
+                ("vol-pool", (TOP,))]
 
     @pytest.mark.parametrize("breakage, asked", [
-        ("the source is no pool volume", 1),
-        ("vol-pool fails", 1),
-        ("vol-pool answers, then fails", 1),
-        ("vol-pool prints no one pool", 1),
+        ("the source is no pool volume", UNLISTED),
+        ("vol-pool fails", UNLISTED),
+        ("vol-pool answers, then fails", UNLISTED),
+        ("vol-pool prints no one pool", UNLISTED),
         ("the refresh fails", 2),
         ("the refresh answers, then fails", 2),
         ("vol-dumpxml fails", 3),
@@ -1967,7 +1971,8 @@ class TestChainReadThroughLibvirt:
         """... and nothing after the failure is asked."""
         host = _overlay_host()
         if breakage == "the source is no pool volume":
-            del host.listed["cluster_1"][TOP]
+            host.never_listed.add(TOP)
+            host.refresh("cluster_1")
         elif breakage == "vol-pool fails":
             host.fail.add("vol-pool")
         elif breakage == "vol-pool answers, then fails":
@@ -1998,7 +2003,8 @@ class TestChainReadThroughLibvirt:
                 f"<path>{BASE}</path>", "")
 
         assert _chains(host, [TOP]) is None
-        assert _libvirt_asked(host) == self.READ[:asked]
+        assert _libvirt_asked(host) == (
+            asked if isinstance(asked, list) else self.READ[:asked])
 
     def test_a_layer_below_that_is_no_pool_volume_fails_closed(self):
         host = _overlay_host()
@@ -2139,7 +2145,108 @@ class TestInUseScanThroughLibvirt:
 
     def test_a_disk_libvirt_cannot_describe_fails_the_scan(self):
         host = self._host()
-        del host.listed["cluster_1"][TOP]
+        host.never_listed.add(TOP)
+        host.refresh("cluster_1")
 
         assert self._scan(host) is None
-        assert host.asked("vol-pool") == [(TOP,)]
+        assert host.asked("vol-pool") == [(TOP,), (TOP,)]
+
+
+class TestFilesAPoolHasNotListedYet:
+    """libvirt lists a file its pool has not seen since it was made -- the
+    overlay ``boxman snapshot take`` adds, which nothing refreshes the pool
+    for -- only once that pool is refreshed, so ``vol-pool`` knows nothing
+    of it. The pool on its directory is refreshed and libvirt asked again
+    (checked on libvirt 10.0: a snapshotted VM kept every file of its own
+    without this, #221)."""
+
+    OVERLAY = f"{POOL}/vm01.s1"
+
+    def _host(self) -> FakeHost:
+        """TOP's snapshot overlay, made after the pool's last refresh."""
+        host = _overlay_host()
+        host.add(self.OVERLAY, backing=TOP)
+        return host
+
+    def test_it_is_read_once_the_pool_on_its_directory_is_refreshed(self):
+        host = self._host()
+
+        assert _chains(host, [self.OVERLAY]) == {
+            self.OVERLAY: [self.OVERLAY, TOP, BASE]}
+        assert [(what, args) for _, what, args in host.log
+                if what not in ("qemu-img", "unreadable-probe")] == [
+            ("vol-pool", (self.OVERLAY,)), ("pool-list", ("--name",)),
+            ("pool-dumpxml", ("cluster_1",)),
+            ("pool-refresh", ("cluster_1",)),
+            ("vol-pool", (self.OVERLAY,)), ("vol-dumpxml", (self.OVERLAY,)),
+            ("vol-pool", (TOP,)), ("vol-dumpxml", (TOP,)),
+            ("vol-pool", (BASE,)), ("vol-dumpxml", (BASE,))]
+
+    def test_the_pools_are_read_once_per_read(self):
+        other = "/ws/cluster_2/vm02.s1"
+        host = self._host()
+        host.add("/ws/cluster_2/vm02.qcow2")
+        host.define_pool("cluster_2", "/ws/cluster_2")
+        host.add(other, backing="/ws/cluster_2/vm02.qcow2")
+
+        assert _chains(host, [self.OVERLAY, other]) == {
+            self.OVERLAY: [self.OVERLAY, TOP, BASE],
+            other: [other, "/ws/cluster_2/vm02.qcow2"]}
+        assert host.asked("pool-list") == [("--name",)]
+        assert host.asked("pool-dumpxml") == [("cluster_1",),
+                                              ("cluster_2",)]
+
+    def test_a_pool_with_no_local_directory_is_passed_over(self):
+        host = self._host()
+        host.define_pool("ceph", None)
+
+        assert _chains(host, [self.OVERLAY]) == {
+            self.OVERLAY: [self.OVERLAY, TOP, BASE]}
+
+    @pytest.mark.parametrize("breakage, asked", [
+        ("no pool is on its directory",
+         ["vol-pool", "pool-list", "pool-dumpxml", "pool-dumpxml"]),
+        ("the pools cannot be listed", ["vol-pool", "pool-list"]),
+        ("the pools are listed, then that fails", ["vol-pool", "pool-list"]),
+        ("a pool cannot be described",
+         ["vol-pool", "pool-list", "pool-dumpxml"]),
+        ("a pool is described, then that fails",
+         ["vol-pool", "pool-list", "pool-dumpxml"]),
+        ("a pool's description does not parse",
+         ["vol-pool", "pool-list", "pool-dumpxml"]),
+        ("its pool cannot be refreshed",
+         ["vol-pool", "pool-list", "pool-dumpxml", "pool-refresh"]),
+        ("libvirt still lists no volume there",
+         ["vol-pool", "pool-list", "pool-dumpxml", "pool-refresh",
+          "vol-pool"]),
+    ])
+    def test_what_cannot_be_told_fails_closed(self, breakage, asked):
+        """... and nothing after the failure is asked."""
+        host = self._host()
+        if breakage == "no pool is on its directory":
+            host.add("/ws/cluster_2/vm02.qcow2")
+            host.define_pool("cluster_2", "/ws/cluster_2")
+            host.files[self.OVERLAY].backing = None
+            host.files["/ws/elsewhere/vm01.s1"] = host.files.pop(self.OVERLAY)
+            source = "/ws/elsewhere/vm01.s1"
+        else:
+            source = self.OVERLAY
+        if breakage == "the pools cannot be listed":
+            host.fail.add("pool-list")
+        elif breakage == "the pools are listed, then that fails":
+            host.fail_after_answering.add("pool-list")
+        elif breakage == "a pool cannot be described":
+            host.fail.add("pool-dumpxml")
+        elif breakage == "a pool is described, then that fails":
+            host.fail_after_answering.add("pool-dumpxml")
+        elif breakage == "a pool's description does not parse":
+            host.pool_xml_override["cluster_1"] = "<pool type='dir'><name>"
+        elif breakage == "its pool cannot be refreshed":
+            host.fail.add("pool-refresh")
+        elif breakage == "libvirt still lists no volume there":
+            host.never_listed.add(self.OVERLAY)
+
+        assert _chains(host, [source]) is None
+        assert [what for _, what, _ in host.log
+                if what not in ("qemu-img", "unreadable-probe",
+                                "absence-probe")] == asked

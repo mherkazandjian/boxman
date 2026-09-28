@@ -2597,6 +2597,24 @@ class TestTeardownWithoutSudo:
         assert t.warnings == ''
         assert host.asked('pool-refresh') == [('cluster_1',)]
 
+    def test_a_snapshot_overlay_its_pool_has_not_listed_goes_too(
+            self, tmp_path):
+        """``snapshot take`` adds ``<vm>.<snapshot>`` over the boot disk and
+        refreshes no pool, so libvirt knows no volume there until the pool
+        on its directory is refreshed (as on the test runner)."""
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        overlay = _file(tmp_path / f'{VM}.s1')
+        memory = _file(tmp_path / f'{VM}_snapshot_s1.raw')
+        host = self._pool(tmp_path, (boot, None))
+        host.add(str(overlay), backing=str(boot))
+        t = _Teardown(tmp_path, disks=[overlay], records=[])
+
+        self._deprovision(t, host)
+
+        assert list(tmp_path.iterdir()) == []
+        assert not memory.exists()
+        assert t.warnings == ''
+
     def test_a_disk_libvirt_cannot_describe_is_still_kept(self, tmp_path):
         """No pool lists it: fail closed, and say so, as before."""
         boot = _file(tmp_path / f'{VM}.qcow2')

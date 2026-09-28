@@ -5,9 +5,10 @@ wrappers hand a command to the shell
 
 It answers what a backing-chain read and the host-wide in-use scan run --
 ``qemu-img info --backing-chain``, the shell probes, and ``virsh``'s
-``vol-pool`` / ``pool-refresh`` / ``vol-dumpxml`` / ``list`` /
-``domblklist`` / ``domstate`` / ``dumpxml`` -- the way libvirt 10.0 answers
-on the test runner, where the output shapes below were captured:
+``vol-pool`` / ``pool-refresh`` / ``vol-dumpxml`` / ``pool-list`` /
+``pool-dumpxml`` / ``list`` / ``domblklist`` / ``domstate`` / ``dumpxml``
+-- the way libvirt 10.0 answers on the test runner, where the output shapes
+below were captured:
 
 - libvirt creates pool volumes (every clone disk) mode 0600, owned by
   ``root`` or ``libvirt-qemu``, so ``qemu-img`` run as the user cannot open
@@ -84,6 +85,10 @@ class FakeHost:
         self.dumpxml_override: dict[str, str] = {}
         #: path -> what ``vol-pool`` prints for it instead of its pool
         self.vol_pool_override: dict[str, str] = {}
+        #: pool name -> what ``pool-dumpxml`` prints for it instead
+        self.pool_xml_override: dict[str, str] = {}
+        #: paths no refresh ever lists (a file libvirt passes over)
+        self.never_listed: set[str] = set()
         #: whether root reads every file (see the module docstring)
         self.root_reads = True
         #: whether ``sudo`` is refused (a password would be needed)
@@ -99,8 +104,9 @@ class FakeHost:
         self.files[path] = Image(**image)
         return path
 
-    def define_pool(self, name: str, target: str) -> None:
-        """A pool on *target*, listing what is there now."""
+    def define_pool(self, name: str, target: str | None) -> None:
+        """A pool on *target* (``None``: one with no local directory, an
+        RBD pool say), listing what is there now."""
         self.pools[name] = target
         self.refresh(name)
 
@@ -108,7 +114,9 @@ class FakeHost:
         target = self.pools[name]
         self.listed[name] = {path: replace(image)
                              for path, image in self.files.items()
-                             if os.path.dirname(path) == target}
+                             if target is not None
+                             and os.path.dirname(path) == target
+                             and path not in self.never_listed}
 
     def define_domain(self, name: str, *rows: tuple[str, str, str, str],
                       running: bool = False) -> None:
@@ -257,6 +265,36 @@ class FakeHost:
         if pool is None:
             return self._not_a_volume(path)
         return Result(stdout=f"{pool}\n\n")
+
+    def _pool_list(self, args: tuple) -> Result:
+        """``pool-list --name``: the active pools, a name that is short
+        padded with blanks, then a blank line (libvirt 10.0)."""
+        return Result(stdout="".join(f"{name:<20}\n"
+                                     for name in sorted(self.pools)) + "\n")
+
+    def _pool_dumpxml(self, args: tuple) -> Result:
+        name = args[0]
+        if name in self.pool_xml_override:
+            return Result(stdout=self.pool_xml_override[name])
+        if name not in self.pools:
+            return Result(stdout="\n",
+                          stderr=f"error: failed to get pool '{name}'\n",
+                          code=1)
+        target = self.pools[name]
+        if target is None:
+            return Result(stdout=(
+                f"<pool type='rbd'>\n  <name>{name}</name>\n  <source>\n"
+                f"    <host name='mon1' port='6789'/>\n    <name>rbd</name>\n"
+                f"  </source>\n</pool>\n\n"))
+        return Result(stdout=(
+            f"<pool type='dir'>\n  <name>{name}</name>\n"
+            f"  <uuid>b2620a50-6945-4976-bf58-dfd7914866c4</uuid>\n"
+            f"  <capacity unit='bytes'>61285326848</capacity>\n"
+            f"  <allocation unit='bytes'>28287864832</allocation>\n"
+            f"  <available unit='bytes'>32997462016</available>\n"
+            f"  <source>\n  </source>\n  <target>\n    <path>{target}</path>\n"
+            + self._permissions("0775", 1001, 110, "    ")
+            + "  </target>\n</pool>\n\n"))
 
     def _pool_refresh(self, args: tuple) -> Result:
         name = args[0]

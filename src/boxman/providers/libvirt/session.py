@@ -236,8 +236,13 @@ class _ChainReads:
     saw it), and :attr:`refreshed` makes that at most once per pool for the
     whole scan or teardown, however many chains and layers it reads. It
     lives exactly as long as this object: a new scan, or a new teardown,
-    refreshes again.
+    refreshes again. So do the pools' target directories
+    (:meth:`pool_on`), read at most once, and only when a file is found in
+    no pool.
     """
+
+    #: :attr:`_pool_targets` before the pools were first read
+    _UNREAD = object()
 
     def __init__(self, provider_config: dict[str, Any]) -> None:
         self.cmd = LibVirtCommandBase(provider_config=provider_config)
@@ -246,6 +251,8 @@ class _ChainReads:
         self.virsh = VirshCommand(provider_config=provider_config)
         #: pool name -> whether its one refresh succeeded
         self.refreshed: dict[str, bool] = {}
+        #: target directory -> active pool, ``None`` when they cannot be told
+        self._pool_targets: Any = self._UNREAD
 
     def refresh(self, pool: str) -> bool:
         """Refresh *pool*, unless this scan or teardown already did; whether
@@ -254,6 +261,50 @@ class _ChainReads:
             result = self.virsh.execute("pool-refresh", pool, warn=True)
             self.refreshed[pool] = bool(result.ok)
         return self.refreshed[pool]
+
+    def pool_of(self, path: str) -> str | None:
+        """The pool libvirt lists *path* in (``virsh vol-pool``), or
+        ``None``."""
+        owner = self.virsh.execute("vol-pool", path, warn=True)
+        return _pool_named(owner.stdout or "") if owner.ok else None
+
+    def pool_on(self, directory: str) -> str | None:
+        """
+        The active pool whose target is *directory*: ``virsh pool-list
+        --name`` and every one's ``pool-dumpxml``, read once per scan or
+        teardown. A pool with no local directory (RBD, say) is passed over.
+
+        Returns:
+            Its name, or ``None`` when no active pool is on *directory* or
+            that cannot be told: the pools cannot be listed, or one's
+            description cannot be read.
+        """
+        if self._pool_targets is self._UNREAD:
+            self._pool_targets = self._read_pool_targets()
+        if self._pool_targets is None:
+            return None
+        return self._pool_targets.get(os.path.normpath(directory))
+
+    def _read_pool_targets(self) -> dict[str, str] | None:
+        """``{target directory: pool}`` of every active pool, or ``None``
+        when any of it cannot be read (see :meth:`pool_on`)."""
+        listing = self.virsh.execute("pool-list", "--name", warn=True)
+        if not listing.ok:
+            return None
+        targets: dict[str, str] = {}
+        for name in (line.strip() for line in listing.stdout.splitlines()):
+            if not name:
+                continue
+            dumped = self.virsh.execute("pool-dumpxml", name, warn=True)
+            if not dumped.ok:
+                return None
+            try:
+                target = ET.fromstring(dumped.stdout).findtext("./target/path")
+            except ET.ParseError:
+                return None
+            if target:
+                targets[os.path.normpath(target)] = name
+        return targets
 
 
 class LibVirtSession(SessionConfigMixin):
@@ -1647,13 +1698,22 @@ class LibVirtSession(SessionConfigMixin):
         as its pool last saw it (an image rebased since still shows its old
         backing file until then), then ``virsh vol-dumpxml``
         (:func:`_volume_image`). ``None`` when any step fails.
+
+        A file made since its pool was last refreshed — the overlay a
+        snapshot adds, which nothing refreshes a pool for — is in no pool
+        until then. The pool on its directory (:meth:`_ChainReads.pool_on`)
+        is refreshed, and libvirt must then list the file (``vol-pool``
+        again); one it still does not, or in a directory no pool is on, is
+        no pool volume.
         """
-        owner = reads.virsh.execute("vol-pool", path, warn=True)
-        pool = _pool_named(owner.stdout or "") if owner.ok else None
+        pool = reads.pool_of(path)
+        if pool is None:
+            holder = reads.pool_on(os.path.dirname(path))
+            if holder is not None and reads.refresh(holder):
+                pool = reads.pool_of(path)
         if pool is None:
             self.logger.debug(
-                f"{path} is not a storage-pool volume libvirt lists: "
-                f"{(owner.stderr or owner.stdout or '').strip()}")
+                f"{path} is not a storage-pool volume libvirt lists")
             return None
         if not reads.refresh(pool):
             self.logger.debug(f"could not refresh storage pool {pool}, "
