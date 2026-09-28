@@ -17,7 +17,7 @@ from boxman.exceptions import (
 
 from ..session_base import SessionConfigMixin
 from . import net_reconcile
-from .cdrom import CDROMManager
+from .cdrom import CDROMManager, explicit_cdrom_targets
 from .clone_vm import CloneVM
 from .commands import LibVirtCommandBase, VirshCommand
 from .destroy_vm import DestroyVM, shutdown_and_wait
@@ -1627,6 +1627,10 @@ class LibVirtSession(SessionConfigMixin):
         """
         Configure all CDROM devices for a VM.
 
+        They are attached in the declared order, and every target the list
+        names explicitly is reserved first, so an entry without a target
+        never takes one a later entry names (#217).
+
         Args:
             vm_name: Name of the VM
             cdroms: List of CDROM configurations
@@ -1635,12 +1639,13 @@ class LibVirtSession(SessionConfigMixin):
             True if all CDROMs were configured successfully, False otherwise
         """
         cdrom_manager = CDROMManager(vm_name=vm_name, provider_config=self.provider_config)
+        reserved = explicit_cdrom_targets(cdroms)
         success = True
         for i, cdrom_config in enumerate(cdroms):
             self.logger.info(
                 f"configuring CDROM {i+1} ('{cdrom_config.get('name', '?')}') "
                 f"for VM {vm_name}")
-            if not cdrom_manager.configure_from_config(cdrom_config):
+            if not cdrom_manager.configure_from_config(cdrom_config, reserved=reserved):
                 self.logger.error(
                     f"failed to configure CDROM {i+1} for VM {vm_name}")
                 success = False
@@ -1715,11 +1720,14 @@ class LibVirtSession(SessionConfigMixin):
 
         success = True
 
-        # 2. Additions and media replacements.
+        # 2. Additions and media replacements. Additions go in the declared
+        #    order, with every target they name explicitly reserved first,
+        #    so one without a target never takes a later one's (#217).
+        reserved = explicit_cdrom_targets(new_cdroms)
         for cdrom_config in new_cdroms:
             name = cdrom_config.get('name', '?')
             self.logger.info(f"attaching new CDROM '{name}' to VM {vm_name}")
-            if not cdrom_manager.configure_from_config(cdrom_config):
+            if not cdrom_manager.configure_from_config(cdrom_config, reserved=reserved):
                 self.logger.error(f"failed to attach CDROM '{name}' to {vm_name}")
                 success = False
 

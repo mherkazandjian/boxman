@@ -95,12 +95,19 @@ def _domain_xml(machine: str | None) -> str:
             "<devices/></domain>")
 
 
+def _target_of(xml: str) -> str:
+    """The ``<target dev=...>`` of a device XML."""
+    return re.search(r"<target dev='([^']+)'", xml).group(1)
+
+
 class FakeVirsh:
     """
     ``virsh`` as a CDROMManager sees it: ``domblklist --details`` and
     ``dumpxml`` of the live definition, or with ``--inactive`` of the
     persistent one. Every call is recorded, and an ``attach-device`` adds
-    its drive to both definitions, as it does for a shut-off domain.
+    its drive to both definitions, as it does for a shut-off domain — or,
+    at a target either definition already holds, is refused the way
+    libvirt 10.0 refuses it, and recorded in ``refused``.
 
     ``fail`` maps ``(command, 'live' | 'persistent')`` to the result that
     query returns instead.
@@ -117,6 +124,7 @@ class FakeVirsh:
         self.fail = fail or {}
         self.calls: list[tuple] = []
         self.attached: list[str] = []
+        self.refused: list[str] = []
 
     def __call__(self, *args, **kwargs):
         self.calls.append(args)
@@ -132,8 +140,14 @@ class FakeVirsh:
         if args[0] == "attach-device":
             # the temp XML still exists while attach-device runs
             xml = Path(args[2]).read_text()
+            target = _target_of(xml)
+            if any(row.split()[2] == target for row in self.live + self.persistent):
+                self.refused.append(target)
+                return _result(ok=False, return_code=1, stderr=(
+                    f"error: Failed to attach device from {args[2]}\n"
+                    f"error: Requested operation is not valid: target "
+                    f"{target} already exists"))
             self.attached.append(xml)
-            target = re.search(r"<target dev='([^']+)'", xml).group(1)
             row = f"file  cdrom   {target}     /isos/attached.iso\n"
             self.live.append(row)
             self.persistent.append(row)
@@ -369,6 +383,127 @@ class TestDefaultTargetThroughTheSession:
         assert "dev='sdb' bus='sata'" in xml
 
 
+def _source_name_of(xml: str) -> str:
+    """The file name of a device XML's ``<source file=...>``."""
+    return Path(re.search(r"<source file='([^']+)'", xml).group(1)).name
+
+
+class TestExplicitTargetsAreReserved:
+    """
+    A target the same list names explicitly is never handed to a targetless
+    entry, whatever the declaration order. Declared first, the targetless
+    entry took it, and the explicit attach after it was refused ("target
+    sdb already exists"), so the list could not be applied (#217). The
+    attach-time counterpart of VMStateDiffer's claimed_targets (#164 FB-5).
+    """
+
+    def _session(self):
+        from boxman.providers.libvirt.session import LibVirtSession
+        session = LibVirtSession(config={"provider": {"libvirt": {}}})
+        session.logger = MagicMock()
+        return session
+
+    def _cdroms(self, tmp_path: Path, explicit: str) -> list[dict]:
+        """A targetless entry declared before one naming *explicit*."""
+        for name in ("tools.iso", "data.iso"):
+            (tmp_path / name).write_bytes(b"iso")
+        return [{"name": "tools", "source": str(tmp_path / "tools.iso")},
+                {"name": "data", "source": str(tmp_path / "data.iso"),
+                 "target": explicit}]
+
+    def _apply(self, session, path: str, cdroms: list[dict], virsh: FakeVirsh) -> bool:
+        with patch("boxman.providers.libvirt.cdrom.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.side_effect = virsh
+            if path == "provision":
+                return session.configure_vm_cdroms("vm01", cdroms)
+            return session.update_vm_cdroms(
+                vm_name="vm01", new_cdroms=cdroms, removed_cdroms=[],
+                changed_cdroms=[], vm_active=False)
+
+    @pytest.mark.parametrize("path", ["provision", "update"])
+    @pytest.mark.parametrize("machine,drives,explicit,default", [
+        # the template's empty seed drive holds sda
+        (Q35, (BOOT_DISK, EMPTY_SEED_DRIVE), "sdb", "sdc"),
+        (I440FX, (BOOT_DISK,), "hda", "hdb"),
+    ], ids=["q35", "i440fx"])
+    def test_a_targetless_cdrom_leaves_a_later_explicit_target_alone(
+            self, tmp_path: Path, path, machine, drives, explicit, default):
+        virsh = FakeVirsh(machine=machine, live=drives)
+
+        ok = self._apply(self._session(), path, self._cdroms(tmp_path, explicit), virsh)
+
+        assert virsh.refused == []
+        assert ok is True
+        # in declared order: the targetless entry first, at the first target
+        # nobody named, then the explicit one where it asked to be
+        assert [(_target_of(xml), _source_name_of(xml)) for xml in virsh.attached] == [
+            (default, "tools.iso"), (explicit, "data.iso")]
+
+    def test_provision_keeps_the_declared_order_and_numbering(self, tmp_path: Path):
+        virsh = FakeVirsh(machine=Q35, live=(BOOT_DISK, EMPTY_SEED_DRIVE))
+        session = self._session()
+
+        assert self._apply(session, "provision", self._cdroms(tmp_path, "sdb"), virsh) is True
+
+        messages = [c.args[0] for c in session.logger.info.call_args_list]
+        assert [m for m in messages if m.startswith("configuring CDROM")] == [
+            "configuring CDROM 1 ('tools') for VM vm01",
+            "configuring CDROM 2 ('data') for VM vm01"]
+
+
+class TestReservedTargetsInTheManager:
+    """CDROMManager's side of the reservation (#217)."""
+
+    def _iso(self, tmp_path: Path) -> str:
+        iso = tmp_path / "tools.iso"
+        iso.write_bytes(b"iso")
+        return str(iso)
+
+    def test_a_reserved_target_is_not_free(self, cd: CDROMManager):
+        virsh = FakeVirsh(machine=Q35, live=(BOOT_DISK, EMPTY_SEED_DRIVE))
+        with patch.object(cd.virsh, "execute", side_effect=virsh):
+            assert cd._find_next_available_target(
+                reserved=frozenset({"sdb", "sdc"})) == "sdd"
+
+    def test_attach_cdrom_passes_the_reservation_on(self, cd: CDROMManager, tmp_path: Path):
+        virsh = FakeVirsh(machine=Q35, live=(BOOT_DISK, EMPTY_SEED_DRIVE))
+        with patch.object(cd.virsh, "execute", side_effect=virsh):
+            assert cd.attach_cdrom(self._iso(tmp_path), reserved=frozenset({"sdb"})) is True
+        [xml] = virsh.attached
+        assert _target_of(xml) == "sdc"
+
+    def test_configure_from_config_passes_the_reservation_on(
+            self, cd: CDROMManager, tmp_path: Path):
+        virsh = FakeVirsh(machine=Q35, live=(BOOT_DISK, EMPTY_SEED_DRIVE))
+        with patch.object(cd.virsh, "execute", side_effect=virsh):
+            assert cd.configure_from_config(
+                {"name": "tools", "source": self._iso(tmp_path)},
+                reserved=frozenset({"sdb"})) is True
+        [xml] = virsh.attached
+        assert _target_of(xml) == "sdc"
+
+    def test_an_explicit_target_is_used_as_given_though_reserved(
+            self, cd: CDROMManager, tmp_path: Path):
+        """The reservation holds the list's explicit targets, this entry's
+        own among them; it only keeps defaults off them."""
+        virsh = FakeVirsh(machine=Q35, live=(BOOT_DISK, EMPTY_SEED_DRIVE))
+        with patch.object(cd.virsh, "execute", side_effect=virsh):
+            assert cd.configure_from_config(
+                {"name": "data", "source": self._iso(tmp_path), "target": "sdb"},
+                reserved=frozenset({"sdb"})) is True
+        [xml] = virsh.attached
+        assert _target_of(xml) == "sdb"
+        assert not virsh.queried("domblklist")
+
+    def test_explicit_cdrom_targets_are_the_named_ones(self):
+        from boxman.providers.libvirt.cdrom import explicit_cdrom_targets
+        assert explicit_cdrom_targets([
+            {"name": "tools", "source": "/isos/tools.iso"},
+            {"name": "data", "source": "/isos/data.iso", "target": "sdb"},
+            {"name": "docs", "source": "/isos/docs.iso", "target": "sdd"},
+        ]) == frozenset({"sdb", "sdd"})
+
+
 class TestAttachCDROM:
 
     def test_missing_iso_returns_false(self, cd: CDROMManager, captured_logs):
@@ -476,7 +611,8 @@ class TestConfigureFromConfig:
     def test_delegates_to_attach_cdrom(self, cd: CDROMManager):
         with patch.object(cd, "attach_cdrom", return_value=True) as attach:
             cd.configure_from_config({"source": "/x.iso", "target": "hdd"})
-        attach.assert_called_once_with(source_path="/x.iso", target_dev="hdd")
+        attach.assert_called_once_with(
+            source_path="/x.iso", target_dev="hdd", reserved=())
 
 
 class TestGetAttachedCDROMs:

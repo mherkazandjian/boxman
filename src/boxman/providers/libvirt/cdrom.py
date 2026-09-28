@@ -1,5 +1,6 @@
 import os
 import tempfile
+from collections.abc import Iterable
 from typing import Any
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
@@ -51,6 +52,21 @@ def _machine_has_builtin_ide(machine: str) -> bool:
         ('pc-i440fx-', 'pc-0.', 'pc-1.', 'rhel'))
 
 
+def explicit_cdrom_targets(cdroms: list[dict[str, Any]]) -> frozenset[str]:
+    """
+    The targets a list of cdrom declarations names explicitly.
+
+    They are reserved before any entry of the list is attached (the
+    ``reserved`` argument of :meth:`CDROMManager.configure_from_config`),
+    so a targetless entry declared earlier cannot take the target a later
+    one names, whatever the declaration order. Taken first, that attach
+    was refused ("target sdb already exists") and the list could not be
+    applied (#217). The attach-time counterpart of ``VMStateDiffer``'s
+    ``claimed_targets`` (#164 FB-5).
+    """
+    return frozenset(entry['target'] for entry in cdroms if entry.get('target'))
+
+
 class CDROMManager:
     """
     Class for managing CDROM/ISO device operations in libvirt.
@@ -74,7 +90,8 @@ class CDROMManager:
     def attach_cdrom(self,
                      source_path: str,
                      target_dev: str | None = None,
-                     persistent: bool = True) -> bool:
+                     persistent: bool = True,
+                     reserved: Iterable[str] = ()) -> bool:
         """
         Attach an ISO image as a CDROM device to the VM.
 
@@ -84,6 +101,9 @@ class CDROMManager:
                 None, the first free target on a bus the domain's machine
                 has (see :meth:`_find_next_available_target`).
             persistent: Whether to make the attachment persistent
+            reserved: Targets other entries of the same list name
+                explicitly (see :func:`explicit_cdrom_targets`); never
+                chosen for a *target_dev* of None.
 
         Returns:
             True if successful, False otherwise
@@ -95,7 +115,7 @@ class CDROMManager:
                 return False
 
             if target_dev is None:
-                target_dev = self._find_next_available_target()
+                target_dev = self._find_next_available_target(reserved)
                 if target_dev is None:
                     self.logger.error(
                         f"could not find available CDROM target for VM {self.vm_name}")
@@ -215,12 +235,17 @@ class CDROMManager:
             self.logger.error(f"error changing CDROM media: {e}")
             return False
 
-    def configure_from_config(self, cdrom_config: dict[str, Any]) -> bool:
+    def configure_from_config(self, cdrom_config: dict[str, Any],
+                              reserved: Iterable[str] = ()) -> bool:
         """
         Configure a CDROM device from a configuration dictionary.
 
         Args:
             cdrom_config: Dictionary with 'name', 'source', and optional 'target' keys
+            reserved: Targets the list *cdrom_config* comes from names
+                explicitly (see :func:`explicit_cdrom_targets`); an entry
+                without a 'target' is not given one of them. An explicit
+                'target' is used as given.
 
         Returns:
             True if successful, False otherwise
@@ -231,7 +256,8 @@ class CDROMManager:
             return False
 
         target = cdrom_config.get('target')
-        return self.attach_cdrom(source_path=source, target_dev=target)
+        return self.attach_cdrom(source_path=source, target_dev=target,
+                                 reserved=reserved)
 
     def get_attached_cdroms(self) -> list[dict[str, Any]]:
         """
@@ -312,7 +338,7 @@ class CDROMManager:
         """
         return 'sata' if target_dev.startswith('sd') else 'ide'
 
-    def _find_next_available_target(self) -> str | None:
+    def _find_next_available_target(self, reserved: Iterable[str] = ()) -> str | None:
         """
         Find the first free target for a CDROM declared without one.
 
@@ -325,7 +351,14 @@ class CDROMManager:
         given an ``hdX`` drive was defined but could not start (#217).
 
         A target in use in either the live or the persistent definition is
-        not handed out (see :meth:`_used_targets`).
+        not handed out (see :meth:`_used_targets`), and neither is a
+        reserved one.
+
+        Args:
+            reserved: Targets other entries of the same list name explicitly
+                (see :func:`explicit_cdrom_targets`). They are taken before
+                those entries are attached: handing one out here made the
+                later explicit attach fail on the target it named (#217).
 
         Returns:
             Device name (e.g., 'sdb' or 'hdc') or None if no slot available
@@ -333,7 +366,7 @@ class CDROMManager:
         Raises:
             ProvisionError: if the domain's block devices cannot be read
         """
-        used_targets = self._used_targets()
+        used_targets = self._used_targets() | set(reserved)
 
         machine = self._machine_type()
         if machine is None:
