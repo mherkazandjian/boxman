@@ -8,6 +8,7 @@ import os
 
 from boxman import log
 from boxman.utils.io import write_files
+from boxman.utils.retained_tree import identity
 
 
 class WorkspaceMixin:
@@ -511,7 +512,7 @@ class WorkspaceMixin:
                     self._runtime_name,
                 )
 
-    def deprovision_files(self) -> None:
+    def deprovision_files(self, scan=None) -> None:
         """
         Remove files and directories created during provisioning.
 
@@ -519,6 +520,13 @@ class WorkspaceMixin:
         - Files listed under workspace.files and cluster.files
         - Generated SSH keys and ssh_config
         - Cluster workdirs (if empty after cleanup)
+
+        *scan* is ``destroy``'s in-use scan (``_scan_workspace``): a file
+        inside the workspace it walked is left to the workspace removal,
+        which spares what another domain uses, and a file outside it that
+        another domain uses — or whose identity cannot be read — is kept
+        and named in a warning (#221 review R3). A directory holding a
+        file kept is never empty, so it stays too.
         """
         workspace = self.config.get('workspace', {})
         workspace_path = workspace.get('path', '')
@@ -526,7 +534,8 @@ class WorkspaceMixin:
         # Remove files listed in workspace.files
         if workspace_path:
             if ws_files := workspace.get('files'):
-                self._remove_files(ws_files, rootdir=workspace_path)
+                self._remove_files(ws_files, rootdir=workspace_path,
+                                   scan=scan)
 
         clusters = self.config['clusters']
         for _cluster_name, cluster in clusters.items():
@@ -535,7 +544,8 @@ class WorkspaceMixin:
 
             # Remove files listed in cluster.files
             if files := cluster.get('files'):
-                self._remove_files(files, rootdir=cluster['workdir'])
+                self._remove_files(files, rootdir=cluster['workdir'],
+                                   scan=scan)
 
             # Remove generated SSH keys
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
@@ -543,11 +553,12 @@ class WorkspaceMixin:
                 admin_key_name: "",
                 f"{admin_key_name}.pub": "",
             }
-            self._remove_files(ssh_key_files, rootdir=base_path)
+            self._remove_files(ssh_key_files, rootdir=base_path, scan=scan)
 
             # Remove generated ssh_config
             ssh_config_name = cluster.get('ssh_config', 'ssh_config')
-            self._remove_files({ssh_config_name: ""}, rootdir=base_path)
+            self._remove_files({ssh_config_name: ""}, rootdir=base_path,
+                               scan=scan)
 
             # Remove cluster workdir if empty
             cluster_workdir = os.path.expanduser(cluster.get('workdir', ''))
@@ -559,7 +570,33 @@ class WorkspaceMixin:
                     pass
 
     @staticmethod
-    def _remove_files(files: dict[str, str], rootdir: str = None) -> None:
+    def _spared(fpath: str, scan) -> bool:
+        """
+        Whether generated file *fpath* stays for ``destroy``'s in-use *scan*
+        (``(in_use, tree)``): it is in the workspace walked, whose removal
+        decides it; or another domain uses it, or whether one does cannot
+        be told — both named in a warning.
+        """
+        in_use, tree = scan
+        if tree is not None and tree.holds(fpath):
+            return True
+        try:
+            target = identity(os.stat(fpath))
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            log.warning(f"left {fpath} in place: whether another domain uses "
+                        f"it could not be told ({exc.strerror})")
+            return True
+        why = in_use.why_kept(fpath, target)
+        if why:
+            log.warning(f"left {fpath} in place: {why}")
+            return True
+        return False
+
+    @staticmethod
+    def _remove_files(files: dict[str, str], rootdir: str = None,
+                      scan=None) -> None:
         rootdir_abs = os.path.normpath(os.path.expanduser(rootdir)) if rootdir else None
         candidate_dirs: set = set()
         for _fpath in files:
@@ -568,7 +605,9 @@ class WorkspaceMixin:
             else:
                 fpath = _fpath
             fpath = os.path.normpath(os.path.expanduser(fpath))
-            if os.path.exists(fpath):
+            if scan is not None and WorkspaceMixin._spared(fpath, scan):
+                pass
+            elif os.path.exists(fpath):
                 os.remove(fpath)
                 log.info(f'removed file {fpath}')
             # Collect all ancestor directories up to (but excluding) rootdir,

@@ -96,6 +96,13 @@ class RetainedTree:
         """The path of *rel*, an entry relative to :attr:`root`."""
         return os.path.join(self.root, rel) if rel else self.root
 
+    def holds(self, path: str) -> bool:
+        """Whether the entry *path* — the directory it is in resolved, its
+        own name not, so a symlink in the tree counts — is in the tree."""
+        entry = os.path.join(os.path.realpath(os.path.dirname(path)),
+                             os.path.basename(path))
+        return entry.startswith(self.root + os.sep)
+
 
 def _open_dir(name: str, dir_fd: int | None, shown: str) -> int:
     """Open the directory *name* (relative to *dir_fd*) for listing, never

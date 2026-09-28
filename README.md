@@ -896,7 +896,9 @@ Details worth knowing:
   host-wide check and removes the workspace except the files another VM
   uses, directly or as a backing file (known by path or by identity). Each
   stays, with the directories on the way to it, and is named in a warning;
-  `destroy` still exits 0. If it cannot tell which files those are — the
+  `destroy` still exits 0. The generated files it removes elsewhere (those
+  `workspace.files`/`cluster.files` list, the SSH keys, `ssh_config`) get
+  the same check. If it cannot tell which files those are — the
   check fails, or a directory in the workspace cannot be read — it exits 2
   and keeps the workspace, the generated files, the runtime and the cache
   entry, like an incomplete teardown. The removal never follows a symlink,

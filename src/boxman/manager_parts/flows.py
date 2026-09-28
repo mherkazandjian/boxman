@@ -1257,8 +1257,10 @@ class FlowsMixin:
                 self._force_rmtree(boxman_dir)
 
         # 4. remove the generated provisioning files (env.sh, ansible.cfg,
-        #    inventory, ssh_config, generated SSH keys)
-        self.deprovision_files()
+        #    inventory, ssh_config, generated SSH keys) — those in the
+        #    workspace are left to step 5, and one elsewhere another domain
+        #    uses stays (2d)
+        self.deprovision_files(scan)
 
         # 5. nuke the workspace workdir, all but the files another domain
         #    uses (2d)

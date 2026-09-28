@@ -719,7 +719,7 @@ class TestDestroySparesFilesInUse:
         mgr.provider.disk_paths_in_use.return_value = FilesInUse(
             {os.path.realpath(used): "other-vm"})
 
-        def replace():
+        def replace(*_scan):
             os.rename(workspace / "cluster_1", workspace / "moved-cluster")
             (workspace / "cluster_1").symlink_to(outside)
         mgr.deprovision_files.side_effect = replace
@@ -764,6 +764,134 @@ class TestDestroySparesFilesInUse:
         assert (workspace / "moved-cluster" /
                 "bprj__demo__bprj_cluster_1_node01.qcow2").exists()
         mgr.unregister_from_cache.assert_not_called()
+
+    # -- #221 review R3: the generated-file cleanup (step 4) -------------------
+
+    def test_a_generated_file_in_the_workspace_another_domain_uses_stays(
+            self, tmp_path, captured_logs):
+        """Codex's reproduction: a file listed in workspace.files is another
+        domain's CD-ROM. The real deprovision_files (step 4) removed it
+        before the workspace removal could spare it, which then claimed it
+        had been left in place. Now step 4 leaves it to step 5, which names
+        it, once."""
+        mgr, workspace = self._manager(tmp_path)
+        del mgr.deprovision_files                # the real step 4
+        seed = _tree(workspace / "cluster_1" / "cfg", "seed.iso") / "seed.iso"
+        mgr.config["workspace"]["files"] = {"cluster_1/cfg/seed.iso": "",
+                                            "env.sh": ""}
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(seed): "other-vm"})
+
+        mgr.destroy(ARGS)
+
+        assert _left(workspace) == ["cluster_1", "cluster_1/cfg",
+                                    "cluster_1/cfg/seed.iso"]
+        assert f"left {os.path.realpath(seed)} in place: domain other-vm " \
+               f"uses it" in self._warnings(mgr)
+        assert "seed.iso" not in captured_logs.text     # not step 4 too
+        mgr.unregister_from_cache.assert_called_once()
+
+    @pytest.mark.parametrize("listed", [
+        "workspace.files", "cluster.files", "the admin key",
+        "the admin key's .pub", "ssh_config"])
+    def test_no_generated_file_another_domain_uses_is_removed(self, tmp_path,
+                                                              listed):
+        """Every file step 4 removes gets the scan's answer."""
+        mgr, workspace = self._manager(tmp_path)
+        del mgr.deprovision_files
+        name = {"workspace.files": "listed.iso",
+                "cluster.files": "cluster_1/listed.iso",
+                "the admin key": "id_ed25519_boxman",
+                "the admin key's .pub": "id_ed25519_boxman.pub",
+                "ssh_config": "ssh_config"}[listed]
+        used = _tree(workspace, name) / name
+        if listed == "workspace.files":
+            mgr.config["workspace"]["files"] = {name: ""}
+        if listed == "cluster.files":
+            mgr.config["clusters"]["cluster_1"]["files"] = {"listed.iso": ""}
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(used): "other-vm"})
+
+        mgr.destroy(ARGS)
+
+        assert used.exists()
+        mgr.unregister_from_cache.assert_called_once()
+
+    def test_a_workspace_reached_through_a_symlink_is_still_step_5s(
+            self, tmp_path, captured_logs):
+        """workspace.path through a symlinked directory: a generated file
+        in it is still recognised as the workspace's, and named once."""
+        mgr, workspace = self._manager(tmp_path)
+        del mgr.deprovision_files
+        via = tmp_path / "via"
+        via.symlink_to(workspace.parent)
+        mgr.config["workspace"]["path"] = str(via / workspace.name)
+        seed = workspace / "cluster_1" / "seed.iso"
+        mgr.config["workspace"]["files"] = {"cluster_1/seed.iso": ""}
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(seed): "other-vm"})
+
+        mgr.destroy(ARGS)
+
+        assert seed.exists()
+        assert "seed.iso" not in captured_logs.text
+        assert "seed.iso in place" in self._warnings(mgr)
+
+    def _generated_elsewhere(self, mgr, tmp_path):
+        """Two generated files outside the workspace, listed in
+        cluster.files by absolute path, in a directory whose name begins
+        with the workspace's."""
+        elsewhere = _tree(tmp_path / "workspaces" / "demo-elsewhere",
+                          "used.iso", "unused.cfg")
+        mgr.config["clusters"]["cluster_1"]["files"] = {
+            str(elsewhere / "used.iso"): "", str(elsewhere / "unused.cfg"): ""}
+        return elsewhere
+
+    def test_a_generated_file_elsewhere_another_domain_uses_stays(
+            self, tmp_path, captured_logs):
+        mgr, workspace = self._manager(tmp_path)
+        del mgr.deprovision_files
+        elsewhere = self._generated_elsewhere(mgr, tmp_path)
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(elsewhere / "used.iso"): "other-vm"})
+
+        mgr.destroy(ARGS)
+
+        assert _left(elsewhere) == ["used.iso"]
+        assert f"left {elsewhere / 'used.iso'} in place: domain other-vm " \
+               f"uses it" in captured_logs.text
+        assert not workspace.exists()
+
+    def test_a_generated_file_used_under_another_name_stays(self, tmp_path):
+        mgr, _workspace = self._manager(tmp_path)
+        del mgr.deprovision_files
+        elsewhere = self._generated_elsewhere(mgr, tmp_path)
+        alias = tmp_path / "images" / "disk.img"
+        alias.parent.mkdir()
+        os.link(elsewhere / "used.iso", alias)
+        in_use = FilesInUse({str(alias): "other-vm"})
+        in_use.identities[_identity(alias)] = "other-vm"
+        mgr.provider.disk_paths_in_use.return_value = in_use
+
+        mgr.destroy(ARGS)
+
+        assert _left(elsewhere) == ["used.iso"]
+
+    @unless_root
+    def test_a_generated_file_whose_identity_cannot_be_read_stays(
+            self, tmp_path, captured_logs):
+        mgr, _workspace = self._manager(tmp_path)
+        del mgr.deprovision_files
+        elsewhere = self._generated_elsewhere(mgr, tmp_path)
+        elsewhere.chmod(0o600)                 # listable, not searchable
+        try:
+            mgr.destroy(ARGS)
+        finally:
+            elsewhere.chmod(0o755)
+
+        assert _left(elsewhere) == ["unused.cfg", "used.iso"]
+        assert "whether another domain uses it could not be told" in \
+            captured_logs.text
 
     def test_a_symlink_to_a_directory_goes_but_not_what_it_points_to(
             self, tmp_path):
