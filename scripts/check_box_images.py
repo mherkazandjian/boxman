@@ -51,16 +51,16 @@ from typing import NamedTuple
 import jinja2
 import yaml
 
-try:
-    from boxman.exceptions import BoxmanError
-    from boxman.utils.jinja_env import create_jinja_env
-except ImportError:  # run straight from a checkout, without PYTHONPATH=src
-    sys.path.insert(0, os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-    from boxman.exceptions import BoxmanError
-    from boxman.utils.jinja_env import create_jinja_env
-
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# this checkout's boxman, ahead of any installed one: an older install lacks
+# boxman.utils.http_opener (#216), and would render the boxes with its own
+# Jinja2 helpers rather than the ones they are written against
+sys.path.insert(0, os.path.join(REPO_DIR, "src"))
+
+from boxman.exceptions import BoxmanError  # noqa: E402
+from boxman.utils.http_opener import StripProxyAuthRedirectHandler  # noqa: E402
+from boxman.utils.jinja_env import create_jinja_env  # noqa: E402
+
 BOXES_DIR = os.path.join(REPO_DIR, "boxes")
 
 DEFAULT_TIMEOUT = 20.0
@@ -239,7 +239,7 @@ def collect_image_refs(config: dict, conf_path: str) -> list[ImageRef]:
 # ---------------------------------------------------------------------------
 
 
-class _ProbeRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _ProbeRedirectHandler(StripProxyAuthRedirectHandler):
     """
     Follow redirects without turning a HEAD into a GET or leaking proxy credentials.
 
@@ -248,23 +248,15 @@ class _ProbeRedirectHandler(urllib.request.HTTPRedirectHandler):
     the method; the other headers (``Range`` included) are carried over by
     urllib already.
 
-    That carry-over includes ``Proxy-Authorization``, which urllib's
-    ProxyHandler adds as an ordinary header and keeps off the wire only when
-    tunnelling. A redirect from a proxied http mirror to a host reached
-    directly (an https CDN with no https proxy set, or a ``no_proxy`` host)
-    would hand that host the proxy password. Drop it from every redirected
-    request; the proxy handler adds it back when the destination is proxied.
+    That carry-over includes ``Proxy-Authorization``, which would hand the
+    proxy password to a host reached directly after the redirect. The base
+    class, shared with boxman's own downloader, drops it (#211, #216).
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is None:
-            return None
-        if req.get_method() == "HEAD":
+        if new is not None and req.get_method() == "HEAD":
             new.method = "HEAD"
-        for hdrs in (new.headers, new.unredirected_hdrs):
-            for key in [k for k in hdrs if k.lower() == "proxy-authorization"]:
-                del hdrs[key]
         return new
 
 
