@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from conftest import domain_listing
@@ -93,6 +94,9 @@ class FakeHost:
         self.root_reads = True
         #: whether ``sudo`` is refused (a password would be needed)
         self.sudo_refused = False
+        #: (what, first argument) -> something to do, once, just before that
+        #: command runs (what: a virsh subcommand or ``qemu-img``)
+        self.before: dict[tuple[str, str], Callable[[], None]] = {}
         #: every command, in order: (identity, what, args)
         self.log: list[tuple[str, str, tuple]] = []
         #: the full command lines, as handed to the shell
@@ -159,10 +163,12 @@ class FakeHost:
         if argv[0] == "if":
             return self._probe(who, argv)
         if argv[0] == "qemu-img":
+            self._run_hook("qemu-img", argv[-1])
             self.log.append((who, "qemu-img", (argv[-1],)))
             return self._qemu_img(root, argv[-1])
         if argv[0] == "virsh":
             sub, args = argv[3], tuple(argv[4:])
+            self._run_hook(sub, args[0] if args else "")
             self.log.append((who, sub, args))
             if sub in self.fail:
                 return Result(stderr=f"error: {sub} failed\n", code=1)
@@ -172,6 +178,11 @@ class FakeHost:
                                 stderr=f"error: {sub} failed late\n", code=1)
             return result
         raise AssertionError(f"the fake host cannot run: {command}")
+
+    def _run_hook(self, what: str, first: str) -> None:
+        hook = self.before.pop((what, first), None)
+        if hook is not None:
+            hook()
 
     def _reads(self, root: bool, image: Image) -> bool:
         return image.readable or (root and self.root_reads)

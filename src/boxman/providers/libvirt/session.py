@@ -1,4 +1,3 @@
-import contextlib
 import json
 import os
 import re
@@ -226,19 +225,19 @@ def _volume_image(xml: str, path: str) -> dict | None:
 class _ChainReads:
     """
     The backing-chain reads of one host-wide in-use scan
-    (:meth:`LibVirtSession.disk_paths_in_use`) or of one teardown
-    (:meth:`LibVirtSession.chain_read_scope`): the command wrapper
+    (:meth:`LibVirtSession.disk_paths_in_use`) or of one
+    :meth:`LibVirtSession.backing_chains` call: the command wrapper
     ``qemu-img`` runs through, the one the readability probe runs through
-    (the same, never with ``sudo``), ``virsh``, and the pool-refresh cache.
+    (the same, never with ``sudo``), ``virsh``, and the pools' target
+    directories (:meth:`pool_on`), read at most once, and only when a file
+    is found in no pool — a map gone stale meanwhile can only make a read
+    fail closed.
 
-    The cache is why this object exists: the libvirt fallback refreshes the
-    pool of every layer it reads (libvirt describes a file as the pool last
-    saw it), and :attr:`refreshed` makes that at most once per pool for the
-    whole scan or teardown, however many chains and layers it reads. It
-    lives exactly as long as this object: a new scan, or a new teardown,
-    refreshes again. So do the pools' target directories
-    (:meth:`pool_on`), read at most once, and only when a file is found in
-    no pool.
+    No pool refresh is shared here: libvirt describes a file as its pool
+    last saw it, and a source whose image is rebased after another source's
+    chain was read must not be read from that refresh (#221 review R1). Each
+    chain read through libvirt refreshes the pools it reads, once each
+    (:meth:`LibVirtSession._libvirt_backing_chain`).
     """
 
     #: :attr:`_pool_targets` before the pools were first read
@@ -249,18 +248,16 @@ class _ChainReads:
         self.probe = LibVirtCommandBase(override_config_use_sudo=False,
                                         provider_config=provider_config)
         self.virsh = VirshCommand(provider_config=provider_config)
-        #: pool name -> whether its one refresh succeeded
-        self.refreshed: dict[str, bool] = {}
         #: target directory -> active pool, ``None`` when they cannot be told
         self._pool_targets: Any = self._UNREAD
 
-    def refresh(self, pool: str) -> bool:
-        """Refresh *pool*, unless this scan or teardown already did; whether
-        that one refresh succeeded."""
-        if pool not in self.refreshed:
+    def refresh(self, pool: str, refreshed: dict[str, bool]) -> bool:
+        """Refresh *pool* unless *refreshed* — one chain's refreshes — holds
+        it already; whether that one refresh succeeded."""
+        if pool not in refreshed:
             result = self.virsh.execute("pool-refresh", pool, warn=True)
-            self.refreshed[pool] = bool(result.ok)
-        return self.refreshed[pool]
+            refreshed[pool] = bool(result.ok)
+        return refreshed[pool]
 
     def pool_of(self, path: str) -> str | None:
         """The pool libvirt lists *path* in (``virsh vol-pool``), or
@@ -272,7 +269,8 @@ class _ChainReads:
         """
         The active pool whose target is *directory*: ``virsh pool-list
         --name`` and every one's ``pool-dumpxml``, read once per scan or
-        teardown. A pool with no local directory (RBD, say) is passed over.
+        :meth:`LibVirtSession.backing_chains` call. A pool with no local
+        directory (RBD, say) is passed over.
 
         Returns:
             Its name, or ``None`` when no active pool is on *directory* or
@@ -1123,9 +1121,10 @@ class LibVirtSession(SessionConfigMixin):
         Chains are read as :meth:`_read_backing_chain` reads them, so the
         0600 pool volumes libvirt makes every clone disk — which the user's
         ``qemu-img`` cannot open under ``use_sudo: false`` — are read
-        through libvirt (#221). The scan has its own :class:`_ChainReads`:
-        each storage pool is refreshed at most once per scan, and a scan
-        never trusts a refresh made before it began.
+        through libvirt (#221), each after a refresh of the pools it reads:
+        a refresh made for one domain's chain is never trusted for
+        another's, whose image may have been rebased meanwhile (#221 review
+        R1).
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         listing = virsh.execute("list", "--all", "--uuid", "--name",
@@ -1460,25 +1459,6 @@ class LibVirtSession(SessionConfigMixin):
         return refresh_pools_holding(
             VirshCommand(provider_config=self.provider_config), paths)
 
-    @contextlib.contextmanager
-    def chain_read_scope(self):
-        """
-        Have every :meth:`backing_chains` call inside the ``with`` block —
-        one teardown's (``_teardown_vm``) — share one :class:`_ChainReads`,
-        so the libvirt fallback refreshes each storage pool at most once for
-        the whole teardown, however many calls it makes (a retried teardown
-        reads what is left of a chain layer by layer). That cache lives in
-        ``_chain_scope`` for the duration of the block only; outside one,
-        each call has its own, and a nested block has its own too. The
-        in-use scan never shares it (:meth:`disk_paths_in_use`).
-        """
-        outer = getattr(self, "_chain_scope", None)
-        self._chain_scope = _ChainReads(self.provider_config)
-        try:
-            yield
-        finally:
-            self._chain_scope = outer
-
     def backing_chains(self,
                        sources: list[str]) -> dict[str, list[str]] | None:
         """
@@ -1493,16 +1473,15 @@ class LibVirtSession(SessionConfigMixin):
         Any other source whose chain cannot be read makes the whole answer
         ``None``: an existing image that cannot be read may depend on
         anything. One the user may not read is read through libvirt
-        (:meth:`_read_backing_chain`), refreshing each pool at most once per
-        call, or per teardown inside :meth:`chain_read_scope`.
+        (:meth:`_read_backing_chain`), after a refresh of each pool that
+        chain reads.
 
         Returns:
             ``{source: chain}`` for every source that is there, or ``None``
             when the chain of one that is not confirmed absent cannot be
             read.
         """
-        reads = (getattr(self, "_chain_scope", None)
-                 or _ChainReads(self.provider_config))
+        reads = _ChainReads(self.provider_config)
         chains: dict[str, list[str]] = {}
         for source in sources:
             images = self._read_backing_chain(reads, source)
@@ -1668,6 +1647,11 @@ class LibVirtSession(SessionConfigMixin):
         image built on nothing — in the shape :meth:`_read_backing_chain`
         returns.
 
+        Each pool this chain reads is refreshed once, for all its layers in
+        that pool, and for this chain only: a refresh made for another
+        source's chain could predate a rebase of this one's image (#221
+        review R1).
+
         Returns:
             The chain, or ``None`` when libvirt cannot describe it: a layer
             is not a storage-pool volume, its pool cannot be refreshed, its
@@ -1675,6 +1659,7 @@ class LibVirtSession(SessionConfigMixin):
             than :data:`_MAX_CHAIN_DEPTH` layers.
         """
         chain: list[dict] = []
+        refreshed: dict[str, bool] = {}
         path: str | None = source
         while path is not None:
             if (len(chain) == _MAX_CHAIN_DEPTH
@@ -1683,21 +1668,23 @@ class LibVirtSession(SessionConfigMixin):
                     f"the backing chain of {source} loops or runs deeper "
                     f"than {_MAX_CHAIN_DEPTH} layers at {path}")
                 return None
-            image = self._libvirt_image(reads, path)
+            image = self._libvirt_image(reads, path, refreshed)
             if image is None:
                 return None
             chain.append(image)
             path = image.get("full-backing-filename")
         return chain
 
-    def _libvirt_image(self, reads: _ChainReads, path: str) -> dict | None:
+    def _libvirt_image(self, reads: _ChainReads, path: str,
+                       refreshed: dict[str, bool]) -> dict | None:
         """
         One layer of a chain, *path*, as libvirt describes it: the pool
-        that holds it (``virsh vol-pool``), refreshed — once per scan or
-        teardown (:class:`_ChainReads`) — because libvirt describes a file
-        as its pool last saw it (an image rebased since still shows its old
-        backing file until then), then ``virsh vol-dumpxml``
-        (:func:`_volume_image`). ``None`` when any step fails.
+        that holds it (``virsh vol-pool``), refreshed — once per chain,
+        *refreshed* recording which pools this chain's read refreshed —
+        because libvirt describes a file as its pool last saw it (an image
+        rebased since still shows its old backing file until then), then
+        ``virsh vol-dumpxml`` (:func:`_volume_image`). ``None`` when any
+        step fails.
 
         A file made since its pool was last refreshed — the overlay a
         snapshot adds, which nothing refreshes a pool for — is in no pool
@@ -1709,13 +1696,13 @@ class LibVirtSession(SessionConfigMixin):
         pool = reads.pool_of(path)
         if pool is None:
             holder = reads.pool_on(os.path.dirname(path))
-            if holder is not None and reads.refresh(holder):
+            if holder is not None and reads.refresh(holder, refreshed):
                 pool = reads.pool_of(path)
         if pool is None:
             self.logger.debug(
                 f"{path} is not a storage-pool volume libvirt lists")
             return None
-        if not reads.refresh(pool):
+        if not reads.refresh(pool, refreshed):
             self.logger.debug(f"could not refresh storage pool {pool}, "
                               f"which holds {path}")
             return None

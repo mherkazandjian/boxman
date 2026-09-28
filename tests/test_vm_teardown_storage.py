@@ -2560,7 +2560,6 @@ class TestTeardownWithoutSudo:
         """*t*'s session reading chains -- and scanning, when *scan* -- the
         way production does, every command answered by *host*."""
         session = LibVirtSession(config={'provider': {'libvirt': {}}})
-        t.session.chain_read_scope.side_effect = session.chain_read_scope
         t.session.backing_chains.side_effect = session.backing_chains
         if scan:
             t.session.disk_paths_in_use.side_effect = (
@@ -2645,10 +2644,11 @@ class TestTeardownWithoutSudo:
         assert t.warnings == ''
         assert (str(sibling),) in host.asked('vol-dumpxml')
 
-    def test_a_retried_teardown_refreshes_each_pool_once(self, tmp_path):
+    def test_a_retried_teardown_reads_what_is_left_through_libvirt(
+            self, tmp_path):
         """Interrupted after removing the head of the boot chain, a retry
-        reads what is left of the chain in calls of its own: one refresh
-        of the pool serves the whole teardown, as one did the first."""
+        reads what is left of the chain through libvirt too -- each chain
+        after a refresh of its own (#221 review R1)."""
         base = _qcow2(tmp_path / f'{VM}.qcow2')
         head = _qcow2(tmp_path / f'{VM}.s1')
         iso = _file(tmp_path / 'tools.iso', b'iso')
@@ -2659,11 +2659,14 @@ class TestTeardownWithoutSudo:
             TestRetriedTeardown._interrupt_at(t, base)
         assert not head.exists() and base.exists()
         del host.files[str(head)]
-        assert host.asked('pool-refresh') == [('cluster_1',)]
+        # the head's chain and the CD-ROM's
+        assert host.asked('pool-refresh') == [('cluster_1',)] * 2
 
         t.session.vm_storage_devices.return_value = None
         t.mgr.logger.reset_mock()
         self._deprovision(t, host)
 
         assert not base.exists() and iso.exists()
-        assert host.asked('pool-refresh') == [('cluster_1',)] * 2
+        assert t.warnings == ''
+        # the CD-ROM's chain, and what is left of the head's
+        assert host.asked('pool-refresh') == [('cluster_1',)] * 4

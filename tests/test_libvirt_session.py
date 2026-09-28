@@ -1871,7 +1871,10 @@ class TestChainReadThroughLibvirt:
         order = host.order()
         assert order.index("pool-refresh") < order.index("vol-dumpxml")
 
-    def test_each_pool_is_refreshed_once_per_read(self):
+    def test_each_chain_is_read_after_a_refresh_of_its_own(self):
+        """One refresh serves every layer of a chain in that pool, and no
+        other chain: a source read later may have been rebased since (#221
+        review R1)."""
         other = f"{POOL}/vm02.qcow2"
         host = _overlay_host()
         host.add(other, backing=BASE)
@@ -1879,21 +1882,35 @@ class TestChainReadThroughLibvirt:
 
         assert _chains(host, [TOP, other]) == {TOP: [TOP, BASE],
                                                other: [other, BASE]}
-        assert host.asked("pool-refresh") == [("cluster_1",)]
+        assert _libvirt_asked(host) == [
+            ("vol-pool", (TOP,)), ("pool-refresh", ("cluster_1",)),
+            ("vol-dumpxml", (TOP,)), ("vol-pool", (BASE,)),
+            ("vol-dumpxml", (BASE,)),
+            ("vol-pool", (other,)), ("pool-refresh", ("cluster_1",)),
+            ("vol-dumpxml", (other,)), ("vol-pool", (BASE,)),
+            ("vol-dumpxml", (BASE,))]
 
-    def test_a_teardown_scope_refreshes_each_pool_once_across_reads(self):
-        """A teardown's retry reads what is left of a chain layer by layer,
-        in several calls: one refresh serves them all -- while a read
-        outside a scope refreshes for itself."""
+    def test_a_source_rebased_after_another_was_read_is_read_as_it_is(self):
+        """The second source's image is rebased out of band once the first
+        source's chain has been read: its chain shows the new backing file,
+        as qemu-img's would (#221 review R1)."""
+        other = f"{POOL}/vm02.qcow2"
+        new = f"{POOL}/new-base.qcow2"
         host = _overlay_host()
-        session = _session({})
-        with patch("boxman.providers.libvirt.commands._shell_run",
-                   side_effect=host.run):
-            with session.chain_read_scope():
-                assert session.backing_chains([TOP]) == {TOP: [TOP, BASE]}
-                assert session.backing_chains([BASE]) == {BASE: [BASE]}
-            assert host.asked("pool-refresh") == [("cluster_1",)]
-            assert session.backing_chains([BASE]) == {BASE: [BASE]}
+        host.add(other, backing=BASE)
+        host.add(new)
+        host.refresh("cluster_1")
+        host.before[("qemu-img", other)] = (
+            lambda: setattr(host.files[other], "backing", new))
+
+        assert _chains(host, [TOP, other]) == {TOP: [TOP, BASE],
+                                               other: [other, new]}
+
+    def test_a_later_read_refreshes_again(self):
+        host = _overlay_host()
+        _chains(host, [TOP])
+        _chains(host, [TOP])
+
         assert host.asked("pool-refresh") == [("cluster_1",)] * 2
 
     # -- no fallback -----------------------------------------------------------
@@ -2131,7 +2148,7 @@ class TestInUseScanThroughLibvirt:
         assert in_use == {TOP: "vm-a", BASE: "vm-a",
                           self.B: "vm-b", self.ISO: "vm-b"}
 
-    def test_each_pool_is_refreshed_once_per_scan(self):
+    def test_each_chain_is_read_after_a_refresh_of_its_own(self):
         host = self._host()
         other = f"{POOL}/vm03.qcow2"
         host.add(other, backing=BASE)
@@ -2139,9 +2156,31 @@ class TestInUseScanThroughLibvirt:
         host.define_domain("vm-c", ("file", "disk", "vda", other))
 
         assert self._scan(host)[other] == "vm-c"
-        assert host.asked("pool-refresh") == [("cluster_1",)]
-        self._scan(host)
         assert host.asked("pool-refresh") == [("cluster_1",)] * 2
+
+    def test_an_image_rebased_mid_scan_is_read_as_it_is_now(self):
+        """Codex's reproduction (#221 review R1): the scan refreshes the pool
+        for vm-a's chain; vm-c's image, already listed, is then rebased onto
+        another file before its chain is read. A refresh reused from vm-a's
+        read showed the old backing file, and left the new one -- which
+        qemu-img would have found -- unprotected."""
+        later = f"{POOL}/later.qcow2"
+        old = f"{POOL}/old.qcow2"
+        new = f"{POOL}/new.qcow2"
+        host = self._host()
+        host.add(later, backing=old)
+        host.add(old)
+        host.add(new)
+        host.refresh("cluster_1")
+        host.define_domain("vm-c", ("file", "disk", "vda", later))
+        host.before[("qemu-img", later)] = (
+            lambda: setattr(host.files[later], "backing", new))
+
+        in_use = self._scan(host)
+
+        assert in_use[later] == "vm-c"
+        assert in_use[new] == "vm-c"
+        assert old not in in_use
 
     def test_a_disk_libvirt_cannot_describe_fails_the_scan(self):
         host = self._host()
