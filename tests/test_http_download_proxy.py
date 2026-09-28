@@ -1,14 +1,15 @@
 """
-#216 -- the urllib download fallback hands proxy credentials to the proxy
+#216 -- the urllib download fallbacks hand proxy credentials to the proxy
 they belong to, and to no one else.
 
-When wget and curl both fail, ``download_url`` downloads with urllib.
-urllib's ProxyHandler adds ``Proxy-Authorization`` (from a proxy URL such as
-``http://user:secret@proxy:3128``) as an ordinary request header, and the
-stock redirect handler copies every header onto the redirected request. So
-when a proxied mirror redirected, the password went along: to a
-``no_proxy`` host or an https CDN reached directly, or in the CONNECT to
-another proxy.
+When wget and curl both fail, ``download_url`` and the cloud-image
+template's own copy of it, ``CloudInitTemplate._download_image``, download
+with urllib. urllib's ProxyHandler adds ``Proxy-Authorization`` (from a
+proxy URL such as ``http://user:secret@proxy:3128``) as an ordinary request
+header, and the stock redirect handler copies every header onto the
+redirected request. So when a proxied mirror redirected, the password went
+along: to a ``no_proxy`` host or an https CDN reached directly, or in the
+CONNECT to another proxy.
 
 Nothing here leaves the host. A "proxy" and an "origin" server run on
 127.0.0.1 ephemeral ports and record the headers of every request they
@@ -34,6 +35,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from boxman.providers.libvirt import cloudinit
 from boxman.utils import http_download
 
 pytestmark = pytest.mark.unit
@@ -147,19 +149,27 @@ def proxies(monkeypatch):
     return use
 
 
-@pytest.fixture
-def download(monkeypatch):
-    """``download_url``, with wget and curl failing so that urllib downloads."""
+@pytest.fixture(params=["download_url", "CloudInitTemplate._download_image"])
+def download(request, monkeypatch, tmp_path):
+    """A downloader whose wget and curl fail, so that urllib downloads."""
+    if request.param == "download_url":
+        module, fetch = http_download, http_download.download_url
+    else:
+        template = cloudinit.CloudInitTemplate(
+            template_name="t", image_path=str(tmp_path / "base.qcow2"),
+            workdir=str(tmp_path / "workdir"),
+            provider_config={"use_sudo": False, "uri": "qemu:///system"})
+        module, fetch = cloudinit, template._download_image
     tried = []
 
     def downloader_fails(command, **_kwargs):
         tried.append(command.split()[0])
         return SimpleNamespace(ok=False)
 
-    monkeypatch.setattr(http_download, "_shell_run", downloader_fails)
+    monkeypatch.setattr(module, "_shell_run", downloader_fails)
 
     def run(url, dst):
-        ok = http_download.download_url(url, str(dst))
+        ok = fetch(url, str(dst))
         assert tried == ["wget", "curl"]
         return ok
 

@@ -32,6 +32,7 @@ import invoke
 from boxman import log
 from boxman.image_cache import ImageCache
 from boxman.loggers.logger import is_verbose
+from boxman.utils.http_opener import build_opener
 from boxman.utils.jinja_env import substitute_env
 from boxman.utils.shell import run as _shell_run
 
@@ -532,11 +533,12 @@ class CloudInitTemplate:
             self.logger.info("download complete (curl)")
             return True
 
-        # Last resort: urllib with timeout
+        # Last resort: urllib with timeout. Not urlopen(): its stock opener
+        # hands the proxy password to wherever a proxied mirror redirects (#216).
         try:
             self.logger.info("falling back to urllib download (timeout=120s)...")
             req = urllib.request.Request(url, headers={"User-Agent": "boxman/1.0"})
-            with urllib.request.urlopen(req, timeout=120) as response:
+            with build_opener().open(req, timeout=120) as response:
                 total = int(response.headers.get("Content-Length", 0))
                 downloaded = 0
                 with open(dst_path, "wb") as out_file:
