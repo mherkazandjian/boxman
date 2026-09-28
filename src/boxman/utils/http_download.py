@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import shlex
 import urllib.request
 
@@ -9,6 +10,25 @@ from boxman import log
 from boxman.loggers.logger import is_verbose
 from boxman.utils.http_opener import build_opener
 from boxman.utils.shell import run as _shell_run
+
+
+def curl_final_status_ok(status: str) -> bool:
+    """Whether a transfer curl finished may count, by its final status.
+
+    *status* is what curl's ``-w '%{http_code}'`` printed: the code of the
+    last response the transfer got. That code decides, not the URL's
+    scheme: curl fetches a URL with no scheme as http, and an ftp:// one
+    through an http proxy can be redirected to an http origin (#224).
+    ``--fail`` refuses a 4xx or 5xx but lets a 3xx through, and ``-L``
+    follows only a 3xx that says where to go, so a 302 without a Location
+    ends the transfer on its own page, with exit 0. A 2xx counts, FTP's 226
+    among them, and so does 000: no response code at all, as for a file://
+    copy. An HTTP transfer cannot end with exit 0 and 000: since curl 7.66
+    a response with no status line (HTTP/0.9) fails unless ``--http0.9``
+    allows it, which boxman never passes, and a status line of 000 fails
+    anyway. An older curl takes HTTP/0.9 as 000.
+    """
+    return re.fullmatch(r"000|2[0-9][0-9]", status.strip()) is not None
 
 
 def download_url(url: str, dst_path: str) -> bool:
@@ -41,12 +61,14 @@ def download_url(url: str, dst_path: str) -> bool:
         os.remove(dst_path)
 
     # curl fallback. --fail so an HTTP 4xx/5xx error page is not written
-    # and accepted as a valid download (wget already fails on HTTP errors).
+    # and accepted as a valid download (wget already fails on HTTP errors),
+    # and the final status must count too, as --fail lets a 3xx through.
     result = _shell_run(
-        f'curl -fL --progress-bar -o {q_dst} {q_url}',
+        f"curl -fL --progress-bar -w '%{{http_code}}' -o {q_dst} {q_url}",
         hide=not is_verbose(logging.DEBUG), warn=True,
     )
-    if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
+    if (result.ok and curl_final_status_ok(result.stdout)
+            and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0):
         log.info("download complete (curl)")
         return True
     if os.path.exists(dst_path):
@@ -73,6 +95,9 @@ def download_url(url: str, dst_path: str) -> bool:
                         log.info(
                             f"  downloaded {downloaded // (1024*1024)} MB "
                             f"/ {total // (1024*1024)} MB ({pct}%)")
+        if not downloaded:
+            # a 2xx with nothing in it is no download (#224)
+            raise ValueError("the response was empty")
         log.info("download complete (urllib)")
         return True
     except Exception as exc:

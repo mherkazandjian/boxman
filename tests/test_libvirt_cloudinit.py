@@ -613,7 +613,8 @@ class TestShellQuoting:
 
         def fake_run(cmd, **_kw):
             calls.append(cmd)
-            return _result(ok="curl" in cmd)
+            # curl's download counts only on the 2xx it prints with -w (#224)
+            return _result(ok="curl" in cmd, stdout="200")
 
         with patch(self.SHELL_RUN, side_effect=fake_run), \
                 patch("boxman.providers.libvirt.cloudinit.os.path.isfile",

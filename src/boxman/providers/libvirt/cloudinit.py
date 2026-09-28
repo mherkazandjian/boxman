@@ -32,6 +32,7 @@ import invoke
 from boxman import log
 from boxman.image_cache import ImageCache
 from boxman.loggers.logger import is_verbose
+from boxman.utils.http_download import curl_final_status_ok
 from boxman.utils.http_opener import build_opener
 from boxman.utils.jinja_env import substitute_env
 from boxman.utils.shell import run as _shell_run
@@ -524,14 +525,23 @@ class CloudInitTemplate:
             self.logger.info("download complete (wget)")
             return True
 
-        # Try curl as second fallback
+        # Try curl as second fallback. --fail, so that an HTTP 4xx/5xx error
+        # page is not written and accepted as the image (#224); wget already
+        # fails on HTTP errors. --fail lets a 3xx through, though, so the
+        # final status curl reports must count too.
         result = _shell_run(
-            f'curl -L --progress-bar -o {shlex.quote(dst_path)} {shlex.quote(url)}',
+            f"curl -fL --progress-bar -w '%{{http_code}}' "
+            f"-o {shlex.quote(dst_path)} {shlex.quote(url)}",
             hide=not is_verbose(logging.DEBUG), warn=True,
         )
-        if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
+        if (result.ok and curl_final_status_ok(result.stdout)
+                and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0):
             self.logger.info("download complete (curl)")
             return True
+        # a failed curl can leave part of the image behind (a transfer cut
+        # off part-way), as can wget: remove it before the last resort
+        if os.path.exists(dst_path):
+            os.remove(dst_path)
 
         # Last resort: urllib with timeout. Not urlopen(): its stock opener
         # hands the proxy password to wherever a proxied mirror redirects (#216).
@@ -553,6 +563,9 @@ class CloudInitTemplate:
                             self.logger.info(
                                 f"  downloaded {downloaded // (1024*1024)} MB "
                                 f"/ {total // (1024*1024)} MB ({pct}%)")
+            if not downloaded:
+                # a 2xx with nothing in it is no image (#224)
+                raise ValueError("the response was empty")
             self.logger.info("download complete (urllib)")
             return True
         except Exception as e:
