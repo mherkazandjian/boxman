@@ -23,7 +23,10 @@ def curl_final_status_ok(status: str) -> bool:
     follows only a 3xx that says where to go, so a 302 without a Location
     ends the transfer on its own page, with exit 0. A 2xx counts, FTP's 226
     among them, and so does 000: no response code at all, as for a file://
-    copy.
+    copy. An HTTP transfer cannot end with exit 0 and 000: since curl 7.66
+    a response with no status line (HTTP/0.9) fails unless ``--http0.9``
+    allows it, which boxman never passes, and a status line of 000 fails
+    anyway. An older curl takes HTTP/0.9 as 000.
     """
     return re.fullmatch(r"000|2[0-9][0-9]", status.strip()) is not None
 
