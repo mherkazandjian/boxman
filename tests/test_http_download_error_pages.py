@@ -7,7 +7,9 @@ cloud-image template. When wget failed, it ran ``curl -L`` without
 0, so the page was accepted as the image and, with the image cache on,
 stored in the cache and reused from there, unless the template set an
 ``image_checksum``. ``download_url`` already runs ``curl -fL``; it is
-covered too, as a guard.
+covered too, as a guard. The ``-L`` is pinned as well: without it, curl
+saves the page a server sends with a redirect and exits 0, and that page
+is taken for the image.
 
 Nothing here leaves the host. The server runs on a 127.0.0.1 ephemeral
 port, as in test_http_download_proxy.py. Every ``*_proxy`` variable is
@@ -48,25 +50,34 @@ ERROR_PAGES = {
 #: an image, and how much of it a server that hangs up part-way sends
 PAYLOAD = bytes(range(256)) * 400
 CUT = 4096
+#: where a server that moved the image redirects to, and the page it sends with the 302
+MOVED = "/mirror/distro.qcow2"
+MOVED_PAGE = b"<html><body>302 Found</body></html>\n"
 
 
 class _Recorder(http.server.BaseHTTPRequestHandler):
     """Record who asked, then answer with the server's status and body.
 
     A server with a ``cut`` promises the whole body but sends only its
-    first ``cut`` bytes, then hangs up.
+    first ``cut`` bytes, then hangs up. A path in its ``moved`` is answered
+    with a 302 to where it moved, and a page saying so.
     """
 
     def do_GET(self):
         server = self.server
         server.requests.append(SimpleNamespace(
             target=self.path, agent=self.headers.get("User-Agent", "")))
-        self.send_response(server.status)
-        if server.status == 401:
+        location = server.moved.get(self.path)
+        status, body, cut = ((302, MOVED_PAGE, None) if location
+                             else (server.status, server.body, server.cut))
+        self.send_response(status)
+        if location:
+            self.send_header("Location", location)
+        if status == 401:
             self.send_header("WWW-Authenticate", 'Basic realm="images"')
-        self.send_header("Content-Length", str(len(server.body)))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(server.body[:server.cut])
+        self.wfile.write(body[:cut])
         self.close_connection = True
 
     def log_message(self, *_args):
@@ -81,10 +92,14 @@ class _Server(http.server.ThreadingHTTPServer):
 
 
 @contextmanager
-def _serving(status, body, cut=None):
-    """Answer every request with *status* and *body* from a 127.0.0.1 ephemeral port."""
+def _serving(status, body, cut=None, moved=None):
+    """Answer requests with *status* and *body* from a 127.0.0.1 ephemeral port.
+
+    *moved* maps a path to where it moved; a request for it gets a 302.
+    """
     server = _Server(("127.0.0.1", 0), _Recorder)
     server.status, server.body, server.cut, server.requests = status, body, cut, []
+    server.moved = moved or {}
     thread = threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True)
     thread.start()
     try:
@@ -235,3 +250,28 @@ def test_a_cut_off_download_is_removed_before_the_urllib_fallback(
     assert at_fallback == [None]
     assert (ok, _left_at(dst)) == (False, None)
     assert _asked_by(server) == ["curl"]
+
+
+def test_curl_follows_a_redirect_to_the_image(downloader, monkeypatch, tmp_path):
+    module, download = downloader
+    ran = _fail_wget(monkeypatch, module)
+    real_build_opener, fallback = module.build_opener, []
+
+    def urllib_fallback():
+        fallback.append("began")
+        return real_build_opener()
+
+    monkeypatch.setattr(module, "build_opener", urllib_fallback)
+    dst = tmp_path / "distro.qcow2"
+    with _serving(200, PAYLOAD, moved={IMAGE: MOVED}) as server:
+        ok = download(_url(server), str(dst))
+
+    assert ok is True
+    # the image, not the page that came with the 302
+    assert dst.read_bytes() == PAYLOAD
+    # curl did it: it asked for the image, then where it moved, and exited 0...
+    assert ran == [("wget", None), ("curl", 0)]
+    assert [request.target for request in server.requests] == [IMAGE, MOVED]
+    assert _asked_by(server) == ["curl", "curl"]
+    # ...and the urllib fallback never began
+    assert fallback == []
