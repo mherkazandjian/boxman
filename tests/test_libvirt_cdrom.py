@@ -7,11 +7,13 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.exceptions import ProvisionError
 from boxman.providers.libvirt.cdrom import CDROMManager
 
 pytestmark = pytest.mark.unit
@@ -44,8 +46,9 @@ class TestGenerateXml:
 
 
 class TestBusForTarget:
-    # _find_next_available_target falls back to sd* once the IDE slots are
-    # taken; the device XML bus must match the target prefix (#85 item 26)
+    # _find_next_available_target hands out sd* targets: the only ones on a
+    # machine without IDE (#217), and on i440fx once the IDE slots are taken;
+    # the device XML bus must match the target prefix (#85 item 26)
 
     def test_hd_targets_are_ide(self, cd: CDROMManager):
         assert cd._bus_for_target("hdc") == "ide"
@@ -70,40 +73,300 @@ class TestBusForTarget:
         assert "dev='sda' bus='sata'" in written["xml"]
 
 
+# domblklist --details has 4 columns: Type Device Target Source
+BLK_HEADER = (
+    "Type  Device  Target  Source\n"
+    "------------------------------------------------\n"
+)
+BOOT_DISK = "file  disk    vda     /var/lib/libvirt/vm01.qcow2\n"
+# The cloud-init templates' seed drive: its media is ejected, the drive
+# stays. On q35 virt-install puts it on SATA, so every clone has it at sda.
+EMPTY_SEED_DRIVE = "file  cdrom   sda     -\n"
+
+Q35 = "pc-q35-8.2"
+I440FX = "pc-i440fx-8.2"
+
+
+def _domain_xml(machine: str | None) -> str:
+    """A domain definition whose ``<os><type>`` names *machine*."""
+    machine_attr = f" machine='{machine}'" if machine else ""
+    return ("<domain type='kvm'><name>vm01</name>"
+            f"<os><type arch='x86_64'{machine_attr}>hvm</type></os>"
+            "<devices/></domain>")
+
+
+class FakeVirsh:
+    """
+    ``virsh`` as a CDROMManager sees it: ``domblklist --details`` and
+    ``dumpxml`` of the live definition, or with ``--inactive`` of the
+    persistent one. Every call is recorded, and an ``attach-device`` adds
+    its drive to both definitions, as it does for a shut-off domain.
+
+    ``fail`` maps ``(command, 'live' | 'persistent')`` to the result that
+    query returns instead.
+    """
+
+    def __init__(self, machine: str | None = Q35, live_machine: str | None = None,
+                 live: tuple[str, ...] = (BOOT_DISK,),
+                 persistent: tuple[str, ...] | None = None,
+                 fail: dict | None = None):
+        self.machine = machine
+        self.live_machine = machine if live_machine is None else live_machine
+        self.live = list(live)
+        self.persistent = list(live if persistent is None else persistent)
+        self.fail = fail or {}
+        self.calls: list[tuple] = []
+        self.attached: list[str] = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append(args)
+        scope = "persistent" if "--inactive" in args else "live"
+        if (args[0], scope) in self.fail:
+            return self.fail[(args[0], scope)]
+        if args[0] == "domblklist":
+            rows = self.persistent if scope == "persistent" else self.live
+            return _result(stdout=BLK_HEADER + "".join(rows))
+        if args[0] == "dumpxml":
+            machine = self.machine if scope == "persistent" else self.live_machine
+            return _result(stdout=_domain_xml(machine))
+        if args[0] == "attach-device":
+            # the temp XML still exists while attach-device runs
+            xml = Path(args[2]).read_text()
+            self.attached.append(xml)
+            target = re.search(r"<target dev='([^']+)'", xml).group(1)
+            row = f"file  cdrom   {target}     /isos/attached.iso\n"
+            self.live.append(row)
+            self.persistent.append(row)
+            return _result()
+        raise AssertionError(f"unexpected virsh call: {args!r}")
+
+    def queried(self, command: str) -> bool:
+        return any(call[0] == command for call in self.calls)
+
+
 class TestFindNextAvailableTarget:
-    # domblklist --details has 4 columns: Type Device Target Source
-    DOMBLKLIST = (
-        "Type  Device  Target  Source\n"
-        "------------------------------------------------\n"
-        "file  disk    vda     /var/lib/libvirt/vm01.qcow2\n"
-    )
+    """
+    The target a cdrom declared without one gets. Its name fixes the bus
+    (see ``_bus_for_target``), so it has to be one the domain's machine
+    has: a q35 domain given an IDE ``hdX`` drive is defined without
+    complaint and then refuses to start (#217).
+    """
+
+    def _pick(self, cd: CDROMManager, virsh: FakeVirsh) -> str | None:
+        with patch.object(cd.virsh, "execute", side_effect=virsh):
+            return cd._find_next_available_target()
+
+    # i440fx: the old default, unchanged
 
     def test_returns_hda_when_slots_free(self, cd: CDROMManager):
-        with patch.object(cd.virsh, "execute", return_value=_result(stdout=self.DOMBLKLIST)):
-            # vda is used, so hda is free
-            assert cd._find_next_available_target() == "hda"
+        # vda is used, so hda is free
+        assert self._pick(cd, FakeVirsh(machine=I440FX)) == "hda"
 
     def test_skips_used_targets(self, cd: CDROMManager):
-        blk = (
-            "Type  Device  Target  Source\n"
-            "------------------------------------------------\n"
-            "file  disk    hda     /tmp/x\n"
-            "file  disk    hdb     /tmp/y\n"
-        )
-        with patch.object(cd.virsh, "execute", return_value=_result(stdout=blk)):
-            assert cd._find_next_available_target() == "hdc"
+        virsh = FakeVirsh(machine=I440FX, live=(
+            "file  disk    hda     /tmp/x\n",
+            "file  disk    hdb     /tmp/y\n"))
+        assert self._pick(cd, virsh) == "hdc"
 
     def test_falls_back_to_sd_when_all_ide_used(self, cd: CDROMManager):
-        blk = (
-            "Type  Device  Target  Source\n"
-            "------------------------------------------------\n"
-            "file  disk    hda     /tmp/a\n"
-            "file  disk    hdb     /tmp/b\n"
-            "file  disk    hdc     /tmp/c\n"
-            "file  disk    hdd     /tmp/d\n"
-        )
-        with patch.object(cd.virsh, "execute", return_value=_result(stdout=blk)):
-            assert cd._find_next_available_target() == "sda"
+        virsh = FakeVirsh(machine=I440FX, live=tuple(
+            f"file  disk    hd{s}     /tmp/{s}\n" for s in "abcd"))
+        assert self._pick(cd, virsh) == "sda"
+
+    # q35, and any machine without a built-in IDE controller: SATA only
+
+    def test_q35_gets_a_sata_target(self, cd: CDROMManager):
+        target = self._pick(cd, FakeVirsh(machine=Q35))
+        assert target == "sda"
+        assert cd._bus_for_target(target) == "sata"
+
+    def test_q35_skips_the_templates_empty_seed_drive(self, cd: CDROMManager):
+        virsh = FakeVirsh(machine=Q35, live=(BOOT_DISK, EMPTY_SEED_DRIVE))
+        assert self._pick(cd, virsh) == "sdb"
+
+    def test_q35_never_falls_back_to_ide(self, cd: CDROMManager):
+        """With every SATA target taken nothing is free: an hdX target is
+        no slot at all on a machine without an IDE controller."""
+        virsh = FakeVirsh(machine=Q35, live=tuple(
+            f"file  cdrom   sd{chr(ord('a') + i)}     -\n" for i in range(10)))
+        assert self._pick(cd, virsh) is None
+
+    @pytest.mark.parametrize("machine,expected", [
+        # the i440fx family, libvirt's test for a built-in IDE controller
+        # (qemuDomainHasBuiltinIDE -> qemuDomainIsI440FX)
+        ("pc", "hda"),
+        ("pc-i440fx-noble", "hda"),
+        ("pc-i440fx-rhel7.6.0", "hda"),
+        ("pc-1.3", "hda"),
+        ("pc-0.15", "hda"),
+        ("rhel6.6.0", "hda"),
+        # no IDE controller
+        ("q35", "sda"),
+        ("pc-q35-noble", "sda"),
+        ("pc-q35-rhel9.4.0", "sda"),
+        ("microvm", "sda"),
+    ])
+    def test_machine_types(self, cd: CDROMManager, machine, expected):
+        assert self._pick(cd, FakeVirsh(machine=machine)) == expected
+
+    def test_the_persistent_machine_type_decides(self, cd: CDROMManager):
+        """The persistent definition is what the domain starts with next,
+        and a start is where an IDE drive on q35 fails."""
+        virsh = FakeVirsh(machine=Q35, live_machine=I440FX)
+        assert self._pick(cd, virsh) == "sda"
+
+    # a machine type that cannot be read: SATA, which both machines have
+
+    @pytest.mark.parametrize("dumpxml", [
+        _result(ok=False, stderr="error: failed to get domain 'vm01'", return_code=1),
+        _result(stdout="not xml"),
+        _result(stdout="<domain><devices/></domain>"),
+        # a failed query is not read, whatever it printed
+        _result(stdout=_domain_xml(I440FX), ok=False, return_code=1),
+    ], ids=["query-fails", "not-xml", "no-os-element", "failed-query-output"])
+    def test_an_unreadable_machine_type_gets_sata(self, cd: CDROMManager, dumpxml):
+        virsh = FakeVirsh(machine=I440FX, fail={("dumpxml", "persistent"): dumpxml})
+        assert self._pick(cd, virsh) == "sda"
+
+    def test_a_definition_naming_no_machine_type_gets_sata(self, cd: CDROMManager):
+        assert self._pick(cd, FakeVirsh(machine=None)) == "sda"
+
+    # collisions: any device, either definition
+
+    def test_sd_targets_in_use_by_any_device_are_skipped(self, cd: CDROMManager):
+        virsh = FakeVirsh(machine=Q35, live=(
+            BOOT_DISK, EMPTY_SEED_DRIVE,
+            "file  disk    sdb     /data/scsi-disk.qcow2\n"))
+        assert self._pick(cd, virsh) == "sdc"
+
+    def test_a_target_only_in_the_persistent_definition_is_taken(
+            self, cd: CDROMManager):
+        """Plain domblklist of a running domain reports only the live
+        definition; a drive attached with --config alone is only in the
+        persistent one, and handing its target out again breaks the next
+        start."""
+        virsh = FakeVirsh(
+            machine=I440FX,
+            live=(BOOT_DISK, "file  cdrom   hda     -\n"),
+            persistent=(BOOT_DISK, "file  cdrom   hda     -\n",
+                        "file  cdrom   hdb     /isos/next-boot.iso\n"))
+        assert self._pick(cd, virsh) == "hdc"
+
+    def test_a_target_only_in_the_live_definition_is_taken(
+            self, cd: CDROMManager):
+        virsh = FakeVirsh(
+            machine=Q35,
+            live=(BOOT_DISK, EMPTY_SEED_DRIVE,
+                  "file  cdrom   sdb     /isos/hotplugged.iso\n"),
+            persistent=(BOOT_DISK, EMPTY_SEED_DRIVE))
+        assert self._pick(cd, virsh) == "sdc"
+
+    # no guessing when the devices in use cannot be read
+
+    @pytest.mark.parametrize("scope", ["live", "persistent"])
+    def test_unreadable_block_devices_raise(self, cd: CDROMManager, scope):
+        """An empty set would make a failed query look like a domain with
+        no devices, and the first target would be handed out whether or
+        not it is taken."""
+        failed = _result(ok=False, stderr="error: no domain", return_code=1)
+        virsh = FakeVirsh(fail={("domblklist", scope): failed})
+        with pytest.raises(ProvisionError, match="could not list the block devices"):
+            self._pick(cd, virsh)
+
+    def test_a_garbled_device_list_raises(self, cd: CDROMManager):
+        garbled = _result(stdout=BLK_HEADER + BOOT_DISK + "file  cdrom\n")
+        virsh = FakeVirsh(fail={("domblklist", "persistent"): garbled})
+        with pytest.raises(ProvisionError, match="could not read the block devices"):
+            self._pick(cd, virsh)
+
+
+class TestAttachDefaultTarget:
+    """attach_cdrom without a target, down to the XML handed to virsh (#217)."""
+
+    def _attach(self, cd: CDROMManager, virsh: FakeVirsh, tmp_path: Path, **kwargs):
+        iso = tmp_path / "extra.iso"
+        iso.write_bytes(b"iso")
+        with patch.object(cd.virsh, "execute", side_effect=virsh):
+            return cd.attach_cdrom(str(iso), **kwargs)
+
+    def test_q35_clone_gets_sdb_on_sata(self, cd: CDROMManager, tmp_path: Path):
+        virsh = FakeVirsh(machine=Q35, live=(BOOT_DISK, EMPTY_SEED_DRIVE))
+        assert self._attach(cd, virsh, tmp_path) is True
+        [xml] = virsh.attached
+        assert "dev='sdb' bus='sata'" in xml
+        assert "bus='ide'" not in xml
+
+    def test_i440fx_still_gets_hda_on_ide(self, cd: CDROMManager, tmp_path: Path):
+        virsh = FakeVirsh(machine=I440FX)
+        assert self._attach(cd, virsh, tmp_path) is True
+        [xml] = virsh.attached
+        assert "dev='hda' bus='ide'" in xml
+
+    def test_an_explicit_target_is_honoured_as_given(self, cd: CDROMManager, tmp_path: Path):
+        """Even an IDE one on q35: the config named it, and the domain is
+        not queried for a default."""
+        virsh = FakeVirsh(machine=Q35)
+        assert self._attach(cd, virsh, tmp_path, target_dev="hdc") is True
+        [xml] = virsh.attached
+        assert "dev='hdc' bus='ide'" in xml
+        assert not virsh.queried("domblklist")
+        assert not virsh.queried("dumpxml")
+
+    def test_nothing_is_attached_when_the_devices_cannot_be_read(
+            self, cd: CDROMManager, tmp_path: Path):
+        failed = _result(ok=False, stderr="error: no domain", return_code=1)
+        virsh = FakeVirsh(fail={("domblklist", "persistent"): failed})
+        assert self._attach(cd, virsh, tmp_path) is False
+        assert virsh.attached == []
+
+
+class TestDefaultTargetThroughTheSession:
+    """
+    The provision and update paths from LibVirtSession down to the XML
+    handed to virsh; only virsh itself is faked (#217).
+    """
+
+    def _session(self):
+        from boxman.providers.libvirt.session import LibVirtSession
+        session = LibVirtSession(config={"provider": {"libvirt": {}}})
+        session.logger = MagicMock()
+        return session
+
+    def _iso(self, tmp_path: Path, name: str) -> str:
+        iso = tmp_path / name
+        iso.write_bytes(b"iso")
+        return str(iso)
+
+    def test_provision_puts_targetless_cdroms_on_sata_on_q35(self, tmp_path: Path):
+        virsh = FakeVirsh(machine=Q35, live=(BOOT_DISK, EMPTY_SEED_DRIVE))
+        cdroms = [{"name": "tools", "source": self._iso(tmp_path, "tools.iso")},
+                  {"name": "data", "source": self._iso(tmp_path, "data.iso")}]
+        with patch("boxman.providers.libvirt.cdrom.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.side_effect = virsh
+            assert self._session().configure_vm_cdroms("vm01", cdroms) is True
+        assert len(virsh.attached) == 2
+        assert "dev='sdb' bus='sata'" in virsh.attached[0]
+        assert "dev='sdc' bus='sata'" in virsh.attached[1]
+
+    def test_provision_on_i440fx_is_unchanged(self, tmp_path: Path):
+        virsh = FakeVirsh(machine=I440FX, live=(BOOT_DISK, "file  cdrom   hda     -\n"))
+        cdroms = [{"name": "tools", "source": self._iso(tmp_path, "tools.iso")}]
+        with patch("boxman.providers.libvirt.cdrom.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.side_effect = virsh
+            assert self._session().configure_vm_cdroms("vm01", cdroms) is True
+        [xml] = virsh.attached
+        assert "dev='hdb' bus='ide'" in xml
+
+    def test_update_attaches_a_new_targetless_cdrom_on_sata_on_q35(self, tmp_path: Path):
+        virsh = FakeVirsh(machine=Q35, live=(BOOT_DISK, EMPTY_SEED_DRIVE))
+        new = [{"name": "tools", "source": self._iso(tmp_path, "tools.iso")}]
+        with patch("boxman.providers.libvirt.cdrom.VirshCommand") as virsh_cls:
+            virsh_cls.return_value.execute.side_effect = virsh
+            assert self._session().update_vm_cdroms(
+                vm_name="vm01", new_cdroms=new, removed_cdroms=[],
+                changed_cdroms=[], vm_active=False) is True
+        [xml] = virsh.attached
+        assert "dev='sdb' bus='sata'" in xml
 
 
 class TestAttachCDROM:

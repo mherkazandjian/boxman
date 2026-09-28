@@ -1,13 +1,21 @@
 import os
 import tempfile
 from typing import Any
+from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
 from boxman import log
 from boxman.exceptions import ProvisionError
 
 from .commands import VirshCommand
-from .virsh_parse import parse_domblklist
+from .virsh_parse import parse_domblklist, parse_domblklist_strict
+
+#: Default CDROM targets on the IDE bus: two channels of two drives, the
+#: whole bus. Offered only on a machine with a built-in IDE controller.
+IDE_TARGETS = tuple(f'hd{suffix}' for suffix in 'abcd')
+
+#: Default CDROM targets on the SATA bus, which i440fx and q35 both have.
+SATA_TARGETS = tuple(f'sd{chr(ord("a") + i)}' for i in range(10))
 
 
 def _xml_attr(value: str) -> str:
@@ -18,6 +26,29 @@ def _xml_attr(value: str) -> str:
     ``&`` or a quote would otherwise produce XML that libvirt cannot parse.
     """
     return escape(str(value), {"'": '&apos;', '"': '&quot;'})
+
+
+def _machine_has_builtin_ide(machine: str) -> bool:
+    """
+    Whether a libvirt machine type comes with an IDE controller.
+
+    Mirrors libvirt's own test (``qemuDomainHasBuiltinIDE``, through
+    ``qemuDomainIsI440FX``) for x86: only the i440fx family — ``pc``,
+    ``pc-i440fx-*`` and the older ``pc-0.*``, ``pc-1.*`` and ``rhel*``
+    types — has one, the PIIX IDE controller. q35 (``q35``, ``pc-q35-*``)
+    has none: libvirt defines a q35 domain holding an IDE drive without
+    complaint, then refuses to start it ("IDE controllers are unsupported
+    for this QEMU binary or machine type", #217).
+
+    Args:
+        machine: The ``machine`` attribute of a domain's ``<os><type>``,
+            e.g. ``pc-i440fx-8.2``.
+
+    Returns:
+        True only for a machine type known to have an IDE controller.
+    """
+    return machine == 'pc' or machine.startswith(
+        ('pc-i440fx-', 'pc-0.', 'pc-1.', 'rhel'))
 
 
 class CDROMManager:
@@ -49,7 +80,9 @@ class CDROMManager:
 
         Args:
             source_path: Absolute path to the ISO image
-            target_dev: Target device name (e.g., 'hdc'). Auto-assigned if None.
+            target_dev: Target device name (e.g., 'sdb'), used as given. If
+                None, the first free target on a bus the domain's machine
+                has (see :meth:`_find_next_available_target`).
             persistent: Whether to make the attachment persistent
 
         Returns:
@@ -270,8 +303,9 @@ class CDROMManager:
         """
         Derive the libvirt bus from a target device name.
 
-        ``_find_next_available_target`` falls back to sd* names once the
-        four IDE slots are taken, so the bus cannot be hardcoded to ide.
+        ``_find_next_available_target`` hands out sd* names — the only ones
+        on a machine without IDE (#217), and on i440fx once the four IDE
+        slots are taken — so the bus cannot be hardcoded to ide.
 
         Returns:
             'sata' for sd* targets, 'ide' otherwise (hd*)
@@ -280,30 +314,106 @@ class CDROMManager:
 
     def _find_next_available_target(self) -> str | None:
         """
-        Find the next available IDE target device for a CDROM.
+        Find the first free target for a CDROM declared without one.
 
-        Parses domblklist to find which hdX devices are in use and
-        returns the first available one.
+        The bus follows from the target's name (see :meth:`_bus_for_target`),
+        so the name must be one the domain's machine can host. IDE
+        ``hda``-``hdd`` is tried first only on a machine with a built-in IDE
+        controller — the i440fx family, where this keeps the old default and
+        existing VMs are unchanged — and then SATA ``sda``-``sdj``. Any other
+        machine gets SATA only: q35 has no IDE controller, and a q35 clone
+        given an ``hdX`` drive was defined but could not start (#217).
+
+        A target in use in either the live or the persistent definition is
+        not handed out (see :meth:`_used_targets`).
 
         Returns:
-            Device name (e.g., 'hdc') or None if no slot available
+            Device name (e.g., 'sdb' or 'hdc') or None if no slot available
+
+        Raises:
+            ProvisionError: if the domain's block devices cannot be read
         """
-        result = self.virsh.execute("domblklist", self.vm_name, "--details", warn=True)
+        used_targets = self._used_targets()
 
-        used_targets = set()
-        if result.ok:
-            used_targets = {row.target for row in parse_domblklist(result.stdout)}
+        machine = self._machine_type()
+        if machine is None:
+            # The machine type cannot be read: prefer SATA, which i440fx and
+            # q35 both have, over IDE, which breaks a q35 domain's next
+            # start (#217).
+            self.logger.warning(
+                f"could not read the machine type of {self.vm_name}; giving "
+                f"its CDROM a SATA target, which i440fx and q35 both support")
+            candidates = SATA_TARGETS
+        elif _machine_has_builtin_ide(machine):
+            # i440fx: IDE first, as before, so existing VMs are unchanged
+            candidates = IDE_TARGETS + SATA_TARGETS
+        else:
+            # q35, or any other machine without an IDE controller
+            candidates = SATA_TARGETS
 
-        # IDE supports hda-hdd (4 devices)
-        for suffix in ('a', 'b', 'c', 'd'):
-            candidate = f'hd{suffix}'
-            if candidate not in used_targets:
-                return candidate
-
-        # Fall back to sata targets
-        for i in range(10):
-            candidate = f'sd{chr(ord("a") + i)}'
+        for candidate in candidates:
             if candidate not in used_targets:
                 return candidate
 
         return None
+
+    def _used_targets(self) -> set[str]:
+        """
+        Every device target in the domain's live and persistent definition.
+
+        Plain ``domblklist`` of a running domain reports only the live
+        definition, while a drive attached with ``--config`` alone is only
+        in the persistent one — what the domain starts with next — and one
+        hot-plugged without it only in the live one. A target taken in
+        either is not free. For a shut-off or transient domain both queries
+        report its one definition (libvirt 10.0).
+
+        Raises:
+            ProvisionError: if either definition cannot be listed or reads
+                as incomplete (see :func:`parse_domblklist_strict`). An empty
+                set would make a failed query look like a domain with no
+                devices, and the first target would be handed out whether or
+                not it is taken (the same trap as #164 FB-5).
+        """
+        used_targets = set()
+        for inactive in ((), ("--inactive",)):
+            definition = 'persistent' if inactive else 'live'
+            result = self.virsh.execute(
+                "domblklist", self.vm_name, "--details", *inactive, warn=True)
+            if not result.ok:
+                raise ProvisionError(
+                    f"could not list the block devices of {self.vm_name} "
+                    f"({definition} definition, exit {result.return_code}): "
+                    f"{(result.stderr or '').strip() or 'no error output'}")
+            rows = parse_domblklist_strict(result.stdout)
+            if rows is None:
+                raise ProvisionError(
+                    f"could not read the block devices of {self.vm_name} "
+                    f"({definition} definition): virsh domblklist printed a "
+                    f"line that is not a device, so which targets are taken "
+                    f"cannot be told")
+            used_targets.update(row.target for row in rows)
+        return used_targets
+
+    def _machine_type(self) -> str | None:
+        """
+        The machine type of the domain's persistent definition, such as
+        ``pc-q35-8.2`` or ``pc-i440fx-8.2``, or None if it cannot be read.
+
+        The persistent definition is the one the domain starts with next,
+        and a start is where a drive its machine cannot host fails (#217);
+        for a transient domain ``--inactive`` reports its one definition.
+        """
+        result = self.virsh.execute(
+            "dumpxml", self.vm_name, "--inactive", warn=True)
+        # a failed query is not read, whatever it printed
+        if not result.ok:
+            return None
+        try:
+            root = ET.fromstring(result.stdout or '')
+        except ET.ParseError:
+            return None
+        os_type = root.find('./os/type')
+        if os_type is None:
+            return None
+        return os_type.get('machine')
