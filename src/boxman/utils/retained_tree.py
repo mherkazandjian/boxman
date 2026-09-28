@@ -205,9 +205,13 @@ def remove_except(tree: RetainedTree,
     verified parent, never through a symlink, and must still be the ones the
     scan saw; so must every kept entry. Every other entry of those
     directories is removed relative to that parent's descriptor
-    (:func:`_remove`). What the user cannot remove (root-owned leftovers of
-    the libvirt container) goes to *fallback*, as paths relative to the
-    root, right after the tree is verified again; it is verified once more
+    (:func:`_remove`), each retained directory's only once its path is
+    checked again (:func:`_still_in_place`); nothing that is the root, a
+    directory on the way or a kept entry is removed or entered under any
+    name. The tree is verified again once the removal is done, whether or
+    not anything is left (#221 review R2a). What the user cannot remove
+    (root-owned leftovers of the libvirt container) goes to *fallback*, as
+    paths relative to the root, right after that; it is verified once more
     afterwards.
 
     Raises:
@@ -215,8 +219,10 @@ def remove_except(tree: RetainedTree,
             longer what the scan saw — nothing more is removed then — or
             something is still there after *fallback*.
     """
-    if not _sweep(tree, remove=True):
-        return
+    _sweep(tree, remove=True)
+    # verified again even when nothing was left: a directory on the way, or
+    # a kept file, moved while the removal ran is not what destroy says it
+    # kept (#221 review R2a)
     left = _sweep(tree, remove=False)
     if left:
         fallback(left)
@@ -269,6 +275,33 @@ def _check_kept(dir_fd: int, name: str, expected: Identity,
             f"check it")
 
 
+def _still_in_place(tree: RetainedTree, fds: dict[str, int],
+                    rel: str) -> None:
+    """
+    Before the removal empties the retained directory *rel* through its
+    descriptor, check again that its path still leads to it — the root, then
+    every directory on the way, each relative to its parent's descriptor: a
+    directory on the way moved or replaced while the removal ran stops it,
+    with nothing more removed (#221 review R2a).
+    """
+    try:
+        if identity(os.stat(tree.root, follow_symlinks=False)) != tree.root_id:
+            raise FileNotFoundError(tree.root)
+        parts = rel.split(os.sep)
+        for depth in range(1, len(parts) + 1):
+            here = os.sep.join(parts[:depth])
+            st = os.stat(parts[depth - 1],
+                         dir_fd=fds[os.path.dirname(here)],
+                         follow_symlinks=False)
+            if identity(st) != tree.dirs[here]:
+                raise FileNotFoundError(here)
+    except OSError as exc:
+        raise ProvisionError(
+            f"{tree.path(rel)}, or a directory above it, was moved or "
+            f"replaced while the workspace was being removed, so nothing "
+            f"more was removed from it — check it") from exc
+
+
 def _doomed(tree: RetainedTree, fd: int, rel: str) -> list[str]:
     """The entries of the verified directory *fd* (*rel*) that go."""
     try:
@@ -290,6 +323,9 @@ def _sweep(tree: RetainedTree, remove: bool) -> list[str]:
     """
     fds: dict[str, int] = {}
     left: list[str] = []
+    # never removed, nor entered, under any name (#221 review R2a)
+    protected = frozenset({tree.root_id, *tree.dirs.values(),
+                           *tree.kept_ids.values()})
     try:
         fds[""] = _open_verified(tree.root, None, tree.root_id, tree.root)
         for rel in sorted(tree.dirs, key=_depth):
@@ -300,10 +336,12 @@ def _sweep(tree: RetainedTree, remove: bool) -> list[str]:
             _check_kept(fds[os.path.dirname(rel)], os.path.basename(rel),
                         expected, tree.path(rel))
         for rel, fd in fds.items():
+            if remove and rel:
+                _still_in_place(tree, fds, rel)
             names = _doomed(tree, fd, rel)
             if remove and names:
                 for name in names:
-                    _remove(fd, name)
+                    _remove(protected, fd, name)
                 names = _doomed(tree, fd, rel)
             left.extend(os.path.join(rel, name) if rel else name
                         for name in names)
@@ -313,16 +351,26 @@ def _sweep(tree: RetainedTree, remove: bool) -> list[str]:
     return left
 
 
-def _remove(parent_fd: int, name: str) -> None:
+def _remove(protected: frozenset[Identity], parent_fd: int,
+            name: str) -> None:
     """
     Remove the entry *name* of the directory *parent_fd*: anything but a
     directory is unlinked; a directory is opened relative to its parent,
     never through a symlink, emptied the same way and removed. Failures are
     not raised — what is left is listed again by the caller.
+
+    An entry whose identity is in *protected* — the root, a directory on the
+    way to a kept entry, a kept entry — is neither removed nor entered,
+    whatever it is called now, and neither is a directory that is not, once
+    opened, the one just looked up: renamed in between, it could be any of
+    those (#221 review R2a). Left there, it fails the verification that
+    follows.
     """
     try:
         st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError:
+        return
+    if identity(st) in protected:
         return
     if not stat.S_ISDIR(st.st_mode):
         with contextlib.suppress(OSError):
@@ -333,8 +381,10 @@ def _remove(parent_fd: int, name: str) -> None:
     except OSError:
         return
     try:
+        if identity(os.fstat(fd)) != identity(st):
+            return
         for sub in os.listdir(fd):
-            _remove(fd, sub)
+            _remove(protected, fd, sub)
     except OSError:
         pass
     finally:

@@ -743,6 +743,41 @@ class TestDestroySparesFilesInUse:
         mgr.deprovision_files.side_effect = replace
         return outside
 
+    def test_a_directory_renamed_between_lookup_and_open_is_not_entered(
+            self, tmp_path, monkeypatch):
+        """Codex's interleaving (#221 review R2a): between the removal's
+        lookup of an empty doomed directory and its open, cluster_1 -- on
+        the way to the kept disk -- is renamed over it. The removal used to
+        empty it through that name, kept disk included, and report success.
+        Now nothing in it is touched, and destroy stops with the project
+        registered."""
+        mgr, workspace = self._manager(tmp_path)
+        (workspace / "aa-doomed").mkdir()
+        cluster = sorted(p.name for p in (workspace / "cluster_1").iterdir())
+        used = workspace / self.USED
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(used): "other-vm"})
+        real_stat = os.stat
+        armed = []
+
+        def stat(path, *args, **kwargs):
+            st = real_stat(path, *args, **kwargs)
+            if armed and path == "aa-doomed" and kwargs.get("dir_fd"):
+                armed.clear()
+                os.rename(workspace / "cluster_1", workspace / "aa-doomed")
+            return st
+
+        # armed at step 4: the scan is done, the removal to come
+        mgr.deprovision_files.side_effect = lambda *_: armed.append(True)
+        monkeypatch.setattr(os, "stat", stat)
+        with pytest.raises(ProvisionError, match="was moved or replaced"):
+            mgr.destroy(ARGS)
+        monkeypatch.undo()
+
+        assert sorted(p.name for p in (workspace / "aa-doomed").iterdir()) \
+            == cluster
+        mgr.unregister_from_cache.assert_not_called()
+
     def test_a_directory_replaced_after_the_scan_stops_the_removal(
             self, tmp_path):
         mgr, workspace = self._manager(tmp_path)
@@ -1516,3 +1551,105 @@ class TestForceRmtreeExcept:
                             docker)
         with pytest.raises(ProvisionError, match="could not be found again"):
             BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+    # -- #221 review R2a: what is kept, under any name, all through ----------
+
+    @staticmethod
+    def _after_verification(monkeypatch, action):
+        """Run *action* once, right after the removal has checked the kept
+        entry -- the tree verified, nothing removed yet."""
+        check = retained_tree._check_kept
+        done = []
+
+        def checked(*args):
+            check(*args)
+            if not done:
+                done.append(True)
+                action()
+
+        monkeypatch.setattr(retained_tree, "_check_kept", checked)
+
+    def test_a_kept_file_moved_into_a_doomed_directory_stays(
+            self, tmp_path, monkeypatch):
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "doomed/x")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        self._after_verification(monkeypatch, lambda: os.rename(
+            workspace / "c1" / "keep.qcow2", workspace / "doomed" / "keep"))
+
+        with pytest.raises(ProvisionError, match="could not be found again"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert (workspace / "doomed" / "keep").exists()
+
+    def test_a_retained_directory_moved_into_a_doomed_one_is_not_entered(
+            self, tmp_path, monkeypatch):
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "c1/drop.qcow2",
+                          "doomed/x")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        self._after_verification(monkeypatch, lambda: os.rename(
+            workspace / "c1", workspace / "doomed" / "c1"))
+
+        with pytest.raises(ProvisionError, match="was moved or replaced"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert _left(workspace / "doomed" / "c1") == ["drop.qcow2",
+                                                      "keep.qcow2"]
+
+    @pytest.mark.parametrize("change", ["moved", "replaced"])
+    def test_a_retained_directory_changed_mid_removal_is_not_emptied(
+            self, tmp_path, monkeypatch, change):
+        """Its path no longer leads to it: its own pass, through the
+        descriptor still open on it, does not run."""
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "c1/drop.qcow2")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+
+        def change_c1():
+            os.rename(workspace / "c1", tmp_path / "c1-old")
+            if change == "replaced":
+                (workspace / "c1").mkdir()
+
+        self._after_verification(monkeypatch, change_c1)
+        with pytest.raises(ProvisionError, match="was moved or replaced"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert _left(tmp_path / "c1-old") == ["drop.qcow2", "keep.qcow2"]
+
+    @pytest.mark.parametrize("change", ["moved", "replaced"])
+    def test_a_root_changed_mid_removal_stops_it(self, tmp_path, monkeypatch,
+                                                 change):
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "c1/drop.qcow2")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+
+        def change_root():
+            os.rename(workspace, tmp_path / "ws-old")
+            if change == "replaced":
+                workspace.mkdir()
+
+        self._after_verification(monkeypatch, change_root)
+        with pytest.raises(ProvisionError, match="was moved or replaced"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert _left(tmp_path / "ws-old" / "c1") == ["drop.qcow2",
+                                                     "keep.qcow2"]
+
+    def test_success_is_verified_even_when_nothing_was_left(
+            self, tmp_path, monkeypatch):
+        """The retained directory is moved out of the workspace during its
+        own pass, after its last doomed file went: nothing is left, but what
+        destroy says it kept is no longer there."""
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "c1/drop.qcow2",
+                          "top.txt")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        unlink = os.unlink
+
+        def unlinked(path, *args, **kwargs):
+            unlink(path, *args, **kwargs)
+            if path == "drop.qcow2":
+                os.rename(workspace / "c1", tmp_path / "c1-elsewhere")
+
+        monkeypatch.setattr(os, "unlink", unlinked)
+        with pytest.raises(ProvisionError, match="could not open"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+        monkeypatch.undo()
+
+        assert (tmp_path / "c1-elsewhere" / "keep.qcow2").exists()
