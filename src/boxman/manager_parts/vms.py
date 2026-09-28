@@ -560,8 +560,13 @@ class VMsMixin:
                 while it still exists, or it cannot be confirmed gone. Its
                 storage is left in place either way.
         """
-        inventory = self._capture_vm_storage(
-            session, full_vm_name, disk_dirs, legacy_disks)
+        # every chain this teardown reads shares one pool-refresh cache: a
+        # chain the user may not read is read through libvirt, whose pools
+        # are refreshed at most once per teardown (#221); the in-use scan
+        # below is a scan of its own and refreshes anew
+        with session.chain_read_scope():
+            inventory = self._capture_vm_storage(
+                session, full_vm_name, disk_dirs, legacy_disks)
 
         session.destroy_vm(full_vm_name)
         if not session.confirm_vm_absent(full_vm_name):

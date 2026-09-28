@@ -884,6 +884,12 @@ Details worth knowing:
   kept is named in a warning; keeping it does not fail the command. (`virsh
   undefine --remove-all-storage` used to wipe and delete every
   storage-pool-listed file the VM referenced, ISOs included — #208.)
+  Under `use_sudo: false`, the default, `qemu-img` runs as you and cannot
+  open the disks libvirt creates (mode 0600, owned by root or
+  `libvirt-qemu`), so the backing chain of a file you may not read is read
+  through libvirt instead — its storage pool refreshed first, since libvirt
+  describes a file as the pool last saw it. A chain libvirt cannot describe
+  (a file in no storage pool, say) still keeps everything (#221).
 - **`destroy` validates its delete targets up front**, before any teardown
   starts. It refuses a path that is empty, relative, a symlink, your home
   directory, a filesystem root or mount point, a top-level path, or a
