@@ -948,11 +948,15 @@ class TestManagerDestroyRuntimeCleanup:
         args.auto_accept = auto_accept
         return args
 
+    # the path is made up: it "exists" by these mocks, lstat included (#221
+    # review R4 made the absence check a strict lookup)
+    @patch("boxman.manager_parts.flows.FlowsMixin._entry_exists",
+           return_value=True)
     @patch("boxman.manager_parts.flows.subprocess.run")
     @patch("boxman.manager_parts.flows.shutil.rmtree")
     @patch("boxman.manager_parts.flows.os.path.isdir")
     def test_docker_fallback_when_boxman_dir_survives_rmtree(
-        self, mock_isdir, mock_rmtree, mock_subprocess_run
+        self, mock_isdir, mock_rmtree, mock_subprocess_run, _mock_exists
     ):
         """When shutil.rmtree leaves root-owned dirs behind, the manager
         should use a throwaway docker container to clean them up."""
@@ -989,11 +993,13 @@ class TestManagerDestroyRuntimeCleanup:
         assert "alpine" in docker_cmd
         assert "/cleanup/*" in docker_cmd[-1]
 
+    @patch("boxman.manager_parts.flows.FlowsMixin._entry_exists",
+           return_value=True)
     @patch("boxman.manager_parts.flows.subprocess.run")
     @patch("boxman.manager_parts.flows.shutil.rmtree")
     @patch("boxman.manager_parts.flows.os.path.isdir")
     def test_no_docker_fallback_when_rmtree_succeeds(
-        self, mock_isdir, mock_rmtree, mock_subprocess_run
+        self, mock_isdir, mock_rmtree, mock_subprocess_run, _mock_exists
     ):
         """When shutil.rmtree fully removes .boxman, no docker fallback."""
         from boxman.manager import BoxmanManager

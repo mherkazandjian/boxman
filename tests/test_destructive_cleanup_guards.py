@@ -17,6 +17,7 @@ decision to delete has to rest on positive evidence, and a failure to observe
 has to read as "stop", never as "nothing there".
 """
 
+import contextlib
 import os
 import shutil
 from types import SimpleNamespace
@@ -124,6 +125,23 @@ class TestForceRmtree:
         with pytest.raises(ProvisionError):
             BoxmanManager._force_rmtree("/")
         assert calls == []
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root searches a mode-000 directory")
+    def test_a_directory_that_cannot_be_looked_up_is_not_taken_for_gone(
+            self, tmp_path, monkeypatch):
+        """#221 review R4: only "no such file" is absence."""
+        workspace = tmp_path / "workspaces" / "demo"
+        (workspace / "c1").mkdir(parents=True)
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            lambda *a, **k: pytest.fail("docker was run"))
+        (tmp_path / "workspaces").chmod(0)
+        try:
+            with pytest.raises(ProvisionError, match="could not look up"):
+                BoxmanManager._force_rmtree(str(workspace))
+        finally:
+            (tmp_path / "workspaces").chmod(0o755)
+        assert (workspace / "c1").is_dir()
 
     def test_raises_when_the_directory_survives_both_attempts(self, tmp_path,
                                                               monkeypatch):
@@ -906,6 +924,64 @@ class TestDestroySparesFilesInUse:
 
         assert _left(workspace) == ["cluster_1", self.USED]
         assert _left(isos) == ["install.iso"]
+
+    # -- #221 review R4: absent is not the same as inaccessible ---------------
+
+    @contextlib.contextmanager
+    def _unsearchable(self, directory):
+        directory.chmod(0)
+        try:
+            yield
+        finally:
+            directory.chmod(0o755)
+
+    def _assert_nothing_cleaned_up(self, mgr, workspace):
+        mgr.deprovision_files.assert_not_called()
+        mgr._retire_stale_teardown_locators.assert_not_called()
+        mgr.unregister_from_cache.assert_not_called()
+        assert (workspace / self.USED).exists()
+
+    @unless_root
+    def test_a_workspace_behind_an_unsearchable_directory_stops_it(
+            self, tmp_path):
+        """Codex's reproduction: the workspace's parent is mode 000, so the
+        workspace could not be looked up -- which is not "it is gone". It
+        used to be skipped, the project unregistered, the workspace left."""
+        mgr, workspace = self._manager(tmp_path)
+
+        with self._unsearchable(workspace.parent), \
+                pytest.raises(ProvisionError, match="could not look up"):
+            mgr.destroy(ARGS)
+
+        self._assert_nothing_cleaned_up(mgr, workspace)
+
+    @unless_root
+    def test_so_does_one_of_a_project_without_libvirt_clusters(
+            self, tmp_path):
+        """No domains to ask about, but the same question, answered before
+        the runtime, the generated files or the cache entry go."""
+        mgr, workspace = self._manager(tmp_path)
+        mgr.config["provider"] = {"docker-compose": {}}
+
+        with self._unsearchable(workspace.parent), \
+                pytest.raises(ProvisionError, match="could not look up"):
+            mgr.destroy(ARGS)
+
+        self._assert_nothing_cleaned_up(mgr, workspace)
+        mgr.provider.disk_paths_in_use.assert_not_called()
+
+    @unless_root
+    def test_one_that_cannot_be_looked_up_is_something_to_do(self, tmp_path):
+        """Not in the cache, nothing else left: an inaccessible workspace
+        still is not "nothing to do"."""
+        mgr, workspace = self._manager(tmp_path)
+        mgr.cache.projects = {}
+
+        with self._unsearchable(workspace.parent), \
+                pytest.raises(ProvisionError, match="could not look up"):
+            mgr.destroy(ARGS)
+
+        self._assert_nothing_cleaned_up(mgr, workspace)
 
     def test_a_workspace_already_gone_is_no_reason_to_stop(self, tmp_path):
         """Registered, yet removed by hand: nothing is left to spare."""

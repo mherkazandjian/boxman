@@ -810,6 +810,38 @@ class FlowsMixin:
         return real
 
     @staticmethod
+    def _entry_exists(path: str) -> bool:
+        """
+        Whether *path* has a directory entry. Only "no such file" is
+        absence: ``os.path.isdir`` and ``os.path.exists`` answer False for a
+        path that cannot be looked up (a directory on the way that cannot be
+        searched), and a workspace behind one was taken for gone (#221
+        review R4).
+
+        Raises:
+            ProvisionError: If it cannot be looked up.
+        """
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ProvisionError(
+                f"could not look up {path} ({exc.strerror}), so whether it is "
+                f"still there cannot be told — make it accessible, then "
+                f"retry") from exc
+        return True
+
+    @staticmethod
+    def _may_exist(path: str) -> bool:
+        """False only when *path* is confirmed to have no entry
+        (:meth:`_entry_exists`)."""
+        try:
+            return FlowsMixin._entry_exists(path)
+        except ProvisionError:
+            return True
+
+    @staticmethod
     def _force_rmtree(path: str) -> None:
         """
         Remove *path* and everything under it.
@@ -830,12 +862,13 @@ class FlowsMixin:
             path: Directory to remove.
 
         Raises:
-            ProvisionError: If the target is unsafe to delete, or if it
-                survived both removal attempts.
+            ProvisionError: If the target is unsafe to delete, cannot be
+                looked up (:meth:`_entry_exists`), or survived both removal
+                attempts.
         """
         real = FlowsMixin._safe_delete_target(path)
 
-        if not os.path.isdir(real):
+        if not FlowsMixin._entry_exists(real) or not os.path.isdir(real):
             log.info(f"{real} does not exist — nothing to remove")
             return
 
@@ -940,10 +973,15 @@ class FlowsMixin:
             no domains to ask about, and its workspace is not walked.
 
         Raises:
-            ProvisionError: If that cannot be told: the scan fails, or a
-                directory of the workspace cannot be listed or an entry's
-                identity read (it could be any file).
+            ProvisionError: If that cannot be told: the workspace cannot be
+                looked up — for any project, libvirt clusters or not — the
+                scan fails, or a directory of the workspace cannot be listed
+                or an entry's identity read (it could be any file).
         """
+        # whether the workspace is there — for every project, before anything
+        # is torn down: only "no such file" is absence (#221 review R4)
+        real = os.path.realpath(workspace_path)
+        present = self._entry_exists(real)
         # the libvirt session of every libvirt cluster, each scanned once
         sessions = {}
         for name in ((self.config or {}).get('clusters') or {}):
@@ -961,8 +999,7 @@ class FlowsMixin:
                     "domains use (the in-use scan failed; see the warnings "
                     "above), so none of it was removed")
             in_use.add(found)
-        real = os.path.realpath(workspace_path)
-        if not os.path.isdir(real):
+        if not present or not os.path.isdir(real):
             return in_use, None
         return in_use, scan_tree(real, in_use.why_kept)
 
@@ -1051,7 +1088,8 @@ class FlowsMixin:
             project_name
             and project_name in (self.cache.projects or {})
         )
-        ws_present = bool(workspace_path and os.path.exists(workspace_path))
+        # a workspace that cannot be looked up is not gone (#221 review R4)
+        ws_present = bool(workspace_path) and self._may_exist(workspace_path)
         boxman_dir_present = bool(
             is_docker and runtime_plan
             and runtime_plan.get("boxman_dir")

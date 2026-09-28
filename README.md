@@ -898,10 +898,11 @@ Details worth knowing:
   stays, with the directories on the way to it, and is named in a warning;
   `destroy` still exits 0. The generated files it removes elsewhere (those
   `workspace.files`/`cluster.files` list, the SSH keys, `ssh_config`) get
-  the same check. If it cannot tell which files those are — the
-  check fails, or a directory in the workspace cannot be read — it exits 2
-  and keeps the workspace, the generated files, the runtime and the cache
-  entry, like an incomplete teardown. The removal never follows a symlink,
+  the same check. If it cannot tell which files those are — the check
+  fails, the workspace cannot be looked up (behind a directory that cannot
+  be searched it is not "gone"), or a directory in it cannot be read — it
+  exits 2 and keeps the workspace, the generated files, the runtime and the
+  cache entry, like an incomplete teardown. The removal never follows a symlink,
   and stops, exiting 2 with the cache entry kept, at a directory on the way
   to a kept file, or a kept file, that is no longer the one the check
   found. Template workdirs (`--templates`) are removed without this check.
