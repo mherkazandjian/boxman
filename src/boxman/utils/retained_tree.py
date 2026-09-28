@@ -41,6 +41,13 @@ Identity = tuple[int, int]
 #: how every directory is opened: for listing, and never through a symlink
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
+#: how many directories below the root the scan and the removal go: far
+#: deeper than a workspace is. A tree deeper than this is refused — by the
+#: scan before anything is removed, by the removal before it enters one —
+#: with ProvisionError, instead of running out of stack or file
+#: descriptors (each level holds one open) (#221 review N1).
+MAX_DEPTH = 256
+
 #: where the kernel says which mount an open file is on (``mnt_id``)
 _FDINFO = "/proc/self/fdinfo/{fd}"
 #: every mount of this process's mount namespace
@@ -77,6 +84,18 @@ def _mount_id(fd: int, shown: str) -> int:
     raise ProvisionError(
         f"could not tell whether {shown} is a mount point ({fdinfo} names no "
         f"mnt_id), so nothing more was removed from the workspace")
+
+
+def _level(rel: str) -> int:
+    """How many directories below the root *rel* is (the root: 0)."""
+    return rel.count(os.sep) + 1 if rel else 0
+
+
+def _too_deep(shown: str, root: str, removed: str) -> ProvisionError:
+    return ProvisionError(
+        f"{shown} is more than {MAX_DEPTH} directories below {root}, deeper "
+        f"than the workspace's removal goes, so {removed} — remove it by "
+        f"hand, then retry")
 
 
 def _same_mount(root_mnt: int, fd: int, shown: str) -> None:
@@ -233,9 +252,10 @@ def scan_tree(root: str,
         way to what stays, and of each entry that stays.
 
     Raises:
-        ProvisionError: If a directory cannot be opened or listed, or an
-            entry's identity cannot be read other than for naming nothing:
-            what is there could be any file.
+        ProvisionError: If a directory cannot be opened or listed, is a
+            mount point, or is more than :data:`MAX_DEPTH` directories below
+            the root, or an entry's identity cannot be read other than for
+            naming nothing: what is there could be any file.
     """
     fd = _open_dir(root, None, root)
     try:
@@ -284,6 +304,9 @@ def _scan(tree: RetainedTree, fd: int, rel: str,
                 f"so none of the workspace was removed — make it "
                 f"accessible") from exc
         if stat.S_ISDIR(st.st_mode):
+            if _level(child) > MAX_DEPTH:
+                raise _too_deep(tree.path(child), tree.root,
+                                "none of the workspace was removed")
             sub = _open_dir(name, fd, tree.path(child))
             try:
                 _same_mount(tree.root_mnt, sub, tree.path(child))
@@ -454,7 +477,8 @@ def _sweep(tree: RetainedTree, remove: bool) -> list[str]:
             if remove and names:
                 for name in names:
                     _remove(tree, protected, fd, name,
-                            tree.path(os.path.join(rel, name)))
+                            tree.path(os.path.join(rel, name)),
+                            _level(rel) + 1)
                 names = _doomed(tree, fd, rel)
             left.extend(os.path.join(rel, name) if rel else name
                         for name in names)
@@ -465,7 +489,7 @@ def _sweep(tree: RetainedTree, remove: bool) -> list[str]:
 
 
 def _remove(tree: RetainedTree, protected: frozenset[Identity],
-            parent_fd: int, name: str, shown: str) -> None:
+            parent_fd: int, name: str, shown: str, level: int) -> None:
     """
     Remove the entry *name* (*shown*) of the directory *parent_fd*: anything
     but a directory is unlinked; a directory is opened relative to its
@@ -481,7 +505,8 @@ def _remove(tree: RetainedTree, protected: frozenset[Identity],
 
     Raises:
         ProvisionError: If a directory it opens is on another mount than the
-            root (:func:`_same_mount`): it is never entered.
+            root (:func:`_same_mount`), or is more than :data:`MAX_DEPTH`
+            directories below it: it is never entered.
     """
     try:
         st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -493,6 +518,8 @@ def _remove(tree: RetainedTree, protected: frozenset[Identity],
         with contextlib.suppress(OSError):
             os.unlink(name, dir_fd=parent_fd)
         return
+    if level > MAX_DEPTH:
+        raise _too_deep(shown, tree.root, "nothing more was removed from it")
     try:
         fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
     except OSError:
@@ -502,7 +529,8 @@ def _remove(tree: RetainedTree, protected: frozenset[Identity],
             return
         _same_mount(tree.root_mnt, fd, shown)
         for sub in os.listdir(fd):
-            _remove(tree, protected, fd, sub, os.path.join(shown, sub))
+            _remove(tree, protected, fd, sub, os.path.join(shown, sub),
+                    level + 1)
     except OSError:
         pass
     finally:

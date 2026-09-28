@@ -721,6 +721,30 @@ def _identity_of_fd(fd):
     return (st.st_dev, st.st_ino)
 
 
+def _chain(root, levels):
+    """*levels* nested one-letter directories under *root*: their paths,
+    outermost first."""
+    root.mkdir(parents=True, exist_ok=True)
+    paths, path = [], root
+    for _ in range(levels):     # os.makedirs recurses once per level
+        path = path / "d"
+        path.mkdir()
+        paths.append(path)
+    return paths
+
+
+@contextlib.contextmanager
+def _removed_after(paths):
+    """Remove the directories *paths* (outermost first), deepest first, when
+    done: pytest's own removal of a very deep tree may run out of stack."""
+    try:
+        yield
+    finally:
+        for path in reversed(paths):
+            with contextlib.suppress(OSError):
+                os.rmdir(path)
+
+
 def _fake_mounts(monkeypatch, *paths):
     """Report each of *paths*, a directory, as a mount point: its mount id
     is off by a million; everything else keeps its real one (#221 review
@@ -1273,6 +1297,20 @@ class TestDestroySparesFilesInUse:
             hidden.chmod(0o755)
 
         mgr.deprovision.assert_called_once()
+
+    def test_a_tree_too_deep_for_the_scan_stops_destroy(self, tmp_path):
+        """Codex's reproduction (#221 review N1): 1,050 nested directories
+        raised a bare RecursionError. Now it is destroy's own error, before
+        anything is removed."""
+        mgr, workspace = self._manager(tmp_path)
+        chain = _chain(workspace / "deep", 1050)
+        with _removed_after(chain):
+            with pytest.raises(ProvisionError, match="directories below"):
+                mgr.destroy(ARGS)
+
+            assert chain[-1].is_dir() and (workspace / self.USED).exists()
+            mgr.deprovision_files.assert_not_called()
+            mgr.unregister_from_cache.assert_not_called()
 
     def test_a_workspace_already_gone_is_no_reason_to_stop(self, tmp_path):
         """Registered, yet removed by hand: nothing is left to spare."""
@@ -1831,6 +1869,40 @@ class TestForceRmtreeExcept:
                             docker)
         with pytest.raises(ProvisionError, match="could not be found again"):
             BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+    # -- #221 review N1: a documented depth ------------------------------------
+
+    def test_the_scan_goes_down_to_the_limit_and_no_further(self, tmp_path):
+        from boxman.utils.retained_tree import MAX_DEPTH
+
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2")
+        chain = _chain(workspace, MAX_DEPTH)
+        (chain[-1] / "f").write_text("deepest file")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        assert tree.kept == {"c1/keep.qcow2": "domain other-vm uses it"}
+
+        (chain[-1] / "d").mkdir()
+        with pytest.raises(ProvisionError,
+                           match=f"more than {MAX_DEPTH} directories below"):
+            _scanned(workspace, "c1/keep.qcow2")
+
+    def test_the_removal_goes_down_to_the_limit_and_no_further(
+            self, tmp_path):
+        """A doomed tree made deeper than the limit after the scan is not
+        entered past it."""
+        from boxman.utils.retained_tree import MAX_DEPTH
+
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        chain = _chain(workspace, MAX_DEPTH)
+        BoxmanManager._force_rmtree_except(str(workspace), tree)
+        assert _left(workspace) == ["c1", "c1/keep.qcow2"]
+
+        chain = _chain(workspace, MAX_DEPTH + 1)
+        with pytest.raises(ProvisionError,
+                           match=f"more than {MAX_DEPTH} directories below"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+        assert chain[-1].is_dir()
 
     # -- #221 review R2b: never cross a mount point --------------------------
 

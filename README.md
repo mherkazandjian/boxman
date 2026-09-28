@@ -907,8 +907,9 @@ Details worth knowing:
   to a kept file, or a kept file, that is no longer the one the check
   found. It never crosses a mount point either: a filesystem or bind mount
   anywhere under the workspace of a libvirt project makes `destroy` exit 2
-  before anything is removed — unmount it first. Template workdirs
-  (`--templates`) are removed without this check.
+  before anything is removed — unmount it first — and so does a directory
+  more than 256 levels deep in it. Template workdirs (`--templates`) are
+  removed without this check.
 - **`destroy` validates its delete targets up front**, before any teardown
   starts. It refuses a path that is empty, relative, a symlink, your home
   directory, a filesystem root or mount point, a top-level path, or a
