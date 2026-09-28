@@ -2,9 +2,9 @@
 
 import logging
 import os
+import re
 import shlex
 import urllib.request
-from urllib.parse import urlsplit
 
 from boxman import log
 from boxman.loggers.logger import is_verbose
@@ -12,19 +12,20 @@ from boxman.utils.http_opener import build_opener
 from boxman.utils.shell import run as _shell_run
 
 
-def curl_ended_on_2xx(url: str, status: str) -> bool:
-    """Whether curl's transfer of an http(s) *url* ended on a 2xx response.
+def curl_final_status_ok(status: str) -> bool:
+    """Whether a transfer curl finished may count, by its final status.
 
-    *status* is what curl's ``-w '%{http_code}'`` printed: the status of the
-    last response it got. ``--fail`` refuses a 4xx or 5xx but lets a 3xx
-    through, and ``-L`` follows only a 3xx that says where to go, so a 302
-    without a Location ends the transfer on the redirect's own page, with
-    exit 0 (#224). Other schemes have no HTTP status, and are not checked.
+    *status* is what curl's ``-w '%{http_code}'`` printed: the code of the
+    last response the transfer got. That code decides, not the URL's
+    scheme: curl fetches a URL with no scheme as http, and an ftp:// one
+    through an http proxy can be redirected to an http origin (#224).
+    ``--fail`` refuses a 4xx or 5xx but lets a 3xx through, and ``-L``
+    follows only a 3xx that says where to go, so a 302 without a Location
+    ends the transfer on its own page, with exit 0. A 2xx counts, FTP's 226
+    among them, and so does 000: no response code at all, as for a file://
+    copy.
     """
-    if urlsplit(url).scheme.lower() not in ("http", "https"):
-        return True
-    status = status.strip()
-    return len(status) == 3 and status.startswith("2")
+    return re.fullmatch(r"000|2[0-9][0-9]", status.strip()) is not None
 
 
 def download_url(url: str, dst_path: str) -> bool:
@@ -58,12 +59,12 @@ def download_url(url: str, dst_path: str) -> bool:
 
     # curl fallback. --fail so an HTTP 4xx/5xx error page is not written
     # and accepted as a valid download (wget already fails on HTTP errors),
-    # and the final status must be a 2xx, as --fail lets a 3xx through.
+    # and the final status must count too, as --fail lets a 3xx through.
     result = _shell_run(
         f"curl -fL --progress-bar -w '%{{http_code}}' -o {q_dst} {q_url}",
         hide=not is_verbose(logging.DEBUG), warn=True,
     )
-    if (result.ok and curl_ended_on_2xx(url, result.stdout)
+    if (result.ok and curl_final_status_ok(result.stdout)
             and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0):
         log.info("download complete (curl)")
         return True

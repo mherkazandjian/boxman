@@ -32,7 +32,7 @@ import invoke
 from boxman import log
 from boxman.image_cache import ImageCache
 from boxman.loggers.logger import is_verbose
-from boxman.utils.http_download import curl_ended_on_2xx
+from boxman.utils.http_download import curl_final_status_ok
 from boxman.utils.http_opener import build_opener
 from boxman.utils.jinja_env import substitute_env
 from boxman.utils.shell import run as _shell_run
@@ -528,13 +528,13 @@ class CloudInitTemplate:
         # Try curl as second fallback. --fail, so that an HTTP 4xx/5xx error
         # page is not written and accepted as the image (#224); wget already
         # fails on HTTP errors. --fail lets a 3xx through, though, so the
-        # final status curl reports must be a 2xx too.
+        # final status curl reports must count too.
         result = _shell_run(
             f"curl -fL --progress-bar -w '%{{http_code}}' "
             f"-o {shlex.quote(dst_path)} {shlex.quote(url)}",
             hide=not is_verbose(logging.DEBUG), warn=True,
         )
-        if (result.ok and curl_ended_on_2xx(url, result.stdout)
+        if (result.ok and curl_final_status_ok(result.stdout)
                 and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0):
             self.logger.info("download complete (curl)")
             return True

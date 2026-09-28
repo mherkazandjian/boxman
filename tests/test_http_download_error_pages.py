@@ -12,10 +12,13 @@ covered too, as a guard.
 ``--fail`` alone did not settle it, in either downloader. It lets a 3xx
 through, and ``-L`` follows only a 3xx that says where to go, so a 302
 without a Location left its page behind, with exit 0. curl's download now
-counts only when the final status curl reports is a 2xx. The urllib
-fallback, for its part, took an empty 200 for the image. The ``-L`` is
-pinned as well: without it, curl saves the page a server sends with a
-redirect and exits 0, and that page is taken for the image.
+counts only when the final status curl reports is a 2xx, or 000 for a
+transfer with no status at all, such as a file:// copy. The status decides,
+not the URL's scheme: a URL with no scheme, or an ftp:// one through an
+http proxy, can end on an http response too. The urllib fallback, for its
+part, took an empty 200 for the image. The ``-L`` is pinned as well:
+without it, curl saves the page a server sends with a redirect and exits
+0, and that page is taken for the image.
 
 Nothing here leaves the host. The server runs on a 127.0.0.1 ephemeral
 port, as in test_http_download_proxy.py. Every ``*_proxy`` variable is
@@ -64,6 +67,8 @@ CUT = 4096
 #: where a server that moved the image redirects to, and the page it sends with the 302
 MOVED = "/mirror/distro.qcow2"
 MOVED_PAGE = b"<html><body>302 Found</body></html>\n"
+#: the http origin an http proxy redirects an ftp:// download to
+FINAL = "/final/distro.qcow2"
 
 
 class _Recorder(http.server.BaseHTTPRequestHandler):
@@ -295,16 +300,51 @@ def test_curl_follows_a_redirect_to_the_image(downloader, monkeypatch, tmp_path)
     assert fallback == []
 
 
-@pytest.mark.parametrize(("url", "status", "counts"), [
-    ("http://mirror.invalid/distro.qcow2", "200", True),
-    ("HTTPS://mirror.invalid/distro.qcow2", "200\n", True),
-    ("http://mirror.invalid/distro.qcow2", "302", False),  # a 3xx that went nowhere
-    ("https://mirror.invalid/distro.qcow2", "404", False),
-    ("http://mirror.invalid/distro.qcow2", "000", False),  # no response at all
-    ("http://mirror.invalid/distro.qcow2", "", False),  # no status printed
-    # other schemes have no HTTP status, and are not held to one
-    ("ftp://mirror.invalid/distro.iso", "226", True),
-    ("file:///srv/distro.iso", "000", True),
+@pytest.mark.parametrize("start", ["no-scheme", "ftp-through-an-http-proxy"])
+def test_a_transfer_that_ends_on_http_is_held_to_a_2xx(downloader, start, monkeypatch, tmp_path):
+    module, download = downloader
+    ran = _fail_wget(monkeypatch, module)
+    dst = tmp_path / "distro.qcow2"
+    page = NOT_THE_IMAGE["http302-no-location"][1]
+
+    with _serving(302, page) as server:
+        origin = f"127.0.0.1:{server.server_port}"
+        if start == "no-scheme":
+            # curl fetches a URL without a scheme as http; urllib cannot
+            url, route, fallback_route = f"{origin}{IMAGE}", [IMAGE], []
+        else:
+            # the loopback server is the http proxy of the ftp:// download,
+            # and the http origin the proxy redirects it to
+            url = f"ftp://{origin}{IMAGE}"
+            monkeypatch.setenv("ftp_proxy", f"http://{origin}")
+            server.moved[url] = f"http://{origin}{FINAL}"
+            route = fallback_route = [url, FINAL]
+        ok = download(url, str(dst))
+
+    assert (ok, _left_at(dst)) == (False, None)
+    # curl went where the URL led, and ended on the 302's page with exit 0...
+    assert ran == [("wget", None), ("curl", 0)]
+    assert [r.target for r in server.requests if r.agent.startswith("curl/")] == route
+    # ...and the urllib fallback, where it could follow, was refused as well
+    assert [r.target for r in server.requests
+            if r.agent.startswith("boxman/")] == fallback_route
+
+
+@pytest.mark.parametrize(("status", "counts"), [
+    ("200", True),
+    ("206", True),
+    ("226", True),  # FTP's transfer complete
+    ("000", True),  # no response code at all, as for a file:// copy
+    ("200\n", True),  # whitespace around the status is not part of it
+    (" \t226 ", True),
+    ("302", False),  # a 3xx that went nowhere
+    ("404", False),
+    ("", False),  # no status printed
+    ("x200", False),  # nor is anything before or after it
+    ("200x", False),
+    ("2000", False),
+    ("0000", False),
+    ("200 302", False),
 ])
-def test_only_a_2xx_counts_for_an_http_download(url, status, counts):
-    assert http_download.curl_ended_on_2xx(url, status) is counts
+def test_only_a_2xx_or_no_status_counts(status, counts):
+    assert http_download.curl_final_status_ok(status) is counts
