@@ -27,6 +27,7 @@ import pytest
 from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.disk_cleanup import FilesInUse, StorageOutcome
+from boxman.utils import retained_tree
 
 pytestmark = pytest.mark.unit
 
@@ -670,6 +671,24 @@ class TestDestroySparesFilesInUse:
         assert _left(workspace) == ["cluster_1", "cluster_1/link.qcow2"]
         assert target.exists()
 
+    def test_a_symlink_to_a_file_known_only_by_its_identity_is_kept(
+            self, tmp_path):
+        """The link's target is in use under another name (a hard link):
+        the scan follows the link for its identity (#221 review R2)."""
+        mgr, workspace = self._manager(tmp_path)
+        target = _tree(tmp_path / "elsewhere", "disk.qcow2") / "disk.qcow2"
+        alias = tmp_path / "images" / "disk.img"
+        alias.parent.mkdir()
+        os.link(target, alias)
+        (workspace / "cluster_1" / "link.qcow2").symlink_to(target)
+        in_use = FilesInUse({str(alias): "other-vm"})
+        in_use.identities[_identity(alias)] = "other-vm"
+        mgr.provider.disk_paths_in_use.return_value = in_use
+
+        mgr.destroy(ARGS)
+
+        assert _left(workspace) == ["cluster_1", "cluster_1/link.qcow2"]
+
     def test_nothing_in_use_removes_the_whole_workspace(self, tmp_path):
         mgr, workspace = self._manager(tmp_path)
 
@@ -689,6 +708,62 @@ class TestDestroySparesFilesInUse:
         mgr.destroy(ARGS)
 
         assert _left(workspace) == ["cluster_1", self.USED]
+
+    def _replace_cluster_at_step_4(self, mgr, workspace, tmp_path):
+        """Codex's reproduction (#221 review R2): between the scan (2d) and
+        the removal (5) -- at step 4 -- cluster_1, on the way to the kept
+        disk, is renamed away and replaced by a symlink to a directory
+        outside the workspace, which holds a file of the kept disk's name."""
+        used = workspace / self.USED
+        outside = _tree(tmp_path / "outside", "unrelated.txt", used.name)
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(used): "other-vm"})
+
+        def replace():
+            os.rename(workspace / "cluster_1", workspace / "moved-cluster")
+            (workspace / "cluster_1").symlink_to(outside)
+        mgr.deprovision_files.side_effect = replace
+        return outside
+
+    def test_a_directory_replaced_after_the_scan_stops_the_removal(
+            self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        outside = self._replace_cluster_at_step_4(mgr, workspace, tmp_path)
+        before = _left(workspace)
+
+        with pytest.raises(ProvisionError, match="could not open"):
+            mgr.destroy(ARGS)
+
+        assert _left(outside) == [
+            "bprj__demo__bprj_cluster_1_node01.qcow2", "unrelated.txt"]
+        assert (workspace / "moved-cluster" /
+                "bprj__demo__bprj_cluster_1_node01.qcow2").exists()
+        assert _left(workspace) == sorted(
+            [*(p.replace("cluster_1", "moved-cluster", 1)
+               for p in before), "cluster_1"])
+        mgr._retire_stale_teardown_locators.assert_not_called()
+        mgr.unregister_from_cache.assert_not_called()
+
+    @unless_root
+    def test_a_directory_replaced_after_the_scan_stops_the_fallback_too(
+            self, tmp_path):
+        """... when the user cannot remove everything, so the docker
+        fallback would be due: it is never run over a replaced directory
+        (the autouse fixture fails the test if it is)."""
+        mgr, workspace = self._manager(tmp_path)
+        outside = self._replace_cluster_at_step_4(mgr, workspace, tmp_path)
+        (workspace / "keys").chmod(0o555)
+        try:
+            with pytest.raises(ProvisionError, match="could not open"):
+                mgr.destroy(ARGS)
+        finally:
+            (workspace / "keys").chmod(0o755)
+
+        assert _left(outside) == [
+            "bprj__demo__bprj_cluster_1_node01.qcow2", "unrelated.txt"]
+        assert (workspace / "moved-cluster" /
+                "bprj__demo__bprj_cluster_1_node01.qcow2").exists()
+        mgr.unregister_from_cache.assert_not_called()
 
     def test_a_symlink_to_a_directory_goes_but_not_what_it_points_to(
             self, tmp_path):
@@ -769,6 +844,27 @@ class TestDestroySparesFilesInUse:
             blind.chmod(0o700)
 
         assert (workspace / "cluster_1" / "seed.iso").exists()
+        mgr.unregister_from_cache.assert_not_called()
+
+    def test_a_directory_the_scan_cannot_list_keeps_everything(
+            self, tmp_path, monkeypatch):
+        """An I/O error listing an open directory during the scan: nothing
+        is taken for empty (#221 review R2)."""
+        mgr, workspace = self._manager(tmp_path)
+        listdir = os.listdir
+
+        def failing(path=".", *args):
+            if isinstance(path, int):
+                raise OSError(5, "Input/output error")
+            return listdir(path, *args)
+
+        monkeypatch.setattr(os, "listdir", failing)
+        with pytest.raises(ProvisionError, match="could not list"):
+            mgr.destroy(ARGS)
+        monkeypatch.undo()
+
+        assert (workspace / "env.sh").exists()
+        mgr.deprovision_files.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
 
     def _docker_manager(self, tmp_path):
@@ -854,40 +950,254 @@ class TestDestroySparesFilesInUse:
         mgr.provider.disk_paths_in_use.assert_called_once_with()
 
 
+def _scanned(workspace, *kept):
+    """The in-use scan of *workspace* that keeps *kept* (relative paths)."""
+    root = os.path.realpath(workspace)
+    wanted = {os.path.join(root, rel) for rel in kept}
+    return retained_tree.scan_tree(
+        root, lambda path, _target: ("domain other-vm uses it"
+                                     if path in wanted else None))
+
+
+def _lidentity(path):
+    st = os.lstat(path)
+    return (st.st_dev, st.st_ino)
+
+
 class TestForceRmtreeExcept:
     """The sparing removal keeps :meth:`_force_rmtree`'s guard and its
     docker fallback -- aimed at exactly what is left, never at a kept file
-    or a directory on the way to one (#221)."""
+    or a directory on the way to one (#221) -- and walks the workspace
+    through directory descriptors, stopping at anything on the way, or kept,
+    that is no longer what the scan found (#221 review R2)."""
 
-    def test_a_rejected_path_reaches_nothing_under_it(self, tmp_path,
-                                                      monkeypatch):
+    @pytest.fixture(autouse=True)
+    def _no_docker(self, monkeypatch):
+        """Unless a test says otherwise, the fallback is never due."""
+        def docker(*args, **kwargs):
+            raise AssertionError(f"docker was run: {args}")
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            docker)
+
+    def test_the_scan_records_what_the_removal_checks(self, tmp_path):
+        workspace = _tree(tmp_path / "ws", "c1/sub/keep.qcow2",
+                          "c1/drop.qcow2", "c2/x")
+        tree = _scanned(workspace, "c1/sub/keep.qcow2")
+
+        assert tree.root == os.path.realpath(workspace)
+        assert tree.root_id == _lidentity(workspace)
+        assert tree.dirs == {"c1": _lidentity(workspace / "c1"),
+                             "c1/sub": _lidentity(workspace / "c1" / "sub")}
+        assert tree.kept == {"c1/sub/keep.qcow2": "domain other-vm uses it"}
+        assert tree.kept_ids == {
+            "c1/sub/keep.qcow2": _lidentity(workspace / "c1" / "sub" /
+                                           "keep.qcow2")}
+
+    def test_everything_else_goes(self, tmp_path):
+        workspace = _tree(tmp_path / "ws", "c1/sub/keep.qcow2",
+                          "c1/drop.qcow2", "c1/sub/x", "c2/y/z", "top.txt")
+        tree = _scanned(workspace, "c1/sub/keep.qcow2")
+
+        BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert _left(workspace) == ["c1", "c1/sub", "c1/sub/keep.qcow2"]
+
+    def test_a_rejected_path_reaches_nothing_under_it(self, tmp_path):
         workspace = _tree(tmp_path / "real_ws", "c1/keep.qcow2",
                           "c1/drop.qcow2", "top.txt")
+        tree = _scanned(workspace, "c1/keep.qcow2")
         link = tmp_path / "ws_link"
         link.symlink_to(workspace)
-        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
-                            lambda *a, **k: pytest.fail("docker was run"))
 
         with pytest.raises(ProvisionError, match="symlink"):
-            BoxmanManager._force_rmtree_except(
-                str(link), [str(workspace / "c1" / "keep.qcow2")])
+            BoxmanManager._force_rmtree_except(str(link), tree)
 
         assert _left(workspace) == ["c1", "c1/drop.qcow2", "c1/keep.qcow2",
                                     "top.txt"]
 
+    def test_a_path_that_leads_elsewhere_than_the_scan_stops_it(
+            self, tmp_path):
+        """A symlinked ancestor repointed since the scan: the target vetted
+        now is not the tree scanned."""
+        scanned = _tree(tmp_path / "a" / "ws", "c1/keep.qcow2", "top.txt")
+        other = _tree(tmp_path / "b" / "ws", "c1/keep.qcow2", "other.txt")
+        via = tmp_path / "via"
+        via.symlink_to(tmp_path / "a")
+        tree = _scanned(via / "ws", "c1/keep.qcow2")
+        via.unlink()
+        via.symlink_to(tmp_path / "b")
+
+        with pytest.raises(ProvisionError, match="the in-use scan read"):
+            BoxmanManager._force_rmtree_except(str(via / "ws"), tree)
+
+        assert _left(scanned) == ["c1", "c1/keep.qcow2", "top.txt"]
+        assert _left(other) == ["c1", "c1/keep.qcow2", "other.txt"]
+
+    def test_a_directory_on_the_way_replaced_by_a_symlink_stops_it(
+            self, tmp_path):
+        """Codex's reproduction (#221 review R2), without destroy around it:
+        nothing inside or outside is removed."""
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "c1/drop.qcow2",
+                          "top.txt")
+        outside = _tree(tmp_path / "outside", "unrelated.txt", "keep.qcow2")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        os.rename(workspace / "c1", workspace / "moved")
+        (workspace / "c1").symlink_to(outside)
+
+        with pytest.raises(ProvisionError, match="could not open"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert _left(outside) == ["keep.qcow2", "unrelated.txt"]
+        assert _left(workspace) == ["c1", "moved", "moved/drop.qcow2",
+                                    "moved/keep.qcow2", "top.txt"]
+
+    def test_a_directory_on_the_way_replaced_by_a_symlink_to_itself(
+            self, tmp_path):
+        """Even one leading back to the very directory scanned: nothing on
+        the way may be a symlink."""
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "c1/drop.qcow2")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        os.rename(workspace / "c1", workspace / "moved")
+        (workspace / "c1").symlink_to(workspace / "moved")
+
+        with pytest.raises(ProvisionError, match="could not open"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert (workspace / "moved" / "drop.qcow2").exists()
+
+    def test_a_directory_on_the_way_replaced_by_another_stops_it(
+            self, tmp_path):
+        """A real directory in its place: known by its identity."""
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "c1/drop.qcow2")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        os.rename(workspace / "c1", workspace / "moved")
+        _tree(workspace / "c1", "keep.qcow2", "planted.txt")
+
+        with pytest.raises(ProvisionError, match="was replaced"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert _left(workspace / "c1") == ["keep.qcow2", "planted.txt"]
+        assert (workspace / "moved" / "drop.qcow2").exists()
+
+    @pytest.mark.parametrize("replaced", ["c1", "the root"])
+    def test_a_directory_moved_in_with_the_kept_file_stops_it(
+            self, tmp_path, replaced):
+        """A directory from elsewhere moved into the place of one on the
+        way, the kept file itself moved into it: only the directory's
+        identity tells that its other files were never the workspace's."""
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "c1/drop.qcow2")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        foreign = _tree(tmp_path / "home" / "data", "precious.txt")
+        if replaced == "c1":
+            os.rename(workspace / "c1" / "keep.qcow2", foreign / "keep.qcow2")
+            os.rename(workspace / "c1", tmp_path / "c1-scanned")
+            os.rename(foreign, workspace / "c1")
+        else:
+            (foreign / "c1").mkdir()
+            os.rename(workspace / "c1" / "keep.qcow2",
+                      foreign / "c1" / "keep.qcow2")
+            os.rename(workspace, tmp_path / "ws-scanned")
+            os.rename(foreign, workspace)
+
+        with pytest.raises(ProvisionError, match="was replaced"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        moved_in = workspace / "c1" if replaced == "c1" else workspace
+        assert (moved_in / "precious.txt").exists()
+
+    def test_a_replaced_root_stops_it(self, tmp_path):
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "top.txt")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        os.rename(workspace, tmp_path / "ws-scanned")
+        _tree(workspace, "c1/keep.qcow2", "other.txt")
+
+        with pytest.raises(ProvisionError, match="was replaced"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert _left(workspace) == ["c1", "c1/keep.qcow2", "other.txt"]
+
+    @pytest.mark.parametrize("change, message", [
+        ("replaced", "was replaced"), ("gone", "could not be found again")])
+    def test_a_kept_file_changed_since_the_scan_stops_it(self, tmp_path,
+                                                         change, message):
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "c1/drop.qcow2")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        os.rename(workspace / "c1" / "keep.qcow2", tmp_path / "keep.moved")
+        if change == "replaced":
+            _tree(workspace / "c1", "keep.qcow2")
+
+        with pytest.raises(ProvisionError, match=message):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert (workspace / "c1" / "drop.qcow2").exists()
+
     @unless_root
-    def test_a_directory_on_the_way_that_cannot_be_listed_stops_it(
+    def test_a_directory_on_the_way_that_cannot_be_opened_stops_it(
             self, tmp_path):
         workspace = _tree(tmp_path / "workspaces" / "demo", "c1/keep.qcow2",
                           "top.txt")
-        real = os.path.realpath(workspace)
+        tree = _scanned(workspace, "c1/keep.qcow2")
         (workspace / "c1").chmod(0o300)
         try:
-            with pytest.raises(ProvisionError, match="could not list"):
-                BoxmanManager._force_rmtree_except(
-                    str(workspace), [os.path.join(real, "c1", "keep.qcow2")])
+            with pytest.raises(ProvisionError, match="could not open"):
+                BoxmanManager._force_rmtree_except(str(workspace), tree)
         finally:
             (workspace / "c1").chmod(0o755)
+
+        assert (workspace / "top.txt").exists()
+
+    def test_a_directory_that_cannot_be_listed_again_stops_it(
+            self, tmp_path, monkeypatch):
+        """An I/O error listing a verified directory: nothing is taken for
+        empty."""
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "top.txt")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        listdir = os.listdir
+
+        def failing(path=".", *args):
+            if isinstance(path, int):
+                raise OSError(5, "Input/output error")
+            return listdir(path, *args)
+
+        monkeypatch.setattr(os, "listdir", failing)
+        with pytest.raises(ProvisionError, match="could not list"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert (workspace / "top.txt").exists()
+
+    def test_a_directory_swapped_for_a_symlink_mid_removal_is_not_followed(
+            self, tmp_path, monkeypatch):
+        """Between looking an entry that goes up and opening it, it becomes
+        a symlink to a directory outside: it is removed as a link, never
+        entered."""
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "doomed/inner")
+        outside = _tree(tmp_path / "outside", "unrelated.txt")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        real_stat = os.stat
+        swapped = []
+
+        def stat_then_swap(path, *args, **kwargs):
+            st = real_stat(path, *args, **kwargs)
+            if path == "doomed" and not swapped:
+                swapped.append(path)
+                os.rename(workspace / "doomed", tmp_path / "doomed-away")
+                (workspace / "doomed").symlink_to(outside)
+            return st
+
+        def docker(argv, **_kwargs):          # as root in the container
+            for target in argv[argv.index("--") + 1:]:
+                os.unlink(os.path.join(tree.root,
+                                       os.path.relpath(target, "/cleanup")))
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(os, "stat", stat_then_swap)
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            docker)
+        BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert swapped
+        assert _left(outside) == ["unrelated.txt"]
+        assert _left(workspace) == ["c1", "c1/keep.qcow2"]
 
     def _locked(self, tmp_path):
         """A workspace whose ``c1`` the user cannot write: what is directly
@@ -895,40 +1205,41 @@ class TestForceRmtreeExcept:
         workspace = _tree(tmp_path / "workspaces" / "demo",
                           "c1/keep.qcow2", "c1/drop.qcow2", "c1/sub/x",
                           "top.txt")
+        tree = _scanned(workspace, "c1/keep.qcow2")
         (workspace / "c1").chmod(0o555)
-        return workspace
+        return workspace, tree
+
+    @staticmethod
+    def _as_root(workspace, argv):
+        """What ``rm -rf`` of *argv*'s targets does as root: c1's mode is
+        no obstacle."""
+        locked = workspace / "c1"
+        locked.chmod(0o755)
+        for target in argv[argv.index("--") + 1:]:
+            path = os.path.join(os.path.realpath(workspace),
+                                os.path.relpath(target, "/cleanup"))
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            elif os.path.lexists(path):
+                os.unlink(path)
+        locked.chmod(0o555)
 
     @unless_root
     def test_leftovers_go_through_docker_but_a_kept_file_never(
             self, tmp_path, monkeypatch):
-        workspace = self._locked(tmp_path)
+        workspace, tree = self._locked(tmp_path)
         real = os.path.realpath(workspace)
         asked = []
 
         def docker(argv, **_kwargs):
             asked.append(argv)
-            locked = workspace / "c1"
-            locked.chmod(0o755)        # as root in the container
-            for target in argv[argv.index("--") + 1:]:
-                path = os.path.join(real, os.path.relpath(target,
-                                                          "/cleanup"))
-                if os.path.isdir(path):
-                    for sub, dirs, files in os.walk(path, topdown=False):
-                        for name in files:
-                            os.unlink(os.path.join(sub, name))
-                        for name in dirs:
-                            os.rmdir(os.path.join(sub, name))
-                    os.rmdir(path)
-                else:
-                    os.unlink(path)
-            locked.chmod(0o555)
+            self._as_root(workspace, argv)
             return SimpleNamespace(returncode=0)
 
         monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
                             docker)
         try:
-            BoxmanManager._force_rmtree_except(
-                str(workspace), [os.path.join(real, "c1", "keep.qcow2")])
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
         finally:
             (workspace / "c1").chmod(0o755)
 
@@ -942,15 +1253,62 @@ class TestForceRmtreeExcept:
     @unless_root
     def test_raises_when_a_leftover_survives_both_attempts(
             self, tmp_path, monkeypatch):
-        workspace = self._locked(tmp_path)
-        real = os.path.realpath(workspace)
+        workspace, tree = self._locked(tmp_path)
         monkeypatch.setattr(
             "boxman.manager_parts.flows.subprocess.run",
             lambda *a, **k: SimpleNamespace(returncode=0))
         try:
             with pytest.raises(ProvisionError, match="could not remove"):
-                BoxmanManager._force_rmtree_except(
-                    str(workspace), [os.path.join(real, "c1", "keep.qcow2")])
+                BoxmanManager._force_rmtree_except(str(workspace), tree)
         finally:
             (workspace / "c1").chmod(0o755)
+
         assert (workspace / "c1" / "keep.qcow2").exists()
+
+    @unless_root
+    def test_the_tree_is_verified_again_right_before_the_fallback(
+            self, tmp_path, monkeypatch):
+        """Replaced between the direct removal and the fallback: the
+        fallback, which resolves paths by name, is never run over it."""
+        workspace, tree = self._locked(tmp_path)
+        outside = _tree(tmp_path / "outside", "unrelated.txt", "drop.qcow2")
+        sweep = retained_tree._sweep
+        sweeps = []
+
+        def swept(t, remove):
+            sweeps.append(remove)
+            left = sweep(t, remove)
+            if remove:
+                (workspace / "c1").chmod(0o755)
+                os.rename(workspace / "c1", workspace / "moved")
+                (workspace / "c1").symlink_to(outside)
+            return left
+
+        monkeypatch.setattr(retained_tree, "_sweep", swept)
+        try:
+            with pytest.raises(ProvisionError, match="could not open"):
+                BoxmanManager._force_rmtree_except(str(workspace), tree)
+        finally:
+            (workspace / "moved").chmod(0o755)
+
+        assert sweeps == [True, False]
+        assert _left(outside) == ["drop.qcow2", "unrelated.txt"]
+        assert (workspace / "moved" / "keep.qcow2").exists()
+
+    @unless_root
+    def test_the_tree_is_verified_again_after_the_fallback(
+            self, tmp_path, monkeypatch):
+        """The fallback resolves paths by name: a kept file it took with it
+        through a replaced directory is found out once it is done."""
+        workspace, tree = self._locked(tmp_path)
+
+        def docker(argv, **_kwargs):
+            self._as_root(workspace, argv)
+            (workspace / "c1").chmod(0o755)
+            (workspace / "c1" / "keep.qcow2").unlink()
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            docker)
+        with pytest.raises(ProvisionError, match="could not be found again"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)

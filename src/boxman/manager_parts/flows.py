@@ -1,7 +1,6 @@
 """Top-level provision/up/down/deprovision/destroy flows for BoxmanManager."""
 
 
-import contextlib
 import os
 import shlex
 import shutil
@@ -10,6 +9,12 @@ import time
 
 from boxman import log
 from boxman.exceptions import BoxmanError, ConfigError, ProvisionError
+from boxman.utils.retained_tree import (
+    InUse,
+    RetainedTree,
+    remove_except,
+    scan_tree,
+)
 
 
 class FlowsMixin:
@@ -862,98 +867,82 @@ class FlowsMixin:
         log.info(f"removed {real}")
 
     @staticmethod
-    def _force_rmtree_except(path: str, keep) -> None:
+    def _docker_remove(root: str, left: list[str]) -> None:
         """
-        :meth:`_force_rmtree`, sparing the files in *keep* — paths under
-        *path*'s canonical target — and the directories on the way to them:
-        every other entry of those directories goes, a directory with its
-        whole tree.
-
-        Vetted by the same guard (:meth:`_safe_delete_target`), and with the
-        same fallback for what the user cannot delete (root-owned leftovers
-        of the libvirt container): a throwaway ``docker run --rm alpine rm
-        -rf`` of exactly the entries still there, never of a kept file or a
-        directory on the way to one.
-
-        Raises:
-            ProvisionError: If the target is unsafe to delete, a directory
-                on the way to a kept file cannot be listed, or an entry
-                survived both removal attempts.
+        :meth:`_force_rmtree`'s fallback for what the user cannot delete
+        (root-owned leftovers of the libvirt container), aimed at exactly
+        *left* — entries relative to *root*, which the caller verified just
+        before — never at what stays.
         """
-        real = FlowsMixin._safe_delete_target(path)
-        keep = set(keep)
-        on_the_way = {real}
-        for kept in keep:
-            parent = os.path.dirname(kept)
-            while parent.startswith(real + os.sep) and parent not in on_the_way:
-                on_the_way.add(parent)
-                parent = os.path.dirname(parent)
-
-        def doomed() -> list[str]:
-            left = []
-            for directory in sorted(on_the_way):
-                try:
-                    names = os.listdir(directory)
-                except OSError as exc:
-                    raise ProvisionError(
-                        f"could not list {directory} ({exc}), which holds a "
-                        f"file another domain uses; nothing more was "
-                        f"removed from it") from exc
-                left.extend(entry for entry in (
-                    os.path.join(directory, name) for name in sorted(names))
-                    if entry not in keep and entry not in on_the_way)
-            return left
-
-        log.info(f"removing {real}, except {len(keep)} file(s) another "
-                 f"domain uses")
-        for entry in doomed():
-            if os.path.isdir(entry) and not os.path.islink(entry):
-                shutil.rmtree(entry, ignore_errors=True)
-            else:
-                with contextlib.suppress(OSError):
-                    os.unlink(entry)
-        left = doomed()
-        if not left:
-            return
-        log.info(f"{len(left)} entries of {real} are still there (root-owned "
+        log.info(f"{len(left)} entries of {root} are still there (root-owned "
                  f"leftovers), removing them via docker")
         result = subprocess.run(
-            ["docker", "run", "--rm", "-v", f"{real}:/cleanup", "alpine",
+            ["docker", "run", "--rm", "-v", f"{root}:/cleanup", "alpine",
              "rm", "-rf", "--",
-             *(os.path.join("/cleanup", os.path.relpath(entry, real))
-               for entry in left)],
+             *(os.path.join("/cleanup", rel) for rel in left)],
             check=False,
         )
         if result.returncode != 0:
             log.warning(
                 f"docker alpine rm -rf exited with {result.returncode}")
-        left = doomed()
-        if left:
-            raise ProvisionError(
-                f"could not remove {', '.join(left)}: still there after both "
-                f"the direct removal and the containerised fallback")
 
-    def _workspace_files_in_use(
-            self, workspace_path: str) -> tuple[dict[str, str] | None, str]:
+    @staticmethod
+    def _force_rmtree_except(path: str, tree: RetainedTree) -> None:
         """
-        The files in the workspace another domain uses, directly or as a
-        backing file — each mapped to that domain — as the host-wide in-use
-        scan every VM teardown asks (``LibVirtSession.disk_paths_in_use``)
-        finds them: by resolved path, or by identity (``st_dev``,
-        ``st_ino``), so a hard link or a bind-mounted alias counts too, and
-        so does a symlink to such a file. Asked once this project's VMs are
-        gone, so every domain the scan finds is another's.
+        :meth:`_force_rmtree`, sparing what *tree* — the in-use scan of
+        *path* (:meth:`_scan_workspace`) — keeps and the directories on the
+        way to it: every other entry of those directories goes, a directory
+        with its whole tree.
 
-        A project without libvirt clusters has no domains to ask about — its
-        workspace is not even walked, so a directory a container made
-        unreadable in it stops nothing — and a workspace that does not exist
-        holds nothing: both ``{}``.
+        Vetted by the same guard (:meth:`_safe_delete_target`), whose
+        canonical path must be the tree scanned. The removal walks the tree
+        through directory descriptors and checks that every directory on the
+        way, and every kept file, is still what the scan found
+        (:func:`~boxman.utils.retained_tree.remove_except`): a directory
+        renamed away and replaced by a symlink since cannot lead it out of
+        the workspace (#221 review R2). The docker fallback is aimed at
+        exactly the entries still there, relative to the verified root.
+
+        Raises:
+            ProvisionError: If the target is unsafe to delete or is not the
+                tree scanned, a directory on the way or a kept file changed
+                since the scan, or an entry survived both removal attempts.
+        """
+        real = FlowsMixin._safe_delete_target(path)
+        if real != tree.root:
+            raise ProvisionError(
+                f"refusing to remove {real}: the in-use scan read "
+                f"{tree.root}, so nothing was removed from the workspace — "
+                f"check where {path} leads")
+        log.info(f"removing {real}, except {len(tree.kept)} file(s) another "
+                 f"domain uses")
+        remove_except(tree, lambda left: FlowsMixin._docker_remove(real, left))
+
+    def _scan_workspace(
+            self, workspace_path: str) -> tuple[InUse, RetainedTree | None] | None:
+        """
+        Step 2d of ``destroy``: what other domains use — the host-wide in-use
+        scan every VM teardown asks (``LibVirtSession.disk_paths_in_use``),
+        on each libvirt session of the project, once each — and the files in
+        the workspace among it, found by resolved path or identity
+        (``st_dev``, ``st_ino``), so a hard link or a bind-mounted alias
+        counts too, and so does a symlink to such a file. Asked once this
+        project's VMs are gone, so every domain the scan finds is another's.
+
+        The workspace is walked through directory descriptors, and the
+        identity of every directory on the way to a kept file, and of each
+        kept file, is recorded for the removal to check
+        (:func:`~boxman.utils.retained_tree.scan_tree`).
 
         Returns:
-            ``(files, "")`` — paths under the workspace's canonical path —
-            or ``(None, why)`` when they cannot be told: the scan fails, or
-            an entry of the workspace cannot be listed or its identity read
-            (it could be any file).
+            ``(in_use, tree)`` — *tree* ``None`` when there is no workspace
+            to walk — or ``None`` when the project has no libvirt clusters:
+            no domains to ask about, and its workspace is not walked.
+
+        Raises:
+            ProvisionError: If that cannot be told: the scan fails, or a
+                directory of the workspace cannot be listed or an entry's
+                identity read (it could be any file).
         """
         # the libvirt session of every libvirt cluster, each scanned once
         sessions = {}
@@ -961,70 +950,41 @@ class FlowsMixin:
             if self.provider_type_for_cluster(name) == 'libvirt':
                 session = self.session_for_cluster(name)
                 sessions[id(session)] = session
-        real = os.path.realpath(workspace_path)
-        if not sessions or not os.path.isdir(real):
-            return {}, ""
-        by_path: dict[str, str] = {}
-        by_identity: dict[tuple[int, int], str] = {}
+        if not sessions:
+            return None
+        in_use = InUse()
         for session in sessions.values():
             found = session.disk_paths_in_use()
             if found is None:
-                return None, (
+                raise ProvisionError(
                     "could not tell which files in the workspace other "
                     "domains use (the in-use scan failed; see the warnings "
                     "above), so none of it was removed")
-            for path, domain in found.items():
-                by_path.setdefault(path, domain)
-            for identity, domain in getattr(found, "identities", {}).items():
-                by_identity.setdefault(identity, domain)
-        used: dict[str, str] = {}
-        unlisted: list[OSError] = []
-        # symlinks to directories are not followed (a domain uses files, not
-        # directories); every other entry is compared
-        for directory, _dirs, files in os.walk(real, onerror=unlisted.append):
-            for name in files:
-                path = os.path.join(directory, name)
-                domain = by_path.get(os.path.realpath(path))
-                if domain is None:
-                    try:
-                        st = os.stat(path)
-                    except FileNotFoundError:
-                        continue      # gone, or a symlink to nothing
-                    except OSError as exc:
-                        return None, (
-                            f"could not read the identity of {path} ({exc}) "
-                            f"to tell whether another domain uses it, so "
-                            f"none of the workspace was removed — make it "
-                            f"accessible")
-                    domain = by_identity.get((st.st_dev, st.st_ino))
-                if domain:
-                    used[path] = domain
-        if unlisted:
-            exc = unlisted[0]
-            return None, (
-                f"could not list {exc.filename} ({exc.strerror}) to tell "
-                f"whether another domain uses a file in it, so none of the "
-                f"workspace was removed — make it readable")
-        return used, ""
+            in_use.add(found)
+        real = os.path.realpath(workspace_path)
+        if not os.path.isdir(real):
+            return in_use, None
+        return in_use, scan_tree(real, in_use.why_kept)
 
     def _remove_workspace(self, workspace_path: str,
-                          in_use: dict[str, str]) -> None:
+                          scan: tuple[InUse, RetainedTree | None] | None,
+                          ) -> None:
         """
-        Remove the workspace (:meth:`_force_rmtree`), except the files in
-        *in_use* — ``{path: domain}`` from :meth:`_workspace_files_in_use` —
-        which stay with the directories on the way to them
-        (:meth:`_force_rmtree_except`), each named with the domain that uses
-        it. Keeping them does not fail ``destroy``.
+        Remove the workspace (:meth:`_force_rmtree`), except the files the
+        in-use scan (:meth:`_scan_workspace`) keeps, which stay with the
+        directories on the way to them (:meth:`_force_rmtree_except`), each
+        named with the domain that uses it. Keeping them does not fail
+        ``destroy``.
         """
-        if not in_use:
+        tree = scan[1] if scan else None
+        if tree is None or not tree.kept:
             self._force_rmtree(workspace_path)
             return
-        self._force_rmtree_except(workspace_path, in_use)
-        for path, domain in sorted(in_use.items()):
+        self._force_rmtree_except(workspace_path, tree)
+        for rel, why in sorted(tree.kept.items()):
             self.logger.warning(
-                f"left {path} in place: domain {domain} uses it, directly or "
-                f"as a backing file; the directories on the way to it stay "
-                f"too")
+                f"left {tree.path(rel)} in place: {why}; the directories on "
+                f"the way to it stay too")
 
     def destroy(self, cli_args):
         """
@@ -1260,12 +1220,13 @@ class FlowsMixin:
         #     project's VMs are gone, so every domain found is another's. What
         #     cannot be told keeps the whole workspace, like a failed teardown
         #     (#221).
-        in_use: dict[str, str] = {}
+        scan = None
         if teardown_ok and workspace_path:
-            in_use, reason = self._workspace_files_in_use(workspace_path)
-            if in_use is None:
+            try:
+                scan = self._scan_workspace(workspace_path)
+            except ProvisionError as exc:
                 teardown_ok = False
-                problems.append(reason)
+                problems.append(str(exc))
 
         if not teardown_ok:
             summary = " | ".join(problems)
@@ -1302,7 +1263,7 @@ class FlowsMixin:
         # 5. nuke the workspace workdir, all but the files another domain
         #    uses (2d)
         if workspace_path:
-            self._remove_workspace(workspace_path, in_use)
+            self._remove_workspace(workspace_path, scan)
 
         # 6. nuke template workdirs (only when --templates was passed)
         for tpl_dir in template_dirs:

@@ -899,8 +899,10 @@ Details worth knowing:
   `destroy` still exits 0. If it cannot tell which files those are — the
   check fails, or a directory in the workspace cannot be read — it exits 2
   and keeps the workspace, the generated files, the runtime and the cache
-  entry, like an incomplete teardown. Template workdirs (`--templates`)
-  are removed without this check.
+  entry, like an incomplete teardown. The removal never follows a symlink,
+  and stops, exiting 2 with the cache entry kept, at a directory on the way
+  to a kept file, or a kept file, that is no longer the one the check
+  found. Template workdirs (`--templates`) are removed without this check.
 - **`destroy` validates its delete targets up front**, before any teardown
   starts. It refuses a path that is empty, relative, a symlink, your home
   directory, a filesystem root or mount point, a top-level path, or a
