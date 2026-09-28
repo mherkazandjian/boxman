@@ -15,12 +15,20 @@ or turn the kept file into something to delete (#221 review R2). Every
 other entry is removed relative to its parent's descriptor, a directory
 through descriptors all the way down, never following a symlink; Python
 3.10 has no ``shutil.rmtree(dir_fd=...)``, so that walk is done here.
+
+Neither the scan nor the removal crosses a mount point: every directory
+either opens must be on the root's mount, told by its mount id — a bind
+mount of a directory of the same filesystem shares its device and inode —
+or the command stops, with nothing on the far side touched; and the
+leftovers handed to the privileged fallback, whose ``rm -rf`` would cross
+one too, must have no mount point at or under them (#221 review R2b).
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import re
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -33,10 +41,102 @@ Identity = tuple[int, int]
 #: how every directory is opened: for listing, and never through a symlink
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
+#: where the kernel says which mount an open file is on (``mnt_id``)
+_FDINFO = "/proc/self/fdinfo/{fd}"
+#: every mount of this process's mount namespace
+_MOUNTINFO = "/proc/self/mountinfo"
+
 
 def identity(st: os.stat_result) -> Identity:
     """The identity of the file *st* describes."""
     return (st.st_dev, st.st_ino)
+
+
+def _mount_id(fd: int, shown: str) -> int:
+    """
+    The id of the mount the open directory *fd* (*shown*) is on: ``mnt_id``
+    in ``/proc/self/fdinfo``. A bind mount of a directory of the same
+    filesystem shares its device and its inode with it, but not its mount
+    id, so this, not ``st_dev``, tells a mount point.
+
+    Raises:
+        ProvisionError: If it cannot be read: whether *shown* is a mount
+            point cannot be told.
+    """
+    fdinfo = _FDINFO.format(fd=fd)
+    try:
+        with open(fdinfo) as fh:
+            for line in fh:
+                key, _, value = line.partition(":")
+                if key == "mnt_id":
+                    return int(value)
+    except (OSError, ValueError) as exc:
+        raise ProvisionError(
+            f"could not tell whether {shown} is a mount point ({exc}), so "
+            f"nothing more was removed from the workspace") from exc
+    raise ProvisionError(
+        f"could not tell whether {shown} is a mount point ({fdinfo} names no "
+        f"mnt_id), so nothing more was removed from the workspace")
+
+
+def _same_mount(root_mnt: int, fd: int, shown: str) -> None:
+    """The open directory *fd* (*shown*) must be on the root's mount."""
+    if _mount_id(fd, shown) != root_mnt:
+        raise ProvisionError(
+            f"{shown} is a mount point — a filesystem, or a bind mount, is "
+            f"mounted there — and the workspace's removal never crosses one, "
+            f"so nothing more was removed from the workspace: unmount it "
+            f"first, then retry")
+
+
+def _mount_points() -> list[str]:
+    """
+    Every mount point of this process's mount namespace, from
+    ``/proc/self/mountinfo``, its octal escapes (``\\040`` for a blank, and
+    so on) decoded.
+
+    Raises:
+        ProvisionError: If it cannot be read, or a line of it has no mount
+            point field.
+    """
+    try:
+        with open(_MOUNTINFO, "rb") as fh:
+            lines = fh.read().splitlines()
+    except OSError as exc:
+        raise ProvisionError(
+            f"could not read {_MOUNTINFO} ({exc.strerror}) to tell whether "
+            f"a filesystem is mounted in what is left of the workspace, so "
+            f"the containerised fallback was not run") from exc
+    points = []
+    for line in lines:
+        fields = line.split(b" ")
+        if len(fields) < 5:
+            raise ProvisionError(
+                f"could not read {_MOUNTINFO} (a line of it names no mount "
+                f"point) to tell whether a filesystem is mounted in what is "
+                f"left of the workspace, so the containerised fallback was "
+                f"not run")
+        points.append(os.fsdecode(re.sub(
+            rb"\\([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]),
+            fields[4])))
+    return points
+
+
+def _refuse_mounts(tree: RetainedTree, left: list[str]) -> None:
+    """None of *left* — what the privileged fallback is about to ``rm -rf``
+    — may be, or hold, a mount point: the container's bind mount of the
+    root carries the mounts under it, and ``rm -rf`` crosses them."""
+    points = _mount_points()
+    for rel in left:
+        path = tree.path(rel)
+        for point in points:
+            if point == path or point.startswith(path + os.sep):
+                shown = path if point == path else f"{point}, inside {path}"
+                raise ProvisionError(
+                    f"a filesystem is mounted at {shown}, which the "
+                    f"containerised fallback would have to remove: it never "
+                    f"crosses a mount point, so nothing more was removed "
+                    f"from the workspace — unmount it first, then retry")
 
 
 class InUse:
@@ -84,6 +184,8 @@ class RetainedTree:
     root: str
     #: its identity
     root_id: Identity
+    #: the id of the mount it is on (:func:`_mount_id`)
+    root_mnt: int
     #: each entry that stays, relative to :attr:`root` -> why
     kept: dict[str, str] = field(default_factory=dict)
     #: each of those entries -> its identity (a final symlink not followed)
@@ -137,7 +239,8 @@ def scan_tree(root: str,
     """
     fd = _open_dir(root, None, root)
     try:
-        tree = RetainedTree(root, identity(os.fstat(fd)))
+        tree = RetainedTree(root, identity(os.fstat(fd)),
+                            _mount_id(fd, root))
         walked: dict[str, Identity] = {}
         _scan(tree, fd, "", why_kept, walked)
     finally:
@@ -183,6 +286,7 @@ def _scan(tree: RetainedTree, fd: int, rel: str,
         if stat.S_ISDIR(st.st_mode):
             sub = _open_dir(name, fd, tree.path(child))
             try:
+                _same_mount(tree.root_mnt, sub, tree.path(child))
                 walked[child] = identity(os.fstat(sub))
                 _scan(tree, sub, child, why_kept, walked)
             finally:
@@ -225,6 +329,7 @@ def remove_except(tree: RetainedTree,
     # kept (#221 review R2a)
     left = _sweep(tree, remove=False)
     if left:
+        _refuse_mounts(tree, left)
         fallback(left)
         left = _sweep(tree, remove=False)
     if left:
@@ -239,9 +344,10 @@ def _depth(rel: str) -> int:
 
 
 def _open_verified(name: str, dir_fd: int | None, expected: Identity,
-                   shown: str) -> int:
+                   shown: str, root_mnt: int) -> int:
     """Open the directory *name* relative to *dir_fd*, never through a
-    symlink, and check that it is still the one with identity *expected*."""
+    symlink, and check that it is still the one with identity *expected*,
+    on the root's mount."""
     try:
         fd = os.open(name, _DIR_FLAGS, dir_fd=dir_fd)
     except OSError as exc:
@@ -249,11 +355,15 @@ def _open_verified(name: str, dir_fd: int | None, expected: Identity,
             f"could not open {shown} again after the in-use scan "
             f"({exc.strerror}; a symlink is never followed), so nothing more "
             f"was removed from the workspace — check it") from exc
-    if identity(os.fstat(fd)) != expected:
+    try:
+        if identity(os.fstat(fd)) != expected:
+            raise ProvisionError(
+                f"{shown} was replaced after the in-use scan, so nothing more "
+                f"was removed from the workspace — check what replaced it")
+        _same_mount(root_mnt, fd, shown)
+    except ProvisionError:
         os.close(fd)
-        raise ProvisionError(
-            f"{shown} was replaced after the in-use scan, so nothing more was "
-            f"removed from the workspace — check what replaced it")
+        raise
     return fd
 
 
@@ -327,11 +437,13 @@ def _sweep(tree: RetainedTree, remove: bool) -> list[str]:
     protected = frozenset({tree.root_id, *tree.dirs.values(),
                            *tree.kept_ids.values()})
     try:
-        fds[""] = _open_verified(tree.root, None, tree.root_id, tree.root)
+        fds[""] = _open_verified(tree.root, None, tree.root_id, tree.root,
+                                 tree.root_mnt)
         for rel in sorted(tree.dirs, key=_depth):
             fds[rel] = _open_verified(os.path.basename(rel),
                                       fds[os.path.dirname(rel)],
-                                      tree.dirs[rel], tree.path(rel))
+                                      tree.dirs[rel], tree.path(rel),
+                                      tree.root_mnt)
         for rel, expected in tree.kept_ids.items():
             _check_kept(fds[os.path.dirname(rel)], os.path.basename(rel),
                         expected, tree.path(rel))
@@ -341,7 +453,8 @@ def _sweep(tree: RetainedTree, remove: bool) -> list[str]:
             names = _doomed(tree, fd, rel)
             if remove and names:
                 for name in names:
-                    _remove(protected, fd, name)
+                    _remove(tree, protected, fd, name,
+                            tree.path(os.path.join(rel, name)))
                 names = _doomed(tree, fd, rel)
             left.extend(os.path.join(rel, name) if rel else name
                         for name in names)
@@ -351,13 +464,13 @@ def _sweep(tree: RetainedTree, remove: bool) -> list[str]:
     return left
 
 
-def _remove(protected: frozenset[Identity], parent_fd: int,
-            name: str) -> None:
+def _remove(tree: RetainedTree, protected: frozenset[Identity],
+            parent_fd: int, name: str, shown: str) -> None:
     """
-    Remove the entry *name* of the directory *parent_fd*: anything but a
-    directory is unlinked; a directory is opened relative to its parent,
-    never through a symlink, emptied the same way and removed. Failures are
-    not raised — what is left is listed again by the caller.
+    Remove the entry *name* (*shown*) of the directory *parent_fd*: anything
+    but a directory is unlinked; a directory is opened relative to its
+    parent, never through a symlink, emptied the same way and removed.
+    Failures are not raised — what is left is listed again by the caller.
 
     An entry whose identity is in *protected* — the root, a directory on the
     way to a kept entry, a kept entry — is neither removed nor entered,
@@ -365,6 +478,10 @@ def _remove(protected: frozenset[Identity], parent_fd: int,
     opened, the one just looked up: renamed in between, it could be any of
     those (#221 review R2a). Left there, it fails the verification that
     follows.
+
+    Raises:
+        ProvisionError: If a directory it opens is on another mount than the
+            root (:func:`_same_mount`): it is never entered.
     """
     try:
         st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -383,8 +500,9 @@ def _remove(protected: frozenset[Identity], parent_fd: int,
     try:
         if identity(os.fstat(fd)) != identity(st):
             return
+        _same_mount(tree.root_mnt, fd, shown)
         for sub in os.listdir(fd):
-            _remove(protected, fd, sub)
+            _remove(tree, protected, fd, sub, os.path.join(shown, sub))
     except OSError:
         pass
     finally:

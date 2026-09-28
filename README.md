@@ -905,7 +905,10 @@ Details worth knowing:
   cache entry, like an incomplete teardown. The removal never follows a symlink,
   and stops, exiting 2 with the cache entry kept, at a directory on the way
   to a kept file, or a kept file, that is no longer the one the check
-  found. Template workdirs (`--templates`) are removed without this check.
+  found. It never crosses a mount point either: a filesystem or bind mount
+  anywhere under the workspace of a libvirt project makes `destroy` exit 2
+  before anything is removed — unmount it first. Template workdirs
+  (`--templates`) are removed without this check.
 - **`destroy` validates its delete targets up front**, before any teardown
   starts. It refuses a path that is empty, relative, a symlink, your home
   directory, a filesystem root or mount point, a top-level path, or a

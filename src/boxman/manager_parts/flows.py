@@ -950,6 +950,18 @@ class FlowsMixin:
         log.info(f"removing {real}, except {len(tree.kept)} file(s) another "
                  f"domain uses")
         remove_except(tree, lambda left: FlowsMixin._docker_remove(real, left))
+        if tree.kept:
+            return
+        # nothing kept: the emptied root goes too, as _force_rmtree's would
+        try:
+            os.rmdir(real)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ProvisionError(
+                f"could not remove {real} once it was empty "
+                f"({exc.strerror})") from exc
+        log.info(f"removed {real}")
 
     def _scan_workspace(
             self, workspace_path: str) -> tuple[InUse, RetainedTree | None] | None:
@@ -1007,14 +1019,17 @@ class FlowsMixin:
                           scan: tuple[InUse, RetainedTree | None] | None,
                           ) -> None:
         """
-        Remove the workspace (:meth:`_force_rmtree`), except the files the
-        in-use scan (:meth:`_scan_workspace`) keeps, which stay with the
-        directories on the way to them (:meth:`_force_rmtree_except`), each
-        named with the domain that uses it. Keeping them does not fail
-        ``destroy``.
+        Remove the workspace, except the files the in-use scan
+        (:meth:`_scan_workspace`) keeps, which stay with the directories on
+        the way to them, each named with the domain that uses it; keeping
+        them does not fail ``destroy``. Whatever it keeps, a scanned
+        workspace goes through the same removal (:meth:`_force_rmtree_except`),
+        which never crosses a mount point (#221 review R2b); one that was not
+        scanned — a project without libvirt clusters, or no workspace — goes
+        through :meth:`_force_rmtree`, as before.
         """
         tree = scan[1] if scan else None
-        if tree is None or not tree.kept:
+        if tree is None:
             self._force_rmtree(workspace_path)
             return
         self._force_rmtree_except(workspace_path, tree)

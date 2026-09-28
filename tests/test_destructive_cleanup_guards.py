@@ -18,8 +18,11 @@ has to read as "stop", never as "nothing there".
 """
 
 import contextlib
+import json
 import os
 import shutil
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
@@ -381,6 +384,9 @@ class TestDestroyTeardownGate:
         mgr.deprovision_files = MagicMock()
         mgr.unregister_from_cache = MagicMock()
         mgr._force_rmtree = MagicMock()
+        # step 5, the workspace's removal: with a libvirt project it goes
+        # through the in-use scan's removal, not _force_rmtree (#221)
+        mgr._remove_workspace = MagicMock()
         mgr._confirm_project_torn_down = MagicMock(return_value=(True, ''))
         return mgr, workspace
 
@@ -389,18 +395,18 @@ class TestDestroyTeardownGate:
         mgr, workspace = self._manager(tmp_path)
         order = MagicMock()
         order.attach_mock(mgr.deprovision_files, "deprovision_files")
-        order.attach_mock(mgr._force_rmtree, "force_rmtree")
+        order.attach_mock(mgr._remove_workspace, "remove_workspace")
         order.attach_mock(mgr.unregister_from_cache, "unregister")
 
         mgr.destroy(ARGS)
 
-        mgr._force_rmtree.assert_any_call(str(workspace))
+        assert mgr._remove_workspace.call_args.args[0] == str(workspace)
         mgr.deprovision_files.assert_called_once()
         mgr.unregister_from_cache.assert_called_once()
         # Order matters: unregistering last is what keeps a failed deletion
         # recoverable, so assert it rather than just the call counts.
         assert [c[0] for c in order.mock_calls] == [
-            "deprovision_files", "force_rmtree", "unregister"]
+            "deprovision_files", "remove_workspace", "unregister"]
 
     def test_stale_teardown_locators_go_once_the_workspace_has(
             self, tmp_path):
@@ -409,14 +415,14 @@ class TestDestroyTeardownGate:
         mgr, workspace = self._manager(tmp_path)
         mgr._retire_stale_teardown_locators = MagicMock()
         order = MagicMock()
-        order.attach_mock(mgr._force_rmtree, "force_rmtree")
+        order.attach_mock(mgr._remove_workspace, "remove_workspace")
         order.attach_mock(mgr._retire_stale_teardown_locators, "retire")
         order.attach_mock(mgr.unregister_from_cache, "unregister")
 
         mgr.destroy(ARGS)
 
         assert [c[0] for c in order.mock_calls] == [
-            "force_rmtree", "retire", "unregister"]
+            "remove_workspace", "retire", "unregister"]
 
     def test_a_failed_deprovision_preserves_everything(self, tmp_path):
         mgr, _workspace = self._manager(tmp_path)
@@ -428,6 +434,7 @@ class TestDestroyTeardownGate:
             mgr.destroy(ARGS)
 
         mgr._force_rmtree.assert_not_called()
+        mgr._remove_workspace.assert_not_called()
         mgr.deprovision_files.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
         mgr._retire_stale_teardown_locators.assert_not_called()
@@ -442,6 +449,7 @@ class TestDestroyTeardownGate:
             mgr.destroy(ARGS)
 
         mgr._force_rmtree.assert_not_called()
+        mgr._remove_workspace.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
 
     def test_an_unanswerable_survivor_query_preserves_everything(self,
@@ -455,6 +463,7 @@ class TestDestroyTeardownGate:
             mgr.destroy(ARGS)
 
         mgr._force_rmtree.assert_not_called()
+        mgr._remove_workspace.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
 
     def test_survivors_preserve_everything(self, tmp_path):
@@ -466,6 +475,7 @@ class TestDestroyTeardownGate:
             mgr.destroy(ARGS)
 
         mgr._force_rmtree.assert_not_called()
+        mgr._remove_workspace.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
 
     def test_a_failed_workspace_removal_keeps_the_project_registered(
@@ -473,7 +483,7 @@ class TestDestroyTeardownGate:
         """Unregistering last is what makes a failed deletion recoverable:
         the leftovers stay visible to ``boxman list``."""
         mgr, workspace = self._manager(tmp_path)
-        mgr._force_rmtree.side_effect = ProvisionError(
+        mgr._remove_workspace.side_effect = ProvisionError(
             f"could not remove {workspace}")
 
         with pytest.raises(ProvisionError, match="could not remove"):
@@ -491,6 +501,7 @@ class TestDestroyTeardownGate:
             mgr.destroy(ARGS)
 
         mgr._force_rmtree.assert_not_called()
+        mgr._remove_workspace.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
 
     def test_template_dirs_are_preserved_when_teardown_failed(self, tmp_path):
@@ -507,6 +518,7 @@ class TestDestroyTeardownGate:
             mgr.destroy(SimpleNamespace(auto_accept=True, templates=True))
 
         mgr._force_rmtree.assert_not_called()
+        mgr._remove_workspace.assert_not_called()
         assert templates.is_dir()
 
     def test_a_failed_runtime_teardown_preserves_everything(self, tmp_path):
@@ -534,6 +546,7 @@ class TestDestroyTeardownGate:
 
         mgr.deprovision_files.assert_not_called()
         mgr._force_rmtree.assert_not_called()
+        mgr._remove_workspace.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
 
     def test_an_unavailable_runtime_preserves_everything(self, tmp_path):
@@ -548,6 +561,7 @@ class TestDestroyTeardownGate:
 
         mgr.deprovision.assert_not_called()
         mgr._force_rmtree.assert_not_called()
+        mgr._remove_workspace.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
 
 
@@ -606,6 +620,25 @@ def _left(root):
 def _identity(path):
     st = os.stat(path)
     return (st.st_dev, st.st_ino)
+
+
+def _identity_of_fd(fd):
+    st = os.fstat(fd)
+    return (st.st_dev, st.st_ino)
+
+
+def _fake_mounts(monkeypatch, *paths):
+    """Report each of *paths*, a directory, as a mount point: its mount id
+    is off by a million; everything else keeps its real one (#221 review
+    R2b)."""
+    mounted = {_identity(path) for path in paths}
+    real = retained_tree._mount_id
+
+    def mount_id(fd, shown):
+        return real(fd, shown) + (10**6 if _identity_of_fd(fd) in mounted
+                                  else 0)
+
+    monkeypatch.setattr(retained_tree, "_mount_id", mount_id)
 
 
 class TestDestroySparesFilesInUse:
@@ -742,6 +775,38 @@ class TestDestroySparesFilesInUse:
             (workspace / "cluster_1").symlink_to(outside)
         mgr.deprovision_files.side_effect = replace
         return outside
+
+    def test_a_mount_point_in_the_workspace_stops_destroy(self, tmp_path,
+                                                          monkeypatch):
+        """#221 review R2b: a filesystem or bind mount under the workspace is
+        never walked into: destroy stops before removing anything, and says
+        to unmount it."""
+        mgr, workspace = self._manager(tmp_path)
+        before = _left(workspace)
+        _fake_mounts(monkeypatch, workspace / "cluster_1" / "nocloud")
+
+        with pytest.raises(ProvisionError, match="unmount it first"):
+            mgr.destroy(ARGS)
+
+        assert _left(workspace) == before
+        mgr.deprovision_files.assert_not_called()
+        mgr.unregister_from_cache.assert_not_called()
+
+    def test_with_nothing_in_use_a_mount_point_is_still_not_crossed(
+            self, tmp_path, monkeypatch):
+        """A mount that appears after the scan: the workspace goes through
+        the same removal, which never enters it, whether or not anything is
+        kept."""
+        mgr, workspace = self._manager(tmp_path)
+        nocloud = workspace / "cluster_1" / "nocloud"
+        mgr.deprovision_files.side_effect = (
+            lambda *_: _fake_mounts(monkeypatch, nocloud))
+
+        with pytest.raises(ProvisionError, match="is a mount point"):
+            mgr.destroy(ARGS)
+
+        assert (nocloud / "user-data").exists()
+        mgr.unregister_from_cache.assert_not_called()
 
     def test_a_directory_renamed_between_lookup_and_open_is_not_entered(
             self, tmp_path, monkeypatch):
@@ -1241,6 +1306,30 @@ class TestForceRmtreeExcept:
 
         assert _left(workspace) == ["c1", "c1/sub", "c1/sub/keep.qcow2"]
 
+    def test_with_nothing_kept_the_root_goes_too_or_it_is_an_error(
+            self, tmp_path, monkeypatch):
+        """Nothing kept: the emptied root is removed as well; if it cannot
+        be, the removal did not complete (#221 review R2b routes a
+        workspace with nothing kept through this removal)."""
+        workspace = _tree(tmp_path / "ws", "c1/x", "top.txt")
+        tree = _scanned(workspace)
+        rmdir = os.rmdir
+
+        def busy(path, *args, **kwargs):
+            if path == os.path.realpath(workspace):
+                raise OSError(16, "Device or resource busy")
+            return rmdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "rmdir", busy)
+        with pytest.raises(ProvisionError, match="once it was empty"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+        monkeypatch.undo()
+        assert _left(workspace) == []
+
+        BoxmanManager._force_rmtree_except(str(workspace),
+                                           _scanned(workspace))
+        assert not workspace.exists()
+
     def test_a_rejected_path_reaches_nothing_under_it(self, tmp_path):
         workspace = _tree(tmp_path / "real_ws", "c1/keep.qcow2",
                           "c1/drop.qcow2", "top.txt")
@@ -1552,6 +1641,121 @@ class TestForceRmtreeExcept:
         with pytest.raises(ProvisionError, match="could not be found again"):
             BoxmanManager._force_rmtree_except(str(workspace), tree)
 
+    # -- #221 review R2b: never cross a mount point --------------------------
+
+    def test_a_directory_mounted_after_the_scan_is_not_entered(
+            self, tmp_path, monkeypatch):
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "aa/x", "top.txt")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        _fake_mounts(monkeypatch, workspace / "aa")
+
+        with pytest.raises(ProvisionError, match="is a mount point"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert (workspace / "aa" / "x").exists()
+
+    @pytest.mark.parametrize("where", ["c1", "the root"])
+    def test_a_retained_directory_mounted_over_stops_it(
+            self, tmp_path, monkeypatch, where):
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2", "top.txt")
+        tree = _scanned(workspace, "c1/keep.qcow2")
+        _fake_mounts(monkeypatch,
+                     workspace / "c1" if where == "c1" else workspace)
+
+        with pytest.raises(ProvisionError, match="is a mount point"):
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+
+        assert (workspace / "top.txt").exists()
+
+    def test_a_mount_id_that_cannot_be_read_stops_the_scan(
+            self, tmp_path, monkeypatch):
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2")
+        monkeypatch.setattr(retained_tree, "_FDINFO",
+                            str(tmp_path / "no-such-dir" / "{fd}"))
+
+        with pytest.raises(ProvisionError, match="is a mount point"):
+            _scanned(workspace, "c1/keep.qcow2")
+
+    def test_fdinfo_that_names_no_mount_id_stops_the_scan(self, tmp_path,
+                                                          monkeypatch):
+        workspace = _tree(tmp_path / "ws", "c1/keep.qcow2")
+        (tmp_path / "fdinfo").write_text("pos:\t0\nflags:\t02004000\n")
+        monkeypatch.setattr(retained_tree, "_FDINFO",
+                            str(tmp_path / "fdinfo"))
+
+        with pytest.raises(ProvisionError, match="names no mnt_id"):
+            _scanned(workspace, "c1/keep.qcow2")
+
+    def test_mountinfo_is_read_with_its_escapes(self, tmp_path, monkeypatch):
+        (tmp_path / "mountinfo").write_bytes(
+            b"22 1 0:21 / / rw - ext4 /dev/vda1 rw\n"
+            b"36 22 0:21 /src /ws/a\\040b\\134c rw,relatime - ext4 /dev/vda1 "
+            b"rw\n")
+        monkeypatch.setattr(retained_tree, "_MOUNTINFO",
+                            str(tmp_path / "mountinfo"))
+
+        assert retained_tree._mount_points() == ["/", "/ws/a b\\c"]
+
+    @pytest.mark.parametrize("mountinfo", ["unreadable", "malformed"])
+    def test_mountinfo_that_cannot_be_read_stops_the_fallback(
+            self, tmp_path, monkeypatch, mountinfo):
+        workspace, tree = self._locked(tmp_path)
+        if mountinfo == "malformed":
+            (tmp_path / "mountinfo").write_text("36 22 0:21\n")
+        monkeypatch.setattr(retained_tree, "_MOUNTINFO",
+                            str(tmp_path / "mountinfo"))
+        try:
+            with pytest.raises(ProvisionError, match="mountinfo"):
+                BoxmanManager._force_rmtree_except(str(workspace), tree)
+        finally:
+            (workspace / "c1").chmod(0o755)
+
+    @unless_root
+    @pytest.mark.parametrize("at", ["c1/sub/m", "c1/drop.qcow2"])
+    def test_the_fallback_never_runs_over_a_mount_point(self, tmp_path,
+                                                        monkeypatch, at):
+        """The container's ``rm -rf`` would cross it: the leftovers are
+        checked against every mount point of this namespace first, and the
+        refusal names the mount point and, when it is inside one, the
+        leftover it is in."""
+        workspace, tree = self._locked(tmp_path)
+        real = os.path.realpath(workspace)
+        monkeypatch.setattr(retained_tree, "_mount_points", lambda: [
+            "/", os.path.join(real, at)])
+        try:
+            with pytest.raises(ProvisionError) as raised:
+                BoxmanManager._force_rmtree_except(str(workspace), tree)
+        finally:
+            (workspace / "c1").chmod(0o755)
+
+        shown = {"c1/sub/m": f"{real}/c1/sub/m, inside {real}/c1/sub",
+                 "c1/drop.qcow2": f"{real}/c1/drop.qcow2"}[at]
+        assert (f"a filesystem is mounted at {shown}, which the "
+                f"containerised fallback would have to remove"
+                in str(raised.value))
+
+    @unless_root
+    def test_a_mount_point_beside_a_leftover_does_not_stop_the_fallback(
+            self, tmp_path, monkeypatch):
+        workspace, tree = self._locked(tmp_path)
+        real = os.path.realpath(workspace)
+        monkeypatch.setattr(retained_tree, "_mount_points", lambda: [
+            "/", os.path.join(real, "c1", "sub-other"),
+            os.path.join(real, "c1", "drop.qcow2.d")])
+
+        def docker(argv, **_kwargs):
+            self._as_root(workspace, argv)
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            docker)
+        try:
+            BoxmanManager._force_rmtree_except(str(workspace), tree)
+        finally:
+            (workspace / "c1").chmod(0o755)
+
+        assert _left(workspace) == ["c1", "c1/keep.qcow2"]
+
     # -- #221 review R2a: what is kept, under any name, all through ----------
 
     @staticmethod
@@ -1653,3 +1857,121 @@ class TestForceRmtreeExcept:
         monkeypatch.undo()
 
         assert (tmp_path / "c1-elsewhere" / "keep.qcow2").exists()
+
+
+# --------------------------------------------------------------------------
+# #221 review R2b, for real: bind mounts in a user and mount namespace
+# --------------------------------------------------------------------------
+
+#: what runs in the namespace: builds ``<base>/ws`` keeping c1/keep.qcow2,
+#: bind-mounts per *case*, runs the scan and the removal, prints the outcome
+_IN_NAMESPACE = r'''
+import json, os, subprocess, sys
+from boxman.exceptions import ProvisionError
+from boxman.utils import retained_tree
+
+case, base = sys.argv[1], os.path.realpath(sys.argv[2])
+ws = os.path.join(base, "ws")
+keep = os.path.join(ws, "c1", "keep.qcow2")
+outside = os.path.join(base, "outside", "unrelated.txt")
+for path in (keep, outside, os.path.join(ws, "doomed", "f.txt")):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("data")
+os.makedirs(os.path.join(ws, "aa-mounted"))
+source, target = {
+    "outside": (os.path.dirname(outside), "aa-mounted"),
+    "retained": (os.path.join(ws, "c1"), "aa-mounted"),
+    "at-scan": (os.path.dirname(outside), "aa-mounted"),
+    "a file": (outside, os.path.join("doomed", "f.txt")),
+}[case]
+target = os.path.join(ws, target)
+fallback, result = [], {}
+try:
+    if case != "at-scan":
+        tree = retained_tree.scan_tree(
+            ws, lambda path, _: "in use" if path == keep else None)
+    subprocess.run(["mount", "--bind", source, target], check=True)
+    try:
+        if case == "at-scan":
+            retained_tree.scan_tree(ws, lambda path, _: None)
+        else:
+            retained_tree.remove_except(tree, fallback.append)
+        result["raised"] = None
+    except ProvisionError as exc:
+        result["raised"] = str(exc)
+    finally:
+        subprocess.run(["umount", target], check=True)
+finally:
+    result["unrelated"] = os.path.exists(outside)
+    result["keep"] = os.path.exists(keep)
+    result["fallback"] = fallback
+    print(json.dumps(result))
+'''
+
+
+@pytest.fixture(scope="module")
+def _user_namespaces(tmp_path_factory):
+    """Skip unless this user can bind-mount in a user and mount namespace
+    (Ubuntu 24.04 forbids unprivileged user namespaces by default)."""
+    probe = tmp_path_factory.mktemp("userns")
+    (probe / "a").mkdir()
+    (probe / "b").mkdir()
+    try:
+        done = subprocess.run(
+            ["unshare", "--user", "--map-root-user", "--mount",
+             "--propagation", "private", "mount", "--bind",
+             str(probe / "a"), str(probe / "b")],
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        pytest.skip(f"no user namespaces here: {exc}")
+    if done.returncode != 0:
+        pytest.skip(f"no user namespaces here: {done.stderr.strip()}")
+
+
+class TestMountPointsForReal:
+    """Codex's two reproductions (#221 review R2b), with real bind mounts:
+    after the scan, another directory -- one outside the workspace, or the
+    retained ``c1`` itself -- is bind-mounted on a doomed one. The removal
+    emptied it. Now it stops at the mount point, and nothing on the far side
+    of it is touched."""
+
+    @staticmethod
+    def _run(tmp_path, case):
+        src = os.path.dirname(os.path.dirname(retained_tree.__file__))
+        done = subprocess.run(
+            ["unshare", "--user", "--map-root-user", "--mount",
+             "--propagation", "private", sys.executable, "-c", _IN_NAMESPACE,
+             case, str(tmp_path)],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "PYTHONPATH": os.path.dirname(src),
+                 "PYTHONDONTWRITEBYTECODE": "1"})
+        assert done.returncode == 0, done.stderr
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    @pytest.mark.parametrize("case", ["outside", "retained"])
+    def test_a_directory_mounted_after_the_scan_is_not_entered(
+            self, tmp_path, _user_namespaces, case):
+        result = self._run(tmp_path, case)
+
+        assert result["raised"]
+        assert result["unrelated"] and result["keep"]
+        assert result["fallback"] == []
+
+    def test_a_mount_point_found_by_the_scan_stops_it(self, tmp_path,
+                                                      _user_namespaces):
+        result = self._run(tmp_path, "at-scan")
+
+        assert "unmount it first" in result["raised"]
+        assert result["unrelated"]
+
+    def test_the_fallback_never_runs_over_a_mounted_file(self, tmp_path,
+                                                         _user_namespaces):
+        """A file bind-mounted on a doomed one cannot be unlinked, so it is
+        left for the fallback, whose ``rm -rf`` must not be asked to cross
+        it."""
+        result = self._run(tmp_path, "a file")
+
+        assert "mounted at" in result["raised"]
+        assert result["unrelated"] and result["keep"]
+        assert result["fallback"] == []
