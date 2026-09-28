@@ -35,6 +35,19 @@ from boxman.utils import retained_tree
 
 pytestmark = pytest.mark.unit
 
+#: subprocess.run itself: the fixture below replaces it for every test (it
+#: is the one flows.subprocess.run names), and the namespace tests need it
+_run = subprocess.run
+
+
+@pytest.fixture(autouse=True)
+def _never_the_real_docker(monkeypatch):
+    """No test here may run the real ``docker run ... alpine rm -rf``
+    fallback: one that needs it replaces this with a fake of its own."""
+    def docker(*args, **kwargs):
+        raise AssertionError(f"the real docker fallback was run: {args}")
+    monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run", docker)
+
 
 # --------------------------------------------------------------------------
 # X1 — the delete-root validator
@@ -145,6 +158,56 @@ class TestForceRmtree:
         finally:
             (tmp_path / "workspaces").chmod(0o755)
         assert (workspace / "c1").is_dir()
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root searches a mode-000 directory")
+    @pytest.mark.parametrize("when", ["the direct removal", "the fallback"])
+    def test_a_parent_made_unsearchable_mid_removal_is_not_success(
+            self, tmp_path, monkeypatch, when):
+        """Codex's interleaving (#221 review R4a): the parent is made
+        unsearchable right before the removal runs, so it removes nothing,
+        and the check after it could not see the directory. That read as
+        "removed"; destroy then unregistered an intact workspace."""
+        workspace = _tree(tmp_path / "workspaces" / "demo", "c1/x", "top.txt")
+        parent = workspace.parent
+        rmtree = shutil.rmtree
+        calls = []
+
+        def removal(path, *args, **kwargs):
+            calls.append(path)
+            if when == "the direct removal":
+                parent.chmod(0)
+            if when == "the direct removal" or len(calls) > 1:
+                rmtree(path, *args, **kwargs)
+
+        def docker(argv, **_kwargs):
+            parent.chmod(0)
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr("boxman.manager_parts.flows.shutil.rmtree",
+                            removal)
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            docker)
+        try:
+            with pytest.raises(ProvisionError, match="could not look up"):
+                BoxmanManager._force_rmtree(str(workspace))
+        finally:
+            parent.chmod(0o755)
+        assert _left(workspace) == ["c1", "c1/x", "top.txt"]
+
+    def test_a_directory_is_told_by_the_one_lookup(self, tmp_path,
+                                                   monkeypatch):
+        """Nothing after the explicit lookup reinterprets a lookup error as
+        "not a directory" (#221 review R4a): os.path.isdir is not asked."""
+        workspace = _tree(tmp_path / "workspaces" / "demo", "top.txt")
+        monkeypatch.setattr("boxman.manager_parts.flows.os.path.isdir",
+                            lambda *_: False)
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            lambda *a, **k: pytest.fail("docker was run"))
+
+        BoxmanManager._force_rmtree(str(workspace))
+
+        assert not workspace.exists()
 
     def test_raises_when_the_directory_survives_both_attempts(self, tmp_path,
                                                               monkeypatch):
@@ -563,6 +626,37 @@ class TestDestroyTeardownGate:
         mgr._force_rmtree.assert_not_called()
         mgr._remove_workspace.assert_not_called()
         mgr.unregister_from_cache.assert_not_called()
+
+
+class TestDestroyRuntimeLookup:
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root searches a mode-000 directory")
+    def test_a_boxman_dir_that_cannot_be_looked_up_is_not_absent(
+            self, tmp_path, monkeypatch):
+        """``destroy-runtime``: a .boxman behind an unsearchable directory
+        is not "no .boxman directory to remove" (#221 review R4a)."""
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            lambda *a, **k: pytest.fail("docker was run"))
+        mgr = _destroy_manager(tmp_path / "workspaces" / "demo")
+        runtime = MagicMock(spec=DockerComposeRuntime)
+        runtime.name = "docker-compose"
+        runtime.plan_destroy_runtime.return_value = {
+            "actions": ["tear down docker-compose environment"],
+            "commands": [], "paths_to_delete": []}
+        boxman_dir = _tree(tmp_path / "proj" / ".boxman", "state")
+        runtime.destroy_runtime.return_value = str(boxman_dir)
+        mgr._runtime_instance = runtime
+        (tmp_path / "proj").chmod(0)
+        try:
+            with pytest.raises(ProvisionError, match="could not look up"):
+                mgr.destroy_runtime(SimpleNamespace(auto_accept=True))
+        finally:
+            (tmp_path / "proj").chmod(0o755)
+
+        assert (boxman_dir / "state").exists()
 
 
 # --------------------------------------------------------------------------
@@ -1082,6 +1176,103 @@ class TestDestroySparesFilesInUse:
             mgr.destroy(ARGS)
 
         self._assert_nothing_cleaned_up(mgr, workspace)
+
+    @unless_root
+    def test_a_workspace_made_unsearchable_mid_removal_stops_destroy(
+            self, tmp_path, monkeypatch):
+        """Codex's interleaving (#221 review R4a) through destroy, for a
+        project without libvirt clusters, whose workspace still goes through
+        _force_rmtree: destroy used to unregister the intact workspace."""
+        mgr, workspace = self._manager(tmp_path)
+        mgr.config["provider"] = {"docker-compose": {}}
+        rmtree = shutil.rmtree
+
+        def removal(path, *args, **kwargs):
+            workspace.parent.chmod(0)
+            rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr("boxman.manager_parts.flows.shutil.rmtree",
+                            removal)
+        try:
+            with pytest.raises(ProvisionError, match="could not look up"):
+                mgr.destroy(ARGS)
+        finally:
+            workspace.parent.chmod(0o755)
+
+        assert (workspace / self.USED).exists()
+        mgr._retire_stale_teardown_locators.assert_not_called()
+        mgr.unregister_from_cache.assert_not_called()
+
+    def test_the_scan_tells_a_directory_by_the_one_lookup(self, tmp_path,
+                                                          monkeypatch):
+        """With os.path.isdir answering False -- as a lookup error would --
+        the workspace is still scanned: a file another domain uses stays."""
+        mgr, workspace = self._manager(tmp_path)
+        used = workspace / self.USED
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(used): "other-vm"})
+        monkeypatch.setattr("boxman.manager_parts.flows.os.path.isdir",
+                            lambda *_: False)
+
+        mgr.destroy(ARGS)
+
+        assert _left(workspace) == ["cluster_1", self.USED]
+
+    @unless_root
+    def test_a_boxman_dir_that_cannot_be_looked_up_stops_destroy(
+            self, tmp_path):
+        """Step 3's .boxman: one behind an unsearchable directory is not
+        "no .boxman to remove"."""
+        mgr, workspace, runtime = self._docker_manager(tmp_path)
+        boxman_dir = _tree(tmp_path / "proj" / ".boxman", "state")
+        runtime.destroy_runtime.return_value = str(boxman_dir)
+        (tmp_path / "proj").chmod(0)
+        try:
+            with pytest.raises(ProvisionError, match="could not look up"):
+                mgr.destroy(ARGS)
+        finally:
+            (tmp_path / "proj").chmod(0o755)
+
+        assert (boxman_dir / "state").exists()
+        mgr.unregister_from_cache.assert_not_called()
+
+    @unless_root
+    @pytest.mark.parametrize("what", ["a template workdir", ".boxman",
+                                      "a compose file"])
+    def test_what_cannot_be_looked_up_is_not_nothing_to_do(self, tmp_path,
+                                                           what):
+        """Not in the cache, no workspace: an inaccessible template workdir,
+        .boxman or compose file is something to tear down, not "nothing to
+        do"."""
+        if what == ".boxman":
+            mgr, workspace, runtime = self._docker_manager(tmp_path)
+        else:
+            mgr, workspace = self._manager(tmp_path)
+        mgr.cache.projects = {}
+        shutil.rmtree(workspace)
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        args = ARGS
+        if what == "a template workdir":
+            mgr.config["templates"] = {"t": {"workdir": str(hidden / "tpl")}}
+            args = SimpleNamespace(auto_accept=True, templates=True)
+        elif what == ".boxman":
+            runtime.plan_destroy_runtime.return_value["boxman_dir"] = str(
+                hidden / ".boxman")
+            runtime.plan_destroy_runtime.return_value["container_running"] = (
+                False)
+        else:
+            mgr.config["provider"] = {"docker-compose": {}}
+            mgr.config["clusters"]["cluster_1"]["workdir"] = str(hidden / "c1")
+        (hidden / "x").mkdir()
+        hidden.chmod(0)
+        try:
+            with contextlib.suppress(ProvisionError):
+                mgr.destroy(args)
+        finally:
+            hidden.chmod(0o755)
+
+        mgr.deprovision.assert_called_once()
 
     def test_a_workspace_already_gone_is_no_reason_to_stop(self, tmp_path):
         """Registered, yet removed by hand: nothing is left to spare."""
@@ -1918,7 +2109,7 @@ def _user_namespaces(tmp_path_factory):
     (probe / "a").mkdir()
     (probe / "b").mkdir()
     try:
-        done = subprocess.run(
+        done = _run(
             ["unshare", "--user", "--map-root-user", "--mount",
              "--propagation", "private", "mount", "--bind",
              str(probe / "a"), str(probe / "b")],
@@ -1939,7 +2130,7 @@ class TestMountPointsForReal:
     @staticmethod
     def _run(tmp_path, case):
         src = os.path.dirname(os.path.dirname(retained_tree.__file__))
-        done = subprocess.run(
+        done = _run(
             ["unshare", "--user", "--map-root-user", "--mount",
              "--propagation", "private", sys.executable, "-c", _IN_NAMESPACE,
              case, str(tmp_path)],

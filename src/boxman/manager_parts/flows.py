@@ -4,6 +4,7 @@
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import time
 
@@ -743,7 +744,8 @@ class FlowsMixin:
                 return
 
         boxman_dir = runtime.destroy_runtime()
-        if boxman_dir and os.path.isdir(boxman_dir):
+        # one that cannot be looked up is not absent (#221 review R4a)
+        if boxman_dir and self._may_exist(boxman_dir):
             self._force_rmtree(boxman_dir)
         else:
             self.logger.info("no .boxman directory to remove")
@@ -810,27 +812,36 @@ class FlowsMixin:
         return real
 
     @staticmethod
-    def _entry_exists(path: str) -> bool:
+    def _lookup(path: str) -> os.stat_result | None:
         """
-        Whether *path* has a directory entry. Only "no such file" is
-        absence: ``os.path.isdir`` and ``os.path.exists`` answer False for a
-        path that cannot be looked up (a directory on the way that cannot be
-        searched), and a workspace behind one was taken for gone (#221
-        review R4).
+        The ``lstat`` of *path*, or ``None`` when it has no directory entry.
+        Only "no such file" is absence: ``os.path.isdir`` and
+        ``os.path.exists`` answer False for a path that cannot be looked up
+        (a directory on the way that cannot be searched), and a workspace
+        behind one was taken for gone — before its removal (#221 review R4),
+        and after it (R4a).
 
         Raises:
             ProvisionError: If it cannot be looked up.
         """
         try:
-            os.lstat(path)
+            return os.lstat(path)
         except FileNotFoundError:
-            return False
+            return None
         except OSError as exc:
             raise ProvisionError(
                 f"could not look up {path} ({exc.strerror}), so whether it is "
                 f"still there cannot be told — make it accessible, then "
                 f"retry") from exc
-        return True
+
+    @staticmethod
+    def _entry_exists(path: str) -> bool:
+        """Whether *path* has a directory entry (:meth:`_lookup`).
+
+        Raises:
+            ProvisionError: If it cannot be looked up.
+        """
+        return FlowsMixin._lookup(path) is not None
 
     @staticmethod
     def _may_exist(path: str) -> bool:
@@ -868,13 +879,16 @@ class FlowsMixin:
         """
         real = FlowsMixin._safe_delete_target(path)
 
-        if not FlowsMixin._entry_exists(real) or not os.path.isdir(real):
+        # every absence or success gate below is one lookup that raises on
+        # anything but "no such file" (#221 review R4a)
+        found = FlowsMixin._lookup(real)
+        if found is None or not stat.S_ISDIR(found.st_mode):
             log.info(f"{real} does not exist — nothing to remove")
             return
 
         log.info(f"removing {real}")
         shutil.rmtree(real, ignore_errors=True)
-        if not os.path.isdir(real):
+        if FlowsMixin._lookup(real) is None:
             log.info(f"removed {real}")
             return
 
@@ -893,7 +907,7 @@ class FlowsMixin:
         # The bind-mount dir itself can't be removed from inside the
         # container, but it should now be empty.
         shutil.rmtree(real, ignore_errors=True)
-        if os.path.isdir(real):
+        if FlowsMixin._lookup(real) is not None:
             raise ProvisionError(
                 f"could not remove {real}: it still exists after both the "
                 f"direct removal and the containerised fallback")
@@ -993,7 +1007,7 @@ class FlowsMixin:
         # whether the workspace is there — for every project, before anything
         # is torn down: only "no such file" is absence (#221 review R4)
         real = os.path.realpath(workspace_path)
-        present = self._entry_exists(real)
+        entry = self._lookup(real)
         # the libvirt session of every libvirt cluster, each scanned once
         sessions = {}
         for name in ((self.config or {}).get('clusters') or {}):
@@ -1011,7 +1025,7 @@ class FlowsMixin:
                     "domains use (the in-use scan failed; see the warnings "
                     "above), so none of it was removed")
             in_use.add(found)
-        if not present or not os.path.isdir(real):
+        if entry is None or not stat.S_ISDIR(entry.st_mode):
             return in_use, None
         return in_use, scan_tree(real, in_use.why_kept)
 
@@ -1105,17 +1119,19 @@ class FlowsMixin:
         )
         # a workspace that cannot be looked up is not gone (#221 review R4)
         ws_present = bool(workspace_path) and self._may_exist(workspace_path)
+        # what cannot be looked up counts as there, never as "nothing to
+        # do" (#221 review R4a)
         boxman_dir_present = bool(
             is_docker and runtime_plan
             and runtime_plan.get("boxman_dir")
-            and os.path.isdir(runtime_plan["boxman_dir"])
+            and self._may_exist(runtime_plan["boxman_dir"])
         )
         container_present = bool(
             is_docker and runtime_plan
             and runtime_plan.get("container_running")
         )
         templates_present = any(
-            os.path.exists(d) for d in template_dirs
+            self._may_exist(d) for d in template_dirs
         )
         # docker-compose clusters keep a generated docker-compose.yml in their
         # workdir until destroy_cluster removes it (only on a successful
@@ -1123,7 +1139,7 @@ class FlowsMixin:
         # retryable after the cache entry was lost — the terms above are
         # otherwise cache-/workspace-/runtime-centric and miss dc state.
         compose_present = any(
-            os.path.isfile(os.path.join(
+            self._may_exist(os.path.join(
                 os.path.expanduser(cluster.get('workdir', '')),
                 'docker-compose.yml'))
             for cluster in self._compose_clusters.values()
@@ -1306,7 +1322,8 @@ class FlowsMixin:
                 raise ProvisionError(
                     f"destroy did not complete — runtime teardown failed: "
                     f"{detail}") from exc
-            if boxman_dir and os.path.isdir(boxman_dir):
+            # one that cannot be looked up is not absent (#221 review R4a)
+            if boxman_dir and self._may_exist(boxman_dir):
                 self._force_rmtree(boxman_dir)
 
         # 4. remove the generated provisioning files (env.sh, ansible.cfg,
