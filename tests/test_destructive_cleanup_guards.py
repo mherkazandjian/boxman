@@ -18,6 +18,7 @@ has to read as "stop", never as "nothing there".
 """
 
 import os
+import shutil
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
@@ -25,7 +26,7 @@ import pytest
 
 from boxman.exceptions import ProvisionError
 from boxman.manager import BoxmanManager
-from boxman.providers.libvirt.disk_cleanup import StorageOutcome
+from boxman.providers.libvirt.disk_cleanup import FilesInUse, StorageOutcome
 
 pytestmark = pytest.mark.unit
 
@@ -560,3 +561,396 @@ class TestPrepareRuntimeWorkdirs:
 
         assert mgr._ensure_writable_dir.call_count == 2
         mgr.logger.warning.assert_called()
+
+
+# --------------------------------------------------------------------------
+# #221 — destroy spares the files another domain uses
+# --------------------------------------------------------------------------
+unless_root = pytest.mark.skipif(os.geteuid() == 0,
+                                 reason="root ignores a directory's mode")
+
+
+def _tree(root, *names):
+    """*root* holding a small file at each of *names*."""
+    for name in names:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"data")
+    return root
+
+
+def _left(root):
+    """Every path under *root*, relative to it, sorted."""
+    return sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+
+
+def _identity(path):
+    st = os.stat(path)
+    return (st.st_dev, st.st_ino)
+
+
+class TestDestroySparesFilesInUse:
+    """``destroy`` removed the whole workspace, so a file a VM teardown had
+    kept because another domain uses it -- directly or as a backing file --
+    went anyway. The host-wide in-use scan every teardown asks now runs once
+    the project's VMs are gone, while libvirt is still there, and the
+    workspace goes except those files, each named (#221)."""
+
+    USED = "cluster_1/bprj__demo__bprj_cluster_1_node01.qcow2"
+
+    @pytest.fixture(autouse=True)
+    def _no_docker(self, monkeypatch):
+        """The user can delete all of these: the fallback is never due."""
+        def docker(*args, **kwargs):
+            raise AssertionError(f"docker was run: {args}")
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            docker)
+
+    def _manager(self, tmp_path):
+        workspace = _tree(
+            tmp_path / "workspaces" / "demo", self.USED,
+            "cluster_1/seed.iso", "cluster_1/nocloud/user-data",
+            "cluster_1/.boxman-teardown-bprj__demo__bprj_cluster_1_node01.json",
+            "env.sh", "keys/id_ed25519")
+        mgr = _destroy_manager(workspace)
+        mgr.deprovision = MagicMock()
+        mgr.destroy_compose_clusters = MagicMock()
+        mgr.deprovision_files = MagicMock()
+        mgr.unregister_from_cache = MagicMock()
+        mgr._confirm_project_torn_down = MagicMock(return_value=(True, ''))
+        mgr._retire_stale_teardown_locators = MagicMock()
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse()
+        return mgr, workspace
+
+    @staticmethod
+    def _warnings(mgr):
+        return " ".join(str(c.args[0])
+                        for c in mgr.logger.warning.call_args_list)
+
+    def test_a_file_another_domain_uses_is_kept_and_named(self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        used = workspace / self.USED
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(used): "other-vm"})
+
+        mgr.destroy(ARGS)
+
+        assert _left(workspace) == ["cluster_1", self.USED]
+        assert f"left {used} in place" in self._warnings(mgr)
+        assert "domain other-vm uses it" in self._warnings(mgr)
+        mgr.provider.disk_paths_in_use.assert_called_once_with()
+        mgr._retire_stale_teardown_locators.assert_called_once()
+        mgr.unregister_from_cache.assert_called_once()
+
+    def test_a_file_used_under_another_name_is_kept(self, tmp_path):
+        """A hard link, a bind mount: the file is known by its identity."""
+        mgr, workspace = self._manager(tmp_path)
+        alias = tmp_path / "elsewhere" / "disk.qcow2"
+        alias.parent.mkdir()
+        os.link(workspace / self.USED, alias)
+        in_use = FilesInUse({str(alias): "other-vm"})
+        in_use.identities[_identity(alias)] = "other-vm"
+        mgr.provider.disk_paths_in_use.return_value = in_use
+
+        mgr.destroy(ARGS)
+
+        assert _left(workspace) == ["cluster_1", self.USED]
+
+    def test_a_symlink_to_a_file_in_use_is_kept(self, tmp_path):
+        """A domain may use the file through it."""
+        mgr, workspace = self._manager(tmp_path)
+        target = tmp_path / "elsewhere" / "disk.qcow2"
+        _tree(target.parent, target.name)
+        (workspace / "cluster_1" / "link.qcow2").symlink_to(target)
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(target): "other-vm"})
+
+        mgr.destroy(ARGS)
+
+        assert _left(workspace) == ["cluster_1", "cluster_1/link.qcow2"]
+        assert target.exists()
+
+    def test_nothing_in_use_removes_the_whole_workspace(self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+
+        mgr.destroy(ARGS)
+
+        assert not workspace.exists()
+        assert self._warnings(mgr) == ""
+
+    def test_a_dangling_symlink_is_no_reason_to_stop(self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        (workspace / "cluster_1" / "old.qcow2").symlink_to(
+            tmp_path / "gone.qcow2")
+        used = workspace / self.USED
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(used): "other-vm"})
+
+        mgr.destroy(ARGS)
+
+        assert _left(workspace) == ["cluster_1", self.USED]
+
+    def test_a_symlink_to_a_directory_goes_but_not_what_it_points_to(
+            self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        isos = _tree(tmp_path / "isos", "install.iso")
+        (workspace / "cluster_1" / "isos").symlink_to(isos)
+        used = workspace / self.USED
+        mgr.provider.disk_paths_in_use.return_value = FilesInUse(
+            {os.path.realpath(used): "other-vm"})
+
+        mgr.destroy(ARGS)
+
+        assert _left(workspace) == ["cluster_1", self.USED]
+        assert _left(isos) == ["install.iso"]
+
+    def test_a_workspace_already_gone_is_no_reason_to_stop(self, tmp_path):
+        """Registered, yet removed by hand: nothing is left to spare."""
+        mgr, workspace = self._manager(tmp_path)
+        shutil.rmtree(workspace)
+
+        mgr.destroy(ARGS)
+
+        mgr.unregister_from_cache.assert_called_once()
+
+    def test_a_failed_teardown_is_not_followed_by_a_scan(self, tmp_path):
+        mgr, _workspace = self._manager(tmp_path)
+        mgr._confirm_project_torn_down = MagicMock(
+            return_value=(False, "VMs are still defined: node01"))
+
+        with pytest.raises(ProvisionError, match="still defined"):
+            mgr.destroy(ARGS)
+
+        mgr.provider.disk_paths_in_use.assert_not_called()
+
+    def test_a_scan_that_cannot_complete_keeps_everything_and_fails(
+            self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        mgr.provider.disk_paths_in_use.return_value = None
+        before = _left(workspace)
+
+        with pytest.raises(ProvisionError, match="destroy did not complete"):
+            mgr.destroy(ARGS)
+
+        assert _left(workspace) == before
+        mgr.deprovision_files.assert_not_called()
+        mgr._retire_stale_teardown_locators.assert_not_called()
+        mgr.unregister_from_cache.assert_not_called()
+
+    @unless_root
+    def test_a_directory_that_cannot_be_listed_keeps_everything(
+            self, tmp_path):
+        """What is in it cannot be compared with what other domains use."""
+        mgr, workspace = self._manager(tmp_path)
+        locked = workspace / "cluster_1" / "nocloud"
+        locked.chmod(0)
+        try:
+            with pytest.raises(ProvisionError, match="could not list"):
+                mgr.destroy(ARGS)
+        finally:
+            locked.chmod(0o700)
+
+        assert (workspace / "cluster_1" / "seed.iso").exists()
+        mgr.deprovision_files.assert_not_called()
+        mgr.unregister_from_cache.assert_not_called()
+
+    @unless_root
+    def test_a_file_whose_identity_cannot_be_read_keeps_everything(
+            self, tmp_path):
+        """A directory that lists but cannot be searched: it could be any
+        file."""
+        mgr, workspace = self._manager(tmp_path)
+        blind = workspace / "cluster_1" / "nocloud"
+        blind.chmod(0o400)
+        try:
+            with pytest.raises(ProvisionError, match="identity"):
+                mgr.destroy(ARGS)
+        finally:
+            blind.chmod(0o700)
+
+        assert (workspace / "cluster_1" / "seed.iso").exists()
+        mgr.unregister_from_cache.assert_not_called()
+
+    def _docker_manager(self, tmp_path):
+        from boxman.runtime.docker_compose import DockerComposeRuntime
+
+        mgr, workspace = self._manager(tmp_path)
+        runtime = MagicMock(spec=DockerComposeRuntime)
+        runtime.name = "docker-compose"
+        runtime.ready_timeout = 60
+        runtime.plan_destroy_runtime.return_value = {
+            "actions": ["tear down docker-compose environment"],
+            "commands": ["docker compose down --volumes"],
+            "paths_to_delete": [],
+            "container_running": True,
+        }
+        runtime.destroy_runtime.return_value = None
+        mgr._runtime_instance = runtime
+        return mgr, workspace, runtime
+
+    def test_the_scan_runs_while_the_runtime_is_still_up(self, tmp_path):
+        """Under the docker runtime libvirt lives in the runtime container,
+        which step 3 takes down."""
+        mgr, workspace, runtime = self._docker_manager(tmp_path)
+        order = MagicMock()
+        order.attach_mock(mgr.provider.disk_paths_in_use, "scan")
+        order.attach_mock(runtime.destroy_runtime, "runtime")
+        order.attach_mock(mgr.deprovision_files, "files")
+
+        mgr.destroy(ARGS)
+
+        assert [c[0] for c in order.mock_calls] == ["scan", "runtime",
+                                                    "files"]
+        assert not workspace.exists()
+
+    def test_a_failed_scan_keeps_the_runtime_too(self, tmp_path):
+        mgr, workspace, runtime = self._docker_manager(tmp_path)
+        mgr.provider.disk_paths_in_use.return_value = None
+
+        with pytest.raises(ProvisionError, match="destroy did not complete"):
+            mgr.destroy(ARGS)
+
+        runtime.destroy_runtime.assert_not_called()
+        assert (workspace / self.USED).exists()
+
+    @unless_root
+    def test_a_project_without_libvirt_clusters_is_not_scanned(
+            self, tmp_path, monkeypatch):
+        """... nor its workspace walked: a directory a container made
+        unreadable there goes through the docker fallback, as before."""
+        mgr, workspace = self._manager(tmp_path)
+        mgr.config["provider"] = {"docker-compose": {}}
+        data = workspace / "cluster_1" / "pgdata"
+        _tree(data, "PG_VERSION")
+        data.chmod(0)
+
+        def docker(argv, **_kwargs):          # as root in the container
+            data.chmod(0o700)
+            for entry in workspace.iterdir():
+                if entry.is_dir():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            docker)
+        try:
+            mgr.destroy(ARGS)
+        finally:
+            if data.exists():
+                data.chmod(0o700)
+
+        mgr.provider.disk_paths_in_use.assert_not_called()
+        assert not workspace.exists()
+
+    def test_clusters_that_share_a_session_are_scanned_once(self, tmp_path):
+        mgr, workspace = self._manager(tmp_path)
+        mgr.config["clusters"]["cluster_2"] = {
+            "workdir": str(workspace / "cluster_2"), "vms": {}}
+
+        mgr.destroy(ARGS)
+
+        mgr.provider.disk_paths_in_use.assert_called_once_with()
+
+
+class TestForceRmtreeExcept:
+    """The sparing removal keeps :meth:`_force_rmtree`'s guard and its
+    docker fallback -- aimed at exactly what is left, never at a kept file
+    or a directory on the way to one (#221)."""
+
+    def test_a_rejected_path_reaches_nothing_under_it(self, tmp_path,
+                                                      monkeypatch):
+        workspace = _tree(tmp_path / "real_ws", "c1/keep.qcow2",
+                          "c1/drop.qcow2", "top.txt")
+        link = tmp_path / "ws_link"
+        link.symlink_to(workspace)
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            lambda *a, **k: pytest.fail("docker was run"))
+
+        with pytest.raises(ProvisionError, match="symlink"):
+            BoxmanManager._force_rmtree_except(
+                str(link), [str(workspace / "c1" / "keep.qcow2")])
+
+        assert _left(workspace) == ["c1", "c1/drop.qcow2", "c1/keep.qcow2",
+                                    "top.txt"]
+
+    @unless_root
+    def test_a_directory_on_the_way_that_cannot_be_listed_stops_it(
+            self, tmp_path):
+        workspace = _tree(tmp_path / "workspaces" / "demo", "c1/keep.qcow2",
+                          "top.txt")
+        real = os.path.realpath(workspace)
+        (workspace / "c1").chmod(0o300)
+        try:
+            with pytest.raises(ProvisionError, match="could not list"):
+                BoxmanManager._force_rmtree_except(
+                    str(workspace), [os.path.join(real, "c1", "keep.qcow2")])
+        finally:
+            (workspace / "c1").chmod(0o755)
+
+    def _locked(self, tmp_path):
+        """A workspace whose ``c1`` the user cannot write: what is directly
+        in it stays after the direct attempt."""
+        workspace = _tree(tmp_path / "workspaces" / "demo",
+                          "c1/keep.qcow2", "c1/drop.qcow2", "c1/sub/x",
+                          "top.txt")
+        (workspace / "c1").chmod(0o555)
+        return workspace
+
+    @unless_root
+    def test_leftovers_go_through_docker_but_a_kept_file_never(
+            self, tmp_path, monkeypatch):
+        workspace = self._locked(tmp_path)
+        real = os.path.realpath(workspace)
+        asked = []
+
+        def docker(argv, **_kwargs):
+            asked.append(argv)
+            locked = workspace / "c1"
+            locked.chmod(0o755)        # as root in the container
+            for target in argv[argv.index("--") + 1:]:
+                path = os.path.join(real, os.path.relpath(target,
+                                                          "/cleanup"))
+                if os.path.isdir(path):
+                    for sub, dirs, files in os.walk(path, topdown=False):
+                        for name in files:
+                            os.unlink(os.path.join(sub, name))
+                        for name in dirs:
+                            os.rmdir(os.path.join(sub, name))
+                    os.rmdir(path)
+                else:
+                    os.unlink(path)
+            locked.chmod(0o555)
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr("boxman.manager_parts.flows.subprocess.run",
+                            docker)
+        try:
+            BoxmanManager._force_rmtree_except(
+                str(workspace), [os.path.join(real, "c1", "keep.qcow2")])
+        finally:
+            (workspace / "c1").chmod(0o755)
+
+        assert _left(workspace) == ["c1", "c1/keep.qcow2"]
+        [argv] = asked
+        assert argv[:6] == ["docker", "run", "--rm", "-v",
+                            f"{real}:/cleanup", "alpine"]
+        assert sorted(argv[argv.index("--") + 1:]) == [
+            "/cleanup/c1/drop.qcow2", "/cleanup/c1/sub"]
+
+    @unless_root
+    def test_raises_when_a_leftover_survives_both_attempts(
+            self, tmp_path, monkeypatch):
+        workspace = self._locked(tmp_path)
+        real = os.path.realpath(workspace)
+        monkeypatch.setattr(
+            "boxman.manager_parts.flows.subprocess.run",
+            lambda *a, **k: SimpleNamespace(returncode=0))
+        try:
+            with pytest.raises(ProvisionError, match="could not remove"):
+                BoxmanManager._force_rmtree_except(
+                    str(workspace), [os.path.join(real, "c1", "keep.qcow2")])
+        finally:
+            (workspace / "c1").chmod(0o755)
+        assert (workspace / "c1" / "keep.qcow2").exists()

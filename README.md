@@ -761,7 +761,8 @@ This project is licensed under the [MIT License](LICENSE).
 - `down` — bring down the infrastructure (save or suspend state)
 - `destroy-runtime` — destroy the docker-compose runtime and clean up .boxman
 - `destroy` — full teardown (VMs + networks + files + runtime + workspace
-  workdir) with a `[y/N]` prompt; use `-y`/`--auto-accept` to skip the prompt
+  workdir, except a file another VM still uses) with a `[y/N]` prompt; use
+  `-y`/`--auto-accept` to skip the prompt
   and `--templates` to also remove template workdirs. Validates every path it
   would delete before starting, and stops at exit 2 without running the
   irreversible cleanup if the teardown did not complete — see
@@ -890,6 +891,16 @@ Details worth knowing:
   through libvirt instead — its storage pool refreshed first, since libvirt
   describes a file as the pool last saw it. A chain libvirt cannot describe
   (a file in no storage pool, say) still keeps everything (#221).
+- **`destroy` spares the files other VMs use.** Once the project's VMs are
+  gone, and before the docker runtime is torn down, it runs the same
+  host-wide check and removes the workspace except the files another VM
+  uses, directly or as a backing file (known by path or by identity). Each
+  stays, with the directories on the way to it, and is named in a warning;
+  `destroy` still exits 0. If it cannot tell which files those are — the
+  check fails, or a directory in the workspace cannot be read — it exits 2
+  and keeps the workspace, the generated files, the runtime and the cache
+  entry, like an incomplete teardown. Template workdirs (`--templates`)
+  are removed without this check.
 - **`destroy` validates its delete targets up front**, before any teardown
   starts. It refuses a path that is empty, relative, a symlink, your home
   directory, a filesystem root or mount point, a top-level path, or a
