@@ -32,6 +32,7 @@ import invoke
 from boxman import log
 from boxman.image_cache import ImageCache
 from boxman.loggers.logger import is_verbose
+from boxman.utils.http_download import curl_ended_on_2xx
 from boxman.utils.http_opener import build_opener
 from boxman.utils.jinja_env import substitute_env
 from boxman.utils.shell import run as _shell_run
@@ -526,12 +527,15 @@ class CloudInitTemplate:
 
         # Try curl as second fallback. --fail, so that an HTTP 4xx/5xx error
         # page is not written and accepted as the image (#224); wget already
-        # fails on HTTP errors.
+        # fails on HTTP errors. --fail lets a 3xx through, though, so the
+        # final status curl reports must be a 2xx too.
         result = _shell_run(
-            f'curl -fL --progress-bar -o {shlex.quote(dst_path)} {shlex.quote(url)}',
+            f"curl -fL --progress-bar -w '%{{http_code}}' "
+            f"-o {shlex.quote(dst_path)} {shlex.quote(url)}",
             hide=not is_verbose(logging.DEBUG), warn=True,
         )
-        if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
+        if (result.ok and curl_ended_on_2xx(url, result.stdout)
+                and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0):
             self.logger.info("download complete (curl)")
             return True
         # a failed curl can leave part of the image behind (a transfer cut
@@ -559,6 +563,9 @@ class CloudInitTemplate:
                             self.logger.info(
                                 f"  downloaded {downloaded // (1024*1024)} MB "
                                 f"/ {total // (1024*1024)} MB ({pct}%)")
+            if not downloaded:
+                # a 2xx with nothing in it is no image (#224)
+                raise ValueError("the response was empty")
             self.logger.info("download complete (urllib)")
             return True
         except Exception as e:

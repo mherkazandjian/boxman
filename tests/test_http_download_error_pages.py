@@ -1,15 +1,21 @@
 """
-#224 -- an HTTP error page is never taken for the image.
+#224 -- nothing but the image is taken for the image.
 
 ``CloudInitTemplate._download_image`` downloads the base image of every
 cloud-image template. When wget failed, it ran ``curl -L`` without
 ``--fail``: curl saved the error page the server answered with and exited
 0, so the page was accepted as the image and, with the image cache on,
 stored in the cache and reused from there, unless the template set an
-``image_checksum``. ``download_url`` already runs ``curl -fL``; it is
-covered too, as a guard. The ``-L`` is pinned as well: without it, curl
-saves the page a server sends with a redirect and exits 0, and that page
-is taken for the image.
+``image_checksum``. ``download_url`` already ran ``curl -fL``; it is
+covered too, as a guard.
+
+``--fail`` alone did not settle it, in either downloader. It lets a 3xx
+through, and ``-L`` follows only a 3xx that says where to go, so a 302
+without a Location left its page behind, with exit 0. curl's download now
+counts only when the final status curl reports is a 2xx. The urllib
+fallback, for its part, took an empty 200 for the image. The ``-L`` is
+pinned as well: without it, curl saves the page a server sends with a
+redirect and exits 0, and that page is taken for the image.
 
 Nothing here leaves the host. The server runs on a 127.0.0.1 ephemeral
 port, as in test_http_download_proxy.py. Every ``*_proxy`` variable is
@@ -42,10 +48,15 @@ pytestmark = [
 ]
 
 IMAGE = "/images/distro.qcow2"
-#: small error pages, like the 14-byte 401 page that #216's probe saw saved
-ERROR_PAGES = {
-    404: b"<html><body><h1>404 Not Found</h1></body></html>\n",
-    401: b"Unauthorized!\n",
+#: answers that are not the image: the status, the body, and curl's exit on
+#: it. --fail refuses an HTTP error with 22, like the 14-byte 401 page that
+#: #216's probe saw saved. A 302 that says nowhere to go, and an empty 200,
+#: curl ends with 0.
+NOT_THE_IMAGE = {
+    "http404": (404, b"<html><body><h1>404 Not Found</h1></body></html>\n", 22),
+    "http401": (401, b"Unauthorized!\n", 22),
+    "http302-no-location": (302, b"<html><body>302 Found, no Location</body></html>\n", 0),
+    "http200-empty": (200, b"", 0),
 }
 #: an image, and how much of it a server that hangs up part-way sends
 PAYLOAD = bytes(range(256)) * 400
@@ -192,40 +203,47 @@ def downloader(request, tmp_path):
     return cloudinit, _template(tmp_path)._download_image
 
 
-@pytest.fixture(params=sorted(ERROR_PAGES), ids=lambda status: f"http{status}")
-def error_page(request):
-    """A server that answers every request with an error page."""
-    with _serving(request.param, ERROR_PAGES[request.param]) as server:
+@pytest.fixture(params=list(NOT_THE_IMAGE))
+def not_the_image(request):
+    """A server that answers every request with something that is not the image.
+
+    Its ``curl_exit`` is the exit status curl ends that answer with.
+    """
+    status, body, curl_exit = NOT_THE_IMAGE[request.param]
+    with _serving(status, body) as server:
+        server.curl_exit = curl_exit
         yield server
 
 
-def test_an_error_page_is_not_taken_for_the_image(downloader, error_page, monkeypatch, tmp_path):
+def test_a_response_that_is_not_the_image_is_refused(
+        downloader, not_the_image, monkeypatch, tmp_path):
     module, download = downloader
     ran = _fail_wget(monkeypatch, module)
     dst = tmp_path / "distro.qcow2"
 
-    ok = download(_url(error_page), str(dst))
+    ok = download(_url(not_the_image), str(dst))
 
     assert (ok, _left_at(dst)) == (False, None)
-    # 22: curl --fail refused the page, and wrote none of it
-    assert ran == [("wget", None), ("curl", 22)]
-    # the urllib fallback then asked the same server, and failed cleanly too
-    assert _asked_by(error_page) == ["curl", "boxman"]
+    # 22: --fail refused an HTTP error and wrote none of it. 0: curl ended on
+    # the answer, a 302's page or nothing at all, and that was refused too
+    assert ran == [("wget", None), ("curl", not_the_image.curl_exit)]
+    # the urllib fallback then asked the same server, and refused it as well
+    assert _asked_by(not_the_image) == ["curl", "boxman"]
 
 
-def test_an_error_page_is_not_stored_in_the_image_cache(error_page, monkeypatch, tmp_path):
+def test_a_response_that_is_not_the_image_is_not_cached(not_the_image, monkeypatch, tmp_path):
     cache_dir = tmp_path / "cache"
     template = _template(tmp_path, image_cache=ImageCache(cache_dir=str(cache_dir)))
     ran = _fail_wget(monkeypatch, cloudinit)
     dst = tmp_path / "distro.qcow2"
 
-    ok = template._fetch_remote_image(_url(error_page), str(dst))
+    ok = template._fetch_remote_image(_url(not_the_image), str(dst))
 
     # nothing in the cache for the next run to take as the image
     cached = {path.name: path.read_bytes() for path in cache_dir.iterdir()}
     assert (ok, cached, _left_at(dst)) == (False, {}, None)
-    assert ran == [("wget", None), ("curl", 22)]
-    assert _asked_by(error_page) == ["curl", "boxman"]
+    assert ran == [("wget", None), ("curl", not_the_image.curl_exit)]
+    assert _asked_by(not_the_image) == ["curl", "boxman"]
 
 
 def test_a_cut_off_download_is_removed_before_the_urllib_fallback(
@@ -275,3 +293,18 @@ def test_curl_follows_a_redirect_to_the_image(downloader, monkeypatch, tmp_path)
     assert _asked_by(server) == ["curl", "curl"]
     # ...and the urllib fallback never began
     assert fallback == []
+
+
+@pytest.mark.parametrize(("url", "status", "counts"), [
+    ("http://mirror.invalid/distro.qcow2", "200", True),
+    ("HTTPS://mirror.invalid/distro.qcow2", "200\n", True),
+    ("http://mirror.invalid/distro.qcow2", "302", False),  # a 3xx that went nowhere
+    ("https://mirror.invalid/distro.qcow2", "404", False),
+    ("http://mirror.invalid/distro.qcow2", "000", False),  # no response at all
+    ("http://mirror.invalid/distro.qcow2", "", False),  # no status printed
+    # other schemes have no HTTP status, and are not held to one
+    ("ftp://mirror.invalid/distro.iso", "226", True),
+    ("file:///srv/distro.iso", "000", True),
+])
+def test_only_a_2xx_counts_for_an_http_download(url, status, counts):
+    assert http_download.curl_ended_on_2xx(url, status) is counts

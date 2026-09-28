@@ -4,11 +4,27 @@ import logging
 import os
 import shlex
 import urllib.request
+from urllib.parse import urlsplit
 
 from boxman import log
 from boxman.loggers.logger import is_verbose
 from boxman.utils.http_opener import build_opener
 from boxman.utils.shell import run as _shell_run
+
+
+def curl_ended_on_2xx(url: str, status: str) -> bool:
+    """Whether curl's transfer of an http(s) *url* ended on a 2xx response.
+
+    *status* is what curl's ``-w '%{http_code}'`` printed: the status of the
+    last response it got. ``--fail`` refuses a 4xx or 5xx but lets a 3xx
+    through, and ``-L`` follows only a 3xx that says where to go, so a 302
+    without a Location ends the transfer on the redirect's own page, with
+    exit 0 (#224). Other schemes have no HTTP status, and are not checked.
+    """
+    if urlsplit(url).scheme.lower() not in ("http", "https"):
+        return True
+    status = status.strip()
+    return len(status) == 3 and status.startswith("2")
 
 
 def download_url(url: str, dst_path: str) -> bool:
@@ -41,12 +57,14 @@ def download_url(url: str, dst_path: str) -> bool:
         os.remove(dst_path)
 
     # curl fallback. --fail so an HTTP 4xx/5xx error page is not written
-    # and accepted as a valid download (wget already fails on HTTP errors).
+    # and accepted as a valid download (wget already fails on HTTP errors),
+    # and the final status must be a 2xx, as --fail lets a 3xx through.
     result = _shell_run(
-        f'curl -fL --progress-bar -o {q_dst} {q_url}',
+        f"curl -fL --progress-bar -w '%{{http_code}}' -o {q_dst} {q_url}",
         hide=not is_verbose(logging.DEBUG), warn=True,
     )
-    if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
+    if (result.ok and curl_ended_on_2xx(url, result.stdout)
+            and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0):
         log.info("download complete (curl)")
         return True
     if os.path.exists(dst_path):
@@ -73,6 +91,9 @@ def download_url(url: str, dst_path: str) -> bool:
                         log.info(
                             f"  downloaded {downloaded // (1024*1024)} MB "
                             f"/ {total // (1024*1024)} MB ({pct}%)")
+        if not downloaded:
+            # a 2xx with nothing in it is no download (#224)
+            raise ValueError("the response was empty")
         log.info("download complete (urllib)")
         return True
     except Exception as exc:

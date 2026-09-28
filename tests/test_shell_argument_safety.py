@@ -187,6 +187,9 @@ def _stub_bin(directory: Path, names: list[str]) -> Path:
             "            dst = sys.argv[sys.argv.index(flag) + 1]\n"
             "    if dst:\n"
             "        open(dst, 'wb').write(b'stub-payload')\n"
+            # ...and curl's only on the 2xx it prints with -w (#224)
+            "    if '-w' in sys.argv:\n"
+            "        sys.stdout.write('200')\n"
             "sys.exit(0)\n"
         )
         stub.chmod(0o755)
