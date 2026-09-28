@@ -183,12 +183,23 @@ def loopback_cert(tmp_path, monkeypatch):
     if openssl is None:
         pytest.skip("needs the openssl CLI to make a certificate")
     cert, key = str(tmp_path / "cert.pem"), str(tmp_path / "key.pem")
+    # A config of our own and every extension spelled out: Python 3.13's
+    # strict verification wants a CA's basic constraints, key usage and key
+    # identifiers, and the basic constraints came from the host's openssl.cnf
+    # (its v3_ca section), so without one the https cases failed. Not
+    # /dev/null: OpenSSL 1.1.1's req wants a distinguished_name section even
+    # with -subj.
+    config = tmp_path / "openssl.cnf"
+    config.write_text("[req]\ndistinguished_name = dn\n[dn]\n")
     subprocess.run(
-        [openssl, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+        [openssl, "req", "-x509", "-config", str(config),
+         "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
          "-nodes", "-keyout", key, "-out", cert, "-days", "2", "-subj", "/CN=127.0.0.1",
          "-addext", "subjectAltName=IP:127.0.0.1",
-         # Python 3.13's strict verification wants a CA's key usage spelled out
-         "-addext", "keyUsage=critical,digitalSignature,keyCertSign"],
+         "-addext", "basicConstraints=critical,CA:TRUE",
+         "-addext", "keyUsage=critical,digitalSignature,keyCertSign",
+         "-addext", "subjectKeyIdentifier=hash",
+         "-addext", "authorityKeyIdentifier=keyid:always"],
         check=True, capture_output=True, timeout=60)
     monkeypatch.setenv("SSL_CERT_FILE", cert)
     return cert, key
