@@ -12,6 +12,8 @@ import importlib.util
 import io
 import os
 import socket
+import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -418,3 +420,18 @@ def test_main_exits_nonzero_on_a_config_that_does_not_render(tmp_path, capsys):
     (box / "conf.yml").write_text("templates: {{ unclosed\n")
     assert checker.main([str(box)], opener=_opener(FakeTransport({}))) == 1
     assert "failed to render" in capsys.readouterr().out
+
+
+def test_the_checkout_boxman_is_imported_ahead_of_an_installed_one(tmp_path):
+    # run directly, without PYTHONPATH=src, over an installed boxman older
+    # than boxman.utils.http_opener (#216): the checkout's own must win
+    stale = tmp_path / "site-packages" / "boxman"
+    (stale / "utils").mkdir(parents=True)
+    (stale / "__init__.py").write_text("")
+    (stale / "exceptions.py").write_text("class BoxmanError(Exception):\n    pass\n")
+    (stale / "utils" / "__init__.py").write_text("")
+    (stale / "utils" / "jinja_env.py").write_text("def create_jinja_env(*_args):\n    pass\n")
+    env = {**os.environ, "PYTHONPATH": str(stale.parent), "PYTHONDONTWRITEBYTECODE": "1"}
+    proc = subprocess.run([sys.executable, _SCRIPT, "--help"], env=env,
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr

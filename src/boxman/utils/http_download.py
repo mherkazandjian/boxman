@@ -7,6 +7,7 @@ import urllib.request
 
 from boxman import log
 from boxman.loggers.logger import is_verbose
+from boxman.utils.http_opener import build_opener
 from boxman.utils.shell import run as _shell_run
 
 
@@ -51,11 +52,13 @@ def download_url(url: str, dst_path: str) -> bool:
     if os.path.exists(dst_path):
         os.remove(dst_path)
 
-    # urllib last resort (always available, no shell deps).
+    # urllib last resort (always available, no shell deps). Not urlopen():
+    # its stock opener hands the proxy password to wherever a proxied
+    # mirror redirects (#216).
     try:
         log.info("falling back to urllib download (timeout=120s)...")
         req = urllib.request.Request(url, headers={"User-Agent": "boxman/1.0"})
-        with urllib.request.urlopen(req, timeout=120) as response:
+        with build_opener().open(req, timeout=120) as response:
             total = int(response.headers.get("Content-Length", 0))
             downloaded = 0
             with open(dst_path, "wb") as out_file:

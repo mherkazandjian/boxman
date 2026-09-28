@@ -47,6 +47,11 @@ def _args_of(command: str) -> list[str]:
     return shlex.split(command)
 
 
+#: every urllib request goes through it: urlopen()'s stock opener, and the
+#: download fallback's own, which keeps proxy credentials off redirects (#216)
+URLLIB_OPEN = "urllib.request.OpenerDirector.open"
+
+
 class TestDownloadUrl:
 
     @pytest.mark.parametrize("payload", [SUBSTITUTION, APOSTROPHE])
@@ -54,8 +59,7 @@ class TestDownloadUrl:
         url = f"https://example.invalid/{payload}.iso"
         with patch("boxman.utils.http_download._shell_run",
                    return_value=_result(ok=False)) as run_fn:
-            with patch("boxman.utils.http_download.urllib.request.urlopen",
-                       side_effect=OSError("no network")):
+            with patch(URLLIB_OPEN, side_effect=OSError("no network")):
                 download_url(url, "/tmp/dst.iso")
 
         for call in run_fn.call_args_list:
@@ -68,8 +72,7 @@ class TestDownloadUrl:
         dst = f"/tmp/{payload}.iso"
         with patch("boxman.utils.http_download._shell_run",
                    return_value=_result(ok=False)) as run_fn:
-            with patch("boxman.utils.http_download.urllib.request.urlopen",
-                       side_effect=OSError("no network")):
+            with patch(URLLIB_OPEN, side_effect=OSError("no network")):
                 download_url("https://example.invalid/x.iso", dst)
 
         for call in run_fn.call_args_list:
@@ -212,7 +215,7 @@ class TestTheShellActuallyRunsThem:
         # real fallback run behind a passing assertion (#164 F1 review 4).
         preamble = (
             "import urllib.request\n"
-            "urllib.request.urlopen = lambda *a, **k: ("
+            "urllib.request.OpenerDirector.open = lambda *a, **k: ("
             "_ for _ in ()).throw(RuntimeError('urllib blocked in test'))\n"
         )
         return subprocess.run(
@@ -286,7 +289,7 @@ class TestVirshCommandsThroughARealShell:
         # real fallback run behind a passing assertion (#164 F1 review 4).
         preamble = (
             "import urllib.request\n"
-            "urllib.request.urlopen = lambda *a, **k: ("
+            "urllib.request.OpenerDirector.open = lambda *a, **k: ("
             "_ for _ in ()).throw(RuntimeError('urllib blocked in test'))\n"
         )
         return subprocess.run(
@@ -343,7 +346,7 @@ class TestVirshCommandsThroughARealShell:
         proc = self._run_in(tmp_path, (
             "import urllib.request\n"
             "reached = []\n"
-            "urllib.request.urlopen = lambda *a, **k: reached.append(1)\n"
+            "urllib.request.OpenerDirector.open = lambda *a, **k: reached.append(1)\n"
             "from boxman.utils.http_download import download_url\n"
             "ok = download_url('https://example.invalid/x.iso', 'dst.iso')\n"
             "print('RESULT', ok, 'URLLIB', bool(reached))\n"
@@ -378,7 +381,7 @@ class TestTheCurlFallbackIsExercised:
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
         preamble = (
             "import urllib.request\n"
-            "urllib.request.urlopen = lambda *a, **k: ("
+            "urllib.request.OpenerDirector.open = lambda *a, **k: ("
             "_ for _ in ()).throw(RuntimeError('urllib blocked in test'))\n"
         )
         return subprocess.run(
