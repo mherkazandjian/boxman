@@ -993,6 +993,11 @@ class FlowsMixin:
         kept file, is recorded for the removal to check
         (:func:`~boxman.utils.retained_tree.scan_tree`).
 
+        What it covers: the workspace (step 5) and the generated files step
+        4 removes (``deprovision_files``). Not a docker-compose cluster's
+        generated ``docker-compose.yml``, which step 2b removed with the
+        cluster before this scan ran.
+
         Returns:
             ``(in_use, tree)`` — *tree* ``None`` when there is no workspace
             to walk — or ``None`` when the project has no libvirt clusters:
@@ -1266,7 +1271,9 @@ class FlowsMixin:
         #     regardless of the libvirt-in-container runtime state: the
         #     compose provider shells out to the host docker directly. This
         #     is a different operation from the one deprovision ran, so its
-        #     failure has to be caught separately.
+        #     failure has to be caught separately. The compose file goes
+        #     here, before the in-use scan (2d): it is the one generated file
+        #     that scan never decides (#221 review R3).
         try:
             self.destroy_compose_clusters()
         except Exception as exc:

@@ -898,18 +898,21 @@ Details worth knowing:
   stays, with the directories on the way to it, and is named in a warning;
   `destroy` still exits 0. The generated files it removes elsewhere (those
   `workspace.files`/`cluster.files` list, the SSH keys, `ssh_config`) get
-  the same check. If it cannot tell which files those are — the check
-  fails, the workspace cannot be looked up (behind a directory that cannot
-  be searched it is not "gone"), or a directory in it cannot be read — it
-  exits 2 and keeps the workspace, the generated files, the runtime and the
-  cache entry, like an incomplete teardown. The removal never follows a symlink,
-  and stops, exiting 2 with the cache entry kept, at a directory on the way
-  to a kept file, or a kept file, that is no longer the one the check
-  found. It never crosses a mount point either: a filesystem or bind mount
-  anywhere under the workspace of a libvirt project makes `destroy` exit 2
-  before anything is removed — unmount it first — and so does a directory
-  more than 256 levels deep in it. Template workdirs (`--templates`) are
-  removed without this check.
+  the same check; a docker-compose cluster's generated `docker-compose.yml`
+  goes earlier, with the cluster, without it. If it cannot tell which files
+  those are — the check fails, the workspace cannot be looked up (behind a
+  directory that cannot be searched it is not "gone"), or a directory in it
+  cannot be read — it exits 2 and keeps the workspace, the generated files,
+  the runtime and the cache entry, like an incomplete teardown. The removal
+  never follows a symlink, and stops, exiting 2 with the cache entry kept,
+  at a directory on the way to a kept file, or a kept file, that is no
+  longer the one the check found. It never crosses a mount point either: a
+  filesystem or bind mount anywhere under the workspace of a libvirt
+  project stops `destroy` at the check, exiting 2 with the rest of the
+  workspace kept (the VMs and the disks they own are gone by then); unmount
+  it, then run `destroy` again. A directory more than 256 levels deep in
+  the workspace stops it the same way. Template workdirs (`--templates`)
+  are removed without this check.
 - **`destroy` validates its delete targets up front**, before any teardown
   starts. It refuses a path that is empty, relative, a symlink, your home
   directory, a filesystem root or mount point, a top-level path, or a

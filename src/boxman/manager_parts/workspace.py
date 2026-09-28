@@ -527,6 +527,12 @@ class WorkspaceMixin:
         another domain uses — or whose identity cannot be read — is kept
         and named in a warning (#221 review R3). A directory holding a
         file kept is never empty, so it stays too.
+
+        Not every generated file comes through here: a docker-compose
+        cluster's generated ``docker-compose.yml`` is removed at step 2b of
+        ``destroy``, with the cluster (the compose provider's
+        ``destroy_cluster``), before the in-use scan runs, so the scan
+        never decides it.
         """
         workspace = self.config.get('workspace', {})
         workspace_path = workspace.get('path', '')
