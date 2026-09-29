@@ -1391,7 +1391,8 @@ class VMsMixin:
                 diff['memballoon_changed'] or
                 diff['memballoon_restart_pending'] or
                 diff['removed_disks'] or
-                diff['shared_folders_restart_pending']
+                diff['shared_folders_restart_pending'] or
+                diff.get('cdroms_restart_pending')
             )
 
             # A declaration whose target still holds a different disk that
@@ -1478,6 +1479,16 @@ class VMsMixin:
             if diff['changed_cdroms']:
                 swaps = [f"{c['target']}->{c['source']}" for c in diff['changed_cdroms']]
                 changes.append(f"change cdroms: {', '.join(swaps)}")
+            # what an earlier update left for the next boot, less the drives
+            # this one changes again
+            touched = {c.get('target') for c in (
+                diff['new_cdroms'] + diff['removed_cdroms']
+                + diff['changed_cdroms'])}
+            waiting = [t for t in diff.get('cdroms_pending_targets', ())
+                       if t not in touched]
+            if waiting:
+                changes.append(
+                    f"cdroms waiting for a restart: {', '.join(waiting)}")
             if diff['new_shared_folders']:
                 names = [f.get('name', '?') for f in diff['new_shared_folders']]
                 changes.append(f"new shared folders: {', '.join(names)}")
@@ -1511,6 +1522,7 @@ class VMsMixin:
             vm_active = VMStateDiffer.domain_is_active(diff['vm_state'])
             restart_needed = False
             folders_touched = False
+            cdroms_touched = False
             pending_restart = diff['memballoon_restart_pending']
 
             # CPU / memory / max ceilings
@@ -1629,6 +1641,7 @@ class VMsMixin:
                         'details': 'CDROM update failed'
                     }))
                     return
+                cdroms_touched = True
 
             # shared folders
             if (diff['new_shared_folders'] or diff['removed_shared_folders'] or
@@ -1666,6 +1679,17 @@ class VMsMixin:
                     restart_needed = True
             elif diff['shared_folders_restart_pending'] and not vm_active:
                 restart_needed = True
+
+            # CDROMs the same way. libvirt cannot hot-plug or hot-unplug an
+            # IDE or SATA drive, so on an active domain a drive is added or
+            # removed in the persistent config alone and the guest sees it at
+            # its next boot (#222). Asked after the changes: a deferred drive
+            # sets the flag, and a pending one dropped from the config again
+            # clears it.
+            if vm_active and (cdroms_touched
+                              or diff.get('cdroms_restart_pending')):
+                if self.provider.cdroms_pending(full_vm_name):
+                    restart_needed = True
 
             # Every change that cannot reach a live guest, in one place.
             # memballoon only ever landed in the persistent config, and was

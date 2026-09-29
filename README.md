@@ -950,9 +950,11 @@ Edit `conf.yml` and run `boxman update` to reconcile the live state with the con
 ### Restarts
 
 Some changes cannot be applied to a live guest: raising a vCPU or memory
-ceiling, and some shared-folder and memballoon changes. `update` writes
-them to the persistent config and reports the VM as needing a restart. It
-does **not** restart the guest by itself.
+ceiling, adding or removing a CD-ROM drive (libvirt cannot hot-plug an IDE
+or SATA drive; changing the ISO in an existing drive is still applied
+live), and some shared-folder and memballoon changes. `update` writes them
+to the persistent config and reports the VM as needing a restart. It does
+**not** restart the guest by itself.
 
 Detaching a disk is different: it is not written and waiting for a boot.
 Nothing is detached until the guest is fully shut down (a paused guest is

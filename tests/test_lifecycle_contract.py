@@ -967,7 +967,8 @@ class TestCdromApplyOrdering:
             removed=[{'target': 'hdc'}])
 
         assert ok is True
-        manager.detach_cdrom.assert_called_once_with('hdc')
+        manager.detach_cdrom.assert_called_once_with(
+            'hdc', domain_active=True, in_guest=True)
 
     def test_activity_decides_the_media_change_scope(self, tmp_path):
         _ok, manager = self._run(

@@ -17,7 +17,7 @@ from boxman.exceptions import (
 
 from ..session_base import SessionConfigMixin
 from . import net_reconcile
-from .cdrom import CDROMManager, explicit_cdrom_targets
+from .cdrom import CDROMManager, cdroms_awaiting_boot, explicit_cdrom_targets
 from .clone_vm import CloneVM
 from .commands import LibVirtCommandBase, VirshCommand
 from .destroy_vm import DestroyVM, shutdown_and_wait
@@ -1935,12 +1935,22 @@ class LibVirtSession(SessionConfigMixin):
         partial application is reported as one rather than dressed up as a
         rollback.
 
+        On an active domain a drive is added or removed in the persistent
+        definition alone: libvirt cannot hot-plug or hot-unplug an IDE or
+        SATA drive and refuses the live change whole, which failed the
+        update (#222). The guest sees it at its next boot, and
+        :meth:`cdroms_pending`, asked after this, is what reports the
+        restart. Media is still changed live.
+
         Args:
             vm_name: Full VM domain name
             new_cdroms: CDROM configs to attach
-            removed_cdroms: CDROM entries to detach (dicts with 'target')
+            removed_cdroms: CDROM entries to detach (dicts with 'target',
+                            and 'config_only' for a drive only the
+                            persistent definition holds)
             changed_cdroms: CDROM entries with changed source
-                            (dicts with 'target' and 'source')
+                            (dicts with 'target' and 'source', and
+                            'config_only' as for a removal)
             vm_active: Whether the domain is active — *not* merely running;
                        see :meth:`VMStateDiffer.domain_is_active`
 
@@ -1987,7 +1997,8 @@ class LibVirtSession(SessionConfigMixin):
         for cdrom_config in new_cdroms:
             name = cdrom_config.get('name', '?')
             self.logger.info(f"attaching new CDROM '{name}' to VM {vm_name}")
-            if not cdrom_manager.configure_from_config(cdrom_config, reserved=reserved):
+            if not cdrom_manager.configure_from_config(
+                    cdrom_config, reserved=reserved, domain_active=vm_active):
                 self.logger.error(f"failed to attach CDROM '{name}' to {vm_name}")
                 success = False
 
@@ -1996,7 +2007,9 @@ class LibVirtSession(SessionConfigMixin):
             source = entry['source']
             self.logger.info(
                 f"changing CDROM media on {target} to {source} on VM {vm_name}")
-            if not cdrom_manager.change_media(target, source, live=vm_active):
+            # a drive the guest does not have yet: `--live` fails for it
+            live = vm_active and not entry.get('config_only')
+            if not cdrom_manager.change_media(target, source, live=live):
                 self.logger.error(
                     f"failed to change CDROM media on {target} on {vm_name}")
                 success = False
@@ -2013,7 +2026,9 @@ class LibVirtSession(SessionConfigMixin):
         for entry in removed_cdroms:
             target = entry['target']
             self.logger.info(f"detaching CDROM {target} from VM {vm_name}")
-            if not cdrom_manager.detach_cdrom(target):
+            if not cdrom_manager.detach_cdrom(
+                    target, domain_active=vm_active,
+                    in_guest=not entry.get('config_only')):
                 self.logger.error(f"failed to detach CDROM {target} from {vm_name}")
                 success = False
 
@@ -3057,6 +3072,24 @@ class LibVirtSession(SessionConfigMixin):
             if attached is None or _norm(attached) != _norm(folder):
                 return True
         return any(name not in desired_names for name in live)
+
+    def cdroms_pending(self, vm_name: str) -> bool:
+        """
+        Does a CDROM drive still differ between the live and the persistent
+        definition of the active *vm_name*?
+
+        Asked **after** the changes are applied, as
+        :meth:`shared_folders_pending` is and for the same reason: the
+        differ's answer describes the state before them. On an active
+        domain a CDROM is added or removed in the persistent definition
+        alone (#222), so this is what says the guest is owed a restart --
+        and that it no longer is, once a pending drive has been dropped
+        from the config again.
+        """
+        manager = CDROMManager(vm_name=vm_name, provider_config=self.provider_config)
+        return bool(cdroms_awaiting_boot(
+            manager.get_attached_cdroms(),
+            manager.get_attached_cdroms(inactive=True)))
 
     def persistent_disks(self, vm_name: str) -> list[dict[str, Any]]:
         """
