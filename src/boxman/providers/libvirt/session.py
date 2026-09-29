@@ -158,6 +158,153 @@ def _absence_probe(path: str) -> str:
     return "; ".join(steps)
 
 
+#: what :func:`_unreadable_probe` prints once it has established that a
+#: path exists and that whoever the probe runs as may not read it
+_UNREADABLE = "boxman-source-unreadable"
+
+#: the most layers :meth:`LibVirtSession._libvirt_backing_chain` follows —
+#: far more than any chain boxman builds (a disk under its snapshot
+#: overlays), so a deeper one is taken for a loop that names its layers
+#: differently each time round, and fails closed
+_MAX_CHAIN_DEPTH = 256
+
+
+def _unreadable_probe(path: str) -> str:
+    """
+    The shell probe behind :meth:`LibVirtSession._source_unreadable`: it
+    prints :data:`_UNREADABLE` only when *path* exists (``-e`` follows a
+    symlink) and whoever it runs as may not read it (``-r``).
+    """
+    quoted = shlex.quote(path)
+    return (f"if [ -e {quoted} ] && [ ! -r {quoted} ]; then "
+            f"echo {_UNREADABLE}; fi")
+
+
+def _pool_named(output: str) -> str | None:
+    """The pool ``virsh vol-pool`` printed — one name, then a blank line on
+    libvirt 10.0 — or ``None`` when *output* is not exactly one name."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return lines[0] if len(lines) == 1 else None
+
+
+def _volume_image(xml: str, path: str) -> dict | None:
+    """
+    One layer of a backing chain, from ``virsh vol-dumpxml`` of *path*, as
+    ``qemu-img info --output=json`` names it: ``filename`` and ``format``,
+    and ``full-backing-filename`` when it is built on another image.
+
+    libvirt describes one level (libvirt 10.0): the volume's ``<target>`` —
+    its path and format — and, for an image built on another, a
+    ``<backingStore>`` naming that file by its absolute path, even when the
+    image names it relative to itself.
+
+    Returns:
+        The layer, or ``None`` when *xml* does not describe *path*: it does
+        not parse, is not a volume, has another target path or no format,
+        or holds a ``<backingStore>`` that names no file.
+    """
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return None
+    fmt = next((element.get("type")
+                for element in root.iterfind("./target/format")), None)
+    if (root.tag != "volume" or root.findtext("./target/path") != path
+            or not fmt):
+        return None
+    image = {"filename": path, "format": fmt}
+    backing = root.find("./backingStore")
+    if backing is not None:
+        below = backing.findtext("path")
+        if not below:
+            return None
+        image["full-backing-filename"] = below
+    return image
+
+
+class _ChainReads:
+    """
+    The backing-chain reads of one host-wide in-use scan
+    (:meth:`LibVirtSession.disk_paths_in_use`) or of one
+    :meth:`LibVirtSession.backing_chains` call: the command wrapper
+    ``qemu-img`` runs through, the one the readability probe runs through
+    (the same, never with ``sudo``), ``virsh``, and the pools' target
+    directories (:meth:`pool_on`), read at most once, and only when a file
+    is found in no pool — a map gone stale meanwhile can only make a read
+    fail closed.
+
+    No pool refresh is shared here: libvirt describes a file as its pool
+    last saw it, and a source whose image is rebased after another source's
+    chain was read must not be read from that refresh (#221 review R1). Each
+    chain read through libvirt refreshes the pools it reads, once each
+    (:meth:`LibVirtSession._libvirt_backing_chain`).
+    """
+
+    #: :attr:`_pool_targets` before the pools were first read
+    _UNREAD = object()
+
+    def __init__(self, provider_config: dict[str, Any]) -> None:
+        self.cmd = LibVirtCommandBase(provider_config=provider_config)
+        self.probe = LibVirtCommandBase(override_config_use_sudo=False,
+                                        provider_config=provider_config)
+        self.virsh = VirshCommand(provider_config=provider_config)
+        #: target directory -> active pool, ``None`` when they cannot be told
+        self._pool_targets: Any = self._UNREAD
+
+    def refresh(self, pool: str, refreshed: dict[str, bool]) -> bool:
+        """Refresh *pool* unless *refreshed* — one chain's refreshes — holds
+        it already; whether that one refresh succeeded."""
+        if pool not in refreshed:
+            result = self.virsh.execute("pool-refresh", pool, warn=True)
+            refreshed[pool] = bool(result.ok)
+        return refreshed[pool]
+
+    def pool_of(self, path: str) -> str | None:
+        """The pool libvirt lists *path* in (``virsh vol-pool``), or
+        ``None``."""
+        owner = self.virsh.execute("vol-pool", path, warn=True)
+        return _pool_named(owner.stdout or "") if owner.ok else None
+
+    def pool_on(self, directory: str) -> str | None:
+        """
+        The active pool whose target is *directory*: ``virsh pool-list
+        --name`` and every one's ``pool-dumpxml``, read once per scan or
+        :meth:`LibVirtSession.backing_chains` call. A pool with no local
+        directory (RBD, say) is passed over.
+
+        Returns:
+            Its name, or ``None`` when no active pool is on *directory* or
+            that cannot be told: the pools cannot be listed, or one's
+            description cannot be read.
+        """
+        if self._pool_targets is self._UNREAD:
+            self._pool_targets = self._read_pool_targets()
+        if self._pool_targets is None:
+            return None
+        return self._pool_targets.get(os.path.normpath(directory))
+
+    def _read_pool_targets(self) -> dict[str, str] | None:
+        """``{target directory: pool}`` of every active pool, or ``None``
+        when any of it cannot be read (see :meth:`pool_on`)."""
+        listing = self.virsh.execute("pool-list", "--name", warn=True)
+        if not listing.ok:
+            return None
+        targets: dict[str, str] = {}
+        for name in (line.strip() for line in listing.stdout.splitlines()):
+            if not name:
+                continue
+            dumped = self.virsh.execute("pool-dumpxml", name, warn=True)
+            if not dumped.ok:
+                return None
+            try:
+                target = ET.fromstring(dumped.stdout).findtext("./target/path")
+            except ET.ParseError:
+                return None
+            if target:
+                targets[os.path.normpath(target)] = name
+        return targets
+
+
 class LibVirtSession(SessionConfigMixin):
     """
     Live session against the libvirt (KVM/QEMU) backend.
@@ -970,6 +1117,14 @@ class LibVirtSession(SessionConfigMixin):
         a bind mount, a hard link, a path only root resolves. A file whose
         identity cannot be read, other than for naming no file, fails the
         scan: it could be any file.
+
+        Chains are read as :meth:`_read_backing_chain` reads them, so the
+        0600 pool volumes libvirt makes every clone disk — which the user's
+        ``qemu-img`` cannot open under ``use_sudo: false`` — are read
+        through libvirt (#221), each after a refresh of the pools it reads:
+        a refresh made for one domain's chain is never trusted for
+        another's, whose image may have been rebased meanwhile (#221 review
+        R1).
         """
         virsh = VirshCommand(provider_config=self.provider_config)
         listing = virsh.execute("list", "--all", "--uuid", "--name",
@@ -993,11 +1148,11 @@ class LibVirtSession(SessionConfigMixin):
                 f"files other domains use, and each keeps them all")
             return None
         active = {line.strip() for line in running.stdout.splitlines()}
-        cmd = LibVirtCommandBase(provider_config=self.provider_config)
+        reads = _ChainReads(self.provider_config)
         in_use = FilesInUse()
         for domain, uuid in domains:
             try:
-                used = self._files_used_by(virsh, cmd, domain, uuid,
+                used = self._files_used_by(virsh, reads, domain, uuid,
                                            domain in active)
             except _DomainGoneError:
                 self.logger.debug(
@@ -1019,12 +1174,12 @@ class LibVirtSession(SessionConfigMixin):
                 in_use.identities.setdefault(identity, owner)
         return in_use
 
-    def _files_used_by(self, virsh, cmd, domain: str, uuid: str,
-                       active: bool) -> FilesInUse | None:
+    def _files_used_by(self, virsh, reads: _ChainReads, domain: str,
+                       uuid: str, active: bool) -> FilesInUse | None:
         """
         What *domain*, whose UUID is *uuid*, uses, as
-        :meth:`disk_paths_in_use` maps it; its block jobs too when it is
-        *active*.
+        :meth:`disk_paths_in_use` maps it — every chain read through the
+        scan's *reads* — and its block jobs too when it is *active*.
 
         Returns:
             The map, or ``None`` when it cannot be told.
@@ -1045,7 +1200,7 @@ class LibVirtSession(SessionConfigMixin):
         live: dict[str, ET.Element | None] = {}
         used = FilesInUse()
         for source in sorted(sources):
-            chain = self._backing_chain_files(cmd, source)
+            chain = self._backing_chain_files(reads, source)
             if chain is None:
                 if not self._source_absent(source):
                     # not proved absent — which a source spelled otherwise
@@ -1076,7 +1231,7 @@ class LibVirtSession(SessionConfigMixin):
             if not self._record_in_use(used, domain, chain):
                 return None
         if active:
-            jobs = self._block_job_files(virsh, cmd, domain, uuid, live)
+            jobs = self._block_job_files(virsh, reads, domain, uuid, live)
             if jobs is None:
                 return None
             if not self._record_in_use(used, domain, jobs):
@@ -1139,7 +1294,8 @@ class LibVirtSession(SessionConfigMixin):
             in_use.identities.setdefault((st.st_dev, st.st_ino), domain)
         return True
 
-    def _block_job_files(self, virsh, cmd, domain: str, uuid: str,
+    def _block_job_files(self, virsh, reads: _ChainReads, domain: str,
+                         uuid: str,
                          live: dict[str, ET.Element | None]) -> list[str] | None:
         """
         The files the block jobs of *domain*, an active domain whose UUID
@@ -1189,7 +1345,7 @@ class LibVirtSession(SessionConfigMixin):
                     f"keeps them all — retry once the job has ended (virsh "
                     f"blockjob {domain} {dev})")
                 return None
-            chain = self._backing_chain_files(cmd, destination)
+            chain = self._backing_chain_files(reads, destination)
             if chain is None:
                 self._raise_if_gone(virsh, domain, uuid)
                 self.logger.warning(
@@ -1316,17 +1472,19 @@ class LibVirtSession(SessionConfigMixin):
         it was deleted, which boxman tolerates elsewhere — and is left out.
         Any other source whose chain cannot be read makes the whole answer
         ``None``: an existing image that cannot be read may depend on
-        anything.
+        anything. One the user may not read is read through libvirt
+        (:meth:`_read_backing_chain`), after a refresh of each pool that
+        chain reads.
 
         Returns:
             ``{source: chain}`` for every source that is there, or ``None``
             when the chain of one that is not confirmed absent cannot be
             read.
         """
-        cmd = LibVirtCommandBase(provider_config=self.provider_config)
+        reads = _ChainReads(self.provider_config)
         chains: dict[str, list[str]] = {}
         for source in sources:
-            images = self._read_backing_chain(cmd, source)
+            images = self._read_backing_chain(reads, source)
             if images is None:
                 if self._source_absent(source):
                     continue
@@ -1424,18 +1582,31 @@ class LibVirtSession(SessionConfigMixin):
         result = probe.execute_shell(_absence_probe(path), warn=True)
         return bool(result.ok) and (result.stdout or "").strip() == _ABSENT
 
-    @staticmethod
-    def _read_backing_chain(cmd, source: str) -> list[dict] | None:
+    def _read_backing_chain(self, reads: _ChainReads,
+                            source: str) -> list[dict] | None:
         """
         ``qemu-img info --backing-chain`` of *source*, head first, or
         ``None`` when it cannot be read or its answer is not a non-empty
         list of images that each name their file. ``-U`` reads images a
         running guest holds locked.
+
+        When ``qemu-img`` ran as the user — its wrapper added no ``sudo`` —
+        and could not open *source* because the user may not read it
+        (:meth:`_source_unreadable`), the chain is read through libvirt
+        instead (:meth:`_libvirt_backing_chain`), in the same shape: libvirt
+        makes every clone disk a 0600 pool volume, owned by root or
+        libvirt-qemu, and reads it as root (#221). A failure for any other
+        reason — the file is readable, or ``qemu-img`` ran as root through
+        ``sudo`` — is not second-guessed, and neither is an answer that does
+        not parse: ``None``, as before.
         """
-        result = cmd.execute_shell(
-            f"qemu-img info --backing-chain --output=json -U "
-            f"{shlex.quote(source)}", warn=True)
+        qemu_img = (f"qemu-img info --backing-chain --output=json -U "
+                    f"{shlex.quote(source)}")
+        result = reads.cmd.execute_shell(qemu_img, warn=True)
         if not result.ok:
+            if (not reads.cmd.sudo_prefix(qemu_img)
+                    and self._source_unreadable(reads, source)):
+                return self._libvirt_backing_chain(reads, source)
             return None
         try:
             chain = json.loads(result.stdout)
@@ -1453,14 +1624,103 @@ class LibVirtSession(SessionConfigMixin):
                 return None
         return chain
 
-    @classmethod
-    def _backing_chain_files(cls, cmd, source: str) -> list[str] | None:
+    def _source_unreadable(self, reads: _ChainReads, path: str) -> bool:
+        """
+        Whether *path* exists and may not be read by whoever ``qemu-img``
+        runs as when its wrapper adds no ``sudo``.
+
+        Asked, like :meth:`_source_absent`, through the same command wrapper
+        ``qemu-img`` runs through, never with ``sudo`` — so under the
+        docker-compose runtime it is answered inside the runtime container —
+        and only from the probe's own positive answer
+        (:func:`_unreadable_probe`), never from ``qemu-img``'s error text.
+        """
+        result = reads.probe.execute_shell(_unreadable_probe(path), warn=True)
+        return bool(result.ok) and (result.stdout or "").strip() == _UNREADABLE
+
+    def _libvirt_backing_chain(self, reads: _ChainReads,
+                               source: str) -> list[dict] | None:
+        """
+        The backing chain of *source*, head first, read through libvirt:
+        each layer from ``virsh vol-dumpxml``, its pool refreshed first
+        (:meth:`_libvirt_image`), following ``<backingStore>`` down to the
+        image built on nothing — in the shape :meth:`_read_backing_chain`
+        returns.
+
+        Each pool this chain reads is refreshed once, for all its layers in
+        that pool, and for this chain only: a refresh made for another
+        source's chain could predate a rebase of this one's image (#221
+        review R1).
+
+        Returns:
+            The chain, or ``None`` when libvirt cannot describe it: a layer
+            is not a storage-pool volume, its pool cannot be refreshed, its
+            description cannot be read, or the chain loops or runs deeper
+            than :data:`_MAX_CHAIN_DEPTH` layers.
+        """
+        chain: list[dict] = []
+        refreshed: dict[str, bool] = {}
+        path: str | None = source
+        while path is not None:
+            if (len(chain) == _MAX_CHAIN_DEPTH
+                    or any(image["filename"] == path for image in chain)):
+                self.logger.debug(
+                    f"the backing chain of {source} loops or runs deeper "
+                    f"than {_MAX_CHAIN_DEPTH} layers at {path}")
+                return None
+            image = self._libvirt_image(reads, path, refreshed)
+            if image is None:
+                return None
+            chain.append(image)
+            path = image.get("full-backing-filename")
+        return chain
+
+    def _libvirt_image(self, reads: _ChainReads, path: str,
+                       refreshed: dict[str, bool]) -> dict | None:
+        """
+        One layer of a chain, *path*, as libvirt describes it: the pool
+        that holds it (``virsh vol-pool``), refreshed — once per chain,
+        *refreshed* recording which pools this chain's read refreshed —
+        because libvirt describes a file as its pool last saw it (an image
+        rebased since still shows its old backing file until then), then
+        ``virsh vol-dumpxml`` (:func:`_volume_image`). ``None`` when any
+        step fails.
+
+        A file made since its pool was last refreshed — the overlay a
+        snapshot adds, which nothing refreshes a pool for — is in no pool
+        until then. The pool on its directory (:meth:`_ChainReads.pool_on`)
+        is refreshed, and libvirt must then list the file (``vol-pool``
+        again); one it still does not, or in a directory no pool is on, is
+        no pool volume.
+        """
+        pool = reads.pool_of(path)
+        if pool is None:
+            holder = reads.pool_on(os.path.dirname(path))
+            if holder is not None and reads.refresh(holder, refreshed):
+                pool = reads.pool_of(path)
+        if pool is None:
+            self.logger.debug(
+                f"{path} is not a storage-pool volume libvirt lists")
+            return None
+        if not reads.refresh(pool, refreshed):
+            self.logger.debug(f"could not refresh storage pool {pool}, "
+                              f"which holds {path}")
+            return None
+        dumped = reads.virsh.execute("vol-dumpxml", path, warn=True)
+        image = _volume_image(dumped.stdout or "", path) if dumped.ok else None
+        if image is None:
+            self.logger.debug(f"libvirt gave no description of {path}: "
+                              f"{(dumped.stderr or '').strip()}")
+        return image
+
+    def _backing_chain_files(self, reads: _ChainReads,
+                             source: str) -> list[str] | None:
         """
         Resolved paths of *source* and every image below it — the images
         and the backing files they name — or ``None`` when the chain cannot
         be read (see :meth:`_read_backing_chain`).
         """
-        images = cls._read_backing_chain(cmd, source)
+        images = self._read_backing_chain(reads, source)
         if images is None:
             return None
         paths = {os.path.realpath(source)}

@@ -9,6 +9,7 @@ the routine with real files in a temporary workdir and a mocked session.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -28,6 +29,7 @@ from boxman.providers.libvirt.disk_ownership import (
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.providers.libvirt.virsh_parse import DomblkRow
 from conftest import domain_listing, domain_uuid, make_bare_manager
+from fake_libvirt_host import FakeHost
 
 pytestmark = pytest.mark.unit
 
@@ -107,10 +109,13 @@ def _image(path, backing=None):
 
 def _production_chains(t):
     """Have *t*'s session read backing chains the way production does:
-    ``LibVirtSession.backing_chains`` running the real ``qemu-img`` (and
-    whatever else it runs) on this host, local runtime, no sudo."""
+    ``LibVirtSession.backing_chains`` running the real ``qemu-img`` and
+    shell probes on this host, local runtime, no sudo. Its ``virsh`` fails
+    every call -- what libvirt answers for these files, in no storage pool
+    (#221) -- so the host's own libvirt is never asked."""
     t.session.backing_chains.side_effect = LibVirtSession(
-        config={'provider': {'libvirt': {}}}).backing_chains
+        config={'provider': {'libvirt': {'virsh_cmd': 'false'}}}
+    ).backing_chains
 
 
 class _Teardown:
@@ -2529,3 +2534,139 @@ def _malformed(tmp_path, layout):
         "targets of lists": {**data, "targets": {"/w/a": ["vdb"]}},
         "boot family of numbers": {**data, "boot_family": [1]},
     }[layout]
+
+
+class TestTeardownWithoutSudo:
+    """Under ``use_sudo: false`` -- the default -- qemu-img runs as the
+    user, and libvirt makes every clone disk a 0600 pool volume the user
+    cannot read: every teardown kept every boot disk, and the next
+    ``provision`` failed on them. The chains are read through libvirt now,
+    the teardown's and the in-use scan's alike (#221)."""
+
+    @staticmethod
+    def _pool(tmp_path, *disks):
+        """*disks* -- ``(path, backing)`` -- as virt-clone leaves them:
+        0600 volumes of the pool on their workdir."""
+        host = FakeHost()
+        for disk, backing in disks:
+            host.add(str(disk),
+                     backing=None if backing is None else str(backing))
+        host.define_pool('cluster_1', str(tmp_path))
+        return host
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _production(t, host, scan=False):
+        """*t*'s session reading chains -- and scanning, when *scan* -- the
+        way production does, every command answered by *host*."""
+        session = LibVirtSession(config={'provider': {'libvirt': {}}})
+        t.session.backing_chains.side_effect = session.backing_chains
+        if scan:
+            t.session.disk_paths_in_use.side_effect = (
+                session.disk_paths_in_use)
+        with patch('boxman.providers.libvirt.commands._shell_run',
+                   side_effect=host.run):
+            yield
+
+    def _deprovision(self, t, host, scan=False):
+        with self._production(t, host, scan):
+            t.deprovision()
+
+    def test_the_boot_disk_goes(self, tmp_path):
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        host = self._pool(tmp_path, (boot, None))
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+
+        self._deprovision(t, host)
+
+        assert list(tmp_path.iterdir()) == []
+        assert t.warnings == ''
+        assert host.asked('vol-dumpxml') == [(str(boot),)]
+
+    def test_a_boot_disk_under_a_snapshot_overlay_goes_with_it(self,
+                                                               tmp_path):
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        overlay = _file(tmp_path / f'{VM}.s1')
+        host = self._pool(tmp_path, (overlay, boot), (boot, None))
+        t = _Teardown(tmp_path, disks=[overlay], records=[])
+
+        self._deprovision(t, host)
+
+        assert list(tmp_path.iterdir()) == []
+        assert t.warnings == ''
+        assert host.asked('pool-refresh') == [('cluster_1',)]
+
+    def test_a_snapshot_overlay_its_pool_has_not_listed_goes_too(
+            self, tmp_path):
+        """``snapshot take`` adds ``<vm>.<snapshot>`` over the boot disk and
+        refreshes no pool, so libvirt knows no volume there until the pool
+        on its directory is refreshed (as on the test runner)."""
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        overlay = _file(tmp_path / f'{VM}.s1')
+        memory = _file(tmp_path / f'{VM}_snapshot_s1.raw')
+        host = self._pool(tmp_path, (boot, None))
+        host.add(str(overlay), backing=str(boot))
+        t = _Teardown(tmp_path, disks=[overlay], records=[])
+
+        self._deprovision(t, host)
+
+        assert list(tmp_path.iterdir()) == []
+        assert not memory.exists()
+        assert t.warnings == ''
+
+    def test_a_disk_libvirt_cannot_describe_is_still_kept(self, tmp_path):
+        """No pool lists it: fail closed, and say so, as before."""
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        host = FakeHost()
+        host.add(str(boot))
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+
+        self._deprovision(t, host)
+
+        assert boot.exists()
+        assert 'backing chains of the vm' in t.warnings
+        assert host.asked('vol-pool') == [(str(boot),)]
+
+    def test_the_in_use_scan_reads_a_siblings_disk_through_libvirt(
+            self, tmp_path):
+        """A parallel deprovision: the sibling's disk is a 0600 volume too,
+        and a scan that cannot read it keeps everything of every VM."""
+        boot = _file(tmp_path / f'{VM}.qcow2')
+        sibling = _file(tmp_path / f'{OTHER}.qcow2')
+        host = self._pool(tmp_path, (boot, None), (sibling, None))
+        host.define_domain(OTHER, ('file', 'disk', 'vda', str(sibling)),
+                           running=True)
+        t = _Teardown(tmp_path, disks=[boot], records=[])
+
+        self._deprovision(t, host, scan=True)
+
+        assert not boot.exists() and sibling.exists()
+        assert t.warnings == ''
+        assert (str(sibling),) in host.asked('vol-dumpxml')
+
+    def test_a_retried_teardown_reads_what_is_left_through_libvirt(
+            self, tmp_path):
+        """Interrupted after removing the head of the boot chain, a retry
+        reads what is left of the chain through libvirt too -- each chain
+        after a refresh of its own (#221 review R1)."""
+        base = _qcow2(tmp_path / f'{VM}.qcow2')
+        head = _qcow2(tmp_path / f'{VM}.s1')
+        iso = _file(tmp_path / 'tools.iso', b'iso')
+        host = self._pool(tmp_path, (head, base), (base, None), (iso, None))
+        t = _Teardown(tmp_path, disks=[head], media=[iso], records=[])
+
+        with self._production(t, host):
+            TestRetriedTeardown._interrupt_at(t, base)
+        assert not head.exists() and base.exists()
+        del host.files[str(head)]
+        # the head's chain and the CD-ROM's
+        assert host.asked('pool-refresh') == [('cluster_1',)] * 2
+
+        t.session.vm_storage_devices.return_value = None
+        t.mgr.logger.reset_mock()
+        self._deprovision(t, host)
+
+        assert not base.exists() and iso.exists()
+        assert t.warnings == ''
+        # the CD-ROM's chain, and what is left of the head's
+        assert host.asked('pool-refresh') == [('cluster_1',)] * 4

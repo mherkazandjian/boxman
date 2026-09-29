@@ -32,6 +32,8 @@ from boxman.exceptions import ConfigError
 from boxman.providers.libvirt.net import Network
 from boxman.providers.libvirt.session import _ABSENT, LibVirtSession
 from conftest import domain_listing, domain_uuid
+from fake_libvirt_host import FakeHost
+from fake_libvirt_host import Result as FakeResult
 
 pytestmark = pytest.mark.unit
 
@@ -1640,10 +1642,13 @@ class TestAbsenceProbe:
         assert not probe.startswith("sudo")
 
     def test_it_runs_where_qemu_img_runs(self):
-        chains, (qemu_img, probe) = self._commands({
+        chains, commands = self._commands({
             "runtime": "docker-compose", "runtime_container": "rt"})
         assert chains == {}
-        for command in (qemu_img, probe):
+        # qemu-img, the probe asking whether it may not be read (#221), and
+        # the absence probe
+        assert len(commands) == 3
+        for command in commands:
             assert command.startswith("docker exec --user root rt bash -c ")
 
     @pytest.mark.parametrize("says, ok", [("", True), (_ABSENT, False),
@@ -1681,10 +1686,35 @@ class TestSourcesGoneFromTheHost:
         assert _session({}).backing_chains([gone]) == {}
 
     def test_an_existing_image_that_cannot_be_read_fails_closed(self, tmp_path):
+        """The real probe, in a real shell, finds that the user may not
+        read it, so libvirt is asked (#221) -- which lists no volume at
+        that path, nor any pool, here."""
         self._unless_root()
         disk = self._image(tmp_path / "a.qcow2")
         os.chmod(disk, 0)
-        assert _session({}).backing_chains([disk]) is None
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:
+            virsh.return_value.execute.return_value = _result(
+                ok=False, stderr="error: Storage volume not found")
+            assert _session({}).backing_chains([disk]) is None
+        assert [c.args for c in virsh.return_value.execute.call_args_list] == [
+            ("vol-pool", disk), ("pool-list", "--name")]
+
+    def test_a_readable_image_qemu_img_cannot_open_is_not_taken_to_libvirt(
+            self, tmp_path):
+        """The real probe finds it readable: whatever stopped qemu-img, it
+        was not the user's permission to read it (#221)."""
+        disk = tmp_path / "a.qcow2"
+        disk.write_bytes(b"QFI\xfb" + b"\xff" * 508)
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:
+            assert _session({}).backing_chains([str(disk)]) is None
+        virsh.return_value.execute.assert_not_called()
+
+    def test_a_missing_source_is_not_taken_to_libvirt(self, tmp_path):
+        """The real probe: what is not there cannot be unreadable."""
+        gone = str(tmp_path / "seed.iso")
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:
+            assert _session({}).backing_chains([gone]) == {}
+        virsh.return_value.execute.assert_not_called()
 
     def test_a_dangling_symlink_is_not_taken_for_absent(self, tmp_path):
         link = tmp_path / "seed.iso"
@@ -1753,8 +1783,509 @@ class TestSourcesGoneFromTheHost:
             if args[0] == "list":
                 return _result(stdout=domain_listing(args, "vm-b")
                                if "--all" in args else "")
+            if args[0] in ("vol-pool", "pool-list"):
+                # a file in no storage pool, on a host with none (#221)
+                return _result(ok=False, stderr="error: Storage volume not "
+                                                "found")
             return _result(stdout=blk)
 
         with patch("boxman.providers.libvirt.session.VirshCommand") as virsh:
             virsh.return_value.execute.side_effect = virsh_execute
             assert _session({}).disk_paths_in_use() is None
+
+
+# ---------------------------------------------------------------------------
+# #221 — a chain the user may not read is read through libvirt
+# ---------------------------------------------------------------------------
+
+#: a cluster workdir, which virt-clone makes libvirt pool ``cluster_1``
+POOL = "/ws/cluster_1"
+TOP = f"{POOL}/vm01.qcow2"
+BASE = f"{POOL}/base.qcow2"
+#: what reads a chain through libvirt
+VIRSH_READS = ("vol-pool", "pool-refresh", "vol-dumpxml")
+
+
+def _pool_host(*images: tuple[str, dict]) -> FakeHost:
+    """A host whose pool ``cluster_1`` lists *images* -- ``(path, fields)``
+    -- as provision leaves clone disks: 0600, which the user cannot read."""
+    host = FakeHost()
+    for path, fields in images:
+        host.add(path, **fields)
+    host.define_pool("cluster_1", POOL)
+    return host
+
+
+def _overlay_host() -> FakeHost:
+    """TOP, an overlay on BASE, both unreadable pool volumes."""
+    return _pool_host((TOP, {"backing": BASE}), (BASE, {}))
+
+
+def _chains(host: FakeHost, sources: list[str],
+            provider: dict | None = None):
+    """``backing_chains(sources)`` with every command answered by *host*."""
+    with patch("boxman.providers.libvirt.commands._shell_run",
+               side_effect=host.run):
+        return _session(provider).backing_chains(sources)
+
+
+def _libvirt_asked(host: FakeHost) -> list[tuple[str, tuple]]:
+    """What libvirt was asked to read a chain, in order."""
+    return [(what, args) for _, what, args in host.log if what in VIRSH_READS]
+
+
+class TestChainReadThroughLibvirt:
+    """With ``use_sudo: false`` -- the default -- qemu-img runs as the user,
+    who may not read the 0600 pool volumes libvirt makes every clone disk.
+    Such a chain is read through libvirt instead, its pool refreshed first,
+    and whatever libvirt cannot describe still fails closed (#221)."""
+
+    def test_an_unreadable_disk_is_read_through_libvirt(self):
+        host = _pool_host((TOP, {}))
+
+        assert _chains(host, [TOP]) == {TOP: [TOP]}
+        assert host.order() == ["qemu-img", "unreadable-probe",
+                                *VIRSH_READS]
+        assert host.asked("vol-pool") == [(TOP,)]
+        assert host.asked("pool-refresh") == [("cluster_1",)]
+        # the probe asks as whom qemu-img ran: the user, never sudo
+        assert host.identities("unreadable-probe") == {"user"}
+
+    def test_an_overlay_is_followed_to_the_bottom(self):
+        host = _overlay_host()
+
+        assert _chains(host, [TOP]) == {TOP: [TOP, BASE]}
+        assert host.asked("vol-dumpxml") == [(TOP,), (BASE,)]
+
+    def test_the_pool_is_refreshed_before_a_layer_is_read(self):
+        """libvirt's answer is the pool's last refresh: rebased out of band,
+        an image still shows its old backing file until the pool is
+        refreshed (checked on libvirt 10.0)."""
+        new = f"{POOL}/new-base.qcow2"
+        host = _overlay_host()
+        host.add(new)
+        host.refresh("cluster_1")
+        host.files[TOP].backing = new       # qemu-img rebase -u, as root
+
+        assert _chains(host, [TOP]) == {TOP: [TOP, new]}
+        order = host.order()
+        assert order.index("pool-refresh") < order.index("vol-dumpxml")
+
+    def test_each_chain_is_read_after_a_refresh_of_its_own(self):
+        """One refresh serves every layer of a chain in that pool, and no
+        other chain: a source read later may have been rebased since (#221
+        review R1)."""
+        other = f"{POOL}/vm02.qcow2"
+        host = _overlay_host()
+        host.add(other, backing=BASE)
+        host.refresh("cluster_1")
+
+        assert _chains(host, [TOP, other]) == {TOP: [TOP, BASE],
+                                               other: [other, BASE]}
+        assert _libvirt_asked(host) == [
+            ("vol-pool", (TOP,)), ("pool-refresh", ("cluster_1",)),
+            ("vol-dumpxml", (TOP,)), ("vol-pool", (BASE,)),
+            ("vol-dumpxml", (BASE,)),
+            ("vol-pool", (other,)), ("pool-refresh", ("cluster_1",)),
+            ("vol-dumpxml", (other,)), ("vol-pool", (BASE,)),
+            ("vol-dumpxml", (BASE,))]
+
+    def test_a_source_rebased_after_another_was_read_is_read_as_it_is(self):
+        """The second source's image is rebased out of band once the first
+        source's chain has been read: its chain shows the new backing file,
+        as qemu-img's would (#221 review R1)."""
+        other = f"{POOL}/vm02.qcow2"
+        new = f"{POOL}/new-base.qcow2"
+        host = _overlay_host()
+        host.add(other, backing=BASE)
+        host.add(new)
+        host.refresh("cluster_1")
+        host.before[("qemu-img", other)] = (
+            lambda: setattr(host.files[other], "backing", new))
+
+        assert _chains(host, [TOP, other]) == {TOP: [TOP, BASE],
+                                               other: [other, new]}
+
+    def test_a_later_read_refreshes_again(self):
+        host = _overlay_host()
+        _chains(host, [TOP])
+        _chains(host, [TOP])
+
+        assert host.asked("pool-refresh") == [("cluster_1",)] * 2
+
+    # -- no fallback -----------------------------------------------------------
+
+    def test_a_readable_image_qemu_img_cannot_open_stays_unread(self):
+        """Not a permission problem, so libvirt is not asked: its reading of
+        a damaged header need not agree with qemu-img's."""
+        host = _pool_host((TOP, {"readable": True, "corrupt": True}))
+
+        assert _chains(host, [TOP]) is None
+        assert host.order() == ["qemu-img", "unreadable-probe",
+                                "absence-probe"]
+
+    def test_a_readable_head_on_an_unreadable_base_stays_unread(self):
+        """The probe asks about the source itself: it can be read, so
+        whatever qemu-img could not open below it is not the user's reading
+        of it."""
+        host = _pool_host((TOP, {"backing": BASE, "readable": True}),
+                          (BASE, {}))
+
+        assert _chains(host, [TOP]) is None
+        assert host.order() == ["qemu-img", "unreadable-probe",
+                                "absence-probe"]
+
+    def test_a_qemu_img_that_ran_with_sudo_is_never_second_guessed(self):
+        """Run as root, qemu-img could read the file: its failure is not
+        the user's, whatever the user's probe would say -- here sudo wants a
+        password."""
+        host = _pool_host((TOP, {}))
+        host.sudo_refused = True
+
+        assert _chains(host, [TOP], {"use_sudo": True}) is None
+        assert "unreadable-probe" not in host.order()
+        assert not set(VIRSH_READS) & set(host.order())
+
+    def test_a_source_that_is_gone_is_left_out_without_libvirt(self):
+        host = _pool_host()
+
+        assert _chains(host, [TOP]) == {}
+        assert host.order() == ["qemu-img", "unreadable-probe",
+                                "absence-probe"]
+
+    # -- what libvirt cannot describe fails closed ------------------------------
+
+    @staticmethod
+    def _xml(host: FakeHost, path: str) -> str:
+        return host._vol_dumpxml((path,)).stdout
+
+    #: what reading TOP -> BASE through libvirt asks, in order
+    READ = [("vol-pool", (TOP,)), ("pool-refresh", ("cluster_1",)),
+            ("vol-dumpxml", (TOP,)), ("vol-pool", (BASE,)),
+            ("vol-dumpxml", (BASE,))]
+    #: ... when libvirt lists no volume at TOP, even once the pool on its
+    #: directory is refreshed
+    UNLISTED = [("vol-pool", (TOP,)), ("pool-refresh", ("cluster_1",)),
+                ("vol-pool", (TOP,))]
+
+    @pytest.mark.parametrize("breakage, asked", [
+        ("the source is no pool volume", UNLISTED),
+        ("vol-pool fails", UNLISTED),
+        ("vol-pool answers, then fails", UNLISTED),
+        ("vol-pool prints no one pool", UNLISTED),
+        ("the refresh fails", 2),
+        ("the refresh answers, then fails", 2),
+        ("vol-dumpxml fails", 3),
+        ("vol-dumpxml answers, then fails", 3),
+        ("the XML does not parse", 3),
+        ("the XML is not a volume", 3),
+        ("the XML describes another path", 3),
+        ("the XML names no format", 3),
+        ("the backing store names no file", 3),
+    ])
+    def test_what_libvirt_cannot_describe_fails_closed(self, breakage,
+                                                       asked):
+        """... and nothing after the failure is asked."""
+        host = _overlay_host()
+        if breakage == "the source is no pool volume":
+            host.never_listed.add(TOP)
+            host.refresh("cluster_1")
+        elif breakage == "vol-pool fails":
+            host.fail.add("vol-pool")
+        elif breakage == "vol-pool answers, then fails":
+            host.fail_after_answering.add("vol-pool")
+        elif breakage == "vol-pool prints no one pool":
+            host.vol_pool_override[TOP] = "cluster_1\ncluster_2\n\n"
+        elif breakage == "the refresh fails":
+            host.fail.add("pool-refresh")
+        elif breakage == "the refresh answers, then fails":
+            host.fail_after_answering.add("pool-refresh")
+        elif breakage == "vol-dumpxml fails":
+            host.fail.add("vol-dumpxml")
+        elif breakage == "vol-dumpxml answers, then fails":
+            host.fail_after_answering.add("vol-dumpxml")
+        elif breakage == "the XML does not parse":
+            host.dumpxml_override[TOP] = "<volume type='file'><name>"
+        elif breakage == "the XML is not a volume":
+            host.dumpxml_override[TOP] = self._xml(host, TOP).replace(
+                "volume", "pool")
+        elif breakage == "the XML describes another path":
+            host.dumpxml_override[TOP] = self._xml(host, TOP).replace(
+                f"<path>{TOP}</path>", f"<path>{POOL}/other.qcow2</path>")
+        elif breakage == "the XML names no format":
+            host.dumpxml_override[TOP] = self._xml(host, TOP).replace(
+                "<format type='qcow2'/>", "", 1)
+        elif breakage == "the backing store names no file":
+            host.dumpxml_override[TOP] = self._xml(host, TOP).replace(
+                f"<path>{BASE}</path>", "")
+
+        assert _chains(host, [TOP]) is None
+        assert _libvirt_asked(host) == (
+            asked if isinstance(asked, list) else self.READ[:asked])
+
+    def test_a_layer_below_that_is_no_pool_volume_fails_closed(self):
+        host = _overlay_host()
+        outside = "/tpl/base.qcow2"
+        del host.files[BASE]
+        host.add(outside)
+        host.files[TOP].backing = outside
+        host.refresh("cluster_1")
+
+        assert _chains(host, [TOP]) is None
+        assert _libvirt_asked(host) == [*self.READ[:3],
+                                        ("vol-pool", (outside,))]
+
+    def test_a_cycle_fails_closed_at_the_first_repeat(self):
+        host = _overlay_host()
+        host.files[BASE].backing = TOP
+        host.refresh("cluster_1")
+
+        assert _chains(host, [TOP]) is None
+        assert _libvirt_asked(host) == self.READ
+
+    @pytest.mark.parametrize("says, ok, fallback", [
+        (None, True, True),
+        ("", True, False),
+        (None, False, False),
+        ("something else", True, False),
+    ], ids=["its answer", "silence", "its answer, failed",
+            "another answer"])
+    def test_only_the_probes_own_answer_takes_it_to_libvirt(self, says, ok,
+                                                           fallback):
+        from boxman.providers.libvirt.session import _UNREADABLE
+
+        host = _overlay_host()
+        run = host.run
+
+        def shell(command, **kwargs):
+            if command.startswith("if [ -e") and "-r" in command:
+                run(command)
+                return FakeResult(
+                    stdout=(_UNREADABLE if says is None else says) + "\n",
+                    code=0 if ok else 1)
+            return run(command)
+
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=shell):
+            chains = _session({}).backing_chains([TOP])
+        assert chains == ({TOP: [TOP, BASE]} if fallback else None)
+        assert bool(_libvirt_asked(host)) is fallback
+
+    def test_a_chain_deeper_than_the_limit_fails_closed(self):
+        from boxman.providers.libvirt.session import _MAX_CHAIN_DEPTH
+
+        layers = [f"{POOL}/layer{i}.qcow2" for i in range(_MAX_CHAIN_DEPTH + 1)]
+
+        def host_of(chain):
+            return _pool_host(*((path, {"backing": below})
+                                for path, below in zip(
+                                    chain, [*chain[1:], None], strict=True)))
+
+        deepest = layers[:_MAX_CHAIN_DEPTH]
+        assert _chains(host_of(deepest), [deepest[0]]) == {
+            deepest[0]: deepest}
+        assert _chains(host_of(layers), [layers[0]]) is None
+
+    # -- through either runtime's command wrappers --------------------------------
+
+    def test_under_the_docker_runtime_all_of_it_runs_in_the_container(self):
+        """A root there that may not read a file (a user namespace) takes
+        the same route, and every command -- qemu-img, the probe, virsh --
+        runs inside the runtime container."""
+        host = _overlay_host()
+        host.root_reads = False
+
+        assert _chains(host, [TOP], {"runtime": "docker-compose",
+                                     "runtime_container": "rt"}) == {
+            TOP: [TOP, BASE]}
+        assert host.commands and all(
+            command.startswith("docker exec --user root rt bash -c ")
+            for command in host.commands)
+
+    def test_qemu_img_exempt_from_sudo_falls_back_with_virsh_as_configured(
+            self):
+        """``use_sudo: true`` with qemu-img in ``sudo_skip_commands``: the
+        user's qemu-img cannot read the disk, the probe runs as the user
+        too, and virsh keeps its sudo."""
+        host = _overlay_host()
+
+        assert _chains(host, [TOP], {"use_sudo": True,
+                                     "sudo_skip_commands": ["qemu-img"]}) == {
+            TOP: [TOP, BASE]}
+        assert host.identities("qemu-img") == {"user"}
+        assert host.identities("unreadable-probe") == {"user"}
+        for what in VIRSH_READS:
+            assert host.identities(what) == {"root"}
+
+
+class TestInUseScanThroughLibvirt:
+    """The host-wide in-use scan every teardown asks reads each domain's
+    chains the same way: a sibling's 0600 clone disk no longer fails it
+    (#221), so a parallel deprovision can tell what the others use."""
+
+    B = "/tpl/b.img"
+    ISO = "/iso/tools.iso"
+
+    def _host(self) -> FakeHost:
+        host = _overlay_host()
+        host.add(self.B, readable=True)
+        host.add(self.ISO, format="raw", readable=True)
+        host.define_domain("vm-a", ("file", "disk", "vda", TOP),
+                           running=True)
+        host.define_domain("vm-b", ("file", "disk", "vda", self.B),
+                           ("file", "cdrom", "sda", self.ISO))
+        return host
+
+    @staticmethod
+    def _scan(host: FakeHost):
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=host.run):
+            return _session({}).disk_paths_in_use()
+
+    def test_an_unreadable_disk_and_its_base_are_mapped(self):
+        in_use = self._scan(self._host())
+
+        assert in_use == {TOP: "vm-a", BASE: "vm-a",
+                          self.B: "vm-b", self.ISO: "vm-b"}
+
+    def test_each_chain_is_read_after_a_refresh_of_its_own(self):
+        host = self._host()
+        other = f"{POOL}/vm03.qcow2"
+        host.add(other, backing=BASE)
+        host.refresh("cluster_1")
+        host.define_domain("vm-c", ("file", "disk", "vda", other))
+
+        assert self._scan(host)[other] == "vm-c"
+        assert host.asked("pool-refresh") == [("cluster_1",)] * 2
+
+    def test_an_image_rebased_mid_scan_is_read_as_it_is_now(self):
+        """Codex's reproduction (#221 review R1): the scan refreshes the pool
+        for vm-a's chain; vm-c's image, already listed, is then rebased onto
+        another file before its chain is read. A refresh reused from vm-a's
+        read showed the old backing file, and left the new one -- which
+        qemu-img would have found -- unprotected."""
+        later = f"{POOL}/later.qcow2"
+        old = f"{POOL}/old.qcow2"
+        new = f"{POOL}/new.qcow2"
+        host = self._host()
+        host.add(later, backing=old)
+        host.add(old)
+        host.add(new)
+        host.refresh("cluster_1")
+        host.define_domain("vm-c", ("file", "disk", "vda", later))
+        host.before[("qemu-img", later)] = (
+            lambda: setattr(host.files[later], "backing", new))
+
+        in_use = self._scan(host)
+
+        assert in_use[later] == "vm-c"
+        assert in_use[new] == "vm-c"
+        assert old not in in_use
+
+    def test_a_disk_libvirt_cannot_describe_fails_the_scan(self):
+        host = self._host()
+        host.never_listed.add(TOP)
+        host.refresh("cluster_1")
+
+        assert self._scan(host) is None
+        assert host.asked("vol-pool") == [(TOP,), (TOP,)]
+
+
+class TestFilesAPoolHasNotListedYet:
+    """libvirt lists a file its pool has not seen since it was made -- the
+    overlay ``boxman snapshot take`` adds, which nothing refreshes the pool
+    for -- only once that pool is refreshed, so ``vol-pool`` knows nothing
+    of it. The pool on its directory is refreshed and libvirt asked again
+    (checked on libvirt 10.0: a snapshotted VM kept every file of its own
+    without this, #221)."""
+
+    OVERLAY = f"{POOL}/vm01.s1"
+
+    def _host(self) -> FakeHost:
+        """TOP's snapshot overlay, made after the pool's last refresh."""
+        host = _overlay_host()
+        host.add(self.OVERLAY, backing=TOP)
+        return host
+
+    def test_it_is_read_once_the_pool_on_its_directory_is_refreshed(self):
+        host = self._host()
+
+        assert _chains(host, [self.OVERLAY]) == {
+            self.OVERLAY: [self.OVERLAY, TOP, BASE]}
+        assert [(what, args) for _, what, args in host.log
+                if what not in ("qemu-img", "unreadable-probe")] == [
+            ("vol-pool", (self.OVERLAY,)), ("pool-list", ("--name",)),
+            ("pool-dumpxml", ("cluster_1",)),
+            ("pool-refresh", ("cluster_1",)),
+            ("vol-pool", (self.OVERLAY,)), ("vol-dumpxml", (self.OVERLAY,)),
+            ("vol-pool", (TOP,)), ("vol-dumpxml", (TOP,)),
+            ("vol-pool", (BASE,)), ("vol-dumpxml", (BASE,))]
+
+    def test_the_pools_are_read_once_per_read(self):
+        other = "/ws/cluster_2/vm02.s1"
+        host = self._host()
+        host.add("/ws/cluster_2/vm02.qcow2")
+        host.define_pool("cluster_2", "/ws/cluster_2")
+        host.add(other, backing="/ws/cluster_2/vm02.qcow2")
+
+        assert _chains(host, [self.OVERLAY, other]) == {
+            self.OVERLAY: [self.OVERLAY, TOP, BASE],
+            other: [other, "/ws/cluster_2/vm02.qcow2"]}
+        assert host.asked("pool-list") == [("--name",)]
+        assert host.asked("pool-dumpxml") == [("cluster_1",),
+                                              ("cluster_2",)]
+
+    def test_a_pool_with_no_local_directory_is_passed_over(self):
+        host = self._host()
+        host.define_pool("ceph", None)
+
+        assert _chains(host, [self.OVERLAY]) == {
+            self.OVERLAY: [self.OVERLAY, TOP, BASE]}
+
+    @pytest.mark.parametrize("breakage, asked", [
+        ("no pool is on its directory",
+         ["vol-pool", "pool-list", "pool-dumpxml", "pool-dumpxml"]),
+        ("the pools cannot be listed", ["vol-pool", "pool-list"]),
+        ("the pools are listed, then that fails", ["vol-pool", "pool-list"]),
+        ("a pool cannot be described",
+         ["vol-pool", "pool-list", "pool-dumpxml"]),
+        ("a pool is described, then that fails",
+         ["vol-pool", "pool-list", "pool-dumpxml"]),
+        ("a pool's description does not parse",
+         ["vol-pool", "pool-list", "pool-dumpxml"]),
+        ("its pool cannot be refreshed",
+         ["vol-pool", "pool-list", "pool-dumpxml", "pool-refresh"]),
+        ("libvirt still lists no volume there",
+         ["vol-pool", "pool-list", "pool-dumpxml", "pool-refresh",
+          "vol-pool"]),
+    ])
+    def test_what_cannot_be_told_fails_closed(self, breakage, asked):
+        """... and nothing after the failure is asked."""
+        host = self._host()
+        if breakage == "no pool is on its directory":
+            host.add("/ws/cluster_2/vm02.qcow2")
+            host.define_pool("cluster_2", "/ws/cluster_2")
+            host.files[self.OVERLAY].backing = None
+            host.files["/ws/elsewhere/vm01.s1"] = host.files.pop(self.OVERLAY)
+            source = "/ws/elsewhere/vm01.s1"
+        else:
+            source = self.OVERLAY
+        if breakage == "the pools cannot be listed":
+            host.fail.add("pool-list")
+        elif breakage == "the pools are listed, then that fails":
+            host.fail_after_answering.add("pool-list")
+        elif breakage == "a pool cannot be described":
+            host.fail.add("pool-dumpxml")
+        elif breakage == "a pool is described, then that fails":
+            host.fail_after_answering.add("pool-dumpxml")
+        elif breakage == "a pool's description does not parse":
+            host.pool_xml_override["cluster_1"] = "<pool type='dir'><name>"
+        elif breakage == "its pool cannot be refreshed":
+            host.fail.add("pool-refresh")
+        elif breakage == "libvirt still lists no volume there":
+            host.never_listed.add(self.OVERLAY)
+
+        assert _chains(host, [source]) is None
+        assert [what for _, what, _ in host.log
+                if what not in ("qemu-img", "unreadable-probe",
+                                "absence-probe")] == asked

@@ -761,7 +761,8 @@ This project is licensed under the [MIT License](LICENSE).
 - `down` — bring down the infrastructure (save or suspend state)
 - `destroy-runtime` — destroy the docker-compose runtime and clean up .boxman
 - `destroy` — full teardown (VMs + networks + files + runtime + workspace
-  workdir) with a `[y/N]` prompt; use `-y`/`--auto-accept` to skip the prompt
+  workdir, except a file another VM still uses) with a `[y/N]` prompt; use
+  `-y`/`--auto-accept` to skip the prompt
   and `--templates` to also remove template workdirs. Validates every path it
   would delete before starting, and stops at exit 2 without running the
   irreversible cleanup if the teardown did not complete — see
@@ -884,6 +885,34 @@ Details worth knowing:
   kept is named in a warning; keeping it does not fail the command. (`virsh
   undefine --remove-all-storage` used to wipe and delete every
   storage-pool-listed file the VM referenced, ISOs included — #208.)
+  Under `use_sudo: false`, the default, `qemu-img` runs as you and cannot
+  open the disks libvirt creates (mode 0600, owned by root or
+  `libvirt-qemu`), so the backing chain of a file you may not read is read
+  through libvirt instead — its storage pool refreshed first, since libvirt
+  describes a file as the pool last saw it. A chain libvirt cannot describe
+  (a file in no storage pool, say) still keeps everything (#221).
+- **`destroy` spares the files other VMs use.** Once the project's VMs are
+  gone, and before the docker runtime is torn down, it runs the same
+  host-wide check and removes the workspace except the files another VM
+  uses, directly or as a backing file (known by path or by identity). Each
+  stays, with the directories on the way to it, and is named in a warning;
+  `destroy` still exits 0. The generated files it removes elsewhere (those
+  `workspace.files`/`cluster.files` list, the SSH keys, `ssh_config`) get
+  the same check; a docker-compose cluster's generated `docker-compose.yml`
+  goes earlier, with the cluster, without it. If it cannot tell which files
+  those are — the check fails, the workspace cannot be looked up (behind a
+  directory that cannot be searched it is not "gone"), or a directory in it
+  cannot be read — it exits 2 and keeps the workspace, the generated files,
+  the runtime and the cache entry, like an incomplete teardown. The removal
+  never follows a symlink, and stops, exiting 2 with the cache entry kept,
+  at a directory on the way to a kept file, or a kept file, that is no
+  longer the one the check found. It never crosses a mount point either: a
+  filesystem or bind mount anywhere under the workspace of a libvirt
+  project stops `destroy` at the check, exiting 2 with the rest of the
+  workspace kept (the VMs and the disks they own are gone by then); unmount
+  it, then run `destroy` again. A directory more than 256 levels deep in
+  the workspace stops it the same way. Template workdirs (`--templates`)
+  are removed without this check.
 - **`destroy` validates its delete targets up front**, before any teardown
   starts. It refuses a path that is empty, relative, a symlink, your home
   directory, a filesystem root or mount point, a top-level path, or a
