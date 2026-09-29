@@ -81,18 +81,33 @@ class DiskRecord:
     target: str
     role: str
     source: str
+    #: the random token boxman marked the image file with when it created
+    #: it (``role: data`` only; empty for a record older than the token, or
+    #: one of a disk boxman did not create). It is what tells the file this
+    #: record was written for from another file put at the same path since
+    #: (#215): see ``DiskManager._own_unattached_image``.
+    token: str = ""
+    #: the inode number of the image file boxman created (``role: data``;
+    #: empty otherwise). A copy that keeps the token's extended attribute
+    #: is another inode (#215).
+    ino: str = ""
 
 
 def records_to_xml(records: list[DiskRecord]) -> str:
     """Render *records* as the metadata block's XML."""
     root = ET.Element("disks")
     for record in records:
-        ET.SubElement(root, "disk", {
+        attributes = {
             "name": record.name,
             "target": record.target,
             "role": record.role,
             "source": record.source,
-        })
+        }
+        if record.token:
+            attributes["token"] = record.token
+        if record.ino:
+            attributes["ino"] = record.ino
+        ET.SubElement(root, "disk", attributes)
     return ET.tostring(root, encoding="unicode")
 
 
@@ -127,6 +142,8 @@ def records_from_xml(xml_text: str) -> list[DiskRecord]:
             target=element.get("target"),
             role=element.get("role"),
             source=element.get("source"),
+            token=element.get("token") or "",
+            ino=element.get("ino") or "",
         ))
     return records
 
@@ -179,12 +196,14 @@ def write_disk_records(virsh, domain_name: str,
 
 
 def record_attached_disk(virsh, domain_name: str, *, name: str, target: str,
-                         source: str, role: str = ROLE_DATA) -> None:
+                         source: str, role: str = ROLE_DATA,
+                         token: str = "", ino: str = "") -> None:
     """Add (or update) one disk's ownership record on *domain_name*."""
     existing = read_disk_records(virsh, domain_name) or []
     kept = [r for r in existing
             if r.name != name and r.target != target]
-    kept.append(DiskRecord(name=name, target=target, role=role, source=source))
+    kept.append(DiskRecord(name=name, target=target, role=role, source=source,
+                           token=token, ino=ino))
     write_disk_records(virsh, domain_name, kept)
 
 

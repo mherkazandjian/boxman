@@ -17,6 +17,20 @@ from boxman.exceptions import ProvisionError
 from boxman.utils.shell import run as _shell_run
 
 from .commands import VirshCommand, VirtInstallCommand
+from .disk import create_image_exclusive, libvirt_disk_source
+
+#: What a refused boot disk tells the operator to do.
+BOOT_DISK_REMEDY = ("If it is stale, remove or rename it and run the "
+                    "command again.")
+
+#: ``{path: descriptor}`` of the boot disks this process made, each held
+#: open. A clone is retried in the same process
+#: (``_clone_with_retry``), and an attempt whose virt-install failed leaves
+#: its image behind: the next attempt uses that image rather than refusing
+#: it as someone else's. The open descriptor is what makes that safe: it
+#: keeps the image's inode from being freed, so its number cannot be reused
+#: by a file that replaced it (ext4 reuses a freed inode number at once).
+_boot_disks_made: dict[str, int] = {}
 
 
 def normalize_disk_size(value: Any, default: str = "20G") -> str:
@@ -129,24 +143,80 @@ class DirectInstallVM:
         return [spec["name"] for spec in self._network_specs()]
 
     # ── creation ──────────────────────────────────────────────────────────
+    def _make_boot_disk(self, disk_path: str, disk_size: str) -> bool:
+        """
+        Create the empty boot disk, never over anything already at its path
+        (:func:`~boxman.providers.libvirt.disk.create_image_exclusive`,
+        #215) -- except the image an earlier attempt of this same process
+        made there (:data:`_boot_disks_made`).
+
+        Returns:
+            True when the disk is in place, False when ``qemu-img`` failed.
+
+        Raises:
+            DiskPathOccupiedError: something else is at *disk_path*.
+            ProvisionError: whether it is cannot be told, or the image could
+                not be put in place.
+        """
+        path = libvirt_disk_source(disk_path)
+        pinned = _boot_disks_made.get(path)
+        if pinned is not None:
+            try:
+                ours, there = os.fstat(pinned), os.lstat(path)
+            except OSError:
+                pass
+            else:
+                if (there.st_dev, there.st_ino) == (ours.st_dev, ours.st_ino):
+                    self.logger.info(
+                        f"using the boot disk {path} an earlier attempt made")
+                    return True
+
+        def run(cmd: str):
+            return _shell_run(self.virsh._wrap_for_runtime(cmd),
+                              hide=True, warn=True)
+
+        made = create_image_exclusive(disk_path, disk_size, "qcow2", run=run,
+                                      remedy=BOOT_DISK_REMEDY)
+        if made is None:
+            return False
+        self._pin(path, made)
+        return True
+
+    @staticmethod
+    def _pin(path: str, made: tuple[int, int]) -> None:
+        """Hold the image just made at *path* open (:data:`_boot_disks_made`),
+        if *path* still names it. Failing to only costs a retry the image."""
+        try:
+            # read-only: this process made the file, so it may read it (some
+            # Python builds lack O_PATH)
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != made:
+            os.close(fd)
+            return
+        earlier = _boot_disks_made.pop(path, None)
+        if earlier is not None:
+            os.close(earlier)
+        _boot_disks_made[path] = fd
+
     def create(self) -> bool:
         """Create the VM (empty boot disk + ``virt-install`` define)."""
         # Resolved first, and deliberately before qemu-img: an unusable
         # `networks:` used to be discovered after the boot disk had already
         # been written, leaving a stray image behind on a refusal (#171 A4).
         network_specs = self._network_specs()
-        disk_path = os.path.expanduser(
+        # absolute, so qemu-img and virt-install name the same file wherever
+        # they run (the docker-compose runtime's container has another cwd)
+        disk_path = libvirt_disk_source(
             os.path.join(self.workdir, f"{self.vm_name}.qcow2"))
         disk_size = self._boot_disk_size()
         # `or` (not .get default) so an explicit null in YAML still falls back
         memory = self.info.get("memory") or 2048
         vcpus = self.info.get("vcpus") or 2
 
-        qemu_img_cmd = f'qemu-img create -f qcow2 {shlex.quote(disk_path)} {disk_size}'
-        qemu_img_cmd = self.virsh._wrap_for_runtime(qemu_img_cmd)
-        result = _shell_run(qemu_img_cmd, hide=True, warn=True)
-        if not result.ok:
-            self.logger.error(f"qemu-img create failed: {result.stderr}")
+        if not self._make_boot_disk(disk_path, disk_size):
             return False
 
         parts = []

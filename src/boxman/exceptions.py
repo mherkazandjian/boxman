@@ -71,6 +71,19 @@ class ImageImportError(ProvisionError):
     """
 
 
+class DiskPathOccupiedError(ProvisionError):
+    """Raised when a new disk image would be created at a path that already
+    has a directory entry: a file, a symlink (dangling or not), a directory.
+
+    ``qemu-img create`` writes through whatever is there -- it truncates a
+    file, and follows a symlink to truncate what it points at or to create
+    its missing target -- and that file may be a disk a teardown kept,
+    another VM's disk, or the base of a snapshot chain. So nothing is
+    created and the entry is left as it was. Retrying finds the same entry:
+    the operator has to remove, rename or adopt it (#215).
+    """
+
+
 class NetworkError(ProvisionError):
     """Raised when a libvirt network cannot be created, destroyed, or
     inspected. Includes bridge collisions and missing NAT config."""

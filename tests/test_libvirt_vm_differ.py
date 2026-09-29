@@ -3,8 +3,10 @@ Unit tests for boxman.providers.libvirt.vm_differ.VMStateDiffer.
 
 Currently pins the disk-diff regression from issue #85 item 23: a
 desired disk whose image file already exists (leftover from a failed
-earlier run) but which is not attached must be reported as an
-attach-only new disk — not silently skipped.
+earlier run) but which is not attached must still be reported as a new
+disk — not silently skipped. It is no longer marked attach-only here: an
+image at that path is attached only when boxman's own record proves it
+made that file for the VM, which the disk manager decides (#215).
 """
 
 from __future__ import annotations
@@ -85,31 +87,27 @@ class TestDiskDiff:
         assert diff["new_disks"] == desired
         assert "attach_only" not in diff["new_disks"][0]
 
-    def test_stale_file_becomes_attach_only(self, differ: VMStateDiffer,
-                                            tmp_path: Path):
+    def test_stale_file_is_still_a_new_disk_not_adopted(
+            self, differ: VMStateDiffer, tmp_path: Path):
         """Regression for issue #85 item 23: image exists but is not
-        attached — must surface as attach-only, not vanish silently."""
+        attached — it must surface as a new disk, not vanish silently. It
+        is passed on as declared, not marked attach-only: whether that file
+        may be attached is decided against boxman's own record where the
+        disk is configured, and it is refused otherwise (#215)."""
         (tmp_path / "vm01_data.qcow2").write_bytes(b"x")
         desired = [{"name": "data", "target": "vdb", "size": 1024}]
         diff = _diff_disks(differ, desired, [], str(tmp_path))
-        assert len(diff["new_disks"]) == 1
-        assert diff["new_disks"][0]["attach_only"] is True
-        assert diff["new_disks"][0]["name"] == "data"
+        assert diff["new_disks"] == desired
+        assert "attach_only" not in diff["new_disks"][0]
 
-    def test_stale_file_logs_warning(self, differ: VMStateDiffer,
-                                     tmp_path: Path, captured_logs):
-        # `captured_logs`, not the raw `caplog`: boxman's logger sets
-        # propagate = False, so pytest's root-attached handler does not see
-        # its records. That assignment sits inside an `if not
-        # logger.handlers:` guard, so whether raw caplog happens to work
-        # depends on import order — this test passed in the test-runner VM
-        # and failed on a workstation for exactly that reason.
+    def test_an_explicit_attach_only_is_passed_on(self,
+                                                  differ: VMStateDiffer,
+                                                  tmp_path: Path):
         (tmp_path / "vm01_data.qcow2").write_bytes(b"x")
-        desired = [{"name": "data", "target": "vdb", "size": 1024}]
-        with captured_logs.at_level("WARNING", logger="boxman"):
-            _diff_disks(differ, desired, [], str(tmp_path))
-        assert any("attach" in rec.message and "vdb" in rec.message
-                   for rec in captured_logs.records)
+        desired = [{"name": "data", "target": "vdb", "size": 1024,
+                    "attach_only": True}]
+        diff = _diff_disks(differ, desired, [], str(tmp_path))
+        assert diff["new_disks"] == desired
 
     def test_attached_disk_not_in_new_disks(self, differ: VMStateDiffer,
                                             tmp_path: Path):

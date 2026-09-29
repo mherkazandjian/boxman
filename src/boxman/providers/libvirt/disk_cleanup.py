@@ -17,7 +17,6 @@ teardown uses it any more.
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import glob as _glob
 import json
 import os
@@ -331,7 +330,9 @@ def save_teardown_inventory(inventory: StorageInventory,
         "disk_sources": inventory.disk_sources,
         "media_sources": inventory.media_sources,
         "records": (None if inventory.records is None
-                    else [dataclasses.asdict(r) for r in inventory.records]),
+                    else [{key: getattr(r, key)
+                           for key in sorted(_RECORD_FIELDS)}
+                          for r in inventory.records]),
         "records_state": inventory.records_state,
         "chains": inventory.chains,
         "boot_family": inventory.boot_family,
@@ -358,7 +359,11 @@ def _is_map(value: object, valid: Callable[[object], bool]) -> bool:
     return isinstance(value, dict) and all(valid(v) for v in value.values())
 
 
-_RECORD_FIELDS = frozenset(f.name for f in dataclasses.fields(DiskRecord))
+#: what an inventory keeps of each ownership record: what the teardown
+#: decides on. A record's creation token and inode number (#215) are left
+#: out, so inventories saved by this version and by the ones before it read
+#: the same.
+_RECORD_FIELDS = frozenset({"name", "target", "role", "source"})
 
 
 def _is_records(value: object) -> bool:
