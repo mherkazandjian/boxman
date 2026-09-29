@@ -26,6 +26,8 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import types
@@ -36,6 +38,8 @@ from tests.conftest import make_bare_manager
 
 from boxman.exceptions import BoxmanError, ProvisionError
 from boxman.manager import BoxmanManager
+from boxman.runtime.docker_compose import DockerComposeRuntime
+from boxman.runtime.local import LocalRuntime
 
 pytestmark = pytest.mark.unit
 
@@ -110,13 +114,18 @@ class Lab:
 
     def block(self, alias: str) -> str | None:
         """The ssh_config block whose first Host alias is *alias*."""
-        if not self.ssh_config.is_file():
-            return None
-        for chunk in self.ssh_config.read_text().split("\n\n\n"):
-            lines = chunk.strip("\n").splitlines()
-            if lines and lines[0].split()[:2] == ["Host", alias]:
-                return "\n".join(lines)
+        return _block_in(self.ssh_config, alias)
+
+
+def _block_in(path, alias: str) -> str | None:
+    """The block of the ssh_config at *path* whose first alias is *alias*."""
+    if not path.is_file():
         return None
+    for chunk in path.read_text().split("\n\n\n"):
+        lines = chunk.strip("\n").splitlines()
+        if lines and lines[0].split()[:2] == ["Host", alias]:
+            return "\n".join(lines)
+    return None
 
 
 def _sync_run_parallel(self, tasks, op_label="parallel task",
@@ -218,7 +227,7 @@ def _written_block(host="Host cluster_1_vm01 node0", hostname="192.168.10.5",
     """A VM block as write_ssh_config writes it, but for the lines named in
     *drop* (by keyword) and the ones in *extra*: one change at a time."""
     lines = [host, f"    Hostname {hostname}", "    User admin",
-             "    IdentityFile /ws/id_ed25519_boxman",
+             '    IdentityFile "/ws/id_ed25519_boxman"',
              "    StrictHostKeyChecking no",
              "    UserKnownHostsFile /dev/null"]
     lines = [line for line in lines if line.split()[0] not in drop]
@@ -230,7 +239,7 @@ JUMP_STANZA = ("Host boxman-libvirt-jump\n"
                "    HostName     127.0.0.1\n"
                "    Port         2678\n"
                "    User         qemu_user\n"
-               "    IdentityFile /ws/.boxman/runtime/docker/data/ssh/id_ed25519\n"
+               '    IdentityFile "/ws/.boxman/runtime/docker/data/ssh/id_ed25519"\n'
                "    StrictHostKeyChecking no\n"
                "    UserKnownHostsFile /dev/null\n"
                "\n\n")
@@ -908,3 +917,305 @@ class TestTheOtherKeyProblemsAreClassified:
 
         assert code == 2
         assert f"could not write the ssh config {lab.ssh_config}" in message
+
+
+def _two_clusters(tmp_path, layout: str, runtime: str, paths: str):
+    """
+    Two clusters and three VMs, running, to write an ssh config for.
+
+    *layout* is "one shared file" (a workspace path) or "a file per
+    cluster"; *runtime* "local" or "docker" (a DockerComposeRuntime mock:
+    the real jump stanza and ProxyJump are written); *paths* is "custom
+    names" -- a control: its own user, key name, ssh_config file name and
+    hostnames per cluster -- or the same with "a blank in the workspace",
+    which every path then holds, or "a blank in the key name".
+
+    Returns the Lab and, per VM, what OpenSSH should read for it: ``(alias,
+    node alias, address, user, config file, identity file)``.
+    """
+    root = tmp_path / ("work space" if paths == "a blank in the workspace"
+                       else "work")
+    root.mkdir()
+    lab = Lab(root, key_pair=False)
+    config = lab.mgr.config
+    second = copy.deepcopy(config["clusters"]["cluster_1"])
+    second.update(workdir=str(root / "c2"), vms={"vm03": {"hostname": "vm03"}})
+    config["clusters"]["cluster_2"] = second
+    key_name = ("access key" if paths == "a blank in the key name"
+                else "custom_key")
+    for number, cluster in enumerate(config["clusters"].values(), 1):
+        cluster["admin_user"] = f"operator{number}"
+        cluster["admin_key_name"] = key_name
+        cluster["ssh_config"] = "custom ssh config"
+        for vm, info in cluster["vms"].items():
+            info["hostname"] = f"guest-{vm}"
+    vm03 = "bprj__demo__bprj_cluster_2_vm03"
+    lab.states[vm03] = "running"
+    lab.addresses = {full("vm01"): "192.168.10.5",
+                     full("vm02"): "192.168.10.6", vm03: "192.168.20.7"}
+    shared = layout == "one shared file"
+    if not shared:
+        config["workspace"] = {}
+        for cluster in config["clusters"].values():
+            os.makedirs(cluster["workdir"])
+    if runtime == "docker":
+        docker = MagicMock(spec=DockerComposeRuntime)
+        docker.ssh_port = 2678
+        docker.ssh_identity_path = str(root / "jump_key")
+        lab.mgr._runtime_instance = docker
+        del lab.mgr._docker_ssh_jump_stanza     # the real stanza, not Lab's
+    expected = []
+    for alias, node, address, user, cluster in (
+            ("cluster_1_guest-vm01", "node0", "192.168.10.5", "operator1", "c1"),
+            ("cluster_1_guest-vm02", "node1", "192.168.10.6", "operator1", "c1"),
+            ("cluster_2_guest-vm03", "node2", "192.168.20.7", "operator2", "c2")):
+        folder = root if shared else root / cluster
+        expected.append((alias, node, address, user,
+                         folder / "custom ssh config", folder / key_name))
+    return lab, expected
+
+
+def _loaded_identity(config_path, host) -> str | None:
+    """The identity file ssh loads for *host*: after ~, %-token and ${VAR}
+    expansion, which ``ssh -G`` does not show. The transport is
+    /bin/false, so no connection is made; ssh -v names what it loads."""
+    out = subprocess.run(
+        ["ssh", "-v", "-F", str(config_path), "-o",
+         f"ProxyCommand={shutil.which('false')}", "-o", "BatchMode=yes",
+         host, "true"],
+        capture_output=True, text=True, timeout=60,
+        stdin=subprocess.DEVNULL)
+    found = re.search(r"identity file (.+) type -?\d+", out.stderr)
+    return found.group(1) if found else None
+
+
+needs_false = pytest.mark.skipif(shutil.which("false") is None,
+                                 reason="the transport here is /bin/false")
+
+
+class TestPathsAreWrittenSoOpenSSHReadsThemBack:
+    """
+    The IdentityFile path went into ssh_config unquoted. A blank in it --
+    from the workspace, a workdir, admin_key_name -- made the whole file
+    invalid for OpenSSH ("keyword identityfile extra arguments at end of
+    line"), and made the strict reading refuse boxman's own blocks, so a
+    stopped VM lost its entry. Every path is now one double-quoted
+    argument with its %s doubled; one that no spelling can carry fails
+    the verb without touching the file (#223).
+    """
+
+    LAYOUTS = pytest.mark.parametrize(
+        "layout", ["one shared file", "a file per cluster"])
+    RUNTIMES = pytest.mark.parametrize("runtime", ["local", "docker"])
+    PATHS = pytest.mark.parametrize("paths", [
+        "custom names", "a blank in the workspace", "a blank in the key name"])
+
+    @LAYOUTS
+    @RUNTIMES
+    @PATHS
+    def test_what_boxman_writes_it_reads_back(
+            self, tmp_path, layout, runtime, paths):
+        lab, vms = _two_clusters(tmp_path, layout, runtime, paths)
+        lab.mgr.write_ssh_config()
+        lab.states = dict.fromkeys(lab.states, "shut off")
+
+        lab.mgr.write_ssh_config(vm_states=dict(lab.states))
+
+        for alias, node, address, _user, config_file, identity in vms:
+            block = _block_in(config_file, alias)
+            assert block is not None, f"{alias} lost its entry"
+            lines = block.splitlines()
+            assert lines[0] == f"Host {alias} {node}"
+            assert f"    Hostname {address}" in lines
+            assert f'    IdentityFile "{identity}"' in lines
+            assert (("    ProxyJump boxman-libvirt-jump" in lines)
+                    == (runtime == "docker"))
+            if runtime == "docker":
+                text = config_file.read_text()
+                assert text.count("Host boxman-libvirt-jump\n") == 1
+
+    @needs_ssh
+    @LAYOUTS
+    @RUNTIMES
+    @PATHS
+    def test_openssh_takes_every_file_boxman_writes(
+            self, tmp_path, layout, runtime, paths):
+        lab, vms = _two_clusters(tmp_path, layout, runtime, paths)
+        lab.mgr.write_ssh_config()
+        lab.states = dict.fromkeys(lab.states, "shut off")
+        # the rewrite: kept entries, comments and all
+        lab.mgr.write_ssh_config(vm_states=dict(lab.states))
+
+        for alias, node, address, user, config_file, identity in vms:
+            for name in (alias, node):
+                effective = _effective(config_file, name)
+                assert effective["hostname"] == address
+                assert effective["user"] == user
+                assert effective["identityfile"] == str(identity)
+                if runtime == "docker":
+                    assert effective["proxyjump"] == "boxman-libvirt-jump"
+
+    @pytest.mark.parametrize("paths", [
+        "a blank in the workspace", "a blank in the key name"])
+    def test_update_keeps_the_entry_of_a_vm_whose_paths_hold_a_blank(
+            self, tmp_path, monkeypatch, update_flow, paths):
+        if paths == "a blank in the workspace":
+            tmp_path = tmp_path / "work space"
+            tmp_path.mkdir()
+        lab = Lab(tmp_path)
+        if paths == "a blank in the key name":
+            lab.mgr.config["clusters"]["cluster_1"]["admin_key_name"] = "access key"
+            (tmp_path / "id_ed25519_boxman").rename(tmp_path / "access key")
+            (tmp_path / "id_ed25519_boxman.pub").rename(
+                tmp_path / "access key.pub")
+        _both_up_once(lab)
+        lab.states[full("vm01")] = "shut off"
+
+        code, message = update(lab, monkeypatch)
+
+        assert code == 0, message
+        lines = lab.block("cluster_1_vm01").splitlines()
+        assert "    Hostname 192.168.10.5" in lines
+        assert lab.logged("error") == []
+        [warning] = [w for w in lab.logged("warning") if "vm01" in w]
+        assert "192.168.10.5" in warning
+
+    @needs_ssh
+    @pytest.mark.parametrize("key_name", [
+        "a blank key", "it's key", "a\\b key"])
+    def test_openssh_reads_the_identity_file_as_written(
+            self, tmp_path, key_name):
+        """A quote inside the other kind is literal, and so is a backslash
+        that OpenSSH reads as no escape."""
+        lab = Lab(tmp_path, key_pair=False)
+        lab.mgr.config["clusters"]["cluster_1"]["admin_key_name"] = key_name
+        lab.addresses = {full("vm01"): "192.168.10.5"}
+        lab.mgr.write_ssh_config()
+
+        effective = _effective(lab.ssh_config, "cluster_1_vm01")
+
+        assert effective["identityfile"] == str(tmp_path / key_name)
+
+    @needs_ssh
+    @needs_false
+    def test_a_percent_sign_in_the_identity_file_is_loaded_as_written(
+            self, tmp_path):
+        """OpenSSH expands %-tokens in IdentityFile: an undoubled %d in
+        `100%done` loaded a file under the user's home instead."""
+        tmp_path = tmp_path / "100%done"
+        tmp_path.mkdir()
+        lab = Lab(tmp_path, key_pair=False)
+        lab.addresses = {full("vm01"): "192.168.10.5"}
+        lab.mgr.write_ssh_config()
+        identity = str(tmp_path / "id_ed25519_boxman")
+
+        # -G shows the argument as read, before the %-tokens are expanded
+        effective = _effective(lab.ssh_config, "cluster_1_vm01")
+        assert effective["identityfile"] == identity.replace("%", "%%")
+        assert _loaded_identity(lab.ssh_config, "cluster_1_vm01") == identity
+
+    @pytest.mark.parametrize("key_name", ["access key", "100%done"])
+    def test_a_file_from_before_the_quoting_keeps_its_entries(
+            self, tmp_path, monkeypatch, update_flow, key_name):
+        """boxman wrote the path unquoted before: blank, % and all. Such a
+        file still keeps a stopped VM's entry, and the rewrite quotes it."""
+        lab = Lab(tmp_path, key_pair=False)
+        lab.mgr.config["clusters"]["cluster_1"]["admin_key_name"] = key_name
+        (tmp_path / key_name).write_text("private\n")
+        (tmp_path / f"{key_name}.pub").write_text("ssh-ed25519 AAAA test\n")
+        identity = tmp_path / key_name
+        lab.ssh_config.write_text("".join(
+            f"Host cluster_1_{vm} node{index}\n"
+            f"    Hostname {address}\n"
+            f"    User admin\n"
+            f"    IdentityFile {identity}\n"
+            f"    StrictHostKeyChecking no\n"
+            f"    UserKnownHostsFile /dev/null\n\n\n"
+            for index, (vm, address) in enumerate(
+                (("vm01", "192.168.10.5"), ("vm02", "192.168.10.6")))))
+        lab.addresses = {full("vm02"): "192.168.10.6"}
+        lab.states[full("vm01")] = "shut off"
+
+        code, message = update(lab, monkeypatch)
+
+        assert code == 0, message
+        lines = lab.block("cluster_1_vm01").splitlines()
+        assert "    Hostname 192.168.10.5" in lines
+        escaped = str(identity).replace("%", "%%")
+        assert f'    IdentityFile "{escaped}"' in lines
+
+    UNWRITABLE = {
+        "a double quote": 'id "boxman"',
+        "a line break": "id\nboxman",
+        "an environment variable": "id${HOME}",
+        "a backslash at its end": "id\\",
+        "a backslash before a quote": "id\\'s",
+    }
+
+    @pytest.mark.parametrize("key_name", list(UNWRITABLE.values()),
+                             ids=list(UNWRITABLE))
+    def test_a_path_no_ssh_config_can_hold_fails_the_verb_clearly(
+            self, tmp_path, monkeypatch, update_flow, key_name):
+        lab = Lab(tmp_path)
+        _both_up_once(lab)
+        before = lab.ssh_config.read_text()
+        lab.mgr.config["clusters"]["cluster_1"]["admin_key_name"] = key_name
+        (tmp_path / key_name).write_text("private\n")
+        (tmp_path / f"{key_name}.pub").write_text("ssh-ed25519 AAAA test\n")
+
+        code, message = update(lab, monkeypatch)
+
+        assert code == 2
+        assert message.startswith(
+            f"update finished with 1 failure(s): could not write the ssh "
+            f"config {lab.ssh_config}: the path "
+            f"{str(tmp_path / key_name)!r} cannot be written into it")
+        assert "\n" not in message
+        # left as it was: never a file OpenSSH refuses
+        assert lab.ssh_config.read_text() == before
+
+    def test_a_jump_key_path_no_ssh_config_can_hold_fails_the_verb_clearly(
+            self, tmp_path, monkeypatch, update_flow):
+        lab = Lab(tmp_path)
+        _both_up_once(lab)
+        before = lab.ssh_config.read_text()
+        docker = MagicMock(spec=DockerComposeRuntime)
+        docker.ssh_port = 2678
+        docker.ssh_identity_path = str(tmp_path / 'jump "key"')
+        lab.mgr._runtime_instance = docker
+        del lab.mgr._docker_ssh_jump_stanza
+
+        code, message = update(lab, monkeypatch)
+
+        assert code == 2
+        assert (f"the path {docker.ssh_identity_path!r} cannot be written "
+                f"into it") in message
+        assert lab.ssh_config.read_text() == before
+
+    @pytest.mark.parametrize("runtime", ["local", "docker-compose"])
+    def test_the_key_check_hands_ssh_the_config_path_whole(
+            self, tmp_path, monkeypatch, runtime):
+        """A blank in the workspace split the -F path for the shell, so the
+        check after each key copy failed, and so did the update."""
+        lab = Lab(tmp_path)
+        lab.mgr._runtime_name = runtime
+        lab.mgr._runtime_instance = (
+            LocalRuntime() if runtime == "local"
+            else DockerComposeRuntime(config={"project_name": "demo"}))
+        commands = []
+
+        def _run(command, **_kwargs):
+            commands.append(command)
+            return types.SimpleNamespace(ok=True, stdout="vm01\n", stderr="")
+
+        monkeypatch.setattr("boxman.manager_parts.ssh.run", _run)
+        config_path = str(tmp_path / "work space" / "ssh config")
+
+        assert lab.mgr._verify_ssh_connection("cluster_1_vm01", config_path)
+
+        [command] = commands
+        argv = shlex.split(command)
+        if runtime != "local":
+            argv = shlex.split(argv[-1])   # what bash -c runs in the container
+        at = argv.index("-F")
+        assert argv[at + 1:at + 3] == [config_path, "cluster_1_vm01"]

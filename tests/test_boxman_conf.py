@@ -644,8 +644,9 @@ class TestWriteSshConfig:
         assert content.count("Host boxman-libvirt-jump") == 1
         assert "Port         2678" in content
         assert "User         qemu_user" in content
+        # quoted, as every path boxman writes into ssh_config (#223)
         assert (
-            "IdentityFile /abs/path/.boxman/runtime/docker/data/ssh/id_ed25519"
+            'IdentityFile "/abs/path/.boxman/runtime/docker/data/ssh/id_ed25519"'
             in content
         )
         # Every VM block has ProxyJump pointing at the jump alias.

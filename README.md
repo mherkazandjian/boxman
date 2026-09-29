@@ -472,6 +472,13 @@ VM, logging in with `admin_pass`.
   to a cluster's workdir.
 - **A cluster without `admin_pass`** gets no key, with a warning: its guests
   have to authorize the key themselves, as the ISO-boot boxes do.
+- **Paths in `ssh_config`** (the `IdentityFile` of each VM and of the docker
+  runtime's jump host) are written quoted, with `%` doubled, so a workspace,
+  workdir or `admin_key_name` may hold blanks or `%`. A file written
+  unquoted by an older boxman is still read, and rewritten quoted. A path
+  OpenSSH cannot read back as written — one holding a double quote, a line
+  break, `${`, or a backslash before a quote or backslash or at its end —
+  fails the verb naming it, and leaves `ssh_config` as it was.
 
 ### Import VM images
 

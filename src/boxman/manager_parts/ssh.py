@@ -28,25 +28,109 @@ _VM_BLOCK_REQUIRED = frozenset({
 #: zero-padded project-wide counter.
 _NODE_ALIAS = re.compile(r'node[0-9]+')
 
+#: What no ssh_config spelling of a path carries through OpenSSH as it
+#: stands: a double quote ends the quoted argument and a line break the
+#: line; ``${`` is expanded as an environment variable, with no escape for
+#: it; and a backslash before a backslash or a quote, or at the end, is an
+#: escape from OpenSSH 8.7 on but literal before it, so no one spelling
+#: suits both. Every other backslash is literal to both.
+_UNWRITABLE_IN_PATH = re.compile(r'["\n\r]|\$\{|\\(?=[\\\'"]|$)')
 
-def _block_address(body: list[list[str]]) -> str | None:
+
+class _UnwritablePathError(ValueError):
+    """A path no ssh_config line can hold so that OpenSSH reads it back."""
+
+
+def _path_argument(path: str) -> str:
     """
-    The IPv4 ``Hostname`` of a VM block's *body*, if the body is exactly
-    what write_ssh_config writes, or None.
+    *path* as one ssh_config argument that OpenSSH reads back as *path*.
+
+    In double quotes, so a blank in it -- in the workspace, a workdir, the
+    ``admin_key_name`` -- does not split it into arguments, which OpenSSH
+    refuses outright ("extra arguments at end of line"); and with each
+    ``%`` doubled, since OpenSSH expands %-tokens in IdentityFile and reads
+    ``%%`` as a literal ``%`` (#223).
+
+    Raises:
+        _UnwritablePathError: *path* holds something no spelling carries (see
+            ``_UNWRITABLE_IN_PATH``).
+    """
+    found = _UNWRITABLE_IN_PATH.search(path)
+    if found:
+        what = {'"': 'a double quote', '\n': 'a line break',
+                '\r': 'a line break', '${': "'${'"}.get(
+                    found.group(), 'a backslash before a quote or a '
+                                   'backslash, or at its end')
+        raise _UnwritablePathError(
+            f"the path {path!r} cannot be written into it: OpenSSH does not "
+            f"read {what} in a path back as written")
+    return '"' + path.replace('%', '%%') + '"'
+
+
+def _config_words(line: str) -> list[str] | None:
+    """
+    The words OpenSSH reads from one ssh_config *line*: separated by blanks,
+    a double- or single-quoted run part of one word, its quotes dropped. So
+    ``IdentityFile "/work space/id"`` is two words. None for a quote left
+    open, which OpenSSH refuses. A backslash stands as it is: boxman never
+    writes one OpenSSH would read as an escape (see _path_argument).
+    """
+    words: list[str] = []
+    word: list[str] | None = None
+    quote = None
+    for char in line:
+        if quote:
+            if char == quote:
+                quote = None
+            else:
+                word.append(char)
+        elif char in ' \t':
+            if word is not None:
+                words.append(''.join(word))
+                word = None
+        else:
+            if word is None:
+                word = []
+            if char in '"\'':
+                quote = char
+            else:
+                word.append(char)
+    if quote:
+        return None
+    if word is not None:
+        words.append(''.join(word))
+    return words
+
+
+def _block_address(body: list[tuple[str, list[str]]]) -> str | None:
+    """
+    The IPv4 ``Hostname`` of a VM block's *body* -- each line raw and as
+    :func:`_config_words` reads it -- if the body is exactly what
+    write_ssh_config writes, or None.
 
     Every directive it writes, once, with the fixed values it writes --
     ``StrictHostKeyChecking no``, ``UserKnownHostsFile /dev/null`` -- and
     ``ProxyJump`` to the docker runtime's jump host at most once; one
-    value each; nothing else.
+    argument each; nothing else. ``IdentityFile`` alone may also take the
+    rest of the line: boxman wrote the path unquoted before it quoted it,
+    so a file written before the upgrade keeps its blocks, and the rewrite
+    quotes them.
     """
     jump = SSHMixin.SSH_JUMP_HOST_ALIAS
     values: dict[str, str] = {}
-    for words in body:
+    for raw, words in body:
         keyword = words[0].lower()
-        if (keyword not in _VM_BLOCK_REQUIRED | {'proxyjump'}
-                or len(words) != 2 or keyword in values):
+        if len(words) == 2:
+            argument = words[1]
+        elif (keyword == 'identityfile' and len(words) > 2
+              and not {'"', "'"} & set(raw)):
+            argument = raw.split(None, 1)[1].strip()
+        else:
             return None
-        values[keyword] = words[1]
+        if (keyword not in _VM_BLOCK_REQUIRED | {'proxyjump'}
+                or keyword in values):
+            return None
+        values[keyword] = argument
     if (not _VM_BLOCK_REQUIRED <= values.keys()
             or values['stricthostkeychecking'] != 'no'
             or values['userknownhostsfile'] != '/dev/null'
@@ -75,11 +159,13 @@ def earlier_vm_addresses(path: str) -> dict[str, str]:
     Only what :meth:`SSHMixin.write_ssh_config` writes is read: a
     ``Host <alias> node<digits>`` line, then exactly the directives it
     writes (see :func:`_block_address`), the ``Hostname`` an IPv4 address;
-    comment lines are skipped. A block that deviates is left out, and so
+    comment lines are skipped. Arguments are read as OpenSSH reads them, a
+    quoted one being one word. A block that deviates is left out, and so
     is one whose aliases another ``Host`` line names too -- whatever else
     that line holds -- since which of them described the VM cannot be
-    told. A file that cannot be read or decoded yields nothing. An
-    earlier block that cannot be understood is no earlier block (#223).
+    told. A file that cannot be read or decoded, or that leaves a quote
+    open, yields nothing. An earlier block that cannot be understood is no
+    earlier block (#223).
     """
     try:
         with open(path, encoding='utf-8') as fobj:
@@ -87,15 +173,19 @@ def earlier_vm_addresses(path: str) -> dict[str, str]:
     except (OSError, UnicodeError):
         return {}
 
-    blocks: list[tuple[list[str], list[list[str]]]] = []
+    blocks: list[tuple[list[str], list[tuple[str, list[str]]]]] = []
     for raw in text.splitlines():
-        words = raw.split()
-        if not words or words[0].startswith('#'):
+        # a comment line is skipped before its words are read, as OpenSSH
+        # skips it: an apostrophe in one opens no quote
+        if not raw.strip() or raw.strip().startswith('#'):
             continue
+        words = _config_words(raw)
+        if words is None:
+            return {}
         if words[0].lower() in ('host', 'match'):
             blocks.append((words, []))
         elif blocks:
-            blocks[-1][1].append(words)
+            blocks[-1][1].append((raw, words))
 
     # every alias of every Host line, counted before any block is judged:
     # a competing definition makes an alias ambiguous whatever its shape
@@ -198,10 +288,13 @@ class SSHMixin:
                 ))
 
                 self.logger.status("  connect via ssh:")
-                # show direct connection if ip is available
+                # show direct connection if ip is available; the paths are
+                # quoted so the command can be pasted when they hold a blank
                 if ip_addresses:
                     first_ip = next(iter(ip_addresses.values()))
-                    self.logger.status(f"    direct: ssh -i {admin_key} {admin_user}@{first_ip}")
+                    self.logger.status(
+                        f"    direct: ssh -i {shlex.quote(admin_key)} "
+                        f"{admin_user}@{first_ip}")
 
                 # show connection using ssh_config if available
                 if 'ssh_config' in cluster:
@@ -209,7 +302,9 @@ class SSHMixin:
                         base_path,
                         cluster.get('ssh_config', 'ssh_config')
                     ))
-                    self.logger.status(f"    via config: ssh -F {ssh_config} {cluster_name}_{hostname}")
+                    self.logger.status(
+                        f"    via config: ssh -F {shlex.quote(ssh_config)} "
+                        f"{cluster_name}_{hostname}")
 
                 self.logger.status("")
 
@@ -258,12 +353,14 @@ class SSHMixin:
             return None
 
         rt = self.runtime_instance
+        # quoted like every path boxman writes here: the project directory
+        # this lives under may have a blank in it (#223)
         return (
             f"Host {self.SSH_JUMP_HOST_ALIAS}\n"
             f"    HostName     127.0.0.1\n"
             f"    Port         {rt.ssh_port}\n"
             f"    User         qemu_user\n"
-            f"    IdentityFile {rt.ssh_identity_path}\n"
+            f"    IdentityFile {_path_argument(rt.ssh_identity_path)}\n"
             f"    StrictHostKeyChecking no\n"
             f"    UserKnownHostsFile /dev/null\n"
             f"\n\n"
@@ -319,7 +416,13 @@ class SSHMixin:
         pad_width = len(str(total_vms - 1)) if total_vms > 1 else 1
         vm_counter = 0
 
-        jump_stanza = self._docker_ssh_jump_stanza()
+        # the docker runtime's jump stanza goes into every file, so a path
+        # of its that no file can hold stops every one of them (below)
+        jump_problem: _UnwritablePathError | None = None
+        try:
+            jump_stanza = self._docker_ssh_jump_stanza()
+        except _UnwritablePathError as exc:
+            jump_stanza, jump_problem = None, exc
 
         # Group clusters by their resolved ssh_config path. When
         # workspace.path is set every cluster resolves to the SAME path,
@@ -447,35 +550,43 @@ class SSHMixin:
                 else:
                     entry['address'] = address
 
-        unwritten: list[tuple[str, OSError]] = []
+        unwritten: list[tuple[str, str, Exception]] = []
         for ssh_config, entries in plans:
             self.logger.info(f"writing ssh config to {ssh_config}")
-            try:
-                with open(ssh_config, 'w') as fobj:
+            # The whole text is made before the file is opened: a path no
+            # line can hold then leaves the file as it was, rather than
+            # truncating it or writing one that OpenSSH refuses (#223).
+            cause: Exception | None = jump_problem
+            if cause is None:
+                try:
                     # docker runtime: jump host stanza
-                    if jump_stanza:
-                        fobj.write(jump_stanza)
-                    for entry in entries:
-                        if entry['address'] is not None:
-                            fobj.write(self._ssh_config_vm_block(
-                                entry, proxy_jump=bool(jump_stanza)))
-            except OSError as exc:
+                    text = (jump_stanza or '') + ''.join(
+                        self._ssh_config_vm_block(
+                            entry, proxy_jump=bool(jump_stanza))
+                        for entry in entries if entry['address'] is not None)
+                    with open(ssh_config, 'w') as fobj:
+                        fobj.write(text)
+                except (_UnwritablePathError, OSError) as exc:
+                    cause = exc
+            if cause is not None:
+                reason = (cause.strerror or str(cause)
+                          if isinstance(cause, OSError) else str(cause))
                 self.logger.error(
-                    f"could not write the ssh config {ssh_config}: "
-                    f"{exc.strerror or exc}")
-                unwritten.append((ssh_config, exc))
+                    f"could not write the ssh config {ssh_config}: {reason}")
+                unwritten.append((ssh_config, reason, cause))
                 continue
 
             for entry in entries:
                 if entry['state'] is not None:
                     self.logger.warning(self._not_running_notice(entry))
             self.logger.info(f"ssh config file written to {ssh_config}")
-            self.logger.info(f"to connect: ssh -F {ssh_config} <hostname>")
+            self.logger.info(
+                f"to connect: ssh -F {shlex.quote(ssh_config)} <hostname>")
 
         if unwritten:
             raise SSHAccessError([
-                f"could not write the ssh config {path}: {exc.strerror or exc}"
-                for path, exc in unwritten]) from unwritten[0][1]
+                f"could not write the ssh config {path}: {reason}"
+                for path, reason, _ in unwritten]) from unwritten[0][2]
 
     def _ssh_config_vm_block(self, entry: dict, proxy_jump: bool) -> str:
         """One VM's block of the ssh config, as write_ssh_config writes it."""
@@ -492,7 +603,9 @@ class SSHMixin:
         lines += [
             f"    Hostname {entry['address']}",
             f"    User {entry['user']}",
-            f"    IdentityFile {entry['identity_file']}",
+            # quoted: the workspace, a workdir or admin_key_name may hold a
+            # blank; raises for a path no ssh_config can spell
+            f"    IdentityFile {_path_argument(entry['identity_file'])}",
             # per host, never under `Host *`: a boxman VM is recreated often
             # enough that its host key changes under a reused IP, so checking
             # it is noise here. In a `Host *` stanza the same two lines
@@ -925,7 +1038,10 @@ class SSHMixin:
             bool: True if successful, False otherwise
         """
         self.logger.info(f"verifying ssh connection to: {hostname}")
-        ssh_cmd = f'ssh -o BatchMode=yes -F {ssh_config_path} {hostname} hostname'
+        # quoted for the shell: a blank in the workspace split the -F path,
+        # so every key check failed and the push was reported as failed
+        target = f'-F {shlex.quote(ssh_config_path)} {shlex.quote(hostname)}'
+        ssh_cmd = f'ssh -o BatchMode=yes {target} hostname'
 
         # When using a non-local runtime, the VM is only reachable from
         # inside the container. The shared ssh_config contains a
@@ -938,8 +1054,7 @@ class SSHMixin:
         if self._runtime_name != 'local':
             ssh_cmd = (
                 f'ssh -o BatchMode=yes -o ProxyJump=none '
-                f'-o ProxyCommand=none -F {ssh_config_path} '
-                f'{hostname} hostname'
+                f'-o ProxyCommand=none {target} hostname'
             )
         ssh_cmd = self.runtime_instance.wrap_command(ssh_cmd)
 
