@@ -4,7 +4,7 @@ import re
 import shlex
 import tempfile
 import time
-from multiprocessing import Process, Queue
+from multiprocessing import Lock, Process, Queue
 from typing import Any
 from xml.etree import ElementTree as ET
 
@@ -1851,6 +1851,10 @@ class LibVirtSession(SessionConfigMixin):
             True if all disks were configured successfully, False otherwise
         """
         disk_manager = DiskManager(vm_name=vm_name, provider_config=self.provider_config)
+        # the processes below record their disks on the one domain: each
+        # write reads the records and writes them back with one added, so
+        # two at once keep only one unless they take turns (#215)
+        disk_manager.records_lock = Lock()
         result_queue: Queue = Queue()
 
         def _configure(i, disk_config):

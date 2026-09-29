@@ -12,6 +12,12 @@ existing ``<prefix>_disk.qcow2``, destroying its contents.
 No race, no detach. Introduced by the fix for round-3 finding 2, which
 changed one side of a documented "matching" pair and not the other.
 
+Since #215 the differ marks nothing ``attach_only``, and creation never
+writes over an existing file: an image already at the path is attached only
+when boxman's own record proves it made it for the VM, and refused
+otherwise. The prediction still has to agree with creation -- the target
+conflict check compares against it.
+
 Each test asserts **reachability as well as outcome**: that creation was
 actually attempted for the disks that should be created, so replacing the
 operation with a no-op fails the test rather than passing it vacuously.
@@ -47,8 +53,10 @@ def test_prediction_and_creation_agree(declared, tmp_path: Path):
 
 
 @pytest.mark.parametrize("declared", SPELLINGS)
-def test_an_existing_image_is_attached_not_recreated(declared, tmp_path: Path):
-    """The differ-to-application path, with the destination already there."""
+def test_an_existing_image_is_never_written(declared, tmp_path: Path):
+    """The differ-to-application path, with the destination already there
+    and no record of boxman making it: refused, not adopted and not
+    overwritten, whatever the spelling (#215)."""
     config = dict(declared, target='vdb', size=1024)
     image = Path(disk_path_for(str(tmp_path), disk_logical_name(config),
                                disk_prefix='vm01'))
@@ -77,29 +85,32 @@ def test_an_existing_image_is_attached_not_recreated(declared, tmp_path: Path):
             desired_disks=[config], workdir=str(tmp_path), disk_prefix="vm01")
 
     assert len(diff['new_disks']) == 1
-    assert diff['new_disks'][0].get('attach_only') is True, (
-        'the existing image was not recognised, so creation would overwrite it')
+    assert diff['new_disks'][0].get('attach_only') is None
 
-    # ...and the application half honours it
+    # ...and the application half, with the real create path, refuses it
     manager = DiskManager.__new__(DiskManager)
     manager.logger = MagicMock()
     manager.virsh = MagicMock()
     manager.vm_name = 'vm01'
     manager.provider_config = {}
-    manager.create_disk = MagicMock(return_value=True)
     manager.attach_disk = MagicMock(return_value=True)
 
-    with patch('boxman.providers.libvirt.disk.record_attached_disk'):
+    with patch('boxman.providers.libvirt.disk.record_attached_disk') as rec, \
+         patch('boxman.providers.libvirt.disk.read_disk_records',
+               return_value=None):
         assert manager.configure_from_disk_config(
             disk_config=diff['new_disks'][0], workdir=str(tmp_path),
-            disk_prefix='vm01') is True
+            disk_prefix='vm01') is False
 
-    manager.create_disk.assert_not_called()
-    # reachability: the attach *did* happen, so this is not passing because
-    # nothing ran at all
-    manager.attach_disk.assert_called_once()
-    assert manager.attach_disk.call_args.kwargs['disk_path'] == str(image)
+    manager.attach_disk.assert_not_called()
+    rec.assert_not_called()
     assert image.read_bytes() == b"existing-data"
+    # reachability: refused at the very path creation would have used, so
+    # this is not passing because nothing ran, or because it looked
+    # somewhere else
+    refusals = [c.args[0] for c in manager.logger.error.call_args_list
+                if 'refusing to create' in c.args[0]]
+    assert len(refusals) == 1 and str(image) in refusals[0]
 
 
 @pytest.mark.parametrize("declared", SPELLINGS)

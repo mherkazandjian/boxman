@@ -27,9 +27,11 @@ import errno
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -40,7 +42,12 @@ from boxman.exceptions import ProvisionError
 from boxman.providers.libvirt import direct_vm
 from boxman.providers.libvirt.bare_vm import BareVM
 from boxman.providers.libvirt.disk import DiskManager
+from boxman.providers.libvirt.disk_ownership import (
+    read_disk_records,
+    records_from_xml,
+)
 from boxman.providers.libvirt.session import LibVirtSession
+from boxman.providers.libvirt.vm_differ import VMStateDiffer
 
 pytestmark = pytest.mark.unit
 
@@ -688,3 +695,508 @@ class TestARefusedCloneIsNotRetried:
 
         assert provider.clone_vm.call_count == 1
         assert sleeps == []
+
+
+# ---------------------------------------------------------------------------
+# `update` finds an image already at a new disk's path. It attaches it only
+# when boxman's ownership record says boxman created that very file for this
+# VM -- a run stopped between creating and attaching it -- and refuses it
+# otherwise, as provision does; `attach_only: true` stays the explicit way
+# to adopt a file (#215). The differ used to adopt any file it found there.
+# ---------------------------------------------------------------------------
+
+#: the extended attribute the image carries the token of its record in
+MARK = "user.boxman.disk"
+
+DATA = {"name": "data", "target": "vdb", "size": 16}
+
+
+def _result(stdout: str = "", ok: bool = True, stderr: str = "") -> MagicMock:
+    r = MagicMock(name="invoke.Result")
+    r.stdout, r.stderr, r.ok, r.failed = stdout, stderr, ok, not ok
+    r.return_code = 0 if ok else 1
+    return r
+
+
+class FakeLibvirt:
+    """What libvirt keeps for the domains that the disk path touches: each
+    domain's persistent boxman metadata and the files attached to it, and
+    every ``virsh`` call in order. ``metadata`` and ``attach-device`` are
+    all creating and attaching a disk runs."""
+
+    def __init__(self):
+        self.metadata: dict[str, str] = {}
+        self.attached: dict[str, list[str]] = {}
+        self.calls: list[str] = []
+        self.attach_failures = 0
+        self.unreadable = False
+        self.unwritable = False
+
+    def execute(self, cmd, *args, **kwargs):
+        domain = args[0]
+        if cmd == "metadata" and "set" in kwargs:
+            self.calls.append(f"record {domain}")
+            if self.unwritable:
+                return _result(ok=False, stderr="error: metadata write failed")
+            self.metadata[domain] = kwargs["set"]
+            return _result()
+        if cmd == "metadata":
+            self.calls.append(f"read {domain}")
+            if self.unreadable:
+                return _result(ok=False, stderr="error: failed to connect")
+            if domain not in self.metadata:
+                return _result(ok=False, stderr=(
+                    "error: metadata not found: Requested metadata element "
+                    "is not present"))
+            return _result(stdout=self.metadata[domain])
+        if cmd == "attach-device":
+            self.calls.append(f"attach {domain}")
+            if self.attach_failures:
+                self.attach_failures -= 1
+                return _result(ok=False, stderr="error: stub attach failure")
+            xml = Path(args[1]).read_text()
+            source = re.search(r"<source file='([^']*)'/>", xml).group(1)
+            self.attached.setdefault(domain, []).append(source)
+            return _result()
+        raise AssertionError(f"unexpected virsh call: {cmd} {args} {kwargs}")
+
+    def records(self, domain: str):
+        return read_disk_records(self, domain)
+
+    def record(self, domain: str, **attributes) -> None:
+        """Put one record on *domain*, as its metadata XML."""
+        attributes = {"name": "data", "target": "vdb", "role": "data",
+                      **attributes}
+        root = ET.Element("disks")
+        ET.SubElement(root, "disk", attributes)
+        self.metadata[domain] = ET.tostring(root, encoding="unicode")
+
+
+@pytest.fixture
+def libvirt() -> FakeLibvirt:
+    return FakeLibvirt()
+
+
+@pytest.fixture
+def marks(tmp_path: Path) -> None:
+    """Skip where the filesystem under the test takes no user xattrs."""
+    probe = tmp_path / "xattr-probe"
+    probe.write_bytes(b"")
+    try:
+        os.setxattr(probe, MARK, b"probe")
+    except OSError as exc:
+        pytest.skip(f"no user extended attributes here ({exc.strerror})")
+    finally:
+        probe.unlink()
+
+
+def _mark(path: Path, token: str) -> None:
+    os.setxattr(path, MARK, token.encode(), follow_symlinks=False)
+
+
+def _differ(libvirt: FakeLibvirt, wd: Path, disks, attached=()):
+    """The real differ, with every probe but the records stubbed."""
+    differ = VMStateDiffer(provider_config={"use_sudo": False,
+                                            "uri": "qemu:///system"})
+    differ.virsh = libvirt
+    with patch.object(differ, "get_vm_state", return_value="running"), \
+         patch.object(differ, "get_actual_cpu",
+                      return_value={"sockets": 1, "cores": 1, "threads": 1,
+                                    "total_vcpus": 1, "current_vcpus": 1}), \
+         patch.object(differ, "get_max_vcpus", return_value=1), \
+         patch.object(differ, "get_actual_memory_mb", return_value=1024), \
+         patch.object(differ, "get_max_memory_mb", return_value=1024), \
+         patch.object(differ, "get_actual_disks",
+                      return_value=list(attached)), \
+         patch.object(differ, "get_actual_memballoon",
+                      return_value={"free_page_reporting": False,
+                                    "autodeflate": False,
+                                    "stats_period": None}), \
+         patch.object(differ, "get_actual_cdroms", return_value=[]), \
+         patch.object(differ, "get_actual_shared_folders", return_value=[]):
+        return differ.diff_vm(
+            domain_name="vm01", desired_cpus=None, desired_memory_mb=None,
+            desired_disks=[dict(d) for d in disks], workdir=str(wd),
+            disk_prefix="vm01")
+
+
+def _session() -> LibVirtSession:
+    return LibVirtSession(
+        config={"provider": {"libvirt": {"use_sudo": False}}})
+
+
+def _update(libvirt: FakeLibvirt, wd: Path, disks=(DATA,)) -> bool:
+    """`update` adding *disks* to vm01: the real differ decides what is new
+    (nothing is attached), the real session adds it."""
+    diff = _differ(libvirt, wd, disks)
+    with patch("boxman.providers.libvirt.disk.VirshCommand",
+               return_value=libvirt):
+        return _session().update_vm_disks(
+            vm_name="vm01", new_disks=diff["new_disks"],
+            resize_disks=diff["resize_disks"], workdir=str(wd),
+            disk_prefix="vm01", vm_running=True)
+
+
+def _provision(libvirt: FakeLibvirt, wd: Path, disks=(DATA,)) -> bool:
+    """provision configuring vm01's disks (each in a child process, so
+    what it does to *libvirt* is not seen here)."""
+    with patch("boxman.providers.libvirt.disk.VirshCommand",
+               return_value=libvirt):
+        return _session().configure_vm_disks(
+            vm_name="vm01", disks=[dict(d) for d in disks],
+            workdir=str(wd), disk_prefix="vm01")
+
+
+def _errors(captured_logs) -> list[str]:
+    return [r.getMessage() for r in captured_logs.records
+            if r.levelno == logging.ERROR]
+
+
+class TestUpdateAttachesOnlyItsOwnImage:
+
+    def _kept(self, tmp_path: Path) -> tuple[Path, Path]:
+        wd = tmp_path / "wd"
+        wd.mkdir()
+        image = wd / "vm01_data.qcow2"
+        image.write_bytes(PRECIOUS)
+        return wd, image
+
+    def _interrupted(self, libvirt: FakeLibvirt, stubs: Stubs,
+                     tmp_path: Path) -> tuple[Path, Path]:
+        """An `update` that created vm01's data disk and stopped before it
+        was attached."""
+        wd = tmp_path / "wd"
+        libvirt.attach_failures = 1
+        assert _update(libvirt, wd) is False
+        image = wd / "vm01_data.qcow2"
+        assert image.is_file() and len(stubs.calls()) == 1
+        return wd, image
+
+    def test_an_image_with_no_record_is_refused(self, stubs: Stubs,
+                                                tmp_path: Path,
+                                                libvirt: FakeLibvirt,
+                                                captured_logs):
+        wd, image = self._kept(tmp_path)
+
+        assert _update(libvirt, wd) is False
+
+        assert image.read_bytes() == PRECIOUS
+        assert libvirt.attached == {} and stubs.calls() == []
+        assert any(str(image) in e and "attach_only" in e
+                   for e in _errors(captured_logs)), _errors(captured_logs)
+
+    def test_a_refused_provision_is_refused_again_by_update(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt):
+        wd, image = self._kept(tmp_path)
+
+        assert _provision(libvirt, wd) is False
+        assert _update(libvirt, wd) is False
+
+        assert image.read_bytes() == PRECIOUS
+        assert libvirt.attached == {} and stubs.calls() == []
+
+    def test_the_own_image_of_an_interrupted_run_is_attached(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks):
+        wd, image = self._interrupted(libvirt, stubs, tmp_path)
+        made = image.read_bytes()
+        # recorded before the attach was tried, not after it succeeded
+        assert libvirt.calls.index("record vm01") < \
+            libvirt.calls.index("attach vm01")
+
+        assert _update(libvirt, wd) is True
+
+        assert libvirt.attached == {"vm01": [str(image)]}
+        assert len(stubs.calls()) == 1          # attached, not made again
+        assert image.read_bytes() == made
+        (record,) = libvirt.records("vm01")
+        # still boxman's own: a teardown removes it with the VM
+        assert (record.name, record.target, record.role, record.source) == \
+            ("data", "vdb", "data", str(image))
+
+    def test_an_own_image_replaced_since_is_refused(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks):
+        wd, image = self._interrupted(libvirt, stubs, tmp_path)
+        image.unlink()
+        image.write_bytes(PRECIOUS)     # may even reuse the inode number
+
+        assert _update(libvirt, wd) is False
+
+        assert image.read_bytes() == PRECIOUS
+        assert libvirt.attached == {}
+
+    def test_a_record_of_another_vm_does_not_vouch(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks):
+        wd, image = self._kept(tmp_path)
+        _mark(image, "t0k3n")
+        libvirt.record("vm02", source=str(image), token="t0k3n")
+
+        assert _update(libvirt, wd) is False
+
+        assert image.read_bytes() == PRECIOUS
+        assert libvirt.attached == {}
+
+    @pytest.mark.parametrize("mismatch", [
+        pytest.param({"source": "/elsewhere/vm01_data.qcow2"}, id="path"),
+        pytest.param({"role": "adopted"}, id="role"),
+        pytest.param({"name": "logs"}, id="name"),
+        pytest.param({"target": "vdc"}, id="target"),
+        pytest.param({"token": "an0th3r"}, id="token"),
+        pytest.param({"token": None}, id="no-token"),
+    ])
+    def test_a_record_that_is_not_for_this_file_does_not_vouch(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks,
+            mismatch):
+        wd, image = self._kept(tmp_path)
+        _mark(image, "t0k3n")
+        attributes = {"source": str(image), "token": "t0k3n", **mismatch}
+        libvirt.record("vm01", **{k: v for k, v in attributes.items()
+                                  if v is not None})
+
+        assert _update(libvirt, wd) is False
+
+        assert image.read_bytes() == PRECIOUS
+        assert libvirt.attached == {}
+
+    def test_an_image_that_lost_its_mark_does_not_vouch(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks,
+            captured_logs):
+        wd, image = self._kept(tmp_path)
+        libvirt.record("vm01", source=str(image), token="t0k3n")
+
+        assert _update(libvirt, wd) is False
+        assert libvirt.attached == {}
+        # refused as an occupied path, not failed on the missing mark
+        assert any(e.startswith("VM vm01: refusing") and str(image) in e
+                   for e in _errors(captured_logs)), _errors(captured_logs)
+
+    def test_a_record_without_a_token_is_no_match_for_an_empty_mark(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks):
+        wd, image = self._kept(tmp_path)
+        os.setxattr(image, MARK, b"")
+        libvirt.record("vm01", source=str(image))
+
+        assert _update(libvirt, wd) is False
+        assert libvirt.attached == {}
+
+    def test_a_symlink_swapped_in_after_the_lookup_is_not_followed(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks,
+            monkeypatch: pytest.MonkeyPatch):
+        wd = tmp_path / "wd"
+        wd.mkdir()
+        own = tmp_path / "own.qcow2"
+        own.write_bytes(PRECIOUS)
+        _mark(own, "t0k3n")
+        entry = wd / "vm01_data.qcow2"
+        entry.symlink_to(own)
+        libvirt.record("vm01", source=str(entry), token="t0k3n")
+        # the lookup saw the plain file that was there a moment before
+        real_lstat, plain = os.lstat, os.lstat(own)
+
+        def lstat(path, *args, **kwargs):
+            if os.fspath(path) == str(entry):
+                return plain
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", lstat)
+
+        assert _update(libvirt, wd) is False
+        assert libvirt.attached == {}
+        assert own.read_bytes() == PRECIOUS
+
+    @pytest.mark.parametrize("kind", ["symlink", "directory"])
+    def test_what_is_not_a_plain_file_is_refused_even_if_recorded(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks,
+            kind):
+        wd = tmp_path / "wd"
+        wd.mkdir()
+        entry = wd / "vm01_data.qcow2"
+        if kind == "symlink":
+            target = tmp_path / "elsewhere.qcow2"
+            target.write_bytes(PRECIOUS)
+            _mark(target, "t0k3n")
+            entry.symlink_to(target)
+        else:
+            entry.mkdir()
+            _mark(entry, "t0k3n")
+        libvirt.record("vm01", source=str(entry), token="t0k3n")
+        before = _tree(tmp_path)
+
+        assert _update(libvirt, wd) is False
+
+        assert _tree(tmp_path) == before
+        assert libvirt.attached == {}
+
+    def test_attach_only_still_adopts_the_file(self, stubs: Stubs,
+                                               tmp_path: Path,
+                                               libvirt: FakeLibvirt):
+        wd, image = self._kept(tmp_path)
+
+        assert _update(libvirt, wd, [dict(DATA, attach_only=True)]) is True
+
+        assert libvirt.attached == {"vm01": [str(image)]}
+        assert image.read_bytes() == PRECIOUS and stubs.calls() == []
+        (record,) = libvirt.records("vm01")
+        assert record.role == "adopted"
+
+    def test_a_new_disk_is_recorded_before_it_is_attached(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks):
+        wd = tmp_path / "wd"
+
+        assert _update(libvirt, wd) is True
+
+        image = wd / "vm01_data.qcow2"
+        assert libvirt.calls.index("record vm01") < \
+            libvirt.calls.index("attach vm01")
+        (record,) = libvirt.records("vm01")
+        assert (record.role, record.source) == ("data", str(image))
+        token = re.search(r'token="([^"]+)"', libvirt.metadata["vm01"])
+        assert token and os.getxattr(image, MARK) == token.group(1).encode()
+
+
+class TestTheOwnImageCheck:
+    """DiskManager's side of it, where the domain's records are read."""
+
+    def test_records_that_cannot_be_read_do_not_vouch(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks,
+            captured_logs):
+        wd = tmp_path / "wd"
+        wd.mkdir()
+        image = wd / "vm01_data.qcow2"
+        image.write_bytes(PRECIOUS)
+        _mark(image, "t0k3n")
+        libvirt.record("vm01", source=str(image), token="t0k3n")
+        libvirt.unreadable = True
+        dm = _dm()
+        dm.virsh = libvirt
+
+        assert dm.configure_from_disk_config(dict(DATA), str(wd),
+                                             "vm01") is False
+
+        assert image.read_bytes() == PRECIOUS
+        assert libvirt.attached == {}
+        # refused as an occupied path, naming it and what to do
+        assert any(e.startswith("VM vm01: refusing") and str(image) in e
+                   for e in _errors(captured_logs)), _errors(captured_logs)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches anything")
+    def test_a_path_that_cannot_be_looked_up_is_refused(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt,
+            captured_logs):
+        wd = tmp_path / "wd"
+        wd.mkdir()
+        libvirt.record("vm01", source=str(wd / "vm01_data.qcow2"),
+                       token="t0k3n")
+        dm = _dm()
+        dm.virsh = libvirt
+        wd.chmod(0o600)
+        try:
+            assert dm.configure_from_disk_config(dict(DATA), str(wd),
+                                                 "vm01") is False
+        finally:
+            wd.chmod(0o755)
+
+        assert libvirt.attached == {} and os.listdir(wd) == []
+        assert any("cannot be told" in e for e in _errors(captured_logs))
+
+    def test_a_record_that_cannot_be_written_does_not_stop_the_attach(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt,
+            captured_logs):
+        wd = tmp_path / "wd"
+        libvirt.unwritable = True
+        dm = _dm()
+        dm.virsh = libvirt
+
+        assert dm.configure_from_disk_config(dict(DATA), str(wd),
+                                             "vm01") is True
+
+        assert libvirt.attached == {"vm01": [str(wd / "vm01_data.qcow2")]}
+        warnings = [r.getMessage() for r in captured_logs.records
+                    if r.levelno == logging.WARNING]
+        assert any("could not record" in w for w in warnings), warnings
+
+
+# a `virsh` that keeps each domain's metadata in a file, attaches anything,
+# and takes a moment to answer a read, as a loaded host does
+_VIRSH = r'''#!/usr/bin/env python3
+import fcntl, json, os, sys, time
+here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+store = os.path.join(here, "virsh-metadata.json")
+args = sys.argv[1:]
+if args[:1] == ["-c"]:
+    args = args[2:]
+cmd, domain = args[0], args[1]
+if cmd == "attach-device":
+    sys.exit(0)
+if cmd != "metadata":
+    sys.exit(3)
+with open(store + ".lock", "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    data = {}
+    if os.path.exists(store):
+        with open(store) as fh:
+            data = json.load(fh)
+    sets = [a[len("--set="):] for a in args if a.startswith("--set=")]
+    if sets:
+        data[domain] = sets[0]
+        with open(store, "w") as fh:
+            json.dump(data, fh)
+        sys.exit(0)
+time.sleep(0.5)
+if domain not in data:
+    sys.stderr.write("error: metadata not found: Requested metadata "
+                     "element is not present" + chr(10))
+    sys.exit(1)
+print(data[domain])
+'''
+
+
+class TestTheDisksOfOneVmKeepEveryRecord:
+    """provision configures a VM's disks in parallel processes, and each one
+    records its disk by reading the domain's records and writing them back
+    with its own added. Two at once kept one of the two -- and a disk
+    without its record is refused by the next run instead of attached, and
+    kept by a teardown instead of removed (#215)."""
+
+    def test_two_disks_configured_together(self, stubs: Stubs,
+                                           tmp_path: Path, marks):
+        stubs.add("virsh", _VIRSH)
+        wd = tmp_path / "wd"
+        disks = [dict(DATA), {"name": "logs", "target": "vdc", "size": 16}]
+
+        assert _session().configure_vm_disks(
+            vm_name="vm01", disks=disks, workdir=str(wd),
+            disk_prefix="vm01") is True
+
+        store = json.loads((stubs.root / "virsh-metadata.json").read_text())
+        records = {r.name: r for r in records_from_xml(store["vm01"])}
+        assert sorted(records) == ["data", "logs"]
+        for name, record in records.items():
+            image = wd / f"vm01_{name}.qcow2"
+            assert os.getxattr(image, MARK) == record.token.encode()
+
+
+class TestTheTeardownInventoryKeepsItsLayout:
+    """The creation token rides on the domain's record, not in a teardown's
+    saved inventory, which the teardown decides with: an inventory saved by
+    this version reads the same as one saved before it, either way."""
+
+    def test_a_record_is_saved_and_read_without_its_token(self,
+                                                          tmp_path: Path):
+        from boxman.providers.libvirt import disk_cleanup
+        from boxman.providers.libvirt.disk_ownership import DiskRecord
+
+        source = str(tmp_path / "vm01_data.qcow2")
+        path = disk_cleanup.save_teardown_inventory(
+            disk_cleanup.StorageInventory(
+                vm_name="vm01", disk_sources=[], media_sources=[],
+                records=[DiskRecord("data", "vdb", "data", source,
+                                    token="t0k3n")],
+                records_state="present", chains={}, boot_family=[],
+                legacy_disks=None),
+            str(tmp_path))
+
+        saved = json.loads(Path(path).read_text())
+        assert saved["records"] == [{"name": "data", "target": "vdb",
+                                     "role": "data", "source": source}]
+        loaded = disk_cleanup.load_teardown_inventory(path, "vm01")
+        assert loaded.records == [DiskRecord("data", "vdb", "data", source)]

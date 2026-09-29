@@ -1,3 +1,4 @@
+import contextlib
 import os
 import secrets
 import shlex
@@ -15,8 +16,14 @@ from .disk_ownership import (
     ROLE_ADOPTED,
     ROLE_DATA,
     disk_logical_name,
+    read_disk_records,
     record_attached_disk,
 )
+
+#: the extended attribute a new image carries its creation token in: the
+#: token its ownership record holds, which tells that very file from any
+#: other put at the same path since (#215)
+IMAGE_MARK_XATTR = "user.boxman.disk"
 
 
 def libvirt_disk_source(disk_path: str) -> str:
@@ -84,7 +91,8 @@ def create_image_exclusive(disk_path: str,
                            size: str,
                            fmt: str,
                            run: Callable[[str], Any],
-                           remedy: str = DATA_DISK_REMEDY
+                           remedy: str = DATA_DISK_REMEDY,
+                           token: str = ""
                            ) -> tuple[int, int] | None:
     """
     Create a new, empty *fmt* image of *size* at *disk_path* with
@@ -132,6 +140,11 @@ def create_image_exclusive(disk_path: str,
             ``warn`` semantics, so a failed command is a result, not an
             exception.
         remedy: what the refusal tells the operator to do.
+        token: when given, the private file is marked with it
+            (:data:`IMAGE_MARK_XATTR`) before ``qemu-img`` writes into it,
+            so the image carries it from its first moment. A filesystem
+            that takes no user extended attributes leaves it unmarked, which
+            only means a later run cannot prove the image is boxman's own.
 
     Returns:
         ``(st_dev, st_ino)`` of the new image, now at *disk_path*; ``None``
@@ -178,6 +191,12 @@ def create_image_exclusive(disk_path: str,
     try:
         try:
             info = os.fstat(fd)
+            if token:
+                try:
+                    os.setxattr(fd, IMAGE_MARK_XATTR, token.encode())
+                except OSError as exc:
+                    log.debug(f"could not mark {scaffold} as boxman's "
+                              f"({exc.strerror})")
         finally:
             os.close(fd)
 
@@ -223,6 +242,12 @@ class DiskManager:
     This class handles creating disk images with qemu-img and attaching them to VMs.
     """
 
+    #: held around each ownership-record write, which reads the domain's
+    #: records and writes them back with one added: callers that configure
+    #: disks of one VM in parallel processes replace it with a lock they
+    #: share, or two writes at once keep only one record (#215)
+    records_lock: Any = contextlib.nullcontext()
+
     def __init__(self, vm_name: str, provider_config: dict[str, Any] | None = None):
         """
         Initialize the disk manager.
@@ -243,7 +268,8 @@ class DiskManager:
         #: str: the name of the VM
         self.vm_name = vm_name
 
-    def create_disk(self, disk_path: str, size: int, format: str = 'qcow2') -> bool:
+    def create_disk(self, disk_path: str, size: int, format: str = 'qcow2',
+                    token: str = "") -> bool:
         """
         Create a new, empty disk image using qemu-img -- never over an
         existing file, symlink or directory
@@ -253,6 +279,7 @@ class DiskManager:
             disk_path: Path where the disk image will be created
             size: Size of the disk in MiB
             format: Disk format (default: qcow2)
+            token: mark the new image with it (:data:`IMAGE_MARK_XATTR`)
 
         Returns:
             True if the image was created, False if qemu-img failed
@@ -269,7 +296,8 @@ class DiskManager:
                 override_config_use_sudo=False)
             created = create_image_exclusive(
                 disk_path, f"{size}M", format,
-                run=lambda cmd: cmd_executor.execute_shell(cmd, warn=True))
+                run=lambda cmd: cmd_executor.execute_shell(cmd, warn=True),
+                token=token)
         except BoxmanError:
             raise
         except Exception as exc:
@@ -279,6 +307,88 @@ class DiskManager:
         if created is None:
             return False
         self.logger.info(f"successfully created disk image at {disk_path}")
+        return True
+
+    def _own_unattached_image(self, name: str, target: str,
+                              source: str) -> str:
+        """
+        Whether the image at *source* is one boxman created for this VM as
+        disk *name* at *target* and recorded, now not attached -- the state
+        a run that stopped between creating and attaching it leaves, or one
+        detached by hand (#215).
+
+        It is, only when all of these hold:
+
+        - *source* is a regular file (never a symlink or a directory);
+        - this VM's own ownership records hold one for exactly this disk:
+          same *name*, *target* and *source*, role ``data`` (created by
+          boxman, not adopted), with a creation token;
+        - the file carries that token (:data:`IMAGE_MARK_XATTR`), which
+          boxman put on the image it created, before anything else could
+          open it.
+
+        The path alone is not enough: a record outlives its file, and a file
+        put at the same path since -- which may even get the old inode
+        number -- is not the one the record was written for. Anything that
+        cannot be read (the path, the records, the mark) proves nothing.
+
+        Returns:
+            The token, or ``""`` when the image is not provably boxman's own.
+        """
+        try:
+            st = os.lstat(source)
+        except OSError:
+            # nothing there, or it cannot be told: create_disk decides, and
+            # refuses the latter
+            return ""
+        if not stat.S_ISREG(st.st_mode):
+            return ""
+        try:
+            records = read_disk_records(self.virsh, self.vm_name)
+        except ProvisionError as exc:
+            self.logger.warning(
+                f"VM {self.vm_name}: cannot tell whether boxman created "
+                f"{source} ({exc})")
+            return ""
+        for record in records or ():
+            # at most one record has this name and target; one without a
+            # token returns "" below, which proves nothing
+            if (record.name == name and record.target == target
+                    and record.role == ROLE_DATA
+                    and record.source == source):
+                try:
+                    mark = os.getxattr(source, IMAGE_MARK_XATTR,
+                                       follow_symlinks=False)
+                except OSError:
+                    return ""
+                if mark == record.token.encode():
+                    return record.token
+        return ""
+
+    def _record(self, name: str, target: str, source: str, role: str,
+                token: str) -> bool:
+        """
+        Record disk *name* on this VM (:func:`record_attached_disk`).
+
+        A failure is not the disk's: it is reported, and the configuring
+        goes on -- but without the record boxman will refuse to detach the
+        disk later rather than guess, and a rerun cannot prove the image is
+        its own.
+
+        Returns:
+            Whether the record was written.
+        """
+        try:
+            with self.records_lock:
+                record_attached_disk(self.virsh, self.vm_name, name=name,
+                                     target=target, source=source,
+                                     role=role, token=token)
+        except ProvisionError as exc:
+            self.logger.warning(
+                f"boxman could not record that disk {name} ({source}) of "
+                f"{self.vm_name} is its own ({exc}). It will not be detached "
+                f"automatically if it is later removed from the config.")
+            return False
         return True
 
     def attach_disk(self,
@@ -402,15 +512,42 @@ class DiskManager:
                                       driver_type=driver_type,
                                       disk_prefix=disk_prefix)
 
-            # 1. create the disk — unless the caller flagged the config
-            # attach_only (image file already exists, e.g. a leftover
-            # from a failed earlier run): recreating it would wipe data.
+            source = libvirt_disk_source(disk_path)
+
+            # 1. the image: an existing one only when the config says to
+            # adopt it (attach_only), or when boxman's own record proves it
+            # made that very file for this VM (a run that stopped between
+            # creating and attaching it); otherwise a new one, which is never
+            # created over anything already there (#215)
+            recorded = False
             if disk_config.get("attach_only"):
                 self.logger.info(
                     f"using existing disk image {disk_path} (attach only)")
-            elif not self.create_disk(disk_path, disk_size, format=driver_type):
-                self.logger.error(f"failed to create disk {disk_path}")
-                return False
+                # it already existed, which is not proof boxman created it
+                # (#164 F2 review)
+                role, token = ROLE_ADOPTED, ""
+            else:
+                role = ROLE_DATA
+                token = self._own_unattached_image(disk_name, target_dev,
+                                                   source)
+                if token:
+                    self.logger.info(
+                        f"attaching {source}: boxman created it for "
+                        f"{self.vm_name} and recorded it, and it is not "
+                        f"attached")
+                    recorded = True
+                else:
+                    token = secrets.token_hex(16)
+                    if not self.create_disk(disk_path, disk_size,
+                                            format=driver_type, token=token):
+                        self.logger.error(
+                            f"failed to create disk {disk_path}")
+                        return False
+                    # Recorded before the attach: a run that stops between
+                    # the two leaves an image whose record lets the rerun
+                    # attach it rather than refuse it (#215).
+                    recorded = self._record(disk_name, target_dev, source,
+                                            role, token)
 
             # 2. attach the disk to the VM
             if not self.attach_disk(
@@ -427,25 +564,8 @@ class DiskManager:
             # declares this disk can tell it apart from the root disk, from
             # one attached by hand, and from a different disk that has since
             # taken the same target (#164 F2).
-            try:
-                record_attached_disk(
-                    self.virsh, self.vm_name,
-                    name=disk_name, target=target_dev,
-                    source=libvirt_disk_source(disk_path),
-                    # attach_only means the image already existed, which is
-                    # not proof boxman created it (#164 F2 review)
-                    role=(ROLE_ADOPTED if disk_config.get("attach_only")
-                          else ROLE_DATA))
-            except ProvisionError as exc:
-                # The disk is attached and working; only the bookkeeping
-                # failed. Do not fail the attach over it -- but say so
-                # clearly, because without the record boxman will refuse to
-                # detach this disk later rather than guess.
-                self.logger.warning(
-                    f"disk {disk_name} is attached to {self.vm_name}, but "
-                    f"boxman could not record that it owns it ({exc}). It "
-                    f"will not be detached automatically if it is later "
-                    f"removed from the config.")
+            if not recorded:
+                self._record(disk_name, target_dev, source, role, token)
 
             self.logger.info(f"successfully configured disk {disk_name} for VM {self.vm_name}")
             return True

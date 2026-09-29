@@ -379,10 +379,11 @@ class VMStateDiffer:
               - memory_changed, desired_memory_mb, actual_memory_mb
               - max_vcpus_changed, desired_max_vcpus, actual_max_vcpus
               - max_memory_changed, desired_max_memory_mb, actual_max_memory_mb
-              - new_disks: list of disk configs to create and attach
-                (a config carries ``attach_only: True`` when its image
-                file already exists on disk — attach it as-is instead of
-                recreating it)
+              - new_disks: list of disk configs to create and attach --
+                every declared disk whose target is not attached. An image
+                already at its path is not adopted here: the disk manager
+                attaches it only when boxman's own record proves it made
+                that file for this VM, and refuses it otherwise (#215)
               - resize_disks: list of dicts with target, source, current_size_mb, desired_size_mb
               - new_cdroms, removed_cdroms, changed_cdroms
               - new_shared_folders, removed_shared_folders, changed_shared_folders
@@ -456,22 +457,16 @@ class VMStateDiffer:
         for disk_config in (desired_disks or []):
             target = disk_config.get('target', DEFAULT_DISK_TARGET)
             desired_size = disk_config.get('size', 1024)
-            expected_path = self._expected_disk_path(disk_config, workdir, disk_prefix)
 
             if target not in actual_targets:
-                if os.path.exists(expected_path):
-                    # Leftover image from a failed earlier run — the disk
-                    # is neither new nor a resize. Attach the existing
-                    # file as-is (skip create) rather than silently
-                    # dropping the desired disk.
-                    self.logger.warning(
-                        f"disk {target} on {domain_name}: image "
-                        f"{expected_path} exists but is not attached — "
-                        f"attaching existing file (skipping create)")
-                    new_disks.append({**disk_config, 'attach_only': True})
-                else:
-                    # new disk — not attached and file doesn't exist
-                    new_disks.append(disk_config)
+                # A new disk, whether or not an image is already at its
+                # path. That file used to be attached as-is here, whoever
+                # made it; now it is attached only when boxman's ownership
+                # record proves boxman made that very file for this VM, and
+                # refused otherwise -- decided where the disk is configured,
+                # against the record and the file (#215). `attach_only:
+                # true` in the config still adopts it on purpose.
+                new_disks.append(disk_config)
             elif target in actual_targets:
                 # disk exists — check if resize needed
                 actual_disk = actual_by_target[target]
