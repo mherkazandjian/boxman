@@ -1601,7 +1601,7 @@ class TestMemballoonUpdateSummary:
                 ('reconcile_networks', lambda self, **kw: {}),
                 ('report_network_results', lambda self, r: None),
                 ('_find_all_existing_project_vms', lambda self: [full]),
-                ('setup_ssh_access', lambda self: None),
+                ('setup_ssh_access', lambda self, **kw: None),
                 ('connect_info', lambda self: None),
                 ('_update_single_vm', _needs_restart_update_worker)):
             monkeypatch.setattr(BoxmanManager, name, replacement)

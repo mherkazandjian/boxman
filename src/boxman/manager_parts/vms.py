@@ -16,6 +16,7 @@ from boxman.exceptions import (
     ConfigError,
     DiskPathOccupiedError,
     ProvisionError,
+    SSHAccessError,
 )
 from boxman.loggers.logger import suppressed
 from boxman.manager_parts.images import ImagesMixin
@@ -1168,6 +1169,18 @@ class VMsMixin:
     #: spellings appear across virsh versions and output modes.
     _SHUT_OFF_STATES = frozenset({'shut off', 'shutoff'})
 
+    #: The states in which a domain is known not to be running: as virsh
+    #: prints them, plus boxman's own 'managedsave' (see _get_vm_states) and
+    #: 'not defined' for a VM libvirt does not list. Where it decides
+    #: whether a VM is expected to answer, any other state -- 'running', or
+    #: one this set does not know, as virsh translates them under a
+    #: non-English locale -- counts as running, so an unreadable state
+    #: fails closed (#223).
+    _NOT_RUNNING_STATES = frozenset({
+        'shut off', 'shutoff', 'paused', 'managedsave', 'saved', 'crashed',
+        'in shutdown', 'pmsuspended', 'dying', 'not defined',
+    })
+
     def _get_vm_states(self) -> dict[str, str]:
         """
         Query libvirt and return a mapping of project VM name -> state string
@@ -1233,6 +1246,28 @@ class VMsMixin:
                     states[vm_name] = 'managedsave'
 
         return states
+
+    def _vm_states_if_known(self) -> dict[str, str] | None:
+        """
+        :meth:`_get_vm_states`, or None when the states cannot be had.
+
+        For the steps that only need to know which VMs are running -- the
+        ssh setup, the wait for addresses -- and must not turn a failed
+        query into a failed command: None, logged, leaves them treating
+        every VM as running, which is how they behaved before they asked.
+        A project without libvirt clusters has no states to ask for, and
+        gets None too rather than an empty mapping, which would read as
+        "no VM exists".
+        """
+        if not self._has_libvirt_clusters():
+            return None
+        try:
+            return self._get_vm_states()
+        except ProvisionError as exc:
+            self.logger.warning(
+                f"could not read the VMs' states, so every VM is treated as "
+                f"running: {exc}")
+            return None
 
     def _managed_save_domains(self) -> set[str]:
         """
@@ -2085,7 +2120,15 @@ class VMsMixin:
             if any(outcome in ('recreated', 'partial')
                    for outcome in network_results.values()):
                 self.wait_for_vm_ips(self._vms_worth_waiting_for())
-            self.setup_ssh_access()
+            # A running VM that did not get its key fails the update, like
+            # any VM that did not update; one that is not running is
+            # expected and only warned about. The VMs cloned above are
+            # `fresh`: whatever the ssh config says about their aliases
+            # belongs to a domain that no longer exists.
+            try:
+                self.setup_ssh_access(fresh=new_vm_names)
+            except SSHAccessError as exc:
+                update_failures.extend(exc.failures)
             self.connect_info()
 
         if update_failures:

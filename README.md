@@ -448,6 +448,26 @@ boxman ssh 0
 boxman ssh 1
 ```
 
+`provision`, `up` and `update` rewrite the project's `ssh_config`;
+`provision` and `update` also add the cluster's admin key to every running
+VM, logging in with `admin_pass`.
+
+- **A VM that is not running** (shut off, paused, saved) is expected: it gets
+  one warning, and keeps its `ssh_config` entry with the address from the
+  file being rewritten, marked as coming from an earlier run. After a `virsh
+  start` or `boxman control start` the entry usually still reaches it —
+  libvirt gives a VM its old DHCP address back — and the next `boxman up` or
+  `boxman update` refreshes it (`update` also adds the key). An earlier
+  address that another VM now reports is not kept, and a VM created in the
+  same run never inherits one.
+- **A running VM that does not get the key** — no address, the copy or the
+  login check after it failed, an `admin_pass` reference that cannot be
+  resolved, a missing public key — makes `provision` and `update` exit 2,
+  naming it, once everything else has run. So does a key pair that cannot
+  be generated or an `ssh_config` that cannot be written.
+- **A cluster without `admin_pass`** gets no key, with a warning: its guests
+  have to authorize the key themselves, as the ISO-boot boxes do.
+
 ### Import VM images
 
 `boxman import-image` defines a libvirt VM from a pre-built package
@@ -964,6 +984,13 @@ cleanly, detaches, and starts it back up.
 
 Pass `--restart` to let it. `--yes` does not imply `--restart` — it answers
 the VM-removal prompt only.
+
+### SSH access
+
+`update` ends by rewriting `ssh_config` and adding the admin key to every
+running VM. A VM that is not running is skipped with a warning and keeps its
+entry; a running one that does not get the key fails the update (exit 2)
+after everything else has run. See [SSH into VMs](#ssh-into-vms).
 
 ### What cannot be updated
 

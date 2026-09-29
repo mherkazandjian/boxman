@@ -4,13 +4,93 @@
 
 
 
+import ipaddress
 import os
 import shlex
 import time
+from collections import Counter
 
+from boxman.exceptions import SSHAccessError
 from boxman.utils.hostnames import hostname_or_key
 from boxman.utils.references import resolve_reference
 from boxman.utils.shell import run
+
+#: The keywords of the VM blocks :meth:`SSHMixin.write_ssh_config` writes.
+#: A block holding any other keyword was not written by boxman, and the
+#: address in it is not reused.
+_VM_BLOCK_KEYWORDS = frozenset({
+    'hostname', 'user', 'identityfile', 'stricthostkeychecking',
+    'userknownhostsfile', 'proxyjump',
+})
+
+
+def _block_address(body: list[list[str]]) -> str | None:
+    """The one IPv4 ``Hostname`` of a VM block's *body*, or None."""
+    hostnames = []
+    for words in body:
+        if words[0].lower() not in _VM_BLOCK_KEYWORDS or len(words) != 2:
+            return None
+        if words[0].lower() == 'hostname':
+            hostnames.append(words[1])
+    if len(hostnames) != 1:
+        return None
+    try:
+        return str(ipaddress.IPv4Address(hostnames[0]))
+    except ValueError:
+        return None
+
+
+def earlier_vm_addresses(path: str) -> dict[str, str]:
+    """
+    The address each VM block of the ssh config at *path* gives, keyed by
+    the block's first ``Host`` alias (``<cluster>_<hostname>``; the second,
+    ``nodeN``, shifts when VMs are added or removed).
+
+    Only what :meth:`SSHMixin.write_ssh_config` writes is read: a
+    ``Host <alias> <nodeN>`` line, then lines of its own keywords, among
+    them exactly one ``Hostname`` holding an IPv4 address; comment lines
+    are skipped. A block that deviates -- another keyword, a second
+    Hostname, a name where the address should be, an alias written twice
+    -- is left out, and a file that cannot be read or decoded yields
+    nothing. An earlier block that cannot be understood is no earlier
+    block (#223).
+    """
+    try:
+        with open(path, encoding='utf-8') as fobj:
+            text = fobj.read()
+    except (OSError, UnicodeError):
+        return {}
+
+    blocks: list[tuple[list[str], list[list[str]]]] = []
+    for raw in text.splitlines():
+        words = raw.split()
+        if not words or words[0].startswith('#'):
+            continue
+        if words[0].lower() in ('host', 'match'):
+            blocks.append((words, []))
+        elif blocks:
+            blocks[-1][1].append(words)
+
+    seen: Counter = Counter()
+    found: dict[str, str] = {}
+    for head, body in blocks:
+        if head[0].lower() != 'host' or len(head) != 3:
+            continue
+        seen[head[1]] += 1
+        address = _block_address(body)
+        if address:
+            found[head[1]] = address
+    return {alias: address for alias, address in found.items()
+            if seen[alias] == 1}
+
+
+def _no_password(value) -> bool:
+    """Whether an ``admin_pass`` value means "no password".
+
+    Absent, empty, or YAML's ``no``. Not ``0``: an all-digit password comes
+    back from yaml.safe_load as an int, and 0 is falsy.
+    """
+    return value is None or value is False or value == ''
 
 
 class SSHMixin:
@@ -160,7 +240,10 @@ class SSHMixin:
             f"\n\n"
         )
 
-    def write_ssh_config(self) -> None:
+    def write_ssh_config(self,
+                         vm_states: dict[str, str] | None = None,
+                         fresh=(),
+                         adding_keys: bool = False) -> None:
         """
         Generate SSH configuration file for easy access to VMs.
 
@@ -172,9 +255,32 @@ class SSHMixin:
         that host-side ``ssh``, ``scp`` and ansible transparently hop
         through the libvirt container to reach VMs on libvirt's internal
         NAT network.
+
+        A VM that is not running keeps the block it had in the file being
+        rewritten, address included, marked as coming from an earlier run;
+        one WARNING per such VM says so, or says why it has no block (#223).
+
+        Args:
+            vm_states: full VM name -> state, as
+                :meth:`_vm_states_if_known` gives it. A VM known not to be
+                running is not asked for its address: it has none, and
+                asking makes the session warn. None -- the states are
+                unknown -- asks every VM, and one without an address gets
+                no block, as before.
+            fresh: full names of the VMs created in this run. An earlier
+                block under their alias describes a domain that is gone,
+                so it is never reused.
+            adding_keys: this run also adds the admin key to the VMs (the
+                ssh setup of ``update`` and ``provision``), so the warning
+                for a VM that is not running, in a cluster with an
+                ``admin_pass``, says its key was not added.
+
+        Raises:
+            SSHAccessError: a file could not be written; the others are.
         """
         ws_path = self.config.get('workspace', {}).get('path', '')
         prj_name = f'bprj__{self.config["project"]}__bprj'
+        fresh = set(fresh)
 
         # count total VMs across all clusters for zero-padded alias numbering
         total_vms = sum(
@@ -202,58 +308,195 @@ class SSHMixin:
                 (cluster_name, cluster, base_path)
             )
 
+        # Every VM's entry is settled before any file is written: whether a
+        # VM that is not running may keep its earlier address depends on the
+        # addresses the running VMs report, in every file.
+        plans: list[tuple[str, list[dict]]] = []
+        live: dict[str, str] = {}   # address -> the running VM reporting it
         for ssh_config, clusters_in_group in groups.items():
-            self.logger.info(f"writing ssh config to {ssh_config}")
+            earlier = ({} if vm_states is None
+                       else earlier_vm_addresses(ssh_config))
+            entries: list[dict] = []
 
-            with open(ssh_config, 'w') as fobj:
-                # docker runtime: jump host stanza
-                if jump_stanza:
-                    fobj.write(jump_stanza)
+            for cluster_name, cluster, base_path in clusters_in_group:
+                admin_priv_key = os.path.expanduser(os.path.join(
+                    base_path,
+                    cluster.get('admin_key_name', 'id_ed25519_boxman')
+                ))
+                # without an admin_pass no verb adds a key to these VMs, so
+                # their warning must not promise one
+                keys = adding_keys and not _no_password(cluster.get('admin_pass'))
 
-                for cluster_name, cluster, base_path in clusters_in_group:
-                    admin_priv_key = os.path.expanduser(os.path.join(
-                        base_path,
-                        cluster.get('admin_key_name', 'id_ed25519_boxman')
-                    ))
+                for vm_name, vm_info in cluster['vms'].items():
+                    full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                    hostname = hostname_or_key(vm_name, vm_info)
+                    prefixed_host = f"{cluster_name}_{hostname}"
+                    padded_alias = f"node{str(vm_counter).zfill(pad_width)}"
+                    vm_counter += 1
+                    entry = {
+                        'vm_name': vm_name,
+                        'label': f"{cluster_name}/{vm_name}",
+                        'host': f"{prefixed_host} {padded_alias}",
+                        'user': cluster.get("admin_user", "admin"),
+                        'identity_file': admin_priv_key,
+                        'keys': keys,
+                        'address': None,
+                        # set only for a VM known not to be running
+                        'state': None,
+                        'earlier': None,
+                        'why_none': None,
+                    }
+                    entries.append(entry)
 
-                    for vm_name, vm_info in cluster['vms'].items():
-                        full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                        hostname = hostname_or_key(vm_name, vm_info)
-                        prefixed_host = f"{cluster_name}_{hostname}"
-                        padded_alias = f"node{str(vm_counter).zfill(pad_width)}"
-                        vm_counter += 1
-
+                    state = (None if vm_states is None
+                             else vm_states.get(full_vm_name, 'not defined'))
+                    if state not in self._NOT_RUNNING_STATES:
                         # get the first ip address if available
-                        ip_addresses = self.session_for_cluster(cluster_name).get_vm_ip_addresses(full_vm_name)
-
+                        ip_addresses = self.session_for_cluster(
+                            cluster_name).get_vm_ip_addresses(full_vm_name)
                         if ip_addresses:
-                            first_ip = next(iter(ip_addresses.values()))
-
-                            fobj.write(f'Host {prefixed_host} {padded_alias}\n')
-                            fobj.write(f'    Hostname {first_ip}\n')
-                            fobj.write(f'    User {cluster.get("admin_user", "admin")}\n')
-                            fobj.write(f'    IdentityFile {admin_priv_key}\n')
-                            # per host, never under `Host *`: a boxman VM is
-                            # recreated often enough that its host key changes
-                            # under a reused IP, so checking it is noise here.
-                            # In a `Host *` stanza the same two lines disable
-                            # checking for every host the reader ever connects
-                            # to, because OpenSSH takes the first value it sees
-                            # for a keyword -- and this file is meant to be
-                            # Include-d (#164 CL-S1).
-                            fobj.write('    StrictHostKeyChecking no\n')
-                            fobj.write('    UserKnownHostsFile /dev/null\n')
-                            if jump_stanza:
-                                fobj.write(
-                                    f'    ProxyJump {self.SSH_JUMP_HOST_ALIAS}\n')
-                            fobj.write('\n\n')
+                            entry['address'] = next(iter(ip_addresses.values()))
+                            live.setdefault(entry['address'], entry['label'])
                         else:
                             self.logger.warning(
                                 f"no ip address available for the vm {vm_name}, "
                                 "skipping SSH config entry")
+                        continue
 
+                    entry['state'] = state
+                    if state == 'not defined':
+                        entry['why_none'] = "libvirt has no such domain"
+                    elif full_vm_name in fresh:
+                        entry['why_none'] = "it was created in this run"
+                    elif prefixed_host not in earlier:
+                        entry['why_none'] = "there is no earlier entry to keep"
+                    else:
+                        entry['earlier'] = earlier[prefixed_host]
+
+            plans.append((ssh_config, entries))
+
+        # A VM that is not running keeps the address of its earlier block
+        # rather than losing the block (#223). Dropping it meant that once
+        # the VM was started outside boxman -- `virsh start`, `boxman control
+        # start` -- neither `ssh -F` nor `boxman ssh` could name it until a
+        # later up or update saw it running. The kept address is usually
+        # still right: a domain keeps its MAC, and libvirt's dnsmasq hands a
+        # returning MAC its old lease, or, the lease gone, picks a free
+        # address by hashing the MAC; a dhcp.hosts reservation makes it
+        # certain. It can be stale all the same, and the block says
+        # `StrictHostKeyChecking no`, so ssh would not notice another host
+        # answering there. The host that matters is another VM of this
+        # project -- same admin user, same key -- where the login would
+        # succeed, silently, on the wrong guest. That is what is checked
+        # here: an address a running VM reports in this run, or that two
+        # kept blocks claim, is not kept. A VM created in this run never
+        # inherits a block (`fresh`): what the file says under its alias
+        # belongs to a domain that is gone. What is left -- another VM
+        # taking the address after this file is written -- is corrected by
+        # the next up or update, and is the lesser evil next to a config
+        # that cannot reach the VM at all.
+        claims = Counter(entry['earlier'] for _, entries in plans
+                         for entry in entries if entry['earlier'])
+        for _, entries in plans:
+            for entry in entries:
+                address = entry['earlier']
+                if address is None:
+                    continue
+                if address in live:
+                    entry['why_none'] = (
+                        f"its earlier address {address} is now "
+                        f"{live[address]}'s")
+                elif claims[address] > 1:
+                    entry['why_none'] = (
+                        f"another VM's earlier entry claims its earlier "
+                        f"address {address} too")
+                else:
+                    entry['address'] = address
+
+        unwritten: list[tuple[str, OSError]] = []
+        for ssh_config, entries in plans:
+            self.logger.info(f"writing ssh config to {ssh_config}")
+            try:
+                with open(ssh_config, 'w') as fobj:
+                    # docker runtime: jump host stanza
+                    if jump_stanza:
+                        fobj.write(jump_stanza)
+                    for entry in entries:
+                        if entry['address'] is not None:
+                            fobj.write(self._ssh_config_vm_block(
+                                entry, proxy_jump=bool(jump_stanza)))
+            except OSError as exc:
+                self.logger.error(
+                    f"could not write the ssh config {ssh_config}: "
+                    f"{exc.strerror or exc}")
+                unwritten.append((ssh_config, exc))
+                continue
+
+            for entry in entries:
+                if entry['state'] is not None:
+                    self.logger.warning(self._not_running_notice(entry))
             self.logger.info(f"ssh config file written to {ssh_config}")
             self.logger.info(f"to connect: ssh -F {ssh_config} <hostname>")
+
+        if unwritten:
+            raise SSHAccessError([
+                f"could not write the ssh config {path}: {exc.strerror or exc}"
+                for path, exc in unwritten]) from unwritten[0][1]
+
+    def _ssh_config_vm_block(self, entry: dict, proxy_jump: bool) -> str:
+        """One VM's block of the ssh config, as write_ssh_config writes it."""
+        lines = [f"Host {entry['host']}"]
+        if entry['state'] is not None:
+            # the VM is not running and keeps its earlier block's address;
+            # earlier_vm_addresses skips these lines when it reads it back
+            lines += [
+                f"    # boxman: {entry['vm_name']} was not running "
+                f"({entry['state']}) when this file was written;",
+                "    # the address below is from an earlier run and may be "
+                "out of date.",
+            ]
+        lines += [
+            f"    Hostname {entry['address']}",
+            f"    User {entry['user']}",
+            f"    IdentityFile {entry['identity_file']}",
+            # per host, never under `Host *`: a boxman VM is recreated often
+            # enough that its host key changes under a reused IP, so checking
+            # it is noise here. In a `Host *` stanza the same two lines
+            # disable checking for every host the reader ever connects to,
+            # because OpenSSH takes the first value it sees for a keyword --
+            # and this file is meant to be Include-d (#164 CL-S1).
+            "    StrictHostKeyChecking no",
+            "    UserKnownHostsFile /dev/null",
+        ]
+        if proxy_jump:
+            lines.append(f"    ProxyJump {self.SSH_JUMP_HOST_ALIAS}")
+        return "\n".join(lines) + "\n\n\n"
+
+    @staticmethod
+    def _not_running_notice(entry: dict) -> str:
+        """The one warning for a VM that write_ssh_config found not running.
+
+        It names the verbs that catch up with the VM: ``update`` adds the
+        key and rewrites the entry of every VM that is running, ``up`` brings
+        a VM up and rewrites the entries but adds no key, and nothing else
+        (``control start``, ``virsh start``) touches either.
+        """
+        if entry['address'] is not None:
+            what = (f"its ssh_config entry keeps the address "
+                    f"{entry['address']} from an earlier run")
+        else:
+            what = f"it has no ssh_config entry, as {entry['why_none']}"
+        if entry['keys']:
+            what += ", and its ssh key was not added"
+        notice = f"vm {entry['label']} is not running ({entry['state']}): {what}."
+        if entry['state'] == 'not defined':
+            return notice
+        if entry['keys']:
+            return (f"{notice} Once it runs, `boxman update` adds the key and "
+                    f"refreshes the entry; `boxman up` brings it up and "
+                    f"refreshes the entry, but adds no key.")
+        return (f"{notice} `boxman up` brings it up and refreshes the entry; "
+                f"`boxman update` refreshes it once it runs.")
 
     def generate_ssh_keys(self) -> bool:
         """
@@ -261,6 +504,11 @@ class SSHMixin:
 
         Creates an SSH key pair in the workspace directory if it doesn't
         already exist.
+
+        A pair that cannot be made is a failure whatever the cluster: the
+        ssh config names the private key as the IdentityFile, and only a
+        host problem stops ssh-keygen here -- a missing binary, a directory
+        that cannot be written, a full disk -- never a configuration.
 
         Returns:
             bool: True if successful, False otherwise
@@ -275,23 +523,32 @@ class SSHMixin:
             admin_priv_key = os.path.join(base_path, admin_key_name)
             admin_pub_key = os.path.join(base_path, f"{admin_key_name}.pub")
 
-            # create directory if it doesn't exist
-            if not os.path.isdir(base_path):
+            # create directory if it doesn't exist -- the ssh config is
+            # written there too. A directory that cannot be created used to
+            # escape from here as a traceback.
+            try:
                 os.makedirs(base_path, exist_ok=True)
+            except OSError as exc:
+                self.logger.error(
+                    f"cannot create {base_path} for the ssh key pair: "
+                    f"{exc.strerror or exc}")
+                success = False
+                continue
 
             # generate key pair if it doesn't exist
             if not os.path.exists(admin_priv_key):
                 self.logger.info(f"generating ssh key pair in {base_path}")
 
                 try:
-                    cmd = f'ssh-keygen -t ed25519 -a 100 -f {admin_priv_key} -q -N ""'
+                    cmd = (f'ssh-keygen -t ed25519 -a 100 '
+                           f'-f {shlex.quote(admin_priv_key)} -q -N ""')
                     run(cmd, hide=True, warn=True)
 
                     # verify keys were created
                     if os.path.isfile(admin_priv_key) and os.path.isfile(admin_pub_key):
                         self.logger.info(f"ssh key pair successfully generated at {admin_priv_key}")
                     else:
-                        self.logger.warning(f"failed to generate ssh key pair at {admin_priv_key}")
+                        self.logger.error(f"failed to generate ssh key pair at {admin_priv_key}")
                         success = False
 
                 except Exception as exc:
@@ -371,11 +628,57 @@ class SSHMixin:
         Add the generated SSH public key to all VMs to enable password-less login.
 
         Uses sshpass to add the public key to each VM using the admin password.
+        Every VM is treated as running; :meth:`setup_ssh_access` passes
+        :meth:`_push_ssh_keys` the VMs' states instead.
 
         Returns:
             bool: True if all VMs received the key successfully, False otherwise
         """
-        all_successful = True
+        return not self._push_ssh_keys()
+
+    def _push_ssh_keys(self,
+                       vm_states: dict[str, str] | None = None,
+                       unreachable=()) -> list[str]:
+        """
+        Add the cluster admin key to every VM boxman expects to reach.
+
+        A VM boxman expects to reach is running and not in *unreachable*:
+        the VMs the verb did not wait for, because a network recreate could
+        not reconnect them or provision could not start them. The others
+        are skipped and are not failures -- write_ssh_config has already
+        warned, once, about a VM that is not running.
+
+        Every way this used to report "not all successful", classified
+        (#223):
+
+        - a VM that is not running: expected, not a failure;
+        - an expected VM with no address, or whose key copy (or the ssh
+          login that checks it) kept failing: a failure;
+        - a cluster without an ``admin_pass``: a configuration boxman
+          supports, not a failure. Nothing else authorizes the cluster key
+          -- it is generated after the template, and no cloud-init or seed
+          carries it -- so without a password boxman cannot add it, and
+          says so once per cluster. The ISO-boot boxes run this way on
+          purpose: the talos guest has no sshd, and the proxmox one
+          authorizes its key from its answer file;
+        - an ``admin_pass`` reference that cannot be resolved (an unset
+          ``${env:...}``, a missing ``file://``), or a public key that is
+          not there: the configuration asks for the key to be added and it
+          cannot be, so it is one failure naming every expected VM of the
+          cluster -- or a warning when none of them is running. The
+          unresolved reference used to escape as a traceback.
+
+        Args:
+            vm_states: full VM name -> state, as for write_ssh_config. None
+                treats every VM as running.
+            unreachable: full names of the VMs not expected to answer.
+
+        Returns:
+            One line per problem, naming the VMs boxman expected to reach
+            that did not get the key; empty when each one did.
+        """
+        failures: list[str] = []
+        unreachable = set(unreachable)
         ws_path = self.config.get('workspace', {}).get('path', '')
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
@@ -383,35 +686,73 @@ class SSHMixin:
             base_path = os.path.expanduser(ws_path or cluster['workdir'])
             admin_key_name = cluster.get('admin_key_name', 'id_ed25519_boxman')
             admin_pub_key = os.path.join(base_path, f"{admin_key_name}.pub")
-
             admin_user = cluster.get('admin_user', 'admin')
-            admin_pass = self.fetch_value(cluster.get('admin_pass', None))
 
-            if not admin_pass:
-                self.logger.info(
-                    f"warning: No admin password provided for cluster {cluster_name}, "
-                    "cannot add SSH keys")
-                all_successful = False
-                continue
-
-            if not os.path.isfile(admin_pub_key):
-                self.logger.error(f"error: SSH public key {admin_pub_key} does not exist")
-                all_successful = False
-                continue
-
-            self.logger.info(f"adding ssh public key to VMs in cluster {cluster_name}")
-
+            targets = []
+            left_out = []
             for vm_name, vm_info in cluster['vms'].items():
                 full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
+                label = f"{cluster_name}/{vm_name}"
+                state = (None if vm_states is None
+                         else vm_states.get(full_vm_name, 'not defined'))
+                if state in self._NOT_RUNNING_STATES:
+                    self.logger.info(
+                        f"not adding the ssh key to vm {label}: it is not "
+                        f"running ({state})")
+                elif full_vm_name in unreachable:
+                    left_out.append(label)
+                else:
+                    targets.append((vm_name, vm_info, full_vm_name, label))
 
+            raw_pass = cluster.get('admin_pass')
+            admin_pass = None
+            problem = None
+            if not _no_password(raw_pass):
+                try:
+                    admin_pass = self.fetch_value(raw_pass)
+                except (ValueError, FileNotFoundError) as exc:
+                    problem = (f"the admin_pass of cluster {cluster_name} "
+                               f"cannot be resolved ({exc})")
+            if problem is None and _no_password(admin_pass):
+                self.logger.warning(
+                    f"cluster {cluster_name} has no admin_pass, so boxman "
+                    f"adds no ssh key to its VMs: the ssh config reaches them "
+                    f"only where the guest already authorizes {admin_pub_key}")
+                continue
+            if problem is None and not os.path.isfile(admin_pub_key):
+                problem = f"the ssh public key {admin_pub_key} does not exist"
+            for label in left_out:
+                self.logger.warning(
+                    f"not adding the ssh key to vm {label}: this run could "
+                    f"not bring it up or reconnect it, see the errors above")
+            if problem:
+                if targets:
+                    # one cause, one failure: it names every VM it stopped
+                    labels = ', '.join(target[3] for target in targets)
+                    self.logger.error(
+                        f"cannot add the ssh key to {labels}: {problem}")
+                    failures.append(f"ssh key not added to {labels}: {problem}")
+                else:
+                    self.logger.warning(
+                        f"{problem}; no VM of cluster {cluster_name} is "
+                        f"running, so no ssh key was due")
+                continue
+
+            if not targets:
+                continue
+            self.logger.info(f"adding ssh public key to VMs in cluster {cluster_name}")
+
+            for vm_name, vm_info, full_vm_name, label in targets:
                 # get the ip addresses for this vm
                 ip_addresses = self.session_for_cluster(cluster_name).get_vm_ip_addresses(full_vm_name)
 
                 if not ip_addresses:
-                    self.logger.warning(
-                        f"no ip address available for vm {vm_name}, "
-                        "cannot add ssh key")
-                    all_successful = False
+                    self.logger.error(
+                        f"vm {label} is running but has no ip address, "
+                        f"cannot add its ssh key")
+                    failures.append(
+                        f"ssh key not added to {label}: it is running but "
+                        f"has no ip address")
                     continue
 
                 # use first available ip address
@@ -428,16 +769,20 @@ class SSHMixin:
                     admin_user=admin_user,
                     admin_pass=admin_pass,
                     pub_key_path=admin_pub_key,
-                    ssh_conf_path=os.path.join(base_path, cluster['ssh_config'])
+                    ssh_conf_path=os.path.join(
+                        base_path, cluster.get('ssh_config', 'ssh_config'))
                 )
 
                 if success:
                     self.logger.info(f"successfully added the ssh key to the vm {vm_name}")
                 else:
                     self.logger.error(f"failed to add the ssh key to the vm {vm_name}")
-                    all_successful = False
+                    failures.append(
+                        f"ssh key not added to {label} ({ip_address}): the "
+                        f"key copy, or the ssh login that checks it, kept "
+                        f"failing")
 
-        return all_successful
+        return failures
 
     def _try_add_ssh_key(self,
                          ip_address: str,
@@ -567,18 +912,40 @@ class SSHMixin:
             self.logger.error(f"ssh connection failed for {hostname}: {result.stderr.strip()}")
             return False
 
-    def setup_ssh_access(self) -> bool:
+    def setup_ssh_access(self, fresh=(), unreachable=()) -> bool:
         """
         Set up SSH access to all VMs.
 
         This method:
         1. Writes global authorized keys file (resolved from boxman.yml)
         2. Generates SSH keys if they don't exist
-        3. Adds the public key to all vms
-        4. Writes an SSH config file for easy access
+        3. Writes an SSH config file for easy access, in which a VM that
+           is not running keeps its earlier address
+        4. Adds the public key to every VM boxman expects to reach
+
+        Each step runs whatever the one before it managed, and a problem is
+        raised only at the end: it used to be returned as False, which both
+        callers dropped, so `update` logged "failed to add ssh keys to some
+        vms" and exited 0 (#223). The VMs' states are read once, for steps
+        3 and 4 both.
+
+        Args:
+            fresh: full names of the VMs created in this run; see
+                :meth:`write_ssh_config`.
+            unreachable: full names of the VMs the caller did not wait for
+                (provision's VMs that never started). With the ones a
+                network recreate could not reconnect, they are not expected
+                to answer, and not getting the key is not a failure for
+                them.
 
         Returns:
-            bool: True if all steps completed successfully, False otherwise
+            bool: True -- a problem raises instead.
+
+        Raises:
+            SSHAccessError: after all four steps, naming each problem -- a
+                key pair that could not be generated, an ssh config that
+                could not be written, a VM boxman expected to reach that did
+                not get the key.
         """
         # write global authorized keys so they can be consumed by container
         # entrypoints or cloud-init scripts
@@ -587,15 +954,27 @@ class SSHMixin:
             global_keys_path = os.path.join(workdir, 'global_authorized_keys')
             self.write_global_authorized_keys_file(global_keys_path)
 
+        failures: list[str] = []
         if not self.generate_ssh_keys():
             self.logger.error("failed to generate ssh keys")
-            return False
+            failures.append(
+                "the admin ssh key pair could not be generated, see the "
+                "errors above")
 
-        self.write_ssh_config()
+        vm_states = self._vm_states_if_known()
+        try:
+            self.write_ssh_config(
+                vm_states=vm_states, fresh=fresh, adding_keys=True)
+        except SSHAccessError as exc:
+            failures.extend(exc.failures)
 
-        if not self.add_ssh_keys_to_vms():
-            self.logger.error("failed to add ssh keys to some vms")
-            return False
+        unreachable = (set(unreachable)
+                       | set(getattr(self, '_reattach_failed_vms', ())))
+        failures.extend(self._push_ssh_keys(
+            vm_states=vm_states, unreachable=unreachable))
+
+        if failures:
+            raise SSHAccessError(failures)
 
         self.logger.info("")
         self.logger.info("ssh access setup complete")
