@@ -123,7 +123,8 @@ def test_a_missing_image_is_still_created(declared, tmp_path: Path):
     manager.virsh = MagicMock()
     manager.vm_name = 'vm01'
     manager.provider_config = {}
-    manager.create_disk = MagicMock(return_value=True)
+    # the new image's (st_dev, st_ino)
+    manager.create_disk = MagicMock(return_value=(1, 2))
     manager.attach_disk = MagicMock(return_value=True)
 
     with patch('boxman.providers.libvirt.disk.record_attached_disk'):

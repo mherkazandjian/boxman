@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -41,13 +42,14 @@ from boxman import exceptions
 from boxman.exceptions import ProvisionError
 from boxman.providers.libvirt import direct_vm
 from boxman.providers.libvirt.bare_vm import BareVM
-from boxman.providers.libvirt.disk import DiskManager
+from boxman.providers.libvirt.disk import DiskManager, create_image_exclusive
 from boxman.providers.libvirt.disk_ownership import (
     read_disk_records,
     records_from_xml,
 )
 from boxman.providers.libvirt.session import LibVirtSession
 from boxman.providers.libvirt.vm_differ import VMStateDiffer
+from boxman.utils.shell import run as shell_run
 
 pytestmark = pytest.mark.unit
 
@@ -57,6 +59,10 @@ PRECIOUS = b"KEEP ME: the data disk a teardown kept\n" * 64
 #: slash-free, so a legal file name, and a shell that expands it leaves a
 #: file named `pwned` in the cwd (each test runs in its own tmp_path)
 LIVE_PAYLOAD = "a$(touch pwned)b"
+
+#: what qemu-img is told to write: the image in the shell's own working
+#: directory, whatever that directory is called by then
+PROC_IMAGE = re.compile(r"/proc/\d+/cwd/image")
 
 _QEMU_IMG = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -89,6 +95,10 @@ try:
 except OSError as exc:
     sys.stderr.write("qemu-img: " + path + ": " + exc.strerror + chr(10))
     sys.exit(1)
+st = os.fstat(fd)
+with open(os.path.join(here, "qemu-img.where"), "a") as fh:
+    fh.write(json.dumps({"cwd": os.getcwd(), "dev": st.st_dev,
+                         "ino": st.st_ino}) + chr(10))
 os.ftruncate(fd, 0)
 os.write(fd, ("QFI" + fmt + ":" + size).encode())
 os.close(fd)
@@ -136,6 +146,14 @@ class Stubs:
         return [line.split(chr(31))
                 for line in log.read_text().splitlines() if line]
 
+    def where(self) -> list[dict]:
+        """Per image the qemu-img stub wrote: its cwd, and the file's
+        device and inode."""
+        log = self.root / "qemu-img.where"
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
     def fail_qemu_img(self) -> None:
         (self.root / "qemu-img.json").write_text(json.dumps({"fail": True}))
 
@@ -174,6 +192,11 @@ def _no_record():
     """Keep the ownership bookkeeping after an attach off the real virsh:
     a disk only gets that far when a guard failed."""
     return patch("boxman.providers.libvirt.disk.record_attached_disk")
+
+
+def _identity(path: Path) -> tuple[int, int]:
+    st = os.lstat(path)
+    return (st.st_dev, st.st_ino)
 
 
 def _outcome(call):
@@ -263,8 +286,9 @@ class TestWithTheRealQemuImg:
     def test_a_new_image_is_made_where_nothing_was(self, tmp_path: Path):
         target = tmp_path / "not" / "yet" / "vm01_data.qcow2"
 
-        assert _dm().create_disk(str(target), 16) is True
+        made = _dm().create_disk(str(target), 16)
 
+        assert made == _identity(target)
         info = json.loads(subprocess.run(
             ["qemu-img", "info", "--output=json", str(target)],
             capture_output=True, text=True, check=True).stdout)
@@ -303,14 +327,15 @@ class TestTheLookupFailsClosed:
     def test_any_other_lookup_error(self, stubs: Stubs, tmp_path: Path,
                                     monkeypatch: pytest.MonkeyPatch):
         target = tmp_path / "wd" / "vm01_data.qcow2"
-        real_lstat = os.lstat
+        real_stat = os.stat
 
-        def lstat(path, *args, **kwargs):
-            if os.fspath(path) == str(target):
+        def stat_(path, *args, **kwargs):
+            # the disk's name, looked up in its opened directory
+            if path == target.name and kwargs.get("dir_fd") is not None:
                 raise OSError(errno.EIO, os.strerror(errno.EIO), str(target))
-            return real_lstat(path, *args, **kwargs)
+            return real_stat(path, *args, **kwargs)
 
-        monkeypatch.setattr(os, "lstat", lstat)
+        monkeypatch.setattr(os, "stat", stat_)
         outcome = _outcome(lambda: _dm().create_disk(str(target), 16))
 
         assert isinstance(outcome, ProvisionError), outcome
@@ -355,7 +380,7 @@ class TestNothingIsLeftBehind:
         stubs.fail_qemu_img()
         wd = tmp_path / "wd"
 
-        assert _dm().create_disk(str(wd / "vm01_data.qcow2"), 16) is False
+        assert _dm().create_disk(str(wd / "vm01_data.qcow2"), 16) is None
 
         assert os.listdir(wd) == []
         assert len(stubs.calls()) == 1
@@ -380,8 +405,9 @@ class TestNothingIsLeftBehind:
                                                  tmp_path: Path):
         target = tmp_path / "wd" / "vm01_data.qcow2"
 
-        assert _dm().create_disk(str(target), 16) is True
+        made = _dm().create_disk(str(target), 16)
 
+        assert made == _identity(target)
         assert os.listdir(target.parent) == [target.name]
         assert target.read_bytes() == b"QFIqcow2:16M"
         assert target.stat().st_nlink == 1
@@ -390,52 +416,66 @@ class TestNothingIsLeftBehind:
         assert stat.S_IMODE(target.stat().st_mode) == 0o644 & ~umask
         (argv,) = stubs.calls()
         assert argv[:3] == ["create", "-f", "qcow2"] and argv[4] == "16M"
-        # made under another name in the same directory, then linked
-        assert Path(argv[3]).parent == target.parent
-        assert argv[3] != str(target)
+        # written through the shell's own working directory: a private
+        # directory inside the disk's, whose image was then linked into place
+        assert PROC_IMAGE.fullmatch(argv[3]), argv[3]
+        (where,) = stubs.where()
+        private = Path(where["cwd"])
+        assert private.parent == target.parent
+        assert private.name.startswith(".boxman-new.")
+        assert (where["dev"], where["ino"]) == made
 
-    def test_a_private_name_taken_beforehand_is_never_followed(
+    @pytest.mark.parametrize("planted", ["symlink", "directory"])
+    def test_a_private_name_taken_beforehand_is_never_used(
             self, stubs: Stubs, tmp_path: Path,
-            monkeypatch: pytest.MonkeyPatch):
+            monkeypatch: pytest.MonkeyPatch, planted):
         monkeypatch.setattr(
             "boxman.providers.libvirt.disk.secrets.token_hex",
             lambda n: "feedface")
         target = tmp_path / "wd" / "vm01_data.qcow2"
         target.parent.mkdir()
-        planted = target.parent / (
+        name = target.parent / (
             f".boxman-new.{os.getpid()}.feedface.{target.name}")
         precious = tmp_path / "precious.qcow2"
         precious.write_bytes(PRECIOUS)
-        planted.symlink_to(precious)
+        if planted == "symlink":
+            name.symlink_to(precious)
+        else:
+            name.mkdir()
+            (name / "image").symlink_to(precious)
+        before = _tree(target.parent)
 
         outcome = _outcome(lambda: _dm().create_disk(str(target), 16))
 
         assert isinstance(outcome, ProvisionError), outcome
         assert precious.read_bytes() == PRECIOUS
-        # and what it did not make, it does not remove
-        assert os.readlink(planted) == str(precious)
-        assert sorted(os.listdir(target.parent)) == [planted.name]
+        # what it did not make, it neither uses nor removes
+        assert _tree(target.parent) == before
         assert stubs.calls() == []
 
-    def test_a_private_file_that_cannot_be_removed_is_named(
+    def test_a_private_image_that_cannot_be_removed_is_named(
             self, stubs: Stubs, tmp_path: Path,
             monkeypatch: pytest.MonkeyPatch, captured_logs):
         real_unlink = os.unlink
 
         def unlink(path, *args, **kwargs):
-            if ".boxman-new." in os.fspath(path):
+            if path == "image" and kwargs.get("dir_fd") is not None:
                 raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
             return real_unlink(path, *args, **kwargs)
 
         monkeypatch.setattr(os, "unlink", unlink)
         target = tmp_path / "wd" / "vm01_data.qcow2"
 
-        assert _dm().create_disk(str(target), 16) is True
+        assert _dm().create_disk(str(target), 16) == _identity(target)
 
-        (argv,) = stubs.calls()
+        (where,) = stubs.where()
         warnings = [r.getMessage() for r in captured_logs.records
                     if r.levelno == logging.WARNING]
-        assert any(argv[3] in w and "remove it by hand" in w
+        image = os.path.join(where["cwd"], "image")
+        assert any(image in w and "remove it by hand" in w
+                   for w in warnings), warnings
+        # ...and the directory it keeps from being removed
+        assert any(f"could not remove {where['cwd']}," in w
                    for w in warnings), warnings
 
 
@@ -445,18 +485,20 @@ class TestEveryArgumentIsQuoted:
         wd = tmp_path / f"it's {LIVE_PAYLOAD}"
         target = wd / f"vm01 {LIVE_PAYLOAD}.qcow2"
 
-        assert _dm().create_disk(str(target), 16) is True
+        assert _dm().create_disk(str(target), 16) == _identity(target)
 
-        (argv,) = stubs.calls()
-        assert Path(argv[3]).parent == wd
+        (where,) = stubs.where()
+        assert Path(where["cwd"]).parent == wd
         assert target.read_bytes() == b"QFIqcow2:16M"
+        assert os.listdir(wd) == [target.name]
         assert not list(tmp_path.rglob("pwned"))
 
     def test_a_hostile_format(self, stubs: Stubs, tmp_path: Path):
         fmt = f"qcow2 {LIVE_PAYLOAD}"
         target = tmp_path / "wd" / "vm01_data.qcow2"
 
-        assert _dm().create_disk(str(target), 16, format=fmt) is True
+        assert _dm().create_disk(str(target), 16, format=fmt) == \
+            _identity(target)
 
         (argv,) = stubs.calls()
         assert argv[:3] == ["create", "-f", fmt]
@@ -468,11 +510,21 @@ class TestEveryArgumentIsQuoted:
         target = tmp_path / f"it's {LIVE_PAYLOAD}" / "vm01_data.qcow2"
         dm = _dm(runtime="docker-compose", runtime_container="boxman-rt")
 
-        assert dm.create_disk(str(target), 16) is True
+        assert dm.create_disk(str(target), 16) == _identity(target)
 
-        assert len(stubs.calls("docker")) == 1
-        (argv,) = stubs.calls()
-        assert Path(argv[3]).parent == target.parent
+        (call,) = stubs.calls("docker")
+        assert call[:6] == ["exec", "--user", "root", "boxman-rt",
+                            "bash", "-c"]
+        # the one command arrives whole, through the single-quote escaping:
+        # the pin and the check first, then qemu-img on the shell's own
+        # working directory
+        (where,) = stubs.where()
+        chain = call[6]
+        assert chain.startswith(f"cd -P -- {shlex.quote(where['cwd'])} && ")
+        assert '[ "$(stat -c %d:%i .)" = ' in chain
+        assert chain.endswith(
+            '; qemu-img create -f qcow2 "/proc/$$/cwd/image" 16M')
+        assert Path(where["cwd"]).parent == target.parent
         assert os.listdir(target.parent) == [target.name]
         assert not list(tmp_path.rglob("pwned"))
 
@@ -912,6 +964,8 @@ class TestUpdateAttachesOnlyItsOwnImage:
         # still boxman's own: a teardown removes it with the VM
         assert (record.name, record.target, record.role, record.source) == \
             ("data", "vdb", "data", str(image))
+        assert record.ino == str(image.stat().st_ino)
+        assert os.getxattr(image, MARK) == record.token.encode()
 
     def test_an_own_image_replaced_since_is_refused(
             self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks):
@@ -924,11 +978,30 @@ class TestUpdateAttachesOnlyItsOwnImage:
         assert image.read_bytes() == PRECIOUS
         assert libvirt.attached == {}
 
+    def test_a_copy_that_kept_the_mark_is_refused(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks,
+            captured_logs):
+        wd, image = self._interrupted(libvirt, stubs, tmp_path)
+        copy = tmp_path / "copy.qcow2"
+        # extended attributes and all, as cp -a, rsync -X and copy2 do
+        shutil.copy2(image, copy)
+        assert os.getxattr(copy, MARK) == os.getxattr(image, MARK)
+        os.replace(copy, image)
+        kept = image.read_bytes()
+
+        assert _update(libvirt, wd) is False
+
+        assert libvirt.attached == {}
+        assert image.read_bytes() == kept
+        assert any(e.startswith("VM vm01: refusing") and str(image) in e
+                   for e in _errors(captured_logs)), _errors(captured_logs)
+
     def test_a_record_of_another_vm_does_not_vouch(
             self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks):
         wd, image = self._kept(tmp_path)
         _mark(image, "t0k3n")
-        libvirt.record("vm02", source=str(image), token="t0k3n")
+        libvirt.record("vm02", source=str(image), token="t0k3n",
+                       ino=str(image.stat().st_ino))
 
         assert _update(libvirt, wd) is False
 
@@ -942,13 +1015,16 @@ class TestUpdateAttachesOnlyItsOwnImage:
         pytest.param({"target": "vdc"}, id="target"),
         pytest.param({"token": "an0th3r"}, id="token"),
         pytest.param({"token": None}, id="no-token"),
+        pytest.param({"ino": "1"}, id="inode"),
+        pytest.param({"ino": None}, id="no-inode"),
     ])
     def test_a_record_that_is_not_for_this_file_does_not_vouch(
             self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks,
             mismatch):
         wd, image = self._kept(tmp_path)
         _mark(image, "t0k3n")
-        attributes = {"source": str(image), "token": "t0k3n", **mismatch}
+        attributes = {"source": str(image), "token": "t0k3n",
+                      "ino": str(image.stat().st_ino), **mismatch}
         libvirt.record("vm01", **{k: v for k, v in attributes.items()
                                   if v is not None})
 
@@ -961,7 +1037,8 @@ class TestUpdateAttachesOnlyItsOwnImage:
             self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks,
             captured_logs):
         wd, image = self._kept(tmp_path)
-        libvirt.record("vm01", source=str(image), token="t0k3n")
+        libvirt.record("vm01", source=str(image), token="t0k3n",
+                       ino=str(image.stat().st_ino))
 
         assert _update(libvirt, wd) is False
         assert libvirt.attached == {}
@@ -973,14 +1050,14 @@ class TestUpdateAttachesOnlyItsOwnImage:
             self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks):
         wd, image = self._kept(tmp_path)
         os.setxattr(image, MARK, b"")
-        libvirt.record("vm01", source=str(image))
+        libvirt.record("vm01", source=str(image),
+                       ino=str(image.stat().st_ino))
 
         assert _update(libvirt, wd) is False
         assert libvirt.attached == {}
 
-    def test_a_symlink_swapped_in_after_the_lookup_is_not_followed(
-            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks,
-            monkeypatch: pytest.MonkeyPatch):
+    def test_a_symlink_at_the_path_is_not_followed_to_the_own_image(
+            self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks):
         wd = tmp_path / "wd"
         wd.mkdir()
         own = tmp_path / "own.qcow2"
@@ -988,16 +1065,10 @@ class TestUpdateAttachesOnlyItsOwnImage:
         _mark(own, "t0k3n")
         entry = wd / "vm01_data.qcow2"
         entry.symlink_to(own)
-        libvirt.record("vm01", source=str(entry), token="t0k3n")
-        # the lookup saw the plain file that was there a moment before
-        real_lstat, plain = os.lstat, os.lstat(own)
-
-        def lstat(path, *args, **kwargs):
-            if os.fspath(path) == str(entry):
-                return plain
-            return real_lstat(path, *args, **kwargs)
-
-        monkeypatch.setattr(os, "lstat", lstat)
+        # the record names the very file the symlink points at: only not
+        # following it keeps this from being adopted
+        libvirt.record("vm01", source=str(entry), token="t0k3n",
+                       ino=str(own.stat().st_ino))
 
         assert _update(libvirt, wd) is False
         assert libvirt.attached == {}
@@ -1015,10 +1086,13 @@ class TestUpdateAttachesOnlyItsOwnImage:
             target.write_bytes(PRECIOUS)
             _mark(target, "t0k3n")
             entry.symlink_to(target)
+            ino = target.stat().st_ino
         else:
             entry.mkdir()
             _mark(entry, "t0k3n")
-        libvirt.record("vm01", source=str(entry), token="t0k3n")
+            ino = entry.stat().st_ino
+        libvirt.record("vm01", source=str(entry), token="t0k3n",
+                       ino=str(ino))
         before = _tree(tmp_path)
 
         assert _update(libvirt, wd) is False
@@ -1064,7 +1138,8 @@ class TestTheOwnImageCheck:
         image = wd / "vm01_data.qcow2"
         image.write_bytes(PRECIOUS)
         _mark(image, "t0k3n")
-        libvirt.record("vm01", source=str(image), token="t0k3n")
+        libvirt.record("vm01", source=str(image), token="t0k3n",
+                       ino=str(image.stat().st_ino))
         libvirt.unreadable = True
         dm = _dm()
         dm.virsh = libvirt
@@ -1176,9 +1251,10 @@ class TestTheDisksOfOneVmKeepEveryRecord:
 
 
 class TestTheTeardownInventoryKeepsItsLayout:
-    """The creation token rides on the domain's record, not in a teardown's
-    saved inventory, which the teardown decides with: an inventory saved by
-    this version reads the same as one saved before it, either way."""
+    """The creation token and inode ride on the domain's record, not in a
+    teardown's saved inventory, which the teardown decides with: an
+    inventory saved by this version reads the same as one saved before it,
+    either way."""
 
     def test_a_record_is_saved_and_read_without_its_token(self,
                                                           tmp_path: Path):
@@ -1190,7 +1266,7 @@ class TestTheTeardownInventoryKeepsItsLayout:
             disk_cleanup.StorageInventory(
                 vm_name="vm01", disk_sources=[], media_sources=[],
                 records=[DiskRecord("data", "vdb", "data", source,
-                                    token="t0k3n")],
+                                    token="t0k3n", ino="4242")],
                 records_state="present", chains={}, boot_family=[],
                 legacy_disks=None),
             str(tmp_path))
@@ -1200,3 +1276,308 @@ class TestTheTeardownInventoryKeepsItsLayout:
                                      "role": "data", "source": source}]
         loaded = disk_cleanup.load_teardown_inventory(path, "vm01")
         assert loaded.records == [DiskRecord("data", "vdb", "data", source)]
+
+
+# ---------------------------------------------------------------------------
+# #215 review round 1, F1: the image is written in boxman's own private
+# directory whatever someone who can change entries in the disk's directory,
+# or a directory above it, does to the names while it is made. One shell
+# command pins that directory by its device and inode, and hands qemu-img
+# /proc/$$/cwd/image.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def real_qemu_img(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    found = shutil.which("qemu-img")
+    if found is None:
+        pytest.skip("needs qemu-img")
+    # whatever a badly quoted command executes lands here, where it is seen
+    monkeypatch.chdir(tmp_path)
+    return found
+
+
+def _private_dirs(directory: Path) -> list[Path]:
+    return sorted(p for p in directory.iterdir()
+                  if p.name.startswith(".boxman-new."))
+
+
+def _swap_then_run(swap):
+    """A `run` that does *swap* right before the command, then runs the
+    command, as given, in a real shell."""
+    def run(cmd: str):
+        swap()
+        return shell_run(cmd, hide=True, warn=True)
+    return run
+
+
+def _warnings(captured_logs) -> list[str]:
+    return [r.getMessage() for r in captured_logs.records
+            if r.levelno == logging.WARNING]
+
+
+# qemu-img as started once the command's check has passed: it moves the
+# private directory away, plants a substitute there holding an `image`
+# symlink to the known file, and runs the real qemu-img with its arguments
+_SWAPPING_QEMU_IMG = r'''#!/usr/bin/env python3
+import os, sys
+here = os.getcwd()
+os.rename(here, here + ".moved-away")
+os.mkdir(here)
+os.symlink("@KNOWN@", os.path.join(here, "image"))
+os.execv("@REAL@", ["@REAL@"] + sys.argv[1:])
+'''
+
+
+class TestTheImageIsWrittenInItsOwnDirectory:
+
+    @pytest.mark.parametrize("substitute", ["symlink", "directory"])
+    def test_a_private_directory_replaced_before_the_command(
+            self, real_qemu_img: str, tmp_path: Path, substitute):
+        wd = tmp_path / "wd"
+        wd.mkdir()
+        target = wd / "vm01_data.qcow2"
+        known = tmp_path / "known.qcow2"
+        known.write_bytes(PRECIOUS)
+        replaced = []
+
+        def swap():
+            (private,) = _private_dirs(wd)
+            private.rename(tmp_path / "moved-away")
+            if substitute == "symlink":
+                private.symlink_to(known)
+            else:
+                private.mkdir()
+                (private / "image").symlink_to(known)
+            replaced.append(private)
+
+        outcome = _outcome(lambda: create_image_exclusive(
+            str(target), "16M", "qcow2", run=_swap_then_run(swap)))
+
+        (private,) = replaced
+        assert isinstance(outcome, ProvisionError), outcome
+        message = str(outcome)
+        assert "moved or replaced" in message
+        assert "nothing was written" in message
+        assert str(private) in message and str(target) in message
+        assert known.read_bytes() == PRECIOUS
+        assert not os.path.lexists(target)
+        # the substitute is left as it was
+        if substitute == "symlink":
+            assert os.readlink(private) == str(known)
+        else:
+            assert os.readlink(private / "image") == str(known)
+
+    def test_a_disk_directory_replaced_by_a_symlink_before_the_command(
+            self, real_qemu_img: str, tmp_path: Path):
+        wd = tmp_path / "wd"
+        wd.mkdir()
+        target = wd / "vm01_data.qcow2"
+        known = tmp_path / "known.qcow2"
+        known.write_bytes(PRECIOUS)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+
+        def swap():
+            (private,) = _private_dirs(wd)
+            # the same private name over there, with a way to the known file
+            (elsewhere / private.name).mkdir()
+            (elsewhere / private.name / "image").symlink_to(known)
+            wd.rename(tmp_path / "wd.moved")
+            wd.symlink_to(elsewhere)
+
+        outcome = _outcome(lambda: create_image_exclusive(
+            str(target), "16M", "qcow2", run=_swap_then_run(swap)))
+
+        assert isinstance(outcome, ProvisionError), outcome
+        assert "moved or replaced" in str(outcome)
+        assert known.read_bytes() == PRECIOUS
+        assert not os.path.lexists(target)          # elsewhere/<disk>
+        assert not os.path.lexists(tmp_path / "wd.moved" / target.name)
+        assert os.readlink(wd) == str(elsewhere)     # left as it is
+        # boxman's own private directory, still named in the directory it
+        # was made in, is removed
+        assert os.listdir(tmp_path / "wd.moved") == []
+
+    def test_a_private_directory_swapped_after_the_check(
+            self, real_qemu_img: str, tmp_path: Path,
+            monkeypatch: pytest.MonkeyPatch):
+        wd = tmp_path / "wd"
+        wd.mkdir()
+        target = wd / "vm01_data.qcow2"
+        known = tmp_path / "known.qcow2"
+        known.write_bytes(PRECIOUS)
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        wrapper = bindir / "qemu-img"
+        wrapper.write_text(_SWAPPING_QEMU_IMG.replace("@KNOWN@", str(known))
+                           .replace("@REAL@", real_qemu_img))
+        wrapper.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+        made = create_image_exclusive(
+            str(target), "16M", "qcow2",
+            run=lambda cmd: shell_run(cmd, hide=True, warn=True))
+
+        # made in boxman's own directory all the same, and published
+        assert made == _identity(target)
+        assert target.is_file() and not target.is_symlink()
+        assert target.read_bytes()[:4] == b"QFI\xfb"
+        assert known.read_bytes() == PRECIOUS
+        substitute, moved = _private_dirs(wd)
+        assert os.readlink(substitute / "image") == str(known)
+        assert moved.name.endswith(".moved-away")
+        assert os.listdir(moved) == []
+
+    def test_the_cleanup_leaves_an_entry_that_replaced_the_private_directory(
+            self, real_qemu_img: str, tmp_path: Path, captured_logs):
+        wd = tmp_path / "wd"
+        wd.mkdir()
+        target = wd / "vm01_data.qcow2"
+        replaced = []
+
+        def swap():
+            (private,) = _private_dirs(wd)
+            private.rename(tmp_path / "moved-away")
+            private.mkdir()         # empty: nothing would stop an rmdir
+            replaced.append(private)
+
+        outcome = _outcome(lambda: create_image_exclusive(
+            str(target), "16M", "qcow2", run=_swap_then_run(swap)))
+
+        (private,) = replaced
+        assert isinstance(outcome, ProvisionError), outcome
+        assert private.is_dir() and not private.is_symlink()
+        assert any(str(private) in w and "moved or replaced" in w
+                   for w in _warnings(captured_logs)), _warnings(captured_logs)
+
+    @pytest.mark.parametrize("forced, prefix", [
+        pytest.param([], "", id="none"),
+        pytest.param(["qemu-img"], "sudo ", id="qemu-img"),
+        pytest.param(["cd", "stat"], "", id="cd-and-stat"),
+    ])
+    def test_the_prefix_goes_to_qemu_img_alone(
+            self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forced,
+            prefix):
+        commands = []
+
+        def run(cmd, **kwargs):
+            commands.append(cmd)
+            return _result()
+
+        monkeypatch.setattr("boxman.providers.libvirt.disk._shell_run", run)
+        target = tmp_path / "wd" / "vm01_data.qcow2"
+        # use_sudo as well: create_disk has always kept it off qemu-img
+        dm = _dm(use_sudo=True, force_sudo_commands=forced)
+
+        assert dm.create_disk(str(target), 16) == _identity(target)
+
+        (cmd,) = commands
+        head, tail = cmd.rsplit("; ", 1)
+        assert head.startswith("cd -P -- ") and "sudo" not in head
+        # the image by the shell's own working directory: an absolute path,
+        # which a sudoers runcwd cannot move somewhere else
+        assert tail == (f'{prefix}qemu-img create -f qcow2 '
+                        f'"/proc/$$/cwd/image" 16M')
+
+    def test_a_private_directory_others_may_change_is_refused(
+            self, stubs: Stubs, tmp_path: Path,
+            monkeypatch: pytest.MonkeyPatch):
+        real_mkdir = os.mkdir
+
+        def mkdir(path, mode=0o777, *, dir_fd=None):
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            if dir_fd is not None:
+                # as a default ACL may leave it
+                os.chmod(path, 0o770, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "mkdir", mkdir)
+        target = tmp_path / "wd" / "vm01_data.qcow2"
+
+        outcome = _outcome(lambda: _dm().create_disk(str(target), 16))
+
+        assert isinstance(outcome, ProvisionError), outcome
+        assert "only the boxman user may change" in str(outcome)
+        assert stubs.calls() == []
+        # its own directory all the same, so removed
+        assert os.listdir(target.parent) == []
+
+    def test_a_private_directory_not_of_this_user_is_refused(
+            self, stubs: Stubs, tmp_path: Path,
+            monkeypatch: pytest.MonkeyPatch, captured_logs):
+        # the directory found at the private name belongs to someone else,
+        # who keeps an `image` of their own in it
+        monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 4242)
+        real_mkdir = os.mkdir
+
+        def mkdir(path, mode=0o777, *, dir_fd=None):
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            if dir_fd is not None:
+                fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY, dir_fd=dir_fd)
+                try:
+                    with open(os.open("image", os.O_WRONLY | os.O_CREAT,
+                                      0o644, dir_fd=fd), "wb") as fh:
+                        fh.write(PRECIOUS)
+                finally:
+                    os.close(fd)
+
+        monkeypatch.setattr(os, "mkdir", mkdir)
+        target = tmp_path / "wd" / "vm01_data.qcow2"
+
+        outcome = _outcome(lambda: _dm().create_disk(str(target), 16))
+
+        assert isinstance(outcome, ProvisionError), outcome
+        assert "only the boxman user may change" in str(outcome)
+        assert stubs.calls() == []
+        # not provably boxman's, so left as it is, with what is in it, and
+        # named
+        (private,) = _private_dirs(target.parent)
+        assert (private / "image").read_bytes() == PRECIOUS
+        assert any(str(private) in w for w in _warnings(captured_logs))
+
+    def test_a_private_directory_swapped_for_a_symlink_is_not_opened(
+            self, stubs: Stubs, tmp_path: Path,
+            monkeypatch: pytest.MonkeyPatch, captured_logs):
+        # a directory of this very user, private, that the name is pointed
+        # at between its mkdir and its open
+        decoy = tmp_path / "decoy"
+        decoy.mkdir(mode=0o700)
+        real_mkdir = os.mkdir
+        swapped = []
+
+        def mkdir(path, mode=0o777, *, dir_fd=None):
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            if dir_fd is not None:
+                os.rmdir(path, dir_fd=dir_fd)
+                os.symlink(decoy, path, dir_fd=dir_fd)
+                swapped.append(path)
+
+        monkeypatch.setattr(os, "mkdir", mkdir)
+        target = tmp_path / "wd" / "vm01_data.qcow2"
+
+        outcome = _outcome(lambda: _dm().create_disk(str(target), 16))
+
+        assert isinstance(outcome, ProvisionError), outcome
+        assert "could not be opened" in str(outcome)
+        assert os.listdir(decoy) == [] and stubs.calls() == []
+        (name,) = swapped
+        assert os.readlink(target.parent / name) == str(decoy)
+        assert not os.path.lexists(target)
+        assert any(name in w for w in _warnings(captured_logs))
+
+    def test_an_image_replaced_in_its_directory_is_not_published(
+            self, tmp_path: Path):
+        target = tmp_path / "wd" / "vm01_data.qcow2"
+
+        def run(cmd):
+            (private,) = _private_dirs(target.parent)
+            # made before the image is replaced, so it is another inode
+            (private / "other").write_bytes(PRECIOUS)
+            os.replace(private / "other", private / "image")
+            return _result()
+
+        outcome = _outcome(lambda: create_image_exclusive(
+            str(target), "16M", "qcow2", run=run))
+
+        assert isinstance(outcome, ProvisionError), outcome
+        assert "not the image boxman made" in str(outcome)
+        assert not os.path.lexists(target)

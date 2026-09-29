@@ -46,7 +46,8 @@ class TestConfigureFromDiskConfig:
     def test_creates_then_attaches_by_default(self, dm: DiskManager,
                                               tmp_path: Path):
         config = {"name": "data", "target": "vdb", "size": 1024}
-        with patch.object(dm, "create_disk", return_value=True) as create, \
+        # create_disk answers with the new image's (st_dev, st_ino)
+        with patch.object(dm, "create_disk", return_value=(1, 2)) as create, \
              patch.object(dm, "attach_disk", return_value=True) as attach:
             assert dm.configure_from_disk_config(config, str(tmp_path),
                                                  "vm01") is True
@@ -74,15 +75,15 @@ class TestDeadErrorBranches:
     warn=True so the not-ok branch is live, and return False on
     failure instead of raising RuntimeError."""
 
-    def test_create_disk_failure_returns_false(self, dm: DiskManager,
-                                               tmp_path: Path):
-        with patch("boxman.providers.libvirt.disk.LibVirtCommandBase"
-                   ) as cmd_cls:
-            cmd_cls.return_value.execute_shell.return_value = _result(
-                ok=False, stderr="x")
-            assert dm.create_disk(str(tmp_path / "d.qcow2"), 1024) is False
-        assert cmd_cls.return_value.execute_shell.call_args.kwargs.get(
-            "warn") is True
+    def test_create_disk_failure_returns_none(self, dm: DiskManager,
+                                              tmp_path: Path):
+        # the command runs through the shell runner as it is (#215), with
+        # warn, so a failure is a result, not a RuntimeError
+        with patch("boxman.providers.libvirt.disk._shell_run",
+                   return_value=_result(ok=False, stderr="x",
+                                        return_code=1)) as run:
+            assert dm.create_disk(str(tmp_path / "d.qcow2"), 1024) is None
+        assert run.call_args.kwargs.get("warn") is True
 
     def test_attach_disk_failure_returns_false(self, dm: DiskManager):
         with patch.object(dm.virsh, "execute",

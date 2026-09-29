@@ -9,6 +9,7 @@ from typing import Any
 
 from boxman import log
 from boxman.exceptions import BoxmanError, DiskPathOccupiedError, ProvisionError
+from boxman.utils.shell import run as _shell_run
 
 from .commands import LibVirtCommandBase, VirshCommand
 from .disk_ownership import (
@@ -87,16 +88,27 @@ def _occupied(path: str, kind: str, remedy: str) -> str:
         f"a snapshot chain; nothing was changed. {remedy}")
 
 
+#: exit status of the image command when the directory it runs in is not the
+#: private directory boxman made: not qemu-img's own failure (1), a shell's
+#: (2, 126, 127) or docker's (125-127)
+PRIVATE_DIR_MOVED_EXIT = 97
+
+#: the image's name inside its private directory
+_PRIVATE_IMAGE = "image"
+
+
 def create_image_exclusive(disk_path: str,
                            size: str,
                            fmt: str,
                            run: Callable[[str], Any],
                            remedy: str = DATA_DISK_REMEDY,
-                           token: str = ""
+                           token: str = "",
+                           sudo: str = "",
                            ) -> tuple[int, int] | None:
     """
     Create a new, empty *fmt* image of *size* at *disk_path* with
-    ``qemu-img create`` -- never over anything already there (#215).
+    ``qemu-img create`` -- never over anything already there, and never
+    through anything put in its way while it is made (#215).
 
     ``qemu-img create`` writes through whatever holds its path: it truncates
     a file, follows a symlink to truncate what it points at, and creates the
@@ -104,30 +116,47 @@ def create_image_exclusive(disk_path: str,
     file may be a disk a teardown kept, another VM's disk, or the base of a
     snapshot chain, and the loss is silent. So:
 
-    1. The path is looked up first, and only "no such file" counts as
-       absent. Any entry -- a file, a symlink (dangling or not), a directory
-       -- is refused; a lookup that fails for another reason (a directory on
-       the way that cannot be searched) fails closed.
-    2. The image is made under a private name in the same directory and
-       then hard-linked to the path. ``link(2)`` fails with ``EEXIST`` if
-       anything holds the name, and decides that in the same step that
-       creates it, so an entry that appears after the lookup is refused
-       too. ``os.link`` is exactly that call; ``ln`` without ``-T`` would
-       link *into* a directory holding the name and report success.
-    3. The private name is removed whatever happens, so a failure at any
-       step leaves nothing behind.
+    1. The disk's directory is opened, and everything below is done through
+       that descriptor rather than its path. The disk's name is looked up in
+       it first, and only "no such file" counts as absent: any entry -- a
+       file, a symlink (dangling or not), a directory -- is refused, and a
+       lookup that fails for another reason fails closed.
+    2. A private directory is made in it, and refused unless it is a
+       directory of the boxman user that no one else may change (mode 0700).
+       The image file is created in it, exclusively, under a fixed name, and
+       marked with *token*.
+    3. One shell command enters the private directory by its path, checks
+       that what it entered is the very directory made in 2 (device and
+       inode), and only then runs ``qemu-img`` on ``/proc/$$/cwd/image``.
+       The shell's working directory is a reference to that directory
+       itself, so whatever happens to its name, or to any directory above
+       it, after the check, the image is written in it. The path is
+       absolute, so a ``sudo`` that starts ``qemu-img`` somewhere else (a
+       sudoers ``runcwd``) still names it. A directory found moved or
+       replaced at the check stops the command before ``qemu-img`` runs.
+    4. The file is published from the pinned directories: checked to still
+       be the file made in 2, then hard-linked to the disk's name.
+       ``link(2)`` fails with ``EEXIST`` if anything holds the name, in the
+       step that creates it, so an entry that appeared after the lookup is
+       refused too.
+    5. The image name and the private directory are removed whatever
+       happens -- the directory only while its name still names it.
 
-    The private file is created here, by the boxman process, and
-    ``qemu-img`` writes the image into it; it never creates the file
-    itself. ``qemu-img`` runs through the caller's command wrapper, so it
-    may run as root -- inside the docker-compose runtime's container, or
-    under a ``force_sudo_commands`` entry -- and with
-    ``fs.protected_hardlinks`` only a file's owner may hard-link a file it
-    cannot write. The link, the lookup and the removal are directory
-    operations on a cluster workdir, which boxman creates on the host and
-    bind-mounts at the same path into the runtime container, so they are
-    made here, by the owner, the same whatever runtime or ``use_sudo``
-    setting ``qemu-img`` runs under.
+    What this guards against: someone other than the boxman user and root
+    who can change entries in the disk's directory or in a directory above
+    it. The boxman user and root can do anything boxman can, so they are out
+    of scope.
+
+    ``qemu-img`` runs through the caller's command wrapper, maybe as root:
+    in the docker-compose runtime's container, or with *sudo*. No descriptor
+    can be handed to it there, so the path it gets names the directory by
+    the shell's own reference instead. Everything else -- the lookups, the
+    private directory, the file, the link, the removal -- is done here, by
+    the boxman user, in the cluster workdir, which boxman creates on the
+    host and bind-mounts at the same path into the runtime container. A
+    runtime whose bind mounts report another device or inode than the host
+    (a VM-based Docker Desktop) fails the check in 3 every time, with the
+    error that says so.
 
     Args:
         disk_path: where the image goes. ``~`` is expanded and the path made
@@ -135,16 +164,18 @@ def create_image_exclusive(disk_path: str,
             (:func:`libvirt_disk_source`).
         size: ``qemu-img`` size argument, e.g. ``1024M`` or ``20G``.
         fmt: image format, e.g. ``qcow2``.
-        run: runs one shell command string where ``qemu-img`` runs and
-            returns its result (``.ok``, ``.stderr``); called with
-            ``warn`` semantics, so a failed command is a result, not an
-            exception.
+        run: runs one shell command string where ``qemu-img`` runs, exactly
+            as given, and returns its result (``.ok``, ``.return_code``,
+            ``.stderr``); called with ``warn`` semantics, so a failed
+            command is a result, not an exception.
         remedy: what the refusal tells the operator to do.
-        token: when given, the private file is marked with it
-            (:data:`IMAGE_MARK_XATTR`) before ``qemu-img`` writes into it,
-            so the image carries it from its first moment. A filesystem
-            that takes no user extended attributes leaves it unmarked, which
-            only means a later run cannot prove the image is boxman's own.
+        token: marks the image (:data:`IMAGE_MARK_XATTR`) before ``qemu-img``
+            writes into it, so it carries it from its first moment. A
+            filesystem that takes no user extended attributes leaves it
+            unmarked, which only means a later run cannot prove the image is
+            boxman's own.
+        sudo: the prefix ``qemu-img`` runs with -- ``"sudo "`` or ``""``.
+            Nothing else in the command is given it.
 
     Returns:
         ``(st_dev, st_ino)`` of the new image, now at *disk_path*; ``None``
@@ -153,86 +184,214 @@ def create_image_exclusive(disk_path: str,
     Raises:
         DiskPathOccupiedError: *disk_path* already has an entry, or one
             appeared while the image was being made. It is left untouched.
-        ProvisionError: whether *disk_path* has an entry cannot be told, or
+        ProvisionError: whether *disk_path* has an entry cannot be told, the
+            private directory is not boxman's or was moved or replaced, or
             the image could not be made or put in place.
     """
     path = libvirt_disk_source(disk_path)
-    directory = os.path.dirname(path)
+    directory, base = os.path.split(path)
     try:
         os.makedirs(directory, exist_ok=True)
     except OSError as exc:
         raise ProvisionError(
             f"could not create the directory {directory} for the disk image "
             f"{path} ({exc.strerror})") from exc
-
     try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        pass
+        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError as exc:
         raise ProvisionError(
-            f"refusing to create the disk image {path}: whether something is "
-            f"already there cannot be told ({exc.strerror}). Make it "
-            f"accessible, then run the command again.") from exc
-    else:
-        raise DiskPathOccupiedError(
-            _occupied(path, _entry_kind(st.st_mode), remedy))
-
-    prefix = f".boxman-new.{os.getpid()}.{secrets.token_hex(4)}."
-    base = os.path.basename(path)
-    scaffold = os.path.join(directory, prefix + base[:255 - len(prefix)])
-    try:
-        # 0644 before the umask: the mode `qemu-img create` gives a new file
-        fd = os.open(scaffold, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except OSError as exc:
-        raise ProvisionError(
-            f"could not create {scaffold} to make the disk image {path} in "
-            f"({exc.strerror})") from exc
+            f"could not open the directory {directory} to create the disk "
+            f"image {path} in ({exc.strerror})") from exc
     try:
         try:
-            info = os.fstat(fd)
-            if token:
-                try:
-                    os.setxattr(fd, IMAGE_MARK_XATTR, token.encode())
-                except OSError as exc:
-                    log.debug(f"could not mark {scaffold} as boxman's "
-                              f"({exc.strerror})")
-        finally:
-            os.close(fd)
-
-        cmd = (f"qemu-img create -f {shlex.quote(fmt)} "
-               f"{shlex.quote(scaffold)} {shlex.quote(size)}")
-        log.info(f"creating disk image {path}: {cmd}")
-        result = run(cmd)
-        if not result.ok:
-            log.error(f"failed to create disk image {path}: {result.stderr}")
-            return None
-
-        try:
-            os.link(scaffold, path)
-        except FileExistsError as exc:
-            kind = "something"
-            try:
-                kind = _entry_kind(os.lstat(path).st_mode)
-            except OSError:
-                pass
-            raise DiskPathOccupiedError(
-                _occupied(path, f"{kind} that appeared while it was being "
-                                f"made", remedy)) from exc
+            st = os.stat(base, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
         except OSError as exc:
             raise ProvisionError(
-                f"could not put the new disk image at {path} "
-                f"({exc.strerror})") from exc
-        return (info.st_dev, info.st_ino)
-    finally:
+                f"refusing to create the disk image {path}: whether something "
+                f"is already there cannot be told ({exc.strerror}). Make it "
+                f"accessible, then run the command again.") from exc
+        else:
+            raise DiskPathOccupiedError(
+                _occupied(path, _entry_kind(st.st_mode), remedy))
+
+        prefix = f".boxman-new.{os.getpid()}.{secrets.token_hex(4)}."
+        private = prefix + base[:255 - len(prefix)]
+        private_path = os.path.join(directory, private)
         try:
-            os.unlink(scaffold)
+            os.mkdir(private, 0o700, dir_fd=dfd)
+        except OSError as exc:
+            raise ProvisionError(
+                f"could not create {private_path} to make the disk image "
+                f"{path} in ({exc.strerror})") from exc
+
+        pfd = None
+        # the private directory's stat, once it is known to be boxman's
+        pinned = None
+        # whether the image's name in it was made here
+        image_made = False
+        try:
+            try:
+                pfd = os.open(private, os.O_RDONLY | os.O_DIRECTORY
+                              | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+            except OSError as exc:
+                raise ProvisionError(
+                    f"refusing to create the disk image {path}: "
+                    f"{private_path}, the private directory boxman made for "
+                    f"it, could not be opened ({exc.strerror}); nothing was "
+                    f"written") from exc
+            pst = os.fstat(pfd)
+            if stat.S_ISDIR(pst.st_mode) and pst.st_uid == os.geteuid():
+                pinned = pst
+            if pinned is None or pst.st_mode & 0o077:
+                raise ProvisionError(
+                    f"refusing to create the disk image {path}: "
+                    f"{private_path} is not a directory only the boxman user "
+                    f"may change ({stat.filemode(pst.st_mode)}, owner uid "
+                    f"{pst.st_uid}); nothing was written")
+
+            try:
+                ifd = os.open(_PRIVATE_IMAGE, os.O_WRONLY | os.O_CREAT
+                              | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              # 0644 before the umask: the mode `qemu-img
+                              # create` gives a new file
+                              0o644, dir_fd=pfd)
+            except OSError as exc:
+                raise ProvisionError(
+                    f"could not create the disk image {path} in "
+                    f"{private_path} ({exc.strerror})") from exc
+            image_made = True
+            try:
+                info = os.fstat(ifd)
+                if token:
+                    try:
+                        os.setxattr(ifd, IMAGE_MARK_XATTR, token.encode())
+                    except OSError as exc:
+                        log.debug(f"could not mark the image made in "
+                                  f"{private_path} as boxman's "
+                                  f"({exc.strerror})")
+            finally:
+                os.close(ifd)
+
+            identity = f"{pinned.st_dev}:{pinned.st_ino}"
+            cmd = (f"cd -P -- {shlex.quote(private_path)} && "
+                   f"[ \"$(stat -c %d:%i .)\" = {shlex.quote(identity)} ] "
+                   f"|| exit {PRIVATE_DIR_MOVED_EXIT}; "
+                   f"{sudo}qemu-img create -f {shlex.quote(fmt)} "
+                   f"\"/proc/$$/cwd/{_PRIVATE_IMAGE}\" {shlex.quote(size)}")
+            log.info(f"creating disk image {path}: {cmd}")
+            result = run(cmd)
+            if not result.ok:
+                if getattr(result, "return_code", None) == \
+                        PRIVATE_DIR_MOVED_EXIT:
+                    raise ProvisionError(
+                        f"refusing to create the disk image {path}: the "
+                        f"private directory boxman made to create it in is "
+                        f"not the one found at {private_path} -- it was moved "
+                        f"or replaced while the image was being made (or the "
+                        f"runtime reports another device and inode for it "
+                        f"than this host, as a VM-based Docker Desktop "
+                        f"does); nothing was written")
+                log.error(
+                    f"failed to create disk image {path}: {result.stderr}")
+                return None
+
+            try:
+                made = os.stat(_PRIVATE_IMAGE, dir_fd=pfd,
+                               follow_symlinks=False)
+            except OSError as exc:
+                raise ProvisionError(
+                    f"refusing to put the new disk image at {path}: the "
+                    f"image made in {private_path} cannot be looked up "
+                    f"({exc.strerror})") from exc
+            if not (stat.S_ISREG(made.st_mode)
+                    and (made.st_dev, made.st_ino)
+                    == (info.st_dev, info.st_ino)):
+                raise ProvisionError(
+                    f"refusing to put the new disk image at {path}: what is "
+                    f"in {private_path} is not the image boxman made there; "
+                    f"nothing was put at {path}")
+            try:
+                os.link(_PRIVATE_IMAGE, base, src_dir_fd=pfd, dst_dir_fd=dfd,
+                        follow_symlinks=False)
+            except FileExistsError as exc:
+                kind = "something"
+                try:
+                    kind = _entry_kind(os.stat(
+                        base, dir_fd=dfd, follow_symlinks=False).st_mode)
+                except OSError:
+                    pass
+                raise DiskPathOccupiedError(
+                    _occupied(path, f"{kind} that appeared while it was being "
+                                    f"made", remedy)) from exc
+            except OSError as exc:
+                raise ProvisionError(
+                    f"could not put the new disk image at {path} "
+                    f"({exc.strerror})") from exc
+            return (info.st_dev, info.st_ino)
+        finally:
+            _remove_private(dfd, pfd, private, private_path, pinned,
+                            image_made, path)
+    finally:
+        os.close(dfd)
+
+
+def _remove_private(dfd: int, pfd: int | None, private: str,
+                    private_path: str, pinned: os.stat_result | None,
+                    image_made: bool, path: str) -> None:
+    """
+    Remove what :func:`create_image_exclusive` made in its private directory
+    -- the image's name, if it made it, through the directory's descriptor
+    -- and then the directory, but only while its name in the disk's
+    directory still names it. Whatever else is found there is left as it
+    is, and named.
+    """
+    if pfd is None:
+        log.warning(
+            f"left {private_path} as it is: it could not be opened, so it "
+            f"cannot be told to be the directory boxman made for the disk "
+            f"image {path}; remove it by hand if it is")
+        return
+    try:
+        try:
+            if image_made:
+                os.unlink(_PRIVATE_IMAGE, dir_fd=pfd)
         except FileNotFoundError:
             pass
         except OSError as exc:
             log.warning(
-                f"could not remove {scaffold}, left from making the disk "
+                f"could not remove {os.path.join(private_path, _PRIVATE_IMAGE)}"
+                f", left from making the disk image {path} ({exc.strerror}); "
+                f"remove it by hand")
+        if pinned is None:
+            log.warning(
+                f"left {private_path} as it is: it is not a directory the "
+                f"boxman user made; remove it by hand if it is stale")
+            return
+        try:
+            there = os.stat(private, dir_fd=dfd, follow_symlinks=False)
+        except OSError:
+            there = None
+        if there is None or (there.st_dev, there.st_ino) != \
+                (pinned.st_dev, pinned.st_ino):
+            log.warning(
+                f"left {private_path} as it is: it is not the private "
+                f"directory boxman made for the disk image {path} any more "
+                f"(it was moved or replaced); remove it by hand if it is "
+                f"stale")
+            return
+        # The one window left is between that check and this rmdir: a
+        # directory swapped in at the name in that instant is removed only
+        # if it is empty, which is all rmdir ever removes.
+        try:
+            os.rmdir(private, dir_fd=dfd)
+        except OSError as exc:
+            log.warning(
+                f"could not remove {private_path}, left from making the disk "
                 f"image {path} ({exc.strerror}); remove it by hand")
+    finally:
+        os.close(pfd)
 
 
 class DiskManager:
@@ -269,10 +428,10 @@ class DiskManager:
         self.vm_name = vm_name
 
     def create_disk(self, disk_path: str, size: int, format: str = 'qcow2',
-                    token: str = "") -> bool:
+                    token: str = "") -> tuple[int, int] | None:
         """
         Create a new, empty disk image using qemu-img -- never over an
-        existing file, symlink or directory
+        existing file, symlink or directory, nor through one put in its way
         (:func:`create_image_exclusive`, #215).
 
         Args:
@@ -282,13 +441,15 @@ class DiskManager:
             token: mark the new image with it (:data:`IMAGE_MARK_XATTR`)
 
         Returns:
-            True if the image was created, False if qemu-img failed
+            ``(st_dev, st_ino)`` of the new image, or ``None`` if qemu-img
+            failed
 
         Raises:
             DiskPathOccupiedError: *disk_path* is already taken; it is left
                 as it was.
-            ProvisionError: whether it is taken cannot be told, or the image
-                could not be put in place.
+            ProvisionError: whether it is taken cannot be told, the image
+                was put in danger while being made, or it could not be put
+                in place.
         """
         try:
             cmd_executor = LibVirtCommandBase(
@@ -296,18 +457,23 @@ class DiskManager:
                 override_config_use_sudo=False)
             created = create_image_exclusive(
                 disk_path, f"{size}M", format,
-                run=lambda cmd: cmd_executor.execute_shell(cmd, warn=True),
-                token=token)
+                # the command as it is, wrapped for the runtime only:
+                # execute_shell would decide a sudo for its first word, `cd`,
+                # while the one qemu-img has always had goes before qemu-img
+                run=lambda cmd: _shell_run(cmd_executor._wrap_for_runtime(cmd),
+                                           hide=True, warn=True),
+                token=token,
+                sudo=cmd_executor.sudo_prefix("qemu-img create"))
         except BoxmanError:
             raise
         except Exception as exc:
             self.logger.error(f"error creating disk image: {exc}")
-            return False
+            return None
 
         if created is None:
-            return False
+            return None
         self.logger.info(f"successfully created disk image at {disk_path}")
-        return True
+        return created
 
     def _own_unattached_image(self, name: str, target: str,
                               source: str) -> str:
@@ -317,56 +483,80 @@ class DiskManager:
         a run that stopped between creating and attaching it leaves, or one
         detached by hand (#215).
 
-        It is, only when all of these hold:
+        It is, only when all of these hold, checked on one open descriptor
+        of the file so they are all about the same file:
 
         - *source* is a regular file (never a symlink or a directory);
         - this VM's own ownership records hold one for exactly this disk:
           same *name*, *target* and *source*, role ``data`` (created by
-          boxman, not adopted), with a creation token;
+          boxman, not adopted), with the image's inode number and creation
+          token;
+        - the file has that inode number;
         - the file carries that token (:data:`IMAGE_MARK_XATTR`), which
           boxman put on the image it created, before anything else could
           open it.
 
         The path alone is not enough: a record outlives its file, and a file
-        put at the same path since -- which may even get the old inode
-        number -- is not the one the record was written for. Anything that
-        cannot be read (the path, the records, the mark) proves nothing.
+        put at the same path since is not the one the record was written
+        for. The mark alone is not enough either: a copy that keeps
+        extended attributes (``cp -a``, ``rsync -X``, ``shutil.copy2``)
+        carries it, but is another inode. Anything that cannot be read (the
+        path, the records, the mark) proves nothing, nor does a record
+        without an inode number.
+
+        One case is beyond it: a copy of the image made with its mark after
+        the image was deleted can be given the same inode number back (ext4
+        reuses a freed one at once). Only a deliberate copy of boxman's own
+        image does that, and telling it apart would take the file's birth
+        time or inode generation, which Python's standard library does not
+        expose; anyone who can put it there could as well replace a disk
+        that is attached. The device number is not compared: a btrfs
+        subvolume's (Fedora's default ``/home``) can change across a
+        reboot, and the record already pins the path.
 
         Returns:
             The token, or ``""`` when the image is not provably boxman's own.
         """
         try:
-            st = os.lstat(source)
+            # never through a symlink; and without blocking, should a FIFO
+            # be there, which is refused below like anything but a file
+            fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                         | os.O_CLOEXEC)
         except OSError:
             # nothing there, or it cannot be told: create_disk decides, and
             # refuses the latter
             return ""
-        if not stat.S_ISREG(st.st_mode):
-            return ""
         try:
-            records = read_disk_records(self.virsh, self.vm_name)
-        except ProvisionError as exc:
-            self.logger.warning(
-                f"VM {self.vm_name}: cannot tell whether boxman created "
-                f"{source} ({exc})")
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode):
+                return ""
+            try:
+                records = read_disk_records(self.virsh, self.vm_name)
+            except ProvisionError as exc:
+                self.logger.warning(
+                    f"VM {self.vm_name}: cannot tell whether boxman created "
+                    f"{source} ({exc})")
+                return ""
+            for record in records or ():
+                # at most one record has this name and target; one without
+                # an inode number or a token proves nothing
+                if (record.name == name and record.target == target
+                        and record.role == ROLE_DATA
+                        and record.source == source):
+                    if record.ino != str(fst.st_ino):
+                        return ""
+                    try:
+                        mark = os.getxattr(fd, IMAGE_MARK_XATTR)
+                    except OSError:
+                        return ""
+                    if mark == record.token.encode():
+                        return record.token
             return ""
-        for record in records or ():
-            # at most one record has this name and target; one without a
-            # token returns "" below, which proves nothing
-            if (record.name == name and record.target == target
-                    and record.role == ROLE_DATA
-                    and record.source == source):
-                try:
-                    mark = os.getxattr(source, IMAGE_MARK_XATTR,
-                                       follow_symlinks=False)
-                except OSError:
-                    return ""
-                if mark == record.token.encode():
-                    return record.token
-        return ""
+        finally:
+            os.close(fd)
 
     def _record(self, name: str, target: str, source: str, role: str,
-                token: str) -> bool:
+                token: str, ino: str = "") -> bool:
         """
         Record disk *name* on this VM (:func:`record_attached_disk`).
 
@@ -382,7 +572,7 @@ class DiskManager:
             with self.records_lock:
                 record_attached_disk(self.virsh, self.vm_name, name=name,
                                      target=target, source=source,
-                                     role=role, token=token)
+                                     role=role, token=token, ino=ino)
         except ProvisionError as exc:
             self.logger.warning(
                 f"boxman could not record that disk {name} ({source}) of "
@@ -520,6 +710,7 @@ class DiskManager:
             # creating and attaching it); otherwise a new one, which is never
             # created over anything already there (#215)
             recorded = False
+            ino = ""
             if disk_config.get("attach_only"):
                 self.logger.info(
                     f"using existing disk image {disk_path} (attach only)")
@@ -538,16 +729,21 @@ class DiskManager:
                     recorded = True
                 else:
                     token = secrets.token_hex(16)
-                    if not self.create_disk(disk_path, disk_size,
-                                            format=driver_type, token=token):
+                    created = self.create_disk(disk_path, disk_size,
+                                               format=driver_type,
+                                               token=token)
+                    if not created:
                         self.logger.error(
                             f"failed to create disk {disk_path}")
                         return False
+                    # the inode of the file made, not of whatever is at the
+                    # path now
+                    ino = str(created[1])
                     # Recorded before the attach: a run that stops between
                     # the two leaves an image whose record lets the rerun
                     # attach it rather than refuse it (#215).
                     recorded = self._record(disk_name, target_dev, source,
-                                            role, token)
+                                            role, token, ino)
 
             # 2. attach the disk to the VM
             if not self.attach_disk(
@@ -565,7 +761,7 @@ class DiskManager:
             # one attached by hand, and from a different disk that has since
             # taken the same target (#164 F2).
             if not recorded:
-                self._record(disk_name, target_dev, source, role, token)
+                self._record(disk_name, target_dev, source, role, token, ino)
 
             self.logger.info(f"successfully configured disk {disk_name} for VM {self.vm_name}")
             return True

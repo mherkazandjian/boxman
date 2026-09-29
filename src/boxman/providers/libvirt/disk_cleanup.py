@@ -360,8 +360,9 @@ def _is_map(value: object, valid: Callable[[object], bool]) -> bool:
 
 
 #: what an inventory keeps of each ownership record: what the teardown
-#: decides on. A record's creation token (#215) is left out, so inventories
-#: saved by this version and by the ones before it read the same.
+#: decides on. A record's creation token and inode number (#215) are left
+#: out, so inventories saved by this version and by the ones before it read
+#: the same.
 _RECORD_FIELDS = frozenset({"name", "target", "role", "source"})
 
 
