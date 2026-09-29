@@ -3,6 +3,8 @@ Shared pytest fixtures and helpers for the boxman test suite.
 
 Fixtures:
 
+    private_tempdir  — points :mod:`tempfile` at a directory of the test's
+                       own, for a test that checks what it left behind there.
     captured_logs    — thin wrapper around pytest's ``caplog`` that attaches
                        to boxman's module-level ``log`` singleton, so tests
                        can assert on what the code logged.
@@ -122,3 +124,22 @@ def domain_listing(args: tuple, *domains: str | tuple[str, str]) -> str:
                      else (domain_uuid(domain), domain))
         lines.append(f"{uid} {name}" if "--uuid" in args else name)
     return "".join(f"{line}\n" for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# tempfile's directory — one of the test's own
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def private_tempdir(tmp_path_factory: pytest.TempPathFactory,
+                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Point :mod:`tempfile` at a directory of this test's own, so a check for
+    what the test left under ``tempfile.gettempdir()`` sees only its own.
+
+    Against the machine's temp dir, such a check also saw another suite
+    running on the same machine at the same moment, which made the same
+    staging directories and removed them a moment later (#231).
+    """
+    monkeypatch.setattr("tempfile.tempdir",
+                        str(tmp_path_factory.mktemp("tempdir")))
