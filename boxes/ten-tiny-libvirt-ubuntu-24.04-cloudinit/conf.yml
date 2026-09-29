@@ -173,4 +173,4 @@ tasks:
 
   ssh:
     description: "ssh to the gateway host"
-    command: ssh -F ${SSH_CONFIG} -t ${GATEWAYHOST}
+    command: ssh -F "${SSH_CONFIG}" -t ${GATEWAYHOST}

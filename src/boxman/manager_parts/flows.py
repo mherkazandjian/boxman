@@ -9,7 +9,12 @@ import subprocess
 import time
 
 from boxman import log
-from boxman.exceptions import BoxmanError, ConfigError, ProvisionError
+from boxman.exceptions import (
+    BoxmanError,
+    ConfigError,
+    ProvisionError,
+    SSHAccessError,
+)
 from boxman.utils.retained_tree import (
     InUse,
     RetainedTree,
@@ -192,8 +197,17 @@ class FlowsMixin:
                 _full_vm_name = f"{prj_name}_{_cluster_name}_{_vm_name}"
                 self.session_for_cluster(_cluster_name).eject_cdrom(_full_vm_name)
 
-        # generate ssh keys, add them to vms, and write ssh config
-        self.setup_ssh_access()
+        # generate ssh keys, add them to vms, and write ssh config. Every VM
+        # was cloned in this run, so none may inherit an earlier ssh_config
+        # block; the ones that never started are not expected to answer. A
+        # VM that is expected to and did not get its key fails provision,
+        # at the end, like `undead`: the rest still needs doing.
+        ssh_failures: list[str] = []
+        try:
+            self.setup_ssh_access(fresh=self._get_project_vm_names(),
+                                  unreachable=undead)
+        except SSHAccessError as exc:
+            ssh_failures = exc.failures
 
         # display connection information (after ssh setup so connections are ready)
         self.connect_info()
@@ -205,11 +219,16 @@ class FlowsMixin:
         # render and deploy the containerlab topology (no-op if not configured)
         self.deploy_netlab()
 
+        problems = []
         if undead:
+            problems.append(
+                f"{len(undead)} VM(s) never started: {', '.join(undead)}")
+        problems.extend(ssh_failures)
+        if problems:
             raise ProvisionError(
-                f"provision finished, but {len(undead)} VM(s) never started: "
-                f"{', '.join(undead)}. The rest of the project was "
-                f"provisioned — see the preceding errors for the cause.")
+                f"provision finished, but {'; '.join(problems)}. The rest of "
+                f"the project was provisioned — see the preceding errors for "
+                f"the cause.")
 
     def up(self, cli_args):
         """
@@ -333,9 +352,10 @@ class FlowsMixin:
             # Re-write SSH config in case IPs changed (DHCP renewals after
             # a host reboot, manual virsh net cycle, etc.) or in case the
             # file is missing/stale from an older boxman version.
-            self.write_ssh_config()
-            if compose_error:
-                raise ProvisionError(compose_error)
+            problems = [compose_error] if compose_error else []
+            problems.extend(self._rewrite_ssh_config())
+            if problems:
+                raise ProvisionError('; '.join(problems))
             return
 
         # --- Start / resume VMs that are not running ---
@@ -428,8 +448,11 @@ class FlowsMixin:
 
         # Wait for IP addresses — but not for the VMs that failed to come
         # up. They have no lease coming, and each one would burn the full
-        # timeout before `up` gets to report why.
-        waiting_for = [name for name in self._get_project_vm_names()
+        # timeout before `up` gets to report why. The same holds for the
+        # ones the network reconcile above could not reconnect, and for any
+        # VM still not running now that the start/resume work is done, so
+        # the list is the shared helper's, taken after that work (#223).
+        waiting_for = [name for name in self._vms_worth_waiting_for()
                        if name not in failures]
         if waiting_for:
             self.wait_for_vm_ips(waiting_for, max_wait=300)
@@ -444,8 +467,9 @@ class FlowsMixin:
         # Display connection information
         self.connect_info()
 
-        # Re-write SSH config with current IPs
-        self.write_ssh_config()
+        # Re-write SSH config with current IPs; a VM that did not come up
+        # keeps its earlier entry
+        ssh_problems = self._rewrite_ssh_config()
 
         problems = []
         if failures:
@@ -454,12 +478,28 @@ class FlowsMixin:
                 f"({', '.join(sorted(failures))})")
         if compose_error:
             problems.append(compose_error)
+        problems.extend(ssh_problems)
         if problems:
             raise ProvisionError(
                 f"{'; '.join(problems)}. The rest of the project was "
                 f"reconciled — see the preceding errors for the cause.")
 
         self.logger.info("infrastructure is up")
+
+    def _rewrite_ssh_config(self) -> list[str]:
+        """Rewrite the ssh config for ``up``, returning its problems.
+
+        The VMs' states are read afresh: ``up`` may just have started some,
+        and a VM that is still not running keeps its earlier entry rather
+        than dropping out of the file (#223). ``up`` adds no keys, so a VM
+        without an address is not a failure here; a file that cannot be
+        written is, reported with ``up``'s other problems.
+        """
+        try:
+            self.write_ssh_config(vm_states=self._vm_states_if_known())
+        except SSHAccessError as exc:
+            return exc.failures
+        return []
 
     def _reconcile_compose_clusters(self) -> str:
         """Bring the dc clusters up, returning the error instead of raising.

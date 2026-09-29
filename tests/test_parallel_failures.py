@@ -425,7 +425,7 @@ class TestUpdateParallelFailures:
             BoxmanManager, "_find_all_existing_project_vms",
             lambda self: [full])
         monkeypatch.setattr(
-            BoxmanManager, "setup_ssh_access", lambda self: None)
+            BoxmanManager, "setup_ssh_access", lambda self, **kw: None)
         monkeypatch.setattr(
             BoxmanManager, "connect_info", lambda self: None)
         monkeypatch.setattr(

@@ -269,13 +269,23 @@ class NetworksMixin:
 
     def _vms_worth_waiting_for(self) -> list[str]:
         """
-        Project VMs minus the ones a recreate could not reconnect.
+        Project VMs minus the ones a recreate could not reconnect, and minus
+        the ones known not to be running.
 
         Waiting on a guest we already reported as unreachable only burns the
-        whole timeout before saying what we already knew.
+        whole timeout before saying what we already knew. The same goes for
+        a guest that is not running: a recreate leaves a shut-off domain
+        shut off, so it has no lease coming (#223). When the states cannot
+        be read, every VM is waited for, as before.
         """
         unreachable = getattr(self, '_reattach_failed_vms', set())
-        return sorted(set(self._get_project_vm_names()) - unreachable)
+        names = set(self._get_project_vm_names()) - unreachable
+        states = self._vm_states_if_known()
+        if states is not None:
+            names = {name for name in names
+                     if states.get(name, 'not defined')
+                     not in self._NOT_RUNNING_STATES}
+        return sorted(names)
 
     def wait_for_vm_ips(self, vm_names: list[str], max_wait: int = 300) -> bool:
         """

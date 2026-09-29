@@ -179,7 +179,7 @@ class TestRestartOptIn:
                 raise_on_network_failures=lambda self, r: None,
                 _find_all_existing_project_vms=lambda self: [full],
                 _normalize_cdroms_for_update=lambda self, names, allow_fetch=True: {},
-                setup_ssh_access=lambda self: None,
+                setup_ssh_access=lambda self, **kw: None,
                 connect_info=lambda self: None,
                 _run_parallel=lambda self, tasks, op_label='x', max_workers=None:
                     _capture(tasks, op_label)):
@@ -217,7 +217,7 @@ class TestRestartOptIn:
                 raise_on_network_failures=lambda self, r: None,
                 _find_all_existing_project_vms=lambda self: [full],
                 _normalize_cdroms_for_update=lambda self, names, allow_fetch=True: {},
-                setup_ssh_access=lambda self: None,
+                setup_ssh_access=lambda self, **kw: None,
                 connect_info=lambda self: None,
                 _run_parallel=lambda self, tasks, op_label='x', max_workers=None:
                     _capture(tasks, op_label)):

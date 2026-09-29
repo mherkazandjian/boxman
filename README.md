@@ -448,6 +448,43 @@ boxman ssh 0
 boxman ssh 1
 ```
 
+`provision`, `up` and `update` rewrite the project's `ssh_config`;
+`provision` and `update` also add the cluster's admin key to every running
+VM, logging in with `admin_pass`.
+
+- **A VM that is not running** (shut off, paused, saved) is expected: it gets
+  one warning, and keeps its `ssh_config` entry with the address from the
+  file being rewritten, marked as coming from an earlier run. After a `virsh
+  start` or `boxman control start` the entry usually still reaches it —
+  libvirt gives a VM its old DHCP address back — and the next `boxman up` or
+  `boxman update` refreshes it (`update` also adds the key). Only an entry
+  exactly as boxman writes it is reused: an edited one, or one whose alias
+  another `Host` line in the file names too, counts as no entry. An earlier
+  address that another VM now reports, on any of its interfaces, is not
+  kept, and a VM created in the same run never inherits one.
+- **A running VM that does not get the key** — no address, the copy or the
+  login check after it failed, an `admin_pass` reference that cannot be
+  resolved or read, a missing public key — makes `provision` and `update`
+  exit 2, naming it, once everything else has run (with none of the
+  cluster's VMs running, the unusable `admin_pass` or key is a warning). So
+  does a key pair that cannot be generated, an `ssh_config` that cannot be
+  written, or `boxman.yml`'s `ssh.authorized_keys` that cannot be written
+  to a cluster's workdir.
+- **A cluster without `admin_pass`** gets no key, with a warning: its guests
+  have to authorize the key themselves, as the ISO-boot boxes do.
+- **Paths in `ssh_config`** (the `IdentityFile` of each VM and of the docker
+  runtime's jump host) are written quoted, with `%` doubled, so a workspace,
+  workdir or `admin_key_name` may hold blanks or `%`. A file written
+  unquoted by an older boxman is still read, and rewritten quoted. A path
+  OpenSSH cannot read back as written — one holding a double quote, a line
+  break, `${`, or a backslash before a quote or backslash or at its end —
+  fails the verb naming it, and leaves `ssh_config` as it was. So does a
+  VM's alias, `<cluster>_<hostname>` (the hostname is the VM's key when it
+  declares none), holding a space or tab, a quote, a backslash, `#`, `=`, or
+  a pattern character (`*`, `?`, `!`, `,`): OpenSSH would not read it as the
+  one literal alias. `boxman ssh` hands ssh the config path as one argument; in
+  your own tasks, quote it: `ssh -F "${SSH_CONFIG}"`.
+
 ### Import VM images
 
 `boxman import-image` defines a libvirt VM from a pre-built package
@@ -965,6 +1002,13 @@ cleanly, detaches, and starts it back up.
 Pass `--restart` to let it. `--yes` does not imply `--restart` — it answers
 the VM-removal prompt only.
 
+### SSH access
+
+`update` ends by rewriting `ssh_config` and adding the admin key to every
+running VM. A VM that is not running is skipped with a warning and keeps its
+entry; a running one that does not get the key fails the update (exit 2)
+after everything else has run. See [SSH into VMs](#ssh-into-vms).
+
 ### What cannot be updated
 
 - **Networks**: adding, removing, or modifying network definitions requires a
@@ -1021,7 +1065,7 @@ tasks:
 
   ssh:
     description: "ssh to the gateway host"
-    command: ssh -F ${SSH_CONFIG} -t ${GATEWAYHOST}
+    command: ssh -F "${SSH_CONFIG}" -t ${GATEWAYHOST}
 ```
 
 > **Note on shell vs Jinja2 variables**: `$ANSIBLE_SITE`, `$SSH_CONFIG`, and

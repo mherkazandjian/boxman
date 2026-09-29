@@ -84,6 +84,22 @@ class DiskPathOccupiedError(ProvisionError):
     """
 
 
+class SSHAccessError(ProvisionError):
+    """Raised once ssh access has been set up as far as it could be, when
+    the admin key pair could not be generated or a VM boxman expected to
+    reach did not get the admin key.
+
+    It is raised last, so the ssh config is written and every other VM has
+    had its key before it propagates. ``failures`` holds one line per
+    problem: ``update`` and ``provision`` report each line among their own
+    failures rather than one sentence that counts as a single failure.
+    """
+
+    def __init__(self, failures: list[str]) -> None:
+        self.failures = list(failures)
+        super().__init__("; ".join(self.failures))
+
+
 class NetworkError(ProvisionError):
     """Raised when a libvirt network cannot be created, destroyed, or
     inspected. Includes bridge collisions and missing NAT config."""
