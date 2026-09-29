@@ -2288,8 +2288,13 @@ class TestChainOrder:
             assert sm._chain_order("vm01") == ["snap1", "snap2", "snap3"]
 
     def test_returns_empty_when_no_snapshots(self, sm: SnapshotManager):
-        with patch.object(sm, "list_snapshots", return_value=[]):
+        # snapshot-list lists no names; the chain is built from it, not
+        # from list_snapshots, so patching that reached the real virsh
+        with patch.object(sm.virsh, "execute",
+                          return_value=_result(stdout="")) as execute:
             assert sm._chain_order("vm01") == []
+        execute.assert_called_once_with(
+            "snapshot-list", "vm01", "--name", warn=True)
 
 
 class TestStripBackingStoreCache:

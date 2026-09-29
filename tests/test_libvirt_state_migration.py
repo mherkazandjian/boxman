@@ -472,6 +472,14 @@ def tmp_compose(rt):
 class TestStrandedDataDir:
     """#164 FB-11 — do not start against an empty relocated data dir."""
 
+    @pytest.fixture(autouse=True)
+    def _no_container(self):
+        """No runtime container: `docker ps -a` finds none. A populated
+        legacy dir makes the check consult docker, and these tests must
+        not ask this machine's (#214)."""
+        with patch("invoke.run", return_value=MagicMock(ok=True, stdout="")):
+            yield
+
     def _rt_with_custom_compose(self, tmp_path):
         rt = _runtime(tmp_path)
         custom = tmp_path / "custom"

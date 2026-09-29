@@ -39,8 +39,10 @@ def _result(stdout: str = "", ok: bool = True, stderr: str = "", return_code: in
 class TestConstruction:
 
     def test_defaults_when_minimal_info(self):
-        n = Network(name="net1", info={}, assign_new_bridge=True,
-                    provider_config={"use_sudo": False})
+        # no libvirt networks yet, rather than this machine's (#214)
+        with patch.object(Network, "list_networks", return_value=[]):
+            n = Network(name="net1", info={}, assign_new_bridge=True,
+                        provider_config={"use_sudo": False})
         # Default forward mode is 'nat'
         assert n.forward_mode == "nat"
         # Default IP / netmask
@@ -50,8 +52,8 @@ class TestConstruction:
         assert n.mac_address.startswith("52:54:00:")
         # Default enable
         assert n.enable is True
-        # Assigned a bridge name
-        assert n.bridge_name is not None
+        # Assigned the first bridge name free
+        assert n.bridge_name == "virbr0"
 
     def test_custom_ip_and_dhcp(self):
         info = {
