@@ -32,6 +32,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -197,6 +198,20 @@ def _no_record():
 def _identity(path: Path) -> tuple[int, int]:
     st = os.lstat(path)
     return (st.st_dev, st.st_ino)
+
+
+def _fds_on(identity: tuple[int, int]) -> list[int]:
+    """This process's open descriptors on the file *identity* names (one
+    unlinked since is still found through its descriptor)."""
+    found = []
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            st = os.stat(f"/proc/self/fd/{name}")
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) == identity:
+            found.append(int(name))
+    return found
 
 
 def _outcome(call):
@@ -1129,6 +1144,82 @@ class TestUpdateAttachesOnlyItsOwnImage:
 
 class TestTheOwnImageCheck:
     """DiskManager's side of it, where the domain's records are read."""
+
+    def test_a_fifo_with_no_writer_is_refused_at_once(
+            self, tmp_path: Path, libvirt: FakeLibvirt):
+        wd = tmp_path / "wd"
+        wd.mkdir()
+        fifo = wd / "vm01_data.qcow2"
+        os.mkfifo(fifo)
+        identity = _identity(fifo)
+        libvirt.record("vm01", source=str(fifo), token="t0k3n",
+                       ino=str(identity[1]))
+        dm = _dm()
+        dm.virsh = libvirt
+        outcome = []
+        # in a thread, joined with a timeout: an open that waits for a
+        # writer must fail this test, not hang the suite
+        worker = threading.Thread(
+            target=lambda: outcome.append(
+                dm._own_unattached_image("data", "vdb", str(fifo))),
+            daemon=True)
+
+        worker.start()
+        worker.join(timeout=5)
+
+        if worker.is_alive():
+            try:
+                # the writer it waits for, to let it go
+                release = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError:
+                pass
+            else:
+                os.close(release)
+            worker.join(timeout=5)
+            pytest.fail("the check blocked opening a FIFO that has no writer")
+        assert outcome == [""]
+        assert _fds_on(identity) == []
+
+    def test_the_inode_and_the_mark_are_read_from_one_open_file(
+            self, tmp_path: Path, marks):
+        wd = tmp_path / "wd"
+        wd.mkdir()
+        # the file the record names: its inode, but no mark
+        image = wd / "vm01_data.qcow2"
+        image.write_bytes(PRECIOUS)
+        original = _identity(image)
+        # another file, carrying the right mark
+        marked = wd / "marked.qcow2"
+        marked.write_bytes(PRECIOUS)
+        _mark(marked, "t0k3n")
+
+        class SwapWhileReading(FakeLibvirt):
+            """Puts the marked file at the path while the records are
+            read: after the file was opened, before the mark is read."""
+
+            swapped = False
+
+            def execute(self, cmd, *args, **kwargs):
+                if (cmd == "metadata" and "set" not in kwargs
+                        and not self.swapped):
+                    os.replace(marked, image)
+                    self.swapped = True
+                return super().execute(cmd, *args, **kwargs)
+
+        libvirt = SwapWhileReading()
+        libvirt.record("vm01", source=str(image), token="t0k3n",
+                       ino=str(original[1]))
+        dm = _dm()
+        dm.virsh = libvirt
+
+        outcome = dm._own_unattached_image("data", "vdb", str(image))
+
+        assert libvirt.swapped
+        assert os.getxattr(image, MARK) == b"t0k3n"
+        # the inode was the recorded one and the mark was not on that file:
+        # refused, though the file now at the path carries the mark
+        assert outcome == ""
+        assert _fds_on(original) == []
 
     def test_records_that_cannot_be_read_do_not_vouch(
             self, stubs: Stubs, tmp_path: Path, libvirt: FakeLibvirt, marks,
