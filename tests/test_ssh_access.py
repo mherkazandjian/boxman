@@ -31,7 +31,8 @@ import shlex
 import shutil
 import subprocess
 import types
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from tests.conftest import make_bare_manager
@@ -992,6 +993,29 @@ def _loaded_identity(config_path, host) -> str | None:
 needs_false = pytest.mark.skipif(shutil.which("false") is None,
                                  reason="the transport here is /bin/false")
 
+needs_bash = pytest.mark.skipif(shutil.which("bash") is None,
+                                reason="entrypoint.sh is a bash script")
+
+DOCKER_DIR = Path(__file__).resolve().parents[1] / "containers" / "docker"
+
+
+def _entrypoint_function(name: str) -> str:
+    """The text of one shell function from entrypoint.sh, to run on its own
+    (as test_libvirt_state_seeding does)."""
+    text = (DOCKER_DIR / "entrypoint.sh").read_text()
+    match = re.search(rf"^{name}\(\) {{\n.*?^}}\n", text, re.M | re.S)
+    assert match, f"{name}() not found in entrypoint.sh"
+    return match.group(0)
+
+
+def _container_ssh_conf(conf, identity: str) -> subprocess.CompletedProcess:
+    """entrypoint.sh's write_boxman_ssh_conf, run with bash for instance
+    ``demo`` on port 2678: no image, no container."""
+    script = (_entrypoint_function("write_boxman_ssh_conf")
+              + 'write_boxman_ssh_conf "$1" demo 2678 "$2"\n')
+    return subprocess.run(["bash", "-c", script, "bash", str(conf), identity],
+                          capture_output=True, text=True, timeout=60)
+
 
 class TestPathsAreWrittenSoOpenSSHReadsThemBack:
     """
@@ -1219,3 +1243,155 @@ class TestPathsAreWrittenSoOpenSSHReadsThemBack:
             argv = shlex.split(argv[-1])   # what bash -c runs in the container
         at = argv.index("-F")
         assert argv[at + 1:at + 3] == [config_path, "cluster_1_vm01"]
+
+    def test_boxman_ssh_hands_ssh_the_config_path_whole(self, tmp_path):
+        """`boxman ssh` ran `ssh -F <SSH_CONFIG> -t <host>` through a shell,
+        unquoted, and SSH_CONFIG is under the workspace."""
+        from boxman.task_runner import TaskRunner
+
+        runner = TaskRunner({
+            "workspace": {"workdir": str(tmp_path)},
+            "clusters": {"cluster_1": {"workdir": str(tmp_path),
+                                       "vms": {"vm01": {}}}},
+        }, cluster_name="cluster_1")
+        config_path = str(tmp_path / "work space" / "ssh_config")
+        runner._env = {"SSH_CONFIG": config_path}
+        runner._workspace_vars = {}
+
+        with patch("boxman.task_runner.subprocess.run") as ssh:
+            ssh.return_value.returncode = 0
+            assert runner.ssh_to_host("cluster_1_vm01") == 0
+
+        command = ssh.call_args.args[0]
+        # what ssh is handed, whether through a shell or not
+        argv = shlex.split(command) if isinstance(command, str) else command
+        at = argv.index("-F")
+        assert argv[at + 1:at + 4] == [config_path, "-t", "cluster_1_vm01"]
+
+
+class TestTheContainersOwnSshConfig:
+    """
+    entrypoint.sh writes /etc/boxman/ssh/boxman.conf, a convenience config
+    for reaching the container from the host. Its IdentityFile, a host path
+    under the project, went in unquoted: a blank in the project directory
+    made the file invalid for OpenSSH. It now follows boxman's own rule --
+    double quotes, % doubled, and a path no spelling carries refused with
+    nothing written. The block is a function, run here with bash on its own.
+    """
+
+    @needs_bash
+    @needs_ssh
+    @pytest.mark.parametrize("identity", [
+        "/work space/.boxman/runtime/docker/data/ssh/id_ed25519",
+        "/work/100%done/.boxman/runtime/docker/data/ssh/id_ed25519",
+    ], ids=["a blank", "a percent sign"])
+    def test_openssh_takes_the_file_it_writes(self, tmp_path, identity):
+        conf = tmp_path / "boxman.conf"
+
+        result = _container_ssh_conf(conf, identity)
+
+        assert result.returncode == 0, result.stderr
+        effective = _effective(conf, "boxman-demo")
+        # -G shows the argument as read, before %-tokens are expanded
+        assert effective["identityfile"] == identity.replace("%", "%%")
+        assert effective["port"] == "2678"
+        assert effective["user"] == "qemu_user"
+
+    @needs_bash
+    @needs_ssh
+    @needs_false
+    def test_a_percent_sign_is_loaded_as_written(self, tmp_path):
+        conf = tmp_path / "boxman.conf"
+        identity = "/work/100%done/id_ed25519"
+
+        assert _container_ssh_conf(conf, identity).returncode == 0
+
+        assert _loaded_identity(conf, "boxman-demo") == identity
+
+    UNWRITABLE = {
+        "a double quote": '/work/"project"/id_ed25519',
+        "a line break": "/work/pro\nject/id_ed25519",
+        "an environment variable": "/work/${HOME}/id_ed25519",
+        "a backslash at its end": "/work/id_ed25519\\",
+        "a backslash before a quote": "/work/it\\'s/id_ed25519",
+    }
+
+    @needs_bash
+    @pytest.mark.parametrize("identity", list(UNWRITABLE.values()),
+                             ids=list(UNWRITABLE))
+    def test_a_path_it_cannot_hold_is_refused_with_nothing_written(
+            self, tmp_path, identity):
+        conf = tmp_path / "boxman.conf"
+        conf.write_text("the earlier file\n")
+
+        result = _container_ssh_conf(conf, identity)
+
+        assert result.returncode != 0
+        assert result.stderr.startswith(f"ERROR: {conf} not written: OpenSSH "
+                                        f"cannot read the identity file path")
+        assert conf.read_text() == "the earlier file\n"
+
+    def test_the_entrypoint_writes_it_through_that_function(self):
+        text = (DOCKER_DIR / "entrypoint.sh").read_text()
+        assert "IdentityFile ${SSH_IDENTITY_FILE}" not in text
+        assert re.search(r"^if write_boxman_ssh_conf /etc/boxman/ssh/boxman\.conf ",
+                         text, re.M)
+
+
+class TestHostAliasesAreWrittenSoOpenSSHReadsThemBack:
+    """
+    A VM's alias is ``<cluster>_<hostname>``, the hostname its key when it
+    declares none -- and a key that is no valid hostname is only a warning.
+    A blank in it made the file invalid; a ``*`` made the alias a pattern,
+    matching other hosts. The writer refuses such an alias as it refuses a
+    path it cannot spell: the verb fails naming the VM, and the file is
+    left as it was (#223).
+    """
+
+    @pytest.mark.parametrize("vm_key", ["my vm", "web*"])
+    def test_an_alias_that_is_not_one_literal_alias_fails_the_verb(
+            self, tmp_path, monkeypatch, update_flow, vm_key):
+        lab = Lab(tmp_path, vms=("vm02",))
+        # no hostname: the key names the alias
+        lab.mgr.config["clusters"]["cluster_1"]["vms"][vm_key] = {}
+        lab.states[full(vm_key)] = "running"
+        lab.addresses = {full(vm_key): "192.168.10.5",
+                         full("vm02"): "192.168.10.6"}
+        lab.ssh_config.write_text("the earlier file\n")
+
+        code, message = update(lab, monkeypatch)
+
+        assert code == 2
+        assert message.startswith(
+            f"update finished with 1 failure(s): could not write the ssh "
+            f"config {lab.ssh_config}: vm cluster_1/{vm_key} would be named "
+            f"'cluster_1_{vm_key}' in it, which OpenSSH does not read back "
+            f"as one alias")
+        assert "\n" not in message
+        assert lab.ssh_config.read_text() == "the earlier file\n"
+
+    def test_an_ordinary_alias_is_written_and_read_back(self, tmp_path):
+        lab = Lab(tmp_path, vms=("vm01",))
+        lab.mgr.config["clusters"]["cluster_1"]["vms"]["vm01"]["hostname"] = (
+            "web-01.lab")
+        lab.addresses = {full("vm01"): "192.168.10.5"}
+        lab.mgr.write_ssh_config()
+        lab.states[full("vm01")] = "shut off"
+
+        lab.mgr.write_ssh_config(vm_states=dict(lab.states))
+
+        lines = lab.block("cluster_1_web-01.lab").splitlines()
+        assert lines[0] == "Host cluster_1_web-01.lab node0"
+        assert "    Hostname 192.168.10.5" in lines
+
+    @needs_ssh
+    def test_openssh_reads_an_ordinary_alias(self, tmp_path):
+        lab = Lab(tmp_path, vms=("vm01",))
+        lab.mgr.config["clusters"]["cluster_1"]["vms"]["vm01"]["hostname"] = (
+            "web-01.lab")
+        lab.addresses = {full("vm01"): "192.168.10.5"}
+
+        lab.mgr.write_ssh_config()
+
+        effective = _effective(lab.ssh_config, "cluster_1_web-01.lab")
+        assert effective["hostname"] == "192.168.10.5"

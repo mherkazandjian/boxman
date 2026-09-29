@@ -348,13 +348,16 @@ class TaskRunner:
             raise RuntimeError(
                 "no VM name given and GATEWAYHOST is not set in the workspace environment"
             )
-        # Host is interpolated into a shell command under shell=True —
-        # guard against shell metacharacters leaking in from external
-        # callers (CI variables, automation).
+        # Kept although no shell sees the name any more (below): a name
+        # with shell metacharacters in it is no host's, whoever passed it
+        # (CI variables, automation).
         _validate_safe_name(host, kind="vm/host name")
 
+        # An argv list, not a shell string: SSH_CONFIG is under the
+        # workspace, and a blank in that path split the -F argument (#223).
         ssh_config = self.env.get("SSH_CONFIG", "")
-        command = f"ssh -F {ssh_config} -t {host}" if ssh_config else f"ssh -t {host}"
+        command = (["ssh", "-F", ssh_config, "-t", host] if ssh_config
+                   else ["ssh", "-t", host])
 
         workdir = self.workspace_config.get(
             "workdir",
@@ -369,11 +372,10 @@ class TaskRunner:
         log.info(f"ssh to '{host}'")
         self._log_env()
         log.info(f"workdir: {workdir or os.getcwd()}")
-        log.info(f"command: {command}")
+        log.info(f"command: {shlex.join(command)}")
 
         result = subprocess.run(
             command,
-            shell=True,
             env=self.env,
             cwd=workdir,
         )

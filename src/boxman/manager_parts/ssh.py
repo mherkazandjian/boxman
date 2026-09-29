@@ -37,8 +37,42 @@ _NODE_ALIAS = re.compile(r'node[0-9]+')
 _UNWRITABLE_IN_PATH = re.compile(r'["\n\r]|\$\{|\\(?=[\\\'"]|$)')
 
 
-class _UnwritablePathError(ValueError):
-    """A path no ssh_config line can hold so that OpenSSH reads it back."""
+#: What keeps a Host alias from being read back as the one literal alias it
+#: is: a blank or a quote splits or joins words, a backslash can escape, a
+#: '#' can start a comment, and *, ?, ! and , make it a pattern, a negation
+#: or a list of them.
+_UNWRITABLE_IN_ALIAS = re.compile(r'[\s"\'\\#*?!,]')
+
+
+class _UnwritableError(ValueError):
+    """A value no ssh_config line can hold so that OpenSSH reads it back:
+    a path, or a Host alias."""
+
+
+def _alias_argument(alias: str, label: str) -> str:
+    """
+    *alias* -- VM *label*'s ``<cluster>_<hostname>`` -- for a Host line, if
+    OpenSSH reads it back as exactly that one alias.
+
+    Nothing checks it for this before here: the hostname is the VM's key
+    when it declares none, and a key that is no valid hostname is only a
+    warning under ``clone_hostname: auto``; cluster names are not checked
+    at all (#223).
+
+    Raises:
+        _UnwritableError: it holds one of ``_UNWRITABLE_IN_ALIAS``.
+    """
+    found = _UNWRITABLE_IN_ALIAS.search(alias)
+    if found:
+        char = found.group()
+        what = ('a blank' if char.isspace()
+                else 'a quote' if char in '"\''
+                else 'a backslash' if char == '\\'
+                else repr(char))
+        raise _UnwritableError(
+            f"vm {label} would be named {alias!r} in it, which OpenSSH does "
+            f"not read back as one alias: it holds {what}")
+    return alias
 
 
 def _path_argument(path: str) -> str:
@@ -52,7 +86,7 @@ def _path_argument(path: str) -> str:
     ``%%`` as a literal ``%`` (#223).
 
     Raises:
-        _UnwritablePathError: *path* holds something no spelling carries (see
+        _UnwritableError: *path* holds something no spelling carries (see
             ``_UNWRITABLE_IN_PATH``).
     """
     found = _UNWRITABLE_IN_PATH.search(path)
@@ -61,7 +95,7 @@ def _path_argument(path: str) -> str:
                 '\r': 'a line break', '${': "'${'"}.get(
                     found.group(), 'a backslash before a quote or a '
                                    'backslash, or at its end')
-        raise _UnwritablePathError(
+        raise _UnwritableError(
             f"the path {path!r} cannot be written into it: OpenSSH does not "
             f"read {what} in a path back as written")
     return '"' + path.replace('%', '%%') + '"'
@@ -418,10 +452,10 @@ class SSHMixin:
 
         # the docker runtime's jump stanza goes into every file, so a path
         # of its that no file can hold stops every one of them (below)
-        jump_problem: _UnwritablePathError | None = None
+        jump_problem: _UnwritableError | None = None
         try:
             jump_stanza = self._docker_ssh_jump_stanza()
-        except _UnwritablePathError as exc:
+        except _UnwritableError as exc:
             jump_stanza, jump_problem = None, exc
 
         # Group clusters by their resolved ssh_config path. When
@@ -468,7 +502,8 @@ class SSHMixin:
                     entry = {
                         'vm_name': vm_name,
                         'label': f"{cluster_name}/{vm_name}",
-                        'host': f"{prefixed_host} {padded_alias}",
+                        'alias': prefixed_host,
+                        'node': padded_alias,
                         'user': cluster.get("admin_user", "admin"),
                         'identity_file': admin_priv_key,
                         'keys': keys,
@@ -566,7 +601,7 @@ class SSHMixin:
                         for entry in entries if entry['address'] is not None)
                     with open(ssh_config, 'w') as fobj:
                         fobj.write(text)
-                except (_UnwritablePathError, OSError) as exc:
+                except (_UnwritableError, OSError) as exc:
                     cause = exc
             if cause is not None:
                 reason = (cause.strerror or str(cause)
@@ -590,7 +625,10 @@ class SSHMixin:
 
     def _ssh_config_vm_block(self, entry: dict, proxy_jump: bool) -> str:
         """One VM's block of the ssh config, as write_ssh_config writes it."""
-        lines = [f"Host {entry['host']}"]
+        # raises for an alias OpenSSH would not read back as one literal
+        # alias, as _path_argument does for a path
+        lines = [f"Host {_alias_argument(entry['alias'], entry['label'])} "
+                 f"{entry['node']}"]
         if entry['state'] is not None:
             # the VM is not running and keeps its earlier block's address;
             # earlier_vm_addresses skips these lines when it reads it back

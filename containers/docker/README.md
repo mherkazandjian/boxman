@@ -120,6 +120,13 @@ ssh -F ~/.ssh/config.d/boxman/boxman-default.conf boxman-default
 sudo virsh list --all
 ```
 
+The entrypoint writes `boxman.conf` on every start, its `IdentityFile`
+quoted and with `%` doubled, so a blank or a `%` in the project path is
+fine. A path OpenSSH cannot read back as written — one holding a double
+quote, a line break, `${`, or a backslash before a quote or backslash or at
+its end — leaves the file unwritten, with an error in `docker logs`; the
+container stays up.
+
 ### Via qemu+ssh (from the host)
 
 ```bash

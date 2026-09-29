@@ -478,7 +478,12 @@ VM, logging in with `admin_pass`.
   unquoted by an older boxman is still read, and rewritten quoted. A path
   OpenSSH cannot read back as written — one holding a double quote, a line
   break, `${`, or a backslash before a quote or backslash or at its end —
-  fails the verb naming it, and leaves `ssh_config` as it was.
+  fails the verb naming it, and leaves `ssh_config` as it was. So does a
+  VM's alias, `<cluster>_<hostname>` (the hostname is the VM's key when it
+  declares none), holding a blank, a quote, a backslash, `#`, or a pattern
+  character (`*`, `?`, `!`, `,`): OpenSSH would not read it as the one
+  literal alias. `boxman ssh` hands ssh the config path as one argument; in
+  your own tasks, quote it: `ssh -F "${SSH_CONFIG}"`.
 
 ### Import VM images
 
@@ -1060,7 +1065,7 @@ tasks:
 
   ssh:
     description: "ssh to the gateway host"
-    command: ssh -F ${SSH_CONFIG} -t ${GATEWAYHOST}
+    command: ssh -F "${SSH_CONFIG}" -t ${GATEWAYHOST}
 ```
 
 > **Note on shell vs Jinja2 variables**: `$ANSIBLE_SITE`, `$SSH_CONFIG`, and

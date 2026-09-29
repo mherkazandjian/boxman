@@ -176,24 +176,24 @@ tasks:
 
   ssh:
     description: "ssh to the gateway host"
-    command: ssh -F ${SSH_CONFIG} -t ${GATEWAYHOST}
+    command: ssh -F "${SSH_CONFIG}" -t ${GATEWAYHOST}
 
   salt-ping:
     description: "salt test.ping on all minions"
     command: >
-      ssh -F ${SSH_CONFIG} ${SALTMASTER}
+      ssh -F "${SSH_CONFIG}" ${SALTMASTER}
       "sudo salt '*' test.ping -t 120"
 
   salt-apply:
     description: "apply salt states on all minions"
     command: >
-      ssh -F ${SSH_CONFIG} ${SALTMASTER}
+      ssh -F "${SSH_CONFIG}" ${SALTMASTER}
       "sudo salt '*' state.apply -t 120"
 
   salt-sync:
     description: "full salt sync (sync_all, states, pillars)"
     command: >
-      ssh -F ${SSH_CONFIG} ${SALTMASTER} "sudo salt '*' saltutil.sync_all -t 120" &&
-      ssh -F ${SSH_CONFIG} ${SALTMASTER} "sudo salt '*' saltutil.sync_states -t 120" &&
-      ssh -F ${SSH_CONFIG} ${SALTMASTER} "sudo salt '*' saltutil.refresh_pillar -t 120" &&
-      ssh -F ${SSH_CONFIG} ${SALTMASTER} "sudo salt '*' saltutil.sync_all -t 120"
+      ssh -F "${SSH_CONFIG}" ${SALTMASTER} "sudo salt '*' saltutil.sync_all -t 120" &&
+      ssh -F "${SSH_CONFIG}" ${SALTMASTER} "sudo salt '*' saltutil.sync_states -t 120" &&
+      ssh -F "${SSH_CONFIG}" ${SALTMASTER} "sudo salt '*' saltutil.refresh_pillar -t 120" &&
+      ssh -F "${SSH_CONFIG}" ${SALTMASTER} "sudo salt '*' saltutil.sync_all -t 120"

@@ -175,6 +175,40 @@ if [ -n "$HOST_UID" ]; then
     chown "$HOST_UID" /etc/boxman/ssh/id_ed25519 /etc/boxman/ssh/id_ed25519.pub
 fi
 
+# ---------------------------------------------------------------------------
+# Write the host-side convenience ssh config for this container to $1:
+# Host boxman-$2 on 127.0.0.1 port $3, with the identity file $4.
+#
+# $4 is a host path under BOXMAN_DATA_DIR, and the project directory it lives
+# under may hold a blank, which split it into arguments OpenSSH refuses. It
+# is written double-quoted, with each % doubled, since OpenSSH expands
+# %-tokens in IdentityFile (#223) -- the rule boxman's own ssh_config follows.
+# A path that no spelling carries is refused: a double quote, a line break,
+# '${' (expanded as an environment variable, with no escape), or a backslash
+# before a quote or a backslash, or at its end (an escape from OpenSSH 8.7
+# on, literal before it). Refused means an error on stderr, a nonzero
+# status, and nothing written -- never a file OpenSSH refuses.
+# ---------------------------------------------------------------------------
+write_boxman_ssh_conf() {
+    local conf="$1" instance="$2" port="$3" identity="$4"
+    case $identity in
+        *'"'* | *$'\n'* | *$'\r'* | *'${'* | *'\\'* | *"\\'"* | *'\')
+            printf 'ERROR: %s not written: OpenSSH cannot read the identity file path %q back as written\n' \
+                "$conf" "$identity" >&2
+            return 1 ;;
+    esac
+    {
+        printf 'Host boxman-%s\n' "$instance"
+        printf '    HostName 127.0.0.1\n'
+        printf '    Port %s\n' "$port"
+        printf '    User qemu_user\n'
+        printf '    IdentityFile "%s"\n' "${identity//%/%%}"
+        printf '    StrictHostKeyChecking no\n'
+        printf '    UserKnownHostsFile /dev/null\n'
+        printf '    LogLevel ERROR\n'
+    } > "$conf"
+}
+
 # Generate ssh_config for host-side convenience
 HOST_DATA_DIR="${BOXMAN_DATA_DIR:-./data}"
 INSTANCE_NAME="${BOXMAN_INSTANCE_NAME:-default}"
@@ -189,20 +223,18 @@ else
     SSH_IDENTITY_FILE="/etc/boxman/ssh/id_ed25519"
 fi
 
-cat > /etc/boxman/ssh/boxman.conf <<EOF
-Host boxman-${INSTANCE_NAME}
-    HostName 127.0.0.1
-    Port ${BOXMAN_SSH_PORT:-2222}
-    User qemu_user
-    IdentityFile ${SSH_IDENTITY_FILE}
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
-    LogLevel ERROR
-EOF
-if [ -n "$HOST_UID" ]; then
-    chown "$HOST_UID" /etc/boxman/ssh/boxman.conf
+# A refused path is reported, not fatal: the file is a convenience, and
+# exiting under `set -e` would restart the container in a loop (#205).
+if write_boxman_ssh_conf /etc/boxman/ssh/boxman.conf "$INSTANCE_NAME" \
+        "${BOXMAN_SSH_PORT:-2222}" "$SSH_IDENTITY_FILE"; then
+    if [ -n "$HOST_UID" ]; then
+        chown "$HOST_UID" /etc/boxman/ssh/boxman.conf
+    fi
+    echo "SSH config written to ${HOST_DATA_DIR}/ssh/boxman.conf"
+else
+    echo "ERROR: ${HOST_DATA_DIR}/ssh/boxman.conf was not written (see" \
+         "above); the container stays up without it." >&2
 fi
-echo "SSH config written to ${HOST_DATA_DIR}/ssh/boxman.conf"
 
 # Regenerate SSH host keys if missing
 ssh-keygen -A 2>/dev/null || true
