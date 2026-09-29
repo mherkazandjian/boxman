@@ -61,6 +61,13 @@ def _refused(action: str, xml_path: str, reason: str) -> Result:
         f"error: Failed to {action} device from {xml_path}\nerror: {reason}\n"))
 
 
+#: libvirt's refusal of an ``attach-device`` or ``detach-device --config``,
+#: captured on the runner from a paused transient domain, which has no
+#: persistent definition to change.
+NO_PERSISTENT_CONFIG = ('Requested operation is not valid: transient domains '
+                        'do not have any persistent config')
+
+
 class FakeDomain:
     """
     One libvirt domain as ``virsh`` shows it: a live definition while the
@@ -81,6 +88,9 @@ class FakeDomain:
       for a drive the live definition lacks.
     * a start boots the persistent definition, which is the live one from
       then on.
+    * *refuse* maps ``attach-device`` or ``detach-device`` to the reason
+      libvirt gives for refusing a change that reaches the persistent
+      definition: refused whole, before anything else, and nothing changes.
 
     A call it does not model fails the test. Every call is recorded in
     :attr:`calls`.
@@ -88,13 +98,15 @@ class FakeDomain:
 
     def __init__(self, machine: str = Q35, state: str = 'running',
                  cdroms: dict[str, str | None] | None = None,
-                 live_cdroms: dict[str, str | None] | None = None):
+                 live_cdroms: dict[str, str | None] | None = None,
+                 refuse: dict[str, str] | None = None):
         self.machine = machine
         self.state = state
         #: target -> (device, bus, source); source None for an empty drive
         self.persistent = self._devices(cdroms or {})
         self.live = (dict(self.persistent) if live_cdroms is None
                      else self._devices(live_cdroms))
+        self.refuse = refuse or {}
         self.calls: list[tuple] = []
 
     def _devices(self, cdroms):
@@ -181,6 +193,8 @@ class FakeDomain:
         bus = disk.find('target').get('bus')
         source = disk.find('source').get('file')
         scope = self._scope(flags)
+        if 'config' in scope and 'attach-device' in self.refuse:
+            return _refused('attach', xml_path, self.refuse['attach-device'])
         if 'config' in scope and target in self.persistent:
             return _refused('attach', xml_path, (
                 f'Requested operation is not valid: target {target} '
@@ -197,6 +211,8 @@ class FakeDomain:
     def _detach_device(self, xml_path, *flags, **_kwargs):
         target = ET.parse(xml_path).getroot().find('target').get('dev')
         scope = self._scope(flags)
+        if 'config' in scope and 'detach-device' in self.refuse:
+            return _refused('detach', xml_path, self.refuse['detach-device'])
         if 'config' in scope and target not in self.persistent:
             raise AssertionError('detaching an absent drive: not modelled')
         if 'live' in scope:
@@ -744,6 +760,42 @@ class TestUpdateEndToEnd:
         assert result['status'] == 'needs_restart', result['details']
         assert domain.calls_of('shutdown') == []
         assert domain.cdroms(inactive=True)['sdb'] == isos['tools']
+
+    # A refused persistent-only change is a failure, not a drive waiting for
+    # the next boot. The refusal stands in for any libvirt may give: it is
+    # the one a transient domain gets, though a real transient domain is
+    # refused sooner, at the differ's `metadata --config` read.
+
+    def test_a_refused_attach_fails_the_update(self, isos, captured_logs):
+        domain = FakeDomain(cdroms={'sda': None},
+                            refuse={'attach-device': NO_PERSISTENT_CONFIG})
+
+        result = self._update(domain, [{'name': 'tools',
+                                        'source': isos['tools']}],
+                              allow_restart=True)
+
+        assert result['status'] == 'failed', result['details']
+        [attach] = domain.calls_of('attach-device')
+        assert _flags(attach) == {'--config'}
+        assert domain.cdroms() == domain.cdroms(inactive=True) == {'sda': None}
+        assert domain.calls_of('shutdown') == domain.calls_of('start') == []
+        assert not [r for r in captured_logs.records
+                    if 'next boot' in r.getMessage()]
+
+    def test_a_refused_detach_fails_the_update(self, isos, captured_logs):
+        domain = FakeDomain(cdroms={'sda': None, 'sdb': isos['tools']},
+                            refuse={'detach-device': NO_PERSISTENT_CONFIG})
+
+        result = self._update(domain, [], allow_restart=True)
+
+        assert result['status'] == 'failed', result['details']
+        [detach] = domain.calls_of('detach-device')
+        assert _flags(detach) == {'--config'}
+        assert domain.cdroms() == domain.cdroms(inactive=True) == {
+            'sda': None, 'sdb': isos['tools']}
+        assert domain.calls_of('shutdown') == domain.calls_of('start') == []
+        assert not [r for r in captured_logs.records
+                    if 'next boot' in r.getMessage()]
 
     def test_a_stopped_vm_is_updated_without_a_restart(self, isos):
         domain = FakeDomain(state='shut off', cdroms={'sda': None})
