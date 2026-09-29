@@ -457,14 +457,19 @@ VM, logging in with `admin_pass`.
   file being rewritten, marked as coming from an earlier run. After a `virsh
   start` or `boxman control start` the entry usually still reaches it —
   libvirt gives a VM its old DHCP address back — and the next `boxman up` or
-  `boxman update` refreshes it (`update` also adds the key). An earlier
-  address that another VM now reports is not kept, and a VM created in the
-  same run never inherits one.
+  `boxman update` refreshes it (`update` also adds the key). Only an entry
+  exactly as boxman writes it is reused: an edited one, or one whose alias
+  another `Host` line in the file names too, counts as no entry. An earlier
+  address that another VM now reports, on any of its interfaces, is not
+  kept, and a VM created in the same run never inherits one.
 - **A running VM that does not get the key** — no address, the copy or the
   login check after it failed, an `admin_pass` reference that cannot be
-  resolved, a missing public key — makes `provision` and `update` exit 2,
-  naming it, once everything else has run. So does a key pair that cannot
-  be generated or an `ssh_config` that cannot be written.
+  resolved or read, a missing public key — makes `provision` and `update`
+  exit 2, naming it, once everything else has run (with none of the
+  cluster's VMs running, the unusable `admin_pass` or key is a warning). So
+  does a key pair that cannot be generated, an `ssh_config` that cannot be
+  written, or `boxman.yml`'s `ssh.authorized_keys` that cannot be written
+  to a cluster's workdir.
 - **A cluster without `admin_pass`** gets no key, with a warning: its guests
   have to authorize the key themselves, as the ISO-boot boxes do.
 

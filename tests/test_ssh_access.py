@@ -23,7 +23,9 @@ their stubbed provisioning steps, run for real. Exit codes are taken from
 
 from __future__ import annotations
 
+import copy
 import logging
+import os
 import shutil
 import subprocess
 import types
@@ -48,12 +50,13 @@ class Lab:
     A bare manager with one cluster and a mocked session.
 
     ``states`` is what the state query reports and ``addresses`` what the
-    session gives a *running* VM; a VM that is not running has no address,
-    as with the real session.
+    session gives a *running* VM -- one address, or a list of them, one per
+    interface; a VM that is not running has no address, as with the real
+    session.
     """
 
     def __init__(self, tmp_path, vms=("vm01", "vm02"), admin_pass="secret",
-                 key_pair=True):
+                 key_pair=True, app_config=None):
         cluster = {
             "workdir": str(tmp_path / "c1"),
             "admin_user": "admin",
@@ -68,9 +71,10 @@ class Lab:
             "workspace": {"path": str(tmp_path)},
             "clusters": {"cluster_1": cluster},
         })
-        self.mgr.app_config = None
+        # boxman.yml; its ssh.authorized_keys are the global keys
+        self.mgr.app_config = app_config
         self.states = {full(vm): "running" for vm in vms}
-        self.addresses: dict[str, str] = {}
+        self.addresses: dict[str, str | list[str]] = {}
         self.session = MagicMock()
         self.session.get_vm_ip_addresses.side_effect = self._addresses_of
         self.mgr.provider = self.session
@@ -87,7 +91,10 @@ class Lab:
     def _addresses_of(self, name):
         if self.states.get(name) != "running" or name not in self.addresses:
             return {}
-        return {"vnet0": self.addresses[name]}
+        found = self.addresses[name]
+        if isinstance(found, str):
+            found = [found]
+        return {f"vnet{i}": address for i, address in enumerate(found)}
 
     def asked_for_address(self, vm) -> int:
         return sum(1 for c in self.session.get_vm_ip_addresses.call_args_list
@@ -206,6 +213,38 @@ def _both_up_once(lab: Lab) -> None:
     lab.mgr.write_ssh_config()
 
 
+def _written_block(host="Host cluster_1_vm01 node0", hostname="192.168.10.5",
+                   drop=(), extra=()) -> bytes:
+    """A VM block as write_ssh_config writes it, but for the lines named in
+    *drop* (by keyword) and the ones in *extra*: one change at a time."""
+    lines = [host, f"    Hostname {hostname}", "    User admin",
+             "    IdentityFile /ws/id_ed25519_boxman",
+             "    StrictHostKeyChecking no",
+             "    UserKnownHostsFile /dev/null"]
+    lines = [line for line in lines if line.split()[0] not in drop]
+    return ("\n".join(lines + list(extra)) + "\n\n\n").encode()
+
+
+#: The stanza write_ssh_config puts first under the docker runtime.
+JUMP_STANZA = ("Host boxman-libvirt-jump\n"
+               "    HostName     127.0.0.1\n"
+               "    Port         2678\n"
+               "    User         qemu_user\n"
+               "    IdentityFile /ws/.boxman/runtime/docker/data/ssh/id_ed25519\n"
+               "    StrictHostKeyChecking no\n"
+               "    UserKnownHostsFile /dev/null\n"
+               "\n\n")
+
+
+def _unreadable(path) -> None:
+    """Make the file at *path* unreadable (mode 000), or skip the test where
+    that does not stop this user reading it -- as root."""
+    path.chmod(0)
+    if os.access(path, os.R_OK):
+        path.chmod(0o600)
+        pytest.skip("mode 000 does not stop this user reading a file")
+
+
 def _effective(config_path, host) -> dict[str, str]:
     """What OpenSSH itself applies to *host* -- not what the file says."""
     out = subprocess.run(
@@ -304,34 +343,44 @@ class TestAVmThatIsNotRunningIsExpected:
         [warning] = [w for w in lab.logged("warning") if "vm01" in w]
         assert "no earlier entry" in warning
 
+    #: Each is a block boxman writes with one thing changed, so each case
+    #: shows the rule that rejects it -- not some other deviation.
     UNPARSEABLE = {
-        "not utf-8":
-            b"\xff\xfeHost cluster_1_vm01 node0\n    Hostname 192.168.10.5\n",
+        "not utf-8": b"\xff\xfe" + _written_block(),
         "not an ssh config at all": b"\x00\x01{\"json\": true}\x7f\n",
         "a name, not an address":
-            b"Host cluster_1_vm01 node0\n    Hostname vm01.example.org\n",
-        "an IPv6 address":
-            b"Host cluster_1_vm01 node0\n    Hostname fe80::1\n",
+            _written_block(hostname="vm01.example.org"),
+        "an IPv6 address": _written_block(hostname="fe80::1"),
         "a keyword boxman never writes":
-            b"Host cluster_1_vm01 node0\n    Hostname 192.168.10.5\n"
-            b"    Port 2222\n",
+            _written_block(extra=["    Port 2222"]),
         "an option with arguments":
-            b"Host cluster_1_vm01 node0\n    Hostname 192.168.10.5\n"
-            b"    ProxyCommand nc %h %p\n",
+            _written_block(extra=["    ProxyCommand nc %h %p"]),
         "two addresses":
-            b"Host cluster_1_vm01 node0\n    Hostname 192.168.10.5\n"
-            b"    Hostname 192.168.10.7\n",
-        "the alias written twice":
-            b"Host cluster_1_vm01 node0\n    Hostname 192.168.10.5\n\n\n"
-            b"Host cluster_1_vm01 node1\n    Hostname 192.168.10.7\n",
+            _written_block(extra=["    Hostname 192.168.10.7"]),
+        "a directive boxman writes, missing": _written_block(drop=("User",)),
+        "host-key checking left on":
+            _written_block(drop=("StrictHostKeyChecking",),
+                           extra=["    StrictHostKeyChecking yes"]),
+        "a jump host boxman never writes":
+            _written_block(extra=["    ProxyJump bastion.example.org"]),
         "key=value syntax":
-            b"Host cluster_1_vm01 node0\n    Hostname=192.168.10.5\n",
-        "a trailing comment":
-            b"Host cluster_1_vm01 node0\n    Hostname 192.168.10.5 # old\n",
+            _written_block(drop=("Hostname",),
+                           extra=["    Hostname=192.168.10.5"]),
+        "a trailing comment": _written_block(hostname="192.168.10.5 # old"),
         "a Host line without the node alias":
-            b"Host cluster_1_vm01\n    Hostname 192.168.10.5\n",
-        "a Match block":
-            b"Match host cluster_1_vm01\n    Hostname 192.168.10.5\n",
+            _written_block(host="Host cluster_1_vm01"),
+        "a second alias that is not node<N>":
+            _written_block(host="Host cluster_1_vm01 production"),
+        "the alias written twice":
+            _written_block()
+            + _written_block(host="Host cluster_1_vm01 node1",
+                             hostname="192.168.10.7"),
+        "the alias under another, one-alias heading":
+            _written_block()
+            + b"Host cluster_1_vm01\n    Hostname 203.0.113.9\n",
+        "its node alias under another heading":
+            _written_block() + b"Host node0\n    Hostname 203.0.113.9\n",
+        "a Match block": _written_block(host="Match host cluster_1_vm01"),
     }
 
     @pytest.mark.parametrize("content", list(UNPARSEABLE.values()),
@@ -352,23 +401,76 @@ class TestAVmThatIsNotRunningIsExpected:
         [warning] = [w for w in lab.logged("warning") if "vm01" in w]
         assert "no earlier entry" in warning
 
+    @pytest.mark.parametrize("interface", ["its only one", "a second one"])
     def test_an_address_a_running_vm_now_reports_is_not_kept(
-            self, tmp_path, monkeypatch, update_flow):
+            self, tmp_path, monkeypatch, update_flow, interface):
         """The stale-address case that matters: another VM of the project,
-        same user and key, would take the login silently."""
+        same user and key, would take the login silently -- on whichever of
+        its interfaces holds the address."""
         lab = Lab(tmp_path)
         _both_up_once(lab)
         lab.states[full("vm01")] = "shut off"
-        lab.addresses[full("vm02")] = "192.168.10.5"
+        if interface == "its only one":
+            lab.addresses[full("vm02")] = "192.168.10.5"
+            own = "192.168.10.5"
+        else:
+            lab.addresses[full("vm02")] = ["192.168.20.6", "192.168.10.5"]
+            own = "192.168.20.6"
 
         code, message = update(lab, monkeypatch)
 
         assert code == 0, message
         assert lab.block("cluster_1_vm01") is None
-        assert "    Hostname 192.168.10.5" in lab.block(
+        # vm02's own block still uses its first address
+        assert f"    Hostname {own}" in lab.block(
             "cluster_1_vm02").splitlines()
         [warning] = [w for w in lab.logged("warning") if "vm01" in w]
         assert "is now cluster_1/vm02's" in warning
+
+    def test_an_address_a_vm_of_another_file_reports_is_not_kept(
+            self, tmp_path):
+        """Clusters without a shared workspace get a file each, but share the
+        project's networks: the check spans every file written."""
+        lab = Lab(tmp_path)
+        config = lab.mgr.config
+        config["workspace"] = {}
+        other = copy.deepcopy(config["clusters"]["cluster_1"])
+        other.update(workdir=str(tmp_path / "c2"),
+                     vms={"vm03": {"hostname": "vm03"}})
+        config["clusters"]["cluster_2"] = other
+        for cluster in config["clusters"].values():
+            os.makedirs(cluster["workdir"])
+        vm03 = "bprj__demo__bprj_cluster_2_vm03"
+        lab.states[vm03] = "running"
+        lab.addresses = {full("vm01"): "192.168.10.5",
+                         full("vm02"): "192.168.10.6",
+                         vm03: "192.168.20.7"}
+        lab.mgr.write_ssh_config()
+        lab.states[full("vm01")] = "shut off"
+        # vm01's old address is now on vm03's second interface
+        lab.addresses[vm03] = ["192.168.20.7", "192.168.10.5"]
+
+        lab.mgr.write_ssh_config(vm_states=dict(lab.states))
+
+        assert "cluster_1_vm01" not in (tmp_path / "c1" / "ssh_config").read_text()
+        [warning] = [w for w in lab.logged("warning") if "cluster_1/vm01" in w]
+        assert "is now cluster_2/vm03's" in warning
+
+    def test_a_kept_entry_keeps_its_jump_host_under_the_docker_runtime(
+            self, tmp_path, monkeypatch, update_flow):
+        """The strict reading still takes the block the docker runtime
+        writes, ProxyJump included."""
+        lab = Lab(tmp_path)
+        lab.mgr._docker_ssh_jump_stanza = lambda: JUMP_STANZA
+        _both_up_once(lab)
+        lab.states[full("vm01")] = "shut off"
+
+        code, message = update(lab, monkeypatch)
+
+        assert code == 0, message
+        lines = lab.block("cluster_1_vm01").splitlines()
+        assert "    Hostname 192.168.10.5" in lines
+        assert "    ProxyJump boxman-libvirt-jump" in lines
 
     def test_an_address_two_earlier_entries_claim_is_kept_by_neither(
             self, tmp_path, monkeypatch, update_flow):
@@ -412,8 +514,10 @@ class TestAVmThatIsNotRunningIsExpected:
         [warning] = [w for w in lab.logged("warning") if "cluster_1/vm01" in w]
         assert "created in this run" in warning
 
+    @pytest.mark.parametrize("networks", [
+        "unchanged", "recreated without reconnecting vm02"])
     def test_up_keeps_the_entry_of_a_vm_that_did_not_come_up(
-            self, tmp_path, monkeypatch):
+            self, tmp_path, monkeypatch, networks):
         lab = Lab(tmp_path)
         _both_up_once(lab)
         lab.states[full("vm01")] = "shut off"
@@ -430,6 +534,12 @@ class TestAVmThatIsNotRunningIsExpected:
         for name in ("wait_for_vm_ips", "ensure_netlab_up",
                      "provision_compose_clusters", "connect_info"):
             setattr(lab.mgr, name, MagicMock())
+        if networks != "unchanged":
+            # vm02 runs, but the recreate left it without its network
+            lab.mgr.reconcile_networks = MagicMock(
+                return_value={"net": "partial"})
+            lab.mgr._reattach_failed_vms = {full("vm02")}
+            del lab.addresses[full("vm02")]
 
         with pytest.raises(ProvisionError, match="could not bring up"):
             lab.mgr.up(types.SimpleNamespace(
@@ -443,6 +553,13 @@ class TestAVmThatIsNotRunningIsExpected:
         # up adds no keys, so it does not say one was skipped
         assert "ssh key" not in warning
         assert "`boxman up`" in warning
+        # vm01 never came up; a vm02 the recreate cut off gets no lease
+        # either -- waiting for either one only burns the timeout
+        if networks == "unchanged":
+            lab.mgr.wait_for_vm_ips.assert_called_once_with(
+                [full("vm02")], max_wait=300)
+        else:
+            lab.mgr.wait_for_vm_ips.assert_not_called()
 
 
 class TestAVmBoxmanExpectsToReachFailsTheVerb:
@@ -502,6 +619,33 @@ class TestAVmBoxmanExpectsToReachFailsTheVerb:
         assert code == 2
         assert f"1 VM(s) never started: {full('vm02')}" in message
         assert "ssh key not added to cluster_1/vm01" in message
+
+    def test_provision_names_the_vms_an_unreadable_admin_pass_kept_out(
+            self, tmp_path, monkeypatch):
+        """A file:// password that exists but cannot be read raised
+        PermissionError out of provision before its connection info,
+        compose clusters and lab."""
+        secret = tmp_path / "admin_pass"
+        secret.write_text("secret\n")
+        _unreadable(secret)
+        lab = Lab(tmp_path, admin_pass=f"file://{secret}")
+        lab.addresses = {full("vm01"): "192.168.10.5",
+                         full("vm02"): "192.168.10.6"}
+        arm_provision(lab, monkeypatch)
+
+        code, message = provision(lab, monkeypatch)
+
+        assert code == 2
+        assert message.startswith(
+            "provision finished, but ssh key not added to cluster_1/vm01, "
+            "cluster_1/vm02: the admin_pass of cluster cluster_1 cannot be "
+            "resolved")
+        assert str(secret) in message
+        assert lab.pushed() == []
+        assert lab.block("cluster_1_vm01") is not None
+        lab.mgr.connect_info.assert_called_once()
+        lab.mgr.provision_compose_clusters.assert_called_once()
+        lab.mgr.deploy_netlab.assert_called_once()
 
     def test_a_state_boxman_does_not_know_counts_as_running(
             self, tmp_path, monkeypatch, update_flow):
@@ -636,11 +780,20 @@ class TestTheOtherKeyProblemsAreClassified:
         assert "key" not in warning
         assert "`boxman up`" in warning
 
+    @pytest.mark.parametrize("reference", [
+        "an unset variable", "a file it may not read"])
     def test_an_admin_pass_that_cannot_be_resolved_fails_the_update(
-            self, tmp_path, monkeypatch, update_flow):
-        """It used to escape from the end of the run as a traceback."""
+            self, tmp_path, monkeypatch, update_flow, reference):
+        """It used to escape from the end of the run as a traceback: a
+        ValueError for the variable, PermissionError for the file."""
         monkeypatch.delenv("A223_UNSET_PASSWORD", raising=False)
-        lab = Lab(tmp_path, admin_pass="${env:A223_UNSET_PASSWORD}")
+        admin_pass = "${env:A223_UNSET_PASSWORD}"
+        if reference == "a file it may not read":
+            secret = tmp_path / "A223_UNSET_PASSWORD"
+            secret.write_text("secret\n")
+            _unreadable(secret)
+            admin_pass = f"file://{secret}"
+        lab = Lab(tmp_path, admin_pass=admin_pass)
         _both_up_once(lab)
 
         code, message = update(lab, monkeypatch)
@@ -654,6 +807,68 @@ class TestTheOtherKeyProblemsAreClassified:
         assert "A223_UNSET_PASSWORD" in message
         assert lab.pushed() == []
         assert lab.block("cluster_1_vm01") is not None
+
+    def test_an_unreadable_admin_pass_with_no_vm_running_is_a_warning(
+            self, tmp_path, monkeypatch, update_flow):
+        """No key was due, so there is nothing it kept from a VM."""
+        secret = tmp_path / "admin_pass"
+        secret.write_text("secret\n")
+        _unreadable(secret)
+        lab = Lab(tmp_path, admin_pass=f"file://{secret}")
+        _both_up_once(lab)
+        lab.states = dict.fromkeys(lab.states, "shut off")
+
+        code, message = update(lab, monkeypatch)
+
+        assert code == 0, message
+        assert lab.logged("error") == []
+        [warning] = [w for w in lab.logged("warning") if "admin_pass" in w]
+        assert str(secret) in warning
+        assert "no VM of cluster cluster_1 is running" in warning
+
+    def test_an_unreadable_global_key_is_skipped_with_a_warning(
+            self, tmp_path, monkeypatch, update_flow):
+        """As an unresolvable one always was, rather than a traceback."""
+        key = tmp_path / "global.pub"
+        key.write_text("ssh-ed25519 AAAA global\n")
+        _unreadable(key)
+        lab = Lab(tmp_path, app_config={
+            "ssh": {"authorized_keys": [f"file://{key}"]}})
+        lab.addresses = {full("vm01"): "192.168.10.5",
+                         full("vm02"): "192.168.10.6"}
+
+        code, message = update(lab, monkeypatch)
+
+        assert code == 0, message
+        assert lab.logged("error") == []
+        assert any(w.startswith("skipping unresolvable SSH key entry")
+                   and str(key) in w for w in lab.logged("warning"))
+
+    @pytest.mark.parametrize("verb", ["update", "provision"])
+    def test_global_keys_that_cannot_be_written_fail_the_verb_last(
+            self, tmp_path, monkeypatch, update_flow, verb):
+        """A file where the cluster's workdir should be stopped the ssh
+        setup with a traceback before any key or config was written."""
+        lab = Lab(tmp_path, app_config={
+            "ssh": {"authorized_keys": ["ssh-ed25519 AAAA global"]}})
+        (tmp_path / "c1").write_text("a file where the workdir should be\n")
+        lab.addresses = {full("vm01"): "192.168.10.5",
+                         full("vm02"): "192.168.10.6"}
+        lab.mgr.connect_info = MagicMock()
+        if verb == "provision":
+            arm_provision(lab, monkeypatch)
+
+        code, message = (update if verb == "update" else provision)(
+            lab, monkeypatch)
+
+        assert code == 2
+        target = tmp_path / "c1" / "global_authorized_keys"
+        assert (f"the global authorized keys of cluster cluster_1 could not "
+                f"be written to {target}") in message
+        # the rest of the setup still ran
+        assert lab.block("cluster_1_vm01") is not None
+        assert lab.pushed() == ["cluster_1_vm01", "cluster_1_vm02"]
+        lab.mgr.connect_info.assert_called_once()
 
     def test_a_missing_public_key_fails_the_update(
             self, tmp_path, monkeypatch, update_flow):

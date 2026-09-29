@@ -448,8 +448,11 @@ class FlowsMixin:
 
         # Wait for IP addresses — but not for the VMs that failed to come
         # up. They have no lease coming, and each one would burn the full
-        # timeout before `up` gets to report why.
-        waiting_for = [name for name in self._get_project_vm_names()
+        # timeout before `up` gets to report why. The same holds for the
+        # ones the network reconcile above could not reconnect, and for any
+        # VM still not running now that the start/resume work is done, so
+        # the list is the shared helper's, taken after that work (#223).
+        waiting_for = [name for name in self._vms_worth_waiting_for()
                        if name not in failures]
         if waiting_for:
             self.wait_for_vm_ips(waiting_for, max_wait=300)

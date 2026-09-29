@@ -352,8 +352,11 @@ class TestLifecycleFailuresRaise:
                      "report_network_results", "raise_on_network_failures"):
             monkeypatch.setattr(BoxmanManager, name,
                                 lambda cls, *a, **kw: None)
+        # what libvirt reports: up asks again after bringing VMs up, to
+        # know which ones to wait for (#223)
+        states = {"vm1": state}
         monkeypatch.setattr(
-            BoxmanManager, "_get_vm_states", lambda cls: {"vm1": state})
+            BoxmanManager, "_get_vm_states", lambda cls: dict(states))
         monkeypatch.setattr(
             BoxmanManager, "reconcile_networks", lambda cls, **kw: {})
         monkeypatch.setattr(
@@ -363,9 +366,15 @@ class TestLifecycleFailuresRaise:
             BoxmanManager, "_get_project_vm_names", lambda cls: ["vm1"])
         monkeypatch.setattr(
             BoxmanManager, "_run_parallel", _sync_run_parallel)
-        mgr.provider.start_vm.return_value = start_ok
-        mgr.provider.resume_vm.return_value = start_ok
-        mgr.provider.restore_vm.return_value = start_ok
+
+        def _brought_up(name, *_args):
+            if start_ok:
+                states[name] = "running"
+            return start_ok
+
+        mgr.provider.start_vm.side_effect = _brought_up
+        mgr.provider.resume_vm.side_effect = _brought_up
+        mgr.provider.restore_vm.side_effect = _brought_up
         for name in ("wait_for_vm_ips", "ensure_netlab_up",
                      "provision_compose_clusters", "connect_info",
                      "write_ssh_config"):

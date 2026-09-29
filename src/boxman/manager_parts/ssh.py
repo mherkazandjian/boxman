@@ -6,6 +6,7 @@
 
 import ipaddress
 import os
+import re
 import shlex
 import time
 from collections import Counter
@@ -15,29 +16,54 @@ from boxman.utils.hostnames import hostname_or_key
 from boxman.utils.references import resolve_reference
 from boxman.utils.shell import run
 
-#: The keywords of the VM blocks :meth:`SSHMixin.write_ssh_config` writes.
-#: A block holding any other keyword was not written by boxman, and the
-#: address in it is not reused.
-_VM_BLOCK_KEYWORDS = frozenset({
+#: The directives of the VM blocks :meth:`SSHMixin.write_ssh_config`
+#: writes, each once. ``proxyjump`` is written under the docker runtime
+#: only; the others always.
+_VM_BLOCK_REQUIRED = frozenset({
     'hostname', 'user', 'identityfile', 'stricthostkeychecking',
-    'userknownhostsfile', 'proxyjump',
+    'userknownhostsfile',
 })
+
+#: The second Host alias write_ssh_config gives a VM: ``node`` and a
+#: zero-padded project-wide counter.
+_NODE_ALIAS = re.compile(r'node[0-9]+')
 
 
 def _block_address(body: list[list[str]]) -> str | None:
-    """The one IPv4 ``Hostname`` of a VM block's *body*, or None."""
-    hostnames = []
+    """
+    The IPv4 ``Hostname`` of a VM block's *body*, if the body is exactly
+    what write_ssh_config writes, or None.
+
+    Every directive it writes, once, with the fixed values it writes --
+    ``StrictHostKeyChecking no``, ``UserKnownHostsFile /dev/null`` -- and
+    ``ProxyJump`` to the docker runtime's jump host at most once; one
+    value each; nothing else.
+    """
+    jump = SSHMixin.SSH_JUMP_HOST_ALIAS
+    values: dict[str, str] = {}
     for words in body:
-        if words[0].lower() not in _VM_BLOCK_KEYWORDS or len(words) != 2:
+        keyword = words[0].lower()
+        if (keyword not in _VM_BLOCK_REQUIRED | {'proxyjump'}
+                or len(words) != 2 or keyword in values):
             return None
-        if words[0].lower() == 'hostname':
-            hostnames.append(words[1])
-    if len(hostnames) != 1:
+        values[keyword] = words[1]
+    if (not _VM_BLOCK_REQUIRED <= values.keys()
+            or values['stricthostkeychecking'] != 'no'
+            or values['userknownhostsfile'] != '/dev/null'
+            or values.get('proxyjump', jump) != jump):
         return None
     try:
-        return str(ipaddress.IPv4Address(hostnames[0]))
+        return str(ipaddress.IPv4Address(values['hostname']))
     except ValueError:
         return None
+
+
+def _normal_address(address: str) -> str:
+    """*address* spelled the way earlier_vm_addresses spells one."""
+    try:
+        return str(ipaddress.ip_address(address))
+    except ValueError:
+        return address
 
 
 def earlier_vm_addresses(path: str) -> dict[str, str]:
@@ -47,13 +73,13 @@ def earlier_vm_addresses(path: str) -> dict[str, str]:
     ``nodeN``, shifts when VMs are added or removed).
 
     Only what :meth:`SSHMixin.write_ssh_config` writes is read: a
-    ``Host <alias> <nodeN>`` line, then lines of its own keywords, among
-    them exactly one ``Hostname`` holding an IPv4 address; comment lines
-    are skipped. A block that deviates -- another keyword, a second
-    Hostname, a name where the address should be, an alias written twice
-    -- is left out, and a file that cannot be read or decoded yields
-    nothing. An earlier block that cannot be understood is no earlier
-    block (#223).
+    ``Host <alias> node<digits>`` line, then exactly the directives it
+    writes (see :func:`_block_address`), the ``Hostname`` an IPv4 address;
+    comment lines are skipped. A block that deviates is left out, and so
+    is one whose aliases another ``Host`` line names too -- whatever else
+    that line holds -- since which of them described the VM cannot be
+    told. A file that cannot be read or decoded yields nothing. An
+    earlier block that cannot be understood is no earlier block (#223).
     """
     try:
         with open(path, encoding='utf-8') as fobj:
@@ -71,17 +97,20 @@ def earlier_vm_addresses(path: str) -> dict[str, str]:
         elif blocks:
             blocks[-1][1].append(words)
 
-    seen: Counter = Counter()
+    # every alias of every Host line, counted before any block is judged:
+    # a competing definition makes an alias ambiguous whatever its shape
+    named = Counter(alias for head, _ in blocks
+                    if head[0].lower() == 'host' for alias in head[1:])
     found: dict[str, str] = {}
     for head, body in blocks:
-        if head[0].lower() != 'host' or len(head) != 3:
+        if (head[0].lower() != 'host' or len(head) != 3
+                or not _NODE_ALIAS.fullmatch(head[2])
+                or named[head[1]] != 1 or named[head[2]] != 1):
             continue
-        seen[head[1]] += 1
         address = _block_address(body)
         if address:
             found[head[1]] = address
-    return {alias: address for alias, address in found.items()
-            if seen[alias] == 1}
+    return found
 
 
 def _no_password(value) -> bool:
@@ -356,7 +385,12 @@ class SSHMixin:
                             cluster_name).get_vm_ip_addresses(full_vm_name)
                         if ip_addresses:
                             entry['address'] = next(iter(ip_addresses.values()))
-                            live.setdefault(entry['address'], entry['label'])
+                            # every address it reports, not only the one its
+                            # block uses: a kept block pointing at any of them
+                            # reaches this VM
+                            for address in ip_addresses.values():
+                                live.setdefault(_normal_address(address),
+                                                entry['label'])
                         else:
                             self.logger.warning(
                                 f"no ip address available for the vm {vm_name}, "
@@ -579,7 +613,10 @@ class SSHMixin:
         for entry in raw_keys:
             try:
                 resolved.append(self.fetch_value(entry))
-            except (ValueError, FileNotFoundError) as exc:
+            except (ValueError, OSError) as exc:
+                # OSError, not just FileNotFoundError: a file:// key that
+                # exists but cannot be read is skipped the same way, rather
+                # than escaping from the ssh setup as a traceback (#223)
                 self.logger.warning(f"skipping unresolvable SSH key entry: {exc}")
         return resolved
 
@@ -710,7 +747,11 @@ class SSHMixin:
             if not _no_password(raw_pass):
                 try:
                     admin_pass = self.fetch_value(raw_pass)
-                except (ValueError, FileNotFoundError) as exc:
+                except (ValueError, OSError) as exc:
+                    # OSError, not just FileNotFoundError: a file:// that
+                    # exists but cannot be read (mode 000, a directory on
+                    # the way that cannot be searched) raises
+                    # PermissionError and the like
                     problem = (f"the admin_pass of cluster {cluster_name} "
                                f"cannot be resolved ({exc})")
             if problem is None and _no_password(admin_pass):
@@ -943,18 +984,32 @@ class SSHMixin:
 
         Raises:
             SSHAccessError: after all four steps, naming each problem -- a
-                key pair that could not be generated, an ssh config that
-                could not be written, a VM boxman expected to reach that did
-                not get the key.
+                global authorized keys file that could not be written, a key
+                pair that could not be generated, an ssh config that could
+                not be written, a VM boxman expected to reach that did not
+                get the key.
         """
+        failures: list[str] = []
+
         # write global authorized keys so they can be consumed by container
-        # entrypoints or cloud-init scripts
-        for _, cluster in self._vm_clusters.items():
+        # entrypoints or cloud-init scripts. A cluster whose file cannot be
+        # written -- a file where its workdir should be, a directory it may
+        # not write -- is recorded like any other step's problem: it used to
+        # escape as a traceback before anything below had run.
+        for cluster_name, cluster in self._vm_clusters.items():
             workdir = os.path.expanduser(cluster['workdir'])
             global_keys_path = os.path.join(workdir, 'global_authorized_keys')
-            self.write_global_authorized_keys_file(global_keys_path)
+            try:
+                self.write_global_authorized_keys_file(global_keys_path)
+            except OSError as exc:
+                reason = exc.strerror or str(exc)
+                self.logger.error(
+                    f"could not write the global authorized keys of cluster "
+                    f"{cluster_name} to {global_keys_path}: {reason}")
+                failures.append(
+                    f"the global authorized keys of cluster {cluster_name} "
+                    f"could not be written to {global_keys_path}: {reason}")
 
-        failures: list[str] = []
         if not self.generate_ssh_keys():
             self.logger.error("failed to generate ssh keys")
             failures.append(
