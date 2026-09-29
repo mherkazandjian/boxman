@@ -612,7 +612,8 @@ class TestConfigureFromConfig:
         with patch.object(cd, "attach_cdrom", return_value=True) as attach:
             cd.configure_from_config({"source": "/x.iso", "target": "hdd"})
         attach.assert_called_once_with(
-            source_path="/x.iso", target_dev="hdd", reserved=())
+            source_path="/x.iso", target_dev="hdd", reserved=(),
+            domain_active=False)
 
 
 class TestGetAttachedCDROMs:

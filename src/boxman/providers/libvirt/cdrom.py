@@ -67,6 +67,30 @@ def explicit_cdrom_targets(cdroms: list[dict[str, Any]]) -> frozenset[str]:
     return frozenset(entry['target'] for entry in cdroms if entry.get('target'))
 
 
+def cdroms_awaiting_boot(live: list[dict[str, Any]],
+                         persistent: list[dict[str, Any]]) -> list[str]:
+    """
+    The CDROM targets a domain's next boot changes: a drive in one of its
+    definitions only, or holding other media in each.
+
+    libvirt cannot hot-plug or hot-unplug an IDE or SATA drive, so on an
+    active domain a CDROM is added or removed in the persistent definition
+    alone, and the guest sees the change when it next boots from that
+    definition (#222).
+
+    Args:
+        live: What :meth:`CDROMManager.get_attached_cdroms` reports for the
+            live definition.
+        persistent: The same for the persistent one.
+
+    Returns:
+        The targets, sorted; empty when the two definitions agree.
+    """
+    live_media = {(c['target'], c['source']) for c in live}
+    persistent_media = {(c['target'], c['source']) for c in persistent}
+    return sorted({target for target, _source in live_media ^ persistent_media})
+
+
 class CDROMManager:
     """
     Class for managing CDROM/ISO device operations in libvirt.
@@ -91,7 +115,8 @@ class CDROMManager:
                      source_path: str,
                      target_dev: str | None = None,
                      persistent: bool = True,
-                     reserved: Iterable[str] = ()) -> bool:
+                     reserved: Iterable[str] = (),
+                     domain_active: bool = False) -> bool:
         """
         Attach an ISO image as a CDROM device to the VM.
 
@@ -104,6 +129,14 @@ class CDROMManager:
             reserved: Targets other entries of the same list name
                 explicitly (see :func:`explicit_cdrom_targets`); never
                 chosen for a *target_dev* of None.
+            domain_active: Whether the domain is active (running or
+                paused). libvirt cannot hot-plug an IDE or SATA drive, the
+                only buses a boxman CDROM gets (see :meth:`_bus_for_target`),
+                and refuses a live-and-persistent attach whole ("disk bus
+                'sata' cannot be hotplugged", #222). For an active domain
+                the drive goes into the persistent definition alone
+                (``--config``), whatever *persistent* says, and the guest
+                sees it at its next boot.
 
         Returns:
             True if successful, False otherwise
@@ -127,7 +160,10 @@ class CDROMManager:
                 temp.write(xml_content)
                 temp_path = temp.name
 
-            attachment_args = ["--persistent"] if persistent else []
+            if domain_active:
+                attachment_args = ["--config"]
+            else:
+                attachment_args = ["--persistent"] if persistent else []
             # warn=True so a failed attach reaches the error branch below
             # instead of raising out of execute (matches change_media)
             result = self.virsh.execute("attach-device", self.vm_name, temp_path,
@@ -139,8 +175,16 @@ class CDROMManager:
                 self.logger.error(f"failed to attach CDROM: {result.stderr}")
                 return False
 
-            self.logger.info(
-                f"attached CDROM {source_path} as {target_dev} on VM {self.vm_name}")
+            if domain_active:
+                self.logger.warning(
+                    f"CDROM {target_dev} ({source_path}) is added to VM "
+                    f"{self.vm_name} at its next boot: libvirt cannot "
+                    f"hot-plug a {self._bus_for_target(target_dev).upper()} "
+                    f"drive")
+            else:
+                self.logger.info(
+                    f"attached CDROM {source_path} as {target_dev} on VM "
+                    f"{self.vm_name}")
             return True
         except Exception as e:
             self.logger.error(f"error attaching CDROM: {e}")
@@ -148,13 +192,24 @@ class CDROMManager:
                 os.unlink(temp_path)
             return False
 
-    def detach_cdrom(self, target_dev: str, persistent: bool = True) -> bool:
+    def detach_cdrom(self, target_dev: str, persistent: bool = True,
+                     domain_active: bool = False, in_guest: bool = True) -> bool:
         """
         Detach a CDROM device from the VM.
 
         Args:
             target_dev: Target device name to detach (e.g., 'hdc')
             persistent: Whether to make the detachment persistent
+            domain_active: Whether the domain is active (running or
+                paused). libvirt cannot hot-unplug an IDE or SATA drive and
+                refuses a live-and-persistent detach whole ("disk device
+                type 'cdrom' cannot be detached", #222). For an active
+                domain the drive leaves the persistent definition alone
+                (``--config``), whatever *persistent* says, and the guest
+                keeps it until its next boot.
+            in_guest: Whether the active domain's guest has the drive. One
+                it does not have, an addition still waiting for a boot, is
+                dropped with nothing left waiting.
 
         Returns:
             True if successful, False otherwise
@@ -171,7 +226,10 @@ class CDROMManager:
                 temp.write(xml_content)
                 temp_path = temp.name
 
-            detach_args = ["--persistent"] if persistent else []
+            if domain_active:
+                detach_args = ["--config"]
+            else:
+                detach_args = ["--persistent"] if persistent else []
             # warn=True so a failed detach reaches the error branch below
             # instead of raising out of execute (matches change_media)
             result = self.virsh.execute("detach-device", self.vm_name, temp_path,
@@ -184,7 +242,14 @@ class CDROMManager:
                     f"failed to detach CDROM {target_dev} from {self.vm_name}: {result.stderr}")
                 return False
 
-            self.logger.info(f"detached CDROM {target_dev} from VM {self.vm_name}")
+            if domain_active and in_guest:
+                self.logger.warning(
+                    f"CDROM {target_dev} is removed from VM {self.vm_name} at "
+                    f"its next boot: libvirt cannot hot-unplug a "
+                    f"{bus.upper()} drive")
+            else:
+                self.logger.info(
+                    f"detached CDROM {target_dev} from VM {self.vm_name}")
             return True
         except Exception as e:
             self.logger.error(f"error detaching CDROM: {e}")
@@ -236,7 +301,8 @@ class CDROMManager:
             return False
 
     def configure_from_config(self, cdrom_config: dict[str, Any],
-                              reserved: Iterable[str] = ()) -> bool:
+                              reserved: Iterable[str] = (),
+                              domain_active: bool = False) -> bool:
         """
         Configure a CDROM device from a configuration dictionary.
 
@@ -246,6 +312,8 @@ class CDROMManager:
                 explicitly (see :func:`explicit_cdrom_targets`); an entry
                 without a 'target' is not given one of them. An explicit
                 'target' is used as given.
+            domain_active: Whether the domain is active; see
+                :meth:`attach_cdrom`.
 
         Returns:
             True if successful, False otherwise
@@ -257,9 +325,10 @@ class CDROMManager:
 
         target = cdrom_config.get('target')
         return self.attach_cdrom(source_path=source, target_dev=target,
-                                 reserved=reserved)
+                                 reserved=reserved,
+                                 domain_active=domain_active)
 
-    def get_attached_cdroms(self) -> list[dict[str, Any]]:
+    def get_attached_cdroms(self, inactive: bool = False) -> list[dict[str, Any]]:
         """
         Every CDROM device on the VM, empty drives included.
 
@@ -273,13 +342,23 @@ class CDROMManager:
         Dropping them made a media request on an existing empty target look
         like a device addition (#164 FB-5).
 
+        Args:
+            inactive: read the **persistent** definition rather than the
+                live domain. On an active domain a CDROM is added or
+                removed there alone (see :meth:`attach_cdrom`), so it is
+                what a reconcile compares against: in the live view a drive
+                added that way was missing, the next update proposed it
+                again, and libvirt refused the duplicate target (#222).
+
         Raises:
             ProvisionError: if the device list cannot be read. Returning an
                 empty list made a failed query indistinguishable from a
                 domain with no CDROMs at all, and the caller then treats
                 every declared cdrom as new (#164 FB-5).
         """
-        result = self.virsh.execute("domblklist", self.vm_name, "--details", warn=True)
+        flags = ("--inactive",) if inactive else ()
+        result = self.virsh.execute(
+            "domblklist", self.vm_name, "--details", *flags, warn=True)
         if not result.ok:
             raise ProvisionError(
                 f"could not list the block devices of {self.vm_name} (exit "

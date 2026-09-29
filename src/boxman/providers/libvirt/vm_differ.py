@@ -4,6 +4,7 @@ from typing import Any
 from boxman import log
 from boxman.exceptions import ProvisionError
 
+from .cdrom import cdroms_awaiting_boot
 from .commands import VirshCommand
 from .disk_ownership import (
     DEFAULT_DISK_TARGET,
@@ -328,16 +329,22 @@ class VMStateDiffer:
                              driver_type=driver_type,
                              disk_prefix=disk_prefix)
 
-    def get_actual_cdroms(self, domain_name: str) -> list[dict[str, Any]]:
+    def get_actual_cdroms(self, domain_name: str,
+                          inactive: bool = False) -> list[dict[str, Any]]:
         """
         Get actual CDROM devices attached to a VM, excluding seed ISOs.
+
+        Args:
+            inactive: read the persistent definition instead of the live
+                domain. See :meth:`CDROMManager.get_attached_cdroms`.
 
         Returns:
             List of dicts with 'target' and 'source' keys.
         """
         from .cdrom import CDROMManager
         return CDROMManager(
-            domain_name, provider_config=self.provider_config).get_attached_cdroms()
+            domain_name, provider_config=self.provider_config).get_attached_cdroms(
+                inactive=inactive)
 
     def get_actual_shared_folders(self, domain_name: str,
                                   inactive: bool = False) -> list[dict[str, Any]]:
@@ -384,7 +391,11 @@ class VMStateDiffer:
                 file already exists on disk — attach it as-is instead of
                 recreating it)
               - resize_disks: list of dicts with target, source, current_size_mb, desired_size_mb
-              - new_cdroms, removed_cdroms, changed_cdroms
+              - new_cdroms, removed_cdroms, changed_cdroms (a removal or
+                a change carries ``config_only: True`` for a drive only
+                the persistent definition holds)
+              - cdroms_restart_pending, and cdroms_pending_targets: the
+                targets the next boot changes
               - new_shared_folders, removed_shared_folders, changed_shared_folders
               - memballoon_changed, memballoon_restart_pending,
                 desired_memballoon (normalized), actual_memballoon, and
@@ -523,6 +534,25 @@ class VMStateDiffer:
 
         # --- CDROM diff ---
         #
+        # Against the PERSISTENT definition, which is what boxman configures,
+        # as the shared-folder diff below does. libvirt cannot hot-plug or
+        # hot-unplug an IDE or SATA drive, so on an active domain a drive is
+        # added to or removed from the persistent definition alone and the
+        # guest sees it at its next boot (#222). Read from the live domain, a
+        # drive added that way was new again on the next update and libvirt
+        # refused the duplicate target, so even `update --restart` failed
+        # before it could restart; and a pending drive dropped from the
+        # config was never removed, because it had never been live.
+        #
+        # Media is another matter: libvirt changes it live. A drive in both
+        # definitions is changed when either holds other media than
+        # declared, and `change-media --live --config` brings both along. A
+        # drive only the persistent definition holds is changed there alone,
+        # since `--live` fails for it. A drive only the live definition holds
+        # has been removed from the config and waits for the boot that drops
+        # it: it matches nothing and is not removed again, and declared anew
+        # it is added anew.
+        #
         # Explicit targets are matched *before* source membership. The other
         # order meant that when the desired ISO happened to be attached at
         # some other target, no swap was generated and the requested target
@@ -530,17 +560,34 @@ class VMStateDiffer:
         # hdc=B.iso desired, hdc was detached and B.iso left on hdd. Swapping
         # two ISOs between explicit targets produced no changes at all
         # (#164 FB-5).
-        actual_cdroms = self.get_actual_cdroms(domain_name)
-        actual_by_target = {
-            c['target']: c for c in actual_cdroms if c.get('target')
+        persistent_cdroms = self.get_actual_cdroms(domain_name, inactive=True)
+        live_cdroms = (
+            self.get_actual_cdroms(domain_name)
+            if vm_state in self._LIVE_DOMAIN_STATES else persistent_cdroms)
+        persistent_by_target = {
+            c['target']: c for c in persistent_cdroms if c.get('target')
         }
+        live_by_target = {c['target']: c for c in live_cdroms if c.get('target')}
+
+        def _media_change(target: str, source: str) -> dict[str, Any] | None:
+            """The change that puts *source* in the drive at *target*."""
+            held = {persistent_by_target[target]['source']}
+            live = live_by_target.get(target)
+            if live is not None:
+                held.add(live['source'])
+            if held == {source}:
+                return None
+            change = {'target': target, 'source': source}
+            if live is None:
+                change['config_only'] = True
+            return change
 
         new_cdroms = []
         changed_cdroms = []
-        # Actual drives accounted for by a desired entry. Anything left over
-        # is what gets removed — computed from what was *matched* rather than
-        # from source membership, so a drive holding the right media at the
-        # wrong target is still reconciled.
+        # Configured drives accounted for by a desired entry. Anything left
+        # over is what gets removed — computed from what was *matched* rather
+        # than from source membership, so a drive holding the right media at
+        # the wrong target is still reconciled.
         matched_targets: set = set()
         claimed_targets: set = set()
 
@@ -584,22 +631,22 @@ class VMStateDiffer:
             target = cdrom_config.get('target')
 
             if target:
-                actual_for_target = actual_by_target.get(target)
-                if actual_for_target is None:
+                if target not in persistent_by_target:
                     new_cdroms.append(cdrom_config)
                     continue
                 matched_targets.add(target)
-                if actual_for_target['source'] != source:
-                    # Covers an empty drive too (source None): inserting media
-                    # into a drive that already exists is a media change, not
-                    # a second device.
-                    changed_cdroms.append({'target': target, 'source': source})
+                # Covers an empty drive too (source None): inserting media
+                # into a drive that already exists is a media change, not a
+                # second device.
+                change = _media_change(target, source)
+                if change:
+                    changed_cdroms.append(change)
                 continue
 
             # Targetless: match by source, one-to-one, and never against a
             # drive some explicit entry has reserved.
             actual = next(
-                (c for c in actual_cdroms
+                (c for c in persistent_cdroms
                  if c['source'] == source
                  and c['target'] not in matched_targets
                  and c['target'] not in claimed_targets), None)
@@ -607,14 +654,25 @@ class VMStateDiffer:
                 new_cdroms.append(cdrom_config)
             else:
                 matched_targets.add(actual['target'])
+                # matched on the configured media; the guest may hold other
+                change = _media_change(actual['target'], source)
+                if change:
+                    changed_cdroms.append(change)
 
         removed_cdroms = [
-            c for c in actual_cdroms
+            # a pending addition, dropped again: the guest never had it
+            {**c, 'config_only': True}
+            if c['target'] not in live_by_target else c
+            for c in persistent_cdroms
             if c['target'] not in matched_targets
             # An empty drive holds no media to remove, and dropping it would
             # silently change the domain's topology.
             and c.get('source') is not None
         ]
+        # Before any change: whether the guest is still waiting for a boot to
+        # see an earlier one.
+        cdroms_pending_targets = cdroms_awaiting_boot(
+            live_cdroms, persistent_cdroms)
 
         # --- Shared folder diff ---
         # What boxman *configures* is the persistent definition, so that is
@@ -693,6 +751,8 @@ class VMStateDiffer:
             'new_cdroms': new_cdroms,
             'removed_cdroms': removed_cdroms,
             'changed_cdroms': changed_cdroms,
+            'cdroms_restart_pending': bool(cdroms_pending_targets),
+            'cdroms_pending_targets': cdroms_pending_targets,
             'shared_folders_restart_pending': shared_folders_restart_pending,
             'new_shared_folders': new_shared_folders,
             'removed_shared_folders': removed_shared_folders,
