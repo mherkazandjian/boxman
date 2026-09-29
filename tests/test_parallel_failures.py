@@ -219,39 +219,51 @@ class TestARealCtrlC:
     def test_a_group_ctrl_c_during_publication_does_not_hang(self):
         """A terminal Ctrl-C also reaches the workers. One interrupted while
         its result was half written left the rest of the message missing,
-        and the parent's cleanup drain waited for it forever."""
+        and the parent's cleanup drain waited for it forever.
+
+        Events place the interrupt, not sleeps: "big" publishes only once
+        "fast" has been delivered, and the group is interrupted as soon as
+        big's first bytes can be read, while a result far larger than a pipe
+        holds is still being written. A fixed sleep assumed "fast" came
+        back first, which a loaded machine does not guarantee (#231)."""
         out = _run_scenario("""
 import multiprocessing, os, signal, time
 import multiprocessing.connection as mpc
 from unittest.mock import patch
-from tests.test_parallel_failures import _big_payload_worker, _manager, _ok_worker
+from tests.test_parallel_failures import _gated_big_payload_worker, _manager, _ok_worker
 
 real_wait = mpc.wait
+gate = multiprocessing.Event()
+got = []
 fired = []
 
 def wait(objects, timeout=None):
     ready = real_wait(objects, timeout)
-    if ready and not fired:  # the fast worker exited, undrained
-        fired.append(True)
-        time.sleep(0.2)      # the big result is now half through the pipe
-        os.killpg(os.getpgrp(), signal.SIGINT)
-        time.sleep(5)
+    if got == ["fast"] and not fired:
+        gate.set()  # "fast" is in hand, so "big" may publish
+        # a poll of the result queue has data (a worker exiting would be
+        # an int sentinel): big's result has started through the pipe
+        if ready and not isinstance(ready[0], int):
+            fired.append(True)
+            os.killpg(os.getpgrp(), signal.SIGINT)
+            time.sleep(5)  # the interrupt lands here
     return ready
 
-got = []
 with patch.object(mpc, "wait", side_effect=wait):
     try:
         _manager()._run_parallel(
             [("fast", _ok_worker, ("record",)),
-             ("big", _big_payload_worker, (1 << 20,))],
+             ("big", _gated_big_payload_worker, (gate, 1 << 20))],
             max_workers=2, on_result=lambda label, payload: got.append(label))
     except KeyboardInterrupt:
         print("interrupted")
+print("fired", bool(fired))
 print("got", ",".join(got))
 print("active", len(multiprocessing.active_children()))
 """)
+        assert "fired True" in out
         assert "interrupted" in out
-        assert "got fast" in out
+        assert "got fast,big" in out
         assert "active 0" in out
 
     def test_a_second_ctrl_c_during_cleanup_changes_nothing(self):
@@ -453,6 +465,12 @@ def _big_payload_worker(size):
     # Returns more than a pipe buffer's worth of data. The old
     # join-then-drain loop deadlocked here: the child blocked in the queue
     # feeder waiting for the parent to read, the parent sat in join().
+    return "x" * size
+
+
+def _gated_big_payload_worker(gate, size):
+    # The same, published only once the parent opens *gate*.
+    gate.wait()
     return "x" * size
 
 
