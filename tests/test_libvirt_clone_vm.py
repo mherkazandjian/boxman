@@ -33,7 +33,9 @@ from boxman.providers.libvirt.clone_vm import (
 )
 from boxman.providers.libvirt.session import LibVirtSession
 
-pytestmark = pytest.mark.unit
+# staging goes to a temp dir of each test's own, so _staging_leftovers
+# cannot see another suite's run on the same machine (#231)
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("private_tempdir")]
 
 
 def _result(stdout: str = "", ok: bool = True, stderr: str = "", return_code: int = 0) -> MagicMock:
@@ -69,9 +71,19 @@ def _machine_id_only(clone: CloneVM):
 
 
 def _staging_leftovers(vm_name: str) -> list[Path]:
-    """Staging directories this vm left behind in the temp dir."""
+    """Staging directories this vm left behind in the temp dir: the test's
+    own, which ``private_tempdir`` makes it."""
     return list(
         Path(tempfile.gettempdir()).glob(f"boxman-hostkeys-{vm_name}-*"))
+
+
+def test_staging_goes_to_a_temp_dir_of_the_tests_own(
+        tmp_path_factory: pytest.TempPathFactory):
+    """The leftover checks below look in ``tempfile.gettempdir()``; the
+    machine's also holds another suite's staging directories while it
+    runs (#231)."""
+    assert Path(tempfile.gettempdir()).is_relative_to(
+        tmp_path_factory.getbasetemp())
 
 
 def _vm(tmp_path: Path, **info) -> CloneVM:

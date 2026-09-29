@@ -351,9 +351,19 @@ class TestHostnameInvocation:
         assert not Path(staged).exists()
 
 
+@pytest.mark.usefixtures("private_tempdir")
 class TestHostnameStagingFailures:
     """Writing the rename script to the host's disk can fail operationally;
-    that must reach the clone policy typed, with nothing left behind."""
+    that must reach the clone policy typed, with nothing left behind.
+
+    Each test stages into a temp dir of its own, so the leftover check
+    cannot see another suite's run on the same machine (#231)."""
+
+    def test_each_test_stages_into_a_temp_dir_of_its_own(
+            self, tmp_path_factory):
+        import tempfile
+        assert Path(tempfile.gettempdir()).is_relative_to(
+            tmp_path_factory.getbasetemp())
 
     @pytest.mark.parametrize("target", [
         "boxman.providers.libvirt.clone_vm.tempfile.mkdtemp",
