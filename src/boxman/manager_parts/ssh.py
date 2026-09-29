@@ -39,9 +39,12 @@ _UNWRITABLE_IN_PATH = re.compile(r'["\n\r]|\$\{|\\(?=[\\\'"]|$)')
 
 #: What keeps a Host alias from being read back as the one literal alias it
 #: is: a blank or a quote splits or joins words, a backslash can escape, a
-#: '#' can start a comment, and *, ?, ! and , make it a pattern, a negation
-#: or a list of them.
-_UNWRITABLE_IN_ALIAS = re.compile(r'[\s"\'\\#*?!,]')
+#: '#' can start a comment, *, ?, ! and , make it a pattern, a negation or a
+#: list of them, and '=' is OpenSSH's separator -- a leading one is taken as
+#: the one between keyword and value (8.7 on), and before 8.7 any unquoted
+#: one split the argument. Blanks are ASCII ones (re.ASCII): OpenSSH splits
+#: at space and tab only, so a U+00A0 in an alias is part of it.
+_UNWRITABLE_IN_ALIAS = re.compile(r'[\s"\'\\#*?!,=]', re.ASCII)
 
 
 class _UnwritableError(ValueError):
@@ -158,7 +161,9 @@ def _block_address(body: list[tuple[str, list[str]]]) -> str | None:
             argument = words[1]
         elif (keyword == 'identityfile' and len(words) > 2
               and not {'"', "'"} & set(raw)):
-            argument = raw.split(None, 1)[1].strip()
+            # the rest of the line, blanks as OpenSSH counts them: space and
+            # tab, not str.split's Unicode ones
+            argument = re.split(r'[ \t]+', raw.strip(' \t'), maxsplit=1)[1]
         else:
             return None
         if (keyword not in _VM_BLOCK_REQUIRED | {'proxyjump'}
@@ -208,10 +213,15 @@ def earlier_vm_addresses(path: str) -> dict[str, str]:
         return {}
 
     blocks: list[tuple[list[str], list[tuple[str, list[str]]]]] = []
-    for raw in text.splitlines():
+    # Lines end at LF alone, as OpenSSH reads them: str.splitlines() also
+    # breaks at U+2028, U+2029, U+0085, \v, \f and \x1c-\x1e, which a path
+    # boxman writes may hold -- the quote split in two then left the whole
+    # file unreadable. CR LF arrives as LF already (text mode).
+    for raw in text.split('\n'):
         # a comment line is skipped before its words are read, as OpenSSH
         # skips it: an apostrophe in one opens no quote
-        if not raw.strip() or raw.strip().startswith('#'):
+        stripped = raw.strip(' \t')
+        if not stripped or stripped.startswith('#'):
             continue
         words = _config_words(raw)
         if words is None:

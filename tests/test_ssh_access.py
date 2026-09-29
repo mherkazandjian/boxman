@@ -119,12 +119,16 @@ class Lab:
 
 
 def _block_in(path, alias: str) -> str | None:
-    """The block of the ssh_config at *path* whose first alias is *alias*."""
+    """The block of the ssh_config at *path* whose first alias is *alias*.
+
+    Lines end at LF and words at a space, as OpenSSH has them: splitlines()
+    and split() would also break at U+2028, U+00A0 and the like, which a
+    path or an alias may hold."""
     if not path.is_file():
         return None
     for chunk in path.read_text().split("\n\n\n"):
-        lines = chunk.strip("\n").splitlines()
-        if lines and lines[0].split()[:2] == ["Host", alias]:
+        lines = chunk.strip("\n").split("\n")
+        if lines and lines[0].split(" ")[:2] == ["Host", alias]:
             return "\n".join(lines)
     return None
 
@@ -260,7 +264,8 @@ def _effective(config_path, host) -> dict[str, str]:
     out = subprocess.run(
         ["ssh", "-F", str(config_path), "-G", host],
         capture_output=True, text=True, check=True).stdout
-    return dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
+    # at LF only: a value may hold U+2028 and the like
+    return dict(line.split(" ", 1) for line in out.split("\n") if " " in line)
 
 
 needs_ssh = pytest.mark.skipif(shutil.which("ssh") is None,
@@ -1138,6 +1143,68 @@ class TestPathsAreWrittenSoOpenSSHReadsThemBack:
         assert effective["identityfile"] == identity.replace("%", "%%")
         assert _loaded_identity(lab.ssh_config, "cluster_1_vm01") == identity
 
+    #: Where Python's str.splitlines() ends a line and OpenSSH does not:
+    #: OpenSSH ends one at LF alone.
+    LINE_SEPARATORS = {
+        "U+2028": " ", "U+2029": " ", "U+0085": "\x85",
+        "a vertical tab": "\x0b", "a form feed": "\x0c",
+        "U+001C": "\x1c", "U+001D": "\x1d", "U+001E": "\x1e",
+    }
+
+    @pytest.mark.parametrize("separator", list(LINE_SEPARATORS.values()),
+                             ids=list(LINE_SEPARATORS))
+    def test_update_keeps_an_entry_whose_key_name_holds_a_line_separator(
+            self, tmp_path, monkeypatch, update_flow, separator):
+        """The writer takes such a path, and OpenSSH reads it; the reader
+        split its quoted line in two, and the quote left open made the
+        whole file unreadable, so a stopped VM lost its entry."""
+        key_name = f"id{separator}boxman"
+        lab = Lab(tmp_path)
+        lab.mgr.config["clusters"]["cluster_1"]["admin_key_name"] = key_name
+        (tmp_path / "id_ed25519_boxman").rename(tmp_path / key_name)
+        (tmp_path / "id_ed25519_boxman.pub").rename(
+            tmp_path / f"{key_name}.pub")
+        _both_up_once(lab)
+        lab.states[full("vm01")] = "shut off"
+
+        code, message = update(lab, monkeypatch)
+
+        assert code == 0, message
+        block = lab.block("cluster_1_vm01")
+        assert block is not None, "the stopped VM lost its ssh_config entry"
+        lines = block.split("\n")
+        assert "    Hostname 192.168.10.5" in lines
+        assert f'    IdentityFile "{tmp_path / key_name}"' in lines
+        assert lab.logged("error") == []
+
+    @needs_ssh
+    @needs_false
+    def test_a_key_name_with_a_unicode_line_separator_round_trips(
+            self, tmp_path, monkeypatch, update_flow):
+        """What OpenSSH reads from such a file, and that it is kept."""
+        key_name = "id boxman"
+        lab = Lab(tmp_path)
+        lab.mgr.config["clusters"]["cluster_1"]["admin_key_name"] = key_name
+        (tmp_path / "id_ed25519_boxman").rename(tmp_path / key_name)
+        (tmp_path / "id_ed25519_boxman.pub").rename(
+            tmp_path / f"{key_name}.pub")
+        _both_up_once(lab)
+        identity = str(tmp_path / key_name)
+        assert _effective(lab.ssh_config,
+                          "cluster_1_vm01")["identityfile"] == identity
+        # ssh -v shows a non-ASCII character as its UTF-8 bytes, in octal
+        assert (_loaded_identity(lab.ssh_config, "cluster_1_vm01")
+                == identity.replace(" ", "\\342\\200\\250"))
+        lab.states[full("vm01")] = "shut off"
+
+        code, message = update(lab, monkeypatch)
+
+        assert code == 0, message
+        assert "    Hostname 192.168.10.5" in lab.block(
+            "cluster_1_vm01").split("\n")
+        assert _effective(lab.ssh_config,
+                          "cluster_1_vm01")["hostname"] == "192.168.10.5"
+
     @pytest.mark.parametrize("key_name", ["access key", "100%done"])
     def test_a_file_from_before_the_quoting_keeps_its_entries(
             self, tmp_path, monkeypatch, update_flow, key_name):
@@ -1267,6 +1334,10 @@ class TestPathsAreWrittenSoOpenSSHReadsThemBack:
         argv = shlex.split(command) if isinstance(command, str) else command
         at = argv.index("-F")
         assert argv[at + 1:at + 4] == [config_path, "-t", "cluster_1_vm01"]
+        # and no shell runs the list: under shell=True the list's first item
+        # is the whole command and the rest go to the shell, not to ssh
+        assert isinstance(command, list)
+        assert ssh.call_args.kwargs.get("shell", False) is False
 
 
 class TestTheContainersOwnSshConfig:
@@ -1370,28 +1441,70 @@ class TestHostAliasesAreWrittenSoOpenSSHReadsThemBack:
         assert "\n" not in message
         assert lab.ssh_config.read_text() == "the earlier file\n"
 
-    def test_an_ordinary_alias_is_written_and_read_back(self, tmp_path):
+    @staticmethod
+    def _web01_in(tmp_path, cluster_name: str):
+        """A Lab whose one cluster is *cluster_name*, holding vm01 with the
+        hostname web-01.lab, running at 192.168.10.5; and vm01's libvirt
+        name."""
         lab = Lab(tmp_path, vms=("vm01",))
-        lab.mgr.config["clusters"]["cluster_1"]["vms"]["vm01"]["hostname"] = (
-            "web-01.lab")
-        lab.addresses = {full("vm01"): "192.168.10.5"}
+        cluster = lab.mgr.config["clusters"].pop("cluster_1")
+        lab.mgr.config["clusters"][cluster_name] = cluster
+        cluster["vms"]["vm01"]["hostname"] = "web-01.lab"
+        name = f"bprj__demo__bprj_{cluster_name}_vm01"
+        lab.states = {name: "running"}
+        lab.addresses = {name: "192.168.10.5"}
+        return lab, name
+
+    @pytest.mark.parametrize("cluster_name", ["=cluster_1", "cluster=1"])
+    def test_an_alias_with_an_equals_sign_fails_the_verb(
+            self, tmp_path, monkeypatch, update_flow, cluster_name):
+        """OpenSSH takes a leading '=' as the separator after the keyword,
+        and before 8.7 split an argument at any unquoted one: the alias
+        would not be the VM's. Such a name is not supported, not quoted."""
+        lab, _name = self._web01_in(tmp_path, cluster_name)
+        lab.ssh_config.write_text("the earlier file\n")
+
+        code, message = update(lab, monkeypatch)
+
+        assert code == 2
+        assert message.startswith(
+            f"update finished with 1 failure(s): could not write the ssh "
+            f"config {lab.ssh_config}: vm {cluster_name}/vm01 would be named "
+            f"'{cluster_name}_web-01.lab' in it, which OpenSSH does not read "
+            f"back as one alias: it holds '='")
+        assert "\n" not in message
+        assert lab.ssh_config.read_text() == "the earlier file\n"
+
+    #: An ordinary alias -- `_`, `-` and `.` -- and one holding U+00A0, which
+    #: OpenSSH reads as part of the alias: it splits at space and tab only.
+    ORDINARY = pytest.mark.parametrize(
+        "cluster_name", ["cluster_1", "cluster 1"],
+        ids=["cluster_1", "a no-break space"])
+
+    @ORDINARY
+    def test_an_ordinary_alias_is_written_and_read_back(
+            self, tmp_path, cluster_name):
+        lab, name = self._web01_in(tmp_path, cluster_name)
+        alias = f"{cluster_name}_web-01.lab"
         lab.mgr.write_ssh_config()
-        lab.states[full("vm01")] = "shut off"
+        lab.states[name] = "shut off"
 
         lab.mgr.write_ssh_config(vm_states=dict(lab.states))
 
-        lines = lab.block("cluster_1_web-01.lab").splitlines()
-        assert lines[0] == "Host cluster_1_web-01.lab node0"
+        lines = lab.block(alias).split("\n")
+        assert lines[0] == f"Host {alias} node0"
         assert "    Hostname 192.168.10.5" in lines
 
     @needs_ssh
-    def test_openssh_reads_an_ordinary_alias(self, tmp_path):
-        lab = Lab(tmp_path, vms=("vm01",))
-        lab.mgr.config["clusters"]["cluster_1"]["vms"]["vm01"]["hostname"] = (
-            "web-01.lab")
-        lab.addresses = {full("vm01"): "192.168.10.5"}
+    @ORDINARY
+    def test_openssh_reads_an_ordinary_alias(self, tmp_path, cluster_name):
+        lab, name = self._web01_in(tmp_path, cluster_name)
+        alias = f"{cluster_name}_web-01.lab"
 
         lab.mgr.write_ssh_config()
+        assert _effective(lab.ssh_config, alias)["hostname"] == "192.168.10.5"
 
-        effective = _effective(lab.ssh_config, "cluster_1_web-01.lab")
-        assert effective["hostname"] == "192.168.10.5"
+        # and once it is kept for a VM that is not running
+        lab.states[name] = "shut off"
+        lab.mgr.write_ssh_config(vm_states=dict(lab.states))
+        assert _effective(lab.ssh_config, alias)["hostname"] == "192.168.10.5"
