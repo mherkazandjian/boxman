@@ -8,7 +8,8 @@ description: >-
   change for CI. Triggers include edits under src/boxman/, tests/,
   scripts/installer/, containers/docker/ or doc/; questions about the
   runtime/provider abstractions, the BoxmanManager mixin layout, the exception
-  hierarchy and exit codes, the sudo-wrapping rules, how config precedence and
+  hierarchy and exit codes, the sudo-wrapping rules, the clone identity pass,
+  the teardown and disk-creation safety rules, how config precedence and
   merging work, which pytest marker a test belongs to, why a default pytest
   run skips a test, or how to run the integration tier safely. For *using*
   boxman to provision infrastructure, use the boxman-user agent instead.
@@ -34,7 +35,7 @@ edit.
 src/boxman/
   scripts/
     app.py             # CLI entry point: dispatch, exit codes, per-verb setup
-    cli_parser.py      # all argparse wiring; parse_args() is the only public surface
+    cli_parser.py      # all argparse wiring: parse_args(), resolve_verbosity()
   manager.py           # BoxmanManager: composes the mixins, owns sessions + runtime
   manager_parts/       # the manager, split by concern (see below)
   abstract/providers.py# ProviderSession protocol
@@ -46,15 +47,17 @@ src/boxman/
     session_base.py    # SessionConfigMixin shared by provider sessions
   runtime/
     __init__.py        # create_runtime() factory
+    base.py            # RuntimeBase, the abstract runtime
     local.py           # commands run on the host (no-op wrapping)
     docker_compose.py  # commands wrapped with docker exec into a libvirt container
   netlab/              # containerlab integration + host shared bridges
-  utils/               # jinja env, references, io, shell, hostnames, parsers
+  utils/               # jinja env, references, io, shell, hostnames, HTTP download,
+                       # descriptor-based tree removal (retained_tree.py)
   config_cache.py      # BoxmanCache: which projects/networks are provisioned
   image_cache.py       # base-image / ISO download cache
   exceptions.py        # the error hierarchy
   loggers/             # verbosity levels and formatting
-tests/                 # ~78 modules, marker-tiered
+tests/                 # ~110 modules, marker-tiered
 doc/                   # architecture + user reference docs
 boxes/                 # runnable example configs, also used by integration tests
 data/templates/        # canonical conf.yml / boxman.yml templates shipped to users
@@ -87,19 +90,19 @@ live in `manager_parts/`:
 
 | Module | Owns |
 |---|---|
-| `config.py` | loading, merging and rendering config; `boxman conf` |
+| `config.py` | loading and rendering config, schema `version:` handling (v2.0 normalisation) |
 | `workspace.py` | workspace/cluster file generation, inventory, env.sh, ansible.cfg |
 | `naming.py` | `full_network_name()`, adapter `network_source` resolution |
-| `ssh.py` | ssh_config generation, host aliases, `boxman ssh` |
-| `images.py` | templates, base images, ISO resolution, OCI push/pull, import-image |
+| `ssh.py` | ssh_config generation, host aliases, admin keys, connection info |
+| `images.py` | templates, base images, ISO resolution, OCI push/pull, import-image, `pxe-boot` |
 | `networks.py` | network reconcile orchestration, isolation self-healing |
-| `vms.py` | clone/configure/start, the `update` diff and its application |
-| `snapshots.py` | every snapshot verb + `_select_vm_targets()` |
-| `flows.py` | `provision`, `up`, `down`, `deprovision`, `destroy` |
+| `vms.py` | clone/configure/start, the `update` diff and its application, clone-identity validation and the closing degradation summary |
+| `snapshots.py` | every snapshot verb, the `storage` verbs, `_select_vm_targets()` |
+| `flows.py` | `provision`, `up`, `down`, `deprovision`, `destroy`, `destroy-runtime` |
 | `compose.py` | docker-compose-provider cluster lifecycle |
 | `control.py` | suspend / resume / save / start |
 | `netlab.py` | containerlab verbs |
-| `misc.py` | `ps`, `list`, `run`, `exec`, `pxe-boot`, storage verbs |
+| `misc.py` | `ps`, `list`, `run`, `exec`, `conf`, `ssh` |
 
 When adding a verb, put it in the mixin that owns the concern, not in
 `manager.py`. If a helper is needed by two mixins, it belongs in `utils/` or on
@@ -142,9 +145,15 @@ stay in sync automatically.
 
 ### A runtime
 
-Subclass `RuntimeBase`, implement `wrap_command()`, register it in the
-`create_runtime` map. Anything that shells out must go through the runtime's
-wrapping, or it will silently run on the wrong side of the container boundary.
+Subclass `RuntimeBase`, implement `wrap_command(command, pass_env=None)` and
+the `name` property, register it in the `create_runtime` map. Anything that
+shells out must go through the runtime's wrapping, or it will silently run on
+the wrong side of the container boundary.
+
+`pass_env` names environment variables the wrapped command needs: the local
+runtime inherits them, the docker runtime forwards each *name* with `-e`. That
+is how a secret reaches a command (`sshpass -e` reads `SSHPASS`) — never put
+one on an argv, where `ps` and `/proc` show it.
 
 ### A config key
 
@@ -152,11 +161,48 @@ wrapping, or it will silently run on the wrong side of the container boundary.
   — that file is the canonical example users copy.
 - Validate it where it is first read, with a message that names the key and
   what to do. Prefer failing before any disk or libvirt I/O: several validators
-  (`validate_base_images()`, network validation) deliberately run up front and
-  aggregate every problem into one error rather than dying halfway through a
-  parallel clone.
+  (`validate_base_images()`, `validate_direct_boot_config()`,
+  `validate_clone_identity_config()`, network validation) deliberately run up
+  front — in `update` as well as `provision` — and aggregate every problem into
+  one error rather than dying halfway through a parallel clone.
 - If it affects a live resource, decide whether `update` can apply it hot,
   needs a restart, or is structural — and make the reconcile plan say which.
+
+### A clone identity property
+
+Every libvirt clone gets one offline `virt-sysprep` pass, run on the shut-off
+clone right after `virt-clone`, that gives it its own machine ID, SSH host keys
+and hostname. It lives in `providers/libvirt/clone_vm.py`. Each property has a
+per-VM `clone_*` policy key (`auto | required | off`, default `auto`), and
+`CloneVM.build_identity_plan()` folds the enabled ones into one
+`IdentityPlan`. To add a property:
+
+1. Resolve its key in `CloneVM.__init__` with `_resolve_policy()`, and add it
+   to the keys `validate_clone_identity_config()` (`manager_parts/vms.py`)
+   checks before anything is created.
+2. In `build_identity_plan()`, append an `IdentityProperty` plus the
+   `--operations` and/or customizations it contributes (set `needs_customize`
+   for the latter). Host-side inputs, such as files to upload, are produced in
+   `stage_identity_plan()`.
+3. Document the key in `data/templates/conf.libvirt.yml`.
+
+Invariants to keep:
+
+- **One pass**, not one per property — each run boots a libguestfs appliance.
+- **Customizations need the `customize` operation.** Without it virt-sysprep
+  exits 0 having done nothing; `assert_customize_invariant()` raises instead.
+  `customize` always writes a fresh machine ID, so any customizing property
+  overrides `clone_machine_id: off` (with a warning).
+- **A failure resolves against the strictest enabled policy.** One `required`
+  property discards the clone (`discard_unsafe_clone()`) and raises; if all are
+  `auto`, a `CloneDegradation` naming every property is recorded and cloning
+  continues. The pass is not atomic, so messages say the clone *may* have kept
+  its template's identity.
+- `provision` and `update` repeat every degradation once at the end, via
+  `report_clone_degradations()` in a `finally`, so a later failure cannot hide
+  it.
+
+The pass runs only at clone time; an existing VM is never re-identified.
 
 ---
 
@@ -170,12 +216,16 @@ Use the hierarchy in `exceptions.py` rather than bare `Exception`:
 BoxmanError
 ├── ConfigError            # bad conf.yml / boxman.yml, unresolvable ${env:VAR}
 ├── ProvisionError         # a provisioning step failed
-│   ├── CloneSanitizerError
+│   ├── CloneSanitizerError    # the clone identity pass failed
 │   │   ├── CloneSanitizerUnavailableError
 │   │   └── CloneCleanupError
+│   ├── ImageImportError
+│   ├── DiskPathOccupiedError  # a new disk's path already has an entry; nothing written
+│   ├── SSHAccessError         # raised last; .failures holds one line per problem
 │   ├── NetworkError
 │   └── TemplateError
 ├── SnapshotError
+│   └── SnapshotRecoveryError  # revert done, overlays not restored — never retry
 └── RuntimeUnavailable     # docker daemon down, libvirtd unreachable — often retriable
 ```
 
@@ -187,9 +237,14 @@ the message *is* the user interface — make it say what to change. A
 
 Do not exit 0 on a failure path. Aborts on config/restore/update were
 deliberately converted from `exit 0` to raises; do not reintroduce the pattern.
+Dispatch calls `getattr(manager, handler)(args)` and discards the return value,
+so a verb that reports failure with `return False` exits 0 — raise instead.
+Provider session methods return a bool for success; check every one you call
+rather than letting it drop.
 
 ### Sudo
 
+The rules live on the libvirt command base (`providers/libvirt/commands.py`).
 `_should_use_sudo_for_command()` resolves, first match wins:
 `force_sudo_commands` → `rm` (never, because unlinking needs write permission
 on the boxman-owned parent dir and a prompting sudo makes cleanup fail
@@ -197,19 +252,57 @@ silently) → `sudo_skip_commands` → global `use_sudo`. Matching is on the
 basename of the first token. If you add a command that may need root, think
 about which bucket it belongs in rather than blanket-wrapping it.
 
+- `use_sudo` describes whether **virsh** needs sudo (and is the fallback for
+  ordinary commands); it says nothing about whether a command needs root. A
+  command that needs root wherever it runs (`iptables`, `ip link set`, sysctl
+  writes) goes through `execute_shell(..., privileged=True)`, which ignores
+  `use_sudo` and decides from the execution context: no prefix when already
+  root — always the case under the docker runtime, which execs as root —
+  `sudo` otherwise, with the force/skip lists still applied first.
+- A shell string that chains commands needs a prefix per command from
+  `sudo_prefix()`: `execute_shell` only looks at the first word, and a
+  hand-written `sudo ` bypasses the force/skip lists entirely.
+
 ### Parallelism
 
-Parallel VM operations go through the shared `_run_parallel` helper, not raw
-`multiprocess.Process` calls. Failures in one worker must not strand the
-others; propagate an aggregate result the caller can report on.
+The manager's parallel VM operations go through the shared `_run_parallel`
+helper (`manager.py`), not raw `multiprocessing.Process` calls. It returns
+`(results, failures)` keyed by task label and logs each failure; one worker's
+failure must not strand the others. Carry failures to the end of the verb:
+finish reconciling what did succeed, then raise one error naming what failed
+(`up` is the reference).
+
+### Destructive operations
+
+Anything irreversible acts only on positive evidence; an observation that
+fails must read as "stop", never as "nothing there".
+
+- Gate removal on a check that fails closed: `confirm_vm_absent()` (a
+  successful `virsh list` without the name), not `is_vm_defined()`, which says
+  "absent" when libvirt is unreachable. For files, only `FileNotFoundError`
+  from `lstat` means absent — `os.path.exists()` / `isdir()` answer False for a
+  path they cannot look up.
+- A VM teardown removes files only through `remove_vm_storage()`
+  (`providers/libvirt/disk_cleanup.py`), which admits them from an inventory
+  taken before undefining and keeps anything another domain uses. libvirt is
+  never asked to delete a VM's storage.
+- Extra disks boxman attaches are recorded in the domain's `<metadata>`
+  (`disk_ownership.py`); detach decisions read that record, never "attached
+  but not declared".
+- Create disk images with `create_image_exclusive()` (`disk.py`), never a bare
+  `qemu-img create`, which truncates whatever holds the path or writes through
+  a symlink; an occupied path raises `DiskPathOccupiedError`.
+- A recursive delete of a configured path is vetted by `_safe_delete_target()`
+  (`manager_parts/flows.py`).
 
 ### Logging
 
-Verbosity is a level, not a boolean: default terse status lines, `-v` info,
-`-vv` debug with `[time LEVEL file:func]`, `-vvv` also echoes shell commands.
-`-q` is warnings and errors. Both flag positions (before and after the
-subcommand) are reconciled by `resolve_verbosity()`, with a `BOXMAN_VERBOSITY`
-env fallback. A message that a user must act on is a warning or error; progress
+Verbosity is a level, not a boolean: default terse `STATUS` lines
+(`log.status()`), `-v` info, `-vv` debug with `[time LEVEL file:func]`, `-vvv`
+also echoes shell commands. `-q` is warnings and errors. `-v` is accepted
+before or after the subcommand and the two are reconciled by
+`resolve_verbosity()`, with a `BOXMAN_VERBOSITY` env fallback; `-q` only after
+it. A message that a user must act on is a warning or error; progress
 narration is info or lower.
 
 ### Docs
@@ -267,11 +360,14 @@ on your workstation:
 ```bash
 make test-vm-up                      # provision the VM (one-time; slow, downloads a template)
 make test-vm-sync                    # rsync the repo in and (re)install the venv
-make test-vm-test                    # default selection (unit + smoke)
+make test-vm-test                    # default selection (all but slow/integration)
 make test-vm-test tier=integration   # the Docker + nested-KVM tier
 make test-vm-test pytest_args="-k test_name"
 make test-vm-destroy                 # tear it down
 ```
+
+`data/dev/test-runner/README.md` lists what the VM carries (docker,
+containerlab for the hybrid lab boxes) and the nested-KVM requirement.
 
 Host-side targets exist for quick local iteration but are not CI-grade:
 
@@ -283,7 +379,11 @@ make test pytest_args="-k test_name"       # one test
 make test-integration                      # docker-compose runtime integration tests
 make test-provision                        # box provisioning integration tests
 make test-dc-e2e                           # docker-compose *provider* e2e tests
+make check-box-images                      # probe every box's image/ISO URLs
 ```
+
+`check-box-images` needs network but downloads nothing and touches no libvirt,
+so it is safe on the host; run it when a box's `image.uri` or `isos:` changes.
 
 `make test-vm-up`, `make test-vm-test tier=integration` and the
 `test-provision` target are all **long operations** — minutes, with downloads.
@@ -297,6 +397,11 @@ Never fire one off silently; ask, or run it in the background and say so.
   asserting on the composed `virsh` / `virt-install` command strings and on
   parsed output fixtures; go through the same helpers rather than inventing a
   new mocking style.
+- `tests/conftest.py` has the shared pieces: `make_bare_manager()` builds a
+  `BoxmanManager` without loading config files, for unit-testing mixin
+  methods, and an autouse fixture points boxman's per-user cache dir at a
+  per-test temp dir. No test may reach the real `~/.config/boxman/cache`;
+  patch `boxman.config_cache.DEFAULT_CACHE_DIR` if one needs a specific dir.
 - Regression tests for a landed fix get the `regression` marker and a comment
   naming what broke.
 - Integration tests must clean up after themselves; a test that leaves a
@@ -343,7 +448,8 @@ python -m pytest tests
   under `boxes/`.
 - **Generated artifacts are not source.** `conf.rendered.yml`, a cluster's
   `docker-compose.yml`, `ssh_config` and `inventory/01-hosts.yml` are rewritten
-  from config; fix the generator, never the output.
+  from config; fix the generator, never the output. `conf.rendered.yml` holds
+  every `env()` value resolved, so it is created 0600 — keep it that way.
 - **`env.sh` and `ansible.cfg` are preserved once they exist** (matched by
   basename). That is intentional, and it means a stale hand-edited `env.sh`
   silently shadows config changes — worth remembering when a bug report says
@@ -351,18 +457,22 @@ python -m pytest tests
 - **The projects cache is runtime-scoped and written atomically**, and it
   tolerates a corrupt file rather than crashing. Keep both properties if you
   touch `config_cache.py`.
-- **`make loc` / `make loc-detailed`** report lines of code by category if you
-  need to size a change.
+- **`make loc` (runs cloc in docker) / `make loc-detailed` (plain Python)**
+  report lines of code by category if you need to size a change.
 
 ---
 
 ## Review checklist for a change
 
 - Does it hook into `up`, not only `provision`?
-- Does it go through the runtime wrapper for anything that shells out?
+- Does it go through the runtime wrapper for anything that shells out, with
+  any secret passed via `pass_env` rather than on the argv?
+- Does a command that needs root use `privileged=True`, not `use_sudo`?
 - Does it use `_select_vm_targets()` for `--vms` / `--cluster`?
 - Does it raise a typed `BoxmanError` with an actionable message, chained from
-  the original?
+  the original — never `return False` from a verb or drop a provider bool?
+- Does every delete or overwrite go through the fail-closed gates under
+  "Destructive operations"?
 - Does it validate up front and aggregate errors, rather than failing halfway
   through a parallel operation?
 - Are new config keys in `data/templates/` with a comment?

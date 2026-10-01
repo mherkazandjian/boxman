@@ -6,8 +6,8 @@ CLI reads this directory, and the project's own tooling does not load it.
 
 | File | Audience | Covers |
 |---|---|---|
-| `boxman-user.md` | Operating boxman | The `conf.yml` schema, the CLI, libvirt resource naming, the networking model, templates, ISO/PXE boot, OCI images, container clusters, snapshots and storage reclaim, and the failure modes that look like bugs but are not |
-| `boxman-developer.md` | Working on boxman | Repository layout, the runtime/provider abstractions, the manager mixins, error and sudo conventions, build and test workflow, and the CI gate |
+| `boxman-user.md` | Operating boxman | The `conf.yml` schema, the CLI, libvirt resource naming, the networking model, templates and clone identity, ISO/PXE boot, OCI images, container clusters, snapshots and storage reclaim, and the failure modes that look like bugs but are not |
+| `boxman-developer.md` | Working on boxman | Repository layout, the runtime/provider abstractions, the manager mixins, the clone identity pass, error, sudo and destructive-operation conventions, build and test workflow (including the disposable test-runner VM), and the CI gate |
 
 ## Installing
 
@@ -35,5 +35,6 @@ decide when the agent applies.
 
 They describe boxman as of the commit they ship with. If you change the CLI
 surface, the config schema, or user-visible behaviour, update the matching
-sections here in the same change — a stale agent definition is worse than none,
-because it produces confident wrong answers.
+sections here in the same change — and `boxman-developer.md` too when the change
+moves the architecture, a convention, or the build/test workflow. A stale agent
+definition is worse than none, because it produces confident wrong answers.

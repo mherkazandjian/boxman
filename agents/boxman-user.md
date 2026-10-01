@@ -42,7 +42,9 @@ detail matters and you are unsure, read the code rather than guessing.
    routinely take 1–10+ minutes. Ask first, or run in the background and say so.
 3. **Destructive verbs need the smallest hammer.** `destroy` nukes everything;
    `deprovision` removes VMs and networks; `destroy-runtime` touches only the
-   docker runtime. Do not reach for `destroy` when `update` would do.
+   docker runtime — but that runtime keeps libvirt's own state, so it takes
+   every domain, network and snapshot definition with it. Do not reach for
+   `destroy` when `update` would do.
 4. **Never hand-edit libvirt state** for boxman-managed resources. `virsh
    undefine` behind boxman's back desynchronises its cache and the next
    provision collides.
@@ -73,7 +75,7 @@ silently no-op'ing because `sudo qemu-img` / `rm` are not passwordless.
 
 ```
 boxman [--conf conf.yml] [--boxman-conf <path>] [--runtime {local,docker,docker-compose}]
-       [-v|-vv|-vvv] [-q] <subcommand> [flags]
+       [-v|-vv|-vvv] <subcommand> [-v|-vv|-vvv] [-q] [flags]
 ```
 
 - `--conf` — project config filename (default `conf.yml`).
@@ -86,7 +88,9 @@ boxman [--conf conf.yml] [--boxman-conf <path>] [--runtime {local,docker,docker-
   subcommand (`boxman -v up` == `boxman up -v`). Default output is terse
   milestones; `-vv` adds `[time LEVEL file:func]` debug lines; `-vvv` also
   echoes the underlying shell commands. `-q` / `--quiet` = warnings and errors
-  only. `BOXMAN_VERBOSITY=2` sets a default that any explicit flag overrides.
+  only, and goes **after** the subcommand (`boxman up -q`; `boxman -q up` is an
+  unrecognised-argument error). `BOXMAN_VERBOSITY=2` sets a default that any
+  explicit flag overrides.
 - `--version` — print version and exit.
 
 > **Runtime is not provider.** *Runtime* = where commands run (host vs.
@@ -95,10 +99,28 @@ boxman [--conf conf.yml] [--boxman-conf <path>] [--runtime {local,docker,docker-
 > share the name `docker-compose`. Mixing them up is the most common
 > first-day confusion.
 
+**Docker runtime state.** Under `--runtime docker`, libvirt's own state
+(domain, network and snapshot definitions, NVRAM, saved state) is bind-mounted
+to the host under the project's `.boxman/`, so it survives a container
+recreate. A recreate while guests run inside the container is refused
+(*refusing to …: N QEMU guest(s) are running inside it*; an unanswerable probe
+counts as "yes"). Shut the guests down first. `--force` on `up` /
+`provision` also authorises the recreate, but only because that `--force`
+already deprovisions every VM and provisions from scratch — it is a rebuild,
+never a way to keep the running guests.
+
 **Exit codes:** any internal boxman error (config, provision, network,
 template, snapshot, runtime-unavailable) prints a one-line `error:` and exits
-**2** — no traceback. Unknown flags are a hard parser error on every
-subcommand except `run`, which forwards its extras to the task.
+**2** — no traceback. That includes **partial failures**: `up`, `down`,
+`provision`, `update`, `deprovision`, `destroy`, `control` and `snapshot`
+finish what they can, then exit 2 naming what did not happen (a VM that would
+not start or save, a compose cluster that failed, a running VM that did not
+get its ssh key); a failed `import-image` exits 2 too. Older boxman releases
+logged many of these and exited 0, so do not read exit 0 from one as proof of
+success. A VM that is merely not running, or an `update` change that waits for
+a restart, is a warning, not a failure. `ps` / `conf` / `run` / `ssh` / `exec`
+exit 1 when there is no `conf.yml`. Unknown flags are a hard parser error on
+every subcommand except `run`, which forwards its extras to the task.
 
 ---
 
@@ -118,7 +140,7 @@ provider:
     virt_install_cmd: virt-install
     virt_clone_cmd: virt-clone
     virsh_cmd: virsh
-    virt_sysprep_cmd: virt-sysprep      # used by clone_machine_id: auto|required
+    virt_sysprep_cmd: virt-sysprep      # used by the clone_* identity policies
     virt_sysprep_timeout: 300
     sudo_skip_commands: [qemu-img]      # never sudo these, whatever use_sudo says
     force_sudo_commands: [virt-sysprep] # always sudo these, whatever use_sudo says
@@ -199,10 +221,13 @@ clusters:
 
     vms:
       <vm_name>:
-        hostname: <hostname>
+        hostname: <hostname>             # the guest's own name (set at clone time)
+                                         # and the ssh alias; defaults to <vm_name>
         base_image: <template-vm-name>   # optional; overrides cluster.base_image
         boot_order: [hd]                 # default; [network,hd]=PXE, [cdrom,hd]=ISO boot
-        clone_machine_id: auto           # auto (default) | required | off
+        clone_machine_id: auto           # auto (default) | required | off — own /etc/machine-id
+        clone_ssh_host_keys: auto        # auto (default) | required | off — own ssh host keys
+        clone_hostname: auto             # auto (default) | required | off — guest named hostname:
         cpus: { sockets: 1, cores: 2, threads: 2 }
         memory: 2048
         max_vcpus: 16                    # optional ceiling for hot-scaling
@@ -211,12 +236,13 @@ clusters:
           free_page_reporting: true
           autodeflate: true
           stats_period: 10
-        disks:
+        disks:                           # size in MiB; image at <workdir>/<domain>_<name>.<type>
           - { name: disk01, driver: { name: qemu, type: qcow2 }, target: vdb, size: 2048 }
+          # never created over an existing file; attach_only: true adopts the file there
         shared_folders:                  # virtiofs host-dir share
           - { name: src, host_path: ./code, readonly: false }
-        cdroms:
-          - { name: installer, source: /iso/ubuntu.iso, target: sda }
+        cdroms:                          # target optional: first free one on a bus the
+          - { name: installer, source: /iso/ubuntu.iso }   # machine type has
         network_adapters:
           - name: adapter_1              # decorative label
             link_state: 'up'
@@ -260,6 +286,14 @@ the basename of the first token, so `/usr/bin/qemu-img resize …` matches
 `qemu-img`. App-level and project-level lists merge per command with the
 project entry winning; a command in both after the merge gets sudo.
 
+`use_sudo` describes **virsh** only. Commands that need root wherever they run
+— the routed-network `iptables` isolation — resolve `force_sudo_commands` →
+`sudo_skip_commands` → **sudo unless the command already runs as root** (the
+boxman process on the local runtime; always root inside the docker runtime).
+Shared-bridge setup (`ip link`, its accept rules, the netfilter sysctl) uses
+sudo unless the boxman process is root, whatever the lists say. So
+`use_sudo: false` for a `libvirt`-group user still needs sudo rights for those.
+
 ### Jinja2 and reference syntax
 
 Helpers available while rendering `conf.yml` and the app config:
@@ -284,21 +318,21 @@ template time:
 
 | Command | Purpose |
 |---|---|
-| `boxman up [--force] [--rebuild-templates] [--recreate-networks] [-y]` | **Primary entry point.** Provisions if absent, restarts shut-off/saved/paused VMs, no-ops if already running. Reconciles shared bridges, libvirt networks, containerlab and container clusters every call. `--force` deprovisions first. |
-| `boxman down [--suspend]` | Save (default) or `--suspend` (pause) all VMs, and tear down containerlab. Networks and disks remain. |
+| `boxman up [--force] [--rebuild-templates] [--recreate-networks] [-y]` | **Primary entry point.** Provisions if absent, restarts shut-off/saved/paused VMs, no-ops if already running. Reconciles shared bridges, libvirt networks, containerlab and container clusters every call. A saved VM is restored from its managed save, not cold-booted; a shut-off VM with an *external* `<workdir>/<vm>.save` left by an older boxman makes `up` refuse — use `control start --restore`, or delete the file. `--force` deprovisions first. |
+| `boxman down [--suspend]` | Save (default: libvirt managed save, which the next `up` / `control start` restores) or `--suspend` (pause) all VMs, and tear down containerlab. Networks and disks remain. A VM libvirt cannot save (PCI passthrough) is a failure, never silently shut down. |
 | `boxman provision [--force] [--rebuild-templates]` | Full provision from scratch. Refuses if state exists unless `--force`. |
-| `boxman update [--dry-run] [-y] [--recreate-networks]` | Non-destructive reconcile: add new VMs, hot-scale CPU/memory, add/grow/remove disks, attach/detach shared folders and cdroms, remove orphaned VMs, plus the network reconcile. Runs the network pass even when no VM changed. |
-| `boxman deprovision [--cleanup]` | Tear down VMs and networks. `--cleanup` also removes generated files, SSH keys, empty dirs. |
-| `boxman destroy [-y] [--templates]` | Nuke everything for this config. `--templates` also removes template workdirs. Prompts unless `-y`. There is no `--force`. |
-| `boxman destroy-runtime [-y]` | Destroy only the docker runtime and `.boxman`. |
+| `boxman update [--dry-run] [-y] [--restart] [--recreate-networks]` | Non-destructive reconcile: add new VMs, hot-scale CPU/memory, add/grow/detach disks, attach/detach shared folders and cdroms, remove orphaned VMs, plus the network reconcile. Runs the network pass even when no VM changed. A change that cannot reach a running guest is written to the persistent config and the VM reported as needing a restart; `--restart` lets `update` power-cycle it (`-y` does not imply it). |
+| `boxman deprovision [--cleanup]` | Tear down VMs and networks. `--cleanup` also removes generated files, SSH keys, empty dirs. If anything survives, exits 2 and keeps the cache entry and generated files so a re-run can finish. |
+| `boxman destroy [-y] [--templates]` | Nuke everything for this config. `--templates` also removes template workdirs. Prompts unless `-y`. There is no `--force`. Checks every path it would delete up front, and exits 2 keeping what is left if the teardown did not complete. |
+| `boxman destroy-runtime [-y]` | Destroy only the docker runtime and `.boxman` — which holds libvirt's own state under that runtime, so every domain, network and snapshot definition goes too. |
 | `boxman list [-p[=plain\|table]] [--json] [--color yes\|no]` | List provisioned projects from the cache. |
 | `boxman ps [-p] [--json]` | Show VM/container states. `-p` adds provider info. |
 | `boxman conf [--json]` | Dump the effective merged config; writes `<conf>.rendered.yml` as a side effect. |
-| `boxman ssh [<vm>] [--cluster <c>]` | Interactive SSH into a **VM** (default: `GATEWAYHOST`). Not for containers. |
+| `boxman ssh [<vm>] [--cluster <c>]` | Interactive SSH into a **VM** (default: `GATEWAYHOST`). `<vm>` is an `ssh_config` alias (`<cluster>_<hostname>`) or a numeric id from `boxman ps`. Not for containers. |
 | `boxman exec <cluster>.<box> [--shell sh] [-- <cmd>]` | `docker compose exec` into a **container**. No command opens a shell. Put a command with its own flags after `--`. |
 | `boxman run [<task>] [-- args] [-l] [--cmd '<sh>'] [--ansible-flags '<f>'] [--cluster <c>]` | Run a named `tasks:` entry (or ad-hoc `--cmd`) with the workspace env loaded. `--ansible-flags` applies **only** to `--cmd`. |
 | `boxman create-templates [--templates a,b] [--force]` | Build `templates:` base images. |
-| `boxman import-image --uri <file://\|http(s)://> [--name N] [--directory D] [--provider libvirt]` | Import a VM from a `manifest.json` package (XML + qcow2). Strict schema validation. |
+| `boxman import-image --uri <file://\|http(s)://> [--name N] [--directory D] [--provider libvirt]` | Import a VM from a `manifest.json` package (XML + qcow2), local or remote. Strict schema validation; every failure exits 2. |
 | `boxman image push <ref> --qcow2 <path> [--metadata vmimage.json]` | Push a qcow2 to an OCI registry via `oras`. |
 | `boxman image inspect <ref>` | Print an OCI image's manifest, `kind`, and `vmimage.json` metadata without downloading the disk. |
 | `boxman snapshot take [--name N] [-m DESC] [--vms a,b] [--cluster c] [--compress-memory] [--force]` | Snapshot in parallel (default name = UTC timestamp). `--force` (aliases `--overwrite`/`--replace`) clears a colliding name and re-takes. |
@@ -307,14 +341,16 @@ template time:
 | `boxman storage {df\|trim\|compact\|optimize\|compress-snapshots}` | qcow2 space reclaim and snapshot-memory compression. |
 | `boxman pxe-boot --vm <name> [--expected-ip IP] [--wait-timeout 600] [--restore-after]` | Network-boot a VM; optionally poll SSH then restore boot order to `[hd]`. |
 | `boxman netlab {deploy\|destroy\|inspect\|ssh <node> [--user U]}` | Containerlab subcommands (only when `containerlab:` is enabled). `netlab ssh` *prints* the ssh command — use `$(boxman netlab ssh sw1)`. |
-| `boxman control {suspend\|resume\|save\|start [--restore]} [--vms a,b] [--cluster c]` | Lifecycle ops; all VMs unless scoped. On container clusters these map to `pause`/`unpause`/`start`; `save` has no equivalent and is skipped with a message. |
+| `boxman control {suspend\|resume\|save\|start [--restore]} [--vms a,b] [--cluster c]` | Lifecycle ops; all VMs unless scoped. `save` is a libvirt managed save that `start` restores on its own; `start --restore` is only for an external `<workdir>/<vm>.save` from an older boxman. On container clusters these map to `pause`/`unpause`/`start`; `save` has no equivalent and is skipped with a message. |
 
-**Selection flags.** `--vms` and `--cluster` compose, and every snapshot,
-storage and control subcommand honours them. Each `--vms` entry matches either
-the bare VM name (`node01`) or the cluster-qualified short name
-(`cluster_1_node01`); the default `all` selects everything. An unknown
-`--cluster` is an error, not a silent empty selection. `--vms` names **libvirt
-VMs only**, so it skips container clusters entirely.
+**Selection flags.** Every snapshot, storage and control subcommand takes
+`--vms`; `--cluster` exists only on `snapshot take` / `restore` / `delete` and
+the `control` verbs (plus `run` and `ssh`, where it scopes the workspace env).
+Where both exist they compose. Each `--vms` entry matches either the bare VM
+name (`node01`) or the cluster-qualified short name (`cluster_1_node01`); the
+default `all` selects everything. An unknown `--cluster` is an error, not a
+silent empty selection. `--vms` names **libvirt VMs only**, so it skips
+container clusters entirely.
 
 **Gotchas.**
 - `-p` means `--pretty` on `list` but provider-info on `ps`.
@@ -339,7 +375,9 @@ coexist without colliding:
 
 ⚠ **The SSH alias is `<cluster>_<hostname>`, not the bare hostname.** A VM
 `node01` in cluster `cluster1` is `ssh cluster1_node01` (or `ssh node0`). It is
-**not** `ssh node01`.
+**not** `ssh node01`. `<hostname>` is the VM's `hostname:`, or its key when
+none is declared. The guest itself is named the bare `<hostname>` (see
+`clone_hostname` under Templates); only the alias carries the cluster prefix.
 
 ⚠ **The `node<N>` alias number is a project-wide 0-indexed counter, not the
 VM's name.** Padding is `len(str(total_vms - 1))`, so a project with ≤10 VMs
@@ -362,7 +400,15 @@ read the generated `ssh_config`.
   by cluster and uses `<cluster>_<vm>` host keys, matching the SSH aliases.
 - **`env.sh` and `ansible.cfg` are preserved** if they already exist on disk —
   boxman will not clobber a customised file. `inventory/01-hosts.yml` and
-  `ssh_config` *are* rewritten on every `provision` / `up`.
+  `ssh_config` *are* rewritten on every `provision` / `up` (and `ssh_config` on
+  every `update`).
+- **A VM that is not running keeps its `ssh_config` block** with the address
+  from the previous file, marked `# boxman: <vm> was not running (<state>) …
+  from an earlier run`. Only a block exactly as boxman wrote it is reused.
+  Paths in the file are written double-quoted; a path holding a double quote,
+  a line break or `${`, or an alias holding a blank, quote, backslash, `#`,
+  `=`, `*`, `?`, `!` or `,`, fails the verb (`could not write the ssh config
+  …`) and leaves the file unchanged.
 - ⚠ The preserve guard matches on **basename**, not the configured path. A
   `workspace.ansible_config: conf/my.cfg` has basename `my.cfg`, which is not
   in the preserve list and **will be clobbered**.
@@ -492,7 +538,10 @@ container boxes via macvlan, or an external bridge.
 
 Creation is idempotent: create if missing, bring up, apply `mtu` and `stp`
 **when declared**. There is **no teardown** — `destroy` leaves shared bridges
-alone because another project may still use one.
+alone because another project may still use one. **Local runtime only:**
+under `--runtime docker` a `shared_networks:` block is a config error, because
+the bridge would be made on the host while the VMs live in the container's
+network namespace.
 
 ⚠ "boxman will not tear it down" is the *only* sense in which a shared bridge
 is safe across projects. Bridge names are global, and every run re-writes the
@@ -597,8 +646,9 @@ hotplug, otherwise a graceful reboot. Run with `-v` to see the plan lines.
   `inventory/01-hosts.yml` under each cluster's dir; each cluster's
   `inventory:` is auto-wired if undeclared.
 - `--cluster <name>` repoints the workspace env (inventory, gateway,
-  `ssh_config`, `ansible.cfg`) at one cluster's tree. Available on `run`,
-  `ssh`, and the snapshot/storage/control verbs.
+  `ssh_config`, `ansible.cfg`) at one cluster's tree on `run` and `ssh`, and
+  restricts `snapshot take` / `restore` / `delete` and `control` to one
+  cluster. The `storage` verbs do not take it.
 - `--vms a,b` targets individual VMs by bare or cluster-qualified name.
 
 ---
@@ -639,18 +689,46 @@ hotplug, otherwise a graceful reboot. Run with `-v` to see the plan lines.
   `write_files` runs in cloud-init's *config* stage, long before `runcmd`, so a
   marker written there is found while the build is still going. Point the
   marker at something the last `runcmd` produces.
-- **`clone_machine_id: auto | required | off`** controls resetting the identity
-  a clone inherits — `/etc/machine-id`, ssh host keys and friends, via
-  `virt-sysprep`. `auto` (default) warns and continues if the sanitizer cannot
-  run, preserving opaque-appliance compatibility; `required` makes that a hard
-  failure and removes the unsafe clone; `off` skips it. ⚠ `virt-sysprep` is
-  often the one libvirt tool that still needs a password under a
-  command-scoped sudoers policy.
+- **Clone identity.** `virt-clone` copies the guest filesystem verbatim, so
+  three per-VM policies reset what a clone would otherwise inherit from its
+  template. Each takes `auto | required | off` and defaults to `auto`:
+  - `clone_machine_id` — the clone gets its own `/etc/machine-id`.
+  - `clone_ssh_host_keys` — the template's `/etc/ssh/ssh_host_*` keys are
+    replaced with a freshly generated set, so clones are distinguishable to
+    ssh clients and do not share private host keys.
+  - `clone_hostname` — the guest boots named after its `hostname:` (or its VM
+    key) instead of its template: `/etc/hostname` gets the value as given (a
+    dotted value is an FQDN), and `/etc/hosts` loopback lines that named the
+    template now name the clone. Where cloud-init is installed, a
+    `cloud.cfg.d/99-boxman-hostname.cfg` drop-in sets `preserve_hostname: true`
+    and drops cloud-init's `update_etc_hosts` module, so a reboot does not bring
+    the template's name back — and cloud-init no longer maintains that clone's
+    `/etc/hosts`. A guest config that could keep the module on anyway fails
+    this property. An invalid `hostname:` is a config error before anything is
+    created; a VM *key* that is not a valid hostname (`my_vm`) only warns under
+    `auto` (the guest keeps its template's name — declare `hostname:`) and is
+    an error under `required`.
+
+  All enabled properties run in **one** offline `virt-sysprep` pass, judged by
+  the strictest policy among them: `auto` warns and continues if the pass
+  cannot run (preserving opaque-appliance compatibility), `required` makes it
+  a hard failure and removes the unsafe clone, `off` skips that property. The
+  pass always writes a fresh random `/etc/machine-id` once any other property
+  is enabled, so `clone_machine_id: off` is overridden (with a warning) unless
+  every `clone_*` policy is `off`. A clone that may have kept template identity
+  under `auto` is reported twice: beside the clone, and in a closing summary
+  at the **end** of `up` / `provision` / `update` (one line per VM, printed
+  however the run ends) — read that summary. Only new clones are affected;
+  existing VMs are not touched. ISO/PXE VMs are installed, not cloned, and are
+  exempt. ⚠ `virt-sysprep` is often the one libvirt tool that still needs a
+  password under a command-scoped sudoers policy.
 - After editing a template's cloud-init, recreate it: `boxman create-templates
   --force`, or `boxman provision --rebuild-templates`.
 - Base-image downloads are cached (default `~/.cache/boxman/images`,
   overridable via `cache.cache_dir` in the app config); checksums are verified
-  on every read.
+  on every read. Downloads honour `http_proxy` / `https_proxy`; an HTTP 4xx/5xx
+  error page or an empty response fails the download instead of being cached
+  as the image. Set `image.checksum` to catch a wrong or truncated file.
 
 ---
 
@@ -680,6 +758,7 @@ clusters:
         disk_size: 16G                  # empty boot disk the installer can target
         networks:                       # NOTE: networks:[{name}], NOT network_adapters:
           - name: live-net
+            mac: '52:54:00:0c:01:01'    # optional; pair with a dhcp.hosts reservation
         cdroms:
           - name: ubuntu-noble-live     # references the isos: entry
 ```
@@ -703,16 +782,22 @@ clusters:
   VM is still applied afterwards by the configure step, and an ISO VM using
   `networks:` logs a spurious `no network adapters defined for vm <x>,
   skipping` warning that is harmless.
+- **`networks[].mac` pins that NIC's MAC**, so a `dhcp.hosts` reservation hands
+  the guest a fixed address and name. It is validated before anything is
+  created: well-formed, and unique across the direct-boot VMs and every
+  `network_adapters[].mac`. Entries may also be bare names (`[live-net]`); a
+  blank entry is refused, and an omitted `networks:` means libvirt's `default`
+  network. The same applies to PXE VMs.
 - **Boot config is validated before any cloning starts.** An `hd`-boot VM needs
   a `base_image`; a `cdrom`-boot VM needs a first `cdroms:` entry that either
   names a known `isos:` key or carries an explicit `source:`; a `network`-boot
   VM needs neither. Problems are aggregated into one error.
-- **Local runtime only** — a non-empty `isos:` block is rejected under
-  `--runtime docker`, because the host image cache is not visible to the
-  in-container `virt-install`. ⚠ The guard fires only when `isos:` is
-  non-empty, so a VM booting via `cdroms: [{source: /abs/path.iso}]` with no
-  `isos:` entry is **not** rejected and will fail later and messier inside the
-  container.
+- **Local runtime only** — under `--runtime docker`, a VM whose `cdroms:`
+  names an `isos:` entry is rejected (*ISO boot ('isos:') is not yet supported
+  under the '<runtime>' runtime*), because the host image cache is not visible
+  to the in-container `virt-install`. ⚠ The guard fires only for referenced
+  `isos:` entries, so a VM booting via `cdroms: [{source: /abs/path.iso}]` is
+  **not** rejected and will fail later and messier inside the container.
 
 ---
 
@@ -720,7 +805,9 @@ clusters:
 
 1. **Declare the VM with `boot_order: [network, hd]`.** boxman then creates a
    *bare VM* — empty qcow2, no clone, no cloud-init seed. `base_image` is
-   ignored for that VM.
+   ignored for that VM. Pin the NIC with `networks: [{name: <net>, mac:
+   '52:54:00:…'}]` so the PXE server's system record / DHCP reservation
+   matches it.
 2. **Provision normally.** The DHCP/TFTP/HTTP comes from the PXE server, not
    from boxman.
 3. **For a one-off re-install on an existing VM:**
@@ -757,10 +844,13 @@ DHCP/TFTP/HTTP serves on.
 { "xml_path": "vm/vm.xml", "image_path": "vm/disk.qcow2", "provider": "libvirt" }
 ```
 
-`--uri` accepts `file://`, `http://`, `https://`; the manifest is downloaded
-but `xml_path` / `image_path` still resolve relative to the manifest's
-directory, so fully-remote packages are not supported yet. Schema validation
-runs *before* any disk I/O. `provider` must be `libvirt`.
+`--uri` accepts `file://`, `http://`, `https://`. For a remote manifest,
+`xml_path` / `image_path` resolve against the manifest's URL and are fetched;
+an absolute reference or a non-http(s) scheme is refused, and remote
+downloads are not checksum-verified. Schema validation runs *before* any disk
+I/O. `provider` must be `libvirt` (any case). The import is staged and moved
+into place in one rename; it refuses a VM name libvirt already has or an
+existing `<directory>/<vm>` directory, and every failure exits 2.
 
 **OCI auth** for push and pull: `ORAS_USERNAME` / `ORAS_PASSWORD`, or
 `~/.oras/config.json` (populated by `oras login`), or an interactive prompt.
@@ -839,6 +929,14 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   top-level `shared_networks:` entry is attached with a **macvlan** whose
   parent is that host bridge, making it directly L2-adjacent to any VM on the
   same bridge.
+- **Network references are checked.** A box `networks:` entry naming nothing
+  the cluster or project defines is a config error (it used to be dropped
+  silently, landing the box on compose's default network). So is a name
+  declared both under the cluster's `networks:` and under `shared_networks:`
+  when a box attaches to it — they are different L2 domains. For a shared
+  network, `gateway` and `ip_range` must lie inside `subnet`, and one with no
+  `ip_range` is warned about: docker then allocates from the whole subnet and
+  may hand a container an address a VM or DHCP server on that bridge holds.
 - **Getting in:** `boxman ssh` stays VM-only; use `boxman exec <cluster>.<box>`.
 - **Ansible:** containers appear in the generated inventory as ordinary hosts
   using the `community.docker` connection plugin, so `boxman run` and `tasks:`
@@ -871,23 +969,53 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
 `boxman update` is the non-destructive path; prefer it over `provision
 --force` when only tweaking a running cluster.
 
+- **Restarts are deferred.** A change that cannot reach a running guest is
+  written to the persistent config, and the summary lists the VM under
+  *restart required* (a warning, exit 0). Restart it yourself, or re-run with
+  `--restart` to let `update` shut it down cleanly and start it. `-y` does not
+  imply `--restart`; a paused guest is never restarted.
 - **CPU / memory**: hot-scaled up to the VM's live ceiling. Asking for more is
   **not an error** — boxman writes the persistent config and logs *"Restart
   needed for changes to take effect (live max ceiling cannot be raised on a
-  running VM)"*. Power-cycle to pick it up. Set `max_vcpus` / `max_memory` at
-  provision time to leave headroom; the ceilings themselves cannot be raised
-  live.
+  running VM)"*. Set `max_vcpus` / `max_memory` at provision time to leave
+  headroom; the ceilings themselves cannot be raised live.
 - **`memballoon`**: `free_page_reporting` / `autodeflate` / `stats_period` are
   diffed and applied; some transitions are flagged restart-pending. Free-page
   reporting returns pages the guest has freed. Host-wide dedup of *live*
   identical pages is KSM — a host policy boxman does not manage.
-- **Disks**: added at runtime; removed on next reboot.
+- **Disks**: new ones are created and attached at runtime — never over a file,
+  symlink or directory already at the image path; that fails the command
+  (exit 2) naming it. Remove or rename it, or set `attach_only: true` to adopt
+  it. A disk dropped from `disks:` is detached only if boxman recorded
+  attaching it and it is still at the recorded target with the recorded
+  source; a replacement at a reused target, a disk a snapshot moved behind an
+  overlay, or a hand-attached disk is reported and left alone, and the image
+  file is never deleted. The detach needs the guest shut off: on a running VM
+  it stays pending — an ordinary reboot does *not* apply it — until
+  `update --restart` or an `update` while the VM is off.
 - **`shared_folders`** (virtiofs): hot-attached with a persistent fallback to
   config-only on next boot. Hotplug needs QEMU 6.2+ / libvirt 8.6+; older hosts
   fall back gracefully.
-- **`cdroms`**: attach / detach / swap by `target` device.
+- **`cdroms`**: swapping the media of an existing drive works live. Adding or
+  removing a drive on a running VM changes only the persistent definition
+  (libvirt cannot hot-plug IDE/SATA): it appears at the next boot, or now with
+  `--restart`. Without `target`, a new drive takes the first free target on a
+  bus the machine type has — SATA `sd*` on q35, IDE `hd*` first on i440fx. On
+  cloned VMs the template's emptied seed drive usually holds `sda`, so do not
+  name `sda` yourself. An `isos:` entry a cdrom names is downloaded if not yet
+  cached; a cached file is never re-fetched, and a checksum mismatch fails
+  that VM rather than triggering a download. `--dry-run` downloads nothing.
+- **SSH step**: `update` ends by rewriting `ssh_config` and adding the cluster
+  admin key to every running VM. A running VM that does not get the key fails
+  the update (exit 2) after everything else ran; one that is not running only
+  warns. A cluster without `admin_pass` gets no key, with a warning.
 - **VM add/remove**: new VMs are added; orphaned ones prompt before removal
-  (skip with `--yes`).
+  (skip with `--yes`). Every VM teardown (`update`, `deprovision`, `destroy`,
+  `provision`/`up --force`) removes only the storage the VM owns: its boot
+  disk, snapshot overlays and memory files, and the extra disks boxman recorded
+  creating. CD-ROM media, `attach_only` disks, anything outside the cluster
+  workdirs and anything another domain uses (directly or as a backing file)
+  are kept, each named in a warning.
 - **`--dry-run`** shows the diff without applying.
 
 ---
@@ -902,6 +1030,15 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   `--force` clears a colliding name or leftover files and re-takes.
 - `snapshot restore [--name N]` restores (latest if omitted). `boxman restore`
   is the shortcut for "all VMs to latest".
+- **A restore backs up the overlays the revert deletes, and refuses if it
+  cannot** (out of space, an unreadable snapshot chain, a stray
+  `<overlay>.preserve` already there). A running guest is paused while they
+  are copied. If the revert itself fails the guest is deliberately left
+  paused — check `virsh domstate` first. Do not name a snapshot
+  `<something>.preserve`.
+- A VM holding a managed save (after `boxman down`) cannot be reverted to a
+  snapshot that captured no memory; the restore refuses up front. Run `boxman
+  up` first, or discard the saved memory with `virsh managedsave-remove`.
 - `snapshot list` is the raw libvirt list; `snapshot log [-n N] [--reverse]
   [--json] [--no-graph]` is a git-log-style aggregated view with an ASCII graph
   and a `← current` marker. Prefer `log` for a human overview.
@@ -970,7 +1107,44 @@ projects cache. Do not `virsh undefine` boxman-managed VMs by hand.
 ### Provision succeeds but `boxman ssh` connects to the wrong IP
 
 `ssh_config` caches the IP at `up` time. If the VM rebooted with a new lease,
-run `boxman up` again — it re-discovers the IP and rewrites the file.
+run `boxman up` again — it re-discovers the IP and rewrites the file. A block
+marked `# boxman: <vm> was not running …` was kept from a run when the VM was
+down; `up` (or `update` once the VM runs) replaces it with the live address.
+
+### `update` / `provision` exits 2 with `ssh key not added to <cluster>/<vm>: …`
+
+A running VM did not get the cluster admin key. The reason follows the colon:
+no IP address (no DHCP lease — check `virsh domifaddr`); the key copy or the
+login check kept failing (wrong `admin_pass`, sshd down, password login
+disabled); an `admin_pass` reference that cannot be resolved (unset
+`${env:VAR}`, missing or unreadable `file://`); or a missing `.pub`. The rest
+of the run completed — fix the cause and run `boxman update` again.
+
+### `deprovision did not complete` / `destroy did not complete`
+
+Something survived the teardown (a VM, a network, a compose cluster, the
+docker runtime), or it could not be confirmed. Teardown is not transactional,
+so some removals already happened; what is kept is the state needed to retry —
+the cache entry, generated files and workspace. `destroy` also exits 2,
+keeping what is left, when it cannot tell which workspace files another domain
+still uses, or a mount point sits under the workspace (`… is a mount point`).
+Fix what the error names and run the same
+command again; both verbs are idempotent. `provision --force` and
+`up --force` abort the same way rather than provisioning over leftovers.
+
+### `up` refuses: *an external save file written by an older boxman exists*
+
+A shut-off VM has a `<workdir>/<vm>.save` from an older boxman. Starting it
+would discard that memory image, and restoring it unasked could apply a stale
+image to a disk that has moved on. Use it with `boxman control start --restore
+--vms <vm>`, or delete the file, then `boxman up`.
+
+### `refusing to create the disk image <path>: a file is already there`
+
+boxman never creates a disk over an existing file, symlink or directory — it
+may be a disk an earlier teardown kept, another VM's disk, or the base of a
+snapshot chain. Nothing was changed. Remove or rename it, or set
+`attach_only: true` on that disk to attach the existing file.
 
 ### `cannot provision — existing VM(s)` / `project is already registered`
 
@@ -986,7 +1160,7 @@ deprovisions and re-provisions everything. If the missing VMs were newly
 ### `boxman update` does not apply the new CPU/memory
 
 Exceeding the live ceiling is not an error — see the update section above.
-Power-cycle the VM.
+Power-cycle the VM, or re-run `boxman update --restart`.
 
 ### A routed-network guest has an address but no connectivity
 
@@ -1058,9 +1232,9 @@ Upgrade boxman so `passlib` is present, and recreate the template.
 | Request | Approach |
 |---|---|
 | "Add a VM" | Edit `clusters.<c>.vms.<new>` → `boxman update`. Not `provision`. |
-| "Bump CPU/RAM on a running VM" | Edit `cpus`/`memory` → `boxman update`. Beyond the live ceiling it applies on the next power-cycle. |
+| "Bump CPU/RAM on a running VM" | Edit `cpus`/`memory` → `boxman update`. Beyond the live ceiling it applies on the next power-cycle, or now with `boxman update --restart`. |
 | "Mount a host directory in a VM" | Add `shared_folders: [{name, host_path, readonly}]` → `boxman update`. Inside: `mount -t virtiofs <name> /mnt/...`. |
-| "Attach an ISO" | Add `cdroms: [{name, source, target}]` → `boxman update`. |
+| "Attach an ISO" | Add `cdroms: [{name, source}]` (`target` optional) → `boxman update`. On a running VM a new drive appears at its next boot, or now with `--restart`; changing the `source` of an existing drive swaps the media live. |
 | "PXE-boot a bare VM" | `boot_order: [network, hd]`, provision normally. One-off re-install: `boxman pxe-boot`. |
 | "Boot from a live/install ISO" | `isos:` entry + a VM with `boot_order: [cdrom, hd]`, `disk_size:`, `cdroms:` — use `vcpus:`/`networks:` on that VM. Local runtime only. |
 | "Use a registry image as the base" | `base_image: oci://registry/repo:tag`, or `templates.<k>.image.uri: oci://…`. `boxman image inspect` first. |
@@ -1077,8 +1251,8 @@ Upgrade boxman so `passlib` is present, and recreate the template.
 | "I broke the template, recreate it" | `boxman create-templates --force`. |
 | "Reclaim disk" | `boxman storage df`, then `boxman storage optimize`. |
 | "See / prune snapshot history" | `boxman snapshot log`; `boxman snapshot collapse --to <name>`. |
-| "Turn up the logging" | `-v` / `-vv` / `-vvv` either side of the subcommand, or `BOXMAN_VERBOSITY=2`. `-q` for warnings only. |
-| "Tear down only the docker runtime" | `boxman destroy-runtime`. |
+| "Turn up the logging" | `-v` / `-vv` / `-vvv` either side of the subcommand, or `BOXMAN_VERBOSITY=2`. `-q` (after the subcommand) for warnings only. |
+| "Tear down only the docker runtime" | `boxman destroy-runtime` — it removes `.boxman`, and with it libvirt's domain, network and snapshot definitions. |
 
 ---
 
@@ -1087,7 +1261,8 @@ Upgrade boxman so `passlib` is present, and recreate the template.
 | Path | Role |
 |---|---|
 | `<project_dir>/conf.yml` | Project config — the file the user edits. |
-| `<project_dir>/conf.rendered.yml` | Jinja-rendered conf, written by `conf` / config load. Gitignored, safe to delete. |
+| `<project_dir>/conf.rendered.yml` | Jinja-rendered conf, written by `conf` / config load. Every `env()` is resolved in it (passwords included), so it is written mode 0600. Gitignored, safe to delete. |
+| `<project_dir>/.boxman/runtime/docker/data/` | Docker runtime only: the container's libvirt image dir, ssh keys, and libvirt's own state (`etc-libvirt/`, `var-lib-libvirt-qemu/`). Removed by `destroy-runtime`. |
 | `~/.config/boxman/boxman.yml` | App-level config: defaults, runtime, ssh keys, image cache. |
 | `~/.config/boxman/cache/projects.json` | Cache of provisioned projects and networks. Runtime-scoped. |
 | `~/.cache/boxman/images/` | Image and ISO cache. |
