@@ -112,7 +112,7 @@ class TestResolveIsos:
             "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}
         })
         mgr._runtime_name = "docker"
-        with pytest.raises(RuntimeError, match="not yet supported under the 'docker' runtime"):
+        with pytest.raises(ConfigError, match="not yet supported under the 'docker' runtime"):
             mgr._resolve_isos()
 
     def test_raises_when_download_fails(self, tmp_path):
@@ -726,3 +726,83 @@ class TestConfigIsRefusedBeforeAnythingIsBuilt:
                   "cdroms": [{"source": "/x.iso"}],
                   "networks": [{"name": "n", "mac": "52:54:00:0c:01:09"}]}}}}}
         _manager_with_config(good).validate_direct_boot_config()
+
+    _ISO_VM = {"project": "p",
+               "isos": {"live": {"uri": "https://example.com/live.iso"}},
+               "clusters": {"c": {"vms": {
+                   "v": {"boot_order": ["cdrom", "hd"], "cdroms": ["live"]}}}}}
+
+    def test_provision_refuses_iso_boot_under_docker_before_anything(self):
+        """The guard in _resolve_isos is only reached from clone_vms, after
+        templates were built and networks defined."""
+        mgr = _manager_with_config(self._ISO_VM)
+        mgr._runtime_name = "docker"
+        cls = type(mgr)
+        with patch.object(cls, "_update_sessions_with_runtime"), \
+             patch.object(cls, "ensure_templates_exist") as templates, \
+             patch.object(cls, "_create_templates_impl") as build, \
+             patch.object(cls, "deprovision") as deprovision, \
+             patch.object(cls, "clone_vms") as clone, \
+             patch.object(cls, "define_networks") as networks:
+            with pytest.raises(ConfigError,
+                               match="not yet supported under the 'docker' runtime"):
+                mgr.provision(SimpleNamespace(force=True, rebuild_templates=False))
+
+        templates.assert_not_called()
+        build.assert_not_called()
+        deprovision.assert_not_called()
+        clone.assert_not_called()
+        networks.assert_not_called()
+
+    def test_iso_runtime_check_refuses_only_a_referenced_iso(self):
+        """Without this the check could pass by rejecting everything."""
+        mgr = _manager_with_config(self._ISO_VM)
+        mgr.validate_iso_runtime()  # local runtime
+
+        explicit_source = {**self._ISO_VM, "clusters": {"c": {"vms": {
+            "v": {"boot_order": ["cdrom", "hd"],
+                  "cdroms": [{"name": "live", "source": "/x.iso"}]}}}}}
+        mgr = _manager_with_config(explicit_source)
+        mgr._runtime_name = "docker"
+        mgr.validate_iso_runtime()  # the source wins; 'live' is only a label
+
+        # The shape is _resolve_isos's to report (as a ConfigError); this
+        # check must not crash on it first with an AttributeError.
+        mgr = _manager_with_config({**self._ISO_VM, "isos": ["live"]})
+        mgr._runtime_name = "docker"
+        mgr.validate_iso_runtime()
+
+
+class TestIsoResolutionErrorsAreConfigErrors:
+    """A bare ValueError or RuntimeError from ISO resolution reached main() as
+    a traceback and exit 1; a ConfigError is one line and exit 2."""
+
+    def test_an_unknown_iso_name_is_a_config_error(self):
+        mgr = _manager_with_config({"project": "p", "clusters": {"c": {"vms": {
+            "v": {"boot_order": ["cdrom", "hd"], "cdroms": ["nope"]}}}}})
+        with pytest.raises(ConfigError, match="unknown iso 'nope'") as info:
+            mgr._resolve_iso_config()
+        assert isinstance(info.value.__cause__, ValueError)
+
+    def test_a_malformed_isos_section_is_a_config_error(self):
+        mgr = _manager_with_config({"project": "p", "isos": ["live"],
+                                    "clusters": {"c": {"vms": {
+                                        "v": {"cdroms": ["live"]}}}}})
+        with pytest.raises(ConfigError, match="'isos:' must be a mapping"):
+            mgr._resolve_iso_config()
+
+    def test_main_exits_2_for_the_docker_refusal(self):
+        from boxman.scripts import app
+
+        mgr = _manager_with_config(TestConfigIsRefusedBeforeAnythingIsBuilt._ISO_VM)
+        mgr._runtime_name = "docker"
+        with pytest.raises(ConfigError) as info:
+            mgr.validate_iso_runtime()
+
+        with patch.object(app, "_main", side_effect=info.value), \
+             patch.object(app.log, "error") as error:
+            with pytest.raises(SystemExit) as exit_info:
+                app.main()
+
+        assert exit_info.value.code == 2
+        error.assert_called_once_with(str(info.value))
