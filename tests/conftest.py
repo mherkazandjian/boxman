@@ -173,7 +173,13 @@ def pytest_configure(config: pytest.Config) -> None:
 def pytest_unconfigure(config: pytest.Config) -> None:
     guard = config.stash.get(_HOST_COMMANDS, None)
     if guard is not None:
-        shutil.rmtree(guard.bindir, ignore_errors=True)
+        # A session aborted mid-test (Ctrl-C, ``pytest.exit()``) skips that
+        # test's teardown hook, so the guard can still be installed here:
+        # restore ``PATH`` before deleting the fakes it would lead with.
+        try:
+            guard.uninstall()
+        finally:
+            shutil.rmtree(guard.bindir, ignore_errors=True)
 
 
 @pytest.hookimpl(wrapper=True)

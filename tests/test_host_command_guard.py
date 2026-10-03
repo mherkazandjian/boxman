@@ -4,6 +4,7 @@ The guard in ``tests/conftest.py`` (#214): outside the integration tier,
 nothing, and a test that calls one fails.
 """
 
+import os
 import shutil
 import subprocess
 
@@ -80,3 +81,44 @@ def test_a_test_that_calls_one_fails_at_teardown(pytester):
         "*ERROR at teardown of test_a_call_fails_the_test*",
         "*    virsh list --all",
     ])
+
+
+#: Sessions that abort while a guarded test runs, which skips that test's
+#: ``pytest_runtest_teardown``, and the exit code each ends with.
+_ABORTED = {
+    "pytest.exit": ("""
+import pytest
+
+
+def test_aborts_the_session():
+    pytest.exit("abort", returncode=3)
+""", 3),
+    "ctrl-c": ("""
+import pytest
+
+
+@pytest.fixture
+def interrupted():
+    raise KeyboardInterrupt
+
+
+def test_aborts_the_session(interrupted):
+    pass
+""", pytest.ExitCode.INTERRUPTED),
+}
+
+
+@pytest.mark.parametrize("abort", _ABORTED)
+def test_a_session_aborted_mid_test_restores_path(pytester, abort):
+    """The guard is still installed when such a session ends; ``PATH``
+    must come back before its fakes are deleted, or whoever called
+    ``pytest.main()`` is left with a ``PATH`` led by a missing directory."""
+    session, exit_code = _ABORTED[abort]
+    pytester.makepyfile(session)
+    before = os.environ["PATH"]
+
+    result = pytester.runpytest_inprocess(plugins=[conftest],
+                                          no_reraise_ctrlc=True)
+
+    assert result.ret == exit_code
+    assert os.environ["PATH"] == before
