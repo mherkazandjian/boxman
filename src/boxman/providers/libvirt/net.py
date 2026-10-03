@@ -1073,8 +1073,17 @@ class Network:
                 self.logger.info(f"network {self.name} does not exist, nothing to destroy")
                 return True
 
-            # destroy only when the network itself is active
-            if self.is_active():
+            # destroy only when the network itself is active -- and "could not
+            # ask" is not "not active": the undefine that follows would leave
+            # a running network running, as a transient one that keeps its
+            # bridge, while its caller records it as removed
+            active = self._listed_networks(active_only=True)
+            if active is None:
+                self.logger.error(
+                    f"could not ask libvirt whether network {self.name} is "
+                    f"running")
+                return False
+            if self.name in active:
                 self.virsh.execute("net-destroy", self.name)
                 self.logger.info(f"network {self.name} destroyed successfully")
 

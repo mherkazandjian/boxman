@@ -552,6 +552,27 @@ class TestAnUnanswerableAttachmentStopsTheRemoval:
         assert host.ran("net-undefine") == []
 
 
+class TestARunningNetworkIsNotUndefinedBlind:
+    """``destroy_network`` read a failed "which networks are running?" as
+    "not running", skipped ``net-destroy`` and let ``net-undefine`` run: on a
+    running network that only makes it transient. It keeps its bridge, and
+    with the cache entry then forgotten nothing records it any more."""
+
+    def test_an_unanswerable_running_check_stops_before_the_undefine(self):
+        host = NetHost()
+        host.define_network(GONE, mode="nat", active=True)
+        # only the running-networks listing fails; `net-list --all` answers
+        host.fail_for.add(("net-list", "--name"))
+        mgr = _live_manager()
+
+        results = _prune(mgr, host)
+
+        assert results == {GONE: "failed"}
+        assert host.ran("net-undefine") == []
+        assert host.networks[GONE]["persistent"]
+        assert GONE in mgr.cache.projects[PROJECT]["networks"]
+
+
 def _ask(host: NetHost, call: str, *args):
     """Call the session method *call* with every command answered by
     *host*."""
