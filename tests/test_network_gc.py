@@ -25,6 +25,7 @@ from boxman.manager import BoxmanManager
 from boxman.providers.libvirt.net import Network
 from boxman.providers.libvirt.session import LibVirtSession
 from fake_libvirt_host import Result
+from test_libvirt_net import _installed
 
 pytestmark = pytest.mark.unit
 
@@ -54,7 +55,10 @@ def _manager(declared: dict | None = None,
     }
     mgr.provider = MagicMock()
     mgr.provider.network_attached_domains.return_value = []
-    mgr.provider.live_network_mode.return_value = "nat"
+    mgr.provider.live_network_state.return_value = {
+        "mode": "nat", "bridge_name": "virbr2",
+        "ip_address": "10.9.0.1", "netmask": "255.255.255.0"}
+    mgr.provider.network_bridges.return_value = {}
     mgr.provider.remove_network.return_value = True
     return mgr
 
@@ -201,22 +205,130 @@ class TestTheModeComesFromTheLiveNetwork:
         return _manager(declared={},
                         provisioned={f"{PREFIX}gone": {"bridge_name": "virbr2"}})
 
-    def test_the_live_mode_is_passed_to_the_removal(self):
+    def test_the_live_mode_and_bridge_are_passed_to_the_removal(self):
+        """The bridge is passed pinned, so ``Network`` does not look it up
+        again on its own -- a lookup that answers a failure with None."""
         mgr = self._orphaned()
-        mgr.provider.live_network_mode.return_value = "route"
+        mgr.provider.live_network_state.return_value = {
+            "mode": "route", "bridge_name": "virbr7"}
         mgr._prune_orphaned_networks(prune=True)
         info = mgr.provider.remove_network.call_args.kwargs["info"]
         assert info["mode"] == "route"
-        assert info["bridge_name"] == "virbr2"
+        assert info["bridge"] == {"name": "virbr7"}
 
-    def test_an_unreadable_live_mode_does_not_invent_one(self):
-        """Guessing "nat" would silently skip the route-mode teardown, which
-        is exactly the iptables leak this fix is about."""
+    def test_the_live_mode_is_recorded_before_anything_is_torn_down(self):
         mgr = self._orphaned()
-        mgr.provider.live_network_mode.return_value = None
+        mgr.provider.live_network_state.return_value = {
+            "mode": "route", "bridge_name": "virbr7"}
+        record = mgr.cache.projects[PROJECT]["networks"][f"{PREFIX}gone"]
+        seen = {}
+        mgr.provider.remove_network.side_effect = (
+            lambda **_kw: seen.update(record) or False)
         mgr._prune_orphaned_networks(prune=True)
+        assert seen["mode"] == "route"
+        assert seen["bridge_name"] == "virbr7"
+        mgr.cache.write_projects_cache.assert_called()
+
+    def test_an_unreadable_live_definition_stops_the_removal(self):
+        """Leaving the mode out does not leave it unset: ``Network`` takes a
+        missing mode for "nat", which skips the route-mode teardown -- the
+        iptables leak this fix is about (Copilot review)."""
+        mgr = self._orphaned()
+        mgr.provider.live_network_state.side_effect = NetworkError("no xml")
+        results = mgr._prune_orphaned_networks(prune=True)
+        assert results == {f"{PREFIX}gone": "failed"}
+        mgr.provider.remove_network.assert_not_called()
+        mgr.cache.unregister_network.assert_not_called()
+
+    def test_a_provider_without_a_live_definition_stops_the_removal(self):
+        mgr = self._orphaned()
+        del mgr.provider.live_network_state
+        results = mgr._prune_orphaned_networks(prune=True)
+        assert results == {f"{PREFIX}gone": "failed"}
+        mgr.provider.remove_network.assert_not_called()
+
+    def test_a_definition_without_a_forward_mode_stops_the_removal(self):
+        mgr = self._orphaned()
+        mgr.provider.live_network_state.return_value = {
+            "mode": None, "bridge_name": "virbr2"}
+        results = mgr._prune_orphaned_networks(prune=True)
+        assert results == {f"{PREFIX}gone": "failed"}
+        mgr.provider.remove_network.assert_not_called()
+
+    def test_a_routed_definition_without_a_bridge_stops_the_removal(self):
+        """Its isolation chains are named after the bridge; without one the
+        teardown would find nothing and report success."""
+        mgr = self._orphaned()
+        mgr.provider.live_network_state.return_value = {
+            "mode": "route", "bridge_name": None}
+        results = mgr._prune_orphaned_networks(prune=True)
+        assert results == {f"{PREFIX}gone": "failed"}
+        mgr.provider.remove_network.assert_not_called()
+
+    def test_a_mode_that_cannot_be_recorded_stops_the_removal(self):
+        mgr = self._orphaned()
+        mgr.cache.write_projects_cache.side_effect = OSError("read-only")
+        results = mgr._prune_orphaned_networks(prune=True)
+        assert results == {f"{PREFIX}gone": "failed"}
+        mgr.provider.remove_network.assert_not_called()
+
+
+class TestANetworkLibvirtNoLongerHas:
+    """Nothing is left in libvirt to read the mode from, so it comes from
+    the cache record an earlier, interrupted removal left -- or not at
+    all."""
+
+    @staticmethod
+    def _orphaned(record: dict):
+        mgr = _manager(declared={}, provisioned={f"{PREFIX}gone": record})
+        mgr.provider.live_network_state.return_value = None
+        return mgr
+
+    def test_without_a_recorded_mode_it_is_not_forgotten(self):
+        mgr = self._orphaned({"bridge_name": "virbr2"})
+        results = mgr._prune_orphaned_networks(prune=True)
+        assert results == {f"{PREFIX}gone": "failed"}
+        mgr.provider.remove_network.assert_not_called()
+        mgr.cache.unregister_network.assert_not_called()
+
+    def test_a_recorded_route_mode_finishes_the_teardown(self):
+        mgr = self._orphaned({"bridge_name": "virbr2", "mode": "route"})
+        results = mgr._prune_orphaned_networks(prune=True)
+        assert results == {f"{PREFIX}gone": "removed"}
         info = mgr.provider.remove_network.call_args.kwargs["info"]
-        assert "mode" not in info
+        assert info == {"mode": "route", "bridge": {"name": "virbr2"}}
+
+    def test_a_recorded_nat_mode_needs_no_bridge_check(self):
+        mgr = self._orphaned({"bridge_name": "virbr2", "mode": "nat"})
+        mgr.provider.network_bridges.side_effect = NetworkError("down")
+        results = mgr._prune_orphaned_networks(prune=True)
+        assert results == {f"{PREFIX}gone": "removed"}
+        info = mgr.provider.remove_network.call_args.kwargs["info"]
+        assert info["mode"] == "nat"
+
+    def test_a_bridge_another_network_now_holds_is_left_alone(self):
+        """The isolation chains are keyed on the bridge name: withdrawing
+        them would withdraw the new holder's isolation."""
+        mgr = self._orphaned({"bridge_name": "virbr2", "mode": "route"})
+        mgr.provider.network_bridges.return_value = {"newcomer": "virbr2"}
+        results = mgr._prune_orphaned_networks(prune=True)
+        assert results == {f"{PREFIX}gone": "failed"}
+        mgr.provider.remove_network.assert_not_called()
+        assert any("newcomer" in str(call)
+                   for call in mgr.logger.error.call_args_list)
+
+    def test_an_unanswerable_bridge_question_stops_the_removal(self):
+        mgr = self._orphaned({"bridge_name": "virbr2", "mode": "route"})
+        mgr.provider.network_bridges.side_effect = NetworkError("down")
+        results = mgr._prune_orphaned_networks(prune=True)
+        assert results == {f"{PREFIX}gone": "failed"}
+        mgr.provider.remove_network.assert_not_called()
+
+    def test_a_recorded_route_without_a_bridge_stops_the_removal(self):
+        mgr = self._orphaned({"mode": "route"})
+        results = mgr._prune_orphaned_networks(prune=True)
+        assert results == {f"{PREFIX}gone": "failed"}
+        mgr.provider.remove_network.assert_not_called()
 
 
 # -- the removal path against libvirt, at the shell boundary ------------------
@@ -368,6 +480,46 @@ def _prune(mgr: BoxmanManager, host: NetHost) -> dict[str, str]:
         return mgr._prune_orphaned_networks(prune=True)
 
 
+class TestAnUnreadableModeStopsTheRemoval:
+    """Copilot review, finding 1: a mode left out of ``info`` is not "no
+    mode" -- ``Network`` defaults it to ``nat``, which skips the route
+    teardown, and the cache entry was then forgotten anyway."""
+
+    def test_a_defined_network_whose_xml_cannot_be_read_is_not_removed(self):
+        host = NetHost()
+        host.define_network(GONE, mode="route")
+        host.fail_for.add(("net-dumpxml", GONE))
+        mgr = _live_manager()
+
+        results = _prune(mgr, host)
+
+        assert results == {GONE: "failed"}
+        assert host.ran("net-destroy") == []
+        assert host.ran("net-undefine") == []
+        assert host.networks[GONE]["persistent"]
+        assert GONE in mgr.cache.projects[PROJECT]["networks"]
+
+    def test_an_interrupted_route_removal_finishes_on_the_next_run(self):
+        """The removal undefines the network before it withdraws the
+        isolation rules, so a teardown refused half way leaves no definition
+        to read the mode from. The next run must still finish the job, not
+        forget the entry with the chains left in the firewall."""
+        table = _installed("virbr2",
+                           refuse={"iptables -X BXM_ISO_I_virbr2": [4, 0]})
+        host = NetHost(iptables=table)
+        host.define_network(GONE, mode="route", bridge="virbr2")
+        mgr = _live_manager()
+
+        assert _prune(mgr, host) == {GONE: "failed"}
+        assert GONE not in host.networks
+        assert table.mentions("virbr2")
+        assert GONE in mgr.cache.projects[PROJECT]["networks"]
+
+        assert _prune(mgr, host) == {GONE: "removed"}
+        assert table.mentions("virbr2") == []
+        assert GONE not in mgr.cache.projects[PROJECT]["networks"]
+
+
 class TestAnUnanswerableAttachmentStopsTheRemoval:
     """Copilot review, finding 2: ``attached_domains()`` answered a failed
     ``virsh list`` with ``[]`` and skipped a domain whose ``domiflist``
@@ -449,3 +601,91 @@ class TestWhatTheSessionSaysIsAttached:
                               assign_new_bridge=False,
                               provider_config={"use_sudo": False})
             assert network.attached_domains() == []
+
+
+class TestWhatTheSessionSaysIsDefined:
+    """``live_network_state`` and ``network_bridges`` either answer or
+    raise: a failure is never "not defined" or "no bridge"."""
+
+    def test_a_defined_network_is_read_from_its_live_xml(self):
+        host = NetHost()
+        host.define_network(GONE, mode="route", bridge="virbr4")
+        state = _ask(host, "live_network_state", GONE)
+        assert state["mode"] == "route"
+        assert state["bridge_name"] == "virbr4"
+
+    def test_a_network_that_is_not_defined_is_none(self):
+        host = NetHost()
+        host.define_network("someone-else")
+        assert _ask(host, "live_network_state", GONE) is None
+
+    def test_a_failed_network_listing_is_not_absence(self):
+        host = NetHost()
+        host.define_network(GONE)
+        host.fail.add("net-list")
+        with pytest.raises(NetworkError, match="could not list"):
+            _ask(host, "live_network_state", GONE)
+
+    def test_an_unreadable_definition_raises(self):
+        host = NetHost()
+        host.define_network(GONE)
+        host.fail_for.add(("net-dumpxml", GONE))
+        with pytest.raises(NetworkError, match="could not be read"):
+            _ask(host, "live_network_state", GONE)
+
+    def test_an_unparseable_definition_raises(self):
+        host = NetHost()
+        host.define_network(GONE)
+        host.xml[GONE] = "<network><forward mode='route'"
+        with pytest.raises(NetworkError, match="could not be parsed"):
+            _ask(host, "live_network_state", GONE)
+
+    def test_every_defined_network_bridge_is_reported(self):
+        host = NetHost()
+        host.define_network("a", bridge="virbr1")
+        host.define_network("b", bridge="virbr2", active=False)
+        assert _ask(host, "network_bridges") == {
+            "a": "virbr1", "b": "virbr2"}
+
+    def test_a_bridge_listing_that_misses_one_network_raises(self):
+        host = NetHost()
+        host.define_network("a", bridge="virbr1")
+        host.define_network("b", bridge="virbr2")
+        host.fail_for.add(("net-dumpxml", "b"))
+        with pytest.raises(NetworkError):
+            _ask(host, "network_bridges")
+
+    def test_a_failed_bridge_listing_raises(self):
+        host = NetHost()
+        host.fail.add("net-list")
+        with pytest.raises(NetworkError):
+            _ask(host, "network_bridges")
+
+
+class TestAnInterruptedRemovalLeavesOthersAlone:
+
+    def test_a_bridge_taken_since_keeps_its_new_owners_isolation(self):
+        table = _installed("virbr2",
+                           refuse={"iptables -X BXM_ISO_I_virbr2": [4, 0]})
+        host = NetHost(iptables=table)
+        host.define_network(GONE, mode="route", bridge="virbr2")
+        mgr = _live_manager()
+        assert _prune(mgr, host) == {GONE: "failed"}
+
+        # a network pinned to virbr2 is defined in the meantime, and its
+        # isolation is installed on the same names
+        host.define_network("newcomer", mode="route", bridge="virbr2")
+        fresh = _installed("virbr2")
+        table.chains, table.rules = fresh.chains, fresh.rules
+
+        assert _prune(mgr, host) == {GONE: "failed"}
+        assert table.rule("INPUT", "-i virbr2 -j BXM_ISO_I_virbr2")
+        assert table.rule("BXM_ISO_O_virbr2", "-j DROP")
+        assert GONE in mgr.cache.projects[PROJECT]["networks"]
+
+    def test_a_network_removed_by_hand_without_a_record_is_kept(self):
+        host = NetHost()
+        mgr = _live_manager()
+        assert _prune(mgr, host) == {GONE: "failed"}
+        assert GONE in mgr.cache.projects[PROJECT]["networks"]
+        assert host.ran("net-destroy") == []

@@ -403,15 +403,136 @@ class NetworksMixin:
         except Exception as exc:
             return [], f'{type(exc).__name__}: {exc}'
 
+    def _record_orphan_state(self, full_name: str, mode: str,
+                             bridge_name: str | None) -> None:
+        """
+        Write a network's live forward mode and bridge into its cache entry.
+
+        ``remove_network`` undefines a network before it withdraws a routed
+        network's isolation rules, so a removal that fails between the two
+        leaves no definition to read the mode from on the next run. The
+        record is what lets that run finish the teardown rather than guess.
+
+        Raises:
+            KeyError: when the entry is no longer in the cache.
+            OSError, ValueError: when the cache cannot be read or written.
+        """
+        self.cache.read_projects_cache()
+        record = self.cache.projects[self.config['project']]['networks'][full_name]
+        if (record.get('mode') == mode
+                and (not bridge_name or record.get('bridge_name') == bridge_name)):
+            return
+        record['mode'] = mode
+        if bridge_name:
+            record['bridge_name'] = bridge_name
+        self.cache.write_projects_cache()
+
+    def _orphan_teardown_info(self, full_name: str,
+                              cached: dict) -> dict | None:
+        """
+        Describe an orphaned network for ``remove_network``, or refuse to.
+
+        The forward mode decides whether removal also withdraws iptables
+        rules -- only ``route`` has boxman-owned ones -- and ``Network``
+        takes a missing mode for ``nat``, which skips exactly that teardown.
+        So the mode is never left out and never guessed:
+
+        - a defined network is described from its *live* definition, and
+          that mode and bridge are recorded in the cache entry before
+          anything is torn down;
+        - a network libvirt no longer has is described from that record --
+          left by an earlier removal that stopped half way -- and a routed
+          one only while no defined network holds its bridge, whose rules
+          would otherwise be the ones withdrawn;
+        - anything that cannot be read, or was never recorded, is a refusal.
+
+        Args:
+            full_name: the fully qualified network name.
+            cached: its cache record.
+
+        Returns:
+            dict: the ``info`` for ``remove_network``, or None when it must
+            not be removed; the reason has been logged.
+        """
+        def refuse(reason: str) -> None:
+            self.logger.error(
+                f"not removing the orphaned network {full_name}: {reason}. "
+                f"Its cache entry is kept, so it is reported again on the "
+                f"next run.")
+
+        session = self.provider
+        if not hasattr(session, 'live_network_state'):
+            refuse("the provider cannot report its live definition, so its "
+                   "forward mode is unknown")
+            return None
+        try:
+            actual = session.live_network_state(full_name)
+        except Exception as exc:
+            refuse(f"its live definition could not be read "
+                   f"({type(exc).__name__}: {exc}), and its forward mode "
+                   f"decides whether isolation rules have to be removed too")
+            return None
+
+        if actual is not None:
+            mode, bridge = actual.get('mode'), actual.get('bridge_name')
+            if not mode:
+                refuse("its live definition names no forward mode")
+                return None
+            if mode == 'route' and not bridge:
+                refuse("it is a routed network with no bridge in its live "
+                       "definition, so its isolation rules cannot be found")
+                return None
+            try:
+                self._record_orphan_state(full_name, mode, bridge)
+            except (KeyError, OSError, ValueError) as exc:
+                refuse(f"its forward mode could not be recorded in the "
+                       f"projects cache first ({type(exc).__name__}: {exc})")
+                return None
+            return self._teardown_info({'actual': actual}, cached)
+
+        mode, bridge = cached.get('mode'), cached.get('bridge_name')
+        if not mode:
+            refuse(f"libvirt no longer has it and its forward mode was never "
+                   f"recorded, so whether it left isolation rules on bridge "
+                   f"{bridge or '(unknown)'} cannot be told. Check for "
+                   f"BXM_ISO_* chains on that bridge and remove the entry "
+                   f"from the projects cache by hand")
+            return None
+
+        info: dict[str, Any] = {'mode': mode}
+        if mode == 'route':
+            if not bridge:
+                refuse("it was a routed network and no bridge is recorded "
+                       "for it, so its isolation rules cannot be found")
+                return None
+            if not hasattr(session, 'network_bridges'):
+                refuse(f"the provider cannot say whether another network "
+                       f"now holds bridge {bridge}")
+                return None
+            try:
+                holders = sorted(name for name, held in
+                                 session.network_bridges().items()
+                                 if held == bridge)
+            except Exception as exc:
+                refuse(f"whether another network now holds bridge {bridge} "
+                       f"could not be determined ({type(exc).__name__}: "
+                       f"{exc})")
+                return None
+            if holders:
+                refuse(f"bridge {bridge} now belongs to "
+                       f"{', '.join(holders)}, and withdrawing the isolation "
+                       f"rules on it would withdraw that network's")
+                return None
+        if bridge:
+            info['bridge'] = {'name': bridge}
+        return info
+
     def _remove_orphaned_network(self, full_name: str, cached: dict) -> str:
         """
         Remove one orphaned network and forget its cache entry.
 
-        The forward mode comes from the *live* definition rather than the
-        cache, which records only the address and bridge: route-mode
-        networks own iptables rules that ``remove_network`` tears down
-        only when it knows the mode, and guessing "nat" would leak exactly
-        the rules this is here to remove.
+        See :meth:`_orphan_teardown_info` for how the network is described
+        to the removal, and when it is not removed at all.
 
         Args:
             full_name: the fully qualified network name.
@@ -420,30 +541,24 @@ class NetworksMixin:
         Returns:
             str: ``removed`` or ``failed``.
         """
-        info = dict(cached)
-        live_mode = None
-        if hasattr(self.provider, 'live_network_mode'):
-            try:
-                live_mode = self.provider.live_network_mode(full_name)
-            except Exception as exc:
-                self.logger.debug(
-                    f"could not read the live mode of {full_name}: {exc}")
-        if live_mode:
-            info['mode'] = live_mode
+        info = self._orphan_teardown_info(full_name, cached)
+        if info is None:
+            return 'failed'
 
         try:
             removed = self.provider.remove_network(name=full_name, info=info)
         except Exception as exc:
             self.logger.error(
                 f"failed to remove the orphaned network {full_name}: "
-                f"{type(exc).__name__}: {exc}")
+                f"{type(exc).__name__}: {exc}. Its cache entry is kept so the "
+                f"next run tries again.")
             return 'failed'
 
         if not removed:
             self.logger.error(
-                f"failed to remove the orphaned network {full_name}: it is "
-                f"still defined. Its cache entry is kept so the next run "
-                f"tries again.")
+                f"failed to remove the orphaned network {full_name} "
+                f"completely. Its cache entry is kept so the next run tries "
+                f"again.")
             return 'failed'
 
         self.logger.info(
