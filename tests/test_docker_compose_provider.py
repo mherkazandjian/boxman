@@ -1089,13 +1089,16 @@ class TestDockerComposeSession:
         session = self._session()
         compose_file = tmp_path / "docker-compose.yml"
         compose_file.write_text("services: {}\n")
+        # A runner built from the file: one without `compose_file` blocks the
+        # removal instead, never calls down_volumes, and stops the stack by
+        # label with a real ComposeRunner (#214).
+        runner = _FakeRunner()
+        runner.compose_file = str(compose_file)
+        runner.down_volumes_result = _fail()
 
-        class _FailRunner:
-            def down_volumes(self):
-                return SimpleNamespace(ok=False, stdout="", stderr="boom")
-
-        with self._patch_teardown(session, _FailRunner(), str(compose_file)):
+        with self._patch_teardown(session, runner, str(compose_file)):
             assert session.destroy_cluster("stack", {}) is False
+        assert ("down_volumes",) in runner.calls
         assert compose_file.exists()  # kept for retry
 
     # -- teardown never regenerates (Finding 5) ----------------------------
