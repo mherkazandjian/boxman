@@ -12,6 +12,7 @@ from boxman import log
 from boxman.exceptions import (
     ConfigError,
     ImageImportError,
+    NetworkError,
     ProvisionError,
 )
 
@@ -753,6 +754,118 @@ class LibVirtSession(SessionConfigMixin):
         network = Network(name=name, info=info)
         status = network.destroy_network()
         return status
+
+    def network_attached_domains(self, name: str) -> list[str]:
+        """
+        The domains whose interfaces use the network *name*.
+
+        Asked before removing a network the config no longer declares: the
+        removal deletes the bridge, so a guest still attached to it is
+        left with a dead nic.
+
+        Args:
+            name: the fully qualified network name.
+
+        Returns:
+            list: domain names, empty when nothing is attached.
+
+        Raises:
+            NetworkError: when the domains, or the interfaces of one of
+                them, could not be listed -- which is not "none attached".
+        """
+        network = Network(
+            name=name,
+            info={},
+            provider_config=self.provider_config,
+            assign_new_bridge=False,
+            manager=self.manager,
+        )
+        return network.attached_domains(strict=True)
+
+    def _listed_network_names(self, virsh: VirshCommand) -> list[str]:
+        """
+        Every network libvirt has defined, running or not.
+
+        Raises:
+            NetworkError: when libvirt could not be asked. That is not "no
+                networks", and a removal deciding on it must stop.
+        """
+        result = virsh.execute("net-list", "--all", "--name",
+                               hide=True, warn=True)
+        if not result.ok:
+            raise NetworkError(
+                f"could not list the libvirt networks: "
+                f"{(result.stderr or '').strip() or '(no stderr)'}")
+        return [line.strip() for line in result.stdout.splitlines()
+                if line.strip()]
+
+    @staticmethod
+    def _read_network_state(virsh: VirshCommand, name: str) -> dict[str, Any]:
+        """
+        A defined network's live XML, parsed.
+
+        Raises:
+            NetworkError: when the XML could not be read or parsed.
+        """
+        result = virsh.execute("net-dumpxml", name, hide=True, warn=True)
+        if not result.ok or not (result.stdout or '').strip():
+            raise NetworkError(
+                f"network {name}: is defined but its XML could not be read: "
+                f"{(result.stderr or '').strip() or '(no output)'}")
+        try:
+            return net_reconcile.parse_network_xml(result.stdout)
+        except ET.ParseError as exc:
+            raise NetworkError(
+                f"network {name}: its XML could not be parsed: {exc}") from exc
+
+    def live_network_state(self, name: str) -> dict[str, Any] | None:
+        """
+        The network *name* as libvirt has it defined, from its live XML.
+
+        The cache records a network's address and bridge but not its mode,
+        and the mode decides whether removing it also has to tear down
+        iptables rules. Reading the definition avoids guessing -- and so
+        does refusing to answer: a mode that cannot be read must not come
+        back as "no mode", which ``Network`` would take for ``nat``.
+
+        Args:
+            name: the fully qualified network name.
+
+        Returns:
+            dict: the state :func:`net_reconcile.parse_network_xml` returns
+            (``mode``, ``bridge_name``, ``ip_address``, ...), or None when a
+            successful listing shows the network is not defined.
+
+        Raises:
+            NetworkError: when libvirt could not be asked, or the network is
+                defined but its XML could not be read or parsed.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        if name not in self._listed_network_names(virsh):
+            return None
+        return self._read_network_state(virsh, name)
+
+    def network_bridges(self) -> dict[str, str | None]:
+        """
+        The bridge of every network libvirt has defined.
+
+        Asked before withdrawing the isolation rules of a network that is
+        no longer defined: those rules are keyed on a bridge name, and one
+        that another network now holds would have that network's rules
+        withdrawn instead.
+
+        Returns:
+            dict: ``{network name: bridge name or None}``.
+
+        Raises:
+            NetworkError: when the listing, or any one definition, could not
+                be read. A partial answer could miss exactly the holder.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        return {
+            network: self._read_network_state(virsh, network).get('bridge_name')
+            for network in self._listed_network_names(virsh)
+        }
 
     def remove_network(self,
                        name: str = None,
