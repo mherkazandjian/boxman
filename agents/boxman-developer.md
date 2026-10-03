@@ -146,9 +146,17 @@ stay in sync automatically.
 ### A runtime
 
 Subclass `RuntimeBase`, implement `wrap_command(command, pass_env=None)` and
-the `name` property, register it in the `create_runtime` map. Anything that
-shells out must go through the runtime's wrapping, or it will silently run on
-the wrong side of the container boundary.
+the `name` property, register it in the `create_runtime` map. Provider
+commands (`virsh`, `qemu-img`, …) must go through the runtime's wrapping, or
+they will silently run on the wrong side of the container boundary. The
+commands that manage the runtime itself (`docker inspect`, `docker cp`,
+`docker compose …` on the libvirt container) run on the host on purpose and
+are not wrapped.
+
+Either way, a subprocess goes through `boxman.utils.shell.run`, never
+`invoke.run` directly: the wrapper defaults `in_stream=False` so nothing reads
+the test runner's or CI's stdin, and `tests/test_utils_shell.py` fails on any
+`invoke.run(` outside `utils/shell.py`.
 
 `pass_env` names environment variables the wrapped command needs: the local
 runtime inherits them, the docker runtime forwards each *name* with `-e`. That

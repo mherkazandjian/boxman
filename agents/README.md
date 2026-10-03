@@ -17,10 +17,10 @@ agents directory:
 
 ```bash
 # available in every project
-mkdir -p ~/.claude/agents && cp agents/*.md ~/.claude/agents/
+mkdir -p ~/.claude/agents && cp agents/boxman-*.md ~/.claude/agents/
 
 # or scoped to one checkout
-mkdir -p .claude/agents && cp agents/*.md .claude/agents/
+mkdir -p .claude/agents && cp agents/boxman-*.md .claude/agents/
 ```
 
 To use them as skills instead, put each file at

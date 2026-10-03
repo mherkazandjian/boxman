@@ -171,7 +171,7 @@ shared_networks:
 isos:
   <iso-name>:
     uri: https://.../foo.iso
-    checksum: sha256:...      # optional; verified on download, a bad file is evicted and re-fetched
+    checksum: sha256:...      # optional; checked on download and on every use of the cached file
 
 # Templates create base images that VMs are cloned from
 templates:
@@ -763,8 +763,10 @@ clusters:
           - name: ubuntu-noble-live     # references the isos: entry
 ```
 
-- ISOs download once, cache alongside base images, and are checksum-verified (a
-  bad file is evicted so the next run re-downloads).
+- ISOs download once, cache alongside base images, and are checksum-verified.
+  A cached ISO that fails its checksum is **never replaced or removed** — a
+  guest may have it attached — so provisioning stops with an error naming the
+  file. Move it aside yourself and re-run to download a fresh copy.
 - **`boot_order` is a dispatch selector, not the firmware order.**
   `boot_order[0] == 'cdrom'` picks the ISO-boot path; the libvirt firmware
   order is hardcoded to `hd,cdrom` (disk first, falling through to CDROM). So
@@ -960,7 +962,7 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
 | `snapshot 'x' already exists` | Names are single-use; delete first. Names differing only by punctuation collide too. |
 | `No python interpreters found` | Ansible module against a minimal image. |
 | `no containers to snapshot` | The cluster is not up. |
-| Container state lost after `up` | Expected — the filesystem is rebuilt from the declared image. Persist data in a volume. |
+| Container state lost after `up` | `up` runs `docker compose up -d --wait`, which keeps an unchanged container but recreates one whose config or image changed — and the first `up` after a `snapshot restore` reverts every box to its declared image. A recreated container's filesystem comes from the image; persist data in a volume. |
 
 ---
 
