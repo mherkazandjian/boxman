@@ -625,6 +625,32 @@ class ImagesMixin:
             seen_macs[mac_s] = loc
         return reasons
 
+    def _iso_shape_problems(self) -> list[str]:
+        """
+        The ``isos:`` / ``cdroms:`` shapes no code path can use.
+
+        Everything downstream assumes ``isos:`` is a mapping and each VM's
+        ``cdroms:`` a list. A list-shaped ``isos:`` or a scalar ``cdroms:``
+        made them raise AttributeError/TypeError, which ``main()`` shows as a
+        traceback and exit 1 -- after templates were built and, in ``update``,
+        networks reconciled. The entries themselves are left to the existing
+        checks, which already report them as config errors.
+        """
+        problems = []
+        isos_conf = self.config.get('isos')
+        if isos_conf and not isinstance(isos_conf, dict):
+            problems.append(
+                "'isos:' must be a mapping of <name>: {uri: ..., checksum: ...}, "
+                f"got {type(isos_conf).__name__}")
+        for cluster_name, cluster in (self.config.get('clusters') or {}).items():
+            for vm_name, vm_info in (cluster.get('vms') or {}).items():
+                cdroms = vm_info.get('cdroms')
+                if cdroms is not None and not isinstance(cdroms, list):
+                    problems.append(
+                        f"{cluster_name}.vms.{vm_name}: 'cdroms:' must be a list, "
+                        f"got {type(cdroms).__name__}")
+        return problems
+
     def validate_direct_boot_config(self) -> None:
         """
         Check what can be checked from the configuration alone, before the
@@ -641,6 +667,10 @@ class ImagesMixin:
         Raises:
             ConfigError: naming every offending VM at once.
         """
+        shape = self._iso_shape_problems()
+        if shape:
+            raise ConfigError("invalid ISO configuration: " + "; ".join(shape))
+
         bad = []
         adapter_macs = self._adapter_mac_index()
         seen_macs: dict[str, str] = {}
@@ -1057,11 +1087,12 @@ class ImagesMixin:
         """
         isos_conf = self.config.get("isos") or {}
         if not isinstance(isos_conf, dict):
-            return  # _resolve_isos reports the shape, as a ConfigError
+            return  # validate_direct_boot_config reports the shape
         needed: set = set()
         for cluster in (self.config.get("clusters") or {}).values():
             for vm_info in (cluster.get("vms") or {}).values():
-                needed |= self._cdrom_iso_names(vm_info)
+                if isinstance(vm_info.get("cdroms") or [], list):
+                    needed |= self._cdrom_iso_names(vm_info)
         if needed & isos_conf.keys():
             self._refuse_iso_boot_under_container_runtime()
 

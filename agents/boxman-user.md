@@ -793,10 +793,14 @@ clusters:
 - **Boot config is validated before any cloning starts.** An `hd`-boot VM needs
   a `base_image`; a `cdrom`-boot VM needs a first `cdroms:` entry that either
   names a known `isos:` key or carries an explicit `source:`; a `network`-boot
-  VM needs neither. Problems are aggregated into one error.
+  VM needs neither. Problems are aggregated into one error. Before even that,
+  `isos:` must be a mapping and every VM's `cdroms:` a list; `provision` and
+  `update` check those shapes before doing anything (no forced deprovision,
+  template build or network change).
 - **Local runtime only** — under `--runtime docker`, a VM whose `cdroms:`
-  names an `isos:` entry is rejected (*ISO boot ('isos:') is not yet supported
-  under the '<runtime>' runtime*), because the host image cache is not visible
+  names an `isos:` entry is rejected, by `provision` before anything is built
+  (*ISO boot ('isos:') is not yet supported under the '<runtime>' runtime*;
+  exit 2), because the host image cache is not visible
   to the in-container `virt-install`. ⚠ The guard fires only for referenced
   `isos:` entries, so a VM booting via `cdroms: [{source: /abs/path.iso}]` is
   **not** rejected and will fail later and messier inside the container.

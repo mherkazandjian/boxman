@@ -766,11 +766,77 @@ class TestConfigIsRefusedBeforeAnythingIsBuilt:
         mgr._runtime_name = "docker"
         mgr.validate_iso_runtime()  # the source wins; 'live' is only a label
 
-        # The shape is _resolve_isos's to report (as a ConfigError); this
-        # check must not crash on it first with an AttributeError.
-        mgr = _manager_with_config({**self._ISO_VM, "isos": ["live"]})
-        mgr._runtime_name = "docker"
-        mgr.validate_iso_runtime()
+        # The shapes are validate_direct_boot_config's to report, and it runs
+        # first; this check must not crash on them on its own.
+        for bad in ({**self._ISO_VM, "isos": ["live"]},
+                    {**self._ISO_VM, "clusters": {"c": {"vms": {"v": {"cdroms": 5}}}}}):
+            mgr = _manager_with_config(bad)
+            mgr._runtime_name = "docker"
+            mgr.validate_iso_runtime()
+
+    _GOOD_ISO = {"live": {"uri": "https://example.com/live.iso"}}
+    _BAD_SHAPES = {
+        "isos is a list": ({"isos": ["live"]}, ["live"]),
+        "isos is a string": ({"isos": "oops"}, ["live"]),
+        "cdroms is an int": ({"isos": _GOOD_ISO}, 5),
+        "cdroms is a string": ({"isos": _GOOD_ISO}, "live"),
+        "cdroms is a mapping": ({"isos": _GOOD_ISO}, {"name": "live"}),
+    }
+
+    @staticmethod
+    def _shaped(top: dict, cdroms, boot_order=("cdrom", "hd")) -> dict:
+        vm = {"boot_order": list(boot_order), "cdroms": cdroms, "base_image": "t"}
+        return {"project": "p", **top, "clusters": {"c": {"vms": {"v": vm}}}}
+
+    @pytest.mark.parametrize("shape", list(_BAD_SHAPES))
+    @pytest.mark.parametrize("boot_order", [("cdrom", "hd"), ("hd",)])
+    def test_provision_refuses_a_malformed_shape_before_anything(self, shape, boot_order):
+        """They raised AttributeError/TypeError -- a traceback and exit 1 --
+        after a forced deprovision and the template build."""
+        mgr = _manager_with_config(self._shaped(*self._BAD_SHAPES[shape], boot_order))
+        cls = type(mgr)
+        with patch.object(cls, "_update_sessions_with_runtime"), \
+             patch.object(cls, "ensure_templates_exist") as templates, \
+             patch.object(cls, "deprovision") as deprovision, \
+             patch.object(cls, "clone_vms") as clone, \
+             patch.object(cls, "define_networks") as networks:
+            with pytest.raises(ConfigError, match="invalid ISO configuration"):
+                mgr.provision(SimpleNamespace(force=True, rebuild_templates=False))
+
+        templates.assert_not_called()
+        deprovision.assert_not_called()
+        clone.assert_not_called()
+        networks.assert_not_called()
+
+    @pytest.mark.parametrize("shape", list(_BAD_SHAPES))
+    def test_update_refuses_a_malformed_shape_before_anything(self, shape):
+        """In update the traceback came after the networks were reconciled."""
+        mgr = _manager_with_config(self._shaped(*self._BAD_SHAPES[shape]))
+        cls = type(mgr)
+        with patch.object(cls, "_update_sessions_with_runtime"), \
+             patch.object(cls, "ensure_templates_exist") as templates, \
+             patch.object(cls, "reconcile_networks") as networks:
+            with pytest.raises(ConfigError, match="invalid ISO configuration"):
+                mgr.update(SimpleNamespace(
+                    force=False, yes=True, dry_run=False, restart=False,
+                    vms=None, cluster=None))
+
+        templates.assert_not_called()
+        networks.assert_not_called()
+
+    @pytest.mark.parametrize("top, cdroms", [
+        ({"isos": _GOOD_ISO}, ["live"]),
+        ({"isos": _GOOD_ISO}, [{"name": "live"}, {"source": "/x.iso"}]),
+        ({"isos": {}}, []),
+        ({"isos": None}, None),
+        ({}, None),
+    ])
+    def test_a_well_shaped_iso_config_is_not_refused(self, top, cdroms):
+        """Without this the shape check could pass by rejecting everything."""
+        config = self._shaped(top, cdroms, boot_order=("hd",))
+        if cdroms is None:
+            del config["clusters"]["c"]["vms"]["v"]["cdroms"]
+        _manager_with_config(config).validate_direct_boot_config()
 
 
 class TestIsoResolutionErrorsAreConfigErrors:
