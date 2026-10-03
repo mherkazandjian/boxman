@@ -320,7 +320,9 @@ class NetworksMixin:
         removal is not, because a network is infrastructure and guests may
         still be attached to it. A network with attached domains is never
         removed even under *prune* — the guests would be left with a dead
-        nic — and the refusal names them.
+        nic — and the refusal names them. Nor is one whose attachments
+        could not be determined: under *prune* that is a failure, since the
+        removal that was asked for could not be done safely.
 
         Args:
             dry_run: say what would happen and change nothing.
@@ -336,7 +338,16 @@ class NetworksMixin:
 
         results: dict[str, str] = {}
         for full_name, cached in sorted(orphans.items()):
-            attached = self._attached_domains(full_name)
+            attached, unknown = self._attached_domains(full_name)
+            if unknown:
+                removing = prune and not dry_run
+                (self.logger.error if removing else self.logger.warning)(
+                    f"network {full_name} is no longer in the config, but "
+                    f"whether guests are still attached to it could not be "
+                    f"determined ({unknown}); not removing it.")
+                results[full_name] = 'failed' if removing else 'skipped'
+                continue
+
             if attached:
                 self.logger.warning(
                     f"network {full_name} is no longer in the config but "
@@ -367,29 +378,30 @@ class NetworksMixin:
 
         return results
 
-    def _attached_domains(self, full_name: str) -> list:
+    def _attached_domains(self, full_name: str) -> tuple[list, str | None]:
         """
         The guests attached to *full_name*, as the provider reports them.
 
         An empty list from a provider that cannot answer is the dangerous
         direction here — it reads as "nothing is attached" and lets the
-        removal proceed — so a provider without the capability is treated
-        as an unanswerable question and reported as attached.
+        removal proceed — so a provider without the capability, or one that
+        fails to answer, is reported as an unknown rather than as an empty
+        list.
 
         Args:
             full_name: the fully qualified network name.
 
         Returns:
-            list: domain names, or a single explanatory entry when the
-            question could not be asked.
+            tuple: ``(domain names, None)``, or ``([], reason)`` when the
+            question could not be answered.
         """
         session = self.provider
         if not hasattr(session, 'network_attached_domains'):
-            return ['<cannot determine: provider does not report attachments>']
+            return [], 'the provider does not report attachments'
         try:
-            return list(session.network_attached_domains(full_name))
+            return list(session.network_attached_domains(full_name)), None
         except Exception as exc:
-            return [f'<cannot determine: {type(exc).__name__}: {exc}>']
+            return [], f'{type(exc).__name__}: {exc}'
 
     def _remove_orphaned_network(self, full_name: str, cached: dict) -> str:
         """

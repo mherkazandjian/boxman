@@ -767,6 +767,10 @@ class LibVirtSession(SessionConfigMixin):
 
         Returns:
             list: domain names, empty when nothing is attached.
+
+        Raises:
+            NetworkError: when the domains, or the interfaces of one of
+                them, could not be listed -- which is not "none attached".
         """
         network = Network(
             name=name,
@@ -775,7 +779,7 @@ class LibVirtSession(SessionConfigMixin):
             assign_new_bridge=False,
             manager=self.manager,
         )
-        return network.attached_domains()
+        return network.attached_domains(strict=True)
 
     def live_network_mode(self, name: str) -> str | None:
         """

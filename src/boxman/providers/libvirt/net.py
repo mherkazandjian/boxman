@@ -701,14 +701,34 @@ class Network:
 
         return bool(ok)
 
-    def attached_domains(self) -> list[str]:
+    def attached_domains(self, strict: bool = False) -> list[str]:
         """
         Return the names of domains whose interfaces use this network.
 
-        Used to tell the user which guests a recreate would disconnect.
+        Used to tell the user which guests a recreate would disconnect, and
+        -- with *strict* -- to decide whether a network may be removed.
+
+        Args:
+            strict: raise rather than answer with what could be read. The
+                lenient default leaves out what it could not ask about,
+                which is an empty list when libvirt cannot list the domains
+                at all; a caller about to delete the network must not read
+                that as "nothing is attached".
+
+        Returns:
+            list: domain names, empty when nothing is attached.
+
+        Raises:
+            NetworkError: with *strict*, when the domains, or the interfaces
+                of one of them, could not be listed.
         """
         result = self.virsh.execute("list", "--all", "--name", hide=True, warn=True)
         if not result.ok:
+            if strict:
+                raise NetworkError(
+                    f"network {self.name}: could not list the domains to see "
+                    f"which use it: "
+                    f"{(result.stderr or '').strip() or '(no stderr)'}")
             return []
 
         attached = []
@@ -716,6 +736,11 @@ class Network:
             iflist = self.virsh.execute(
                 "domiflist", domain, hide=True, warn=True)
             if not iflist.ok:
+                if strict:
+                    raise NetworkError(
+                        f"network {self.name}: could not read the interfaces "
+                        f"of domain {domain}: "
+                        f"{(iflist.stderr or '').strip() or '(no stderr)'}")
                 continue
             for row in parse_domiflist(iflist.stdout):
                 if row.type == 'network' and row.source == self.name:
