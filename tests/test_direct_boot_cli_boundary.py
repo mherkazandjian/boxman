@@ -137,3 +137,30 @@ def test_the_boundary_really_routes_through_the_validation(tmp_path):
     assert any("sentinel-from-the-preflight" in m for m in _run.last_messages), \
         _run.last_messages
 
+
+def test_a_list_shaped_isos_section_exits_2_and_builds_nothing(tmp_path):
+    """`isos: [live]` used to pass every up-front check, then crash in
+    validate_base_images() with an AttributeError: a traceback and exit 1,
+    after a forced deprovision and the template build."""
+    path = tmp_path / "conf.yml"
+    path.write_text(
+        "isos: [live]\n"
+        + _CONF.format(workdir=tmp_path / "ws", mac="52:54:00:0c:01:01")
+        .replace("- source: /nonexistent/installer.iso", "- live"))
+    with patch("boxman.manager.BoxmanManager._update_sessions_with_runtime") as reached, \
+         patch("boxman.manager_parts.flows.FlowsMixin.deprovision") as deprovision, \
+         patch("boxman.manager_parts.images.ImagesMixin.ensure_templates_exist") as templates, \
+         patch("boxman.manager_parts.vms.VMsMixin.clone_vms") as clone, \
+         patch("boxman.manager_parts.networks.NetworksMixin.define_networks") as networks:
+        code = _run(["--conf", str(path), "provision", "--force"])
+
+    assert code == 2, f"expected a clean exit 2, got {code}"
+    reached.assert_called()
+    assert any("'isos:' must be a mapping" in m for m in _run.last_messages), \
+        _run.last_messages
+
+    deprovision.assert_not_called()
+    templates.assert_not_called()
+    clone.assert_not_called()
+    networks.assert_not_called()
+

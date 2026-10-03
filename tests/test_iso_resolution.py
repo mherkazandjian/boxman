@@ -112,7 +112,7 @@ class TestResolveIsos:
             "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}
         })
         mgr._runtime_name = "docker"
-        with pytest.raises(RuntimeError, match="not yet supported under the 'docker' runtime"):
+        with pytest.raises(ConfigError, match="not yet supported under the 'docker' runtime"):
             mgr._resolve_isos()
 
     def test_raises_when_download_fails(self, tmp_path):
@@ -726,3 +726,149 @@ class TestConfigIsRefusedBeforeAnythingIsBuilt:
                   "cdroms": [{"source": "/x.iso"}],
                   "networks": [{"name": "n", "mac": "52:54:00:0c:01:09"}]}}}}}
         _manager_with_config(good).validate_direct_boot_config()
+
+    _ISO_VM = {"project": "p",
+               "isos": {"live": {"uri": "https://example.com/live.iso"}},
+               "clusters": {"c": {"vms": {
+                   "v": {"boot_order": ["cdrom", "hd"], "cdroms": ["live"]}}}}}
+
+    def test_provision_refuses_iso_boot_under_docker_before_anything(self):
+        """The guard in _resolve_isos is only reached from clone_vms, after
+        templates were built and networks defined."""
+        mgr = _manager_with_config(self._ISO_VM)
+        mgr._runtime_name = "docker"
+        cls = type(mgr)
+        with patch.object(cls, "_update_sessions_with_runtime"), \
+             patch.object(cls, "ensure_templates_exist") as templates, \
+             patch.object(cls, "_create_templates_impl") as build, \
+             patch.object(cls, "deprovision") as deprovision, \
+             patch.object(cls, "clone_vms") as clone, \
+             patch.object(cls, "define_networks") as networks:
+            with pytest.raises(ConfigError,
+                               match="not yet supported under the 'docker' runtime"):
+                mgr.provision(SimpleNamespace(force=True, rebuild_templates=False))
+
+        templates.assert_not_called()
+        build.assert_not_called()
+        deprovision.assert_not_called()
+        clone.assert_not_called()
+        networks.assert_not_called()
+
+    def test_iso_runtime_check_refuses_only_a_referenced_iso(self):
+        """Without this the check could pass by rejecting everything."""
+        mgr = _manager_with_config(self._ISO_VM)
+        mgr.validate_iso_runtime()  # local runtime
+
+        explicit_source = {**self._ISO_VM, "clusters": {"c": {"vms": {
+            "v": {"boot_order": ["cdrom", "hd"],
+                  "cdroms": [{"name": "live", "source": "/x.iso"}]}}}}}
+        mgr = _manager_with_config(explicit_source)
+        mgr._runtime_name = "docker"
+        mgr.validate_iso_runtime()  # the source wins; 'live' is only a label
+
+        # The shapes are validate_direct_boot_config's to report, and it runs
+        # first; this check must not crash on them on its own.
+        for bad in ({**self._ISO_VM, "isos": ["live"]},
+                    {**self._ISO_VM, "clusters": {"c": {"vms": {"v": {"cdroms": 5}}}}}):
+            mgr = _manager_with_config(bad)
+            mgr._runtime_name = "docker"
+            mgr.validate_iso_runtime()
+
+    _GOOD_ISO = {"live": {"uri": "https://example.com/live.iso"}}
+    _BAD_SHAPES = {
+        "isos is a list": ({"isos": ["live"]}, ["live"]),
+        "isos is a string": ({"isos": "oops"}, ["live"]),
+        "cdroms is an int": ({"isos": _GOOD_ISO}, 5),
+        "cdroms is a string": ({"isos": _GOOD_ISO}, "live"),
+        "cdroms is a mapping": ({"isos": _GOOD_ISO}, {"name": "live"}),
+    }
+
+    @staticmethod
+    def _shaped(top: dict, cdroms, boot_order=("cdrom", "hd")) -> dict:
+        vm = {"boot_order": list(boot_order), "cdroms": cdroms, "base_image": "t"}
+        return {"project": "p", **top, "clusters": {"c": {"vms": {"v": vm}}}}
+
+    @pytest.mark.parametrize("shape", list(_BAD_SHAPES))
+    @pytest.mark.parametrize("boot_order", [("cdrom", "hd"), ("hd",)])
+    def test_provision_refuses_a_malformed_shape_before_anything(self, shape, boot_order):
+        """They raised AttributeError/TypeError -- a traceback and exit 1 --
+        after a forced deprovision and the template build."""
+        mgr = _manager_with_config(self._shaped(*self._BAD_SHAPES[shape], boot_order))
+        cls = type(mgr)
+        with patch.object(cls, "_update_sessions_with_runtime"), \
+             patch.object(cls, "ensure_templates_exist") as templates, \
+             patch.object(cls, "deprovision") as deprovision, \
+             patch.object(cls, "clone_vms") as clone, \
+             patch.object(cls, "define_networks") as networks:
+            with pytest.raises(ConfigError, match="invalid ISO configuration"):
+                mgr.provision(SimpleNamespace(force=True, rebuild_templates=False))
+
+        templates.assert_not_called()
+        deprovision.assert_not_called()
+        clone.assert_not_called()
+        networks.assert_not_called()
+
+    @pytest.mark.parametrize("shape", list(_BAD_SHAPES))
+    def test_update_refuses_a_malformed_shape_before_anything(self, shape):
+        """In update the traceback came after the networks were reconciled."""
+        mgr = _manager_with_config(self._shaped(*self._BAD_SHAPES[shape]))
+        cls = type(mgr)
+        with patch.object(cls, "_update_sessions_with_runtime"), \
+             patch.object(cls, "ensure_templates_exist") as templates, \
+             patch.object(cls, "reconcile_networks") as networks:
+            with pytest.raises(ConfigError, match="invalid ISO configuration"):
+                mgr.update(SimpleNamespace(
+                    force=False, yes=True, dry_run=False, restart=False,
+                    vms=None, cluster=None))
+
+        templates.assert_not_called()
+        networks.assert_not_called()
+
+    @pytest.mark.parametrize("top, cdroms", [
+        ({"isos": _GOOD_ISO}, ["live"]),
+        ({"isos": _GOOD_ISO}, [{"name": "live"}, {"source": "/x.iso"}]),
+        ({"isos": {}}, []),
+        ({"isos": None}, None),
+        ({}, None),
+    ])
+    def test_a_well_shaped_iso_config_is_not_refused(self, top, cdroms):
+        """Without this the shape check could pass by rejecting everything."""
+        config = self._shaped(top, cdroms, boot_order=("hd",))
+        if cdroms is None:
+            del config["clusters"]["c"]["vms"]["v"]["cdroms"]
+        _manager_with_config(config).validate_direct_boot_config()
+
+
+class TestIsoResolutionErrorsAreConfigErrors:
+    """A bare ValueError or RuntimeError from ISO resolution reached main() as
+    a traceback and exit 1; a ConfigError is one line and exit 2."""
+
+    def test_an_unknown_iso_name_is_a_config_error(self):
+        mgr = _manager_with_config({"project": "p", "clusters": {"c": {"vms": {
+            "v": {"boot_order": ["cdrom", "hd"], "cdroms": ["nope"]}}}}})
+        with pytest.raises(ConfigError, match="unknown iso 'nope'") as info:
+            mgr._resolve_iso_config()
+        assert isinstance(info.value.__cause__, ValueError)
+
+    def test_a_malformed_isos_section_is_a_config_error(self):
+        mgr = _manager_with_config({"project": "p", "isos": ["live"],
+                                    "clusters": {"c": {"vms": {
+                                        "v": {"cdroms": ["live"]}}}}})
+        with pytest.raises(ConfigError, match="'isos:' must be a mapping"):
+            mgr._resolve_iso_config()
+
+    def test_main_exits_2_for_the_docker_refusal(self):
+        from boxman.scripts import app
+
+        mgr = _manager_with_config(TestConfigIsRefusedBeforeAnythingIsBuilt._ISO_VM)
+        mgr._runtime_name = "docker"
+        with pytest.raises(ConfigError) as info:
+            mgr.validate_iso_runtime()
+
+        with patch.object(app, "_main", side_effect=info.value), \
+             patch.object(app.log, "error") as error:
+            with pytest.raises(SystemExit) as exit_info:
+                app.main()
+
+        assert exit_info.value.code == 2
+        error.assert_called_once_with(str(info.value))

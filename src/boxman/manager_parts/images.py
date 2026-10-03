@@ -625,6 +625,32 @@ class ImagesMixin:
             seen_macs[mac_s] = loc
         return reasons
 
+    def _iso_shape_problems(self) -> list[str]:
+        """
+        The ``isos:`` / ``cdroms:`` shapes no code path can use.
+
+        Everything downstream assumes ``isos:`` is a mapping and each VM's
+        ``cdroms:`` a list. A list-shaped ``isos:`` or a scalar ``cdroms:``
+        made them raise AttributeError/TypeError, which ``main()`` shows as a
+        traceback and exit 1 -- after templates were built and, in ``update``,
+        networks reconciled. The entries themselves are left to the existing
+        checks, which already report them as config errors.
+        """
+        problems = []
+        isos_conf = self.config.get('isos')
+        if isos_conf and not isinstance(isos_conf, dict):
+            problems.append(
+                "'isos:' must be a mapping of <name>: {uri: ..., checksum: ...}, "
+                f"got {type(isos_conf).__name__}")
+        for cluster_name, cluster in (self.config.get('clusters') or {}).items():
+            for vm_name, vm_info in (cluster.get('vms') or {}).items():
+                cdroms = vm_info.get('cdroms')
+                if cdroms is not None and not isinstance(cdroms, list):
+                    problems.append(
+                        f"{cluster_name}.vms.{vm_name}: 'cdroms:' must be a list, "
+                        f"got {type(cdroms).__name__}")
+        return problems
+
     def validate_direct_boot_config(self) -> None:
         """
         Check what can be checked from the configuration alone, before the
@@ -641,6 +667,10 @@ class ImagesMixin:
         Raises:
             ConfigError: naming every offending VM at once.
         """
+        shape = self._iso_shape_problems()
+        if shape:
+            raise ConfigError("invalid ISO configuration: " + "; ".join(shape))
+
         bad = []
         adapter_macs = self._adapter_mac_index()
         seen_macs: dict[str, str] = {}
@@ -1028,6 +1058,44 @@ class ImagesMixin:
 
         return failures
 
+    def _refuse_iso_boot_under_container_runtime(self) -> None:
+        """Raise :class:`ConfigError` unless the runtime is ``local``.
+
+        ISO boot needs the file visible to the in-container virt-install; the
+        host cache dir is not bind-mounted under a containerized runtime.
+        """
+        runtime_name = getattr(self, "_runtime_name", "local") or "local"
+        if runtime_name != "local":
+            raise ConfigError(
+                f"ISO boot ('isos:') is not yet supported under the "
+                f"'{runtime_name}' runtime; use the local runtime "
+                f"(the downloaded ISO is not visible inside the libvirt container)."
+            )
+
+    def validate_iso_runtime(self) -> None:
+        """
+        Refuse a VM that boots from an ``isos:`` entry under a containerized
+        runtime, before the command does anything.
+
+        :meth:`_resolve_isos` refuses the same thing, but ``provision`` only
+        reaches it from :meth:`clone_vms` -- after templates were built and
+        networks defined. Applies the same filter: only ``isos:`` entries some
+        VM's ``cdroms:`` names.
+
+        Raises:
+            ConfigError: the runtime is not ``local`` and a VM names one.
+        """
+        isos_conf = self.config.get("isos") or {}
+        if not isinstance(isos_conf, dict):
+            return  # validate_direct_boot_config reports the shape
+        needed: set = set()
+        for cluster in (self.config.get("clusters") or {}).values():
+            for vm_info in (cluster.get("vms") or {}).values():
+                if isinstance(vm_info.get("cdroms") or [], list):
+                    needed |= self._cdrom_iso_names(vm_info)
+        if needed & isos_conf.keys():
+            self._refuse_iso_boot_under_container_runtime()
+
     def _resolve_isos(self, names: set | None = None) -> dict[str, str]:
         """Download and cache ISOs declared in the ``isos:`` config section.
 
@@ -1050,16 +1118,7 @@ class ImagesMixin:
             if not isos_conf:
                 return {}
 
-        # ISO boot needs the file visible to the in-container virt-install; the
-        # host cache dir is not bind-mounted under a containerized runtime. Fail
-        # fast with guidance instead of a confusing missing-file error later.
-        runtime_name = getattr(self, "_runtime_name", "local") or "local"
-        if runtime_name != "local":
-            raise RuntimeError(
-                f"ISO boot ('isos:') is not yet supported under the "
-                f"'{runtime_name}' runtime; use the local runtime "
-                f"(the downloaded ISO is not visible inside the libvirt container)."
-            )
+        self._refuse_iso_boot_under_container_runtime()
 
         cache_conf = (self.app_config or {}).get("cache", {})
         cache = ImageCache.from_config(cache_conf)
@@ -1298,18 +1357,25 @@ class ImagesMixin:
         for _cluster_name, _cluster, _vm_name, vm_info in targets:
             needed |= self._cdrom_iso_names(vm_info)
 
-        resolved_isos = self._resolve_isos(needed)
-        for cluster_name, cluster, vm_name, vm_info in targets:
-            resolved = self._inject_resolved_iso(vm_info, resolved_isos)
-            if self._is_diskless_boot(resolved):
-                # Specs, not names. `_resolved_network_names` is the names-only
-                # wrapper over this one, and the {name, mac} form is what carries
-                # a pinned MAC through to virt-install -- taking the wrapper here
-                # would drop every pin without failing anywhere until a DHCP
-                # reservation quietly stopped matching its NIC.
-                resolved["_resolved_networks"] = self._resolved_network_specs(
-                    cluster_name, resolved)
-            cluster["vms"][vm_name] = resolved
+        # The helpers report a malformed isos:/cdroms:/networks: entry as a
+        # bare ValueError. Nothing between here and main() catches one, so it
+        # surfaced as a traceback and exit 1 instead of a one-line error.
+        try:
+            resolved_isos = self._resolve_isos(needed)
+            for cluster_name, cluster, vm_name, vm_info in targets:
+                resolved = self._inject_resolved_iso(vm_info, resolved_isos)
+                if self._is_diskless_boot(resolved):
+                    # Specs, not names. `_resolved_network_names` is the
+                    # names-only wrapper over this one, and the {name, mac}
+                    # form is what carries a pinned MAC through to virt-install
+                    # -- taking the wrapper here would drop every pin without
+                    # failing anywhere until a DHCP reservation quietly stopped
+                    # matching its NIC.
+                    resolved["_resolved_networks"] = self._resolved_network_specs(
+                        cluster_name, resolved)
+                cluster["vms"][vm_name] = resolved
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
 
     def ensure_templates_exist(self) -> bool:
         """
