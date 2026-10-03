@@ -360,8 +360,11 @@ against real guests:
   files move with the config surface is stated in `agents/README.md`
   ("Keeping them accurate").
 - `doc/tutorial/README.md`'s clone-policy section, including the §4 caveat
-  removal.
-- The `data/templates/` config comments.
+  removal — **done in #203 and #209**: the section covers all three `clone_*`
+  policies, and the "prefer `off` for guests that do not regenerate a machine
+  ID" reasoning is replaced by the fresh-value semantics.
+- The `data/templates/` config comments — **done in #203 and #209**:
+  `conf.libvirt.yml` comments the three `clone_*` keys.
 
 ## 9. Open questions
 
