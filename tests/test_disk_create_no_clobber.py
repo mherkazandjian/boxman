@@ -23,6 +23,7 @@ without it: there the reproductions fail on the damage, which is the point.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import logging
@@ -189,10 +190,16 @@ def _dm(**provider) -> DiskManager:
                                         "uri": "qemu:///system", **provider})
 
 
+@contextlib.contextmanager
 def _no_record():
-    """Keep the ownership bookkeeping after an attach off the real virsh:
-    a disk only gets that far when a guard failed."""
-    return patch("boxman.providers.libvirt.disk.record_attached_disk")
+    """Keep the ownership bookkeeping off the real virsh (#214). The domain
+    carries no records, so nothing found at a disk's path is boxman's own;
+    and nothing is recorded after an attach -- a disk only gets that far
+    when a guard failed."""
+    with patch("boxman.providers.libvirt.disk.read_disk_records",
+               return_value=None), \
+         patch("boxman.providers.libvirt.disk.record_attached_disk"):
+        yield
 
 
 def _identity(path: Path) -> tuple[int, int]:

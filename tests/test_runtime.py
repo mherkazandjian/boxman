@@ -264,16 +264,23 @@ class TestDockerComposeRuntime:
         })
         return rt, compose_path
 
+    @staticmethod
+    def _ensure_ready_while_running(rt):
+        """ensure_ready against a running container that already has every
+        mount. docker is stood in for: these tests used to query the
+        machine's own, and could stop and copy out of a real
+        boxman-libvirt-default (#214)."""
+        with patch("invoke.run", side_effect=_docker_cmd_dispatch(rt)), \
+             patch.object(rt, "_wait_for_libvirtd"), \
+             patch.object(rt, "_log_compose_file"):
+            rt.ensure_ready()
+
     def test_user_compose_file_is_never_rewritten(self, tmp_path):
         """ensure_ready leaves a user-supplied compose file byte-identical
         and drops no .env next to it."""
         rt, compose_path = self._user_compose_setup(tmp_path)
 
-        with patch.object(rt, "_container_is_running", return_value=True), \
-             patch.object(rt, "_project_dir_accessible", return_value=True), \
-             patch.object(rt, "_wait_for_libvirtd"), \
-             patch.object(rt, "_log_compose_file"):
-            rt.ensure_ready()
+        self._ensure_ready_while_running(rt)
 
         assert compose_path.read_text() == self.USER_COMPOSE
         assert not (compose_path.parent / ".env").exists()
@@ -283,11 +290,7 @@ class TestDockerComposeRuntime:
         .boxman/runtime/docker, named for compose override merging."""
         rt, compose_path = self._user_compose_setup(tmp_path)
 
-        with patch.object(rt, "_container_is_running", return_value=True), \
-             patch.object(rt, "_project_dir_accessible", return_value=True), \
-             patch.object(rt, "_wait_for_libvirtd"), \
-             patch.object(rt, "_log_compose_file"):
-            rt.ensure_ready()
+        self._ensure_ready_while_running(rt)
 
         import yaml
         override = tmp_path / "proj" / ".boxman" / "runtime" / "docker" / \
@@ -305,11 +308,7 @@ class TestDockerComposeRuntime:
         passes the .boxman .env via --env-file for user files."""
         rt, compose_path = self._user_compose_setup(tmp_path)
 
-        with patch.object(rt, "_container_is_running", return_value=True), \
-             patch.object(rt, "_project_dir_accessible", return_value=True), \
-             patch.object(rt, "_wait_for_libvirtd"), \
-             patch.object(rt, "_log_compose_file"):
-            rt.ensure_ready()
+        self._ensure_ready_while_running(rt)
 
         cmd = rt._compose_base_cmd(str(compose_path), str(compose_path.parent))
         override = rt._bind_mount_override_path()
@@ -334,12 +333,8 @@ class TestDockerComposeRuntime:
 
         with patch.object(rt, "get_compose_file_path",
                           return_value=str(compose_path)), \
-             patch.object(rt, "_write_bind_mount_override") as override_mock, \
-             patch.object(rt, "_container_is_running", return_value=True), \
-             patch.object(rt, "_project_dir_accessible", return_value=True), \
-             patch.object(rt, "_wait_for_libvirtd"), \
-             patch.object(rt, "_log_compose_file"):
-            rt.ensure_ready()
+             patch.object(rt, "_write_bind_mount_override") as override_mock:
+            self._ensure_ready_while_running(rt)
 
         override_mock.assert_not_called()
         import yaml

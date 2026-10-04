@@ -239,15 +239,23 @@ class TestAFailedGenerationChangesNothing:
         write.assert_not_called()
 
     def test_a_valid_cluster_still_writes(self, tmp_path):
-        """Reachability: the path does work when the config is good."""
+        """Reachability: the path does work when the config is good.
+
+        Compose is stood in for, accepting the candidate: the real one made
+        this test depend on the machine's docker (#214)."""
         session = self._session(tmp_path)
 
-        runner, workdir, compose_file = session._compose_context(
-            "proj", _cluster(["app_bridge"]))
+        with mock.patch("boxman.providers.docker_compose.session."
+                        "ComposeRunner") as compose:
+            compose.return_value.validate.return_value = mock.Mock(ok=True)
+            runner, workdir, compose_file = session._compose_context(
+                "proj", _cluster(["app_bridge"]))
 
         assert (tmp_path / "docker-compose.yml").exists()
         assert compose_file.endswith("docker-compose.yml")
-        assert runner is not None
+        compose.return_value.validate.assert_called_once()
+        assert runner is compose.return_value
+        assert compose.call_args.kwargs["compose_file"] == compose_file
 
 
 def _cluster_extra(cluster, extra):

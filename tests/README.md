@@ -5,6 +5,20 @@ Tiers (markers in `pyproject.toml`): `unit`, `smoke`, `regression`, and
 VM, `make help`). A default `pytest` run excludes `slow` and `integration`
 via `addopts`. Shared fixtures live in `conftest.py`.
 
+## docker, virsh and sudo are for the integration tier only
+
+Around every test not marked `integration`, `conftest.py` puts fakes of
+`docker`, `virsh` and `sudo` first on `PATH`. A fake runs nothing: it records
+the call and exits 1, and the test then fails at teardown with the calls it
+made. The real commands act on the machine running the tests — its
+containers, its libvirt domains and networks, or as root — so a default-tier
+test that reached them passed or failed depending on the host, and some
+could stop a container or write to a domain (#214). Mock the call (the
+command-dispatch stand-ins in `test_runtime.py` and
+`test_libvirt_state_migration.py` are examples), or mark the test
+`integration`. A test that runs a fake on purpose takes the calls back with
+the `host_commands` fixture.
+
 ## Dead base-image URLs
 
 The example boxes pin point-release cloud images and ISOs, and mirrors

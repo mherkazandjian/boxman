@@ -43,8 +43,17 @@ def dm() -> DiskManager:
 
 class TestConfigureFromDiskConfig:
 
+    @pytest.fixture(autouse=True)
+    def record(self):
+        """The ownership record, which goes into the domain's metadata
+        through virsh. Unmocked, these tests read this machine's libvirt,
+        and would write the record into any domain named vm01 (#214)."""
+        with patch("boxman.providers.libvirt.disk.record_attached_disk"
+                   ) as record:
+            yield record
+
     def test_creates_then_attaches_by_default(self, dm: DiskManager,
-                                              tmp_path: Path):
+                                              tmp_path: Path, record):
         config = {"name": "data", "target": "vdb", "size": 1024}
         # create_disk answers with the new image's (st_dev, st_ino)
         with patch.object(dm, "create_disk", return_value=(1, 2)) as create, \
@@ -53,9 +62,10 @@ class TestConfigureFromDiskConfig:
                                                  "vm01") is True
         create.assert_called_once()
         attach.assert_called_once()
+        record.assert_called_once()
 
     def test_attach_only_skips_create(self, dm: DiskManager,
-                                      tmp_path: Path):
+                                      tmp_path: Path, record):
         """Regression for issue #85 item 23: attach_only must not run
         qemu-img create — that would wipe the existing image."""
         (tmp_path / "vm01_data.qcow2").write_bytes(b"x")
@@ -68,6 +78,7 @@ class TestConfigureFromDiskConfig:
         create.assert_not_called()
         attach.assert_called_once()
         assert (tmp_path / "vm01_data.qcow2").read_bytes() == b"x"
+        record.assert_called_once()
 
 
 class TestDeadErrorBranches:

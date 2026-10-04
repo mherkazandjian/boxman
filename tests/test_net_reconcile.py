@@ -354,7 +354,11 @@ class TestPinnedBridgeAndStp:
 
     def test_an_unrecognised_stp_value_is_rejected(self):
         # quietly turning `stp: enabled` into 'off' would disable stp silently
-        with pytest.raises(ValueError, match="stp must be on or off"):
+        # the network is not defined yet, rather than asking this
+        # machine's libvirt (#214)
+        with patch.object(Network, "get_bridge_from_network",
+                          return_value=None), \
+                pytest.raises(ValueError, match="stp must be on or off"):
             Network(name="demo", info={"bridge": {"stp": "enabled"}},
                     assign_new_bridge=False,
                     provider_config={"use_sudo": False})
