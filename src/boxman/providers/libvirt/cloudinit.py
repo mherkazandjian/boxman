@@ -993,38 +993,38 @@ class CloudInitTemplate:
         staged = [dst_image_path + self.STAGED_SUFFIX,
                   seed_iso_path + self.STAGED_SUFFIX]
 
+        installed = False
         try:
-            ready = self._build_staged(template_dir, *staged)
-        except OSError as exc:
-            self.logger.error(
-                f"cannot create template '{self.template_name}': {exc}")
-            ready = False
-        if not ready:
-            self._discard(staged)
-            self._report_kept(replacing)
-            return False
+            try:
+                ready = self._build_staged(template_dir, *staged)
+            except (OSError, ValueError) as exc:
+                # a seed file that cannot be written, a password the hash
+                # backend refuses (#238 review)
+                self.logger.error(
+                    f"cannot create template '{self.template_name}': {exc}")
+                ready = False
+            if not ready:
+                self._report_kept(replacing)
+                return False
 
-        if replacing and not self._remove_old_template():
-            self._discard(staged)
-            return False
+            if replacing and not self._remove_old_template():
+                return False
 
-        try:
-            os.replace(staged[0], dst_image_path)
-            os.replace(staged[1], seed_iso_path)
-        except OSError as exc:
-            self.logger.error(
-                f"cannot put the new disk and seed of template "
-                f"'{self.template_name}' in place: {exc}")
+            try:
+                os.replace(staged[0], dst_image_path)
+                os.replace(staged[1], seed_iso_path)
+            except OSError as exc:
+                self.logger.error(
+                    f"cannot put the new disk and seed of template "
+                    f"'{self.template_name}' in place: {exc}")
+            else:
+                installed = self._install_template(
+                    dst_image_path, seed_iso_path, bridge_device)
+        finally:
+            # on every way out, what is still staged was not used
             self._discard(staged)
-            installed = False
-        else:
-            installed = self._install_template(
-                dst_image_path, seed_iso_path, bridge_device)
         if not installed and replacing:
-            self.logger.error(
-                f"the previous template '{self.template_name}' was removed "
-                f"before this step, so there is no template now: run "
-                f"create-templates again to build it")
+            self._report_removed()
         return installed
 
     def _build_staged(self, template_dir: str, staged_image: str,
@@ -1063,6 +1063,21 @@ class CloudInitTemplate:
             self.logger.error(
                 f"the existing template '{self.template_name}' was left as "
                 f"it was")
+
+    def _report_removed(self) -> None:
+        """Say what is there once a failure follows the old template's removal."""
+        if self._check_vm_exists():
+            # verification failing shuts the new domain down and keeps it
+            self.logger.error(
+                f"the previous template '{self.template_name}' was removed "
+                f"before this step; its replacement is defined but did not "
+                f"complete, and is kept for inspection: rebuild it with "
+                f"create-templates --force")
+        else:
+            self.logger.error(
+                f"the previous template '{self.template_name}' was removed "
+                f"before this step, and no replacement is defined: run "
+                f"create-templates again to build it")
 
     def _remove_old_template(self) -> bool:
         """

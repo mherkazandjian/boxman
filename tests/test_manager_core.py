@@ -405,6 +405,216 @@ class TestOneTemplatesErrorDoesNotEndTheRun:
         assert failed == ['one']
         assert built == ['one', 'two']
 
+    @staticmethod
+    def _two_templates(tmp_path: Path, **one):
+        from unittest.mock import patch as _patch
+        with _patch("boxman.manager.BoxmanCache"):
+            m = BoxmanManager()
+        m.config = {
+            'project': 'demo',
+            'provider': {'libvirt': {'uri': 'qemu:///system',
+                                     'use_sudo': False}},
+            'templates': {
+                name: {'name': name, 'image': str(tmp_path / 'base.qcow2'),
+                       'workdir': str(tmp_path / 'templates'),
+                       **(one if name == 'one' else {})}
+                for name in ('one', 'two')
+            },
+        }
+        m.app_config = {'cache': {'enabled': False}}
+        return m
+
+    def _run(self, m, ensure_writable_dir=None):
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
+        virsh = MagicMock()
+        virsh.execute.return_value = MagicMock(ok=True, stdout="")
+        built: list = []
+
+        def create_template(template, force=False):
+            built.append(template.template_name)
+            return True
+
+        with _patch("boxman.manager_parts.images.VirshCommand",
+                    return_value=virsh), \
+             _patch.object(m, "_ensure_writable_dir",
+                           side_effect=ensure_writable_dir), \
+             _patch("boxman.providers.libvirt.cloudinit.CloudInitTemplate."
+                    "create_template", create_template):
+            return m._create_templates_impl(), built
+
+    def test_a_directory_it_cannot_prepare_fails_only_that_template(
+            self, tmp_path: Path):
+        """From the review of #238: the directories were prepared outside
+        the per-template catch."""
+        m = self._two_templates(tmp_path)
+
+        def ensure(path, **_kwargs):
+            if path.endswith('/one'):
+                raise PermissionError(13, "Permission denied", path)
+
+        failed, built = self._run(m, ensure)
+        assert failed == ['one']
+        assert built == ['two']
+
+    def test_an_existing_template_that_fails_before_its_build_is_kept(
+            self, tmp_path: Path):
+        """A failure while preparing a template that already exists (with
+        --force) happens before anything of it is touched, and says so --
+        the build's own message never gets to run."""
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
+        m = self._two_templates(tmp_path)
+        m.logger = MagicMock()
+        virsh = MagicMock()
+        virsh.execute.return_value = MagicMock(ok=True, stdout="one\ntwo\n")
+
+        def ensure(path, **_kwargs):
+            if path.endswith('/one'):
+                raise PermissionError(13, "Permission denied", path)
+
+        with _patch("boxman.manager_parts.images.VirshCommand",
+                    return_value=virsh), \
+             _patch.object(m, "_ensure_writable_dir", side_effect=ensure), \
+             _patch("boxman.providers.libvirt.cloudinit.CloudInitTemplate."
+                    "create_template", lambda template, force=False: True):
+            failed = m._create_templates_impl(force=True)
+        assert failed == ['one']
+        errors = [c.args[0] for c in m.logger.error.call_args_list]
+        assert "the existing template 'one' was left as it was" in errors
+
+    def test_an_error_from_inside_the_build_is_not_called_kept(
+            self, tmp_path: Path):
+        """Once the build began, only it knows whether the old template
+        survived; the loop does not claim it did."""
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
+        m = self._two_templates(tmp_path)
+        m.logger = MagicMock()
+        virsh = MagicMock()
+        virsh.execute.return_value = MagicMock(ok=True, stdout="one\ntwo\n")
+
+        def create_template(template, force=False):
+            if template.template_name == 'one':
+                raise OSError(5, "Input/output error")
+            return True
+
+        with _patch("boxman.manager_parts.images.VirshCommand",
+                    return_value=virsh), \
+             _patch.object(m, "_ensure_writable_dir"), \
+             _patch("boxman.providers.libvirt.cloudinit.CloudInitTemplate."
+                    "create_template", create_template):
+            failed = m._create_templates_impl(force=True)
+        assert failed == ['one']
+        assert not any("left as it was" in c.args[0]
+                       for c in m.logger.error.call_args_list)
+
+    def test_a_new_template_that_fails_before_its_build_claims_no_old_one(
+            self, tmp_path: Path):
+        from unittest.mock import MagicMock
+        m = self._two_templates(tmp_path)
+        m.logger = MagicMock()
+
+        def ensure(path, **_kwargs):
+            if path.endswith('/one'):
+                raise PermissionError(13, "Permission denied", path)
+
+        failed, built = self._run(m, ensure)
+        assert failed == ['one']
+        assert not any("left as it was" in c.args[0]
+                       for c in m.logger.error.call_args_list)
+
+    def test_a_bad_value_in_the_template_block_fails_only_that_template(
+            self, tmp_path: Path):
+        """From the review of #238: the constructor, which refuses a bad
+        timeout, ran outside the per-template catch too."""
+        m = self._two_templates(tmp_path, cloudinit_agent_timeout='soon')
+        failed, built = self._run(m)
+        assert failed == ['one']
+        assert built == ['two']
+
+
+class TestPreparingTheTemplateDirKeepsTheOldTemplate:
+    """
+    From the review of #238: before create_template ran, the manager swept
+    the template's directory for foreign-owned build artifacts and unlinked
+    a stale ``seed.iso`` -- the old template's seed, which a failed rebuild
+    then had no way to restore. The directory is now only made usable.
+    """
+
+    @staticmethod
+    def _manager(tmp_path: Path):
+        from unittest.mock import patch as _patch
+        with _patch("boxman.manager.BoxmanCache"):
+            m = BoxmanManager()
+        m.config = {
+            'project': 'demo',
+            'provider': {'libvirt': {'uri': 'qemu:///system',
+                                     'use_sudo': False}},
+            'templates': {'one': {'name': 'one',
+                                  'image': str(tmp_path / 'base.qcow2'),
+                                  'workdir': str(tmp_path / 'templates')}},
+        }
+        m.app_config = {'cache': {'enabled': False}}
+        return m
+
+    @staticmethod
+    def _run(m, create_template, take_ownership, foreign=False):
+        import os
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
+        virsh = MagicMock()
+        virsh.execute.return_value = MagicMock(ok=True, stdout="one\n")
+        uid = os.getuid() + (1 if foreign else 0)
+        with _patch("boxman.manager_parts.images.VirshCommand",
+                    return_value=virsh), \
+             _patch("boxman.manager_parts.images.os.getuid",
+                    return_value=uid), \
+             _patch.object(m, "_take_ownership", take_ownership), \
+             _patch("boxman.providers.libvirt.cloudinit.CloudInitTemplate."
+                    "create_template", create_template):
+            return m._create_templates_impl(force=True)
+
+    def test_a_foreign_owned_old_seed_is_still_there_for_the_build(
+            self, tmp_path: Path):
+        from unittest.mock import MagicMock
+        m = self._manager(tmp_path)
+        template_dir = tmp_path / 'templates' / 'one'
+        template_dir.mkdir(parents=True)
+        seed = template_dir / 'seed.iso'
+        seed.write_bytes(b"the old template's seed")
+        seen: list = []
+
+        def create_template(template, force=False):
+            seen.append(seed.exists())
+            return False   # the rebuild fails: the old template must be whole
+
+        failed = self._run(m, create_template,
+                           MagicMock(return_value=MagicMock(ok=True)),
+                           foreign=True)
+        assert failed == ['one']
+        assert seen == [True]
+        assert seed.read_bytes() == b"the old template's seed"
+
+    def test_a_seed_dir_it_cannot_write_is_made_writable_not_emptied(
+            self, tmp_path: Path):
+        """Seed files are replaced, which needs a writable ``nocloud/``; one
+        left unwritable by an earlier build has the directory itself
+        repaired, as the sweep used to do for a foreign-owned one."""
+        from unittest.mock import MagicMock
+        m = self._manager(tmp_path)
+        nocloud = tmp_path / 'templates' / 'one' / 'nocloud'
+        nocloud.mkdir(parents=True)
+        (nocloud / 'user-data').write_text("old\n")
+        nocloud.chmod(0o555)
+        take = MagicMock(return_value=MagicMock(ok=True))
+        try:
+            self._run(m, lambda template, force=False: True, take)
+        finally:
+            nocloud.chmod(0o755)
+        assert str(nocloud) in [c.args[0] for c in take.call_args_list]
+        assert (nocloud / 'user-data').read_text() == "old\n"
+
 
 class TestCloneVmsExitCodeGuard:
     """

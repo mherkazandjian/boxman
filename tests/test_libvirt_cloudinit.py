@@ -691,6 +691,13 @@ class TestAForcedRebuildKeepsTheOldTemplateUntilItCanReplaceIt:
         nocloud.chmod(0o555)   # nothing in it can be replaced
 
     @staticmethod
+    def _fail_value(t, template_dir):
+        # from the review: preparing the user-data can raise ValueError (a
+        # password the hash backend refuses) once the disk is staged
+        t.prepare_nocloud_dir = MagicMock(
+            side_effect=ValueError("password too long"))
+
+    @staticmethod
     def _fail_seed(t, template_dir):
         def seed(nocloud_dir, iso):
             Path(iso).write_bytes(b"half a seed")
@@ -699,7 +706,7 @@ class TestAForcedRebuildKeepsTheOldTemplateUntilItCanReplaceIt:
 
     @pytest.mark.parametrize("fail", [
         "_fail_dhcp", "_fail_copy", "_fail_resize", "_fail_nocloud",
-        "_fail_seed"])
+        "_fail_value", "_fail_seed"])
     def test_a_step_that_fails_leaves_the_old_template_as_it_was(
             self, tmp_path: Path, fail: str, captured_logs):
         t, template_dir, events = self._forced(tmp_path)
@@ -725,7 +732,7 @@ class TestAForcedRebuildKeepsTheOldTemplateUntilItCanReplaceIt:
         assert "left as it was" in errors
 
     def test_the_old_template_goes_only_once_the_new_one_is_ready(
-            self, tmp_path: Path):
+            self, tmp_path: Path, captured_logs):
         t, template_dir, events = self._forced(tmp_path)
         t.disk_size = "20G"
         t._resize_disk_image = MagicMock(return_value=True)
@@ -752,10 +759,16 @@ class TestAForcedRebuildKeepsTheOldTemplateUntilItCanReplaceIt:
         install = shell.call_args.args[0]
         assert f"--disk=path={disk}," in install
         assert f"--disk=path={template_dir / 'seed.iso'},device=cdrom" in install
+        # a success claims neither outcome of a failure
+        messages = " ".join(r.getMessage() for r in captured_logs.records)
+        assert "left as it was" not in messages
+        assert "was removed before" not in messages
 
     def test_a_failure_after_the_swap_says_the_old_template_is_gone(
             self, tmp_path: Path, captured_logs):
         t, template_dir, events = self._forced(tmp_path)
+        # virt-install failed: no domain of that name afterwards
+        t._check_vm_exists.side_effect = [True, False]
         with patch(self.SLEEP), \
                 patch(self.SHELL_RUN,
                       return_value=_result(ok=False, stderr="no space")):
@@ -763,6 +776,61 @@ class TestAForcedRebuildKeepsTheOldTemplateUntilItCanReplaceIt:
         assert "undefine" in [e[0] for e in events]
         errors = " ".join(r.getMessage() for r in captured_logs.records)
         assert "was removed" in errors
+        assert "no replacement is defined" in errors
+
+    def test_a_replacement_that_failed_verification_is_not_called_absent(
+            self, tmp_path: Path, captured_logs):
+        """From the review: cloud-init verification failing leaves the new
+        domain defined and shut off for inspection, and create-templates
+        without --force then refuses it -- so "there is no template now"
+        was wrong advice."""
+        t, template_dir, events = self._forced(tmp_path)
+        t._check_vm_exists.side_effect = [True, True]
+        t.verify_and_shutdown.return_value = False
+        with patch(self.SLEEP), patch(self.SHELL_RUN, return_value=_result()):
+            assert t.create_template(force=True) is False
+        errors = " ".join(r.getMessage() for r in captured_logs.records)
+        assert "was removed" in errors
+        assert "kept for inspection" in errors and "--force" in errors
+        assert "no replacement is defined" not in errors
+
+    @pytest.mark.parametrize("which", [0, 1], ids=["disk", "seed"])
+    def test_a_failed_move_into_place_is_reported_and_cleaned_up(
+            self, tmp_path: Path, which: int, captured_logs):
+        """From the review: neither rename failure was exercised."""
+        import boxman.providers.libvirt.cloudinit as cloudinit
+        t, template_dir, events = self._forced(tmp_path)
+        t._check_vm_exists.side_effect = [True, False]
+        old_disk = template_dir / f"{t.template_name}.qcow2"
+        old_seed = template_dir / "seed.iso"
+
+        def execute(cmd, *args, **kwargs):
+            events.append((cmd, *args))
+            if cmd == "domstate":
+                return _result(stdout="shut off")
+            if cmd == "undefine":   # --remove-all-storage takes what it names
+                old_disk.unlink()
+                old_seed.unlink()
+            return _result()
+
+        t.virsh.execute = MagicMock(side_effect=execute)
+        real_replace = os.replace
+        moves: list = []
+
+        def replace(src, dst):
+            moves.append(src)
+            if len(moves) == which + 1:
+                raise OSError(28, "No space left on device")
+            return real_replace(src, dst)
+
+        with patch(self.SLEEP), \
+                patch(self.SHELL_RUN, return_value=_result()) as shell, \
+                patch.object(cloudinit.os, "replace", side_effect=replace):
+            assert t.create_template(force=True) is False
+        shell.assert_not_called()   # no virt-install
+        assert not list(template_dir.glob(f"*{t.STAGED_SUFFIX}"))
+        errors = " ".join(r.getMessage() for r in captured_logs.records)
+        assert "No space left" in errors and "was removed" in errors
 
     def test_files_an_interrupted_rebuild_staged_are_cleared_first(
             self, tmp_path: Path):
