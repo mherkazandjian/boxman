@@ -157,6 +157,64 @@ class TestPrepareNocloudDir:
         assert "password: '$6$" in rendered
 
 
+    def test_a_seed_file_it_cannot_open_for_writing_is_replaced(
+            self, tmp_path: Path):
+        """#238: an earlier build under another user (root, or the docker
+        runtime) leaves ``root:root 0644`` seed files in the user's own
+        ``nocloud/``. They cannot be opened for writing, but the directory
+        lets them be replaced. A 0444 file of our own refuses the same way."""
+        if os.geteuid() == 0:
+            pytest.skip("root opens any file for writing")
+        nocloud = tmp_path / "nocloud"
+        nocloud.mkdir()
+        for name in ("user-data", "meta-data", "network-config"):
+            (nocloud / name).write_text("stale\n")
+            (nocloud / name).chmod(0o444)
+        t = _make_template(tmp_path)
+        t.prepare_nocloud_dir(str(tmp_path))
+        assert (nocloud / "user-data").read_text().startswith("#cloud-config")
+        assert "instance-id:" in (nocloud / "meta-data").read_text()
+        assert (nocloud / "network-config").read_text() != "stale\n"
+
+    def test_a_symlink_in_place_of_a_seed_file_is_not_written_through(
+            self, tmp_path: Path):
+        """The user-data carries password hashes; writing it through a
+        symlink planted in ``nocloud/`` would put them wherever it points."""
+        nocloud = tmp_path / "nocloud"
+        nocloud.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.write_text("keep me\n")
+        (nocloud / "user-data").symlink_to(elsewhere)
+        t = _make_template(tmp_path)
+        t.prepare_nocloud_dir(str(tmp_path))
+        assert elsewhere.read_text() == "keep me\n"
+        assert not (nocloud / "user-data").is_symlink()
+        assert (nocloud / "user-data").read_text().startswith("#cloud-config")
+
+    def test_what_appears_after_the_old_file_is_cleared_is_not_written(
+            self, tmp_path: Path):
+        """The file is created exclusively: a symlink planted between the
+        unlink and the write makes it fail, not write through."""
+        import boxman.providers.libvirt.cloudinit as cloudinit
+        nocloud = tmp_path / "nocloud"
+        nocloud.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.write_text("keep me\n")
+        real_unlink = os.unlink
+
+        def unlink_then_plant(path, *args, **kwargs):
+            real_unlink(path, *args, **kwargs)
+            if path.endswith("user-data"):
+                os.symlink(elsewhere, path)
+
+        (nocloud / "user-data").write_text("stale\n")
+        t = _make_template(tmp_path)
+        with patch.object(cloudinit.os, "unlink", side_effect=unlink_then_plant), \
+                pytest.raises(FileExistsError):
+            t.prepare_nocloud_dir(str(tmp_path))
+        assert elsewhere.read_text() == "keep me\n"
+
+
 class TestBuildSeedIso:
 
     def test_cloud_localds_success_returns_true(self, tmp_path: Path):
@@ -464,12 +522,16 @@ class TestCreateTemplateSafeguards:
 
     @staticmethod
     def _stub_success_path(t: CloudInitTemplate) -> None:
-        """Stub out everything past the VM-exists / DHCP gates."""
+        """Stub out everything past the VM-exists / DHCP gates. The disk and
+        seed stubs write their files: the build moves them into place."""
         t._resolve_bridge = MagicMock(return_value="virbr0")
         t._verify_dhcp_on_network = MagicMock(return_value=True)
-        t.copy_base_image = MagicMock(return_value=True)
+        t.copy_base_image = MagicMock(
+            side_effect=lambda dst: Path(dst).write_bytes(b"disk") or True)
         t.prepare_nocloud_dir = MagicMock(return_value="/nocloud")
-        t.build_seed_iso = MagicMock(return_value=True)
+        t.build_seed_iso = MagicMock(
+            side_effect=lambda _nocloud, iso: Path(iso).write_bytes(b"seed")
+            or True)
         t.verify_and_shutdown = MagicMock(return_value=True)
 
     def test_force_recreate_waits_for_shut_off_before_undefine(self, tmp_path: Path):
@@ -506,9 +568,12 @@ class TestCreateTemplateSafeguards:
             return _result()
 
         with patch.object(t.virsh, "execute", side_effect=fake_execute), \
-                patch(self.SLEEP):
+                patch(self.SLEEP), patch(self.SHELL_RUN) as shell:
             assert t.create_template(force=True) is False
-        t.copy_base_image.assert_not_called()
+        shell.assert_not_called()   # no virt-install
+        # what was built for the replacement is not left behind
+        template_dir = Path(t.workdir) / t.template_name
+        assert not list(template_dir.glob(f"*{t.STAGED_SUFFIX}"))
 
     def test_force_recreate_aborts_when_vm_stays_running(self, tmp_path: Path):
         t = _make_template(tmp_path)
@@ -545,6 +610,186 @@ class TestCreateTemplateSafeguards:
                 patch(self.SHELL_RUN, return_value=_result()):
             assert t.create_template() is True
         t._verify_dhcp_on_network.assert_not_called()
+
+
+class TestAForcedRebuildKeepsTheOldTemplateUntilItCanReplaceIt:
+    """
+    #238: ``--force`` destroyed and undefined the working template first,
+    and only then ran the steps that can fail: the DHCP check, fetching the
+    base image, resizing it, writing the cloud-init seed. A predictable
+    error there left no template at all. The new disk and seed are now
+    built under other names first, and the old template is removed only
+    once they are ready.
+    """
+
+    SLEEP = "boxman.providers.libvirt.cloudinit.time.sleep"
+    SHELL_RUN = "boxman.providers.libvirt.cloudinit._shell_run"
+
+    @staticmethod
+    def _forced(tmp_path: Path, **overrides):
+        """A template whose domain exists, with its old disk and seed on
+        disk, and every external step stood in for."""
+        t = _make_template(tmp_path, **overrides)
+        template_dir = tmp_path / "workdir" / t.template_name
+        template_dir.mkdir(parents=True)
+        (template_dir / f"{t.template_name}.qcow2").write_bytes(b"old image")
+        (template_dir / "seed.iso").write_bytes(b"old seed")
+        events: list = []
+
+        def copy(dst):
+            events.append(("copy", dst))
+            Path(dst).write_bytes(b"new image")
+            return True
+
+        def seed(nocloud_dir, iso):
+            events.append(("seed", iso))
+            Path(iso).write_bytes(b"new seed")
+            return True
+
+        def execute(cmd, *args, **kwargs):
+            events.append((cmd, *args))
+            if cmd == "domstate":
+                return _result(stdout="shut off")
+            return _result()
+
+        t._check_vm_exists = MagicMock(return_value=True)
+        t._resolve_bridge = MagicMock(return_value="virbr0")
+        t._verify_dhcp_on_network = MagicMock(return_value=True)
+        t.copy_base_image = MagicMock(side_effect=copy)
+        t.build_seed_iso = MagicMock(side_effect=seed)
+        t.verify_and_shutdown = MagicMock(return_value=True)
+        t.virsh.execute = MagicMock(side_effect=execute)
+        return t, template_dir, events
+
+    @staticmethod
+    def _files(template_dir: Path) -> list[str]:
+        return sorted(p.name for p in template_dir.iterdir() if p.is_file())
+
+    @staticmethod
+    def _fail_dhcp(t, template_dir):
+        t._verify_dhcp_on_network.return_value = False
+
+    @staticmethod
+    def _fail_copy(t, template_dir):
+        def copy(dst):
+            Path(dst).write_bytes(b"half an image")
+            return False
+        t.copy_base_image.side_effect = copy
+
+    @staticmethod
+    def _fail_resize(t, template_dir):
+        t.disk_size = "20G"
+        t._resize_disk_image = MagicMock(return_value=False)
+
+    @staticmethod
+    def _fail_nocloud(t, template_dir):
+        if os.geteuid() == 0:
+            pytest.skip("root writes through any permission")
+        nocloud = template_dir / "nocloud"
+        nocloud.mkdir()
+        (nocloud / "user-data").write_text("stale\n")
+        nocloud.chmod(0o555)   # nothing in it can be replaced
+
+    @staticmethod
+    def _fail_seed(t, template_dir):
+        def seed(nocloud_dir, iso):
+            Path(iso).write_bytes(b"half a seed")
+            return False
+        t.build_seed_iso.side_effect = seed
+
+    @pytest.mark.parametrize("fail", [
+        "_fail_dhcp", "_fail_copy", "_fail_resize", "_fail_nocloud",
+        "_fail_seed"])
+    def test_a_step_that_fails_leaves_the_old_template_as_it_was(
+            self, tmp_path: Path, fail: str, captured_logs):
+        t, template_dir, events = self._forced(tmp_path)
+        getattr(self, fail)(t, template_dir)
+        try:
+            with patch(self.SLEEP), \
+                    patch(self.SHELL_RUN, return_value=_result()) as shell:
+                assert t.create_template(force=True) is False
+        finally:
+            (template_dir / "nocloud").exists() and \
+                (template_dir / "nocloud").chmod(0o755)
+
+        commands = [e[0] for e in events]
+        assert "destroy" not in commands and "undefine" not in commands
+        shell.assert_not_called()   # no virt-install
+        assert (template_dir / f"{t.template_name}.qcow2").read_bytes() \
+            == b"old image"
+        assert (template_dir / "seed.iso").read_bytes() == b"old seed"
+        # nothing half-built is left next to them
+        assert self._files(template_dir) == sorted(
+            [f"{t.template_name}.qcow2", "seed.iso"])
+        errors = " ".join(r.getMessage() for r in captured_logs.records)
+        assert "left as it was" in errors
+
+    def test_the_old_template_goes_only_once_the_new_one_is_ready(
+            self, tmp_path: Path):
+        t, template_dir, events = self._forced(tmp_path)
+        t.disk_size = "20G"
+        t._resize_disk_image = MagicMock(return_value=True)
+        disk = template_dir / f"{t.template_name}.qcow2"
+        with patch(self.SLEEP), \
+                patch(self.SHELL_RUN, return_value=_result()) as shell:
+            assert t.create_template(force=True) is True
+
+        order = [e[0] for e in events]
+        assert order.index("copy") < order.index("destroy")
+        assert order.index("seed") < order.index("destroy")
+        # built under other names: --remove-all-storage takes what the old
+        # domain names, which would otherwise be the new disk and seed
+        staged_disk = next(e[1] for e in events if e[0] == "copy")
+        staged_seed = next(e[1] for e in events if e[0] == "seed")
+        assert staged_disk != str(disk)
+        # the old disk is not resized in place either
+        t._resize_disk_image.assert_called_once_with(staged_disk, "20G")
+        assert staged_seed != str(template_dir / "seed.iso")
+        assert disk.read_bytes() == b"new image"
+        assert (template_dir / "seed.iso").read_bytes() == b"new seed"
+        assert self._files(template_dir) == sorted(
+            [disk.name, "seed.iso"])
+        install = shell.call_args.args[0]
+        assert f"--disk=path={disk}," in install
+        assert f"--disk=path={template_dir / 'seed.iso'},device=cdrom" in install
+
+    def test_a_failure_after_the_swap_says_the_old_template_is_gone(
+            self, tmp_path: Path, captured_logs):
+        t, template_dir, events = self._forced(tmp_path)
+        with patch(self.SLEEP), \
+                patch(self.SHELL_RUN,
+                      return_value=_result(ok=False, stderr="no space")):
+            assert t.create_template(force=True) is False
+        assert "undefine" in [e[0] for e in events]
+        errors = " ".join(r.getMessage() for r in captured_logs.records)
+        assert "was removed" in errors
+
+    def test_files_an_interrupted_rebuild_staged_are_cleared_first(
+            self, tmp_path: Path):
+        """A rebuild interrupted after staging leaves its files behind,
+        possibly owned by whoever ran it; they are not written into."""
+        if os.geteuid() == 0:
+            pytest.skip("root writes through any permission")
+        t, template_dir, events = self._forced(tmp_path)
+        for name in (f"{t.template_name}.qcow2", "seed.iso"):
+            stale = template_dir / f"{name}{t.STAGED_SUFFIX}"
+            stale.write_bytes(b"stale")
+            stale.chmod(0o444)
+        with patch(self.SLEEP), patch(self.SHELL_RUN, return_value=_result()):
+            assert t.create_template(force=True) is True
+        assert (template_dir / "seed.iso").read_bytes() == b"new seed"
+        assert self._files(template_dir) == sorted(
+            [f"{t.template_name}.qcow2", "seed.iso"])
+
+    def test_a_fresh_build_reports_no_old_template(
+            self, tmp_path: Path, captured_logs):
+        t, template_dir, events = self._forced(tmp_path)
+        t._check_vm_exists.return_value = False
+        self._fail_seed(t, template_dir)
+        with patch(self.SLEEP), patch(self.SHELL_RUN, return_value=_result()):
+            assert t.create_template(force=True) is False
+        errors = " ".join(r.getMessage() for r in captured_logs.records)
+        assert "left as it was" not in errors and "was removed" not in errors
 
 
 class TestShellQuoting:
@@ -630,12 +875,7 @@ class TestShellQuoting:
     def test_virt_install_command_quotes_name_and_paths(self, tmp_path: Path):
         t = _make_template(tmp_path, template_name="my tmpl")
         t._check_vm_exists = MagicMock(return_value=False)
-        t._resolve_bridge = MagicMock(return_value="virbr0")
-        t._verify_dhcp_on_network = MagicMock(return_value=True)
-        t.copy_base_image = MagicMock(return_value=True)
-        t.prepare_nocloud_dir = MagicMock(return_value="/nocloud")
-        t.build_seed_iso = MagicMock(return_value=True)
-        t.verify_and_shutdown = MagicMock(return_value=True)
+        TestCreateTemplateSafeguards._stub_success_path(t)
         with patch.object(t.virsh, "execute", return_value=_result()), \
                 patch(self.SHELL_RUN, return_value=_result()) as run:
             assert t.create_template() is True

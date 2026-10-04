@@ -299,8 +299,10 @@ class ImagesMixin:
 
             try:
                 success = ct.create_template(force=force)
-            except ValueError as exc:
-                # a bad timeout or marker in the template block
+            except (ValueError, OSError) as exc:
+                # a bad timeout or marker in the template block, or a file the
+                # build cannot write: this template failed, and the others are
+                # still built (#238)
                 self.logger.error(f"template '{tpl_key}': {exc}")
                 success = False
 

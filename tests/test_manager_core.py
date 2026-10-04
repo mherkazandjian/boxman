@@ -359,6 +359,53 @@ class TestCheckTemplatesForClusters:
         assert captured[0].get('requested') == ['tpl1']
 
 
+class TestOneTemplatesErrorDoesNotEndTheRun:
+    """
+    #238: around create_template, _create_templates_impl caught only
+    ValueError. A PermissionError while writing the cloud-init seed ended
+    the run as a traceback, without the failure summary, and the other
+    requested templates were never tried.
+    """
+
+    def test_an_os_error_fails_that_template_and_the_next_is_built(
+            self, tmp_path: Path):
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
+        with _patch("boxman.manager.BoxmanCache"):
+            m = BoxmanManager()
+        m.config = {
+            'project': 'demo',
+            'provider': {'libvirt': {'uri': 'qemu:///system',
+                                     'use_sudo': False}},
+            'templates': {
+                name: {'name': name, 'image': str(tmp_path / 'base.qcow2'),
+                       'workdir': str(tmp_path / 'templates')}
+                for name in ('one', 'two')
+            },
+        }
+        m.app_config = {'cache': {'enabled': False}}
+        virsh = MagicMock()
+        virsh.execute.return_value = MagicMock(ok=True, stdout="")
+        built: list = []
+
+        def create_template(template, force=False):
+            built.append(template.template_name)
+            if template.template_name == 'one':
+                raise PermissionError(
+                    13, "Permission denied", "nocloud/user-data")
+            return True
+
+        with _patch("boxman.manager_parts.images.VirshCommand",
+                    return_value=virsh), \
+             _patch.object(m, "_ensure_writable_dir"), \
+             _patch("boxman.providers.libvirt.cloudinit.CloudInitTemplate."
+                    "create_template", create_template):
+            failed = m._create_templates_impl()
+
+        assert failed == ['one']
+        assert built == ['one', 'two']
+
+
 class TestCloneVmsExitCodeGuard:
     """
     Regression: a failed clone subprocess used to leave provision running
