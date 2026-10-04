@@ -182,11 +182,16 @@ class CloudInitTemplate:
         return f"oci-cache:///{safe}-{digest}.qcow2"
 
     def _check_vm_exists(self) -> bool:
+        return self._domain_present() is True
+
+    def _domain_present(self) -> bool | None:
+        """Whether the template's domain is defined, or ``None`` when libvirt
+        could not be asked."""
         result = self.virsh.execute("list", "--all", "--name", hide=True, warn=True)
-        if result.ok:
-            names = [n.strip() for n in result.stdout.strip().split("\n") if n.strip()]
-            return self.template_name in names
-        return False
+        if not result.ok:
+            return None
+        names = [n.strip() for n in result.stdout.strip().split("\n") if n.strip()]
+        return self.template_name in names
 
     def build_seed_iso(self, nocloud_dir: str, seed_iso_path: str) -> bool:
         self.logger.info(f"building cloud-init seed ISO: {seed_iso_path}")
@@ -316,6 +321,25 @@ class CloudInitTemplate:
             f"failed to start network '{net_name}': {result.stderr}")
         return False
 
+    @staticmethod
+    def _write_fresh(path: str, text: str) -> None:
+        """
+        Write *text* to a new file at *path*, replacing whatever was there.
+
+        An earlier build that ran as another user (root, or the docker
+        runtime) leaves seed files this user cannot open for writing, though
+        the directory lets them be replaced (#238). So the old entry is
+        unlinked and the new file created exclusively: nothing found at the
+        path, or put there in between -- a file, a symlink -- is written
+        through. The user-data carries password hashes.
+        """
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        with open(path, "x") as fobj:
+            fobj.write(text)
+
     def prepare_nocloud_dir(self, base_dir: str) -> str:
         nocloud_dir = os.path.join(base_dir, "nocloud")
         os.makedirs(nocloud_dir, exist_ok=True)
@@ -342,8 +366,7 @@ class CloudInitTemplate:
         )
 
         userdata_path = os.path.join(nocloud_dir, "user-data")
-        with open(userdata_path, "w") as fobj:
-            fobj.write(userdata)
+        self._write_fresh(userdata_path, userdata)
         self.logger.info(f"wrote user-data to {userdata_path}")
         self.logger.debug(f"user-data content:\n{userdata}")
 
@@ -354,8 +377,7 @@ class CloudInitTemplate:
                 hostname=self.template_name,
             )
         metadata_path = os.path.join(nocloud_dir, "meta-data")
-        with open(metadata_path, "w") as fobj:
-            fobj.write(metadata)
+        self._write_fresh(metadata_path, metadata)
         self.logger.info(f"wrote meta-data to {metadata_path}")
 
         # Use custom network config if provided, otherwise use default DHCP config.
@@ -375,8 +397,7 @@ class CloudInitTemplate:
             if not network_config:
                 network_config = DEFAULT_NETWORK_CONFIG
             network_config_path = os.path.join(nocloud_dir, "network-config")
-            with open(network_config_path, "w") as fobj:
-                fobj.write(network_config)
+            self._write_fresh(network_config_path, network_config)
             self.logger.info(f"wrote network-config to {network_config_path}")
 
         return nocloud_dir
@@ -924,40 +945,29 @@ class CloudInitTemplate:
             self.logger.warning(f"failed to parse network XML: {exc}")
             return False
 
+    #: Appended to the new disk and seed while they are built next to the
+    #: files of the template they replace (#238). The old domain names the
+    #: final paths, and ``undefine --remove-all-storage`` removes what it
+    #: names, so the new files reach those paths only once it is gone.
+    STAGED_SUFFIX = ".boxman-staged"
+
     def create_template(self, force: bool = False) -> bool:
         self.logger.status(f"creating cloud-init template: {self.template_name}")
 
-        if self._check_vm_exists():
-            if not force:
-                self.logger.error(
-                    f"template VM '{self.template_name}' already exists. "
-                    f"Use --force to delete and recreate it."
-                )
-                return False
-            else:
-                self.logger.warning(
-                    f"template VM '{self.template_name}' exists, "
-                    f"destroying first (--force was specified)")
-                self.virsh.execute(
-                    "destroy", self.template_name, hide=True, warn=True)
-                # undefine fails while QEMU is still tearing the domain down,
-                # and the virt-install below would then die with "domain
-                # already exists" — wait for shut-off before removing it
-                if not self._wait_until_shut_off():
-                    self.logger.error(
-                        f"template VM '{self.template_name}' did not shut off "
-                        f"after destroy — refusing to recreate it")
-                    return False
-                undefine = self.virsh.execute(
-                    "undefine", self.template_name,
-                    "--remove-all-storage", hide=True, warn=True)
-                if not undefine.ok:
-                    self.logger.error(
-                        f"failed to undefine template VM "
-                        f"'{self.template_name}': {undefine.stderr}")
-                    return False
-                self.logger.info(
-                    f"template VM '{self.template_name}' has been removed")
+        replacing = self._check_vm_exists()
+        if replacing and not force:
+            self.logger.error(
+                f"template VM '{self.template_name}' already exists. "
+                f"Use --force to delete and recreate it."
+            )
+            return False
+
+        # Everything that can fail without touching an existing template
+        # comes first. --force used to remove the template before any of it,
+        # so a predictable error -- no DHCP, a base image that cannot be had,
+        # a seed file that cannot be written -- left no template at all
+        # (#238). The old one is removed only once the new disk and seed
+        # are ready.
 
         # Resolve bridge device (auto-starts the network if needed)
         bridge_device = self._resolve_bridge()
@@ -971,6 +981,7 @@ class CloudInitTemplate:
                 self.logger.error(
                     f"cannot create template '{self.template_name}': "
                     f"no DHCP on network '{self.network}' — see above")
+                self._report_kept(replacing)
                 return False
 
         template_dir = os.path.join(self.workdir, self.template_name)
@@ -983,20 +994,143 @@ class CloudInitTemplate:
         else:
             image_ext = os.path.splitext(self.image_path)[1] or f".{self.disk_format}"
         dst_image_path = os.path.join(template_dir, f"{self.template_name}{image_ext}")
-        if not self.copy_base_image(dst_image_path):
+        seed_iso_path = os.path.join(template_dir, "seed.iso")
+        staged = [dst_image_path + self.STAGED_SUFFIX,
+                  seed_iso_path + self.STAGED_SUFFIX]
+
+        installed = False
+        # what this run staged and has not yet moved into place: once moved,
+        # the names are free, and whatever appears there is not its own
+        pending = list(staged)
+        try:
+            try:
+                ready = self._build_staged(template_dir, *staged)
+            except (OSError, ValueError) as exc:
+                # a seed file that cannot be written, a password the hash
+                # backend refuses (#238 review)
+                self.logger.error(
+                    f"cannot create template '{self.template_name}': {exc}")
+                ready = False
+            if not ready:
+                self._report_kept(replacing)
+                return False
+
+            if replacing and not self._remove_old_template():
+                return False
+
+            try:
+                os.replace(staged[0], dst_image_path)
+                pending.remove(staged[0])
+                os.replace(staged[1], seed_iso_path)
+                pending.remove(staged[1])
+            except OSError as exc:
+                self.logger.error(
+                    f"cannot put the new disk and seed of template "
+                    f"'{self.template_name}' in place: {exc}")
+            else:
+                installed = self._install_template(
+                    dst_image_path, seed_iso_path, bridge_device)
+        finally:
+            # on every way out, what is still staged was not used
+            self._discard(pending)
+        if not installed and replacing:
+            self._report_removed()
+        return installed
+
+    def _build_staged(self, template_dir: str, staged_image: str,
+                      staged_seed: str) -> bool:
+        """
+        Build the new disk and cloud-init seed under their staged names.
+
+        Returns:
+            Whether both are ready; a step that fails has logged why.
+        """
+        # an interrupted run leaves its staged files behind
+        self._discard([staged_image, staged_seed])
+        if not self.copy_base_image(staged_image):
             return False
 
         # Resize the disk image if a target size was specified
         if self.disk_size:
-            if not self._resize_disk_image(dst_image_path, self.disk_size):
+            if not self._resize_disk_image(staged_image, self.disk_size):
                 return False
 
         nocloud_dir = self.prepare_nocloud_dir(template_dir)
+        return self.build_seed_iso(nocloud_dir, staged_seed)
 
-        seed_iso_path = os.path.join(template_dir, "seed.iso")
-        if not self.build_seed_iso(nocloud_dir, seed_iso_path):
+    def _discard(self, paths: list[str]) -> None:
+        """Remove what was staged, best-effort: it is never the template."""
+        for path in paths:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self.logger.warning(f"could not remove {path}: {exc}")
+
+    def _report_kept(self, replacing: bool) -> None:
+        if replacing:
+            self.logger.error(
+                f"the existing template '{self.template_name}' was left as "
+                f"it was")
+
+    def _report_removed(self) -> None:
+        """Say what is there once a failure follows the old template's removal."""
+        present = self._domain_present()
+        if present is None:
+            self.logger.error(
+                f"the previous template '{self.template_name}' was removed "
+                f"before this step, and whether a replacement is defined "
+                f"could not be determined (libvirt did not answer): check "
+                f"with 'virsh list --all' before rebuilding it")
+        elif present:
+            # verification failing shuts the new domain down and keeps it
+            self.logger.error(
+                f"the previous template '{self.template_name}' was removed "
+                f"before this step; its replacement is defined but did not "
+                f"complete, and is kept for inspection: rebuild it with "
+                f"create-templates --force")
+        else:
+            self.logger.error(
+                f"the previous template '{self.template_name}' was removed "
+                f"before this step, and no replacement is defined: run "
+                f"create-templates again to build it")
+
+    def _remove_old_template(self) -> bool:
+        """
+        Destroy and undefine the template being replaced, with its storage.
+
+        Returns:
+            Whether it is gone; when not, the reason has been logged.
+        """
+        self.logger.warning(
+            f"template VM '{self.template_name}' exists, and its "
+            f"replacement is ready: removing it (--force was specified)")
+        self.virsh.execute(
+            "destroy", self.template_name, hide=True, warn=True)
+        # undefine fails while QEMU is still tearing the domain down,
+        # and the virt-install below would then die with "domain
+        # already exists" — wait for shut-off before removing it
+        if not self._wait_until_shut_off():
+            self.logger.error(
+                f"template VM '{self.template_name}' did not shut off "
+                f"after destroy — refusing to recreate it")
             return False
+        undefine = self.virsh.execute(
+            "undefine", self.template_name,
+            "--remove-all-storage", hide=True, warn=True)
+        if not undefine.ok:
+            self.logger.error(
+                f"failed to undefine template VM "
+                f"'{self.template_name}': {undefine.stderr}")
+            return False
+        self.logger.info(
+            f"template VM '{self.template_name}' has been removed")
+        return True
 
+    def _install_template(self, dst_image_path: str, seed_iso_path: str,
+                          bridge_device: str | None) -> bool:
+        """Define and boot the template from its disk and seed, then verify it."""
         self.logger.info("running virt-install to create template VM...")
 
         try:

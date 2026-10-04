@@ -331,7 +331,7 @@ template time:
 | `boxman ssh [<vm>] [--cluster <c>]` | Interactive SSH into a **VM** (default: `GATEWAYHOST`). `<vm>` is an `ssh_config` alias (`<cluster>_<hostname>`) or a numeric id from `boxman ps`. Not for containers. |
 | `boxman exec <cluster>.<box> [--shell sh] [-- <cmd>]` | `docker compose exec` into a **container**. No command opens a shell. Put a command with its own flags after `--`. |
 | `boxman run [<task>] [-- args] [-l] [--cmd '<sh>'] [--ansible-flags '<f>'] [--cluster <c>]` | Run a named `tasks:` entry (or ad-hoc `--cmd`) with the workspace env loaded. `--ansible-flags` applies **only** to `--cmd`. |
-| `boxman create-templates [--templates a,b] [--force]` | Build `templates:` base images. |
+| `boxman create-templates [--templates a,b] [--force]` | Build `templates:` base images. `--force` rebuilds one that exists: the new disk and seed are built first, and the old template is removed only once they are ready, so a failure before that (no DHCP, an image that cannot be had, a seed file that cannot be written) leaves it in place. One template's failure does not stop the others (#238). |
 | `boxman import-image --uri <file://\|http(s)://> [--name N] [--directory D] [--provider libvirt]` | Import a VM from a `manifest.json` package (XML + qcow2), local or remote. Strict schema validation; every failure exits 2. |
 | `boxman image push <ref> --qcow2 <path> [--metadata vmimage.json]` | Push a qcow2 to an OCI registry via `oras`. |
 | `boxman image inspect <ref>` | Print an OCI image's manifest, `kind`, and `vmimage.json` metadata without downloading the disk. |

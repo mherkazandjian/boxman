@@ -160,7 +160,6 @@ class ImagesMixin:
             force: If True, recreate existing templates.
         """
         from boxman.image_cache import ImageCache
-        from boxman.providers.libvirt.cloudinit import CloudInitTemplate
 
         cache_conf = self.app_config.get('cache', {}) if self.app_config else {}
         image_cache = ImageCache.from_config(cache_conf)
@@ -261,47 +260,43 @@ class ImagesMixin:
             tpl_bridge = tpl_conf.get('bridge', None)
             tpl_workdir = tpl_conf.get('workdir', default_workdir)
 
-            # Ensure the workdir exists and is writable by the current user.
-            # Earlier steps (e.g. docker runtime) may have created it as root.
-            expanded_workdir = os.path.expanduser(tpl_workdir)
-            self._ensure_writable_dir(expanded_workdir)
-
-            # Also pre-create the template subdirectory that cloudinit.py
-            # will use, so it doesn't hit PermissionError.
-            template_subdir = os.path.join(expanded_workdir, tpl_name)
-            self._ensure_writable_dir(template_subdir)
-
-            self.logger.info(f"creating template '{tpl_key}' -> VM name '{tpl_name}'")
-
-            ct = CloudInitTemplate(
-                template_name=tpl_name,
-                image_path=image_path,
-                cloudinit_userdata=cloudinit_userdata,
-                cloudinit_metadata=cloudinit_metadata,
-                cloudinit_network_config=cloudinit_network_config,
-                cloudinit_done_marker=cloudinit_done_marker,
-                cloudinit_agent_timeout=cloudinit_agent_timeout,
-                cloudinit_guest_exec_timeout=cloudinit_guest_exec_timeout,
-                cloudinit_done_timeout=cloudinit_done_timeout,
-                cloudinit_fallback_timeout=cloudinit_fallback_timeout,
-                workdir=tpl_workdir,
-                provider_config=provider_config,
-                memory=tpl_memory,
-                vcpus=tpl_vcpus,
-                os_variant=tpl_os_variant,
-                disk_format=tpl_disk_format,
-                disk_size=tpl_disk_size,
-                network=tpl_network,
-                bridge=tpl_bridge,
-                image_checksum=image_checksum,
-                image_cache=image_cache,
-            )
-
+            ct = None
             try:
+                ct = self._prepare_template(
+                    tpl_key, tpl_name, tpl_workdir,
+                    template_name=tpl_name,
+                    image_path=image_path,
+                    cloudinit_userdata=cloudinit_userdata,
+                    cloudinit_metadata=cloudinit_metadata,
+                    cloudinit_network_config=cloudinit_network_config,
+                    cloudinit_done_marker=cloudinit_done_marker,
+                    cloudinit_agent_timeout=cloudinit_agent_timeout,
+                    cloudinit_guest_exec_timeout=cloudinit_guest_exec_timeout,
+                    cloudinit_done_timeout=cloudinit_done_timeout,
+                    cloudinit_fallback_timeout=cloudinit_fallback_timeout,
+                    workdir=tpl_workdir,
+                    provider_config=provider_config,
+                    memory=tpl_memory,
+                    vcpus=tpl_vcpus,
+                    os_variant=tpl_os_variant,
+                    disk_format=tpl_disk_format,
+                    disk_size=tpl_disk_size,
+                    network=tpl_network,
+                    bridge=tpl_bridge,
+                    image_checksum=image_checksum,
+                    image_cache=image_cache,
+                )
                 success = ct.create_template(force=force)
-            except ValueError as exc:
-                # a bad timeout or marker in the template block
+            except (ValueError, OSError) as exc:
+                # a bad timeout or marker in the template block, a directory
+                # that cannot be made usable, a file the build cannot write:
+                # this template failed, and the others are still built (#238)
                 self.logger.error(f"template '{tpl_key}': {exc}")
+                if ct is None and tpl_key in existing_templates:
+                    # its build never began, so nothing of it was touched
+                    self.logger.error(
+                        f"the existing template '{tpl_name}' was left as it "
+                        f"was")
                 success = False
 
             if success:
@@ -311,6 +306,42 @@ class ImagesMixin:
                 failed.append(tpl_key)
 
         return failed
+
+    def _prepare_template(self, tpl_key: str, tpl_name: str,
+                          tpl_workdir: str, **template_kwargs):
+        """
+        Prepare one template's directories, and return its builder.
+
+        The directories are made usable, never swept: the sweep unlinks a
+        foreign-owned ``seed.iso``, which in a template's directory is the
+        seed of the template a ``--force`` rebuild must leave whole until
+        its replacement is ready (#238 review) -- and the workdir may be
+        another template's directory. The build stages its own files and
+        moves them over the old ones.
+        """
+        # Ensure the workdir exists and is writable by the current user.
+        # Earlier steps (e.g. docker runtime) may have created it as root.
+        # Not swept either: workdirs may nest, so it can be another
+        # template's directory (#238 review).
+        expanded_workdir = os.path.expanduser(tpl_workdir)
+        self._ensure_writable_dir(expanded_workdir, sweep_foreign=False)
+
+        # Also pre-create the template subdirectory that cloudinit.py
+        # will use, so it doesn't hit PermissionError.
+        template_subdir = os.path.join(expanded_workdir, tpl_name)
+        self._ensure_writable_dir(template_subdir, sweep_foreign=False)
+
+        # The seed files are replaced in place, which needs the directory
+        # they are in to be writable; one an earlier build left otherwise is
+        # repaired, the directory alone, as the sweep used to.
+        nocloud = os.path.join(template_subdir, 'nocloud')
+        if os.path.isdir(nocloud):
+            self._normalize_ownership(nocloud, sweep_foreign=False)
+
+        from boxman.providers.libvirt.cloudinit import CloudInitTemplate
+
+        self.logger.info(f"creating template '{tpl_key}' -> VM name '{tpl_name}'")
+        return CloudInitTemplate(**template_kwargs)
 
     def _ensure_writable_dir(self, path: str,
                              sweep_foreign: bool = True) -> None:
