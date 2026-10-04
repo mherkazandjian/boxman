@@ -315,14 +315,16 @@ class ImagesMixin:
         The directories are made usable, never swept: the sweep unlinks a
         foreign-owned ``seed.iso``, which in a template's directory is the
         seed of the template a ``--force`` rebuild must leave whole until
-        its replacement is ready (#238 review). The build stages its own
-        files and moves them over the old ones.
+        its replacement is ready (#238 review) -- and the workdir may be
+        another template's directory. The build stages its own files and
+        moves them over the old ones.
         """
         # Ensure the workdir exists and is writable by the current user.
         # Earlier steps (e.g. docker runtime) may have created it as root.
-        # Its sweep cannot reach a template: each lives in its own directory.
+        # Not swept either: workdirs may nest, so it can be another
+        # template's directory (#238 review).
         expanded_workdir = os.path.expanduser(tpl_workdir)
-        self._ensure_writable_dir(expanded_workdir)
+        self._ensure_writable_dir(expanded_workdir, sweep_foreign=False)
 
         # Also pre-create the template subdirectory that cloudinit.py
         # will use, so it doesn't hit PermissionError.

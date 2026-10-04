@@ -543,7 +543,7 @@ class TestPreparingTheTemplateDirKeepsTheOldTemplate:
     """
 
     @staticmethod
-    def _manager(tmp_path: Path):
+    def _manager(tmp_path: Path, **more):
         from unittest.mock import patch as _patch
         with _patch("boxman.manager.BoxmanCache"):
             m = BoxmanManager()
@@ -553,7 +553,8 @@ class TestPreparingTheTemplateDirKeepsTheOldTemplate:
                                      'use_sudo': False}},
             'templates': {'one': {'name': 'one',
                                   'image': str(tmp_path / 'base.qcow2'),
-                                  'workdir': str(tmp_path / 'templates')}},
+                                  'workdir': str(tmp_path / 'templates')},
+                          **more},
         }
         m.app_config = {'cache': {'enabled': False}}
         return m
@@ -564,7 +565,7 @@ class TestPreparingTheTemplateDirKeepsTheOldTemplate:
         from unittest.mock import MagicMock
         from unittest.mock import patch as _patch
         virsh = MagicMock()
-        virsh.execute.return_value = MagicMock(ok=True, stdout="one\n")
+        virsh.execute.return_value = MagicMock(ok=True, stdout="one\ntwo\n")
         uid = os.getuid() + (1 if foreign else 0)
         with _patch("boxman.manager_parts.images.VirshCommand",
                     return_value=virsh), \
@@ -596,6 +597,31 @@ class TestPreparingTheTemplateDirKeepsTheOldTemplate:
         assert seen == [True]
         assert seed.read_bytes() == b"the old template's seed"
 
+    def test_another_templates_workdir_does_not_sweep_this_ones_seed(
+            self, tmp_path: Path):
+        """From round 2 of the review: workdirs may nest, and a template
+        whose workdir is another's directory swept that directory as its
+        root, removing the other's old seed."""
+        from unittest.mock import MagicMock
+        nested = str(tmp_path / 'templates' / 'one')
+        m = self._manager(tmp_path, two={
+            'name': 'two', 'image': str(tmp_path / 'base.qcow2'),
+            'workdir': nested})
+        template_dir = tmp_path / 'templates' / 'one'
+        template_dir.mkdir(parents=True)
+        seed = template_dir / 'seed.iso'
+        seed.write_bytes(b"one's old seed")
+        seen: list = []
+
+        def create_template(template, force=False):
+            seen.append(seed.exists())
+            return False
+
+        self._run(m, create_template,
+                  MagicMock(return_value=MagicMock(ok=True)), foreign=True)
+        assert seen == [True, True]
+        assert seed.read_bytes() == b"one's old seed"
+
     def test_a_seed_dir_it_cannot_write_is_made_writable_not_emptied(
             self, tmp_path: Path):
         """Seed files are replaced, which needs a writable ``nocloud/``; one
@@ -609,10 +635,15 @@ class TestPreparingTheTemplateDirKeepsTheOldTemplate:
         nocloud.chmod(0o555)
         take = MagicMock(return_value=MagicMock(ok=True))
         try:
-            self._run(m, lambda template, force=False: True, take)
+            # everything looks foreign-owned: the repair still touches the
+            # directory alone, never what is in it
+            self._run(m, lambda template, force=False: True, take,
+                      foreign=True)
         finally:
             nocloud.chmod(0o755)
-        assert str(nocloud) in [c.args[0] for c in take.call_args_list]
+        targets = [c.args[0] for c in take.call_args_list]
+        assert str(nocloud) in targets
+        assert str(nocloud / 'user-data') not in targets
         assert (nocloud / 'user-data').read_text() == "old\n"
 
 

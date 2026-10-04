@@ -182,11 +182,16 @@ class CloudInitTemplate:
         return f"oci-cache:///{safe}-{digest}.qcow2"
 
     def _check_vm_exists(self) -> bool:
+        return self._domain_present() is True
+
+    def _domain_present(self) -> bool | None:
+        """Whether the template's domain is defined, or ``None`` when libvirt
+        could not be asked."""
         result = self.virsh.execute("list", "--all", "--name", hide=True, warn=True)
-        if result.ok:
-            names = [n.strip() for n in result.stdout.strip().split("\n") if n.strip()]
-            return self.template_name in names
-        return False
+        if not result.ok:
+            return None
+        names = [n.strip() for n in result.stdout.strip().split("\n") if n.strip()]
+        return self.template_name in names
 
     def build_seed_iso(self, nocloud_dir: str, seed_iso_path: str) -> bool:
         self.logger.info(f"building cloud-init seed ISO: {seed_iso_path}")
@@ -994,6 +999,9 @@ class CloudInitTemplate:
                   seed_iso_path + self.STAGED_SUFFIX]
 
         installed = False
+        # what this run staged and has not yet moved into place: once moved,
+        # the names are free, and whatever appears there is not its own
+        pending = list(staged)
         try:
             try:
                 ready = self._build_staged(template_dir, *staged)
@@ -1012,7 +1020,9 @@ class CloudInitTemplate:
 
             try:
                 os.replace(staged[0], dst_image_path)
+                pending.remove(staged[0])
                 os.replace(staged[1], seed_iso_path)
+                pending.remove(staged[1])
             except OSError as exc:
                 self.logger.error(
                     f"cannot put the new disk and seed of template "
@@ -1022,7 +1032,7 @@ class CloudInitTemplate:
                     dst_image_path, seed_iso_path, bridge_device)
         finally:
             # on every way out, what is still staged was not used
-            self._discard(staged)
+            self._discard(pending)
         if not installed and replacing:
             self._report_removed()
         return installed
@@ -1066,7 +1076,14 @@ class CloudInitTemplate:
 
     def _report_removed(self) -> None:
         """Say what is there once a failure follows the old template's removal."""
-        if self._check_vm_exists():
+        present = self._domain_present()
+        if present is None:
+            self.logger.error(
+                f"the previous template '{self.template_name}' was removed "
+                f"before this step, and whether a replacement is defined "
+                f"could not be determined (libvirt did not answer): check "
+                f"with 'virsh list --all' before rebuilding it")
+        elif present:
             # verification failing shuts the new domain down and keeps it
             self.logger.error(
                 f"the previous template '{self.template_name}' was removed "

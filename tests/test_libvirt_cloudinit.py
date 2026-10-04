@@ -650,8 +650,13 @@ class TestAForcedRebuildKeepsTheOldTemplateUntilItCanReplaceIt:
             events.append((cmd, *args))
             if cmd == "domstate":
                 return _result(stdout="shut off")
+            if cmd == "list":
+                # by default no domain of that name once the old is gone
+                return (t.listings.pop(0) if len(t.listings) > 1
+                        else t.listings[0])
             return _result()
 
+        t.listings = [_result(stdout="")]
         t._check_vm_exists = MagicMock(return_value=True)
         t._resolve_bridge = MagicMock(return_value="virbr0")
         t._verify_dhcp_on_network = MagicMock(return_value=True)
@@ -764,11 +769,29 @@ class TestAForcedRebuildKeepsTheOldTemplateUntilItCanReplaceIt:
         assert "left as it was" not in messages
         assert "was removed before" not in messages
 
+    def test_staged_names_are_not_removed_once_moved_into_place(
+            self, tmp_path: Path):
+        """From round 2 of the review: after the swap this run owns nothing
+        at the staged names, but its cleanup still unlinked them -- taking
+        what another rebuild of the template staged there meanwhile."""
+        t, template_dir, events = self._forced(tmp_path)
+        others = [template_dir / f"{t.template_name}.qcow2{t.STAGED_SUFFIX}",
+                  template_dir / f"seed.iso{t.STAGED_SUFFIX}"]
+
+        def verify():
+            for path in others:   # staged by someone else during the boot
+                path.write_bytes(b"another run's")
+            return True
+
+        t.verify_and_shutdown = MagicMock(side_effect=verify)
+        with patch(self.SLEEP), patch(self.SHELL_RUN, return_value=_result()):
+            assert t.create_template(force=True) is True
+        assert all(p.read_bytes() == b"another run's" for p in others)
+
     def test_a_failure_after_the_swap_says_the_old_template_is_gone(
             self, tmp_path: Path, captured_logs):
         t, template_dir, events = self._forced(tmp_path)
         # virt-install failed: no domain of that name afterwards
-        t._check_vm_exists.side_effect = [True, False]
         with patch(self.SLEEP), \
                 patch(self.SHELL_RUN,
                       return_value=_result(ok=False, stderr="no space")):
@@ -785,7 +808,7 @@ class TestAForcedRebuildKeepsTheOldTemplateUntilItCanReplaceIt:
         without --force then refuses it -- so "there is no template now"
         was wrong advice."""
         t, template_dir, events = self._forced(tmp_path)
-        t._check_vm_exists.side_effect = [True, True]
+        t.listings = [_result(stdout=f"{t.template_name}\n")]
         t.verify_and_shutdown.return_value = False
         with patch(self.SLEEP), patch(self.SHELL_RUN, return_value=_result()):
             assert t.create_template(force=True) is False
@@ -794,13 +817,30 @@ class TestAForcedRebuildKeepsTheOldTemplateUntilItCanReplaceIt:
         assert "kept for inspection" in errors and "--force" in errors
         assert "no replacement is defined" not in errors
 
+    def test_a_replacement_libvirt_cannot_be_asked_about_is_not_called_absent(
+            self, tmp_path: Path, captured_logs):
+        """From round 2 of the review: a failed `virsh list` read as "no
+        such domain", and the message then claimed no replacement was
+        defined, with advice to retry without --force."""
+        t, template_dir, events = self._forced(tmp_path)
+        del t._check_vm_exists   # the real lookup, for both questions
+        t.listings = [_result(stdout=f"{t.template_name}\n"),
+                      _result(ok=False, stderr="libvirt connection unavailable")]
+        t.verify_and_shutdown.return_value = False
+        with patch(self.SLEEP), patch(self.SHELL_RUN, return_value=_result()):
+            assert t.create_template(force=True) is False
+        errors = " ".join(r.getMessage() for r in captured_logs.records)
+        assert "was removed" in errors
+        assert "could not be determined" in errors
+        assert "no replacement is defined" not in errors
+        assert "kept for inspection" not in errors
+
     @pytest.mark.parametrize("which", [0, 1], ids=["disk", "seed"])
     def test_a_failed_move_into_place_is_reported_and_cleaned_up(
             self, tmp_path: Path, which: int, captured_logs):
         """From the review: neither rename failure was exercised."""
         import boxman.providers.libvirt.cloudinit as cloudinit
         t, template_dir, events = self._forced(tmp_path)
-        t._check_vm_exists.side_effect = [True, False]
         old_disk = template_dir / f"{t.template_name}.qcow2"
         old_seed = template_dir / "seed.iso"
 
@@ -811,7 +851,7 @@ class TestAForcedRebuildKeepsTheOldTemplateUntilItCanReplaceIt:
             if cmd == "undefine":   # --remove-all-storage takes what it names
                 old_disk.unlink()
                 old_seed.unlink()
-            return _result()
+            return _result()   # `list`: no domain of that name
 
         t.virsh.execute = MagicMock(side_effect=execute)
         real_replace = os.replace
