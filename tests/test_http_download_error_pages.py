@@ -553,17 +553,21 @@ except KeyboardInterrupt:
 """
 
 
-@pytest.mark.parametrize("to", ["the-process-group", "boxman-alone"])
+@pytest.mark.parametrize("to", ["the-process-group", "boxman-alone", "boxman-alone-exit-trap"])
 def test_ctrl_c_stops_a_download_wget_is_doing(real_wget, to, tmp_path):
     """The whole of it, for real.
 
     A terminal's Ctrl-C reaches wget and boxman alike. A SIGINT to boxman
     alone, from ``kill -INT`` or a supervisor, invoke used to answer by
     writing ``\\x03`` to wget's stdin, which wget does not read: the
-    download ran on (#227 review).
+    download ran on (#227 review). With an EXIT trap from ``BASH_ENV``,
+    bash stays between boxman and wget unless it is told to ``exec`` wget.
     """
     dst = tmp_path / "distro.qcow2"
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+    if to.endswith("exit-trap"):
+        (tmp_path / "bash_env").write_text("trap : EXIT\n")
+        env["BASH_ENV"] = str(tmp_path / "bash_env")
     with _serving(200, PAYLOAD, stall=True) as server:
         child = subprocess.Popen(
             [sys.executable, "-c", _DOWNLOAD_IN_A_CHILD, _url(server), str(dst)],

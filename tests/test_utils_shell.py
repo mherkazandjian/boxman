@@ -96,12 +96,40 @@ class TestCommandsMigrationStatic:
         )
 
 
-#: a child that runs *command* with run_stoppable and says how that ended
+#: a program that, on SIGINT, exits 3 rather than dying of it, so that only
+#: the runner can tell boxman it was a Ctrl-C; it says it is up by creating
+#: the file named first, and, a second after its SIGINT (not a kill), that
+#: it is done, by creating the same name with ``.sigint`` added: the runner
+#: must wait for that before boxman goes on to clean up after it
+_TRAPS_SIGINT = (
+    "import pathlib, signal, sys, time\n"
+    "up = pathlib.Path(sys.argv[1])\n"
+    "def stop(*_):\n"
+    "    time.sleep(1)\n"
+    "    up.with_name(up.name + '.sigint').touch()\n"
+    "    sys.exit(3)\n"
+    "signal.signal(signal.SIGINT, stop)\n"
+    "up.touch()\n"
+    "time.sleep(60)\n"
+)
+
+#: a child that runs a command with run_stoppable and says how that ended.
+#: With a second argument, invoke is held up between starting the command
+#: and waiting for it, and the command's PID is written to that file
 _RUN_STOPPABLE_IN_A_CHILD = """
-import sys
-from boxman.utils.shell import run_stoppable
+import os, sys, time
+from boxman.utils import shell
+if len(sys.argv) > 2:
+    real = shell._StoppingLocal.create_io_threads
+    def held_up(self):
+        with open(sys.argv[2] + ".tmp", "w") as pid_file:
+            pid_file.write(str(self.process.pid))
+        os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+        time.sleep(60)
+        return real(self)
+    shell._StoppingLocal.create_io_threads = held_up
 try:
-    result = run_stoppable(sys.argv[1], hide=True, warn=True)
+    result = shell.run_stoppable(sys.argv[1], hide=True, warn=os.environ.get("WARN") != "no")
     print("RETURNED", result.exited, flush=True)
 except KeyboardInterrupt:
     print("STOPPED", flush=True)
@@ -120,23 +148,25 @@ class TestRunStoppable:
         from boxman.utils.shell import run_stoppable
         assert run_stoppable("true").ok
 
-    def test_a_sigint_to_boxman_alone_stops_the_command_and_is_raised(self, tmp_path):
+    def _sigint_boxman_alone(self, tmp_path, ready, held_up=None, env=None):
+        """Run the child, SIGINT its Python alone once *ready* exists, and
+        return what the child printed."""
         import os
+        import shlex
         import signal
         import subprocess
         import sys
         import time
         from pathlib import Path
 
-        ready = tmp_path / "ready"
-        # it ends only on a SIGINT of its own, and then with exit 3, not a
-        # death by SIGINT that the exit status alone would give away
-        command = (f"trap 'kill $! 2>/dev/null; exit 3' INT; touch {ready}; "
-                   f"sleep 60 >/dev/null 2>&1 & wait")
-        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+        command = " ".join(shlex.quote(part) for part in (
+            sys.executable, "-c", _TRAPS_SIGINT, str(tmp_path / "up")))
+        env = dict(env or os.environ,
+                   PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
         child = subprocess.Popen(
-            [sys.executable, "-c", _RUN_STOPPABLE_IN_A_CHILD, command], env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            [sys.executable, "-c", _RUN_STOPPABLE_IN_A_CHILD, command,
+             *([str(held_up)] if held_up else [])],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             start_new_session=True)
         try:
             deadline = time.monotonic() + 30
@@ -149,5 +179,36 @@ class TestRunStoppable:
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
+        return out, err
 
+    @pytest.mark.parametrize("warn", [True, False], ids=["warn", "no-warn"])
+    @pytest.mark.parametrize("bash_env", [None, "trap : EXIT\n"], ids=["plain", "exit-trap"])
+    def test_a_sigint_to_boxman_alone_stops_the_command_and_is_raised(
+            self, bash_env, warn, tmp_path):
+        """With an EXIT trap from ``BASH_ENV`` to run afterwards, bash does
+        not replace itself with the program, and a SIGINT to bash alone
+        left the program running (#227 review). Without ``warn``, the
+        program's exit 3 is a KeyboardInterrupt too, not an UnexpectedExit."""
+        import os
+
+        env = dict(os.environ, WARN="yes" if warn else "no")
+        if bash_env:
+            (tmp_path / "bash_env").write_text(bash_env)
+            env["BASH_ENV"] = str(tmp_path / "bash_env")
+        out, err = self._sigint_boxman_alone(tmp_path, tmp_path / "up", env=env)
         assert out.split() == ["STOPPED"], err
+        assert (tmp_path / "up.sigint").exists()
+
+    def test_a_sigint_before_invoke_waits_stops_the_command(self, tmp_path):
+        """invoke passes on only a KeyboardInterrupt that comes while it
+        waits; one between starting the command and waiting for it left the
+        command running on its own (#227 review)."""
+        import os
+
+        pid_file = tmp_path / "pid"
+        out, err = self._sigint_boxman_alone(tmp_path, pid_file, held_up=pid_file)
+        assert out.split() == ["STOPPED"], err
+        # stopped by its SIGINT, and gone, not running on without boxman
+        assert (tmp_path / "up.sigint").exists()
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)

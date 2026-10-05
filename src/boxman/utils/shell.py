@@ -26,6 +26,7 @@ Added in a Phase 2.8 follow-up of the engineering review plan.
 from __future__ import annotations
 
 import signal
+import subprocess
 from typing import Any
 
 import invoke
@@ -43,11 +44,26 @@ class _StoppingLocal(invoke.runners.Local):
     command has ended.
     """
 
+    #: how long a command has to end after its SIGINT, before it is killed
+    STOP_TIMEOUT = 10
+
     def send_interrupt(self, interrupt: KeyboardInterrupt) -> None:
         self.interrupted = True
         process = getattr(self, "process", None)
         if process is not None and process.poll() is None:
             process.send_signal(signal.SIGINT)
+
+    def _stop(self) -> None:
+        """Send the command SIGINT, and wait for it to end (#227 review)."""
+        process = getattr(self, "process", None)
+        if process is None or process.poll() is not None:
+            return
+        process.send_signal(signal.SIGINT)
+        try:
+            process.wait(timeout=self.STOP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
     def run(self, command: str, **kwargs: Any) -> invoke.runners.Result:
         self.interrupted = False
@@ -56,6 +72,12 @@ class _StoppingLocal(invoke.runners.Local):
         except invoke.exceptions.UnexpectedExit:
             if self.interrupted:
                 raise KeyboardInterrupt from None
+            raise
+        except KeyboardInterrupt:
+            # one invoke did not pass on: it came after the command started
+            # and before invoke began to wait for it, so the command would
+            # run on without boxman
+            self._stop()
             raise
         if self.interrupted:
             raise KeyboardInterrupt
@@ -67,12 +89,15 @@ def run_stoppable(command: str, **kwargs: Any) -> invoke.runners.Result:
     :func:`run`, except that a Ctrl-C stops *command* and is raised.
 
     For a command that would otherwise ride out a Ctrl-C (see
-    :class:`_StoppingLocal`). The command should be a single program, which
-    the shell replaces itself with, so that the SIGINT reaches it.
+    :class:`_StoppingLocal`). *command* is a single program and its
+    arguments: the shell is told to ``exec`` it, so that the SIGINT reaches
+    the program itself. Left to itself, a shell keeps itself between them
+    whenever it has something to do afterwards, an EXIT trap from a
+    ``BASH_ENV`` file for one, and the program rides the SIGINT out.
     """
     kwargs.setdefault("in_stream", False)
     config = invoke.Config(overrides={"runners": {"local": _StoppingLocal}})
-    return invoke.Context(config).run(command, **kwargs)
+    return invoke.Context(config).run(f"exec {command}", **kwargs)
 
 
 def run(command: str, **kwargs: Any) -> invoke.runners.Result:
