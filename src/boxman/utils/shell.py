@@ -25,9 +25,54 @@ Added in a Phase 2.8 follow-up of the engineering review plan.
 
 from __future__ import annotations
 
+import signal
 from typing import Any
 
 import invoke
+
+
+class _StoppingLocal(invoke.runners.Local):
+    """invoke's local runner, made to stop a command on a Ctrl-C.
+
+    invoke answers a KeyboardInterrupt by writing ``\\x03`` to the command's
+    stdin and waiting on: right for an editor or a REPL, but a command that
+    does not read its stdin, as a download does not, runs to its end, and
+    the interrupt is lost. Only a SIGINT to the whole process group, as from
+    a terminal's Ctrl-C, reached the command itself (#227). This runner
+    sends the command SIGINT, and raises the KeyboardInterrupt once the
+    command has ended.
+    """
+
+    def send_interrupt(self, interrupt: KeyboardInterrupt) -> None:
+        self.interrupted = True
+        process = getattr(self, "process", None)
+        if process is not None and process.poll() is None:
+            process.send_signal(signal.SIGINT)
+
+    def run(self, command: str, **kwargs: Any) -> invoke.runners.Result:
+        self.interrupted = False
+        try:
+            result = super().run(command, **kwargs)
+        except invoke.exceptions.UnexpectedExit:
+            if self.interrupted:
+                raise KeyboardInterrupt from None
+            raise
+        if self.interrupted:
+            raise KeyboardInterrupt
+        return result
+
+
+def run_stoppable(command: str, **kwargs: Any) -> invoke.runners.Result:
+    """
+    :func:`run`, except that a Ctrl-C stops *command* and is raised.
+
+    For a command that would otherwise ride out a Ctrl-C (see
+    :class:`_StoppingLocal`). The command should be a single program, which
+    the shell replaces itself with, so that the SIGINT reaches it.
+    """
+    kwargs.setdefault("in_stream", False)
+    config = invoke.Config(overrides={"runners": {"local": _StoppingLocal}})
+    return invoke.Context(config).run(command, **kwargs)
 
 
 def run(command: str, **kwargs: Any) -> invoke.runners.Result:

@@ -204,6 +204,29 @@ class TestADownloadCutShortIsNeverTheImage:
         assert os.listdir(cache_dir) == ["distro.qcow2"]
         assert Path(cached).read_bytes() == IMAGE
 
+    def test_two_downloads_at_once_do_not_share_a_file(self, tmp_path: Path):
+        """A second call while the first downloads: a thread, or a run in
+        another PID namespace sharing the cache, can have the same PID, so
+        a name made of the PID alone was both calls' (#227 review). The
+        second one's failure then removed the first one's download, or the
+        first published the second one's part."""
+        cache = ImageCache(cache_dir=str(tmp_path / "cache"))
+
+        def fails_after_a_part(url, dst):
+            Path(dst).write_bytes(IMAGE[:100])
+            return False
+
+        def downloads_whole(url, dst):
+            _download_whole(url, dst)
+            # meanwhile, another call downloads the same image, and fails
+            assert cache.ensure(IMAGE_URL, fails_after_a_part) is None
+            return True
+
+        path = cache.ensure(IMAGE_URL, downloads_whole)
+
+        assert Path(path).read_bytes() == IMAGE
+        assert os.listdir(tmp_path / "cache") == ["distro.qcow2"]
+
     def test_a_failed_download_leaves_nothing_in_the_cache(self, tmp_path: Path):
         cache = ImageCache(cache_dir=str(tmp_path / "cache"))
 

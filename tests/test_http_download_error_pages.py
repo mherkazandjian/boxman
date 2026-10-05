@@ -93,13 +93,27 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
     with a 302 to where it moved, and a page saying so. A server that
     ``stalls`` sends the first request part of the body, sets ``stalled``,
     and sends no more until the server stops; the requests after it get
-    the whole answer.
+    the whole answer. A server that ``resumes`` cuts its first answer off
+    like one with a ``cut``, and answers a request for the rest of the body
+    (``Range: bytes=<first>-``) with a 206 and that rest. ``headers`` are
+    sent with every answer but a 302.
     """
 
     def do_GET(self):
         server = self.server
+        asked_range = self.headers.get("Range")
         server.requests.append(SimpleNamespace(
-            target=self.path, agent=self.headers.get("User-Agent", "")))
+            target=self.path, agent=self.headers.get("User-Agent", ""), range=asked_range))
+        if server.resume and asked_range:
+            first = int(asked_range.removeprefix("bytes=").rstrip("-"))
+            rest, whole = server.body[first:], len(server.body)
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {first}-{whole - 1}/{whole}")
+            self.send_header("Content-Length", str(len(rest)))
+            self.end_headers()
+            self.wfile.write(rest)
+            self.close_connection = True
+            return
         if server.stall and not server.stalled.is_set():
             self.send_response(200)
             self.send_header("Content-Length", str(len(server.body)))
@@ -113,9 +127,14 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
         location = server.moved.get(self.path)
         status, body, cut = ((302, MOVED_PAGE, None) if location
                              else (server.status, server.body, server.cut))
+        if server.resume:
+            cut = CUT
         self.send_response(status)
         if location:
             self.send_header("Location", location)
+        else:
+            for name, value in server.headers.items():
+                self.send_header(name, value)
         if status == 401:
             self.send_header("WWW-Authenticate", 'Basic realm="images"')
         self.send_header("Content-Length", str(len(body)))
@@ -135,14 +154,14 @@ class _Server(http.server.ThreadingHTTPServer):
 
 
 @contextmanager
-def _serving(status, body, cut=None, moved=None, stall=False):
+def _serving(status, body, cut=None, moved=None, stall=False, resume=False, headers=None):
     """Answer requests with *status* and *body* from a 127.0.0.1 ephemeral port.
 
     *moved* maps a path to where it moved; a request for it gets a 302.
     """
     server = _Server(("127.0.0.1", 0), _Recorder)
     server.status, server.body, server.cut, server.requests = status, body, cut, []
-    server.moved = moved or {}
+    server.moved, server.headers, server.resume = moved or {}, headers or {}, resume
     server.stall, server.stalled, server.released = stall, threading.Event(), threading.Event()
     thread = threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True)
     thread.start()
@@ -391,13 +410,17 @@ def _run_for_real(monkeypatch, module):
     return ran
 
 
-@pytest.fixture
-def real_wget(monkeypatch, tmp_path):
-    """The real wget, reading an empty ``.wgetrc`` rather than the user's."""
+@pytest.fixture(params=["empty", "logfile"], ids=["wgetrc-empty", "wgetrc-logfile"])
+def real_wget(request, monkeypatch, tmp_path):
+    """The real wget, reading a ``.wgetrc`` of the test's rather than the user's.
+
+    One is empty. The other sends wget's messages to a log file, the
+    status lines among them, where boxman would not see them (#227 review).
+    """
     if shutil.which("wget") is None:
         pytest.skip("needs the wget CLI")
     wgetrc = tmp_path / "wgetrc"
-    wgetrc.write_text("")
+    wgetrc.write_text(f"logfile = {tmp_path / 'wget.log'}\n" if request.param == "logfile" else "")
     monkeypatch.setenv("WGETRC", str(wgetrc))
 
 
@@ -530,8 +553,15 @@ except KeyboardInterrupt:
 """
 
 
-def test_ctrl_c_stops_a_download_wget_is_doing(real_wget, tmp_path):
-    """The whole of it, for real: a terminal's Ctrl-C reaches wget and boxman alike."""
+@pytest.mark.parametrize("to", ["the-process-group", "boxman-alone"])
+def test_ctrl_c_stops_a_download_wget_is_doing(real_wget, to, tmp_path):
+    """The whole of it, for real.
+
+    A terminal's Ctrl-C reaches wget and boxman alike. A SIGINT to boxman
+    alone, from ``kill -INT`` or a supervisor, invoke used to answer by
+    writing ``\\x03`` to wget's stdin, which wget does not read: the
+    download ran on (#227 review).
+    """
     dst = tmp_path / "distro.qcow2"
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
     with _serving(200, PAYLOAD, stall=True) as server:
@@ -542,8 +572,11 @@ def test_ctrl_c_stops_a_download_wget_is_doing(real_wget, tmp_path):
         try:
             # wget is part-way through once the server has sent it part of the image
             assert server.stalled.wait(timeout=60)
-            os.killpg(child.pid, signal.SIGINT)
-            out, _ = child.communicate(timeout=60)
+            if to == "the-process-group":
+                os.killpg(child.pid, signal.SIGINT)
+            else:
+                os.kill(child.pid, signal.SIGINT)
+            out, _ = child.communicate(timeout=30)
         finally:
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGKILL)
@@ -581,28 +614,90 @@ Length: 47
 """
 
 
-@pytest.mark.parametrize(("output", "counts"), [
-    pytest.param(WGET_302_THEN_200, True, id="302-then-200"),  # the last decides
-    pytest.param(WGET_300, False, id="300"),
-    pytest.param("  HTTP/1.1 206 Partial Content\n", True, id="206"),
-    pytest.param("  HTTP/2 200\n", True, id="http2-200"),
-    pytest.param("  HTTP/1.1 200 OK\n  HTTP/1.1 300 Multiple Choices\n", False,
+#: a 206 for the rest of the image, from byte 4096 on, as wget asks for when
+#: it resumes a download that was cut off
+RESUMED = "  HTTP/1.1 206 Partial Content\n  Content-Range: bytes 4096-102399/102400\n"
+HTTP = "http://127.0.0.1:41915/images/distro.qcow2"
+WHOLE = 102400
+
+
+@pytest.mark.parametrize(("output", "url", "size", "counts"), [
+    pytest.param(WGET_302_THEN_200, HTTP, WHOLE, True, id="302-then-200"),  # the last decides
+    pytest.param(WGET_300, HTTP, 47, False, id="300"),
+    pytest.param("  HTTP/2 200\n", HTTP, WHOLE, True, id="http2-200"),
+    pytest.param("  HTTP/1.1 200 OK\n  HTTP/1.1 300 Multiple Choices\n", HTTP, WHOLE, False,
                  id="200-then-300"),
-    # no status printed at all, as for ftp://: wget's exit status decides,
-    # as it did before
-    pytest.param("==> RETR distro.qcow2 ... done.\n", True, id="ftp"),
-    pytest.param("", True, id="nothing"),
     # a status line is one wget printed, not one inside a header value
-    pytest.param("  HTTP/1.1 200 OK\n  X-Note: HTTP/1.1 300\n", True,
+    pytest.param("  HTTP/1.1 200 OK\n  X-Note: HTTP/1.1 300\n", HTTP, WHOLE, True,
                  id="status-in-a-header"),
+    # a 206 counts when what wget has is the whole length it gives
+    pytest.param(RESUMED, HTTP, WHOLE, True, id="206-resumed-whole"),
+    pytest.param(RESUMED, HTTP, WHOLE - 1, False, id="206-resumed-short"),
+    pytest.param("  HTTP/1.1 206 Partial Content\n  Content-Range: bytes 0-4095/102400\n",
+                 HTTP, 4096, False, id="206-a-part"),
+    pytest.param("  HTTP/1.1 206 Partial Content\n  Content-Length: 4096\n", HTTP, 4096,
+                 False, id="206-no-range"),
+    pytest.param("  HTTP/1.1 206 Partial Content\n  Content-Range: bytes */102400\n",
+                 HTTP, WHOLE, False, id="206-unsatisfied-range"),
+    # the Content-Range of an earlier response is not the final one's
+    pytest.param("  HTTP/1.1 206 Partial Content\n  Content-Range: bytes 0-102399/102400\n"
+                 "Retrying.\n  HTTP/1.1 206 Partial Content\n  Content-Length: 4096\n",
+                 HTTP, WHOLE, False, id="206-range-of-an-earlier-response"),
+    # no status printed at all: wget's exit status decides for ftp://, which
+    # prints none, as before; an http(s) one whose status went unseen does
+    # not count (#227 review: a wgetrc can send it to a log file)
+    pytest.param("==> RETR distro.qcow2 ... done.\n", "ftp://127.0.0.1/distro.qcow2", WHOLE,
+                 True, id="ftp"),
+    pytest.param("", "ftp://127.0.0.1/distro.qcow2", WHOLE, True, id="ftp-nothing"),
+    pytest.param("", HTTP, WHOLE, False, id="http-nothing"),
+    pytest.param("", "https://127.0.0.1/distro.qcow2", WHOLE, False, id="https-nothing"),
+    pytest.param("", "127.0.0.1:41915/distro.qcow2", WHOLE, False, id="no-scheme-nothing"),
 ])
-def test_only_a_2xx_wget_printed_last_counts(output, counts):
-    assert http_download.wget_final_status_ok(output) is counts
+def test_only_a_whole_2xx_wget_printed_last_counts(output, url, size, counts):
+    assert http_download.wget_download_ok(output, url, size) is counts
+
+
+#: an answer that says it is the first 4096 bytes of the image
+A_PART = {"Content-Range": f"bytes 0-{CUT - 1}/{len(PAYLOAD)}"}
+
+
+def test_a_part_the_server_calls_a_part_is_refused(downloader, real_wget, monkeypatch, tmp_path):
+    """A 206 to a request for the whole is a part of it (#227 review).
+
+    It came complete, with the length it promised, so no length check sees
+    it; only its Content-Range says what it is a part of. curl and urllib
+    never ask for a range, so neither takes a 206 at all.
+    """
+    module, download = downloader
+    ran = _run_for_real(monkeypatch, module)
+    dst = tmp_path / "distro.qcow2"
+
+    with _serving(206, PAYLOAD[:CUT], headers=A_PART) as server:
+        ok = download(_url(server), str(dst))
+
+    assert (ok, _left_at(dst)) == (False, None)
+    assert ran == [("wget", 0), ("curl", 0)]
+    assert _asked_by(server) == ["Wget", "curl", "boxman"]
+
+
+def test_wget_resumes_a_download_that_was_cut_off(downloader, real_wget, monkeypatch, tmp_path):
+    """A 206 that completes what wget has counts: wget asks for it itself."""
+    module, download = downloader
+    ran = _run_for_real(monkeypatch, module)
+    dst = tmp_path / "distro.qcow2"
+
+    with _serving(200, PAYLOAD, resume=True) as server:
+        ok = download(_url(server), str(dst))
+
+    assert (ok, _left_at(dst)) == (True, PAYLOAD)
+    assert ran == [("wget", 0)]
+    # the first answer was cut off; wget asked for the rest of it
+    assert [request.range for request in server.requests] == [None, f"bytes={CUT}-"]
 
 
 @pytest.mark.parametrize(("status", "counts"), [
     ("200", True),
-    ("206", True),
+    ("206", False),  # a part: curl is never asked for a range (#227 review)
     ("226", True),  # FTP's transfer complete
     ("000", True),  # no response code at all, as for a file:// copy
     ("200\n", True),  # whitespace around the status is not part of it

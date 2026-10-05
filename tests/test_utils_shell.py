@@ -94,3 +94,60 @@ class TestCommandsMigrationStatic:
             "these modules still call invoke.run() directly — route them "
             f"through boxman.utils.shell.run: {offenders}"
         )
+
+
+#: a child that runs *command* with run_stoppable and says how that ended
+_RUN_STOPPABLE_IN_A_CHILD = """
+import sys
+from boxman.utils.shell import run_stoppable
+try:
+    result = run_stoppable(sys.argv[1], hide=True, warn=True)
+    print("RETURNED", result.exited, flush=True)
+except KeyboardInterrupt:
+    print("STOPPED", flush=True)
+"""
+
+
+class TestRunStoppable:
+    """
+    invoke answers a Ctrl-C by writing ``\\x03`` to the command's stdin and
+    waiting on, so a command that does not read its stdin rode out a
+    SIGINT sent to boxman alone (#227 review). ``run_stoppable`` signals
+    the command and raises the KeyboardInterrupt once it has ended.
+    """
+
+    def test_does_not_raise_under_capture(self):
+        from boxman.utils.shell import run_stoppable
+        assert run_stoppable("true").ok
+
+    def test_a_sigint_to_boxman_alone_stops_the_command_and_is_raised(self, tmp_path):
+        import os
+        import signal
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        ready = tmp_path / "ready"
+        # it ends only on a SIGINT of its own, and then with exit 3, not a
+        # death by SIGINT that the exit status alone would give away
+        command = (f"trap 'kill $! 2>/dev/null; exit 3' INT; touch {ready}; "
+                   f"sleep 60 >/dev/null 2>&1 & wait")
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+        child = subprocess.Popen(
+            [sys.executable, "-c", _RUN_STOPPABLE_IN_A_CHILD, command], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        try:
+            deadline = time.monotonic() + 30
+            while not ready.exists():
+                assert child.poll() is None and time.monotonic() < deadline, child.stderr.read()
+                time.sleep(0.05)
+            os.kill(child.pid, signal.SIGINT)
+            out, err = child.communicate(timeout=20)
+        finally:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+
+        assert out.split() == ["STOPPED"], err

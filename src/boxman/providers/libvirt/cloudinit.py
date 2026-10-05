@@ -439,7 +439,8 @@ class CloudInitTemplate:
            directly to *dst_path* when it is not).
         3. Verify the checksum if one was specified; abort on mismatch.
         4. Copy from cache to *dst_path* (no-op when cache is disabled and
-           the download went directly to *dst_path*).
+           the download went directly to *dst_path*), and verify the copy
+           as well.
 
         *download_fn* selects how the image is obtained on a cache miss; it
         defaults to the http(s) downloader. The OCI path passes
@@ -460,7 +461,16 @@ class CloudInitTemplate:
                     return False
 
             # Copy sparse from cache to the template workdir.
-            return self._copy_local(src, dst_path)
+            if not self._copy_local(src, dst_path):
+                return False
+            # ...and verify the copy too, which is what the template is built
+            # from: another run can put a download of its own at the cache
+            # path between the check above and the copy (#227)
+            if self.image_checksum and not self._verify_checksum(dst_path):
+                if os.path.exists(dst_path):
+                    os.remove(dst_path)
+                return False
+            return True
 
         else:
             # No cache — download directly to dst_path.
