@@ -97,10 +97,10 @@ class TestCommandsMigrationStatic:
 
 
 #: a program that, on SIGINT, exits 3 rather than dying of it, so that only
-#: the runner can tell boxman it was a Ctrl-C; it says it is up by creating
-#: the file named first, and, a second after its SIGINT (not a kill), that
-#: it is done, by creating the same name with ``.sigint`` added: the runner
-#: must wait for that before boxman goes on to clean up after it
+#: the runner can tell boxman it was a Ctrl-C. It says it is up by creating
+#: the file named first; that its SIGINT handler began, by creating the same
+#: name with ``.stopping`` added; and, a second later, that it is done, with
+#: ``.sigint``: the runner must wait for that before boxman cleans up
 _TRAPS_SIGINT = (
     "import pathlib, signal, sys, time\n"
     "up = pathlib.Path(sys.argv[1])\n"
@@ -118,9 +118,11 @@ _TRAPS_SIGINT = (
 #: With a second argument, invoke is held up between starting the command
 #: and waiting for it, the command's PID is written to that file, and the
 #: child says whether the command is still there when the interrupt
-#: reaches it
+#: reaches it. With INJECT=<Popen method>:<n>, the n-th call of that method
+#: once the runner is stopping the command first creates the file
+#: INJECT_MARKER names and pauses, so that a SIGINT lands inside it
 _RUN_STOPPABLE_IN_A_CHILD = """
-import os, sys, time
+import os, subprocess, sys, time
 from boxman.utils import shell
 if len(sys.argv) > 2:
     real = shell._StoppingLocal.create_io_threads
@@ -131,6 +133,22 @@ if len(sys.argv) > 2:
         time.sleep(60)
         return real(self)
     shell._StoppingLocal.create_io_threads = held_up
+if os.environ.get("INJECT"):
+    name, nth = os.environ["INJECT"].split(":")
+    stopping, calls = [], []
+    real_stop, real_method = shell._StoppingLocal._stop, getattr(subprocess.Popen, name)
+    def stop(self):
+        stopping.append(True)
+        return real_stop(self)
+    def paused(self, *args, **kwargs):
+        if stopping:
+            calls.append(True)
+            if len(calls) == int(nth):
+                open(os.environ["INJECT_MARKER"], "w").close()
+                time.sleep(5)
+        return real_method(self, *args, **kwargs)
+    shell._StoppingLocal._stop = stop
+    setattr(subprocess.Popen, name, paused)
 try:
     result = shell.run_stoppable(sys.argv[1], hide=True, warn=os.environ.get("WARN") != "no")
     print("RETURNED", result.exited, flush=True)
@@ -158,9 +176,9 @@ class TestRunStoppable:
         from boxman.utils.shell import run_stoppable
         assert run_stoppable("true").ok
 
-    def _sigint_boxman_alone(self, tmp_path, ready, held_up=None, env=None, again_when=None):
-        """Run the child, SIGINT its Python alone once *ready* exists (and
-        again once *again_when* does), and return what the child printed."""
+    def _sigint_boxman_alone(self, tmp_path, signal_at, held_up=None, env=None):
+        """Run the child, and SIGINT its Python alone as each file in
+        *signal_at* appears; return what it printed, and how it exited."""
         import os
         import shlex
         import signal
@@ -179,19 +197,19 @@ class TestRunStoppable:
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             start_new_session=True)
         try:
-            for when in (ready, again_when) if again_when else (ready,):
+            for when in signal_at:
                 deadline = time.monotonic() + 30
                 while not when.exists():
                     assert child.poll() is None and time.monotonic() < deadline, \
                         child.stderr.read()
                     time.sleep(0.05)
                 os.kill(child.pid, signal.SIGINT)
-            out, err = child.communicate(timeout=20)
+            out, err = child.communicate(timeout=30)
         finally:
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-        return out, err
+        return out, err, child.returncode
 
     @pytest.mark.parametrize("warn", [True, False], ids=["warn", "no-warn"])
     @pytest.mark.parametrize("bash_env", [None, "trap : EXIT\n"], ids=["plain", "exit-trap"])
@@ -207,8 +225,8 @@ class TestRunStoppable:
         if bash_env:
             (tmp_path / "bash_env").write_text(bash_env)
             env["BASH_ENV"] = str(tmp_path / "bash_env")
-        out, err = self._sigint_boxman_alone(tmp_path, tmp_path / "up", env=env)
-        assert out.split() == ["STOPPED"], err
+        out, err, code = self._sigint_boxman_alone(tmp_path, [tmp_path / "up"], env=env)
+        assert (out.split(), code) == (["STOPPED"], 0), err
         assert (tmp_path / "up.sigint").exists()
 
     def test_a_sigint_before_invoke_waits_stops_the_command(self, tmp_path):
@@ -218,20 +236,45 @@ class TestRunStoppable:
         import os
 
         pid_file = tmp_path / "pid"
-        out, err = self._sigint_boxman_alone(tmp_path, pid_file, held_up=pid_file)
+        out, err, code = self._sigint_boxman_alone(tmp_path, [pid_file], held_up=pid_file)
         # gone by the time the interrupt reached the caller, stopped by its
         # SIGINT rather than killed, and not running on without boxman
-        assert out.split() == ["STOPPED", "GONE"], err
+        assert (out.split(), code) == (["STOPPED", "GONE"], 0), err
         assert (tmp_path / "up.sigint").exists()
         with pytest.raises(ProcessLookupError):
             os.kill(int(pid_file.read_text()), 0)
 
-    def test_a_second_sigint_while_it_stops_still_waits_for_it(self, tmp_path):
-        """A second Ctrl-C while the command ends after the first one cut
-        that wait short, and the interrupt reached the caller with the
-        command still running (#227 review). Now it is killed, and still
-        waited for."""
-        pid_file = tmp_path / "pid"
-        out, err = self._sigint_boxman_alone(
-            tmp_path, pid_file, held_up=pid_file, again_when=tmp_path / "up.stopping")
-        assert out.split() == ["STOPPED", "GONE"], err
+    @pytest.mark.parametrize(("inject", "escalated", "killed"), [
+        # the graceful stage: a SIGINT at its very start, in the SIGINT it
+        # sends, or in its wait (once the command's handler has begun); the
+        # command is killed then, before its handler is done
+        ("poll:1", False, True),
+        ("send_signal:1", False, True),
+        (None, True, True),
+        # the kill, and the wait for it, after a SIGINT ended the graceful
+        # wait (the handler may be done by then: these pause for a while)
+        ("kill:1", True, None),
+        ("wait:2", True, None),
+    ], ids=["at-the-first-poll", "at-the-sigint", "at-the-graceful-wait", "at-the-kill",
+            "at-the-last-wait"])
+    def test_another_sigint_while_it_stops_still_waits_for_it(
+            self, inject, escalated, killed, tmp_path):
+        """A further Ctrl-C at any step of stopping the command used to be
+        able to cut it short: the interrupt reached the caller with the
+        command still running, or dead and not reaped (#227 review). Now
+        it is killed at once, and still waited for."""
+        import os
+
+        pid_file, marker = tmp_path / "pid", tmp_path / "inject"
+        env = dict(os.environ, INJECT=inject or "", INJECT_MARKER=str(marker))
+        signal_at = [pid_file]
+        if escalated:
+            # a second SIGINT once the command is in its SIGINT handler
+            signal_at.append(tmp_path / "up.stopping")
+        if inject:
+            signal_at.append(marker)
+        out, err, code = self._sigint_boxman_alone(
+            tmp_path, signal_at, held_up=pid_file, env=env)
+        assert (out.split(), code) == (["STOPPED", "GONE"], 0), err
+        if killed:
+            assert not (tmp_path / "up.sigint").exists()
