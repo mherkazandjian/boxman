@@ -105,6 +105,7 @@ _TRAPS_SIGINT = (
     "import pathlib, signal, sys, time\n"
     "up = pathlib.Path(sys.argv[1])\n"
     "def stop(*_):\n"
+    "    up.with_name(up.name + '.stopping').touch()\n"
     "    time.sleep(1)\n"
     "    up.with_name(up.name + '.sigint').touch()\n"
     "    sys.exit(3)\n"
@@ -115,7 +116,9 @@ _TRAPS_SIGINT = (
 
 #: a child that runs a command with run_stoppable and says how that ended.
 #: With a second argument, invoke is held up between starting the command
-#: and waiting for it, and the command's PID is written to that file
+#: and waiting for it, the command's PID is written to that file, and the
+#: child says whether the command is still there when the interrupt
+#: reaches it
 _RUN_STOPPABLE_IN_A_CHILD = """
 import os, sys, time
 from boxman.utils import shell
@@ -132,7 +135,14 @@ try:
     result = shell.run_stoppable(sys.argv[1], hide=True, warn=os.environ.get("WARN") != "no")
     print("RETURNED", result.exited, flush=True)
 except KeyboardInterrupt:
-    print("STOPPED", flush=True)
+    if len(sys.argv) > 2:
+        try:
+            os.kill(int(open(sys.argv[2]).read()), 0)
+            print("STOPPED LIVE", flush=True)
+        except ProcessLookupError:
+            print("STOPPED GONE", flush=True)
+    else:
+        print("STOPPED", flush=True)
 """
 
 
@@ -148,9 +158,9 @@ class TestRunStoppable:
         from boxman.utils.shell import run_stoppable
         assert run_stoppable("true").ok
 
-    def _sigint_boxman_alone(self, tmp_path, ready, held_up=None, env=None):
-        """Run the child, SIGINT its Python alone once *ready* exists, and
-        return what the child printed."""
+    def _sigint_boxman_alone(self, tmp_path, ready, held_up=None, env=None, again_when=None):
+        """Run the child, SIGINT its Python alone once *ready* exists (and
+        again once *again_when* does), and return what the child printed."""
         import os
         import shlex
         import signal
@@ -169,11 +179,13 @@ class TestRunStoppable:
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             start_new_session=True)
         try:
-            deadline = time.monotonic() + 30
-            while not ready.exists():
-                assert child.poll() is None and time.monotonic() < deadline, child.stderr.read()
-                time.sleep(0.05)
-            os.kill(child.pid, signal.SIGINT)
+            for when in (ready, again_when) if again_when else (ready,):
+                deadline = time.monotonic() + 30
+                while not when.exists():
+                    assert child.poll() is None and time.monotonic() < deadline, \
+                        child.stderr.read()
+                    time.sleep(0.05)
+                os.kill(child.pid, signal.SIGINT)
             out, err = child.communicate(timeout=20)
         finally:
             if child.poll() is None:
@@ -207,8 +219,19 @@ class TestRunStoppable:
 
         pid_file = tmp_path / "pid"
         out, err = self._sigint_boxman_alone(tmp_path, pid_file, held_up=pid_file)
-        assert out.split() == ["STOPPED"], err
-        # stopped by its SIGINT, and gone, not running on without boxman
+        # gone by the time the interrupt reached the caller, stopped by its
+        # SIGINT rather than killed, and not running on without boxman
+        assert out.split() == ["STOPPED", "GONE"], err
         assert (tmp_path / "up.sigint").exists()
         with pytest.raises(ProcessLookupError):
             os.kill(int(pid_file.read_text()), 0)
+
+    def test_a_second_sigint_while_it_stops_still_waits_for_it(self, tmp_path):
+        """A second Ctrl-C while the command ends after the first one cut
+        that wait short, and the interrupt reached the caller with the
+        command still running (#227 review). Now it is killed, and still
+        waited for."""
+        pid_file = tmp_path / "pid"
+        out, err = self._sigint_boxman_alone(
+            tmp_path, pid_file, held_up=pid_file, again_when=tmp_path / "up.stopping")
+        assert out.split() == ["STOPPED", "GONE"], err

@@ -54,16 +54,27 @@ class _StoppingLocal(invoke.runners.Local):
             process.send_signal(signal.SIGINT)
 
     def _stop(self) -> None:
-        """Send the command SIGINT, and wait for it to end (#227 review)."""
+        """Send the command SIGINT, and wait for it to end (#227 review).
+
+        It is killed if it has not ended in time, or if another Ctrl-C
+        comes while it ends; either way, it has ended when this returns.
+        """
         process = getattr(self, "process", None)
         if process is None or process.poll() is not None:
             return
-        process.send_signal(signal.SIGINT)
         try:
+            process.send_signal(signal.SIGINT)
             process.wait(timeout=self.STOP_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+            return
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            pass
+        while True:
+            try:
+                process.kill()
+                process.wait()
+                return
+            except KeyboardInterrupt:
+                continue  # it is being killed: gone in a moment
 
     def run(self, command: str, **kwargs: Any) -> invoke.runners.Result:
         self.interrupted = False
