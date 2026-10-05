@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shlex
+import signal
 import urllib.request
 
 from boxman import log
@@ -31,12 +32,45 @@ def curl_final_status_ok(status: str) -> bool:
     return re.fullmatch(r"000|2[0-9][0-9]", status.strip()) is not None
 
 
+#: a status line among what ``wget -S`` printed: wget indents the headers of
+#: each response it got, the status line first
+_WGET_STATUS_LINE = re.compile(r"^[ \t]*HTTP/[0-9.]+[ \t]+([0-9]{3})\b", re.MULTILINE)
+
+
+def wget_final_status_ok(output: str) -> bool:
+    """Whether a download wget finished may count, by the last status it printed.
+
+    *output* is what ``wget -S`` printed: the status line and headers of
+    each response it got, a redirect's among them, so the last status line
+    is the final one. wget saves the page of a 300 that names nowhere to go
+    as the download and exits 0 (#227); a 302 without a Location, and an
+    HTTP error, it refuses on its own. A 2xx counts. With no status line at
+    all, as for an ftp:// download, wget's exit status decides, as before.
+    """
+    statuses = _WGET_STATUS_LINE.findall(output)
+    return not statuses or statuses[-1].startswith("2")
+
+
+def _stopped_by_ctrl_c(result) -> bool:
+    """Whether a command ended because the user pressed Ctrl-C.
+
+    invoke swallows the KeyboardInterrupt and returns the command's result:
+    a death by SIGINT, or a shell's 130 for one. Read as a failed download,
+    it sent ``download_url`` on to the next downloader, so a Ctrl-C started
+    the download over instead of stopping it (#227).
+    """
+    return getattr(result, "exited", None) in (-signal.SIGINT, 128 + signal.SIGINT)
+
+
 def download_url(url: str, dst_path: str) -> bool:
     """Download *url* to *dst_path*; return True on success.
 
     Tries wget first (best progress + redirect handling), then curl, and
     finally a urllib fallback. A partial *dst_path* left by a failed
-    attempt is removed before the next attempt.
+    attempt is removed before the next attempt. A Ctrl-C or a kill can
+    still leave part of a download at *dst_path*: a caller that keeps what
+    it downloads, as the image cache does, downloads beside where it keeps
+    it and renames the file into place (#227).
 
     Both operands are shell-quoted. These commands run through a shell, and
     ``$(…)`` inside double quotes is still evaluated by it — so a URL or
@@ -50,15 +84,20 @@ def download_url(url: str, dst_path: str) -> bool:
     q_dst = shlex.quote(dst_path)
 
     # wget: handles redirects, proxies, SSL well; prints chunky progress.
+    # -S prints the status line of every response it got, as exit 0 alone
+    # lets the page of a 300 through (#227).
     result = _shell_run(
-        f'wget --progress=dot:mega -O {q_dst} {q_url}',
+        f'wget -S --progress=dot:mega -O {q_dst} {q_url}',
         hide=not is_verbose(logging.DEBUG), warn=True,
     )
-    if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
+    if (result.ok and wget_final_status_ok(result.stderr)
+            and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0):
         log.info("download complete (wget)")
         return True
     if os.path.exists(dst_path):
         os.remove(dst_path)
+    if _stopped_by_ctrl_c(result):
+        raise KeyboardInterrupt
 
     # curl fallback. --fail so an HTTP 4xx/5xx error page is not written
     # and accepted as a valid download (wget already fails on HTTP errors),
@@ -73,6 +112,8 @@ def download_url(url: str, dst_path: str) -> bool:
         return True
     if os.path.exists(dst_path):
         os.remove(dst_path)
+    if _stopped_by_ctrl_c(result):
+        raise KeyboardInterrupt
 
     # urllib last resort (always available, no shell deps). Not urlopen():
     # its stock opener hands the proxy password to wherever a proxied
@@ -98,6 +139,11 @@ def download_url(url: str, dst_path: str) -> bool:
         if not downloaded:
             # a 2xx with nothing in it is no download (#224)
             raise ValueError("the response was empty")
+        if total and downloaded != total:
+            # read() returns nothing when the server hangs up early, as it
+            # does at the end of the body: only the length tells (#227)
+            raise ValueError(
+                f"the response ended after {downloaded} of its {total} bytes")
         log.info("download complete (urllib)")
         return True
     except Exception as exc:

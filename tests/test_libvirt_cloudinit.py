@@ -946,12 +946,15 @@ class TestShellQuoting:
         assert shlex.quote("/tmp/a b.qcow2") in cmd
         assert shlex.quote("/tmp/c d.qcow2") in cmd
 
+    #: the template downloads with download_url since #227
+    DOWNLOAD_RUN = "boxman.utils.http_download._shell_run"
+
     def test_wget_command_quotes_dst_and_url(self, tmp_path: Path):
         t = _make_template(tmp_path)
-        with patch(self.SHELL_RUN, return_value=_result(ok=True)) as run, \
-                patch("boxman.providers.libvirt.cloudinit.os.path.isfile",
+        with patch(self.DOWNLOAD_RUN, return_value=_result(ok=True)) as run, \
+                patch("boxman.utils.http_download.os.path.isfile",
                       return_value=True), \
-                patch("boxman.providers.libvirt.cloudinit.os.path.getsize",
+                patch("boxman.utils.http_download.os.path.getsize",
                       return_value=10):
             assert t._download_image(
                 "http://x/y iso.qcow2", "/tmp/d st.img") is True
@@ -969,10 +972,10 @@ class TestShellQuoting:
             # curl's download counts only on the 2xx it prints with -w (#224)
             return _result(ok="curl" in cmd, stdout="200")
 
-        with patch(self.SHELL_RUN, side_effect=fake_run), \
-                patch("boxman.providers.libvirt.cloudinit.os.path.isfile",
+        with patch(self.DOWNLOAD_RUN, side_effect=fake_run), \
+                patch("boxman.utils.http_download.os.path.isfile",
                       return_value=True), \
-                patch("boxman.providers.libvirt.cloudinit.os.path.getsize",
+                patch("boxman.utils.http_download.os.path.getsize",
                       return_value=10):
             assert t._download_image(
                 "http://x/y iso.qcow2", "/tmp/d st.img") is True

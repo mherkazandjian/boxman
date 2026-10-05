@@ -15,6 +15,7 @@ Usage
     ok = ImageCache.verify_checksum(local_path, 'sha256:abc123...')
 """
 
+import contextlib
 import hashlib
 import os
 from collections.abc import Callable
@@ -87,13 +88,20 @@ class ImageCache:
             return dst
 
         self.logger.info(f"cache miss — downloading to cache: {dst}")
-        if download_fn(url, dst):
-            return dst
-
-        # Download failed; make sure no partial file lingers in the cache.
-        if os.path.exists(dst):
-            os.remove(dst)
-        return None
+        # Downloaded beside the cache path, under a name of this process's
+        # own, and renamed onto it only once complete. is_cached takes any
+        # non-empty file there for the image, so a download cut short by
+        # Ctrl-C or a kill must never be found at it (#227).
+        partial = f"{dst}.part-{os.getpid()}"
+        try:
+            if not download_fn(url, partial):
+                return None
+            os.replace(partial, dst)
+        finally:
+            # on every way out, what was not put in place is no image
+            with contextlib.suppress(OSError):
+                os.remove(partial)
+        return dst
 
     # ── checksum ────────────────────────────────────────────────────────────
 

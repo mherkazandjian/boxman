@@ -20,12 +20,22 @@ part, took an empty 200 for the image. The ``-L`` is pinned as well:
 without it, curl saves the page a server sends with a redirect and exits
 0, and that page is taken for the image.
 
+#227 -- nor is part of it, or a page wget saved. The urllib fallback read
+until the server stopped sending; ``read()`` returns nothing when a server
+hangs up early, as at the end of the body, so a cut-off body was taken for
+the image. It is held to its Content-Length now. wget saves the page of a
+300 that names nowhere to go and exits 0, so its download counts only when
+the last status ``wget -S`` printed is a 2xx. The template's downloader is
+``download_url`` since then; both are still asked.
+
 Nothing here leaves the host. The server runs on a 127.0.0.1 ephemeral
 port, as in test_http_download_proxy.py. Every ``*_proxy`` variable is
 cleared and curl reads an empty ``.curlrc``, so curl goes to the server
 directly, and looking up any name but 127.0.0.1 fails in this process,
-where the urllib fallback runs. wget is stubbed to fail. curl is the real
-one, and so is the urllib fallback after it unless a test says otherwise.
+where the urllib fallback runs. wget is stubbed to fail, except in the
+tests that ask for the real one, which reads an empty ``.wgetrc``. curl is
+the real one, and so is the urllib fallback after it unless a test says
+otherwise.
 """
 
 from __future__ import annotations
@@ -33,10 +43,14 @@ from __future__ import annotations
 import http.server
 import os
 import shutil
+import signal
 import socket
 import socketserver
+import subprocess
+import sys
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -76,13 +90,26 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
 
     A server with a ``cut`` promises the whole body but sends only its
     first ``cut`` bytes, then hangs up. A path in its ``moved`` is answered
-    with a 302 to where it moved, and a page saying so.
+    with a 302 to where it moved, and a page saying so. A server that
+    ``stalls`` sends the first request part of the body, sets ``stalled``,
+    and sends no more until the server stops; the requests after it get
+    the whole answer.
     """
 
     def do_GET(self):
         server = self.server
         server.requests.append(SimpleNamespace(
             target=self.path, agent=self.headers.get("User-Agent", "")))
+        if server.stall and not server.stalled.is_set():
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(server.body)))
+            self.end_headers()
+            self.wfile.write(server.body[:CUT])
+            self.wfile.flush()
+            server.stalled.set()
+            server.released.wait()
+            self.close_connection = True
+            return
         location = server.moved.get(self.path)
         status, body, cut = ((302, MOVED_PAGE, None) if location
                              else (server.status, server.body, server.cut))
@@ -108,7 +135,7 @@ class _Server(http.server.ThreadingHTTPServer):
 
 
 @contextmanager
-def _serving(status, body, cut=None, moved=None):
+def _serving(status, body, cut=None, moved=None, stall=False):
     """Answer requests with *status* and *body* from a 127.0.0.1 ephemeral port.
 
     *moved* maps a path to where it moved; a request for it gets a 302.
@@ -116,11 +143,13 @@ def _serving(status, body, cut=None, moved=None):
     server = _Server(("127.0.0.1", 0), _Recorder)
     server.status, server.body, server.cut, server.requests = status, body, cut, []
     server.moved = moved or {}
+    server.stall, server.stalled, server.released = stall, threading.Event(), threading.Event()
     thread = threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True)
     thread.start()
     try:
         yield server
     finally:
+        server.released.set()
         server.shutdown()
         server.server_close()
         thread.join()
@@ -202,10 +231,14 @@ def _template(tmp_path, **overrides):
 
 @pytest.fixture(params=["CloudInitTemplate._download_image", "download_url"])
 def downloader(request, tmp_path):
-    """``(module, download)``: a downloader, and the module whose shell it runs."""
+    """``(module, download)``: a downloader, and the module whose shell it runs.
+
+    The template's is ``download_url`` since #227; it kept a copy of it
+    before, so both are still asked.
+    """
     if request.param == "download_url":
         return http_download, http_download.download_url
-    return cloudinit, _template(tmp_path)._download_image
+    return http_download, _template(tmp_path)._download_image
 
 
 @pytest.fixture(params=list(NOT_THE_IMAGE))
@@ -239,7 +272,7 @@ def test_a_response_that_is_not_the_image_is_refused(
 def test_a_response_that_is_not_the_image_is_not_cached(not_the_image, monkeypatch, tmp_path):
     cache_dir = tmp_path / "cache"
     template = _template(tmp_path, image_cache=ImageCache(cache_dir=str(cache_dir)))
-    ran = _fail_wget(monkeypatch, cloudinit)
+    ran = _fail_wget(monkeypatch, http_download)
     dst = tmp_path / "distro.qcow2"
 
     ok = template._fetch_remote_image(_url(not_the_image), str(dst))
@@ -328,6 +361,243 @@ def test_a_transfer_that_ends_on_http_is_held_to_a_2xx(downloader, start, monkey
     # ...and the urllib fallback, where it could follow, was refused as well
     assert [r.target for r in server.requests
             if r.agent.startswith("boxman/")] == fallback_route
+
+
+def _fail_wget_and_curl(monkeypatch, module):
+    """Make *module*'s wget and curl both fail, so that urllib downloads."""
+    ran = []
+
+    def shell_run(command, **_kwargs):
+        ran.append(command.split()[0])
+        return SimpleNamespace(ok=False)
+
+    monkeypatch.setattr(module, "_shell_run", shell_run)
+    return ran
+
+
+def _run_for_real(monkeypatch, module):
+    """Run *module*'s wget and curl for real, recording ``(program, exit status)``."""
+    real_run = module._shell_run
+    ran = []
+
+    def shell_run(command, **kwargs):
+        program = command.split()[0]
+        assert program in ("wget", "curl"), f"unexpected command: {command}"
+        result = real_run(command, **kwargs)
+        ran.append((program, result.exited))
+        return result
+
+    monkeypatch.setattr(module, "_shell_run", shell_run)
+    return ran
+
+
+@pytest.fixture
+def real_wget(monkeypatch, tmp_path):
+    """The real wget, reading an empty ``.wgetrc`` rather than the user's."""
+    if shutil.which("wget") is None:
+        pytest.skip("needs the wget CLI")
+    wgetrc = tmp_path / "wgetrc"
+    wgetrc.write_text("")
+    monkeypatch.setenv("WGETRC", str(wgetrc))
+
+
+def test_a_body_cut_short_of_its_length_is_refused(downloader, monkeypatch, tmp_path):
+    """#227: the urllib fallback read to the end of what came and took that.
+
+    ``read()`` returns nothing when a server hangs up early, as it does at
+    the end of the body, so only the Content-Length tells the two apart.
+    """
+    module, download = downloader
+    ran = _fail_wget(monkeypatch, module)
+    dst = tmp_path / "distro.qcow2"
+
+    with _serving(200, PAYLOAD, cut=CUT) as server:
+        ok = download(_url(server), str(dst))
+
+    assert (ok, _left_at(dst)) == (False, None)
+    # curl saw the cut (18), and the urllib fallback after it got the same
+    assert ran == [("wget", None), ("curl", 18)]
+    assert _asked_by(server) == ["curl", "boxman"]
+
+
+def test_a_body_cut_short_is_not_cached(monkeypatch, tmp_path):
+    cache_dir = tmp_path / "cache"
+    template = _template(tmp_path, image_cache=ImageCache(cache_dir=str(cache_dir)))
+    _fail_wget(monkeypatch, http_download)
+    dst = tmp_path / "distro.qcow2"
+
+    with _serving(200, PAYLOAD, cut=CUT) as server:
+        ok = template._fetch_remote_image(_url(server), str(dst))
+
+    cached = {path.name: path.read_bytes() for path in cache_dir.iterdir()}
+    assert (ok, cached, _left_at(dst)) == (False, {}, None)
+
+
+def test_the_urllib_fallback_takes_a_whole_body(downloader, monkeypatch, tmp_path):
+    module, download = downloader
+    ran = _fail_wget_and_curl(monkeypatch, module)
+    dst = tmp_path / "distro.qcow2"
+
+    with _serving(200, PAYLOAD) as server:
+        ok = download(_url(server), str(dst))
+
+    assert (ok, _left_at(dst)) == (True, PAYLOAD)
+    assert ran == ["wget", "curl"]
+    assert _asked_by(server) == ["boxman"]
+
+
+#: what a server sends with a 300 that names no choice to follow
+MULTIPLE_CHOICES_PAGE = b"<html><body>300 Multiple Choices</body></html>\n"
+
+
+def test_wget_does_not_take_a_300s_page_for_the_image(
+        downloader, real_wget, monkeypatch, tmp_path):
+    """wget saves the page of a 300 with no Location, and exits 0 (#227).
+
+    A 302 with no Location wget refuses on its own (exit 8); a 300 it does
+    not. Its exit status cannot tell, so the last status it printed must.
+    """
+    module, download = downloader
+    ran = _run_for_real(monkeypatch, module)
+    dst = tmp_path / "distro.qcow2"
+
+    with _serving(300, MULTIPLE_CHOICES_PAGE) as server:
+        ok = download(_url(server), str(dst))
+
+    assert (ok, _left_at(dst)) == (False, None)
+    # wget and curl both ended on the page with exit 0, and neither counted;
+    # the urllib fallback refused it too
+    assert ran == [("wget", 0), ("curl", 0)]
+    assert _asked_by(server) == ["Wget", "curl", "boxman"]
+
+
+def test_wget_follows_a_redirect_to_the_image(downloader, real_wget, monkeypatch, tmp_path):
+    module, download = downloader
+    ran = _run_for_real(monkeypatch, module)
+    dst = tmp_path / "distro.qcow2"
+
+    with _serving(200, PAYLOAD, moved={IMAGE: MOVED}) as server:
+        ok = download(_url(server), str(dst))
+
+    assert (ok, _left_at(dst)) == (True, PAYLOAD)
+    assert ran == [("wget", 0)]
+    assert [request.target for request in server.requests] == [IMAGE, MOVED]
+
+
+@pytest.mark.parametrize("exited", [-signal.SIGINT, 128 + signal.SIGINT])
+@pytest.mark.parametrize("stopped", ["wget", "curl"])
+def test_a_downloader_stopped_by_ctrl_c_ends_the_download(
+        downloader, stopped, exited, monkeypatch, tmp_path):
+    """invoke swallows a Ctrl-C and returns the command's death by SIGINT.
+
+    Read as a failure, it sent the download on to the next downloader, so a
+    Ctrl-C started it over (#227); a shell reports the same death as 130.
+    """
+    module, download = downloader
+    dst = tmp_path / "distro.qcow2"
+    ran = []
+
+    def shell_run(command, **_kwargs):
+        program = command.split()[0]
+        ran.append(program)
+        dst.write_bytes(PAYLOAD[:CUT])  # each leaves part of the image
+        return SimpleNamespace(ok=False, exited=exited if program == stopped else 4,
+                               stdout="", stderr="")
+
+    def urllib_fallback():
+        ran.append("urllib")
+        raise OSError("the urllib fallback began")
+
+    monkeypatch.setattr(module, "_shell_run", shell_run)
+    monkeypatch.setattr(module, "build_opener", urllib_fallback)
+
+    with pytest.raises(KeyboardInterrupt):
+        download("http://127.0.0.1:9/distro.qcow2", str(dst))
+
+    # nothing after the one that was stopped
+    assert ran == (["wget"] if stopped == "wget" else ["wget", "curl"])
+    assert _left_at(dst) is None
+
+
+#: run in a process of its own, so that it can be sent a Ctrl-C
+_DOWNLOAD_IN_A_CHILD = """
+import sys
+from boxman.utils.http_download import download_url
+try:
+    print("RETURNED", download_url(sys.argv[1], sys.argv[2]), flush=True)
+except KeyboardInterrupt:
+    print("STOPPED", flush=True)
+"""
+
+
+def test_ctrl_c_stops_a_download_wget_is_doing(real_wget, tmp_path):
+    """The whole of it, for real: a terminal's Ctrl-C reaches wget and boxman alike."""
+    dst = tmp_path / "distro.qcow2"
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+    with _serving(200, PAYLOAD, stall=True) as server:
+        child = subprocess.Popen(
+            [sys.executable, "-c", _DOWNLOAD_IN_A_CHILD, _url(server), str(dst)],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            start_new_session=True)
+        try:
+            # wget is part-way through once the server has sent it part of the image
+            assert server.stalled.wait(timeout=60)
+            os.killpg(child.pid, signal.SIGINT)
+            out, _ = child.communicate(timeout=60)
+        finally:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+
+    # its last word, after boxman's own log lines
+    assert [line for line in out.splitlines()
+            if line.startswith(("STOPPED", "RETURNED"))] == ["STOPPED"]
+    # nothing went on to ask again: not curl, not the urllib fallback
+    assert _asked_by(server) == ["Wget"]
+    assert _left_at(dst) is None
+
+
+#: wget 1.x's ``-S`` output: each response's status line and headers,
+#: indented two spaces, among wget's own messages
+WGET_302_THEN_200 = """\
+--2026-10-05 21:16:00--  http://127.0.0.1:41915/moved
+Connecting to 127.0.0.1:41915... connected.
+HTTP request sent, awaiting response...
+  HTTP/1.0 302 Found
+  Location: /ok
+  Content-Length: 0
+Location: /ok [following]
+--2026-10-05 21:16:00--  http://127.0.0.1:41915/ok
+HTTP request sent, awaiting response...
+  HTTP/1.0 200 OK
+  Content-Length: 102400
+Length: 102400 (100K)
+"""
+WGET_300 = """\
+HTTP request sent, awaiting response...
+  HTTP/1.0 300 Multiple Choices
+  Content-Length: 47
+Length: 47
+"""
+
+
+@pytest.mark.parametrize(("output", "counts"), [
+    pytest.param(WGET_302_THEN_200, True, id="302-then-200"),  # the last decides
+    pytest.param(WGET_300, False, id="300"),
+    pytest.param("  HTTP/1.1 206 Partial Content\n", True, id="206"),
+    pytest.param("  HTTP/2 200\n", True, id="http2-200"),
+    pytest.param("  HTTP/1.1 200 OK\n  HTTP/1.1 300 Multiple Choices\n", False,
+                 id="200-then-300"),
+    # no status printed at all, as for ftp://: wget's exit status decides,
+    # as it did before
+    pytest.param("==> RETR distro.qcow2 ... done.\n", True, id="ftp"),
+    pytest.param("", True, id="nothing"),
+    # a status line is one wget printed, not one inside a header value
+    pytest.param("  HTTP/1.1 200 OK\n  X-Note: HTTP/1.1 300\n", True,
+                 id="status-in-a-header"),
+])
+def test_only_a_2xx_wget_printed_last_counts(output, counts):
+    assert http_download.wget_final_status_ok(output) is counts
 
 
 @pytest.mark.parametrize(("status", "counts"), [

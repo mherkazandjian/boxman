@@ -23,8 +23,6 @@ import shlex
 import shutil
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from typing import Any
 
 import invoke
@@ -32,8 +30,7 @@ import invoke
 from boxman import log
 from boxman.image_cache import ImageCache
 from boxman.loggers.logger import is_verbose
-from boxman.utils.http_download import curl_final_status_ok
-from boxman.utils.http_opener import build_opener
+from boxman.utils.http_download import download_url
 from boxman.utils.jinja_env import substitute_env
 from boxman.utils.shell import run as _shell_run
 
@@ -534,67 +531,12 @@ class CloudInitTemplate:
         return False
 
     def _download_image(self, url: str, dst_path: str) -> bool:
-        """Download a cloud image from a URL with progress and fallbacks."""
-        self.logger.status(f"downloading base image {url} -> {dst_path}")
+        """Download a cloud image from a URL: :func:`download_url`.
 
-        # Try wget first (handles redirects, proxies, SSL better)
-        result = _shell_run(
-            f'wget --progress=dot:mega -O {shlex.quote(dst_path)} {shlex.quote(url)}',
-            hide=not is_verbose(logging.DEBUG), warn=True,
-        )
-        if result.ok and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0:
-            self.logger.info("download complete (wget)")
-            return True
-
-        # Try curl as second fallback. --fail, so that an HTTP 4xx/5xx error
-        # page is not written and accepted as the image (#224); wget already
-        # fails on HTTP errors. --fail lets a 3xx through, though, so the
-        # final status curl reports must count too.
-        result = _shell_run(
-            f"curl -fL --progress-bar -w '%{{http_code}}' "
-            f"-o {shlex.quote(dst_path)} {shlex.quote(url)}",
-            hide=not is_verbose(logging.DEBUG), warn=True,
-        )
-        if (result.ok and curl_final_status_ok(result.stdout)
-                and os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0):
-            self.logger.info("download complete (curl)")
-            return True
-        # a failed curl can leave part of the image behind (a transfer cut
-        # off part-way), as can wget: remove it before the last resort
-        if os.path.exists(dst_path):
-            os.remove(dst_path)
-
-        # Last resort: urllib with timeout. Not urlopen(): its stock opener
-        # hands the proxy password to wherever a proxied mirror redirects (#216).
-        try:
-            self.logger.info("falling back to urllib download (timeout=120s)...")
-            req = urllib.request.Request(url, headers={"User-Agent": "boxman/1.0"})
-            with build_opener().open(req, timeout=120) as response:
-                total = int(response.headers.get("Content-Length", 0))
-                downloaded = 0
-                with open(dst_path, "wb") as out_file:
-                    while True:
-                        chunk = response.read(1024 * 1024)  # 1 MB chunks
-                        if not chunk:
-                            break
-                        out_file.write(chunk)
-                        downloaded += len(chunk)
-                        if total:
-                            pct = downloaded * 100 // total
-                            self.logger.info(
-                                f"  downloaded {downloaded // (1024*1024)} MB "
-                                f"/ {total // (1024*1024)} MB ({pct}%)")
-            if not downloaded:
-                # a 2xx with nothing in it is no image (#224)
-                raise ValueError("the response was empty")
-            self.logger.info("download complete (urllib)")
-            return True
-        except Exception as e:
-            self.logger.error(f"failed to download image: {e}")
-            # Clean up partial download
-            if os.path.exists(dst_path):
-                os.remove(dst_path)
-            return False
+        The template kept a copy of that downloader, and #216 and #224 each
+        had to be fixed in both (#227).
+        """
+        return download_url(url, dst_path)
 
     def _download_oci_image(self, image_ref: str, dst_path: str) -> bool:
         """Pull a qcow2 from an OCI registry (via oras) to *dst_path*.
