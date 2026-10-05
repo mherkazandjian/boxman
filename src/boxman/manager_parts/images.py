@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import os
 import re
+import secrets
 import shlex
 from urllib.parse import urlparse
 
@@ -1203,7 +1204,9 @@ class ImagesMixin:
             return local_path
 
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        staging = f"{local_path}.part-{os.getpid()}"
+        # this call's own: a run in another PID namespace sharing the cache
+        # can have the same PID (#227)
+        staging = f"{local_path}.part-{os.getpid()}-{secrets.token_hex(4)}"
         try:
             if not self._download_iso(uri, staging):
                 raise ProvisionError(

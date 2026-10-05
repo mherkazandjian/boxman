@@ -727,8 +727,13 @@ hotplug, otherwise a graceful reboot. Run with `-v` to see the plan lines.
 - Base-image downloads are cached (default `~/.cache/boxman/images`,
   overridable via `cache.cache_dir` in the app config); checksums are verified
   on every read. Downloads honour `http_proxy` / `https_proxy`; an HTTP 4xx/5xx
-  error page or an empty response fails the download instead of being cached
-  as the image. Set `image.checksum` to catch a wrong or truncated file.
+  error page, a 300 with no `Location`, an empty response, one cut short of its
+  length, or only a part of the file fails the download instead of being
+  cached as the image. A
+  download reaches the cache only once complete, so a Ctrl-C mid-download
+  leaves nothing there. Set `image.checksum` to catch a wrong file, or one cut
+  short by an older boxman. A cached file that fails its checksum fails every
+  run until you remove it from the cache.
 
 ---
 

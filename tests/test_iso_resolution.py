@@ -191,6 +191,41 @@ class TestResolveIsos:
         assert result == {"talos-omni": str(dest)}
         assert dest.read_bytes() == b"theirs"
 
+    def test_two_downloads_at_once_do_not_share_a_file(self, tmp_path):
+        """A second resolver while the first downloads: a run in another PID
+        namespace sharing the cache can have the same PID, so a staging name
+        made of the PID alone was both runs' (#227 review). The second one's
+        failure then removed the first one's download before it was
+        published."""
+        dest = tmp_path / "talos-omni-deadbeef.iso"
+        mgr = _manager_with_config({
+            "isos": {"talos-omni": {"uri": "https://example.com/talos.iso"}}
+        })
+
+        def _fails_after_a_part(url, path):
+            with open(path, "wb") as handle:
+                handle.write(b"inst")
+            return False
+
+        def _downloads_whole(url, path):
+            with open(path, "wb") as handle:
+                handle.write(b"installer")
+            # meanwhile, another resolver downloads the same ISO, and fails
+            with patch.object(type(mgr), "_download_iso",
+                              side_effect=_fails_after_a_part):
+                with pytest.raises(ProvisionError, match="failed to download"):
+                    mgr._ensure_iso_present(
+                        "talos-omni", "https://example.com/talos.iso", str(dest), None)
+            return True
+
+        with patch.object(type(mgr), "_download_iso", side_effect=_downloads_whole):
+            path = mgr._ensure_iso_present(
+                "talos-omni", "https://example.com/talos.iso", str(dest), None)
+
+        assert path == str(dest)
+        assert dest.read_bytes() == b"installer"
+        assert [p.name for p in tmp_path.iterdir()] == [dest.name]
+
     def test_verifies_checksum_when_provided(self, tmp_path):
         present = tmp_path / "talos-omni-deadbeef.iso"
         present.write_bytes(b"installer")
