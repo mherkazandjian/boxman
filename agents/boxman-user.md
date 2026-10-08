@@ -318,7 +318,7 @@ template time:
 
 | Command | Purpose |
 |---|---|
-| `boxman up [--force] [--rebuild-templates] [--recreate-networks] [-y]` | **Primary entry point.** Provisions if absent, restarts shut-off/saved/paused VMs, no-ops if already running. Reconciles shared bridges, libvirt networks, containerlab and container clusters every call. A saved VM is restored from its managed save, not cold-booted; a shut-off VM with an *external* `<workdir>/<vm>.save` left by an older boxman makes `up` refuse — use `control start --restore`, or delete the file. `--force` deprovisions first. |
+| `boxman up [--force] [--rebuild-templates] [--recreate-networks] [--prune-networks] [-y]` | **Primary entry point.** Provisions if absent, restarts shut-off/saved/paused VMs, no-ops if already running. Reconciles shared bridges, libvirt networks, containerlab and container clusters every call. A saved VM is restored from its managed save, not cold-booted; a shut-off VM with an *external* `<workdir>/<vm>.save` left by an older boxman makes `up` refuse — use `control start --restore`, or delete the file. `--force` deprovisions first. A network removed from `conf.yml` is only reported; `--prune-networks` removes it, never while guests are attached (see *Reconciliation*). |
 | `boxman down [--suspend]` | Save (default: libvirt managed save, which the next `up` / `control start` restores) or `--suspend` (pause) all VMs, and tear down containerlab. Networks and disks remain. A VM libvirt cannot save (PCI passthrough) is a failure, never silently shut down. |
 | `boxman provision [--force] [--rebuild-templates]` | Full provision from scratch. Refuses if state exists unless `--force`. |
 | `boxman update [--dry-run] [-y] [--restart] [--recreate-networks]` | Non-destructive reconcile: add new VMs, hot-scale CPU/memory, add/grow/detach disks, attach/detach shared folders and cdroms, remove orphaned VMs, plus the network reconcile. Runs the network pass even when no VM changed. A change that cannot reach a running guest is written to the persistent config and the VM reported as needing a restart; `--restart` lets `update` power-cycle it (`-y` does not imply it). |
@@ -637,6 +637,17 @@ them. Without the flag, boxman reports the drift and applies nothing. With it,
 you get a prompt naming the affected VMs (skip with `-y`), and each one is
 reconnected afterwards: a hot detach/attach where the machine type supports PCI
 hotplug, otherwise a graceful reboot. Run with `-v` to see the plan lines.
+
+- **Removing a network from `conf.yml` does not delete it.** The network
+  reconcile (`up` on an existing cluster, and `update`) reports every network
+  this project provisioned and no longer declares; `boxman up --prune-networks`
+  removes it, a routed network's isolation rules included. A network with
+  guests still attached is left alone and the guests named. If boxman cannot
+  tell which guests are attached, or cannot read the network's forward mode,
+  `--prune-networks` leaves it in place and the run exits 2. A network that is
+  not removed keeps its cache entry, so the next run reports it again. A
+  network borrowed from another project (`project::cluster::net`) is never
+  touched.
 
 ---
 
