@@ -28,7 +28,7 @@ and boxman's Linux-only clone-identity pass switched off (§5).
 
 | | |
 |---|---|
-| Host | `scds001`. **Assumed to be "sc1"**: its libvirt holds the `sc1-talos` project. Confirm (Q1). |
+| Host | `scds001`, which the team's own notes call "sc1" (its libvirt also holds the `sc1-talos` project) |
 | Host CPU / RAM / disk | AMD Ryzen 7 PRO 8700GE, 16 threads, 1 NUMA node; 124 GiB RAM (≈46 GiB available with 7 VMs running); 523 GiB free on `/` |
 | Nested virt | `kvm_amd nested=1` (on) |
 | Stack | Rocky 9.7, libvirt 10.10.0, qemu-kvm 9.1.0, virt-install with osinfo-db 20250606, edk2-ovmf 20241117, swtpm 0.8.0, **virtio-win 1.9.49 (RPM, already installed)** |
@@ -116,11 +116,11 @@ Source: the **virtio-win** package (`dnf install virtio-win`; the Fedora
 build lives at fedorapeople.org). It is already on scds001 as
 `/usr/share/virtio-win/virtio-win-1.9.49.iso` (622 MB), so the PoC downloads
 nothing for it. Its licence file is BSD-3-Clause; the RPM is tagged
-Apache-2.0 AND BSD-3-Clause AND GPL-2.0. The drivers are signed: Server 2022 loaded
-them with signature enforcement on and no test-signing. Whether this build
-is WHQL-certified (RHEL's is; the Fedora build is not) does not matter for a
-lab. The licences allow redistribution. 1.9.49 ships `2k22`, `2k25`, `w10` and `w11`
-directories for every driver.
+Apache-2.0 AND BSD-3-Clause AND GPL-2.0. The drivers are signed: Server 2022
+loaded them with signature enforcement on and no test-signing. Whether this
+build is WHQL-certified (RHEL's is; the Fedora build is not) does not matter
+for a lab. The licences allow redistribution. 1.9.49 ships `2k22`, `2k25`,
+`w10` and `w11` directories for every driver.
 
 Injection, as done in the PoC:
 
@@ -223,8 +223,8 @@ asks for an owner.
   production ([Evaluation Center](https://www.microsoft.com/en-us/evalcenter/);
   the binding text is the licence terms shown at install, which the answer
   file accepts with `AcceptEula`). Accepting a EULA unattended on someone's
-  behalf is itself a policy point (Q4). When it expires the guest warns and periodically shuts itself
-  down.
+  behalf is itself a policy point (Q4). When it expires the guest warns and
+  periodically shuts itself down.
 - **May go in a box (git):** answer-file templates, setup scripts, the
   download URL, size and checksum. The user's own boxman downloads the ISO
   from Microsoft.
@@ -298,10 +298,10 @@ Two things showed up that are **not** Windows-specific:
   and left the project registered. Its host-wide "is this file used by
   another domain" scan could not stat a disk that **another user's** VM uses
   in that user's 0700 home directory (EACCES), and boxman keeps everything when it cannot
-  tell. That is fail-safe and correct (README, Teardown safety). On a shared
-  host it means **`destroy` never completes for anyone** while any VM's disk
-  is unreadable to the caller. `deprovision` then finished the
-  unregistration. Worth its own issue.
+  tell. That is fail-safe and correct (README, Teardown safety). It did not
+  complete here, and likely will not on any shared host where the caller
+  cannot read some other VM's disk; that generalisation is for a separate
+  issue to confirm (Q8). `deprovision` then finished the unregistration.
 - The first `boxman up` reports exit 0 although its only VM was shut off for
   the whole IP wait (G2).
 
@@ -354,7 +354,10 @@ Plus `make-answer-iso.sh` to render the answer file, and a second
          # boxman public key, and the image index
    isos:
      virtio-win:
-       uri: file:///usr/share/virtio-win/virtio-win.iso   # or the fedorapeople URL
+       # file:// should work today through download_url's curl fallback
+       # (read from the code, not tested), but it copies 622 MB into the
+       # cache; a plain local path that is used in place would be better
+       uri: file:///usr/share/virtio-win/virtio-win.iso
    ```
 
    boxman would ship a default `autounattend.xml.j2` and `boxman-setup.ps1`
@@ -389,7 +392,8 @@ prompt (§3.1). Win11 client licensing on VMs is its own question.
 
 ## 6. Open questions for @mherkazandjian
 
-1. **Is scds001 "sc1"?** All host numbers here are from scds001.
+1. **Sizing target.** All host numbers here are from scds001 ("sc1"). Is
+   that where Windows guests would run, or on another host?
 2. **What is Windows for?** Ansible role testing against Windows targets?
    AD/domain-controller labs? User desktops? That decides Core vs Desktop,
    2022 vs 2025, and whether Phase 3 matters at all.
