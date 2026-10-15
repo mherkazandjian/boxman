@@ -29,9 +29,9 @@ and boxman's Linux-only clone-identity pass switched off (§5).
 | | |
 |---|---|
 | Host | `scds001`, which the team's own notes call "sc1" (its libvirt also holds the `sc1-talos` project) |
-| Host CPU / RAM / disk | AMD Ryzen 7 PRO 8700GE, 16 threads, 1 NUMA node; 124 GiB RAM (≈46 GiB available with 7 VMs running); 523 GiB free on `/` |
+| Host CPU / RAM / disk | AMD Ryzen 7 PRO 8700GE, 16 threads, 1 NUMA node; 124 GiB RAM (≈46 GiB available with 7 VMs running on 2026-10-09; ≈33 GiB on 2026-10-15); 523 GiB free on `/` |
 | Nested virt | `kvm_amd nested=1` (on) |
-| Stack | Rocky 9.7, libvirt 10.10.0, qemu-kvm 9.1.0, virt-install with osinfo-db 20250606, edk2-ovmf 20241117, swtpm 0.8.0, **virtio-win 1.9.49 (RPM, already installed)** |
+| Stack | Rocky 9.7, libvirt 10.10.0, qemu-kvm 9.1.0, virt-install with osinfo-db 20250606, edk2-ovmf 20241117, swtpm 0.8.0, **virtio-win 1.9.49 (RPM, already installed; the host has since moved to 1.9.61, same layout)** |
 | qemu process user | `root` (`/etc/libvirt/qemu.conf`): disks under a 0700 home still work. That is a property of this host, not a requirement. |
 | Guest | Windows Server 2022 Standard Evaluation (Server Core), build 20348, en-US |
 | Media | the Evaluation Center ISO (§3.5), downloaded once with the owner's approval |
@@ -54,7 +54,7 @@ What was verified, and how:
 | `boxman up` idempotence | a second `up` on the running VM found its DHCP address and wrote `ssh_config`/inventory |
 | Secrets after install | Windows scrubbed the password from every file under `C:\Windows\Panther` (checked for the plain-text value). The attached answer ISO still exposed it (`F:\autounattend.xml`) until `virsh change-media … --eject --live --config`; after that the guest could no longer read it (G7) |
 | `boxman up` exit status during G2 | the first `up` exited **0** after its 600 s IP wait with the only VM shut off (rc captured from boxman itself, not a pipe) |
-| Teardown leaves media alone | after `boxman destroy -y`, the cached ISO and `/usr/share/virtio-win/virtio-win.iso` are still there |
+| Teardown and shared media | **Not safe on older boxman.** A boxman without 248235f (#208) undefines with `--remove-all-storage --wipe-storage`, which zero-filled both the cached eval ISO and the RPM-owned `/usr/share/virtio-win` ISO on 2026-10-15. With 248235f, undefine passes no storage flags and boxman removes only the storage it owns. Until then, eject or detach the CD-ROMs before `boxman destroy` |
 
 The committed answer-file template differs from the one used in the clean
 run in one way: after review it no longer contains the RDP setting
@@ -114,13 +114,15 @@ Things learned about the answer file:
 
 Source: the **virtio-win** package (`dnf install virtio-win`; the Fedora
 build lives at fedorapeople.org). It is already on scds001 as
-`/usr/share/virtio-win/virtio-win-1.9.49.iso` (622 MB), so the PoC downloads
-nothing for it. Its licence file is BSD-3-Clause; the RPM is tagged
+`/usr/share/virtio-win/virtio-win.iso`, a symlink to the versioned ISO
+(1.9.49, 622 MB, during the spike; 1.9.61, 615 MB, since 2026-10-15). The PoC
+uses the symlink, so it downloads nothing and survives package upgrades. Its licence file is BSD-3-Clause; the RPM is tagged
 Apache-2.0 AND BSD-3-Clause AND GPL-2.0. The drivers are signed: Server 2022
 loaded them with signature enforcement on and no test-signing. Whether this
 build is WHQL-certified (RHEL's is; the Fedora build is not) does not matter
 for a lab. The licences allow redistribution. 1.9.49 ships `2k22`, `2k25`,
-`w10` and `w11` directories for every driver.
+`w10` and `w11` directories for every driver; 1.9.61 keeps the same
+`viostor`/`NetKVM`/`Balloon` `2k22\amd64` paths and MSI names.
 
 Injection, as done in the PoC:
 
