@@ -30,7 +30,7 @@ provider:
 
 isos:
   winsrv2022-eval:
-    # Windows Server 2022 evaluation, en-US, build 20348.169, 5,044,094,976
+    # Windows Server 2022 evaluation, en-US, build 20348.587, 5,044,094,976
     # bytes. Resolved from the Evaluation Center link
     # https://go.microsoft.com/fwlink/?linkid=2195280&clcid=0x409&culture=en-us&country=us
     # (pinned to its target so the cache key and checksum stay stable).
