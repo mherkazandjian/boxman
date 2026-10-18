@@ -20,15 +20,15 @@ one manual step (see [Known gaps](#known-gaps)).
    answer ISO.
 3. WinPE finds `autounattend.xml` on the answer ISO. It loads `viostor` and
    `NetKVM` from the virtio-win ISO, partitions the disk (MBR, SeaBIOS) and
-   applies the Server Core image. It then reboots, and the VM **powers off**
-   at that reboot (see below).
+   applies the Server Core image. It then reboots; virt-install, kept
+   waiting by `--wait=-1`, starts the VM again.
 4. After the next start: specialize, OOBE, one auto-logon as Administrator,
    and `boxman-setup.ps1`. That installs all virtio drivers and the QEMU
    guest agent, enables WinRM (HTTP 5985, NTLM, Basic off) and installs
    OpenSSH Server from Windows Update. The log ends with
    `boxman-setup: done` in `C:\boxman-setup.log`.
 
-Measured on scds001: about 85 s from `virt-install` to the first power-off,
+Measured on scds001: about 85 s from `virt-install` to Setup's first reboot,
 and about 2 min from the second start to WinRM and SSH answering.
 
 ## Prerequisites
@@ -48,9 +48,6 @@ export BOXMAN_WIN_ADMIN_PASS='...'                  # 8+ chars, 3 character clas
 export BOXMAN_WIN_SSH_PUBKEY=~/.ssh/id_ed25519.pub  # optional
 ./make-answer-iso.sh
 boxman up
-# The VM powers off at Setup's first reboot, about 1-2 min in:
-virsh -c qemu:///system domstate bprj__boxman_dev_windows-server-2022-iso-boot__bprj_win_win01
-boxman up            # starts it again; Setup finishes within ~2 min
 ```
 
 Once `C:\boxman-setup.log` ends with `boxman-setup: done`, **eject the
@@ -89,11 +86,11 @@ ansible all -i "$IP," -m ansible.windows.win_ping \
 
 All of these are covered in the doc.
 
-- **Powers off after the first Setup reboot.** virt-install's install-phase
-  domain has `on_reboot=destroy`, and boxman runs it with `--wait=0`, so
-  nothing restarts it. A second `boxman up` does. Before that, the first
-  `boxman up` waits 600 s for an IP that never comes, then exits 0 with a
-  warning.
+- **Powers off after the first Setup reboot without `--wait=-1`.**
+  virt-install's install-phase domain has `on_reboot=destroy`, and boxman
+  runs it with `--wait=0`. The box overrides that with a later `--wait=-1`;
+  without it the VM stays off, and the first `boxman up` waits 600 s and
+  exits 0.
 - **`boxman ssh` / generated `ssh_config` do not work.** They use
   `User admin` and boxman's own key. Use `Administrator` and the key you
   baked into the answer ISO. The generated inventory has no

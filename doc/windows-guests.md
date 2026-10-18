@@ -18,11 +18,11 @@ and the QEMU guest agent, and is reachable by Ansible over **both** WinRM and
 OpenSSH (`ansible.windows.win_ping` → `pong` on both). The install takes 3 to
 3.5 minutes of active time on scds001.
 
-It needed four workarounds in `virt_install_extra_args` and one manual
-restart. Each points at a small, specific gap in boxman (§4). None of them
-are architectural. Clone-based Windows boxes, which would match how every
-Linux box works, need more: a sysprep'd local template plus cloudbase-init,
-and boxman's Linux-only clone-identity pass switched off (§5).
+It needed five workarounds in `virt_install_extra_args`. Each points at a
+small, specific gap in boxman (§4). None of them are architectural.
+Clone-based Windows boxes, which would match how every Linux box works, need
+more: a sysprep'd local template plus cloudbase-init, and boxman's
+Linux-only clone-identity pass switched off (§5).
 
 ## 2. What was tested, and where
 
@@ -287,7 +287,7 @@ AMD/KVM is known to be fragile and was not tried.
 | # | Gap | Where | Effect | PoC workaround | Proper fix |
 |---|---|---|---|---|---|
 | G1 | **Extra `cdroms:` reach the guest only after the install has started.** virt-install starts the installer at once (`--wait=0`); additional CD-ROMs are attached afterwards, to the persistent definition only, because SATA/IDE drives cannot be hot-plugged | `manager_parts/vms.py` (configure step, `extra_cdroms`), `cdrom.py` `cdroms_awaiting_boot` | Setup never sees the virtio-win or answer ISO. Any ISO-boot OS that needs a second medium at install time has the same problem | both ISOs passed as `--disk=…,device=cdrom` in `virt_install_extra_args` | `IsoBootVM` attaches **every** `cdroms:` entry at virt-install time (`--disk …,device=cdrom` per entry) |
-| G2 | **The VM stays off after the installer's first reboot.** The install-phase domain has `on_reboot=destroy`; with `--wait=0` nothing restarts it into the final definition | `direct_vm.py` (`--wait=0`) | Windows (and any installer that reboots) stops after phase 1. The first `boxman up` then waits 600 s for an IP and **exits 0** with a warning | run `boxman up` again | for installer ISOs, watch the domain and start it when it stops, or let virt-install wait (`--wait` with a timeout), or use `--noreboot`. Also: "VM shut off while waiting for IP" should fail fast, not wait 600 s |
+| G2 | **The VM stays off after the installer's first reboot.** The install-phase domain has `on_reboot=destroy`; with `--wait=0` nothing restarts it into the final definition | `direct_vm.py` (`--wait=0`) | Windows (and any installer that reboots) stops after phase 1. The first `boxman up` then waits 600 s for an IP and **exits 0** with a warning | `'--wait=-1'` last in `virt_install_extra_args` (virt-install waits and restarts the guest; `boxman up` blocks for the install phase) | for installer ISOs, watch the domain and start it when it stops, or let virt-install wait (`--wait` with a timeout). Also: "VM shut off while waiting for IP" should fail fast, not wait 600 s |
 | G3 | **No guest-agent channel.** virt-install adds `org.qemu.guest_agent.0` only for OS variants it knows have an agent (Linux) | `direct_vm.py` | `boxman storage trim`, agent IP lookup, fsinfo and fsfreeze fail ("QEMU guest agent is not configured") | `--channel=unix,target.type=virtio,name=org.qemu.guest_agent.0` | always add the channel in `DirectInstallVM` (harmless when no agent runs) |
 | G4 | **OS detection picks the wrong version.** `--os-variant=detect=on` identifies the 2022 eval ISO as `win2k25` | `direct_vm.py` | wrong libosinfo defaults; it happens to be harmless for 2022 vs 2025 | a later `--os-variant=win2k22` in extra args (the last one wins) | an `os_variant:` key for direct-boot VMs, as templates already have |
 | G5 | **ssh access assumes a Linux guest.** `ssh_config` writes `User admin`; the `admin_pass` key push is `sshpass ssh-copy-id` (to `~/.ssh/authorized_keys`); the generated inventory has no `ansible_connection` or `ansible_shell_type` | `manager_parts/ssh.py`, `manager_parts/workspace.py` | `boxman ssh` and `boxman run` do not reach the guest | the key is baked into the answer ISO; the user is passed by hand | `os: windows` → `User Administrator` (or `admin_user`), the key pushed into `administrators_authorized_keys` by the guest setup (not ssh-copy-id), inventory vars `ansible_shell_type: powershell` (or the WinRM set) |
@@ -327,10 +327,10 @@ vms:
       - '--channel=unix,target.type=virtio,name=org.qemu.guest_agent.0'
       - '--disk=path=/usr/share/virtio-win/virtio-win.iso,device=cdrom,readonly=on'
       - '--disk=path={{ env("HOME") }}/workspaces/…/answer.iso,device=cdrom,readonly=on'
+      - '--wait=-1'                   # G2
 ```
 
-Plus `make-answer-iso.sh` to render the answer file, and a second
-`boxman up` after the first reboot (G2).
+Plus `make-answer-iso.sh` to render the answer file.
 
 ### 5.2 Phase 1: first-class unattended install (small, and fixes Linux installers too)
 
@@ -422,5 +422,5 @@ prompt (§3.1). Win11 client licensing on VMs is its own question.
 
 See the box [README](../boxes/windows-server-2022-iso-boot/README.md). In
 short: `dnf install virtio-win`; `BOXMAN_WIN_ADMIN_PASS=… ./make-answer-iso.sh`;
-`boxman up`; when the VM powers off, `boxman up` again; once
-`boxman-setup: done`, eject the answer ISO (G7); then `win_ping`.
+`boxman up`; once `boxman-setup: done`, eject the answer ISO (G7); then
+`win_ping`.

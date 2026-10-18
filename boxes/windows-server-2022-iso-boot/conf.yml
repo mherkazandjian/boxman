@@ -89,3 +89,9 @@ clusters:
           - '--channel=unix,target.type=virtio,name=org.qemu.guest_agent.0'
           - '--disk=path=/usr/share/virtio-win/virtio-win.iso,device=cdrom,readonly=on'
           - '--disk=path={{ env("HOME") }}/workspaces/windows-server-2022-iso-boot/answer.iso,device=cdrom,readonly=on'
+          # boxman runs virt-install with --wait=0, which returns while the
+          # install-phase domain (on_reboot=destroy) is still running, so the
+          # VM stayed off after Setup's first reboot (G2). A later --wait wins:
+          # virt-install then waits for that stop and boots the installed
+          # disk itself. `boxman up` blocks until then.
+          - '--wait=-1'
