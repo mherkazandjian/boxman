@@ -114,16 +114,27 @@ _TRAPS_SIGINT = (
     "time.sleep(60)\n"
 )
 
+#: a program that ignores SIGINT altogether; it says it is up as above
+_IGNORES_SIGINT = (
+    "import pathlib, signal, sys, time\n"
+    "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+    "pathlib.Path(sys.argv[1]).touch()\n"
+    "time.sleep(60)\n"
+)
+
 #: a child that runs a command with run_stoppable and says how that ended.
 #: With a second argument, invoke is held up between starting the command
 #: and waiting for it, the command's PID is written to that file, and the
 #: child says whether the command is still there when the interrupt
 #: reaches it. With INJECT=<Popen method>:<n>, the n-th call of that method
 #: once the runner is stopping the command first creates the file
-#: INJECT_MARKER names and pauses, so that a SIGINT lands inside it
+#: INJECT_MARKER names and pauses, so that a SIGINT lands inside it.
+#: STOP_TIMEOUT shortens the runner's grace before a kill
 _RUN_STOPPABLE_IN_A_CHILD = """
 import os, subprocess, sys, time
 from boxman.utils import shell
+if os.environ.get("STOP_TIMEOUT"):
+    shell._StoppingLocal.STOP_TIMEOUT = float(os.environ["STOP_TIMEOUT"])
 if len(sys.argv) > 2:
     real = shell._StoppingLocal.create_io_threads
     def held_up(self):
@@ -176,7 +187,8 @@ class TestRunStoppable:
         from boxman.utils.shell import run_stoppable
         assert run_stoppable("true").ok
 
-    def _sigint_boxman_alone(self, tmp_path, signal_at, held_up=None, env=None):
+    def _sigint_boxman_alone(self, tmp_path, signal_at, held_up=None, env=None,
+                             program=_TRAPS_SIGINT):
         """Run the child, and SIGINT its Python alone as each file in
         *signal_at* appears; return what it printed, and how it exited."""
         import os
@@ -188,7 +200,7 @@ class TestRunStoppable:
         from pathlib import Path
 
         command = " ".join(shlex.quote(part) for part in (
-            sys.executable, "-c", _TRAPS_SIGINT, str(tmp_path / "up")))
+            sys.executable, "-c", program, str(tmp_path / "up")))
         env = dict(env or os.environ,
                    PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
         child = subprocess.Popen(
@@ -278,3 +290,14 @@ class TestRunStoppable:
         assert (out.split(), code) == (["STOPPED", "GONE"], 0), err
         if killed:
             assert not (tmp_path / "up.sigint").exists()
+
+    def test_a_command_that_ignores_its_sigint_is_killed_after_the_grace(self, tmp_path):
+        """invoke waits on, without a limit, after it passes a Ctrl-C on:
+        a command that ignores its SIGINT held boxman up indefinitely
+        (#244 review). The runner's grace and kill apply there too."""
+        import os
+
+        env = dict(os.environ, STOP_TIMEOUT="1")
+        out, err, code = self._sigint_boxman_alone(
+            tmp_path, [tmp_path / "up"], env=env, program=_IGNORES_SIGINT)
+        assert (out.split(), code) == (["STOPPED"], 0), err

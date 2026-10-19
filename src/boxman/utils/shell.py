@@ -40,18 +40,19 @@ class _StoppingLocal(invoke.runners.Local):
     does not read its stdin, as a download does not, runs to its end, and
     the interrupt is lost. Only a SIGINT to the whole process group, as from
     a terminal's Ctrl-C, reached the command itself (#227). This runner
-    sends the command SIGINT, and raises the KeyboardInterrupt once the
-    command has ended.
+    sends the command SIGINT, kills it if it has not ended in time, and
+    raises the KeyboardInterrupt once it has ended.
     """
 
     #: how long a command has to end after its SIGINT, before it is killed
     STOP_TIMEOUT = 10
 
     def send_interrupt(self, interrupt: KeyboardInterrupt) -> None:
+        # invoke calls this from its wait for the command, and waits on
+        # afterwards without a limit: stopping it here is what gives a
+        # command that ignores its SIGINT a deadline (#244 review)
         self.interrupted = True
-        process = getattr(self, "process", None)
-        if process is not None and process.poll() is None:
-            process.send_signal(signal.SIGINT)
+        self._stop()
 
     def _stop(self) -> None:
         """Send the command SIGINT, and wait for it to end (#227 review).
