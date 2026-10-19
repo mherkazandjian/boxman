@@ -7,6 +7,7 @@ import yaml
 
 from boxman.exceptions import ConfigError
 from boxman.task_runner import TaskRunner
+from boxman.utils.hostnames import ssh_alias
 
 
 class MiscMixin:
@@ -259,8 +260,8 @@ class MiscMixin:
 
     def resolve_vm_name(self, identifier: str) -> str:
         """
-        Resolve a VM identifier to the short name used in the workspace
-        (``{cluster}_{vm}``).
+        Resolve a VM identifier to the name ``boxman ssh`` hands to ssh: the
+        VM's ``ssh_config`` alias, ``{cluster}_{hostname}`` (#247).
 
         The identifier can be:
         - A numeric boxman id (from ``boxman ps``)
@@ -277,7 +278,8 @@ class MiscMixin:
                     f"VM id {idx} out of range (0-{len(vm_list) - 1})"
                 )
             cluster_name, vm_name, _ = vm_list[idx]
-            return f"{cluster_name}_{vm_name}"
+            vm_info = self.config["clusters"][cluster_name]["vms"][vm_name] or {}
+            return ssh_alias(cluster_name, vm_name, vm_info)
         return identifier
 
     def show_conf(self, cli_args, merged_provider=None):

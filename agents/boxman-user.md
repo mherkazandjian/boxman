@@ -397,7 +397,10 @@ read the generated `ssh_config`.
   cluster-specific files but **not** picked up by the env loader.
 - **Auto-generated workspace files** when not declared: `env.sh`,
   `inventory/01-hosts.yml`, `ansible.cfg`. The generated inventory groups VMs
-  by cluster and uses `<cluster>_<vm>` host keys, matching the SSH aliases.
+  by cluster under `<cluster>_<vm>` host keys (the VM key: `--limit` and
+  `host_vars` go by it). A VM whose `hostname:` differs from its key also gets
+  `ansible_host: <cluster>_<hostname>`, its SSH alias, and its `boxman_alias`
+  is its `node<N>`. `env.sh`'s `GATEWAYHOST` is the first VM's SSH alias.
 - **`env.sh` and `ansible.cfg` are preserved** if they already exist on disk —
   boxman will not clobber a customised file. `inventory/01-hosts.yml` and
   `ssh_config` *are* rewritten on every `provision` / `up` (and `ssh_config` on
