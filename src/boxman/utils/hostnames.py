@@ -44,6 +44,23 @@ def hostname_or_key(vm_name: str, vm_info: dict):
     return vm_name if declared is None else declared
 
 
+def ssh_alias(cluster_name: str, vm_name: str, vm_info: dict) -> str:
+    """
+    A VM's ``Host`` alias in the generated ``ssh_config``.
+
+    Everything that hands a VM to ssh -- ``env.sh``'s ``GATEWAYHOST``, the
+    inventory's ``ansible_host``, ``boxman ssh``'s own key push -- names it by
+    this, so that ``ssh -F ssh_config`` resolves it (#247).
+
+    :param cluster_name: the VM's cluster
+    :param vm_name: the VM's key under ``vms:``
+    :param vm_info: the VM's config block
+    :return: ``<cluster>_<hostname>``, the VM key standing in for an absent
+        or null ``hostname:``
+    """
+    return f"{cluster_name}_{hostname_or_key(vm_name, vm_info)}"
+
+
 #: One DNS label per RFC 1123: letters, digits and inner hyphens, 1-63 long.
 _HOSTNAME_LABEL = re.compile(r'^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$')
 

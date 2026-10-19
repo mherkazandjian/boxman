@@ -12,7 +12,7 @@ import time
 from collections import Counter
 
 from boxman.exceptions import SSHAccessError
-from boxman.utils.hostnames import hostname_or_key
+from boxman.utils.hostnames import hostname_or_key, ssh_alias
 from boxman.utils.references import resolve_reference
 from boxman.utils.shell import run
 
@@ -348,7 +348,7 @@ class SSHMixin:
                     ))
                     self.logger.status(
                         f"    via config: ssh -F {shlex.quote(ssh_config)} "
-                        f"{cluster_name}_{hostname}")
+                        f"{ssh_alias(cluster_name, vm_name, vm_info)}")
 
                 self.logger.status("")
 
@@ -410,6 +410,22 @@ class SSHMixin:
             f"\n\n"
         )
 
+    def _node_aliases(self) -> dict[tuple[str, str], str]:
+        """
+        Each VM's padded ``node<N>`` alias, by ``(cluster, vm key)``.
+
+        A project-wide count over the libvirt VMs in config order, padded to
+        the width of the last number. ``write_ssh_config`` puts it on the
+        VM's ``Host`` line and the inventory gives it as ``boxman_alias``, so
+        the two name the same VM (#247): the inventory used to count
+        docker-compose boxes too, and to pad to that count.
+        """
+        vms = [(cluster_name, vm_name)
+               for cluster_name, cluster in self._vm_clusters.items()
+               for vm_name in (cluster.get('vms') or {})]
+        width = len(str(len(vms) - 1)) if len(vms) > 1 else 1
+        return {vm: f"node{str(i).zfill(width)}" for i, vm in enumerate(vms)}
+
     def write_ssh_config(self,
                          vm_states: dict[str, str] | None = None,
                          fresh=(),
@@ -452,13 +468,7 @@ class SSHMixin:
         prj_name = f'bprj__{self.config["project"]}__bprj'
         fresh = set(fresh)
 
-        # count total VMs across all clusters for zero-padded alias numbering
-        total_vms = sum(
-            len(cluster.get('vms', {}))
-            for cluster in self.config['clusters'].values()
-        )
-        pad_width = len(str(total_vms - 1)) if total_vms > 1 else 1
-        vm_counter = 0
+        node_of = self._node_aliases()
 
         # the docker runtime's jump stanza goes into every file, so a path
         # of its that no file can hold stops every one of them (below)
@@ -505,10 +515,8 @@ class SSHMixin:
 
                 for vm_name, vm_info in cluster['vms'].items():
                     full_vm_name = f"{prj_name}_{cluster_name}_{vm_name}"
-                    hostname = hostname_or_key(vm_name, vm_info)
-                    prefixed_host = f"{cluster_name}_{hostname}"
-                    padded_alias = f"node{str(vm_counter).zfill(pad_width)}"
-                    vm_counter += 1
+                    prefixed_host = ssh_alias(cluster_name, vm_name, vm_info)
+                    padded_alias = node_of[(cluster_name, vm_name)]
                     entry = {
                         'vm_name': vm_name,
                         'label': f"{cluster_name}/{vm_name}",
@@ -963,8 +971,7 @@ class SSHMixin:
                 self.logger.info(f"adding ssh key to vm {vm_name} ({ip_address})...")
 
                 # try to add the key with exponential backoff
-                hostname = hostname_or_key(vm_name, vm_info)
-                prefixed_host = f"{cluster_name}_{hostname}"
+                prefixed_host = ssh_alias(cluster_name, vm_name, vm_info)
                 success = self._try_add_ssh_key(
                     ip_address=ip_address,
                     hostname=prefixed_host,

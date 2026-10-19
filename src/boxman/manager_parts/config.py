@@ -4,6 +4,7 @@
 
 
 
+import json
 import os
 import re
 from typing import Any
@@ -414,9 +415,12 @@ class ConfigMixin:
             for var, value in (host_extra_vars.get(host) or {}).items():
                 # a bool unquoted: ansible coerces "False" for a typed option,
                 # but `ansible_host_key_checking` is read with `is False` once
-                # coerced, and an untyped consumer would see a truthy string
+                # coerced, and an untyped consumer would see a truthy string.
+                # Anything else as a JSON string, which is a YAML
+                # double-quoted scalar: a VM's ansible_host comes from its
+                # hostname:, which nothing has checked yet (#247)
                 rendered = ('true' if value is True else 'false'
-                            if value is False else f'"{value}"')
+                            if value is False else json.dumps(str(value), ensure_ascii=False))
                 lines.append(f'          {var}: {rendered}')
             host_blocks.append('\n'.join(lines))
         host_lines = '\n'.join(host_blocks)

@@ -7,6 +7,7 @@
 import os
 
 from boxman import log
+from boxman.utils.hostnames import ssh_alias
 from boxman.utils.io import write_files
 from boxman.utils.retained_tree import identity
 
@@ -95,7 +96,15 @@ class WorkspaceMixin:
                         'ansible_host': f'{project}-{box}-1',
                     }))
             else:
-                for vm_name in (cluster.get('vms') or {}):
+                for vm_name, vm_info in (cluster.get('vms') or {}).items():
+                    host_key = f'{cname}_{vm_name}'
+                    # ssh_config names the VM's Host block after its
+                    # hostname:, the inventory after its key: where the two
+                    # differ, ansible_host points ssh at the block (#247).
+                    # The key stays the host's name -- host_vars and --limit
+                    # patterns hang on it, and two VMs may share a hostname.
+                    alias = ssh_alias(cname, vm_name, vm_info or {})
+                    connect = {} if alias == host_key else {'ansible_host': alias}
                     # per host, not `[defaults] host_key_checking = False`:
                     # that setting makes Ansible pass StrictHostKeyChecking=no
                     # on the command line for *every* target, which overrides
@@ -110,15 +119,19 @@ class WorkspaceMixin:
                     # a user's own --ssh-common-args (a ProxyJump, say). This one
                     # only makes the ssh plugin add -o StrictHostKeyChecking=no,
                     # which is exactly what the blanket setting used to do.
-                    all_hosts.append((cname, vm_name, f'{cname}_{vm_name}', {
+                    all_hosts.append((cname, vm_name, host_key, {
+                        **connect,
                         'ansible_host_key_checking': False,
                     }))
 
+        # A VM's boxman_alias is its node<N> ssh_config alias (#247). A
+        # container has none: it carries on the count after the VMs, padded
+        # to the project's host count as it always was.
+        alias_of = dict(self._node_aliases())
         pad_width = len(str(len(all_hosts) - 1)) if len(all_hosts) > 1 else 1
-        alias_of = {
-            (c, n): f"node{str(i).zfill(pad_width)}"
-            for i, (c, n, _hk, _ev) in enumerate(all_hosts)
-        }
+        for (c, n, _hk, ev) in all_hosts:
+            if ev.get('ansible_connection'):
+                alias_of[(c, n)] = f"node{str(len(alias_of)).zfill(pad_width)}"
 
         # --- env.sh (workspace-level) --- GATEWAYHOST is the first libvirt VM
         # (the `boxman ssh` default target); a dc-only project leaves it empty
@@ -126,9 +139,11 @@ class WorkspaceMixin:
         if all_hosts and env_sh_key not in ws_files:
             # a libvirt VM is one Ansible reaches over ssh -- an empty extra-vars
             # dict used to be the tell, until VM rows started carrying their own
-            # host-key options, so the connection plugin is asked instead
+            # host-key options, so the connection plugin is asked instead.
+            # It is named by its ssh_config alias, which `boxman ssh` hands
+            # to `ssh -F ssh_config` (#247).
             first_vm = next(
-                (hk for (_c, _n, hk, ev) in all_hosts
+                (ev.get('ansible_host', hk) for (_c, _n, hk, ev) in all_hosts
                  if not ev.get('ansible_connection')), '')
             inv_val = custom_inventory if custom_inventory else 'inventory'
             cfg_val = custom_ansible_config if custom_ansible_config else 'ansible.cfg'
