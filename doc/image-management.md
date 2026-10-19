@@ -37,10 +37,21 @@ Images are keyed by the basename of their URL. A cache hit skips the
 download; a cache miss downloads to `cache_dir` and reuses for every
 subsequent project that references the same URL.
 
+A download is written beside its place in the cache and moved there only
+once it is complete, so a download that fails or is cut short (a Ctrl-C,
+a kill, a server that hangs up before the length it promised or sends only
+a part of the file) leaves nothing a later run would take for the image. A
+download killed outright (SIGKILL, a power cut) leaves its part as
+`<name>.part-<pid>-<random>`, which no run uses; remove it by hand. A file
+cut short by a boxman older than this is not recognised: set a checksum,
+or remove it.
+
 When a checksum is given the cache verifies it on every read and aborts
-on mismatch — a corrupted file is re-downloaded on the next run rather
-than silently used. See the README "Image Caching" section for the
-checksum-spec format and the full hit/miss matrix.
+on mismatch, and the copy a template is built from is verified as well.
+The file stays in the cache, and every run aborts on it until it is
+removed from `cache_dir`; the next run then downloads it again. See the
+README "Image Caching" section for the checksum-spec format and the full
+hit/miss matrix.
 
 `boxman import-image` does **not** use this cache: a remote manifest and
 the files it references are downloaded fresh on each import.

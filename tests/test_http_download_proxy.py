@@ -4,7 +4,8 @@ they belong to, and to no one else.
 
 When wget and curl both fail, ``download_url`` and the cloud-image
 template's own copy of it, ``CloudInitTemplate._download_image``, download
-with urllib. urllib's ProxyHandler adds ``Proxy-Authorization`` (from a
+with urllib. Since #227 the template's is ``download_url`` itself; both are
+still asked. urllib's ProxyHandler adds ``Proxy-Authorization`` (from a
 proxy URL such as ``http://user:secret@proxy:3128``) as an ordinary request
 header, and the stock redirect handler copies every header onto the
 redirected request. So when a proxied mirror redirected, the password went
@@ -153,20 +154,21 @@ def proxies(monkeypatch):
 def download(request, monkeypatch, tmp_path):
     """A downloader whose wget and curl fail, so that urllib downloads."""
     if request.param == "download_url":
-        module, fetch = http_download, http_download.download_url
+        fetch = http_download.download_url
     else:
         template = cloudinit.CloudInitTemplate(
             template_name="t", image_path=str(tmp_path / "base.qcow2"),
             workdir=str(tmp_path / "workdir"),
             provider_config={"use_sudo": False, "uri": "qemu:///system"})
-        module, fetch = cloudinit, template._download_image
+        # download_url since #227, so the same shell
+        fetch = template._download_image
     tried = []
 
     def downloader_fails(command, **_kwargs):
         tried.append(command.split()[0])
         return SimpleNamespace(ok=False)
 
-    monkeypatch.setattr(module, "_shell_run", downloader_fails)
+    monkeypatch.setattr(http_download, "_shell_run", downloader_fails)
 
     def run(url, dst):
         ok = fetch(url, str(dst))

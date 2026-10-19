@@ -13,13 +13,16 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shlex
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boxman.image_cache import ImageCache
 from boxman.providers.libvirt.cloudinit import (
     DEFAULT_DONE_MARKER,
     DEFAULT_META_DATA,
@@ -946,12 +949,17 @@ class TestShellQuoting:
         assert shlex.quote("/tmp/a b.qcow2") in cmd
         assert shlex.quote("/tmp/c d.qcow2") in cmd
 
+    #: the template downloads with download_url since #227
+    DOWNLOAD_RUN = "boxman.utils.http_download._shell_run"
+
     def test_wget_command_quotes_dst_and_url(self, tmp_path: Path):
         t = _make_template(tmp_path)
-        with patch(self.SHELL_RUN, return_value=_result(ok=True)) as run, \
-                patch("boxman.providers.libvirt.cloudinit.os.path.isfile",
+        # wget's download counts on a 2xx it printed (#227)
+        wget_ok = _result(ok=True, stderr="  HTTP/1.1 200 OK\n")
+        with patch(self.DOWNLOAD_RUN, return_value=wget_ok) as run, \
+                patch("boxman.utils.http_download.os.path.isfile",
                       return_value=True), \
-                patch("boxman.providers.libvirt.cloudinit.os.path.getsize",
+                patch("boxman.utils.http_download.os.path.getsize",
                       return_value=10):
             assert t._download_image(
                 "http://x/y iso.qcow2", "/tmp/d st.img") is True
@@ -969,10 +977,10 @@ class TestShellQuoting:
             # curl's download counts only on the 2xx it prints with -w (#224)
             return _result(ok="curl" in cmd, stdout="200")
 
-        with patch(self.SHELL_RUN, side_effect=fake_run), \
-                patch("boxman.providers.libvirt.cloudinit.os.path.isfile",
+        with patch(self.DOWNLOAD_RUN, side_effect=fake_run), \
+                patch("boxman.utils.http_download.os.path.isfile",
                       return_value=True), \
-                patch("boxman.providers.libvirt.cloudinit.os.path.getsize",
+                patch("boxman.utils.http_download.os.path.getsize",
                       return_value=10):
             assert t._download_image(
                 "http://x/y iso.qcow2", "/tmp/d st.img") is True
@@ -993,3 +1001,56 @@ class TestShellQuoting:
         assert f"path={shlex.quote(dst_image)}" in cmd
         seed = os.path.join(t.workdir, "my tmpl", "seed.iso")
         assert f"path={shlex.quote(seed)}" in cmd
+
+
+class TestACachedImageIsCheckedWhereItIsUsed:
+    """
+    #227 review: ``_fetch_remote_image`` checked the cached file, then
+    copied it by its path. Another run's download, of the same URL but other
+    bytes (a mutable "current" image, an OCI tag), can be renamed onto that
+    path in between, and the template was built from bytes nobody checked.
+    """
+
+    IMAGE = b"the image its checksum names " * 64
+    OTHER = b"another run's download of the same URL " * 64
+
+    def _template(self, tmp_path: Path) -> CloudInitTemplate:
+        return _make_template(
+            tmp_path, image_cache=ImageCache(cache_dir=str(tmp_path / "cache")),
+            image_checksum=f"sha256:{hashlib.sha256(self.IMAGE).hexdigest()}")
+
+    def _download(self, url, dst):
+        Path(dst).write_bytes(self.IMAGE)
+        return True
+
+    def test_an_image_replaced_between_the_check_and_the_copy(self, tmp_path: Path):
+        t = self._template(tmp_path)
+        dst = tmp_path / "staged.qcow2"
+
+        def copy_after_another_run_published(src, to):
+            # another run renames its finished download onto the cache path
+            other = Path(src).with_name("other.part")
+            other.write_bytes(self.OTHER)
+            os.replace(other, src)
+            shutil.copyfile(src, to)
+            return True
+
+        with patch.object(t, "_copy_local", side_effect=copy_after_another_run_published):
+            ok = t._fetch_remote_image("https://example.com/distro.qcow2", str(dst),
+                                       download_fn=self._download)
+
+        assert (ok, dst.exists()) == (False, False)
+
+    def test_an_image_that_stays_put_is_copied(self, tmp_path: Path):
+        t = self._template(tmp_path)
+        dst = tmp_path / "staged.qcow2"
+
+        def copy(src, to):
+            shutil.copyfile(src, to)
+            return True
+
+        with patch.object(t, "_copy_local", side_effect=copy):
+            ok = t._fetch_remote_image("https://example.com/distro.qcow2", str(dst),
+                                       download_fn=self._download)
+
+        assert (ok, dst.read_bytes()) == (True, self.IMAGE)

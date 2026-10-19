@@ -158,6 +158,18 @@ Either way, a subprocess goes through `boxman.utils.shell.run`, never
 the test runner's or CI's stdin, and `tests/test_utils_shell.py` fails on any
 `invoke.run(` outside `utils/shell.py`.
 
+The one exception is a command that must stop on a Ctrl-C: it goes through
+`boxman.utils.shell.run_stoppable` (today only the downloaders in
+`utils/http_download.py`). Plain `run` behaves as invoke does: it answers a
+Ctrl-C by writing `\x03` to the command's stdin and waiting on, so a command
+that does not read its stdin rides the interrupt out, and `run` raises no
+`KeyboardInterrupt` for it: the command's ending is reported as any other
+(its result, or `UnexpectedExit` under `warn=False` if it failed).
+`run_stoppable` `exec`s the command, so pass a
+single program and its arguments. On a Ctrl-C it sends the command SIGINT, and
+kills it after `STOP_TIMEOUT` (10 s) or at a further Ctrl-C. It raises
+`KeyboardInterrupt` only once the command has ended and been reaped.
+
 `pass_env` names environment variables the wrapped command needs: the local
 runtime inherits them, the docker runtime forwards each *name* with `-e`. That
 is how a secret reaches a command (`sshpass -e` reads `SSHPASS`) — never put
