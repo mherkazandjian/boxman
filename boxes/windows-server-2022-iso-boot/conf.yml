@@ -74,7 +74,7 @@ clusters:
         networks:
           - name: win-net
         cdroms:
-          - winsrv2022-eval
+          - name: winsrv2022-eval
         # Windows Setup reads its drivers and answer file during the very
         # first boot, which virt-install starts. A cdroms: entry beyond the
         # first is attached only afterwards, to the persistent definition
