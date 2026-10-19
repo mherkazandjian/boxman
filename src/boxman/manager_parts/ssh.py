@@ -410,18 +410,46 @@ class SSHMixin:
             f"\n\n"
         )
 
+    def _ssh_config_groups(self) -> dict[str, list[tuple[str, dict, str]]]:
+        """
+        The libvirt clusters by the ``ssh_config`` file their VMs go in.
+
+        Returns:
+            ``{file: [(cluster name, cluster, base path), ...]}``, the files
+            in the order their first cluster comes, and each file's clusters
+            in config order. When workspace.path is set every cluster
+            resolves to the SAME file unless it names its own, so each
+            file must be written once with all of its VM blocks: opening it
+            'w' once per cluster would have the later one truncate the
+            earlier one's entries.
+        """
+        ws_path = self.config.get('workspace', {}).get('path', '')
+        groups: dict[str, list[tuple[str, dict, str]]] = {}
+        for cluster_name, cluster in self._vm_clusters.items():
+            base_path = ws_path or cluster.get('workdir', '~')
+            ssh_config = os.path.expanduser(os.path.join(
+                base_path,
+                cluster.get('ssh_config', 'ssh_config')
+            ))
+            groups.setdefault(ssh_config, []).append(
+                (cluster_name, cluster, base_path)
+            )
+        return groups
+
     def _node_aliases(self) -> dict[tuple[str, str], str]:
         """
         Each VM's padded ``node<N>`` alias, by ``(cluster, vm key)``.
 
-        A project-wide count over the libvirt VMs in config order, padded to
-        the width of the last number. ``write_ssh_config`` puts it on the
-        VM's ``Host`` line and the inventory gives it as ``boxman_alias``, so
-        the two name the same VM (#247): the inventory used to count
-        docker-compose boxes too, and to pad to that count.
+        A project-wide count over the libvirt VMs, file by file as
+        ``write_ssh_config`` writes them, padded to the width of the last
+        number. ``write_ssh_config`` puts it on the VM's ``Host`` line and the
+        inventory gives it as ``boxman_alias``, so the two name the same VM
+        (#247): the inventory used to count docker-compose boxes too, and to
+        pad to that count.
         """
         vms = [(cluster_name, vm_name)
-               for cluster_name, cluster in self._vm_clusters.items()
+               for clusters in self._ssh_config_groups().values()
+               for cluster_name, cluster, _base_path in clusters
                for vm_name in (cluster.get('vms') or {})]
         width = len(str(len(vms) - 1)) if len(vms) > 1 else 1
         return {vm: f"node{str(i).zfill(width)}" for i, vm in enumerate(vms)}
@@ -464,7 +492,6 @@ class SSHMixin:
         Raises:
             SSHAccessError: a file could not be written; the others are.
         """
-        ws_path = self.config.get('workspace', {}).get('path', '')
         prj_name = f'bprj__{self.config["project"]}__bprj'
         fresh = set(fresh)
 
@@ -478,21 +505,7 @@ class SSHMixin:
         except _UnwritableError as exc:
             jump_stanza, jump_problem = None, exc
 
-        # Group clusters by their resolved ssh_config path. When
-        # workspace.path is set every cluster resolves to the SAME path,
-        # so we must write each unique path once with all relevant VM
-        # blocks — opening 'w' once per cluster would have the later
-        # iteration truncate the earlier one's entries.
-        groups: dict[str, list[tuple[str, dict, str]]] = {}
-        for cluster_name, cluster in self._vm_clusters.items():
-            base_path = ws_path or cluster.get('workdir', '~')
-            ssh_config = os.path.expanduser(os.path.join(
-                base_path,
-                cluster.get('ssh_config', 'ssh_config')
-            ))
-            groups.setdefault(ssh_config, []).append(
-                (cluster_name, cluster, base_path)
-            )
+        groups = self._ssh_config_groups()
 
         # Every VM's entry is settled before any file is written: whether a
         # VM that is not running may keep its earlier address depends on the

@@ -122,10 +122,13 @@ def test_the_gateway_stays_the_first_vm_under_its_alias(tmp_path):
 
     assert aliases == [["web_front", "node0"], ["web_w2", "node1"], ["db_pg", "node2"]]
     assert env["GATEWAYHOST"] == "web_front"
-    assert _ssh_targets(inventories[0]) == {
-        "web_w1": "web_front", "web_w2": "web_w2", "db_d1": "db_pg"}
-    for inventory in inventories:
-        assert set(_ssh_targets(inventory).values()) <= _every_alias(aliases)
+    # the combined inventory, then each cluster's own: each host reaches
+    # its own VM's alias, not just some alias of the project's
+    assert [_ssh_targets(inventory) for inventory in inventories] == [
+        {"web_w1": "web_front", "web_w2": "web_w2", "db_d1": "db_pg"},
+        {"web_w1": "web_front", "web_w2": "web_w2"},
+        {"db_d1": "db_pg"},
+    ]
 
 
 def test_two_vms_that_declare_one_hostname_stay_two_hosts(tmp_path):
@@ -230,3 +233,76 @@ class TestEverySiteThatNamesTheVmForSsh:
         said = [c.args[0] for c in manager.logger.status.call_args_list]
         via_config = [line for line in said if "via config:" in line]
         assert len(via_config) == 1 and via_config[0].endswith(" lab_myvm")
+
+
+@pytest.mark.parametrize("workspace_path", [True, False], ids=["workspace-path", "workdirs"])
+def test_node_numbers_follow_the_files_they_are_written_to(workspace_path, tmp_path):
+    """``write_ssh_config`` numbers VMs file by file; a cluster that names an
+    ssh_config file of its own between two that share one comes last. The
+    shared numbering must keep that, or ``ssh node2`` reaches another VM
+    (#247 review)."""
+    shared, other = tmp_path / "shared", tmp_path / "other"
+    clusters = {
+        "a": {"vms": {"a": {}}},
+        "b": {"vms": {"b": {}}, "ssh_config": "other_ssh_config"},
+        "c": {"vms": {"c1": {}, "c2": {}}},
+    }
+    for name, cluster in clusters.items():
+        cluster.setdefault("ssh_config", "ssh_config")
+        cluster["admin_pass"] = "secret"
+        if not workspace_path:
+            cluster["workdir"] = str(other if name == "b" else shared)
+    config = {"project": "p", "clusters": clusters,
+              "workspace": {"path": str(shared)} if workspace_path else {}}
+    shared.mkdir()
+    other.mkdir()
+    manager = make_bare_manager(config)
+    manager.resolve_workspace_defaults()
+    session = MagicMock()
+    session.get_vm_ip_addresses.side_effect = lambda name: {"eth0": "192.168.10.10"}
+    manager.session_for_cluster = lambda cluster_name: session
+    manager._docker_ssh_jump_stanza = lambda: None
+    manager.write_ssh_config()
+
+    def host_lines(path):
+        return [line.split()[1:] for line in path.read_text().splitlines()
+                if line.startswith("Host ")]
+
+    # as f06c8fe wrote them
+    assert host_lines(shared / "ssh_config") == [
+        ["a_a", "node0"], ["c_c1", "node1"], ["c_c2", "node2"]]
+    b_file = shared / "other_ssh_config" if workspace_path else other / "other_ssh_config"
+    assert host_lines(b_file) == [["b_b", "node3"]]
+    # and the inventory names the same ones
+    inventory = yaml.safe_load(config["workspace"]["files"]["inventory/01-hosts.yml"])
+    assert _node_aliases(inventory) == {
+        "a_a": "node0", "b_b": "node3", "c_c1": "node1", "c_c2": "node2"}
+
+
+class TestANumericIdReachesTheAlias:
+    """``boxman ssh <id>``, the id ``boxman ps`` shows, named the VM by its
+    key, which ssh_config does not know when ``hostname:`` differs (#247
+    review)."""
+
+    @staticmethod
+    def _manager():
+        return make_bare_manager({
+            "project": "p",
+            "clusters": {"lab": {"vms": {"vm00": {}, "vm01": {"hostname": "myvm"}}}},
+        })
+
+    def test_resolve_vm_name(self):
+        manager = self._manager()
+        assert [manager.resolve_vm_name(i) for i in ("0", "1", "lab_vm01")] == [
+            "lab_vm00", "lab_myvm", "lab_vm01"]
+
+    def test_boxman_ssh(self, monkeypatch):
+        from types import SimpleNamespace
+
+        runner = MagicMock()
+        runner.return_value.ssh_to_host.return_value = 0
+        monkeypatch.setattr("boxman.manager_parts.misc.TaskRunner", runner)
+
+        self._manager().ssh_session(SimpleNamespace(vm_name="1", cluster=None))
+
+        runner.return_value.ssh_to_host.assert_called_once_with("lab_myvm")
