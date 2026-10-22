@@ -349,12 +349,22 @@ against real guests:
 - `clone_hostname: off` reproduces today's behaviour;
 - two clones have **different** machine IDs (the §4 upgrade).
 
-## 8. Docs to update, per `AGENTS.md`
+## 8. Docs to update
 
-`.claude/skills/boxman/SKILL.md`, `agents/boxman-user.md` (both currently read
-as if `hostname:` already names the guest), `agents/boxman-developer.md` for the
-pass architecture, `doc/tutorial/README.md`'s clone-policy section including the
-§4 caveat removal, and the `data/templates/` config comments.
+- `.claude/skills/boxman/SKILL.md` (when this was written it read as if
+  `hostname:` already named the guest).
+- `agents/boxman-user.md` (which read the same way) and
+  `agents/boxman-developer.md` for the pass architecture — **done in #240**:
+  the user file documents `hostname:` naming the guest and the three `clone_*`
+  policies, the developer file the one-pass architecture. The rule that these
+  files move with the config surface is stated in `agents/README.md`
+  ("Keeping them accurate").
+- `doc/tutorial/README.md`'s clone-policy section, including the §4 caveat
+  removal — **done in #203 and #209**: the section covers all three `clone_*`
+  policies, and the "prefer `off` for guests that do not regenerate a machine
+  ID" reasoning is replaced by the fresh-value semantics.
+- The `data/templates/` config comments — **done in #203 and #209**:
+  `conf.libvirt.yml` comments the three `clone_*` keys.
 
 ## 9. Open questions
 
@@ -398,11 +408,13 @@ against a disk carrying template host keys:
   the shut-off clone against the staged fingerprints was proposed in review and
   not built.
 
-## 10. A note on `agents/`
+## 10. A note on `agents/` (resolved)
 
-`AGENTS.md` requires `agents/boxman-user.md` and `agents/boxman-developer.md`
-to be updated whenever the config surface changes. Those files do not exist on
-`main`: they live only on the unmerged branch `doc/agent-definitions`, whose
-`boxman-user.md` documents `clone_machine_id` in two places. They therefore
-cannot be updated from this branch without creating a conflicting copy, and
-need the same treatment when that branch lands.
+`agents/boxman-user.md` and `agents/boxman-developer.md` must be updated
+whenever the config surface changes, as `agents/README.md` ("Keeping them
+accurate") states. When this plan was written they lived only on the unmerged
+branch `doc/agent-definitions`, so they could not be updated from here without
+creating a conflicting copy. That branch landed as #240, which documents the
+clone identity work in both files: `hostname:` naming the guest and the
+`clone_machine_id`, `clone_ssh_host_keys` and `clone_hostname` policies in
+`boxman-user.md`, and the one-pass architecture in `boxman-developer.md`.
