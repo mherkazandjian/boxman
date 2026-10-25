@@ -885,8 +885,11 @@ Details worth knowing:
   symlink, or anything another VM uses directly, as a backing file or as
   the destination of a block job it runs (a block copy) — storage-pool
   volumes included. A protected file is recognised by its
-  identity as well as its path, so under a bind mount or a hard link too;
-  one boxman cannot look up keeps everything. A disk's backing chain goes
+  identity as well as its path, so under a bind mount or a hard link too.
+  One boxman may not look up — another user's VM keeping its disks in that
+  user's home — is looked up with `sudo -n stat` where the provider runs
+  `stat` under sudo (`use_sudo`, or `stat` in `force_sudo_commands`; local
+  runtime only); one it still cannot keeps everything. A disk's backing chain goes
   as a whole or not at all, overlays first, so no kept disk loses its
   backing file. A VM that predates the ownership record has its declared
   disks removed by name.
