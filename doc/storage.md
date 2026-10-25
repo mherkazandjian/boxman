@@ -64,7 +64,7 @@ Column meanings:
 | `ALLOC` | `qemu-img info` (`actual-size`) | Bytes the qcow2 is consuming on the host |
 | `CHAIN` | `qemu-img info --backing-chain` | Length of the backing-file chain (1 = no overlays) |
 | `SNAPS` | `virsh snapshot-list --name` | Number of libvirt snapshots for the VM |
-| `SNAPMEM` | sum of `<vm>_snapshot_*.raw` and `*.raw.zst` sizes | Total memory-dump on-disk per VM (shown on the boot disk row) |
+| `SNAPMEM` | sum of `<vm>_snapshot_*.raw` and `*.raw.zst` sizes, in the workdir and the `snapshot_dir` | Total memory-dump on-disk per VM (shown on the boot disk row) |
 | `RECLAIM~` | `qemu-img measure --output=json` (`required`) vs `actual-size` | Estimated bytes recoverable by `compact` |
 
 `storage df` never writes anything. It is the right first step before
@@ -275,7 +275,8 @@ work — `<backingStore>` elements nest.
 ## Snapshot memory compression (zstd)
 
 A live snapshot taken with `virsh snapshot-create-as --memspec=…` writes
-the VM's full RAM to a `<vm>_snapshot_<name>.raw` file. These dominate
+the VM's full RAM to a `<vm>_snapshot_<name>.raw` file — in the cluster's
+`snapshot_dir` when it sets one, else in its `workdir`. These dominate
 the disk footprint of a project with many snapshots — RAM doesn't
 compact like a qcow2.
 

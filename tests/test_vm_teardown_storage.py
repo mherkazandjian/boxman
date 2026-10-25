@@ -125,11 +125,13 @@ class _Teardown:
 
     def __init__(self, workdir, *, disks=(), media=(), rows=None,
                  records=None, records_error=None, in_use=None,
-                 chains=STANDALONE):
+                 chains=STANDALONE, snapshot_dir=None):
         self.workdir = workdir
+        cluster = {'workdir': str(workdir)}
+        if snapshot_dir is not None:
+            cluster['snapshot_dir'] = str(snapshot_dir)
         self.mgr = make_bare_manager(
-            {'project': 'demo',
-             'clusters': {'cluster_1': {'workdir': str(workdir)}}})
+            {'project': 'demo', 'clusters': {'cluster_1': cluster}})
         session = self.session = MagicMock()
         session.vm_storage_devices.return_value = rows if rows is not None else (
             [DomblkRow('file', 'disk', f'vd{chr(97 + i)}', str(p))
@@ -2670,3 +2672,172 @@ class TestTeardownWithoutSudo:
         assert t.warnings == ''
         # the CD-ROM's chain, and what is left of the head's
         assert host.asked('pool-refresh') == [('cluster_1',)] * 4
+
+
+class TestMemoryImagesInASnapshotDir:
+    """A cluster's ``snapshot_dir`` holds its VMs' memory images, written
+    there by ``snapshot take``: a teardown removes the VM's own from it, by
+    every rule a workdir's files go by, and nothing else of the VM's is
+    ever a candidate there."""
+
+    @staticmethod
+    def _dirs(tmp_path):
+        workdir, snaps = tmp_path / 'work', tmp_path / 'snaps'
+        workdir.mkdir()
+        snaps.mkdir()
+        return workdir, snaps
+
+    def test_its_memory_images_go_and_the_directory_stays(self, tmp_path):
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        overlay = _file(workdir / f'{VM}.s1')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        zst = _file(snaps / f'{VM}_snapshot_s2.raw.zst')
+        t = _Teardown(workdir, disks=[overlay], records=[], snapshot_dir=snaps)
+
+        t.deprovision()
+
+        assert not (boot.exists() or overlay.exists() or raw.exists()
+                    or zst.exists())
+        assert snaps.is_dir() and list(snaps.iterdir()) == []
+        assert t.warnings == ''
+
+    def test_nothing_else_of_the_vms_there_is_a_candidate(self, tmp_path):
+        workdir, snaps = self._dirs(tmp_path)
+        _qcow2(workdir / f'{VM}.qcow2')
+        kept = [_qcow2(snaps / f'{VM}.qcow2'),
+                _file(snaps / f'{VM}.s1'),
+                _file(snaps / f'{VM}_snapshot_s1.txt'),
+                _file(snaps / f'{VM}_snapshot_s1.raw.gz'),
+                _qcow2(snaps / f'{VM}_disk01.qcow2'),
+                _file(snaps / f'{OTHER}_snapshot_s1.raw')]
+        t = _Teardown(workdir, disks=[], records=[], snapshot_dir=snaps)
+
+        t.deprovision()
+
+        assert all(path.exists() for path in kept)
+        assert t.warnings == ''
+
+    def test_a_recorded_disk_named_like_a_memory_image_there_is_kept(
+            self, tmp_path):
+        """A raw data disk ``snapshot_x`` is ``<vm>_snapshot_x.raw``: an
+        extra disk is never decided by name, and a recorded one only ever
+        goes from a cluster workdir."""
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        data = _file(snaps / f'{VM}_snapshot_x.raw', b'raw data disk')
+        t = _Teardown(workdir, disks=[boot, data],
+                      records=[_record('snapshot_x', data)],
+                      snapshot_dir=snaps)
+
+        t.deprovision([{'name': 'snapshot_x', 'driver': {'type': 'raw'}}])
+
+        assert not boot.exists()
+        assert data.read_bytes() == b'raw data disk'
+        assert f'left {data} in place' in t.warnings
+        assert 'outside every cluster workdir' in t.warnings
+
+    def test_a_symlink_named_as_a_memory_image_is_kept(self, tmp_path):
+        workdir, snaps = self._dirs(tmp_path)
+        _qcow2(workdir / f'{VM}.qcow2')
+        target = _file(tmp_path / 'elsewhere' / 'precious.raw', b'precious')
+        link = snaps / f'{VM}_snapshot_s1.raw'
+        os.symlink(target, link)
+        t = _Teardown(workdir, disks=[], records=[], snapshot_dir=snaps)
+
+        t.deprovision()
+
+        assert os.path.islink(link)
+        assert target.read_bytes() == b'precious'
+        assert f'left {link} in place' in t.warnings
+
+    def test_one_another_domain_uses_is_kept(self, tmp_path):
+        workdir, snaps = self._dirs(tmp_path)
+        _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        t = _Teardown(workdir, disks=[], records=[], snapshot_dir=snaps,
+                      in_use={str(raw): OTHER})
+
+        t.deprovision()
+
+        assert raw.exists()
+        assert f'left {raw} in place' in t.warnings
+
+    def test_a_missing_snapshot_dir_holds_none(self, tmp_path):
+        workdir = tmp_path / 'work'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      snapshot_dir=tmp_path / 'not-made-yet')
+
+        t.deprovision()
+
+        assert not boot.exists()
+        assert t.warnings == ''
+
+    @unless_root
+    def test_an_unlistable_snapshot_dir_leaves_the_domain_defined(
+            self, tmp_path):
+        """It may hold the VM's memory images, so the teardown stops at
+        capture: nothing undefined, nothing removed, nothing saved."""
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        t = _Teardown(workdir, disks=[boot], records=[], snapshot_dir=snaps)
+        snaps.chmod(0)
+        try:
+            with pytest.raises(ProvisionError, match='could not list') as exc:
+                t.deprovision()
+        finally:
+            snaps.chmod(0o700)
+
+        assert 'a snapshot_dir that may hold its memory images' in str(
+            exc.value)
+        assert 'leaving it defined' in str(exc.value)
+        t.session.destroy_vm.assert_not_called()
+        assert boot.exists() and raw.exists()
+        assert not _saved(workdir).exists()
+
+    def test_a_vm_gone_from_the_config_loses_them_too(self, tmp_path):
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        t = _Teardown(workdir, disks=[boot], records=[], snapshot_dir=snaps)
+
+        t.update_remove()
+
+        assert not (boot.exists() or raw.exists())
+        assert t.warnings == ''
+
+    def test_a_retry_removes_what_the_first_pass_kept(self, tmp_path):
+        """Decided with the saved inventory, once the domain is gone."""
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        t = _Teardown(workdir, disks=[boot], records=[], snapshot_dir=snaps,
+                      in_use={str(raw): OTHER})
+        t.deprovision()
+        assert raw.exists() and _saved(workdir).exists()
+
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.mgr.logger.reset_mock()
+
+        t.deprovision()
+
+        assert not raw.exists()
+        assert not _saved(workdir).exists()
+        assert t.warnings == ''
+
+    def test_a_vm_undefined_with_nothing_saved_loses_them_by_name(
+            self, tmp_path):
+        """With nothing to decide by but names, boxman's own artifact types
+        go: a memory image there is one."""
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw.zst')
+        t = _Teardown(workdir, rows=[], records=[], snapshot_dir=snaps)
+        t.session.vm_storage_devices.return_value = None
+
+        t.deprovision()
+
+        assert not (boot.exists() or raw.exists())
