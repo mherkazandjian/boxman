@@ -394,7 +394,9 @@ boxman restore --name "pre-upgrade"
 
 The `--compress-memory` flag zstd-compresses the snapshot memory dump
 (typically a ~71% reduction at sub-second/GB). Restore decompresses
-transparently — no flag needed at revert time. See
+transparently — no flag needed at revert time. The memory dumps go to
+the cluster's `snapshot_dir` when it sets one, else to its `workdir`
+(disk overlays always sit beside their disks). See
 [Disk Reclaim and Storage](doc/storage.md) for the full reclaim
 workflow and the `boxman storage` subcommand.
 
@@ -878,7 +880,8 @@ Details worth knowing:
   running.
 - **Only the storage the VM owns is removed, by boxman — never by libvirt.**
   Its boot disk, snapshot overlays and memory files (the files under the VM's
-  own `<vm>.*` / `<vm>_snapshot_*` names in a cluster workdir) and the extra
+  own `<vm>.*` / `<vm>_snapshot_*` names in a cluster workdir, and its memory
+  images in a cluster's `snapshot_dir`) and the extra
   disks boxman recorded creating for it. Never: a CD-ROM or ISO it has
   attached (in either its live or its persistent definition), an
   `attach_only` (adopted) disk, anything outside the cluster workdirs, a

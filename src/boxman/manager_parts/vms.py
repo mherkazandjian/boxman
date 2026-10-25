@@ -39,6 +39,7 @@ from boxman.providers.libvirt.disk_cleanup import (
     entry_exists,
     file_identities,
     load_teardown_inventory,
+    memory_image_candidates,
     read_teardown_locator,
     remove_vm_storage,
     save_teardown_inventory,
@@ -585,7 +586,8 @@ class VMsMixin:
         # remove_vm_storage() raises on a filesystem error, which reaches
         # _run_parallel's failure handling
         outcome = remove_vm_storage(
-            inventory, self._cluster_workdirs(), session.disk_paths_in_use)
+            inventory, self._cluster_workdirs(), session.disk_paths_in_use,
+            memory_dirs=self._cluster_snapshot_dirs())
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")
@@ -706,6 +708,22 @@ class VMsMixin:
                 raise ProvisionError(
                     f"{full_vm_name}: could not list {workdir} ({exc}), "
                     f"which holds its boot disk, overlays and memory files; "
+                    + ("leaving it defined and its storage in place"
+                       if exists else "leaving its storage in place")
+                    + " — make that directory readable, then retry") from exc
+        # its memory images in the clusters' snapshot_dir: every cluster's,
+        # since names anchored at the full vm name match no other vm's, and a
+        # vm gone from the config no longer says which cluster it was in. A
+        # snapshot_dir that cannot be listed may hold them, and stops the
+        # teardown here, before the undefine.
+        for snapshot_dir in self._cluster_snapshot_dirs():
+            try:
+                found.update(memory_image_candidates(snapshot_dir,
+                                                     full_vm_name))
+            except OSError as exc:
+                raise ProvisionError(
+                    f"{full_vm_name}: could not list {snapshot_dir} ({exc}), "
+                    f"a snapshot_dir that may hold its memory images; "
                     + ("leaving it defined and its storage in place"
                        if exists else "leaving its storage in place")
                     + " — make that directory readable, then retry") from exc

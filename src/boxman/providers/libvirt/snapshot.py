@@ -161,7 +161,10 @@ class SnapshotManager:
 
         Args:
             vm_name: Name of the VM
-            vm_dir: Directory where the VM is located
+            vm_dir: Directory the memory image is written to, as
+                ``<vm>_snapshot_<name>.raw`` (the cluster's
+                ``snapshot_dir``, by default its workdir); disk
+                overlays are created beside their disks
             snapshot_name: Name for the snapshot
             description: Description for the snapshot
             compress_memory: If True, zstd-compress the .raw memory file

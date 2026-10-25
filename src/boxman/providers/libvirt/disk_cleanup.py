@@ -169,6 +169,35 @@ def boot_family_candidates(workdir: str, vm_name: str) -> list[str]:
     return sorted(found)
 
 
+def is_memory_image(vm_name: str, path: str) -> bool:
+    """
+    Whether *path* is named as ``snapshot take`` names *vm_name*'s memory
+    images: ``<vm>_snapshot_<name>.raw``, or the ``.raw.zst`` that
+    compression leaves. The name only: what the file is, is not read.
+    """
+    name = os.path.basename(path)
+    return (name.startswith(f"{vm_name}_snapshot_")
+            and name.endswith((".raw", ".raw.zst")))
+
+
+def memory_image_candidates(directory: str, vm_name: str) -> list[str]:
+    """
+    The entries of *directory* named as *vm_name*'s memory images
+    (:func:`is_memory_image`) — what a teardown decides with in a cluster's
+    ``snapshot_dir``, where nothing else of the VM's is ever a candidate.
+
+    Read as :func:`boot_family_candidates` reads a workdir: only a directory
+    that does not exist holds none, a symlink or an entry that cannot be
+    looked up stays a candidate (the refusals then keep it), and the name is
+    matched literally, never as a pattern.
+
+    Raises:
+        OSError: If *directory* exists but cannot be listed.
+    """
+    return [path for path in boot_family_candidates(directory, vm_name)
+            if is_memory_image(vm_name, path)]
+
+
 def file_identities(paths: Iterable[str]) -> dict[str, tuple[int, int]]:
     """
     ``(st_dev, st_ino)`` of each path that exists, without following a
@@ -755,6 +784,7 @@ def remove_vm_storage(
     inventory: StorageInventory,
     workdirs: Iterable[str],
     paths_in_use: Callable[[], dict[str, str] | None],
+    memory_dirs: Iterable[str] = (),
 ) -> StorageOutcome:
     """
     Remove the storage an undefined VM owns — and nothing else.
@@ -770,7 +800,9 @@ def remove_vm_storage(
 
     1. **The boot-disk family** — files under the VM's exclusive names in
        its disk directories (:func:`boot_family_candidates`): its boot disk,
-       its overlays and its memory-snapshot files. Extra-disk files
+       its overlays and its memory-snapshot files; and its memory images in
+       the clusters' ``snapshot_dir`` (*memory_dirs*,
+       :func:`memory_image_candidates`). Extra-disk files
        (attached, recorded, config-declared, or a layer under one) are
        never decided by name.
     2. **Extra disks recorded with role ``data``** at exactly their
@@ -785,8 +817,10 @@ def remove_vm_storage(
        its record, if it had one, is gone.
 
     Every admitted file must be a regular file, not a symlink, inside one
-    of the cluster *workdirs* once symlinks are resolved, and not a CD-ROM
-    (or other media) source of either definition.
+    of the cluster *workdirs* once symlinks are resolved — a memory image of
+    the boot-disk family (:func:`is_memory_image`) inside one of
+    *memory_dirs* too, and nothing else there — and not a CD-ROM (or other
+    media) source of either definition.
 
     Every protection that compares files matches them by resolved path and
     by identity (:class:`_Identities`): the media and what they are built
@@ -810,6 +844,7 @@ def remove_vm_storage(
     outcome = StorageOutcome()
     real = os.path.realpath
     real_workdirs = {real(os.path.expanduser(w)) for w in workdirs}
+    real_memory_dirs = {real(os.path.expanduser(d)) for d in memory_dirs}
     chains = inventory.chains
     legacy = list(inventory.legacy_disks or ())
     records = inventory.records or []
@@ -842,16 +877,22 @@ def remove_vm_storage(
                 out.append(path)
         return out
 
-    def static_refusal(path: str) -> str | None:
+    def static_refusal(path: str, memory_dirs_too: bool = False) -> str | None:
         reason = media_refusal(path)
         if reason:
             return reason
         reason = _regular_file_refusal(path)
         if reason:
             return reason
-        if real(os.path.dirname(path)) not in real_workdirs:
-            return _OUTSIDE
-        return None
+        directory = real(os.path.dirname(path))
+        if directory in real_workdirs:
+            return None
+        # a cluster's snapshot_dir holds the vm's memory images, nothing
+        # else of it: an extra disk never qualifies by its name
+        if (memory_dirs_too and directory in real_memory_dirs
+                and is_memory_image(vm, path)):
+            return None
+        return _OUTSIDE
 
     attached_extras = unique(
         path for path in inventory.disk_sources
@@ -869,7 +910,7 @@ def remove_vm_storage(
     for path in inventory.boot_family:
         if path in extra_related and media_refusal(path) is None:
             continue
-        reason = static_refusal(path)
+        reason = static_refusal(path, memory_dirs_too=True)
         if reason is None and inventory.records_state == RECORDS_UNKNOWN:
             reason = _boxman_artifact_refusal(vm, path)
         if reason:
