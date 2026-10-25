@@ -29,6 +29,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from boxman.exceptions import ConfigError
+from boxman.providers.libvirt.commands import LibVirtCommandBase
 from boxman.providers.libvirt.net import Network
 from boxman.providers.libvirt.session import _ABSENT, LibVirtSession
 from conftest import domain_listing, domain_uuid
@@ -51,6 +52,28 @@ def _result(stdout: str = "", ok: bool = True, stderr: str = "", return_code: in
 def _session(provider: dict | None = None) -> LibVirtSession:
     cfg = {"provider": {"libvirt": provider or {}}}
     return LibVirtSession(config=cfg)
+
+
+#: the command an identity read through sudo runs (``_identity_through_sudo``)
+_SUDO_STAT = "sudo -n stat "
+
+
+def _answer_sudo_stat(command, sudo, asked):
+    """Answer a ``sudo -n stat`` from *sudo*, which maps the path asked to
+    ``(ok, stdout, stderr)``; record the command in *asked*. A test that
+    gives no *sudo* never expects one."""
+    assert sudo is not None, f"no read through sudo expected: {command}"
+    asked.append(command)
+    ok, stdout, stderr = sudo(shlex.split(command)[-1])
+    return _result(ok=ok, stdout=stdout, stderr=stderr)
+
+
+def _sudo_policy(cmd, provider: dict | None) -> None:
+    """Give the patched command wrapper *cmd* the real sudo policy of
+    *provider*: whether ``stat`` would run under sudo is what the identity
+    read decides by."""
+    cmd.return_value.sudo_prefix.side_effect = LibVirtCommandBase(
+        provider_config=provider or {}).sudo_prefix
 
 
 class TestConfigPrecedence:
@@ -861,8 +884,10 @@ class TestInUseWithAMissingSource:
            + " file   disk     vdb      /ws/gone.qcow2\n")
 
     def _run(self, state, state_ok=True, absent=("/ws/gone.qcow2",),
-             live="", dump_ok=True):
-        """*live* is what ``virsh dumpxml`` (the live definition) says."""
+             live="", dump_ok=True, provider=None, sudo=None):
+        """*live* is what ``virsh dumpxml`` (the live definition) says;
+        *provider* the session's provider config, and *sudo* what a read
+        through sudo answers (:func:`_answer_sudo_stat`)."""
         calls = []
 
         def virsh_execute(*args, **kwargs):
@@ -881,6 +906,8 @@ class TestInUseWithAMissingSource:
             return _result(stdout=self.BLK)
 
         def shell(command, **kwargs):
+            if command.startswith(_SUDO_STAT):
+                return _answer_sudo_stat(command, sudo, calls)
             if _ABSENT in command:
                 probed = shlex.split(command)[3]
                 calls.append(f"probe {probed}")
@@ -895,7 +922,8 @@ class TestInUseWithAMissingSource:
              patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
             virsh.return_value.execute.side_effect = virsh_execute
             cmd.return_value.execute_shell.side_effect = shell
-            return _session({}).disk_paths_in_use(), calls
+            _sudo_policy(cmd, provider)
+            return _session(provider or {}).disk_paths_in_use(), calls
 
     @pytest.mark.parametrize("state", [
         "running", "paused", "pmsuspended", "in shutdown", "crashed", "idle"])
@@ -1086,6 +1114,32 @@ class TestInUseWithAMissingSource:
         assert in_use is None
         assert str(base) in captured_logs.text
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_a_held_file_it_may_not_look_up_is_read_through_sudo(
+            self, tmp_path):
+        """The held files of a running domain take the same read as every
+        other file the scan records (:meth:`_read_identity`)."""
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        base = hidden / "base.qcow2"
+        base.write_bytes(b"base")
+        st = os.stat(base)
+        live = self._live("<source file='/ws/gone.qcow2' index='1'/>"
+                          + self._level(base))
+        hidden.chmod(0)
+        try:
+            in_use, calls = self._run(
+                "running", live=live, provider={"use_sudo": True},
+                sudo=lambda path: (True, f"{st.st_dev} {st.st_ino}", ""))
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is not None
+        assert in_use[os.path.realpath(base)] == "vm-b"
+        assert in_use.identities[(st.st_dev, st.st_ino)] == "vm-b"
+        assert (f"sudo -n stat -L --printf='%d %i' -- "
+                f"{shlex.quote(os.path.realpath(base))}") in calls
+
     def test_a_missing_volume_source_fails_the_scan(self, captured_logs):
         """A pool volume's chain is not read from the live definition."""
         virsh = MagicMock()
@@ -1107,9 +1161,14 @@ class TestInUseByIdentity:
     review)."""
 
     @staticmethod
-    def _scan(tmp_path, source, chain_json):
+    def _scan(tmp_path, source, chain_json, provider=None, sudo=None,
+              asked_sudo=None):
+        """*provider* is the session's provider config, *sudo* what a read
+        through sudo answers (:func:`_answer_sudo_stat`), and *asked_sudo*
+        collects the reads through sudo that were made."""
         blk = (TestDiskPathsInUse.HEADER
                + f" file   disk     vda      {source}\n")
+        asked_sudo = [] if asked_sudo is None else asked_sudo
 
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
@@ -1118,6 +1177,8 @@ class TestInUseByIdentity:
             return _result(stdout=blk)
 
         def shell(command, **kwargs):
+            if command.startswith(_SUDO_STAT):
+                return _answer_sudo_stat(command, sudo, asked_sudo)
             if _ABSENT in command:
                 return _result(stdout="")
             asked = command.rsplit(" ", 1)[1].strip("'")
@@ -1129,7 +1190,8 @@ class TestInUseByIdentity:
              patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
             virsh.return_value.execute.side_effect = virsh_execute
             cmd.return_value.execute_shell.side_effect = shell
-            return _session({}).disk_paths_in_use()
+            _sudo_policy(cmd, provider)
+            return _session(provider or {}).disk_paths_in_use()
 
     @staticmethod
     def _chain(top, base):
@@ -1166,6 +1228,106 @@ class TestInUseByIdentity:
         assert in_use is None
         assert str(top) in captured_logs.text
         assert "make it accessible" in captured_logs.text
+
+    @staticmethod
+    def _hidden_chain(tmp_path):
+        """A chain under a directory the user may not search -- another
+        user's home, where a domain of theirs keeps its disks -- and the
+        identities root reads there."""
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        top, base = hidden / "b.top", hidden / "base.qcow2"
+        top.write_bytes(b"top")
+        base.write_bytes(b"base")
+        identities = {}
+        for path in (top, base):
+            st = os.stat(path)
+            identities[str(path)] = (st.st_dev, st.st_ino)
+        return hidden, top, base, identities
+
+    @staticmethod
+    def _as_root(identities):
+        """``sudo -n stat`` answering as root does, from *identities*."""
+        def answer(path):
+            dev, ino = identities[path]
+            return True, f"{dev} {ino}", ""
+        return answer
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    @pytest.mark.parametrize("provider", [
+        {"use_sudo": True},
+        {"use_sudo": False, "force_sudo_commands": ["stat"]},
+    ], ids=["use_sudo", "force_sudo_commands"])
+    def test_a_file_it_may_not_look_up_is_read_through_sudo(
+            self, tmp_path, provider):
+        """A domain whose disks sit under its user's 0700 home made every
+        scan fail, so every teardown on that host kept all its disks."""
+        hidden, top, base, identities = self._hidden_chain(tmp_path)
+        asked = []
+        hidden.chmod(0)
+        try:
+            in_use = self._scan(tmp_path, top, self._chain(top, base),
+                                provider=provider,
+                                sudo=self._as_root(identities),
+                                asked_sudo=asked)
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is not None
+        for path in (top, base):
+            assert in_use.identities[identities[str(path)]] == "vm-b"
+        assert asked == [f"sudo -n stat -L --printf='%d %i' -- "
+                         f"{shlex.quote(str(path))}" for path in (top, base)]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    @pytest.mark.parametrize("provider", [
+        {},
+        {"use_sudo": True, "sudo_skip_commands": ["stat"]},
+        {"use_sudo": True, "runtime": "docker-compose",
+         "runtime_container": "boxman-libvirt"},
+    ], ids=["no use_sudo", "stat in sudo_skip_commands", "docker runtime"])
+    def test_without_sudo_for_stat_it_still_fails_the_scan(
+            self, tmp_path, captured_logs, provider):
+        """No read through sudo where the provider would not sudo ``stat``,
+        nor in a runtime container, whose mounts are not the host's."""
+        hidden, top, base, _ = self._hidden_chain(tmp_path)
+        hidden.chmod(0)
+        try:
+            in_use = self._scan(tmp_path, top, self._chain(top, base),
+                                provider=provider)
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is None
+        assert "Permission denied" in captured_logs.text
+        assert "through sudo" not in captured_logs.text
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    @pytest.mark.parametrize("answer, said", [
+        ((False, "", "sudo: a password is required"),
+         "through sudo -n stat: sudo: a password is required"),
+        ((False, "", ""), "through sudo -n stat: it failed"),
+        ((True, "", ""), "through sudo -n stat: it answered ''"),
+        ((True, "64769", ""), "it answered '64769'"),
+        ((True, "1 2 3", ""), "it answered '1 2 3'"),
+        ((True, "-1 2", ""), "it answered '-1 2'"),
+        ((True, "dev ino", ""), "it answered 'dev ino'"),
+    ], ids=["refused", "failed silently", "no answer", "one number",
+            "three numbers", "negative", "not numbers"])
+    def test_a_read_through_sudo_that_gives_no_identity_fails_the_scan(
+            self, tmp_path, captured_logs, answer, said):
+        hidden, top, base, _ = self._hidden_chain(tmp_path)
+        hidden.chmod(0)
+        try:
+            in_use = self._scan(tmp_path, top, self._chain(top, base),
+                                provider={"use_sudo": True},
+                                sudo=lambda path: answer)
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is None
+        assert f"could not read the identity of {top}" in captured_logs.text
+        assert said in captured_logs.text
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
     def test_a_directory_that_can_be_searched_but_not_listed_is_read(
@@ -1235,6 +1397,7 @@ class TestInUseWithABlockJob:
              patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
             virsh.return_value.execute.side_effect = virsh_execute
             cmd.return_value.execute_shell.side_effect = shell
+            _sudo_policy(cmd, {})
             return _session({}).disk_paths_in_use(), calls
 
     @staticmethod

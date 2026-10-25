@@ -1114,9 +1114,12 @@ class LibVirtSession(SessionConfigMixin):
         Every file is recorded by its identity too, ``(st_dev, st_ino)``
         read host-side (:attr:`FilesInUse.identities`), so a teardown
         recognises it under a name no resolved path unifies with its own —
-        a bind mount, a hard link, a path only root resolves. A file whose
-        identity cannot be read, other than for naming no file, fails the
-        scan: it could be any file.
+        a bind mount, a hard link, a path only root resolves. A file the
+        boxman process may not look up — another user's domain keeping its
+        disks in that user's home — is read through ``sudo`` where this
+        provider runs ``stat`` under sudo (:meth:`_read_identity`). A file
+        whose identity cannot be read, other than for naming no file, fails
+        the scan: it could be any file.
 
         Chains are read as :meth:`_read_backing_chain` reads them, so the
         0600 pool volumes libvirt makes every clone disk — which the user's
@@ -1214,9 +1217,7 @@ class LibVirtSession(SessionConfigMixin):
                 for path in held:
                     resolved = os.path.realpath(path)
                     try:
-                        st = os.stat(resolved)
-                    except FileNotFoundError:
-                        continue      # deleted too: nothing to protect
+                        identity = self._read_identity(resolved)
                     except OSError as exc:
                         self.logger.warning(
                             f"could not read the identity of {path}, which "
@@ -1225,8 +1226,10 @@ class LibVirtSession(SessionConfigMixin):
                             f"told, so each keeps everything — make it "
                             f"accessible")
                         return None
+                    if identity is None:
+                        continue      # deleted too: nothing to protect
                     used.setdefault(resolved, domain)
-                    used.identities.setdefault((st.st_dev, st.st_ino), domain)
+                    used.identities.setdefault(identity, domain)
                 continue
             if not self._record_in_use(used, domain, chain):
                 return None
@@ -1281,9 +1284,7 @@ class LibVirtSession(SessionConfigMixin):
         for path in paths:
             in_use.setdefault(path, domain)
             try:
-                st = os.stat(path)
-            except FileNotFoundError:
-                continue
+                identity = self._read_identity(path)
             except OSError as exc:
                 self.logger.warning(
                     f"could not read the identity of {path}, which domain "
@@ -1291,8 +1292,66 @@ class LibVirtSession(SessionConfigMixin):
                     f"remove is that one cannot be told, so each keeps "
                     f"everything — make it accessible")
                 return False
-            in_use.identities.setdefault((st.st_dev, st.st_ino), domain)
+            if identity is not None:
+                in_use.identities.setdefault(identity, domain)
         return True
+
+    def _read_identity(self, path: str) -> tuple[int, int] | None:
+        """
+        ``(st_dev, st_ino)`` of *path*, symlinks followed, read host-side —
+        or ``None`` when it names no file.
+
+        Read as the boxman process first. Refused that (``EACCES``: a
+        directory on the way it may not search — another user's home,
+        where a domain of theirs keeps its disks), it is read with ``sudo
+        -n stat`` instead, but only when this provider runs ``stat`` under
+        sudo (:meth:`LibVirtCommandBase.sudo_prefix`: ``use_sudo``, or
+        ``stat`` in ``force_sudo_commands``), and only under the local
+        runtime: under docker-compose a shell command runs in the runtime
+        container, whose mounts are not this host's, and an identity read
+        there is not one to compare with the host's. ``-n``: sudo never
+        prompts for a password, it fails.
+
+        Raises:
+            OSError: The identity cannot be read, other than for naming no
+                file, and no sudo read stands in for it — sudo is not this
+                provider's for ``stat``, or the read through it failed or
+                answered something other than two numbers. Through sudo a
+                file that is not there fails too: a missing file is not told
+                from an unreadable one by ``stat``'s error text.
+        """
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return None
+        except PermissionError as refused:
+            return self._identity_through_sudo(path, refused)
+        return (st.st_dev, st.st_ino)
+
+    def _identity_through_sudo(self, path: str,
+                               refused: PermissionError) -> tuple[int, int]:
+        """
+        :meth:`_read_identity` for *path*, which the boxman process was
+        *refused*: ``sudo -n stat -L``, on this host.
+
+        Raises:
+            OSError: *refused* itself when sudo may not stand in, or one
+                saying why the read through sudo gave no identity.
+        """
+        stat_cmd = f"stat -L --printf='%d %i' -- {shlex.quote(path)}"
+        cmd = LibVirtCommandBase(provider_config=self.provider_config)
+        if (self.provider_config.get('runtime', 'local') != 'local'
+                or not cmd.sudo_prefix(stat_cmd)):
+            raise refused
+        result = cmd.execute_shell(f"sudo -n {stat_cmd}", warn=True)
+        answer = (result.stdout or "").strip() if result.ok else ""
+        identity = re.fullmatch(r"(\d+) (\d+)", answer)
+        if identity is None:
+            why = (f"it answered {answer!r}" if result.ok
+                   else (result.stderr or "").strip() or "it failed")
+            raise OSError(
+                f"{refused}; and through sudo -n stat: {why}") from refused
+        return (int(identity.group(1)), int(identity.group(2)))
 
     def _block_job_files(self, virsh, reads: _ChainReads, domain: str,
                          uuid: str,
