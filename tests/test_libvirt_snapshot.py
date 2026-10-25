@@ -303,6 +303,45 @@ class TestValidateSnapshot:
         assert ok is True
         assert errors == []
 
+    @staticmethod
+    def _memory_only(sm: SnapshotManager, mem: Path):
+        xml = f"<domainsnapshot><memory file='{mem}'/><disks/></domainsnapshot>"
+
+        def fake(*args, **_kwargs):
+            if args[0] == "snapshot-info":
+                return _result(ok=True)
+            return _result(stdout=xml)
+
+        return patch.object(sm.virsh, "execute", side_effect=fake)
+
+    def test_compressed_memory_is_valid(self, sm: SnapshotManager, tmp_path: Path):
+        """``--compress-memory`` leaves only ``<raw>.zst``, while libvirt
+        still records the ``.raw`` path. The take's own verification and
+        the restore's pre-validation both reported such a snapshot as
+        "memory file missing", though snapshot_restore decompresses it."""
+        mem = tmp_path / "vm01_snapshot_snap1.raw"
+        (tmp_path / "vm01_snapshot_snap1.raw.zst").write_bytes(b"x")
+        with self._memory_only(sm, mem):
+            ok, errors = sm.validate_snapshot("vm01", "snap1")
+        assert ok is True
+        assert errors == []
+
+    def test_neither_raw_nor_zst_names_both(self, sm: SnapshotManager, tmp_path: Path):
+        mem = tmp_path / "vm01_snapshot_snap1.raw"
+        with self._memory_only(sm, mem):
+            ok, errors = sm.validate_snapshot("vm01", "snap1")
+        assert ok is False
+        assert errors == [f"memory file missing: {mem} (nor {mem}.zst)"]
+
+    def test_a_zst_of_another_name_does_not_count(self, sm: SnapshotManager,
+                                                  tmp_path: Path):
+        mem = tmp_path / "vm01_snapshot_snap1.raw"
+        (tmp_path / "vm01_snapshot_snap2.raw.zst").write_bytes(b"x")
+        (tmp_path / "vm01_snapshot_snap1.zst").write_bytes(b"x")
+        with self._memory_only(sm, mem):
+            ok, _errors = sm.validate_snapshot("vm01", "snap1")
+        assert ok is False
+
 
 class TestListSnapshots:
 
