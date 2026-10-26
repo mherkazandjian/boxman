@@ -368,7 +368,8 @@ Plus `make-answer-iso.sh` to render the answer file.
 2. **G2**: done: no install phase. `--cdrom` with `--install no_install=yes`
    gives one definition, so the installer's reboot boots the installed disk;
    the IP wait stops waiting for a VM that stopped running, and a
-   virt-install that failed after defining its domain is not retried.
+   virt-install that failed after defining its domain, or that found the
+   name already taken, is not retried.
 3. **G3**: done in this branch: the guest-agent channel is always added.
    **G4**: done: an `os_variant:` key for direct-boot VMs, so a box does not
    depend on the host's osinfo-db. **G7**: install-only media. A medium needed only for

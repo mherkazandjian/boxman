@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.exceptions import PartialInstallError, ProvisionError
+from boxman.exceptions import (
+    DomainExistsError,
+    PartialInstallError,
+    ProvisionError,
+)
 from boxman.providers.libvirt.direct_vm import normalize_disk_size
 from boxman.providers.libvirt.iso_boot_vm import IsoBootVM
 
@@ -502,6 +506,49 @@ class TestAFailedInstallThatLeftItsDomain:
         provider.clone_vm.side_effect = PartialInstallError(self.FAILED)
 
         with pytest.raises(PartialInstallError):
+            vms._clone_with_retry(provider, {"workdir": "/w"},
+                                  {"boot_order": ["cdrom", "hd"]}, "win01")
+
+        assert provider.clone_vm.call_count == 1
+        assert sleeps == []
+
+
+class TestANameTakenBeforeVirtInstallRan:
+    """A domain by the VM's name that was already defined: virt-install
+    refuses the name before it defines anything, so this is not a partial
+    install of this run, as the message used to say."""
+
+    IN_USE = "ERROR    Guest name 'iso-test01' is already in use."
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_it_raises_saying_so(self, mock_run, tmp_path):
+        mock_run.side_effect = [_result(ok=True),
+                                _result(ok=False, stderr=self.IN_USE)]
+        with pytest.raises(DomainExistsError) as exc:
+            _make_iso_vm(tmp_path).create()
+        assert "already defined" in str(exc.value)
+        assert self.IN_USE in str(exc.value)
+        # qemu-img and virt-install only: no domain lookup is needed
+        assert mock_run.call_count == 2
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_a_disk_in_use_is_not_taken_for_it(self, mock_run, tmp_path):
+        mock_run.side_effect = [
+            _result(ok=True),
+            _result(ok=False, stderr="ERROR    Disk /x.iso is already in "
+                                     "use by other guests ['other']."),
+            _result(ok=False)]
+        assert _make_iso_vm(tmp_path).create() is False
+
+    def test_it_is_not_retried(self, monkeypatch):
+        from boxman.manager_parts import vms
+
+        sleeps: list = []
+        monkeypatch.setattr(vms.time, "sleep", sleeps.append)
+        provider = MagicMock()
+        provider.clone_vm.side_effect = DomainExistsError(self.IN_USE)
+
+        with pytest.raises(DomainExistsError):
             vms._clone_with_retry(provider, {"workdir": "/w"},
                                   {"boot_order": ["cdrom", "hd"]}, "win01")
 

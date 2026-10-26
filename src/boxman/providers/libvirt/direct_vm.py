@@ -9,11 +9,16 @@ disk-size units, …) applies to both.
 """
 
 import os
+import re
 import shlex
 from typing import Any
 
 from boxman import log
-from boxman.exceptions import PartialInstallError, ProvisionError
+from boxman.exceptions import (
+    DomainExistsError,
+    PartialInstallError,
+    ProvisionError,
+)
 from boxman.utils.shell import run as _shell_run
 
 from .commands import VirshCommand, VirtInstallCommand
@@ -21,6 +26,11 @@ from .disk import create_image_exclusive, libvirt_disk_source
 
 #: The virtio-serial port name the QEMU guest agent listens on.
 GUEST_AGENT_CHANNEL = "org.qemu.guest_agent.0"
+
+#: virt-install's refusal of a name in use (virtinst's guest.py), which it
+#: checks before it defines anything. Under a locale that translates it,
+#: it is not recognised, and the failure is treated as any other.
+_NAME_IN_USE = re.compile(r"Guest name '.*' is already in use")
 
 #: What a refused boot disk tells the operator to do.
 BOOT_DISK_REMEDY = ("If it is stale, remove or rename it and run the "
@@ -275,11 +285,18 @@ class DirectInstallVM:
         result = _shell_run(cmd, hide=True, warn=True)
         if not result.ok:
             self.logger.error(f"virt-install failed: {result.stderr}")
+            # both streams: virt-install prints why it gave up on a --wait
+            # ("exceeded specified time limit") to stdout
+            said = "\n".join(text.strip() for text in
+                             (result.stdout, result.stderr) if text)
+            if _NAME_IN_USE.search(said):
+                raise DomainExistsError(
+                    f"virt-install did not create {self._describe()}: a "
+                    f"domain by that name is already defined, by an earlier "
+                    f"run or another one. Remove it (boxman destroy) or "
+                    f"rename it before running again. virt-install "
+                    f"said:\n{said}")
             if self._domain_exists():
-                # both streams: virt-install prints why it gave up on a
-                # --wait ("exceeded specified time limit") to stdout
-                said = "\n".join(text.strip() for text in
-                                 (result.stdout, result.stderr) if text)
                 raise PartialInstallError(
                     f"virt-install failed after defining {self._describe()}, "
                     f"which is left as it is: its console shows how far the "

@@ -94,6 +94,14 @@ class PartialInstallError(ProvisionError):
     """
 
 
+class DomainExistsError(ProvisionError):
+    """Raised when ``virt-install`` refused a direct-install VM's name
+    because a domain by that name was already defined, by an earlier run or
+    another one. virt-install checks the name before it defines anything,
+    so this run defined nothing, and retrying finds the name taken again.
+    """
+
+
 class SSHAccessError(ProvisionError):
     """Raised once ssh access has been set up as far as it could be, when
     the admin key pair could not be generated or a VM boxman expected to
