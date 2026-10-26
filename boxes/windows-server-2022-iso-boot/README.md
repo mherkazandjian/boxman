@@ -26,9 +26,10 @@ one manual step (see [Known gaps](#known-gaps)).
 4. After the next start: specialize, OOBE, one auto-logon as Administrator,
    and `boxman-setup.ps1`. That installs all virtio drivers and the QEMU
    guest agent, enables WinRM (HTTP 5985, NTLM, Basic off) and installs
-   OpenSSH Server from Windows Update. `C:\boxman-setup.log` ends with
-   `boxman-setup: done`, or with `boxman-setup: FAILED: …` naming the
-   steps that did not complete. The script then logs the auto-logon
+   OpenSSH Server from Windows Update. The last `boxman-setup:` line in
+   `C:\boxman-setup.log` is `boxman-setup: done`, or `boxman-setup:
+   FAILED: …` naming the steps that did not complete (the transcript's
+   footer follows it). The script then logs the auto-logon
    session off.
 
 Measured on the test host: about 85 s from `virt-install` to Setup's first reboot,
@@ -54,7 +55,7 @@ export BOXMAN_WIN_SSH_PUBKEY=~/.ssh/id_ed25519.pub  # optional
 boxman up
 ```
 
-Once `C:\boxman-setup.log` ends with `boxman-setup: done` (or with
+Once `C:\boxman-setup.log` says `boxman-setup: done` (or
 `boxman-setup: FAILED: …`, which names the steps left to do by hand),
 **eject the answer ISO**. It holds the Administrator password in plain
 text and otherwise stays attached for the VM's whole life. It is not in
@@ -79,7 +80,7 @@ IP=$(virsh -c qemu:///system domifaddr \
      | awk '/ipv4/{split($4,a,"/");print a[1]}')
 
 # OpenSSH (only if BOXMAN_WIN_SSH_PUBKEY was set)
-ssh Administrator@$IP 'powershell -c "Get-Content C:\boxman-setup.log -Tail 2"'
+ssh Administrator@$IP 'powershell -c "(Select-String -Path C:\boxman-setup.log -Pattern ^boxman-setup: | Select-Object -Last 1).Line"'
 
 # Ansible over WinRM (needs pywinrm on the controller)
 ansible all -i "$IP," -m ansible.windows.win_ping \

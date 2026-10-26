@@ -67,8 +67,14 @@ failed steps and logs its session off, the install wait is bounded
 (`--wait=30` instead of `-1`), and virtio-win is a `cdroms:` entry that
 boxman hands to virt-install (G1, fixed in this branch) instead of a raw
 `--disk`, and the agent channel comes from boxman (G3) instead of a raw
-`--channel`. These are covered by unit tests, a PowerShell parse and a
-virt-install dry run, not yet by a fresh Windows install.
+`--channel`. A fresh install with the box at `2e52d33`, on a second host
+(Rocky 9.6, osinfo-db 20250124, virtio-win 1.9.61), confirmed them: all
+three CD-ROMs were in the definition virt-install created (`sda`-`sdc`),
+the install phase took 87 s, virt-install restarted the guest 0.3 s after
+Setup's reboot, `boxman-setup: done` came 77 s later with no session left
+logged on (`quser`), `guest-ping` answered over the channel boxman added,
+the eject by path worked, and `boxman update --dry-run` then found no
+changes.
 
 Not tested: Windows 11 / Server 2025, UEFI + Secure Boot + TPM, Desktop
 Experience, cloudbase-init, sysprep + clone, snapshots of a Windows guest,
@@ -296,9 +302,9 @@ AMD/KVM is known to be fragile and was not tried.
 | # | Gap | Where | Effect | PoC workaround | Proper fix |
 |---|---|---|---|---|---|
 | G1 | **Extra `cdroms:` reach the guest only after the install has started.** virt-install starts the installer at once (`--wait=0`); additional CD-ROMs are attached afterwards, to the persistent definition only, because SATA/IDE drives cannot be hot-plugged | `manager_parts/vms.py` (configure step, `extra_cdroms`), `cdrom.py` `cdroms_awaiting_boot` | Setup never sees the virtio-win or answer ISO. Any ISO-boot OS that needs a second medium at install time has the same problem | none any more: virtio-win is a `cdroms:` entry (`source:`, used in place). The answer ISO is still a raw `--disk` in `virt_install_extra_args`, because `boxman update` would put a declared one back after its eject (G7) | **fixed in this branch:** `IsoBootVM` passes every `cdroms:` entry to virt-install (`--disk …,device=cdrom` per entry), and the configure step attaches none for ISO-boot VMs |
-| G2 | **The VM stays off after the installer's first reboot.** The install-phase domain has `on_reboot=destroy`; with `--wait=0` nothing restarts it into the final definition | `direct_vm.py` (`--wait=0`) | Windows (and any installer that reboots) stops after phase 1. The first `boxman up` then waits 600 s for an IP and **exits 0** with a warning | `'--wait=30'` last in `virt_install_extra_args` (virt-install waits up to 30 min and restarts the guest; `boxman up` blocks for the install phase) | planned, in a follow-up: no install phase. `IsoBootVM` passes the boot ISO as a plain CD-ROM `--disk` with `--boot hd,cdrom`, as PXE VMs already run, so there is one definition with a normal reboot and the installer's reboot boots the installed disk (checked with a virt-install dry run). That drops virt-install's OS detection, which reads only `--cdrom` media, so it comes with G4's `os_variant:` key and real boots of every CD-boot box. Also: "VM shut off while waiting for IP" should fail fast, not wait 600 s, and a virt-install that timed out after defining the domain should not be retried (the retries fail with "name already in use" and hide the cause) |
+| G2 | **The VM stays off after the installer's first reboot.** The install-phase domain has `on_reboot=destroy`; with `--wait=0` nothing restarts it into the final definition | `direct_vm.py` (`--wait=0`) | Windows (and any installer that reboots) stops after phase 1. The first `boxman up` then waits 600 s for an IP and **exits 0** with a warning | `'--wait=30'` last in `virt_install_extra_args` (virt-install waits up to 30 min and restarts the guest; `boxman up` blocks for the install phase) | planned, in a follow-up: no install phase. `IsoBootVM` keeps `--cdrom` and adds `--install no_install=yes`, so virt-install writes one definition (boot `hd,cdrom`, a normal reboot) and the installer's reboot boots the installed disk. Unlike a plain CD-ROM `--disk`, this keeps virt-install's OS detection from the ISO (virt-install dry runs: the `--disk` form loses the OS id, and with it Windows' `localtime` clock). Real boots of every CD-boot box before it merges. Also: "VM shut off while waiting for IP" should fail fast, not wait 600 s, and a virt-install that timed out after defining the domain should not be retried (the retries fail with "name already in use" and hide the cause) |
 | G3 | **No guest-agent channel.** virt-install adds `org.qemu.guest_agent.0` only for OS variants it knows have an agent (Linux) | `direct_vm.py` | `boxman storage trim`, agent IP lookup, fsinfo and fsfreeze fail ("QEMU guest agent is not configured") | none any more | **fixed in this branch:** `DirectInstallVM` always adds the channel, unless `virt_install_extra_args` already add one (harmless when no agent runs) |
-| G4 | **OS detection picks the wrong version.** `--os-variant=detect=on` identifies the 2022 eval ISO as `win2k25` | `direct_vm.py` | wrong libosinfo defaults; it happens to be harmless for 2022 vs 2025 | a later `--os-variant=win2k22` in extra args (the last one wins) | an `os_variant:` key for direct-boot VMs, as templates already have |
+| G4 | **OS detection picks the wrong version.** With osinfo-db 20250606, `--os-variant=detect=on` identifies the 2022 eval ISO as `win2k25` (20250124 gets `win2k22` right), so the result depends on the host | `direct_vm.py` | wrong libosinfo defaults; it happens to be harmless for 2022 vs 2025 | a later `--os-variant=win2k22` in extra args (the last one wins) | an `os_variant:` key for direct-boot VMs, as templates already have |
 | G5 | **ssh access assumes a Linux guest.** `ssh_config` writes `User admin`; the `admin_pass` key push is `sshpass ssh-copy-id` (to `~/.ssh/authorized_keys`); the generated inventory has no `ansible_connection` or `ansible_shell_type` | `manager_parts/ssh.py`, `manager_parts/workspace.py` | `boxman ssh` and `boxman run` do not reach the guest | the key is baked into the answer ISO; the user is passed by hand | `os: windows` → `User Administrator` (or `admin_user`), the key pushed into `administrators_authorized_keys` by the guest setup (not ssh-copy-id), inventory vars `ansible_shell_type: powershell` (or the WinRM set) |
 | G6 | the post-provision "eject `seed.iso`" step ran over the ISO-boot VM | `manager_parts/flows.py:194` | **none here.** All three CD-ROMs were still attached afterwards; listed only so that a Windows template using a `cidata` seed checks it | n/a | n/a |
 | G7 | **The answer ISO stays attached for the VM's whole life**, live and persistent, and it holds the Administrator password in plain text. Any process in the guest can read it from the CD | `direct_vm.py` (media given to virt-install stay in the definition) | password exposure inside the guest. And since the answer ISO is not in `cdroms:`, `boxman update` takes it for a removed drive and detaches it, on every run, until it is ejected | eject it once setup is done (README step: `virsh change-media <domain> <answer.iso path> --eject --force --live --config`); `update` leaves an empty drive alone | install-only media: boxman attaches them at virt-install time, ejects them once the install is done (as it already ejects `seed.iso`), and never compares them in `update`. Phase 2 avoids the password part, because the per-clone secret comes from the cloudbase-init seed |
@@ -346,13 +352,13 @@ Plus `make-answer-iso.sh` to render the answer file.
 
 1. **G1**: done in this branch: `IsoBootVM` attaches all `cdroms:` at
    virt-install time.
-2. **G2**: no install phase. The boot ISO is a plain CD-ROM `--disk` with
-   `--boot hd,cdrom`, so the installer's reboot boots the installed disk;
+2. **G2**: no install phase. `--cdrom` with `--install no_install=yes`
+   gives one definition, so the installer's reboot boots the installed disk;
    the IP wait fails fast on a VM that is shut off, and a virt-install that
    timed out is not retried.
 3. **G3**: done in this branch: the guest-agent channel is always added.
-   **G4**: an `os_variant:` key for direct-boot VMs, needed once G2 removes
-   virt-install's detection from the ISO. **G7**: install-only media. A medium needed only for
+   **G4**: an `os_variant:` key for direct-boot VMs, so a box does not
+   depend on the host's osinfo-db. **G7**: install-only media. A medium needed only for
    the install (the answer ISO, virtio-win) is attached at virt-install
    time, ejected by boxman once the install is done, and never compared by
    `boxman update`. A golden image or template built this way carries no
@@ -432,9 +438,10 @@ prompt (§3.1). Win11 client licensing on VMs is its own question.
    Update. Do lab networks always have internet, or should boxman support an
    FoD ISO, or target Server 2025, where OpenSSH is in-box?
 7. **G2 would change how every CD-boot box boots** (talos, nixos, guix,
-   ubuntu-live, proxmox-nested-ceph-cluster): no install phase, so no OS
-   detection from the ISO. OK as a general change, with an `os_variant:`
-   key, or gate it on `os: windows`? (G1 and G3 are general already: each
+   ubuntu-live, proxmox-nested-ceph-cluster): no install phase, so the
+   installer's reboot is a normal reboot rather than a power-off (OS
+   detection from the ISO is kept). OK as a general change, or gate it on
+   `os: windows`? (G1 and G3 are general already: each
    of those boxes declares a single CD-ROM, so G1 changes none of them, and
    G3 only adds an agent channel where virt-install added none.)
 8. **The shared-host teardown issue** (§4): file separately?
