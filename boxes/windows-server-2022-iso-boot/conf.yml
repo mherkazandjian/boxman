@@ -51,7 +51,7 @@ clusters:
         bridge:
           stp: 'on'
           delay: '0'
-        mac: '52:54:00:00:98:01'
+        mac: '52:54:00:00:99:01'
         ip:
           address: '192.168.153.1'
           netmask: '255.255.255.0'
