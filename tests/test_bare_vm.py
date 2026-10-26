@@ -149,3 +149,12 @@ def test_a_pxe_vm_gets_the_guest_agent_channel_too(mock_run, tmp_path):
     _make_bare_vm(tmp_path).create()
     assert ("--channel=unix,target.type=virtio,name=org.qemu.guest_agent.0"
             in mock_run.call_args_list[1][0][0])
+
+
+@patch("boxman.providers.libvirt.direct_vm._shell_run")
+def test_a_pxe_vm_can_name_its_os_variant(mock_run, tmp_path):
+    """There is no install medium to detect a PXE guest's OS from, so
+    `os_variant:` is the only way to give virt-install one (G4)."""
+    mock_run.return_value = _result(ok=True)
+    _make_bare_vm(tmp_path, os_variant="rocky9").create()
+    assert "--os-variant=rocky9" in mock_run.call_args_list[1][0][0]

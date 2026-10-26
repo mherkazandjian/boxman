@@ -97,6 +97,17 @@ class DirectInstallVM:
         """
         return normalize_disk_size(self.info.get("disk_size"))
 
+    def _os_variant(self) -> str:
+        """The ``--os-variant`` value: the VM's ``os_variant:``, else detection.
+
+        virt-install detects the OS only from install media, and the
+        osinfo-db it detects with differs between hosts: one reads the
+        Windows Server 2022 ISO as 2025 (G4). A box can name the variant,
+        as a template's ``os_variant:`` does; ``osinfo-query os`` lists them.
+        """
+        variant = self.info.get("os_variant")
+        return shlex.quote(str(variant)) if variant else "detect=on,require=off"
+
     @staticmethod
     def _network_spec(entry: Any) -> dict[str, Any] | None:
         """Normalise one ``networks:`` / ``_resolved_networks`` entry.
@@ -242,7 +253,7 @@ class DirectInstallVM:
             parts.append(net_arg)
         parts.extend(media_args)
         parts.append(f"--boot={self.boot_order}")
-        parts.append("--os-variant=detect=on,require=off")
+        parts.append(f"--os-variant={self._os_variant()}")
         parts.append("--graphics=vnc")
         parts.append("--noautoconsole")
         parts.append("--wait=0")

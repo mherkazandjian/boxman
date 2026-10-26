@@ -423,3 +423,23 @@ class TestThereIsNoInstallPhase:
         assert "--cdrom=/data/talos.iso" in cmd
         assert "--os-variant=detect=on,require=off" in cmd
         assert "device=cdrom" not in cmd
+
+
+class TestOsVariant:
+    """G4: virt-install detects the OS with the host's osinfo-db, and two
+    hosts read the same Windows Server 2022 ISO as 2022 and as 2025.
+    `os_variant:` names it, as a template's does."""
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_one_given_is_passed_instead_of_detection(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        _make_iso_vm(tmp_path, os_variant="win2k22").create()
+        cmd = mock_run.call_args_list[1][0][0]
+        assert "--os-variant=win2k22" in cmd
+        assert "detect=on" not in cmd
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_it_is_shell_quoted(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        _make_iso_vm(tmp_path, os_variant="win2k22; true").create()
+        assert "--os-variant='win2k22; true'" in mock_run.call_args_list[1][0][0]
