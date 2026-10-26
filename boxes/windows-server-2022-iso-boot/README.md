@@ -55,12 +55,14 @@ boxman up
 Once `C:\boxman-setup.log` ends with `boxman-setup: done` (or with
 `boxman-setup: FAILED: …`, which names the steps left to do by hand),
 **eject the answer ISO**. It holds the Administrator password in plain text, and
-otherwise stays attached for the VM's whole life:
+otherwise stays attached for the VM's whole life. The drive is named by
+the ISO's path, not by a target such as `sdc`, which depends on the order
+virt-install attaches media in; `--force` gets past a guest's tray lock:
 
 ```bash
 virsh -c qemu:///system change-media \
-  bprj__boxman_dev_windows-server-2022-iso-boot__bprj_win_win01 sdc \
-  --eject --live --config
+  bprj__boxman_dev_windows-server-2022-iso-boot__bprj_win_win01 \
+  ~/workspaces/windows-server-2022-iso-boot/answer.iso --eject --force --live --config
 ```
 
 ## Verify
