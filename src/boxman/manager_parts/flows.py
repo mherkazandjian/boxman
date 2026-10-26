@@ -53,7 +53,7 @@ class FlowsMixin:
         self.validate_direct_boot_config()
         self.validate_clone_identity_config()
         self.validate_iso_runtime()
-        self.validate_snapshot_dirs()
+        self.validate_memory_snapshot_dirs()
         # os: windows, and the answer ISOs of the VMs this run installs: a
         # password Windows would refuse at OOBE stops the run here, not a
         # guest at a prompt nobody answers

@@ -125,11 +125,11 @@ class _Teardown:
 
     def __init__(self, workdir, *, disks=(), media=(), rows=None,
                  records=None, records_error=None, in_use=None,
-                 chains=STANDALONE, snapshot_dir=None):
+                 chains=STANDALONE, memory_snapshot_dir=None):
         self.workdir = workdir
         cluster = {'workdir': str(workdir)}
-        if snapshot_dir is not None:
-            cluster['snapshot_dir'] = str(snapshot_dir)
+        if memory_snapshot_dir is not None:
+            cluster['memory_snapshot_dir'] = str(memory_snapshot_dir)
         self.mgr = make_bare_manager(
             {'project': 'demo', 'clusters': {'cluster_1': cluster}})
         session = self.session = MagicMock()
@@ -2675,7 +2675,7 @@ class TestTeardownWithoutSudo:
 
 
 class TestMemoryImagesInASnapshotDir:
-    """A cluster's ``snapshot_dir`` holds its VMs' memory images, written
+    """A cluster's ``memory_snapshot_dir`` holds its VMs' memory images, written
     there by ``snapshot take``: a teardown removes the VM's own from it, by
     every rule a workdir's files go by, and nothing else of the VM's is
     ever a candidate there."""
@@ -2693,7 +2693,7 @@ class TestMemoryImagesInASnapshotDir:
         overlay = _file(workdir / f'{VM}.s1')
         raw = _file(snaps / f'{VM}_snapshot_s1.raw')
         zst = _file(snaps / f'{VM}_snapshot_s2.raw.zst')
-        t = _Teardown(workdir, disks=[overlay], records=[], snapshot_dir=snaps)
+        t = _Teardown(workdir, disks=[overlay], records=[], memory_snapshot_dir=snaps)
 
         t.deprovision()
 
@@ -2711,7 +2711,7 @@ class TestMemoryImagesInASnapshotDir:
                 _file(snaps / f'{VM}_snapshot_s1.raw.gz'),
                 _qcow2(snaps / f'{VM}_disk01.qcow2'),
                 _file(snaps / f'{OTHER}_snapshot_s1.raw')]
-        t = _Teardown(workdir, disks=[], records=[], snapshot_dir=snaps)
+        t = _Teardown(workdir, disks=[], records=[], memory_snapshot_dir=snaps)
 
         t.deprovision()
 
@@ -2728,7 +2728,7 @@ class TestMemoryImagesInASnapshotDir:
         data = _file(snaps / f'{VM}_snapshot_x.raw', b'raw data disk')
         t = _Teardown(workdir, disks=[boot, data],
                       records=[_record('snapshot_x', data)],
-                      snapshot_dir=snaps)
+                      memory_snapshot_dir=snaps)
 
         t.deprovision([{'name': 'snapshot_x', 'driver': {'type': 'raw'}}])
 
@@ -2743,7 +2743,7 @@ class TestMemoryImagesInASnapshotDir:
         target = _file(tmp_path / 'elsewhere' / 'precious.raw', b'precious')
         link = snaps / f'{VM}_snapshot_s1.raw'
         os.symlink(target, link)
-        t = _Teardown(workdir, disks=[], records=[], snapshot_dir=snaps)
+        t = _Teardown(workdir, disks=[], records=[], memory_snapshot_dir=snaps)
 
         t.deprovision()
 
@@ -2755,7 +2755,7 @@ class TestMemoryImagesInASnapshotDir:
         workdir, snaps = self._dirs(tmp_path)
         _qcow2(workdir / f'{VM}.qcow2')
         raw = _file(snaps / f'{VM}_snapshot_s1.raw')
-        t = _Teardown(workdir, disks=[], records=[], snapshot_dir=snaps,
+        t = _Teardown(workdir, disks=[], records=[], memory_snapshot_dir=snaps,
                       in_use={str(raw): OTHER})
 
         t.deprovision()
@@ -2763,11 +2763,11 @@ class TestMemoryImagesInASnapshotDir:
         assert raw.exists()
         assert f'left {raw} in place' in t.warnings
 
-    def test_a_missing_snapshot_dir_holds_none(self, tmp_path):
+    def test_a_missing_memory_snapshot_dir_holds_none(self, tmp_path):
         workdir = tmp_path / 'work'
         boot = _qcow2(workdir / f'{VM}.qcow2')
         t = _Teardown(workdir, disks=[boot], records=[],
-                      snapshot_dir=tmp_path / 'not-made-yet')
+                      memory_snapshot_dir=tmp_path / 'not-made-yet')
 
         t.deprovision()
 
@@ -2775,14 +2775,14 @@ class TestMemoryImagesInASnapshotDir:
         assert t.warnings == ''
 
     @unless_root
-    def test_an_unlistable_snapshot_dir_leaves_the_domain_defined(
+    def test_an_unlistable_memory_snapshot_dir_leaves_the_domain_defined(
             self, tmp_path):
         """It may hold the VM's memory images, so the teardown stops at
         capture: nothing undefined, nothing removed, nothing saved."""
         workdir, snaps = self._dirs(tmp_path)
         boot = _qcow2(workdir / f'{VM}.qcow2')
         raw = _file(snaps / f'{VM}_snapshot_s1.raw')
-        t = _Teardown(workdir, disks=[boot], records=[], snapshot_dir=snaps)
+        t = _Teardown(workdir, disks=[boot], records=[], memory_snapshot_dir=snaps)
         snaps.chmod(0)
         try:
             with pytest.raises(ProvisionError, match='could not list') as exc:
@@ -2790,7 +2790,7 @@ class TestMemoryImagesInASnapshotDir:
         finally:
             snaps.chmod(0o700)
 
-        assert 'a snapshot_dir that may hold its memory images' in str(
+        assert 'a memory_snapshot_dir that may hold its memory images' in str(
             exc.value)
         assert 'leaving it defined' in str(exc.value)
         t.session.destroy_vm.assert_not_called()
@@ -2801,7 +2801,7 @@ class TestMemoryImagesInASnapshotDir:
         workdir, snaps = self._dirs(tmp_path)
         boot = _qcow2(workdir / f'{VM}.qcow2')
         raw = _file(snaps / f'{VM}_snapshot_s1.raw')
-        t = _Teardown(workdir, disks=[boot], records=[], snapshot_dir=snaps)
+        t = _Teardown(workdir, disks=[boot], records=[], memory_snapshot_dir=snaps)
 
         t.update_remove()
 
@@ -2813,7 +2813,7 @@ class TestMemoryImagesInASnapshotDir:
         workdir, snaps = self._dirs(tmp_path)
         boot = _qcow2(workdir / f'{VM}.qcow2')
         raw = _file(snaps / f'{VM}_snapshot_s1.raw')
-        t = _Teardown(workdir, disks=[boot], records=[], snapshot_dir=snaps,
+        t = _Teardown(workdir, disks=[boot], records=[], memory_snapshot_dir=snaps,
                       in_use={str(raw): OTHER})
         t.deprovision()
         assert raw.exists() and _saved(workdir).exists()
@@ -2835,7 +2835,7 @@ class TestMemoryImagesInASnapshotDir:
         workdir, snaps = self._dirs(tmp_path)
         boot = _qcow2(workdir / f'{VM}.qcow2')
         raw = _file(snaps / f'{VM}_snapshot_s1.raw.zst')
-        t = _Teardown(workdir, rows=[], records=[], snapshot_dir=snaps)
+        t = _Teardown(workdir, rows=[], records=[], memory_snapshot_dir=snaps)
         t.session.vm_storage_devices.return_value = None
 
         t.deprovision()

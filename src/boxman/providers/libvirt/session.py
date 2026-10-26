@@ -2346,7 +2346,7 @@ class LibVirtSession(SessionConfigMixin):
         Args:
             vm_name (str, optional): Full name of the VM to snapshot
             vm_dir (str): Directory the memory image is written to (the
-                cluster's ``snapshot_dir``, by default its workdir)
+                cluster's ``memory_snapshot_dir``, by default its workdir)
             snapshot_name (str): Name for the snapshot
             description (str, optional): Description for the snapshot
             compress_memory: zstd-compress the memory ``.raw`` file after

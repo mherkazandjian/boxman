@@ -1,11 +1,11 @@
 """
-A cluster's ``snapshot_dir``: where ``snapshot take`` writes its VMs'
+A cluster's ``memory_snapshot_dir``: where ``snapshot take`` writes its VMs'
 memory images, instead of the cluster workdir.
 
 Only the memory images move there. A disk snapshot is an overlay libvirt
 names after its disk and creates beside it, and the newest overlay is the
 disk the guest writes to. The teardown side (memory images removed from a
-snapshot_dir, nothing else there) is in test_vm_teardown_storage.py.
+memory_snapshot_dir, nothing else there) is in test_vm_teardown_storage.py.
 """
 
 from __future__ import annotations
@@ -66,73 +66,73 @@ class TestTheDirectory:
     def test_unset_is_the_workdir(self, tmp_path):
         mgr = _manager({"workdir": str(tmp_path / "c1")})
 
-        assert mgr.cluster_snapshot_dir("cluster_1") == str(tmp_path / "c1")
+        assert mgr.cluster_memory_snapshot_dir("cluster_1") == str(tmp_path / "c1")
 
     def test_set_is_expanded_and_absolute(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
         mgr = _manager({"workdir": str(tmp_path / "c1"),
-                        "snapshot_dir": "~/snaps/../snapshots"})
+                        "memory_snapshot_dir": "~/snaps/../snapshots"})
 
-        assert (mgr.cluster_snapshot_dir("cluster_1")
+        assert (mgr.cluster_memory_snapshot_dir("cluster_1")
                 == str(tmp_path / "snapshots"))
 
     @pytest.mark.parametrize("value", ["", "   ", 7, ["/data"], {"p": 1}],
                              ids=["empty", "blank", "int", "list", "dict"])
     def test_a_value_that_is_not_a_path_is_refused(self, tmp_path, value):
-        mgr = _manager({"workdir": str(tmp_path), "snapshot_dir": value})
+        mgr = _manager({"workdir": str(tmp_path), "memory_snapshot_dir": value})
 
         with pytest.raises(ConfigError,
-                           match="clusters.cluster_1.snapshot_dir must be"):
-            mgr.cluster_snapshot_dir("cluster_1")
+                           match="clusters.cluster_1.memory_snapshot_dir must be"):
+            mgr.cluster_memory_snapshot_dir("cluster_1")
 
     def test_a_container_runtime_refuses_it(self, tmp_path):
         """The libvirt container sees the workspace and the workdirs, which
         are bind-mounted into it, and not this directory."""
         mgr = _manager({"workdir": str(tmp_path),
-                        "snapshot_dir": str(tmp_path / "s")},
+                        "memory_snapshot_dir": str(tmp_path / "s")},
                        runtime="docker-compose")
 
         with pytest.raises(ConfigError, match="'docker-compose' runtime"):
-            mgr.cluster_snapshot_dir("cluster_1")
+            mgr.cluster_memory_snapshot_dir("cluster_1")
 
     def test_a_container_runtime_without_it_keeps_the_workdir(self, tmp_path):
         mgr = _manager({"workdir": str(tmp_path)}, runtime="docker-compose")
 
-        assert mgr.cluster_snapshot_dir("cluster_1") == str(tmp_path)
+        assert mgr.cluster_memory_snapshot_dir("cluster_1") == str(tmp_path)
 
     def test_a_docker_compose_cluster_refuses_it(self, tmp_path):
         mgr = _manager({"workdir": str(tmp_path),
-                        "snapshot_dir": str(tmp_path / "s")})
+                        "memory_snapshot_dir": str(tmp_path / "s")})
         mgr.provider_type_for_cluster = MagicMock(return_value="docker-compose")
 
         with pytest.raises(ConfigError, match="docker-compose cluster"):
-            mgr.cluster_snapshot_dir("cluster_1")
+            mgr.cluster_memory_snapshot_dir("cluster_1")
 
     def test_validate_checks_every_cluster_up_front(self, tmp_path):
         mgr = _manager({"workdir": str(tmp_path)})
         mgr.config["clusters"]["cluster_2"] = {
-            "workdir": str(tmp_path / "c2"), "snapshot_dir": 0, "vms": {}}
+            "workdir": str(tmp_path / "c2"), "memory_snapshot_dir": 0, "vms": {}}
 
-        with pytest.raises(ConfigError, match="cluster_2.snapshot_dir"):
-            mgr.validate_snapshot_dirs()
+        with pytest.raises(ConfigError, match="cluster_2.memory_snapshot_dir"):
+            mgr.validate_memory_snapshot_dirs()
 
     def test_only_the_clusters_that_set_one_are_listed(self, tmp_path):
         mgr = _manager({"workdir": str(tmp_path / "c1")})
         mgr.config["clusters"]["cluster_2"] = {
             "workdir": str(tmp_path / "c2"),
-            "snapshot_dir": str(tmp_path / "s2"), "vms": {}}
+            "memory_snapshot_dir": str(tmp_path / "s2"), "vms": {}}
 
-        assert mgr._cluster_snapshot_dirs() == [str(tmp_path / "s2")]
+        assert mgr._cluster_memory_snapshot_dirs() == [str(tmp_path / "s2")]
 
 
 class TestTake:
 
-    def test_the_memory_image_goes_to_the_snapshot_dir(self, tmp_path,
+    def test_the_memory_image_goes_to_the_memory_snapshot_dir(self, tmp_path,
                                                        monkeypatch):
         snaps = tmp_path / "snaps"
         snaps.mkdir()
         mgr = _manager({"workdir": str(tmp_path / "c1"),
-                        "snapshot_dir": str(snaps)})
+                        "memory_snapshot_dir": str(snaps)})
 
         _take(mgr, monkeypatch)
 
@@ -151,30 +151,30 @@ class TestTake:
         assert mgr.provider.snapshot_take.call_args.kwargs["vm_dir"] == str(
             workdir)
 
-    def test_a_missing_snapshot_dir_is_made_0700(self, tmp_path, monkeypatch):
+    def test_a_missing_memory_snapshot_dir_is_made_0700(self, tmp_path, monkeypatch):
         snaps = tmp_path / "on" / "the" / "way" / "snaps"
         mgr = _manager({"workdir": str(tmp_path / "c1"),
-                        "snapshot_dir": str(snaps)})
+                        "memory_snapshot_dir": str(snaps)})
 
         _take(mgr, monkeypatch)
 
         assert snaps.is_dir()
         assert stat.S_IMODE(os.stat(snaps).st_mode) == 0o700
 
-    def test_an_existing_snapshot_dir_keeps_its_mode(self, tmp_path,
+    def test_an_existing_memory_snapshot_dir_keeps_its_mode(self, tmp_path,
                                                      monkeypatch):
         snaps = tmp_path / "snaps"
         snaps.mkdir(mode=0o750)
         os.chmod(snaps, 0o750)
         mgr = _manager({"workdir": str(tmp_path / "c1"),
-                        "snapshot_dir": str(snaps)})
+                        "memory_snapshot_dir": str(snaps)})
 
         _take(mgr, monkeypatch)
 
         assert stat.S_IMODE(os.stat(snaps).st_mode) == 0o750
 
     def test_a_missing_workdir_is_not_made(self, tmp_path, monkeypatch):
-        """Only a snapshot_dir is made on first use: a workdir that is not
+        """Only a memory_snapshot_dir is made on first use: a workdir that is not
         there is not this command's to create."""
         workdir = tmp_path / "c1"
         mgr = _manager({"workdir": str(workdir)})
@@ -184,13 +184,13 @@ class TestTake:
         assert not workdir.exists()
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root writes anywhere")
-    def test_a_snapshot_dir_that_cannot_be_made_stops_before_any_take(
+    def test_a_memory_snapshot_dir_that_cannot_be_made_stops_before_any_take(
             self, tmp_path, monkeypatch):
         locked = tmp_path / "locked"
         locked.mkdir()
         locked.chmod(0o500)
         mgr = _manager({"workdir": str(tmp_path / "c1"),
-                        "snapshot_dir": str(locked / "snaps")})
+                        "memory_snapshot_dir": str(locked / "snaps")})
         try:
             with pytest.raises(SnapshotError,
                                match="could not create the snapshot directory"):
@@ -203,7 +203,7 @@ class TestTake:
     def test_a_container_runtime_refuses_before_any_take(self, tmp_path,
                                                          monkeypatch):
         mgr = _manager({"workdir": str(tmp_path / "c1"),
-                        "snapshot_dir": str(tmp_path / "snaps")},
+                        "memory_snapshot_dir": str(tmp_path / "snaps")},
                        runtime="docker-compose")
 
         with pytest.raises(ConfigError):
@@ -214,8 +214,8 @@ class TestTake:
 
 
 class TestStorageDf:
-    """``storage df`` counts a VM's memory images in its snapshot_dir and in
-    its workdir, where those taken before a snapshot_dir was set stay."""
+    """``storage df`` counts a VM's memory images in its memory_snapshot_dir and in
+    its workdir, where those taken before a memory_snapshot_dir was set stay."""
 
     @staticmethod
     def _df(mgr, monkeypatch, workdir):
@@ -242,7 +242,7 @@ class TestStorageDf:
         snaps.mkdir()
         (workdir / f"{VM}_snapshot_old.raw.zst").write_bytes(b"x" * 1024)
         (snaps / f"{VM}_snapshot_new.raw").write_bytes(b"x" * 2048)
-        mgr = _manager({"workdir": str(workdir), "snapshot_dir": str(snaps)})
+        mgr = _manager({"workdir": str(workdir), "memory_snapshot_dir": str(snaps)})
 
         line = self._df(mgr, monkeypatch, workdir)
 
