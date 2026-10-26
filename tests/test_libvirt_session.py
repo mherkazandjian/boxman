@@ -23,12 +23,14 @@ import os
 import shlex
 import shutil
 import subprocess
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from boxman.exceptions import ConfigError
+from boxman.providers.libvirt import disk_cleanup
 from boxman.providers.libvirt.commands import LibVirtCommandBase
 from boxman.providers.libvirt.net import Network
 from boxman.providers.libvirt.session import _ABSENT, LibVirtSession
@@ -66,6 +68,57 @@ def _answer_sudo_stat(command, sudo, asked):
     asked.append(command)
     ok, stdout, stderr = sudo(shlex.split(command)[-1])
     return _result(ok=ok, stdout=stdout, stderr=stderr)
+
+
+def _lossy_alias(tmp_path):
+    """
+    A name only root can follow, which the user's ``os.path.realpath``
+    turns into the name of another file that exists: ``source.qcow2``
+    leads, through a symlink inside a directory the user may not search
+    and a ``..`` after it, to A -- the disk a domain uses -- while realpath
+    run as the user, unable to read that symlink, folds the ``..`` by
+    spelling and lands on B, an unrelated file. Call the returned
+    *lock()* to make that directory unsearchable, *unlock()* after.
+    """
+    work, hidden = tmp_path / "work", tmp_path / "hidden"
+    (work / "deep").mkdir(parents=True)
+    hidden.mkdir()
+    a = work / "vm-a.qcow2"
+    a.write_bytes(b"A: the disk vm-b uses")
+    b = hidden / "vm-a.qcow2"
+    b.write_bytes(b"B: unrelated")
+    os.symlink(work / "deep", hidden / "hop")
+    source = tmp_path / "source.qcow2"
+    os.symlink("hidden/hop/../vm-a.qcow2", source)
+    return types.SimpleNamespace(
+        work=work, hidden=hidden, a=a, b=b, source=source,
+        lock=lambda: hidden.chmod(0), unlock=lambda: hidden.chmod(0o700))
+
+
+def _stat_as_root(layout):
+    """``sudo -n stat -L`` as root answers it: the kernel's own lookup of
+    exactly the name asked, the hidden directory searchable for it."""
+    def answer(path):
+        layout.unlock()
+        try:
+            st = os.stat(path)
+        finally:
+            layout.lock()
+        return True, f"{st.st_dev} {st.st_ino}", ""
+    return answer
+
+
+def _remove_vm_a(layout, in_use):
+    """Tear down vm-a, whose boot disk is A, against the scan *in_use*:
+    the real removal routine, with the hidden directory locked."""
+    a = str(layout.a)
+    inventory = disk_cleanup.StorageInventory(
+        vm_name="vm-a", disk_sources=[], media_sources=[], records=None,
+        records_state=disk_cleanup.RECORDS_NONE, chains={},
+        boot_family=[a], legacy_disks=None,
+        identities=disk_cleanup.file_identities([a]))
+    return disk_cleanup.remove_vm_storage(
+        inventory, [str(layout.work)], lambda: in_use)
 
 
 def _sudo_policy(cmd, provider: dict | None) -> None:
@@ -1118,7 +1171,7 @@ class TestInUseWithAMissingSource:
     def test_a_held_file_it_may_not_look_up_is_read_through_sudo(
             self, tmp_path):
         """The held files of a running domain take the same read as every
-        other file the scan records (:meth:`_read_identity`)."""
+        other file the scan records (:meth:`_identify`)."""
         hidden = tmp_path / "hidden"
         hidden.mkdir()
         base = hidden / "base.qcow2"
@@ -1135,10 +1188,35 @@ class TestInUseWithAMissingSource:
             hidden.chmod(0o700)
 
         assert in_use is not None
-        assert in_use[os.path.realpath(base)] == "vm-b"
+        assert in_use[str(base)] == "vm-b"
         assert in_use.identities[(st.st_dev, st.st_ino)] == "vm-b"
         assert (f"sudo -n stat -L --printf='%d %i' -- "
-                f"{shlex.quote(os.path.realpath(base))}") in calls
+                f"{shlex.quote(str(base))}") in calls
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_a_held_alias_realpath_misreads_still_protects_its_file(
+            self, tmp_path):
+        """The held layer is named through a symlink the user cannot
+        follow: its identity is read from that name, so the disk the domain
+        holds is protected, not the file a user's realpath misnames."""
+        layout = _lossy_alias(tmp_path)
+        live = self._live("<source file='/ws/gone.qcow2' index='1'/>"
+                          + self._level(layout.source))
+        a_id = (os.stat(layout.a).st_dev, os.stat(layout.a).st_ino)
+        b_id = (os.stat(layout.b).st_dev, os.stat(layout.b).st_ino)
+        layout.lock()
+        try:
+            in_use, _ = self._run("running", live=live,
+                                  provider={"use_sudo": True},
+                                  sudo=_stat_as_root(layout))
+            outcome = _remove_vm_a(layout, in_use)
+        finally:
+            layout.unlock()
+
+        assert layout.a.exists(), "the disk vm-b holds was removed"
+        assert [path for path, _ in outcome.kept] == [str(layout.a)]
+        assert in_use.identities[a_id] == "vm-b"
+        assert b_id not in in_use.identities
 
     def test_a_missing_volume_source_fails_the_scan(self, captured_logs):
         """A pool volume's chain is not read from the live definition."""
@@ -1278,6 +1356,37 @@ class TestInUseByIdentity:
             assert in_use.identities[identities[str(path)]] == "vm-b"
         assert asked == [f"sudo -n stat -L --printf='%d %i' -- "
                          f"{shlex.quote(str(path))}" for path in (top, base)]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_an_alias_realpath_misreads_still_protects_its_file(
+            self, tmp_path):
+        """A disk named through a symlink the user cannot follow, then a
+        ``..``: resolved as the user it reads as another file that exists.
+        The identity is read from the name as given, so the disk the domain
+        uses is protected and stays, and the other file is not taken for
+        it."""
+        layout = _lossy_alias(tmp_path)
+        a_id = (os.stat(layout.a).st_dev, os.stat(layout.a).st_ino)
+        b_id = (os.stat(layout.b).st_dev, os.stat(layout.b).st_ino)
+        asked = []
+        layout.lock()
+        try:
+            assert os.path.realpath(layout.source) == str(layout.b)
+            in_use = self._scan(tmp_path, layout.source,
+                                f'{{"filename": "{layout.source}"}}',
+                                provider={"use_sudo": True},
+                                sudo=_stat_as_root(layout), asked_sudo=asked)
+            outcome = _remove_vm_a(layout, in_use)
+        finally:
+            layout.unlock()
+
+        assert layout.a.exists(), "the disk vm-b uses was removed"
+        assert [path for path, _ in outcome.kept] == [str(layout.a)]
+        assert asked == [f"sudo -n stat -L --printf='%d %i' -- "
+                         f"{shlex.quote(str(layout.source))}"]
+        assert in_use.identities[a_id] == "vm-b"
+        assert b_id not in in_use.identities
+        assert str(layout.b) not in in_use
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
     @pytest.mark.parametrize("provider", [
