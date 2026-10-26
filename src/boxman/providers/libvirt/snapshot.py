@@ -155,7 +155,8 @@ class SnapshotManager:
                         description: str,
                         compress_memory: bool = False,
                         compress_level: int = 3,
-                        force: bool = False) -> bool:
+                        force: bool = False,
+                        paths_in_use=None) -> bool:
         """
         Create a snapshot of a VM.
 
@@ -179,13 +180,17 @@ class SnapshotManager:
                 that name, or orphaned per-disk overlay / memory files a
                 prior deletion left behind — so the name can be re-used.
                 See :meth:`_force_clear_for_retake`.
+            paths_in_use: With *force*, what every domain uses
+                (``LibVirtSession.disk_paths_in_use``), asked before a
+                leftover is removed; without it none is.
 
         Returns:
             bool: True if successful, False otherwise
         """
         try:
             if force and not self._force_clear_for_retake(
-                    vm_name, vm_dir, snapshot_name):
+                    vm_name, vm_dir, snapshot_name,
+                    paths_in_use=paths_in_use):
                 return False
             # Before saving memory state, ensure cdroms point directly at
             # their raw ISO backing files (not qcow2 overlays of them).
@@ -265,7 +270,8 @@ class SnapshotManager:
     def _force_clear_for_retake(self,
                                 vm_name: str,
                                 vm_dir: str,
-                                snapshot_name: str) -> bool:
+                                snapshot_name: str,
+                                paths_in_use=None) -> bool:
         """
         Remove anything that would make a fresh snapshot named
         *snapshot_name* collide, so ``snapshot take --force`` can re-use the
@@ -281,7 +287,17 @@ class SnapshotManager:
            files.
 
         Files that are part of the VM's *current* active disk chain are never
-        removed. Returns True when the name is clear to re-use.
+        removed. Nor is a leftover any domain uses, the VM itself included:
+        each is matched by resolved path and by identity against
+        *paths_in_use* (``LibVirtSession.disk_paths_in_use``), asked once
+        there is anything to remove. The memory image's directory can be a
+        cluster's memory_snapshot_dir outside the workdir, reaching a disk
+        under another name — a symlink to the directory a live disk is in.
+        One in use, a scan that fails or none given, or a leftover that
+        cannot be inspected refuses the retake: the snapshot would be
+        written over that file.
+
+        Returns True when the name is clear to re-use.
         """
         info = self.virsh.execute(
             "snapshot-info", vm_name, snapshot_name, warn=True)
@@ -312,18 +328,53 @@ class SnapshotManager:
         snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
         candidates.append(os.path.join(vm_dir, snap_fname))
         candidates.append(os.path.join(vm_dir, f"{snap_fname}.zst"))
-        for path in candidates:
-            if path in active:
-                continue  # in the live chain — never remove
-            if os.path.isfile(path):
-                self.virsh.execute_shell(
-                    f"rm -f -- {shlex.quote(path)}", warn=True)
-                removed.append(path)
+        # in the live chain — never remove
+        leftovers = [path for path in candidates
+                     if path not in active and os.path.isfile(path)]
+        refusal = self._leftover_in_use(leftovers, paths_in_use)
+        if refusal:
+            self.logger.error(
+                f"--force: {refusal}; refusing to remove it, or to take "
+                f"'{snapshot_name}' on {vm_name} over it")
+            return False
+        for path in leftovers:
+            self.virsh.execute_shell(
+                f"rm -f -- {shlex.quote(path)}", warn=True)
+            removed.append(path)
         if removed:
             self.logger.info(
                 f"--force: removed {len(removed)} leftover snapshot file(s) "
                 f"for '{snapshot_name}' on {vm_name}")
         return True
+
+    @staticmethod
+    def _leftover_in_use(leftovers: list[str], paths_in_use) -> str | None:
+        """
+        Why one of *leftovers* may not be removed, if one may not: a domain
+        uses it, by resolved path or by identity (``(st_dev, st_ino)``, links
+        followed); it cannot be inspected; or what the domains use cannot be
+        told — *paths_in_use* is ``None``, or answers ``None``.
+        """
+        if not leftovers:
+            return None
+        identities = {}
+        for path in leftovers:
+            try:
+                st = os.stat(path)
+            except OSError as exc:
+                return f"{path} could not be inspected ({exc})"
+            identities[path] = (st.st_dev, st.st_ino)
+        in_use = paths_in_use() if paths_in_use is not None else None
+        if in_use is None:
+            return (f"could not check whether a domain uses "
+                    f"{', '.join(leftovers)}")
+        used_ids = getattr(in_use, "identities", {})
+        for path in leftovers:
+            domain = (in_use.get(os.path.realpath(path))
+                      or used_ids.get(identities[path]))
+            if domain:
+                return f"{path}: domain {domain} uses it"
+        return None
 
     # ── memory file compression (zstd) ──────────────────────────────────
     #

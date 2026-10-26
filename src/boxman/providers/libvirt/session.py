@@ -2370,7 +2370,8 @@ class LibVirtSession(SessionConfigMixin):
             description=description,
             compress_memory=compress_memory,
             compress_level=compress_level,
-            force=force)
+            force=force,
+            paths_in_use=self.disk_paths_in_use)
 
     def snapshot_log_data(self, vm_name: str) -> dict:
         """
