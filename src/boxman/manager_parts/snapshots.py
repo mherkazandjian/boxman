@@ -3,6 +3,7 @@
 import errno
 import json
 import os
+import stat
 import time
 
 from boxman import log
@@ -965,14 +966,21 @@ class SnapshotsMixin:
             disks = vm_disk_paths(workdir, full_vm_name, vm_info)
             snap_count = storage.count_snapshots(full_vm_name)
             # the workdir too: memory images taken before a
-            # memory_snapshot_dir was set stay where they were written
+            # memory_snapshot_dir was set stay where they were written. Each
+            # file once, by identity: the two can be one directory under
+            # two names (a symlink, a bind mount), or share a hard link.
             memory_dir = self.cluster_memory_snapshot_dir(cluster_name)
-            mem_files = sorted({
-                os.path.abspath(path)
-                for directory in (workdir, memory_dir)
+            mem_sizes: dict[tuple[int, int], int] = {}
+            for directory in (workdir, memory_dir):
                 for path in storage.snapshot_memory_files(directory,
-                                                          full_vm_name)})
-            mem_total = sum(os.path.getsize(p) for p in mem_files if os.path.isfile(p))
+                                                          full_vm_name):
+                    try:
+                        st = os.stat(path)
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(st.st_mode):
+                        mem_sizes[(st.st_dev, st.st_ino)] = st.st_size
+            mem_total = sum(mem_sizes.values())
             snap_mem_total_per_vm[full_vm_name] = mem_total
             for disk_path in disks:
                 if not os.path.isfile(disk_path):

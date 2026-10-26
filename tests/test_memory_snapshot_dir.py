@@ -384,6 +384,28 @@ class TestStorageDf:
 
         assert "1.0K" in line and "2.0K" not in line
 
+    @pytest.mark.parametrize("how", ["symlink", "hard link"])
+    def test_one_file_under_two_names_is_counted_once(self, tmp_path,
+                                                      monkeypatch, how):
+        """The memory_snapshot_dir another name of the workdir, or the image
+        linked into it: one file, whatever its names."""
+        workdir = tmp_path / "c1"
+        workdir.mkdir()
+        image = workdir / f"{VM}_snapshot_s1.raw"
+        image.write_bytes(b"x" * 1024)
+        snaps = tmp_path / "snaps"
+        if how == "symlink":
+            os.symlink(workdir, snaps)
+        else:
+            snaps.mkdir()
+            os.link(image, snaps / image.name)
+        mgr = _manager({"workdir": str(workdir),
+                        "memory_snapshot_dir": str(snaps)})
+
+        line = self._df(mgr, monkeypatch, workdir)
+
+        assert "1.0K" in line and "2.0K" not in line
+
 
 class TestCheckedUpFront:
     """``provision`` checks every cluster's memory_snapshot_dir before it
