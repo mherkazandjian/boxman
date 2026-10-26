@@ -1049,7 +1049,10 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   libvirt creates beside its disk, and the newest overlay is the disk the
   guest writes to. Images already taken stay where they were written;
   restore, delete and compression follow the path libvirt recorded.
-  Local runtime only: a container runtime refuses it up front.
+  After the key is changed or unset, a teardown removes nothing from the
+  old directory: it keeps such an image and names it in a warning, to
+  remove by hand. Local runtime only: a container runtime refuses it up
+  front (`provision`, `up`, `update`).
 - `snapshot restore [--name N]` restores (latest if omitted). `boxman restore`
   is the shortcut for "all VMs to latest".
 - **A restore backs up the overlays the revert deletes, and refuses if it

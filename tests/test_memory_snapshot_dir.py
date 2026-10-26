@@ -116,6 +116,16 @@ class TestTheDirectory:
         with pytest.raises(ConfigError, match="cluster_2.memory_snapshot_dir"):
             mgr.validate_memory_snapshot_dirs()
 
+    def test_validate_needs_no_workdir_of_a_cluster_that_sets_none(self):
+        """A cluster with no workdir and no workspace.path to derive one
+        from is warned about, not refused; checking this key must not
+        crash on it."""
+        mgr = _manager({})
+
+        mgr.validate_memory_snapshot_dirs()
+
+        assert mgr._cluster_memory_snapshot_dirs() == []
+
     def test_only_the_clusters_that_set_one_are_listed(self, tmp_path):
         mgr = _manager({"workdir": str(tmp_path / "c1")})
         mgr.config["clusters"]["cluster_2"] = {
@@ -257,3 +267,35 @@ class TestStorageDf:
         line = self._df(mgr, monkeypatch, workdir)
 
         assert "1.0K" in line and "2.0K" not in line
+
+
+class TestCheckedUpFront:
+    """``provision`` checks every cluster's memory_snapshot_dir before it
+    builds anything. ``up`` on a project that is already there, and
+    ``update``, never reach those checks, so they make the same one first:
+    a directory the libvirt container would not see, here."""
+
+    @staticmethod
+    def _refused(tmp_path):
+        return _manager({"workdir": str(tmp_path),
+                         "memory_snapshot_dir": str(tmp_path / "snaps")},
+                        runtime="docker-compose")
+
+    def test_up_on_an_existing_project_refuses_it_before_reading_a_vm(
+            self, tmp_path, monkeypatch):
+        mgr = self._refused(tmp_path)
+        states = MagicMock(return_value={VM: "shut off"})
+        monkeypatch.setattr(BoxmanManager, "_get_vm_states",
+                            lambda _self: states())
+
+        with pytest.raises(ConfigError, match="memory_snapshot_dir"):
+            mgr.up(types.SimpleNamespace(force=False, vms="all", cluster=None))
+
+        states.assert_not_called()
+
+    def test_update_refuses_it(self, tmp_path):
+        mgr = self._refused(tmp_path)
+
+        with pytest.raises(ConfigError, match="memory_snapshot_dir"):
+            mgr._update(types.SimpleNamespace(dry_run=True, yes=False,
+                                              restart=False))

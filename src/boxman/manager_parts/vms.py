@@ -1953,6 +1953,7 @@ class VMsMixin:
         # (#171 A3).
         self.validate_direct_boot_config()
         self.validate_clone_identity_config()
+        self.validate_memory_snapshot_dirs()
         dry_run = getattr(cli_args, 'dry_run', False)
         auto_accept = getattr(cli_args, 'yes', False)
         # Deliberately not `auto_accept or ...`: --yes answers the VM-removal
