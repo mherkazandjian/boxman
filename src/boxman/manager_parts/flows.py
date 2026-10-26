@@ -260,6 +260,9 @@ class FlowsMixin:
         Reuses the same provider methods as ``boxman control start`` and
         ``boxman control resume``.
         """
+        # provision makes this check itself, but a project already there
+        # never reaches it
+        self.validate_memory_snapshot_dirs()
         config = self.config
         expected_vms = self._get_project_vm_names()
 

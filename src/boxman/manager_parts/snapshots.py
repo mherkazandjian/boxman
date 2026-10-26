@@ -23,15 +23,34 @@ class SnapshotsMixin:
         the newest overlay is the disk the guest writes to.
 
         Raises:
-            ConfigError: ``memory_snapshot_dir`` is set on a docker-compose
-                cluster, is not a non-empty string, or is set under a
-                container runtime, which bind-mounts the workspace and the
-                workdirs into the libvirt container but not this directory.
+            ConfigError: the ``memory_snapshot_dir`` it sets is not usable
+                (:meth:`_configured_memory_snapshot_dir`).
+        """
+        configured = self._configured_memory_snapshot_dir(cluster_name)
+        if configured is not None:
+            return configured
+        cluster = self.config['clusters'][cluster_name]
+        return os.path.abspath(os.path.expanduser(cluster['workdir']))
+
+    def _configured_memory_snapshot_dir(self, cluster_name: str) -> str | None:
+        """
+        The ``memory_snapshot_dir`` *cluster_name* sets, ``~`` expanded and
+        absolute; ``None`` when it sets none. Its ``workdir`` is not looked
+        at: a cluster may have none yet (no ``workspace.path`` to derive one
+        from), and that is not this key's to refuse.
+
+        Raises:
+            ConfigError: it is set on a docker-compose cluster, is not a
+                non-empty string, or is set under a container runtime,
+                which bind-mounts the workspace and the workdirs into the
+                libvirt container but not this directory.
         """
         cluster = self.config['clusters'][cluster_name]
+        if not isinstance(cluster, dict):
+            return None
         configured = cluster.get('memory_snapshot_dir')
         if configured is None:
-            return os.path.abspath(os.path.expanduser(cluster['workdir']))
+            return None
         where = f"clusters.{cluster_name}.memory_snapshot_dir"
         if self._is_compose_cluster(cluster_name):
             raise ConfigError(
@@ -53,27 +72,27 @@ class SnapshotsMixin:
     def validate_memory_snapshot_dirs(self) -> None:
         """
         Check every cluster's ``memory_snapshot_dir`` up front
-        (:meth:`cluster_memory_snapshot_dir`), before a command builds
+        (:meth:`_configured_memory_snapshot_dir`), before a command builds
         anything.
 
         Raises:
             ConfigError: one of them is not usable.
         """
-        for cluster_name in (self.config.get('clusters') or {}):
-            self.cluster_memory_snapshot_dir(cluster_name)
+        self._cluster_memory_snapshot_dirs()
 
     def _cluster_memory_snapshot_dirs(self) -> list[str]:
         """
         The ``memory_snapshot_dir`` of every cluster that sets one, resolved
-        (:meth:`cluster_memory_snapshot_dir`): where a VM teardown also looks
-        for the VM's memory images, and the only files it may remove there.
+        (:meth:`_configured_memory_snapshot_dir`): where a VM teardown also
+        looks for the VM's memory images, and the only files it may remove
+        there.
+
+        Raises:
+            ConfigError: one of them is not usable.
         """
-        return sorted({
-            self.cluster_memory_snapshot_dir(cluster_name)
-            for cluster_name, cluster in (self.config.get('clusters')
-                                          or {}).items()
-            if isinstance(cluster, dict)
-            and cluster.get('memory_snapshot_dir') is not None})
+        configured = (self._configured_memory_snapshot_dir(cluster_name)
+                      for cluster_name in (self.config.get('clusters') or {}))
+        return sorted({path for path in configured if path is not None})
 
     def _ensure_memory_snapshot_dir(self, path: str) -> None:
         """

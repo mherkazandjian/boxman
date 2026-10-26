@@ -2238,6 +2238,7 @@ class VMsMixin:
         # (#171 A3).
         self.validate_direct_boot_config()
         self.validate_clone_identity_config()
+        self.validate_memory_snapshot_dirs()
         self.validate_guest_os_config()
         # A new VM installed unattended needs its password, its computer
         # name and its answer file now. Checked where it is built, that came
