@@ -1395,7 +1395,12 @@ class TestInUseByIdentity:
         realpath, needing every component of the absolute path, cannot look
         inside the unsearchable directory above it and would fold the ``..``
         into B's name. The name is recorded as given, the identity is A's,
-        and B is not marked in use."""
+        and B is not marked in use.
+
+        Only where this Python's realpath does fold it: 3.9 to 3.12 resolve
+        a relative name component by component from the current directory,
+        reach A as ``stat`` does, and leave nothing to misread — skipped
+        there."""
         private, outside = tmp_path / "private", tmp_path / "outside"
         cwd = private / "cwd"
         cwd.mkdir(parents=True)
@@ -1412,7 +1417,9 @@ class TestInUseByIdentity:
         private.chmod(0)
         try:
             assert (os.stat(name).st_dev, os.stat(name).st_ino) == a_id
-            assert os.path.realpath(name) == str(b)
+            if os.path.realpath(name) != str(b):
+                pytest.skip("this Python's realpath resolves the name as "
+                            "stat does: nothing to misread")
             in_use = self._scan(tmp_path, name, f'{{"filename": "{name}"}}')
         finally:
             private.chmod(0o700)
