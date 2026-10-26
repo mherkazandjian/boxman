@@ -16,9 +16,10 @@ fqdn = { source = "from-dhcp", domain = "pve.lab" }
 root-password-hashed = "__PWHASH__"
 root-ssh-keys = ["__PUBKEY__"]
 reboot-on-error = false
-# power off instead of rebooting: virt-install's transient install domain ends
-# either way, and a shut-off domain is exactly what the next `boxman up`
-# starts from disk (persistent config: boot hd first, install media ejected)
+# power off instead of rebooting, so "installed" is a domain libvirt reports
+# `shut off` (scripts/wait-installed.sh). The next `boxman up` starts it, and
+# its firmware boots hd before cdrom: the installed disk, with the ISO still
+# attached behind it
 reboot-mode = "power-off"
 
 [network]

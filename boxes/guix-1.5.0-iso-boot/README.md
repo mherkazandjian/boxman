@@ -19,8 +19,8 @@ the guest.
 (boxman *does* still generate an `ssh_config` and an `id_ed25519_boxman`
 keypair in the workspace, and `boxman up` prints an `ssh …` line for the VM.
 Ignore both: the `admin` user they name does not exist in the guest. `boxman
-up` also ends with `ERROR: failed to add ssh keys to some vms`, which is the
-correct outcome here, not a fault.)
+up` also warns that the cluster `has no admin_pass, so boxman adds no ssh key
+to its VMs`, which is the correct outcome here, not a fault.)
 
 As with the NixOS box, that is the current limit of the tooling rather than an
 oversight:

@@ -135,9 +135,10 @@ scripts are exposed as `tasks:` for use on a host directly, e.g.
   install, before reporting: the guests there have no libvirt
   DHCP lease (host1's dnsmasq serves them) and no guest agent until the
   first-boot hook installs it. The installs run meanwhile; nothing is lost.
-- `boxman up` ends with `ERROR: failed to add ssh keys to some vms` on both
-  hosts, as on every ISO-boot box: there is no `admin_pass` and nothing to
-  push a key into — the answer file already authorises the lab key for root.
+- `boxman up` warns that cluster `pve` `has no admin_pass, so boxman adds no
+  ssh key to its VMs` on both hosts, as on every ISO-boot box: there is
+  nothing to push a key into — the answer file already authorises the lab key
+  for root.
 - On host1 `boxman ssh pve1` (alias `pve_pve1`) works once the node has an
   address; on host2 the ssh_config stays empty until the agent is up.
 
@@ -245,8 +246,9 @@ Two consequences worth knowing:
   snapshot, and then ships a deliberately frozen stack that drifts out of
   support.
 
-This relies on the post-create CPU/memory step editing the persistent config
-(`dumpxml --inactive`) — the fix that ships with this box. Before it, boxman
+The post-create CPU/memory step edits the persistent config
+(`dumpxml --inactive`), a fix that shipped with this box. It had to while
+ISO-boot VMs still had virt-install's install phase: before the fix, boxman
 copied the transient install XML over the persistent one, and every ISO-boot
 VM with `memory:` set would have re-run its installer on the second boot.
 
