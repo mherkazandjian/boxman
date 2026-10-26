@@ -376,7 +376,10 @@ Plus `make-answer-iso.sh` to render the answer file.
 
    boxman would ship a default `autounattend.xml.j2` and `boxman-setup.ps1`
    (this PoC's, parameterised), so a minimal Windows VM is `os: windows`
-   plus an ISO.
+   plus an ISO. virt-install's own `--unattended` was evaluated and
+   rejected: with osinfo-db 20250124 it refuses `win2k22` (no Windows Server
+   2022 template), and its Windows templates need a product key and inject
+   no virtio drivers.
 5. **`os: windows` switches** (G5): ssh user `Administrator` (or
    `admin_user`); the boxman key goes in through the answer ISO, not
    `ssh-copy-id`; inventory gets `ansible_shell_type: powershell` (or the
