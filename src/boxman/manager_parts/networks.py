@@ -295,10 +295,13 @@ class NetworksMixin:
         reported and no longer waited for: an ISO-boot guest left off by its
         installer's reboot (G2) used to cost the whole timeout. Stopping is
         not an error in itself -- a guest may power itself off by design, as
-        the proxmox box's unattended install does.
+        the proxmox box's unattended install does. A VM that stops after it
+        got its address is reported too. An address once seen counts: a VM
+        still running is not asked again, even if a reboot hides it for a
+        while.
 
         Returns:
-            True if they all got one.
+            True if they all got one and none stopped.
         """
         if not vm_names:
             return True
@@ -312,14 +315,20 @@ class NetworksMixin:
             # None when the states cannot be read: then every VM is waited
             # for, as before this asked
             states = self._vm_states_if_known()
-            for name in list(pending) if states is not None else []:
+            for name in vm_names if states is not None else []:
                 state = states.get(name, 'not defined')
-                if state in self._NOT_RUNNING_STATES:
+                if name in stopped or state not in self._NOT_RUNNING_STATES:
+                    continue
+                if name in pending:
                     self.logger.warning(
                         f"vm {name} stopped running ({state}) while boxman "
                         f"waited for its IP address; no longer waiting for it")
                     pending.remove(name)
-                    stopped.append(name)
+                else:
+                    self.logger.warning(
+                        f"vm {name} stopped running ({state}) after it got "
+                        f"its IP address, while boxman waited for the others")
+                stopped.append(name)
             pending = [name for name in pending
                        if not self.provider.get_vm_ip_addresses(name)]
             if not pending:

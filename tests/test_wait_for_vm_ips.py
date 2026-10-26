@@ -80,6 +80,21 @@ class TestAVmThatStops:
         lab.mgr.wait_for_vm_ips([VM1, VM2], max_wait=600)
         lab.mgr.logger.error.assert_not_called()
 
+    def test_after_it_got_an_address_is_reported(self, monkeypatch):
+        """VM1 has its address at once, then shuts off while VM2 is still
+        booting: VM1 is reported once, and VM2 still waited for."""
+        lab = Lab(monkeypatch,
+                  states=lambda r: {VM1: "shut off" if r >= 1 else "running",
+                                    VM2: "running"},
+                  ips=lambda r, name: IP if name == VM1 or r >= 3 else {})
+
+        assert lab.mgr.wait_for_vm_ips([VM1, VM2], max_wait=600) is False
+
+        assert lab.warnings().count(VM1) == 1
+        assert "after it got its IP address" in lab.warnings()
+        assert lab.sleeps == [1, 2, 4]           # until VM2 has its address
+        assert [name for _, name in lab.asked].count(VM1) == 1
+
     def test_that_never_ran_costs_no_wait_at_all(self, monkeypatch):
         lab = Lab(monkeypatch, states=lambda r: {VM1: "shut off"},
                   ips=lambda r, name: {})
@@ -103,6 +118,8 @@ class TestTheWaitOtherwise:
         assert lab.sleeps == [1, 2, 4]
 
     def test_does_not_ask_again_for_a_vm_that_has_one(self, monkeypatch):
+        """An address once seen counts, so a reboot that hides it for a
+        while does not send the wait back to that VM."""
         lab = Lab(monkeypatch, states=lambda r: {VM1: "running", VM2: "running"},
                   ips=lambda r, name: IP if name == VM1 or r >= 2 else {})
         lab.mgr.wait_for_vm_ips([VM1, VM2], max_wait=600)
