@@ -2,9 +2,13 @@
 <!--
   Answer file for an unattended Windows Server 2022 install on libvirt/KVM.
 
-  Rendered by make-answer-iso.sh, which substitutes @ADMIN_PASS@ and
-  @COMPUTER_NAME@ and writes the result onto a small ISO. Never commit a
-  rendered copy: it holds the Administrator password in plain text.
+  Rendered by make-answer-iso.sh, which fills in the Administrator password
+  and the computer name and writes the result onto a small ISO. Never commit
+  a rendered copy: it holds the Administrator password in plain text.
+
+  Keep the placeholder names out of comments: they are replaced everywhere,
+  which would copy the password into the comment, and a password with two
+  hyphens in a row would make the file invalid XML.
 
   Assumes SeaBIOS (MBR partitioning), a virtio-blk boot disk and a virtio-net
   NIC (what boxman's IsoBootVM creates) and the virtio-win ISO attached as

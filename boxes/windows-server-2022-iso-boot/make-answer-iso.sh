@@ -34,24 +34,20 @@ if ! [[ $name =~ ^[A-Za-z0-9-]{1,15}$ ]] || [[ $name =~ ^[0-9]+$ ]]; then
     exit 2
 fi
 
-xml_escape() {
-    local s=$1
-    s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}
-    s=${s//\"/&quot;}; s=${s//\'/&apos;}
-    printf '%s' "$s"
-}
-
 # Created before the umask below, so qemu can still reach the VM disk there.
 mkdir -p "$(dirname "$out")"
 umask 077
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 
-PASS=$(xml_escape "$pass") NAME=$name python3 - "$here/autounattend.xml.in" \
+# The password is escaped in Python: bash 5.2 expands an unquoted & in a
+# ${s//pat/rep} replacement to the matched text, which garbled the entities.
+PASS=$pass NAME=$name python3 - "$here/autounattend.xml.in" \
     "$stage/autounattend.xml" <<'EOF'
 import os, sys
+from xml.sax.saxutils import escape
 text = open(sys.argv[1], encoding="utf-8").read()
-text = text.replace("@ADMIN_PASS@", os.environ["PASS"])
+text = text.replace("@ADMIN_PASS@", escape(os.environ["PASS"]))
 text = text.replace("@COMPUTER_NAME@", os.environ["NAME"])
 open(sys.argv[2], "w", encoding="utf-8").write(text)
 EOF
