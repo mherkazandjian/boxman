@@ -1146,7 +1146,11 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   timestamp); overlay disks are preserved. `--compress-memory` zstd-compresses
   the memory `.raw` (~70% smaller, transparently decompressed on restore).
   `--force` clears a colliding name or leftover files and re-takes; a
-  leftover any domain uses (matched by path or by identity) refuses it.
+  leftover any domain uses, or another domain's snapshot records as its
+  memory image (matched by path or by identity), refuses it. A take never
+  writes its memory image over a file already there (a leftover, or another
+  VM's image under the same name — VM `web`'s snapshot `replica_snapshot_s1`
+  and VM `web_snapshot_replica`'s `s1` name one file): it refuses.
 - A cluster's memory images (`<vm>_snapshot_<name>.raw`, or `.raw.zst`)
   go to its `memory_snapshot_dir` when it sets one (an absolute path, or
   `~/…`; made `0700` on first use, but never by creating a missing cluster

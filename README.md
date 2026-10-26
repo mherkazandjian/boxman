@@ -893,7 +893,8 @@ Details worth knowing:
   VM's full name can begin with this one's: kept, and named), a
   symlink, or anything another VM uses directly, as a backing file or as
   the destination of a block job it runs (a block copy) — storage-pool
-  volumes included. A protected file is recognised by its
+  volumes included — or that another VM's snapshot records as its memory
+  image. A protected file is recognised by its
   identity as well as its path, so under a bind mount or a hard link too.
   One boxman may not look up — another user's VM keeping its disks in that
   user's home — is looked up with `sudo -n stat` where the provider runs
