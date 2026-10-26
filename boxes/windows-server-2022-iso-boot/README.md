@@ -25,8 +25,9 @@ one manual step (see [Known gaps](#known-gaps)).
 4. After the next start: specialize, OOBE, one auto-logon as Administrator,
    and `boxman-setup.ps1`. That installs all virtio drivers and the QEMU
    guest agent, enables WinRM (HTTP 5985, NTLM, Basic off) and installs
-   OpenSSH Server from Windows Update. The log ends with
-   `boxman-setup: done` in `C:\boxman-setup.log`.
+   OpenSSH Server from Windows Update. `C:\boxman-setup.log` ends with
+   `boxman-setup: done`, or with `boxman-setup: FAILED: …` naming the
+   steps that did not complete.
 
 Measured on the test host: about 85 s from `virt-install` to Setup's first reboot,
 and about 2 min from the second start to WinRM and SSH answering.
@@ -50,8 +51,9 @@ export BOXMAN_WIN_SSH_PUBKEY=~/.ssh/id_ed25519.pub  # optional
 boxman up
 ```
 
-Once `C:\boxman-setup.log` ends with `boxman-setup: done`, **eject the
-answer ISO**. It holds the Administrator password in plain text, and
+Once `C:\boxman-setup.log` ends with `boxman-setup: done` (or with
+`boxman-setup: FAILED: …`, which names the steps left to do by hand),
+**eject the answer ISO**. It holds the Administrator password in plain text, and
 otherwise stays attached for the VM's whole life:
 
 ```bash
