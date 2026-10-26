@@ -131,7 +131,8 @@ scripts are exposed as `tasks:` for use on a host directly, e.g.
 ### Expected noise
 
 - `boxman up` on **host2** waits the full IP-discovery timeout (600 s on the
-  first run, 300 s later) before reporting: the guests there have no libvirt
+  first run, 300 s later), or until a node powers off at the end of its
+  install, before reporting: the guests there have no libvirt
   DHCP lease (host1's dnsmasq serves them) and no guest agent until the
   first-boot hook installs it. The installs run meanwhile; nothing is lost.
 - `boxman up` ends with `ERROR: failed to add ssh keys to some vms` on both
