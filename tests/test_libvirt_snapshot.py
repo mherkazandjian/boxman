@@ -407,6 +407,39 @@ class TestMemoryImages:
                 ["s1"], lambda _n: None, list_ok=False)):
             assert sm.memory_images("vm01") is None
 
+    @staticmethod
+    def _listing(stdout: str):
+        """snapshot-list printing exactly *stdout*; every snapshot saved
+        its memory to ``/s/<name>.raw``."""
+        def execute(*args, **_kw):
+            if args[0] == "snapshot-list":
+                return _result(stdout=stdout)
+            return _result(stdout=TestMemoryImages._xml(
+                args[2], f"<memory snapshot='external' "
+                         f"file='/s/{args[2]}.raw'/>"))
+        return execute
+
+    def test_the_lines_virsh_ends_its_list_with_are_no_entry(
+            self, sm: SnapshotManager):
+        """Each name, a newline, and the blank line virsh prints after a
+        command."""
+        with patch.object(sm.virsh, "execute",
+                          side_effect=self._listing("s1\n\n")):
+            assert sm.memory_images("vm01") == {"s1": "/s/s1.raw"}
+
+    @pytest.mark.parametrize("stdout", ["\n\n\n", "s1\n\ns2\n\n",
+                                        "s1\ns1\n\n"],
+                             ids=["a name of newlines", "a blank entry",
+                                  "a name twice"])
+    def test_a_list_that_cannot_be_trusted_is_unknown(
+            self, sm: SnapshotManager, stdout):
+        """A blank entry cannot be told apart from a name made only of
+        newlines, whose snapshot would drop out unread — as
+        _strict_overlay_inventory refuses it."""
+        with patch.object(sm.virsh, "execute",
+                          side_effect=self._listing(stdout)):
+            assert sm.memory_images("vm01") is None
+
     @pytest.mark.parametrize("bad", [None, "<domainsnapshot><name>s2"],
                              ids=["unreadable", "not xml"])
     def test_one_snapshot_that_cannot_be_read_makes_it_unknown(

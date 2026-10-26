@@ -455,17 +455,20 @@ class SnapshotManager:
         the ``.raw``, also once compression left only its ``.raw.zst``.
 
         Returns ``None`` when they cannot all be read — the list, or any
-        one snapshot's XML — which is not "none recorded".
+        one snapshot's XML — which is not "none recorded"; or when the list
+        cannot be trusted, as :meth:`_strict_overlay_inventory` refuses it:
+        a blank entry, which cannot be told apart from a name made only of
+        newlines, or a name listed twice.
         """
         list_result = self.virsh.execute(
             "snapshot-list", vm_name, "--name", warn=True)
         if not list_result.ok:
             return None
+        names = self._listed_snapshot_names(list_result.stdout)
+        if any(n == '' for n in names) or len(set(names)) != len(names):
+            return None
         images: dict[str, str] = {}
-        # exact names, newline-delimited: see _strict_overlay_inventory
-        for name in list_result.stdout.split('\n'):
-            if not name:
-                continue
+        for name in names:
             xml_result = self.virsh.execute(
                 "snapshot-dumpxml", vm_name, name, warn=True)
             if not xml_result.ok:
@@ -856,6 +859,26 @@ class SnapshotManager:
                 continue
         return overlays
 
+    @staticmethod
+    def _listed_snapshot_names(stdout: str) -> list[str]:
+        """
+        The entries ``virsh snapshot-list --name`` printed, split on newline
+        alone, without the terminators virsh adds.
+
+        Exactly those, and no more: one from the newline after the last
+        name, and one from the blank line vsh prints after a command.
+        Popping *every* trailing empty instead erases the evidence a caller
+        needs — a list whose only snapshot is named LF is all empty
+        fragments, and would come back as a domain with no snapshots at
+        all.
+        """
+        names = stdout.split('\n')
+        if names and names[-1] == '':
+            names.pop()
+        if names and names[-1] == '':
+            names.pop()
+        return names
+
     def _strict_overlay_inventory(
             self, vm_name: str) -> tuple[dict[str, list[str]], list[str]]:
         """
@@ -901,17 +924,7 @@ class SnapshotManager:
         # erases a name made of spaces -- either way the snapshot drops out
         # of the inventory before the duplicate and topology checks can
         # notice, and the revert deletes its overlay regardless.
-        names = list_result.stdout.split('\n')
-        # Exactly the terminators virsh adds, and no more: one from the
-        # newline after the last name, and one from the blank line vsh
-        # prints after a command. Popping *every* trailing empty instead
-        # erases the evidence the check below needs -- a list whose only
-        # snapshot is named LF is all empty fragments, and would come back
-        # as a domain with no snapshots at all.
-        if names and names[-1] == '':
-            names.pop()
-        if names and names[-1] == '':
-            names.pop()
+        names = self._listed_snapshot_names(list_result.stdout)
 
         # A name containing a newline splits into fragments that name no
         # snapshot, and the dumpxml below refuses on those. A name made
