@@ -881,13 +881,16 @@ Details worth knowing:
   running.
 - **Only the storage the VM owns is removed, by boxman — never by libvirt.**
   Its boot disk, snapshot overlays and memory files (the files under the VM's
-  own `<vm>.*` / `<vm>_snapshot_*` names in a cluster workdir, and its memory
-  images in a cluster's `memory_snapshot_dir`) and the extra
+  own `<vm>.*` / `<vm>_snapshot_*` names in a cluster workdir, and the memory
+  images its own snapshots recorded in a cluster workdir or
+  `memory_snapshot_dir`) and the extra
   disks boxman recorded creating for it. Never: a CD-ROM or ISO it has
   attached (in either its live or its persistent definition), an
   `attach_only` (adopted) disk, anything outside the cluster workdirs (a
   memory image a snapshot recorded outside them and every
-  `memory_snapshot_dir` is named in a warning instead), a
+  `memory_snapshot_dir` is named in a warning instead), anything in a
+  `memory_snapshot_dir` only named as one of its memory images (another
+  VM's full name can begin with this one's: kept, and named), a
   symlink, or anything another VM uses directly, as a backing file or as
   the destination of a block job it runs (a block copy) — storage-pool
   volumes included. A protected file is recognised by its
