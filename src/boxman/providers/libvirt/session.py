@@ -2478,6 +2478,9 @@ class LibVirtSession(SessionConfigMixin):
         listed under its name is another one, renamed to it since. A VM
         clearing a leftover for ``--force`` reads its own snapshots too: the
         one of that name is gone by then, and no other records the file.
+        Each domain is read by the UUID the listing gave, not by its name: a
+        domain renamed meanwhile, and its old name taken by another, would
+        otherwise answer for the newcomer.
 
         Fails closed: ``None`` when the domain list cannot be read, or the
         snapshots of a domain cannot — unless it went away meanwhile
@@ -2495,7 +2498,7 @@ class LibVirtSession(SessionConfigMixin):
         snapshots = SnapshotManager(self.provider_config)
         recorded = FilesInUse()
         for domain, uuid in domains:
-            images = snapshots.memory_images(domain)
+            images = snapshots.memory_images(uuid)
             if images is None:
                 try:
                     self._raise_if_gone(virsh, domain, uuid)

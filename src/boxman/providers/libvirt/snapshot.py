@@ -450,9 +450,10 @@ class SnapshotManager:
 
     def memory_images(self, vm_name: str) -> dict[str, str] | None:
         """
-        ``{snapshot name: memory file}`` for every snapshot of *vm_name*
-        that saved the guest's memory, the file as libvirt recorded it —
-        the ``.raw``, also once compression left only its ``.raw.zst``.
+        ``{snapshot name: memory file}`` for every snapshot of *vm_name* —
+        a domain's name or UUID, as virsh takes either — that saved the
+        guest's memory, the file as libvirt recorded it: the ``.raw``, also
+        once compression left only its ``.raw.zst``.
 
         Returns ``None`` when they cannot all be read — the list, or any
         one snapshot's XML — which is not "none recorded"; or when the list

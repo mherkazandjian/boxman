@@ -2664,11 +2664,21 @@ class TestSnapshotMemoryInUse:
     identity, which no teardown or ``--force`` retake may remove. Fails
     closed: ``None`` once any of them cannot be told."""
 
-    def _run(self, images, relists=(), listing_ok=True):
+    def _run(self, images, relists=(), listing_ok=True, by_name=None):
         """Domains vm-a, vm-b and vm-x; *images* maps a domain to what
-        ``SnapshotManager.memory_images`` answers for it."""
+        ``SnapshotManager.memory_images`` answers when asked by that
+        domain's UUID. Asked by a name, it answers from *by_name* — a domain
+        defined under that name since — and fails the test otherwise."""
         relists = iter(relists)
         listed = []
+        by_uuid = {domain_uuid(name): answer for name, answer in images.items()}
+
+        def memory_images(_self, domain):
+            if domain in by_uuid:
+                return by_uuid[domain]
+            if by_name is not None and domain in by_name:
+                return by_name[domain]
+            raise AssertionError(f"memory_images asked for {domain!r}")
 
         def virsh_execute(*args, **kwargs):
             if args[:2] == ("list", "--all"):
@@ -2684,7 +2694,7 @@ class TestSnapshotMemoryInUse:
         with patch("boxman.providers.libvirt.session.VirshCommand") as virsh, \
              patch("boxman.providers.libvirt.session.SnapshotManager."
                    "memory_images", autospec=True,
-                   side_effect=lambda _self, domain: images[domain]):
+                   side_effect=memory_images):
             virsh.return_value.execute.side_effect = virsh_execute
             return _session({}).snapshot_memory_in_use()
 
@@ -2715,6 +2725,19 @@ class TestSnapshotMemoryInUse:
         in_use = self._run({"vm-a": {}, "vm-b": {}, "vm-x": {"s1": str(raw)}})
 
         assert in_use[str(raw)] == "vm-x"
+
+    def test_a_domain_is_read_by_its_uuid_whatever_holds_its_name_since(
+            self, tmp_path):
+        """vm-a renamed after the listing, and an empty domain defined under
+        vm-a since: read by its name, the newcomer answered, and the image
+        vm-a's snapshot records went unprotected."""
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+
+        in_use = self._run({"vm-a": {"s1": str(raw)}, "vm-b": {}, "vm-x": {}},
+                           by_name={"vm-a": {}})
+
+        assert in_use[str(raw)] == "vm-a"
 
     def test_a_domain_whose_snapshots_cannot_be_read_fails_it(self):
         assert self._run({"vm-a": {}, "vm-b": None, "vm-x": {}},
