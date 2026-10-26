@@ -190,7 +190,7 @@ class SnapshotManager:
             paths_in_use: With *force*, what every domain uses
                 (``LibVirtSession.disk_paths_in_use``), asked before a
                 leftover is removed; without it none is.
-            memory_in_use: With *force*, the memory images other domains'
+            memory_in_use: With *force*, the memory images domains'
                 snapshots record (``LibVirtSession.snapshot_memory_in_use``),
                 asked likewise.
 
@@ -317,7 +317,7 @@ class SnapshotManager:
 
         Files that are part of the VM's *current* active disk chain are never
         removed. Nor is a leftover any domain uses, the VM itself included,
-        or one another domain's snapshot records as its memory image: each
+        or one a snapshot records as its memory image: each
         is matched by resolved path and by identity against *paths_in_use*
         (``LibVirtSession.disk_paths_in_use``) and *memory_in_use*
         (``LibVirtSession.snapshot_memory_in_use``), asked once there is
@@ -385,7 +385,7 @@ class SnapshotManager:
                          memory_in_use) -> str | None:
         """
         Why one of *leftovers* may not be removed, if one may not: a domain
-        uses it, or another domain's snapshot records it as its memory
+        uses it, or a domain's snapshot records it as its memory
         image, by resolved path or by identity (``(st_dev, st_ino)``, links
         followed); it cannot be inspected; or either cannot be told — the
         scan is ``None``, or answers ``None``.

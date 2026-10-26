@@ -3536,10 +3536,8 @@ class TestForceClearProtectsFilesInUse:
 
         assert create.call_args.kwargs["paths_in_use"] == (
             session.disk_paths_in_use)
-        with patch.object(session, "snapshot_memory_in_use",
-                          return_value="recorded") as recorded:
-            assert create.call_args.kwargs["memory_in_use"]() == "recorded"
-        recorded.assert_called_once_with("vm01")
+        assert create.call_args.kwargs["memory_in_use"] == (
+            session.snapshot_memory_in_use)
 
 
 class TestTakeWritesOverNoFile:

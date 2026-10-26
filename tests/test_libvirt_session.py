@@ -2659,14 +2659,14 @@ class TestFilesAPoolHasNotListedYet:
 
 
 class TestSnapshotMemoryInUse:
-    """The memory images every other domain's snapshots record — the
+    """The memory images every defined domain's snapshots record — the
     ``.raw`` and the ``.raw.zst`` compression leaves of it — by path and by
     identity, which no teardown or ``--force`` retake may remove. Fails
     closed: ``None`` once any of them cannot be told."""
 
     def _run(self, images, relists=(), listing_ok=True):
-        """Domains vm-a, vm-b and the VM torn down, vm-x; *images* maps a
-        domain to what ``SnapshotManager.memory_images`` answers for it."""
+        """Domains vm-a, vm-b and vm-x; *images* maps a domain to what
+        ``SnapshotManager.memory_images`` answers for it."""
         relists = iter(relists)
         listed = []
 
@@ -2686,7 +2686,7 @@ class TestSnapshotMemoryInUse:
                    "memory_images", autospec=True,
                    side_effect=lambda _self, domain: images[domain]):
             virsh.return_value.execute.side_effect = virsh_execute
-            return _session({}).snapshot_memory_in_use("vm-x")
+            return _session({}).snapshot_memory_in_use()
 
     def test_what_other_domains_snapshots_record_by_path_and_identity(
             self, tmp_path):
@@ -2698,13 +2698,23 @@ class TestSnapshotMemoryInUse:
         in_use = self._run({
             "vm-a": {"s1": str(raw)},
             "vm-b": {"s2": str(tmp_path / "b_snapshot_s2.raw")},
-            "vm-x": {"s9": "/never/asked.raw"}})
+            "vm-x": {}})
 
         assert in_use[str(raw)] == "vm-a"
         assert in_use[str(zst)] == "vm-b"
-        assert "/never/asked.raw" not in in_use
         ids = {(os.stat(p).st_dev, os.stat(p).st_ino) for p in (raw, zst)}
         assert set(in_use.identities) == ids
+
+    def test_a_domain_under_the_torn_down_vms_name_is_read_too(self, tmp_path):
+        """The VM a teardown removes is undefined by the time this is asked:
+        a domain listed under its name now is another one — renamed to it
+        since — and its images are as protected as any."""
+        raw = tmp_path / "x_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+
+        in_use = self._run({"vm-a": {}, "vm-b": {}, "vm-x": {"s1": str(raw)}})
+
+        assert in_use[str(raw)] == "vm-x"
 
     def test_a_domain_whose_snapshots_cannot_be_read_fails_it(self):
         assert self._run({"vm-a": {}, "vm-b": None, "vm-x": {}},

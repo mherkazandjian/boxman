@@ -3263,7 +3263,7 @@ class TestMemoryImagesAnotherSnapshotRecords:
         assert shared.read_bytes() == b'replica RAM'
         assert (f'left {shared} in place because a snapshot of domain '
                 f'{self.REPLICA} records it as its memory image') in t.warnings
-        t.session.snapshot_memory_in_use.assert_called_once_with(VM)
+        t.session.snapshot_memory_in_use.assert_called_once_with()
 
     def test_one_recorded_there_under_another_name_is_kept(self, tmp_path):
         workdir, snaps = self._dirs(tmp_path)

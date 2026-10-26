@@ -2372,7 +2372,7 @@ class LibVirtSession(SessionConfigMixin):
             compress_level=compress_level,
             force=force,
             paths_in_use=self.disk_paths_in_use,
-            memory_in_use=lambda: self.snapshot_memory_in_use(vm_name))
+            memory_in_use=self.snapshot_memory_in_use)
 
     def snapshot_log_data(self, vm_name: str) -> dict:
         """
@@ -2462,16 +2462,22 @@ class LibVirtSession(SessionConfigMixin):
         """
         return SnapshotManager(self.provider_config).memory_images(vm_name)
 
-    def snapshot_memory_in_use(self, vm_name: str) -> FilesInUse | None:
+    def snapshot_memory_in_use(self) -> FilesInUse | None:
         """
-        The memory images the snapshots of every domain but *vm_name*
-        record — each ``.raw`` as libvirt recorded it, and the ``.raw.zst``
+        The memory images the snapshots of every defined domain record —
+        each ``.raw`` as libvirt recorded it, and the ``.raw.zst``
         compression leaves beside it — mapped, as :meth:`disk_paths_in_use`
         maps files, by path and by identity to the domain. A teardown or a
-        ``snapshot take --force`` that removes a memory image of *vm_name*
-        must not remove one of these: two domains' snapshots can record one
-        path, in a memory_snapshot_dir their clusters share, when one VM's
-        full name begins with the other's.
+        ``snapshot take --force`` that removes a memory image must not
+        remove one of these: two domains' snapshots can record one path, in
+        a memory_snapshot_dir their clusters share, when one VM's full name
+        begins with the other's.
+
+        No domain is left out, not even by the name of the VM being torn
+        down: that one is undefined by the time this is asked, so a domain
+        listed under its name is another one, renamed to it since. A VM
+        clearing a leftover for ``--force`` reads its own snapshots too: the
+        one of that name is gone by then, and no other records the file.
 
         Fails closed: ``None`` when the domain list cannot be read, or the
         snapshots of a domain cannot — unless it went away meanwhile
@@ -2489,8 +2495,6 @@ class LibVirtSession(SessionConfigMixin):
         snapshots = SnapshotManager(self.provider_config)
         recorded = FilesInUse()
         for domain, uuid in domains:
-            if domain == vm_name:
-                continue
             images = snapshots.memory_images(domain)
             if images is None:
                 try:
