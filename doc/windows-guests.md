@@ -187,7 +187,8 @@ opt-in.**
 
 The PoC enables both, so either can be dropped later without rebuilding.
 RDP is left off: Windows' default, and nothing here needs a desktop
-session. The console is reachable over VNC (`virsh vncdisplay`).
+session. The console is reachable over VNC (`virsh vncdisplay`); it shows
+the logon screen, since the setup script logs its auto-logon session off.
 
 **Offline labs.** The PoC guest had internet through its NAT network, and
 two things depended on it: the OpenSSH Feature on Demand (Windows Update),

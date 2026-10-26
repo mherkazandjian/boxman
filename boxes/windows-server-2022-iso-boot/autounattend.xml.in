@@ -103,7 +103,8 @@
         </AdministratorPassword>
       </UserAccounts>
       <!-- One automatic logon, so FirstLogonCommands run; LogonCount 1 turns
-           it off again afterwards. -->
+           it off again afterwards, and boxman-setup.ps1 logs that session
+           off when it is done. -->
       <AutoLogon>
         <Enabled>true</Enabled>
         <LogonCount>1</LogonCount>

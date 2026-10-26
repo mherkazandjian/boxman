@@ -27,7 +27,8 @@ one manual step (see [Known gaps](#known-gaps)).
    guest agent, enables WinRM (HTTP 5985, NTLM, Basic off) and installs
    OpenSSH Server from Windows Update. `C:\boxman-setup.log` ends with
    `boxman-setup: done`, or with `boxman-setup: FAILED: …` naming the
-   steps that did not complete.
+   steps that did not complete. The script then logs the auto-logon
+   session off.
 
 Measured on the test host: about 85 s from `virt-install` to Setup's first reboot,
 and about 2 min from the second start to WinRM and SSH answering.

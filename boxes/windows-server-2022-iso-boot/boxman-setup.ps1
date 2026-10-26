@@ -83,3 +83,7 @@ if ($failed) {
     Write-Output 'boxman-setup: done'
 }
 Stop-Transcript
+
+# End the one auto-logon session: otherwise the console (VNC, no password)
+# stays logged in as Administrator.
+shutdown.exe /l /f
