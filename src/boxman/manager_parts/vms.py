@@ -42,6 +42,7 @@ from boxman.providers.libvirt.disk_cleanup import (
     file_identities,
     load_teardown_inventory,
     memory_image_candidates,
+    memory_image_name,
     read_teardown_locator,
     remove_vm_storage,
     save_teardown_inventory,
@@ -807,7 +808,7 @@ class VMsMixin:
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")
-        self._name_memory_images_left_outside(full_vm_name, inventory)
+        self._name_memory_images_left(full_vm_name, inventory, outcome)
         # The saved inventory and its locator stay while the inventory still
         # protects a kept file, so a retry keeps it too; with nothing kept
         # they have done their job. The inventory goes first (a locator left
@@ -827,37 +828,92 @@ class VMsMixin:
         if removed:
             session.refresh_pools_holding(removed)
 
-    def _name_memory_images_left_outside(self, full_vm_name: str,
-                                         inventory: StorageInventory) -> None:
+    def _name_memory_images_left(self, full_vm_name: str,
+                                 inventory: StorageInventory,
+                                 outcome) -> None:
         """
-        Warn of each memory image *full_vm_name*'s snapshots recorded
-        outside every cluster workdir and memory_snapshot_dir that is still
-        there — the ``.raw`` libvirt recorded, or the ``.raw.zst`` that
-        compression left of it.
+        Warn of each memory image of *full_vm_name*'s left after its
+        teardown that the teardown did not already name as kept: the image
+        is the guest's RAM, and unnamed it would outlive the VM unnoticed.
+        The domain is gone, so its snapshots can no longer be restored.
 
-        A teardown removes nothing there, and the image is the guest's RAM:
-        unnamed, it would outlive the VM unnoticed. One is left there when a
-        cluster's memory_snapshot_dir is changed or unset after the snapshot
-        was taken. The domain is gone, so it can no longer be restored.
+        Two kinds, told apart by what the teardown did, not by where the
+        file is:
 
-        One inside them is not named here: the teardown removed it, or
-        already said why it kept it.
+        * one its snapshots recorded — the ``.raw`` libvirt recorded, or the
+          ``.raw.zst`` compression left of it — that is still there: outside
+          every cluster workdir and memory_snapshot_dir (left there when a
+          cluster's memory_snapshot_dir was changed or unset after the
+          snapshot was taken), or not named as boxman names it. One that
+          cannot be looked up is named as maybe there.
+        * one in a memory_snapshot_dir named as its memory image that none
+          of its snapshots recorded, which a teardown never removes by its
+          name (:func:`remove_vm_storage`).
+
+        Files are matched by resolved path or identity, so an image kept or
+        recorded under another name of its file is one file, named once.
         """
-        removable = {os.path.realpath(os.path.expanduser(d))
-                     for d in (*self._cluster_workdirs(),
-                               *self._cluster_memory_snapshot_dirs())}
+        def identity(path: str) -> tuple[int, int] | None:
+            try:
+                st = os.stat(path)
+            except OSError:
+                return None
+            return (st.st_dev, st.st_ino)
+
+        def matcher(paths):
+            resolved = {os.path.realpath(path) for path in paths}
+            ids = {identity(path) for path in paths} - {None}
+            return lambda path: (os.path.realpath(path) in resolved
+                                 or identity(path) in ids)
+
+        is_kept = matcher([path for path, _reason in outcome.kept])
+        recorded_paths = []
         for snapshot, recorded in sorted(inventory.memory_images.items()):
+            boxman_named = (os.path.basename(recorded)
+                            == memory_image_name(full_vm_name, snapshot))
             for path in (recorded, f"{recorded}.zst"):
-                if (not os.path.lexists(path)
-                        or os.path.realpath(os.path.dirname(path))
-                        in removable):
+                recorded_paths.append(path)
+                what = (f"the memory image of its snapshot '{snapshot}', "
+                        f"which can no longer be restored")
+                try:
+                    if not entry_exists(path):
+                        continue
+                except OSError as exc:
+                    self.logger.warning(
+                        f"{full_vm_name}: could not tell whether {path} is "
+                        f"still there ({exc}) — {what}; if it is, remove it "
+                        f"by hand")
+                    continue
+                if is_kept(path):
+                    continue
+                why = ("it is outside every cluster workdir and "
+                       "memory_snapshot_dir, where a teardown removes "
+                       "nothing" if boxman_named else
+                       "it is not named as boxman names the memory image of "
+                       "that snapshot, so no teardown removes it")
+                self.logger.warning(
+                    f"{full_vm_name}: left {path} in place because {why} — "
+                    f"{what}; remove it by hand")
+
+        is_recorded = matcher(recorded_paths)
+        for memory_dir in self._cluster_memory_snapshot_dirs():
+            try:
+                found = memory_image_candidates(memory_dir, full_vm_name)
+            except OSError as exc:
+                self.logger.warning(
+                    f"{full_vm_name}: could not list {memory_dir} ({exc}), a "
+                    f"memory_snapshot_dir: a memory image of it there that "
+                    f"none of its snapshots recorded is not named")
+                continue
+            for path in found:
+                if is_kept(path) or is_recorded(path):
                     continue
                 self.logger.warning(
-                    f"{full_vm_name}: left {path} in place because it is "
-                    f"outside every cluster workdir and memory_snapshot_dir, "
-                    f"where a teardown removes nothing — the memory image of "
-                    f"its snapshot '{snapshot}', which can no longer be "
-                    f"restored; remove it by hand")
+                    f"{full_vm_name}: left {path} in place because none of "
+                    f"its snapshots recorded it, though it is named as one "
+                    f"of its memory images — another VM's full name can "
+                    f"begin with this one's; remove it by hand if it is "
+                    f"this VM's")
 
     def _capture_vm_storage(self,
                             session,
@@ -928,16 +984,17 @@ class VMsMixin:
                 records_state = (RECORDS_NONE if records is None
                                  else RECORDS_PRESENT)
 
-        # the memory file each snapshot recorded, to name one left where a
-        # teardown removes nothing; nothing removed rests on them
+        # the memory file each snapshot recorded: the only ones a teardown
+        # removes from a memory_snapshot_dir (remove_vm_storage), and named
+        # when left where it removes nothing
         memory_images: dict[str, str] = {}
         if exists:
             recorded = session.snapshot_memory_images(full_vm_name)
             if recorded is None:
                 self.logger.warning(
-                    f"{full_vm_name}: could not read its snapshots; a memory "
-                    f"image one of them recorded outside every cluster "
-                    f"workdir and memory_snapshot_dir will not be named")
+                    f"{full_vm_name}: could not read its snapshots, so none "
+                    f"of its memory images in a memory_snapshot_dir will be "
+                    f"removed, and one recorded elsewhere will not be named")
             else:
                 memory_images = recorded
 
@@ -973,27 +1030,13 @@ class VMsMixin:
                     + ("leaving it defined and its storage in place"
                        if exists else "leaving its storage in place")
                     + " — make that directory readable, then retry") from exc
-        # its memory images in the clusters' memory_snapshot_dir: every
-        # cluster's, since names anchored at the full vm name match no other
-        # vm's, and a vm gone from the config no longer says which cluster it
-        # was in. A memory_snapshot_dir that cannot be listed may hold them,
-        # and stops the teardown here, before the undefine.
-        for memory_dir in self._cluster_memory_snapshot_dirs():
-            try:
-                found.update(memory_image_candidates(memory_dir,
-                                                     full_vm_name))
-            except OSError as exc:
-                raise ProvisionError(
-                    f"{full_vm_name}: could not list {memory_dir} ({exc}), "
-                    f"a memory_snapshot_dir that may hold its memory images; "
-                    + ("leaving it defined and its storage in place"
-                       if exists else "leaving its storage in place")
-                    + " — make that directory readable, then retry") from exc
         boot_family = sorted(found)
         files = [*disk_sources, *boot_family, *(legacy_disks or ()),
                  *(record.source for record in records or ()),
                  *(layer for chain in (chains or {}).values()
-                   for layer in chain)]
+                   for layer in chain),
+                 *(path for recorded in memory_images.values()
+                   for path in (recorded, f"{recorded}.zst"))]
         inventory = StorageInventory(
             vm_name=full_vm_name,
             disk_sources=disk_sources,

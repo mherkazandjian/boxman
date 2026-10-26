@@ -180,12 +180,18 @@ def is_memory_image(vm_name: str, path: str) -> bool:
             and name.endswith((".raw", ".raw.zst")))
 
 
+def memory_image_name(vm_name: str, snapshot_name: str) -> str:
+    """The name ``snapshot take`` gives the memory image of *vm_name*'s
+    snapshot *snapshot_name*; compression leaves it with ``.zst`` added."""
+    return f"{vm_name}_snapshot_{snapshot_name}.raw"
+
+
 def memory_image_candidates(directory: str, vm_name: str) -> list[str]:
     """
     The entries of *directory* named as *vm_name*'s memory images
-    (:func:`is_memory_image`) — what a teardown decides with in a cluster's
-    ``memory_snapshot_dir``, where nothing else of the VM's is ever a
-    candidate.
+    (:func:`is_memory_image`). A teardown only names them: in a cluster's
+    ``memory_snapshot_dir`` it removes no file by its name, since another
+    VM's full name can begin with this one's (:func:`remove_vm_storage`).
 
     Read as :func:`boot_family_candidates` reads a workdir: only a directory
     that does not exist holds none, a symlink or an entry that cannot be
@@ -213,6 +219,28 @@ def file_identities(paths: Iterable[str]) -> dict[str, tuple[int, int]]:
             continue
         identities[path] = (st.st_dev, st.st_ino)
     return identities
+
+
+def _directory_identities(directories: Iterable[str],
+                          ) -> tuple[set[tuple[int, int]], dict[str, OSError]]:
+    """
+    ``(st_dev, st_ino)`` of each of *directories* that exists, links followed
+    by the filesystem — never a path folded by its spelling, which
+    ``os.path.realpath`` does past a link it cannot read — and, apart, each
+    one that could not be looked up for a reason other than not existing.
+    """
+    identities: set[tuple[int, int]] = set()
+    unreadable: dict[str, OSError] = {}
+    for directory in directories:
+        try:
+            st = os.stat(os.path.expanduser(directory))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            unreadable[directory] = exc
+            continue
+        identities.add((st.st_dev, st.st_ino))
+    return identities, unreadable
 
 
 def _leftover_refusal(vm_name: str,
@@ -812,11 +840,20 @@ def remove_vm_storage(
 
     1. **The boot-disk family** — files under the VM's exclusive names in
        its disk directories (:func:`boot_family_candidates`): its boot disk,
-       its overlays and its memory-snapshot files; and its memory images in
-       the clusters' ``memory_snapshot_dir`` (*memory_dirs*,
-       :func:`memory_image_candidates`). Extra-disk files
+       its overlays and its memory-snapshot files. Extra-disk files
        (attached, recorded, config-declared, or a layer under one) are
        never decided by name.
+    1b. **The memory images its snapshots recorded**
+       (``StorageInventory.memory_images``), each named exactly as
+       :func:`memory_image_name` names that snapshot's (or with the
+       ``.zst`` compression adds), in a cluster workdir or one of the
+       clusters' ``memory_snapshot_dir`` (*memory_dirs*). Nothing in a
+       memory_snapshot_dir is decided by name: every cluster's is one, and
+       another VM's full name can begin with this one's. Its directory is
+       told by identity, links followed by the filesystem; when it, or a
+       directory it might be, cannot be looked up, the image is kept. One
+       recorded anywhere else is not boxman's to remove (the caller names
+       it).
     2. **Extra disks recorded with role ``data``** at exactly their
        attached source, by the rules of :func:`_leftover_refusal`; and a
        recorded disk an external snapshot moved behind overlays, together
@@ -829,9 +866,8 @@ def remove_vm_storage(
        its record, if it had one, is gone.
 
     Every admitted file must be a regular file, not a symlink, inside one
-    of the cluster *workdirs* once symlinks are resolved — a memory image of
-    the boot-disk family (:func:`is_memory_image`) inside one of
-    *memory_dirs* too, and nothing else there — and not a CD-ROM (or other
+    of the cluster *workdirs* once symlinks are resolved (a recorded memory
+    image, see 1b, one of *memory_dirs* too), and not a CD-ROM (or other
     media) source of either definition.
 
     Every protection that compares files matches them by resolved path and
@@ -855,8 +891,8 @@ def remove_vm_storage(
     vm = inventory.vm_name
     outcome = StorageOutcome()
     real = os.path.realpath
+    workdirs = list(workdirs)
     real_workdirs = {real(os.path.expanduser(w)) for w in workdirs}
-    real_memory_dirs = {real(os.path.expanduser(d)) for d in memory_dirs}
     chains = inventory.chains
     legacy = list(inventory.legacy_disks or ())
     records = inventory.records or []
@@ -889,22 +925,16 @@ def remove_vm_storage(
                 out.append(path)
         return out
 
-    def static_refusal(path: str, memory_dirs_too: bool = False) -> str | None:
+    def static_refusal(path: str) -> str | None:
         reason = media_refusal(path)
         if reason:
             return reason
         reason = _regular_file_refusal(path)
         if reason:
             return reason
-        directory = real(os.path.dirname(path))
-        if directory in real_workdirs:
-            return None
-        # a cluster's memory_snapshot_dir holds the vm's memory images, nothing
-        # else of it: an extra disk never qualifies by its name
-        if (memory_dirs_too and directory in real_memory_dirs
-                and is_memory_image(vm, path)):
-            return None
-        return _OUTSIDE
+        if real(os.path.dirname(path)) not in real_workdirs:
+            return _OUTSIDE
+        return None
 
     attached_extras = unique(
         path for path in inventory.disk_sources
@@ -922,13 +952,44 @@ def remove_vm_storage(
     for path in inventory.boot_family:
         if path in extra_related and media_refusal(path) is None:
             continue
-        reason = static_refusal(path, memory_dirs_too=True)
+        reason = static_refusal(path)
         if reason is None and inventory.records_state == RECORDS_UNKNOWN:
             reason = _boxman_artifact_refusal(vm, path)
         if reason:
             admission.refuse(path, reason)
         else:
             admission.admit(path)
+
+    # -- 1b. the memory images its snapshots recorded --------------------
+    managed, unreadable_dirs = _directory_identities([*workdirs,
+                                                      *memory_dirs])
+    for snapshot, recorded in sorted(inventory.memory_images.items()):
+        if os.path.basename(recorded) != memory_image_name(vm, snapshot):
+            continue      # not boxman's (named by the caller)
+        for path in (recorded, f"{recorded}.zst"):
+            if not _may_exist(path) or path in extra_related:
+                continue
+            try:
+                st = os.stat(os.path.dirname(path))
+            except OSError as exc:
+                admission.refuse(path, (
+                    f"its directory could not be looked up ({exc}), so "
+                    f"whether it is in a cluster workdir or "
+                    f"memory_snapshot_dir cannot be told"))
+                continue
+            if (st.st_dev, st.st_ino) not in managed:
+                if unreadable_dirs:
+                    directory, exc = min(unreadable_dirs.items())
+                    admission.refuse(path, (
+                        f"whether it is in a cluster workdir or "
+                        f"memory_snapshot_dir cannot be told: {directory} "
+                        f"could not be looked up ({exc})"))
+                continue  # outside all of them (named by the caller)
+            reason = media_refusal(path) or _regular_file_refusal(path)
+            if reason:
+                admission.refuse(path, reason)
+            else:
+                admission.admit(path)
 
     # -- 2./3. extra disks -------------------------------------------------
     state = inventory.records_state
