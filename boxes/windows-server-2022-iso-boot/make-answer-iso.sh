@@ -38,7 +38,7 @@ fi
 mkdir -p "$(dirname "$out")"
 umask 077
 stage=$(mktemp -d)
-trap 'rm -rf "$stage"' EXIT
+trap 'rm -rf "$stage" "$out.tmp"' EXIT
 
 # The password is escaped in Python: bash 5.2 expands an unquoted & in a
 # ${s//pat/rep} replacement to the matched text, which garbled the entities.
