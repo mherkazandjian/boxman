@@ -1389,6 +1389,41 @@ class TestInUseByIdentity:
         assert str(layout.b) not in in_use
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_a_name_stat_reads_but_realpath_cannot_resolve_is_kept_as_given(
+            self, tmp_path, monkeypatch):
+        """``stat`` reaches A through the current directory's handle while
+        realpath, needing every component of the absolute path, cannot look
+        inside the unsearchable directory above it and would fold the ``..``
+        into B's name. The name is recorded as given, the identity is A's,
+        and B is not marked in use."""
+        private, outside = tmp_path / "private", tmp_path / "outside"
+        cwd = private / "cwd"
+        cwd.mkdir(parents=True)
+        (outside / "deep").mkdir(parents=True)
+        a = outside / "vm-a.qcow2"
+        a.write_bytes(b"A")
+        b = cwd / "vm-a.qcow2"
+        b.write_bytes(b"B")
+        os.symlink(outside / "deep", cwd / "hop")
+        name = "hop/../vm-a.qcow2"
+        a_id = (os.stat(a).st_dev, os.stat(a).st_ino)
+        b_id = (os.stat(b).st_dev, os.stat(b).st_ino)
+        monkeypatch.chdir(cwd)
+        private.chmod(0)
+        try:
+            assert (os.stat(name).st_dev, os.stat(name).st_ino) == a_id
+            assert os.path.realpath(name) == str(b)
+            in_use = self._scan(tmp_path, name, f'{{"filename": "{name}"}}')
+        finally:
+            private.chmod(0o700)
+
+        assert in_use is not None
+        assert in_use.identities[a_id] == "vm-b"
+        assert b_id not in in_use.identities
+        assert str(b) not in in_use
+        assert in_use[name] == "vm-b"
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
     @pytest.mark.parametrize("provider", [
         {},
         {"use_sudo": True, "sudo_skip_commands": ["stat"]},
@@ -1472,9 +1507,10 @@ class TestInUseWithABlockJob:
             "</mirror>")
 
     def _run(self, live="", active="vm-b\n", active_ok=True, dump_ok=True,
-             chains=None):
+             chains=None, provider=None, sudo=None):
         """vm-a is shut off; vm-b is active unless *active* says otherwise,
-        and *live* is its live definition."""
+        and *live* is its live definition; *provider* the session's provider
+        config, and *sudo* what a read through sudo answers."""
         calls = []
         chains = dict(TestDiskPathsInUse.CHAIN,
                       **{"/ws/b.qcow2": '{"filename": "/ws/b.qcow2"}'},
@@ -1495,6 +1531,8 @@ class TestInUseWithABlockJob:
             return _result(stdout=self.BLK)
 
         def shell(command, **kwargs):
+            if command.startswith(_SUDO_STAT):
+                return _answer_sudo_stat(command, sudo, calls)
             if _ABSENT in command:
                 return _result(stdout="")
             source = command.rsplit(" ", 1)[1].strip("'")
@@ -1506,14 +1544,40 @@ class TestInUseWithABlockJob:
              patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
             virsh.return_value.execute.side_effect = virsh_execute
             cmd.return_value.execute_shell.side_effect = shell
-            _sudo_policy(cmd, {})
-            return _session({}).disk_paths_in_use(), calls
+            _sudo_policy(cmd, provider)
+            return _session(provider or {}).disk_paths_in_use(), calls
 
     @staticmethod
     def _live(mirror):
         return ("<domain><devices><disk type='file' device='disk'>"
                 "<source file='/ws/b.qcow2' index='1'/><backingStore/>"
                 f"{mirror}<target dev='vda'/></disk></devices></domain>")
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_a_destination_alias_realpath_misreads_still_protects_its_file(
+            self, tmp_path):
+        """A block copy's destination named through a symlink the user
+        cannot follow: its identity is read from that name too."""
+        layout = _lossy_alias(tmp_path)
+        mirror = f"<mirror type='file' file='{layout.source}' job='copy'/>"
+        a_id = (os.stat(layout.a).st_dev, os.stat(layout.a).st_ino)
+        b_id = (os.stat(layout.b).st_dev, os.stat(layout.b).st_ino)
+        layout.lock()
+        try:
+            in_use, _ = self._run(
+                live=self._live(mirror), provider={"use_sudo": True},
+                sudo=_stat_as_root(layout),
+                chains={str(layout.source):
+                        f'{{"filename": "{layout.source}"}}'})
+            outcome = _remove_vm_a(layout, in_use)
+        finally:
+            layout.unlock()
+
+        assert layout.a.exists(), "the disk vm-b's block job holds was removed"
+        assert [path for path, _ in outcome.kept] == [str(layout.a)]
+        assert in_use.identities[a_id] == "vm-b"
+        assert b_id not in in_use.identities
+        assert str(layout.b) not in in_use
 
     def test_a_block_copy_destination_is_in_use(self):
         in_use, _ = self._run(live=self._live(self.COPY), chains={

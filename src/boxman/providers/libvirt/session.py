@@ -1066,7 +1066,9 @@ class LibVirtSession(SessionConfigMixin):
 
         Covers each domain's disk and CD-ROM sources in both its live and
         its persistent definition, and every layer of their backing chains,
-        as resolved paths, so a caller can tell whether a file it is about
+        by path — resolved where that can be done strictly, else as named —
+        and by identity, which is what decides: a caller tells whether a
+        file it is about
         to delete is still some domain's disk or the base of one. Plain
         ``domblklist`` of a running domain reports only the live
         definition, while the persistent one — what the domain uses on its
@@ -1309,8 +1311,12 @@ class LibVirtSession(SessionConfigMixin):
         file.
 
         Read as the boxman process first. Then the name is the resolved
-        path, exact: every lookup on the way was one the process could
-        make. Refused that (``EACCES``: a directory on the way it may not
+        path when ``os.path.realpath(strict=True)`` can make every lookup on
+        the way, else the name as given: a successful ``stat`` does not make
+        resolution exact (a relative name read through the current
+        directory, a ``/proc/<pid>/fd`` link), and the identity, read from
+        the name itself, is what protects the file. Refused that
+        (``EACCES``: a directory on the way it may not
         search — another user's home, where a domain of theirs keeps its
         disks), the identity is read with ``sudo -n stat -L`` from the name
         as given, and that name, unresolved, is the one recorded. Never from
@@ -1342,7 +1348,11 @@ class LibVirtSession(SessionConfigMixin):
             return None
         except PermissionError as refused:
             return path, self._identity_through_sudo(path, refused)
-        return os.path.realpath(path), (st.st_dev, st.st_ino)
+        try:
+            name = os.path.realpath(path, strict=True)
+        except OSError:
+            name = path         # best effort only: the identity decides
+        return name, (st.st_dev, st.st_ino)
 
     def _identity_through_sudo(self, path: str,
                                refused: PermissionError) -> tuple[int, int]:
@@ -1384,7 +1394,7 @@ class LibVirtSession(SessionConfigMixin):
         A ``network`` one names nothing on this host.
 
         Returns:
-            Their resolved paths, or ``None``, with a warning saying why,
+            Their names as given, or ``None``, with a warning saying why,
             when they cannot be told: the live definition cannot be read, a
             mirror names no file, or a destination's chain cannot be read.
 
