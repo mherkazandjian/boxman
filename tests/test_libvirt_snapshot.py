@@ -367,6 +367,56 @@ class TestListSnapshots:
             assert sm.list_snapshots("vm01") == []
 
 
+class TestMemoryImages:
+    """The memory file libvirt recorded for each snapshot that saved the
+    guest's memory — or ``None`` when they cannot all be read, which is
+    not "none recorded"."""
+
+    @staticmethod
+    def _xml(name: str, memory: str) -> str:
+        return (f"<domainsnapshot><name>{name}</name>{memory}"
+                f"<disks><disk name='vda' snapshot='external'>"
+                f"<source file='/w/vm01.{name}'/></disk></disks>"
+                f"</domainsnapshot>")
+
+    def test_each_snapshot_that_saved_memory_names_its_file(
+            self, sm: SnapshotManager):
+        xml = {
+            "s1": self._xml("s1", "<memory snapshot='external' "
+                                  "file='/snaps/vm01_snapshot_s1.raw'/>"),
+            "disk-only": self._xml("disk-only", "<memory snapshot='no'/>"),
+            "s2": self._xml("s2", "<memory snapshot='external' "
+                                  "file='/old/vm01_snapshot_s2.raw'/>"),
+        }
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots(list(xml), xml.get)):
+            assert sm.memory_images("vm01") == {
+                "s1": "/snaps/vm01_snapshot_s1.raw",
+                "s2": "/old/vm01_snapshot_s2.raw",
+            }
+
+    def test_no_snapshots_record_none(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots([], lambda _n: None)):
+            assert sm.memory_images("vm01") == {}
+
+    def test_a_list_that_fails_is_unknown(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute", side_effect=_virsh_snapshots(
+                ["s1"], lambda _n: None, list_ok=False)):
+            assert sm.memory_images("vm01") is None
+
+    @pytest.mark.parametrize("bad", [None, "<domainsnapshot><name>s2"],
+                             ids=["unreadable", "not xml"])
+    def test_one_snapshot_that_cannot_be_read_makes_it_unknown(
+            self, sm: SnapshotManager, bad):
+        xml = {"s1": self._xml("s1", "<memory snapshot='external' "
+                                     "file='/s/vm01_snapshot_s1.raw'/>"),
+               "s2": bad}
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots(list(xml), xml.get)):
+            assert sm.memory_images("vm01") is None
+
+
 class TestGetSnapshotOverlayFiles:
 
     def test_collects_external_overlays_per_snapshot(self, sm: SnapshotManager):

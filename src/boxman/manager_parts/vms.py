@@ -807,6 +807,7 @@ class VMsMixin:
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")
+        self._name_memory_images_left_outside(full_vm_name, inventory)
         # The saved inventory and its locator stay while the inventory still
         # protects a kept file, so a retry keeps it too; with nothing kept
         # they have done their job. The inventory goes first (a locator left
@@ -825,6 +826,38 @@ class VMsMixin:
                     os.remove(inventory.locator_at)
         if removed:
             session.refresh_pools_holding(removed)
+
+    def _name_memory_images_left_outside(self, full_vm_name: str,
+                                         inventory: StorageInventory) -> None:
+        """
+        Warn of each memory image *full_vm_name*'s snapshots recorded
+        outside every cluster workdir and memory_snapshot_dir that is still
+        there — the ``.raw`` libvirt recorded, or the ``.raw.zst`` that
+        compression left of it.
+
+        A teardown removes nothing there, and the image is the guest's RAM:
+        unnamed, it would outlive the VM unnoticed. One is left there when a
+        cluster's memory_snapshot_dir is changed or unset after the snapshot
+        was taken. The domain is gone, so it can no longer be restored.
+
+        One inside them is not named here: the teardown removed it, or
+        already said why it kept it.
+        """
+        removable = {os.path.realpath(os.path.expanduser(d))
+                     for d in (*self._cluster_workdirs(),
+                               *self._cluster_memory_snapshot_dirs())}
+        for snapshot, recorded in sorted(inventory.memory_images.items()):
+            for path in (recorded, f"{recorded}.zst"):
+                if (not os.path.lexists(path)
+                        or os.path.realpath(os.path.dirname(path))
+                        in removable):
+                    continue
+                self.logger.warning(
+                    f"{full_vm_name}: left {path} in place because it is "
+                    f"outside every cluster workdir and memory_snapshot_dir, "
+                    f"where a teardown removes nothing — the memory image of "
+                    f"its snapshot '{snapshot}', which can no longer be "
+                    f"restored; remove it by hand")
 
     def _capture_vm_storage(self,
                             session,
@@ -895,6 +928,19 @@ class VMsMixin:
                 records_state = (RECORDS_NONE if records is None
                                  else RECORDS_PRESENT)
 
+        # the memory file each snapshot recorded, to name one left where a
+        # teardown removes nothing; nothing removed rests on them
+        memory_images: dict[str, str] = {}
+        if exists:
+            recorded = session.snapshot_memory_images(full_vm_name)
+            if recorded is None:
+                self.logger.warning(
+                    f"{full_vm_name}: could not read its snapshots; a memory "
+                    f"image one of them recorded outside every cluster "
+                    f"workdir and memory_snapshot_dir will not be named")
+            else:
+                memory_images = recorded
+
         # every disk's chain, the boot disk's included, and every media
         # source's: a qcow2 CD-ROM can be built on a file the vm also
         # attaches as a disk. What may be removed is decided across all of
@@ -959,6 +1005,7 @@ class VMsMixin:
             legacy_disks=legacy_disks,
             identities=file_identities(files),
             targets=targets,
+            memory_images=memory_images,
         )
         if exists:
             # saved before the undefine, which drops what it was read from;

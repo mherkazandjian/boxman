@@ -2452,6 +2452,14 @@ class LibVirtSession(SessionConfigMixin):
             return None
         return state in ('running', 'paused')
 
+    def snapshot_memory_images(self, vm_name: str) -> dict[str, str] | None:
+        """
+        The memory file libvirt recorded for each of *vm_name*'s snapshots
+        that saved one, by snapshot name; ``None`` when they cannot all be
+        read (:meth:`SnapshotManager.memory_images`).
+        """
+        return SnapshotManager(self.provider_config).memory_images(vm_name)
+
     def snapshot_restore(self, vm_name, snapshot_name=None):
         """
         Restore a VM to a specific snapshot.
