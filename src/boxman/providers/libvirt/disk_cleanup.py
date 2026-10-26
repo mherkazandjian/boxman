@@ -294,6 +294,9 @@ class StorageInventory:
     identities: dict[str, tuple[int, int]] = field(default_factory=dict)
     #: the target (``vdb``, ...) each disk source is attached at
     targets: dict[str, str] = field(default_factory=dict)
+    #: the memory file each of its snapshots recorded, by snapshot name:
+    #: only to name one the teardown leaves where it removes nothing
+    memory_images: dict[str, str] = field(default_factory=dict)
     #: where it was saved before undefining (see
     #: :func:`save_teardown_inventory`); not saved itself
     saved_at: str | None = None
@@ -370,6 +373,7 @@ def save_teardown_inventory(inventory: StorageInventory,
         "identities": {path_: list(identity) for path_, identity
                        in inventory.identities.items()},
         "targets": inventory.targets,
+        "memory_images": inventory.memory_images,
     }
     _write_json_atomically(path, data)
     return path
@@ -457,6 +461,11 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
     legacy = _field(data, "legacy_disks", lambda v: v is None or _is_paths(v))
     identities = _field(data, "identities",
                         lambda v: _is_map(v, _is_identity))
+    # absent from an inventory saved before they were recorded
+    memory_images = (
+        _field(data, "memory_images",
+               lambda v: _is_map(v, lambda p: isinstance(p, str)))
+        if "memory_images" in data else {})
     return StorageInventory(
         vm_name=vm_name,
         disk_sources=list(_field(data, "disk_sources", _is_paths)),
@@ -471,6 +480,7 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
         identities={k: (v[0], v[1]) for k, v in identities.items()},
         targets=dict(_field(data, "targets",
                             lambda v: _is_map(v, lambda t: isinstance(t, str)))),
+        memory_images=dict(memory_images),
         saved_at=path,
     )
 

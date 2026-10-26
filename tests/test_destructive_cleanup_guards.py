@@ -242,7 +242,8 @@ class _TeardownGate:
         mgr = BoxmanManager.__new__(BoxmanManager)
         mgr.config = {"project": "demo"}
         mgr.logger = MagicMock()
-        self.inventory = SimpleNamespace(saved_at=None, locator_at=None)
+        self.inventory = SimpleNamespace(saved_at=None, locator_at=None,
+                                         memory_images={})
         mgr._capture_vm_storage = MagicMock(return_value=self.inventory)
         return mgr
 

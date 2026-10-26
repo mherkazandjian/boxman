@@ -355,6 +355,38 @@ class SnapshotManager:
         path = memory_elem.get("file")
         return path or None
 
+    def memory_images(self, vm_name: str) -> dict[str, str] | None:
+        """
+        ``{snapshot name: memory file}`` for every snapshot of *vm_name*
+        that saved the guest's memory, the file as libvirt recorded it —
+        the ``.raw``, also once compression left only its ``.raw.zst``.
+
+        Returns ``None`` when they cannot all be read — the list, or any
+        one snapshot's XML — which is not "none recorded".
+        """
+        list_result = self.virsh.execute(
+            "snapshot-list", vm_name, "--name", warn=True)
+        if not list_result.ok:
+            return None
+        images: dict[str, str] = {}
+        # exact names, newline-delimited: see _strict_overlay_inventory
+        for name in list_result.stdout.split('\n'):
+            if not name:
+                continue
+            xml_result = self.virsh.execute(
+                "snapshot-dumpxml", vm_name, name, warn=True)
+            if not xml_result.ok:
+                return None
+            try:
+                root = ET.fromstring(xml_result.stdout)
+            except ET.ParseError:
+                return None
+            memory_elem = root.find("memory")
+            path = memory_elem.get("file") if memory_elem is not None else None
+            if path:
+                images[name] = path
+        return images
+
     def compress_memory_file(self,
                              raw_path: str,
                              level: int = 3,

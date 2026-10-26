@@ -884,7 +884,9 @@ Details worth knowing:
   images in a cluster's `memory_snapshot_dir`) and the extra
   disks boxman recorded creating for it. Never: a CD-ROM or ISO it has
   attached (in either its live or its persistent definition), an
-  `attach_only` (adopted) disk, anything outside the cluster workdirs, a
+  `attach_only` (adopted) disk, anything outside the cluster workdirs (a
+  memory image a snapshot recorded outside them and every
+  `memory_snapshot_dir` is named in a warning instead), a
   symlink, or anything another VM uses directly, as a backing file or as
   the destination of a block job it runs (a block copy) — storage-pool
   volumes included. A protected file is recognised by its

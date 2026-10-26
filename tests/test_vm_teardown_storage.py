@@ -125,7 +125,8 @@ class _Teardown:
 
     def __init__(self, workdir, *, disks=(), media=(), rows=None,
                  records=None, records_error=None, in_use=None,
-                 chains=STANDALONE, memory_snapshot_dir=None):
+                 chains=STANDALONE, memory_snapshot_dir=None,
+                 memory_images=None):
         self.workdir = workdir
         cluster = {'workdir': str(workdir)}
         if memory_snapshot_dir is not None:
@@ -145,6 +146,8 @@ class _Teardown:
             session.backing_chains.return_value = chains
         session.disk_paths_in_use.return_value = (
             {} if in_use is None else in_use)
+        session.snapshot_memory_images.return_value = (
+            {} if memory_images is None else memory_images)
         self.mgr.session_for_cluster = MagicMock(return_value=session)
         self.mgr.provider = session
         self.mgr._vm_disk_records = MagicMock(
@@ -1028,6 +1031,7 @@ class TestSavedInventoryLifecycle:
         "disk sources a string", "a chain a string",
         "identities of booleans", "an identity of three",
         "targets of lists", "boot family of numbers",
+        "memory images a list", "memory images of numbers",
     ])
     def test_a_malformed_saved_inventory_keeps_everything(self, tmp_path,
                                                           layout):
@@ -2535,6 +2539,8 @@ def _malformed(tmp_path, layout):
         "an identity of three": {**data, "identities": {"/w/a": [1, 2, 3]}},
         "targets of lists": {**data, "targets": {"/w/a": ["vdb"]}},
         "boot family of numbers": {**data, "boot_family": [1]},
+        "memory images a list": {**data, "memory_images": ["/s/a.raw"]},
+        "memory images of numbers": {**data, "memory_images": {"s1": 1}},
     }[layout]
 
 
@@ -2841,3 +2847,145 @@ class TestMemoryImagesInASnapshotDir:
         t.deprovision()
 
         assert not (boot.exists() or raw.exists())
+
+
+class TestMemoryImagesLeftOutside:
+    """A memory image a snapshot recorded outside every cluster workdir and
+    memory_snapshot_dir — one taken before the cluster's memory_snapshot_dir
+    was changed or unset — is no file a teardown may remove, so it is kept;
+    and named, since it is the guest's RAM and its domain is gone."""
+
+    @staticmethod
+    def _dirs(tmp_path):
+        workdir, old = tmp_path / 'work', tmp_path / 'old-snaps'
+        workdir.mkdir()
+        old.mkdir()
+        return workdir, old
+
+    def test_one_outside_is_kept_and_named(self, tmp_path):
+        workdir, old = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(old / f'{VM}_snapshot_s1.raw')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_images={'s1': str(raw)})
+
+        t.deprovision()
+
+        assert not boot.exists()
+        assert raw.exists()
+        assert f"left {raw} in place" in t.warnings
+        assert "snapshot 's1'" in t.warnings
+
+    def test_its_compressed_file_is_named_when_only_that_is_left(
+            self, tmp_path):
+        """libvirt keeps recording the .raw once compression left only the
+        .raw.zst beside it."""
+        workdir, old = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = old / f'{VM}_snapshot_s1.raw'
+        zst = _file(old / f'{VM}_snapshot_s1.raw.zst')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_images={'s1': str(raw)})
+
+        t.deprovision()
+
+        assert zst.exists()
+        assert f"left {zst} in place" in t.warnings
+        assert f"left {raw} in place" not in t.warnings
+
+    def test_one_in_the_memory_snapshot_dir_goes_unnamed(self, tmp_path):
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_snapshot_dir=snaps,
+                      memory_images={'s1': str(raw)})
+
+        t.deprovision()
+
+        assert not raw.exists()
+        assert t.warnings == ''
+
+    def test_one_kept_in_its_directory_is_not_called_outside(self, tmp_path):
+        """Recorded under another spelling of the path, it is still in the
+        memory_snapshot_dir: the teardown said why it kept it, and nothing
+        may call it outside."""
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_snapshot_dir=snaps, in_use={str(raw): OTHER},
+                      memory_images={
+                          's1': f'{snaps}/../{snaps.name}/{raw.name}'})
+
+        t.deprovision()
+
+        assert raw.exists()
+        assert f'left {raw} in place because domain {OTHER} uses it' in (
+            t.warnings)
+        assert 'outside every cluster workdir and memory_snapshot_dir' not in (
+            t.warnings)
+
+    def test_one_already_gone_goes_unnamed(self, tmp_path):
+        workdir, old = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_images={'s1': str(old / f'{VM}_snapshot_s1.raw')})
+
+        t.deprovision()
+
+        assert t.warnings == ''
+
+    def test_a_retry_names_it_from_the_saved_inventory(self, tmp_path):
+        """The undefine drops the snapshot metadata it was read from."""
+        workdir, old = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(old / f'{VM}_snapshot_s1.raw')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      in_use={str(boot): OTHER},
+                      memory_images={'s1': str(raw)})
+        t.deprovision()
+        assert boot.exists() and _saved(workdir).exists()
+
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.session.snapshot_memory_images.return_value = {}
+        t.mgr.logger.reset_mock()
+
+        t.deprovision()
+
+        assert not boot.exists()
+        assert f"left {raw} in place" in t.warnings
+
+    def test_an_inventory_saved_before_they_were_recorded_is_read(
+            self, tmp_path):
+        workdir, _old = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      in_use={str(boot): OTHER})
+        t.deprovision()
+        saved = json.loads(_saved(workdir).read_text())
+        del saved['memory_images']
+        _saved(workdir).write_text(json.dumps(saved))
+
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.mgr.logger.reset_mock()
+
+        t.deprovision()
+
+        assert not boot.exists()
+        assert t.warnings == ''
+
+    def test_snapshots_that_cannot_be_read_are_reported_and_it_goes_on(
+            self, tmp_path):
+        """Naming is all they are read for: nothing removed rests on them."""
+        workdir, _old = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        t = _Teardown(workdir, disks=[boot], records=[])
+        t.session.snapshot_memory_images.return_value = None
+
+        t.deprovision()
+
+        assert not boot.exists()
+        assert 'could not read its snapshots' in t.warnings
