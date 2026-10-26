@@ -397,3 +397,29 @@ class TestTheGuestAgentChannel:
         cmd = mock_run.call_args_list[1][0][0]
         assert cmd.count("org.qemu.guest_agent.0") == 1
         assert own in cmd
+
+
+class TestThereIsNoInstallPhase:
+    """G2: `--cdrom` alone made virt-install run an install phase, whose
+    definition boots the CD-ROM only and has on_reboot=destroy. With
+    boxman's --wait=0 nothing restarted it, so the guest stayed off after
+    its installer's first reboot (Windows Setup's, 85 s in)."""
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_virt_install_is_told_not_to_run_one(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        _make_iso_vm(tmp_path, iso_path="/data/talos.iso").create()
+        assert "--install=no_install=yes" in mock_run.call_args_list[1][0][0]
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_the_iso_stays_a_cdrom_so_the_os_is_still_detected(self, mock_run,
+                                                                tmp_path):
+        """virt-install detects the OS only from `--cdrom`/`--location`
+        media; the same ISO as a CD-ROM `--disk` lost the OS id, and with it
+        Windows' localtime clock (virt-install dry run)."""
+        mock_run.return_value = _result(ok=True)
+        _make_iso_vm(tmp_path, iso_path="/data/talos.iso").create()
+        cmd = mock_run.call_args_list[1][0][0]
+        assert "--cdrom=/data/talos.iso" in cmd
+        assert "--os-variant=detect=on,require=off" in cmd
+        assert "device=cdrom" not in cmd

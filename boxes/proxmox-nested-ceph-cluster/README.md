@@ -143,13 +143,12 @@ scripts are exposed as `tasks:` for use on a host directly, e.g.
 ## How the boot works (why there is no reinstall loop)
 
 `boot_order: [cdrom, hd]` selects boxman's ISO-boot path, which runs
-`virt-install --cdrom … --boot hd,cdrom`. virt-install then does a two-phase
-install: the *transient* domain boots cdrom-first with `on_reboot=destroy`,
-while the *persistent* definition it writes boots `hd,cdrom` with the install
-media ejected. The answer file says `reboot-mode = "power-off"`, so after the
-unattended install the domain is simply `shut off`; `make wait-installed`
-watches for that, and `make boot` (`boxman up` again) starts the persistent
-definition from disk. The first-boot hook (`scripts/first-boot.sh`, baked into
+`virt-install --cdrom … --install no_install=yes --boot hd,cdrom`: one
+definition, with no install phase, whose empty disk is skipped on the first
+boot so the ISO boots. The answer file says `reboot-mode = "power-off"`, so
+after the unattended install the domain is simply `shut off`;
+`make wait-installed` watches for that, and `make boot` (`boxman up` again)
+starts it, now from the installed disk. The ISO stays attached behind it. The first-boot hook (`scripts/first-boot.sh`, baked into
 the ISO) then disables the enterprise repos, enables `pve-no-subscription`,
 sets MTU 1450 on `vmbr0` **and its bridge port**, runs a **`dist-upgrade`**,
 installs `qemu-guest-agent` and writes `/var/lib/pve-lab/first-boot.done`, which
@@ -392,7 +391,7 @@ the next `make up`.
 | host2 guests get no DHCP although `ping 10.77.0.1` from host2's `br-pve` address works | firewalld. With `br_netfilter` loaded (docker loads it), *bridged* frames traverse firewalld's forward hook, and a bridge bound to no zone ends in the public zone's `reject with icmpx admin-prohibited` — host-originated packets use INPUT/OUTPUT and never see it (tunnel counters told the story: 29 sent, 3 received). boxman's physdev `ACCEPT` is in the iptables table and cannot override a later nftables reject. `vxlan-up.sh` binds `br-pve` to the `trusted` zone; verify with a netns + veth on `br-pve` pinging `10.77.0.1` (a plain ping from the host proves nothing). TX checksum offload on the VXLAN was tested and is *not* a factor. |
 | Installer aborts with `root disk '/dev/vda' too small (0 GB < 2 GB)` | The domain got `<driver type='raw'>` for the qcow2 boot disk, so the guest saw the 197 KiB file as a raw disk (`virsh domblkinfo <dom> vda` shows a tiny capacity). virt-install's `format=` only governs volume *creation*; for a file that already exists it takes the type from the libvirt pool's volume record, which was stale after a destroy plus a manual `rm` of images. boxman now passes `driver.type=qcow2` explicitly (fix shipped with this box). If you removed images by hand, `virsh pool-refresh vms` before the next `boxman up`. |
 | `wait-first-boot` times out and the node's log says `has MTU 1500, expected 1450` | The message ends with which of the two checks failed. `after the reload` means the reload did not apply the lab MTU to that interface; `after the upgrade` means something during the `dist-upgrade` moved it back, and the interfaces file is probably still right. `ip -o link show vmbr0` and its bridge port on the node; check `/etc/network/interfaces` has `mtu 1450` in *both* stanzas, then `ifreload -a`. The hook refuses to publish readiness over this because the VXLAN carries 1450-byte frames and Ceph on a 1500 node fails in ways that look like anything but an MTU problem. |
-| A node that was still *installing* is suddenly `shut off` | Do not `virsh reset`/`reboot` a node during the install: the transient install domain has `on_reboot=destroy`, which libvirt also applies to a reset, and the persistent definition has no install media. Re-provision the site (`boxman destroy -y`, `make sync`, `make up` order) instead. |
+| A node reset during its install comes up half-installed | Do not `virsh reset`/`reboot` a node during the install: it is a plain reboot, which boots whatever the installer has written to the disk so far (or the ISO again, before a bootloader is written). Re-provision the site (`boxman destroy -y`, `make sync`, `make up` order) instead. |
 | `virsh net-start` fails on host1: bridge in use | `virbr-pve` already existed (a leftover from `vxlan-up.sh` run too early). `sudo ip link del virbr-pve`, then `boxman up`, then `vxlan-up.sh`. |
 | Nodes on host2 lose connectivity after a host reboot / `boxman destroy` on host1 | The VXLAN is not persistent, and host1's bridge is recreated by libvirt. `make boot` (or `vxlan-up.sh` on both hosts) restores it. |
 | ssh works but `pvecm`/`pveceph` fail with a dpkg lock | The first-boot hook is still running apt. Use `make wait-first-boot`. |
@@ -402,6 +401,5 @@ the next `make up`.
 | Big transfers hang while ping works | MTU: something is at 1500 on a 1450 path. `make mtu-check`; `ip -d link show vxlan-pve`, `ip link show vmbr0` on the node. |
 | Nested VM has no address | It gets DHCP from host1 through the node's `vmbr0`; check the reservation `demo01`, `qm config 100` (`net0 … mtu=1`), and that the node's bridge carries the VM's MAC (`brctl showmacs vmbr0`). |
 
-Do **not** run `boxman update` on these projects: the cdrom reconcile would
-re-insert the install ISO. Harmless with the hd-first persistent boot order,
-but a surprise.
+The install ISO stays attached to every node (behind the disk in the boot
+order), so `boxman update`'s cdrom reconcile finds it where `cdroms:` says.

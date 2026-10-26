@@ -772,7 +772,9 @@ clusters:
   order is hardcoded to `hd,cdrom` (disk first, falling through to CDROM). So
   the first boot finds the empty disk unbootable and boots the installer; once
   the OS is installed the disk wins. `[cdrom, hd]` and `[cdrom]` behave
-  identically — anything past element 0 is ignored.
+  identically — anything past element 0 is ignored. There is no virt-install
+  install phase: an installer's reboot is a plain reboot (into the disk, once
+  it is bootable), and the ISO stays attached until you eject it.
 - **`cdroms:` entry forms:** a bare string, `{name: <iso-name>}` (resolved from
   `isos:`), or `{source: /abs/path.iso}` (explicit local file). The first cdrom
   is the boot ISO; the others go to virt-install with it, so an installer

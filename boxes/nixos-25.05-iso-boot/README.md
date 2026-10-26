@@ -111,14 +111,12 @@ virsh -c qemu:///system list --all | grep nixos01
 ```bash
 virsh -c qemu:///system dumpxml "$V" | grep -A2 '<boot\|cdrom\|\.iso'
 # expect: <disk device='cdrom'> … <source file='…nixos-minimal-25.05-….iso'/>
-#         <boot dev='cdrom'/> <boot dev='hd'/>
+#         <boot dev='hd'/> <boot dev='cdrom'/>
 ```
 
-Note the boot order you actually get is **`cdrom` then `hd`**, even though
-`IsoBootVM` asks virt-install for `hd,cdrom`: passing `--cdrom=` puts
-virt-install into two-phase install mode, and boxman never reaches the
-post-install reconfigure. For this box it makes no difference — it live-boots
-and never installs — but do not rely on the `hd`-first ordering.
+The boot order is **`hd` then `cdrom`**, and there is no virt-install
+install phase that would boot the CD-ROM first: the empty disk is skipped,
+so the ISO boots, and once something bootable is on the disk, the disk wins.
 
 **4. It actually booted the installer** — watch the console:
 
@@ -155,9 +153,9 @@ ip -brief addr               # note the address handed out above
 From there either install by hand, or point `nixos-anywhere` at that address.
 Anything you install lands on the empty 20 G disk.
 
-Be aware the domain boots **cdrom first** (see above), so once you have
-installed something you must detach the CDROM — or change the boot order — or
-the VM will drop back into the installer on every reboot.
+The domain boots the disk first (see above), so once a bootloader is
+installed there, a reboot starts the installed system rather than the
+installer. The ISO stays attached until you eject it.
 
 ## Refreshing the ISO
 
