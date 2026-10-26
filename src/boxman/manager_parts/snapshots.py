@@ -10,24 +10,31 @@ from boxman import log
 from boxman.exceptions import ConfigError, SnapshotError, SnapshotRecoveryError
 
 
-def _dirs_made_for(path: str) -> list[str]:
+def _dirs_made_for(path: str) -> tuple[tuple[int, int], tuple[str, ...]]:
     """
-    The directories ``os.makedirs(path)`` would create, outermost first, each
-    by its real path: the deepest ancestor of *path* that exists, resolved by
-    the filesystem, then the names below it. Empty when *path* exists.
+    Where ``os.makedirs(path)`` would start creating, and what: the identity
+    of the deepest ancestor of *path* that exists — ``(st_dev, st_ino)``,
+    links followed by the filesystem, so another name of that directory (a
+    symlink, a bind mount) is the same one — and the names below it,
+    outermost first; none when *path* exists.
 
     Raises:
         OSError: an ancestor cannot be looked up for a reason other than
-            being missing, or a missing part is ``.`` or ``..`` — where that
-            leads is left to how ``makedirs`` folds it.
+            being missing; or a missing part is a dangling symlink, whose
+            target ``makedirs`` would create under another name, or is
+            ``.`` or ``..`` — where either leads is left to how ``makedirs``
+            folds it.
     """
     missing: list[str] = []
     head = path
     while True:
         try:
-            os.stat(head or os.curdir)
+            st = os.stat(head or os.curdir)
             break
         except FileNotFoundError:
+            if head and os.path.islink(head):
+                raise OSError(errno.ENOENT, "a dangling symlink is on the "
+                                            "way", head) from None
             parent, name = os.path.split(head)
             if parent == head:
                 raise
@@ -37,11 +44,7 @@ def _dirs_made_for(path: str) -> list[str]:
     if any(name in (os.curdir, os.pardir) for name in missing):
         raise OSError(errno.EINVAL, "'.' or '..' below a directory that does "
                                     "not exist yet", path)
-    made, current = [], os.path.realpath(head or os.curdir, strict=True)
-    for name in reversed(missing):
-        current = os.path.join(current, name)
-        made.append(current)
-    return made
+    return (st.st_dev, st.st_ino), tuple(reversed(missing))
 
 
 class SnapshotsMixin:
@@ -149,33 +152,38 @@ class SnapshotsMixin:
 
         Never a cluster workdir that does not exist, under any name: that is
         not this command's to create, so a *path* inside one, or equal to
-        it, is refused.
+        it, is refused (:func:`_dirs_made_for`).
 
         Raises:
             SnapshotError: it could not be created, or creating it would also
                 create a missing cluster workdir — or whether it would
-                cannot be told.
+                cannot be told; or it exists and is not a directory.
         """
         try:
-            made = _dirs_made_for(path)
+            anchor, made = _dirs_made_for(path)
         except OSError as exc:
             raise SnapshotError(
                 f"could not create the snapshot directory {path} "
                 f"({exc})") from exc
         if not made:
+            if not os.path.isdir(path):
+                raise SnapshotError(
+                    f"the snapshot directory {path} is not a directory")
             return
         for cluster_name, cluster in (self.config.get('clusters') or {}).items():
             workdir = cluster.get('workdir') if isinstance(cluster, dict) else None
             if not workdir:
                 continue
             try:
-                makes_workdir = _dirs_made_for(os.path.expanduser(workdir))
+                workdir_anchor, makes_workdir = _dirs_made_for(
+                    os.path.expanduser(workdir))
             except OSError as exc:
                 raise SnapshotError(
                     f"could not create the snapshot directory {path}: whether "
                     f"that would also create {workdir}, the workdir of "
                     f"cluster {cluster_name}, cannot be told ({exc})") from exc
-            if makes_workdir and makes_workdir[-1] in made:
+            if (makes_workdir and workdir_anchor == anchor
+                    and made[:len(makes_workdir)] == makes_workdir):
                 raise SnapshotError(
                     f"could not create the snapshot directory {path}: that "
                     f"would also create {workdir}, the workdir of cluster "

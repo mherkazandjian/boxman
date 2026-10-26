@@ -258,6 +258,53 @@ class TestTake:
 
         assert not (real / "c1").exists()
 
+    def test_one_reaching_a_missing_workdir_through_a_dangling_symlink(
+            self, tmp_path, monkeypatch):
+        """``alias -> target``, with no target yet: making
+        ``target/c1/snaps`` makes the workdir ``alias/c1`` too."""
+        os.symlink(tmp_path / "target", tmp_path / "alias")
+        mgr = _manager({"workdir": str(tmp_path / "alias" / "c1"),
+                        "memory_snapshot_dir": str(tmp_path / "target" / "c1"
+                                                   / "snaps")})
+
+        with pytest.raises(SnapshotError, match="would also create"):
+            _take(mgr, monkeypatch)
+
+        assert not (tmp_path / "target").exists()
+
+    def test_one_reaching_a_missing_workdir_by_a_name_no_path_resolves(
+            self, tmp_path, monkeypatch):
+        """As a bind mount is: one directory under two names whose resolved
+        paths differ — here, with ``realpath`` resolving nothing."""
+        real = tmp_path / "real"
+        real.mkdir()
+        os.symlink(real, tmp_path / "bind")
+        monkeypatch.setattr(os.path, "realpath",
+                            lambda path, strict=False: os.fspath(path))
+        mgr = _manager({"workdir": str(tmp_path / "bind" / "c1"),
+                        "memory_snapshot_dir": str(real / "c1" / "snaps")})
+
+        with pytest.raises(SnapshotError, match="would also create"):
+            _take(mgr, monkeypatch)
+
+        assert not (real / "c1").exists()
+
+    def test_an_existing_file_is_refused_before_any_snapshot(
+            self, tmp_path, monkeypatch):
+        """Not a directory: the take would fail at the VM, after the
+        docker-compose clusters were snapshotted."""
+        snaps = tmp_path / "snaps"
+        snaps.write_bytes(b"not a directory")
+        mgr = _manager({"workdir": str(tmp_path / "c1"),
+                        "memory_snapshot_dir": str(snaps)})
+        session = self._with_a_compose_cluster(mgr, tmp_path)
+
+        with pytest.raises(SnapshotError, match="is not a directory"):
+            _take(mgr, monkeypatch)
+
+        session.snapshot_take_cluster.assert_not_called()
+        mgr.provider.snapshot_take.assert_not_called()
+
     def test_another_clusters_missing_workdir_is_not_made_either(
             self, tmp_path, monkeypatch):
         (tmp_path / "c1").mkdir()
