@@ -196,7 +196,7 @@ templates:
 clusters:
   <cluster_name>:
     workdir: <dir>                   # VM disks + cluster scratch (auto-derives)
-    snapshot_dir: <dir>              # optional: snapshot memory images (default: workdir)
+    memory_snapshot_dir: <dir>       # optional: snapshot memory images (default: workdir)
     base_image: <template-vm-name>   # cluster default; overridable per VM
     admin_user: ...
     admin_pass: file://...           # also: ${env:VAR}, or a plain literal
@@ -1044,7 +1044,7 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   the memory `.raw` (~70% smaller, transparently decompressed on restore).
   `--force` clears a colliding name or leftover files and re-takes.
 - A cluster's memory images (`<vm>_snapshot_<name>.raw`, or `.raw.zst`)
-  go to its `snapshot_dir` when it sets one (made `0700` on first use),
+  go to its `memory_snapshot_dir` when it sets one (made `0700` on first use),
   else to its `workdir`. Only those move: a disk snapshot is an overlay
   libvirt creates beside its disk, and the newest overlay is the disk the
   guest writes to. Images already taken stay where they were written;

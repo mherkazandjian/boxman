@@ -184,7 +184,8 @@ def memory_image_candidates(directory: str, vm_name: str) -> list[str]:
     """
     The entries of *directory* named as *vm_name*'s memory images
     (:func:`is_memory_image`) — what a teardown decides with in a cluster's
-    ``snapshot_dir``, where nothing else of the VM's is ever a candidate.
+    ``memory_snapshot_dir``, where nothing else of the VM's is ever a
+    candidate.
 
     Read as :func:`boot_family_candidates` reads a workdir: only a directory
     that does not exist holds none, a symlink or an entry that cannot be
@@ -801,7 +802,7 @@ def remove_vm_storage(
     1. **The boot-disk family** — files under the VM's exclusive names in
        its disk directories (:func:`boot_family_candidates`): its boot disk,
        its overlays and its memory-snapshot files; and its memory images in
-       the clusters' ``snapshot_dir`` (*memory_dirs*,
+       the clusters' ``memory_snapshot_dir`` (*memory_dirs*,
        :func:`memory_image_candidates`). Extra-disk files
        (attached, recorded, config-declared, or a layer under one) are
        never decided by name.
@@ -887,7 +888,7 @@ def remove_vm_storage(
         directory = real(os.path.dirname(path))
         if directory in real_workdirs:
             return None
-        # a cluster's snapshot_dir holds the vm's memory images, nothing
+        # a cluster's memory_snapshot_dir holds the vm's memory images, nothing
         # else of it: an extra disk never qualifies by its name
         if (memory_dirs_too and directory in real_memory_dirs
                 and is_memory_image(vm, path)):
