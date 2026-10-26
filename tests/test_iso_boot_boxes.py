@@ -36,7 +36,8 @@ ISO_BOXES = sorted(
 
 # every box shipped as an ISO-boot example must be picked up here; a rename
 # that silently drops one from this list is the failure mode being guarded
-EXPECTED_AT_LEAST = {"nixos-25.05-iso-boot", "guix-1.5.0-iso-boot"}
+EXPECTED_AT_LEAST = {"nixos-25.05-iso-boot", "guix-1.5.0-iso-boot",
+                     "windows-server-2022-iso-boot"}
 
 
 def _config(box_dir: str) -> dict:
