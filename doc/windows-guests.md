@@ -292,7 +292,7 @@ AMD/KVM is known to be fragile and was not tried.
 | G4 | **OS detection picks the wrong version.** `--os-variant=detect=on` identifies the 2022 eval ISO as `win2k25` | `direct_vm.py` | wrong libosinfo defaults; it happens to be harmless for 2022 vs 2025 | a later `--os-variant=win2k22` in extra args (the last one wins) | an `os_variant:` key for direct-boot VMs, as templates already have |
 | G5 | **ssh access assumes a Linux guest.** `ssh_config` writes `User admin`; the `admin_pass` key push is `sshpass ssh-copy-id` (to `~/.ssh/authorized_keys`); the generated inventory has no `ansible_connection` or `ansible_shell_type` | `manager_parts/ssh.py`, `manager_parts/workspace.py` | `boxman ssh` and `boxman run` do not reach the guest | the key is baked into the answer ISO; the user is passed by hand | `os: windows` → `User Administrator` (or `admin_user`), the key pushed into `administrators_authorized_keys` by the guest setup (not ssh-copy-id), inventory vars `ansible_shell_type: powershell` (or the WinRM set) |
 | G6 | the post-provision "eject `seed.iso`" step ran over the ISO-boot VM | `manager_parts/flows.py:194` | **none here.** All three CD-ROMs were still attached afterwards; listed only so that a Windows template using a `cidata` seed checks it | n/a | n/a |
-| G7 | **The answer ISO stays attached for the VM's whole life**, live and persistent, and it holds the Administrator password in plain text. Any process in the guest can read it from the CD | `direct_vm.py` (media given to virt-install stay in the definition) | password exposure inside the guest | eject it once setup is done (README step: `virsh change-media <domain> <answer.iso path> --eject --force --live --config`) | boxman ejects the answer medium once the guest is up, as it already ejects `seed.iso`. Phase 2 avoids it, because the per-clone secret comes from the cloudbase-init seed |
+| G7 | **The answer ISO stays attached for the VM's whole life**, live and persistent, and it holds the Administrator password in plain text. Any process in the guest can read it from the CD | `direct_vm.py` (media given to virt-install stay in the definition) | password exposure inside the guest. And since neither the answer ISO nor virtio-win is in `cdroms:`, `boxman update` takes each for a removed drive and detaches it, on every run, while it holds media | eject both once setup is done (README step: `virsh change-media <domain> <ISO path> --eject --force --live --config`, once per ISO); `update` leaves empty drives alone | install-only media: boxman attaches them at virt-install time, ejects them once the install is done (as it already ejects `seed.iso`), and never compares them in `update`. Phase 2 avoids the password part, because the per-clone secret comes from the cloudbase-init seed |
 
 Two things showed up that are **not** Windows-specific:
 
@@ -338,7 +338,11 @@ Plus `make-answer-iso.sh` to render the answer file.
 2. **G2**: the direct-boot install survives its own reboots, and the IP wait
    fails fast on a VM that is shut off.
 3. **G3, G4**: always add the guest-agent channel; add an `os_variant:` key
-   for direct-boot VMs. **G7**: eject the answer medium once the guest is up.
+   for direct-boot VMs. **G7**: install-only media. A medium needed only for
+   the install (the answer ISO, virtio-win) is attached at virt-install
+   time, ejected by boxman once the install is done, and never compared by
+   `boxman update`. A golden image or template built this way carries no
+   install media and no password ISO.
 4. A new **`unattend:`** block. boxman renders the answer file and builds
    the answer ISO itself, as it already builds NoCloud seeds:
 

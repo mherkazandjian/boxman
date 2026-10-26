@@ -54,15 +54,25 @@ boxman up
 
 Once `C:\boxman-setup.log` ends with `boxman-setup: done` (or with
 `boxman-setup: FAILED: …`, which names the steps left to do by hand),
-**eject the answer ISO**. It holds the Administrator password in plain text, and
-otherwise stays attached for the VM's whole life. The drive is named by
-the ISO's path, not by a target such as `sdc`, which depends on the order
-virt-install attaches media in; `--force` gets past a guest's tray lock:
+**eject the answer ISO and virtio-win**. Both are needed only for the
+install, and both otherwise stay attached for the VM's whole life:
+
+- the answer ISO holds the Administrator password in plain text;
+- `boxman update` does not know either drive (they are not in `cdroms:`),
+  so while one holds media it is taken for a drive removed from the
+  config and detached, with a pending restart, on every run. Empty drives
+  are left alone.
+
+Each drive is named by its ISO's path, not by a target such as `sdc`,
+which depends on the order virt-install attaches media in; `--force` gets
+past a guest's tray lock:
 
 ```bash
-virsh -c qemu:///system change-media \
-  bprj__boxman_dev_windows-server-2022-iso-boot__bprj_win_win01 \
-  ~/workspaces/windows-server-2022-iso-boot/answer.iso --eject --force --live --config
+dom=bprj__boxman_dev_windows-server-2022-iso-boot__bprj_win_win01
+for iso in ~/workspaces/windows-server-2022-iso-boot/answer.iso \
+           /usr/share/virtio-win/virtio-win.iso; do
+  virsh -c qemu:///system change-media "$dom" "$iso" --eject --force --live --config
+done
 ```
 
 ## Verify
@@ -104,6 +114,7 @@ All of these are covered in the doc.
 - **No `admin_pass` key push.** It runs `ssh-copy-id`, which writes
   `~/.ssh/authorized_keys`. Windows' sshd reads
   `C:\ProgramData\ssh\administrators_authorized_keys` for administrators.
-- **The answer ISO stays attached** until you eject it (above).
+- **The answer ISO and virtio-win stay attached** until you eject them
+  (above). Until then `boxman update` detaches them on every run.
 - **Licensing.** The ISO is a 180-day evaluation for test/demo use. Do not
   push the ISO or a disk installed from it to a registry.
