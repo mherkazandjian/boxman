@@ -13,7 +13,7 @@ import shlex
 from typing import Any
 
 from boxman import log
-from boxman.exceptions import ProvisionError
+from boxman.exceptions import PartialInstallError, ProvisionError
 from boxman.utils.shell import run as _shell_run
 
 from .commands import VirshCommand, VirtInstallCommand
@@ -275,7 +275,28 @@ class DirectInstallVM:
         result = _shell_run(cmd, hide=True, warn=True)
         if not result.ok:
             self.logger.error(f"virt-install failed: {result.stderr}")
+            if self._domain_exists():
+                # both streams: virt-install prints why it gave up on a
+                # --wait ("exceeded specified time limit") to stdout
+                said = "\n".join(text.strip() for text in
+                                 (result.stdout, result.stderr) if text)
+                raise PartialInstallError(
+                    f"virt-install failed after defining {self._describe()}, "
+                    f"which is left as it is: its console shows how far the "
+                    f"install got. Remove it (boxman destroy) before running "
+                    f"again. virt-install said:\n{said}")
             return False
 
         self.logger.info(f"{self._describe()} created")
         return True
+
+    def _domain_exists(self) -> bool:
+        """Whether libvirt has a domain by this VM's name.
+
+        A query that fails counts as no, which leaves a failed create to be
+        retried as it was before this was asked.
+        """
+        cmd = self.virsh.build_command("domstate", self.vm_name)
+        result = _shell_run(self.virsh._wrap_for_runtime(cmd),
+                            hide=True, warn=True)
+        return bool(result.ok)
