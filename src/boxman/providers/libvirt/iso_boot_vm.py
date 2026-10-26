@@ -1,8 +1,12 @@
 """Create a VM that boots from an install ISO (e.g. Talos Linux)."""
 
+import os
 import shlex
 from typing import Any
 
+from boxman.exceptions import ProvisionError
+
+from .cdrom import CDROMManager
 from .direct_vm import DirectInstallVM
 
 
@@ -18,6 +22,9 @@ class IsoBootVM(DirectInstallVM):
     ISO and installs to disk; after the OS reboots, the now-bootable disk is
     used instead of re-running the installer. (Using ``cdrom,hd`` would loop
     back into the installer on every reboot.)
+
+    Every further ``cdroms:`` entry is given to virt-install too, so the
+    installer sees it on its first boot (a driver ISO, an answer file).
     """
 
     boot_order = "hd,cdrom"
@@ -33,8 +40,41 @@ class IsoBootVM(DirectInstallVM):
         super().__init__(vm_name, info, provider_config, workdir)
         self.iso_path = iso_path
 
+    def _extra_cdroms(self) -> list[dict[str, Any]]:
+        """The resolved ``cdroms:`` entries other than the boot ISO."""
+        extra = []
+        for entry in self.info.get("cdroms") or []:
+            source = entry.get("source") if isinstance(entry, dict) else None
+            if source == self.iso_path:
+                continue
+            if not source:
+                raise ProvisionError(
+                    f"vm {self.vm_name}: cdroms entry {entry!r} has no "
+                    f"resolved source to give virt-install")
+            extra.append(entry)
+        return extra
+
     def _media_args(self) -> list[str]:
-        return [f"--cdrom={shlex.quote(self.iso_path)}"]
+        # Every cdrom goes to virt-install, not only the boot ISO. Attached
+        # by the configure step instead, once virt-install had started the
+        # installer, a SATA/IDE drive reached the persistent definition only
+        # (libvirt cannot hot-plug one), and an installer that needs a second
+        # medium -- drivers, an answer file -- never saw it.
+        args = [f"--cdrom={shlex.quote(self.iso_path)}"]
+        for entry in self._extra_cdroms():
+            source = os.path.abspath(os.path.expanduser(entry["source"]))
+            if not os.path.isfile(source):
+                raise ProvisionError(
+                    f"vm {self.vm_name}: cdrom "
+                    f"'{entry.get('name') or entry['source']}': ISO file does "
+                    f"not exist: {source}")
+            disk = f"path={source},device=cdrom,readonly=on"
+            target = entry.get("target")
+            if target:
+                disk += (f",target.dev={target},"
+                         f"target.bus={CDROMManager._bus_for_target(target)}")
+            args.append(f"--disk={shlex.quote(disk)}")
+        return args
 
     def _describe(self) -> str:
         return f"ISO-boot VM '{self.vm_name}'"

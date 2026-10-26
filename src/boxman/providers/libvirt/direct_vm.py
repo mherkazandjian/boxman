@@ -207,6 +207,9 @@ class DirectInstallVM:
         # `networks:` used to be discovered after the boot disk had already
         # been written, leaving a stray image behind on a refusal (#171 A4).
         network_specs = self._network_specs()
+        # likewise install media that cannot be attached (a cdroms: source
+        # that does not exist)
+        media_args = self._media_args()
         # absolute, so qemu-img and virt-install name the same file wherever
         # they run (the docker-compose runtime's container has another cwd)
         disk_path = libvirt_disk_source(
@@ -234,7 +237,7 @@ class DirectInstallVM:
             if spec["mac"]:
                 net_arg += f",mac={spec['mac']}"
             parts.append(net_arg)
-        parts.extend(self._media_args())
+        parts.extend(media_args)
         parts.append(f"--boot={self.boot_order}")
         parts.append("--os-variant=detect=on,require=off")
         parts.append("--graphics=vnc")
