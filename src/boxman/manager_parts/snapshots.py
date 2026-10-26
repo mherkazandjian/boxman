@@ -15,7 +15,9 @@ class SnapshotsMixin:
         """
         Where ``snapshot take`` writes the memory images of *cluster_name*'s
         VMs: its ``memory_snapshot_dir``, else its ``workdir`` — ``~``
-        expanded, absolute.
+        expanded, and otherwise as written: ``..`` after a symlink is the
+        parent of where the symlink points, which only the filesystem can
+        tell, so neither is folded by its spelling.
 
         Only the memory images (``<vm>_snapshot_<name>.raw``, and the
         ``.raw.zst`` that compression leaves) go there. A disk snapshot is
@@ -30,18 +32,22 @@ class SnapshotsMixin:
         if configured is not None:
             return configured
         cluster = self.config['clusters'][cluster_name]
-        return os.path.abspath(os.path.expanduser(cluster['workdir']))
+        return os.path.expanduser(cluster['workdir'])
 
     def _configured_memory_snapshot_dir(self, cluster_name: str) -> str | None:
         """
-        The ``memory_snapshot_dir`` *cluster_name* sets, ``~`` expanded and
-        absolute; ``None`` when it sets none. Its ``workdir`` is not looked
+        The ``memory_snapshot_dir`` *cluster_name* sets, ``~`` expanded
+        (:meth:`cluster_memory_snapshot_dir`); ``None`` when it sets none.
+        Its ``workdir`` is not looked
         at: a cluster may have none yet (no ``workspace.path`` to derive one
         from), and that is not this key's to refuse.
 
         Raises:
             ConfigError: it is set on a docker-compose cluster, is not a
-                non-empty string, or is set under a container runtime,
+                non-empty string or not an absolute path once ``~`` is
+                expanded (relative to wherever boxman runs, a teardown run
+                from elsewhere would look in another directory than the
+                take wrote to), or is set under a container runtime,
                 which bind-mounts the workspace and the workdirs into the
                 libvirt container but not this directory.
         """
@@ -60,6 +66,11 @@ class SnapshotsMixin:
         if not isinstance(configured, str) or not configured.strip():
             raise ConfigError(
                 f"{where} must be a directory path, not {configured!r}")
+        path = os.path.expanduser(configured)
+        if not os.path.isabs(path):
+            raise ConfigError(
+                f"{where} must be an absolute path (or start with ~), not "
+                f"{configured!r}")
         runtime_name = getattr(self, '_runtime_name', 'local') or 'local'
         if runtime_name != 'local':
             raise ConfigError(
@@ -67,7 +78,7 @@ class SnapshotsMixin:
                 f"runtime, whose libvirt container does not see that "
                 f"directory; use the local runtime, or leave it unset so the "
                 f"memory images go to the cluster workdir")
-        return os.path.abspath(os.path.expanduser(configured))
+        return path
 
     def validate_memory_snapshot_dirs(self) -> None:
         """

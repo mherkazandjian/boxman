@@ -68,13 +68,49 @@ class TestTheDirectory:
 
         assert mgr.cluster_memory_snapshot_dir("cluster_1") == str(tmp_path / "c1")
 
-    def test_set_is_expanded_and_absolute(self, monkeypatch, tmp_path):
+    def test_unset_is_the_workdir_as_the_take_always_wrote_there(
+            self, tmp_path):
+        """Not normalized: ``link/..`` is the parent of where ``link``
+        points, which only the filesystem can tell."""
+        (tmp_path / "actual" / "child").mkdir(parents=True)
+        os.symlink(tmp_path / "actual" / "child", tmp_path / "link")
+        workdir = f"{tmp_path}/link/../c1"
+        mgr = _manager({"workdir": workdir})
+
+        assert mgr.cluster_memory_snapshot_dir("cluster_1") == workdir
+
+    def test_set_is_expanded(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
         mgr = _manager({"workdir": str(tmp_path / "c1"),
-                        "memory_snapshot_dir": "~/snaps/../snapshots"})
+                        "memory_snapshot_dir": "~/snapshots"})
 
         assert (mgr.cluster_memory_snapshot_dir("cluster_1")
                 == str(tmp_path / "snapshots"))
+
+    def test_a_dotdot_after_a_symlink_is_left_to_the_filesystem(
+            self, tmp_path):
+        """Folded by its spelling, ``link/../memory`` named the directory
+        beside ``link``: the take wrote there, and a teardown removed from
+        there, instead of the directory configured."""
+        (tmp_path / "actual" / "child").mkdir(parents=True)
+        (tmp_path / "actual" / "memory").mkdir()
+        (tmp_path / "memory").mkdir()
+        os.symlink(tmp_path / "actual" / "child", tmp_path / "link")
+        mgr = _manager({"workdir": str(tmp_path / "c1"),
+                        "memory_snapshot_dir": f"{tmp_path}/link/../memory"})
+
+        assert os.path.samefile(mgr.cluster_memory_snapshot_dir("cluster_1"),
+                                tmp_path / "actual" / "memory")
+
+    def test_a_relative_one_is_refused(self, tmp_path):
+        """Relative to wherever boxman runs, a teardown run from elsewhere
+        would look in another directory than the take wrote to."""
+        mgr = _manager({"workdir": str(tmp_path / "c1"),
+                        "memory_snapshot_dir": "snaps"})
+
+        with pytest.raises(ConfigError, match="memory_snapshot_dir must be an "
+                                              "absolute path"):
+            mgr.cluster_memory_snapshot_dir("cluster_1")
 
     @pytest.mark.parametrize("value", ["", "   ", 7, ["/data"], {"p": 1}],
                              ids=["empty", "blank", "int", "list", "dict"])
