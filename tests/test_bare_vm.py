@@ -140,3 +140,12 @@ class TestNetworkMacPinning:
         vm.create()
         cmd = mock_run.call_args_list[1][0][0]
         assert "--network=network=bprj__p__mgmt,model=virtio,mac=52:54:00:0c:01:01" in cmd
+
+
+@patch("boxman.providers.libvirt.direct_vm._shell_run")
+def test_a_pxe_vm_gets_the_guest_agent_channel_too(mock_run, tmp_path):
+    """G3 is fixed in DirectInstallVM, so PXE VMs share it."""
+    mock_run.return_value = _result(ok=True)
+    _make_bare_vm(tmp_path).create()
+    assert ("--channel=unix,target.type=virtio,name=org.qemu.guest_agent.0"
+            in mock_run.call_args_list[1][0][0])

@@ -372,3 +372,28 @@ class TestTheConfigureStepLeavesIsoBootCdromsAlone:
         provider = self._configure({"cdroms": cdroms})
         provider.configure_vm_cdroms.assert_called_once()
         assert provider.configure_vm_cdroms.call_args.kwargs["cdroms"] == cdroms
+
+
+class TestTheGuestAgentChannel:
+    """G3: virt-install adds the qemu-guest-agent channel only for OSes it
+    knows ship virtio-serial, so a Windows guest had none and `boxman
+    storage trim` and agent IP lookup failed on it."""
+
+    CHANNEL = "--channel=unix,target.type=virtio,name=org.qemu.guest_agent.0"
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_every_direct_install_vm_gets_one(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path)
+        vm.create()
+        assert mock_run.call_args_list[1][0][0].count(self.CHANNEL) == 1
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_one_the_box_adds_itself_is_not_doubled(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        own = "--channel unix,target_type=virtio,name=org.qemu.guest_agent.0"
+        vm = _make_iso_vm(tmp_path, virt_install_extra_args=[own])
+        vm.create()
+        cmd = mock_run.call_args_list[1][0][0]
+        assert cmd.count("org.qemu.guest_agent.0") == 1
+        assert own in cmd

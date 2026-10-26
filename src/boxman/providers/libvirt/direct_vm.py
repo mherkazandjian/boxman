@@ -19,6 +19,9 @@ from boxman.utils.shell import run as _shell_run
 from .commands import VirshCommand, VirtInstallCommand
 from .disk import create_image_exclusive, libvirt_disk_source
 
+#: The virtio-serial port name the QEMU guest agent listens on.
+GUEST_AGENT_CHANNEL = "org.qemu.guest_agent.0"
+
 #: What a refused boot disk tells the operator to do.
 BOOT_DISK_REMEDY = ("If it is stale, remove or rename it and run the "
                     "command again.")
@@ -243,7 +246,16 @@ class DirectInstallVM:
         parts.append("--graphics=vnc")
         parts.append("--noautoconsole")
         parts.append("--wait=0")
-        for extra in self.info.get("virt_install_extra_args", []):
+        extra_args = self.info.get("virt_install_extra_args", [])
+        # virt-install adds the guest-agent channel only for OSes it knows
+        # ship virtio-serial (Linux), and drops its own whenever a channel
+        # is given. Without one, `boxman storage trim` and agent IP lookup
+        # fail on a Windows or undetected guest (G3). A box that adds its
+        # own keeps it, rather than getting a second.
+        if not any(GUEST_AGENT_CHANNEL in arg for arg in extra_args):
+            parts.append(
+                f"--channel=unix,target.type=virtio,name={GUEST_AGENT_CHANNEL}")
+        for extra in extra_args:
             parts.append(extra)
 
         cmd = " ".join(parts)
