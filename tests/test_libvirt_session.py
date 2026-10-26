@@ -2766,3 +2766,143 @@ class TestSnapshotMemoryInUse:
             hidden.chmod(0o700)
 
         assert in_use is None
+
+
+class _SnapshotHost:
+    """Domains and their snapshots, answered where boxman hands a command
+    to the shell (``commands._shell_run``): ``list --all --uuid --name``,
+    and ``snapshot-list`` / ``snapshot-dumpxml`` for a domain named, as
+    virsh takes one, by its UUID or by its name -- a read by name answered
+    by whichever domain holds that name when it runs."""
+
+    def __init__(self) -> None:
+        #: ``[uuid, name, {snapshot: its memory file, or None}]``, as listed
+        self.domains: list[list] = []
+        #: subcommand -> something to do, once, just before it first runs
+        self.before: dict = {}
+        #: ``(subcommand, args)`` of every command, in order
+        self.log: list[tuple[str, tuple]] = []
+
+    def define(self, name: str, uid: str | None = None, **snapshots) -> str:
+        uid = uid or domain_uuid(name)
+        self.domains.append([uid, name, snapshots])
+        return uid
+
+    def rename(self, old: str, new: str) -> None:
+        self._get(old)[1] = new
+
+    def undefine(self, name: str) -> None:
+        self.domains.remove(self._get(name))
+
+    def _get(self, ref: str) -> list | None:
+        """The domain *ref* names: by UUID first, then by name, as virsh
+        looks one up."""
+        for field in (0, 1):
+            for domain in self.domains:
+                if domain[field] == ref:
+                    return domain
+        return None
+
+    def run(self, command: str, **_kwargs) -> FakeResult:
+        argv = shlex.split(command)
+        sub, args = argv[3], tuple(argv[4:])
+        hook = self.before.pop(sub, None)
+        if hook is not None:
+            hook()
+        self.log.append((sub, args))
+        if sub == "list":
+            return FakeResult(stdout=domain_listing(
+                args, *[(uid, name) for uid, name, _ in self.domains]) + "\n")
+        domain = self._get(args[0])
+        if domain is None:
+            return FakeResult(
+                stderr=f"error: failed to get domain '{args[0]}'\n", code=1)
+        snapshots = domain[2]
+        if sub == "snapshot-list":
+            return FakeResult(
+                stdout="".join(f"{name}\n" for name in snapshots) + "\n")
+        if sub == "snapshot-dumpxml" and args[1] in snapshots:
+            memory = snapshots[args[1]]
+            element = (f"<memory snapshot='external' file='{memory}'/>"
+                       if memory else "<memory snapshot='no'/>")
+            return FakeResult(stdout=f"<domainsnapshot><name>{args[1]}</name>"
+                                     f"{element}</domainsnapshot>\n")
+        if sub == "snapshot-dumpxml":
+            return FakeResult(
+                stderr="error: Domain snapshot not found\n", code=1)
+        raise AssertionError(f"the fake host cannot run: {command}")
+
+
+class TestSnapshotMemoryInUseThroughVirsh:
+    """The same scan with only the shell faked: the real ``VirshCommand``
+    builds every command, and a domain renamed or undefined mid-scan is so
+    on the host those commands reach (Codex's fifth review of #252)."""
+
+    @staticmethod
+    def _scan(host: _SnapshotHost):
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=host.run):
+            return _session({}).snapshot_memory_in_use()
+
+    def test_both_reads_name_each_domain_by_its_uuid(self, tmp_path):
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        host = _SnapshotHost()
+        uuids = {host.define("vm-a", s1=str(raw)),
+                 host.define("vm-b", s1=None),
+                 host.define("vm-x")}
+
+        in_use = self._scan(host)
+
+        assert in_use[str(raw)] == "vm-a"
+        reads = [(sub, args[0]) for sub, args in host.log if sub != "list"]
+        assert {sub for sub, _ in reads} == {"snapshot-list",
+                                             "snapshot-dumpxml"}
+        assert {domain for _, domain in reads} == uuids
+
+    @pytest.mark.parametrize("reused", [False, True],
+                             ids=["renamed", "its-name-reused"])
+    @pytest.mark.parametrize("before", ["snapshot-list", "snapshot-dumpxml"])
+    def test_a_domain_renamed_mid_scan_keeps_its_image(self, tmp_path,
+                                                       before, reused):
+        """Codex's reproduction (#252 review R4): vm-a renamed while the
+        scan reads it, and an empty domain defined under vm-a since. Read
+        by its name, the newcomer answered for it -- no snapshots, or not
+        that one -- and the image vm-a's snapshot records went unprotected;
+        renamed alone, it could no longer be read and failed the scan."""
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        host = _SnapshotHost()
+        host.define("vm-a", s1=str(raw))
+        host.define("vm-x")
+
+        def rename():
+            host.rename("vm-a", "vm-a-old")
+            if reused:
+                host.define("vm-a", uid=domain_uuid("vm-a-new"))
+
+        host.before[before] = rename
+
+        in_use = self._scan(host)
+
+        assert in_use[str(raw)] == "vm-a"
+        st = raw.stat()
+        assert in_use.identities[(st.st_dev, st.st_ino)] == "vm-a"
+
+    @pytest.mark.parametrize("before", ["snapshot-list", "snapshot-dumpxml"])
+    def test_a_domain_undefined_mid_scan_is_skipped(self, tmp_path, before):
+        """vm-b undefined just before its snapshots, or the one it listed,
+        are read: a listing taken since names neither it nor its UUID, so
+        it holds nothing, and the scan goes on to protect what vm-a's
+        snapshot records."""
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        host = _SnapshotHost()
+        host.define("vm-b", s1=str(tmp_path / "b_snapshot_s1.raw"))
+        host.define("vm-a", s1=str(raw))
+        host.before[before] = lambda: host.undefine("vm-b")
+
+        in_use = self._scan(host)
+
+        assert in_use[str(raw)] == "vm-a"
+        assert [sub for sub, _ in host.log].count("list") == 2
