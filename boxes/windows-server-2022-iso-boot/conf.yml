@@ -87,9 +87,6 @@ clusters:
           # IsoBootVM passes --os-variant=detect=on, which takes this 2022
           # media for win2k25; a later --os-variant wins.
           - '--os-variant=win2k22'
-          # virt-install adds the qemu-guest-agent channel for Linux variants
-          # only; without it `boxman storage trim` and agent IP lookup fail.
-          - '--channel=unix,target.type=virtio,name=org.qemu.guest_agent.0'
           - '--disk=path={{ env("HOME") }}/workspaces/windows-server-2022-iso-boot/answer.iso,device=cdrom,readonly=on'
           # boxman runs virt-install with --wait=0, which returns while the
           # install-phase domain (on_reboot=destroy) is still running, so the
