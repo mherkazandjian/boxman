@@ -355,7 +355,8 @@ Plus `make-answer-iso.sh` to render the answer file.
    `boxman update`. A golden image or template built this way carries no
    install media and no password ISO.
 4. A new **`unattend:`** block. boxman renders the answer file and builds
-   the answer ISO itself, as it already builds NoCloud seeds:
+   the answer ISO itself, as it already builds NoCloud seeds (with the
+   seed-ISO helper, generalised to take a label and a list of files):
 
    ```yaml
    vms:

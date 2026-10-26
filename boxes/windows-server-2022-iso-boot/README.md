@@ -38,7 +38,8 @@ and about 2 min from the second start to WinRM and SSH answering.
 
 - The **local** runtime, libvirt/KVM, and `sudo` for `qemu:///system`.
 - `dnf install virtio-win` (provides `/usr/share/virtio-win/virtio-win.iso`).
-- `genisoimage`. `xmllint` is optional and used if present.
+- `genisoimage`, `mkisofs` or `xorrisofs`. `xmllint` is optional and used
+  if present.
 - About 4.7 GiB for the ISO in `~/.cache/boxman/images`, and 7-8 GB for the
   installed disk. The VM has 2 vCPU and 4 GiB RAM.
 - Internet access from the guest, for the OpenSSH Feature on Demand.

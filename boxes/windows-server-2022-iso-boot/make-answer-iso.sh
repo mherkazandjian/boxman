@@ -33,6 +33,15 @@ if ! [[ $name =~ ^[A-Za-z0-9-]{1,15}$ ]] || [[ $name =~ ^[0-9]+$ ]]; then
     echo "BOXMAN_WIN_HOSTNAME '$name' is not a valid Windows computer name" >&2
     exit 2
 fi
+# genisoimage, mkisofs and xorrisofs take the same flags; distros ship
+# different ones (Debian's xorriso package has only xorrisofs).
+for iso_tool in genisoimage mkisofs xorrisofs; do
+    command -v "$iso_tool" >/dev/null && break
+done
+if ! command -v "$iso_tool" >/dev/null; then
+    echo "need genisoimage, mkisofs or xorrisofs to build the answer ISO" >&2
+    exit 2
+fi
 
 # Created before the umask below, so qemu can still reach the VM disk there.
 mkdir -p "$(dirname "$out")"
@@ -61,6 +70,6 @@ if [[ -n ${BOXMAN_WIN_SSH_PUBKEY:-} ]]; then
 fi
 
 # Write beside the target and rename, so a guest never sees a half-written ISO.
-genisoimage -quiet -J -r -V BOXMAN_ANSWER -o "$out.tmp" "$stage"
+"$iso_tool" -quiet -J -r -V BOXMAN_ANSWER -o "$out.tmp" "$stage"
 mv -f "$out.tmp" "$out"
 echo "wrote $out"
