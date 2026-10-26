@@ -1,11 +1,46 @@
 """Snapshot and storage flows for BoxmanManager."""
 
+import errno
 import json
 import os
 import time
 
 from boxman import log
 from boxman.exceptions import ConfigError, SnapshotError, SnapshotRecoveryError
+
+
+def _dirs_made_for(path: str) -> list[str]:
+    """
+    The directories ``os.makedirs(path)`` would create, outermost first, each
+    by its real path: the deepest ancestor of *path* that exists, resolved by
+    the filesystem, then the names below it. Empty when *path* exists.
+
+    Raises:
+        OSError: an ancestor cannot be looked up for a reason other than
+            being missing, or a missing part is ``.`` or ``..`` — where that
+            leads is left to how ``makedirs`` folds it.
+    """
+    missing: list[str] = []
+    head = path
+    while True:
+        try:
+            os.stat(head or os.curdir)
+            break
+        except FileNotFoundError:
+            parent, name = os.path.split(head)
+            if parent == head:
+                raise
+            if name:
+                missing.append(name)
+            head = parent
+    if any(name in (os.curdir, os.pardir) for name in missing):
+        raise OSError(errno.EINVAL, "'.' or '..' below a directory that does "
+                                    "not exist yet", path)
+    made, current = [], os.path.realpath(head or os.curdir, strict=True)
+    for name in reversed(missing):
+        current = os.path.join(current, name)
+        made.append(current)
+    return made
 
 
 class SnapshotsMixin:
@@ -111,9 +146,40 @@ class SnapshotsMixin:
         missing — the directory itself ``0700``: a memory image is the
         guest's RAM. An existing directory is left as it is.
 
+        Never a cluster workdir that does not exist, under any name: that is
+        not this command's to create, so a *path* inside one, or equal to
+        it, is refused.
+
         Raises:
-            SnapshotError: it could not be created.
+            SnapshotError: it could not be created, or creating it would also
+                create a missing cluster workdir — or whether it would
+                cannot be told.
         """
+        try:
+            made = _dirs_made_for(path)
+        except OSError as exc:
+            raise SnapshotError(
+                f"could not create the snapshot directory {path} "
+                f"({exc})") from exc
+        if not made:
+            return
+        for cluster_name, cluster in (self.config.get('clusters') or {}).items():
+            workdir = cluster.get('workdir') if isinstance(cluster, dict) else None
+            if not workdir:
+                continue
+            try:
+                makes_workdir = _dirs_made_for(os.path.expanduser(workdir))
+            except OSError as exc:
+                raise SnapshotError(
+                    f"could not create the snapshot directory {path}: whether "
+                    f"that would also create {workdir}, the workdir of "
+                    f"cluster {cluster_name}, cannot be told ({exc})") from exc
+            if makes_workdir and makes_workdir[-1] in made:
+                raise SnapshotError(
+                    f"could not create the snapshot directory {path}: that "
+                    f"would also create {workdir}, the workdir of cluster "
+                    f"{cluster_name}, which does not exist — provision that "
+                    f"cluster first, or set a memory_snapshot_dir outside it")
         try:
             os.makedirs(path, mode=0o700, exist_ok=True)
         except OSError as exc:
@@ -342,6 +408,20 @@ class SnapshotsMixin:
         # Ensure provider configs reflect runtime settings
         self._update_sessions_with_runtime()
 
+        # Every check, and every directory made, before anything is
+        # snapshotted: the docker-compose clusters are, first.
+        self.validate_memory_snapshot_dirs()
+        # each VM's memory image goes to its cluster's memory_snapshot_dir
+        vm_targets = [
+            (full_vm_name, self.cluster_memory_snapshot_dir(cluster_name))
+            for full_vm_name, cluster_name, _vm_name, _workdir
+            in self._select_vm_targets(cli_args)
+        ]
+        # a memory_snapshot_dir is made on first use; a workdir exists by now
+        for memory_snapshot_dir in self._cluster_memory_snapshot_dirs():
+            if any(d == memory_snapshot_dir for _vm, d in vm_targets):
+                self._ensure_memory_snapshot_dir(memory_snapshot_dir)
+
         # docker-compose clusters first (cluster-scoped, D3). Failures are
         # isolated per cluster so a dc cluster that isn't up can't stop the
         # VMs of a mixed project from being snapshotted.
@@ -351,12 +431,6 @@ class SnapshotsMixin:
                 cname, cluster, cli_args.snapshot_name,
                 getattr(cli_args, 'snapshot_descr', '') or ''))
 
-        # each VM's memory image goes to its cluster's memory_snapshot_dir
-        vm_targets = [
-            (full_vm_name, self.cluster_memory_snapshot_dir(cluster_name))
-            for full_vm_name, cluster_name, _vm_name, _workdir
-            in self._select_vm_targets(cli_args)
-        ]
         if not vm_targets:
             if not dc_done:
                 self.logger.warning(
@@ -364,10 +438,6 @@ class SnapshotsMixin:
                     "--cluster/--vms selection")
             self._exit_if_dc_failed(dc_failed, 'take')
             return
-        # a memory_snapshot_dir is made on first use; a workdir exists by now
-        for memory_snapshot_dir in self._cluster_memory_snapshot_dirs():
-            if any(d == memory_snapshot_dir for _vm, d in vm_targets):
-                self._ensure_memory_snapshot_dir(memory_snapshot_dir)
 
         compress_memory = getattr(cli_args, 'compress_memory', False)
         compress_level = getattr(cli_args, 'memory_compress_level', 3)

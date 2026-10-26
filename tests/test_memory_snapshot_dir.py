@@ -229,6 +229,86 @@ class TestTake:
 
         assert not workdir.exists()
 
+    @pytest.mark.parametrize("where", ["inside", "equal"])
+    def test_one_in_a_missing_workdir_does_not_make_the_workdir(
+            self, tmp_path, monkeypatch, where):
+        workdir = tmp_path / "c1"
+        snaps = workdir / "snaps" if where == "inside" else workdir
+        mgr = _manager({"workdir": str(workdir),
+                        "memory_snapshot_dir": str(snaps)})
+
+        with pytest.raises(SnapshotError, match=f"would also create {workdir}, "
+                                                f"the workdir of cluster "
+                                                f"cluster_1"):
+            _take(mgr, monkeypatch)
+
+        assert not workdir.exists()
+        mgr.provider.snapshot_take.assert_not_called()
+
+    def test_one_reaching_a_missing_workdir_by_another_name_does_not_make_it(
+            self, tmp_path, monkeypatch):
+        real = tmp_path / "real"
+        real.mkdir()
+        os.symlink(real, tmp_path / "alias")
+        mgr = _manager({"workdir": str(tmp_path / "alias" / "c1"),
+                        "memory_snapshot_dir": str(real / "c1" / "snaps")})
+
+        with pytest.raises(SnapshotError, match="would also create"):
+            _take(mgr, monkeypatch)
+
+        assert not (real / "c1").exists()
+
+    def test_another_clusters_missing_workdir_is_not_made_either(
+            self, tmp_path, monkeypatch):
+        (tmp_path / "c1").mkdir()
+        mgr = _manager({"workdir": str(tmp_path / "c1"),
+                        "memory_snapshot_dir": str(tmp_path / "c2" / "snaps")})
+        mgr.config["clusters"]["cluster_2"] = {
+            "workdir": str(tmp_path / "c2"), "vms": {}}
+
+        with pytest.raises(SnapshotError,
+                           match="the workdir of cluster cluster_2"):
+            _take(mgr, monkeypatch)
+
+        assert not (tmp_path / "c2").exists()
+
+    @staticmethod
+    def _with_a_compose_cluster(mgr, tmp_path):
+        mgr.config["clusters"]["web"] = {
+            "provider": "docker-compose", "workdir": str(tmp_path / "web"),
+            "boxes": {}}
+        session = MagicMock()
+        session.snapshot_take_cluster.return_value = True
+        mgr.session_for_cluster = MagicMock(return_value=session)
+        return session
+
+    def test_a_compose_only_project_is_refused_before_any_snapshot(
+            self, tmp_path, monkeypatch):
+        """It has no VM to take, and returned before the check."""
+        mgr = _manager({})
+        mgr.config["clusters"] = {}
+        session = self._with_a_compose_cluster(mgr, tmp_path)
+        mgr.config["clusters"]["web"]["memory_snapshot_dir"] = str(
+            tmp_path / "snaps")
+
+        with pytest.raises(ConfigError, match="docker-compose cluster takes "
+                                              "no memory_snapshot_dir"):
+            _take(mgr, monkeypatch)
+
+        session.snapshot_take_cluster.assert_not_called()
+
+    def test_a_mixed_project_is_refused_before_its_containers_are_snapshotted(
+            self, tmp_path, monkeypatch):
+        mgr = _manager({"workdir": str(tmp_path / "c1"),
+                        "memory_snapshot_dir": "snaps"})
+        session = self._with_a_compose_cluster(mgr, tmp_path)
+
+        with pytest.raises(ConfigError, match="must be an absolute path"):
+            _take(mgr, monkeypatch)
+
+        session.snapshot_take_cluster.assert_not_called()
+        mgr.provider.snapshot_take.assert_not_called()
+
     @pytest.mark.skipif(os.geteuid() == 0, reason="root writes anywhere")
     def test_a_memory_snapshot_dir_that_cannot_be_made_stops_before_any_take(
             self, tmp_path, monkeypatch):
