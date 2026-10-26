@@ -2,7 +2,8 @@
 
 Proof of concept: an **unattended Windows Server 2022 (Server Core)
 install** on libvirt, reachable over **WinRM and OpenSSH** and driven by
-Ansible. It uses boxman's existing ISO-boot path with no code change. The
+Ansible. It uses boxman's ISO-boot path, which gives virt-install every
+`cdroms:` entry, so Setup sees the driver ISO on its first boot. The
 findings, the gaps it works around and the proposed design are in
 [doc/windows-guests.md](../../doc/windows-guests.md).
 
@@ -54,25 +55,19 @@ boxman up
 
 Once `C:\boxman-setup.log` ends with `boxman-setup: done` (or with
 `boxman-setup: FAILED: …`, which names the steps left to do by hand),
-**eject the answer ISO and virtio-win**. Both are needed only for the
-install, and both otherwise stay attached for the VM's whole life:
-
-- the answer ISO holds the Administrator password in plain text;
-- `boxman update` does not know either drive (they are not in `cdroms:`),
-  so while one holds media it is taken for a drive removed from the
-  config and detached, with a pending restart, on every run. Empty drives
-  are left alone.
-
-Each drive is named by its ISO's path, not by a target such as `sdc`,
-which depends on the order virt-install attaches media in; `--force` gets
-past a guest's tray lock:
+**eject the answer ISO**. It holds the Administrator password in plain
+text and otherwise stays attached for the VM's whole life. It is not in
+`cdroms:`, so until it is ejected `boxman update` takes it for a drive
+removed from the config and detaches it, with a pending restart, on every
+run; an empty drive is left alone. (virtio-win is declared in `cdroms:`
+and stays attached.) The drive is named by the ISO's path, not by a
+target such as `sdc`, which depends on the order virt-install attaches
+media in; `--force` gets past a guest's tray lock:
 
 ```bash
-dom=bprj__boxman_dev_windows-server-2022-iso-boot__bprj_win_win01
-for iso in ~/workspaces/windows-server-2022-iso-boot/answer.iso \
-           /usr/share/virtio-win/virtio-win.iso; do
-  virsh -c qemu:///system change-media "$dom" "$iso" --eject --force --live --config
-done
+virsh -c qemu:///system change-media \
+  bprj__boxman_dev_windows-server-2022-iso-boot__bprj_win_win01 \
+  ~/workspaces/windows-server-2022-iso-boot/answer.iso --eject --force --live --config
 ```
 
 ## Verify
@@ -114,7 +109,7 @@ All of these are covered in the doc.
 - **No `admin_pass` key push.** It runs `ssh-copy-id`, which writes
   `~/.ssh/authorized_keys`. Windows' sshd reads
   `C:\ProgramData\ssh\administrators_authorized_keys` for administrators.
-- **The answer ISO and virtio-win stay attached** until you eject them
-  (above). Until then `boxman update` detaches them on every run.
+- **The answer ISO stays attached** until you eject it (above). Until
+  then `boxman update` detaches it on every run.
 - **Licensing.** The ISO is a 180-day evaluation for test/demo use. Do not
   push the ISO or a disk installed from it to a registry.
