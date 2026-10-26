@@ -93,5 +93,8 @@ clusters:
           # install-phase domain (on_reboot=destroy) is still running, so the
           # VM stayed off after Setup's first reboot (G2). A later --wait wins:
           # virt-install then waits for that stop and boots the installed
-          # disk itself. `boxman up` blocks until then.
-          - '--wait=-1'
+          # disk itself. `boxman up` blocks until then, for at most 30
+          # minutes (the install phase takes about 1.5): if Setup stalls,
+          # virt-install gives up, `boxman up` fails, and the domain is left
+          # running so its VNC console shows where Setup stopped.
+          - '--wait=30'

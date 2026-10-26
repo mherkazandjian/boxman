@@ -21,7 +21,7 @@ one manual step (see [Known gaps](#known-gaps)).
 3. WinPE finds `autounattend.xml` on the answer ISO. It loads `viostor` and
    `NetKVM` from the virtio-win ISO, partitions the disk (MBR, SeaBIOS) and
    applies the Server Core image. It then reboots; virt-install, kept
-   waiting by `--wait=-1`, starts the VM again.
+   waiting by `--wait=30` (at most 30 minutes), starts the VM again.
 4. After the next start: specialize, OOBE, one auto-logon as Administrator,
    and `boxman-setup.ps1`. That installs all virtio drivers and the QEMU
    guest agent, enables WinRM (HTTP 5985, NTLM, Basic off) and installs
@@ -89,11 +89,12 @@ ansible all -i "$IP," -m ansible.windows.win_ping \
 
 All of these are covered in the doc.
 
-- **Powers off after the first Setup reboot without `--wait=-1`.**
+- **Powers off after the first Setup reboot without `--wait=30`.**
   virt-install's install-phase domain has `on_reboot=destroy`, and boxman
-  runs it with `--wait=0`. The box overrides that with a later `--wait=-1`;
+  runs it with `--wait=0`. The box overrides that with a later `--wait=30`;
   without it the VM stays off, and the first `boxman up` waits 600 s and
-  exits 0.
+  exits 0. If Setup stalls, virt-install gives up after 30 minutes and
+  `boxman up` fails, leaving the VM running so its console can be checked.
 - **`boxman ssh` / generated `ssh_config` do not work.** They use
   `User admin` and boxman's own key. Use `Administrator` and the key you
   baked into the answer ISO. The generated inventory has no
