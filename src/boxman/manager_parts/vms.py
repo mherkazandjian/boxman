@@ -132,6 +132,35 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
             else:
                 raise
 
+
+class _SameFiles:
+    """Files, matched by their name as given or by their identity
+    (``os.stat``, links followed); a file whose identity cannot be read is
+    matched by its name alone."""
+
+    def __init__(self) -> None:
+        self._names: set[str] = set()
+        self._identities: set[tuple[int, int]] = set()
+
+    @staticmethod
+    def _identity(path: str) -> tuple[int, int] | None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    def add(self, path: str) -> None:
+        self._names.add(path)
+        identity = self._identity(path)
+        if identity is not None:
+            self._identities.add(identity)
+
+    def __contains__(self, path: object) -> bool:
+        return (path in self._names
+                or self._identity(path) in self._identities)
+
+
 class VMsMixin:
 
     ### end networks define / remove / destroy
@@ -851,29 +880,20 @@ class VMsMixin:
           of its snapshots recorded, which a teardown never removes by its
           name (:func:`remove_vm_storage`).
 
-        Files are matched by resolved path or identity, so an image kept or
-        recorded under another name of its file is one file, named once.
+        A file is matched by its name as given or by its identity, read with
+        ``os.stat`` — never by ``os.path.realpath``, which folds ``..`` past
+        a link it cannot read and so can name another file. So an image
+        kept, recorded or already named under another name of its file is
+        one file, named once.
         """
-        def identity(path: str) -> tuple[int, int] | None:
-            try:
-                st = os.stat(path)
-            except OSError:
-                return None
-            return (st.st_dev, st.st_ino)
-
-        def matcher(paths):
-            resolved = {os.path.realpath(path) for path in paths}
-            ids = {identity(path) for path in paths} - {None}
-            return lambda path: (os.path.realpath(path) in resolved
-                                 or identity(path) in ids)
-
-        is_kept = matcher([path for path, _reason in outcome.kept])
-        recorded_paths = []
+        reported, recorded_files = _SameFiles(), _SameFiles()
+        for path, _reason in outcome.kept:
+            reported.add(path)
         for snapshot, recorded in sorted(inventory.memory_images.items()):
             boxman_named = (os.path.basename(recorded)
                             == memory_image_name(full_vm_name, snapshot))
             for path in (recorded, f"{recorded}.zst"):
-                recorded_paths.append(path)
+                recorded_files.add(path)
                 what = (f"the memory image of its snapshot '{snapshot}', "
                         f"which can no longer be restored")
                 try:
@@ -885,8 +905,9 @@ class VMsMixin:
                         f"still there ({exc}) — {what}; if it is, remove it "
                         f"by hand")
                     continue
-                if is_kept(path):
+                if path in reported:
                     continue
+                reported.add(path)
                 why = ("it is outside every cluster workdir and "
                        "memory_snapshot_dir, where a teardown removes "
                        "nothing" if boxman_named else
@@ -896,7 +917,6 @@ class VMsMixin:
                     f"{full_vm_name}: left {path} in place because {why} — "
                     f"{what}; remove it by hand")
 
-        is_recorded = matcher(recorded_paths)
         for memory_dir in self._cluster_memory_snapshot_dirs():
             try:
                 found = memory_image_candidates(memory_dir, full_vm_name)
@@ -907,8 +927,9 @@ class VMsMixin:
                     f"none of its snapshots recorded is not named")
                 continue
             for path in found:
-                if is_kept(path) or is_recorded(path):
+                if path in reported or path in recorded_files:
                     continue
+                reported.add(path)
                 self.logger.warning(
                     f"{full_vm_name}: left {path} in place because none of "
                     f"its snapshots recorded it, though it is named as one "

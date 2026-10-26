@@ -3082,6 +3082,62 @@ class TestMemoryImagesLeftOutside:
         assert t.warnings == f'{VM}: left {recorded} in place because ' \
                              f'domain {OTHER} uses it'
 
+    @unless_root
+    def test_a_recorded_path_that_cannot_be_resolved_hides_no_other_image(
+            self, tmp_path):
+        """``hidden/hop/../../memory`` under an unsearchable ``hidden``,
+        with ``hop`` a symlink, is ``elsewhere/memory``: folded unread it
+        named the image in the configured ``memory``, which no snapshot
+        recorded, and that one went unnamed."""
+        workdir, snaps = tmp_path / 'work', tmp_path / 'memory'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        listed = _file(snaps / f'{VM}_snapshot_s1.raw', b'unrecorded')
+        (tmp_path / 'elsewhere' / 'a' / 'b').mkdir(parents=True)
+        _file(tmp_path / 'elsewhere' / 'memory' / f'{VM}_snapshot_s1.raw')
+        (tmp_path / 'hidden').mkdir()
+        os.symlink(tmp_path / 'elsewhere' / 'a' / 'b',
+                   tmp_path / 'hidden' / 'hop')
+        recorded = f'{tmp_path}/hidden/hop/../../memory/{VM}_snapshot_s1.raw'
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_snapshot_dir=snaps, memory_images={'s1': recorded})
+        (tmp_path / 'hidden').chmod(0)
+        try:
+            t.deprovision()
+        finally:
+            (tmp_path / 'hidden').chmod(0o700)
+
+        assert listed.read_bytes() == b'unrecorded'
+        assert (f'left {listed} in place because none of its snapshots '
+                f'recorded it') in t.warnings
+
+    def test_one_file_listed_through_two_directories_is_named_once(
+            self, tmp_path):
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        _file(snaps / f'{VM}_snapshot_s1.raw')
+        os.symlink(snaps, tmp_path / 'alias')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_snapshot_dir=snaps)
+        t.mgr.config['clusters']['cluster_2'] = {
+            'workdir': str(tmp_path / 'work2'),
+            'memory_snapshot_dir': str(tmp_path / 'alias'), 'vms': {}}
+
+        t.deprovision()
+
+        assert t.warnings.count('none of its snapshots recorded it') == 1
+
+    def test_two_recorded_names_of_one_file_are_named_once(self, tmp_path):
+        workdir, old = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(old / f'{VM}_snapshot_s1.raw')
+        s2 = _link(s1, old / f'{VM}_snapshot_s2.raw')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_images={'s1': str(s1), 's2': str(s2)})
+
+        t.deprovision()
+
+        assert t.warnings.count('outside every cluster workdir') == 1
+
     def test_one_already_gone_goes_unnamed(self, tmp_path):
         workdir, old = self._dirs(tmp_path)
         boot = _qcow2(workdir / f'{VM}.qcow2')
