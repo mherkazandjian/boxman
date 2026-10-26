@@ -3138,6 +3138,32 @@ class TestMemoryImagesLeftOutside:
 
         assert t.warnings.count('outside every cluster workdir') == 1
 
+    @unless_root
+    def test_one_that_cannot_be_inspected_is_named_once(self, tmp_path):
+        """Kept because it could not be inspected, it is not also named as
+        maybe there — nor is its .raw.zst, nor either again for a second
+        snapshot recording the same file."""
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        zst = f'{raw}.zst'
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_snapshot_dir=snaps,
+                      memory_images={'s1': str(raw), 'again': str(raw)})
+        snaps.chmod(0)
+        try:
+            t.deprovision()
+        finally:
+            snaps.chmod(0o700)
+
+        warnings = [str(c.args[0])
+                    for c in t.mgr.logger.warning.call_args_list]
+        for path in (raw, zst):
+            named = [w for w in warnings
+                     if f'left {path} in place' in w
+                     or f'whether {path} is still there' in w]
+            assert len(named) == 1, named
+
     def test_one_already_gone_goes_unnamed(self, tmp_path):
         workdir, old = self._dirs(tmp_path)
         boot = _qcow2(workdir / f'{VM}.qcow2')

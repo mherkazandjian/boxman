@@ -896,16 +896,17 @@ class VMsMixin:
                 recorded_files.add(path)
                 what = (f"the memory image of its snapshot '{snapshot}', "
                         f"which can no longer be restored")
+                if path in reported:
+                    continue
                 try:
                     if not entry_exists(path):
                         continue
                 except OSError as exc:
+                    reported.add(path)
                     self.logger.warning(
                         f"{full_vm_name}: could not tell whether {path} is "
                         f"still there ({exc}) — {what}; if it is, remove it "
                         f"by hand")
-                    continue
-                if path in reported:
                     continue
                 reported.add(path)
                 why = ("it is outside every cluster workdir and "
