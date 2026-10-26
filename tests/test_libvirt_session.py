@@ -2656,3 +2656,80 @@ class TestFilesAPoolHasNotListedYet:
         assert [what for _, what, _ in host.log
                 if what not in ("qemu-img", "unreadable-probe",
                                 "absence-probe")] == asked
+
+
+class TestSnapshotMemoryInUse:
+    """The memory images every other domain's snapshots record — the
+    ``.raw`` and the ``.raw.zst`` compression leaves of it — by path and by
+    identity, which no teardown or ``--force`` retake may remove. Fails
+    closed: ``None`` once any of them cannot be told."""
+
+    def _run(self, images, relists=(), listing_ok=True):
+        """Domains vm-a, vm-b and the VM torn down, vm-x; *images* maps a
+        domain to what ``SnapshotManager.memory_images`` answers for it."""
+        relists = iter(relists)
+        listed = []
+
+        def virsh_execute(*args, **kwargs):
+            if args[:2] == ("list", "--all"):
+                listed.append(args)
+                if len(listed) == 1:
+                    if not listing_ok:
+                        return _result(ok=False, stderr="error: no hypervisor")
+                    return _result(stdout=domain_listing(
+                        args, "vm-a", "vm-b", "vm-x"))
+                return _result(stdout=domain_listing(args, *next(relists)))
+            raise AssertionError(f"unexpected virsh {args}")
+
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh, \
+             patch("boxman.providers.libvirt.session.SnapshotManager."
+                   "memory_images", autospec=True,
+                   side_effect=lambda _self, domain: images[domain]):
+            virsh.return_value.execute.side_effect = virsh_execute
+            return _session({}).snapshot_memory_in_use("vm-x")
+
+    def test_what_other_domains_snapshots_record_by_path_and_identity(
+            self, tmp_path):
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        zst = tmp_path / "b_snapshot_s2.raw.zst"
+        zst.write_bytes(b"RAM")
+
+        in_use = self._run({
+            "vm-a": {"s1": str(raw)},
+            "vm-b": {"s2": str(tmp_path / "b_snapshot_s2.raw")},
+            "vm-x": {"s9": "/never/asked.raw"}})
+
+        assert in_use[str(raw)] == "vm-a"
+        assert in_use[str(zst)] == "vm-b"
+        assert "/never/asked.raw" not in in_use
+        ids = {(os.stat(p).st_dev, os.stat(p).st_ino) for p in (raw, zst)}
+        assert set(in_use.identities) == ids
+
+    def test_a_domain_whose_snapshots_cannot_be_read_fails_it(self):
+        assert self._run({"vm-a": {}, "vm-b": None, "vm-x": {}},
+                         relists=[("vm-a", "vm-b", "vm-x")]) is None
+
+    def test_a_domain_gone_meanwhile_holds_nothing(self):
+        in_use = self._run({"vm-a": {}, "vm-b": None, "vm-x": {}},
+                           relists=[("vm-a", "vm-x")])
+
+        assert in_use == {}
+
+    def test_a_domain_list_that_fails_fails_it(self):
+        assert self._run({}, listing_ok=False) is None
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root searches a mode-000 directory")
+    def test_an_image_that_cannot_be_looked_up_fails_it(self, tmp_path):
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        (hidden / "a_snapshot_s1.raw").write_bytes(b"RAM")
+        hidden.chmod(0)
+        try:
+            in_use = self._run({"vm-a": {"s1": str(hidden / "a_snapshot_s1.raw")},
+                                "vm-b": {}, "vm-x": {}})
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is None

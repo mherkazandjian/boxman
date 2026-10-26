@@ -156,9 +156,16 @@ class SnapshotManager:
                         compress_memory: bool = False,
                         compress_level: int = 3,
                         force: bool = False,
-                        paths_in_use=None) -> bool:
+                        paths_in_use=None,
+                        memory_in_use=None) -> bool:
         """
         Create a snapshot of a VM.
+
+        The memory image is written only where no file is: one already
+        there — a leftover, or another VM's image under the same name (VM
+        ``v``'s snapshot ``r_snapshot_s1`` and ``s1`` of VM ``v_snapshot_r``
+        name one file) — refuses the take, after *force* has cleared what
+        it may.
 
         Args:
             vm_name: Name of the VM
@@ -183,6 +190,9 @@ class SnapshotManager:
             paths_in_use: With *force*, what every domain uses
                 (``LibVirtSession.disk_paths_in_use``), asked before a
                 leftover is removed; without it none is.
+            memory_in_use: With *force*, the memory images other domains'
+                snapshots record (``LibVirtSession.snapshot_memory_in_use``),
+                asked likewise.
 
         Returns:
             bool: True if successful, False otherwise
@@ -190,7 +200,27 @@ class SnapshotManager:
         try:
             if force and not self._force_clear_for_retake(
                     vm_name, vm_dir, snapshot_name,
-                    paths_in_use=paths_in_use):
+                    paths_in_use=paths_in_use, memory_in_use=memory_in_use):
+                return False
+            snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
+            mem_path = os.path.join(vm_dir, snap_fname)
+            for path in (mem_path, f"{mem_path}.zst"):
+                try:
+                    os.lstat(path)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    self.logger.error(
+                        f"cannot tell whether {path} already exists ({exc}); "
+                        f"refusing to take snapshot '{snapshot_name}' of "
+                        f"{vm_name}, which could write over it")
+                    return False
+                self.logger.error(
+                    f"{path} already exists — a leftover of an earlier "
+                    f"snapshot, or another VM's memory image under the same "
+                    f"name; refusing to write snapshot '{snapshot_name}' of "
+                    f"{vm_name} over it (snapshot take --force clears a "
+                    f"leftover no domain uses)")
                 return False
             # Before saving memory state, ensure cdroms point directly at
             # their raw ISO backing files (not qcow2 overlays of them).
@@ -198,8 +228,6 @@ class SnapshotManager:
             # "Image is not in qcow2 format" when QEMU validates the chain.
             self._flatten_cdrom_overlays(vm_name)
 
-            snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
-            mem_path = os.path.join(vm_dir, snap_fname)
             # Exclude cdroms from the snapshot so no new qcow2 overlay is
             # created for them (they stay at the raw ISO after this call).
             cdrom_args = self._cdrom_diskspec_args(vm_name)
@@ -271,7 +299,8 @@ class SnapshotManager:
                                 vm_name: str,
                                 vm_dir: str,
                                 snapshot_name: str,
-                                paths_in_use=None) -> bool:
+                                paths_in_use=None,
+                                memory_in_use=None) -> bool:
         """
         Remove anything that would make a fresh snapshot named
         *snapshot_name* collide, so ``snapshot take --force`` can re-use the
@@ -287,15 +316,18 @@ class SnapshotManager:
            files.
 
         Files that are part of the VM's *current* active disk chain are never
-        removed. Nor is a leftover any domain uses, the VM itself included:
-        each is matched by resolved path and by identity against
-        *paths_in_use* (``LibVirtSession.disk_paths_in_use``), asked once
-        there is anything to remove. The memory image's directory can be a
-        cluster's memory_snapshot_dir outside the workdir, reaching a disk
-        under another name — a symlink to the directory a live disk is in.
-        One in use, a scan that fails or none given, or a leftover that
-        cannot be inspected refuses the retake: the snapshot would be
-        written over that file.
+        removed. Nor is a leftover any domain uses, the VM itself included,
+        or one another domain's snapshot records as its memory image: each
+        is matched by resolved path and by identity against *paths_in_use*
+        (``LibVirtSession.disk_paths_in_use``) and *memory_in_use*
+        (``LibVirtSession.snapshot_memory_in_use``), asked once there is
+        anything to remove. The memory image's directory can be a cluster's
+        memory_snapshot_dir outside the workdir, reaching a disk under
+        another name — a symlink to the directory a live disk is in — or
+        holding another VM's image under the same name. One in use or
+        recorded, a scan that fails or none given, or a leftover that cannot
+        be inspected refuses the retake: the snapshot would be written over
+        that file.
 
         Returns True when the name is clear to re-use.
         """
@@ -331,7 +363,8 @@ class SnapshotManager:
         # in the live chain — never remove
         leftovers = [path for path in candidates
                      if path not in active and os.path.isfile(path)]
-        refusal = self._leftover_in_use(leftovers, paths_in_use)
+        refusal = self._leftover_in_use(leftovers, paths_in_use,
+                                        memory_in_use)
         if refusal:
             self.logger.error(
                 f"--force: {refusal}; refusing to remove it, or to take "
@@ -348,12 +381,14 @@ class SnapshotManager:
         return True
 
     @staticmethod
-    def _leftover_in_use(leftovers: list[str], paths_in_use) -> str | None:
+    def _leftover_in_use(leftovers: list[str], paths_in_use,
+                         memory_in_use) -> str | None:
         """
         Why one of *leftovers* may not be removed, if one may not: a domain
-        uses it, by resolved path or by identity (``(st_dev, st_ino)``, links
-        followed); it cannot be inspected; or what the domains use cannot be
-        told — *paths_in_use* is ``None``, or answers ``None``.
+        uses it, or another domain's snapshot records it as its memory
+        image, by resolved path or by identity (``(st_dev, st_ino)``, links
+        followed); it cannot be inspected; or either cannot be told — the
+        scan is ``None``, or answers ``None``.
         """
         if not leftovers:
             return None
@@ -368,12 +403,19 @@ class SnapshotManager:
         if in_use is None:
             return (f"could not check whether a domain uses "
                     f"{', '.join(leftovers)}")
-        used_ids = getattr(in_use, "identities", {})
-        for path in leftovers:
-            domain = (in_use.get(os.path.realpath(path))
-                      or used_ids.get(identities[path]))
-            if domain:
-                return f"{path}: domain {domain} uses it"
+        recorded = memory_in_use() if memory_in_use is not None else None
+        if recorded is None:
+            return (f"could not check whether a snapshot of another domain "
+                    f"records {', '.join(leftovers)} as its memory image")
+        for scan, what in ((in_use, "domain {} uses it"),
+                           (recorded, "a snapshot of domain {} records it "
+                                      "as its memory image")):
+            used_ids = getattr(scan, "identities", {})
+            for path in leftovers:
+                domain = (scan.get(os.path.realpath(path))
+                          or used_ids.get(identities[path]))
+                if domain:
+                    return f"{path}: {what.format(domain)}"
         return None
 
     # ── memory file compression (zstd) ──────────────────────────────────

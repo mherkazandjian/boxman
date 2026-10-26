@@ -126,7 +126,7 @@ class _Teardown:
     def __init__(self, workdir, *, disks=(), media=(), rows=None,
                  records=None, records_error=None, in_use=None,
                  chains=STANDALONE, memory_snapshot_dir=None,
-                 memory_images=None):
+                 memory_images=None, memory_in_use=None):
         self.workdir = workdir
         cluster = {'workdir': str(workdir)}
         if memory_snapshot_dir is not None:
@@ -148,6 +148,9 @@ class _Teardown:
             {} if in_use is None else in_use)
         session.snapshot_memory_images.return_value = (
             {} if memory_images is None else memory_images)
+        session.snapshot_memory_in_use.return_value = (
+            disk_cleanup.FilesInUse() if memory_in_use is None
+            else memory_in_use)
         self.mgr.session_for_cluster = MagicMock(return_value=session)
         self.mgr.provider = session
         self.mgr._vm_disk_records = MagicMock(
@@ -3168,3 +3171,101 @@ class TestMemoryImagesLeftOutside:
         assert 'could not read its snapshots' in t.warnings
         assert f'left {raw} in place because none of its snapshots ' \
                f'recorded it' in t.warnings
+
+
+class TestMemoryImagesAnotherSnapshotRecords:
+    """Neither its name nor this VM's own record makes a memory image this
+    VM's alone: two domains' snapshots can record one path — V's snapshot
+    ``replica_snapshot_s1`` and ``s1`` of V_snapshot_replica, in a
+    memory_snapshot_dir their clusters share. What every other domain's
+    snapshots record (``LibVirtSession.snapshot_memory_in_use``) is kept,
+    by path or identity; asked only when a memory image would go."""
+
+    REPLICA = f'{VM}_snapshot_replica'
+
+    @staticmethod
+    def _dirs(tmp_path):
+        workdir, snaps = tmp_path / 'work', tmp_path / 'snaps'
+        workdir.mkdir()
+        snaps.mkdir()
+        return workdir, snaps
+
+    def test_one_another_domains_snapshot_records_too_is_kept(self, tmp_path):
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        shared = _file(snaps / f'{VM}_snapshot_replica_snapshot_s1.raw',
+                       b'replica RAM')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_snapshot_dir=snaps,
+                      memory_images={'replica_snapshot_s1': str(shared)},
+                      memory_in_use=disk_cleanup.FilesInUse(
+                          {str(shared): self.REPLICA}))
+
+        t.deprovision()
+
+        assert not boot.exists()
+        assert shared.read_bytes() == b'replica RAM'
+        assert (f'left {shared} in place because a snapshot of domain '
+                f'{self.REPLICA} records it as its memory image') in t.warnings
+        t.session.snapshot_memory_in_use.assert_called_once_with(VM)
+
+    def test_one_recorded_there_under_another_name_is_kept(self, tmp_path):
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw', b'RAM')
+        other = _link(raw, tmp_path / 'elsewhere' / 'theirs.raw')
+        recorded = disk_cleanup.FilesInUse({str(other): OTHER})
+        st = os.stat(other)
+        recorded.identities[(st.st_dev, st.st_ino)] = OTHER
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_snapshot_dir=snaps,
+                      memory_images={'s1': str(raw)}, memory_in_use=recorded)
+
+        t.deprovision()
+
+        assert raw.read_bytes() == b'RAM'
+        assert f'domain {OTHER} records it as its memory image' in t.warnings
+
+    def test_a_memory_file_in_its_workdir_another_snapshot_records_is_kept(
+            self, tmp_path):
+        """Removed there by its name: a workdir two clusters share holds
+        both VMs' images."""
+        workdir = tmp_path / 'work'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        shared = _file(workdir / f'{VM}_snapshot_replica_snapshot_s1.raw')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_in_use=disk_cleanup.FilesInUse(
+                          {str(shared): self.REPLICA}))
+
+        t.deprovision()
+
+        assert not boot.exists()
+        assert shared.exists()
+
+    def test_when_other_snapshots_cannot_be_read_its_memory_images_are_kept(
+            self, tmp_path):
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_snapshot_dir=snaps,
+                      memory_images={'s1': str(raw)})
+        t.session.snapshot_memory_in_use.return_value = None
+
+        t.deprovision()
+
+        assert not boot.exists()
+        assert raw.exists()
+        assert (f'left {raw} in place because whether a snapshot of another '
+                f'domain records it as its memory image could not be '
+                f'checked') in t.warnings
+
+    def test_without_a_memory_image_to_remove_none_is_read(self, tmp_path):
+        workdir = tmp_path / 'work'
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        t = _Teardown(workdir, disks=[boot], records=[])
+
+        t.deprovision()
+
+        assert not boot.exists()
+        t.session.snapshot_memory_in_use.assert_not_called()

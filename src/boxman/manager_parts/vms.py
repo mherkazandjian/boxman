@@ -804,7 +804,8 @@ class VMsMixin:
         # _run_parallel's failure handling
         outcome = remove_vm_storage(
             inventory, self._cluster_workdirs(), session.disk_paths_in_use,
-            memory_dirs=self._cluster_memory_snapshot_dirs())
+            memory_dirs=self._cluster_memory_snapshot_dirs(),
+            memory_in_use=lambda: session.snapshot_memory_in_use(full_vm_name))
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")

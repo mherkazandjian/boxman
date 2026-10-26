@@ -825,6 +825,7 @@ def remove_vm_storage(
     workdirs: Iterable[str],
     paths_in_use: Callable[[], dict[str, str] | None],
     memory_dirs: Iterable[str] = (),
+    memory_in_use: Callable[[], dict[str, str] | None] | None = None,
 ) -> StorageOutcome:
     """
     Remove the storage an undefined VM owns — and nothing else.
@@ -881,7 +882,11 @@ def remove_vm_storage(
     whole (:func:`_refuse_incomplete_chains`), and an unreadable chain
     keeps everything; nothing another domain uses directly or as a backing
     file is removed (*paths_in_use* is asked once, and ``None`` keeps
-    everything). What remains is removed heads first, each through
+    everything); and no memory image (:func:`is_memory_image`) a snapshot
+    of another domain records — neither its name nor this VM's own record
+    makes it this VM's alone (*memory_in_use*, asked once, only when one
+    would go; ``None`` keeps them all). What remains is removed heads
+    first, each through
     :func:`remove_if_unchanged` against the identity taken before
     undefining; a layer replaced since keeps everything below it.
 
@@ -1073,6 +1078,30 @@ def remove_vm_storage(
                 admission.refuse(path, f"domain {domain} uses it")
         if chains:
             _refuse_incomplete_chains(chains, admission)
+
+    # -- recorded by another domain's snapshot -----------------------------
+    memory_named = [(resolved, path)
+                    for resolved, path in admission.admitted.items()
+                    if is_memory_image(vm, path)]
+    if memory_named and memory_in_use is not None:
+        recorded = memory_in_use()
+        recorded_ids = getattr(recorded, "identities", {})
+        for resolved, path in memory_named:
+            if resolved not in admission.admitted:
+                continue     # withdrawn meanwhile, under another name
+            if recorded is None:
+                admission.refuse(path, (
+                    "whether a snapshot of another domain records it as its "
+                    "memory image could not be checked"))
+                continue
+            domain = recorded.get(resolved) or recorded.get(path) or next(
+                (recorded_ids[identity]
+                 for identity in sorted(identities.of(path))
+                 if identity in recorded_ids), None)
+            if domain:
+                admission.refuse(path, (
+                    f"a snapshot of domain {domain} records it as its memory "
+                    f"image"))
 
     # -- removal, heads first ------------------------------------------------
     # (ordered by resolved path: a layer named otherwise than the file

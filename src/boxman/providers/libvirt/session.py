@@ -2371,7 +2371,8 @@ class LibVirtSession(SessionConfigMixin):
             compress_memory=compress_memory,
             compress_level=compress_level,
             force=force,
-            paths_in_use=self.disk_paths_in_use)
+            paths_in_use=self.disk_paths_in_use,
+            memory_in_use=lambda: self.snapshot_memory_in_use(vm_name))
 
     def snapshot_log_data(self, vm_name: str) -> dict:
         """
@@ -2460,6 +2461,50 @@ class LibVirtSession(SessionConfigMixin):
         read (:meth:`SnapshotManager.memory_images`).
         """
         return SnapshotManager(self.provider_config).memory_images(vm_name)
+
+    def snapshot_memory_in_use(self, vm_name: str) -> FilesInUse | None:
+        """
+        The memory images the snapshots of every domain but *vm_name*
+        record — each ``.raw`` as libvirt recorded it, and the ``.raw.zst``
+        compression leaves beside it — mapped, as :meth:`disk_paths_in_use`
+        maps files, by path and by identity to the domain. A teardown or a
+        ``snapshot take --force`` that removes a memory image of *vm_name*
+        must not remove one of these: two domains' snapshots can record one
+        path, in a memory_snapshot_dir their clusters share, when one VM's
+        full name begins with the other's.
+
+        Fails closed: ``None`` when the domain list cannot be read, or the
+        snapshots of a domain cannot — unless it went away meanwhile
+        (:meth:`_raise_if_gone`) — or an image's identity cannot be read
+        other than for naming no file.
+        """
+        virsh = VirshCommand(provider_config=self.provider_config)
+        listing = virsh.execute("list", "--all", "--uuid", "--name",
+                                warn=True)
+        if not listing.ok:
+            return None
+        domains = _listed_domains(listing.stdout)
+        if domains is None:
+            return None
+        snapshots = SnapshotManager(self.provider_config)
+        recorded = FilesInUse()
+        for domain, uuid in domains:
+            if domain == vm_name:
+                continue
+            images = snapshots.memory_images(domain)
+            if images is None:
+                try:
+                    self._raise_if_gone(virsh, domain, uuid)
+                except _DomainGoneError:
+                    continue
+                except _DomainRenamedError:
+                    return None
+                return None
+            paths = [path for image in images.values()
+                     for path in (image, f"{image}.zst")]
+            if not self._record_in_use(recorded, domain, paths):
+                return None
+        return recorded
 
     def snapshot_restore(self, vm_name, snapshot_name=None):
         """

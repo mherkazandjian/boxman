@@ -3323,7 +3323,8 @@ class TestForceClearForRetake:
              patch.object(sm.virsh, "execute_shell", side_effect=fake_shell):
             assert sm._force_clear_for_retake(
                 "vm01", str(tmp_path), "snapX",
-                paths_in_use=MagicMock(return_value={})) is True
+                paths_in_use=MagicMock(return_value={}),
+                memory_in_use=MagicMock(return_value={})) is True
 
         joined = "\n".join(removed_cmds)
         assert orphan_overlay in joined
@@ -3385,7 +3386,8 @@ class TestForceClearProtectsFilesInUse:
         p.write_bytes(b"x")
         return str(p)
 
-    def _clear(self, sm, vm_dir, scan, active=()):
+    def _clear(self, sm, vm_dir, scan, active=(), memory=None):
+        memory = memory or MagicMock(return_value={})
         rm = []
         with patch.object(sm.virsh, "execute", return_value=self._ABSENT), \
              patch.object(sm, "_data_disk_targets", return_value=[
@@ -3396,7 +3398,8 @@ class TestForceClearProtectsFilesInUse:
                           rm.append(cmd) or _result()), \
              patch.object(sm, "logger") as logger:
             ok = sm._force_clear_for_retake("vm01", str(vm_dir), "snapX",
-                                            paths_in_use=scan)
+                                            paths_in_use=scan,
+                                            memory_in_use=memory)
         errors = " ".join(str(c.args[0]) for c in logger.error.call_args_list)
         return ok, rm, errors
 
@@ -3453,12 +3456,41 @@ class TestForceClearProtectsFilesInUse:
 
     def test_with_nothing_left_over_nothing_is_asked(
             self, sm: SnapshotManager, tmp_path: Path):
-        scan = MagicMock(return_value={})
+        scan, memory = MagicMock(return_value={}), MagicMock(return_value={})
 
-        ok, rm, _errors = self._clear(sm, tmp_path, scan)
+        ok, rm, _errors = self._clear(sm, tmp_path, scan, memory=memory)
 
         assert ok is True and rm == []
         scan.assert_not_called()
+        memory.assert_not_called()
+
+    def test_a_leftover_another_domains_snapshot_records_is_kept(
+            self, sm: SnapshotManager, tmp_path: Path):
+        """vm01's snapshot ``replica_snapshot_snapX`` would write where
+        vm01_snapshot_replica's ``snapX`` keeps its RAM: no domain uses that
+        file as a disk, but a snapshot records it."""
+        mem = self._touch(tmp_path / "vm01_snapshot_snapX.raw")
+        memory = MagicMock(return_value=FilesInUse(
+            {os.path.realpath(mem): "vm01_snapshot_replica"}))
+
+        ok, rm, errors = self._clear(sm, tmp_path,
+                                     MagicMock(return_value={}),
+                                     memory=memory)
+
+        assert ok is False and rm == [] and os.path.isfile(mem)
+        assert (f"{mem}: a snapshot of domain vm01_snapshot_replica records "
+                f"it as its memory image") in errors
+
+    def test_other_snapshots_that_cannot_be_read_keep_everything(
+            self, sm: SnapshotManager, tmp_path: Path):
+        mem = self._touch(tmp_path / "vm01_snapshot_snapX.raw")
+
+        ok, rm, errors = self._clear(sm, tmp_path,
+                                     MagicMock(return_value={}),
+                                     memory=MagicMock(return_value=None))
+
+        assert ok is False and rm == [] and os.path.isfile(mem)
+        assert "could not check whether a snapshot of another domain" in errors
 
     def test_the_session_hands_it_its_scan(self, tmp_path: Path):
         session = LibVirtSession(
@@ -3471,6 +3503,68 @@ class TestForceClearProtectsFilesInUse:
 
         assert create.call_args.kwargs["paths_in_use"] == (
             session.disk_paths_in_use)
+        with patch.object(session, "snapshot_memory_in_use",
+                          return_value="recorded") as recorded:
+            assert create.call_args.kwargs["memory_in_use"]() == "recorded"
+        recorded.assert_called_once_with("vm01")
+
+
+class TestTakeWritesOverNoFile:
+    """The memory image goes where no file is: one already there is a
+    leftover, or another VM's image — VM ``vm01``'s snapshot
+    ``replica_snapshot_s1`` is named as ``s1`` of ``vm01_snapshot_replica``
+    is — and the take would write the guest's RAM over it. ``--force``
+    clears a leftover no domain uses first; what it leaves is protected."""
+
+    @staticmethod
+    def _take(sm, tmp_path, force=False):
+        with patch.object(sm, "_force_clear_for_retake", return_value=True), \
+             patch.object(sm, "_flatten_cdrom_overlays"), \
+             patch.object(sm, "_cdrom_diskspec_args", return_value=[]), \
+             patch.object(sm.virsh, "execute",
+                          return_value=_result()) as execute, \
+             patch.object(sm, "logger") as logger:
+            ok = sm.create_snapshot("vm01", str(tmp_path), "s1", "d",
+                                    force=force)
+        errors = " ".join(str(c.args[0]) for c in logger.error.call_args_list)
+        return ok, execute, errors
+
+    @pytest.mark.parametrize("name", ["vm01_snapshot_s1.raw",
+                                      "vm01_snapshot_s1.raw.zst"])
+    @pytest.mark.parametrize("force", [False, True], ids=["plain", "force"])
+    def test_a_file_already_there_refuses_it(self, sm: SnapshotManager,
+                                             tmp_path: Path, name, force):
+        (tmp_path / name).write_bytes(b"someone's RAM")
+
+        ok, execute, errors = self._take(sm, tmp_path, force=force)
+
+        assert ok is False
+        execute.assert_not_called()
+        assert (tmp_path / name).read_bytes() == b"someone's RAM"
+        assert f"{tmp_path / name} already exists" in errors
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root searches a mode-000 directory")
+    def test_one_that_cannot_be_looked_up_refuses_it(
+            self, sm: SnapshotManager, tmp_path: Path):
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        hidden.chmod(0)
+        try:
+            ok, execute, errors = self._take(sm, hidden)
+        finally:
+            hidden.chmod(0o700)
+
+        assert ok is False
+        execute.assert_not_called()
+        assert "cannot tell whether" in errors
+
+    def test_with_none_there_it_is_taken(self, sm: SnapshotManager,
+                                         tmp_path: Path):
+        ok, execute, _errors = self._take(sm, tmp_path)
+
+        assert ok is True
+        assert execute.call_args.args[0] == "snapshot-create-as"
 
 
 class TestCreateSnapshotForce:
@@ -3478,7 +3572,7 @@ class TestCreateSnapshotForce:
 
     def test_force_invokes_clear_before_create(self, sm: SnapshotManager,
                                                tmp_path: Path):
-        scan = MagicMock()
+        scan, memory = MagicMock(), MagicMock()
         with patch.object(sm, "_force_clear_for_retake",
                           return_value=True) as clear, \
              patch.object(sm, "_flatten_cdrom_overlays"), \
@@ -3486,9 +3580,9 @@ class TestCreateSnapshotForce:
              patch.object(sm.virsh, "execute", return_value=_result()):
             assert sm.create_snapshot(
                 "vm01", str(tmp_path), "snapX", "d", force=True,
-                paths_in_use=scan) is True
+                paths_in_use=scan, memory_in_use=memory) is True
         clear.assert_called_once_with("vm01", str(tmp_path), "snapX",
-                                      paths_in_use=scan)
+                                      paths_in_use=scan, memory_in_use=memory)
 
     def test_force_clear_failure_aborts_create(self, sm: SnapshotManager,
                                               tmp_path: Path):
