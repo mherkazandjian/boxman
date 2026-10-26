@@ -64,7 +64,7 @@ Column meanings:
 | `ALLOC` | `qemu-img info` (`actual-size`) | Bytes the qcow2 is consuming on the host |
 | `CHAIN` | `qemu-img info --backing-chain` | Length of the backing-file chain (1 = no overlays) |
 | `SNAPS` | `virsh snapshot-list --name` | Number of libvirt snapshots for the VM |
-| `SNAPMEM` | sum of `<vm>_snapshot_*.raw` and `*.raw.zst` sizes, in the workdir and the `memory_snapshot_dir` | Total memory-dump on-disk per VM (shown on the boot disk row) |
+| `SNAPMEM` | sum of `<vm>_snapshot_*.raw` and `*.raw.zst` sizes in the workdir, and of every memory image its snapshots recorded (in a `memory_snapshot_dir`, say), each file once | Total memory-dump on-disk per VM (shown on the boot disk row) |
 | `RECLAIM~` | `qemu-img measure --output=json` (`required`) vs `actual-size` | Estimated bytes recoverable by `compact` |
 
 `storage df` never writes anything. It is the right first step before
