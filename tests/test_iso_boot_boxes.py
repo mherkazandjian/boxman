@@ -36,7 +36,8 @@ ISO_BOXES = sorted(
 
 # every box shipped as an ISO-boot example must be picked up here; a rename
 # that silently drops one from this list is the failure mode being guarded
-EXPECTED_AT_LEAST = {"nixos-25.05-iso-boot", "guix-1.5.0-iso-boot"}
+EXPECTED_AT_LEAST = {"nixos-25.05-iso-boot", "guix-1.5.0-iso-boot",
+                     "windows-server-2022-iso-boot"}
 
 
 def _config(box_dir: str) -> dict:
@@ -83,8 +84,14 @@ class TestIsoBoxConfig:
         for cluster in config["clusters"].values():
             for vm_name, vm in (cluster.get("vms") or {}).items():
                 vms += 1
-                cdroms = [c["name"] for c in (vm.get("cdroms") or [])]
-                assert cdroms, f"{vm_name} has no cdroms:"
+                entries = vm.get("cdroms") or []
+                assert entries, f"{vm_name} has no cdroms:"
+                # the medium the VM boots must be pinned; a later entry may
+                # name a local `source:` instead (a driver ISO from a host
+                # package), which boxman attaches in place
+                assert not entries[0].get("source"), (
+                    f"{vm_name} must boot from a pinned isos: entry")
+                cdroms = [c["name"] for c in entries if not c.get("source")]
                 assert set(cdroms) <= declared, (
                     f"{vm_name} references an undeclared iso: {cdroms}")
                 assert "cdrom" in (vm.get("boot_order") or []), vm_name

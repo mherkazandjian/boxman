@@ -264,3 +264,136 @@ class TestTheBootDiskIsDeclaredQcow2:
         qemu_img = str(mock_run.call_args_list[0].args[0])
         assert "qemu-img create" in qemu_img
         assert "-f qcow2" in qemu_img, qemu_img
+
+
+class TestEveryCdromReachesTheInstaller:
+    """G1: a cdroms: entry after the boot ISO was attached by the configure
+    step, once virt-install had started the installer, and so reached only
+    the persistent definition (libvirt cannot hot-plug a SATA/IDE drive). An
+    installer that needs a second medium (Windows Setup: drivers, an answer
+    file) never saw it."""
+
+    @staticmethod
+    def _iso(tmp_path, name):
+        path = tmp_path / name
+        path.write_bytes(b"")
+        return str(path)
+
+    def _vm(self, tmp_path, *extra):
+        boot = self._iso(tmp_path, "boot.iso")
+        return _make_iso_vm(tmp_path, iso_path=boot,
+                            cdroms=[{"name": "boot", "source": boot}, *extra])
+
+    @staticmethod
+    def _virt_install(mock_run):
+        return mock_run.call_args_list[1][0][0]
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_extra_cdroms_go_to_virt_install_in_declared_order(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        drivers = self._iso(tmp_path, "drivers.iso")
+        answer = self._iso(tmp_path, "answer.iso")
+        vm = self._vm(tmp_path, {"name": "drivers", "source": drivers},
+                      {"source": answer})
+        assert vm.create() is True
+        cmd = self._virt_install(mock_run)
+        positions = [cmd.index(arg) for arg in (
+            "--cdrom=",
+            f"--disk=path={drivers},device=cdrom,readonly=on",
+            f"--disk=path={answer},device=cdrom,readonly=on")]
+        assert positions == sorted(positions)
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_the_boot_iso_is_not_attached_twice(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        vm = self._vm(tmp_path)
+        vm.create()
+        cmd = self._virt_install(mock_run)
+        assert cmd.count(vm.iso_path) == 1
+        assert "device=cdrom" not in cmd
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_an_explicit_target_and_its_bus_are_passed(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        sata = self._iso(tmp_path, "sata.iso")
+        ide = self._iso(tmp_path, "ide.iso")
+        vm = self._vm(tmp_path, {"source": sata, "target": "sdc"},
+                      {"source": ide, "target": "hdd"})
+        vm.create()
+        cmd = self._virt_install(mock_run)
+        assert f"path={sata},device=cdrom,readonly=on,target.dev=sdc,target.bus=sata" in cmd
+        assert f"path={ide},device=cdrom,readonly=on,target.dev=hdd,target.bus=ide" in cmd
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_a_missing_iso_is_refused_before_the_boot_disk_is_made(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        vm = self._vm(tmp_path, {"name": "drivers",
+                                 "source": str(tmp_path / "absent.iso")})
+        with pytest.raises(ProvisionError, match="absent.iso"):
+            vm.create()
+        assert mock_run.call_count == 0
+
+    def test_an_unresolved_entry_is_refused(self, tmp_path):
+        vm = self._vm(tmp_path, {"name": "drivers"})
+        with pytest.raises(ProvisionError, match="no resolved source"):
+            vm._media_args()
+
+
+class TestTheConfigureStepLeavesIsoBootCdromsAlone:
+    """IsoBootVM hands every cdrom to virt-install, so the configure step
+    that follows the create must not attach them a second time."""
+
+    @staticmethod
+    def _configure(vm_info):
+        from boxman.manager import BoxmanManager
+        mgr = BoxmanManager.__new__(BoxmanManager)
+        mgr.config = {"project": "demo", "clusters": {
+            "c1": {"workdir": "/tmp/ws", "vms": {"vm1": vm_info}}}}
+        mgr.provider = MagicMock()
+        mgr.provider.has_managed_save.return_value = False
+        mgr.logger = MagicMock()
+        mgr.cache = MagicMock()
+        mgr.cache.projects = {}
+        mgr._configure_and_start_vm(
+            "c1", mgr.config["clusters"]["c1"], "vm1", vm_info)
+        return mgr.provider
+
+    def test_an_iso_boot_vm_gets_none_attached_after_create(self):
+        provider = self._configure({
+            "boot_order": ["cdrom", "hd"],
+            "_resolved_iso_path": "/c/boot.iso",
+            "cdroms": [{"name": "boot", "source": "/c/boot.iso"},
+                       {"name": "drivers", "source": "/c/drivers.iso"}],
+        })
+        provider.configure_vm_cdroms.assert_not_called()
+
+    def test_a_cloned_vm_still_gets_its_cdroms_attached(self):
+        cdroms = [{"name": "tools", "source": "/c/tools.iso"}]
+        provider = self._configure({"cdroms": cdroms})
+        provider.configure_vm_cdroms.assert_called_once()
+        assert provider.configure_vm_cdroms.call_args.kwargs["cdroms"] == cdroms
+
+
+class TestTheGuestAgentChannel:
+    """G3: virt-install adds the qemu-guest-agent channel only for OSes it
+    knows ship virtio-serial, so a Windows guest had none and `boxman
+    storage trim` and agent IP lookup failed on it."""
+
+    CHANNEL = "--channel=unix,target.type=virtio,name=org.qemu.guest_agent.0"
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_every_direct_install_vm_gets_one(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        vm = _make_iso_vm(tmp_path)
+        vm.create()
+        assert mock_run.call_args_list[1][0][0].count(self.CHANNEL) == 1
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_one_the_box_adds_itself_is_not_doubled(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        own = "--channel unix,target_type=virtio,name=org.qemu.guest_agent.0"
+        vm = _make_iso_vm(tmp_path, virt_install_extra_args=[own])
+        vm.create()
+        cmd = mock_run.call_args_list[1][0][0]
+        assert cmd.count("org.qemu.guest_agent.0") == 1
+        assert own in cmd

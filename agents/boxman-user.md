@@ -783,7 +783,8 @@ clusters:
   identically — anything past element 0 is ignored.
 - **`cdroms:` entry forms:** a bare string, `{name: <iso-name>}` (resolved from
   `isos:`), or `{source: /abs/path.iso}` (explicit local file). The first cdrom
-  is the boot ISO; extras attach afterwards.
+  is the boot ISO; the others go to virt-install with it, so an installer
+  sees them on its first boot (a driver ISO, an answer file).
 - **Direct-install VMs use a simpler schema than cloned VMs:** `vcpus:` (flat
   int) instead of `cpus:{…}`, and `networks: [{name: …}]` for the first NIC
   instead of `network_adapters:`; `disk_size:` sets the empty boot disk. On a

@@ -19,6 +19,9 @@ from boxman.utils.shell import run as _shell_run
 from .commands import VirshCommand, VirtInstallCommand
 from .disk import create_image_exclusive, libvirt_disk_source
 
+#: The virtio-serial port name the QEMU guest agent listens on.
+GUEST_AGENT_CHANNEL = "org.qemu.guest_agent.0"
+
 #: What a refused boot disk tells the operator to do.
 BOOT_DISK_REMEDY = ("If it is stale, remove or rename it and run the "
                     "command again.")
@@ -207,6 +210,9 @@ class DirectInstallVM:
         # `networks:` used to be discovered after the boot disk had already
         # been written, leaving a stray image behind on a refusal (#171 A4).
         network_specs = self._network_specs()
+        # likewise install media that cannot be attached (a cdroms: source
+        # that does not exist)
+        media_args = self._media_args()
         # absolute, so qemu-img and virt-install name the same file wherever
         # they run (the docker-compose runtime's container has another cwd)
         disk_path = libvirt_disk_source(
@@ -234,13 +240,22 @@ class DirectInstallVM:
             if spec["mac"]:
                 net_arg += f",mac={spec['mac']}"
             parts.append(net_arg)
-        parts.extend(self._media_args())
+        parts.extend(media_args)
         parts.append(f"--boot={self.boot_order}")
         parts.append("--os-variant=detect=on,require=off")
         parts.append("--graphics=vnc")
         parts.append("--noautoconsole")
         parts.append("--wait=0")
-        for extra in self.info.get("virt_install_extra_args", []):
+        extra_args = self.info.get("virt_install_extra_args", [])
+        # virt-install adds the guest-agent channel only for OSes it knows
+        # ship virtio-serial (Linux), and drops its own whenever a channel
+        # is given. Without one, `boxman storage trim` and agent IP lookup
+        # fail on a Windows or undetected guest (G3). A box that adds its
+        # own keeps it, rather than getting a second.
+        if not any(GUEST_AGENT_CHANNEL in arg for arg in extra_args):
+            parts.append(
+                f"--channel=unix,target.type=virtio,name={GUEST_AGENT_CHANNEL}")
+        for extra in extra_args:
             parts.append(extra)
 
         cmd = " ".join(parts)

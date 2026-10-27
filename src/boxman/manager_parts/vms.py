@@ -453,14 +453,11 @@ class VMsMixin:
                 self.logger.error(f"some shared folders could not be configured for vm {vm_name}")
                 problems.append('shared folders')
 
-        # cdroms — the cdrom-boot ISO is already attached by virt-install at
-        # create time, so attach only any *additional* cdroms here (avoids a
-        # spurious "missing source" failure and a duplicate attach)
-        boot_iso = vm_info.get('_resolved_iso_path')
-        extra_cdroms = [
-            c for c in (vm_info.get('cdroms') or [])
-            if not (isinstance(c, dict) and boot_iso and c.get('source') == boot_iso)
-        ]
+        # cdroms — an ISO-boot VM got every one of them from virt-install at
+        # create time (IsoBootVM), so that its installer sees them on its
+        # first boot; attaching them here again would duplicate the drives
+        extra_cdroms = ([] if vm_info.get('_resolved_iso_path')
+                        else vm_info.get('cdroms') or [])
         if extra_cdroms:
             self.logger.info(f"configuring CDROMs for vm {vm_name}")
             success = self.session_for_cluster(cluster_name).configure_vm_cdroms(
