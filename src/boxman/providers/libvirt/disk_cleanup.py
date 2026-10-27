@@ -592,11 +592,12 @@ _WHY_NO_RECORD = {
 class FilesInUse(dict):
     """
     What other domains use (``LibVirtSession.disk_paths_in_use``): the
-    mapping itself is resolved path -> domain, and :attr:`identities` maps
+    mapping itself is path -> domain — resolved where that could be done
+    strictly, else as the domain named it — and :attr:`identities` maps
     each of those files' identity, ``(st_dev, st_ino)``, to its domain — so
     a file used under a name no resolved path unifies with the teardown's
     (a bind mount, a hard link, a path boxman cannot resolve) is still
-    recognised.
+    recognised. A consumer consults both.
     """
 
     def __init__(self, *args, **kwargs) -> None:

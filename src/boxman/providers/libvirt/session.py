@@ -1066,7 +1066,9 @@ class LibVirtSession(SessionConfigMixin):
 
         Covers each domain's disk and CD-ROM sources in both its live and
         its persistent definition, and every layer of their backing chains,
-        as resolved paths, so a caller can tell whether a file it is about
+        by path — resolved where that can be done strictly, else as named —
+        and by identity, which is what decides: a caller tells whether a
+        file it is about
         to delete is still some domain's disk or the base of one. Plain
         ``domblklist`` of a running domain reports only the live
         definition, while the persistent one — what the domain uses on its
@@ -1114,9 +1116,13 @@ class LibVirtSession(SessionConfigMixin):
         Every file is recorded by its identity too, ``(st_dev, st_ino)``
         read host-side (:attr:`FilesInUse.identities`), so a teardown
         recognises it under a name no resolved path unifies with its own —
-        a bind mount, a hard link, a path only root resolves. A file whose
-        identity cannot be read, other than for naming no file, fails the
-        scan: it could be any file.
+        a bind mount, a hard link, a path only root resolves. Each is read
+        from the name it was given — by the domain, ``qemu-img`` or libvirt
+        — never from a resolved one (:meth:`_identify`). A file the boxman
+        process may not look up — another user's domain keeping its disks in
+        that user's home — is read through ``sudo`` where this provider runs
+        ``stat`` under sudo. A file whose identity cannot be read, other
+        than for naming no file, fails the scan: it could be any file.
 
         Chains are read as :meth:`_read_backing_chain` reads them, so the
         0600 pool volumes libvirt makes every clone disk — which the user's
@@ -1212,11 +1218,8 @@ class LibVirtSession(SessionConfigMixin):
                 if held is None:
                     return None
                 for path in held:
-                    resolved = os.path.realpath(path)
                     try:
-                        st = os.stat(resolved)
-                    except FileNotFoundError:
-                        continue      # deleted too: nothing to protect
+                        found = self._identify(path)
                     except OSError as exc:
                         self.logger.warning(
                             f"could not read the identity of {path}, which "
@@ -1225,8 +1228,11 @@ class LibVirtSession(SessionConfigMixin):
                             f"told, so each keeps everything — make it "
                             f"accessible")
                         return None
-                    used.setdefault(resolved, domain)
-                    used.identities.setdefault((st.st_dev, st.st_ino), domain)
+                    if found is None:
+                        continue      # deleted too: nothing to protect
+                    name, identity = found
+                    used.setdefault(name, domain)
+                    used.identities.setdefault(identity, domain)
                 continue
             if not self._record_in_use(used, domain, chain):
                 return None
@@ -1273,17 +1279,15 @@ class LibVirtSession(SessionConfigMixin):
     def _record_in_use(self, in_use: FilesInUse, domain: str,
                        paths: list[str]) -> bool:
         """
-        Record *paths*, resolved, as used by *domain*: each by its path,
-        and by its identity when it names a file. False, with a warning,
-        when an identity cannot be read other than for naming no file — it
-        could be any file.
+        Record *paths*, each as it was named, as used by *domain*: by the
+        name :meth:`_identify` gives it, and by its identity when it names a
+        file — a file that is not there by its resolved path alone. False,
+        with a warning, when an identity cannot be read other than for
+        naming no file — it could be any file.
         """
         for path in paths:
-            in_use.setdefault(path, domain)
             try:
-                st = os.stat(path)
-            except FileNotFoundError:
-                continue
+                found = self._identify(path)
             except OSError as exc:
                 self.logger.warning(
                     f"could not read the identity of {path}, which domain "
@@ -1291,8 +1295,89 @@ class LibVirtSession(SessionConfigMixin):
                     f"remove is that one cannot be told, so each keeps "
                     f"everything — make it accessible")
                 return False
-            in_use.identities.setdefault((st.st_dev, st.st_ino), domain)
+            if found is None:
+                in_use.setdefault(os.path.realpath(path), domain)
+                continue
+            name, identity = found
+            in_use.setdefault(name, domain)
+            in_use.identities.setdefault(identity, domain)
         return True
+
+    def _identify(self, path: str) -> tuple[str, tuple[int, int]] | None:
+        """
+        *path*, as it was named, the way the in-use scan records a file:
+        the name to protect it by, and its identity ``(st_dev, st_ino)``,
+        symlinks followed, read host-side — or ``None`` when it names no
+        file.
+
+        Read as the boxman process first. Then the name is the resolved
+        path when ``os.path.realpath(strict=True)`` can make every lookup on
+        the way, else the name as given: a successful ``stat`` does not make
+        resolution exact (a relative name read through the current
+        directory, a ``/proc/<pid>/fd`` link), and the identity, read from
+        the name itself, is what protects the file. Refused that
+        (``EACCES``: a directory on the way it may not
+        search — another user's home, where a domain of theirs keeps its
+        disks), the identity is read with ``sudo -n stat -L`` from the name
+        as given, and that name, unresolved, is the one recorded. Never from
+        a resolved path: ``os.path.realpath``, unable to look inside such a
+        directory, takes a symlink there for a directory and folds a
+        following ``..`` by its spelling alone, which can name another file
+        that exists — and the identity of that one, not of the file the
+        domain uses, would be recorded.
+
+        Sudo stands in only when this provider runs ``stat`` under sudo
+        (:meth:`LibVirtCommandBase.sudo_prefix`: ``use_sudo``, or ``stat``
+        in ``force_sudo_commands``), and only under the local runtime: under
+        docker-compose a shell command runs in the runtime container, whose
+        mounts are not this host's, and an identity read there is not one to
+        compare with the host's. ``-n``: sudo never prompts for a password,
+        it fails.
+
+        Raises:
+            OSError: The identity cannot be read, other than for naming no
+                file, and no sudo read stands in for it — sudo is not this
+                provider's for ``stat``, or the read through it failed or
+                answered something other than two numbers. Through sudo a
+                file that is not there fails too: a missing file is not told
+                from an unreadable one by ``stat``'s error text.
+        """
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return None
+        except PermissionError as refused:
+            return path, self._identity_through_sudo(path, refused)
+        try:
+            name = os.path.realpath(path, strict=True)
+        except OSError:
+            name = path         # best effort only: the identity decides
+        return name, (st.st_dev, st.st_ino)
+
+    def _identity_through_sudo(self, path: str,
+                               refused: PermissionError) -> tuple[int, int]:
+        """
+        :meth:`_identify` for *path*, as it was named, which the boxman
+        process was *refused*: ``sudo -n stat -L``, on this host.
+
+        Raises:
+            OSError: *refused* itself when sudo may not stand in, or one
+                saying why the read through sudo gave no identity.
+        """
+        stat_cmd = f"stat -L --printf='%d %i' -- {shlex.quote(path)}"
+        cmd = LibVirtCommandBase(provider_config=self.provider_config)
+        if (self.provider_config.get('runtime', 'local') != 'local'
+                or not cmd.sudo_prefix(stat_cmd)):
+            raise refused
+        result = cmd.execute_shell(f"sudo -n {stat_cmd}", warn=True)
+        answer = (result.stdout or "").strip() if result.ok else ""
+        identity = re.fullmatch(r"(\d+) (\d+)", answer)
+        if identity is None:
+            why = (f"it answered {answer!r}" if result.ok
+                   else (result.stderr or "").strip() or "it failed")
+            raise OSError(
+                f"{refused}; and through sudo -n stat: {why}") from refused
+        return (int(identity.group(1)), int(identity.group(2)))
 
     def _block_job_files(self, virsh, reads: _ChainReads, domain: str,
                          uuid: str,
@@ -1309,7 +1394,7 @@ class LibVirtSession(SessionConfigMixin):
         A ``network`` one names nothing on this host.
 
         Returns:
-            Their resolved paths, or ``None``, with a warning saying why,
+            Their names as given, or ``None``, with a warning saying why,
             when they cannot be told: the live definition cannot be read, a
             mirror names no file, or a destination's chain cannot be read.
 
@@ -1716,20 +1801,26 @@ class LibVirtSession(SessionConfigMixin):
     def _backing_chain_files(self, reads: _ChainReads,
                              source: str) -> list[str] | None:
         """
-        Resolved paths of *source* and every image below it — the images
-        and the backing files they name — or ``None`` when the chain cannot
-        be read (see :meth:`_read_backing_chain`).
+        *source* and every image below it — the images and the backing
+        files they name — each as it was named (by the domain, ``qemu-img``
+        or libvirt), or ``None`` when the chain cannot be read (see
+        :meth:`_read_backing_chain`).
+
+        Not resolved here: a resolved path is only as good as the lookups on
+        the way, and one the user may not make can turn it into the name of
+        another file (:meth:`_identify`), so each name is kept as given and
+        resolved where it is recorded.
         """
         images = self._read_backing_chain(reads, source)
         if images is None:
             return None
-        paths = {os.path.realpath(source)}
+        names = {source}
         for image in images:
-            paths.add(os.path.realpath(image['filename']))
+            names.add(image['filename'])
             backing = image.get('full-backing-filename')
             if isinstance(backing, str) and backing:
-                paths.add(os.path.realpath(backing))
-        return sorted(paths)
+                names.add(backing)
+        return sorted(names)
 
     def start_vm(self, vm_name: str) -> bool:
         """

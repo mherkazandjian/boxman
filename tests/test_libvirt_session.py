@@ -23,12 +23,15 @@ import os
 import shlex
 import shutil
 import subprocess
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from boxman.exceptions import ConfigError
+from boxman.providers.libvirt import disk_cleanup
+from boxman.providers.libvirt.commands import LibVirtCommandBase
 from boxman.providers.libvirt.net import Network
 from boxman.providers.libvirt.session import _ABSENT, LibVirtSession
 from conftest import domain_listing, domain_uuid
@@ -51,6 +54,79 @@ def _result(stdout: str = "", ok: bool = True, stderr: str = "", return_code: in
 def _session(provider: dict | None = None) -> LibVirtSession:
     cfg = {"provider": {"libvirt": provider or {}}}
     return LibVirtSession(config=cfg)
+
+
+#: the command an identity read through sudo runs (``_identity_through_sudo``)
+_SUDO_STAT = "sudo -n stat "
+
+
+def _answer_sudo_stat(command, sudo, asked):
+    """Answer a ``sudo -n stat`` from *sudo*, which maps the path asked to
+    ``(ok, stdout, stderr)``; record the command in *asked*. A test that
+    gives no *sudo* never expects one."""
+    assert sudo is not None, f"no read through sudo expected: {command}"
+    asked.append(command)
+    ok, stdout, stderr = sudo(shlex.split(command)[-1])
+    return _result(ok=ok, stdout=stdout, stderr=stderr)
+
+
+def _lossy_alias(tmp_path):
+    """
+    A name only root can follow, which the user's ``os.path.realpath``
+    turns into the name of another file that exists: ``source.qcow2``
+    leads, through a symlink inside a directory the user may not search
+    and a ``..`` after it, to A -- the disk a domain uses -- while realpath
+    run as the user, unable to read that symlink, folds the ``..`` by
+    spelling and lands on B, an unrelated file. Call the returned
+    *lock()* to make that directory unsearchable, *unlock()* after.
+    """
+    work, hidden = tmp_path / "work", tmp_path / "hidden"
+    (work / "deep").mkdir(parents=True)
+    hidden.mkdir()
+    a = work / "vm-a.qcow2"
+    a.write_bytes(b"A: the disk vm-b uses")
+    b = hidden / "vm-a.qcow2"
+    b.write_bytes(b"B: unrelated")
+    os.symlink(work / "deep", hidden / "hop")
+    source = tmp_path / "source.qcow2"
+    os.symlink("hidden/hop/../vm-a.qcow2", source)
+    return types.SimpleNamespace(
+        work=work, hidden=hidden, a=a, b=b, source=source,
+        lock=lambda: hidden.chmod(0), unlock=lambda: hidden.chmod(0o700))
+
+
+def _stat_as_root(layout):
+    """``sudo -n stat -L`` as root answers it: the kernel's own lookup of
+    exactly the name asked, the hidden directory searchable for it."""
+    def answer(path):
+        layout.unlock()
+        try:
+            st = os.stat(path)
+        finally:
+            layout.lock()
+        return True, f"{st.st_dev} {st.st_ino}", ""
+    return answer
+
+
+def _remove_vm_a(layout, in_use):
+    """Tear down vm-a, whose boot disk is A, against the scan *in_use*:
+    the real removal routine, with the hidden directory locked."""
+    a = str(layout.a)
+    inventory = disk_cleanup.StorageInventory(
+        vm_name="vm-a", disk_sources=[], media_sources=[], records=None,
+        records_state=disk_cleanup.RECORDS_NONE, chains={},
+        boot_family=[a], legacy_disks=None,
+        identities=disk_cleanup.file_identities([a]))
+    return disk_cleanup.remove_vm_storage(
+        inventory, [str(layout.work)], lambda: in_use)
+
+
+def _sudo_policy(cmd, provider: dict | None) -> None:
+    """Give the patched command wrapper *cmd* the real sudo policy of
+    *provider*: whether ``stat`` would run under sudo is what the identity
+    read decides by."""
+    cmd.return_value.sudo_prefix.side_effect = LibVirtCommandBase(
+        provider_config=provider or {}).sudo_prefix
 
 
 class TestConfigPrecedence:
@@ -861,8 +937,10 @@ class TestInUseWithAMissingSource:
            + " file   disk     vdb      /ws/gone.qcow2\n")
 
     def _run(self, state, state_ok=True, absent=("/ws/gone.qcow2",),
-             live="", dump_ok=True):
-        """*live* is what ``virsh dumpxml`` (the live definition) says."""
+             live="", dump_ok=True, provider=None, sudo=None):
+        """*live* is what ``virsh dumpxml`` (the live definition) says;
+        *provider* the session's provider config, and *sudo* what a read
+        through sudo answers (:func:`_answer_sudo_stat`)."""
         calls = []
 
         def virsh_execute(*args, **kwargs):
@@ -881,6 +959,8 @@ class TestInUseWithAMissingSource:
             return _result(stdout=self.BLK)
 
         def shell(command, **kwargs):
+            if command.startswith(_SUDO_STAT):
+                return _answer_sudo_stat(command, sudo, calls)
             if _ABSENT in command:
                 probed = shlex.split(command)[3]
                 calls.append(f"probe {probed}")
@@ -895,7 +975,8 @@ class TestInUseWithAMissingSource:
              patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
             virsh.return_value.execute.side_effect = virsh_execute
             cmd.return_value.execute_shell.side_effect = shell
-            return _session({}).disk_paths_in_use(), calls
+            _sudo_policy(cmd, provider)
+            return _session(provider or {}).disk_paths_in_use(), calls
 
     @pytest.mark.parametrize("state", [
         "running", "paused", "pmsuspended", "in shutdown", "crashed", "idle"])
@@ -1086,6 +1167,57 @@ class TestInUseWithAMissingSource:
         assert in_use is None
         assert str(base) in captured_logs.text
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_a_held_file_it_may_not_look_up_is_read_through_sudo(
+            self, tmp_path):
+        """The held files of a running domain take the same read as every
+        other file the scan records (:meth:`_identify`)."""
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        base = hidden / "base.qcow2"
+        base.write_bytes(b"base")
+        st = os.stat(base)
+        live = self._live("<source file='/ws/gone.qcow2' index='1'/>"
+                          + self._level(base))
+        hidden.chmod(0)
+        try:
+            in_use, calls = self._run(
+                "running", live=live, provider={"use_sudo": True},
+                sudo=lambda path: (True, f"{st.st_dev} {st.st_ino}", ""))
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is not None
+        assert in_use[str(base)] == "vm-b"
+        assert in_use.identities[(st.st_dev, st.st_ino)] == "vm-b"
+        assert (f"sudo -n stat -L --printf='%d %i' -- "
+                f"{shlex.quote(str(base))}") in calls
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_a_held_alias_realpath_misreads_still_protects_its_file(
+            self, tmp_path):
+        """The held layer is named through a symlink the user cannot
+        follow: its identity is read from that name, so the disk the domain
+        holds is protected, not the file a user's realpath misnames."""
+        layout = _lossy_alias(tmp_path)
+        live = self._live("<source file='/ws/gone.qcow2' index='1'/>"
+                          + self._level(layout.source))
+        a_id = (os.stat(layout.a).st_dev, os.stat(layout.a).st_ino)
+        b_id = (os.stat(layout.b).st_dev, os.stat(layout.b).st_ino)
+        layout.lock()
+        try:
+            in_use, _ = self._run("running", live=live,
+                                  provider={"use_sudo": True},
+                                  sudo=_stat_as_root(layout))
+            outcome = _remove_vm_a(layout, in_use)
+        finally:
+            layout.unlock()
+
+        assert layout.a.exists(), "the disk vm-b holds was removed"
+        assert [path for path, _ in outcome.kept] == [str(layout.a)]
+        assert in_use.identities[a_id] == "vm-b"
+        assert b_id not in in_use.identities
+
     def test_a_missing_volume_source_fails_the_scan(self, captured_logs):
         """A pool volume's chain is not read from the live definition."""
         virsh = MagicMock()
@@ -1107,9 +1239,14 @@ class TestInUseByIdentity:
     review)."""
 
     @staticmethod
-    def _scan(tmp_path, source, chain_json):
+    def _scan(tmp_path, source, chain_json, provider=None, sudo=None,
+              asked_sudo=None):
+        """*provider* is the session's provider config, *sudo* what a read
+        through sudo answers (:func:`_answer_sudo_stat`), and *asked_sudo*
+        collects the reads through sudo that were made."""
         blk = (TestDiskPathsInUse.HEADER
                + f" file   disk     vda      {source}\n")
+        asked_sudo = [] if asked_sudo is None else asked_sudo
 
         def virsh_execute(*args, **kwargs):
             if args[0] == "list":
@@ -1118,6 +1255,8 @@ class TestInUseByIdentity:
             return _result(stdout=blk)
 
         def shell(command, **kwargs):
+            if command.startswith(_SUDO_STAT):
+                return _answer_sudo_stat(command, sudo, asked_sudo)
             if _ABSENT in command:
                 return _result(stdout="")
             asked = command.rsplit(" ", 1)[1].strip("'")
@@ -1129,7 +1268,8 @@ class TestInUseByIdentity:
              patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
             virsh.return_value.execute.side_effect = virsh_execute
             cmd.return_value.execute_shell.side_effect = shell
-            return _session({}).disk_paths_in_use()
+            _sudo_policy(cmd, provider)
+            return _session(provider or {}).disk_paths_in_use()
 
     @staticmethod
     def _chain(top, base):
@@ -1167,6 +1307,179 @@ class TestInUseByIdentity:
         assert str(top) in captured_logs.text
         assert "make it accessible" in captured_logs.text
 
+    @staticmethod
+    def _hidden_chain(tmp_path):
+        """A chain under a directory the user may not search -- another
+        user's home, where a domain of theirs keeps its disks -- and the
+        identities root reads there."""
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        top, base = hidden / "b.top", hidden / "base.qcow2"
+        top.write_bytes(b"top")
+        base.write_bytes(b"base")
+        identities = {}
+        for path in (top, base):
+            st = os.stat(path)
+            identities[str(path)] = (st.st_dev, st.st_ino)
+        return hidden, top, base, identities
+
+    @staticmethod
+    def _as_root(identities):
+        """``sudo -n stat`` answering as root does, from *identities*."""
+        def answer(path):
+            dev, ino = identities[path]
+            return True, f"{dev} {ino}", ""
+        return answer
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    @pytest.mark.parametrize("provider", [
+        {"use_sudo": True},
+        {"use_sudo": False, "force_sudo_commands": ["stat"]},
+    ], ids=["use_sudo", "force_sudo_commands"])
+    def test_a_file_it_may_not_look_up_is_read_through_sudo(
+            self, tmp_path, provider):
+        """A domain whose disks sit under its user's 0700 home made every
+        scan fail, so every teardown on that host kept all its disks."""
+        hidden, top, base, identities = self._hidden_chain(tmp_path)
+        asked = []
+        hidden.chmod(0)
+        try:
+            in_use = self._scan(tmp_path, top, self._chain(top, base),
+                                provider=provider,
+                                sudo=self._as_root(identities),
+                                asked_sudo=asked)
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is not None
+        for path in (top, base):
+            assert in_use.identities[identities[str(path)]] == "vm-b"
+        assert asked == [f"sudo -n stat -L --printf='%d %i' -- "
+                         f"{shlex.quote(str(path))}" for path in (top, base)]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_an_alias_realpath_misreads_still_protects_its_file(
+            self, tmp_path):
+        """A disk named through a symlink the user cannot follow, then a
+        ``..``: resolved as the user it reads as another file that exists.
+        The identity is read from the name as given, so the disk the domain
+        uses is protected and stays, and the other file is not taken for
+        it."""
+        layout = _lossy_alias(tmp_path)
+        a_id = (os.stat(layout.a).st_dev, os.stat(layout.a).st_ino)
+        b_id = (os.stat(layout.b).st_dev, os.stat(layout.b).st_ino)
+        asked = []
+        layout.lock()
+        try:
+            assert os.path.realpath(layout.source) == str(layout.b)
+            in_use = self._scan(tmp_path, layout.source,
+                                f'{{"filename": "{layout.source}"}}',
+                                provider={"use_sudo": True},
+                                sudo=_stat_as_root(layout), asked_sudo=asked)
+            outcome = _remove_vm_a(layout, in_use)
+        finally:
+            layout.unlock()
+
+        assert layout.a.exists(), "the disk vm-b uses was removed"
+        assert [path for path, _ in outcome.kept] == [str(layout.a)]
+        assert asked == [f"sudo -n stat -L --printf='%d %i' -- "
+                         f"{shlex.quote(str(layout.source))}"]
+        assert in_use.identities[a_id] == "vm-b"
+        assert b_id not in in_use.identities
+        assert str(layout.b) not in in_use
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_a_name_stat_reads_but_realpath_cannot_resolve_is_kept_as_given(
+            self, tmp_path, monkeypatch):
+        """``stat`` reaches A through the current directory's handle while
+        realpath, needing every component of the absolute path, cannot look
+        inside the unsearchable directory above it and would fold the ``..``
+        into B's name. The name is recorded as given, the identity is A's,
+        and B is not marked in use.
+
+        Only where this Python's realpath does fold it: 3.9 to 3.12 resolve
+        a relative name component by component from the current directory,
+        reach A as ``stat`` does, and leave nothing to misread — skipped
+        there."""
+        private, outside = tmp_path / "private", tmp_path / "outside"
+        cwd = private / "cwd"
+        cwd.mkdir(parents=True)
+        (outside / "deep").mkdir(parents=True)
+        a = outside / "vm-a.qcow2"
+        a.write_bytes(b"A")
+        b = cwd / "vm-a.qcow2"
+        b.write_bytes(b"B")
+        os.symlink(outside / "deep", cwd / "hop")
+        name = "hop/../vm-a.qcow2"
+        a_id = (os.stat(a).st_dev, os.stat(a).st_ino)
+        b_id = (os.stat(b).st_dev, os.stat(b).st_ino)
+        monkeypatch.chdir(cwd)
+        private.chmod(0)
+        try:
+            assert (os.stat(name).st_dev, os.stat(name).st_ino) == a_id
+            if os.path.realpath(name) != str(b):
+                pytest.skip("this Python's realpath resolves the name as "
+                            "stat does: nothing to misread")
+            in_use = self._scan(tmp_path, name, f'{{"filename": "{name}"}}')
+        finally:
+            private.chmod(0o700)
+
+        assert in_use is not None
+        assert in_use.identities[a_id] == "vm-b"
+        assert b_id not in in_use.identities
+        assert str(b) not in in_use
+        assert in_use[name] == "vm-b"
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    @pytest.mark.parametrize("provider", [
+        {},
+        {"use_sudo": True, "sudo_skip_commands": ["stat"]},
+        {"use_sudo": True, "runtime": "docker-compose",
+         "runtime_container": "boxman-libvirt"},
+    ], ids=["no use_sudo", "stat in sudo_skip_commands", "docker runtime"])
+    def test_without_sudo_for_stat_it_still_fails_the_scan(
+            self, tmp_path, captured_logs, provider):
+        """No read through sudo where the provider would not sudo ``stat``,
+        nor in a runtime container, whose mounts are not the host's."""
+        hidden, top, base, _ = self._hidden_chain(tmp_path)
+        hidden.chmod(0)
+        try:
+            in_use = self._scan(tmp_path, top, self._chain(top, base),
+                                provider=provider)
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is None
+        assert "Permission denied" in captured_logs.text
+        assert "through sudo" not in captured_logs.text
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    @pytest.mark.parametrize("answer, said", [
+        ((False, "", "sudo: a password is required"),
+         "through sudo -n stat: sudo: a password is required"),
+        ((False, "", ""), "through sudo -n stat: it failed"),
+        ((True, "", ""), "through sudo -n stat: it answered ''"),
+        ((True, "64769", ""), "it answered '64769'"),
+        ((True, "1 2 3", ""), "it answered '1 2 3'"),
+        ((True, "-1 2", ""), "it answered '-1 2'"),
+        ((True, "dev ino", ""), "it answered 'dev ino'"),
+    ], ids=["refused", "failed silently", "no answer", "one number",
+            "three numbers", "negative", "not numbers"])
+    def test_a_read_through_sudo_that_gives_no_identity_fails_the_scan(
+            self, tmp_path, captured_logs, answer, said):
+        hidden, top, base, _ = self._hidden_chain(tmp_path)
+        hidden.chmod(0)
+        try:
+            in_use = self._scan(tmp_path, top, self._chain(top, base),
+                                provider={"use_sudo": True},
+                                sudo=lambda path: answer)
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is None
+        assert f"could not read the identity of {top}" in captured_logs.text
+        assert said in captured_logs.text
+
     @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
     def test_a_directory_that_can_be_searched_but_not_listed_is_read(
             self, tmp_path):
@@ -1201,9 +1514,10 @@ class TestInUseWithABlockJob:
             "</mirror>")
 
     def _run(self, live="", active="vm-b\n", active_ok=True, dump_ok=True,
-             chains=None):
+             chains=None, provider=None, sudo=None):
         """vm-a is shut off; vm-b is active unless *active* says otherwise,
-        and *live* is its live definition."""
+        and *live* is its live definition; *provider* the session's provider
+        config, and *sudo* what a read through sudo answers."""
         calls = []
         chains = dict(TestDiskPathsInUse.CHAIN,
                       **{"/ws/b.qcow2": '{"filename": "/ws/b.qcow2"}'},
@@ -1224,6 +1538,8 @@ class TestInUseWithABlockJob:
             return _result(stdout=self.BLK)
 
         def shell(command, **kwargs):
+            if command.startswith(_SUDO_STAT):
+                return _answer_sudo_stat(command, sudo, calls)
             if _ABSENT in command:
                 return _result(stdout="")
             source = command.rsplit(" ", 1)[1].strip("'")
@@ -1235,13 +1551,40 @@ class TestInUseWithABlockJob:
              patch("boxman.providers.libvirt.session.LibVirtCommandBase") as cmd:
             virsh.return_value.execute.side_effect = virsh_execute
             cmd.return_value.execute_shell.side_effect = shell
-            return _session({}).disk_paths_in_use(), calls
+            _sudo_policy(cmd, provider)
+            return _session(provider or {}).disk_paths_in_use(), calls
 
     @staticmethod
     def _live(mirror):
         return ("<domain><devices><disk type='file' device='disk'>"
                 "<source file='/ws/b.qcow2' index='1'/><backingStore/>"
                 f"{mirror}<target dev='vda'/></disk></devices></domain>")
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root searches mode 000")
+    def test_a_destination_alias_realpath_misreads_still_protects_its_file(
+            self, tmp_path):
+        """A block copy's destination named through a symlink the user
+        cannot follow: its identity is read from that name too."""
+        layout = _lossy_alias(tmp_path)
+        mirror = f"<mirror type='file' file='{layout.source}' job='copy'/>"
+        a_id = (os.stat(layout.a).st_dev, os.stat(layout.a).st_ino)
+        b_id = (os.stat(layout.b).st_dev, os.stat(layout.b).st_ino)
+        layout.lock()
+        try:
+            in_use, _ = self._run(
+                live=self._live(mirror), provider={"use_sudo": True},
+                sudo=_stat_as_root(layout),
+                chains={str(layout.source):
+                        f'{{"filename": "{layout.source}"}}'})
+            outcome = _remove_vm_a(layout, in_use)
+        finally:
+            layout.unlock()
+
+        assert layout.a.exists(), "the disk vm-b's block job holds was removed"
+        assert [path for path, _ in outcome.kept] == [str(layout.a)]
+        assert in_use.identities[a_id] == "vm-b"
+        assert b_id not in in_use.identities
+        assert str(layout.b) not in in_use
 
     def test_a_block_copy_destination_is_in_use(self):
         in_use, _ = self._run(live=self._live(self.COPY), chains={

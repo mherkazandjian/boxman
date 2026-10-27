@@ -161,12 +161,13 @@ def _refuse_mounts(tree: RetainedTree, left: list[str]) -> None:
 class InUse:
     """
     What other domains use, as the host-wide in-use scan reports it
-    (``LibVirtSession.disk_paths_in_use``): files by resolved path, and by
-    identity, each mapped to the domain that uses it.
+    (``LibVirtSession.disk_paths_in_use``): files by path — resolved where
+    that could be done strictly, else as named — and by identity, each
+    mapped to the domain that uses it. The identity is what decides.
     """
 
     def __init__(self) -> None:
-        #: resolved path -> domain
+        #: path (resolved where it could be) -> domain
         self.by_path: dict[str, str] = {}
         #: identity -> domain
         self.by_identity: dict[Identity, str] = {}
