@@ -2,9 +2,9 @@
 #
 # A spike, not a finished box. It uses boxman's ISO-boot path
 # (boot_order: [cdrom, hd] -> IsoBootVM -> virt-install), which hands every
-# cdroms: entry to virt-install, and works around the remaining gaps with
-# virt_install_extra_args -- see doc/windows-guests.md for why each is there
-# and what a proper `os: windows` box would look like instead.
+# cdroms: entry to virt-install, and works around the one gap left (the
+# answer ISO, G7) with virt_install_extra_args -- see doc/windows-guests.md
+# for why, and for what a proper `os: windows` box would look like instead.
 #
 # Before `boxman up`, build the answer ISO (it holds the Administrator
 # password, so it is generated, never committed):
@@ -71,6 +71,9 @@ clusters:
         # after Setup's first reboot the installed disk boots, not Setup again.
         boot_order: [cdrom, hd]
         disk_size: 40G
+        # virt-install's own detection reads this 2022 ISO as win2k25 with
+        # some osinfo-db versions (G4)
+        os_variant: win2k22
         networks:
           - name: win-net
         cdroms:
@@ -84,16 +87,4 @@ clusters:
         # ejected after setup, and `boxman update` would put a declared one
         # back. As a raw --disk it still reaches Setup's first boot.
         virt_install_extra_args:
-          # IsoBootVM passes --os-variant=detect=on, which takes this 2022
-          # media for win2k25; a later --os-variant wins.
-          - '--os-variant=win2k22'
           - '--disk=path={{ env("HOME") }}/workspaces/windows-server-2022-iso-boot/answer.iso,device=cdrom,readonly=on'
-          # boxman runs virt-install with --wait=0, which returns while the
-          # install-phase domain (on_reboot=destroy) is still running, so the
-          # VM stayed off after Setup's first reboot (G2). A later --wait wins:
-          # virt-install then waits for that stop and boots the installed
-          # disk itself. `boxman up` blocks until then, for at most 30
-          # minutes (the install phase takes about 1.5): if Setup stalls,
-          # virt-install gives up, `boxman up` fails, and the domain is left
-          # running so its VNC console shows where Setup stopped.
-          - '--wait=30'

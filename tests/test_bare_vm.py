@@ -95,11 +95,12 @@ class TestBareVMCreate:
     def test_create_fails_on_virt_install_error(self, mock_run, tmp_path):
         ok_result = _result(ok=True)
         fail_result = _result(ok=False, stderr="virt-install error")
-        mock_run.side_effect = [ok_result, fail_result]
+        # then `virsh domstate`, which finds no domain left behind
+        mock_run.side_effect = [ok_result, fail_result, _result(ok=False)]
         vm = _make_bare_vm(tmp_path)
         result = vm.create()
         assert result is False
-        assert mock_run.call_count == 2
+        assert mock_run.call_count == 3
 
     @patch('boxman.providers.libvirt.direct_vm._shell_run')
     def test_qemu_img_command_contains_disk_path(self, mock_run, tmp_path):
@@ -149,3 +150,12 @@ def test_a_pxe_vm_gets_the_guest_agent_channel_too(mock_run, tmp_path):
     _make_bare_vm(tmp_path).create()
     assert ("--channel=unix,target.type=virtio,name=org.qemu.guest_agent.0"
             in mock_run.call_args_list[1][0][0])
+
+
+@patch("boxman.providers.libvirt.direct_vm._shell_run")
+def test_a_pxe_vm_can_name_its_os_variant(mock_run, tmp_path):
+    """There is no install medium to detect a PXE guest's OS from, so
+    `os_variant:` is the only way to give virt-install one (G4)."""
+    mock_run.return_value = _result(ok=True)
+    _make_bare_vm(tmp_path, os_variant="rocky9").create()
+    assert "--os-variant=rocky9" in mock_run.call_args_list[1][0][0]

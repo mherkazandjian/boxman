@@ -9,11 +9,16 @@ disk-size units, …) applies to both.
 """
 
 import os
+import re
 import shlex
 from typing import Any
 
 from boxman import log
-from boxman.exceptions import ProvisionError
+from boxman.exceptions import (
+    DomainExistsError,
+    PartialInstallError,
+    ProvisionError,
+)
 from boxman.utils.shell import run as _shell_run
 
 from .commands import VirshCommand, VirtInstallCommand
@@ -21,6 +26,11 @@ from .disk import create_image_exclusive, libvirt_disk_source
 
 #: The virtio-serial port name the QEMU guest agent listens on.
 GUEST_AGENT_CHANNEL = "org.qemu.guest_agent.0"
+
+#: virt-install's refusal of a name in use (virtinst's guest.py), which it
+#: checks before it defines anything. Under a locale that translates it,
+#: it is not recognised, and the failure is treated as any other.
+_NAME_IN_USE = re.compile(r"Guest name '.*' is already in use")
 
 #: What a refused boot disk tells the operator to do.
 BOOT_DISK_REMEDY = ("If it is stale, remove or rename it and run the "
@@ -96,6 +106,17 @@ class DirectInstallVM:
         later by the configure step (in MiB), exactly as for cloned VMs.
         """
         return normalize_disk_size(self.info.get("disk_size"))
+
+    def _os_variant(self) -> str:
+        """The ``--os-variant`` value: the VM's ``os_variant:``, else detection.
+
+        virt-install detects the OS only from install media, and the
+        osinfo-db it detects with differs between hosts: one reads the
+        Windows Server 2022 ISO as 2025 (G4). A box can name the variant,
+        as a template's ``os_variant:`` does; ``osinfo-query os`` lists them.
+        """
+        variant = self.info.get("os_variant")
+        return shlex.quote(str(variant)) if variant else "detect=on,require=off"
 
     @staticmethod
     def _network_spec(entry: Any) -> dict[str, Any] | None:
@@ -242,7 +263,7 @@ class DirectInstallVM:
             parts.append(net_arg)
         parts.extend(media_args)
         parts.append(f"--boot={self.boot_order}")
-        parts.append("--os-variant=detect=on,require=off")
+        parts.append(f"--os-variant={self._os_variant()}")
         parts.append("--graphics=vnc")
         parts.append("--noautoconsole")
         parts.append("--wait=0")
@@ -264,7 +285,35 @@ class DirectInstallVM:
         result = _shell_run(cmd, hide=True, warn=True)
         if not result.ok:
             self.logger.error(f"virt-install failed: {result.stderr}")
+            # both streams: virt-install prints why it gave up on a --wait
+            # ("exceeded specified time limit") to stdout
+            said = "\n".join(text.strip() for text in
+                             (result.stdout, result.stderr) if text)
+            if _NAME_IN_USE.search(said):
+                raise DomainExistsError(
+                    f"virt-install did not create {self._describe()}: a "
+                    f"domain by that name is already defined, by an earlier "
+                    f"run or another one. Remove it (boxman destroy) or "
+                    f"rename it before running again. virt-install "
+                    f"said:\n{said}")
+            if self._domain_exists():
+                raise PartialInstallError(
+                    f"virt-install failed after defining {self._describe()}, "
+                    f"which is left as it is: its console shows how far the "
+                    f"install got. Remove it (boxman destroy) before running "
+                    f"again. virt-install said:\n{said}")
             return False
 
         self.logger.info(f"{self._describe()} created")
         return True
+
+    def _domain_exists(self) -> bool:
+        """Whether libvirt has a domain by this VM's name.
+
+        A query that fails counts as no, which leaves a failed create to be
+        retried as it was before this was asked.
+        """
+        cmd = self.virsh.build_command("domstate", self.vm_name)
+        result = _shell_run(self.virsh._wrap_for_runtime(cmd),
+                            hide=True, warn=True)
+        return bool(result.ok)

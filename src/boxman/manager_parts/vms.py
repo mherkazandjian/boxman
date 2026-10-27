@@ -15,6 +15,8 @@ from boxman.exceptions import (
     CloneSanitizerError,
     ConfigError,
     DiskPathOccupiedError,
+    DomainExistsError,
+    PartialInstallError,
     ProvisionError,
     SSHAccessError,
 )
@@ -107,12 +109,15 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
             for degradation in degradations:
                 log.warning(degradation.message)
             return degradations
-        except (CloneSanitizerError, ConfigError, DiskPathOccupiedError):
+        except (CloneSanitizerError, ConfigError, DiskPathOccupiedError,
+                DomainExistsError, PartialInstallError):
             # Required sanitizer and invalid-policy failures are permanent.
             # Retrying would either repeat the same inspection or run into an
             # unsafe clone whose cleanup already failed. So is a boot disk
             # path held by something this run did not make (#215): it is
-            # still there on the next attempt.
+            # still there on the next attempt. And so is a domain name that
+            # is taken, whether before virt-install ran or by the domain a
+            # failed virt-install left defined.
             raise
         except Exception:
             if not last_attempt:

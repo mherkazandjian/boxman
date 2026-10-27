@@ -291,27 +291,65 @@ class NetworksMixin:
         """
         Wait until every named VM reports an address, or *max_wait* passes.
 
+        A VM that stops running meanwhile has no lease coming, so it is
+        reported and no longer waited for: an ISO-boot guest left off by its
+        installer's reboot (G2) used to cost the whole timeout. Stopping is
+        not an error in itself -- a guest may power itself off by design, as
+        the proxmox box's unattended install does. A VM that stops after it
+        got its address is reported too. An address once seen counts: a VM
+        still running is not asked again, even if a reboot hides it for a
+        while.
+
         Returns:
-            True if they all got one.
+            True if they all got one and none stopped.
         """
         if not vm_names:
             return True
 
         self.logger.info("waiting for VMs to get IP addresses...")
+        pending = list(vm_names)
+        stopped: list[str] = []
         wait_time = 1
         total_waited = 0
-        while total_waited < max_wait:
-            if all(self.provider.get_vm_ip_addresses(name) for name in vm_names):
-                self.logger.info(
-                    f"all VMs have IP addresses (waited {total_waited}s)")
-                return True
+        while True:
+            # None when the states cannot be read: then every VM is waited
+            # for, as before this asked
+            states = self._vm_states_if_known()
+            for name in vm_names if states is not None else []:
+                state = states.get(name, 'not defined')
+                if name in stopped or state not in self._NOT_RUNNING_STATES:
+                    continue
+                if name in pending:
+                    self.logger.warning(
+                        f"vm {name} stopped running ({state}) while boxman "
+                        f"waited for its IP address; no longer waiting for it")
+                    pending.remove(name)
+                else:
+                    self.logger.warning(
+                        f"vm {name} stopped running ({state}) after it got "
+                        f"its IP address, while boxman waited for the others")
+                stopped.append(name)
+            pending = [name for name in pending
+                       if not self.provider.get_vm_ip_addresses(name)]
+            if not pending:
+                break
+            if total_waited >= max_wait:
+                self.logger.warning(
+                    f"not every VM had an IP address after {max_wait}s; the "
+                    f"ssh config may be incomplete")
+                return False
             time.sleep(wait_time)
             total_waited += wait_time
             wait_time = min(wait_time * 2, 60)
 
-        self.logger.warning(
-            f"not every VM had an IP address after {max_wait}s; the ssh "
-            f"config may be incomplete")
+        if not stopped:
+            self.logger.info(
+                f"all VMs have IP addresses (waited {total_waited}s)")
+            return True
+        if len(stopped) < len(vm_names):
+            self.logger.info(
+                f"the VMs still running have IP addresses (waited "
+                f"{total_waited}s)")
         return False
 
     def _define_network(self,

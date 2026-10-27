@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Block until this site's nodes have finished the unattended install. The
-# answer file says `reboot-mode = "power-off"`, and virt-install's transient
-# install domain ends on a reboot anyway (on_reboot=destroy), so "installed"
-# == libvirt reports the domain `shut off`. Usage: wait-installed.sh [timeout-s]
+# answer file says `reboot-mode = "power-off"`, so "installed" == libvirt
+# reports the domain `shut off`. Usage: wait-installed.sh [timeout-s]
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 timeout=${1:-1800}

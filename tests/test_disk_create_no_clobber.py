@@ -632,6 +632,13 @@ class TestADirectInstallBootDisk:
             os.close(fd)
         direct_vm._boot_disks_made.clear()
 
+    @pytest.fixture(autouse=True)
+    def _no_domain_is_left(self, monkeypatch: pytest.MonkeyPatch):
+        """The virt-install stub defines nothing, so a failed one leaves no
+        domain; asking the real virsh would only ask this host."""
+        monkeypatch.setattr(direct_vm.DirectInstallVM, "_domain_exists",
+                            lambda self: False)
+
     @staticmethod
     def _vm(workdir) -> BareVM:
         return BareVM(vm_name="pxe01",

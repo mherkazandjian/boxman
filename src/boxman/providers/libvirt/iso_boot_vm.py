@@ -23,6 +23,10 @@ class IsoBootVM(DirectInstallVM):
     used instead of re-running the installer. (Using ``cdrom,hd`` would loop
     back into the installer on every reboot.)
 
+    There is no install phase (``--install no_install=yes``): that order is
+    the one the guest boots with from the start, and the installer's reboot
+    is a reboot. The ISO stays in the definition.
+
     Every further ``cdroms:`` entry is given to virt-install too, so the
     installer sees it on its first boot (a driver ISO, an answer file).
     """
@@ -60,7 +64,16 @@ class IsoBootVM(DirectInstallVM):
         # installer, a SATA/IDE drive reached the persistent definition only
         # (libvirt cannot hot-plug one), and an installer that needs a second
         # medium -- drivers, an answer file -- never saw it.
-        args = [f"--cdrom={shlex.quote(self.iso_path)}"]
+        #
+        # `--cdrom` alone makes virt-install run an install phase: a first
+        # definition that boots the CD-ROM only and has on_reboot=destroy.
+        # boxman's --wait=0 left nothing to restart it, so the guest stayed
+        # off after an installer's first reboot (G2). `no_install=yes` gives
+        # the one definition, with a normal reboot. `--cdrom` stays because
+        # it is the medium virt-install detects the OS from; a CD-ROM
+        # `--disk` would not be read.
+        args = [f"--cdrom={shlex.quote(self.iso_path)}",
+                "--install=no_install=yes"]
         for entry in self._extra_cdroms():
             source = os.path.abspath(os.path.expanduser(entry["source"]))
             if not os.path.isfile(source):

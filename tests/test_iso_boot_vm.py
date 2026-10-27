@@ -6,16 +6,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from boxman.exceptions import ProvisionError
+from boxman.exceptions import (
+    DomainExistsError,
+    PartialInstallError,
+    ProvisionError,
+)
 from boxman.providers.libvirt.direct_vm import normalize_disk_size
 from boxman.providers.libvirt.iso_boot_vm import IsoBootVM
 
 pytestmark = pytest.mark.unit
 
 
-def _result(ok: bool = True, stderr: str = "") -> MagicMock:
+def _result(ok: bool = True, stderr: str = "", stdout: str = "") -> MagicMock:
     r = MagicMock(name="invoke.Result")
     r.ok = ok
+    r.stdout = stdout
     r.stderr = stderr
     r.failed = not ok
     return r
@@ -140,7 +145,10 @@ class TestIsoBootVMCreate:
 
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_create_fails_on_virt_install_error(self, mock_run, tmp_path):
-        mock_run.side_effect = [_result(ok=True), _result(ok=False, stderr="permission denied")]
+        # qemu-img, virt-install, then `virsh domstate`: no domain was left
+        mock_run.side_effect = [_result(ok=True),
+                                _result(ok=False, stderr="permission denied"),
+                                _result(ok=False)]
         vm = _make_iso_vm(tmp_path)
         assert vm.create() is False
 
@@ -397,3 +405,152 @@ class TestTheGuestAgentChannel:
         cmd = mock_run.call_args_list[1][0][0]
         assert cmd.count("org.qemu.guest_agent.0") == 1
         assert own in cmd
+
+
+class TestThereIsNoInstallPhase:
+    """G2: `--cdrom` alone made virt-install run an install phase, whose
+    definition boots the CD-ROM only and has on_reboot=destroy. With
+    boxman's --wait=0 nothing restarted it, so the guest stayed off after
+    its installer's first reboot (Windows Setup's, 85 s in)."""
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_virt_install_is_told_not_to_run_one(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        _make_iso_vm(tmp_path, iso_path="/data/talos.iso").create()
+        assert "--install=no_install=yes" in mock_run.call_args_list[1][0][0]
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_the_iso_stays_a_cdrom_so_the_os_is_still_detected(self, mock_run,
+                                                                tmp_path):
+        """virt-install detects the OS only from `--cdrom`/`--location`
+        media; the same ISO as a CD-ROM `--disk` lost the OS id, and with it
+        Windows' localtime clock (virt-install dry run)."""
+        mock_run.return_value = _result(ok=True)
+        _make_iso_vm(tmp_path, iso_path="/data/talos.iso").create()
+        cmd = mock_run.call_args_list[1][0][0]
+        assert "--cdrom=/data/talos.iso" in cmd
+        assert "--os-variant=detect=on,require=off" in cmd
+        assert "device=cdrom" not in cmd
+
+
+class TestOsVariant:
+    """G4: virt-install detects the OS with the host's osinfo-db, and two
+    hosts read the same Windows Server 2022 ISO as 2022 and as 2025.
+    `os_variant:` names it, as a template's does."""
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_one_given_is_passed_instead_of_detection(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        _make_iso_vm(tmp_path, os_variant="win2k22").create()
+        cmd = mock_run.call_args_list[1][0][0]
+        assert "--os-variant=win2k22" in cmd
+        assert "detect=on" not in cmd
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_it_is_shell_quoted(self, mock_run, tmp_path):
+        mock_run.return_value = _result(ok=True)
+        _make_iso_vm(tmp_path, os_variant="win2k22; true").create()
+        assert "--os-variant='win2k22; true'" in mock_run.call_args_list[1][0][0]
+
+
+class TestAFailedInstallThatLeftItsDomain:
+    """A virt-install that failed after defining the domain (a --wait that
+    ran out) was retried four more times. Each retry failed on the name
+    being in use, and those errors were what the operator saw."""
+
+    FAILED = "Domain installation does not appear to have been successful."
+    TIMED_OUT = ("Installation has exceeded specified time limit. "
+                 "Exiting application.")
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_it_raises_with_virt_install_s_own_words(self, mock_run, tmp_path):
+        # qemu-img, virt-install, then `virsh domstate`: the domain is there
+        mock_run.side_effect = [_result(ok=True),
+                                _result(ok=False, stderr=self.FAILED),
+                                _result(ok=True)]
+        with pytest.raises(PartialInstallError) as exc:
+            _make_iso_vm(tmp_path).create()
+        assert self.FAILED in str(exc.value)
+        assert "boxman destroy" in str(exc.value)
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_a_timeout_reported_on_stdout_is_in_the_message(self, mock_run,
+                                                            tmp_path):
+        """virt-install prints why a --wait gave up to stdout; stderr held
+        only osinfo warnings (seen on a real `--wait=1`)."""
+        mock_run.side_effect = [
+            _result(ok=True),
+            _result(ok=False, stdout=self.TIMED_OUT,
+                    stderr="WARNING  Using --osinfo generic"),
+            _result(ok=True)]
+        with pytest.raises(PartialInstallError, match="exceeded specified time"):
+            _make_iso_vm(tmp_path).create()
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_the_domain_is_looked_up_by_the_vm_s_name(self, mock_run, tmp_path):
+        mock_run.side_effect = [_result(ok=True),
+                                _result(ok=False, stderr=self.FAILED),
+                                _result(ok=False)]
+        # no domain: an ordinary failure, which the caller may retry
+        assert _make_iso_vm(tmp_path).create() is False
+        lookup = mock_run.call_args_list[2][0][0]
+        assert " domstate " in lookup
+        assert lookup.endswith(" iso-test01")
+
+    def test_it_is_not_retried(self, monkeypatch):
+        from boxman.manager_parts import vms
+
+        sleeps: list = []
+        monkeypatch.setattr(vms.time, "sleep", sleeps.append)
+        provider = MagicMock()
+        provider.clone_vm.side_effect = PartialInstallError(self.FAILED)
+
+        with pytest.raises(PartialInstallError):
+            vms._clone_with_retry(provider, {"workdir": "/w"},
+                                  {"boot_order": ["cdrom", "hd"]}, "win01")
+
+        assert provider.clone_vm.call_count == 1
+        assert sleeps == []
+
+
+class TestANameTakenBeforeVirtInstallRan:
+    """A domain by the VM's name that was already defined: virt-install
+    refuses the name before it defines anything, so this is not a partial
+    install of this run, as the message used to say."""
+
+    IN_USE = "ERROR    Guest name 'iso-test01' is already in use."
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_it_raises_saying_so(self, mock_run, tmp_path):
+        mock_run.side_effect = [_result(ok=True),
+                                _result(ok=False, stderr=self.IN_USE)]
+        with pytest.raises(DomainExistsError) as exc:
+            _make_iso_vm(tmp_path).create()
+        assert "already defined" in str(exc.value)
+        assert self.IN_USE in str(exc.value)
+        # qemu-img and virt-install only: no domain lookup is needed
+        assert mock_run.call_count == 2
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_a_disk_in_use_is_not_taken_for_it(self, mock_run, tmp_path):
+        mock_run.side_effect = [
+            _result(ok=True),
+            _result(ok=False, stderr="ERROR    Disk /x.iso is already in "
+                                     "use by other guests ['other']."),
+            _result(ok=False)]
+        assert _make_iso_vm(tmp_path).create() is False
+
+    def test_it_is_not_retried(self, monkeypatch):
+        from boxman.manager_parts import vms
+
+        sleeps: list = []
+        monkeypatch.setattr(vms.time, "sleep", sleeps.append)
+        provider = MagicMock()
+        provider.clone_vm.side_effect = DomainExistsError(self.IN_USE)
+
+        with pytest.raises(DomainExistsError):
+            vms._clone_with_retry(provider, {"workdir": "/w"},
+                                  {"boot_order": ["cdrom", "hd"]}, "win01")
+
+        assert provider.clone_vm.call_count == 1
+        assert sleeps == []

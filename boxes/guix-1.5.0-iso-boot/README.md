@@ -19,8 +19,8 @@ the guest.
 (boxman *does* still generate an `ssh_config` and an `id_ed25519_boxman`
 keypair in the workspace, and `boxman up` prints an `ssh …` line for the VM.
 Ignore both: the `admin` user they name does not exist in the guest. `boxman
-up` also ends with `ERROR: failed to add ssh keys to some vms`, which is the
-correct outcome here, not a fault.)
+up` also warns that the cluster `has no admin_pass, so boxman adds no ssh key
+to its VMs`, which is the correct outcome here, not a fault.)
 
 As with the NixOS box, that is the current limit of the tooling rather than an
 oversight:
@@ -124,14 +124,12 @@ virsh -c qemu:///system list --all | grep guix01
 ```bash
 virsh -c qemu:///system dumpxml "$V" | grep -A2 '<boot\|cdrom\|\.iso'
 # expect: <disk device='cdrom'> … <source file='…guix-system-install-….iso'/>
-#         <boot dev='cdrom'/> <boot dev='hd'/>
+#         <boot dev='hd'/> <boot dev='cdrom'/>
 ```
 
-Note the boot order you actually get is **`cdrom` then `hd`**, even though
-`IsoBootVM` asks virt-install for `hd,cdrom`: passing `--cdrom=` puts
-virt-install into two-phase install mode, and boxman never reaches the
-post-install reconfigure. For this box it makes no difference — it boots the
-installer and never completes one — but do not rely on the `hd`-first ordering.
+The boot order is **`hd` then `cdrom`**, and there is no virt-install
+install phase that would boot the CD-ROM first: the empty disk is skipped,
+so the ISO boots, and once something bootable is on the disk, the disk wins.
 
 **4. It actually booted the installer** — watch the console:
 
@@ -162,9 +160,9 @@ Run the guided installer on the console, or drop to a shell on another tty and
 write an `operating-system` declaration by hand and `guix system init` it onto
 the 30 G disk.
 
-Be aware the domain boots **cdrom first** (see above), so once you have
-installed something you must detach the CDROM — or change the boot order — or
-the VM will drop back into the installer on every reboot.
+The domain boots the disk first (see above), so once a bootloader is
+installed there, a reboot starts the installed system rather than the
+installer. The ISO stays attached until you eject it.
 
 If you install, remember Guix pulls a large number of substitutes on first
 build; the VM needs working outbound networking through `guix-net`.

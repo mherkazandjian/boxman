@@ -232,10 +232,11 @@ class TestMemballoonValidation:
 class TestConfigureCpuMemoryEditsPersistentConfig:
     """configure_cpu_memory must read the *inactive* (persistent) XML.
 
-    A direct-boot (ISO/PXE) VM is still running virt-install's transient
-    install XML (cdrom-first, on_reboot=destroy, install media inserted) when
-    the post-create configure step runs. Redefining from the live XML would
-    persist that and re-run the installer on every boot.
+    The live XML can differ from the persistent one. It did most while ISO-boot
+    VMs still had virt-install's install phase (G2): the post-create configure
+    step ran while the guest was on the transient install XML (cdrom-first,
+    on_reboot=destroy, install media inserted), and redefining from the live
+    XML persisted that and re-ran the installer on every boot.
 
     The two fixtures below deliberately differ. An earlier version of this
     test returned one XML for both dumps and carried no boot order, reboot
@@ -244,7 +245,7 @@ class TestConfigureCpuMemoryEditsPersistentConfig:
     installer XML would have passed it unchanged (#171 C1).
     """
 
-    #: what virt-install's transient install domain looks like
+    #: what virt-install's transient install domain looked like
     _LIVE = ("<domain type='kvm'><name>d</name>"
              "<memory unit='KiB'>1048576</memory>"
              "<currentMemory unit='KiB'>1048576</currentMemory>"

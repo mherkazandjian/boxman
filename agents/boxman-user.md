@@ -780,11 +780,18 @@ clusters:
   order is hardcoded to `hd,cdrom` (disk first, falling through to CDROM). So
   the first boot finds the empty disk unbootable and boots the installer; once
   the OS is installed the disk wins. `[cdrom, hd]` and `[cdrom]` behave
-  identically — anything past element 0 is ignored.
+  identically — anything past element 0 is ignored. There is no virt-install
+  install phase: an installer's reboot is a plain reboot (into the disk, once
+  it is bootable), and the ISO stays attached until you eject it.
 - **`cdroms:` entry forms:** a bare string, `{name: <iso-name>}` (resolved from
   `isos:`), or `{source: /abs/path.iso}` (explicit local file). The first cdrom
   is the boot ISO; the others go to virt-install with it, so an installer
   sees them on its first boot (a driver ISO, an answer file).
+- **`os_variant:`** (e.g. `win2k22`, `ubuntu24.04`; `osinfo-query os` lists
+  them) sets virt-install's `--os-variant`, which picks device defaults such
+  as the clock. Without it, virt-install detects the OS from the boot ISO with
+  the host's osinfo-db, and that can differ between hosts. A PXE VM has no
+  medium to detect from, so it needs the key to get anything but defaults.
 - **Direct-install VMs use a simpler schema than cloned VMs:** `vcpus:` (flat
   int) instead of `cpus:{…}`, and `networks: [{name: …}]` for the first NIC
   instead of `network_adapters:`; `disk_size:` sets the empty boot disk. On a

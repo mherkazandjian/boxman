@@ -393,11 +393,13 @@ class VirshEdit:
             true if successful, false otherwise
         """
         try:
-            # Edit the persistent definition, never the live one. A direct-boot
-            # (ISO/PXE) VM is still running virt-install's *transient* install
-            # XML when this runs (cdrom-first, on_reboot=destroy, install media
-            # inserted); redefining from the live XML would persist that and
-            # make the guest re-run the installer on every boot.
+            # Edit the persistent definition, never the live one: the live XML
+            # also holds what changed for this run only, such as a device
+            # attached live, and redefining from it would make that permanent.
+            # It once held more: until ISO-boot VMs lost virt-install's install
+            # phase (G2), a new one was running the transient install XML here
+            # (cdrom-first, on_reboot=destroy), and persisting that made the
+            # guest re-run its installer on every boot.
             xml_content = self.get_domain_xml(domain_name, inactive=True)
 
             # debug: log current cpu configuration

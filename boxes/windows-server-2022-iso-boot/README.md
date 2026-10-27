@@ -21,9 +21,10 @@ one manual step (see [Known gaps](#known-gaps)).
    answer ISO.
 3. WinPE finds `autounattend.xml` on the answer ISO. It loads `viostor` and
    `NetKVM` from the virtio-win ISO, partitions the disk (MBR, SeaBIOS) and
-   applies the Server Core image. It then reboots; virt-install, kept
-   waiting by `--wait=30` (at most 30 minutes), starts the VM again.
-4. After the next start: specialize, OOBE, one auto-logon as Administrator,
+   applies the Server Core image. It then reboots into the disk it just
+   installed: the firmware order is `hd,cdrom`, and boxman runs
+   virt-install without an install phase, so the reboot is a plain reboot.
+4. After that reboot: specialize, OOBE, one auto-logon as Administrator,
    and `boxman-setup.ps1`. That installs all virtio drivers and the QEMU
    guest agent, enables WinRM (HTTP 5985, NTLM, Basic off) and installs
    OpenSSH Server from Windows Update. The last `boxman-setup:` line in
@@ -33,7 +34,7 @@ one manual step (see [Known gaps](#known-gaps)).
    password Setup stored for it, and logs that session off.
 
 Measured on the test host: about 85 s from `virt-install` to Setup's first reboot,
-and about 2 min from the second start to WinRM and SSH answering.
+and about 2 min from that reboot to WinRM and SSH answering.
 
 ## Prerequisites
 
@@ -98,12 +99,6 @@ ansible all -i "$IP," -m ansible.windows.win_ping \
 
 All of these are covered in the doc.
 
-- **Powers off after the first Setup reboot without `--wait=30`.**
-  virt-install's install-phase domain has `on_reboot=destroy`, and boxman
-  runs it with `--wait=0`. The box overrides that with a later `--wait=30`;
-  without it the VM stays off, and the first `boxman up` waits 600 s and
-  exits 0. If Setup stalls, virt-install gives up after 30 minutes and
-  `boxman up` fails, leaving the VM running so its console can be checked.
 - **`boxman ssh` / generated `ssh_config` do not work.** They use
   `User admin` and boxman's own key. Use `Administrator` and the key you
   baked into the answer ISO. The generated inventory has no
