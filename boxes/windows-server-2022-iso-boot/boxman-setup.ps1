@@ -86,6 +86,53 @@ try {
 } catch { Fail "auto-logon off: $_" }
 Remove-ItemProperty -Path $winlogon -Name AutoLogonCount, DefaultPassword -ErrorAction SilentlyContinue
 
+# Setup keeps the AutoLogon password as the LSA secret DefaultPassword, not
+# in the registry value, and nothing removes it: not the last logon, not a
+# reboot. LsaStorePrivateData with no data deletes a secret.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class BoxmanLsa {
+    [StructLayout(LayoutKind.Sequential)]
+    struct LSA_UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct LSA_OBJECT_ATTRIBUTES {
+        public int Length; public IntPtr RootDirectory; public IntPtr ObjectName;
+        public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService;
+    }
+    [DllImport("advapi32.dll")]
+    static extern uint LsaOpenPolicy(IntPtr system, ref LSA_OBJECT_ATTRIBUTES attrs, uint access, out IntPtr policy);
+    [DllImport("advapi32.dll")]
+    static extern uint LsaStorePrivateData(IntPtr policy, ref LSA_UNICODE_STRING key, IntPtr data);
+    [DllImport("advapi32.dll")]
+    static extern uint LsaClose(IntPtr policy);
+    [DllImport("advapi32.dll")]
+    static extern int LsaNtStatusToWinError(uint status);
+
+    // The Win32 error code: 0 when deleted, 2 when there was no such secret.
+    public static int DeleteSecret(string name) {
+        var attrs = new LSA_OBJECT_ATTRIBUTES();
+        attrs.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
+        IntPtr policy;
+        uint status = LsaOpenPolicy(IntPtr.Zero, ref attrs, 0x000F0FFF /* POLICY_ALL_ACCESS */, out policy);
+        if (status != 0) return LsaNtStatusToWinError(status);
+        var key = new LSA_UNICODE_STRING();
+        key.Length = (ushort)(name.Length * 2);
+        key.MaximumLength = (ushort)(key.Length + 2);
+        key.Buffer = Marshal.StringToHGlobalUni(name);
+        try {
+            status = LsaStorePrivateData(policy, ref key, IntPtr.Zero);
+        } finally {
+            Marshal.FreeHGlobal(key.Buffer);
+            LsaClose(policy);
+        }
+        return LsaNtStatusToWinError(status);
+    }
+}
+'@
+$err = [BoxmanLsa]::DeleteSecret('DefaultPassword')
+if ($err -notin 0, 2) { Fail "LSA secret DefaultPassword (Win32 error $err)" }
+
 if ($failed) {
     Write-Output "boxman-setup: FAILED: $($failed -join '; ')"
 } else {

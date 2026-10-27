@@ -122,7 +122,10 @@ Things learned about the answer file:
   answer file (`<PlainText>false</PlainText>` is only base64). The file is
   rendered from a template at build time, the ISO is written mode 0600, and
   nothing rendered is committed. On this host libvirt then chowns it to root
-  while attached.
+  while attached. In the guest, Setup keeps the `AutoLogon` password as the
+  LSA secret `DefaultPassword` (not the registry value of that name), and it
+  was still there after the one logon and two reboots, so `boxman-setup.ps1`
+  deletes it. Without that, every snapshot or copy of the disk carries it.
 
 ### 3.2 virtio drivers: disk, net, balloon
 

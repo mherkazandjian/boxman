@@ -29,8 +29,8 @@ one manual step (see [Known gaps](#known-gaps)).
    OpenSSH Server from Windows Update. The last `boxman-setup:` line in
    `C:\boxman-setup.log` is `boxman-setup: done`, or `boxman-setup:
    FAILED: …` naming the steps that did not complete (the transcript's
-   footer follows it). The script then turns auto-logon off and logs
-   that session off.
+   footer follows it). The script then turns auto-logon off, deletes the
+   password Setup stored for it, and logs that session off.
 
 Measured on the test host: about 85 s from `virt-install` to Setup's first reboot,
 and about 2 min from the second start to WinRM and SSH answering.
