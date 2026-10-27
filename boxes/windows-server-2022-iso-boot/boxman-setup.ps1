@@ -77,6 +77,15 @@ if (Get-Service sshd -ErrorAction SilentlyContinue) {
     }
 } else { Fail 'sshd not available (OpenSSH capability did not install)' }
 
+# 5. Auto-logon off. LogonCount 1 allows no second auto-logon, but it leaves
+#    AutoAdminLogon set until Windows clears it at the next boot. Clear it
+#    now, with the count and any stored password.
+$winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+try {
+    Set-ItemProperty -Path $winlogon -Name AutoAdminLogon -Value '0' -ErrorAction Stop
+} catch { Fail "auto-logon off: $_" }
+Remove-ItemProperty -Path $winlogon -Name AutoLogonCount, DefaultPassword -ErrorAction SilentlyContinue
+
 if ($failed) {
     Write-Output "boxman-setup: FAILED: $($failed -join '; ')"
 } else {
