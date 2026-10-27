@@ -623,7 +623,12 @@ class SnapshotManager:
 
         Checks:
         1. ``virsh snapshot-info`` succeeds (snapshot exists in libvirt).
-        2. The memory ``.raw`` file referenced in the snapshot XML exists on disk.
+        2. The memory file referenced in the snapshot XML exists on disk:
+           the ``.raw`` itself, or its compressed ``.raw.zst`` sibling
+           (``snapshot take --compress-memory``, ``storage
+           compress-snapshots``), which :meth:`snapshot_restore`
+           decompresses before the revert. libvirt keeps recording the
+           ``.raw`` path either way.
         3. All external disk overlay files referenced in the snapshot XML exist on disk.
 
         Args:
@@ -651,12 +656,15 @@ class SnapshotManager:
         try:
             root = ET.fromstring(dumpxml_result.stdout)
 
-            # Check memory file
+            # Check memory file: a compressed snapshot keeps only the
+            # .raw.zst next to the .raw path libvirt recorded
             memory_elem = root.find("memory")
             if memory_elem is not None:
                 mem_file = memory_elem.get("file")
-                if mem_file and not os.path.isfile(mem_file):
-                    errors.append(f"memory file missing: {mem_file}")
+                if (mem_file and not os.path.isfile(mem_file)
+                        and not os.path.isfile(f"{mem_file}.zst")):
+                    errors.append(
+                        f"memory file missing: {mem_file} (nor {mem_file}.zst)")
 
             # Check external disk overlay files
             for disk in root.findall(".//disks/disk"):
