@@ -1390,10 +1390,22 @@ class VMsMixin:
             session, session.backing_chains(sources) if sources else {},
             saved.disk_sources, saved.chains)
         recorded_only = snapshot_only_overlays(saved.overlays, sources)
+        read_now = (session.backing_chains(recorded_only) if recorded_only
+                    else {})
         overlay_chains = self._chains_left(
-            session,
-            session.backing_chains(recorded_only) if recorded_only else {},
-            recorded_only, saved.overlay_chains, unknown_keeps_all=True)
+            session, read_now, recorded_only, saved.overlay_chains,
+            unknown_keeps_all=True)
+        known = saved.overlay_chains or {}
+        learned = {head: chain for head, chain in (read_now or {}).items()
+                   if known.get(head) != chain}
+        if learned and saved.saved_at is not None:
+            # one gone at first and back since, say: what was read of it
+            # now is saved — never what is left of one, which starts below
+            # it — as the next retry may find it gone again
+            saved = dataclasses.replace(
+                saved, overlay_chains={**known, **learned})
+            self._save_teardown_inventory(saved,
+                                          os.path.dirname(saved.saved_at))
         return dataclasses.replace(saved, chains=chains,
                                    overlay_chains=overlay_chains)
 

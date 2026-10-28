@@ -3978,6 +3978,39 @@ class TestOverlaysInADiskSnapshotDir:
 
         assert not (s1.exists() or base.exists())
 
+    def test_a_retry_saves_what_it_learns_of_one_gone_at_first(
+            self, tmp_path):
+        """``s2`` was not there at first, so it was saved as built on
+        nothing; back since, on ``middle``, a retry reads its chain — and
+        saves it, as the next one may find ``s2`` gone again."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        middle = _file(workdir / f'{VM}.middle')
+        s2 = ov / f'{VM}.s2'
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'s2': [str(s2)]},
+                      in_use={str(base): OTHER, str(middle): OTHER})
+        t.session.backing_chains.side_effect = _live({
+            s1: [s1, base], middle: [middle, s1, base],
+            s2: [s2, middle, s1, base]})
+        t.deprovision()
+        assert all(p.exists() for p in (base, s1, middle))
+        _file(s2)
+        middle.rename(tmp_path / 'replaced')
+        _file(middle, b'replacement')
+
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.deprovision()
+        assert s1.exists() and base.exists()
+        s2.unlink()
+        t.mgr.logger.reset_mock()
+        t.deprovision()
+
+        assert middle.read_bytes() == b'replacement'
+        assert s1.exists() and base.exists()
+
     def test_their_chains_that_cannot_be_read_keep_everything(self, tmp_path):
         t, files = self._built_on_the_attached_one(tmp_path)
         s2 = files[0]
