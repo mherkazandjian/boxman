@@ -3800,6 +3800,24 @@ class TestOverlaysInADiskSnapshotDir:
         assert self._specs(args) == [
             "vda,snapshot=external,file=/fast/ov/vm01.s2"]
 
+    def test_a_read_only_disk_set_to_be_snapshotted_gets_its_overlay_there(
+            self, sm, tmp_path):
+        """Its own ``snapshot='external'`` overrides the read-only default:
+        libvirt takes it, and left unnamed its overlay would land beside
+        it."""
+        ok, [args] = self._create(
+            sm, tmp_path, "/fast/ov",
+            blklist=self._blklist(("vda", "/work/vm01.qcow2"),
+                                  ("vdb", "/reference/ref.qcow2")),
+            domain=self._domain(
+                "<disk type='file' device='disk' snapshot='external'>"
+                "<readonly/><target dev='vdb'/></disk>"))
+
+        assert ok is True
+        assert self._specs(args) == [
+            "vda,snapshot=external,file=/fast/ov/vm01.s2",
+            "vdb,snapshot=external,file=/fast/ov/ref.s2"]
+
     def test_a_definition_that_cannot_be_read_refuses_the_take(self, sm,
                                                                tmp_path):
         ok, creates = self._create(sm, tmp_path, "/fast/ov", domain=None)
@@ -3844,7 +3862,10 @@ class TestOverlaysInADiskSnapshotDir:
             "<disk device='disk'><readonly/><target dev='vdb'/></disk>",
             "<disk device='disk' snapshot='no'><target dev='vdc'/></disk>",
             "<disk device='disk' snapshot='external'>"
-            "<target dev='vdd'/></disk>")
+            "<target dev='vdd'/></disk>",
+            # read-only, but set to be snapshotted: libvirt takes it
+            "<disk device='disk' snapshot='external'><readonly/>"
+            "<target dev='vde'/></disk>")
         with patch.object(sm.virsh, "execute",
                           return_value=_result(stdout=domain)) as execute:
             assert sm._snapshot_excluded_targets("vm01") == {"vdb", "vdc"}
