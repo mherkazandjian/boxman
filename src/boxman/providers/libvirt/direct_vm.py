@@ -284,18 +284,24 @@ class DirectInstallVM:
         self.logger.info(f"creating {self._describe()}: {cmd}")
         result = _shell_run(cmd, hide=True, warn=True)
         if not result.ok:
-            self.logger.error(f"virt-install failed: {result.stderr}")
             # both streams: virt-install prints why it gave up on a --wait
             # ("exceeded specified time limit") to stdout
             said = "\n".join(text.strip() for text in
                              (result.stdout, result.stderr) if text)
-            if _NAME_IN_USE.search(said):
+            refusal = _NAME_IN_USE.search(said)
+            if refusal:
+                # the refusal only: what virt-install prints after it is its
+                # advice for a failed install, to start the domain, and the
+                # domain may be another run's
                 raise DomainExistsError(
                     f"virt-install did not create {self._describe()}: a "
                     f"domain by that name is already defined, by an earlier "
-                    f"run or another one. Remove it (boxman destroy) or "
-                    f"rename it before running again. virt-install "
-                    f"said:\n{said}")
+                    f"run or by one still going (virt-install: "
+                    f"\"{refusal.group(0)}\"). If an earlier run left it, "
+                    f"remove it (boxman destroy) or rename the VM before "
+                    f"running again. If another run is still using it, let "
+                    f"that run finish: boxman destroy would remove its VM.")
+            self.logger.error(f"virt-install failed: {result.stderr}")
             if self._domain_exists():
                 raise PartialInstallError(
                     f"virt-install failed after defining {self._describe()}, "
