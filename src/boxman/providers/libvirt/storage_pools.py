@@ -80,7 +80,10 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
 
     A pool named *name* on another directory is never taken for it: a
     workdir ``…/ws/web`` and an overlay directory ``…/ov/web`` share a
-    basename.
+    basename. Nor is one whose directory cannot be looked up: which is on
+    it is told by identity — ``(st_dev, st_ino)``, links followed by the
+    filesystem — never by a path ``realpath`` folded as text where it
+    could not search.
 
     Best effort: what stops it is named in a warning, never raised.
 
@@ -93,8 +96,13 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
     Returns:
         The pool's name, or ``None`` when there is none on *directory*.
     """
-    target = os.path.realpath(directory)
     where = f"could not see to a storage pool on {directory}"
+    try:
+        st = os.stat(directory)
+    except OSError as exc:
+        log.warning(f"{where}: it could not be looked up ({exc})")
+        return None
+    target = (st.st_dev, st.st_ino)
     listing = virsh.execute("pool-list", "--all", "--name", warn=True)
     if not listing.ok:
         log.warning(f"{where}: the pools could not be listed: "
@@ -111,7 +119,13 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
             path = None
         # one with no local directory (RBD, say) is not on it; one that
         # cannot be read makes the definition below fail, if it is
-        if path is None or os.path.realpath(path) != target:
+        if path is None:
+            continue
+        try:
+            on = os.stat(path)
+        except OSError:
+            continue      # not known to be on it
+        if (on.st_dev, on.st_ino) != target:
             continue
         active = virsh.execute("pool-list", "--name", warn=True)
         if active.ok and pool in (line.strip()

@@ -5,6 +5,7 @@ removes a VM's files itself, the pools that listed them are refreshed.
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -174,6 +175,40 @@ class TestEnsurePoolOn:
 
         assert ensure_pool_on(virsh, str(ov), "web") is None
         assert self._verbs(virsh, "pool-define-as") == []
+
+    def test_one_on_it_under_another_name_is_used(self, tmp_path):
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        (tmp_path / "alias").symlink_to(ov)
+        virsh = self._virsh({"mine": str(tmp_path / "alias")})
+
+        assert ensure_pool_on(virsh, str(ov), "bprj_ov") == "mine"
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root searches a mode-000 directory")
+    def test_one_whose_directory_cannot_be_looked_up_is_not_taken_for_it(
+            self, tmp_path):
+        """``hidden/link/../../ov``, ``link`` leading into ``actual/a/b``, is
+        ``actual/ov``; under an unsearchable ``hidden``, ``realpath`` folds
+        it as text into the directory asked for."""
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        (tmp_path / "actual" / "a" / "b").mkdir(parents=True)
+        (tmp_path / "actual" / "ov").mkdir()
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        (hidden / "link").symlink_to(tmp_path / "actual" / "a" / "b")
+        virsh = self._virsh(
+            {"other": os.path.join(hidden, "link", "..", "..", "ov")})
+        hidden.chmod(0)
+        try:
+            pool = ensure_pool_on(virsh, str(ov), "bprj_ov")
+        finally:
+            hidden.chmod(0o700)
+
+        assert pool == "bprj_ov"
+        assert self._verbs(virsh, "pool-define-as") == [
+            ("pool-define-as", "bprj_ov", "dir", "--target", str(ov))]
 
     def test_pools_that_cannot_be_listed_give_none(self, tmp_path):
         virsh = self._virsh({}, list_ok=False)
