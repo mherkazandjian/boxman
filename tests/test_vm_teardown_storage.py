@@ -3666,6 +3666,26 @@ class TestOverlaysInADiskSnapshotDir:
         named = base if path == 'deprovision' else head
         assert f'left {named} in place' in t.warnings
 
+    @pytest.mark.parametrize("snapshot_dir", ["unset", "set"])
+    def test_the_directory_of_an_image_it_is_built_on_is_not_swept(
+            self, tmp_path, snapshot_dir):
+        """Built on a template in another cluster's workdir, update looks
+        there for nothing under its name: ``<vm>.other.s1`` there is VM
+        ``<vm>.other``'s."""
+        workdir, ov = self._dirs(tmp_path)
+        other = tmp_path / 'other'
+        template = _qcow2(other / 'template.qcow2')
+        stray = _file(other / f'{VM}.other.s1')
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      disk_snapshot_dir=ov if snapshot_dir == "set" else None,
+                      chains={str(boot): [str(boot), str(template)]})
+        t.mgr.config['clusters']['cluster_2'] = {'workdir': str(other)}
+
+        t.update_remove()
+
+        assert stray.exists() and template.exists()
+
     @PATHS
     def test_nothing_else_of_the_vms_there_is_a_candidate(self, tmp_path,
                                                           path):

@@ -1029,12 +1029,7 @@ class VMsMixin:
         chains = session.backing_chains(sources) if sources else {}
 
         if disk_dirs is None:
-            # where its disks are and every layer below them: an overlay in
-            # a disk_snapshot_dir is built on a boot disk in a workdir
-            disk_dirs = self._vm_disk_dirs(full_vm_name, [
-                *disk_sources,
-                *(layer for source in disk_sources
-                  for layer in (chains or {}).get(source, ()))])
+            disk_dirs = self._vm_disk_dirs(full_vm_name, disk_sources)
 
         # decided with at capture and, for a domain undefined with nothing
         # saved, by the name-based fallback: a cluster workdir that cannot
@@ -1061,6 +1056,16 @@ class VMsMixin:
                     + ("leaving it defined and its storage in place"
                        if exists else "leaving its storage in place")
                     + " — make that directory readable, then retry") from exc
+        if self._cluster_disk_snapshot_dirs():
+            # a disk in a disk_snapshot_dir is built on a boot disk in a
+            # workdir no listing above may have read: the layers under its
+            # own disks are its family one by one, under its names — their
+            # directories are never swept for them
+            found.update(
+                layer for source in disk_sources
+                if os.path.basename(source).startswith(f"{full_vm_name}.")
+                for layer in (chains or {}).get(source, ())
+                if os.path.basename(layer).startswith(f"{full_vm_name}."))
         boot_family = sorted(found)
 
         # the overlays each snapshot recorded: with its disks and the layers
