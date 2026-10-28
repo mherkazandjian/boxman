@@ -2376,7 +2376,7 @@ class LibVirtSession(SessionConfigMixin):
             compress_level=compress_level,
             force=force,
             paths_in_use=self.disk_paths_in_use,
-            memory_in_use=self.snapshot_memory_in_use,
+            recorded_in_use=self.snapshot_files_in_use,
             disk_dir=disk_dir)
 
     def ensure_pool_on(self, directory: str, name: str) -> str | None:
@@ -2476,16 +2476,28 @@ class LibVirtSession(SessionConfigMixin):
         """
         return SnapshotManager(self.provider_config).memory_images(vm_name)
 
-    def snapshot_memory_in_use(self) -> FilesInUse | None:
+    def snapshot_overlay_files(self,
+                               vm_name: str) -> dict[str, list[str]] | None:
         """
-        The memory images the snapshots of every defined domain record —
-        each ``.raw`` as libvirt recorded it, and the ``.raw.zst``
-        compression leaves beside it — mapped, as :meth:`disk_paths_in_use`
-        maps files, by path and by identity to the domain. A teardown or a
-        ``snapshot take --force`` that removes a memory image must not
-        remove one of these: two domains' snapshots can record one path, in
-        a memory_snapshot_dir their clusters share, when one VM's full name
-        begins with the other's.
+        The external overlays libvirt recorded for each of *vm_name*'s
+        snapshots that created any, by snapshot name; ``None`` when they
+        cannot all be told (:meth:`SnapshotManager.overlay_files`).
+        """
+        return SnapshotManager(self.provider_config).overlay_files(vm_name)
+
+    def snapshot_files_in_use(self) -> FilesInUse | None:
+        """
+        The files the snapshots of every defined domain record — each
+        memory image as libvirt recorded it, with the ``.raw.zst``
+        compression leaves beside it, and each external overlay — mapped,
+        as :meth:`disk_paths_in_use` maps files, by path and by identity to
+        the domain. A teardown or a ``snapshot take --force`` that removes
+        a memory image, or a file in a disk_snapshot_dir, must not remove
+        one of these: two domains' snapshots can record one path, in a
+        directory their clusters share, when one VM's full name begins with
+        the other's (``v`` taking ``x.s1`` and ``v.x`` taking ``s1`` both
+        name the overlay ``v.x.s1``), and an overlay no domain runs on any
+        more is still its snapshot's.
 
         No domain is left out, not even by the name of the VM being torn
         down: that one is undefined by the time this is asked, so a domain
@@ -2498,7 +2510,7 @@ class LibVirtSession(SessionConfigMixin):
 
         Fails closed: ``None`` when the domain list cannot be read, or the
         snapshots of a domain cannot — unless it went away meanwhile
-        (:meth:`_raise_if_gone`) — or an image's identity cannot be read
+        (:meth:`_raise_if_gone`) — or a file's identity cannot be read
         other than for naming no file.
         """
         virsh = VirshCommand(provider_config=self.provider_config)
@@ -2513,7 +2525,9 @@ class LibVirtSession(SessionConfigMixin):
         recorded = FilesInUse()
         for domain, uuid in domains:
             images = snapshots.memory_images(uuid)
-            if images is None:
+            overlays = (snapshots.overlay_files(uuid) if images is not None
+                        else None)
+            if overlays is None:
                 try:
                     self._raise_if_gone(virsh, domain, uuid)
                 except _DomainGoneError:
@@ -2521,8 +2535,9 @@ class LibVirtSession(SessionConfigMixin):
                 except _DomainRenamedError:
                     return None
                 return None
-            paths = [path for image in images.values()
-                     for path in (image, f"{image}.zst")]
+            paths = [*(path for image in images.values()
+                       for path in (image, f"{image}.zst")),
+                     *(path for files in overlays.values() for path in files)]
             if not self._record_in_use(recorded, domain, paths):
                 return None
         return recorded

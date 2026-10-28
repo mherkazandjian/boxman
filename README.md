@@ -883,8 +883,10 @@ Details worth knowing:
 - **Only the storage the VM owns is removed, by boxman — never by libvirt.**
   Its boot disk, snapshot overlays and memory files (the files under the VM's
   own `<vm>.*` / `<vm>_snapshot_*` names in a cluster workdir, its overlays
-  in a cluster's `disk_snapshot_dir` — the boot disk's under `<vm>.*`, a
-  recorded extra disk's as part of its own chain — and the memory
+  in a cluster's `disk_snapshot_dir` — the boot disk's that libvirt names
+  as the VM's (its disks, the layers below them, the overlays its snapshots
+  recorded), never by name, and a recorded extra disk's as part of its own
+  chain — and the memory
   images its own snapshots recorded in a cluster workdir or
   `memory_snapshot_dir`) and the extra
   disks boxman recorded creating for it. Never: a CD-ROM or ISO it has

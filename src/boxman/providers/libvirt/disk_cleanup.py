@@ -338,6 +338,10 @@ class StorageInventory:
     #: the memory file each of its snapshots recorded, by snapshot name:
     #: only to name one the teardown leaves where it removes nothing
     memory_images: dict[str, str] = field(default_factory=dict)
+    #: the external overlays each of its snapshots recorded, by snapshot
+    #: name: with its disks and the layers below them, what decides its
+    #: files in a disk_snapshot_dir
+    overlays: dict[str, list[str]] = field(default_factory=dict)
     #: where it was saved before undefining (see
     #: :func:`save_teardown_inventory`); not saved itself
     saved_at: str | None = None
@@ -415,6 +419,7 @@ def save_teardown_inventory(inventory: StorageInventory,
                        in inventory.identities.items()},
         "targets": inventory.targets,
         "memory_images": inventory.memory_images,
+        "overlays": inventory.overlays,
     }
     _write_json_atomically(path, data)
     return path
@@ -507,6 +512,8 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
         _field(data, "memory_images",
                lambda v: _is_map(v, lambda p: isinstance(p, str)))
         if "memory_images" in data else {})
+    overlays = (_field(data, "overlays", lambda v: _is_map(v, _is_paths))
+                if "overlays" in data else {})
     return StorageInventory(
         vm_name=vm_name,
         disk_sources=list(_field(data, "disk_sources", _is_paths)),
@@ -522,6 +529,7 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
         targets=dict(_field(data, "targets",
                             lambda v: _is_map(v, lambda t: isinstance(t, str)))),
         memory_images=dict(memory_images),
+        overlays={k: list(v) for k, v in overlays.items()},
         saved_at=path,
     )
 
@@ -846,7 +854,7 @@ def remove_vm_storage(
     workdirs: Iterable[str],
     paths_in_use: Callable[[], dict[str, str] | None],
     memory_dirs: Iterable[str] = (),
-    memory_in_use: Callable[[], dict[str, str] | None] | None = None,
+    recorded_in_use: Callable[[], dict[str, str] | None] | None = None,
     overlay_dirs: Iterable[str] = (),
 ) -> StorageOutcome:
     """
@@ -865,10 +873,9 @@ def remove_vm_storage(
        its disk directories (:func:`boot_family_candidates`): its boot disk,
        its overlays and its memory-snapshot files. Extra-disk files
        (attached, recorded, config-declared, or a layer under one) are
-       never decided by name. In a cluster's ``disk_snapshot_dir``
-       (*overlay_dirs*, told by identity like a memory_snapshot_dir) only
-       the overlays under ``<vm>.`` are; a memory image found in a
-       memory_snapshot_dir is left to 1b.
+       never decided by name. A file found in a cluster's
+       ``disk_snapshot_dir`` (*overlay_dirs*) is left to 1c, a memory
+       image found in a memory_snapshot_dir to 1b.
     1b. **The memory images its snapshots recorded**
        (``StorageInventory.memory_images``), each named exactly as
        :func:`memory_image_name` names that snapshot's (or with the
@@ -880,6 +887,13 @@ def remove_vm_storage(
        directory it might be, cannot be looked up, the image is kept. One
        recorded anywhere else is not boxman's to remove (the caller names
        it).
+    1c. **The boot disk's overlays in a disk_snapshot_dir** — what libvirt
+       names as the VM's there: its disk sources, the layers of their
+       chains, and the overlays its snapshots recorded
+       (``StorageInventory.overlays``), under ``<vm>.``. Nothing there is
+       decided by name either, for the same reason, and a listing of it
+       admits nothing. Its directory is told by identity, as in 1b, which
+       sees a bind mount for the directory it is.
     2. **Extra disks recorded with role ``data``** at exactly their
        attached source, by the rules of :func:`_leftover_refusal`; and a
        recorded disk an external snapshot moved behind overlays, together
@@ -894,9 +908,9 @@ def remove_vm_storage(
 
     Every admitted file must be a regular file, not a symlink, inside one
     of the cluster *workdirs* once symlinks are resolved (a recorded memory
-    image, see 1b, one of *memory_dirs* too, and an overlay one of
-    *overlay_dirs*), and not a CD-ROM (or other media) source of either
-    definition.
+    image, see 1b, one of *memory_dirs* too, and an overlay, see 1c and 2,
+    one of *overlay_dirs*), and not a CD-ROM (or other media) source of
+    either definition.
 
     Every protection that compares files matches them by resolved path and
     by identity (:class:`_Identities`): the media and what they are built
@@ -909,11 +923,12 @@ def remove_vm_storage(
     whole (:func:`_refuse_incomplete_chains`), and an unreadable chain
     keeps everything; nothing another domain uses directly or as a backing
     file is removed (*paths_in_use* is asked once, and ``None`` keeps
-    everything); and no memory image (:func:`is_memory_image`) a snapshot
-    of another domain records — neither its name nor this VM's own record
-    makes it this VM's alone (*memory_in_use*, asked once, only when one
-    would go; ``None`` keeps them all). What remains is removed heads
-    first, each through
+    everything); and no memory image (:func:`is_memory_image`), nor
+    anything from a disk_snapshot_dir, that a snapshot of another domain
+    records — neither its name nor this VM's own record makes it this VM's
+    alone: two VMs' names can give one file name (*recorded_in_use*, asked
+    once, only when one would go; ``None`` keeps them all). What remains is
+    removed heads first, each through
     :func:`remove_if_unchanged` against the identity taken before
     undefining; a layer replaced since keeps everything below it.
 
@@ -957,35 +972,38 @@ def remove_vm_storage(
                 out.append(path)
         return out
 
+    overlay_dirs = list(overlay_dirs)
     overlay_ids, unreadable_overlay_dirs = _directory_identities(overlay_dirs)
     memory_ids, _unreadable = _directory_identities(memory_dirs)
 
-    def static_refusal(path: str, overlay: bool = False) -> str | None:
+    def static_refusal(path: str) -> str | None:
         reason = media_refusal(path)
         if reason:
             return reason
         reason = _regular_file_refusal(path)
         if reason:
             return reason
-        if real(os.path.dirname(path)) in real_workdirs:
-            return None
-        if not (overlay and os.path.basename(path).startswith(f"{vm}.")):
+        if real(os.path.dirname(path)) not in real_workdirs:
             return _OUTSIDE
-        # an overlay of the boot disk's: in a disk_snapshot_dir, by identity
+        return None
+
+    def in_overlay_dir(path: str) -> tuple[bool, str | None]:
+        """Whether *path* is in a disk_snapshot_dir, by identity — or why
+        that cannot be told."""
         try:
             st = os.stat(os.path.dirname(path))
         except OSError as exc:
-            return (f"its directory could not be looked up ({exc}), so "
-                    f"whether it is in a cluster workdir or disk_snapshot_dir "
-                    f"cannot be told")
+            return False, (f"its directory could not be looked up ({exc}), "
+                           f"so whether it is in a cluster workdir or "
+                           f"disk_snapshot_dir cannot be told")
         if (st.st_dev, st.st_ino) in overlay_ids:
-            return None
+            return True, None
         if unreadable_overlay_dirs:
             directory, exc = min(unreadable_overlay_dirs.items())
-            return (f"whether it is in a cluster workdir or disk_snapshot_dir "
-                    f"cannot be told: {directory} could not be looked up "
-                    f"({exc})")
-        return _OUTSIDE
+            return False, (f"whether it is in a cluster workdir or "
+                           f"disk_snapshot_dir cannot be told: {directory} "
+                           f"could not be looked up ({exc})")
+        return False, None
 
     attached_extras = unique(
         path for path in inventory.disk_sources
@@ -1018,7 +1036,10 @@ def remove_vm_storage(
             else:
                 deferred.append(path)
             continue
-        reason = static_refusal(path, overlay=True)
+        if (overlay_dirs and real(os.path.dirname(path)) not in real_workdirs
+                and any(in_overlay_dir(path))):
+            continue      # what libvirt names as the vm's decides it (1c)
+        reason = static_refusal(path)
         if reason is None and inventory.records_state == RECORDS_UNKNOWN:
             reason = _boxman_artifact_refusal(vm, path)
         if reason:
@@ -1063,6 +1084,28 @@ def remove_vm_storage(
     for path in deferred:
         if not admission.is_admitted_as(path):
             admission.refuse(path, _OUTSIDE)
+
+    # -- 1c. the boot disk's overlays in a disk_snapshot_dir --------------
+    from_overlay_dirs: set[str] = set()
+    named_by_libvirt = unique([
+        *inventory.disk_sources,
+        *(layer for layers in (chains or {}).values() for layer in layers),
+        *(path for paths in inventory.overlays.values() for path in paths)])
+    for path in named_by_libvirt if overlay_dirs else ():
+        if (not os.path.basename(path).startswith(f"{vm}.")
+                or real(os.path.dirname(path)) in real_workdirs
+                or not _may_exist(path)
+                or (path in extra_related and media_refusal(path) is None)):
+            continue      # decided by another rule, or nothing to decide
+        inside, reason = in_overlay_dir(path)
+        if not (inside or reason):
+            continue      # outside all of them, as in 1
+        reason = reason or media_refusal(path) or _regular_file_refusal(path)
+        if reason:
+            admission.refuse(path, reason)
+        else:
+            admission.admit(path)
+            from_overlay_dirs.add(real(path))
 
     # -- 2./3. extra disks -------------------------------------------------
     state = inventory.records_state
@@ -1148,19 +1191,20 @@ def remove_vm_storage(
             _refuse_incomplete_chains(chains, admission)
 
     # -- recorded by another domain's snapshot -----------------------------
-    memory_named = [(resolved, path)
-                    for resolved, path in admission.admitted.items()
-                    if is_memory_image(vm, path)]
-    if memory_named and memory_in_use is not None:
-        recorded = memory_in_use()
+    snapshot_named = [(resolved, path)
+                      for resolved, path in admission.admitted.items()
+                      if is_memory_image(vm, path)
+                      or resolved in from_overlay_dirs]
+    if snapshot_named and recorded_in_use is not None:
+        recorded = recorded_in_use()
         recorded_ids = getattr(recorded, "identities", {})
-        for resolved, path in memory_named:
+        for resolved, path in snapshot_named:
             if resolved not in admission.admitted:
                 continue     # withdrawn meanwhile, under another name
             if recorded is None:
                 admission.refuse(path, (
-                    "whether a snapshot of another domain records it as its "
-                    "memory image could not be checked"))
+                    "whether a snapshot of another domain records it could "
+                    "not be checked"))
                 continue
             domain = recorded.get(resolved) or recorded.get(path) or next(
                 (recorded_ids[identity]
@@ -1168,8 +1212,9 @@ def remove_vm_storage(
                  if identity in recorded_ids), None)
             if domain:
                 admission.refuse(path, (
-                    f"a snapshot of domain {domain} records it as its memory "
-                    f"image"))
+                    f"a snapshot of domain {domain} records it"))
+        if chains:
+            _refuse_incomplete_chains(chains, admission)
 
     # -- removal, heads first ------------------------------------------------
     # (ordered by resolved path: a layer named otherwise than the file

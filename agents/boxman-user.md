@@ -1173,11 +1173,13 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   a libvirt storage pool on it (`bprj__<project>__bprj_<cluster>_disk_snapshots`
   unless one is already on it); under `use_sudo: false` the in-use scan reads
   the overlays through it, and without one every teardown keeps what it
-  would remove (the take warns). A teardown removes the VM's overlays there
-  by the workdir's rules — the boot disk's under `<vm>.`, a data disk's
-  only as a layer of a chain proven the VM's own — and nothing else of the
-  VM's there. One directory may serve as both `memory_snapshot_dir` and
-  `disk_snapshot_dir`. Local runtime only, like `memory_snapshot_dir`.
+  would remove (the take warns). A teardown never decides by name there —
+  another VM's full name can begin with this one's and a dot: it removes
+  the boot disk's overlays libvirt names as the VM's (its disks, the layers
+  below them, the overlays its snapshots recorded), a data disk's only as a
+  layer of a chain proven the VM's own, and nothing else; one another
+  domain's snapshot records is kept. One directory may serve as both
+  `memory_snapshot_dir` and `disk_snapshot_dir`. Local runtime only, like `memory_snapshot_dir`.
 - `snapshot restore [--name N]` restores (latest if omitted). `boxman restore`
   is the shortcut for "all VMs to latest".
 - **A restore backs up the overlays the revert deletes, and refuses if it

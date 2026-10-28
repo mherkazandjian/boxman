@@ -834,7 +834,7 @@ class VMsMixin:
         outcome = remove_vm_storage(
             inventory, self._cluster_workdirs(), session.disk_paths_in_use,
             memory_dirs=self._cluster_memory_snapshot_dirs(),
-            memory_in_use=session.snapshot_memory_in_use,
+            recorded_in_use=session.snapshot_files_in_use,
             overlay_dirs=self._cluster_disk_snapshot_dirs())
         for path, reason in outcome.kept:
             self.logger.warning(
@@ -948,8 +948,9 @@ class VMsMixin:
         """
         Inventory *full_vm_name*'s storage before it is undefined: its block
         devices in both definitions, its ownership records, the backing
-        chain of each of its disks, its boot-disk family, and the identity
-        of every one of those files.
+        chain of each of its disks, its boot-disk family, the memory images
+        and (with a disk_snapshot_dir set) the overlays its snapshots
+        recorded, and the identity of every one of those files.
 
         A domain already gone (an interrupted teardown being retried) is
         inventoried by name only, and its ownership state is *unknown*, not
@@ -1059,30 +1060,31 @@ class VMsMixin:
                     + ("leaving it defined and its storage in place"
                        if exists else "leaving its storage in place")
                     + " — make that directory readable, then retry") from exc
-        # a disk_snapshot_dir holds the overlays snapshot take created there,
-        # named as beside their disks: only those under the VM's exclusive
-        # name are its boot disk's family (a memory image there is decided
-        # by what its snapshots recorded, a data disk's overlay by its chain)
-        for overlay_dir in self._cluster_disk_snapshot_dirs():
-            try:
-                found.update(
-                    path for path in boot_family_candidates(overlay_dir,
-                                                            full_vm_name)
-                    if os.path.basename(path).startswith(f"{full_vm_name}."))
-            except OSError as exc:
-                raise ProvisionError(
-                    f"{full_vm_name}: could not list {overlay_dir} ({exc}), a "
-                    f"disk_snapshot_dir, which may hold its disk overlays; "
-                    + ("leaving it defined and its storage in place"
-                       if exists else "leaving its storage in place")
-                    + " — make that directory readable, then retry") from exc
         boot_family = sorted(found)
+
+        # the overlays each snapshot recorded: with its disks and the layers
+        # below them, the only files a teardown removes from a
+        # disk_snapshot_dir, which it never lists — another VM's full name
+        # can begin with this one's and a dot (remove_vm_storage)
+        overlays: dict[str, list[str]] = {}
+        if exists and self._cluster_disk_snapshot_dirs():
+            recorded = session.snapshot_overlay_files(full_vm_name)
+            if recorded is None:
+                self.logger.warning(
+                    f"{full_vm_name}: could not read the overlays its "
+                    f"snapshots recorded, so any of them in a "
+                    f"disk_snapshot_dir that its disks are not built on will "
+                    f"be left in place")
+            else:
+                overlays = recorded
+
         files = [*disk_sources, *boot_family, *(legacy_disks or ()),
                  *(record.source for record in records or ()),
                  *(layer for chain in (chains or {}).values()
                    for layer in chain),
                  *(path for recorded in memory_images.values()
-                   for path in (recorded, f"{recorded}.zst"))]
+                   for path in (recorded, f"{recorded}.zst")),
+                 *(path for paths in overlays.values() for path in paths)]
         inventory = StorageInventory(
             vm_name=full_vm_name,
             disk_sources=disk_sources,
@@ -1095,6 +1097,7 @@ class VMsMixin:
             identities=file_identities(files),
             targets=targets,
             memory_images=memory_images,
+            overlays=overlays,
         )
         if exists:
             # saved before the undefine, which drops what it was read from;

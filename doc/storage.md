@@ -293,6 +293,11 @@ clusters:
   `disk_snapshot_dir` holds live disks, not backups. A take sees to a
   libvirt storage pool on it, which the in-use scan reads the overlays
   through under `use_sudo: false`.
+- A teardown removes from a `disk_snapshot_dir` only what libvirt names as
+  the VM's: its disks, the layers below them, and the overlays its
+  snapshots recorded. Never what is there under its name, since another
+  VM's full name can begin with this one's and a dot, and never an overlay
+  another domain's snapshot records.
 - `storage df` and `storage compact` work from each VM's base disks in the
   workdir, as before: the overlays above them, beside the disk or in a
   `disk_snapshot_dir`, are not measured or compacted.

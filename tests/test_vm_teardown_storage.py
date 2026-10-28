@@ -126,8 +126,8 @@ class _Teardown:
     def __init__(self, workdir, *, disks=(), media=(), rows=None,
                  records=None, records_error=None, in_use=None,
                  chains=STANDALONE, memory_snapshot_dir=None,
-                 memory_images=None, memory_in_use=None,
-                 disk_snapshot_dir=None):
+                 memory_images=None, recorded_in_use=None,
+                 disk_snapshot_dir=None, overlays=()):
         self.workdir = workdir
         cluster = {'workdir': str(workdir)}
         if memory_snapshot_dir is not None:
@@ -151,9 +151,12 @@ class _Teardown:
             {} if in_use is None else in_use)
         session.snapshot_memory_images.return_value = (
             {} if memory_images is None else memory_images)
-        session.snapshot_memory_in_use.return_value = (
-            disk_cleanup.FilesInUse() if memory_in_use is None
-            else memory_in_use)
+        # the overlays its snapshots recorded; None: they cannot be read
+        session.snapshot_overlay_files.return_value = (
+            None if overlays is None else dict(overlays))
+        session.snapshot_files_in_use.return_value = (
+            disk_cleanup.FilesInUse() if recorded_in_use is None
+            else recorded_in_use)
         self.mgr.session_for_cluster = MagicMock(return_value=session)
         self.mgr.provider = session
         self.mgr._vm_disk_records = MagicMock(
@@ -1043,6 +1046,7 @@ class TestSavedInventoryLifecycle:
         "identities of booleans", "an identity of three",
         "targets of lists", "boot family of numbers",
         "memory images a list", "memory images of numbers",
+        "overlays a list", "overlays of strings",
     ])
     def test_a_malformed_saved_inventory_keeps_everything(self, tmp_path,
                                                           layout):
@@ -2605,6 +2609,8 @@ def _malformed(tmp_path, layout):
         "boot family of numbers": {**data, "boot_family": [1]},
         "memory images a list": {**data, "memory_images": ["/s/a.raw"]},
         "memory images of numbers": {**data, "memory_images": {"s1": 1}},
+        "overlays a list": {**data, "overlays": ["/ov/a.s1"]},
+        "overlays of strings": {**data, "overlays": {"s1": "/ov/a.s1"}},
     }[layout]
 
 
@@ -3473,7 +3479,7 @@ class TestMemoryImagesAnotherSnapshotRecords:
     VM's alone: two domains' snapshots can record one path — V's snapshot
     ``replica_snapshot_s1`` and ``s1`` of V_snapshot_replica, in a
     memory_snapshot_dir their clusters share. What every other domain's
-    snapshots record (``LibVirtSession.snapshot_memory_in_use``) is kept,
+    snapshots record (``LibVirtSession.snapshot_files_in_use``) is kept,
     by path or identity; asked only when a memory image would go."""
 
     REPLICA = f'{VM}_snapshot_replica'
@@ -3493,7 +3499,7 @@ class TestMemoryImagesAnotherSnapshotRecords:
         t = _Teardown(workdir, disks=[boot], records=[],
                       memory_snapshot_dir=snaps,
                       memory_images={'replica_snapshot_s1': str(shared)},
-                      memory_in_use=disk_cleanup.FilesInUse(
+                      recorded_in_use=disk_cleanup.FilesInUse(
                           {str(shared): self.REPLICA}))
 
         t.deprovision()
@@ -3501,8 +3507,8 @@ class TestMemoryImagesAnotherSnapshotRecords:
         assert not boot.exists()
         assert shared.read_bytes() == b'replica RAM'
         assert (f'left {shared} in place because a snapshot of domain '
-                f'{self.REPLICA} records it as its memory image') in t.warnings
-        t.session.snapshot_memory_in_use.assert_called_once_with()
+                f'{self.REPLICA} records it') in t.warnings
+        t.session.snapshot_files_in_use.assert_called_once_with()
 
     def test_one_recorded_there_under_another_name_is_kept(self, tmp_path):
         workdir, snaps = self._dirs(tmp_path)
@@ -3514,12 +3520,12 @@ class TestMemoryImagesAnotherSnapshotRecords:
         recorded.identities[(st.st_dev, st.st_ino)] = OTHER
         t = _Teardown(workdir, disks=[boot], records=[],
                       memory_snapshot_dir=snaps,
-                      memory_images={'s1': str(raw)}, memory_in_use=recorded)
+                      memory_images={'s1': str(raw)}, recorded_in_use=recorded)
 
         t.deprovision()
 
         assert raw.read_bytes() == b'RAM'
-        assert f'domain {OTHER} records it as its memory image' in t.warnings
+        assert f'domain {OTHER} records it' in t.warnings
 
     def test_a_memory_file_in_its_workdir_another_snapshot_records_is_kept(
             self, tmp_path):
@@ -3529,7 +3535,7 @@ class TestMemoryImagesAnotherSnapshotRecords:
         boot = _qcow2(workdir / f'{VM}.qcow2')
         shared = _file(workdir / f'{VM}_snapshot_replica_snapshot_s1.raw')
         t = _Teardown(workdir, disks=[boot], records=[],
-                      memory_in_use=disk_cleanup.FilesInUse(
+                      recorded_in_use=disk_cleanup.FilesInUse(
                           {str(shared): self.REPLICA}))
 
         t.deprovision()
@@ -3545,15 +3551,14 @@ class TestMemoryImagesAnotherSnapshotRecords:
         t = _Teardown(workdir, disks=[boot], records=[],
                       memory_snapshot_dir=snaps,
                       memory_images={'s1': str(raw)})
-        t.session.snapshot_memory_in_use.return_value = None
+        t.session.snapshot_files_in_use.return_value = None
 
         t.deprovision()
 
         assert not boot.exists()
         assert raw.exists()
         assert (f'left {raw} in place because whether a snapshot of another '
-                f'domain records it as its memory image could not be '
-                f'checked') in t.warnings
+                f'domain records it could not be checked') in t.warnings
 
     def test_without_a_memory_image_to_remove_none_is_read(self, tmp_path):
         workdir = tmp_path / 'work'
@@ -3563,18 +3568,20 @@ class TestMemoryImagesAnotherSnapshotRecords:
         t.deprovision()
 
         assert not boot.exists()
-        t.session.snapshot_memory_in_use.assert_not_called()
+        t.session.snapshot_files_in_use.assert_not_called()
 
 
 class TestOverlaysInADiskSnapshotDir:
     """A cluster's ``disk_snapshot_dir`` holds the overlays ``snapshot take``
     created there, under the names libvirt gives them beside their disks:
     ``<vm>.<snapshot>`` for the boot disk, ``<vm>_<disk>.<snapshot>`` for a
-    data disk. A teardown removes them by the rules a workdir's are removed
-    by — the boot disk's family under the VM's exclusive name, a data
-    disk's only as a layer of a chain proven the VM's own — and nothing
-    else of the VM's there: a memory image there is decided by what the
-    VM's snapshots recorded, as in a memory_snapshot_dir."""
+    data disk. Nothing there is the VM's by its name: every cluster's is
+    one, and another VM's full name can begin with this one's and a dot. A
+    teardown removes the boot disk's overlays libvirt names as the VM's —
+    its disks, the layers below them, the overlays its snapshots recorded —
+    and a data disk's only as a layer of a chain proven the VM's own; a
+    memory image there is decided by what its snapshots recorded, as in a
+    memory_snapshot_dir."""
 
     PATHS = pytest.mark.parametrize("path", ["deprovision", "update_remove"])
 
@@ -3653,13 +3660,223 @@ class TestOverlaysInADiskSnapshotDir:
         assert all(p.exists() for p in kept)
         assert t.warnings == ''
 
+    @PATHS
+    def test_another_vms_files_there_under_its_name_are_kept(self, tmp_path,
+                                                             path):
+        """VM ``<vm>.other``'s overlay and memory image begin with this
+        VM's full name and a dot, and so does a file no snapshot made."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        head = _file(ov / f'{VM}.s1')
+        foreign = [_file(ov / f'{VM}.other.s1'),
+                   _file(ov / f'{VM}.other_snapshot_s1.raw'),
+                   _qcow2(ov / f'{VM}.qcow2')]
+        t = _Teardown(workdir, disks=[head], records=[], disk_snapshot_dir=ov,
+                      overlays={'s1': [str(head)]},
+                      chains={str(head): [str(head), str(base)]})
+
+        getattr(t, path)()
+
+        assert not (base.exists() or head.exists())
+        assert all(p.exists() for p in foreign)
+        assert t.warnings == ''
+
+    @PATHS
+    def test_an_overlay_only_its_snapshots_record_goes_too(self, tmp_path,
+                                                           path):
+        """Reverted to ``s1``, the VM no longer runs on ``s2``'s overlay,
+        but its snapshot ``s2`` records it."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1, s2 = _file(ov / f'{VM}.s1'), _file(ov / f'{VM}.s2')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'s1': [str(s1)], 's2': [str(s2)]},
+                      chains={str(s1): [str(s1), str(base)]})
+
+        getattr(t, path)()
+
+        assert not any(p.exists() for p in (base, s1, s2))
+        assert t.warnings == ''
+
+    @PATHS
+    def test_snapshots_that_cannot_be_read_keep_what_only_they_record(
+            self, tmp_path, path):
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1, s2 = _file(ov / f'{VM}.s1'), _file(ov / f'{VM}.s2')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays=None,
+                      chains={str(s1): [str(s1), str(base)]})
+
+        getattr(t, path)()
+
+        assert not (base.exists() or s1.exists())
+        assert s2.exists()
+        assert 'could not read the overlays its snapshots recorded' in (
+            t.warnings)
+
+    def test_one_another_domains_snapshot_records_is_kept(self, tmp_path):
+        """VM ``<vm>`` taking ``x.s1`` and VM ``<vm>.x`` taking ``s1`` name
+        one overlay: one another domain's snapshot records is not this
+        VM's alone."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1, shared = _file(ov / f'{VM}.s1'), _file(ov / f'{VM}.x.s1')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'s1': [str(s1)], 'x.s1': [str(shared)]},
+                      recorded_in_use=disk_cleanup.FilesInUse(
+                          {os.path.realpath(shared): f'{VM}.x'}),
+                      chains={str(s1): [str(s1), str(base)]})
+
+        t.deprovision()
+
+        assert shared.exists()
+        assert not (base.exists() or s1.exists())
+        assert f'a snapshot of domain {VM}.x records it' in t.warnings
+
+    def test_a_layer_another_domains_snapshot_records_keeps_its_base(
+            self, tmp_path):
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'s1': [str(s1)]},
+                      recorded_in_use=disk_cleanup.FilesInUse(
+                          {os.path.realpath(s1): OTHER}),
+                      chains={str(s1): [str(s1), str(base)]})
+
+        t.deprovision()
+
+        assert s1.exists() and base.exists()
+        assert f'a snapshot of domain {OTHER} records it' in t.warnings
+
+    @PATHS
+    def test_a_data_disks_overlay_only_a_snapshot_records_is_kept(
+            self, tmp_path, path):
+        """A data disk's files go only as a chain proven its own."""
+        workdir, ov = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        data = _file(workdir / f'{VM}_disk01.qcow2')
+        s2 = _file(ov / f'{VM}_disk01.s2')
+        t = _Teardown(workdir, disks=[boot, data], disk_snapshot_dir=ov,
+                      records=[_record('disk01', data)],
+                      overlays={'s2': [str(s2)]})
+
+        getattr(t, path)()
+
+        assert not (boot.exists() or data.exists())
+        assert s2.exists()
+
+    def test_a_retry_removes_what_its_snapshots_recorded(self, tmp_path):
+        """Undefined, the domain's snapshots are gone: the retry decides
+        with what the first attempt saved."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1, s2 = _file(ov / f'{VM}.s1'), _file(ov / f'{VM}.s2')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'s1': [str(s1)], 's2': [str(s2)]})
+        t.session.backing_chains.side_effect = _live(
+            {s1: [s1, base]})
+        TestRetriedTeardown._interrupt_at(t, s2)
+        assert s2.exists()
+
+        t.session.vm_storage_devices.return_value = None
+        t.session.snapshot_overlay_files.return_value = None
+        t.mgr.logger.reset_mock()
+        t.deprovision()
+
+        assert not any(p.exists() for p in (base, s1, s2))
+        assert t.warnings == ''
+
+    @staticmethod
+    def _through_dotdot(tmp_path):
+        """A disk_snapshot_dir spelled ``link/..``: the parent of where
+        ``link`` points, ``overlays`` — not ``tmp_path``, which folding the
+        spelling as text gives."""
+        (tmp_path / 'overlays' / 'child').mkdir(parents=True)
+        os.symlink(tmp_path / 'overlays' / 'child', tmp_path / 'link')
+        return os.path.join(tmp_path, 'link', os.pardir)
+
+    @PATHS
+    def test_one_spelled_through_a_symlink_and_dotdot(self, tmp_path, path):
+        workdir = tmp_path / 'work'
+        workdir.mkdir()
+        ov = self._through_dotdot(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        head = _file(tmp_path / 'overlays' / f'{VM}.s1')
+        named = os.path.join(ov, f'{VM}.s1')   # as the take named it
+        t = _Teardown(workdir, disks=[named], records=[], disk_snapshot_dir=ov,
+                      overlays={'s1': [named]},
+                      chains={named: [named, str(base)]})
+
+        getattr(t, path)()
+
+        assert not (head.exists() or base.exists())
+        assert t.warnings == ''
+
+    def test_one_there_replaced_since_keeps_its_base(self, tmp_path):
+        """Spelled through ``link/..`` too, an overlay replaced after the
+        capture is put back, and so is everything below it (#257)."""
+        workdir = tmp_path / 'work'
+        workdir.mkdir()
+        ov = self._through_dotdot(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        head = _file(tmp_path / 'overlays' / f'{VM}.s1')
+        named = os.path.join(ov, f'{VM}.s1')
+        t = _Teardown(workdir, disks=[named], records=[], disk_snapshot_dir=ov,
+                      overlays={'s1': [named]},
+                      chains={named: [named, str(base)]})
+        remove = disk_cleanup.remove_vm_storage
+
+        def replaced_first(*args, **kwargs):
+            # moved away, not unlinked: its inode number stays taken
+            head.rename(tmp_path / 'replaced')
+            _file(head, b'replacement')
+            return remove(*args, **kwargs)
+
+        with patch('boxman.manager_parts.vms.remove_vm_storage',
+                   side_effect=replaced_first):
+            t.deprovision()
+
+        assert head.read_bytes() == b'replacement' and base.exists()
+        assert 'replaced after the vm was inspected' in t.warnings
+
+    def test_an_inventory_saved_before_they_were_recorded_is_read(
+            self, tmp_path):
+        """Its disks' chains, read again, still name the overlays under
+        them; one only a snapshot recorded is no longer known to be its
+        own, and is kept."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1, s2 = _file(ov / f'{VM}.s1'), _file(ov / f'{VM}.s2')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'s1': [str(s1)], 's2': [str(s2)]},
+                      in_use={str(base): OTHER, str(s2): OTHER})
+        t.session.backing_chains.side_effect = _live({s1: [s1, base]})
+        t.deprovision()
+        assert all(p.exists() for p in (base, s1, s2))
+        saved = json.loads(_saved(ov).read_text())
+        assert saved['overlays'] == {'s1': [str(s1)], 's2': [str(s2)]}
+        del saved['overlays']
+        _saved(ov).write_text(json.dumps(saved))
+
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.mgr.logger.reset_mock()
+        t.deprovision()
+
+        assert not (base.exists() or s1.exists())
+        assert s2.exists()
+
     def test_a_symlink_under_its_name_there_is_kept(self, tmp_path):
+        """One its snapshot recorded included."""
         workdir, ov = self._dirs(tmp_path)
         boot = _qcow2(workdir / f'{VM}.qcow2')
         target = _file(tmp_path / 'precious.qcow2', b'precious')
         link = ov / f'{VM}.s1'
         os.symlink(target, link)
-        t = _Teardown(workdir, disks=[boot], records=[], disk_snapshot_dir=ov)
+        t = _Teardown(workdir, disks=[boot], records=[], disk_snapshot_dir=ov,
+                      overlays={'s1': [str(link)]})
 
         t.deprovision()
 
@@ -3702,21 +3919,24 @@ class TestOverlaysInADiskSnapshotDir:
         assert t.warnings == ''
 
     @unless_root
-    def test_one_that_cannot_be_listed_leaves_the_domain_defined(self,
-                                                                 tmp_path):
+    def test_one_that_cannot_be_searched_keeps_what_is_recorded_there(
+            self, tmp_path):
+        """It is never listed, so one that cannot be is no reason to stop;
+        but what it holds cannot be inspected, so it stays."""
         workdir, ov = self._dirs(tmp_path)
-        base = _qcow2(workdir / f'{VM}.qcow2')
-        t = _Teardown(workdir, disks=[base], records=[], disk_snapshot_dir=ov)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        s2 = _file(ov / f'{VM}.s2')
+        t = _Teardown(workdir, disks=[boot], records=[], disk_snapshot_dir=ov,
+                      overlays={'s2': [str(s2)]})
         ov.chmod(0)
         try:
-            with pytest.raises(ProvisionError, match='could not list') as exc:
-                t.deprovision()
+            t.deprovision()
         finally:
             ov.chmod(0o700)
 
-        assert f'could not list {ov} (' in str(exc.value)
-        t.session.destroy_vm.assert_not_called()
-        assert base.exists()
+        t.session.destroy_vm.assert_called()
+        assert not boot.exists() and s2.exists()
+        assert f'left {s2} in place' in t.warnings
 
     @unless_root
     def test_one_that_cannot_be_looked_up_keeps_what_may_be_in_it(self,

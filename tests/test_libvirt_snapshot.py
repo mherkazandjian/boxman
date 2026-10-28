@@ -3357,7 +3357,7 @@ class TestForceClearForRetake:
             assert sm._force_clear_for_retake(
                 "vm01", str(tmp_path), "snapX",
                 paths_in_use=MagicMock(return_value={}),
-                memory_in_use=MagicMock(return_value={})) is True
+                recorded_in_use=MagicMock(return_value={})) is True
 
         joined = "\n".join(removed_cmds)
         assert orphan_overlay in joined
@@ -3432,7 +3432,7 @@ class TestForceClearProtectsFilesInUse:
              patch.object(sm, "logger") as logger:
             ok = sm._force_clear_for_retake("vm01", str(vm_dir), "snapX",
                                             paths_in_use=scan,
-                                            memory_in_use=memory)
+                                            recorded_in_use=memory)
         errors = " ".join(str(c.args[0]) for c in logger.error.call_args_list)
         return ok, rm, errors
 
@@ -3512,7 +3512,7 @@ class TestForceClearProtectsFilesInUse:
 
         assert ok is False and rm == [] and os.path.isfile(mem)
         assert (f"{mem}: a snapshot of domain vm01_snapshot_replica records "
-                f"it as its memory image") in errors
+                f"it") in errors
 
     def test_other_snapshots_that_cannot_be_read_keep_everything(
             self, sm: SnapshotManager, tmp_path: Path):
@@ -3536,8 +3536,8 @@ class TestForceClearProtectsFilesInUse:
 
         assert create.call_args.kwargs["paths_in_use"] == (
             session.disk_paths_in_use)
-        assert create.call_args.kwargs["memory_in_use"] == (
-            session.snapshot_memory_in_use)
+        assert create.call_args.kwargs["recorded_in_use"] == (
+            session.snapshot_files_in_use)
 
 
 class TestTakeWritesOverNoFile:
@@ -3611,9 +3611,9 @@ class TestCreateSnapshotForce:
              patch.object(sm.virsh, "execute", return_value=_result()):
             assert sm.create_snapshot(
                 "vm01", str(tmp_path), "snapX", "d", force=True,
-                paths_in_use=scan, memory_in_use=memory) is True
+                paths_in_use=scan, recorded_in_use=memory) is True
         clear.assert_called_once_with("vm01", str(tmp_path), "snapX",
-                                      paths_in_use=scan, memory_in_use=memory,
+                                      paths_in_use=scan, recorded_in_use=memory,
                                       disk_dir=None)
 
     def test_force_clear_failure_aborts_create(self, sm: SnapshotManager,
@@ -3745,7 +3745,7 @@ class TestOverlaysInADiskSnapshotDir:
             assert sm._force_clear_for_retake(
                 "vm01", str(tmp_path), "snapX", disk_dir=str(ov),
                 paths_in_use=MagicMock(return_value={}),
-                memory_in_use=MagicMock(return_value={})) is True
+                recorded_in_use=MagicMock(return_value={})) is True
 
         joined = "\n".join(removed)
         assert str(orphan) in joined
@@ -3770,7 +3770,7 @@ class TestOverlaysInADiskSnapshotDir:
             assert sm._force_clear_for_retake(
                 "vm01", str(tmp_path), "snapX", disk_dir=str(ov),
                 paths_in_use=scan,
-                memory_in_use=MagicMock(return_value={})) is False
+                recorded_in_use=MagicMock(return_value={})) is False
 
         assert str(used) not in "\n".join(removed)
         assert used.read_bytes() == b"another domain's disk"

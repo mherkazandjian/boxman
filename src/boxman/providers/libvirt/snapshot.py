@@ -212,7 +212,7 @@ class SnapshotManager:
                         compress_level: int = 3,
                         force: bool = False,
                         paths_in_use=None,
-                        memory_in_use=None,
+                        recorded_in_use=None,
                         disk_dir: str | None = None) -> bool:
         """
         Create a snapshot of a VM.
@@ -248,8 +248,8 @@ class SnapshotManager:
             paths_in_use: With *force*, what every domain uses
                 (``LibVirtSession.disk_paths_in_use``), asked before a
                 leftover is removed; without it none is.
-            memory_in_use: With *force*, the memory images domains'
-                snapshots record (``LibVirtSession.snapshot_memory_in_use``),
+            recorded_in_use: With *force*, the memory images domains'
+                snapshots record (``LibVirtSession.snapshot_files_in_use``),
                 asked likewise.
 
         Returns:
@@ -258,7 +258,7 @@ class SnapshotManager:
         try:
             if force and not self._force_clear_for_retake(
                     vm_name, vm_dir, snapshot_name,
-                    paths_in_use=paths_in_use, memory_in_use=memory_in_use,
+                    paths_in_use=paths_in_use, recorded_in_use=recorded_in_use,
                     disk_dir=disk_dir):
                 return False
             snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
@@ -369,7 +369,7 @@ class SnapshotManager:
                                 vm_dir: str,
                                 snapshot_name: str,
                                 paths_in_use=None,
-                                memory_in_use=None,
+                                recorded_in_use=None,
                                 disk_dir: str | None = None) -> bool:
         """
         Remove anything that would make a fresh snapshot named
@@ -388,10 +388,10 @@ class SnapshotManager:
 
         Files that are part of the VM's *current* active disk chain are never
         removed. Nor is a leftover any domain uses, the VM itself included,
-        or one a snapshot records as its memory image: each
+        or one a snapshot records, as its memory image or an overlay: each
         is matched by resolved path and by identity against *paths_in_use*
-        (``LibVirtSession.disk_paths_in_use``) and *memory_in_use*
-        (``LibVirtSession.snapshot_memory_in_use``), asked once there is
+        (``LibVirtSession.disk_paths_in_use``) and *recorded_in_use*
+        (``LibVirtSession.snapshot_files_in_use``), asked once there is
         anything to remove. The memory image's directory can be a cluster's
         memory_snapshot_dir outside the workdir, reaching a disk under
         another name — a symlink to the directory a live disk is in — or
@@ -436,7 +436,7 @@ class SnapshotManager:
         leftovers = [path for path in candidates
                      if path not in active and os.path.isfile(path)]
         refusal = self._leftover_in_use(leftovers, paths_in_use,
-                                        memory_in_use)
+                                        recorded_in_use)
         if refusal:
             self.logger.error(
                 f"--force: {refusal}; refusing to remove it, or to take "
@@ -454,11 +454,11 @@ class SnapshotManager:
 
     @staticmethod
     def _leftover_in_use(leftovers: list[str], paths_in_use,
-                         memory_in_use) -> str | None:
+                         recorded_in_use) -> str | None:
         """
         Why one of *leftovers* may not be removed, if one may not: a domain
-        uses it, or a domain's snapshot records it as its memory
-        image, by resolved path or by identity (``(st_dev, st_ino)``, links
+        uses it, or a domain's snapshot records it (as its memory image or
+        an overlay), by resolved path or by identity (``(st_dev, st_ino)``, links
         followed); it cannot be inspected; or either cannot be told — the
         scan is ``None``, or answers ``None``.
         """
@@ -475,13 +475,12 @@ class SnapshotManager:
         if in_use is None:
             return (f"could not check whether a domain uses "
                     f"{', '.join(leftovers)}")
-        recorded = memory_in_use() if memory_in_use is not None else None
+        recorded = recorded_in_use() if recorded_in_use is not None else None
         if recorded is None:
             return (f"could not check whether a snapshot of another domain "
-                    f"records {', '.join(leftovers)} as its memory image")
+                    f"records {', '.join(leftovers)}")
         for scan, what in ((in_use, "domain {} uses it"),
-                           (recorded, "a snapshot of domain {} records it "
-                                      "as its memory image")):
+                           (recorded, "a snapshot of domain {} records it")):
             used_ids = getattr(scan, "identities", {})
             for path in leftovers:
                 domain = (scan.get(os.path.realpath(path))
@@ -555,6 +554,22 @@ class SnapshotManager:
             if path:
                 images[name] = path
         return images
+
+    def overlay_files(self, vm_name: str) -> dict[str, list[str]] | None:
+        """
+        ``{snapshot name: [overlay, ...]}`` for every snapshot of *vm_name*
+        — a domain's name or UUID — that created external overlays, each as
+        libvirt recorded it.
+
+        Returns ``None`` when they cannot all be told, as
+        :meth:`_strict_overlay_inventory` refuses: a snapshot is left out
+        only when its metadata says it created none.
+        """
+        try:
+            overlays, _order = self._strict_overlay_inventory(vm_name)
+        except SnapshotError:
+            return None
+        return overlays
 
     def compress_memory_file(self,
                              raw_path: str,
