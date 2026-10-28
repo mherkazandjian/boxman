@@ -515,10 +515,16 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
     present and of its type, the records complete — so a truncated,
     hand-edited or foreign file is refused as unreadable, never half-read.
 
+    One that is a symbolic link is refused too: boxman saves its inventory
+    as a file of its own, and a retry saving what it found through a link
+    would replace the link, leaving the file it names as it was.
+
     Raises:
         OSError, ValueError: If it cannot be read, is not a saved inventory
-            of this layout, or names another VM.
+            of this layout, is a symbolic link, or names another VM.
     """
+    if os.path.islink(path):
+        raise ValueError("it is a symbolic link, not the file boxman saved")
     data = _json_object(path)
     _version(data, TEARDOWN_INVENTORY_VERSION)
     name = _field(data, "vm_name", lambda v: isinstance(v, str))

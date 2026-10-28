@@ -1047,6 +1047,7 @@ class TestSavedInventoryLifecycle:
         "targets of lists", "boot family of numbers",
         "memory images a list", "memory images of numbers",
         "overlays a list", "overlays of strings", "overlay chains a list",
+        "overlay chains changed a list",
     ])
     def test_a_malformed_saved_inventory_keeps_everything(self, tmp_path,
                                                           layout):
@@ -1063,6 +1064,27 @@ class TestSavedInventoryLifecycle:
 
         assert boot.exists()
         t.session.destroy_vm.assert_not_called()
+
+    def test_a_saved_inventory_that_is_a_symlink_keeps_everything(
+            self, tmp_path):
+        """boxman saves its inventory as a file of its own: one that names
+        another file is not that, and a retry saving through it would
+        replace the link and leave the file it names as it was."""
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[],
+                      in_use={str(boot): OTHER})
+        t.deprovision()
+        elsewhere = tmp_path / 'elsewhere' / 'inventory.json'
+        elsewhere.parent.mkdir()
+        _saved(tmp_path).rename(elsewhere)
+        os.symlink(elsewhere, _saved(tmp_path))
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+
+        with pytest.raises(ProvisionError, match='symbolic link'):
+            t.deprovision()
+
+        assert boot.exists()
 
     def test_an_inventory_saved_for_another_vm_is_refused(self, tmp_path):
         path = disk_cleanup.save_teardown_inventory(disk_cleanup.StorageInventory(
@@ -2612,6 +2634,8 @@ def _malformed(tmp_path, layout):
         "overlays a list": {**data, "overlays": ["/ov/a.s1"]},
         "overlays of strings": {**data, "overlays": {"s1": "/ov/a.s1"}},
         "overlay chains a list": {**data, "overlay_chains": ["/ov/a.s1"]},
+        "overlay chains changed a list": {**data,
+                                          "overlay_chains_changed": ["a"]},
     }[layout]
 
 
