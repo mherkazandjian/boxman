@@ -519,6 +519,12 @@ class TestANameTakenBeforeVirtInstallRan:
     install of this run, as the message used to say."""
 
     IN_USE = "ERROR    Guest name 'iso-test01' is already in use."
+    #: what virt-install prints after the refusal, as after any failed
+    #: install (seen on a real one)
+    ADVICE = ("Domain installation does not appear to have been successful.\n"
+              "If it was, you can restart your domain by running:\n"
+              "  virsh --connect qemu:///system start iso-test01\n"
+              "otherwise, please restart your installation.")
 
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_it_raises_saying_so(self, mock_run, tmp_path):
@@ -527,9 +533,29 @@ class TestANameTakenBeforeVirtInstallRan:
         with pytest.raises(DomainExistsError) as exc:
             _make_iso_vm(tmp_path).create()
         assert "already defined" in str(exc.value)
-        assert self.IN_USE in str(exc.value)
+        assert "Guest name 'iso-test01' is already in use" in str(exc.value)
         # qemu-img and virt-install only: no domain lookup is needed
         assert mock_run.call_count == 2
+
+    @patch("boxman.providers.libvirt.direct_vm._shell_run")
+    def test_virt_install_s_advice_to_start_the_domain_is_left_out(
+            self, mock_run, tmp_path):
+        """The domain may be another run's: the message says when to
+        destroy it, and passes on no advice to start it."""
+        mock_run.side_effect = [
+            _result(ok=True),
+            _result(ok=False, stderr=f"{self.IN_USE}\n{self.ADVICE}")]
+        vm = _make_iso_vm(tmp_path)
+        vm.logger = MagicMock()
+        with pytest.raises(DomainExistsError) as exc:
+            vm.create()
+        message = str(exc.value)
+        assert "restart your domain" not in message
+        assert "virsh" not in message
+        assert "If an earlier run left it" in message
+        assert "If another run is still using it" in message
+        # nor is it logged on the way
+        vm.logger.error.assert_not_called()
 
     @patch("boxman.providers.libvirt.direct_vm._shell_run")
     def test_a_disk_in_use_is_not_taken_for_it(self, mock_run, tmp_path):
