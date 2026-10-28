@@ -26,6 +26,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from boxman import log
+from boxman.utils.io import mkstemp_in
 
 from .disk import disk_path_for
 from .disk_ownership import ROLE_DATA, DiskRecord
@@ -291,8 +292,8 @@ def teardown_inventory_path(directory: str, vm_name: str) -> str:
 def _write_json_atomically(path: str, data: object) -> None:
     """Write *data* to *path* as JSON: into a staging file beside it,
     flushed and synced, then renamed over it."""
-    fd, staging = tempfile.mkstemp(prefix=".boxman-teardown-",
-                                   suffix=".tmp", dir=os.path.dirname(path))
+    fd, staging = mkstemp_in(os.path.dirname(path),
+                             prefix=".boxman-teardown-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as fh:
             json.dump(data, fh)

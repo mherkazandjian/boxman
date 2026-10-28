@@ -1,8 +1,8 @@
 import json
 import os
-import tempfile
 
 from boxman import log
+from boxman.utils.io import mkstemp_in
 
 DEFAULT_CACHE_DIR = '~/.config/boxman/cache'
 
@@ -80,8 +80,8 @@ class BoxmanCache:
         it into place, so a crashed or concurrent writer can never leave a
         truncated projects.json behind.
         """
-        fd, tmp_file = tempfile.mkstemp(
-            dir=self.cache_dir, prefix='.projects.json.', suffix='.tmp')
+        fd, tmp_file = mkstemp_in(
+            self.cache_dir, prefix='.projects.json.', suffix='.tmp')
         try:
             with os.fdopen(fd, 'w') as fobj:
                 json.dump(self.projects, fobj, indent=4)

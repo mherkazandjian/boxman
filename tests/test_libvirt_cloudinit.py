@@ -1054,3 +1054,38 @@ class TestACachedImageIsCheckedWhereItIsUsed:
                                        download_fn=self._download)
 
         assert (ok, dst.read_bytes()) == (True, self.IMAGE)
+
+
+class TestAnOciPullIsStagedBesideItsDestination:
+    """oras pulls into a directory made beside *dst_path*, so the disk is
+    renamed onto it within one filesystem. That directory was made beside
+    ``os.path.abspath(dst_path)``, which folds ``link/..`` as text into
+    another directory, created when missing (#260)."""
+
+    def test_a_destination_spelled_through_a_symlink_and_dotdot(
+            self, tmp_path: Path):
+        actual = tmp_path / "actual"
+        (actual / "deep").mkdir(parents=True)
+        (actual / "cache").mkdir()
+        (tmp_path / "link").symlink_to(actual / "deep",
+                                       target_is_directory=True)
+        dst = os.path.join(str(tmp_path), "link", "..", "cache", "disk.qcow2")
+        pulled_into = []
+
+        def pull(_image_ref, out_dir):
+            pulled_into.append(out_dir)
+            disk = Path(out_dir) / "disk.qcow2"
+            disk.write_bytes(b"qcow2")
+            return str(disk)
+
+        with patch("boxman.providers.libvirt.oci_pull.pull_oci_image",
+                   side_effect=pull):
+            ok = _make_template(tmp_path)._download_oci_image(
+                "oci://registry.example.com/repo:tag", dst)
+
+        assert ok is True
+        assert os.path.samefile(os.path.dirname(pulled_into[0]),
+                                actual / "cache")
+        assert not (tmp_path / "cache").exists()
+        assert [p.name for p in (actual / "cache").iterdir()] == ["disk.qcow2"]
+        assert (actual / "cache" / "disk.qcow2").read_bytes() == b"qcow2"

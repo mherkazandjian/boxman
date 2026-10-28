@@ -17,7 +17,6 @@ import copy
 import json
 import os
 import re
-import tempfile
 from datetime import datetime, timezone
 from typing import Any
 
@@ -37,6 +36,7 @@ from boxman.providers.docker_compose.compose_runner import (
 )
 from boxman.providers.session_base import SessionConfigMixin
 from boxman.utils.compose_names import sanitize_project_name
+from boxman.utils.io import mkstemp_in
 
 
 class _FileFirstRunner:
@@ -690,8 +690,10 @@ class DockerComposeSession(SessionConfigMixin):
                 os.makedirs(workdir, exist_ok=True)
                 # (2) unique per invocation — a fixed name lets a second
                 # writer overwrite the bytes between validation and rename.
-                handle, staged = tempfile.mkstemp(
-                    dir=workdir, prefix=".docker-compose.", suffix=".candidate")
+                # Made in *workdir* as given, where the generator writes it
+                # by name (#260).
+                handle, staged = mkstemp_in(
+                    workdir, prefix=".docker-compose.", suffix=".candidate")
                 os.close(handle)
                 self._generator.write(compose, workdir,
                                       filename=os.path.basename(staged))
