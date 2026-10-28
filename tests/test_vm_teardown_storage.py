@@ -3624,6 +3624,29 @@ class TestOverlaysInADiskSnapshotDir:
         assert list(ov.iterdir()) == []
         assert t.warnings == ''
 
+    @pytest.mark.parametrize("scan", ["records it", "cannot be read"])
+    def test_a_data_disks_overlay_another_snapshot_records_is_kept(
+            self, tmp_path, scan):
+        """Admitted as a layer of the data disk's chain, it is asked
+        about as everything from a disk_snapshot_dir is."""
+        workdir, ov = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        data = _file(workdir / f'{VM}_disk01.qcow2')
+        s1 = _file(ov / f'{VM}_disk01.s1')
+        t = _Teardown(workdir, disks=[boot, s1], disk_snapshot_dir=ov,
+                      records=[_record('disk01', data)],
+                      recorded_in_use=disk_cleanup.FilesInUse(
+                          {os.path.realpath(s1): OTHER}),
+                      chains={str(s1): [str(s1), str(data)]})
+        if scan == "cannot be read":
+            t.session.snapshot_files_in_use.return_value = None
+
+        t.deprovision()
+
+        assert s1.exists() and data.exists()
+        assert not boot.exists()
+        assert f'left {s1} in place' in t.warnings
+
     @PATHS
     def test_unset_they_are_kept_as_before(self, tmp_path, path):
         """Not a cluster's disk_snapshot_dir, the directory is like any

@@ -1086,7 +1086,6 @@ def remove_vm_storage(
             admission.refuse(path, _OUTSIDE)
 
     # -- 1c. the boot disk's overlays in a disk_snapshot_dir --------------
-    from_overlay_dirs: set[str] = set()
     named_by_libvirt = unique([
         *inventory.disk_sources,
         *(layer for layers in (chains or {}).values() for layer in layers),
@@ -1105,7 +1104,6 @@ def remove_vm_storage(
             admission.refuse(path, reason)
         else:
             admission.admit(path)
-            from_overlay_dirs.add(real(path))
 
     # -- 2./3. extra disks -------------------------------------------------
     state = inventory.records_state
@@ -1191,10 +1189,12 @@ def remove_vm_storage(
             _refuse_incomplete_chains(chains, admission)
 
     # -- recorded by another domain's snapshot -----------------------------
+    # everything from a disk_snapshot_dir, by whichever rule it came: a
+    # data disk's chain (2) as much as the boot disk's overlays (1c)
     snapshot_named = [(resolved, path)
                       for resolved, path in admission.admitted.items()
                       if is_memory_image(vm, path)
-                      or resolved in from_overlay_dirs]
+                      or _directory_is_one_of(path, overlay_ids)]
     if snapshot_named and recorded_in_use is not None:
         recorded = recorded_in_use()
         recorded_ids = getattr(recorded, "identities", {})
