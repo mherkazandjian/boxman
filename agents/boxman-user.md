@@ -1179,7 +1179,9 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   below them, the overlays its snapshots recorded), a data disk's only as a
   layer of a chain proven the VM's own, and nothing else; one another
   domain's snapshot records is kept. One directory may serve as both
-  `memory_snapshot_dir` and `disk_snapshot_dir`. Local runtime only, like `memory_snapshot_dir`.
+  `memory_snapshot_dir` and `disk_snapshot_dir`, or one sit inside the
+  other: a take makes the directories it creates on QEMU's way to the
+  overlays `0711`. Local runtime only, like `memory_snapshot_dir`.
 - `snapshot restore [--name N]` restores (latest if omitted). `boxman restore`
   is the shortcut for "all VMs to latest".
 - **A restore backs up the overlays the revert deletes, and refuses if it

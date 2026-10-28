@@ -208,6 +208,69 @@ class TestTake:
         # one that was there already is not this take's to change
         assert stat.S_IMODE(os.stat(tmp_path / "on").st_mode) == 0o750
 
+    @staticmethod
+    def _take_under_umask_077(tmp_path, monkeypatch, memory, disk):
+        mgr = _manager({"workdir": str(tmp_path / "c1"),
+                        "memory_snapshot_dir": str(memory),
+                        "disk_snapshot_dir": str(disk)})
+        old = os.umask(0o077)
+        try:
+            _take(mgr, monkeypatch)
+        finally:
+            os.umask(old)
+
+    @staticmethod
+    def _mode(path):
+        return stat.S_IMODE(os.stat(path).st_mode)
+
+    def test_one_new_directory_for_both_is_made_searchable(self, tmp_path,
+                                                           monkeypatch):
+        """Made ``0700`` for the memory images first, it would stop QEMU
+        before the overlays; ``0711`` lets it search, never list."""
+        snaps = tmp_path / "snaps"
+
+        self._take_under_umask_077(tmp_path, monkeypatch, snaps, snaps)
+
+        assert self._mode(snaps) == 0o711
+
+    def test_a_disk_snapshot_dir_in_a_new_memory_snapshot_dir(self, tmp_path,
+                                                              monkeypatch):
+        there = tmp_path / "there"
+        there.mkdir()
+        there.chmod(0o700)
+        memory = there / "mem"
+        overlays = memory / "ov"
+
+        self._take_under_umask_077(tmp_path, monkeypatch, memory, overlays)
+
+        assert self._mode(memory) == 0o711
+        assert self._mode(overlays) == 0o711
+        # there already: not this take's to change
+        assert self._mode(there) == 0o700
+
+    def test_a_memory_snapshot_dir_in_a_new_disk_snapshot_dir(self, tmp_path,
+                                                              monkeypatch):
+        """Made on the way to the memory images, the disk_snapshot_dir
+        still has to be searchable; the memory images' own stays 0700."""
+        overlays = tmp_path / "ov"
+        memory = overlays / "mem"
+
+        self._take_under_umask_077(tmp_path, monkeypatch, memory, overlays)
+
+        assert self._mode(overlays) == 0o711
+        assert self._mode(memory) == 0o700
+
+    def test_an_existing_one_for_both_keeps_its_mode(self, tmp_path,
+                                                     monkeypatch):
+        """Not this take's to change, as for one set for the overlays
+        alone."""
+        snaps = tmp_path / "snaps"
+        snaps.mkdir(mode=0o700)
+
+        self._take_under_umask_077(tmp_path, monkeypatch, snaps, snaps)
+
+        assert self._mode(snaps) == 0o700
+
     def test_an_existing_one_keeps_its_mode(self, tmp_path, monkeypatch):
         ov = tmp_path / "ov"
         ov.mkdir()

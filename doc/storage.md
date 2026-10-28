@@ -288,7 +288,8 @@ clusters:
 - Each is `~` expanded and otherwise taken as written; a relative path is
   refused. A missing one is made on first use: `0700` for memory images
   (the guest's RAM), `0711` for overlays (QEMU opens them as another user).
-  Local runtime only.
+  One directory for both, or one inside the other, is made `0711` wherever
+  QEMU must pass to reach the overlays. Local runtime only.
 - After a take the newest overlay is the disk the guest writes to, so a
   `disk_snapshot_dir` holds live disks, not backups. A take sees to a
   libvirt storage pool on it, which the in-use scan reads the overlays

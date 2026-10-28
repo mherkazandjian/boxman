@@ -47,6 +47,28 @@ def _dirs_made_for(path: str) -> tuple[tuple[int, int], tuple[str, ...]]:
     return (st.st_dev, st.st_ino), tuple(reversed(missing))
 
 
+def _search_through(path: str, identities: set[tuple[int, int]]) -> None:
+    """
+    Give search permission, to everyone, to *path* and to each directory
+    above it that is one of *identities* — told by ``(st_dev, st_ino)``, and
+    reached through ``..`` as the filesystem resolves it, not as *path* is
+    spelled.
+
+    Raises:
+        OSError: one cannot be looked up or changed.
+    """
+    head = path
+    while True:
+        st = os.stat(head)
+        if (st.st_dev, st.st_ino) in identities:
+            os.chmod(head, stat.S_IMODE(st.st_mode) | 0o111)
+        parent = os.path.join(head, os.pardir)
+        above = os.stat(parent)
+        if (above.st_dev, above.st_ino) == (st.st_dev, st.st_ino):
+            return      # the root
+        head = parent
+
+
 class SnapshotsMixin:
 
     ### snapshot directories ####
@@ -184,24 +206,35 @@ class SnapshotsMixin:
                       for cluster_name in (self.config.get('clusters') or {}))
         return sorted({path for path in configured if path is not None})
 
-    def _ensure_memory_snapshot_dir(self, path: str) -> None:
+    def _ensure_memory_snapshot_dir(self, path: str) -> set[tuple[int, int]]:
         """
         Create *path*, and the directories on the way to it, when it is
         missing — the directory itself ``0700``: a memory image is the
         guest's RAM, and libvirt writes it as root. An existing directory
         is left as it is.
 
+        Returns:
+            The identities of the directories it made
+            (:meth:`_ensure_snapshot_dir`).
+
         Raises:
             SnapshotError: it could not be created.
         """
-        self._ensure_snapshot_dir(path, 0o700)
+        return self._ensure_snapshot_dir(path, 0o700)
 
-    def _ensure_disk_snapshot_dir(self, path: str, cluster_name: str) -> None:
+    def _ensure_disk_snapshot_dir(self, path: str, cluster_name: str,
+                                  made_for_memory: set[tuple[int, int]]
+                                  = frozenset()) -> None:
         """
         Create *path* when it is missing — ``0711``: QEMU, running as another
         user under ``qemu:///system``, opens the overlays there, so it must
         be able to search the directory, not list it — and see to a storage
         pool on it, named after *cluster_name*.
+
+        A directory this take made ``0700`` for the memory images
+        (*made_for_memory*) that is *path*, or on the way to it, is given
+        search permission too: one ``snapshot_dir`` for both, or one inside
+        the other, would otherwise stop QEMU there.
 
         Under ``use_sudo: false`` the in-use scan reads a file the user
         cannot through its pool (#221). Without one the overlays there go
@@ -209,9 +242,16 @@ class SnapshotsMixin:
         removed: the take still goes on, and a warning says so.
 
         Raises:
-            SnapshotError: it could not be created.
+            SnapshotError: it could not be created or made searchable.
         """
         self._ensure_snapshot_dir(path, 0o711)
+        if made_for_memory:
+            try:
+                _search_through(path, made_for_memory)
+            except OSError as exc:
+                raise SnapshotError(
+                    f"could not make the snapshot directory {path} "
+                    f"searchable ({exc})") from exc
         prj_name = f'bprj__{self.config["project"]}__bprj'
         pool = self.session_for_cluster(cluster_name).ensure_pool_on(
             path, f"{prj_name}_{cluster_name}_disk_snapshots")
@@ -222,7 +262,8 @@ class SnapshotsMixin:
                 f"there, and every teardown keeps what it would remove until "
                 f"one is defined on it")
 
-    def _ensure_snapshot_dir(self, path: str, mode: int) -> None:
+    def _ensure_snapshot_dir(self, path: str,
+                             mode: int) -> set[tuple[int, int]]:
         """
         Create *path*, and the directories on the way to it, when it is
         missing — the directory itself with *mode*, whatever the umask, and
@@ -232,6 +273,10 @@ class SnapshotsMixin:
         Never a cluster workdir that does not exist, under any name: that is
         not this command's to create, so a *path* inside one, or equal to
         it, is refused (:func:`_dirs_made_for`).
+
+        Returns:
+            The identities — ``(st_dev, st_ino)`` — of the directories it
+            made; none when *path* exists.
 
         Raises:
             SnapshotError: it could not be created, or creating it would also
@@ -248,7 +293,7 @@ class SnapshotsMixin:
             if not os.path.isdir(path):
                 raise SnapshotError(
                     f"the snapshot directory {path} is not a directory")
-            return
+            return set()
         for cluster_name, cluster in (self.config.get('clusters') or {}).items():
             workdir = cluster.get('workdir') if isinstance(cluster, dict) else None
             if not workdir:
@@ -268,21 +313,24 @@ class SnapshotsMixin:
                     f"would also create {workdir}, the workdir of cluster "
                     f"{cluster_name}, which does not exist — provision that "
                     f"cluster first, or set the snapshot directory outside it")
+        identities: set[tuple[int, int]] = set()
         try:
             os.makedirs(path, mode=mode, exist_ok=True)
             # makedirs gives *mode* to the last one only, through the umask
             head = path.rstrip(os.sep)
             for depth in range(len(made)):
+                st = os.stat(head)
                 if depth:
-                    current = stat.S_IMODE(os.stat(head).st_mode)
-                    os.chmod(head, current | (mode & 0o111))
+                    os.chmod(head, stat.S_IMODE(st.st_mode) | (mode & 0o111))
                 else:
                     os.chmod(head, mode)
+                identities.add((st.st_dev, st.st_ino))
                 head = os.path.dirname(head)
         except OSError as exc:
             raise SnapshotError(
                 f"could not create the snapshot directory {path} "
                 f"({exc})") from exc
+        return identities
 
     ### start snapshot functions ####
     def snapshot_list(self, cli_args):
@@ -518,13 +566,16 @@ class SnapshotsMixin:
             in self._select_vm_targets(cli_args)
         ]
         # a memory_snapshot_dir is made on first use; a workdir exists by now
+        made_for_memory: set[tuple[int, int]] = set()
         for memory_snapshot_dir in self._cluster_memory_snapshot_dirs():
             if any(d == memory_snapshot_dir for _vm, _c, d, _o in vm_targets):
-                self._ensure_memory_snapshot_dir(memory_snapshot_dir)
+                made_for_memory |= self._ensure_memory_snapshot_dir(
+                    memory_snapshot_dir)
         for disk_snapshot_dir in self._cluster_disk_snapshot_dirs():
             users = [c for _vm, c, _d, o in vm_targets if o == disk_snapshot_dir]
             if users:
-                self._ensure_disk_snapshot_dir(disk_snapshot_dir, users[0])
+                self._ensure_disk_snapshot_dir(disk_snapshot_dir, users[0],
+                                               made_for_memory)
 
         # docker-compose clusters first (cluster-scoped, D3). Failures are
         # isolated per cluster so a dc cluster that isn't up can't stop the
