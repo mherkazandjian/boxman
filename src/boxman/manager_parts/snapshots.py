@@ -47,26 +47,55 @@ def _dirs_made_for(path: str) -> tuple[tuple[int, int], tuple[str, ...]]:
     return (st.st_dev, st.st_ino), tuple(reversed(missing))
 
 
+def _searched_on_the_way(path: str) -> list[str]:
+    """
+    Every directory the kernel searches to resolve *path*, each named by a
+    path that reaches it: the one each component is looked up in — a ``..``
+    as much as a name, through every symlink on the way and the components
+    of its target — and the directory *path* names.
+
+    Raises:
+        OSError: a symlink cannot be read, or there are too many on the way.
+    """
+    searched: list[str] = []
+    links = 0
+
+    def walk(current: str, spelled: str) -> str:
+        nonlocal links
+        for name in spelled.split(os.sep):
+            if name in ('', os.curdir):
+                continue
+            searched.append(current)
+            step = os.path.join(current, name)
+            if name != os.pardir and os.path.islink(step):
+                links += 1
+                if links > 40:
+                    raise OSError(errno.ELOOP, "too many symlinks on the way",
+                                  path)
+                target = os.readlink(step)
+                step = walk(os.sep if os.path.isabs(target) else current,
+                            target)
+            current = step
+        return current
+
+    searched.append(walk(os.sep if os.path.isabs(path) else os.curdir, path))
+    return searched
+
+
 def _search_through(path: str, identities: set[tuple[int, int]]) -> None:
     """
-    Give search permission, to everyone, to *path* and to each directory
-    above it that is one of *identities* — told by ``(st_dev, st_ino)``, and
-    reached through ``..`` as the filesystem resolves it, not as *path* is
-    spelled.
+    Give search permission, to everyone, to each directory resolving *path*
+    searches (:func:`_searched_on_the_way`) that is one of *identities* —
+    told by ``(st_dev, st_ino)``: ``memory/../disk`` searches ``memory``,
+    which no walk up from ``disk`` meets.
 
     Raises:
         OSError: one cannot be looked up or changed.
     """
-    head = path
-    while True:
-        st = os.stat(head)
+    for directory in _searched_on_the_way(path):
+        st = os.stat(directory)
         if (st.st_dev, st.st_ino) in identities:
-            os.chmod(head, stat.S_IMODE(st.st_mode) | 0o111)
-        parent = os.path.join(head, os.pardir)
-        above = os.stat(parent)
-        if (above.st_dev, above.st_ino) == (st.st_dev, st.st_ino):
-            return      # the root
-        head = parent
+            os.chmod(directory, stat.S_IMODE(st.st_mode) | 0o111)
 
 
 class SnapshotsMixin:

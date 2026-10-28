@@ -260,6 +260,29 @@ class TestTake:
         assert self._mode(overlays) == 0o711
         assert self._mode(memory) == 0o700
 
+    def test_one_spelled_through_a_new_memory_snapshot_dir(self, tmp_path,
+                                                           monkeypatch):
+        """``memory/../disk``: QEMU searches ``memory`` for its ``..``,
+        which walking up from ``disk`` never meets."""
+        memory = tmp_path / "memory"
+        disk = os.path.join(memory, os.pardir, "disk")
+
+        self._take_under_umask_077(tmp_path, monkeypatch, memory, disk)
+
+        assert self._mode(memory) == 0o711
+        assert self._mode(tmp_path / "disk") == 0o711
+
+    def test_one_spelled_through_a_symlink_to_it(self, tmp_path, monkeypatch):
+        """``link/../disk``, ``link`` leading to the new memory directory:
+        resolving it searches what ``link`` points to as well."""
+        memory = tmp_path / "memory"
+        (tmp_path / "link").symlink_to(memory)
+        disk = os.path.join(tmp_path, "link", os.pardir, "disk")
+
+        self._take_under_umask_077(tmp_path, monkeypatch, memory, disk)
+
+        assert self._mode(memory) == 0o711
+
     def test_an_existing_one_for_both_keeps_its_mode(self, tmp_path,
                                                      monkeypatch):
         """Not this take's to change, as for one set for the overlays
