@@ -3790,6 +3790,82 @@ class TestOverlaysInADiskSnapshotDir:
         assert not (boot.exists() or data.exists())
         assert s2.exists()
 
+    def _built_on_the_attached_one(self, tmp_path, **kw):
+        """``s2`` -> ``s1`` -> base, the VM attached at ``s1``: ``s2`` known
+        only from its snapshot."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1, s2 = _file(ov / f'{VM}.s1'), _file(ov / f'{VM}.s2')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'s1': [str(s1)], 's2': [str(s2)]}, **kw)
+        t.session.backing_chains.side_effect = _live(
+            {s1: [s1, base], s2: [s2, s1, base]})
+        return t, (s2, s1, base)
+
+    def test_one_only_a_snapshot_records_keeps_what_it_is_built_on(
+            self, tmp_path):
+        """Kept as another domain's, ``s2`` still needs ``s1`` and the
+        base: the chains of the overlays its snapshots recorded are read
+        too."""
+        t, files = self._built_on_the_attached_one(tmp_path)
+        s2 = files[0]
+        t.session.snapshot_files_in_use.return_value = (
+            disk_cleanup.FilesInUse({os.path.realpath(s2): OTHER}))
+
+        t.deprovision()
+
+        assert all(p.exists() for p in files)
+
+    def test_one_only_a_snapshot_records_replaced_since_keeps_its_chain(
+            self, tmp_path):
+        t, (s2, s1, base) = self._built_on_the_attached_one(tmp_path)
+        remove = disk_cleanup.remove_vm_storage
+
+        def replaced_first(*args, **kwargs):
+            s2.rename(tmp_path / 'replaced')
+            _file(s2, b'replacement')
+            return remove(*args, **kwargs)
+
+        with patch('boxman.manager_parts.vms.remove_vm_storage',
+                   side_effect=replaced_first):
+            t.deprovision()
+
+        assert s2.read_bytes() == b'replacement'
+        assert s1.exists() and base.exists()
+
+    def test_a_retry_reads_their_chains_again(self, tmp_path):
+        t, files = self._built_on_the_attached_one(tmp_path)
+        s2 = files[0]
+        t.session.snapshot_files_in_use.return_value = (
+            disk_cleanup.FilesInUse({os.path.realpath(s2): OTHER}))
+        t.deprovision()
+        assert all(p.exists() for p in files)
+
+        t.session.vm_storage_devices.return_value = None
+        t.mgr.logger.reset_mock()
+        t.deprovision()
+
+        assert all(p.exists() for p in files)
+
+        t.session.snapshot_files_in_use.return_value = (
+            disk_cleanup.FilesInUse())
+        t.deprovision()
+
+        assert not any(p.exists() for p in files)
+
+    def test_their_chains_that_cannot_be_read_keep_everything(self, tmp_path):
+        t, files = self._built_on_the_attached_one(tmp_path)
+        s2 = files[0]
+        live = t.session.backing_chains.side_effect
+        t.session.backing_chains.side_effect = (
+            lambda sources: None if str(s2) in map(str, sources)
+            else live(sources))
+
+        t.deprovision()
+
+        assert all(p.exists() for p in files)
+        assert 'could not be read' in t.warnings
+
     def test_a_retry_removes_what_its_snapshots_recorded(self, tmp_path):
         """Undefined, the domain's snapshots are gone: the retry decides
         with what the first attempt saved."""

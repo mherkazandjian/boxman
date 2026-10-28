@@ -206,6 +206,20 @@ def memory_image_candidates(directory: str, vm_name: str) -> list[str]:
             if is_memory_image(vm_name, path)]
 
 
+def snapshot_only_overlays(overlays: dict[str, list[str]],
+                           sources: Iterable[str]) -> list[str]:
+    """The overlays *overlays* records that are none of *sources* — each
+    once, as recorded: those whose backing chains are read apart from the
+    disks' (``StorageInventory.overlay_chains``)."""
+    sources = set(sources)
+    found: list[str] = []
+    for paths in overlays.values():
+        for path in paths:
+            if path not in sources and path not in found:
+                found.append(path)
+    return found
+
+
 def file_identities(paths: Iterable[str]) -> dict[str, tuple[int, int]]:
     """
     ``(st_dev, st_ino)`` of each path that exists, without following a
@@ -342,6 +356,10 @@ class StorageInventory:
     #: name: with its disks and the layers below them, what decides its
     #: files in a disk_snapshot_dir
     overlays: dict[str, list[str]] = field(default_factory=dict)
+    #: the backing chain of each of :attr:`overlays` that is no disk or
+    #: media source, as :attr:`chains` holds theirs; ``None`` when one could
+    #: not be read. Read again on a retry, not saved
+    overlay_chains: dict[str, list[str]] | None = field(default_factory=dict)
     #: where it was saved before undefining (see
     #: :func:`save_teardown_inventory`); not saved itself
     saved_at: str | None = None
@@ -947,7 +965,9 @@ def remove_vm_storage(
     identities = _Identities(inventory.identities, [
         *inventory.media_sources, *inventory.disk_sources,
         *(record.source for record in records), *legacy,
-        *(layer for layers in (chains or {}).values() for layer in layers)])
+        *(layer for layers in (chains or {}).values() for layer in layers),
+        *(layer for layers in (inventory.overlay_chains or {}).values()
+          for layer in layers)])
     admission = _Admission(identities)
     # a media source and every image under it: a qcow2 CD-ROM can be built
     # on a file the vm also attaches as a disk. Protected before anything is
@@ -1153,11 +1173,21 @@ def remove_vm_storage(
                 admission.refuse(path, _WHY_NO_RECORD[state])
 
     # -- dependencies across the whole inventory ---------------------------
-    if chains is None:
+    # an overlay only a snapshot records, once admitted, is held up by its
+    # chain as a disk is by its own: kept, it keeps what it is built on
+    overlay_chains = inventory.overlay_chains
+    if chains is not None and overlay_chains is not None:
+        chains = {**{overlay: layers
+                     for overlay, layers in overlay_chains.items()
+                     if admission.is_admitted(overlay)},
+                  **chains}
+    if chains is None or overlay_chains is None:
+        unread = ("of the vm's disks" if chains is None
+                  else "of the overlays its snapshots recorded")
         for path in list(admission.admitted.values()):
             admission.refuse(path, (
-                "the backing chains of the vm's disks could not be read, so "
-                "what depends on it cannot be told"))
+                f"the backing chains {unread} could not be read, so what "
+                f"depends on it cannot be told"))
     else:
         _refuse_incomplete_chains(chains, admission)
     if identities.unreadable:

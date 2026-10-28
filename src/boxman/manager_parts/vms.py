@@ -47,6 +47,7 @@ from boxman.providers.libvirt.disk_cleanup import (
     remove_vm_storage,
     save_teardown_inventory,
     save_teardown_locator,
+    snapshot_only_overlays,
     teardown_inventory_path,
     teardown_locator_path,
 )
@@ -1077,6 +1078,11 @@ class VMsMixin:
                     f"be left in place")
             else:
                 overlays = recorded
+        # and what those only a snapshot records are built on: kept, one
+        # keeps that too (remove_vm_storage)
+        recorded_only = snapshot_only_overlays(overlays, sources)
+        overlay_chains = (session.backing_chains(recorded_only)
+                          if recorded_only else {})
 
         files = [*disk_sources, *boot_family, *(legacy_disks or ()),
                  *(record.source for record in records or ()),
@@ -1084,7 +1090,9 @@ class VMsMixin:
                    for layer in chain),
                  *(path for recorded in memory_images.values()
                    for path in (recorded, f"{recorded}.zst")),
-                 *(path for paths in overlays.values() for path in paths)]
+                 *(path for paths in overlays.values() for path in paths),
+                 *(layer for chain in (overlay_chains or {}).values()
+                   for layer in chain)]
         inventory = StorageInventory(
             vm_name=full_vm_name,
             disk_sources=disk_sources,
@@ -1098,6 +1106,7 @@ class VMsMixin:
             targets=targets,
             memory_images=memory_images,
             overlays=overlays,
+            overlay_chains=overlay_chains,
         )
         if exists:
             # saved before the undefine, which drops what it was read from;
@@ -1375,7 +1384,11 @@ class VMsMixin:
                     chains = (None if below is None
                               else {**chains, source: below[layer]})
                     break
-        return dataclasses.replace(saved, chains=chains)
+        recorded_only = snapshot_only_overlays(saved.overlays, sources)
+        overlay_chains = (session.backing_chains(recorded_only)
+                          if recorded_only else {})
+        return dataclasses.replace(saved, chains=chains,
+                                   overlay_chains=overlay_chains)
 
     def _vm_disk_dirs(self,
                       full_vm_name: str,
