@@ -1374,26 +1374,44 @@ class VMsMixin:
         target, its record and its dependencies. A media source gone since
         has no chain — boxman never removes one, and nothing depends on an
         image that is not there. A chain that cannot be read makes them all
-        unknown (``None``), which keeps everything.
+        unknown (``None``), which keeps everything. The overlays only its
+        snapshots recorded are read again the same way, one removed since
+        standing for what is left of its saved chain.
         """
         sources = [*saved.disk_sources, *saved.media_sources]
-        chains = session.backing_chains(sources) if sources else {}
-        for source in saved.disk_sources:
+        chains = self._chains_left(
+            session, session.backing_chains(sources) if sources else {},
+            saved.disk_sources, saved.chains)
+        recorded_only = snapshot_only_overlays(saved.overlays, sources)
+        overlay_chains = self._chains_left(
+            session,
+            session.backing_chains(recorded_only) if recorded_only else {},
+            recorded_only, saved.overlay_chains)
+        return dataclasses.replace(saved, chains=chains,
+                                   overlay_chains=overlay_chains)
+
+    @staticmethod
+    def _chains_left(session, chains: dict[str, list[str]] | None,
+                     heads: list[str],
+                     saved: dict[str, list[str]] | None,
+                     ) -> dict[str, list[str]] | None:
+        """
+        *chains*, as read now, with each of *heads* removed since mapped to
+        the chain of the topmost layer of its *saved* one that is still
+        there; ``None`` when one cannot be read.
+        """
+        for head in heads:
             if chains is None:
                 break
-            if source in chains:
+            if head in chains:
                 continue
-            for layer in (saved.chains or {}).get(source, [])[1:]:
+            for layer in (saved or {}).get(head, [])[1:]:
                 below = session.backing_chains([layer])
                 if below is None or layer in below:
                     chains = (None if below is None
-                              else {**chains, source: below[layer]})
+                              else {**chains, head: below[layer]})
                     break
-        recorded_only = snapshot_only_overlays(saved.overlays, sources)
-        overlay_chains = (session.backing_chains(recorded_only)
-                          if recorded_only else {})
-        return dataclasses.replace(saved, chains=chains,
-                                   overlay_chains=overlay_chains)
+        return chains
 
     def _vm_disk_dirs(self,
                       full_vm_name: str,

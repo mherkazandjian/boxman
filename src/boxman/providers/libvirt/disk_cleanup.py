@@ -357,8 +357,9 @@ class StorageInventory:
     #: files in a disk_snapshot_dir
     overlays: dict[str, list[str]] = field(default_factory=dict)
     #: the backing chain of each of :attr:`overlays` that is no disk or
-    #: media source, as :attr:`chains` holds theirs; ``None`` when one could
-    #: not be read. Read again on a retry, not saved
+    #: media source, as :attr:`chains` holds theirs, and like theirs read
+    #: again on a retry (one removed since mapped to what is left of it);
+    #: ``None`` when one could not be read
     overlay_chains: dict[str, list[str]] | None = field(default_factory=dict)
     #: where it was saved before undefining (see
     #: :func:`save_teardown_inventory`); not saved itself
@@ -438,6 +439,7 @@ def save_teardown_inventory(inventory: StorageInventory,
         "targets": inventory.targets,
         "memory_images": inventory.memory_images,
         "overlays": inventory.overlays,
+        "overlay_chains": inventory.overlay_chains,
     }
     _write_json_atomically(path, data)
     return path
@@ -532,6 +534,10 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
         if "memory_images" in data else {})
     overlays = (_field(data, "overlays", lambda v: _is_map(v, _is_paths))
                 if "overlays" in data else {})
+    overlay_chains = (
+        _field(data, "overlay_chains",
+               lambda v: v is None or _is_map(v, _is_paths))
+        if "overlay_chains" in data else {})
     return StorageInventory(
         vm_name=vm_name,
         disk_sources=list(_field(data, "disk_sources", _is_paths)),
@@ -548,6 +554,8 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
                             lambda v: _is_map(v, lambda t: isinstance(t, str)))),
         memory_images=dict(memory_images),
         overlays={k: list(v) for k, v in overlays.items()},
+        overlay_chains=(None if overlay_chains is None
+                        else {k: list(v) for k, v in overlay_chains.items()}),
         saved_at=path,
     )
 
@@ -1174,12 +1182,14 @@ def remove_vm_storage(
 
     # -- dependencies across the whole inventory ---------------------------
     # an overlay only a snapshot records, once admitted, is held up by its
-    # chain as a disk is by its own: kept, it keeps what it is built on
+    # chain as a disk is by its own: kept, it keeps what it is built on —
+    # and so does what is left of one a first attempt removed
     overlay_chains = inventory.overlay_chains
     if chains is not None and overlay_chains is not None:
         chains = {**{overlay: layers
                      for overlay, layers in overlay_chains.items()
-                     if admission.is_admitted(overlay)},
+                     if admission.is_admitted(overlay)
+                     or not _may_exist(overlay)},
                   **chains}
     if chains is None or overlay_chains is None:
         unread = ("of the vm's disks" if chains is None

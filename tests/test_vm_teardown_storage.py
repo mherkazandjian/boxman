@@ -1046,7 +1046,7 @@ class TestSavedInventoryLifecycle:
         "identities of booleans", "an identity of three",
         "targets of lists", "boot family of numbers",
         "memory images a list", "memory images of numbers",
-        "overlays a list", "overlays of strings",
+        "overlays a list", "overlays of strings", "overlay chains a list",
     ])
     def test_a_malformed_saved_inventory_keeps_everything(self, tmp_path,
                                                           layout):
@@ -2611,6 +2611,7 @@ def _malformed(tmp_path, layout):
         "memory images of numbers": {**data, "memory_images": {"s1": 1}},
         "overlays a list": {**data, "overlays": ["/ov/a.s1"]},
         "overlays of strings": {**data, "overlays": {"s1": "/ov/a.s1"}},
+        "overlay chains a list": {**data, "overlay_chains": ["/ov/a.s1"]},
     }[layout]
 
 
@@ -3872,6 +3873,34 @@ class TestOverlaysInADiskSnapshotDir:
         t.deprovision()
 
         assert not any(p.exists() for p in files)
+
+    def test_a_retry_keeps_what_a_layer_of_one_gone_since_is_built_on(
+            self, tmp_path):
+        """``s2`` -> ``middle`` -> ``s1`` -> base, the first attempt
+        interrupted once ``s2`` went: the retry no longer finds ``s2``, but
+        a ``middle`` replaced since still needs ``s1`` and the base, as
+        the chain saved with the inventory shows."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        middle = _file(workdir / f'{VM}.middle')
+        s2 = _file(ov / f'{VM}.s2')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'s2': [str(s2)]})
+        t.session.backing_chains.side_effect = _live({
+            s1: [s1, base], middle: [middle, s1, base],
+            s2: [s2, middle, s1, base]})
+        TestRetriedTeardown._interrupt_at(t, middle)
+        assert not s2.exists() and middle.exists()
+        middle.rename(tmp_path / 'replaced')
+        _file(middle, b'replacement')
+
+        t.session.vm_storage_devices.return_value = None
+        t.mgr.logger.reset_mock()
+        t.deprovision()
+
+        assert middle.read_bytes() == b'replacement'
+        assert s1.exists() and base.exists()
 
     def test_their_chains_that_cannot_be_read_keep_everything(self, tmp_path):
         t, files = self._built_on_the_attached_one(tmp_path)
