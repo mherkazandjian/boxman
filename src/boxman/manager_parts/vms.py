@@ -1382,29 +1382,20 @@ class VMsMixin:
         has no chain — boxman never removes one, and nothing depends on an
         image that is not there. A chain that cannot be read makes them all
         unknown (``None``), which keeps everything. The overlays only its
-        snapshots recorded are read again the same way, one removed since
-        standing for what is left of its saved chain.
+        snapshots recorded are read again too (:meth:`_overlay_chains_now`).
         """
         sources = [*saved.disk_sources, *saved.media_sources]
         chains = self._chains_left(
             session, session.backing_chains(sources) if sources else {},
             saved.disk_sources, saved.chains)
-        recorded_only = snapshot_only_overlays(saved.overlays, sources)
-        read_now = (session.backing_chains(recorded_only) if recorded_only
-                    else {})
-        overlay_chains = self._chains_left(
-            session, read_now, recorded_only, saved.overlay_chains,
-            unknown_keeps_all=True)
-        known = saved.overlay_chains or {}
-        learned = {head: chain for head, chain in (read_now or {}).items()
-                   if known.get(head) != chain}
+        overlay_chains, learned = self._overlay_chains_now(session, saved,
+                                                           sources)
         if learned and saved.saved_at is not None:
-            # one gone at first and back since, say: what was read of it
-            # now is saved — never what is left of one, which starts below
-            # it — as the next retry may find it gone again. Where it was
-            # found, alone: its locator, if it has one, names it already
-            saved = dataclasses.replace(
-                saved, overlay_chains={**known, **learned})
+            # what this retry read that the saved chains did not hold, as
+            # the next one may find those files gone or replaced. Where it
+            # was found, alone: its locator, if it has one, names it already
+            saved = dataclasses.replace(saved, overlay_chains={
+                **(saved.overlay_chains or {}), **learned})
             try:
                 save_teardown_inventory(saved,
                                         os.path.dirname(saved.saved_at))
@@ -1417,25 +1408,80 @@ class VMsMixin:
                                    overlay_chains=overlay_chains)
 
     @staticmethod
+    def _overlay_chains_now(session, saved: StorageInventory,
+                            sources: list[str],
+                            ) -> tuple[dict[str, list[str]] | None,
+                                       dict[str, list[str]]]:
+        """
+        The chains of the overlays only *saved*'s snapshots recorded, read
+        again for a retry, and what of them is new, to be saved.
+
+        Each file a saved chain is kept for is one whose dependencies
+        matter: a recorded overlay, or a layer below one that it no longer
+        stands on. One still there has its chain read now; if it no longer
+        stands on layers its saved chain went through — replaced since by
+        another image — the topmost of those still there is read as well,
+        and kept under its own name, so what that layer needs stays held
+        up. One gone since stands likewise for the topmost layer of its
+        saved chain still there. A recorded one gone with no chain saved
+        for it at all leaves what is left of it unknown; one gone already
+        at the first attempt was saved as ``[]``, and holds nothing up.
+
+        Returns:
+            ``(chains, learned)``: the chains to decide with — ``None`` when
+            one cannot be read or told, which keeps everything — and those
+            read now that the saved ones do not hold.
+        """
+        known = saved.overlay_chains
+        heads = list(dict.fromkeys([
+            *snapshot_only_overlays(saved.overlays, sources),
+            *(known or {})]))
+        if not heads:
+            return {}, {}
+        read = session.backing_chains(heads)
+        if read is None:
+            return None, {}
+        chains, learned = dict(read), {}
+        for head in heads:
+            saved_chain = (known or {}).get(head)
+            if head in read:
+                if saved_chain != read[head]:
+                    learned[head] = read[head]
+                below: list[str] = []
+                for layer in (saved_chain or [])[1:]:
+                    if layer in read[head]:
+                        break       # it still stands on the rest
+                    below.append(layer)
+            elif saved_chain is None:
+                return None, {}     # recorded, gone, nothing known of it
+            else:
+                below = saved_chain[1:]
+            for layer in below:
+                left = session.backing_chains([layer])
+                if left is None:
+                    return None, {}
+                if layer in left:
+                    chains[layer] = left[layer]
+                    if (known or {}).get(layer) != left[layer]:
+                        learned[layer] = left[layer]
+                    break
+        return chains, learned
+
+    @staticmethod
     def _chains_left(session, chains: dict[str, list[str]] | None,
                      heads: list[str],
                      saved: dict[str, list[str]] | None,
-                     unknown_keeps_all: bool = False,
                      ) -> dict[str, list[str]] | None:
         """
         *chains*, as read now, with each of *heads* removed since mapped to
         the chain of the topmost layer of its *saved* one that is still
-        there; ``None`` when one cannot be read — or, *unknown_keeps_all*,
-        when one removed since has no saved chain at all, so what is left
-        of it cannot be told.
+        there; ``None`` when one cannot be read.
         """
         for head in heads:
             if chains is None:
                 break
             if head in chains:
                 continue
-            if unknown_keeps_all and head not in (saved or {}):
-                return None
             for layer in (saved or {}).get(head, [])[1:]:
                 below = session.backing_chains([layer])
                 if below is None or layer in below:

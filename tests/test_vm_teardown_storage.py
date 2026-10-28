@@ -4060,6 +4060,38 @@ class TestOverlaysInADiskSnapshotDir:
 
         assert boot.exists() and s2.exists()
 
+    def test_a_retry_keeps_what_was_under_one_replaced_since(self, tmp_path):
+        """``s2`` -> ``middle`` -> ``s1`` -> base, ``middle`` in a
+        directory no rule removes from: ``s2`` replaced since by a
+        standalone image no longer says what ``middle`` needs, its saved
+        chain still does."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        middle = _file(tmp_path / 'unmanaged' / 'middle.qcow2')
+        s2 = _file(ov / f'{VM}.s2')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'s2': [str(s2)]}, in_use={str(base): OTHER})
+        t.session.backing_chains.side_effect = _live({
+            s1: [s1, base], middle: [middle, s1, base],
+            s2: [s2, middle, s1, base]})
+        t.deprovision()
+        assert all(p.exists() for p in (base, s1, middle, s2))
+        s2.rename(tmp_path / 'old-s2')
+        _file(s2, b'standalone')
+
+        t.session.backing_chains.side_effect = _live({
+            s1: [s1, base], middle: [middle, s1, base], s2: [s2]})
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.deprovision()
+        assert all(p.exists() for p in (base, s1, middle))
+        # and the next one still knows, s2 gone or not
+        s2.unlink()
+        t.deprovision()
+
+        assert all(p.exists() for p in (base, s1, middle))
+
     def test_their_chains_that_cannot_be_read_keep_everything(self, tmp_path):
         t, files = self._built_on_the_attached_one(tmp_path)
         s2 = files[0]
