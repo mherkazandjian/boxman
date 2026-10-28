@@ -4092,6 +4092,94 @@ class TestOverlaysInADiskSnapshotDir:
 
         assert all(p.exists() for p in (base, s1, middle))
 
+    @pytest.mark.parametrize("head", ["still there", "gone"])
+    def test_a_retry_keeps_a_tail_detached_from_what_is_left(self, tmp_path,
+                                                             head):
+        """``h`` -> ``m1`` -> ``m2`` -> ``s1`` -> base, ``m1`` and ``m2``
+        where nothing is removed from, ``m1`` rebased onto nothing since:
+        ``m2`` still needs ``s1`` and the base, as the saved chain says."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        m1 = _file(tmp_path / 'unmanaged' / 'm1.qcow2')
+        m2 = _file(tmp_path / 'unmanaged' / 'm2.qcow2')
+        h = _file(ov / f'{VM}.h')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'h': [str(h)]}, in_use={str(base): OTHER})
+        t.session.backing_chains.side_effect = _live({
+            s1: [s1, base], m2: [m2, s1, base], m1: [m1, m2, s1, base],
+            h: [h, m1, m2, s1, base]})
+        t.deprovision()
+        assert all(p.exists() for p in (base, s1, m1, m2, h))
+        if head == "gone":
+            h.unlink()
+
+        t.session.backing_chains.side_effect = _live({
+            s1: [s1, base], m2: [m2, s1, base], m1: [m1], h: [h, m1]})
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.deprovision()
+
+        assert all(p.exists() for p in (base, s1, m2))
+
+    def test_a_retry_counts_a_saved_chain_as_it_was_saved(self, tmp_path):
+        """``m2`` rebased onto nothing since: what stood on ``s1`` when
+        the chain was saved is not known to stand on nothing now."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        m2 = _file(tmp_path / 'unmanaged' / 'm2.qcow2')
+        h = _file(ov / f'{VM}.h')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'h': [str(h)]}, in_use={str(base): OTHER})
+        t.session.backing_chains.side_effect = _live({
+            s1: [s1, base], m2: [m2, s1, base], h: [h, m2, s1, base]})
+        t.deprovision()
+
+        t.session.backing_chains.side_effect = _live({
+            s1: [s1, base], m2: [m2], h: [h, m2]})
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.deprovision()
+
+        assert all(p.exists() for p in (base, s1, m2))
+
+    def test_a_retry_saves_what_it_read_though_another_read_failed(
+            self, tmp_path):
+        """``h`` gone at first, back since on ``m`` -> ``s1`` -> base; the
+        chain of what is left of ``g`` cannot be read this time, which keeps
+        everything — and what was read of ``h`` is saved all the same."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        m = _file(tmp_path / 'unmanaged' / 'm.qcow2')
+        g = _file(ov / f'{VM}.g')
+        g_below = _file(tmp_path / 'unmanaged' / 'g-below.qcow2')
+        h = ov / f'{VM}.h'
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'h': [str(h)], 'g': [str(g)]},
+                      in_use={str(base): OTHER})
+        chains = {s1: [s1, base], m: [m, s1, base], g: [g, g_below],
+                  g_below: [g_below], h: [h, m, s1, base]}
+        t.session.backing_chains.side_effect = _live(chains)
+        t.deprovision()
+        _file(h)
+        g.unlink()
+        live = _live(chains)
+        t.session.backing_chains.side_effect = (
+            lambda sources: None if str(g_below) in map(str, sources)
+            else live(sources))
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.deprovision()
+        assert all(p.exists() for p in (base, s1, m, h))
+
+        h.unlink()
+        t.session.backing_chains.side_effect = live
+        t.deprovision()
+
+        assert all(p.exists() for p in (base, s1, m))
+
     def test_their_chains_that_cannot_be_read_keep_everything(self, tmp_path):
         t, files = self._built_on_the_attached_one(tmp_path)
         s2 = files[0]

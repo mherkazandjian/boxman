@@ -1413,58 +1413,50 @@ class VMsMixin:
                             ) -> tuple[dict[str, list[str]] | None,
                                        dict[str, list[str]]]:
         """
-        The chains of the overlays only *saved*'s snapshots recorded, read
-        again for a retry, and what of them is new, to be saved.
+        The chains of the overlays only *saved*'s snapshots recorded, for a
+        retry to decide with, and what of them is new, to be saved.
 
-        Each file a saved chain is kept for is one whose dependencies
-        matter: a recorded overlay, or a layer below one that it no longer
-        stands on. One still there has its chain read now; if it no longer
-        stands on layers its saved chain went through — replaced since by
-        another image — the topmost of those still there is read as well,
-        and kept under its own name, so what that layer needs stays held
-        up. One gone since stands likewise for the topmost layer of its
-        saved chain still there. A recorded one gone with no chain saved
-        for it at all leaves what is left of it unknown; one gone already
-        at the first attempt was saved as ``[]``, and holds nothing up.
+        Nothing a saved chain said is dropped: what stood on a layer when
+        it was saved is not known to stand on nothing now — a layer can be
+        rebased onto nothing, an overlay replaced, by anything, since — so
+        what is left of every saved chain counts, as it was saved. And
+        every file one names, every recorded overlay too, that is still
+        there has its chain read now, each on its own: what it stands on
+        now counts as well, and is what is saved for it, so a later retry
+        knows it should that file go. A recorded overlay gone with no chain
+        saved for it at all leaves what is left of it unknown, and so does
+        a chain that cannot be read — ``None``, which keeps everything —
+        though what was read is saved all the same. One gone already at the
+        first attempt was saved as ``[]``, and holds nothing up.
 
         Returns:
-            ``(chains, learned)``: the chains to decide with — ``None`` when
-            one cannot be read or told, which keeps everything — and those
-            read now that the saved ones do not hold.
+            ``(chains, learned)``: the chains to decide with, or ``None``;
+            and those read now that the saved ones do not hold.
         """
-        known = saved.overlay_chains
-        heads = list(dict.fromkeys([
-            *snapshot_only_overlays(saved.overlays, sources),
-            *(known or {})]))
-        if not heads:
-            return {}, {}
-        read = session.backing_chains(heads)
-        if read is None:
-            return None, {}
-        chains, learned = dict(read), {}
-        for head in heads:
-            saved_chain = (known or {}).get(head)
-            if head in read:
-                if saved_chain != read[head]:
-                    learned[head] = read[head]
-                below: list[str] = []
-                for layer in (saved_chain or [])[1:]:
-                    if layer in read[head]:
-                        break       # it still stands on the rest
-                    below.append(layer)
-            elif saved_chain is None:
-                return None, {}     # recorded, gone, nothing known of it
+        known = saved.overlay_chains or {}
+        recorded = snapshot_only_overlays(saved.overlays, sources)
+        named = list(dict.fromkeys([
+            *recorded, *known,
+            *(layer for layers in known.values() for layer in layers)]))
+        read: dict[str, list[str]] = {}
+        unreadable = False
+        for path in named:
+            one = session.backing_chains([path])
+            if one is None:
+                unreadable = True
             else:
-                below = saved_chain[1:]
-            for layer in below:
-                left = session.backing_chains([layer])
-                if left is None:
-                    return None, {}
-                if layer in left:
-                    chains[layer] = left[layer]
-                    if (known or {}).get(layer) != left[layer]:
-                        learned[layer] = left[layer]
-                    break
+                read.update(one)
+        learned = {path: chain for path, chain in read.items()
+                   if known.get(path) != chain}
+        unknown = any(head not in read and head not in known
+                      for head in recorded)
+        if unreadable or unknown:
+            return None, learned
+        chains = dict(read)
+        for head, layers in known.items():
+            left = [layer for layer in layers if layer in read]
+            if left:
+                chains[f"{head}, as saved"] = left
         return chains, learned
 
     @staticmethod
