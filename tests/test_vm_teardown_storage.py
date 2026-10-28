@@ -4746,3 +4746,43 @@ class TestOverlaysInADiskSnapshotDir:
             t.deprovision()
 
         assert all(p.exists() for p in (base, s1, h))
+
+    @unless_root
+    def test_a_retry_saves_what_it_found_beside_an_inventory_through_dotdot(
+            self, tmp_path):
+        """Found without its locator, through a workdir spelled
+        ``locked/link/..``: the chains a retry reads first are staged
+        beside the inventory, where ``link/..`` leads, not in ``locked``,
+        which that spelling folds to as text and which cannot be written."""
+        work = tmp_path / 'work'
+        (work / 'child').mkdir(parents=True)
+        locked = tmp_path / 'locked'
+        locked.mkdir()
+        os.symlink(work / 'child', locked / 'link')
+        ov = tmp_path / 'ov'
+        ov.mkdir()
+        boot = _qcow2(work / f'{VM}.qcow2')
+        h = _file(ov / f'{VM}.h')
+        t = _Teardown(work, disks=[boot], records=[], disk_snapshot_dir=ov,
+                      overlays={'h': [str(h)]})
+        live = _live({h: [h, boot]})
+        t.session.backing_chains.side_effect = (
+            lambda sources: None if str(h) in map(str, sources)
+            else live(sources))
+        t.deprovision()
+        assert boot.exists() and h.exists()
+        locator = config_cache.teardown_locator_dir()
+        for name in os.listdir(locator):
+            os.unlink(os.path.join(locator, name))
+        spelled = os.path.join(locked, 'link', os.pardir)
+        t.workdir = spelled
+        t.mgr.config['clusters']['cluster_1']['workdir'] = spelled
+        t.session.backing_chains.side_effect = live
+        t.session.vm_storage_devices.return_value = None
+        locked.chmod(0o555)
+        try:
+            t.deprovision()
+        finally:
+            locked.chmod(0o755)
+
+        assert not (boot.exists() or h.exists())
