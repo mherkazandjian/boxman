@@ -2684,7 +2684,7 @@ class TestSnapshotMemoryInUse:
     closed: ``None`` once any of them cannot be told."""
 
     def _run(self, images, relists=(), listing_ok=True, by_name=None,
-             overlays=None, **scan):
+             overlays=None, chains=None, **scan):
         """Domains vm-a, vm-b and vm-x; *images* maps a domain to what
         ``SnapshotManager.memory_images`` answers when asked by that
         domain's UUID, and *overlays* to what ``overlay_files`` answers (by
@@ -2735,7 +2735,47 @@ class TestSnapshotMemoryInUse:
                    "recorded_files", autospec=True,
                    side_effect=recorded_files):
             virsh.return_value.execute.side_effect = virsh_execute
-            return _session({}).snapshot_files_in_use(**scan)
+            session = _session({})
+            with patch.object(session, "backing_chains", side_effect=(
+                    chains if callable(chains)
+                    else lambda sources: {src: (chains or {}).get(src, [src])
+                                          for src in sources})):
+                return session.snapshot_files_in_use(**scan)
+
+    def test_what_other_domains_recorded_overlays_are_built_on(self,
+                                                              tmp_path):
+        """``db.s2``, an inactive overlay of vm-b, built on ``web.s1`` on
+        a base: removing those would break it, whatever vm-b runs on."""
+        names = ("db.s2", "web.s1", "base.qcow2")
+        db_s2, web_s1, base = (tmp_path / name for name in names)
+        for path in (db_s2, web_s1, base):
+            path.write_bytes(b"image")
+
+        in_use = self._run({"vm-a": {}, "vm-b": {}, "vm-x": {}},
+                           overlays={"vm-b": {"s2": [str(db_s2)]}},
+                           chains={str(db_s2): [str(db_s2), str(web_s1),
+                                                str(base)]})
+
+        assert {in_use[str(p)] for p in (db_s2, web_s1, base)} == {"vm-b"}
+
+    def test_their_chains_that_cannot_be_read_fail_it(self, tmp_path):
+        overlay = tmp_path / "b.s1"
+        overlay.write_bytes(b"overlay")
+
+        assert self._run({"vm-a": {}, "vm-b": {}, "vm-x": {}},
+                         overlays={"vm-b": {"s1": [str(overlay)]}},
+                         chains=lambda sources: None) is None
+
+    def test_without_overlays_no_chain_is_read(self, tmp_path):
+        overlay = tmp_path / "b.s1"
+        overlay.write_bytes(b"overlay")
+
+        def unread(sources):
+            raise AssertionError(f"read the chains of {sources}")
+
+        assert self._run({"vm-a": {}, "vm-b": {}, "vm-x": {}},
+                         overlays={"vm-b": {"s1": [str(overlay)]}},
+                         chains=unread, overlays_too=False) == {}
 
     def test_without_overlays_it_holds_the_memory_images_alone(self, tmp_path):
         """For a cluster with no disk_snapshot_dir: what it held before
@@ -2923,9 +2963,15 @@ class TestSnapshotMemoryInUseThroughVirsh:
 
     @staticmethod
     def _scan(host: _SnapshotHost):
+        """The scan, each overlay's chain read as the overlay alone: the
+        fake host answers virsh, not qemu-img."""
+        session = _session({})
         with patch("boxman.providers.libvirt.commands._shell_run",
-                   side_effect=host.run):
-            return _session({}).snapshot_files_in_use()
+                   side_effect=host.run), \
+             patch.object(session, "backing_chains",
+                          side_effect=lambda sources: {s: [s]
+                                                       for s in sources}):
+            return session.snapshot_files_in_use()
 
     def test_both_reads_name_each_domain_by_its_uuid(self, tmp_path):
         raw = tmp_path / "a_snapshot_s1.raw"

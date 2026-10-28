@@ -2521,7 +2521,8 @@ class LibVirtSession(SessionConfigMixin):
         directory their clusters share, when one VM's full name begins with
         the other's (``v`` taking ``x.s1`` and ``v.x`` taking ``s1`` both
         name the overlay ``v.x.s1``), and an overlay no domain runs on any
-        more is still its snapshot's. Without a disk_snapshot_dir the
+        more is still its snapshot's — and so is everything it is built on
+        (:meth:`backing_chains`). Without a disk_snapshot_dir the
         memory images alone are asked about, as before overlays could be
         there: an overlay whose identity cannot be read fails no such scan.
 
@@ -2535,7 +2536,8 @@ class LibVirtSession(SessionConfigMixin):
         otherwise answer for the newcomer.
 
         Fails closed: ``None`` when the domain list cannot be read, or the
-        snapshots of a domain cannot — unless it went away meanwhile
+        snapshots of a domain cannot, or a recorded overlay's chain cannot
+        — unless it went away meanwhile
         (:meth:`_raise_if_gone`) — or a file's identity cannot be read
         other than for naming no file.
         """
@@ -2560,10 +2562,18 @@ class LibVirtSession(SessionConfigMixin):
                     return None
                 return None
             images, overlays = files
-            paths = [*(path for image in images.values()
-                       for path in (image, f"{image}.zst")),
-                     *(path for layers in overlays.values() for path in layers
-                       if overlays_too)]
+            paths = [path for image in images.values()
+                     for path in (image, f"{image}.zst")]
+            its_overlays = ([path for layers in overlays.values()
+                             for path in layers] if overlays_too else [])
+            if its_overlays:
+                # and what they are built on: an inactive overlay of another
+                # domain can be built on this one's files, and needs them
+                chains = self.backing_chains(its_overlays)
+                if chains is None:
+                    return None
+                paths += [*its_overlays, *(layer for chain in chains.values()
+                                           for layer in chain)]
             if not self._record_in_use(recorded, domain, paths):
                 return None
         return recorded
