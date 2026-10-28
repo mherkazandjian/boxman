@@ -3647,7 +3647,9 @@ class TestOverlaysInADiskSnapshotDir:
         t.deprovision()
 
         assert s1.exists() and data.exists()
-        assert not boot.exists()
+        # with a disk_snapshot_dir set, a scan that cannot be read keeps
+        # everything, the boot disk in the workdir too
+        assert boot.exists() == (scan == "cannot be read")
         assert f'left {s1} in place' in t.warnings
 
     @PATHS
@@ -3688,6 +3690,27 @@ class TestOverlaysInADiskSnapshotDir:
         t.update_remove()
 
         assert stray.exists() and template.exists()
+
+    @PATHS
+    def test_a_layer_under_its_name_another_snapshot_records_is_kept(
+            self, tmp_path, path):
+        """Built on ``<vm>.other.s1`` in another cluster's workdir, an
+        inactive overlay of VM ``<vm>.other`` that its snapshot records:
+        under this VM's name and in its chain, but not its alone."""
+        workdir, ov = self._dirs(tmp_path)
+        other = tmp_path / 'other'
+        lower = _qcow2(other / f'{VM}.other.s1')
+        s2 = _file(ov / f'{VM}.s2')
+        t = _Teardown(workdir, disks=[s2], records=[], disk_snapshot_dir=ov,
+                      overlays={'s2': [str(s2)]},
+                      recorded_in_use=disk_cleanup.FilesInUse(
+                          {os.path.realpath(lower): f'{VM}.other'}),
+                      chains={str(s2): [str(s2), str(lower)]})
+        t.mgr.config['clusters']['cluster_2'] = {'workdir': str(other)}
+
+        getattr(t, path)()
+
+        assert lower.exists() and s2.exists()
 
     @PATHS
     def test_nothing_else_of_the_vms_there_is_a_candidate(self, tmp_path,
@@ -3905,6 +3928,54 @@ class TestOverlaysInADiskSnapshotDir:
 
         assert middle.read_bytes() == b'replacement'
         assert s1.exists() and base.exists()
+
+    def test_a_retry_after_their_chains_could_not_be_read_keeps_everything(
+            self, tmp_path):
+        """Nothing saved says what ``middle`` is built on once ``s2`` is
+        gone: unknown, not nothing."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        middle = _file(workdir / f'{VM}.middle')
+        s2 = _file(ov / f'{VM}.s2')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'s2': [str(s2)]})
+        live = _live({s1: [s1, base], middle: [middle, s1, base],
+                      s2: [s2, middle, s1, base]})
+        t.session.backing_chains.side_effect = (
+            lambda sources: None if str(s2) in map(str, sources)
+            else live(sources))
+        t.deprovision()
+        assert all(p.exists() for p in (base, s1, middle, s2))
+        s2.unlink()
+        middle.rename(tmp_path / 'replaced')
+        _file(middle, b'replacement')
+
+        t.session.backing_chains.side_effect = live
+        t.session.vm_storage_devices.return_value = None
+        t.mgr.logger.reset_mock()
+        t.deprovision()
+
+        assert middle.read_bytes() == b'replacement'
+        assert s1.exists() and base.exists()
+
+    def test_a_retry_is_not_held_up_by_one_gone_before_it_began(
+            self, tmp_path):
+        """Recorded, but already gone when the teardown first looked: it
+        held nothing up then, and holds nothing up now."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        t = _Teardown(workdir, disks=[s1], records=[], disk_snapshot_dir=ov,
+                      overlays={'s9': [str(ov / f'{VM}.s9')]})
+        t.session.backing_chains.side_effect = _live({s1: [s1, base]})
+        TestRetriedTeardown._interrupt_at(t, s1)
+
+        t.session.vm_storage_devices.return_value = None
+        t.mgr.logger.reset_mock()
+        t.deprovision()
+
+        assert not (s1.exists() or base.exists())
 
     def test_their_chains_that_cannot_be_read_keep_everything(self, tmp_path):
         t, files = self._built_on_the_attached_one(tmp_path)

@@ -297,7 +297,7 @@ clusters:
 - A teardown removes from a `disk_snapshot_dir` only what libvirt names as
   the VM's: its disks, the layers below them, and the overlays its
   snapshots recorded. Never what is there under its name, since another
-  VM's full name can begin with this one's and a dot, and never an overlay
+  VM's full name can begin with this one's and a dot, and never a file
   another domain's snapshot records.
 - `storage df` and `storage compact` work from each VM's base disks in the
   workdir, as before: the overlays above them, beside the disk or in a

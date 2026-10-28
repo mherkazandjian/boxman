@@ -357,8 +357,9 @@ class StorageInventory:
     #: files in a disk_snapshot_dir
     overlays: dict[str, list[str]] = field(default_factory=dict)
     #: the backing chain of each of :attr:`overlays` that is no disk or
-    #: media source, as :attr:`chains` holds theirs, and like theirs read
-    #: again on a retry (one removed since mapped to what is left of it);
+    #: media source, as :attr:`chains` holds theirs — ``[]`` for one already
+    #: gone — and like theirs read again on a retry (one removed since mapped
+    #: to what is left of it, and with nothing saved for it, unknown);
     #: ``None`` when one could not be read
     overlay_chains: dict[str, list[str]] | None = field(default_factory=dict)
     #: where it was saved before undefining (see
@@ -949,11 +950,11 @@ def remove_vm_storage(
     whole (:func:`_refuse_incomplete_chains`), and an unreadable chain
     keeps everything; nothing another domain uses directly or as a backing
     file is removed (*paths_in_use* is asked once, and ``None`` keeps
-    everything); and no memory image (:func:`is_memory_image`), nor
-    anything from a disk_snapshot_dir, that a snapshot of another domain
-    records — neither its name nor this VM's own record makes it this VM's
-    alone: two VMs' names can give one file name (*recorded_in_use*, asked
-    once, only when one would go; ``None`` keeps them all). What remains is
+    everything); and no memory image (:func:`is_memory_image`) — with
+    *overlay_dirs*, no file at all — that a snapshot of another domain
+    records: neither its name nor this VM's own record makes it this VM's
+    alone, as two VMs' names can give one file name (*recorded_in_use*,
+    asked once, only when one would go; ``None`` keeps them all). What remains is
     removed heads first, each through
     :func:`remove_if_unchanged` against the identity taken before
     undefining; a layer replaced since keeps everything below it.
@@ -1229,12 +1230,12 @@ def remove_vm_storage(
             _refuse_incomplete_chains(chains, admission)
 
     # -- recorded by another domain's snapshot -----------------------------
-    # everything from a disk_snapshot_dir, by whichever rule it came: a
-    # data disk's chain (2) as much as the boot disk's overlays (1c)
+    # with a disk_snapshot_dir anywhere, everything: overlays are named
+    # libvirt's way, after the source, so a layer under this VM's name — in
+    # its chain, in another cluster's workdir — can be another's snapshot's
     snapshot_named = [(resolved, path)
                       for resolved, path in admission.admitted.items()
-                      if is_memory_image(vm, path)
-                      or _directory_is_one_of(path, overlay_ids)]
+                      if overlay_dirs or is_memory_image(vm, path)]
     if snapshot_named and recorded_in_use is not None:
         recorded = recorded_in_use()
         recorded_ids = getattr(recorded, "identities", {})

@@ -1091,6 +1091,11 @@ class VMsMixin:
         recorded_only = snapshot_only_overlays(overlays, sources)
         overlay_chains = (session.backing_chains(recorded_only)
                           if recorded_only else {})
+        if overlay_chains is not None:
+            # gone already: saved as built on nothing, which a retry tells
+            # apart from one it knows nothing of
+            for overlay in recorded_only:
+                overlay_chains.setdefault(overlay, [])
 
         files = [*disk_sources, *boot_family, *(legacy_disks or ()),
                  *(record.source for record in records or ()),
@@ -1389,7 +1394,7 @@ class VMsMixin:
         overlay_chains = self._chains_left(
             session,
             session.backing_chains(recorded_only) if recorded_only else {},
-            recorded_only, saved.overlay_chains)
+            recorded_only, saved.overlay_chains, unknown_keeps_all=True)
         return dataclasses.replace(saved, chains=chains,
                                    overlay_chains=overlay_chains)
 
@@ -1397,17 +1402,22 @@ class VMsMixin:
     def _chains_left(session, chains: dict[str, list[str]] | None,
                      heads: list[str],
                      saved: dict[str, list[str]] | None,
+                     unknown_keeps_all: bool = False,
                      ) -> dict[str, list[str]] | None:
         """
         *chains*, as read now, with each of *heads* removed since mapped to
         the chain of the topmost layer of its *saved* one that is still
-        there; ``None`` when one cannot be read.
+        there; ``None`` when one cannot be read — or, *unknown_keeps_all*,
+        when one removed since has no saved chain at all, so what is left
+        of it cannot be told.
         """
         for head in heads:
             if chains is None:
                 break
             if head in chains:
                 continue
+            if unknown_keeps_all and head not in (saved or {}):
+                return None
             for layer in (saved or {}).get(head, [])[1:]:
                 below = session.backing_chains([layer])
                 if below is None or layer in below:
