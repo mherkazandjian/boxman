@@ -452,6 +452,48 @@ class TestMemoryImages:
             assert sm.memory_images("vm01") is None
 
 
+class TestOverlayFiles:
+    """The external overlays libvirt recorded for each snapshot, read as
+    the memory images are: a disk that names no file, whatever its mode,
+    records none — only a list or a description that cannot be read, or
+    trusted, makes them unknown."""
+
+    @staticmethod
+    def _xml(name: str, disks: str) -> str:
+        return (f"<domainsnapshot><name>{name}</name>"
+                f"<memory snapshot='no'/><disks>{disks}</disks>"
+                f"</domainsnapshot>")
+
+    def test_each_external_disk_names_its_overlay(self, sm: SnapshotManager):
+        xml = {
+            "s1": self._xml("s1", "<disk name='vda' snapshot='external'>"
+                                  "<source file='/ov/vm01.s1'/></disk>"
+                                  "<disk name='vdb' snapshot='no'/>"),
+            "manual": self._xml("manual",
+                                "<disk name='vda' snapshot='manual'/>"),
+            "internal": self._xml("internal",
+                                  "<disk name='vda' snapshot='internal'/>"),
+            "block": self._xml("block",
+                               "<disk name='vda' snapshot='external' "
+                               "type='block'><source dev='/dev/vg/vm01'/>"
+                               "</disk>"),
+        }
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots(list(xml), xml.get)):
+            assert sm.overlay_files("vm01") == {
+                "s1": ["/ov/vm01.s1"], "block": ["/dev/vg/vm01"]}
+
+    @pytest.mark.parametrize("bad", [None, "<domainsnapshot><name>s2"],
+                             ids=["unreadable", "not xml"])
+    def test_one_snapshot_that_cannot_be_read_makes_them_unknown(
+            self, sm: SnapshotManager, bad):
+        xml = {"s1": self._xml("s1", "<disk name='vda' snapshot='no'/>"),
+               "s2": bad}
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots(list(xml), xml.get)):
+            assert sm.overlay_files("vm01") is None
+
+
 class TestGetSnapshotOverlayFiles:
 
     def test_collects_external_overlays_per_snapshot(self, sm: SnapshotManager):

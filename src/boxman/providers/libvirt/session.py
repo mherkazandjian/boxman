@@ -2524,10 +2524,8 @@ class LibVirtSession(SessionConfigMixin):
         snapshots = SnapshotManager(self.provider_config)
         recorded = FilesInUse()
         for domain, uuid in domains:
-            images = snapshots.memory_images(uuid)
-            overlays = (snapshots.overlay_files(uuid) if images is not None
-                        else None)
-            if overlays is None:
+            files = snapshots.recorded_files(uuid)
+            if files is None:
                 try:
                     self._raise_if_gone(virsh, domain, uuid)
                 except _DomainGoneError:
@@ -2535,9 +2533,10 @@ class LibVirtSession(SessionConfigMixin):
                 except _DomainRenamedError:
                     return None
                 return None
+            images, overlays = files
             paths = [*(path for image in images.values()
                        for path in (image, f"{image}.zst")),
-                     *(path for files in overlays.values() for path in files)]
+                     *(path for layers in overlays.values() for path in layers)]
             if not self._record_in_use(recorded, domain, paths):
                 return None
         return recorded

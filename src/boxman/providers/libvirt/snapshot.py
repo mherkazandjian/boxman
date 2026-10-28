@@ -574,6 +574,38 @@ class SnapshotManager:
         a blank entry, which cannot be told apart from a name made only of
         newlines, or a name listed twice.
         """
+        recorded = self.recorded_files(vm_name)
+        return None if recorded is None else recorded[0]
+
+    def overlay_files(self, vm_name: str) -> dict[str, list[str]] | None:
+        """
+        ``{snapshot name: [overlay, ...]}`` for every snapshot of *vm_name*
+        — a domain's name or UUID — that created external overlays, each as
+        libvirt recorded it (:meth:`recorded_files`).
+        """
+        recorded = self.recorded_files(vm_name)
+        return None if recorded is None else recorded[1]
+
+    def recorded_files(self, vm_name: str) -> tuple[
+            dict[str, str], dict[str, list[str]]] | None:
+        """
+        The files every snapshot of *vm_name* — a domain's name or UUID —
+        recorded, in one read: ``({snapshot: memory file}, {snapshot:
+        [overlay, ...]})``, each as libvirt recorded it, and a snapshot only
+        where it recorded one.
+
+        Read for what they name, not to revert: a disk whose mode names no
+        file — ``no``, ``internal``, ``manual`` — records none, and an
+        external one names its ``file`` or, a block device, its ``dev``.
+        :meth:`_strict_overlay_inventory` refuses those forms it cannot back
+        up; a teardown, and the scan of what other domains record, would
+        then fail over a domain whose snapshots are only unusual.
+
+        Returns ``None`` when they cannot all be read — the list, or any one
+        snapshot's XML — which is not "none recorded"; or when the list
+        cannot be trusted: a blank entry, which cannot be told apart from a
+        name made only of newlines, or a name listed twice.
+        """
         list_result = self.virsh.execute(
             "snapshot-list", vm_name, "--name", warn=True)
         if not list_result.ok:
@@ -582,6 +614,7 @@ class SnapshotManager:
         if any(n == '' for n in names) or len(set(names)) != len(names):
             return None
         images: dict[str, str] = {}
+        overlays: dict[str, list[str]] = {}
         for name in names:
             xml_result = self.virsh.execute(
                 "snapshot-dumpxml", vm_name, name, warn=True)
@@ -595,23 +628,17 @@ class SnapshotManager:
             path = memory_elem.get("file") if memory_elem is not None else None
             if path:
                 images[name] = path
-        return images
-
-    def overlay_files(self, vm_name: str) -> dict[str, list[str]] | None:
-        """
-        ``{snapshot name: [overlay, ...]}`` for every snapshot of *vm_name*
-        — a domain's name or UUID — that created external overlays, each as
-        libvirt recorded it.
-
-        Returns ``None`` when they cannot all be told, as
-        :meth:`_strict_overlay_inventory` refuses: a snapshot is left out
-        only when its metadata says it created none.
-        """
-        try:
-            overlays, _order = self._strict_overlay_inventory(vm_name)
-        except SnapshotError:
-            return None
-        return overlays
+            files = []
+            for disk in root.findall("disks/disk"):
+                source = disk.find("source")
+                if disk.get("snapshot") != "external" or source is None:
+                    continue
+                path = source.get("file") or source.get("dev")
+                if path:
+                    files.append(path)
+            if files:
+                overlays[name] = files
+        return images, overlays
 
     def compress_memory_file(self,
                              raw_path: str,

@@ -2686,6 +2686,13 @@ class TestSnapshotMemoryInUse:
                 return {}
             raise AssertionError(f"overlay_files asked for {domain!r}")
 
+        def recorded_files(_self, domain):
+            images_ = memory_images(_self, domain)
+            overlays_ = overlay_files(_self, domain)
+            if images_ is None or overlays_ is None:
+                return None
+            return images_, overlays_
+
         def memory_images(_self, domain):
             if domain in by_uuid:
                 return by_uuid[domain]
@@ -2706,11 +2713,8 @@ class TestSnapshotMemoryInUse:
 
         with patch("boxman.providers.libvirt.session.VirshCommand") as virsh, \
              patch("boxman.providers.libvirt.session.SnapshotManager."
-                   "memory_images", autospec=True,
-                   side_effect=memory_images), \
-             patch("boxman.providers.libvirt.session.SnapshotManager."
-                   "overlay_files", autospec=True,
-                   side_effect=overlay_files):
+                   "recorded_files", autospec=True,
+                   side_effect=recorded_files):
             virsh.return_value.execute.side_effect = virsh_execute
             return _session({}).snapshot_files_in_use()
 
@@ -2817,11 +2821,14 @@ class _SnapshotHost:
         self.log: list[tuple[str, tuple]] = []
 
     def define(self, name: str, uid: str | None = None,
-               overlays: dict | None = None, **snapshots) -> str:
+               overlays: dict | None = None, disks: dict | None = None,
+               **snapshots) -> str:
         """*snapshots*: each one's memory file, or None; *overlays*: the
-        overlay a snapshot created, by snapshot name."""
+        overlay a snapshot created, by snapshot name; *disks*: a
+        snapshot's ``<disks>`` content as written, in place of either."""
         uid = uid or domain_uuid(name)
-        self.domains.append([uid, name, snapshots, overlays or {}])
+        self.domains.append([uid, name, snapshots, overlays or {},
+                             disks or {}])
         return uid
 
     def rename(self, old: str, new: str) -> None:
@@ -2862,9 +2869,10 @@ class _SnapshotHost:
             element = (f"<memory snapshot='external' file='{memory}'/>"
                        if memory else "<memory snapshot='no'/>")
             overlay = domain[3].get(args[1])
-            disk = (f"<disk name='vda' snapshot='external'>"
-                    f"<source file='{overlay}'/></disk>" if overlay
-                    else "<disk name='vda' snapshot='no'/>")
+            disk = domain[4].get(args[1]) or (
+                f"<disk name='vda' snapshot='external'>"
+                f"<source file='{overlay}'/></disk>" if overlay
+                else "<disk name='vda' snapshot='no'/>")
             return FakeResult(stdout=f"<domainsnapshot><name>{args[1]}</name>"
                                      f"{element}<disks>{disk}</disks>"
                                      f"</domainsnapshot>\n")
@@ -2900,6 +2908,21 @@ class TestSnapshotMemoryInUseThroughVirsh:
         assert {sub for sub, _ in reads} == {"snapshot-list",
                                              "snapshot-dumpxml"}
         assert {domain for _, domain in reads} == uuids
+
+    def test_a_disk_in_a_mode_that_names_no_file_does_not_fail_it(
+            self, tmp_path):
+        """libvirt's ``manual`` mode, say: an unrelated domain's snapshot
+        in it must not make every teardown keep its memory images."""
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        host = _SnapshotHost()
+        host.define("vm-a", s1=str(raw))
+        host.define("vm-b", disks={"m": "<disk name='vda' snapshot='manual'/>"},
+                    m=None)
+
+        in_use = self._scan(host)
+
+        assert in_use is not None and in_use[str(raw)] == "vm-a"
 
     def test_the_overlays_a_domains_snapshots_record(self, tmp_path):
         overlay = tmp_path / "b.x.s1"
