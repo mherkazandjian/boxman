@@ -4011,6 +4011,55 @@ class TestOverlaysInADiskSnapshotDir:
         assert middle.read_bytes() == b'replacement'
         assert s1.exists() and base.exists()
 
+    def test_one_kept_unadmitted_keeps_what_it_is_built_on(self, tmp_path):
+        """A data disk's inactive overlay is never admitted, but it is
+        still there, built on the disk's chain: that chain stays."""
+        workdir, ov = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        data = _file(workdir / f'{VM}_disk01.qcow2')
+        s1 = _file(ov / f'{VM}_disk01.s1')
+        s2 = _file(ov / f'{VM}_disk01.s2')
+        t = _Teardown(workdir, disks=[boot, s1], disk_snapshot_dir=ov,
+                      records=[_record('disk01', data)],
+                      overlays={'s2': [str(s2)]})
+        t.session.backing_chains.side_effect = _live(
+            {s1: [s1, data], s2: [s2, s1, data]})
+
+        t.deprovision()
+
+        assert not boot.exists()
+        assert all(p.exists() for p in (s2, s1, data))
+
+    def test_a_retry_rewrites_no_locator(self, tmp_path):
+        """Found without one, through a workdir spelled ``link/..``, the
+        inventory a retry saves again is saved alone: a locator recorded
+        for it now would name it by that spelling folded as text."""
+        work = tmp_path / 'work'
+        (work / 'child').mkdir(parents=True)
+        os.symlink(work / 'child', tmp_path / 'link')
+        ov = tmp_path / 'ov'
+        ov.mkdir()
+        boot = _qcow2(work / f'{VM}.qcow2')
+        s2 = ov / f'{VM}.s2'
+        t = _Teardown(work, disks=[boot], records=[], disk_snapshot_dir=ov,
+                      overlays={'s2': [str(s2)]}, in_use={str(boot): OTHER})
+        t.session.backing_chains.side_effect = _live({s2: [s2, boot]})
+        t.deprovision()
+        locator = config_cache.teardown_locator_dir()
+        for name in os.listdir(locator):
+            os.unlink(os.path.join(locator, name))
+        _file(s2)
+        spelled = os.path.join(tmp_path, 'link', os.pardir)
+        t.workdir = spelled
+        t.mgr.config['clusters']['cluster_1']['workdir'] = spelled
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+
+        t.deprovision()
+        t.deprovision()
+
+        assert boot.exists() and s2.exists()
+
     def test_their_chains_that_cannot_be_read_keep_everything(self, tmp_path):
         t, files = self._built_on_the_attached_one(tmp_path)
         s2 = files[0]

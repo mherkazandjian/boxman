@@ -483,6 +483,22 @@ class TestOverlayFiles:
             assert sm.overlay_files("vm01") == {
                 "s1": ["/ov/vm01.s1"], "block": ["/dev/vg/vm01"]}
 
+    @pytest.mark.parametrize("source", [
+        "<source protocol='nbd' name='web.s2'><host name='h'/></source>",
+        "",
+    ], ids=["a network source", "no source"])
+    def test_an_external_disk_that_names_no_local_file_makes_them_unknown(
+            self, sm: SnapshotManager, source):
+        """Its overlay is somewhere, and can be built on local files: not
+        knowing it is not "none recorded"."""
+        xml = {"s2": self._xml("s2", f"<disk name='vda' snapshot='external' "
+                                     f"type='network'>{source}</disk>")}
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots(list(xml), xml.get)):
+            assert sm.overlay_files("vm01") is None
+            # the memory images are read as before
+            assert sm.memory_images("vm01") == {}
+
     @pytest.mark.parametrize("bad", [None, "<domainsnapshot><name>s2"],
                              ids=["unreadable", "not xml"])
     def test_one_snapshot_that_cannot_be_read_makes_them_unknown(

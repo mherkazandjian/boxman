@@ -2710,7 +2710,7 @@ class TestSnapshotMemoryInUse:
             overlays_ = overlay_files(_self, domain)
             if images_ is None or overlays_ is None:
                 return None
-            return images_, overlays_
+            return images_, overlays_, False
 
         def memory_images(_self, domain):
             if domain in by_uuid:
@@ -2962,7 +2962,7 @@ class TestSnapshotMemoryInUseThroughVirsh:
     on the host those commands reach (Codex's fifth review of #252)."""
 
     @staticmethod
-    def _scan(host: _SnapshotHost):
+    def _scan(host: _SnapshotHost, **scan):
         """The scan, each overlay's chain read as the overlay alone: the
         fake host answers virsh, not qemu-img."""
         session = _session({})
@@ -2971,7 +2971,7 @@ class TestSnapshotMemoryInUseThroughVirsh:
              patch.object(session, "backing_chains",
                           side_effect=lambda sources: {s: [s]
                                                        for s in sources}):
-            return session.snapshot_files_in_use()
+            return session.snapshot_files_in_use(**scan)
 
     def test_both_reads_name_each_domain_by_its_uuid(self, tmp_path):
         raw = tmp_path / "a_snapshot_s1.raw"
@@ -3003,6 +3003,18 @@ class TestSnapshotMemoryInUseThroughVirsh:
         in_use = self._scan(host)
 
         assert in_use is not None and in_use[str(raw)] == "vm-a"
+
+    def test_a_network_overlay_another_domain_records_fails_it(self):
+        """Where overlays are asked about, one whose file cannot be named
+        could be built on anything; the memory images alone still read."""
+        host = _SnapshotHost()
+        host.define("vm-a", s1=None)
+        host.define("vm-b", disks={
+            "n": "<disk name='vda' snapshot='external' type='network'>"
+                 "<source protocol='nbd' name='b.s1'/></disk>"}, n=None)
+
+        assert self._scan(host) is None
+        assert self._scan(host, overlays_too=False) == {}
 
     def test_the_overlays_a_domains_snapshots_record(self, tmp_path):
         overlay = tmp_path / "b.x.s1"

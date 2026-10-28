@@ -1401,11 +1401,18 @@ class VMsMixin:
         if learned and saved.saved_at is not None:
             # one gone at first and back since, say: what was read of it
             # now is saved — never what is left of one, which starts below
-            # it — as the next retry may find it gone again
+            # it — as the next retry may find it gone again. Where it was
+            # found, alone: its locator, if it has one, names it already
             saved = dataclasses.replace(
                 saved, overlay_chains={**known, **learned})
-            self._save_teardown_inventory(saved,
-                                          os.path.dirname(saved.saved_at))
+            try:
+                save_teardown_inventory(saved,
+                                        os.path.dirname(saved.saved_at))
+            except OSError as exc:
+                raise ProvisionError(
+                    f"{saved.vm_name}: could not save what this retry "
+                    f"learned to its teardown inventory at {saved.saved_at} "
+                    f"({exc}); leaving its storage in place") from exc
         return dataclasses.replace(saved, chains=chains,
                                    overlay_chains=overlay_chains)
 

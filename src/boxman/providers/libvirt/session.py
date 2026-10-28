@@ -2561,7 +2561,9 @@ class LibVirtSession(SessionConfigMixin):
                 except _DomainRenamedError:
                     return None
                 return None
-            images, overlays = files
+            images, overlays, unnamed = files
+            if overlays_too and unnamed:
+                return None     # an overlay of its somewhere unknown
             paths = [path for image in images.values()
                      for path in (image, f"{image}.zst")]
             its_overlays = ([path for layers in overlays.values()

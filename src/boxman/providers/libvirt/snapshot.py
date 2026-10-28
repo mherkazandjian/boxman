@@ -583,18 +583,24 @@ class SnapshotManager:
         """
         ``{snapshot name: [overlay, ...]}`` for every snapshot of *vm_name*
         — a domain's name or UUID — that created external overlays, each as
-        libvirt recorded it (:meth:`recorded_files`).
+        libvirt recorded it (:meth:`recorded_files`); ``None`` when they
+        cannot all be told, an external one that names no local file
+        included.
         """
         recorded = self.recorded_files(vm_name)
-        return None if recorded is None else recorded[1]
+        if recorded is None or recorded[2]:
+            return None
+        return recorded[1]
 
     def recorded_files(self, vm_name: str) -> tuple[
-            dict[str, str], dict[str, list[str]]] | None:
+            dict[str, str], dict[str, list[str]], bool] | None:
         """
         The files every snapshot of *vm_name* — a domain's name or UUID —
         recorded, in one read: ``({snapshot: memory file}, {snapshot:
-        [overlay, ...]})``, each as libvirt recorded it, and a snapshot only
-        where it recorded one.
+        [overlay, ...]}, unnamed)``, each as libvirt recorded it, a snapshot
+        only where it recorded one, and *unnamed* whether an external disk
+        named no local file — a network source, or none — whose overlay is
+        then somewhere unknown, and can be built on local files.
 
         Read for what they name, not to revert: a disk whose mode names no
         file — ``no``, ``internal``, ``manual`` — records none, and an
@@ -617,6 +623,7 @@ class SnapshotManager:
             return None
         images: dict[str, str] = {}
         overlays: dict[str, list[str]] = {}
+        unnamed = False
         for name in names:
             xml_result = self.virsh.execute(
                 "snapshot-dumpxml", vm_name, name, warn=True)
@@ -632,15 +639,18 @@ class SnapshotManager:
                 images[name] = path
             files = []
             for disk in root.findall("disks/disk"):
-                source = disk.find("source")
-                if disk.get("snapshot") != "external" or source is None:
+                if disk.get("snapshot") != "external":
                     continue
-                path = source.get("file") or source.get("dev")
+                source = disk.find("source")
+                path = (source.get("file") or source.get("dev")
+                        if source is not None else None)
                 if path:
                     files.append(path)
+                else:
+                    unnamed = True
             if files:
                 overlays[name] = files
-        return images, overlays
+        return images, overlays, unnamed
 
     def compress_memory_file(self,
                              raw_path: str,

@@ -1196,16 +1196,13 @@ def remove_vm_storage(
                 admission.refuse(path, _WHY_NO_RECORD[state])
 
     # -- dependencies across the whole inventory ---------------------------
-    # an overlay only a snapshot records, once admitted, is held up by its
-    # chain as a disk is by its own: kept, it keeps what it is built on —
-    # and so does what is left of one a first attempt removed
+    # an overlay only a snapshot records is held up by its chain as a disk
+    # is by its own: kept — never admitted, as a data disk's, or refused —
+    # it keeps what it is built on, and so does what is left of one a first
+    # attempt removed
     overlay_chains = inventory.overlay_chains
     if chains is not None and overlay_chains is not None:
-        chains = {**{overlay: layers
-                     for overlay, layers in overlay_chains.items()
-                     if admission.is_admitted(overlay)
-                     or not _may_exist(overlay)},
-                  **chains}
+        chains = {**overlay_chains, **chains}
     if chains is None or overlay_chains is None:
         unread = ("of the vm's disks" if chains is None
                   else "of the overlays its snapshots recorded")
