@@ -847,6 +847,7 @@ def remove_vm_storage(
     paths_in_use: Callable[[], dict[str, str] | None],
     memory_dirs: Iterable[str] = (),
     memory_in_use: Callable[[], dict[str, str] | None] | None = None,
+    overlay_dirs: Iterable[str] = (),
 ) -> StorageOutcome:
     """
     Remove the storage an undefined VM owns — and nothing else.
@@ -864,7 +865,10 @@ def remove_vm_storage(
        its disk directories (:func:`boot_family_candidates`): its boot disk,
        its overlays and its memory-snapshot files. Extra-disk files
        (attached, recorded, config-declared, or a layer under one) are
-       never decided by name.
+       never decided by name. In a cluster's ``disk_snapshot_dir``
+       (*overlay_dirs*, told by identity like a memory_snapshot_dir) only
+       the overlays under ``<vm>.`` are; a memory image found in a
+       memory_snapshot_dir is left to 1b.
     1b. **The memory images its snapshots recorded**
        (``StorageInventory.memory_images``), each named exactly as
        :func:`memory_image_name` names that snapshot's (or with the
@@ -880,7 +884,8 @@ def remove_vm_storage(
        attached source, by the rules of :func:`_leftover_refusal`; and a
        recorded disk an external snapshot moved behind overlays, together
        with its whole chain, when :func:`_owned_snapshot_chain` proves the
-       chain the VM's own.
+       chain the VM's own — its overlays beside it or in one of
+       *overlay_dirs*.
     3. **A legacy domain** — one inventoried with no ownership record at
        all: when the config is known (*legacy_disks*), its config-declared
        disks, by name. A VM gone from conf.yml keeps them, and so does a
@@ -889,8 +894,9 @@ def remove_vm_storage(
 
     Every admitted file must be a regular file, not a symlink, inside one
     of the cluster *workdirs* once symlinks are resolved (a recorded memory
-    image, see 1b, one of *memory_dirs* too), and not a CD-ROM (or other
-    media) source of either definition.
+    image, see 1b, one of *memory_dirs* too, and an overlay one of
+    *overlay_dirs*), and not a CD-ROM (or other media) source of either
+    definition.
 
     Every protection that compares files matches them by resolved path and
     by identity (:class:`_Identities`): the media and what they are built
@@ -943,8 +949,6 @@ def remove_vm_storage(
             return _UNDER_MEDIA
         return None
 
-    memory_ids, _unreadable = _directory_identities(memory_dirs)
-
     def unique(paths):
         seen, out = set(), []
         for path in paths:
@@ -953,16 +957,35 @@ def remove_vm_storage(
                 out.append(path)
         return out
 
-    def static_refusal(path: str) -> str | None:
+    overlay_ids, unreadable_overlay_dirs = _directory_identities(overlay_dirs)
+    memory_ids, _unreadable = _directory_identities(memory_dirs)
+
+    def static_refusal(path: str, overlay: bool = False) -> str | None:
         reason = media_refusal(path)
         if reason:
             return reason
         reason = _regular_file_refusal(path)
         if reason:
             return reason
-        if real(os.path.dirname(path)) not in real_workdirs:
+        if real(os.path.dirname(path)) in real_workdirs:
+            return None
+        if not (overlay and os.path.basename(path).startswith(f"{vm}.")):
             return _OUTSIDE
-        return None
+        # an overlay of the boot disk's: in a disk_snapshot_dir, by identity
+        try:
+            st = os.stat(os.path.dirname(path))
+        except OSError as exc:
+            return (f"its directory could not be looked up ({exc}), so "
+                    f"whether it is in a cluster workdir or disk_snapshot_dir "
+                    f"cannot be told")
+        if (st.st_dev, st.st_ino) in overlay_ids:
+            return None
+        if unreadable_overlay_dirs:
+            directory, exc = min(unreadable_overlay_dirs.items())
+            return (f"whether it is in a cluster workdir or disk_snapshot_dir "
+                    f"cannot be told: {directory} could not be looked up "
+                    f"({exc})")
+        return _OUTSIDE
 
     attached_extras = unique(
         path for path in inventory.disk_sources
@@ -995,7 +1018,7 @@ def remove_vm_storage(
             else:
                 deferred.append(path)
             continue
-        reason = static_refusal(path)
+        reason = static_refusal(path, overlay=True)
         if reason is None and inventory.records_state == RECORDS_UNKNOWN:
             reason = _boxman_artifact_refusal(vm, path)
         if reason:
@@ -1049,7 +1072,7 @@ def remove_vm_storage(
                     or not _may_exist(record.source)):
                 continue
             chain, reason = _owned_snapshot_chain(
-                inventory, record, real_workdirs, media)
+                inventory, record, real_workdirs, media, overlay_ids)
             if chain is None:
                 admission.refuse(record.source, (
                     f"boxman created it, but it was no longer attached "
@@ -1225,6 +1248,7 @@ def _owned_snapshot_chain(inventory: StorageInventory,
                           record: DiskRecord,
                           workdirs: set[str],
                           media: _FileSet | None = None,
+                          overlay_dirs: set[tuple[int, int]] = frozenset(),
                           ) -> tuple[list[str] | None, str | None]:
     """
     The snapshot chain of a ``data`` disk whose recorded source an external
@@ -1242,8 +1266,10 @@ def _owned_snapshot_chain(inventory: StorageInventory,
       backing chain (nothing below it: boxman creates data disks
       standalone), and that disk is attached at the record's target;
     - every layer, as ``qemu-img`` named it, is a regular file and not a
-      symlink, in the base's directory, named ``<vm>_<name>.<suffix>``,
-      and not a CD-ROM or other media source of the vm.
+      symlink, in the base's directory or in a cluster's
+      ``disk_snapshot_dir`` (*overlay_dirs*, their identities), named
+      ``<vm>_<name>.<suffix>``, and not a CD-ROM or other media source of
+      the vm.
 
     Whether it may go as a whole, and whether another domain uses a layer,
     is decided by :func:`remove_vm_storage` across the whole inventory.
@@ -1283,7 +1309,8 @@ def _owned_snapshot_chain(inventory: StorageInventory,
         if not os.path.basename(layer).startswith(stem):
             return None, (f"{layer} in its chain is not named for disk "
                           f"{record.name!r}")
-        if real(os.path.dirname(layer)) != directory:
+        if (real(os.path.dirname(layer)) != directory
+                and not _directory_is_one_of(layer, overlay_dirs)):
             return None, f"{layer} in its chain is in another directory"
         if layer in media:
             return None, f"{layer} in its chain is a media source of the vm"

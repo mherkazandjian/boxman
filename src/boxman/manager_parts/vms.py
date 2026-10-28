@@ -834,7 +834,8 @@ class VMsMixin:
         outcome = remove_vm_storage(
             inventory, self._cluster_workdirs(), session.disk_paths_in_use,
             memory_dirs=self._cluster_memory_snapshot_dirs(),
-            memory_in_use=session.snapshot_memory_in_use)
+            memory_in_use=session.snapshot_memory_in_use,
+            overlay_dirs=self._cluster_disk_snapshot_dirs())
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")
@@ -991,9 +992,6 @@ class VMsMixin:
             if row.device == 'disk':
                 targets.setdefault(row.source, row.target)
 
-        if disk_dirs is None:
-            disk_dirs = self._vm_disk_dirs(full_vm_name, disk_sources)
-
         records, records_state = None, RECORDS_UNKNOWN
         if exists:
             try:
@@ -1028,6 +1026,14 @@ class VMsMixin:
         sources = [*disk_sources, *media_sources]
         chains = session.backing_chains(sources) if sources else {}
 
+        if disk_dirs is None:
+            # where its disks are and every layer below them: an overlay in
+            # a disk_snapshot_dir is built on a boot disk in a workdir
+            disk_dirs = self._vm_disk_dirs(full_vm_name, [
+                *disk_sources,
+                *(layer for source in disk_sources
+                  for layer in (chains or {}).get(source, ()))])
+
         # decided with at capture and, for a domain undefined with nothing
         # saved, by the name-based fallback: a cluster workdir that cannot
         # be listed stops the teardown — before the undefine, at capture.
@@ -1050,6 +1056,23 @@ class VMsMixin:
                 raise ProvisionError(
                     f"{full_vm_name}: could not list {workdir} ({exc}), "
                     f"which holds its boot disk, overlays and memory files; "
+                    + ("leaving it defined and its storage in place"
+                       if exists else "leaving its storage in place")
+                    + " — make that directory readable, then retry") from exc
+        # a disk_snapshot_dir holds the overlays snapshot take created there,
+        # named as beside their disks: only those under the VM's exclusive
+        # name are its boot disk's family (a memory image there is decided
+        # by what its snapshots recorded, a data disk's overlay by its chain)
+        for overlay_dir in self._cluster_disk_snapshot_dirs():
+            try:
+                found.update(
+                    path for path in boot_family_candidates(overlay_dir,
+                                                            full_vm_name)
+                    if os.path.basename(path).startswith(f"{full_vm_name}."))
+            except OSError as exc:
+                raise ProvisionError(
+                    f"{full_vm_name}: could not list {overlay_dir} ({exc}), a "
+                    f"disk_snapshot_dir, which may hold its disk overlays; "
                     + ("leaving it defined and its storage in place"
                        if exists else "leaving its storage in place")
                     + " — make that directory readable, then retry") from exc
