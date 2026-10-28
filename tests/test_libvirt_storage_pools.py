@@ -213,6 +213,34 @@ class TestEnsurePoolOn:
         assert self._verbs(virsh, "pool-define-as") == [
             ("pool-define-as", "bprj_ov", "dir", "--target", str(ov))]
 
+    @pytest.mark.parametrize("alias", ["symlink", "bind mount"])
+    def test_its_name_taken_on_it_under_another_spelling_gets_another(
+            self, tmp_path, alias):
+        """Defined on an alias by an earlier version, say: that pool serves
+        no lookup by this spelling, and its name cannot be given again."""
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        other = tmp_path / "alias"
+        real_stat = os.stat
+        if alias == "symlink":
+            other.symlink_to(ov)
+            looked_up = real_stat
+        else:
+            other.mkdir()
+
+            def looked_up(path, *args, **kwargs):
+                return real_stat(ov if str(path) == str(other) else path,
+                                 *args, **kwargs)
+        virsh = self._virsh({"bprj_ov": str(other), "bprj_ov_2": "/elsewhere"})
+
+        with patch("boxman.providers.libvirt.storage_pools.os.stat",
+                   side_effect=looked_up):
+            pool = ensure_pool_on(virsh, str(ov), "bprj_ov")
+
+        assert pool == "bprj_ov_3"
+        assert self._verbs(virsh, "pool-define-as") == [
+            ("pool-define-as", "bprj_ov_3", "dir", "--target", str(ov))]
+
     @pytest.mark.skipif(os.geteuid() == 0,
                         reason="root searches a mode-000 directory")
     def test_one_whose_directory_cannot_be_looked_up_is_not_taken_for_it(

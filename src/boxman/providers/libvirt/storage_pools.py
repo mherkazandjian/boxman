@@ -87,7 +87,8 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
     serves neither — and is that directory by identity, ``(st_dev,
     st_ino)``: spelled alike, ``hidden/link/../../ov`` can be another
     directory than ``ov``, and one that cannot be looked up is not taken
-    for it.
+    for it. With *name* taken by a pool on this directory under another
+    path, the first free ``<name>_<n>`` is defined instead.
 
     Best effort: what stops it is named in a warning, never raised.
 
@@ -114,6 +115,8 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
         return None
     names = [line.strip() for line in listing.stdout.splitlines()
              if line.strip()]
+    # on it, but under another path: no lookup by this one finds them
+    elsewhere: set[str] = set()
     for pool in names:
         dumped = virsh.execute("pool-dumpxml", pool, warn=True)
         try:
@@ -123,14 +126,16 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
             path = None
         # one with no local directory (RBD, say) is not on it; one that
         # cannot be read makes the definition below fail, if it is
-        if path is None or os.path.normpath(path) != os.path.normpath(
-                directory):
+        if path is None:
             continue
         try:
             on = os.stat(path)
         except OSError:
             continue      # not known to be on it
         if (on.st_dev, on.st_ino) != target:
+            continue
+        if os.path.normpath(path) != os.path.normpath(directory):
+            elsewhere.add(pool)
             continue
         active = virsh.execute("pool-list", "--name", warn=True)
         if active.ok and pool in (line.strip()
@@ -142,7 +147,13 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
                         f"started: {(started.stderr or '').strip()}")
             return None
         return pool
-    if name in names:
+    if name in elsewhere:
+        # its name is taken on this very directory, under another path
+        taken, n = name, 2
+        while f"{taken}_{n}" in names:
+            n += 1
+        name = f"{taken}_{n}"
+    elif name in names:
         log.warning(f"{where}: a pool named {name} is on another directory")
         return None
     for verb in ("pool-define-as", "pool-start"):
