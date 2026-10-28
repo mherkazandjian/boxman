@@ -3509,7 +3509,9 @@ class TestMemoryImagesAnotherSnapshotRecords:
         assert shared.read_bytes() == b'replica RAM'
         assert (f'left {shared} in place because a snapshot of domain '
                 f'{self.REPLICA} records it') in t.warnings
-        t.session.snapshot_files_in_use.assert_called_once_with()
+        # no disk_snapshot_dir: the memory images alone, as before
+        t.session.snapshot_files_in_use.assert_called_once_with(
+            overlays_too=False)
 
     def test_one_recorded_there_under_another_name_is_kept(self, tmp_path):
         workdir, snaps = self._dirs(tmp_path)
@@ -3777,6 +3779,8 @@ class TestOverlaysInADiskSnapshotDir:
         assert shared.exists()
         assert not (base.exists() or s1.exists())
         assert f'a snapshot of domain {VM}.x records it' in t.warnings
+        t.session.snapshot_files_in_use.assert_called_once_with(
+            overlays_too=True)
 
     def test_a_layer_another_domains_snapshot_records_keeps_its_base(
             self, tmp_path):

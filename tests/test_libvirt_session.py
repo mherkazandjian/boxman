@@ -2684,7 +2684,7 @@ class TestSnapshotMemoryInUse:
     closed: ``None`` once any of them cannot be told."""
 
     def _run(self, images, relists=(), listing_ok=True, by_name=None,
-             overlays=None):
+             overlays=None, **scan):
         """Domains vm-a, vm-b and vm-x; *images* maps a domain to what
         ``SnapshotManager.memory_images`` answers when asked by that
         domain's UUID, and *overlays* to what ``overlay_files`` answers (by
@@ -2735,7 +2735,22 @@ class TestSnapshotMemoryInUse:
                    "recorded_files", autospec=True,
                    side_effect=recorded_files):
             virsh.return_value.execute.side_effect = virsh_execute
-            return _session({}).snapshot_files_in_use()
+            return _session({}).snapshot_files_in_use(**scan)
+
+    def test_without_overlays_it_holds_the_memory_images_alone(self, tmp_path):
+        """For a cluster with no disk_snapshot_dir: what it held before
+        overlays could be there, so it fails only where it failed then."""
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        overlay = tmp_path / "b.s1"
+        overlay.write_bytes(b"overlay")
+
+        in_use = self._run({"vm-a": {"s1": str(raw)}, "vm-b": {}, "vm-x": {}},
+                           overlays={"vm-b": {"s1": [str(overlay)]}},
+                           overlays_too=False)
+
+        assert in_use[str(raw)] == "vm-a"
+        assert str(overlay) not in in_use
 
     def test_the_overlays_other_domains_snapshots_record(self, tmp_path):
         """Run on or not: one only a snapshot records is that snapshot's."""

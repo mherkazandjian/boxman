@@ -3573,19 +3573,25 @@ class TestForceClearProtectsFilesInUse:
         assert ok is False and rm == [] and os.path.isfile(mem)
         assert "could not check whether a snapshot of another domain" in errors
 
-    def test_the_session_hands_it_its_scan(self, tmp_path: Path):
+    @pytest.mark.parametrize("disk_dir", [None, "/fast/ov"])
+    def test_the_session_hands_it_its_scan(self, tmp_path: Path, disk_dir):
+        """Other domains' overlays are asked about only with a
+        disk_snapshot_dir; without one, the memory images alone, as
+        before."""
         session = LibVirtSession(
             config={'provider': {'libvirt': {'virsh_cmd': 'false'}}})
         with patch.object(SnapshotManager, "create_snapshot",
                           return_value=True) as create:
             session.snapshot_take(vm_name="vm01", vm_dir=str(tmp_path),
                                   snapshot_name="snapX", description="",
-                                  force=True)
+                                  force=True, disk_dir=disk_dir)
 
         assert create.call_args.kwargs["paths_in_use"] == (
             session.disk_paths_in_use)
-        assert create.call_args.kwargs["recorded_in_use"] == (
-            session.snapshot_files_in_use)
+        with patch.object(session, "snapshot_files_in_use",
+                          return_value="scan") as scan:
+            assert create.call_args.kwargs["recorded_in_use"]() == "scan"
+        scan.assert_called_once_with(overlays_too=disk_dir is not None)
 
 
 class TestTakeWritesOverNoFile:

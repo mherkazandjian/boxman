@@ -831,12 +831,15 @@ class VMsMixin:
                 f"storage under a possibly-live guest")
 
         # remove_vm_storage() raises on a filesystem error, which reaches
-        # _run_parallel's failure handling
+        # _run_parallel's failure handling. Other domains' overlays are
+        # asked about only where one can be removed: in a disk_snapshot_dir
+        overlay_dirs = self._cluster_disk_snapshot_dirs()
         outcome = remove_vm_storage(
             inventory, self._cluster_workdirs(), session.disk_paths_in_use,
             memory_dirs=self._cluster_memory_snapshot_dirs(),
-            recorded_in_use=session.snapshot_files_in_use,
-            overlay_dirs=self._cluster_disk_snapshot_dirs())
+            recorded_in_use=lambda: session.snapshot_files_in_use(
+                overlays_too=bool(overlay_dirs)),
+            overlay_dirs=overlay_dirs)
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")

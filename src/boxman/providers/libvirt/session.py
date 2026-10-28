@@ -2397,7 +2397,8 @@ class LibVirtSession(SessionConfigMixin):
             compress_level=compress_level,
             force=force,
             paths_in_use=self.disk_paths_in_use,
-            recorded_in_use=self.snapshot_files_in_use,
+            recorded_in_use=lambda: self.snapshot_files_in_use(
+                overlays_too=disk_dir is not None),
             disk_dir=disk_dir)
 
     def ensure_pool_on(self, directory: str, name: str) -> str | None:
@@ -2506,11 +2507,13 @@ class LibVirtSession(SessionConfigMixin):
         """
         return SnapshotManager(self.provider_config).overlay_files(vm_name)
 
-    def snapshot_files_in_use(self) -> FilesInUse | None:
+    def snapshot_files_in_use(self,
+                              overlays_too: bool = True) -> FilesInUse | None:
         """
         The files the snapshots of every defined domain record — each
         memory image as libvirt recorded it, with the ``.raw.zst``
-        compression leaves beside it, and each external overlay — mapped,
+        compression leaves beside it, and, *overlays_too*, each external
+        overlay — mapped,
         as :meth:`disk_paths_in_use` maps files, by path and by identity to
         the domain. A teardown or a ``snapshot take --force`` that removes
         a memory image, or a file in a disk_snapshot_dir, must not remove
@@ -2518,7 +2521,9 @@ class LibVirtSession(SessionConfigMixin):
         directory their clusters share, when one VM's full name begins with
         the other's (``v`` taking ``x.s1`` and ``v.x`` taking ``s1`` both
         name the overlay ``v.x.s1``), and an overlay no domain runs on any
-        more is still its snapshot's.
+        more is still its snapshot's. Without a disk_snapshot_dir the
+        memory images alone are asked about, as before overlays could be
+        there: an overlay whose identity cannot be read fails no such scan.
 
         No domain is left out, not even by the name of the VM being torn
         down: that one is undefined by the time this is asked, so a domain
@@ -2557,7 +2562,8 @@ class LibVirtSession(SessionConfigMixin):
             images, overlays = files
             paths = [*(path for image in images.values()
                        for path in (image, f"{image}.zst")),
-                     *(path for layers in overlays.values() for path in layers)]
+                     *(path for layers in overlays.values() for path in layers
+                       if overlays_too)]
             if not self._record_in_use(recorded, domain, paths):
                 return None
         return recorded
