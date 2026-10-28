@@ -161,11 +161,13 @@ class SnapshotManager:
 
     def _snapshot_excluded_targets(self, vm_name: str) -> set[str] | None:
         """
-        The targets of *vm_name*'s disks a snapshot leaves out unless a
-        diskspec names them — those set ``snapshot='no'``, and read-only
-        ones that set no mode of their own (one set ``external`` is taken)
-        — which ``domblklist`` does not show; ``None`` when its definition
-        cannot be read.
+        The targets of *vm_name*'s disks a snapshot takes no external
+        overlay of unless a diskspec says otherwise — those set a mode of
+        their own other than ``external`` (``no``, ``manual``,
+        ``internal``), and read-only ones that set none — which
+        ``domblklist`` does not show; ``None`` when its definition cannot
+        be read. Naming one in a diskspec would change its mode, not just
+        where its overlay goes.
         """
         result = self.virsh.execute("dumpxml", vm_name, warn=True)
         if not result.ok:
@@ -179,8 +181,9 @@ class SnapshotManager:
             target = disk.find("target")
             dev = target.get("dev") if target is not None else None
             mode = disk.get("snapshot")
-            if dev and (mode == "no" or (mode is None
-                                         and disk.find("readonly") is not None)):
+            if dev and (mode not in (None, "external")
+                        or (mode is None
+                            and disk.find("readonly") is not None)):
                 excluded.add(dev)
         return excluded
 

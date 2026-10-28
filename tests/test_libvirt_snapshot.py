@@ -3806,7 +3806,12 @@ class TestOverlaysInADiskSnapshotDir:
         "<target dev='vdb'/></disk>",
         "<disk type='file' device='disk' snapshot='no'>"
         "<target dev='vdb'/></disk>",
-    ], ids=["read-only", "snapshot-no"])
+        "<disk type='file' device='disk' snapshot='manual'>"
+        "<target dev='vdb'/></disk>",
+        "<disk type='file' device='disk' snapshot='internal'>"
+        "<target dev='vdb'/></disk>",
+    ], ids=["read-only", "snapshot-no", "snapshot-manual",
+            "snapshot-internal"])
     def test_a_disk_a_snapshot_leaves_out_gets_no_overlay(self, sm, tmp_path,
                                                           excluded):
         """libvirt leaves it out unless told otherwise, and domblklist
@@ -3887,10 +3892,15 @@ class TestOverlaysInADiskSnapshotDir:
             "<target dev='vdd'/></disk>",
             # read-only, but set to be snapshotted: libvirt takes it
             "<disk device='disk' snapshot='external'><readonly/>"
-            "<target dev='vde'/></disk>")
+            "<target dev='vde'/></disk>",
+            # set to another mode of their own: no external overlay
+            "<disk device='disk' snapshot='manual'><target dev='vdf'/></disk>",
+            "<disk device='disk' snapshot='internal'>"
+            "<target dev='vdg'/></disk>")
         with patch.object(sm.virsh, "execute",
                           return_value=_result(stdout=domain)) as execute:
-            assert sm._snapshot_excluded_targets("vm01") == {"vdb", "vdc"}
+            assert sm._snapshot_excluded_targets("vm01") == {
+                "vdb", "vdc", "vdf", "vdg"}
         assert execute.call_args.args[:2] == ("dumpxml", "vm01")
 
     def test_force_clears_a_leftover_there(self, sm, tmp_path):
