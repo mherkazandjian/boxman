@@ -159,21 +159,49 @@ class SnapshotManager:
         stem = os.path.splitext(os.path.basename(source))[0]
         return f"{stem}.{snapshot_name}"
 
+    def _snapshot_excluded_targets(self, vm_name: str) -> set[str] | None:
+        """
+        The targets of *vm_name*'s disks a snapshot leaves out unless a
+        diskspec names them — read-only ones, and those set
+        ``snapshot='no'`` — which ``domblklist`` does not show; ``None``
+        when its definition cannot be read.
+        """
+        result = self.virsh.execute("dumpxml", vm_name, warn=True)
+        if not result.ok:
+            return None
+        try:
+            root = ET.fromstring(result.stdout)
+        except ET.ParseError:
+            return None
+        excluded = set()
+        for disk in root.findall("./devices/disk"):
+            target = disk.find("target")
+            dev = target.get("dev") if target is not None else None
+            if dev and (disk.find("readonly") is not None
+                        or disk.get("snapshot") == "no"):
+                excluded.add(dev)
+        return excluded
+
     def _overlay_diskspec_args(self, vm_name: str, snapshot_name: str,
                                disk_dir: str | None) -> list[str] | None:
         """
         ``--diskspec <target>,snapshot=external,file=<overlay>`` for each
-        disk of *vm_name*: its overlay in *disk_dir*, under the name libvirt
-        would give it beside the disk (:meth:`_overlay_name`), so every rule
-        anchored at the VM's names still applies. ``[]`` when *disk_dir* is
-        ``None``: libvirt then creates each beside its disk.
+        disk of *vm_name* a snapshot takes: its overlay in *disk_dir*, under
+        the name libvirt would give it beside the disk
+        (:meth:`_overlay_name`). ``[]`` when *disk_dir* is ``None``: libvirt
+        then creates each beside its disk.
+
+        A disk a snapshot leaves out unless told otherwise
+        (:meth:`_snapshot_excluded_targets`) is not named: a diskspec would
+        force it in.
 
         A ``,`` in the path is written ``,,``: virsh splits a diskspec at
         commas.
 
         Returns ``None`` — the reason logged — when the overlays cannot be
         placed there: the disks cannot be listed (taken anyway, the overlays
-        would land beside the disks), or two disks would share an overlay.
+        would land beside the disks), the definition cannot be read, or two
+        disks would share an overlay.
         """
         if disk_dir is None:
             return []
@@ -185,10 +213,17 @@ class SnapshotManager:
                 f"{where}: its disks could not be listed "
                 f"({(result.stderr or '').strip()})")
             return None
+        excluded = self._snapshot_excluded_targets(vm_name)
+        if excluded is None:
+            self.logger.error(
+                f"{where}: its definition could not be read, to tell which "
+                f"disks a snapshot leaves out")
+            return None
         args: list[str] = []
         taken: dict[str, str] = {}
         for row in parse_domblklist(result.stdout):
-            if row.device != 'disk' or not row.source or row.source == '-':
+            if (row.device != 'disk' or not row.source or row.source == '-'
+                    or row.target in excluded):
                 continue
             overlay = os.path.join(
                 disk_dir, self._overlay_name(row.source, snapshot_name))
@@ -340,10 +375,17 @@ class SnapshotManager:
         stale file at that exact path is what triggers libvirt's "external
         snapshot file … already exists and is not a block device" error on
         a re-take.
+
+        A disk a snapshot leaves out (:meth:`_snapshot_excluded_targets`)
+        gets no overlay, so a file at its name is no leftover: none is
+        predicted for it, and none at all when that cannot be told.
         """
+        excluded = self._snapshot_excluded_targets(vm_name)
+        if excluded is None:
+            return []
         paths = []
-        for _target, source in self._data_disk_targets(vm_name):
-            if not source or source == '-':
+        for target, source in self._data_disk_targets(vm_name):
+            if not source or source == '-' or target in excluded:
                 continue
             directory = (os.path.dirname(source) if disk_dir is None
                          else disk_dir)

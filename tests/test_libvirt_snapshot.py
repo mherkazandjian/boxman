@@ -3314,12 +3314,16 @@ class TestWouldBeOverlayPaths:
         # libvirt drops the source's final suffix and appends .<snapshot>
         with patch.object(sm, "_data_disk_targets",
                           return_value=[("vda", "/ws/vm01.qcow2"),
-                                        ("vdb", "/ws/vm01-data.1784942899")]):
+                                        ("vdb", "/ws/vm01-data.1784942899")]), \
+             patch.object(sm, "_snapshot_excluded_targets",
+                          return_value=set()):
             paths = sm._would_be_overlay_paths("vm01", "snapX")
         assert paths == ["/ws/vm01.snapX", "/ws/vm01-data.snapX"]
 
     def test_skips_placeholder_source(self, sm: SnapshotManager):
-        with patch.object(sm, "_data_disk_targets", return_value=[("vda", "-")]):
+        with patch.object(sm, "_data_disk_targets", return_value=[("vda", "-")]), \
+             patch.object(sm, "_snapshot_excluded_targets",
+                          return_value=set()):
             assert sm._would_be_overlay_paths("vm01", "snapX") == []
 
 
@@ -3353,6 +3357,8 @@ class TestForceClearForRetake:
         with patch.object(sm.virsh, "execute", return_value=absent), \
              patch.object(sm, "_data_disk_targets",
                           return_value=[("vda", active)]), \
+             patch.object(sm, "_snapshot_excluded_targets",
+                          return_value=set()), \
              patch.object(sm.virsh, "execute_shell", side_effect=fake_shell):
             assert sm._force_clear_for_retake(
                 "vm01", str(tmp_path), "snapX",
@@ -3652,8 +3658,16 @@ class TestOverlaysInADiskSnapshotDir:
         return "Type Device Target Source\n" + "".join(
             f"file disk {target} {source}\n" for target, source in rows)
 
+    #: a definition whose disks a snapshot takes as it is told
+    DOMAIN = "<domain><devices/></domain>"
+
+    @staticmethod
+    def _domain(*disks: str) -> str:
+        return f"<domain><devices>{''.join(disks)}</devices></domain>"
+
     def _create(self, sm, tmp_path, disk_dir, blklist=None, listed=True,
-                **kw):
+                domain=DOMAIN, **kw):
+        """*domain*: what ``dumpxml`` answers; ``None``, it fails."""
         calls = []
 
         def execute(*args, **_kw):
@@ -3663,6 +3677,10 @@ class TestOverlaysInADiskSnapshotDir:
                     return _result(ok=False, stderr="error: no domain")
                 return _result(stdout=self.BLKLIST if blklist is None
                                else blklist)
+            if args[0] == "dumpxml":
+                if domain is None:
+                    return _result(ok=False, stderr="error: no domain")
+                return _result(stdout=domain)
             return _result()
 
         with patch.object(sm, "_flatten_cdrom_overlays"), \
@@ -3719,13 +3737,76 @@ class TestOverlaysInADiskSnapshotDir:
         assert ok is False
         assert creates == []
 
+    @pytest.mark.parametrize("excluded", [
+        "<disk type='file' device='disk'><readonly/>"
+        "<target dev='vdb'/></disk>",
+        "<disk type='file' device='disk' snapshot='no'>"
+        "<target dev='vdb'/></disk>",
+    ], ids=["read-only", "snapshot-no"])
+    def test_a_disk_a_snapshot_leaves_out_gets_no_overlay(self, sm, tmp_path,
+                                                          excluded):
+        """libvirt leaves it out unless told otherwise, and domblklist
+        does not say so: named, it would be forced into the snapshot — and
+        here would collide with the writable disk's overlay."""
+        ok, [args] = self._create(
+            sm, tmp_path, "/fast/ov",
+            blklist=self._blklist(("vda", "/work/vm01.qcow2"),
+                                  ("vdb", "/reference/vm01.qcow2")),
+            domain=self._domain(excluded))
+
+        assert ok is True
+        assert self._specs(args) == [
+            "vda,snapshot=external,file=/fast/ov/vm01.s2"]
+
+    def test_a_definition_that_cannot_be_read_refuses_the_take(self, sm,
+                                                               tmp_path):
+        ok, creates = self._create(sm, tmp_path, "/fast/ov", domain=None)
+
+        assert ok is False
+        assert creates == []
+
     def test_force_predicts_the_leftovers_there(self, sm):
         with patch.object(sm, "_data_disk_targets",
                           return_value=[("vda", "/ws/vm01.qcow2"),
-                                        ("vdb", "/fast/ov/vm01_data.s1")]):
+                                        ("vdb", "/fast/ov/vm01_data.s1")]), \
+                patch.object(sm, "_snapshot_excluded_targets",
+                             return_value=set()):
             assert sm._would_be_overlay_paths(
                 "vm01", "snapX", disk_dir="/fast/ov") == [
                     "/fast/ov/vm01.snapX", "/fast/ov/vm01_data.snapX"]
+
+    @pytest.mark.parametrize("disk_dir", [None, "/fast/ov"])
+    def test_force_predicts_none_for_a_disk_a_snapshot_leaves_out(
+            self, sm, disk_dir):
+        """Never created there, a file at its name is no leftover."""
+        with patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", "/work/vm01.qcow2"),
+                                        ("vdb", "/reference/vm01.qcow2")]), \
+                patch.object(sm, "_snapshot_excluded_targets",
+                             return_value={"vdb"}):
+            paths = sm._would_be_overlay_paths("vm01", "snapX",
+                                               disk_dir=disk_dir)
+
+        assert paths == [os.path.join(disk_dir or "/work", "vm01.snapX")]
+
+    def test_force_predicts_nothing_when_it_cannot_tell(self, sm):
+        with patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", "/work/vm01.qcow2")]), \
+                patch.object(sm, "_snapshot_excluded_targets",
+                             return_value=None):
+            assert sm._would_be_overlay_paths("vm01", "snapX") == []
+
+    def test_what_a_snapshot_leaves_out_is_read_from_the_definition(self, sm):
+        domain = self._domain(
+            "<disk device='disk'><target dev='vda'/></disk>",
+            "<disk device='disk'><readonly/><target dev='vdb'/></disk>",
+            "<disk device='disk' snapshot='no'><target dev='vdc'/></disk>",
+            "<disk device='disk' snapshot='external'>"
+            "<target dev='vdd'/></disk>")
+        with patch.object(sm.virsh, "execute",
+                          return_value=_result(stdout=domain)) as execute:
+            assert sm._snapshot_excluded_targets("vm01") == {"vdb", "vdc"}
+        assert execute.call_args.args[:2] == ("dumpxml", "vm01")
 
     def test_force_clears_a_leftover_there(self, sm, tmp_path):
         ov = tmp_path / "ov"
@@ -3739,6 +3820,8 @@ class TestOverlaysInADiskSnapshotDir:
         with patch.object(sm.virsh, "execute", return_value=absent), \
              patch.object(sm, "_data_disk_targets",
                           return_value=[("vda", str(tmp_path / "vm01.qcow2"))]), \
+             patch.object(sm, "_snapshot_excluded_targets",
+                          return_value=set()), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=lambda cmd, *a, **k: (
                               removed.append(cmd), _result())[1]):
@@ -3764,6 +3847,8 @@ class TestOverlaysInADiskSnapshotDir:
         with patch.object(sm.virsh, "execute", return_value=absent), \
              patch.object(sm, "_data_disk_targets",
                           return_value=[("vda", str(tmp_path / "vm01.qcow2"))]), \
+             patch.object(sm, "_snapshot_excluded_targets",
+                          return_value=set()), \
              patch.object(sm.virsh, "execute_shell",
                           side_effect=lambda cmd, *a, **k: (
                               removed.append(cmd), _result())[1]):

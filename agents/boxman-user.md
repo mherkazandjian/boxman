@@ -1167,7 +1167,8 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
   (same path rules; made `0711` on first use, the directories made on the
   way searchable, since QEMU opens the overlays as another user), else
   beside each disk. They keep libvirt's names, `<vm>.<snapshot>` and
-  `<vm>_<disk>.<snapshot>`. After a take the newest overlay *is* the disk
+  `<vm>_<disk>.<snapshot>`; a read-only disk, or one set `snapshot='no'`,
+  gets none, as without it. After a take the newest overlay *is* the disk
   the guest writes to: the directory holds live disks, not backups — and
   restore writes its `<overlay>.preserve` copies there too. A take sees to
   a libvirt storage pool on it (`bprj__<project>__bprj_<cluster>_disk_snapshots`
