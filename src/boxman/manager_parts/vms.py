@@ -1383,36 +1383,67 @@ class VMsMixin:
         image that is not there. A chain that cannot be read makes them all
         unknown (``None``), which keeps everything. The overlays only its
         snapshots recorded are read again too, and decided with only as
-        they were saved (:meth:`_overlay_chains_now`).
+        they were saved (:meth:`_overlay_chains_now`); what of them this
+        retry found is saved first.
         """
         sources = [*saved.disk_sources, *saved.media_sources]
         chains = self._chains_left(
             session, session.backing_chains(sources) if sources else {},
             saved.disk_sources, saved.chains)
-        return dataclasses.replace(
-            saved, chains=chains,
-            overlay_chains=self._overlay_chains_now(session, saved, sources))
+        overlay_chains, found = self._overlay_chains_now(session, saved,
+                                                         sources)
+        if found:
+            # before anything is removed, as the next retry may find those
+            # files gone. Where it was found, alone: its locator, if it has
+            # one, names it already
+            saved = dataclasses.replace(saved, **found)
+            try:
+                save_teardown_inventory(saved,
+                                        os.path.dirname(saved.saved_at))
+            except OSError as exc:
+                raise ProvisionError(
+                    f"{saved.vm_name}: could not save what this retry found "
+                    f"to its teardown inventory at {saved.saved_at} ({exc}); "
+                    f"leaving its storage in place") from exc
+        return dataclasses.replace(saved, chains=chains,
+                                   overlay_chains=overlay_chains)
 
     def _overlay_chains_now(self, session, saved: StorageInventory,
                             sources: list[str],
-                            ) -> dict[str, list[str]] | None:
+                            ) -> tuple[dict[str, list[str]] | None,
+                                       dict[str, object]]:
         """
         The chains of the overlays only *saved*'s snapshots recorded, read
         again, now, for a retry to decide with — or ``None``, which keeps
-        everything.
+        everything — and what of them to save.
 
-        A retry decides only with chains read now that agree with those the
-        first attempt saved, which are never changed. A teardown removes
-        heads first, so what an interruption leaves of a saved chain is its
-        bottom part, built as it was: the chain of its topmost layer still
-        there, read now, is the saved chain from that layer down. Anything
-        else — a layer rebased or replaced since, a chain that cannot be
-        read, one gone at first (saved as ``[]``) and back since, a recorded
-        overlay with no chain saved — is not what the first attempt decided
-        with, and what depends on what cannot be told. A first attempt that
-        could read none of them (``None`` saved) removed nothing, so they
-        are read as it would have read them, if all of them are still there.
+        A retry decides only with chains read now that agree with those
+        saved, which are never rewritten. A teardown removes heads first,
+        so what an interruption leaves of a saved chain is its bottom part,
+        built as it was: the chain of its topmost layer still there, read
+        now, is the saved chain from that layer down. A layer rebased or
+        replaced since, or one gone at first (saved as ``[]``) and back, is
+        not what was decided with, and what depends on what cannot be told
+        again: that is saved, and every retry after keeps everything too,
+        should those files go. A chain that cannot be read, or a recorded
+        overlay with no chain saved, keeps everything this time. Saved as
+        ``None`` (none could be read), nothing was removed, so they are read
+        as at capture, all of them still there — and saved, for the retries
+        after this one to decide with.
+
+        Returns:
+            ``(chains, found)``: the chains to decide with, or ``None``; and
+            the inventory's fields to save before anything is removed
+            (empty: none).
         """
+        def changed(reason: str) -> None:
+            self.logger.warning(
+                f"{saved.vm_name}: {reason}; what depends on what cannot be "
+                f"told, so no retry removes anything of it")
+
+        if saved.overlay_chains_changed:
+            changed(saved.overlay_chains_changed)
+            return None, {}
         known = saved.overlay_chains
         heads = list(dict.fromkeys([
             *snapshot_only_overlays(saved.overlays, sources),
@@ -1425,35 +1456,43 @@ class VMsMixin:
                 self.logger.warning(
                     f"{saved.vm_name}: {gone[0]}, an overlay a snapshot of it "
                     f"recorded, is gone, and no chain was saved for it")
-            return None if gone else now
+            if now is None or gone:
+                return None, {}
+            return now, {"overlay_chains": now}
         chains: dict[str, list[str]] = {}
+        unknown = False
         for head in heads:
             if head not in known:
                 self.logger.warning(
                     f"{saved.vm_name}: no chain was saved for {head}, an "
                     f"overlay a snapshot of it recorded")
-                return None
+                unknown = True
+                continue
             # [] — gone at first: it is read once more, and must be gone
             layers = known[head]
             for index, layer in enumerate(layers or [head]):
                 now = session.backing_chains([layer])
                 if now is None:
-                    return None
+                    unknown = True
+                    break
                 if layer not in now:
                     continue      # removed since, from the top
                 if now[layer] != layers[index:]:
-                    self.logger.warning(
-                        f"{saved.vm_name}: {layer}, of an overlay a snapshot "
-                        f"of it recorded, is built on "
-                        f"{' -> '.join(now[layer][1:]) or 'nothing'} now, "
-                        + (f"not on "
-                           f"{' -> '.join(layers[index + 1:]) or 'nothing'}"
-                           if layers else "and was not there")
-                        + " when its teardown began")
-                    return None
+                    built_on = ' -> '.join(now[layer][1:]) or 'nothing'
+                    reason = (
+                        f"{layer}, of an overlay a snapshot of it recorded, "
+                        f"was built on "
+                        f"{' -> '.join(layers[index + 1:]) or 'nothing'} "
+                        f"when its teardown began, and on {built_on} at a "
+                        f"retry" if layers else
+                        f"{layer}, an overlay a snapshot of it recorded, was "
+                        f"not there when its teardown began, and was built "
+                        f"on {built_on} at a retry")
+                    changed(reason)
+                    return None, {"overlay_chains_changed": reason}
                 chains[layer] = now[layer]
                 break
-        return chains
+        return (None if unknown else chains), {}
 
     @staticmethod
     def _chains_left(session, chains: dict[str, list[str]] | None,

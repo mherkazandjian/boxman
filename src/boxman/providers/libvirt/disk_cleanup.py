@@ -361,10 +361,13 @@ class StorageInventory:
     overlays: dict[str, list[str]] | None = None
     #: the backing chain of each of :attr:`overlays` that is no disk or
     #: media source, as :attr:`chains` holds theirs — ``[]`` for one already
-    #: gone — and like theirs read again on a retry (one removed since mapped
-    #: to what is left of it, and with nothing saved for it, unknown);
-    #: ``None`` when one could not be read
+    #: gone — which a retry decides with only as they agree with it; never
+    #: rewritten once known. ``None`` when one could not be read, until the
+    #: first retry that reads them all saves them
     overlay_chains: dict[str, list[str]] | None = field(default_factory=dict)
+    #: why a retry found :attr:`overlay_chains` otherwise than saved: once
+    #: set, saved with it, and every retry keeps everything
+    overlay_chains_changed: str | None = None
     #: where it was saved before undefining (see
     #: :func:`save_teardown_inventory`); not saved itself
     saved_at: str | None = None
@@ -444,6 +447,7 @@ def save_teardown_inventory(inventory: StorageInventory,
         "memory_images": inventory.memory_images,
         "overlays": inventory.overlays,
         "overlay_chains": inventory.overlay_chains,
+        "overlay_chains_changed": inventory.overlay_chains_changed,
     }
     _write_json_atomically(path, data)
     return path
@@ -544,6 +548,9 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
         _field(data, "overlay_chains",
                lambda v: v is None or _is_map(v, _is_paths))
         if "overlay_chains" in data else {})
+    changed = (_field(data, "overlay_chains_changed",
+                      lambda v: v is None or isinstance(v, str))
+               if "overlay_chains_changed" in data else None)
     return StorageInventory(
         vm_name=vm_name,
         disk_sources=list(_field(data, "disk_sources", _is_paths)),
@@ -563,6 +570,7 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
                   else {k: list(v) for k, v in overlays.items()}),
         overlay_chains=(None if overlay_chains is None
                         else {k: list(v) for k, v in overlay_chains.items()}),
+        overlay_chains_changed=changed,
         saved_at=path,
     )
 

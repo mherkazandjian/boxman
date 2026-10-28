@@ -300,8 +300,8 @@ clusters:
   VM's full name can begin with this one's and a dot, and never a file
   another domain's snapshot records. Run again after an interruption, it
   goes on only while the backing chains of the overlays only its snapshots
-  recorded are as the first attempt read them, less the layers it removed;
-  one rebased or replaced since keeps everything, and is named.
+  recorded are as first read, less the layers it removed; one rebased or
+  replaced since keeps everything from then on, and is named.
 - `storage df` and `storage compact` work from each VM's base disks in the
   workdir, as before: the overlays above them, beside the disk or in a
   `disk_snapshot_dir`, are not measured or compacted.
