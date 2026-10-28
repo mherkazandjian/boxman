@@ -1062,7 +1062,7 @@ def remove_vm_storage(
     for path in inventory.boot_family:
         if path in extra_related and media_refusal(path) is None:
             continue
-        if (is_memory_image(vm, path)
+        if (overlay_dirs and is_memory_image(vm, path)
                 and real(os.path.dirname(path)) not in real_workdirs
                 and _directory_is_one_of(path, memory_ids)):
             # what its snapshots recorded decides it (1b), but every refusal
@@ -1204,12 +1204,13 @@ def remove_vm_storage(
     if chains is not None and overlay_chains is not None:
         chains = {**overlay_chains, **chains}
     if chains is None or overlay_chains is None:
-        unread = ("of the vm's disks" if chains is None
-                  else "of the overlays its snapshots recorded")
+        unread = ("of the vm's disks could not be read" if chains is None
+                  else "of the overlays its snapshots recorded could not be "
+                       "read, or changed since the teardown began")
         for path in list(admission.admitted.values()):
             admission.refuse(path, (
-                f"the backing chains {unread} could not be read, so what "
-                f"depends on it cannot be told"))
+                f"the backing chains {unread}, so what depends on it cannot "
+                f"be told"))
     else:
         _refuse_incomplete_chains(chains, admission)
     if identities.unreadable:
