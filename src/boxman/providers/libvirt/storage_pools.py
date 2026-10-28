@@ -69,3 +69,73 @@ def refresh_pools_holding(virsh, paths: Iterable[str]) -> list[str]:
                 f"could not refresh storage pool {pool} after removing files "
                 f"from it: {(result.stderr or '').strip()}")
     return refreshed
+
+
+def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
+    """
+    An active storage pool on *directory*, for the chain reads that find a
+    file there through libvirt (#221): the one already on it, under
+    whatever name — started if it is not — else a new directory pool
+    *name*, started and set to autostart.
+
+    A pool named *name* on another directory is never taken for it: a
+    workdir ``…/ws/web`` and an overlay directory ``…/ov/web`` share a
+    basename.
+
+    Best effort: what stops it is named in a warning, never raised.
+
+    Args:
+        virsh: Command executor with an ``execute`` method (a
+            :class:`VirshCommand`).
+        directory: The directory the pool must be on.
+        name: The name of the pool to define when none is on it.
+
+    Returns:
+        The pool's name, or ``None`` when there is none on *directory*.
+    """
+    target = os.path.realpath(directory)
+    where = f"could not see to a storage pool on {directory}"
+    listing = virsh.execute("pool-list", "--all", "--name", warn=True)
+    if not listing.ok:
+        log.warning(f"{where}: the pools could not be listed: "
+                    f"{(listing.stderr or '').strip()}")
+        return None
+    names = [line.strip() for line in listing.stdout.splitlines()
+             if line.strip()]
+    for pool in names:
+        dumped = virsh.execute("pool-dumpxml", pool, warn=True)
+        try:
+            path = (ET.fromstring(dumped.stdout).findtext("./target/path")
+                    if dumped.ok else None)
+        except ET.ParseError:
+            path = None
+        # one with no local directory (RBD, say) is not on it; one that
+        # cannot be read makes the definition below fail, if it is
+        if path is None or os.path.realpath(path) != target:
+            continue
+        active = virsh.execute("pool-list", "--name", warn=True)
+        if active.ok and pool in (line.strip()
+                                  for line in active.stdout.splitlines()):
+            return pool
+        started = virsh.execute("pool-start", pool, warn=True)
+        if not started.ok:
+            log.warning(f"{where}: pool {pool} is on it but could not be "
+                        f"started: {(started.stderr or '').strip()}")
+            return None
+        return pool
+    if name in names:
+        log.warning(f"{where}: a pool named {name} is on another directory")
+        return None
+    for verb in ("pool-define-as", "pool-start"):
+        args = ((name, "dir", "--target", directory)
+                if verb == "pool-define-as" else (name,))
+        result = virsh.execute(verb, *args, warn=True)
+        if not result.ok:
+            log.warning(f"{where}: {verb} {name} failed: "
+                        f"{(result.stderr or '').strip()}")
+            return None
+    autostart = virsh.execute("pool-autostart", name, warn=True)
+    if not autostart.ok:
+        log.warning(f"storage pool {name} on {directory} will not start with "
+                    f"the host: {(autostart.stderr or '').strip()}")
+    return name

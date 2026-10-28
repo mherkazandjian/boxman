@@ -148,6 +148,61 @@ class SnapshotManager:
                 args.extend(["--diskspec", f"{row.target},snapshot=no"])
         return args
 
+    @staticmethod
+    def _overlay_name(source: str, snapshot_name: str) -> str:
+        """
+        The name libvirt gives the external overlay of a disk whose current
+        source is *source*, when no ``file=`` is given: the source's last
+        suffix dropped, then ``.<snapshot_name>`` — ``…_data.qcow2`` and
+        ``…_data.1785187648`` both give ``…_data.<snapshot_name>``.
+        """
+        stem = os.path.splitext(os.path.basename(source))[0]
+        return f"{stem}.{snapshot_name}"
+
+    def _overlay_diskspec_args(self, vm_name: str, snapshot_name: str,
+                               disk_dir: str | None) -> list[str] | None:
+        """
+        ``--diskspec <target>,snapshot=external,file=<overlay>`` for each
+        disk of *vm_name*: its overlay in *disk_dir*, under the name libvirt
+        would give it beside the disk (:meth:`_overlay_name`), so every rule
+        anchored at the VM's names still applies. ``[]`` when *disk_dir* is
+        ``None``: libvirt then creates each beside its disk.
+
+        A ``,`` in the path is written ``,,``: virsh splits a diskspec at
+        commas.
+
+        Returns ``None`` — the reason logged — when the overlays cannot be
+        placed there: the disks cannot be listed (taken anyway, the overlays
+        would land beside the disks), or two disks would share an overlay.
+        """
+        if disk_dir is None:
+            return []
+        where = f"cannot place the overlays of {vm_name} in {disk_dir}"
+        result = self.virsh.execute("domblklist", vm_name, "--details",
+                                    warn=True)
+        if not result.ok:
+            self.logger.error(
+                f"{where}: its disks could not be listed "
+                f"({(result.stderr or '').strip()})")
+            return None
+        args: list[str] = []
+        taken: dict[str, str] = {}
+        for row in parse_domblklist(result.stdout):
+            if row.device != 'disk' or not row.source or row.source == '-':
+                continue
+            overlay = os.path.join(
+                disk_dir, self._overlay_name(row.source, snapshot_name))
+            if overlay in taken:
+                self.logger.error(
+                    f"{where}: disks {taken[overlay]} and {row.target} would "
+                    f"both get {overlay}")
+                return None
+            taken[overlay] = row.target
+            spec = (f"{row.target},snapshot=external,"
+                    f"file={overlay.replace(',', ',,')}")
+            args.extend(["--diskspec", spec])
+        return args
+
     def create_snapshot(self,
                         vm_name: str,
                         vm_dir: str,
@@ -157,7 +212,8 @@ class SnapshotManager:
                         compress_level: int = 3,
                         force: bool = False,
                         paths_in_use=None,
-                        memory_in_use=None) -> bool:
+                        memory_in_use=None,
+                        disk_dir: str | None = None) -> bool:
         """
         Create a snapshot of a VM.
 
@@ -171,8 +227,10 @@ class SnapshotManager:
             vm_name: Name of the VM
             vm_dir: Directory the memory image is written to, as
                 ``<vm>_snapshot_<name>.raw`` (the cluster's
-                ``memory_snapshot_dir``, by default its workdir); disk
-                overlays are created beside their disks
+                ``memory_snapshot_dir``, by default its workdir)
+            disk_dir: Directory the disk overlays are created in (the
+                cluster's ``disk_snapshot_dir``); ``None``, beside their
+                disks (:meth:`_overlay_diskspec_args`)
             snapshot_name: Name for the snapshot
             description: Description for the snapshot
             compress_memory: If True, zstd-compress the .raw memory file
@@ -200,7 +258,8 @@ class SnapshotManager:
         try:
             if force and not self._force_clear_for_retake(
                     vm_name, vm_dir, snapshot_name,
-                    paths_in_use=paths_in_use, memory_in_use=memory_in_use):
+                    paths_in_use=paths_in_use, memory_in_use=memory_in_use,
+                    disk_dir=disk_dir):
                 return False
             snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
             mem_path = os.path.join(vm_dir, snap_fname)
@@ -222,6 +281,10 @@ class SnapshotManager:
                     f"{vm_name} over it (snapshot take --force clears a "
                     f"leftover no domain uses)")
                 return False
+            overlay_args = self._overlay_diskspec_args(
+                vm_name, snapshot_name, disk_dir)
+            if overlay_args is None:
+                return False
             # Before saving memory state, ensure cdroms point directly at
             # their raw ISO backing files (not qcow2 overlays of them).
             # This prevents snapshot-revert from failing with
@@ -242,6 +305,7 @@ class SnapshotManager:
                 "--description", description,
                 "--atomic",
                 f"--memspec={mem_path}",
+                *overlay_args,
                 *cdrom_args)
 
             if result.ok:
@@ -261,25 +325,30 @@ class SnapshotManager:
 
     def _would_be_overlay_paths(self,
                                 vm_name: str,
-                                snapshot_name: str) -> list[str]:
+                                snapshot_name: str,
+                                disk_dir: str | None = None) -> list[str]:
         """
         Predict the overlay file ``snapshot-create-as`` would create for
-        each data disk of *vm_name*.
+        each data disk of *vm_name* — in *disk_dir* when one is given
+        (:meth:`_overlay_diskspec_args`), else beside the disk.
 
         With no explicit ``file=`` in the diskspec, libvirt derives the new
         external-overlay path from the disk's *current* source by dropping
         its final suffix and appending ``.<snapshot_name>`` — e.g. a live
         source ``…_provider01.qcow2`` (or ``…_provider01.1785187648``)
-        yields ``…_provider01.<snapshot_name>``. A stale file at that exact
-        path is what triggers libvirt's "external snapshot file … already
-        exists and is not a block device" error on a re-take.
+        yields ``…_provider01.<snapshot_name>`` (:meth:`_overlay_name`). A
+        stale file at that exact path is what triggers libvirt's "external
+        snapshot file … already exists and is not a block device" error on
+        a re-take.
         """
         paths = []
         for _target, source in self._data_disk_targets(vm_name):
             if not source or source == '-':
                 continue
-            stem = os.path.splitext(source)[0]
-            paths.append(f"{stem}.{snapshot_name}")
+            directory = (os.path.dirname(source) if disk_dir is None
+                         else disk_dir)
+            paths.append(os.path.join(
+                directory, self._overlay_name(source, snapshot_name)))
         return paths
 
     @staticmethod
@@ -300,11 +369,13 @@ class SnapshotManager:
                                 vm_dir: str,
                                 snapshot_name: str,
                                 paths_in_use=None,
-                                memory_in_use=None) -> bool:
+                                memory_in_use=None,
+                                disk_dir: str | None = None) -> bool:
         """
         Remove anything that would make a fresh snapshot named
         *snapshot_name* collide, so ``snapshot take --force`` can re-use the
-        name. Two cases:
+        name — its memory image in *vm_dir*, its overlays in *disk_dir* or,
+        with none, beside their disks. Two cases:
 
         1. A live libvirt snapshot with that name still exists → delete it
            properly via :meth:`delete_snapshot` (blockcommit/collapse merges
@@ -356,7 +427,8 @@ class SnapshotManager:
 
         active = {src for _t, src in self._data_disk_targets(vm_name)}
         removed = []
-        candidates = list(self._would_be_overlay_paths(vm_name, snapshot_name))
+        candidates = list(self._would_be_overlay_paths(
+            vm_name, snapshot_name, disk_dir=disk_dir))
         snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
         candidates.append(os.path.join(vm_dir, snap_fname))
         candidates.append(os.path.join(vm_dir, f"{snap_fname}.zst"))

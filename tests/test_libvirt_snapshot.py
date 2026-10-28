@@ -3613,7 +3613,8 @@ class TestCreateSnapshotForce:
                 "vm01", str(tmp_path), "snapX", "d", force=True,
                 paths_in_use=scan, memory_in_use=memory) is True
         clear.assert_called_once_with("vm01", str(tmp_path), "snapX",
-                                      paths_in_use=scan, memory_in_use=memory)
+                                      paths_in_use=scan, memory_in_use=memory,
+                                      disk_dir=None)
 
     def test_force_clear_failure_aborts_create(self, sm: SnapshotManager,
                                               tmp_path: Path):
@@ -3632,3 +3633,144 @@ class TestCreateSnapshotForce:
              patch.object(sm.virsh, "execute", return_value=_result()):
             sm.create_snapshot("vm01", str(tmp_path), "snapX", "d")
         clear.assert_not_called()
+
+
+class TestOverlaysInADiskSnapshotDir:
+    """``create_snapshot(disk_dir=...)`` creates each disk's overlay in that
+    directory, under the name libvirt gives it beside the disk: the current
+    source with its last suffix dropped, then ``.<snapshot>``."""
+
+    BLKLIST = (
+        "Type   Device  Target  Source\n"
+        "file   disk    vda     /ws/vm01.qcow2\n"
+        "file   disk    vdb     /fast/ov/vm01_data.s1\n"
+        "file   cdrom   sda     /iso/seed.iso\n"
+    )
+
+    @staticmethod
+    def _blklist(*rows: tuple[str, str]) -> str:
+        return "Type Device Target Source\n" + "".join(
+            f"file disk {target} {source}\n" for target, source in rows)
+
+    def _create(self, sm, tmp_path, disk_dir, blklist=None, listed=True,
+                **kw):
+        calls = []
+
+        def execute(*args, **_kw):
+            calls.append(args)
+            if args[0] == "domblklist":
+                if not listed:
+                    return _result(ok=False, stderr="error: no domain")
+                return _result(stdout=self.BLKLIST if blklist is None
+                               else blklist)
+            return _result()
+
+        with patch.object(sm, "_flatten_cdrom_overlays"), \
+             patch.object(sm.virsh, "execute", side_effect=execute):
+            ok = sm.create_snapshot("vm01", str(tmp_path), "s2", "d",
+                                    disk_dir=disk_dir, **kw)
+        creates = [c for c in calls if c[0] == "snapshot-create-as"]
+        return ok, creates
+
+    @staticmethod
+    def _specs(args) -> list[str]:
+        return [args[i + 1] for i, a in enumerate(args) if a == "--diskspec"]
+
+    def test_each_disk_gets_its_overlay_there(self, sm, tmp_path):
+        ok, [args] = self._create(sm, tmp_path, "/fast/ov")
+
+        assert ok is True
+        assert self._specs(args) == [
+            "vda,snapshot=external,file=/fast/ov/vm01.s2",
+            "vdb,snapshot=external,file=/fast/ov/vm01_data.s2",
+            "sda,snapshot=no",
+        ]
+
+    def test_unset_names_no_overlay_file(self, sm, tmp_path):
+        """libvirt then creates each beside its disk, as before."""
+        ok, [args] = self._create(sm, tmp_path, None)
+
+        assert ok is True
+        assert self._specs(args) == ["sda,snapshot=no"]
+
+    def test_a_comma_in_the_path_is_doubled(self, sm, tmp_path):
+        """virsh splits a diskspec at commas; ``,,`` is a literal one."""
+        ok, [args] = self._create(
+            sm, tmp_path, "/fast/a,b",
+            blklist=self._blklist(("vda", "/ws/vm01.qcow2")))
+
+        assert self._specs(args) == [
+            "vda,snapshot=external,file=/fast/a,,b/vm01.s2"]
+
+    def test_two_disks_that_would_share_an_overlay_refuse_the_take(
+            self, sm, tmp_path):
+        ok, creates = self._create(
+            sm, tmp_path, "/fast/ov",
+            blklist=self._blklist(("vda", "/a/data.qcow2"),
+                                  ("vdb", "/b/data.qcow2")))
+
+        assert ok is False
+        assert creates == []
+
+    def test_disks_that_cannot_be_listed_refuse_the_take(self, sm, tmp_path):
+        """Taken anyway, the overlays would land beside the disks."""
+        ok, creates = self._create(sm, tmp_path, "/fast/ov", listed=False)
+
+        assert ok is False
+        assert creates == []
+
+    def test_force_predicts_the_leftovers_there(self, sm):
+        with patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", "/ws/vm01.qcow2"),
+                                        ("vdb", "/fast/ov/vm01_data.s1")]):
+            assert sm._would_be_overlay_paths(
+                "vm01", "snapX", disk_dir="/fast/ov") == [
+                    "/fast/ov/vm01.snapX", "/fast/ov/vm01_data.snapX"]
+
+    def test_force_clears_a_leftover_there(self, sm, tmp_path):
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        orphan = ov / "vm01.snapX"
+        orphan.write_bytes(b"x")
+        beside = tmp_path / "vm01.snapX"
+        beside.write_bytes(b"not this one")
+        removed = []
+        absent = _result(ok=False, stderr="Domain snapshot not found")
+        with patch.object(sm.virsh, "execute", return_value=absent), \
+             patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", str(tmp_path / "vm01.qcow2"))]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=lambda cmd, *a, **k: (
+                              removed.append(cmd), _result())[1]):
+            assert sm._force_clear_for_retake(
+                "vm01", str(tmp_path), "snapX", disk_dir=str(ov),
+                paths_in_use=MagicMock(return_value={}),
+                memory_in_use=MagicMock(return_value={})) is True
+
+        joined = "\n".join(removed)
+        assert str(orphan) in joined
+        assert str(beside) not in joined
+
+    def test_force_keeps_a_leftover_there_another_domain_uses(self, sm,
+                                                              tmp_path):
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        used = ov / "vm01.snapX"
+        used.write_bytes(b"another domain's disk")
+        scan = MagicMock(return_value=FilesInUse(
+            {os.path.realpath(used): "vm02"}))
+        removed = []
+        absent = _result(ok=False, stderr="Domain snapshot not found")
+        with patch.object(sm.virsh, "execute", return_value=absent), \
+             patch.object(sm, "_data_disk_targets",
+                          return_value=[("vda", str(tmp_path / "vm01.qcow2"))]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=lambda cmd, *a, **k: (
+                              removed.append(cmd), _result())[1]):
+            assert sm._force_clear_for_retake(
+                "vm01", str(tmp_path), "snapX", disk_dir=str(ov),
+                paths_in_use=scan,
+                memory_in_use=MagicMock(return_value={})) is False
+
+        assert str(used) not in "\n".join(removed)
+        assert used.read_bytes() == b"another domain's disk"

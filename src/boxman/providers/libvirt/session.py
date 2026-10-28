@@ -31,7 +31,7 @@ from .net import Network, NetworkInterface
 from .shared_folder import SharedFolderManager
 from .snapshot import SnapshotManager
 from .storage import StorageManager
-from .storage_pools import refresh_pools_holding
+from .storage_pools import ensure_pool_on, refresh_pools_holding
 from .virsh_edit import VirshEdit
 from .virsh_parse import (
     LOCAL_SOURCE_TYPES,
@@ -2339,7 +2339,8 @@ class LibVirtSession(SessionConfigMixin):
                       description=None,
                       compress_memory: bool = False,
                       compress_level: int = 3,
-                      force: bool = False):
+                      force: bool = False,
+                      disk_dir: str | None = None):
         """
         Create a snapshot of a specific VM
 
@@ -2347,6 +2348,9 @@ class LibVirtSession(SessionConfigMixin):
             vm_name (str, optional): Full name of the VM to snapshot
             vm_dir (str): Directory the memory image is written to (the
                 cluster's ``memory_snapshot_dir``, by default its workdir)
+            disk_dir: Directory the disk overlays are created in (the
+                cluster's ``disk_snapshot_dir``); ``None``, beside their
+                disks
             snapshot_name (str): Name for the snapshot
             description (str, optional): Description for the snapshot
             compress_memory: zstd-compress the memory ``.raw`` file after
@@ -2372,7 +2376,17 @@ class LibVirtSession(SessionConfigMixin):
             compress_level=compress_level,
             force=force,
             paths_in_use=self.disk_paths_in_use,
-            memory_in_use=self.snapshot_memory_in_use)
+            memory_in_use=self.snapshot_memory_in_use,
+            disk_dir=disk_dir)
+
+    def ensure_pool_on(self, directory: str, name: str) -> str | None:
+        """
+        An active storage pool on *directory* — the one there, or a new
+        one named *name* — or ``None``, the reason in a warning
+        (:func:`storage_pools.ensure_pool_on`).
+        """
+        return ensure_pool_on(VirshCommand(provider_config=self.provider_config),
+                              directory, name)
 
     def snapshot_log_data(self, vm_name: str) -> dict:
         """

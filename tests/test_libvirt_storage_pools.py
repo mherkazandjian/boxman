@@ -9,7 +9,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from boxman.providers.libvirt.storage_pools import refresh_pools_holding
+from boxman.providers.libvirt.storage_pools import (
+    ensure_pool_on,
+    refresh_pools_holding,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -88,3 +91,96 @@ def test_an_unlistable_pool_set_is_a_warning(tmp_path, monkeypatch):
     virsh = _virsh({"cluster_1": str(tmp_path)}, list_ok=False)
     assert refresh_pools_holding(virsh, [str(tmp_path / "vm.qcow2")]) == []
     assert warnings
+
+
+class TestEnsurePoolOn:
+    """A storage pool on a cluster's disk_snapshot_dir: without one, the
+    overlays there cannot be read under ``use_sudo: false`` (#221), and
+    every teardown keeps everything."""
+
+    @staticmethod
+    def _virsh(pools, active=None, define_ok=True, list_ok=True):
+        """*pools*: name -> target path; *active*: the running ones (all
+        by default)."""
+        pools = dict(pools)
+        running = set(pools) if active is None else set(active)
+        virsh = MagicMock()
+
+        def execute(*args, **kwargs):
+            verb = args[0]
+            if verb == "pool-list":
+                names = pools if "--all" in args else running
+                return _result(stdout="".join(f"{p}\n" for p in names),
+                               ok=list_ok, stderr="error: no connection")
+            if verb == "pool-dumpxml":
+                return _result(stdout=f"<pool type='dir'><name>{args[1]}"
+                                      f"</name><target><path>"
+                                      f"{pools[args[1]]}</path></target>"
+                                      f"</pool>")
+            if verb == "pool-define-as":
+                if define_ok:
+                    pools[args[1]] = args[args.index("--target") + 1]
+                return _result(ok=define_ok, stderr="error: define failed")
+            if verb in ("pool-start", "pool-autostart"):
+                if verb == "pool-start":
+                    running.add(args[1])
+                return _result()
+            raise AssertionError(args)
+
+        virsh.execute.side_effect = execute
+        return virsh
+
+    @staticmethod
+    def _verbs(virsh, *wanted):
+        return [c.args for c in virsh.execute.call_args_list
+                if c.args[0] in wanted]
+
+    def test_one_already_on_it_is_used_whatever_its_name(self, tmp_path):
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        virsh = self._virsh({"web": str(tmp_path / "web"), "mine": str(ov)})
+
+        assert ensure_pool_on(virsh, str(ov), "bprj_ov") == "mine"
+        assert self._verbs(virsh, "pool-define-as", "pool-start") == []
+
+    def test_an_inactive_one_on_it_is_started(self, tmp_path):
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        virsh = self._virsh({"mine": str(ov)}, active=[])
+
+        assert ensure_pool_on(virsh, str(ov), "bprj_ov") == "mine"
+        assert self._verbs(virsh, "pool-start") == [("pool-start", "mine")]
+
+    def test_with_none_one_is_defined_started_and_autostarted(self, tmp_path):
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        virsh = self._virsh({"web": str(tmp_path / "web")})
+
+        assert ensure_pool_on(virsh, str(ov), "bprj_ov") == "bprj_ov"
+        assert self._verbs(virsh, "pool-define-as", "pool-start",
+                           "pool-autostart") == [
+            ("pool-define-as", "bprj_ov", "dir", "--target", str(ov)),
+            ("pool-start", "bprj_ov"),
+            ("pool-autostart", "bprj_ov"),
+        ]
+
+    def test_a_pool_of_that_name_on_another_directory_is_not_taken(
+            self, tmp_path):
+        """A workdir ``.../ws/web`` and an overlay directory ``.../ov/web``
+        share a basename: a pool found by name would not be on it."""
+        ov = tmp_path / "ov" / "web"
+        ov.mkdir(parents=True)
+        virsh = self._virsh({"web": str(tmp_path / "ws" / "web")})
+
+        assert ensure_pool_on(virsh, str(ov), "web") is None
+        assert self._verbs(virsh, "pool-define-as") == []
+
+    def test_pools_that_cannot_be_listed_give_none(self, tmp_path):
+        virsh = self._virsh({}, list_ok=False)
+
+        assert ensure_pool_on(virsh, str(tmp_path), "bprj_ov") is None
+
+    def test_a_definition_that_fails_gives_none(self, tmp_path):
+        virsh = self._virsh({}, define_ok=False)
+
+        assert ensure_pool_on(virsh, str(tmp_path), "bprj_ov") is None
