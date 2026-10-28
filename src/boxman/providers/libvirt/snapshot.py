@@ -2094,6 +2094,66 @@ class SnapshotManager:
             except OSError:
                 pass
 
+    @staticmethod
+    def _same_file(path: str, other: str) -> bool:
+        """
+        Whether *path* and *other* name one file: by ``(st_dev, st_ino)``,
+        so a symlinked or bind-mounted image directory cannot hide it, and
+        by resolved path only when one of them cannot be stat'ed.
+        """
+        try:
+            return os.path.samefile(path, other)
+        except OSError:
+            return os.path.realpath(path) == os.path.realpath(other)
+
+    def _collapse_keeps(self,
+                        vm_name: str,
+                        kept: list[str],
+                        disks: list[tuple[str, str]]) -> list[tuple] | None:
+        """
+        The files :meth:`collapse_to` must not remove, each with the reason:
+        every disk's head, and every overlay the *kept* snapshots record --
+        the target's among them, which is what each head stands on once it
+        is rebased. That covers each disk's live chain after the rebase.
+
+        The head needs saying. An external snapshot records the overlay it
+        created, and that overlay became the active disk, so until a revert
+        moves the domain the newest snapshot's recorded overlay *is* the
+        head -- and the rebase rewrites the head in place.
+
+        Returns:
+            list: ``(path, reason)`` pairs, or None when a head cannot be
+            stat'ed. Then no comparison can show that a dropped overlay is
+            not the live disk under another name, so none may be removed.
+        """
+        keeps = []
+        for disk_target, head in disks:
+            try:
+                os.stat(head)
+            except OSError:
+                return None
+            keeps.append((head, f"it is the disk {disk_target} runs on"))
+        for snap in kept:
+            for disk_target, _head in disks:
+                path = self._overlay_path_for_snapshot(
+                    vm_name, snap, disk_target)
+                if path:
+                    keeps.append(
+                        (path, f"kept snapshot '{snap}' still records it"))
+        return keeps
+
+    def _collapse_keep_reason(self,
+                              path: str,
+                              keeps: list[tuple] | None) -> str | None:
+        """Why *path* has to stay (see :meth:`_collapse_keeps`), or None."""
+        if keeps is None:
+            return ("the domain's disks could not be examined, so nothing "
+                    "shows it is not still in use")
+        for kept_path, reason in keeps:
+            if self._same_file(path, kept_path):
+                return reason
+        return None
+
     def collapse_to(self,
                     vm_name: str,
                     target_name: str,
@@ -2107,6 +2167,10 @@ class SnapshotManager:
         what the full chain produced. Then strip ``<backingStore>``
         cache, ``virsh define``, delete the dropped snapshots' overlay
         and memory files, and clear their libvirt metadata.
+
+        A dropped overlay that is still live -- usually the newest one,
+        which is the head itself -- is kept, and so is anything the kept
+        snapshots record (see :meth:`_collapse_keeps`).
 
         VM must be offline. Returns True on success.
         """
@@ -2138,6 +2202,10 @@ class SnapshotManager:
             self.logger.error(f"no data disks found for vm {vm_name}")
             return False
 
+        # the heads do not move in the rebase, so this is already the
+        # set the cleanup below has to leave alone
+        keeps = self._collapse_keeps(vm_name, chain[:target_idx + 1], disks)
+
         if dry_run:
             self.logger.info(
                 f"[dry-run] {vm_name}: would drop {len(drop_set)} snapshot(s) "
@@ -2147,6 +2215,18 @@ class SnapshotManager:
                     vm_name, target_name, disk_target)
                 self.logger.info(
                     f"[dry-run]   would rebase {source} onto {new_base}")
+            for snap in drop_set:
+                for disk_target, _ in disks:
+                    overlay = self._overlay_path_for_snapshot(
+                        vm_name, snap, disk_target)
+                    if not overlay or not os.path.isfile(overlay):
+                        continue
+                    reason = self._collapse_keep_reason(overlay, keeps)
+                    if reason:
+                        self.logger.info(
+                            f"[dry-run]   would keep {overlay}: {reason}")
+                    else:
+                        self.logger.info(f"[dry-run]   would remove {overlay}")
             return True
 
         # Per-disk rebase — must succeed for every disk before we touch metadata.
@@ -2158,6 +2238,15 @@ class SnapshotManager:
                     f"cannot find overlay for disk '{disk_target}' in "
                     f"snapshot '{target_name}' of vm {vm_name}")
                 return False
+            if self._same_file(head_path, new_base):
+                # nothing stands between them: the head is the target's own
+                # overlay (a revert and a new take put it there). Rebasing a
+                # file onto itself trips qemu's image lock at best, and
+                # without one writes a backing chain that loops.
+                self.logger.info(
+                    f"{head_path} is the overlay of '{target_name}' itself; "
+                    f"nothing to rebase for {disk_target}")
+                continue
             if not self._qemu_img_rebase(head_path, new_base):
                 return False
 
@@ -2168,9 +2257,22 @@ class SnapshotManager:
             for disk_target, _ in disks:
                 overlay = self._overlay_path_for_snapshot(
                     vm_name, snap, disk_target)
-                if overlay and os.path.isfile(overlay):
-                    self.virsh.execute_shell(
-                        f"rm -f '{overlay}'", warn=True)
+                if not overlay or not os.path.isfile(overlay):
+                    continue
+                reason = self._collapse_keep_reason(overlay, keeps)
+                if keeps is None:
+                    self.logger.warning(
+                        f"not removing {overlay} of dropped snapshot "
+                        f"'{snap}' on {vm_name}: {reason}. Remove it by hand "
+                        f"once nothing uses it.")
+                    continue
+                if reason:
+                    self.logger.info(
+                        f"keeping {overlay} of dropped snapshot '{snap}': "
+                        f"{reason}")
+                    continue
+                self.virsh.execute_shell(
+                    f"rm -f '{overlay}'", warn=True)
             mem_path = self._memory_path_from_xml(vm_name, snap)
             if mem_path:
                 for path in (mem_path, f"{mem_path}.zst"):

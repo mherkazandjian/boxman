@@ -11,8 +11,10 @@ Part of Phase 1.2 of the review plan
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2513,6 +2515,409 @@ class TestCollapseTo:
         meta_calls = [c for c in executed
                       if c[0] == "snapshot-delete" and "--metadata" in c]
         assert len(meta_calls) == 2
+
+
+needs_qemu = pytest.mark.skipif(
+    not (shutil.which("qemu-img") and shutil.which("qemu-io")),
+    reason="needs qemu-img and qemu-io to build real overlay chains")
+
+
+def _qemu(*args: str) -> str:
+    return subprocess.run(list(args), check=True, capture_output=True,
+                          text=True).stdout
+
+
+def _pattern(era: int) -> str:
+    """The byte the guest writes during *era* (0: before any snapshot)."""
+    return f"0x{0xb0 + era:x}"
+
+
+def _write(image: Path, era: int) -> None:
+    _qemu("qemu-io", "-c", f"write -P {_pattern(era)} {era * 64}k 64k",
+          str(image))
+
+
+def _reads(image: Path, era: int, pattern: str | None = None) -> bool:
+    """Whether reading *image* returns what *era* wrote (or *pattern*)."""
+    proc = subprocess.run(
+        ["qemu-io", "-r", "-c",
+         f"read -P {pattern or _pattern(era)} {era * 64}k 64k", str(image)],
+        capture_output=True, text=True)
+    return (proc.returncode == 0
+            and "Pattern verification failed" not in proc.stdout)
+
+
+def _chain(image: Path) -> list[str]:
+    """The files qemu opens for *image*, top first."""
+    out = _qemu("qemu-img", "info", "-U", "--backing-chain",
+                "--output=json", str(image))
+    return [entry["filename"] for entry in json.loads(out)]
+
+
+def _take_external(tmp_path: Path, names: list[str], real: bool = True):
+    """Lay out what ``snapshot-create-as --memspec`` leaves, one take per name.
+
+    libvirt records, per disk, the *new* overlay a take creates, and that
+    overlay becomes the domain's active disk -- so after the last take the
+    newest snapshot's recorded overlay is the head. With *real*, each
+    overlay is a qcow2 on the one before and the guest writes era *i*'s
+    pattern into it while it is the head; otherwise the files are plain.
+
+    Returns ``(base, overlays, memory)``, the last two keyed by name.
+    """
+    base = tmp_path / "vm01_disk.qcow2"
+    if real:
+        _qemu("qemu-img", "create", "-q", "-f", "qcow2", str(base), "1M")
+        _write(base, 0)
+    else:
+        base.write_bytes(b"base")
+    overlays: dict[str, Path] = {}
+    memory: dict[str, Path] = {}
+    backing = base
+    for era, name in enumerate(names, start=1):
+        overlay = tmp_path / f"vm01_disk.{name}"
+        if real:
+            _qemu("qemu-img", "create", "-q", "-f", "qcow2",
+                  "-b", str(backing), "-F", "qcow2", str(overlay))
+            _write(overlay, era)
+        else:
+            overlay.write_bytes(name.encode())
+        memory[name] = tmp_path / f"vm01_snapshot_{name}.raw"
+        memory[name].write_bytes(b"memory image")
+        overlays[name] = overlay
+        backing = overlay
+    return base, overlays, memory
+
+
+class _Libvirt:
+    """A ``virsh.execute`` double for a domain with external snapshots.
+
+    Answers the calls :meth:`SnapshotManager.collapse_to` and
+    :meth:`SnapshotManager.delete_snapshot` make, shaped like libvirt's own
+    output: ``snapshot-dumpxml`` records each snapshot's overlay under
+    ``<disks>`` (next to a cdrom left out with ``snapshot='no'``) and the
+    disk as it was when the snapshot was taken under ``<domain>``;
+    ``domblklist --details`` names *heads*; a plain ``snapshot-delete``
+    refuses an external snapshot, and ``--metadata`` forgets it.
+
+    *records* maps snapshot -> {disk target: recorded overlay}; *parents*
+    defaults to a linear chain in the order given.
+    """
+
+    def __init__(self, records: dict, heads: dict, memory: dict,
+                 parents: dict | None = None):
+        self.records = records
+        self.heads = heads
+        self.memory = memory
+        names = list(records)
+        self.parents = parents or {
+            n: (names[i - 1] if i else None) for i, n in enumerate(names)}
+        self.snapshots = names
+
+    def _snapshot_xml(self, name: str) -> str:
+        parent = self.parents[name]
+        disks = "".join(
+            f"<disk name='{target}' snapshot='external' type='file'>"
+            f"<driver type='qcow2'/><source file='{path}'/></disk>"
+            for target, path in self.records[name].items())
+        taken_on = "".join(
+            f"<disk type='file' device='disk'>"
+            f"<source file='{self.records[parent][t] if parent else 'base'}'/>"
+            f"<target dev='{t}' bus='virtio'/></disk>"
+            for t in self.records[name])
+        return (f"<domainsnapshot><name>{name}</name>"
+                f"<state>running</state>"
+                + (f"<parent><name>{parent}</name></parent>" if parent else "")
+                + f"<creationTime>1785187648</creationTime>"
+                f"<memory snapshot='external' file='{self.memory[name]}'/>"
+                f"<disks>{disks}<disk name='sda' snapshot='no'/></disks>"
+                f"<domain type='kvm'><name>vm01</name><devices>{taken_on}"
+                f"</devices></domain></domainsnapshot>")
+
+    def __call__(self, *args, **_kw):
+        verb = args[0]
+        if verb == "snapshot-info":
+            if args[2] in self.snapshots:
+                return _result()
+            return _result(ok=False, stderr="error: Domain snapshot not found")
+        if verb == "snapshot-list":
+            return _result(stdout="".join(f"{n}\n" for n in self.snapshots)
+                           + "\n")
+        if verb == "snapshot-dumpxml":
+            if args[2] not in self.snapshots:
+                return _result(ok=False, stderr="error: Domain snapshot not found")
+            return _result(stdout=self._snapshot_xml(args[2]))
+        if verb == "domblklist":
+            rows = "".join(f" file   disk     {t}      {p}\n"
+                           for t, p in self.heads.items())
+            return _result(stdout=(
+                " Type   Device   Target   Source\n"
+                "------------------------------------------------\n"
+                + rows + " file   cdrom    sda      /p/seed.iso\n"))
+        if verb == "dumpxml":
+            disks = "".join(
+                f"<disk type='file' device='disk'><source file='{p}'/>"
+                f"<backingStore type='file'><source file='/stale'/>"
+                f"</backingStore><target dev='{t}'/></disk>"
+                for t, p in self.heads.items())
+            return _result(stdout=f"<domain><devices>{disks}</devices></domain>")
+        if verb == "define":
+            return _result()
+        if verb == "snapshot-delete":
+            if "--metadata" in args:
+                self.snapshots.remove(args[2])
+                return _result()
+            return _result(ok=False, stderr=(
+                "error: unsupported configuration: deletion of 1 external "
+                "disk snapshots not supported yet"))
+        raise AssertionError(f"unexpected virsh call: {args}")
+
+
+class TestCollapseKeepsTheLiveDisk:
+    """collapse_to must not remove the disk the domain runs on.
+
+    An external snapshot records the overlay it created, and that overlay
+    becomes the active disk: after ``take s1; take s2`` the head *is* s2's
+    recorded overlay. Removing every dropped snapshot's recorded overlay
+    therefore removed the live disk -- after ``collapse --to s1``, and after
+    ``snapshot delete`` of the newest snapshot, which collapses to its
+    parent.
+    """
+
+    @needs_qemu
+    def test_two_snapshots_keep_the_head(self, sm, tmp_path):
+        base, overlays, memory = _take_external(tmp_path, ["s1", "s2"])
+        head = overlays["s2"]
+        virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
+                         {"vda": str(head)}, memory)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            assert sm.collapse_to("vm01", "s1") is True
+
+        assert head.is_file(), "the live disk was removed"
+        assert _chain(head) == [str(head), str(overlays["s1"]), str(base)]
+        assert all(_reads(head, era) for era in (0, 1, 2))
+        # the rest of the drop still happens
+        assert not memory["s2"].exists()
+        assert memory["s1"].exists()
+        assert virsh.snapshots == ["s1"]
+
+    @needs_qemu
+    def test_three_snapshots_keep_the_head_the_middle_layer_goes(
+            self, sm, tmp_path):
+        base, overlays, memory = _take_external(tmp_path, ["s1", "s2", "s3"])
+        head = overlays["s3"]
+        virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
+                         {"vda": str(head)}, memory)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            assert sm.collapse_to("vm01", "s1") is True
+
+        assert head.is_file(), "the live disk was removed"
+        # rebased past s2, with s2's writes merged into the head
+        assert _chain(head) == [str(head), str(overlays["s1"]), str(base)]
+        assert all(_reads(head, era) for era in (0, 1, 2, 3))
+        assert not overlays["s2"].exists()
+        assert not memory["s2"].exists() and not memory["s3"].exists()
+        assert overlays["s1"].exists() and memory["s1"].exists()
+        assert virsh.snapshots == ["s1"]
+
+    @needs_qemu
+    def test_deleting_the_newest_snapshot_keeps_the_head(self, sm, tmp_path):
+        base, overlays, memory = _take_external(tmp_path, ["s1", "s2", "s3"])
+        head = overlays["s3"]
+        virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
+                         {"vda": str(head)}, memory)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            assert sm.delete_snapshot("vm01", "s3") is True
+
+        assert head.is_file(), "the live disk was removed"
+        assert _chain(head) == [str(head), str(overlays["s2"]),
+                                str(overlays["s1"]), str(base)]
+        assert all(_reads(head, era) for era in (0, 1, 2, 3))
+        assert not memory["s3"].exists()
+        assert virsh.snapshots == ["s1", "s2"]
+
+    @needs_qemu
+    def test_after_a_revert_the_dropped_overlay_goes_the_head_stays(
+            self, sm, tmp_path):
+        # take s1, take s2, revert to s1: s1 has a child, so libvirt puts
+        # the domain on a fresh overlay of the disk s1 was taken from and
+        # leaves s1's record alone. s2's overlay is then not live.
+        base, overlays, memory = _take_external(tmp_path, ["s1", "s2"])
+        head = tmp_path / "vm01_disk.1785187700"
+        _qemu("qemu-img", "create", "-q", "-f", "qcow2",
+              "-b", str(base), "-F", "qcow2", str(head))
+        _write(head, 5)
+        virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
+                         {"vda": str(head)}, memory)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            assert sm.collapse_to("vm01", "s1") is True
+
+        assert head.is_file()
+        assert not overlays["s2"].exists()
+        assert _chain(head) == [str(head), str(overlays["s1"]), str(base)]
+        # what the guest sees is still the reverted state: the writes made
+        # after s1 was taken stay undone, the ones after the revert stay
+        assert _reads(head, 0) and _reads(head, 5)
+        assert _reads(head, 1, pattern="0") and _reads(head, 2, pattern="0")
+
+    @needs_qemu
+    def test_a_head_that_is_the_targets_own_overlay_is_not_rebased(
+            self, sm, tmp_path):
+        # take s1, s2, s4; revert to s1; take s3. The chain order puts s4,
+        # on the abandoned branch, after s3 -- and s3's overlay is the head.
+        # Rebasing a file onto itself either trips qemu's image lock or,
+        # without one, writes a backing chain that loops.
+        base, overlays, memory = _take_external(tmp_path, ["s1", "s2", "s4"])
+        reverted = tmp_path / "vm01_disk.1785187700"
+        _qemu("qemu-img", "create", "-q", "-f", "qcow2",
+              "-b", str(base), "-F", "qcow2", str(reverted))
+        head = tmp_path / "vm01_disk.s3"
+        _qemu("qemu-img", "create", "-q", "-f", "qcow2",
+              "-b", str(reverted), "-F", "qcow2", str(head))
+        _write(head, 6)
+        memory["s3"] = tmp_path / "vm01_snapshot_s3.raw"
+        memory["s3"].write_bytes(b"memory image")
+        records = {n: {"vda": str(overlays[n])} for n in ("s1", "s2", "s4")}
+        records["s3"] = {"vda": str(head)}
+        virsh = _Libvirt(records, {"vda": str(head)}, memory,
+                         parents={"s1": None, "s2": "s1", "s4": "s2",
+                                  "s3": "s1"})
+        calls: list[str] = []
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs(calls)):
+            assert sm._chain_order("vm01") == ["s1", "s2", "s3", "s4"]
+            assert sm.collapse_to("vm01", "s3") is True
+
+        assert not any("qemu-img rebase" in c for c in calls)
+        assert head.is_file()
+        assert _chain(head) == [str(head), str(reverted), str(base)]
+        assert _reads(head, 0) and _reads(head, 6)
+        assert not overlays["s4"].exists() and not memory["s4"].exists()
+        assert overlays["s2"].exists() and overlays["s1"].exists()
+        assert virsh.snapshots == ["s1", "s2", "s3"]
+
+    @pytest.mark.parametrize("alias", ["symlink", "hardlink"])
+    def test_the_head_is_recognised_under_another_spelling(
+            self, sm, tmp_path, alias):
+        # domblklist and the snapshot metadata need not spell the path the
+        # same way: a symlinked image directory, a bind mount (stood in for
+        # by a hard link, which no path resolution sees through either)
+        _base, overlays, memory = _take_external(
+            tmp_path, ["s1", "s2"], real=False)
+        other = tmp_path / "other"
+        if alias == "symlink":
+            other.symlink_to(tmp_path)
+        else:
+            other.mkdir()
+            os.link(overlays["s2"], other / "vm01_disk.s2")
+        virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
+                         {"vda": str(other / "vm01_disk.s2")}, memory)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()), \
+             patch.object(sm, "_qemu_img_rebase", return_value=True):
+            assert sm.collapse_to("vm01", "s1") is True
+
+        assert overlays["s2"].is_file(), "the live disk was removed"
+        assert not memory["s2"].exists()
+
+    def test_the_overlay_the_head_is_rebased_onto_is_kept(
+            self, sm, tmp_path):
+        # metadata in which a dropped snapshot names the target's overlay:
+        # after the rebase that file backs the head, and the kept target
+        # still records it
+        _base, overlays, memory = _take_external(
+            tmp_path, ["s1", "s2"], real=False)
+        head = tmp_path / "vm01_disk.1785187700"
+        head.write_bytes(b"head")
+        alias = tmp_path / "alias"
+        alias.symlink_to(tmp_path)
+        virsh = _Libvirt({"s1": {"vda": str(overlays["s1"])},
+                          "s2": {"vda": str(alias / "vm01_disk.s1")}},
+                         {"vda": str(head)}, memory)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()), \
+             patch.object(sm, "_qemu_img_rebase", return_value=True):
+            assert sm.collapse_to("vm01", "s1") is True
+
+        assert overlays["s1"].is_file()
+        assert head.is_file()
+
+    def test_a_head_that_cannot_be_examined_keeps_every_overlay(
+            self, sm, tmp_path):
+        # the head is s2's overlay under a spelling that cannot be stat'ed,
+        # so nothing can show that s2's recorded overlay is not that file
+        _base, overlays, memory = _take_external(
+            tmp_path, ["s1", "s2"], real=False)
+        other = tmp_path / "other"
+        other.mkdir()
+        hidden = other / "vm01_disk.s2"
+        os.link(overlays["s2"], hidden)
+        virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
+                         {"vda": str(hidden)}, memory)
+        real_stat = os.stat
+
+        def stat(path, *args, **kwargs):
+            if os.fspath(path) == str(hidden):
+                raise PermissionError(13, "Permission denied", str(hidden))
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()), \
+             patch.object(sm, "_qemu_img_rebase", return_value=True), \
+             patch.object(sm.logger, "warning") as warning, \
+             patch("os.stat", side_effect=stat):
+            assert sm.collapse_to("vm01", "s1") is True
+
+        assert overlays["s2"].is_file(), "the live disk was removed"
+        warned = " ".join(str(c.args[0]) for c in warning.call_args_list)
+        assert str(overlays["s2"]) in warned
+        # the snapshot itself is still dropped
+        assert not memory["s2"].exists()
+        assert virsh.snapshots == ["s1"]
+
+    def test_dry_run_reports_the_head_as_kept(self, sm, tmp_path):
+        _base, overlays, memory = _take_external(
+            tmp_path, ["s1", "s2", "s3"], real=False)
+        head = overlays["s3"]
+        virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
+                         {"vda": str(head)}, memory)
+        calls: list[str] = []
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs(calls)), \
+             patch.object(sm.logger, "info") as info:
+            assert sm.collapse_to("vm01", "s1", dry_run=True) is True
+
+        assert calls == []
+        assert all(p.exists() for p in overlays.values())
+        lines = [str(c.args[0]) for c in info.call_args_list]
+        assert any("would remove" in line and str(overlays["s2"]) in line
+                   for line in lines)
+        assert any("would keep" in line and str(head) in line
+                   for line in lines)
+        assert not any("would remove" in line and str(head) in line
+                       for line in lines)
+        assert virsh.snapshots == ["s1", "s2", "s3"]
 
 
 class TestFlattenCdromOverlays:
