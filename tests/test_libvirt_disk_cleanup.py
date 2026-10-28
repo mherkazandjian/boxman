@@ -191,3 +191,44 @@ class TestRemoveIfUnchanged:
 
         assert remove_if_unchanged(str(disk), (1, 2)) == ("gone", None)
         assert list(tmp_path.iterdir()) == []
+
+    def test_a_file_named_through_a_symlink_and_dotdot_is_removed(
+            self, tmp_path: Path):
+        """``link/..`` is the directory above the link's target. Since
+        Python 3.12 ``tempfile.mkdtemp`` folds the ``..`` out of the name it
+        returns, which then named a directory that did not exist: the file
+        was reported gone and left, with the private directory beside it
+        (#257)."""
+        actual = tmp_path / "actual"
+        (actual / "deep").mkdir(parents=True)
+        (tmp_path / "link").symlink_to(actual / "deep",
+                                       target_is_directory=True)
+        disk = actual / "vm01_snapshot_s1.raw"
+        disk.write_bytes(b"data")
+        path = str(tmp_path / "link" / ".." / disk.name)
+        identity = file_identities([path])[path]
+
+        assert remove_if_unchanged(path, identity) == ("removed", None)
+        assert sorted(p.name for p in actual.iterdir()) == ["deep"]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["actual", "link"]
+
+    def test_a_file_still_there_is_never_reported_gone(
+            self, tmp_path: Path, monkeypatch):
+        """The claim fails with FileNotFoundError when the private directory
+        is gone too: the file stays where it was, a failed claim (#257)."""
+        disk = tmp_path / "vm01_disk01.qcow2"
+        disk.write_bytes(b"data")
+        identity = file_identities([str(disk)])[str(disk)]
+        rename = os.rename
+
+        def vanished(src, dst, *args, **kwargs):
+            os.rmdir(os.path.dirname(dst))
+            return rename(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "rename", vanished)
+
+        with pytest.raises(FileNotFoundError):
+            remove_if_unchanged(str(disk), identity)
+
+        assert disk.read_bytes() == b"data"
+        assert sorted(p.name for p in tmp_path.iterdir()) == [disk.name]

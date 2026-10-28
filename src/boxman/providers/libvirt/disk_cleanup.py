@@ -1127,9 +1127,19 @@ def remove_if_unchanged(path: str,
         not the attached file and the name was taken again, so it stays at
         *where*, inside the private directory); or ``"gone"`` (someone
         removed it first).
+
+    Raises:
+        OSError: If it could not be moved aside for any other reason, the
+            private directory having gone too among them; it is left as it
+            was.
     """
     directory, name = os.path.split(path)
-    private = tempfile.mkdtemp(prefix=".boxman-removing-", dir=directory)
+    # mkdtemp makes it under *directory* as given, but since Python 3.12
+    # returns its name made absolute, and that folds ``link/..`` as text
+    # into what can be another directory: only the last component is kept
+    # (#257)
+    private = os.path.join(directory, os.path.basename(
+        tempfile.mkdtemp(prefix=".boxman-removing-", dir=directory)))
     moved = os.path.join(private, name)
     try:
         os.rename(path, moved)
@@ -1139,7 +1149,9 @@ def remove_if_unchanged(path: str,
         # there must not hide why the rename failed.
         with contextlib.suppress(OSError):
             os.rmdir(private)
-        if isinstance(exc, FileNotFoundError):
+        # what is missing can be the private directory: only a file
+        # confirmed absent is gone
+        if isinstance(exc, FileNotFoundError) and not _may_exist(path):
             return "gone", None
         raise
     st = os.lstat(moved)

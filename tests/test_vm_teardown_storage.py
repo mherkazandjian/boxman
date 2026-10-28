@@ -2409,6 +2409,59 @@ class TestASiblingGoneMidScan:
         assert 'domain vm-sibling was renamed vm-renamed' in captured_logs.text
 
 
+class TestASourceSpelledThroughASymlinkAndDotdot:
+    """``<dir>/link/../x`` names a file in the directory above the link's
+    target, and a workdir configured that way keeps the spelling. Such a
+    file is removed, or the teardown fails naming it; it is never left
+    unreported (#257)."""
+
+    @staticmethod
+    def _inventory(tmp_path):
+        actual = tmp_path / 'actual'
+        (actual / 'deep').mkdir(parents=True)
+        (tmp_path / 'link').symlink_to(actual / 'deep',
+                                       target_is_directory=True)
+        memory = _file(actual / f'{VM}_snapshot_s1.raw')
+        path = str(tmp_path / 'link' / '..' / memory.name)
+        inventory = _inventory(
+            boot_family=[path],
+            identities=disk_cleanup.file_identities([path]))
+        return actual, memory, path, inventory
+
+    def test_it_is_removed(self, tmp_path):
+        actual, memory, path, inventory = self._inventory(tmp_path)
+
+        outcome = disk_cleanup.remove_vm_storage(
+            inventory, [str(actual)], lambda: {})
+
+        assert outcome.removed == [path] and outcome.kept == []
+        assert not memory.exists()
+        assert sorted(p.name for p in actual.iterdir()) == ['deep']
+
+    def test_a_claim_that_fails_with_the_file_still_there_fails_the_teardown(
+            self, tmp_path, monkeypatch):
+        """Something removed the private directory before the claim: the
+        file is still there, so it is not taken for gone."""
+        actual, memory, path, inventory = self._inventory(tmp_path)
+        rename = os.rename
+
+        def vanished(src, dst, *args, **kwargs):
+            os.rmdir(os.path.dirname(dst))
+            return rename(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, 'rename', vanished)
+
+        with pytest.raises(FileNotFoundError) as raised:
+            disk_cleanup.remove_vm_storage(
+                inventory, [str(actual)], lambda: {})
+
+        # named in the error the teardown fails with
+        assert raised.value.filename == path
+        assert memory.read_bytes() == b'data'
+        assert sorted(p.name for p in actual.iterdir()) == sorted(
+            ['deep', memory.name])
+
+
 class TestRunningDomainWithAMissingSource:
     """Another domain still running with a deleted image attached can hold
     it open in QEMU together with the images below it: a base of it that
