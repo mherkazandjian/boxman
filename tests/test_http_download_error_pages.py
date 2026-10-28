@@ -363,20 +363,23 @@ def test_a_transfer_that_ends_on_http_is_held_to_a_2xx(downloader, start, monkey
         origin = f"127.0.0.1:{server.server_port}"
         if start == "no-scheme":
             # curl fetches a URL without a scheme as http; urllib cannot
-            url, route, fallback_route = f"{origin}{IMAGE}", [IMAGE], []
+            url, routes, fallback_route = f"{origin}{IMAGE}", [[IMAGE]], []
         else:
             # the loopback server is the http proxy of the ftp:// download,
             # and the http origin the proxy redirects it to
             url = f"ftp://{origin}{IMAGE}"
             monkeypatch.setenv("ftp_proxy", f"http://{origin}")
             server.moved[url] = f"http://{origin}{FINAL}"
-            route = fallback_route = [url, FINAL]
+            fallback_route = [url, FINAL]
+            # curl 8.5 follows the proxy's redirect, 8.18 stops at it: both
+            # end on an http 302
+            routes = [fallback_route, [url]]
         ok = download(url, str(dst))
 
     assert (ok, _left_at(dst)) == (False, None)
-    # curl went where the URL led, and ended on the 302's page with exit 0...
+    # curl went where the URL led, and ended on a 302's page with exit 0...
     assert ran == [("wget", None), ("curl", 0)]
-    assert [r.target for r in server.requests if r.agent.startswith("curl/")] == route
+    assert [r.target for r in server.requests if r.agent.startswith("curl/")] in routes
     # ...and the urllib fallback, where it could follow, was refused as well
     assert [r.target for r in server.requests
             if r.agent.startswith("boxman/")] == fallback_route
