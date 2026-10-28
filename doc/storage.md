@@ -272,6 +272,36 @@ work — `<backingStore>` elements nest.
 
 ---
 
+## Where snapshot files go
+
+Two optional cluster keys move a snapshot's files off the disks'
+filesystem; unset, nothing changes:
+
+```yaml
+clusters:
+  web:
+    workdir: ~/boxman/ws/web
+    memory_snapshot_dir: /mnt/bulk/snapshots/web   # memory images; default: the workdir
+    disk_snapshot_dir: /mnt/fast/overlays/web      # disk overlays; default: beside each disk
+```
+
+- Each is `~` expanded and otherwise taken as written; a relative path is
+  refused. A missing one is made on first use: `0700` for memory images
+  (the guest's RAM), `0711` for overlays (QEMU opens them as another user).
+  Local runtime only.
+- After a take the newest overlay is the disk the guest writes to, so a
+  `disk_snapshot_dir` holds live disks, not backups. A take sees to a
+  libvirt storage pool on it, which the in-use scan reads the overlays
+  through under `use_sudo: false`.
+- `storage df` and `storage compact` work from each VM's base disks in the
+  workdir, as before: the overlays above them, beside the disk or in a
+  `disk_snapshot_dir`, are not measured or compacted.
+- `snapshot restore`, `delete` and `collapse` follow the paths libvirt
+  recorded, wherever they are; a restore writes its `<overlay>.preserve`
+  copies beside each overlay.
+
+---
+
 ## Snapshot memory compression (zstd)
 
 A live snapshot taken with `virsh snapshot-create-as --memspec=…` writes
