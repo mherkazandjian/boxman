@@ -206,14 +206,14 @@ def memory_image_candidates(directory: str, vm_name: str) -> list[str]:
             if is_memory_image(vm_name, path)]
 
 
-def snapshot_only_overlays(overlays: dict[str, list[str]],
+def snapshot_only_overlays(overlays: dict[str, list[str]] | None,
                            sources: Iterable[str]) -> list[str]:
     """The overlays *overlays* records that are none of *sources* — each
     once, as recorded: those whose backing chains are read apart from the
     disks' (``StorageInventory.overlay_chains``)."""
     sources = set(sources)
     found: list[str] = []
-    for paths in overlays.values():
+    for paths in (overlays or {}).values():
         for path in paths:
             if path not in sources and path not in found:
                 found.append(path)
@@ -354,8 +354,11 @@ class StorageInventory:
     memory_images: dict[str, str] = field(default_factory=dict)
     #: the external overlays each of its snapshots recorded, by snapshot
     #: name: with its disks and the layers below them, what decides its
-    #: files in a disk_snapshot_dir
-    overlays: dict[str, list[str]] = field(default_factory=dict)
+    #: files in a disk_snapshot_dir. ``None`` when they are not known —
+    #: not read (no disk_snapshot_dir was set), unreadable, or from an
+    #: inventory saved before they were recorded: then nothing is
+    #: removed from a disk_snapshot_dir, as before there were any
+    overlays: dict[str, list[str]] | None = None
     #: the backing chain of each of :attr:`overlays` that is no disk or
     #: media source, as :attr:`chains` holds theirs — ``[]`` for one already
     #: gone — and like theirs read again on a retry (one removed since mapped
@@ -533,8 +536,10 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
         _field(data, "memory_images",
                lambda v: _is_map(v, lambda p: isinstance(p, str)))
         if "memory_images" in data else {})
-    overlays = (_field(data, "overlays", lambda v: _is_map(v, _is_paths))
-                if "overlays" in data else {})
+    # not known in one saved before they were recorded
+    overlays = (_field(data, "overlays",
+                       lambda v: v is None or _is_map(v, _is_paths))
+                if "overlays" in data else None)
     overlay_chains = (
         _field(data, "overlay_chains",
                lambda v: v is None or _is_map(v, _is_paths))
@@ -554,7 +559,8 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
         targets=dict(_field(data, "targets",
                             lambda v: _is_map(v, lambda t: isinstance(t, str)))),
         memory_images=dict(memory_images),
-        overlays={k: list(v) for k, v in overlays.items()},
+        overlays=(None if overlays is None
+                  else {k: list(v) for k, v in overlays.items()}),
         overlay_chains=(None if overlay_chains is None
                         else {k: list(v) for k, v in overlay_chains.items()}),
         saved_at=path,
@@ -920,7 +926,9 @@ def remove_vm_storage(
        (``StorageInventory.overlays``), under ``<vm>.``. Nothing there is
        decided by name either, for the same reason, and a listing of it
        admits nothing. Its directory is told by identity, as in 1b, which
-       sees a bind mount for the directory it is.
+       sees a bind mount for the directory it is. With those overlays not
+       known (``None``) nothing there is admitted, a data disk's chain (2)
+       included: one only a snapshot records can be built on any of them.
     2. **Extra disks recorded with role ``data``** at exactly their
        attached source, by the rules of :func:`_leftover_refusal`; and a
        recorded disk an external snapshot moved behind overlays, together
@@ -1003,6 +1011,9 @@ def remove_vm_storage(
 
     overlay_dirs = list(overlay_dirs)
     overlay_ids, unreadable_overlay_dirs = _directory_identities(overlay_dirs)
+    # what its snapshots recorded is not known: nothing in a
+    # disk_snapshot_dir is admitted, as before there were any (1c, 2)
+    overlays_known = inventory.overlays is not None
     memory_ids, _unreadable = _directory_identities(memory_dirs)
 
     def static_refusal(path: str) -> str | None:
@@ -1065,7 +1076,8 @@ def remove_vm_storage(
             else:
                 deferred.append(path)
             continue
-        if (overlay_dirs and real(os.path.dirname(path)) not in real_workdirs
+        if (overlay_dirs and overlays_known
+                and real(os.path.dirname(path)) not in real_workdirs
                 and any(in_overlay_dir(path))):
             continue      # what libvirt names as the vm's decides it (1c)
         reason = static_refusal(path)
@@ -1118,8 +1130,9 @@ def remove_vm_storage(
     named_by_libvirt = unique([
         *inventory.disk_sources,
         *(layer for layers in (chains or {}).values() for layer in layers),
-        *(path for paths in inventory.overlays.values() for path in paths)])
-    for path in named_by_libvirt if overlay_dirs else ():
+        *(path for paths in (inventory.overlays or {}).values()
+          for path in paths)])
+    for path in named_by_libvirt if overlay_dirs and overlays_known else ():
         if (not os.path.basename(path).startswith(f"{vm}.")
                 or real(os.path.dirname(path)) in real_workdirs
                 or not _may_exist(path)
@@ -1142,7 +1155,8 @@ def remove_vm_storage(
                     or not _may_exist(record.source)):
                 continue
             chain, reason = _owned_snapshot_chain(
-                inventory, record, real_workdirs, media, overlay_ids)
+                inventory, record, real_workdirs, media,
+                overlay_ids if overlays_known else frozenset())
             if chain is None:
                 admission.refuse(record.source, (
                     f"boxman created it, but it was no longer attached "

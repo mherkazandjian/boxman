@@ -1075,17 +1075,15 @@ class VMsMixin:
         # below them, the only files a teardown removes from a
         # disk_snapshot_dir, which it never lists — another VM's full name
         # can begin with this one's and a dot (remove_vm_storage)
-        overlays: dict[str, list[str]] = {}
+        overlays: dict[str, list[str]] | None = None
         if exists and self._cluster_disk_snapshot_dirs():
-            recorded = session.snapshot_overlay_files(full_vm_name)
-            if recorded is None:
+            overlays = session.snapshot_overlay_files(full_vm_name)
+            if overlays is None:
                 self.logger.warning(
                     f"{full_vm_name}: could not read the overlays its "
-                    f"snapshots recorded, so any of them in a "
-                    f"disk_snapshot_dir that its disks are not built on will "
-                    f"be left in place")
-            else:
-                overlays = recorded
+                    f"snapshots recorded, one of which can be built on any "
+                    f"of its files, so nothing in a disk_snapshot_dir will be "
+                    f"removed, nor what that is built on")
         # and what those only a snapshot records are built on: kept, one
         # keeps that too (remove_vm_storage)
         recorded_only = snapshot_only_overlays(overlays, sources)
@@ -1103,7 +1101,8 @@ class VMsMixin:
                    for layer in chain),
                  *(path for recorded in memory_images.values()
                    for path in (recorded, f"{recorded}.zst")),
-                 *(path for paths in overlays.values() for path in paths),
+                 *(path for paths in (overlays or {}).values()
+                   for path in paths),
                  *(layer for chain in (overlay_chains or {}).values()
                    for layer in chain)]
         inventory = StorageInventory(

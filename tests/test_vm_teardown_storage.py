@@ -3779,8 +3779,9 @@ class TestOverlaysInADiskSnapshotDir:
 
         getattr(t, path)()
 
-        assert not (base.exists() or s1.exists())
-        assert s2.exists()
+        # one only they record can be built on any of its files: nothing in
+        # a disk_snapshot_dir goes, nor what that is built on
+        assert all(p.exists() for p in (base, s1, s2))
         assert 'could not read the overlays its snapshots recorded' in (
             t.warnings)
 
@@ -4064,11 +4065,10 @@ class TestOverlaysInADiskSnapshotDir:
         assert head.read_bytes() == b'replacement' and base.exists()
         assert 'replaced after the vm was inspected' in t.warnings
 
-    def test_an_inventory_saved_before_they_were_recorded_is_read(
+    def test_an_inventory_saved_before_they_were_recorded_admits_nothing(
             self, tmp_path):
-        """Its disks' chains, read again, still name the overlays under
-        them; one only a snapshot recorded is no longer known to be its
-        own, and is kept."""
+        """Read, but it cannot tell what is built on the files there: one
+        only a snapshot recorded can be, on any of them."""
         workdir, ov = self._dirs(tmp_path)
         base = _qcow2(workdir / f'{VM}.qcow2')
         s1, s2 = _file(ov / f'{VM}.s1'), _file(ov / f'{VM}.s2')
@@ -4088,8 +4088,59 @@ class TestOverlaysInADiskSnapshotDir:
         t.mgr.logger.reset_mock()
         t.deprovision()
 
-        assert not (base.exists() or s1.exists())
-        assert s2.exists()
+        assert all(p.exists() for p in (base, s1, s2))
+
+    @pytest.mark.parametrize("saved_by", ["an earlier version",
+                                          "a capture with it unset"])
+    def test_a_retry_with_it_newly_set_admits_nothing_there(self, tmp_path,
+                                                            saved_by):
+        """Saved knowing nothing of its snapshots' overlays, an inventory
+        retried after a disk_snapshot_dir is set cannot tell what is built
+        on the files there: they stay, and so does what they are built
+        on, as the inventory's own version kept them."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _qcow2(workdir / f'{VM}.qcow2')
+        s1 = _file(ov / f'{VM}.s1')
+        t = _Teardown(workdir, disks=[s1], records=[],
+                      in_use={str(base): OTHER},
+                      chains={str(s1): [str(s1), str(base)]})
+        t.deprovision()
+        assert base.exists() and s1.exists()
+        saved = json.loads(_saved(ov).read_text())
+        if saved_by == "an earlier version":
+            for key in ("overlays", "overlay_chains"):
+                saved.pop(key, None)
+        else:
+            assert saved['overlays'] is None
+        _saved(ov).write_text(json.dumps(saved))
+
+        t.mgr.config['clusters']['cluster_1']['disk_snapshot_dir'] = str(ov)
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.deprovision()
+
+        assert base.exists() and s1.exists()
+
+    def test_a_retry_with_it_newly_set_keeps_a_data_disks_chain_there(
+            self, tmp_path):
+        workdir, ov = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        data = _file(workdir / f'{VM}_disk01.qcow2')
+        s1 = _file(ov / f'{VM}_disk01.s1')
+        t = _Teardown(workdir, disks=[boot, s1],
+                      records=[_record('disk01', data)],
+                      in_use={str(boot): OTHER},
+                      chains={str(s1): [str(s1), str(data)]})
+        t.deprovision()
+        assert all(p.exists() for p in (boot, data, s1))
+
+        t.mgr.config['clusters']['cluster_1']['disk_snapshot_dir'] = str(ov)
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+        t.deprovision()
+
+        assert not boot.exists()
+        assert data.exists() and s1.exists()
 
     def test_a_symlink_under_its_name_there_is_kept(self, tmp_path):
         """One its snapshot recorded included."""
@@ -4175,7 +4226,8 @@ class TestOverlaysInADiskSnapshotDir:
         files = [str(head), str(base)]
         inventory = _inventory(
             disk_sources=[str(head)], chains={str(head): files},
-            boot_family=files, identities=disk_cleanup.file_identities(files))
+            boot_family=files, identities=disk_cleanup.file_identities(files),
+            overlays={})
         locked.chmod(0)
         try:
             outcome = disk_cleanup.remove_vm_storage(
