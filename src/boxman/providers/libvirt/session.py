@@ -273,6 +273,11 @@ class _ChainReads:
         :meth:`LibVirtSession.backing_chains` call. A pool with no local
         directory (RBD, say) is passed over.
 
+        Several pools whose targets read alike once normalized — a target
+        ``x/../ov`` with ``x`` a symlink is not ``ov`` — are told apart by
+        identity, ``(st_dev, st_ino)``: the one that is *directory*, if one
+        can be told to be.
+
         Returns:
             Its name, or ``None`` when no active pool is on *directory* or
             that cannot be told: the pools cannot be listed, or one's
@@ -282,15 +287,30 @@ class _ChainReads:
             self._pool_targets = self._read_pool_targets()
         if self._pool_targets is None:
             return None
-        return self._pool_targets.get(os.path.normpath(directory))
+        pools = self._pool_targets.get(os.path.normpath(directory), [])
+        if len(pools) <= 1:
+            return pools[0][0] if pools else None
+        try:
+            st = os.stat(directory)
+        except OSError:
+            return None
+        for name, target in pools:
+            try:
+                on = os.stat(target)
+            except OSError:
+                continue
+            if (on.st_dev, on.st_ino) == (st.st_dev, st.st_ino):
+                return name
+        return None
 
-    def _read_pool_targets(self) -> dict[str, str] | None:
-        """``{target directory: pool}`` of every active pool, or ``None``
-        when any of it cannot be read (see :meth:`pool_on`)."""
+    def _read_pool_targets(self) -> dict[str, list[tuple[str, str]]] | None:
+        """``{normalized target directory: [(pool, its target), ...]}`` of
+        every active pool, or ``None`` when any of it cannot be read (see
+        :meth:`pool_on`)."""
         listing = self.virsh.execute("pool-list", "--name", warn=True)
         if not listing.ok:
             return None
-        targets: dict[str, str] = {}
+        targets: dict[str, list[tuple[str, str]]] = {}
         for name in (line.strip() for line in listing.stdout.splitlines()):
             if not name:
                 continue
@@ -302,7 +322,8 @@ class _ChainReads:
             except ET.ParseError:
                 return None
             if target:
-                targets[os.path.normpath(target)] = name
+                targets.setdefault(os.path.normpath(target), []).append(
+                    (name, target))
         return targets
 
 

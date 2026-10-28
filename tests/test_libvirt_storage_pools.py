@@ -6,7 +6,7 @@ removes a VM's files itself, the pools that listed them are refreshed.
 from __future__ import annotations
 
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -176,13 +176,42 @@ class TestEnsurePoolOn:
         assert ensure_pool_on(virsh, str(ov), "web") is None
         assert self._verbs(virsh, "pool-define-as") == []
 
-    def test_one_on_it_under_another_name_is_used(self, tmp_path):
+    def test_one_on_it_spelled_alike_is_used(self, tmp_path):
         ov = tmp_path / "ov"
         ov.mkdir()
-        (tmp_path / "alias").symlink_to(ov)
-        virsh = self._virsh({"mine": str(tmp_path / "alias")})
+        virsh = self._virsh({"mine": f"{ov}/"})
 
         assert ensure_pool_on(virsh, str(ov), "bprj_ov") == "mine"
+
+    @pytest.mark.parametrize("alias", ["symlink", "bind mount"])
+    def test_one_on_it_only_under_another_spelling_gets_one_of_its_own(
+            self, tmp_path, alias):
+        """The chain reads find the pool on a file's directory by its
+        spelling, and libvirt a volume by its path (#221): one on the same
+        directory under another name serves neither."""
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        other = tmp_path / "alias"
+        real_stat = os.stat
+        if alias == "symlink":
+            other.symlink_to(ov)
+            looked_up = real_stat
+        else:
+            # a bind mount: another directory with ov's identity
+            other.mkdir()
+
+            def looked_up(path, *args, **kwargs):
+                return real_stat(ov if str(path) == str(other) else path,
+                                 *args, **kwargs)
+        virsh = self._virsh({"mine": str(other)})
+
+        with patch("boxman.providers.libvirt.storage_pools.os.stat",
+                   side_effect=looked_up):
+            pool = ensure_pool_on(virsh, str(ov), "bprj_ov")
+
+        assert pool == "bprj_ov"
+        assert self._verbs(virsh, "pool-define-as") == [
+            ("pool-define-as", "bprj_ov", "dir", "--target", str(ov))]
 
     @pytest.mark.skipif(os.geteuid() == 0,
                         reason="root searches a mode-000 directory")

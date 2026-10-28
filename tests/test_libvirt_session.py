@@ -2588,6 +2588,25 @@ class TestFilesAPoolHasNotListedYet:
             ("vol-pool", (TOP,)), ("vol-dumpxml", (TOP,)),
             ("vol-pool", (BASE,)), ("vol-dumpxml", (BASE,))]
 
+    def test_of_pools_whose_targets_read_alike_the_one_on_it_is_used(
+            self, tmp_path):
+        """``x/../ov``, ``x`` leading into ``actual/deep``, reads as ``ov``
+        but is ``actual/ov``: which of the two is on the directory is told
+        by its identity."""
+        ov = tmp_path / "ov"
+        ov.mkdir()
+        (tmp_path / "actual" / "deep").mkdir(parents=True)
+        (tmp_path / "actual" / "ov").mkdir()
+        (tmp_path / "x").symlink_to(tmp_path / "actual" / "deep")
+        overlay = str(ov / "vm01.s1")
+        host = FakeHost()
+        host.define_pool("a-mine", str(ov))
+        host.define_pool("z-other", os.path.join(tmp_path, "x", "..", "ov"))
+        host.add(overlay)
+
+        assert _chains(host, [overlay]) == {overlay: [overlay]}
+        assert host.asked("pool-refresh") == [("a-mine",)]
+
     def test_the_pools_are_read_once_per_read(self):
         other = "/ws/cluster_2/vm02.s1"
         host = self._host()

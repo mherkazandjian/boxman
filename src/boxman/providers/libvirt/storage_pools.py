@@ -80,10 +80,14 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
 
     A pool named *name* on another directory is never taken for it: a
     workdir ``…/ws/web`` and an overlay directory ``…/ov/web`` share a
-    basename. Nor is one whose directory cannot be looked up: which is on
-    it is told by identity — ``(st_dev, st_ino)``, links followed by the
-    filesystem — never by a path ``realpath`` folded as text where it
-    could not search.
+    basename. One is on it when its target is spelled as *directory* is,
+    once normalized — the chain reads find the pool on a file's directory
+    by that spelling, and libvirt a volume by its path (#221), so a pool on
+    the same directory under another name, a symlink or a bind mount,
+    serves neither — and is that directory by identity, ``(st_dev,
+    st_ino)``: spelled alike, ``hidden/link/../../ov`` can be another
+    directory than ``ov``, and one that cannot be looked up is not taken
+    for it.
 
     Best effort: what stops it is named in a warning, never raised.
 
@@ -119,7 +123,8 @@ def ensure_pool_on(virsh, directory: str, name: str) -> str | None:
             path = None
         # one with no local directory (RBD, say) is not on it; one that
         # cannot be read makes the definition below fail, if it is
-        if path is None:
+        if path is None or os.path.normpath(path) != os.path.normpath(
+                directory):
             continue
         try:
             on = os.stat(path)
