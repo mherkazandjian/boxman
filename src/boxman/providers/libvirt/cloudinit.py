@@ -560,9 +560,14 @@ class CloudInitTemplate:
 
         self.logger.info(
             f"pulling base image from OCI registry {image_ref} -> {dst_path}")
-        dst_dir = os.path.dirname(os.path.abspath(dst_path))
+        # beside *dst_path* as given: abspath folds ``link/..`` as text into
+        # what can be another directory, and so does the name mkdtemp
+        # returns since Python 3.12, so only its last component is kept
+        # (#260)
+        dst_dir = os.path.dirname(dst_path) or os.curdir
         os.makedirs(dst_dir, exist_ok=True)
-        tmp_dir = tempfile.mkdtemp(prefix=".boxman-oci-pull-", dir=dst_dir)
+        tmp_dir = os.path.join(dst_dir, os.path.basename(
+            tempfile.mkdtemp(prefix=".boxman-oci-pull-", dir=dst_dir)))
         try:
             qcow2 = pull_oci_image(image_ref, tmp_dir)
             os.replace(qcow2, dst_path)  # atomic rename on the same filesystem

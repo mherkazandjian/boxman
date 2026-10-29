@@ -18,9 +18,14 @@ from pathlib import Path
 import pytest
 
 from boxman.providers.libvirt.disk_cleanup import (
+    StorageInventory,
     file_identities,
+    load_teardown_inventory,
+    read_teardown_locator,
     remove_if_unchanged,
     remove_vm_disks,
+    save_teardown_inventory,
+    save_teardown_locator,
 )
 
 pytestmark = pytest.mark.unit
@@ -154,6 +159,97 @@ class TestRemoveVmDisks:
         kept.write_bytes(b"x")
         remove_vm_disks(str(alias), "vm01", [], protected=[str(kept)])
         assert kept.exists()
+
+
+class TestTeardownFilesAreStagedBesideThem:
+    """The teardown inventory and its locator are each written into a
+    staging file beside them and renamed over them. Since Python 3.12
+    ``tempfile.mkstemp`` folds ``link/..`` out of its directory before it
+    creates the file, so the staging file was made in another directory,
+    or, as here, in none, and the teardown stopped there (#260)."""
+
+    @staticmethod
+    def _beside_target(tmp_path: Path, name: str) -> tuple[Path, str]:
+        """*name* beside the link's target, and ``link/../<name>``, its
+        spelling through the link; folded as text, that is a *name* beside
+        the link, which does not exist."""
+        actual = tmp_path / "actual"
+        (actual / "deep").mkdir(parents=True)
+        (tmp_path / "link").symlink_to(actual / "deep",
+                                       target_is_directory=True)
+        return actual / name, str(tmp_path / "link" / ".." / name)
+
+    def test_an_inventory_beside_disks_spelled_through_a_symlink_and_dotdot(
+            self, tmp_path: Path):
+        disks, directory = self._beside_target(tmp_path, "vms")
+        disks.mkdir()
+        inventory = StorageInventory(
+            vm_name="vm01", disk_sources=[], media_sources=[], records=[],
+            records_state="present", chains={}, boot_family=[],
+            legacy_disks=None)
+
+        path = save_teardown_inventory(inventory, directory)
+
+        assert load_teardown_inventory(path, "vm01").vm_name == "vm01"
+        assert [p.name for p in disks.iterdir()] == [
+            ".boxman-teardown-vm01.json"]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["actual", "link"]
+
+    def test_a_locator_spelled_through_a_symlink_and_dotdot(
+            self, tmp_path: Path):
+        locators, directory = self._beside_target(tmp_path, "teardown")
+        locator = os.path.join(directory, "vm01.json")
+        inventory = str(tmp_path / ".boxman-teardown-vm01.json")
+
+        save_teardown_locator(locator, "vm01", inventory)
+
+        assert read_teardown_locator(locator, "vm01") == inventory
+        assert [p.name for p in locators.iterdir()] == ["vm01.json"]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["actual", "link"]
+
+
+class TestTeardownLocatorNamesTheSavedInventory:
+    """A retry reads the inventory the locator names. The locator recorded
+    ``os.path.abspath`` of where it was saved, which folds ``link/..`` as
+    text: for an inventory saved through ``link/..`` it named a file in
+    another directory, missing there (the retry stopped) or a stale one
+    (the retry decided with it)."""
+
+    @staticmethod
+    def _inventory(disk_source: str) -> StorageInventory:
+        return StorageInventory(
+            vm_name="vm01", disk_sources=[disk_source], media_sources=[],
+            records=[], records_state="present", chains={}, boot_family=[],
+            legacy_disks=None)
+
+    @pytest.mark.parametrize("stale", [False, True],
+                             ids=["none-folded", "stale-folded"])
+    @pytest.mark.parametrize("relative", [False, True],
+                             ids=["absolute", "relative"])
+    def test_an_inventory_saved_through_a_symlink_and_dotdot(
+            self, tmp_path: Path, monkeypatch, relative, stale):
+        disks, directory = TestTeardownFilesAreStagedBesideThem._beside_target(
+            tmp_path, "vms")
+        disks.mkdir()
+        if stale:
+            # where link/../vms folds to as text: an earlier inventory there
+            (tmp_path / "vms").mkdir()
+            save_teardown_inventory(self._inventory("/stale.qcow2"),
+                                    str(tmp_path / "vms"))
+        if relative:
+            monkeypatch.chdir(tmp_path)
+            directory = os.path.join("link", "..", "vms")
+        saved = save_teardown_inventory(self._inventory("/current.qcow2"),
+                                        directory)
+        locator = str(tmp_path / "locators" / "vm01.json")
+
+        save_teardown_locator(locator, "vm01", saved)
+
+        located = read_teardown_locator(locator, "vm01")
+        assert os.path.isfile(located), located
+        assert os.path.samefile(located, disks / ".boxman-teardown-vm01.json")
+        assert load_teardown_inventory(located, "vm01").disk_sources == [
+            "/current.qcow2"]
 
 
 class TestRemoveIfUnchanged:

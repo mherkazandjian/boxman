@@ -2195,6 +2195,40 @@ class TestTheComposeFileIsValidatedBeforeItReplacesTheWorkingOne:
         assert written["services"]["web"]["networks"] == ["corp"]
         assert list(tmp_path.glob(".docker-compose.yml.candidate")) == []
 
+    def test_a_workdir_spelled_through_a_symlink_and_dotdot(self, tmp_path):
+        """``link/..`` is the directory above the link's target. Since
+        Python 3.12 ``tempfile.mkstemp`` folds the ``..`` out before it
+        creates the file, so the candidate was made, empty, in another
+        directory: that file was validated and published, while the
+        generated one was written beside the working file and left there
+        (#260)."""
+        actual = tmp_path / "actual"
+        (actual / "deep").mkdir(parents=True)
+        (tmp_path / "link").symlink_to(actual / "deep",
+                                       target_is_directory=True)
+        cfg = dict(self._cfg(tmp_path), workdir=str(tmp_path / "link" / ".."))
+        session = self._session(tmp_path)
+        runner = _FakeRunner()
+        validated = []
+
+        def record(compose_file):
+            runner.calls.append(("validate", compose_file))
+            with open(compose_file) as fobj:
+                validated.append(yaml.safe_load(fobj))
+            return None
+
+        runner.validate = record
+        with mock.patch("boxman.providers.docker_compose.session.ComposeRunner",
+                        return_value=runner):
+            session.up_cluster("stack", cfg)
+
+        assert sorted(p.name for p in actual.iterdir()) == [
+            "deep", "docker-compose.yml"]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["actual", "link"]
+        written = yaml.safe_load((actual / "docker-compose.yml").read_text())
+        assert validated == [written]
+        assert written["services"]["web"]["networks"] == ["corp"]
+
     def test_nothing_is_published_when_compose_cannot_be_run(self, tmp_path):
         """No validation, no publication.
 

@@ -241,6 +241,30 @@ class TestAtomicWrite:
         # whatever the interleaving, the file must still be valid JSON
         json.loads(Path(cache.projects_cache_file).read_text())
 
+    def test_a_cache_dir_spelled_through_a_symlink_and_dotdot(
+            self, tmp_path: Path):
+        """``link/../cache`` is ``cache`` beside the link's target. Since
+        Python 3.12 ``tempfile.mkstemp`` folds the ``..`` out before it
+        creates the file, so the staging file was made in another directory
+        than projects.json, or, as here, in none (#260)."""
+        actual = tmp_path / "actual"
+        (actual / "deep").mkdir(parents=True)
+        (actual / "cache").mkdir()
+        (tmp_path / "link").symlink_to(actual / "deep",
+                                       target_is_directory=True)
+        cache_dir = str(tmp_path / "link" / ".." / "cache")
+        with patch("boxman.config_cache.DEFAULT_CACHE_DIR", cache_dir):
+            cache = BoxmanCache()
+        cache.projects = {"x": {}}
+
+        cache.write_projects_cache()
+
+        assert json.loads((actual / "cache" / "projects.json").read_text()) \
+            == {"x": {}}
+        assert [p.name for p in (actual / "cache").iterdir()] == [
+            "projects.json"]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["actual", "link"]
+
 
 class TestRegisterProjectReturn:
 

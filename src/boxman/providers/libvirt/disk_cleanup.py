@@ -26,6 +26,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from boxman import log
+from boxman.utils.io import mkstemp_in
 
 from .disk import disk_path_for
 from .disk_ownership import ROLE_DATA, DiskRecord
@@ -291,8 +292,8 @@ def teardown_inventory_path(directory: str, vm_name: str) -> str:
 def _write_json_atomically(path: str, data: object) -> None:
     """Write *data* to *path* as JSON: into a staging file beside it,
     flushed and synced, then renamed over it."""
-    fd, staging = tempfile.mkstemp(prefix=".boxman-teardown-",
-                                   suffix=".tmp", dir=os.path.dirname(path))
+    fd, staging = mkstemp_in(os.path.dirname(path),
+                             prefix=".boxman-teardown-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as fh:
             json.dump(data, fh)
@@ -463,6 +464,11 @@ def save_teardown_locator(locator: str, vm_name: str,
     looks up — by the vm name alone — so it finds the inventory wherever
     that was, whatever directories the retry itself would search.
 
+    *inventory_path* is recorded as given, joined onto the working directory
+    when relative, with nothing folded: ``os.path.abspath`` folds
+    ``link/..`` as text, into what can be another directory than the one
+    the inventory was written to (#260).
+
     Raises:
         OSError: If it cannot be written.
     """
@@ -470,7 +476,8 @@ def save_teardown_locator(locator: str, vm_name: str,
     _write_json_atomically(locator, {
         "version": TEARDOWN_LOCATOR_VERSION,
         "vm_name": vm_name,
-        "inventory": os.path.abspath(inventory_path),
+        "inventory": (inventory_path if os.path.isabs(inventory_path)
+                      else os.path.join(os.getcwd(), inventory_path)),
     })
 
 
