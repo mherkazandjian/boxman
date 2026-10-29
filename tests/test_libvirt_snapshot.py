@@ -2811,6 +2811,70 @@ class TestCollapseKeepsTheLiveDisk:
         assert virsh.snapshots == ["s1", "s2", "s3"]
 
     @pytest.mark.parametrize("alias", ["symlink", "hardlink"])
+    def test_a_head_named_otherwise_than_the_target_is_rebased(
+            self, sm, tmp_path, alias):
+        # one file here need not be one file where qemu-img runs (a
+        # container with mounts of its own): only one path is, so another
+        # spelling is left to qemu-img, as before
+        _base, overlays, memory = _take_external(
+            tmp_path, ["s1", "s2"], real=False)
+        other = tmp_path / "other"
+        if alias == "symlink":
+            other.symlink_to(tmp_path)
+        else:
+            other.mkdir()
+            os.link(overlays["s1"], other / "vm01_disk.s1")
+        head = other / "vm01_disk.s1"
+        virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
+                         {"vda": str(head)}, memory)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()), \
+             patch.object(sm, "_qemu_img_rebase",
+                          return_value=True) as rebase:
+            assert sm.collapse_to("vm01", "s1") is True
+
+        rebase.assert_called_once_with(str(head), str(overlays["s1"]))
+
+    @needs_qemu
+    def test_a_target_overlay_that_is_not_there_stops_the_collapse(
+            self, sm, tmp_path):
+        # s1 records its overlay through a directory that is not there:
+        # as text the path folds to the head, but nothing is at it
+        base, overlays, memory = _take_external(tmp_path, ["s1", "s2"])
+        head = overlays["s1"]
+        virsh = _Libvirt(
+            {"s1": {"vda": str(tmp_path / "absent" / ".." / head.name)},
+             "s2": {"vda": str(overlays["s2"])}},
+            {"vda": str(head)}, memory)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()):
+            assert sm.collapse_to("vm01", "s1") is False
+
+        assert _chain(head) == [str(head), str(base)]
+        assert all(p.exists() for p in overlays.values())
+        assert memory["s2"].exists()
+        assert virsh.snapshots == ["s1", "s2"]
+
+    def test_dry_run_reports_no_rebase_of_the_targets_own_overlay(
+            self, sm, tmp_path):
+        _base, overlays, memory = _take_external(
+            tmp_path, ["s1", "s2"], real=False)
+        virsh = _Libvirt({n: {"vda": str(p)} for n, p in overlays.items()},
+                         {"vda": str(overlays["s1"])}, memory)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.logger, "info") as info:
+            assert sm.collapse_to("vm01", "s1", dry_run=True) is True
+
+        lines = [str(c.args[0]) for c in info.call_args_list]
+        assert not any("would rebase" in line for line in lines)
+        assert any("nothing to rebase" in line for line in lines)
+
+    @pytest.mark.parametrize("alias", ["symlink", "hardlink"])
     def test_the_head_is_recognised_under_another_spelling(
             self, sm, tmp_path, alias):
         # domblklist and the snapshot metadata need not spell the path the

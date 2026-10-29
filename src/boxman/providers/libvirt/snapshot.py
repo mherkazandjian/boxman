@@ -2217,8 +2217,13 @@ class SnapshotManager:
             for disk_target, source in disks:
                 new_base = self._overlay_path_for_snapshot(
                     vm_name, target_name, disk_target)
-                self.logger.info(
-                    f"[dry-run]   would rebase {source} onto {new_base}")
+                if source == new_base:
+                    self.logger.info(
+                        f"[dry-run]   {source} is the overlay of "
+                        f"'{target_name}' itself; nothing to rebase")
+                else:
+                    self.logger.info(
+                        f"[dry-run]   would rebase {source} onto {new_base}")
             for snap in drop_set:
                 for disk_target, _ in disks:
                     overlay = self._overlay_path_for_snapshot(
@@ -2242,11 +2247,15 @@ class SnapshotManager:
                     f"cannot find overlay for disk '{disk_target}' in "
                     f"snapshot '{target_name}' of vm {vm_name}")
                 return False
-            if self._same_file(head_path, new_base):
+            if head_path == new_base:
                 # nothing stands between them: the head is the target's own
                 # overlay (a revert and a new take put it there). Rebasing a
                 # file onto itself trips qemu's image lock at best, and
-                # without one writes a backing chain that loops.
+                # without one writes a backing chain that loops. Only the
+                # same path says so: one file here need not be one file
+                # where qemu-img runs (a container's own mounts), and a
+                # path that cannot be examined proves nothing. Any other
+                # spelling is left to qemu-img, as before.
                 self.logger.info(
                     f"{head_path} is the overlay of '{target_name}' itself; "
                     f"nothing to rebase for {disk_target}")
