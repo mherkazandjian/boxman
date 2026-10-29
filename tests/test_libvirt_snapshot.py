@@ -2894,6 +2894,49 @@ class TestCollapseKeepsTheLiveDisk:
         assert not memory["s2"].exists()
         assert virsh.snapshots == ["s1"]
 
+    @pytest.mark.parametrize("error", [
+        PermissionError(13, "Permission denied"),
+        # in a container a path can be there that boxman, on the host,
+        # does not see -- and the rm runs in the container
+        FileNotFoundError(2, "No such file or directory"),
+    ], ids=["denied", "missing"])
+    def test_a_kept_overlay_that_cannot_be_examined_keeps_every_overlay(
+            self, sm, tmp_path, error):
+        # kept s1 records its overlay under a spelling that cannot be
+        # stat'ed, and the dropped s2 records that file under one that can:
+        # nothing shows that s2's is not the file the head stands on
+        _base, overlays, memory = _take_external(
+            tmp_path, ["s1", "s2"], real=False)
+        head = tmp_path / "vm01_disk.1785187700"
+        head.write_bytes(b"head")
+        other = tmp_path / "other"
+        other.mkdir()
+        hidden = other / "vm01_disk.s1"
+        os.link(overlays["s1"], hidden)
+        virsh = _Libvirt({"s1": {"vda": str(hidden)},
+                          "s2": {"vda": str(overlays["s1"])}},
+                         {"vda": str(head)}, memory)
+        real_stat = os.stat
+
+        def stat(path, *args, **kwargs):
+            if os.fspath(path) == str(hidden):
+                raise error
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=_shell_that_runs()), \
+             patch.object(sm, "_qemu_img_rebase", return_value=True), \
+             patch.object(sm.logger, "warning") as warning, \
+             patch("os.stat", side_effect=stat):
+            assert sm.collapse_to("vm01", "s1") is True
+
+        assert overlays["s1"].is_file(), "what the head stands on was removed"
+        warned = " ".join(str(c.args[0]) for c in warning.call_args_list)
+        assert str(overlays["s1"]) in warned
+        assert not memory["s2"].exists()
+        assert virsh.snapshots == ["s1"]
+
     def test_dry_run_reports_the_head_as_kept(self, sm, tmp_path):
         _base, overlays, memory = _take_external(
             tmp_path, ["s1", "s2", "s3"], real=False)

@@ -2122,16 +2122,14 @@ class SnapshotManager:
         head -- and the rebase rewrites the head in place.
 
         Returns:
-            list: ``(path, reason)`` pairs, or None when a head cannot be
-            stat'ed. Then no comparison can show that a dropped overlay is
-            not the live disk under another name, so none may be removed.
+            list: ``(path, reason)`` pairs, or None when one of them cannot
+            be stat'ed -- not even when it seems missing, since the removal
+            may run where it is there (a container). Then no comparison can
+            show that a dropped overlay is not that file under another name,
+            so none may be removed.
         """
         keeps = []
         for disk_target, head in disks:
-            try:
-                os.stat(head)
-            except OSError:
-                return None
             keeps.append((head, f"it is the disk {disk_target} runs on"))
         for snap in kept:
             for disk_target, _head in disks:
@@ -2140,6 +2138,11 @@ class SnapshotManager:
                 if path:
                     keeps.append(
                         (path, f"kept snapshot '{snap}' still records it"))
+        for path, _reason in keeps:
+            try:
+                os.stat(path)
+            except OSError:
+                return None
         return keeps
 
     def _collapse_keep_reason(self,
@@ -2147,8 +2150,9 @@ class SnapshotManager:
                               keeps: list[tuple] | None) -> str | None:
         """Why *path* has to stay (see :meth:`_collapse_keeps`), or None."""
         if keeps is None:
-            return ("the domain's disks could not be examined, so nothing "
-                    "shows it is not still in use")
+            return ("the domain's disks, or the overlays its kept snapshots "
+                    "record, could not be examined, so nothing shows it is "
+                    "not still in use")
         for kept_path, reason in keeps:
             if self._same_file(path, kept_path):
                 return reason
