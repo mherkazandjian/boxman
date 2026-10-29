@@ -20,6 +20,7 @@ import contextlib
 import glob as _glob
 import json
 import os
+import re
 import stat
 import tempfile
 from collections.abc import Callable, Iterable
@@ -507,6 +508,29 @@ def _version(data: dict, expected: int) -> None:
         raise ValueError(f"unknown layout {version!r}")
 
 
+#: the kernel's table of the mounts this process sees
+MOUNTINFO = "/proc/self/mountinfo"
+
+_OCTAL_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+
+def mount_points(mountinfo: str) -> set[str] | None:
+    """
+    Every mount point the *mountinfo* table lists, unescaped as the kernel
+    escapes them (a space as ``\\040``), or None when it cannot be read.
+    """
+    try:
+        # undecodable bytes as os.fsdecode() gives them in a path
+        with open(mountinfo, encoding="utf-8",
+                  errors="surrogateescape") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    return {_OCTAL_ESCAPE.sub(lambda m: chr(int(m.group(1), 8)),
+                              line.split(" ")[4])
+            for line in lines if line.count(" ") >= 4}
+
+
 def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
     """
     Read back what :func:`save_teardown_inventory` saved for *vm_name*.
@@ -517,14 +541,26 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
 
     One that is a symbolic link is refused too: boxman saves its inventory
     as a file of its own, and a retry saving what it found through a link
-    would replace the link, leaving the file it names as it was.
+    would replace the link, leaving the file it names as it was. So is one
+    with another name -- a hard link, or a file mounted on it: the save
+    puts a new file under the one name it loaded, and the other name keeps
+    the old one, for a search without the locator to find. A mount table
+    that cannot be read refuses nothing.
 
     Raises:
         OSError, ValueError: If it cannot be read, is not a saved inventory
-            of this layout, is a symbolic link, or names another VM.
+            of this layout, is a symbolic link, has another name, or names
+            another VM.
     """
     if os.path.islink(path):
         raise ValueError("it is a symbolic link, not the file boxman saved")
+    if os.stat(path).st_nlink > 1:
+        raise ValueError("it has another name, a hard link, which a save "
+                         "under this one would leave as it was")
+    mounts = mount_points(MOUNTINFO)
+    if mounts is not None and os.path.realpath(path) in mounts:
+        raise ValueError("a file is mounted on it, which a save under "
+                         "another name of that file would leave as it was")
     data = _json_object(path)
     _version(data, TEARDOWN_INVENTORY_VERSION)
     name = _field(data, "vm_name", lambda v: isinstance(v, str))

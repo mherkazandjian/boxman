@@ -1086,6 +1086,64 @@ class TestSavedInventoryLifecycle:
 
         assert boot.exists()
 
+    def test_a_saved_inventory_with_another_name_keeps_everything(
+            self, tmp_path):
+        """A retry's save puts a new file under the one name it loaded: a
+        hard link left under another name stays as it was, for a search
+        without the locator to find."""
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[],
+                      in_use={str(boot): OTHER})
+        t.deprovision()
+        (tmp_path / 'elsewhere').mkdir()
+        os.link(_saved(tmp_path), tmp_path / 'elsewhere' / 'inventory.json')
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+
+        with pytest.raises(ProvisionError, match='hard link'):
+            t.deprovision()
+
+        assert boot.exists()
+
+    def test_a_saved_inventory_mounted_from_elsewhere_keeps_everything(
+            self, tmp_path):
+        """A file bind-mounted there stays the file it was when a retry
+        saves under another name of it."""
+        boot = _qcow2(tmp_path / f'{VM}.qcow2')
+        t = _Teardown(tmp_path, disks=[boot], records=[],
+                      in_use={str(boot): OTHER})
+        t.deprovision()
+        mountinfo = tmp_path / 'mountinfo'
+        mountinfo.write_text(
+            "22 1 253:0 / / rw,relatime shared:1 - xfs /dev/vda1 rw\n"
+            f"97 22 253:0 /elsewhere/inventory.json "
+            f"{os.path.realpath(_saved(tmp_path))} rw,relatime shared:1 "
+            "- xfs /dev/vda1 rw\n")
+        t.session.vm_storage_devices.return_value = None
+        t.session.disk_paths_in_use.return_value = {}
+
+        with patch.object(disk_cleanup, 'MOUNTINFO', str(mountinfo)), \
+                pytest.raises(ProvisionError, match='mounted'):
+            t.deprovision()
+
+        assert boot.exists()
+
+    @pytest.mark.parametrize("spelled, path", [
+        ("/srv/images/inv.json", "/srv/images/inv.json"),
+        (r"/srv/my\040images/inv.json", "/srv/my images/inv.json"),
+        (r"/srv/tab\011and\134back/inv.json", "/srv/tab\tand\\back/inv.json"),
+    ], ids=["plain", "space", "tab and backslash"])
+    def test_mount_points_are_read_as_the_kernel_escapes_them(
+            self, tmp_path, spelled, path):
+        mountinfo = tmp_path / 'mountinfo'
+        mountinfo.write_text(
+            f"97 22 253:0 /x {spelled} rw shared:1 - xfs /dev/vda1 rw\n")
+
+        assert disk_cleanup.mount_points(str(mountinfo)) == {path}
+
+    def test_no_mount_table_refuses_nothing(self, tmp_path):
+        assert disk_cleanup.mount_points(str(tmp_path / 'missing')) is None
+
     def test_an_inventory_saved_for_another_vm_is_refused(self, tmp_path):
         path = disk_cleanup.save_teardown_inventory(disk_cleanup.StorageInventory(
             vm_name=OTHER, disk_sources=[], media_sources=[], records=[],
