@@ -302,17 +302,34 @@ class TestAVmThatIsNotRunningIsExpected:
         assert "`boxman up`" in about_it[0]
         assert lab.pushed() == ["cluster_1_vm02"]
 
-    def test_the_session_is_asked_for_its_address_once_per_run(
+    def test_the_session_is_not_asked_for_its_address(
             self, tmp_path, monkeypatch, update_flow):
-        """The session logs "is not running, cannot get the ip addresses"
-        each time it is asked. The ssh steps asked twice and connect_info
-        a third time; only connect_info's lookup is left."""
+        """The session logged "is not running, cannot get the ip addresses"
+        as a warning each time it was asked. The ssh steps asked twice and
+        connect_info a third time; none is left, as each one knows the VM
+        is not running."""
         lab = Lab(tmp_path, vms=("vm01",))
         lab.states[full("vm01")] = "shut off"
 
         update(lab, monkeypatch)
 
-        assert lab.asked_for_address("vm01") == 1
+        assert lab.asked_for_address("vm01") == 0
+
+    def test_the_connection_summary_says_it_is_not_running(
+            self, tmp_path, monkeypatch, update_flow):
+        lab = Lab(tmp_path)
+        _both_up_once(lab)
+        lab.states[full("vm01")] = "shut off"
+
+        update(lab, monkeypatch)
+
+        said = lab.logged("status")
+        vm01 = said.index("vm: vm01 (hostname: vm01)")
+        assert said[vm01 + 1] == (
+            "  ip addresses: not available, the vm is not running (shut off)")
+        vm02 = said.index("vm: vm02 (hostname: vm02)")
+        assert said[vm02 + 1:vm02 + 3] == [
+            "  ip addresses:", "    vnet0: 192.168.10.6"]
 
     @needs_ssh
     def test_openssh_resolves_the_kept_entry(

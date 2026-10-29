@@ -212,6 +212,8 @@ class TestEverySiteThatNamesTheVmForSsh:
         session.get_vm_ip_addresses.side_effect = lambda name: {"eth0": "192.168.10.10"}
         manager.session_for_cluster = lambda cluster_name: session
         manager._docker_ssh_jump_stanza = lambda: None
+        # connect_info reads the VMs' states; unknown, it asks every VM
+        manager._vm_states_if_known = lambda: None
         return manager
 
     def test_the_key_push(self, tmp_path):

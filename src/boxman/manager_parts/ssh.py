@@ -302,6 +302,11 @@ class SSHMixin:
         """
         self.logger.status("=== vm connection information ===")
         ws_path = self.config.get('workspace', {}).get('path', '')
+        # A VM known not to be running is said to be so here, and not asked
+        # for an address it cannot have: the session only logs that at
+        # debug level, and "not available" alone did not say why. None --
+        # the states are unknown -- asks every VM, as before.
+        vm_states = self._vm_states_if_known()
 
         prj_name = f'bprj__{self.config["project"]}__bprj'
         for cluster_name, cluster in self._vm_clusters.items():
@@ -313,13 +318,23 @@ class SSHMixin:
 
                 self.logger.status(f"vm: {vm_name} (hostname: {hostname})")
 
-                # get the ip addresses for all interfaces
-                ip_addresses = self.session_for_cluster(cluster_name).get_vm_ip_addresses(full_vm_name)
+                state = (None if vm_states is None
+                         else vm_states.get(full_vm_name, 'not defined'))
+                if state in self._NOT_RUNNING_STATES:
+                    ip_addresses = {}
+                else:
+                    # get the ip addresses for all interfaces
+                    ip_addresses = self.session_for_cluster(
+                        cluster_name).get_vm_ip_addresses(full_vm_name)
 
                 if ip_addresses:
                     self.logger.status("  ip addresses:")
                     for iface, ip in ip_addresses.items():
                         self.logger.status(f"    {iface}: {ip}")
+                elif state in self._NOT_RUNNING_STATES:
+                    self.logger.status(
+                        f"  ip addresses: not available, the vm is not "
+                        f"running ({state})")
                 else:
                     self.logger.status("  ip addresses: not available")
 
@@ -477,10 +492,9 @@ class SSHMixin:
         Args:
             vm_states: full VM name -> state, as
                 :meth:`_vm_states_if_known` gives it. A VM known not to be
-                running is not asked for its address: it has none, and
-                asking makes the session warn. None -- the states are
-                unknown -- asks every VM, and one without an address gets
-                no block, as before.
+                running is not asked for its address: it has none. None
+                -- the states are unknown -- asks every VM, and one without
+                an address gets no block, as before.
             fresh: full names of the VMs created in this run. An earlier
                 block under their alias describes a domain that is gone,
                 so it is never reused.

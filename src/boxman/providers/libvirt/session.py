@@ -2272,10 +2272,15 @@ class LibVirtSession(SessionConfigMixin):
             # use virsh commands to get domain info
             virsh = VirshCommand(provider_config=self.provider_config)
 
-            # first check if the vm is running
+            # first check if the vm is running. Not a warning: this is asked
+            # once per round of the IP wait and again by each ssh step, so a
+            # stopped VM repeated it long after the wait had said it
+            # stopped. The callers say so once, where it matters: the wait
+            # when a VM stops, the ssh config and key steps for a VM that is
+            # not running, and connect_info in its summary.
             result = virsh.execute("domstate", vm_name, warn=True)
             if not result.ok or "running" not in result.stdout:
-                self.logger.warning(f"the vm {vm_name} is not running, cannot get the ip addresses")
+                self.logger.debug(f"the vm {vm_name} is not running, cannot get the ip addresses")
                 return {}
 
             def _parse_domifaddr(output: str) -> dict[str, str]:

@@ -454,6 +454,30 @@ class TestStartVM:
             assert s.start_vm("vm01") is False
 
 
+class TestTheAddressesOfAVmThatIsNotRunning:
+    """Asked once per round of the IP wait and again by each ssh step, the
+    session warned "is not running, cannot get the ip addresses" each time,
+    long after the wait had reported the stop. The callers say it once;
+    the session logs it at debug level only."""
+
+    @pytest.mark.parametrize("domstate", [
+        _result(stdout="shut off\n"),
+        _result(ok=False, stderr="error: failed to get domain 'vm01'")])
+    def test_are_none_and_nothing_is_warned(self, domstate):
+        s = _session({})
+        s.logger = MagicMock()
+        virsh = MagicMock()
+        virsh.execute.return_value = domstate
+        with patch("boxman.providers.libvirt.session.VirshCommand",
+                   return_value=virsh):
+            assert s.get_vm_ip_addresses("vm01") == {}
+        s.logger.warning.assert_not_called()
+        assert "vm01 is not running" in s.logger.debug.call_args.args[0]
+        # and no address source is asked
+        assert [c.args[0] for c in virsh.execute.call_args_list] == [
+            "domstate"]
+
+
 class TestCloneVMDelegation:
 
     def test_calls_cloneVM_with_expected_args(self, tmp_path: Path):
