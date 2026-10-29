@@ -675,6 +675,7 @@ class VMsMixin:
         failed = self.eject_install_media(chosen, dry_run=dry_run,
                                           declared_done=True)
         self._raise_for_control_failures(failed, 'finish-install')
+
     def _forget_answer_iso(self, cluster: dict[str, Any],
                            vm_info: dict[str, Any], full_vm_name: str,
                            dry_run: bool) -> list[str]:

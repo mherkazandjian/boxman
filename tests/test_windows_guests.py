@@ -937,6 +937,32 @@ class TestRemovingIt:
         self._eject(mgr, InstallMediaOutcome())
         assert not iso.exists()
 
+    def test_finish_install_deletes_it_as_the_agent_path_does(self, tmp_path):
+        mgr, iso = self._with_iso(tmp_path)
+        session = MagicMock()
+        session.eject_install_media.return_value = InstallMediaOutcome(
+            held=[('sdc', str(iso))], ejected=[('sdc', str(iso))])
+        mgr.session_for_cluster = MagicMock(return_value=session)
+        mgr._update_sessions_with_runtime = MagicMock()
+        mgr._is_compose_cluster = lambda name: False
+        mgr.finish_install(types.SimpleNamespace(vms='c1_win01', cluster=None,
+                                                 dry_run=False))
+        assert session.eject_install_media.call_args.kwargs[
+            'declared_done'] is True
+        assert not iso.exists()
+
+    def test_a_finish_install_dry_run_keeps_it(self, tmp_path):
+        mgr, iso = self._with_iso(tmp_path)
+        session = MagicMock()
+        session.eject_install_media.return_value = InstallMediaOutcome(
+            held=[('sdc', str(iso))], would_eject=[('sdc', str(iso))])
+        mgr.session_for_cluster = MagicMock(return_value=session)
+        mgr._update_sessions_with_runtime = MagicMock()
+        mgr._is_compose_cluster = lambda name: False
+        mgr.finish_install(types.SimpleNamespace(vms='win01', cluster=None,
+                                                 dry_run=True))
+        assert iso.exists()
+
     def test_it_stays_while_the_install_runs(self, tmp_path):
         mgr, iso = self._with_iso(tmp_path)
         self._eject(mgr, InstallMediaOutcome(held=[('sdc', str(iso))],
@@ -989,6 +1015,22 @@ class TestSshToAWindowsVm:
         lab.mgr.write_ssh_config()
         assert '    User ops' in lab.block('cluster_1_win01')
         assert '    User ops' in lab.block('cluster_1_vm02')
+
+    def test_the_clusters_admin_user_is_the_account_its_answer_file_makes(
+            self, tmp_path):
+        # decided on #271: a cluster-level admin_user carries over to its
+        # Windows VMs, and the answer file creates that account, so the
+        # user the ssh config names exists in the guest
+        mgr = _manager(tmp_path, cluster={'admin_user': 'ops'})
+        cluster = mgr.config['clusters']['c1']
+        vm_info = cluster['vms']['win01']
+        context = mgr._answer_context('c1', cluster, 'win01', vm_info)
+        assert context['admin_user'] == 'ops'
+        account = ET.fromstring(render_answer_file(
+            mgr._answer_template(vm_info), context).encode()).find(
+                './/u:LocalAccount', NS)
+        assert account.find('u:Name', NS).text == 'ops'
+        assert account.find('u:Group', NS).text == 'Administrators'
 
     def test_its_own_admin_user_wins(self, tmp_path):
         lab, _cluster = self._lab(tmp_path, cluster_user='ops',

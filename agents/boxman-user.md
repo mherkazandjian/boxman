@@ -905,6 +905,10 @@ vms:
 - **Clock:** the domain gets `--clock offset=utc` and the answer file sets
   `RealTimeIsUniversal`; virt-install's default `localtime` put a UTC guest
   an hour ahead on a CET host.
+- **A guest whose agent never comes up** keeps its install media (and the
+  answer ISO) until `boxman control finish-install --vms <cluster>_<vm>`;
+  until then `update --restart` does not restart it (`--force-restart`
+  does). A cluster-level `admin_user` carries over to its Windows VMs.
 - **Timing:** about 2 min to the installed system's DHCP lease (the first
   `up`'s IP wait), 3-3.5 min to `boxman-setup: done`; the Server 2022
   OpenSSH Feature on Demand needs guest internet.

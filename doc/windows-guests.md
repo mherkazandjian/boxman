@@ -494,7 +494,9 @@ No script: boxman renders its own answer file and builds the answer ISO.
    2022 template), and its Windows templates need a product key and inject
    no virtio drivers.
 5. **Done: `os: windows` switches** (G5): ssh user `Administrator` (or
-   `admin_user`, the VM's or the cluster's); the boxman key goes in through
+   `admin_user`, the VM's or the cluster's: decided, a cluster-level
+   `admin_user` carries over to its Windows VMs, and the answer file
+   creates that account); the boxman key goes in through
    the answer ISO, not `ssh-copy-id`; inventory gets
    `ansible_shell_type: powershell`; clone identity is forced `off`
    (`required` is refused); `cloudinit*` keys are refused, and so is a
@@ -553,6 +555,11 @@ prompt (§3.1). Win11 client licensing on VMs is its own question.
    of those boxes declares a single CD-ROM, so G1 changes none of them, and
    G3 only adds an agent channel where virt-install added none.)
 8. **The shared-host teardown issue** (§4): file separately?
+9. **A cluster-level `admin_user` and Windows VMs.** Decided: it carries
+   over. An `os: windows` VM's ssh user is its own `admin_user`, else the
+   cluster's, else `Administrator`, and the default answer file creates
+   any account other than Administrator in Administrators, with the
+   Administrator password, so the name the ssh config uses exists.
 
 ## 7. Reproducing
 
