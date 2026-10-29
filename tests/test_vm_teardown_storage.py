@@ -3677,6 +3677,23 @@ class TestOverlaysInADiskSnapshotDir:
         ov.mkdir()
         return workdir, ov
 
+    def test_one_the_vm_attaches_as_media_there_is_kept_and_named(
+            self, tmp_path):
+        """``update`` lists the directory of the vm's disks. Left there to
+        what libvirt names as the vm's, a CD-ROM under the vm's name is
+        kept first: with the chains unread, nothing else would name it, and
+        with nothing kept the inventory saying what it is would go too."""
+        workdir, ov = self._dirs(tmp_path)
+        iso = _file(ov / f'{VM}.install.iso')
+        s1 = ov / f'{VM}.s1'                  # already gone
+        t = _Teardown(workdir, disks=[s1], media=[iso], records=[],
+                      disk_snapshot_dir=ov, chains=None)
+
+        t.update_remove()
+
+        assert iso.exists()
+        assert str(iso) in t.warnings and 'CD-ROM' in t.warnings
+
     @PATHS
     def test_the_boot_disks_overlays_there_go_with_its_base(self, tmp_path,
                                                             path):

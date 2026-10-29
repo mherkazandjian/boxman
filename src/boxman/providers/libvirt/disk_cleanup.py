@@ -1129,7 +1129,12 @@ def remove_vm_storage(
         if (overlay_dirs and overlays_known
                 and real(os.path.dirname(path)) not in real_workdirs
                 and any(in_overlay_dir(path))):
-            continue      # what libvirt names as the vm's decides it (1c)
+            # what libvirt names as the vm's decides it (1c), but a CD-ROM
+            # is kept first here too
+            reason = media_refusal(path)
+            if reason:
+                admission.refuse(path, reason)
+            continue
         reason = static_refusal(path)
         if reason is None and inventory.records_state == RECORDS_UNKNOWN:
             reason = _boxman_artifact_refusal(vm, path)
