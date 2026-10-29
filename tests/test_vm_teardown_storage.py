@@ -3071,6 +3071,42 @@ class TestMemoryImagesInASnapshotDir:
         assert raw.exists()
         assert str(raw) in t.warnings and 'CD-ROM' in t.warnings
 
+    def test_one_there_with_the_chains_unread_is_kept_and_named(
+            self, tmp_path):
+        """With the chains unread nothing tells whether a CD-ROM is built
+        on it: left to what the snapshots recorded, it was decided by
+        nothing, and the inventory that keeps it on a retry went too."""
+        workdir, snaps = self._dirs(tmp_path)
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        seed = _qcow2(tmp_path / 'elsewhere' / 'seed.qcow2')
+        t = _Teardown(workdir, disks=[snaps / f'{VM}.qcow2'], media=[seed],
+                      records=[], memory_snapshot_dir=snaps, chains=None)
+
+        t.update_remove()
+
+        assert raw.exists()
+        assert (f'left {raw} in place because the backing chains'
+                in t.warnings)
+
+    @pytest.mark.parametrize("suffix", [".raw", ".raw.zst"])
+    def test_a_symlink_there_keeps_the_recorded_image_it_names(
+            self, tmp_path, suffix):
+        """A symlink is no file a teardown unlinks, and its refusal holds
+        for the file it names, which the snapshots recorded in the
+        workdir."""
+        workdir, snaps = self._dirs(tmp_path)
+        target = _file(workdir / f'{VM}_snapshot_s1{suffix}')
+        link = snaps / target.name
+        link.symlink_to(target)
+        t = _Teardown(workdir, disks=[snaps / f'{VM}.qcow2'], records=[],
+                      memory_snapshot_dir=snaps, memory_images={
+                          's1': str(workdir / f'{VM}_snapshot_s1.raw')})
+
+        t.update_remove()
+
+        assert target.exists() and link.is_symlink()
+        assert f'left {link} in place because it is a symlink' in t.warnings
+
 
 class TestMemoryImagesLeftOutside:
     """A memory image a snapshot recorded outside every cluster workdir and

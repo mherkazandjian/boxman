@@ -631,6 +631,8 @@ def _regular_file_refusal(path: str) -> str | None:
 _MEDIA = "it is a CD-ROM or other media source of the vm"
 _UNDER_MEDIA = "it backs a CD-ROM or other media source of the vm"
 _OUTSIDE = "it is outside every cluster workdir of the project"
+_CHAINS_UNREAD = ("the backing chains of the vm's disks could not be read, "
+                  "so whether a CD-ROM is built on it cannot be told")
 _NOT_AN_ARTIFACT = (
     "the vm was already undefined and no saved teardown inventory was "
     "found, so only boxman's own qcow2 images and memory files are removed "
@@ -974,9 +976,12 @@ def remove_vm_storage(
         if (is_memory_image(vm, path)
                 and real(os.path.dirname(path)) not in real_workdirs
                 and _directory_is_one_of(path, memory_ids)):
-            # what its snapshots recorded decides it (1b), but a CD-ROM is
-            # kept first, as on every route
-            reason = media_refusal(path)
+            # what its snapshots recorded decides it (1b), but every refusal
+            # other than being outside the workdirs comes first, as on
+            # every route: a CD-ROM is kept, a symlink keeps the file it
+            # names, unread chains keep what a CD-ROM may be built on
+            reason = (media_refusal(path) or _regular_file_refusal(path)
+                      or (_CHAINS_UNREAD if chains is None else None))
             if reason:
                 admission.refuse(path, reason)
             continue
