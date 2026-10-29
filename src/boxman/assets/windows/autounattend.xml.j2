@@ -1,30 +1,44 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-  Answer file for an unattended Windows Server 2022 install on libvirt/KVM.
+{#-
+  boxman's default answer file: an unattended Windows Server 2022 install on
+  libvirt/KVM (an `os: windows` VM with `unattend:`, doc/windows-guests.md).
 
-  Rendered by make-answer-iso.sh, which fills in the Administrator password
-  and the computer name and writes the result onto a small ISO. Never commit
-  a rendered copy: it holds the Administrator password in plain text.
+  boxman renders it with Jinja -- the env() helpers of conf.yml, and every
+  value autoescaped for XML -- and writes the result onto the VM's answer
+  ISO, never anywhere else: it holds the Administrator password in plain
+  text. These comments are Jinja's, so none of them reaches the guest.
 
-  Keep the placeholder names out of comments: they are replaced everywhere,
-  which would copy the password into the comment, and a password with two
-  hyphens in a row would make the file invalid XML.
+  Variables (an `unattend: vars:` entry overrides any of them):
+    admin_pass     the Administrator password (the VM's or cluster's
+                   admin_pass), checked against Windows' complexity rule
+    admin_user     the ssh user; an account other than Administrator is
+                   created, in Administrators, with the same password
+    computer_name  the VM's hostname: or key, a valid NetBIOS name
+    image_index    the install.wim image: on the 2022 evaluation ISO, 1 is
+                   Standard Core, 2 Standard with Desktop Experience
+    locale         en-US unless set
+    timezone       UTC unless set
+    virtio_os      the virtio-win driver directory, 2k22 unless set
 
   Assumes SeaBIOS (MBR partitioning), a virtio-blk boot disk and a virtio-net
-  NIC (what boxman's IsoBootVM creates) and the virtio-win ISO attached as
-  a CD-ROM so WinPE can load viostor/NetKVM before it looks for a disk.
--->
+  NIC, which is what boxman's IsoBootVM creates, and the virtio-win ISO
+  attached as a CD-ROM, so WinPE can load viostor and NetKVM before it looks
+  for a disk.
+-#}
+{%- set locale = locale | default('en-US') %}
+{%- set timezone = timezone | default('UTC') %}
+{%- set virtio_os = virtio_os | default('2k22') %}
 <unattend xmlns="urn:schemas-microsoft-com:unattend"
           xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
 
   <settings pass="windowsPE">
     <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
-      <InputLocale>en-US</InputLocale>
-      <SystemLocale>en-US</SystemLocale>
-      <UILanguage>en-US</UILanguage>
-      <UserLocale>en-US</UserLocale>
+      <SetupUILanguage><UILanguage>{{ locale }}</UILanguage></SetupUILanguage>
+      <InputLocale>{{ locale }}</InputLocale>
+      <SystemLocale>{{ locale }}</SystemLocale>
+      <UILanguage>{{ locale }}</UILanguage>
+      <UserLocale>{{ locale }}</UserLocale>
     </component>
 
     <!-- The CD-ROM letters are not fixed, so offer every likely one; Setup
@@ -32,12 +46,12 @@
     <component name="Microsoft-Windows-PnpCustomizationsWinPE" processorArchitecture="amd64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <DriverPaths>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="1"><Path>D:\viostor\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="2"><Path>E:\viostor\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="3"><Path>F:\viostor\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="4"><Path>D:\NetKVM\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="5"><Path>E:\NetKVM\2k22\amd64</Path></PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="6"><Path>F:\NetKVM\2k22\amd64</Path></PathAndCredentials>
+{%- for driver in ('viostor', 'NetKVM') %}
+{%- set outer = loop.index0 %}
+{%- for letter in ('D', 'E', 'F') %}
+        <PathAndCredentials wcm:action="add" wcm:keyValue="{{ outer * 3 + loop.index }}"><Path>{{ letter }}:\{{ driver }}\{{ virtio_os }}\amd64</Path></PathAndCredentials>
+{%- endfor %}
+{%- endfor %}
       </DriverPaths>
     </component>
 
@@ -69,10 +83,9 @@
       </DiskConfiguration>
       <ImageInstall>
         <OSImage>
-          <!-- Index 1 = Standard Evaluation, Server Core (no desktop). -->
           <InstallFrom>
             <MetaData wcm:action="add">
-              <Key>/IMAGE/INDEX</Key><Value>1</Value>
+              <Key>/IMAGE/INDEX</Key><Value>{{ image_index }}</Value>
             </MetaData>
           </InstallFrom>
           <InstallTo><DiskID>0</DiskID><PartitionID>2</PartitionID></InstallTo>
@@ -89,8 +102,8 @@
   <settings pass="specialize">
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <ComputerName>@COMPUTER_NAME@</ComputerName>
-      <TimeZone>UTC</TimeZone>
+      <ComputerName>{{ computer_name }}</ComputerName>
+      <TimeZone>{{ timezone }}</TimeZone>
     </component>
   </settings>
 
@@ -99,8 +112,19 @@
                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <UserAccounts>
         <AdministratorPassword>
-          <Value>@ADMIN_PASS@</Value><PlainText>true</PlainText>
+          <Value>{{ admin_pass }}</Value><PlainText>true</PlainText>
         </AdministratorPassword>
+{%- if admin_user | lower != 'administrator' %}
+        <!-- the ssh user; as a member of Administrators it reads the same
+             administrators_authorized_keys -->
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>{{ admin_user }}</Name>
+            <Group>Administrators</Group>
+            <Password><Value>{{ admin_pass }}</Value><PlainText>true</PlainText></Password>
+          </LocalAccount>
+        </LocalAccounts>
+{%- endif %}
       </UserAccounts>
       <!-- One automatic logon, so FirstLogonCommands run. LogonCount 1 allows
            no second one; boxman-setup.ps1 also turns auto-logon off, and logs
@@ -109,7 +133,7 @@
         <Enabled>true</Enabled>
         <LogonCount>1</LogonCount>
         <Username>Administrator</Username>
-        <Password><Value>@ADMIN_PASS@</Value><PlainText>true</PlainText></Password>
+        <Password><Value>{{ admin_pass }}</Value><PlainText>true</PlainText></Password>
       </AutoLogon>
       <OOBE>
         <HideEULAPage>true</HideEULAPage>
@@ -118,7 +142,7 @@
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <Description>boxman guest setup (drivers, agent, WinRM, OpenSSH)</Description>
+          <Description>boxman guest setup (drivers, agent, OpenSSH)</Description>
           <CommandLine>cmd /c for %d in (D E F G) do @if exist %d:\boxman-setup.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File %d:\boxman-setup.ps1</CommandLine>
         </SynchronousCommand>
       </FirstLogonCommands>

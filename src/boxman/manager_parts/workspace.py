@@ -119,9 +119,18 @@ class WorkspaceMixin:
                     # a user's own --ssh-common-args (a ProxyJump, say). This one
                     # only makes the ssh plugin add -o StrictHostKeyChecking=no,
                     # which is exactly what the blanket setting used to do.
+                    # A Windows guest's sshd starts PowerShell (the setup
+                    # script makes it the default shell), and Ansible has to
+                    # know: its POSIX shell plugin would send it sh. The
+                    # connection stays ssh, the default, so no
+                    # ansible_connection is set: that is what tells a
+                    # container from a VM below.
+                    shell = ({'ansible_shell_type': 'powershell'}
+                             if self.is_windows(vm_info) else {})
                     all_hosts.append((cname, vm_name, host_key, {
                         **connect,
                         'ansible_host_key_checking': False,
+                        **shell,
                     }))
 
         # A VM's boxman_alias is its node<N> ssh_config alias (#247). A
@@ -248,6 +257,10 @@ class WorkspaceMixin:
                 "ssh_args = -o ControlMaster=auto -o ControlPersist=60s\n"
                 "control_path = /tmp/ansible-ssh-%%h-%%p-%%r\n"
             )
+
+        # the answer ISO of an unattended Windows install lives in its
+        # cluster's workdir, resolved above
+        self.add_answer_cdroms()
 
     def prepare_runtime_workdirs(self, workdirs) -> None:
         """

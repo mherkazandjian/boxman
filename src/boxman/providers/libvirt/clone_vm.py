@@ -629,13 +629,22 @@ class CloneVM:
             return False
 
     def _resolve_policy(self, config_key: str) -> str:
-        """Read and validate one ``auto|required|off`` policy key."""
+        """Read and validate one ``auto|required|off`` policy key.
+
+        ``off`` for an ``os: windows`` clone, whatever it says: every
+        property the pass resets -- /etc/machine-id, /etc/ssh host keys,
+        /etc/hostname -- is a Linux file, and a Windows clone gets its
+        identity from ``sysprep /generalize`` in its template instead.
+        ``required`` is refused before the clone (``validate_guest_os_config``).
+        """
         policy = self.info.get(config_key, 'auto')
         if not isinstance(policy, str) or policy not in IDENTITY_POLICIES:
             choices = ', '.join(sorted(IDENTITY_POLICIES))
             raise ConfigError(
                 f"{config_key} for vm '{self.new_vm_name}' must be one of "
                 f"{choices}, got {policy!r}")
+        if self.info.get('os') == 'windows':
+            return 'off'
         return policy
 
     def _resolve_guest_hostname(self) -> str | None:

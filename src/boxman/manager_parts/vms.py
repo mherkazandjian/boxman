@@ -196,6 +196,9 @@ class VMsMixin:
         # resolve isos/cdroms/networks in place so both the clone subprocesses
         # and the later configure/start step see the resolved values
         self._resolve_iso_config()
+        # the answer ISO of an unattended Windows install, which virt-install
+        # attaches with the rest
+        self.build_answer_media()
         clone_tasks = [
             (cluster, vm_info, new_vm_name)
             for cluster, vm_info, new_vm_name in vm_clone_tasks()
@@ -280,6 +283,11 @@ class VMsMixin:
                             f"{loc}.{key} must be one of {choices}, "
                             f"got {policy!r}")
 
+                if self.is_windows(vm_info):
+                    # the identity pass is off for Windows (and `required`
+                    # refused by validate_guest_os_config), so its Linux
+                    # hostname rule has nothing to check
+                    continue
                 policy = vm_info.get('clone_hostname', 'auto')
                 declared = self.declared_hostname(vm_info)
                 if declared is not None:
@@ -556,6 +564,9 @@ class VMsMixin:
                         self.logger.info(
                             f"vm {label}: no install-only medium is left in "
                             f"its drives; nothing to eject")
+                    # ejected by an earlier run, or by hand
+                    problems.extend(self._forget_answer_iso(
+                        cluster, vm_info, full, dry_run))
                     continue
                 held = ', '.join(f"{target} ({source})"
                                  for target, source in outcome.held)
@@ -589,6 +600,9 @@ class VMsMixin:
                     problems.append(
                         f"vm {label}: install-only medium {source} is still "
                         f"in {target}: {reason}")
+                if not outcome.failed:
+                    problems.extend(self._forget_answer_iso(
+                        cluster, vm_info, full, dry_run))
         return problems
 
     def finish_install(self, cli_args) -> None:
@@ -650,6 +664,22 @@ class VMsMixin:
         failed = self.eject_install_media(chosen, dry_run=dry_run,
                                           declared_done=True)
         self._raise_for_control_failures(failed, 'finish-install')
+    def _forget_answer_iso(self, cluster: dict[str, Any],
+                           vm_info: dict[str, Any], full_vm_name: str,
+                           dry_run: bool) -> list[str]:
+        """
+        Remove the answer ISO of a VM no drive holds it in any more: the
+        install has no use for it, and it holds the Administrator password.
+        Returns the problem, if it could not be.
+        """
+        if dry_run or self.unattend_of(vm_info) is None:
+            return []
+        try:
+            self.remove_answer_media(full_vm_name, [cluster['workdir']])
+        except BoxmanError as exc:
+            self.logger.error(str(exc))
+            return [str(exc)]
+        return []
 
     def _destroy_vm_and_disks(
         self, cluster_name: str, cluster: dict[str, Any], vm_name: str, vm_info: dict[str, Any]
@@ -679,6 +709,9 @@ class VMsMixin:
         self._teardown_vm(self.session_for_cluster(cluster_name),
                           full_vm_name, disk_dirs=[workdir],
                           legacy_disks=legacy_disks)
+        # the domain is confirmed gone: _teardown_vm raises otherwise
+        if self.unattend_of(vm_info) is not None:
+            self.remove_answer_media(full_vm_name, [workdir])
 
     def _destroy_removed_vm(self, full_vm_name: str) -> None:
         """
@@ -695,6 +728,10 @@ class VMsMixin:
         # resolved. Revisited in Phase 3 (#51).
         self._teardown_vm(self.provider, full_vm_name,
                           disk_dirs=None, legacy_disks=None)
+        # its cluster may be gone from the config too, and the full name is
+        # unique to it, so every workdir is looked in
+        self.remove_answer_media(full_vm_name, self._cluster_workdirs(),
+                                 strict=False)
 
     def _teardown_vm(self,
                      session,
@@ -1488,6 +1525,9 @@ class VMsMixin:
         # Scoped to the new VMs: fetching media for guests that already exist
         # can overwrite an ISO one of them currently has open (#164 FB-5).
         self._resolve_iso_config(new_vm_names)
+        # an unattended Windows install among them: checked, then built
+        self.validate_answer_media(new_vm_names)
+        self.build_answer_media(new_vm_names)
         clone_tasks = []
         for cluster_name, cluster in self._vm_clusters.items():
             for vm_name, vm_info in cluster['vms'].items():
@@ -2102,6 +2142,7 @@ class VMsMixin:
         # (#171 A3).
         self.validate_direct_boot_config()
         self.validate_clone_identity_config()
+        self.validate_guest_os_config()
         dry_run = getattr(cli_args, 'dry_run', False)
         auto_accept = getattr(cli_args, 'yes', False)
         # Deliberately not `auto_accept or ...`: --yes answers the VM-removal
