@@ -22,6 +22,8 @@ the README gives — installed nothing at all. It failed only at runtime, as a
 from __future__ import annotations
 
 import os
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -30,6 +32,36 @@ tomllib = pytest.importorskip(
 
 PYPROJECT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pyproject.toml")
+REPO = os.path.dirname(PYPROJECT)
+
+#: Files under boxes/ that git tracks and the package need not ship, each
+#: with the reason. None so far: every file of a box is needed to run it.
+BOX_FILES_NOT_SHIPPED: dict[str, str] = {}
+
+#: What running a box leaves in its directory, all of it ignored by git:
+#: under .boxman/ the docker runtime's copy of its assets and a cluster
+#: workdir, terraform init's provider cache, and the proxmox box's keys,
+#: answer file, ISO, rendered config, terraform state and API token.
+LEFT_BEHIND_BY_A_RUN = [
+    "boxes/talos-iso-boot/.boxman/runtime/docker/README.md",
+    "boxes/talos-iso-boot/.boxman/runtime/docker/Makefile",
+    "boxes/talos-iso-boot/.boxman/runtime/docker/entrypoint.sh",
+    "boxes/talos-iso-boot/.boxman/runtime/docker/docker-compose.yml",
+    "boxes/tiny-libvirt-rocky-9-cloudinit/.boxman/c1/id_ed25519_boxman",
+    "boxes/tiny-libvirt-rocky-9-cloudinit/conf.rendered.yml",
+    "boxes/proxmox-nested-ceph-cluster/keys/id_ed25519_pvelab",
+    "boxes/proxmox-nested-ceph-cluster/answer.toml",
+    "boxes/proxmox-nested-ceph-cluster/pve-auto.iso",
+    "boxes/proxmox-nested-ceph-cluster/conf.rendered.yml",
+    "boxes/proxmox-nested-ceph-cluster/terraform/.env",
+    "boxes/proxmox-nested-ceph-cluster/terraform/terraform.tfvars",
+    "boxes/proxmox-nested-ceph-cluster/terraform/terraform.tfstate",
+    "boxes/proxmox-nested-ceph-cluster/terraform/terraform.tfstate.backup",
+    "boxes/proxmox-nested-ceph-cluster/terraform/.terraform.lock.hcl",
+    *(f"boxes/proxmox-nested-ceph-cluster/terraform/.terraform/providers/"
+      f"registry.terraform.io/bpg/proxmox/0.66.0/linux_amd64/{name}"
+      for name in ("README.md", "CHANGELOG.md", "terraform-provider-proxmox")),
+]
 
 
 @pytest.fixture(scope="module")
@@ -97,3 +129,67 @@ def test_every_file_the_dockerfile_copies_ships_in_the_package(pyproject):
     assert not missing, (
         f"the Dockerfile copies {missing}, which pyproject.toml does not "
         f"include in the package")
+
+
+def _shipped_under_boxes(pyproject, root: Path) -> set[str]:
+    """The files under *root*/boxes the wheel would ship, found as poetry
+    finds them: each include path globbed from the project root with
+    pathlib."""
+    shipped = set()
+    for entry in pyproject["tool"]["poetry"].get("include", []):
+        path = entry["path"] if isinstance(entry, dict) else entry
+        # an entry with no format is sdist-only
+        formats = entry.get("format", []) if isinstance(entry, dict) else []
+        if path.startswith("boxes/") and "wheel" in formats:
+            shipped |= {found.relative_to(root).as_posix()
+                        for found in root.glob(path) if found.is_file()}
+    return shipped
+
+
+def _tracked_under_boxes() -> list[str] | None:
+    """The files under boxes/ git tracks here; None outside a checkout of
+    this repository (an unpacked sdist, say)."""
+    try:
+        top = subprocess.run(["git", "-C", REPO, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    if top.returncode != 0 or (os.path.realpath(top.stdout.strip())
+                               != os.path.realpath(REPO)):
+        return None
+    listed = subprocess.run(["git", "-C", REPO, "ls-files", "-z", "--", "boxes"],
+                            capture_output=True, text=True, check=True)
+    return [path for path in listed.stdout.split("\0") if path]
+
+
+def test_every_file_of_a_box_ships_in_the_wheel(pyproject):
+    """``include`` names the types of file boxes keep, not the whole tree,
+    and the two boxes that run partly outside boxman were left half out:
+    the proxmox one's Makefile, answer-file template, scripts and
+    terraform, the Windows one's answer-file template and scripts.
+    Installed from the wheel, both boxes were there and neither could run.
+    A file of a type no rule names fails here instead of going missing."""
+    tracked = _tracked_under_boxes()
+    if tracked is None:
+        pytest.skip("not a git checkout: which files the boxes hold is unknown")
+    missing = sorted(set(tracked) - _shipped_under_boxes(pyproject, Path(REPO))
+                     - set(BOX_FILES_NOT_SHIPPED))
+    assert not missing, (
+        "git tracks these files of a box, which no include rule in "
+        "pyproject.toml ships: add a rule for them, or put them on "
+        "BOX_FILES_NOT_SHIPPED with the reason:\n  " + "\n  ".join(missing))
+
+
+def test_what_running_a_box_leaves_behind_does_not_ship(pyproject, tmp_path):
+    """poetry ships whatever an include rule matches, ignored by git or not,
+    and expands the rules with pathlib, whose ``**`` walks hidden
+    directories too: ``boxes/**/*.md`` shipped the README.md of a box's
+    .boxman/ copy of the docker runtime's assets, and the README.md and
+    CHANGELOG.md of terraform's provider cache."""
+    for path in LEFT_BEHIND_BY_A_RUN:
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text("left behind by a run\n")
+    swept = sorted(_shipped_under_boxes(pyproject, tmp_path))
+    assert not swept, (
+        "an include rule in pyproject.toml ships what running a box leaves "
+        "behind:\n  " + "\n  ".join(swept))

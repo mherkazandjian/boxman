@@ -24,12 +24,41 @@ include = [
     # Enumerate the file types boxes actually ship instead of `boxes/**/*`:
     # a blanket include would sweep in gitignored, generated `*.rendered.yml`
     # files (which can hold local secrets), and poetry's `exclude` does not
-    # override an explicit `include`.
-    { path = "boxes/**/conf.yml", format = ["sdist", "wheel"] },
-    { path = "boxes/**/site.yml", format = ["sdist", "wheel"] },
-    { path = "boxes/**/*.md", format = ["sdist", "wheel"] },
-    { path = "boxes/**/*.j2", format = ["sdist", "wheel"] },
-    { path = "boxes/**/*.html", format = ["sdist", "wheel"] },
+    # override an explicit `include` -- nor does .gitignore.
+    #
+    # Each type is named in the directory a box keeps it in, never under
+    # `**`: poetry expands these with pathlib, whose `**` also walks hidden
+    # directories, and those hold what running a box leaves behind --
+    # `.boxman/` (the docker runtime's copied assets, cluster workdirs) and
+    # `terraform/.terraform/` (terraform init's provider cache, with its
+    # README.md and CHANGELOG.md). Generated files beside these (keys/,
+    # answer.toml, *.iso, terraform state, .env, *.tfvars) match none.
+    # tests/test_packaging.py fails for a tracked file no rule ships.
+    { path = "boxes/*/conf.yml", format = ["sdist", "wheel"] },
+    { path = "boxes/*/projects/*/conf.yml", format = ["sdist", "wheel"] },
+    { path = "boxes/*/ansible/site.yml", format = ["sdist", "wheel"] },
+    { path = "boxes/*/*.md", format = ["sdist", "wheel"] },
+    { path = "boxes/*/configs/*.j2", format = ["sdist", "wheel"] },
+    { path = "boxes/*/site/*.html", format = ["sdist", "wheel"] },
+    # what a box runs outside boxman: its Makefile, the templates it
+    # renders (answer.toml.tmpl, autounattend.xml.in), the scripts,
+    # the guest-side setup script and its terraform. The scripts keep their
+    # mode: the wheel marks a file executable when git has it so, and pip
+    # restores that, which `./make-answer-iso.sh` and the Makefile's
+    # `scripts/ssh-site` need (the *.sh under scripts/ are run with bash).
+    { path = "boxes/*/Makefile", format = ["sdist", "wheel"] },
+    { path = "boxes/*/*.tmpl", format = ["sdist", "wheel"] },
+    { path = "boxes/*/*.in", format = ["sdist", "wheel"] },
+    { path = "boxes/*/*.sh", format = ["sdist", "wheel"] },
+    { path = "boxes/*/*.ps1", format = ["sdist", "wheel"] },
+    { path = "boxes/*/scripts/*.sh", format = ["sdist", "wheel"] },
+    { path = "boxes/*/scripts/ssh-site", format = ["sdist", "wheel"] },
+    { path = "boxes/*/terraform/*.tf", format = ["sdist", "wheel"] },
+    # They keep what the box generates out of git (its ssh keys, the answer
+    # file with the root password hash, terraform state, the API token in
+    # .env) for a copy of the box put under version control.
+    { path = "boxes/*/.gitignore", format = ["sdist", "wheel"] },
+    { path = "boxes/*/terraform/.gitignore", format = ["sdist", "wheel"] },
 ]
 
 [tool.poetry.scripts]
