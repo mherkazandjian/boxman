@@ -243,6 +243,18 @@ def _directory_identities(directories: Iterable[str],
     return identities, unreadable
 
 
+def _directory_is_one_of(path: str,
+                         identities: set[tuple[int, int]]) -> bool:
+    """Whether the directory *path* is in is, by identity
+    (:func:`_directory_identities`), one of those *identities* names;
+    ``False`` when it cannot be looked up."""
+    try:
+        st = os.stat(os.path.dirname(path))
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) in identities
+
+
 def _leftover_refusal(vm_name: str,
                       path: str,
                       record: DiskRecord | None,
@@ -922,6 +934,8 @@ def remove_vm_storage(
             return _UNDER_MEDIA
         return None
 
+    memory_ids, _unreadable = _directory_identities(memory_dirs)
+
     def unique(paths):
         seen, out = set(), []
         for path in paths:
@@ -957,6 +971,10 @@ def remove_vm_storage(
     for path in inventory.boot_family:
         if path in extra_related and media_refusal(path) is None:
             continue
+        if (is_memory_image(vm, path)
+                and real(os.path.dirname(path)) not in real_workdirs
+                and _directory_is_one_of(path, memory_ids)):
+            continue      # what its snapshots recorded decides it (1b)
         reason = static_refusal(path)
         if reason is None and inventory.records_state == RECORDS_UNKNOWN:
             reason = _boxman_artifact_refusal(vm, path)

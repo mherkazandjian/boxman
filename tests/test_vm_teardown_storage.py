@@ -2987,6 +2987,61 @@ class TestMemoryImagesInASnapshotDir:
                f'recorded it' in t.warnings
 
 
+    @pytest.mark.parametrize("path", ["deprovision", "update_remove"])
+    def test_its_recorded_images_beside_a_boot_disk_there_go_too(
+            self, tmp_path, path):
+        """A boot disk in the memory_snapshot_dir makes the images beside it
+        its family too, which ``update`` lists: those its snapshots
+        recorded are still decided by what they recorded, whichever
+        teardown finds them, and the boot disk stays outside the workdir."""
+        workdir, snaps = self._dirs(tmp_path)
+        boot = _qcow2(snaps / f'{VM}.qcow2')
+        raw = _file(snaps / f'{VM}_snapshot_s1.raw')
+        zst = _file(snaps / f'{VM}_snapshot_s1.raw.zst')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_snapshot_dir=snaps,
+                      memory_images={'s1': str(raw)})
+
+        getattr(t, path)()
+
+        assert boot.exists()
+        assert not (raw.exists() or zst.exists())
+
+
+    @pytest.mark.parametrize("path", ["deprovision", "update_remove"])
+    def test_one_no_snapshot_records_goes_from_a_workdir_that_is_the_dir(
+            self, tmp_path, path):
+        """The workdir itself the memory_snapshot_dir: a memory image of the
+        vm's there is its family, as in any workdir, recorded or not."""
+        workdir = tmp_path / 'work'
+        workdir.mkdir()
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        old = _file(workdir / f'{VM}_snapshot_old.raw')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_snapshot_dir=workdir)
+
+        getattr(t, path)()
+
+        assert not (boot.exists() or old.exists())
+
+    def test_one_beside_a_boot_disk_outside_every_such_dir_is_named(
+            self, tmp_path):
+        """Beside a boot disk outside every workdir and memory_snapshot_dir,
+        a memory image under the vm's name is its family: kept, as outside
+        them, and named."""
+        workdir, snaps = self._dirs(tmp_path)
+        elsewhere = tmp_path / 'elsewhere'
+        boot = _qcow2(elsewhere / f'{VM}.qcow2')
+        raw = _file(elsewhere / f'{VM}_snapshot_s1.raw')
+        t = _Teardown(workdir, disks=[boot], records=[],
+                      memory_snapshot_dir=snaps)
+
+        t.update_remove()
+
+        assert boot.exists() and raw.exists()
+        assert f'left {raw} in place' in t.warnings
+
+
 class TestMemoryImagesLeftOutside:
     """A memory image a snapshot recorded outside every cluster workdir and
     memory_snapshot_dir — one taken before the cluster's memory_snapshot_dir
