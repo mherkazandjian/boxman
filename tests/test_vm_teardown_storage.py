@@ -3694,6 +3694,38 @@ class TestOverlaysInADiskSnapshotDir:
         assert iso.exists()
         assert str(iso) in t.warnings and 'CD-ROM' in t.warnings
 
+    def test_one_there_with_the_chains_unread_is_kept_and_named(
+            self, tmp_path):
+        """With the chains unread nothing tells whether a CD-ROM is built
+        on a file there: left to what libvirt names as the vm's, it was
+        decided by nothing, and the inventory went too."""
+        workdir, ov = self._dirs(tmp_path)
+        base = _file(ov / f'{VM}.base.qcow2')
+        seed = _qcow2(tmp_path / 'elsewhere' / 'seed.qcow2')
+        t = _Teardown(workdir, disks=[ov / f'{VM}.s1'], media=[seed],
+                      records=[], disk_snapshot_dir=ov, chains=None)
+
+        t.update_remove()
+
+        assert base.exists()
+        assert (f'left {base} in place because the backing chains'
+                in t.warnings)
+
+    def test_a_symlink_there_keeps_the_file_it_names(self, tmp_path):
+        """A symlink is no file a teardown unlinks, and its refusal holds
+        for the file it names, as anywhere else."""
+        workdir, ov = self._dirs(tmp_path)
+        boot = _qcow2(workdir / f'{VM}.qcow2')
+        link = ov / f'{VM}.extra'
+        link.symlink_to(boot)
+        t = _Teardown(workdir, disks=[boot, ov / f'{VM}.s1'], records=[],
+                      disk_snapshot_dir=ov)
+
+        t.update_remove()
+
+        assert boot.exists() and link.is_symlink()
+        assert f'left {link} in place because it is a symlink' in t.warnings
+
     @PATHS
     def test_the_boot_disks_overlays_there_go_with_its_base(self, tmp_path,
                                                             path):

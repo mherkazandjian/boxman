@@ -1129,9 +1129,11 @@ def remove_vm_storage(
         if (overlay_dirs and overlays_known
                 and real(os.path.dirname(path)) not in real_workdirs
                 and any(in_overlay_dir(path))):
-            # what libvirt names as the vm's decides it (1c), but a CD-ROM
-            # is kept first here too
-            reason = media_refusal(path)
+            # what libvirt names as the vm's decides it (1c), after every
+            # refusal other than being outside the workdirs, as for a
+            # memory image above
+            reason = (media_refusal(path) or _regular_file_refusal(path)
+                      or (_CHAINS_UNREAD if chains is None else None))
             if reason:
                 admission.refuse(path, reason)
             continue
