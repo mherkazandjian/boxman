@@ -384,7 +384,7 @@ isos:
 vms:
   win01:
     os: windows                       # G5, and an unattended install
-    admin_pass: '{{ env("BOXMAN_WIN_ADMIN_PASS") }}'
+    admin_pass: '${env:BOXMAN_WIN_ADMIN_PASS}'  # read when the ISO is built
     boot_order: [cdrom, hd]
     disk_size: 40G
     memory: 4096
@@ -464,18 +464,25 @@ No script: boxman renders its own answer file and builds the answer ISO.
      `admin_user` (created in Administrators when it is not
      Administrator), `computer_name` (`hostname:` or the VM key, a NetBIOS
      name), `image_index` (1, Server Core), and `unattend: vars:`, which
-     also set `locale`, `timezone` and `virtio_os`. It must render into
-     well-formed XML. `files:` replaces the default script list.
-   - The password comes from `admin_pass` on the VM or the cluster, and is
-     checked against Windows' default policy (8+ characters, 3 classes, no
-     account name) before anything is built, without being echoed.
+     also set `locale`, `timezone` and `virtio_os` (but none of the
+     values boxman derives). It must render into well-formed XML.
+     `files:` replaces the default script list. The template and files
+     are looked for only when a VM is about to be created.
+   - The password comes from `admin_pass` on the VM or the cluster, as a
+     reference (`${env:BOXMAN_WIN_ADMIN_PASS}`, `file://`) read only when
+     the ISO is built: through the `env()` template helper it would pass
+     through the YAML, where a quote breaks the file, and land in
+     `conf.rendered.yml`. It is checked against Windows' complexity rule
+     (8+ characters, 3 of Microsoft's categories, no account name) before
+     anything is built, without being echoed.
    - The answer ISO (`BOXMAN_ANSWER`: `autounattend.xml`, the files,
      `authorized_keys`) is staged in a 0700 directory, written 0600 and
      moved into place, in the cluster workdir as
      `<domain>-unattend.iso`, never under the box (`*-unattend.iso` is
      gitignored, and a workdir inside a git work tree gets a warning). It
      is an install-only cdrom boxman adds to the VM, so it is ejected with
-     the rest (G7); the file is deleted then, and with the VM. libvirt's
+     the rest (G7); the file is deleted then, when the create fails
+     before the domain exists, and with the VM. libvirt's
      `dynamic_ownership` hands it to qemu while the VM runs. The cloud-init
      seed still has no such policy (#197).
    - The domain gets `--clock offset=utc`, and the answer file sets

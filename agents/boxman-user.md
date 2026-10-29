@@ -864,7 +864,7 @@ example (Server 2022 Core evaluation, SeaBIOS, OpenSSH only).
 vms:
   win01:
     os: windows
-    admin_pass: '{{ env("BOXMAN_WIN_ADMIN_PASS") }}'  # never a literal in the box
+    admin_pass: '${env:BOXMAN_WIN_ADMIN_PASS}'  # read at ISO build, see below
     boot_order: [cdrom, hd]
     disk_size: 40G
     os_variant: win2k22
@@ -881,13 +881,22 @@ vms:
   `ssh.authorized_keys`) to `<workdir>/<domain>-unattend.iso`, mode 0600.
   It is an install-only cdrom boxman adds, ejected with the others once the
   install is done, and deleted then, and with the VM. `update` never needs
-  the password; the `up` that creates the VM does.
-- **Refused before anything is built:** an `admin_pass` Windows' default
-  policy would refuse (8+ chars, 3 of upper/lower/digit/symbol, no account
-  name), a computer name (`hostname:` or key) that is not a NetBIOS name,
-  an answer file that does not render into XML, `cloudinit*` keys, a
-  `base_image` that is a `templates:` entry, `clone_*: required`, and an
-  unattended install under a non-local runtime.
+  the password; the `up` that creates the VM does. Give it as a reference
+  (`${env:VAR}` or `file://`), not `{{ env("VAR") }}`: the template helper
+  pastes it into the YAML, where a quote breaks the file, and into
+  `conf.rendered.yml`; a reference is read only when the ISO is built.
+- **Refused before anything is built:** an `admin_pass` Windows' complexity
+  rule would refuse (8+ chars, 3 of Microsoft's categories -- upper case,
+  lower case, digits 0-9, the symbols ``~!@#$%^&*_-+=`|\(){}[]:;"'<>,.?/``
+  (not a space or a currency sign), other letters -- no account name), a
+  computer name (`hostname:` or key) that is not a NetBIOS name, an answer
+  file that does not render into XML, `unattend: vars:` setting what boxman
+  derives (`admin_pass`, `admin_user`, `computer_name`, `image_index`,
+  `vm_name`), no OS ISO in `cdroms:`, `cloudinit*` keys, a `base_image` that
+  is a `templates:` entry, `clone_*: required`, and an unattended install
+  under a non-local runtime. `update` checks a new VM's before it touches
+  networks or downloads anything; the template and files are looked for
+  only for a VM about to be created, so moving them later is harmless.
 - **ssh:** user `Administrator`, or the VM's/cluster's `admin_user` (created
   in Administrators by the default answer file); the key comes from the
   answer ISO, so no `ssh-copy-id` push; `boxman ssh <cluster>_<vm>` opens
