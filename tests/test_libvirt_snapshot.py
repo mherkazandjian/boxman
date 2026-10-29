@@ -22,6 +22,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from boxman.exceptions import SnapshotError, SnapshotRecoveryError
+from boxman.providers.libvirt.disk_cleanup import FilesInUse
+from boxman.providers.libvirt.session import LibVirtSession
 from boxman.providers.libvirt.snapshot import SnapshotManager
 
 pytestmark = pytest.mark.unit
@@ -365,6 +367,89 @@ class TestListSnapshots:
     def test_empty_list_on_failure(self, sm: SnapshotManager):
         with patch.object(sm.virsh, "execute", return_value=_result(ok=False)):
             assert sm.list_snapshots("vm01") == []
+
+
+class TestMemoryImages:
+    """The memory file libvirt recorded for each snapshot that saved the
+    guest's memory — or ``None`` when they cannot all be read, which is
+    not "none recorded"."""
+
+    @staticmethod
+    def _xml(name: str, memory: str) -> str:
+        return (f"<domainsnapshot><name>{name}</name>{memory}"
+                f"<disks><disk name='vda' snapshot='external'>"
+                f"<source file='/w/vm01.{name}'/></disk></disks>"
+                f"</domainsnapshot>")
+
+    def test_each_snapshot_that_saved_memory_names_its_file(
+            self, sm: SnapshotManager):
+        xml = {
+            "s1": self._xml("s1", "<memory snapshot='external' "
+                                  "file='/snaps/vm01_snapshot_s1.raw'/>"),
+            "disk-only": self._xml("disk-only", "<memory snapshot='no'/>"),
+            "s2": self._xml("s2", "<memory snapshot='external' "
+                                  "file='/old/vm01_snapshot_s2.raw'/>"),
+        }
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots(list(xml), xml.get)):
+            assert sm.memory_images("vm01") == {
+                "s1": "/snaps/vm01_snapshot_s1.raw",
+                "s2": "/old/vm01_snapshot_s2.raw",
+            }
+
+    def test_no_snapshots_record_none(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots([], lambda _n: None)):
+            assert sm.memory_images("vm01") == {}
+
+    def test_a_list_that_fails_is_unknown(self, sm: SnapshotManager):
+        with patch.object(sm.virsh, "execute", side_effect=_virsh_snapshots(
+                ["s1"], lambda _n: None, list_ok=False)):
+            assert sm.memory_images("vm01") is None
+
+    @staticmethod
+    def _listing(stdout: str):
+        """snapshot-list printing exactly *stdout*; every snapshot saved
+        its memory to ``/s/<name>.raw``."""
+        def execute(*args, **_kw):
+            if args[0] == "snapshot-list":
+                return _result(stdout=stdout)
+            return _result(stdout=TestMemoryImages._xml(
+                args[2], f"<memory snapshot='external' "
+                         f"file='/s/{args[2]}.raw'/>"))
+        return execute
+
+    def test_the_lines_virsh_ends_its_list_with_are_no_entry(
+            self, sm: SnapshotManager):
+        """Each name, a newline, and the blank line virsh prints after a
+        command."""
+        with patch.object(sm.virsh, "execute",
+                          side_effect=self._listing("s1\n\n")):
+            assert sm.memory_images("vm01") == {"s1": "/s/s1.raw"}
+
+    @pytest.mark.parametrize("stdout", ["\n\n\n", "s1\n\ns2\n\n",
+                                        "s1\ns1\n\n"],
+                             ids=["a name of newlines", "a blank entry",
+                                  "a name twice"])
+    def test_a_list_that_cannot_be_trusted_is_unknown(
+            self, sm: SnapshotManager, stdout):
+        """A blank entry cannot be told apart from a name made only of
+        newlines, whose snapshot would drop out unread — as
+        _strict_overlay_inventory refuses it."""
+        with patch.object(sm.virsh, "execute",
+                          side_effect=self._listing(stdout)):
+            assert sm.memory_images("vm01") is None
+
+    @pytest.mark.parametrize("bad", [None, "<domainsnapshot><name>s2"],
+                             ids=["unreadable", "not xml"])
+    def test_one_snapshot_that_cannot_be_read_makes_it_unknown(
+            self, sm: SnapshotManager, bad):
+        xml = {"s1": self._xml("s1", "<memory snapshot='external' "
+                                     "file='/s/vm01_snapshot_s1.raw'/>"),
+               "s2": bad}
+        with patch.object(sm.virsh, "execute",
+                          side_effect=_virsh_snapshots(list(xml), xml.get)):
+            assert sm.memory_images("vm01") is None
 
 
 class TestGetSnapshotOverlayFiles:
@@ -3270,7 +3355,9 @@ class TestForceClearForRetake:
                           return_value=[("vda", active)]), \
              patch.object(sm.virsh, "execute_shell", side_effect=fake_shell):
             assert sm._force_clear_for_retake(
-                "vm01", str(tmp_path), "snapX") is True
+                "vm01", str(tmp_path), "snapX",
+                paths_in_use=MagicMock(return_value={}),
+                memory_in_use=MagicMock(return_value={})) is True
 
         joined = "\n".join(removed_cmds)
         assert orphan_overlay in joined
@@ -3314,19 +3401,219 @@ class TestForceClearForRetake:
                 "vm01", str(tmp_path), "snapX") is False
 
 
+class TestForceClearProtectsFilesInUse:
+    """A leftover is removed only once no domain is known to use it — by
+    path or by identity, the VM's own disks and every backing layer
+    included (``LibVirtSession.disk_paths_in_use``). A memory_snapshot_dir
+    outside the workdir can reach a disk under another name: a symlink to
+    the directory a live disk is in, say. Comparing names missed that, and
+    ``rm -f`` deleted the disk."""
+
+    _ABSENT = _result(
+        ok=False, stderr="Domain snapshot not found: no domain snapshot "
+                         "with matching name 'snapX'")
+
+    @staticmethod
+    def _touch(p: Path) -> str:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
+        return str(p)
+
+    def _clear(self, sm, vm_dir, scan, active=(), memory=None):
+        memory = memory or MagicMock(return_value={})
+        rm = []
+        with patch.object(sm.virsh, "execute", return_value=self._ABSENT), \
+             patch.object(sm, "_data_disk_targets", return_value=[
+                 (f"vd{chr(97 + i)}", source)
+                 for i, source in enumerate(active)]), \
+             patch.object(sm.virsh, "execute_shell",
+                          side_effect=lambda cmd, *_a, **_k:
+                          rm.append(cmd) or _result()), \
+             patch.object(sm, "logger") as logger:
+            ok = sm._force_clear_for_retake("vm01", str(vm_dir), "snapX",
+                                            paths_in_use=scan,
+                                            memory_in_use=memory)
+        errors = " ".join(str(c.args[0]) for c in logger.error.call_args_list)
+        return ok, rm, errors
+
+    def test_a_live_disk_reached_through_an_alias_of_the_directory_is_kept(
+            self, sm: SnapshotManager, tmp_path: Path):
+        live = self._touch(tmp_path / "shared" / "vm01_snapshot_snapX.raw")
+        os.symlink(tmp_path / "shared", tmp_path / "snaps")
+        scan = MagicMock(return_value=FilesInUse(
+            {os.path.realpath(live): "vm01"}))
+
+        ok, rm, errors = self._clear(sm, tmp_path / "snaps", scan,
+                                     active=[live])
+
+        assert ok is False
+        assert rm == []
+        assert os.path.isfile(live)
+        assert "domain vm01 uses it" in errors
+
+    def test_a_leftover_another_domain_uses_is_kept(
+            self, sm: SnapshotManager, tmp_path: Path):
+        mem = self._touch(tmp_path / "vm01_snapshot_snapX.raw")
+        scan = MagicMock(return_value=FilesInUse(
+            {os.path.realpath(mem): "vm02"}))
+
+        ok, rm, errors = self._clear(sm, tmp_path, scan)
+
+        assert ok is False and rm == [] and os.path.isfile(mem)
+        assert f"{mem}: domain vm02 uses it" in errors
+
+    def test_one_used_under_another_name_of_its_file_is_kept(
+            self, sm: SnapshotManager, tmp_path: Path):
+        mem = self._touch(tmp_path / "vm01_snapshot_snapX.raw")
+        other = tmp_path / "elsewhere" / "disk.raw"
+        other.parent.mkdir()
+        os.link(mem, other)
+        used = FilesInUse({str(other): "vm02"})
+        st = os.stat(other)
+        used.identities[(st.st_dev, st.st_ino)] = "vm02"
+
+        ok, rm, _errors = self._clear(sm, tmp_path,
+                                      MagicMock(return_value=used))
+
+        assert ok is False and rm == [] and os.path.isfile(mem)
+
+    def test_a_scan_that_fails_keeps_everything(
+            self, sm: SnapshotManager, tmp_path: Path):
+        mem = self._touch(tmp_path / "vm01_snapshot_snapX.raw")
+
+        ok, rm, errors = self._clear(sm, tmp_path,
+                                     MagicMock(return_value=None))
+
+        assert ok is False and rm == [] and os.path.isfile(mem)
+        assert "could not check whether a domain uses" in errors
+
+    def test_with_nothing_left_over_nothing_is_asked(
+            self, sm: SnapshotManager, tmp_path: Path):
+        scan, memory = MagicMock(return_value={}), MagicMock(return_value={})
+
+        ok, rm, _errors = self._clear(sm, tmp_path, scan, memory=memory)
+
+        assert ok is True and rm == []
+        scan.assert_not_called()
+        memory.assert_not_called()
+
+    def test_a_leftover_another_domains_snapshot_records_is_kept(
+            self, sm: SnapshotManager, tmp_path: Path):
+        """vm01's snapshot ``replica_snapshot_snapX`` would write where
+        vm01_snapshot_replica's ``snapX`` keeps its RAM: no domain uses that
+        file as a disk, but a snapshot records it."""
+        mem = self._touch(tmp_path / "vm01_snapshot_snapX.raw")
+        memory = MagicMock(return_value=FilesInUse(
+            {os.path.realpath(mem): "vm01_snapshot_replica"}))
+
+        ok, rm, errors = self._clear(sm, tmp_path,
+                                     MagicMock(return_value={}),
+                                     memory=memory)
+
+        assert ok is False and rm == [] and os.path.isfile(mem)
+        assert (f"{mem}: a snapshot of domain vm01_snapshot_replica records "
+                f"it as its memory image") in errors
+
+    def test_other_snapshots_that_cannot_be_read_keep_everything(
+            self, sm: SnapshotManager, tmp_path: Path):
+        mem = self._touch(tmp_path / "vm01_snapshot_snapX.raw")
+
+        ok, rm, errors = self._clear(sm, tmp_path,
+                                     MagicMock(return_value={}),
+                                     memory=MagicMock(return_value=None))
+
+        assert ok is False and rm == [] and os.path.isfile(mem)
+        assert "could not check whether a snapshot of another domain" in errors
+
+    def test_the_session_hands_it_its_scan(self, tmp_path: Path):
+        session = LibVirtSession(
+            config={'provider': {'libvirt': {'virsh_cmd': 'false'}}})
+        with patch.object(SnapshotManager, "create_snapshot",
+                          return_value=True) as create:
+            session.snapshot_take(vm_name="vm01", vm_dir=str(tmp_path),
+                                  snapshot_name="snapX", description="",
+                                  force=True)
+
+        assert create.call_args.kwargs["paths_in_use"] == (
+            session.disk_paths_in_use)
+        assert create.call_args.kwargs["memory_in_use"] == (
+            session.snapshot_memory_in_use)
+
+
+class TestTakeWritesOverNoFile:
+    """The memory image goes where no file is: one already there is a
+    leftover, or another VM's image — VM ``vm01``'s snapshot
+    ``replica_snapshot_s1`` is named as ``s1`` of ``vm01_snapshot_replica``
+    is — and the take would write the guest's RAM over it. ``--force``
+    clears a leftover no domain uses first; what it leaves is protected."""
+
+    @staticmethod
+    def _take(sm, tmp_path, force=False):
+        with patch.object(sm, "_force_clear_for_retake", return_value=True), \
+             patch.object(sm, "_flatten_cdrom_overlays"), \
+             patch.object(sm, "_cdrom_diskspec_args", return_value=[]), \
+             patch.object(sm.virsh, "execute",
+                          return_value=_result()) as execute, \
+             patch.object(sm, "logger") as logger:
+            ok = sm.create_snapshot("vm01", str(tmp_path), "s1", "d",
+                                    force=force)
+        errors = " ".join(str(c.args[0]) for c in logger.error.call_args_list)
+        return ok, execute, errors
+
+    @pytest.mark.parametrize("name", ["vm01_snapshot_s1.raw",
+                                      "vm01_snapshot_s1.raw.zst"])
+    @pytest.mark.parametrize("force", [False, True], ids=["plain", "force"])
+    def test_a_file_already_there_refuses_it(self, sm: SnapshotManager,
+                                             tmp_path: Path, name, force):
+        (tmp_path / name).write_bytes(b"someone's RAM")
+
+        ok, execute, errors = self._take(sm, tmp_path, force=force)
+
+        assert ok is False
+        execute.assert_not_called()
+        assert (tmp_path / name).read_bytes() == b"someone's RAM"
+        assert f"{tmp_path / name} already exists" in errors
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root searches a mode-000 directory")
+    def test_one_that_cannot_be_looked_up_refuses_it(
+            self, sm: SnapshotManager, tmp_path: Path):
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        hidden.chmod(0)
+        try:
+            ok, execute, errors = self._take(sm, hidden)
+        finally:
+            hidden.chmod(0o700)
+
+        assert ok is False
+        execute.assert_not_called()
+        assert "cannot tell whether" in errors
+
+    def test_with_none_there_it_is_taken(self, sm: SnapshotManager,
+                                         tmp_path: Path):
+        ok, execute, _errors = self._take(sm, tmp_path)
+
+        assert ok is True
+        assert execute.call_args.args[0] == "snapshot-create-as"
+
+
 class TestCreateSnapshotForce:
     """create_snapshot(force=...) runs the clear step before create-as."""
 
     def test_force_invokes_clear_before_create(self, sm: SnapshotManager,
                                                tmp_path: Path):
+        scan, memory = MagicMock(), MagicMock()
         with patch.object(sm, "_force_clear_for_retake",
                           return_value=True) as clear, \
              patch.object(sm, "_flatten_cdrom_overlays"), \
              patch.object(sm, "_cdrom_diskspec_args", return_value=[]), \
              patch.object(sm.virsh, "execute", return_value=_result()):
             assert sm.create_snapshot(
-                "vm01", str(tmp_path), "snapX", "d", force=True) is True
-        clear.assert_called_once_with("vm01", str(tmp_path), "snapX")
+                "vm01", str(tmp_path), "snapX", "d", force=True,
+                paths_in_use=scan, memory_in_use=memory) is True
+        clear.assert_called_once_with("vm01", str(tmp_path), "snapX",
+                                      paths_in_use=scan, memory_in_use=memory)
 
     def test_force_clear_failure_aborts_create(self, sm: SnapshotManager,
                                               tmp_path: Path):

@@ -41,6 +41,8 @@ from boxman.providers.libvirt.disk_cleanup import (
     entry_exists,
     file_identities,
     load_teardown_inventory,
+    memory_image_candidates,
+    memory_image_name,
     read_teardown_locator,
     remove_vm_storage,
     save_teardown_inventory,
@@ -129,6 +131,35 @@ def _clone_with_retry(provider, cluster, vm_info, new_vm_name,
                 time.sleep(delay)
             else:
                 raise
+
+
+class _SameFiles:
+    """Files, matched by their name as given or by their identity
+    (``os.stat``, links followed); a file whose identity cannot be read is
+    matched by its name alone."""
+
+    def __init__(self) -> None:
+        self._names: set[str] = set()
+        self._identities: set[tuple[int, int]] = set()
+
+    @staticmethod
+    def _identity(path: str) -> tuple[int, int] | None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    def add(self, path: str) -> None:
+        self._names.add(path)
+        identity = self._identity(path)
+        if identity is not None:
+            self._identities.add(identity)
+
+    def __contains__(self, path: object) -> bool:
+        return (path in self._names
+                or self._identity(path) in self._identities)
+
 
 class VMsMixin:
 
@@ -801,10 +832,13 @@ class VMsMixin:
         # remove_vm_storage() raises on a filesystem error, which reaches
         # _run_parallel's failure handling
         outcome = remove_vm_storage(
-            inventory, self._cluster_workdirs(), session.disk_paths_in_use)
+            inventory, self._cluster_workdirs(), session.disk_paths_in_use,
+            memory_dirs=self._cluster_memory_snapshot_dirs(),
+            memory_in_use=session.snapshot_memory_in_use)
         for path, reason in outcome.kept:
             self.logger.warning(
                 f"{full_vm_name}: left {path} in place because {reason}")
+        self._name_memory_images_left(full_vm_name, inventory, outcome)
         # The saved inventory and its locator stay while the inventory still
         # protects a kept file, so a retry keeps it too; with nothing kept
         # they have done their job. The inventory goes first (a locator left
@@ -823,6 +857,86 @@ class VMsMixin:
                     os.remove(inventory.locator_at)
         if removed:
             session.refresh_pools_holding(removed)
+
+    def _name_memory_images_left(self, full_vm_name: str,
+                                 inventory: StorageInventory,
+                                 outcome) -> None:
+        """
+        Warn of each memory image of *full_vm_name*'s left after its
+        teardown that the teardown did not already name as kept: the image
+        is the guest's RAM, and unnamed it would outlive the VM unnoticed.
+        The domain is gone, so its snapshots can no longer be restored.
+
+        Two kinds, told apart by what the teardown did, not by where the
+        file is:
+
+        * one its snapshots recorded — the ``.raw`` libvirt recorded, or the
+          ``.raw.zst`` compression left of it — that is still there: outside
+          every cluster workdir and memory_snapshot_dir (left there when a
+          cluster's memory_snapshot_dir was changed or unset after the
+          snapshot was taken), or not named as boxman names it. One that
+          cannot be looked up is named as maybe there.
+        * one in a memory_snapshot_dir named as its memory image that none
+          of its snapshots recorded, which a teardown never removes by its
+          name (:func:`remove_vm_storage`).
+
+        A file is matched by its name as given or by its identity, read with
+        ``os.stat`` — never by ``os.path.realpath``, which folds ``..`` past
+        a link it cannot read and so can name another file. So an image
+        kept, recorded or already named under another name of its file is
+        one file, named once.
+        """
+        reported, recorded_files = _SameFiles(), _SameFiles()
+        for path, _reason in outcome.kept:
+            reported.add(path)
+        for snapshot, recorded in sorted(inventory.memory_images.items()):
+            boxman_named = (os.path.basename(recorded)
+                            == memory_image_name(full_vm_name, snapshot))
+            for path in (recorded, f"{recorded}.zst"):
+                recorded_files.add(path)
+                what = (f"the memory image of its snapshot '{snapshot}', "
+                        f"which can no longer be restored")
+                if path in reported:
+                    continue
+                try:
+                    if not entry_exists(path):
+                        continue
+                except OSError as exc:
+                    reported.add(path)
+                    self.logger.warning(
+                        f"{full_vm_name}: could not tell whether {path} is "
+                        f"still there ({exc}) — {what}; if it is, remove it "
+                        f"by hand")
+                    continue
+                reported.add(path)
+                why = ("it is outside every cluster workdir and "
+                       "memory_snapshot_dir, where a teardown removes "
+                       "nothing" if boxman_named else
+                       "it is not named as boxman names the memory image of "
+                       "that snapshot, so no teardown removes it")
+                self.logger.warning(
+                    f"{full_vm_name}: left {path} in place because {why} — "
+                    f"{what}; remove it by hand")
+
+        for memory_dir in self._cluster_memory_snapshot_dirs():
+            try:
+                found = memory_image_candidates(memory_dir, full_vm_name)
+            except OSError as exc:
+                self.logger.warning(
+                    f"{full_vm_name}: could not list {memory_dir} ({exc}), a "
+                    f"memory_snapshot_dir: a memory image of it there that "
+                    f"none of its snapshots recorded is not named")
+                continue
+            for path in found:
+                if path in reported or path in recorded_files:
+                    continue
+                reported.add(path)
+                self.logger.warning(
+                    f"{full_vm_name}: left {path} in place because none of "
+                    f"its snapshots recorded it, though it is named as one "
+                    f"of its memory images — another VM's full name can "
+                    f"begin with this one's; remove it by hand if it is "
+                    f"this VM's")
 
     def _capture_vm_storage(self,
                             session,
@@ -893,6 +1007,20 @@ class VMsMixin:
                 records_state = (RECORDS_NONE if records is None
                                  else RECORDS_PRESENT)
 
+        # the memory file each snapshot recorded: the only ones a teardown
+        # removes from a memory_snapshot_dir (remove_vm_storage), and named
+        # when left where it removes nothing
+        memory_images: dict[str, str] = {}
+        if exists:
+            recorded = session.snapshot_memory_images(full_vm_name)
+            if recorded is None:
+                self.logger.warning(
+                    f"{full_vm_name}: could not read its snapshots, so none "
+                    f"of its memory images in a memory_snapshot_dir will be "
+                    f"removed, and one recorded elsewhere will not be named")
+            else:
+                memory_images = recorded
+
         # every disk's chain, the boot disk's included, and every media
         # source's: a qcow2 CD-ROM can be built on a file the vm also
         # attaches as a disk. What may be removed is decided across all of
@@ -929,7 +1057,9 @@ class VMsMixin:
         files = [*disk_sources, *boot_family, *(legacy_disks or ()),
                  *(record.source for record in records or ()),
                  *(layer for chain in (chains or {}).values()
-                   for layer in chain)]
+                   for layer in chain),
+                 *(path for recorded in memory_images.values()
+                   for path in (recorded, f"{recorded}.zst"))]
         inventory = StorageInventory(
             vm_name=full_vm_name,
             disk_sources=disk_sources,
@@ -941,6 +1071,7 @@ class VMsMixin:
             legacy_disks=legacy_disks,
             identities=file_identities(files),
             targets=targets,
+            memory_images=memory_images,
         )
         if exists:
             # saved before the undefine, which drops what it was read from;
@@ -2173,6 +2304,7 @@ class VMsMixin:
         # (#171 A3).
         self.validate_direct_boot_config()
         self.validate_clone_identity_config()
+        self.validate_memory_snapshot_dirs()
         self.validate_guest_os_config()
         # A new VM installed unattended needs its password, its computer
         # name and its answer file now. Checked where it is built, that came

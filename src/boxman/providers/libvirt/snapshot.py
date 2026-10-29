@@ -155,13 +155,24 @@ class SnapshotManager:
                         description: str,
                         compress_memory: bool = False,
                         compress_level: int = 3,
-                        force: bool = False) -> bool:
+                        force: bool = False,
+                        paths_in_use=None,
+                        memory_in_use=None) -> bool:
         """
         Create a snapshot of a VM.
 
+        The memory image is written only where no file is: one already
+        there — a leftover, or another VM's image under the same name (VM
+        ``v``'s snapshot ``r_snapshot_s1`` and ``s1`` of VM ``v_snapshot_r``
+        name one file) — refuses the take, after *force* has cleared what
+        it may.
+
         Args:
             vm_name: Name of the VM
-            vm_dir: Directory where the VM is located
+            vm_dir: Directory the memory image is written to, as
+                ``<vm>_snapshot_<name>.raw`` (the cluster's
+                ``memory_snapshot_dir``, by default its workdir); disk
+                overlays are created beside their disks
             snapshot_name: Name for the snapshot
             description: Description for the snapshot
             compress_memory: If True, zstd-compress the .raw memory file
@@ -176,13 +187,40 @@ class SnapshotManager:
                 that name, or orphaned per-disk overlay / memory files a
                 prior deletion left behind — so the name can be re-used.
                 See :meth:`_force_clear_for_retake`.
+            paths_in_use: With *force*, what every domain uses
+                (``LibVirtSession.disk_paths_in_use``), asked before a
+                leftover is removed; without it none is.
+            memory_in_use: With *force*, the memory images domains'
+                snapshots record (``LibVirtSession.snapshot_memory_in_use``),
+                asked likewise.
 
         Returns:
             bool: True if successful, False otherwise
         """
         try:
             if force and not self._force_clear_for_retake(
-                    vm_name, vm_dir, snapshot_name):
+                    vm_name, vm_dir, snapshot_name,
+                    paths_in_use=paths_in_use, memory_in_use=memory_in_use):
+                return False
+            snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
+            mem_path = os.path.join(vm_dir, snap_fname)
+            for path in (mem_path, f"{mem_path}.zst"):
+                try:
+                    os.lstat(path)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    self.logger.error(
+                        f"cannot tell whether {path} already exists ({exc}); "
+                        f"refusing to take snapshot '{snapshot_name}' of "
+                        f"{vm_name}, which could write over it")
+                    return False
+                self.logger.error(
+                    f"{path} already exists — a leftover of an earlier "
+                    f"snapshot, or another VM's memory image under the same "
+                    f"name; refusing to write snapshot '{snapshot_name}' of "
+                    f"{vm_name} over it (snapshot take --force clears a "
+                    f"leftover no domain uses)")
                 return False
             # Before saving memory state, ensure cdroms point directly at
             # their raw ISO backing files (not qcow2 overlays of them).
@@ -190,8 +228,6 @@ class SnapshotManager:
             # "Image is not in qcow2 format" when QEMU validates the chain.
             self._flatten_cdrom_overlays(vm_name)
 
-            snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
-            mem_path = os.path.join(vm_dir, snap_fname)
             # Exclude cdroms from the snapshot so no new qcow2 overlay is
             # created for them (they stay at the raw ISO after this call).
             cdrom_args = self._cdrom_diskspec_args(vm_name)
@@ -262,7 +298,9 @@ class SnapshotManager:
     def _force_clear_for_retake(self,
                                 vm_name: str,
                                 vm_dir: str,
-                                snapshot_name: str) -> bool:
+                                snapshot_name: str,
+                                paths_in_use=None,
+                                memory_in_use=None) -> bool:
         """
         Remove anything that would make a fresh snapshot named
         *snapshot_name* collide, so ``snapshot take --force`` can re-use the
@@ -278,7 +316,20 @@ class SnapshotManager:
            files.
 
         Files that are part of the VM's *current* active disk chain are never
-        removed. Returns True when the name is clear to re-use.
+        removed. Nor is a leftover any domain uses, the VM itself included,
+        or one a snapshot records as its memory image: each
+        is matched by resolved path and by identity against *paths_in_use*
+        (``LibVirtSession.disk_paths_in_use``) and *memory_in_use*
+        (``LibVirtSession.snapshot_memory_in_use``), asked once there is
+        anything to remove. The memory image's directory can be a cluster's
+        memory_snapshot_dir outside the workdir, reaching a disk under
+        another name — a symlink to the directory a live disk is in — or
+        holding another VM's image under the same name. One in use or
+        recorded, a scan that fails or none given, or a leftover that cannot
+        be inspected refuses the retake: the snapshot would be written over
+        that file.
+
+        Returns True when the name is clear to re-use.
         """
         info = self.virsh.execute(
             "snapshot-info", vm_name, snapshot_name, warn=True)
@@ -309,18 +360,63 @@ class SnapshotManager:
         snap_fname = f"{vm_name}_snapshot_{snapshot_name}.raw"
         candidates.append(os.path.join(vm_dir, snap_fname))
         candidates.append(os.path.join(vm_dir, f"{snap_fname}.zst"))
-        for path in candidates:
-            if path in active:
-                continue  # in the live chain — never remove
-            if os.path.isfile(path):
-                self.virsh.execute_shell(
-                    f"rm -f -- {shlex.quote(path)}", warn=True)
-                removed.append(path)
+        # in the live chain — never remove
+        leftovers = [path for path in candidates
+                     if path not in active and os.path.isfile(path)]
+        refusal = self._leftover_in_use(leftovers, paths_in_use,
+                                        memory_in_use)
+        if refusal:
+            self.logger.error(
+                f"--force: {refusal}; refusing to remove it, or to take "
+                f"'{snapshot_name}' on {vm_name} over it")
+            return False
+        for path in leftovers:
+            self.virsh.execute_shell(
+                f"rm -f -- {shlex.quote(path)}", warn=True)
+            removed.append(path)
         if removed:
             self.logger.info(
                 f"--force: removed {len(removed)} leftover snapshot file(s) "
                 f"for '{snapshot_name}' on {vm_name}")
         return True
+
+    @staticmethod
+    def _leftover_in_use(leftovers: list[str], paths_in_use,
+                         memory_in_use) -> str | None:
+        """
+        Why one of *leftovers* may not be removed, if one may not: a domain
+        uses it, or a domain's snapshot records it as its memory
+        image, by resolved path or by identity (``(st_dev, st_ino)``, links
+        followed); it cannot be inspected; or either cannot be told — the
+        scan is ``None``, or answers ``None``.
+        """
+        if not leftovers:
+            return None
+        identities = {}
+        for path in leftovers:
+            try:
+                st = os.stat(path)
+            except OSError as exc:
+                return f"{path} could not be inspected ({exc})"
+            identities[path] = (st.st_dev, st.st_ino)
+        in_use = paths_in_use() if paths_in_use is not None else None
+        if in_use is None:
+            return (f"could not check whether a domain uses "
+                    f"{', '.join(leftovers)}")
+        recorded = memory_in_use() if memory_in_use is not None else None
+        if recorded is None:
+            return (f"could not check whether a snapshot of another domain "
+                    f"records {', '.join(leftovers)} as its memory image")
+        for scan, what in ((in_use, "domain {} uses it"),
+                           (recorded, "a snapshot of domain {} records it "
+                                      "as its memory image")):
+            used_ids = getattr(scan, "identities", {})
+            for path in leftovers:
+                domain = (scan.get(os.path.realpath(path))
+                          or used_ids.get(identities[path]))
+                if domain:
+                    return f"{path}: {what.format(domain)}"
+        return None
 
     # ── memory file compression (zstd) ──────────────────────────────────
     #
@@ -351,6 +447,42 @@ class SnapshotManager:
             return None
         path = memory_elem.get("file")
         return path or None
+
+    def memory_images(self, vm_name: str) -> dict[str, str] | None:
+        """
+        ``{snapshot name: memory file}`` for every snapshot of *vm_name* —
+        a domain's name or UUID, as virsh takes either — that saved the
+        guest's memory, the file as libvirt recorded it: the ``.raw``, also
+        once compression left only its ``.raw.zst``.
+
+        Returns ``None`` when they cannot all be read — the list, or any
+        one snapshot's XML — which is not "none recorded"; or when the list
+        cannot be trusted, as :meth:`_strict_overlay_inventory` refuses it:
+        a blank entry, which cannot be told apart from a name made only of
+        newlines, or a name listed twice.
+        """
+        list_result = self.virsh.execute(
+            "snapshot-list", vm_name, "--name", warn=True)
+        if not list_result.ok:
+            return None
+        names = self._listed_snapshot_names(list_result.stdout)
+        if any(n == '' for n in names) or len(set(names)) != len(names):
+            return None
+        images: dict[str, str] = {}
+        for name in names:
+            xml_result = self.virsh.execute(
+                "snapshot-dumpxml", vm_name, name, warn=True)
+            if not xml_result.ok:
+                return None
+            try:
+                root = ET.fromstring(xml_result.stdout)
+            except ET.ParseError:
+                return None
+            memory_elem = root.find("memory")
+            path = memory_elem.get("file") if memory_elem is not None else None
+            if path:
+                images[name] = path
+        return images
 
     def compress_memory_file(self,
                              raw_path: str,
@@ -728,6 +860,26 @@ class SnapshotManager:
                 continue
         return overlays
 
+    @staticmethod
+    def _listed_snapshot_names(stdout: str) -> list[str]:
+        """
+        The entries ``virsh snapshot-list --name`` printed, split on newline
+        alone, without the terminators virsh adds.
+
+        Exactly those, and no more: one from the newline after the last
+        name, and one from the blank line vsh prints after a command.
+        Popping *every* trailing empty instead erases the evidence a caller
+        needs — a list whose only snapshot is named LF is all empty
+        fragments, and would come back as a domain with no snapshots at
+        all.
+        """
+        names = stdout.split('\n')
+        if names and names[-1] == '':
+            names.pop()
+        if names and names[-1] == '':
+            names.pop()
+        return names
+
     def _strict_overlay_inventory(
             self, vm_name: str) -> tuple[dict[str, list[str]], list[str]]:
         """
@@ -773,17 +925,7 @@ class SnapshotManager:
         # erases a name made of spaces -- either way the snapshot drops out
         # of the inventory before the duplicate and topology checks can
         # notice, and the revert deletes its overlay regardless.
-        names = list_result.stdout.split('\n')
-        # Exactly the terminators virsh adds, and no more: one from the
-        # newline after the last name, and one from the blank line vsh
-        # prints after a command. Popping *every* trailing empty instead
-        # erases the evidence the check below needs -- a list whose only
-        # snapshot is named LF is all empty fragments, and would come back
-        # as a domain with no snapshots at all.
-        if names and names[-1] == '':
-            names.pop()
-        if names and names[-1] == '':
-            names.pop()
+        names = self._listed_snapshot_names(list_result.stdout)
 
         # A name containing a newline splits into fragments that name no
         # snapshot, and the dumpxml below refuses on those. A name made

@@ -1,14 +1,200 @@
 """Snapshot and storage flows for BoxmanManager."""
 
+import errno
 import json
 import os
+import stat
 import time
 
 from boxman import log
-from boxman.exceptions import SnapshotError, SnapshotRecoveryError
+from boxman.exceptions import ConfigError, SnapshotError, SnapshotRecoveryError
+
+
+def _dirs_made_for(path: str) -> tuple[tuple[int, int], tuple[str, ...]]:
+    """
+    Where ``os.makedirs(path)`` would start creating, and what: the identity
+    of the deepest ancestor of *path* that exists — ``(st_dev, st_ino)``,
+    links followed by the filesystem, so another name of that directory (a
+    symlink, a bind mount) is the same one — and the names below it,
+    outermost first; none when *path* exists.
+
+    Raises:
+        OSError: an ancestor cannot be looked up for a reason other than
+            being missing; or a missing part is a dangling symlink, whose
+            target ``makedirs`` would create under another name, or is
+            ``.`` or ``..`` — where either leads is left to how ``makedirs``
+            folds it.
+    """
+    missing: list[str] = []
+    head = path
+    while True:
+        try:
+            st = os.stat(head or os.curdir)
+            break
+        except FileNotFoundError:
+            if head and os.path.islink(head):
+                raise OSError(errno.ENOENT, "a dangling symlink is on the "
+                                            "way", head) from None
+            parent, name = os.path.split(head)
+            if parent == head:
+                raise
+            if name:
+                missing.append(name)
+            head = parent
+    if any(name in (os.curdir, os.pardir) for name in missing):
+        raise OSError(errno.EINVAL, "'.' or '..' below a directory that does "
+                                    "not exist yet", path)
+    return (st.st_dev, st.st_ino), tuple(reversed(missing))
 
 
 class SnapshotsMixin:
+
+    ### snapshot directories ####
+    def cluster_memory_snapshot_dir(self, cluster_name: str) -> str:
+        """
+        Where ``snapshot take`` writes the memory images of *cluster_name*'s
+        VMs: its ``memory_snapshot_dir``, else its ``workdir`` — ``~``
+        expanded, and otherwise as written: ``..`` after a symlink is the
+        parent of where the symlink points, which only the filesystem can
+        tell, so neither is folded by its spelling.
+
+        Only the memory images (``<vm>_snapshot_<name>.raw``, and the
+        ``.raw.zst`` that compression leaves) go there. A disk snapshot is
+        an overlay libvirt names after its disk and creates beside it, and
+        the newest overlay is the disk the guest writes to.
+
+        Raises:
+            ConfigError: the ``memory_snapshot_dir`` it sets is not usable
+                (:meth:`_configured_memory_snapshot_dir`).
+        """
+        configured = self._configured_memory_snapshot_dir(cluster_name)
+        if configured is not None:
+            return configured
+        cluster = self.config['clusters'][cluster_name]
+        return os.path.expanduser(cluster['workdir'])
+
+    def _configured_memory_snapshot_dir(self, cluster_name: str) -> str | None:
+        """
+        The ``memory_snapshot_dir`` *cluster_name* sets, ``~`` expanded
+        (:meth:`cluster_memory_snapshot_dir`); ``None`` when it sets none.
+        Its ``workdir`` is not looked
+        at: a cluster may have none yet (no ``workspace.path`` to derive one
+        from), and that is not this key's to refuse.
+
+        Raises:
+            ConfigError: it is set on a docker-compose cluster, is not a
+                non-empty string or not an absolute path once ``~`` is
+                expanded (relative to wherever boxman runs, a teardown run
+                from elsewhere would look in another directory than the
+                take wrote to), or is set under a container runtime,
+                which bind-mounts the workspace and the workdirs into the
+                libvirt container but not this directory.
+        """
+        cluster = self.config['clusters'][cluster_name]
+        if not isinstance(cluster, dict):
+            return None
+        configured = cluster.get('memory_snapshot_dir')
+        if configured is None:
+            return None
+        where = f"clusters.{cluster_name}.memory_snapshot_dir"
+        if self._is_compose_cluster(cluster_name):
+            raise ConfigError(
+                f"{where}: a docker-compose cluster takes no "
+                f"memory_snapshot_dir — its snapshots are images, not memory "
+                f"files")
+        if not isinstance(configured, str) or not configured.strip():
+            raise ConfigError(
+                f"{where} must be a directory path, not {configured!r}")
+        path = os.path.expanduser(configured)
+        if not os.path.isabs(path):
+            raise ConfigError(
+                f"{where} must be an absolute path (or start with ~), not "
+                f"{configured!r}")
+        runtime_name = getattr(self, '_runtime_name', 'local') or 'local'
+        if runtime_name != 'local':
+            raise ConfigError(
+                f"{where} is not supported under the '{runtime_name}' "
+                f"runtime, whose libvirt container does not see that "
+                f"directory; use the local runtime, or leave it unset so the "
+                f"memory images go to the cluster workdir")
+        return path
+
+    def validate_memory_snapshot_dirs(self) -> None:
+        """
+        Check every cluster's ``memory_snapshot_dir`` up front
+        (:meth:`_configured_memory_snapshot_dir`), before a command builds
+        anything.
+
+        Raises:
+            ConfigError: one of them is not usable.
+        """
+        self._cluster_memory_snapshot_dirs()
+
+    def _cluster_memory_snapshot_dirs(self) -> list[str]:
+        """
+        The ``memory_snapshot_dir`` of every cluster that sets one, resolved
+        (:meth:`_configured_memory_snapshot_dir`): where a VM teardown also
+        looks for the VM's memory images, and the only files it may remove
+        there.
+
+        Raises:
+            ConfigError: one of them is not usable.
+        """
+        configured = (self._configured_memory_snapshot_dir(cluster_name)
+                      for cluster_name in (self.config.get('clusters') or {}))
+        return sorted({path for path in configured if path is not None})
+
+    def _ensure_memory_snapshot_dir(self, path: str) -> None:
+        """
+        Create *path*, and the directories on the way to it, when it is
+        missing — the directory itself ``0700``: a memory image is the
+        guest's RAM. An existing directory is left as it is.
+
+        Never a cluster workdir that does not exist, under any name: that is
+        not this command's to create, so a *path* inside one, or equal to
+        it, is refused (:func:`_dirs_made_for`).
+
+        Raises:
+            SnapshotError: it could not be created, or creating it would also
+                create a missing cluster workdir — or whether it would
+                cannot be told; or it exists and is not a directory.
+        """
+        try:
+            anchor, made = _dirs_made_for(path)
+        except OSError as exc:
+            raise SnapshotError(
+                f"could not create the snapshot directory {path} "
+                f"({exc})") from exc
+        if not made:
+            if not os.path.isdir(path):
+                raise SnapshotError(
+                    f"the snapshot directory {path} is not a directory")
+            return
+        for cluster_name, cluster in (self.config.get('clusters') or {}).items():
+            workdir = cluster.get('workdir') if isinstance(cluster, dict) else None
+            if not workdir:
+                continue
+            try:
+                workdir_anchor, makes_workdir = _dirs_made_for(
+                    os.path.expanduser(workdir))
+            except OSError as exc:
+                raise SnapshotError(
+                    f"could not create the snapshot directory {path}: whether "
+                    f"that would also create {workdir}, the workdir of "
+                    f"cluster {cluster_name}, cannot be told ({exc})") from exc
+            if (makes_workdir and workdir_anchor == anchor
+                    and made[:len(makes_workdir)] == makes_workdir):
+                raise SnapshotError(
+                    f"could not create the snapshot directory {path}: that "
+                    f"would also create {workdir}, the workdir of cluster "
+                    f"{cluster_name}, which does not exist — provision that "
+                    f"cluster first, or set a memory_snapshot_dir outside it")
+        try:
+            os.makedirs(path, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise SnapshotError(
+                f"could not create the snapshot directory {path} "
+                f"({exc})") from exc
 
     ### start snapshot functions ####
     def snapshot_list(self, cli_args):
@@ -231,6 +417,20 @@ class SnapshotsMixin:
         # Ensure provider configs reflect runtime settings
         self._update_sessions_with_runtime()
 
+        # Every check, and every directory made, before anything is
+        # snapshotted: the docker-compose clusters are, first.
+        self.validate_memory_snapshot_dirs()
+        # each VM's memory image goes to its cluster's memory_snapshot_dir
+        vm_targets = [
+            (full_vm_name, self.cluster_memory_snapshot_dir(cluster_name))
+            for full_vm_name, cluster_name, _vm_name, _workdir
+            in self._select_vm_targets(cli_args)
+        ]
+        # a memory_snapshot_dir is made on first use; a workdir exists by now
+        for memory_snapshot_dir in self._cluster_memory_snapshot_dirs():
+            if any(d == memory_snapshot_dir for _vm, d in vm_targets):
+                self._ensure_memory_snapshot_dir(memory_snapshot_dir)
+
         # docker-compose clusters first (cluster-scoped, D3). Failures are
         # isolated per cluster so a dc cluster that isn't up can't stop the
         # VMs of a mixed project from being snapshotted.
@@ -240,11 +440,6 @@ class SnapshotsMixin:
                 cname, cluster, cli_args.snapshot_name,
                 getattr(cli_args, 'snapshot_descr', '') or ''))
 
-        vm_targets = [
-            (full_vm_name, workdir)
-            for full_vm_name, _cluster_name, _vm_name, workdir
-            in self._select_vm_targets(cli_args)
-        ]
         if not vm_targets:
             if not dc_done:
                 self.logger.warning(
@@ -778,8 +973,32 @@ class SnapshotsMixin:
             vm_info = self.config['clusters'][cluster_name]['vms'][vm_name] or {}
             disks = vm_disk_paths(workdir, full_vm_name, vm_info)
             snap_count = storage.count_snapshots(full_vm_name)
-            mem_files = storage.snapshot_memory_files(workdir, full_vm_name)
-            mem_total = sum(os.path.getsize(p) for p in mem_files if os.path.isfile(p))
+            # its workdir's memory images by name, as ever, and every one
+            # its snapshots recorded, wherever it is — taken before a
+            # memory_snapshot_dir was set or changed, it stays where it was
+            # written. A memory_snapshot_dir is not read by name: another
+            # VM's full name can begin with this one's. Each file once, by
+            # identity: two names can lead to one (a symlink, a bind mount,
+            # a hard link).
+            images = list(storage.snapshot_memory_files(workdir,
+                                                        full_vm_name))
+            recorded = self.provider.snapshot_memory_images(full_vm_name)
+            if recorded is None:
+                self.logger.warning(
+                    f"{full_vm_name}: could not read its snapshots, so its "
+                    f"SNAPMEM counts only the memory images in its workdir")
+            else:
+                images += [path for image in recorded.values()
+                           for path in (image, f"{image}.zst")]
+            mem_sizes: dict[tuple[int, int], int] = {}
+            for path in images:
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode):
+                    mem_sizes[(st.st_dev, st.st_ino)] = st.st_size
+            mem_total = sum(mem_sizes.values())
             snap_mem_total_per_vm[full_vm_name] = mem_total
             for disk_path in disks:
                 if not os.path.isfile(disk_path):

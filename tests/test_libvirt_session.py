@@ -2656,3 +2656,253 @@ class TestFilesAPoolHasNotListedYet:
         assert [what for _, what, _ in host.log
                 if what not in ("qemu-img", "unreadable-probe",
                                 "absence-probe")] == asked
+
+
+class TestSnapshotMemoryInUse:
+    """The memory images every defined domain's snapshots record — the
+    ``.raw`` and the ``.raw.zst`` compression leaves of it — by path and by
+    identity, which no teardown or ``--force`` retake may remove. Fails
+    closed: ``None`` once any of them cannot be told."""
+
+    def _run(self, images, relists=(), listing_ok=True, by_name=None):
+        """Domains vm-a, vm-b and vm-x; *images* maps a domain to what
+        ``SnapshotManager.memory_images`` answers when asked by that
+        domain's UUID. Asked by a name, it answers from *by_name* — a domain
+        defined under that name since — and fails the test otherwise."""
+        relists = iter(relists)
+        listed = []
+        by_uuid = {domain_uuid(name): answer for name, answer in images.items()}
+
+        def memory_images(_self, domain):
+            if domain in by_uuid:
+                return by_uuid[domain]
+            if by_name is not None and domain in by_name:
+                return by_name[domain]
+            raise AssertionError(f"memory_images asked for {domain!r}")
+
+        def virsh_execute(*args, **kwargs):
+            if args[:2] == ("list", "--all"):
+                listed.append(args)
+                if len(listed) == 1:
+                    if not listing_ok:
+                        return _result(ok=False, stderr="error: no hypervisor")
+                    return _result(stdout=domain_listing(
+                        args, "vm-a", "vm-b", "vm-x"))
+                return _result(stdout=domain_listing(args, *next(relists)))
+            raise AssertionError(f"unexpected virsh {args}")
+
+        with patch("boxman.providers.libvirt.session.VirshCommand") as virsh, \
+             patch("boxman.providers.libvirt.session.SnapshotManager."
+                   "memory_images", autospec=True,
+                   side_effect=memory_images):
+            virsh.return_value.execute.side_effect = virsh_execute
+            return _session({}).snapshot_memory_in_use()
+
+    def test_what_other_domains_snapshots_record_by_path_and_identity(
+            self, tmp_path):
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        zst = tmp_path / "b_snapshot_s2.raw.zst"
+        zst.write_bytes(b"RAM")
+
+        in_use = self._run({
+            "vm-a": {"s1": str(raw)},
+            "vm-b": {"s2": str(tmp_path / "b_snapshot_s2.raw")},
+            "vm-x": {}})
+
+        assert in_use[str(raw)] == "vm-a"
+        assert in_use[str(zst)] == "vm-b"
+        ids = {(os.stat(p).st_dev, os.stat(p).st_ino) for p in (raw, zst)}
+        assert set(in_use.identities) == ids
+
+    def test_a_domain_under_the_torn_down_vms_name_is_read_too(self, tmp_path):
+        """The VM a teardown removes is undefined by the time this is asked:
+        a domain listed under its name now is another one — renamed to it
+        since — and its images are as protected as any."""
+        raw = tmp_path / "x_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+
+        in_use = self._run({"vm-a": {}, "vm-b": {}, "vm-x": {"s1": str(raw)}})
+
+        assert in_use[str(raw)] == "vm-x"
+
+    def test_a_domain_is_read_by_its_uuid_whatever_holds_its_name_since(
+            self, tmp_path):
+        """vm-a renamed after the listing, and an empty domain defined under
+        vm-a since: read by its name, the newcomer answered, and the image
+        vm-a's snapshot records went unprotected."""
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+
+        in_use = self._run({"vm-a": {"s1": str(raw)}, "vm-b": {}, "vm-x": {}},
+                           by_name={"vm-a": {}})
+
+        assert in_use[str(raw)] == "vm-a"
+
+    def test_a_domain_whose_snapshots_cannot_be_read_fails_it(self):
+        assert self._run({"vm-a": {}, "vm-b": None, "vm-x": {}},
+                         relists=[("vm-a", "vm-b", "vm-x")]) is None
+
+    def test_a_domain_gone_meanwhile_holds_nothing(self):
+        in_use = self._run({"vm-a": {}, "vm-b": None, "vm-x": {}},
+                           relists=[("vm-a", "vm-x")])
+
+        assert in_use == {}
+
+    def test_a_domain_list_that_fails_fails_it(self):
+        assert self._run({}, listing_ok=False) is None
+
+    @pytest.mark.skipif(os.geteuid() == 0,
+                        reason="root searches a mode-000 directory")
+    def test_an_image_that_cannot_be_looked_up_fails_it(self, tmp_path):
+        hidden = tmp_path / "hidden"
+        hidden.mkdir()
+        (hidden / "a_snapshot_s1.raw").write_bytes(b"RAM")
+        hidden.chmod(0)
+        try:
+            in_use = self._run({"vm-a": {"s1": str(hidden / "a_snapshot_s1.raw")},
+                                "vm-b": {}, "vm-x": {}})
+        finally:
+            hidden.chmod(0o700)
+
+        assert in_use is None
+
+
+class _SnapshotHost:
+    """Domains and their snapshots, answered where boxman hands a command
+    to the shell (``commands._shell_run``): ``list --all --uuid --name``,
+    and ``snapshot-list`` / ``snapshot-dumpxml`` for a domain named, as
+    virsh takes one, by its UUID or by its name -- a read by name answered
+    by whichever domain holds that name when it runs."""
+
+    def __init__(self) -> None:
+        #: ``[uuid, name, {snapshot: its memory file, or None}]``, as listed
+        self.domains: list[list] = []
+        #: subcommand -> something to do, once, just before it first runs
+        self.before: dict = {}
+        #: ``(subcommand, args)`` of every command, in order
+        self.log: list[tuple[str, tuple]] = []
+
+    def define(self, name: str, uid: str | None = None, **snapshots) -> str:
+        uid = uid or domain_uuid(name)
+        self.domains.append([uid, name, snapshots])
+        return uid
+
+    def rename(self, old: str, new: str) -> None:
+        self._get(old)[1] = new
+
+    def undefine(self, name: str) -> None:
+        self.domains.remove(self._get(name))
+
+    def _get(self, ref: str) -> list | None:
+        """The domain *ref* names: by UUID first, then by name, as virsh
+        looks one up."""
+        for field in (0, 1):
+            for domain in self.domains:
+                if domain[field] == ref:
+                    return domain
+        return None
+
+    def run(self, command: str, **_kwargs) -> FakeResult:
+        argv = shlex.split(command)
+        sub, args = argv[3], tuple(argv[4:])
+        hook = self.before.pop(sub, None)
+        if hook is not None:
+            hook()
+        self.log.append((sub, args))
+        if sub == "list":
+            return FakeResult(stdout=domain_listing(
+                args, *[(uid, name) for uid, name, _ in self.domains]) + "\n")
+        domain = self._get(args[0])
+        if domain is None:
+            return FakeResult(
+                stderr=f"error: failed to get domain '{args[0]}'\n", code=1)
+        snapshots = domain[2]
+        if sub == "snapshot-list":
+            return FakeResult(
+                stdout="".join(f"{name}\n" for name in snapshots) + "\n")
+        if sub == "snapshot-dumpxml" and args[1] in snapshots:
+            memory = snapshots[args[1]]
+            element = (f"<memory snapshot='external' file='{memory}'/>"
+                       if memory else "<memory snapshot='no'/>")
+            return FakeResult(stdout=f"<domainsnapshot><name>{args[1]}</name>"
+                                     f"{element}</domainsnapshot>\n")
+        if sub == "snapshot-dumpxml":
+            return FakeResult(
+                stderr="error: Domain snapshot not found\n", code=1)
+        raise AssertionError(f"the fake host cannot run: {command}")
+
+
+class TestSnapshotMemoryInUseThroughVirsh:
+    """The same scan with only the shell faked: the real ``VirshCommand``
+    builds every command, and a domain renamed or undefined mid-scan is so
+    on the host those commands reach (Codex's fifth review of #252)."""
+
+    @staticmethod
+    def _scan(host: _SnapshotHost):
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=host.run):
+            return _session({}).snapshot_memory_in_use()
+
+    def test_both_reads_name_each_domain_by_its_uuid(self, tmp_path):
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        host = _SnapshotHost()
+        uuids = {host.define("vm-a", s1=str(raw)),
+                 host.define("vm-b", s1=None),
+                 host.define("vm-x")}
+
+        in_use = self._scan(host)
+
+        assert in_use[str(raw)] == "vm-a"
+        reads = [(sub, args[0]) for sub, args in host.log if sub != "list"]
+        assert {sub for sub, _ in reads} == {"snapshot-list",
+                                             "snapshot-dumpxml"}
+        assert {domain for _, domain in reads} == uuids
+
+    @pytest.mark.parametrize("reused", [False, True],
+                             ids=["renamed", "its-name-reused"])
+    @pytest.mark.parametrize("before", ["snapshot-list", "snapshot-dumpxml"])
+    def test_a_domain_renamed_mid_scan_keeps_its_image(self, tmp_path,
+                                                       before, reused):
+        """Codex's reproduction (#252 review R4): vm-a renamed while the
+        scan reads it, and an empty domain defined under vm-a since. Read
+        by its name, the newcomer answered for it -- no snapshots, or not
+        that one -- and the image vm-a's snapshot records went unprotected;
+        renamed alone, it could no longer be read and failed the scan."""
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        host = _SnapshotHost()
+        host.define("vm-a", s1=str(raw))
+        host.define("vm-x")
+
+        def rename():
+            host.rename("vm-a", "vm-a-old")
+            if reused:
+                host.define("vm-a", uid=domain_uuid("vm-a-new"))
+
+        host.before[before] = rename
+
+        in_use = self._scan(host)
+
+        assert in_use[str(raw)] == "vm-a"
+        st = raw.stat()
+        assert in_use.identities[(st.st_dev, st.st_ino)] == "vm-a"
+
+    @pytest.mark.parametrize("before", ["snapshot-list", "snapshot-dumpxml"])
+    def test_a_domain_undefined_mid_scan_is_skipped(self, tmp_path, before):
+        """vm-b undefined just before its snapshots, or the one it listed,
+        are read: a listing taken since names neither it nor its UUID, so
+        it holds nothing, and the scan goes on to protect what vm-a's
+        snapshot records."""
+        raw = tmp_path / "a_snapshot_s1.raw"
+        raw.write_bytes(b"RAM")
+        host = _SnapshotHost()
+        host.define("vm-b", s1=str(tmp_path / "b_snapshot_s1.raw"))
+        host.define("vm-a", s1=str(raw))
+        host.before[before] = lambda: host.undefine("vm-b")
+
+        in_use = self._scan(host)
+
+        assert in_use[str(raw)] == "vm-a"
+        assert [sub for sub, _ in host.log].count("list") == 2

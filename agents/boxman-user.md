@@ -196,6 +196,7 @@ templates:
 clusters:
   <cluster_name>:
     workdir: <dir>                   # VM disks + cluster scratch (auto-derives)
+    memory_snapshot_dir: <abs dir>   # optional: snapshot memory images (default: workdir)
     base_image: <template-vm-name>   # cluster default; overridable per VM
     admin_user: ...
     admin_pass: file://...           # also: ${env:VAR}, or a plain literal
@@ -1144,7 +1145,24 @@ edit `conf.yml`, not the output. `provision` / `up` run `docker compose up -d
 - `snapshot take` snapshots selected VMs in parallel (default name = UTC
   timestamp); overlay disks are preserved. `--compress-memory` zstd-compresses
   the memory `.raw` (~70% smaller, transparently decompressed on restore).
-  `--force` clears a colliding name or leftover files and re-takes.
+  `--force` clears a colliding name or leftover files and re-takes; a
+  leftover any domain uses, or another domain's snapshot records as its
+  memory image (matched by path or by identity), refuses it. A take never
+  writes its memory image over a file already there (a leftover, or another
+  VM's image under the same name — VM `web`'s snapshot `replica_snapshot_s1`
+  and VM `web_snapshot_replica`'s `s1` name one file): it refuses.
+- A cluster's memory images (`<vm>_snapshot_<name>.raw`, or `.raw.zst`)
+  go to its `memory_snapshot_dir` when it sets one (an absolute path, or
+  `~/…`; made `0700` on first use, but never by creating a missing cluster
+  workdir), else to its `workdir`. Only those move: a disk snapshot is an
+  overlay libvirt creates beside its disk, and the newest overlay is the
+  disk the guest writes to. Images already taken stay where they were
+  written; restore, delete and compression follow the path libvirt recorded.
+  A teardown removes an image only if one of the VM's own snapshots recorded
+  it, and only from a cluster workdir or `memory_snapshot_dir`: after the
+  key is changed or unset, one left anywhere else is kept and named in a
+  warning, to remove by hand. Local runtime only: a container runtime
+  refuses it up front (`provision`, `up`, `update`, `snapshot take`).
 - `snapshot restore [--name N]` restores (latest if omitted). `boxman restore`
   is the shortcut for "all VMs to latest".
 - **A restore backs up the overlays the revert deletes, and refuses if it

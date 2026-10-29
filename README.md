@@ -395,7 +395,9 @@ boxman restore --name "pre-upgrade"
 
 The `--compress-memory` flag zstd-compresses the snapshot memory dump
 (typically a ~71% reduction at sub-second/GB). Restore decompresses
-transparently — no flag needed at revert time. See
+transparently — no flag needed at revert time. The memory dumps go to
+the cluster's `memory_snapshot_dir` when it sets one, else to its `workdir`
+(disk overlays always sit beside their disks). See
 [Disk Reclaim and Storage](doc/storage.md) for the full reclaim
 workflow and the `boxman storage` subcommand.
 
@@ -879,13 +881,20 @@ Details worth knowing:
   running.
 - **Only the storage the VM owns is removed, by boxman — never by libvirt.**
   Its boot disk, snapshot overlays and memory files (the files under the VM's
-  own `<vm>.*` / `<vm>_snapshot_*` names in a cluster workdir) and the extra
+  own `<vm>.*` / `<vm>_snapshot_*` names in a cluster workdir, and the memory
+  images its own snapshots recorded in a cluster workdir or
+  `memory_snapshot_dir`) and the extra
   disks boxman recorded creating for it. Never: a CD-ROM or ISO it has
   attached (in either its live or its persistent definition), an
-  `attach_only` (adopted) disk, anything outside the cluster workdirs, a
+  `attach_only` (adopted) disk, anything outside the cluster workdirs (a
+  memory image a snapshot recorded outside them and every
+  `memory_snapshot_dir` is named in a warning instead), anything in a
+  `memory_snapshot_dir` only named as one of its memory images (another
+  VM's full name can begin with this one's: kept, and named), a
   symlink, or anything another VM uses directly, as a backing file or as
   the destination of a block job it runs (a block copy) — storage-pool
-  volumes included. A protected file is recognised by its
+  volumes included — or that another VM's snapshot records as its memory
+  image. A protected file is recognised by its
   identity as well as its path, so under a bind mount or a hard link too.
   One boxman may not look up — another user's VM keeping its disks in that
   user's home — is looked up with `sudo -n stat` where the provider runs

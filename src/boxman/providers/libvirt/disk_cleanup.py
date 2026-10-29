@@ -170,6 +170,42 @@ def boot_family_candidates(workdir: str, vm_name: str) -> list[str]:
     return sorted(found)
 
 
+def is_memory_image(vm_name: str, path: str) -> bool:
+    """
+    Whether *path* is named as ``snapshot take`` names *vm_name*'s memory
+    images: ``<vm>_snapshot_<name>.raw``, or the ``.raw.zst`` that
+    compression leaves. The name only: what the file is, is not read.
+    """
+    name = os.path.basename(path)
+    return (name.startswith(f"{vm_name}_snapshot_")
+            and name.endswith((".raw", ".raw.zst")))
+
+
+def memory_image_name(vm_name: str, snapshot_name: str) -> str:
+    """The name ``snapshot take`` gives the memory image of *vm_name*'s
+    snapshot *snapshot_name*; compression leaves it with ``.zst`` added."""
+    return f"{vm_name}_snapshot_{snapshot_name}.raw"
+
+
+def memory_image_candidates(directory: str, vm_name: str) -> list[str]:
+    """
+    The entries of *directory* named as *vm_name*'s memory images
+    (:func:`is_memory_image`). A teardown only names them: in a cluster's
+    ``memory_snapshot_dir`` it removes no file by its name, since another
+    VM's full name can begin with this one's (:func:`remove_vm_storage`).
+
+    Read as :func:`boot_family_candidates` reads a workdir: only a directory
+    that does not exist holds none, a symlink or an entry that cannot be
+    looked up stays a candidate (the refusals then keep it), and the name is
+    matched literally, never as a pattern.
+
+    Raises:
+        OSError: If *directory* exists but cannot be listed.
+    """
+    return [path for path in boot_family_candidates(directory, vm_name)
+            if is_memory_image(vm_name, path)]
+
+
 def file_identities(paths: Iterable[str]) -> dict[str, tuple[int, int]]:
     """
     ``(st_dev, st_ino)`` of each path that exists, without following a
@@ -184,6 +220,40 @@ def file_identities(paths: Iterable[str]) -> dict[str, tuple[int, int]]:
             continue
         identities[path] = (st.st_dev, st.st_ino)
     return identities
+
+
+def _directory_identities(directories: Iterable[str],
+                          ) -> tuple[set[tuple[int, int]], dict[str, OSError]]:
+    """
+    ``(st_dev, st_ino)`` of each of *directories* that exists, links followed
+    by the filesystem — never a path folded by its spelling, which
+    ``os.path.realpath`` does past a link it cannot read — and, apart, each
+    one that could not be looked up for a reason other than not existing.
+    """
+    identities: set[tuple[int, int]] = set()
+    unreadable: dict[str, OSError] = {}
+    for directory in directories:
+        try:
+            st = os.stat(os.path.expanduser(directory))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            unreadable[directory] = exc
+            continue
+        identities.add((st.st_dev, st.st_ino))
+    return identities, unreadable
+
+
+def _directory_is_one_of(path: str,
+                         identities: set[tuple[int, int]]) -> bool:
+    """Whether the directory *path* is in is, by identity
+    (:func:`_directory_identities`), one of those *identities* names;
+    ``False`` when it cannot be looked up."""
+    try:
+        st = os.stat(os.path.dirname(path))
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) in identities
 
 
 def _leftover_refusal(vm_name: str,
@@ -265,6 +335,9 @@ class StorageInventory:
     identities: dict[str, tuple[int, int]] = field(default_factory=dict)
     #: the target (``vdb``, ...) each disk source is attached at
     targets: dict[str, str] = field(default_factory=dict)
+    #: the memory file each of its snapshots recorded, by snapshot name:
+    #: only to name one the teardown leaves where it removes nothing
+    memory_images: dict[str, str] = field(default_factory=dict)
     #: where it was saved before undefining (see
     #: :func:`save_teardown_inventory`); not saved itself
     saved_at: str | None = None
@@ -341,6 +414,7 @@ def save_teardown_inventory(inventory: StorageInventory,
         "identities": {path_: list(identity) for path_, identity
                        in inventory.identities.items()},
         "targets": inventory.targets,
+        "memory_images": inventory.memory_images,
     }
     _write_json_atomically(path, data)
     return path
@@ -428,6 +502,11 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
     legacy = _field(data, "legacy_disks", lambda v: v is None or _is_paths(v))
     identities = _field(data, "identities",
                         lambda v: _is_map(v, _is_identity))
+    # absent from an inventory saved before they were recorded
+    memory_images = (
+        _field(data, "memory_images",
+               lambda v: _is_map(v, lambda p: isinstance(p, str)))
+        if "memory_images" in data else {})
     return StorageInventory(
         vm_name=vm_name,
         disk_sources=list(_field(data, "disk_sources", _is_paths)),
@@ -442,6 +521,7 @@ def load_teardown_inventory(path: str, vm_name: str) -> StorageInventory:
         identities={k: (v[0], v[1]) for k, v in identities.items()},
         targets=dict(_field(data, "targets",
                             lambda v: _is_map(v, lambda t: isinstance(t, str)))),
+        memory_images=dict(memory_images),
         saved_at=path,
     )
 
@@ -558,6 +638,8 @@ def _regular_file_refusal(path: str) -> str | None:
 _MEDIA = "it is a CD-ROM or other media source of the vm"
 _UNDER_MEDIA = "it backs a CD-ROM or other media source of the vm"
 _OUTSIDE = "it is outside every cluster workdir of the project"
+_CHAINS_UNREAD = ("the backing chains of the vm's disks could not be read, "
+                  "so whether a CD-ROM is built on it cannot be told")
 _NOT_AN_ARTIFACT = (
     "the vm was already undefined and no saved teardown inventory was "
     "found, so only boxman's own qcow2 images and memory files are removed "
@@ -763,6 +845,8 @@ def remove_vm_storage(
     inventory: StorageInventory,
     workdirs: Iterable[str],
     paths_in_use: Callable[[], dict[str, str] | None],
+    memory_dirs: Iterable[str] = (),
+    memory_in_use: Callable[[], dict[str, str] | None] | None = None,
 ) -> StorageOutcome:
     """
     Remove the storage an undefined VM owns — and nothing else.
@@ -781,6 +865,17 @@ def remove_vm_storage(
        its overlays and its memory-snapshot files. Extra-disk files
        (attached, recorded, config-declared, or a layer under one) are
        never decided by name.
+    1b. **The memory images its snapshots recorded**
+       (``StorageInventory.memory_images``), each named exactly as
+       :func:`memory_image_name` names that snapshot's (or with the
+       ``.zst`` compression adds), in a cluster workdir or one of the
+       clusters' ``memory_snapshot_dir`` (*memory_dirs*). Nothing in a
+       memory_snapshot_dir is decided by name: every cluster's is one, and
+       another VM's full name can begin with this one's. Its directory is
+       told by identity, links followed by the filesystem; when it, or a
+       directory it might be, cannot be looked up, the image is kept. One
+       recorded anywhere else is not boxman's to remove (the caller names
+       it).
     2. **Extra disks recorded with role ``data``** at exactly their
        attached source, by the rules of :func:`_leftover_refusal`; and a
        recorded disk an external snapshot moved behind overlays, together
@@ -793,8 +888,9 @@ def remove_vm_storage(
        its record, if it had one, is gone.
 
     Every admitted file must be a regular file, not a symlink, inside one
-    of the cluster *workdirs* once symlinks are resolved, and not a CD-ROM
-    (or other media) source of either definition.
+    of the cluster *workdirs* once symlinks are resolved (a recorded memory
+    image, see 1b, one of *memory_dirs* too), and not a CD-ROM (or other
+    media) source of either definition.
 
     Every protection that compares files matches them by resolved path and
     by identity (:class:`_Identities`): the media and what they are built
@@ -807,7 +903,11 @@ def remove_vm_storage(
     whole (:func:`_refuse_incomplete_chains`), and an unreadable chain
     keeps everything; nothing another domain uses directly or as a backing
     file is removed (*paths_in_use* is asked once, and ``None`` keeps
-    everything). What remains is removed heads first, each through
+    everything); and no memory image (:func:`is_memory_image`) a snapshot
+    of another domain records — neither its name nor this VM's own record
+    makes it this VM's alone (*memory_in_use*, asked once, only when one
+    would go; ``None`` keeps them all). What remains is removed heads
+    first, each through
     :func:`remove_if_unchanged` against the identity taken before
     undefining; a layer replaced since keeps everything below it.
 
@@ -817,6 +917,7 @@ def remove_vm_storage(
     vm = inventory.vm_name
     outcome = StorageOutcome()
     real = os.path.realpath
+    workdirs = list(workdirs)
     real_workdirs = {real(os.path.expanduser(w)) for w in workdirs}
     chains = inventory.chains
     legacy = list(inventory.legacy_disks or ())
@@ -841,6 +942,8 @@ def remove_vm_storage(
         if path in under_media:
             return _UNDER_MEDIA
         return None
+
+    memory_ids, _unreadable = _directory_identities(memory_dirs)
 
     def unique(paths):
         seen, out = set(), []
@@ -874,8 +977,23 @@ def remove_vm_storage(
           for layer in layers)])
 
     # -- 1. the boot-disk family ------------------------------------------
+    deferred = []         # left to what the snapshots recorded (1b)
     for path in inventory.boot_family:
         if path in extra_related and media_refusal(path) is None:
+            continue
+        if (is_memory_image(vm, path)
+                and real(os.path.dirname(path)) not in real_workdirs
+                and _directory_is_one_of(path, memory_ids)):
+            # what its snapshots recorded decides it (1b), but every refusal
+            # other than being outside the workdirs comes first, as on
+            # every route: a CD-ROM is kept, a symlink keeps the file it
+            # names, unread chains keep what a CD-ROM may be built on
+            reason = (media_refusal(path) or _regular_file_refusal(path)
+                      or (_CHAINS_UNREAD if chains is None else None))
+            if reason:
+                admission.refuse(path, reason)
+            else:
+                deferred.append(path)
             continue
         reason = static_refusal(path)
         if reason is None and inventory.records_state == RECORDS_UNKNOWN:
@@ -884,6 +1002,44 @@ def remove_vm_storage(
             admission.refuse(path, reason)
         else:
             admission.admit(path)
+
+    # -- 1b. the memory images its snapshots recorded --------------------
+    managed, unreadable_dirs = _directory_identities([*workdirs,
+                                                      *memory_dirs])
+    for snapshot, recorded in sorted(inventory.memory_images.items()):
+        if os.path.basename(recorded) != memory_image_name(vm, snapshot):
+            continue      # not boxman's (named by the caller)
+        for path in (recorded, f"{recorded}.zst"):
+            if not _may_exist(path) or path in extra_related:
+                continue
+            try:
+                st = os.stat(os.path.dirname(path))
+            except OSError as exc:
+                admission.refuse(path, (
+                    f"its directory could not be looked up ({exc}), so "
+                    f"whether it is in a cluster workdir or "
+                    f"memory_snapshot_dir cannot be told"))
+                continue
+            if (st.st_dev, st.st_ino) not in managed:
+                if unreadable_dirs:
+                    directory, exc = min(unreadable_dirs.items())
+                    admission.refuse(path, (
+                        f"whether it is in a cluster workdir or "
+                        f"memory_snapshot_dir cannot be told: {directory} "
+                        f"could not be looked up ({exc})"))
+                continue  # outside all of them (named by the caller)
+            reason = media_refusal(path) or _regular_file_refusal(path)
+            if reason:
+                admission.refuse(path, reason)
+            else:
+                admission.admit(path)
+    # one left to them that they did not record is kept, as outside the
+    # workdirs, as it was before it was left to them: refused, so that
+    # every protection applied to what is admitted still holds it, and the
+    # saved inventory stays
+    for path in deferred:
+        if not admission.is_admitted_as(path):
+            admission.refuse(path, _OUTSIDE)
 
     # -- 2./3. extra disks -------------------------------------------------
     state = inventory.records_state
@@ -967,6 +1123,30 @@ def remove_vm_storage(
                 admission.refuse(path, f"domain {domain} uses it")
         if chains:
             _refuse_incomplete_chains(chains, admission)
+
+    # -- recorded by another domain's snapshot -----------------------------
+    memory_named = [(resolved, path)
+                    for resolved, path in admission.admitted.items()
+                    if is_memory_image(vm, path)]
+    if memory_named and memory_in_use is not None:
+        recorded = memory_in_use()
+        recorded_ids = getattr(recorded, "identities", {})
+        for resolved, path in memory_named:
+            if resolved not in admission.admitted:
+                continue     # withdrawn meanwhile, under another name
+            if recorded is None:
+                admission.refuse(path, (
+                    "whether a snapshot of another domain records it as its "
+                    "memory image could not be checked"))
+                continue
+            domain = recorded.get(resolved) or recorded.get(path) or next(
+                (recorded_ids[identity]
+                 for identity in sorted(identities.of(path))
+                 if identity in recorded_ids), None)
+            if domain:
+                admission.refuse(path, (
+                    f"a snapshot of domain {domain} records it as its memory "
+                    f"image"))
 
     # -- removal, heads first ------------------------------------------------
     # (ordered by resolved path: a layer named otherwise than the file
