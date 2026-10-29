@@ -2110,23 +2110,25 @@ class SnapshotManager:
         """
         Whether *path* and *other* are one file where qemu-img opens them:
         by ``(st_dev, st_ino)``, read with the commands boxman runs (in a
-        container, with its own mounts; with sudo when that is used), not
-        as boxman sees them. The same path is one file without asking.
+        container, with its own mounts; with sudo as the force and skip
+        lists say), not as boxman sees them. The same path is one file
+        without asking.
 
         Returns:
             bool: or None when either cannot be stat'ed there.
         """
         if path == other:
             return True
-        sudo = "sudo " if self.use_sudo else ""
         result = self.virsh.execute_shell(
-            f"{sudo}stat -L -c '%d %i' -- {shlex.quote(path)} "
+            f"stat -L -c '%d %i' -- {shlex.quote(path)} "
             f"{shlex.quote(other)}", warn=True, hide=True)
         if not result.ok:
             return None
         identities = [line.split() for line in result.stdout.splitlines()
                       if line.strip()]
-        if len(identities) != 2 or any(len(i) != 2 for i in identities):
+        if len(identities) != 2 or not all(
+                len(i) == 2 and all(n.isdigit() for n in i)
+                for i in identities):
             return None
         return identities[0] == identities[1]
 

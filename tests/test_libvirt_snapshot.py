@@ -2881,6 +2881,66 @@ class TestCollapseKeepsTheLiveDisk:
         assert not overlays["s4"].exists()
         assert virsh.snapshots == ["s1", "s2", "s3"]
 
+    @pytest.mark.parametrize("output", ["64768 11\n", "64768 11\nx y\n",
+                                        "64768 11 7\n64768 11 7\n"],
+                             ids=["one line", "not numbers", "three fields"])
+    def test_an_identity_check_that_says_something_else_tells_nothing(
+            self, sm, output):
+        with patch.object(sm.virsh, "execute_shell",
+                          return_value=_result(stdout=output)):
+            assert sm._one_file_where_qemu_runs("/a/x", "/b/y") is None
+
+    def test_every_disk_is_told_before_any_is_rebased(self, sm, tmp_path):
+        # the second disk cannot be told: the first is not rebased either
+        _base, overlays, memory = _take_external(
+            tmp_path, ["s1", "s2"], real=False)
+        data = {n: tmp_path / f"vm01_disk01.{n}" for n in ("s1", "s2")}
+        for p in data.values():
+            p.write_bytes(b"data")
+        head = tmp_path / "vm01_disk.1785187700"
+        head.write_bytes(b"head")
+        virsh = _Libvirt(
+            {n: {"vda": str(overlays[n]), "vdb": str(data[n])}
+             for n in ("s1", "s2")},
+            {"vda": str(head), "vdb": str(data["s2"])}, memory)
+        runs = _shell_that_runs()
+
+        def shell(cmd, *args, **kwargs):
+            if cmd.startswith("stat ") and str(data["s2"]) in cmd:
+                return _result(ok=False, stderr="stat: Permission denied")
+            return runs(cmd, *args, **kwargs)
+
+        with patch.object(sm.virsh, "execute", side_effect=virsh), \
+             patch.object(sm.virsh, "execute_shell", side_effect=shell), \
+             patch.object(sm, "_qemu_img_rebase",
+                          return_value=True) as rebase:
+            assert sm.collapse_to("vm01", "s1") is False
+
+        rebase.assert_not_called()
+        assert all(p.exists() for p in [*overlays.values(), *data.values()])
+        assert virsh.snapshots == ["s1", "s2"]
+
+    @pytest.mark.parametrize("skip, sudo", [([], True), (["stat"], False)],
+                             ids=["sudo", "stat skipped"])
+    def test_the_identity_check_takes_sudo_as_configured(self, skip, sudo):
+        # the force and skip lists decide it, as for every command, not a
+        # hand-written prefix
+        sm = SnapshotManager(provider_config={
+            "use_sudo": True, "sudo_skip_commands": skip,
+            "uri": "qemu:///system"})
+        run: list[str] = []
+
+        def shell_run(command, **_kwargs):
+            run.append(command)
+            return _result(stdout="64768 11\n64768 12\n")
+
+        with patch("boxman.providers.libvirt.commands._shell_run",
+                   side_effect=shell_run):
+            assert sm._one_file_where_qemu_runs("/a/x", "/b/y") is False
+
+        assert len(run) == 1 and "stat -L" in run[0]
+        assert run[0].startswith("sudo ") is sudo
+
     def test_one_that_cannot_be_examined_where_qemu_img_runs_stops(
             self, sm, tmp_path):
         _base, overlays, memory = _take_external(
