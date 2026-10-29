@@ -520,10 +520,12 @@ def mount_points(mountinfo: str) -> set[str] | None:
     escapes them (a space as ``\\040``), or None when it cannot be read.
     """
     try:
-        # undecodable bytes as os.fsdecode() gives them in a path
-        with open(mountinfo, encoding="utf-8",
-                  errors="surrogateescape") as fh:
-            lines = fh.read().splitlines()
+        # undecodable bytes as os.fsdecode() gives them in a path; only a
+        # line feed ends a line, which the kernel escapes in a mount point,
+        # while a carriage return and the like are left as they are
+        with open(mountinfo, encoding="utf-8", errors="surrogateescape",
+                  newline="") as fh:
+            lines = fh.read().split("\n")
     except OSError:
         return None
     return {_OCTAL_ESCAPE.sub(lambda m: chr(int(m.group(1), 8)),

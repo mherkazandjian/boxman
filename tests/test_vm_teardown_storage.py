@@ -1141,6 +1141,19 @@ class TestSavedInventoryLifecycle:
 
         assert disk_cleanup.mount_points(str(mountinfo)) == {path}
 
+    @pytest.mark.parametrize("sep", ["\r", "\x0b", "\x0c", "\x1c", "\x85",
+                                     "\u2028"])
+    def test_only_a_line_feed_ends_a_mount_point(self, tmp_path, sep):
+        # the kernel escapes a space, a tab, a line feed and a backslash
+        # in a mount point and leaves every other character as it is
+        mountinfo = tmp_path / 'mountinfo'
+        mountinfo.write_bytes(
+            f"97 22 253:0 /x /srv/inv.json{sep}-extra rw shared:1 - xfs "
+            f"/dev/vda1 rw\n".encode())
+
+        assert disk_cleanup.mount_points(str(mountinfo)) == {
+            f"/srv/inv.json{sep}-extra"}
+
     def test_no_mount_table_refuses_nothing(self, tmp_path):
         assert disk_cleanup.mount_points(str(tmp_path / 'missing')) is None
 
