@@ -189,8 +189,14 @@ class TestRunStoppable:
 
     def _sigint_boxman_alone(self, tmp_path, signal_at, held_up=None, env=None,
                              program=_TRAPS_SIGINT):
-        """Run the child, and SIGINT its Python alone as each file in
-        *signal_at* appears; return what it printed, and how it exited."""
+        """Run the child, and SIGINT its Python alone at each point in
+        *signal_at*: once the file there, or every file of a tuple there, has
+        appeared; return what it printed, and how it exited.
+
+        A held-up run's PID file appears as soon as the command is started,
+        when it may not have set up its SIGINT handler yet: a SIGINT then
+        ends it there and then, so a point that needs that handler to run
+        waits for the command to be up too (#258)."""
         import os
         import shlex
         import signal
@@ -210,8 +216,9 @@ class TestRunStoppable:
             start_new_session=True)
         try:
             for when in signal_at:
+                files = when if isinstance(when, tuple) else (when,)
                 deadline = time.monotonic() + 30
-                while not when.exists():
+                while not all(path.exists() for path in files):
                     assert child.poll() is None and time.monotonic() < deadline, \
                         child.stderr.read()
                     time.sleep(0.05)
@@ -248,7 +255,11 @@ class TestRunStoppable:
         import os
 
         pid_file = tmp_path / "pid"
-        out, err, code = self._sigint_boxman_alone(tmp_path, [pid_file], held_up=pid_file)
+        # once invoke is held up and the command is up: a SIGINT before the
+        # command had set up its handler ended it there and then, and
+        # up.sigint never came (#258)
+        out, err, code = self._sigint_boxman_alone(
+            tmp_path, [(pid_file, tmp_path / "up")], held_up=pid_file)
         # gone by the time the interrupt reached the caller, stopped by its
         # SIGINT rather than killed, and not running on without boxman
         assert (out.split(), code) == (["STOPPED", "GONE"], 0), err
@@ -279,7 +290,10 @@ class TestRunStoppable:
 
         pid_file, marker = tmp_path / "pid", tmp_path / "inject"
         env = dict(os.environ, INJECT=inject or "", INJECT_MARKER=str(marker))
-        signal_at = [pid_file]
+        # the first SIGINT once invoke is held up and the command is up: one
+        # before the command had set up its handler ended it there and then,
+        # and up.stopping never came (#258)
+        signal_at = [(pid_file, tmp_path / "up")]
         if escalated:
             # a second SIGINT once the command is in its SIGINT handler
             signal_at.append(tmp_path / "up.stopping")
