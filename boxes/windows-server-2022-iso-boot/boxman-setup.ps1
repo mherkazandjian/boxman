@@ -4,6 +4,10 @@
 # Every step runs even when an earlier one failed, and all of it is logged
 # to C:\boxman-setup.log. The last line written is "boxman-setup: done" when
 # every step worked, or "boxman-setup: FAILED: ..." naming those that did not.
+#
+# The CD-ROMs are install-only: boxman ejects them on the first `up` or
+# `update` that finds the QEMU guest agent answering. So nothing is read off
+# them after step 1 installs the agent; the public key is read first.
 
 Start-Transcript -Path C:\boxman-setup.log -Append
 $ErrorActionPreference = 'Continue'
@@ -31,8 +35,15 @@ function Install-Msi($relpath) {
     if ($p.ExitCode -notin 0, 3010) { Fail "$msi (msiexec exit code $($p.ExitCode))" }
 }
 
+# 0. The optional public key for Administrator, read now: the media may be
+#    gone by step 4.
+$authorizedKeys = $null
+$key = Find-Media 'authorized_keys'
+if ($key) { $authorizedKeys = Get-Content -Raw -Path $key }
+
 # 1. virtio drivers for everything (balloon, serial, rng, ...) plus the QEMU
-#    guest agent. WinPE only loaded viostor and NetKVM.
+#    guest agent, last: the agent answering is what tells boxman the media
+#    are no longer needed. WinPE only loaded viostor and NetKVM.
 Install-Msi 'virtio-win-gt-x64.msi'
 Install-Msi 'guest-agent\qemu-ga-x86_64.msi'
 
@@ -66,12 +77,11 @@ if (Get-Service sshd -ErrorAction SilentlyContinue) {
         New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `
             -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
     }
-    # Optional public key for Administrator (members of Administrators read
-    # this file, not ~/.ssh/authorized_keys).
-    $key = Find-Media 'authorized_keys'
-    if ($key) {
+    # The public key read in step 0 (members of Administrators read this
+    # file, not ~/.ssh/authorized_keys).
+    if ($authorizedKeys) {
         $dst = 'C:\ProgramData\ssh\administrators_authorized_keys'
-        Copy-Item $key $dst -Force
+        Set-Content -Path $dst -Value $authorizedKeys -NoNewline -Encoding ascii
         icacls.exe $dst /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
         if ($LASTEXITCODE -ne 0) { Fail "authorized_keys (icacls exit code $LASTEXITCODE)" }
     }

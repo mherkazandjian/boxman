@@ -7,8 +7,8 @@ Ansible. It uses boxman's ISO-boot path, which gives virt-install every
 findings, the gaps it works around and the proposed design are in
 [doc/windows-guests.md](../../doc/windows-guests.md).
 
-This is a spike box. It is not a template, it is not cloned, and it needs
-one manual step (see [Known gaps](#known-gaps)).
+This is a spike box. It is not a template and it is not cloned (see
+[Known gaps](#known-gaps)).
 
 ## What happens
 
@@ -18,7 +18,7 @@ one manual step (see [Known gaps](#known-gaps)).
 2. `boxman up` downloads the evaluation ISO into the cache and checks its
    sha256. It creates an empty 40G virtio disk and runs `virt-install` with
    three CD-ROMs: the Windows ISO, the host's `virtio-win.iso`, and the
-   answer ISO.
+   answer ISO. All three are `install_only` (see step 5).
 3. WinPE finds `autounattend.xml` on the answer ISO. It loads `viostor` and
    `NetKVM` from the virtio-win ISO, partitions the disk (MBR, SeaBIOS) and
    applies the Server Core image. It then reboots into the disk it just
@@ -32,6 +32,14 @@ one manual step (see [Known gaps](#known-gaps)).
    FAILED: …` naming the steps that did not complete (the transcript's
    footer follows it). The script then turns auto-logon off, deletes the
    password Setup stored for it, and logs that session off.
+5. The first `boxman up` or `boxman update` after that ejects the three
+   CD-ROMs: the guest agent reports `C:\` on the boot disk, which is
+   boxman's sign that the installed system is up. Until then, each `up`
+   and `update` logs why the media stay and how to eject them by hand.
+   The answer ISO holds the Administrator password in plain text, so this
+   matters: until the eject, any process in the guest can read it from
+   the drive. `boxman update` never compares the three: it neither puts
+   them back after the eject nor detaches them mid-install.
 
 Measured on the test host: about 85 s from `virt-install` to Setup's first reboot,
 and about 2 min from that reboot to WinRM and SSH answering.
@@ -58,19 +66,13 @@ boxman up
 
 Once `C:\boxman-setup.log` says `boxman-setup: done` (or
 `boxman-setup: FAILED: …`, which names the steps left to do by hand),
-**eject the answer ISO**. It holds the Administrator password in plain
-text and otherwise stays attached for the VM's whole life. It is not in
-`cdroms:`, so until it is ejected `boxman update` takes it for a drive
-removed from the config and detaches it, with a pending restart, on every
-run; an empty drive is left alone. (virtio-win is declared in `cdroms:`
-and stays attached.) The drive is named by the ISO's path, not by a
-target such as `sdc`, which depends on the order virt-install attaches
-media in; `--force` gets past a guest's tray lock:
+run `boxman up` again: it ejects the install media (step 5) and rewrites
+the ssh config.
 
 ```bash
-virsh -c qemu:///system change-media \
-  bprj__boxman_dev_windows-server-2022-iso-boot__bprj_win_win01 \
-  ~/workspaces/windows-server-2022-iso-boot/answer.iso --eject --force --live --config
+boxman up
+virsh -c qemu:///system domblklist \
+  bprj__boxman_dev_windows-server-2022-iso-boot__bprj_win_win01   # sda-sdc: -
 ```
 
 ## Verify
@@ -106,7 +108,9 @@ All of these are covered in the doc.
 - **No `admin_pass` key push.** It runs `ssh-copy-id`, which writes
   `~/.ssh/authorized_keys`. Windows' sshd reads
   `C:\ProgramData\ssh\administrators_authorized_keys` for administrators.
-- **The answer ISO stays attached** until you eject it (above). Until
-  then `boxman update` detaches it on every run.
+- **A guest whose agent does not run keeps its install media.** boxman
+  ejects them only once the guest agent reports the installed system, so
+  if `boxman-setup.ps1` could not install the agent, eject them by hand:
+  each `up` and `update` logs the `virsh change-media` command.
 - **Licensing.** The ISO is a 180-day evaluation for test/demo use. Do not
   push the ISO or a disk installed from it to a registry.

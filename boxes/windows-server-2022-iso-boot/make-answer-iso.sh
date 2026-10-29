@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the answer ISO (autounattend.xml + boxman-setup.ps1 [+ authorized_keys])
-# that conf.yml attaches as the third CD-ROM.
+# that conf.yml attaches as the third CD-ROM, install-only.
 #
 #   BOXMAN_WIN_ADMIN_PASS=...  required; Administrator password. Must meet
 #                              Windows' complexity rule (8+ chars, 3 of:
